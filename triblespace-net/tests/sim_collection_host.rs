@@ -1023,7 +1023,7 @@ fn full_replication_fetches_a_recent_descriptor_name_before_old_blob_eof() {
         let fresh_record = CollectionRecord::Commit(CollectionCommit::sign(
             &server_key,
             fresh.handle(),
-            metadata,
+            metadata.into(),
             metadata,
         ));
         server_store.insert(fresh_record).unwrap();

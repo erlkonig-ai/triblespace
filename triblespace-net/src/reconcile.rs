@@ -1006,6 +1006,42 @@ mod tests {
     }
 
     #[test]
+    fn full_scan_recent_cohort_spends_finite_windows_without_taking_regular_turns() {
+        let mut scan = FullScan::default();
+        for ordinal in 0_u32..1_024 {
+            let mut source = [0; 32];
+            source[..4].copy_from_slice(&ordinal.to_be_bytes());
+            scan.observe([1; 32], source);
+        }
+        scan.recent.clear();
+        next_ready(&mut scan);
+        scan.advance();
+        scan.yield_source();
+        scan.observe([2; 32], [2; 32]);
+        scan.observe([3; 32], [3; 32]);
+        let mut recent_roots = Vec::new();
+        let mut regular_turns = 0;
+        for _ in 0..SCAN_STARTUP_WORDS * 4 {
+            let cursor = next_ready(&mut scan);
+            if cursor.recent {
+                recent_roots.push(cursor.handles().0[0]);
+            } else {
+                regular_turns += 1;
+                assert_eq!(cursor.handles().0, [1; 32]);
+            }
+            scan.advance();
+            scan.yield_source();
+        }
+        assert_eq!(regular_turns, SCAN_STARTUP_WORDS * 2);
+        assert_eq!(
+            recent_roots,
+            [vec![3; SCAN_STARTUP_WORDS], vec![2; SCAN_STARTUP_WORDS]].concat(),
+            "newest-first is a finite window per arrival, not cohort round-robin",
+        );
+        assert!(scan.recent.is_empty());
+    }
+
+    #[test]
     fn full_scan_request_deadline_and_untouched_quota_word_keep_the_owed_turn() {
         let mut scan = FullScan::default();
         scan.observe([1; 32], [1; 32]);
