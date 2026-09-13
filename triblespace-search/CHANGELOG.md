@@ -13,15 +13,24 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   one attribute of image bytes through nomic-embed-vision-v1.5, any number of
   text attributes through the document side of nomic-embed-text-v1.5, both
   models pinned by the archive handles of their roots inside the pile's own
-  model collection. Rows are keyed `[attribute id | entity id]`, so a hit
-  names the entity and no per-entity vector is stored anywhere. The
+  model collection. Rows are keyed `[model root id | entity id]` for
+  content rows (the vision root for an image, the text root for a text or
+  PDF) and `[attribute id | entity id]` for text-attribute rows, so a hit
+  names the entity, no per-entity vector is stored anywhere, and a reader
+  tells image rows from text rows by the key alone. The
   descriptor names the compute class the index is canonical on; `map`
   refuses to compute elsewhere, where the `DERIVE` results arrive by
-  replication. Minted the mapping id `B94732E5DA22EFE9A4961BE906F5C500` and
-  six argument attributes.
+  replication. The content attribute's bytes are classified: a raster image
+  goes through the vision model, a PDF's own text layer (via `lopdf`) and any
+  valid UTF-8 through the text model's document side. Minted the mapping id
+  `021EE2F74220BDAE30CC35FB08FC9427` (replacing
+  `4704CB1C2A54CDBF96F54BFFC53A0733`, whose content rows were keyed by the
+  content attribute, and the image-only `B94732E5DA22EFE9A4961BE906F5C500`
+  of the night before) and six argument attributes.
 - Added `NvFp4CosineIndex::reconstructed_top_k`: the best rows by the cosine
   against each row's own two-stage reconstruction, without fetching a source
   embedding; the whole search for an index whose rows are not blob handles.
+  Added `NvFp4CosineIndex::len` and `segments` beside `is_empty`.
 
 
 ### Canonical row-local NVFP4 cosine collection

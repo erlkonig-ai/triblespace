@@ -910,6 +910,19 @@ impl<E: BlobEncoding> NvFp4CosineIndex<E> {
     pub fn is_empty(&self) -> bool {
         self.members.iter().all(|member| member.layout.rows == 0)
     }
+
+    /// Number of rows across the retained segments, duplicates included; an
+    /// upper bound on the distinct rows a scan visits.
+    pub fn len(&self) -> usize {
+        self.members.iter().map(|member| member.layout.rows).sum()
+    }
+
+    /// The retained segments: each member's content handle and its row count.
+    pub fn segments(&self) -> impl Iterator<Item = ([u8; HANDLE_LEN], usize)> + '_ {
+        self.members
+            .iter()
+            .map(|member| (member.content_handle, member.layout.rows))
+    }
 }
 
 impl<E> NvFp4CosineIndex<E>

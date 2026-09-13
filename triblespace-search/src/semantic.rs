@@ -3,22 +3,35 @@
 //!
 //! [`SemanticIndex`] is a [`CollectionMapping`] from one `SimpleArchive`
 //! source (the Files collection, say) to [`NvFp4CosineSet`]. Its descriptor
-//! names what to embed (one attribute whose values are handles to image
-//! bytes, and any number whose values are handles to UTF-8 text), the exact
+//! names what to embed (one content attribute whose values are handles to
+//! raw bytes, classified by the bytes themselves: a raster image goes
+//! through the vision model, a PDF's own text layer and any valid UTF-8 go
+//! through the text model's document side; plus any number of attributes
+//! whose values are handles to UTF-8 text), the exact
 //! model bytes to embed with (the archive handles of the roots inside the
 //! pile's own `mary-model-graph` collection, so a new model is a new
 //! descriptor and the old index stays readable), the compute class the index
 //! is canonical on, and the row dimension.
 //!
-//! A row is keyed by the attribute it embeds and the entity it belongs to,
-//! `[attribute id | entity id]` in 32 bytes, so a hit names the entity
-//! without any stored per-entity vector: the vectors a writer may have
-//! stored under a per-file attribute are not the index any more. JP,
-//! 2026-09-13, on this shape: "it's the right shape let's build it".
+//! A row is keyed by what embedded it and the entity it belongs to, 32
+//! bytes: a content row by the root of the model its bytes went through,
+//! `[model root id | entity id]` (the vision root for an image, the text
+//! root for a text or a PDF), a text-attribute row by its attribute,
+//! `[attribute id | entity id]`. So a hit names the entity without any
+//! stored per-entity vector (the vectors a writer may have stored under a
+//! per-file attribute are not the index any more), and a reader tells an
+//! image row from a text row by the key alone, which it must: text-to-text
+//! cosines in this space sit near 0.7 and text-to-image near 0.07, so the
+//! two kinds rank apart. JP, 2026-09-13, on this shape: "it's the right
+//! shape let's build it".
 //!
 //! Images go through nomic-embed-vision-v1.5 and texts through the document
 //! side of nomic-embed-text-v1.5, the two halves of one aligned space, so a
-//! text query finds an image by cosine alone. Rows are the two-stage NVFP4
+//! text query finds an image by cosine alone. JP, 2026-09-13, on the text
+//! side: "just point to the file blob itself as a UTF8String if it is one";
+//! a scanned PDF has no text layer and waits for an OCR model in the pile.
+//! The text model reads the first 2,048 tokens of a document; chunk rows for
+//! long documents are the follow-up. Rows are the two-stage NVFP4
 //! form JP settled for the index side on 2026-09-11 (97.6 % recall\@10
 //! against f32 on our own prose); [`NvFp4CosineIndex::reconstructed_top_k`]
 //! answers a query from the rows alone.
@@ -62,15 +75,23 @@ use crate::nvfp4::{encode_rows, nvfp4_dimension, NvFp4CosineSet, StoredRow, HAND
 
 /// The mapping algorithm: selected attributes of a `SimpleArchive` source,
 /// embedded through the nomic v1.5 text and vision models pinned by the
-/// descriptor, to two-stage NVFP4 rows keyed by attribute and entity.
+/// descriptor, to two-stage NVFP4 rows keyed by model root (content rows)
+/// or attribute (text-attribute rows) and entity. The content attribute's
+/// bytes are classified (image, PDF text layer, UTF-8).
 ///
-/// Minted with `trible genid` on 2026-09-13.
-pub const NOMIC_ATTRIBUTES_TO_NVFP4: Id = id_hex!("B94732E5DA22EFE9A4961BE906F5C500");
+/// Minted with `trible genid` on 2026-09-13. It replaces
+/// `4704CB1C2A54CDBF96F54BFFC53A0733` of the same day, which keyed content
+/// rows by the content attribute and so could not tell an image row from a
+/// text row, and `B94732E5DA22EFE9A4961BE906F5C500`, the image-only mapping
+/// of the night before; neither left sky. A mapping that computes something
+/// else is a different function and gets a different id.
+pub const NOMIC_ATTRIBUTES_TO_NVFP4: Id = id_hex!("021EE2F74220BDAE30CC35FB08FC9427");
 
 attributes! {
-    /// The one attribute whose values are handles to image bytes; every
-    /// entity carrying it gets a vision row. Minted 2026-09-13.
-    "13E4B93C65EA173282139D7DEBC1CC9B" as pub semantic_image_attribute: GenId;
+    /// The one attribute whose values are handles to raw content bytes; every
+    /// entity carrying it gets a row when the bytes are an image, a PDF with
+    /// a text layer, or UTF-8 text. Minted 2026-09-13.
+    "13E4B93C65EA173282139D7DEBC1CC9B" as pub semantic_content_attribute: GenId;
     /// An attribute whose values are handles to UTF-8 text; repeatable, one
     /// text row per (attribute, entity). Minted 2026-09-13.
     "02C9C79EA911BE8AAF9070A83B26CD10" as pub semantic_text_attribute: GenId;
@@ -109,8 +130,8 @@ impl MetaDescribe for NomicAttributesToNvFp4Recipe {
     fn describe() -> Fragment {
         let id = NOMIC_ATTRIBUTES_TO_NVFP4;
         entity! { ExclusiveId::force_ref(&id) @
-            metadata::name: "nomic-attributes-to-nvfp4",
-            metadata::description: "Selected image and text attributes of a SimpleArchive source, embedded through the nomic-embed v1.5 vision and text models pinned by the descriptor, as two-stage NVFP4 cosine rows keyed by attribute and entity.",
+            metadata::name: "nomic-content-to-nvfp4",
+            metadata::description: "Selected attributes of a SimpleArchive source embedded through the nomic-embed v1.5 vision and text models pinned by the descriptor, as two-stage NVFP4 cosine rows keyed by attribute and entity; the content attribute's bytes are classified as image, PDF text layer or UTF-8 text.",
             metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
         }
     }
@@ -119,15 +140,15 @@ impl MetaDescribe for NomicAttributesToNvFp4Recipe {
 /// One concrete semantic index: what to embed, with which pinned model
 /// bytes, on which compute, into rows of which dimension.
 pub struct SemanticIndex<E: BlobEncoding> {
-    /// Attribute whose values are handles to image bytes, if images are
-    /// indexed.
-    pub image_attribute: Option<Id>,
+    /// Attribute whose values are handles to raw content bytes (image, PDF or
+    /// UTF-8 text), if content is indexed.
+    pub content_attribute: Option<Id>,
     /// Attributes whose values are handles to UTF-8 text.
     pub text_attributes: BTreeSet<Id>,
     /// Member archives of the model collection holding the roots and the
     /// text tokenizer.
     pub model_archives: BTreeSet<[u8; 32]>,
-    /// The vision root; required when `image_attribute` is set.
+    /// The vision root; required when `content_attribute` is set.
     pub vision_root: Option<Id>,
     /// The text root; required when `text_attributes` is not empty.
     pub text_root: Option<Id>,
@@ -142,7 +163,7 @@ pub struct SemanticIndex<E: BlobEncoding> {
 impl<E: BlobEncoding> Clone for SemanticIndex<E> {
     fn clone(&self) -> Self {
         Self {
-            image_attribute: self.image_attribute,
+            content_attribute: self.content_attribute,
             text_attributes: self.text_attributes.clone(),
             model_archives: self.model_archives.clone(),
             vision_root: self.vision_root,
@@ -156,7 +177,7 @@ impl<E: BlobEncoding> Clone for SemanticIndex<E> {
 
 impl<E: BlobEncoding> PartialEq for SemanticIndex<E> {
     fn eq(&self, other: &Self) -> bool {
-        self.image_attribute == other.image_attribute
+        self.content_attribute == other.content_attribute
             && self.text_attributes == other.text_attributes
             && self.model_archives == other.model_archives
             && self.vision_root == other.vision_root
@@ -172,7 +193,7 @@ impl<E: BlobEncoding> std::fmt::Debug for SemanticIndex<E> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("SemanticIndex")
-            .field("image_attribute", &self.image_attribute)
+            .field("content_attribute", &self.content_attribute)
             .field("text_attributes", &self.text_attributes)
             .field("model_archives", &self.model_archives.len())
             .field("vision_root", &self.vision_root)
@@ -187,7 +208,7 @@ impl<E: BlobEncoding> SemanticIndex<E> {
     /// A new index description. `dimension` must be positive and at least
     /// one of the two model roots must be named with its attributes.
     pub fn new(
-        image_attribute: Option<Id>,
+        content_attribute: Option<Id>,
         text_attributes: impl IntoIterator<Item = Id>,
         model_archives: impl IntoIterator<Item = [u8; 32]>,
         vision_root: Option<Id>,
@@ -196,7 +217,7 @@ impl<E: BlobEncoding> SemanticIndex<E> {
         dimension: usize,
     ) -> Result<Self, CollectionOperationError> {
         let index = Self {
-            image_attribute,
+            content_attribute,
             text_attributes: text_attributes.into_iter().collect(),
             model_archives: model_archives.into_iter().collect(),
             vision_root,
@@ -216,14 +237,14 @@ impl<E: BlobEncoding> SemanticIndex<E> {
         if self.model_archives.is_empty() {
             return Err(fatal("semantic index names no model archive"));
         }
-        if self.image_attribute.is_some() && self.vision_root.is_none() {
-            return Err(fatal("semantic index embeds images but names no vision root"));
+        if self.content_attribute.is_some() && self.vision_root.is_none() && self.text_root.is_none() {
+            return Err(fatal("semantic index embeds content but names neither a vision nor a text root"));
         }
         if !self.text_attributes.is_empty() && self.text_root.is_none() {
             return Err(fatal("semantic index embeds text but names no text root"));
         }
-        if self.image_attribute.is_none() && self.text_attributes.is_empty() {
-            return Err(fatal("semantic index embeds nothing: no image or text attribute"));
+        if self.content_attribute.is_none() && self.text_attributes.is_empty() {
+            return Err(fatal("semantic index embeds nothing: no content or text attribute"));
         }
         if self.compute.is_empty() {
             return Err(fatal("semantic index names no compute class"));
@@ -232,7 +253,8 @@ impl<E: BlobEncoding> SemanticIndex<E> {
     }
 
     /// The row key of one (attribute, entity) pair: attribute id in the high
-    /// sixteen bytes, entity id in the low sixteen.
+    /// sixteen bytes, entity id in the low sixteen. A content row's
+    /// "attribute" is the root of the model that embedded it.
     pub fn row_key(attribute: Id, entity: RawId) -> [u8; HANDLE_LEN] {
         let mut key = [0u8; HANDLE_LEN];
         key[..16].copy_from_slice(&attribute[..]);
@@ -241,7 +263,8 @@ impl<E: BlobEncoding> SemanticIndex<E> {
     }
 
     /// The (attribute, entity) pair a row key names, or `None` for a key
-    /// that is not one of ours.
+    /// that is not one of ours; for a content row the first id is the model
+    /// root, the descriptor's `vision_root` or `text_root`.
     pub fn row_entity(key: &[u8; HANDLE_LEN]) -> Option<(Id, Id)> {
         let attribute = Id::new(key[..16].try_into().expect("16 bytes"))?;
         let entity = Id::new(key[16..].try_into().expect("16 bytes"))?;
@@ -378,6 +401,130 @@ fn repeated_archives(facts: &TribleSet, mapping: Id, attribute: Id) -> BTreeSet<
     .collect()
 }
 
+/// What one content blob is, decided by its bytes alone, so the row a
+/// mapping produces is a function of the bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Content {
+    /// A raster the vision model can decode.
+    Image,
+    /// A PDF; its text layer, possibly empty (a scanned document).
+    Pdf(String),
+    /// Valid UTF-8 text.
+    Text(String),
+    /// Bytes this index has no model for.
+    Other,
+}
+
+/// The most a PDF page's decompressed content may inflate to before it is
+/// treated as hostile and skipped (lopdf's decompression-bomb guard).
+const PDF_PAGE_CONTENT_LIMIT: usize = 64 * 1024 * 1024;
+
+/// Classify content bytes: the image decoder decides first, then the PDF
+/// magic, then UTF-8 validity. A file that decodes as an image is an image
+/// even if it also happens to be valid UTF-8 (an SVG is text, and the image
+/// decoder does not read SVG, so it lands on the text side, which is right).
+pub fn classify(bytes: &[u8]) -> Content {
+    if image::guess_format(bytes).is_ok() {
+        return Content::Image;
+    }
+    if bytes.starts_with(b"%PDF") {
+        return Content::Pdf(pdf_text(bytes));
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(text) if !text.trim().is_empty() => {
+            let text = if looks_like_html(text) {
+                strip_html(text)
+            } else {
+                text.to_owned()
+            };
+            if text.trim().is_empty() {
+                Content::Other
+            } else {
+                Content::Text(head(&text, TEXT_HEAD_BYTES))
+            }
+        }
+        _ => Content::Other,
+    }
+}
+
+/// The most of a document the text model is given. It reads 2,048 tokens,
+/// about eight kilobytes of English; sixteen keeps every model-visible byte
+/// and spares the tokenizer a megabyte of HTML it would only discard.
+const TEXT_HEAD_BYTES: usize = 16 * 1024;
+
+fn head(text: &str, bytes: usize) -> String {
+    if text.len() <= bytes {
+        return text.to_owned();
+    }
+    let mut end = bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
+
+fn looks_like_html(text: &str) -> bool {
+    let start = head(text, 512).to_ascii_lowercase();
+    start.contains("<html") || start.contains("<!doctype html") || start.contains("<body")
+}
+
+/// The text of an HTML document: script and style blocks removed, tags
+/// removed, the five common entities decoded, whitespace collapsed. A page
+/// from the web archive is then what its reader saw, which is what a query
+/// means by it.
+fn strip_html(html: &str) -> String {
+    let mut out = String::with_capacity(html.len() / 2);
+    let lower = html.to_ascii_lowercase();
+    let mut i = 0;
+    while i < html.len() {
+        if lower[i..].starts_with("<script") || lower[i..].starts_with("<style") {
+            let close = if lower[i..].starts_with("<script") {
+                "</script>"
+            } else {
+                "</style>"
+            };
+            match lower[i..].find(close) {
+                Some(offset) => i += offset + close.len(),
+                None => break,
+            }
+            out.push(' ');
+            continue;
+        }
+        if html[i..].starts_with('<') {
+            match html[i..].find('>') {
+                Some(offset) => i += offset + 1,
+                None => break,
+            }
+            out.push(' ');
+            continue;
+        }
+        let next = html[i..].find('<').map(|o| i + o).unwrap_or(html.len());
+        out.push_str(&html[i..next]);
+        i = next;
+    }
+    let decoded = out
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'");
+    decoded.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The text layer of a PDF, every page in order; empty for a document that
+/// has none, or that lopdf cannot read. A failure to read is the same answer
+/// every time for the same bytes, so it is a classification, not an error.
+fn pdf_text(bytes: &[u8]) -> String {
+    let Ok(document) = lopdf::Document::load_mem(bytes) else {
+        return String::new();
+    };
+    let pages: Vec<u32> = document.get_pages().keys().copied().collect();
+    document
+        .extract_text_with_limit(&pages, PDF_PAGE_CONTENT_LIMIT)
+        .unwrap_or_default()
+}
+
 impl<E> CollectionMapping for SemanticIndex<E>
 where
     E: BlobEncoding,
@@ -388,7 +535,7 @@ where
     type Target = NvFp4CosineSet<E>;
 
     fn fragment(&self) -> Fragment {
-        let image: Option<Inline<GenId>> = self.image_attribute.map(|id| id.to_inline());
+        let image: Option<Inline<GenId>> = self.content_attribute.map(|id| id.to_inline());
         let vision: Option<Inline<GenId>> = self.vision_root.map(|id| id.to_inline());
         let text: Option<Inline<GenId>> = self.text_root.map(|id| id.to_inline());
         let mut fragment = entity! { _ @
@@ -397,7 +544,7 @@ where
             metadata::blob_encoding*: E::describe(),
             nvfp4_dimension: self.dimension as u64,
             semantic_compute: self.compute.as_str(),
-            semantic_image_attribute?: image,
+            semantic_content_attribute?: image,
             semantic_vision_root?: vision,
             semantic_text_root?: text,
         };
@@ -436,7 +583,7 @@ where
             .try_from_inline()
             .map_err(|source| fatal(format!("semantic index: invalid compute class: {source:?}")))?;
         Self::new(
-            scalar_id(facts, semantic_image_attribute.id())?,
+            scalar_id(facts, semantic_content_attribute.id())?,
             repeated_ids(facts, mapping, semantic_text_attribute.id()),
             repeated_archives(facts, mapping, semantic_model_archive.id()),
             scalar_id(facts, semantic_vision_root.id())?,
@@ -468,7 +615,7 @@ where
             let entity: RawId = raw[..16].try_into().expect("16-byte entity");
             let value: [u8; 32] = raw[32..].try_into().expect("32-byte trible value");
             if self
-                .image_attribute
+                .content_attribute
                 .is_some_and(|attribute| raw[16..32] == attribute[..])
             {
                 images.entry(entity).or_default().insert(value);
@@ -521,29 +668,62 @@ where
             )));
         }
         let models = self.models(reader)?;
+        // SEMANTIC_TRACE=1 prints one line per source member on stderr: what
+        // it held and what it cost, the only progress an index build shows.
+        let trace = std::env::var_os("SEMANTIC_TRACE").is_some();
+        let started = std::time::Instant::now();
+        let (mut n_image, mut n_text, mut n_pdf, mut n_other) = (0usize, 0usize, 0usize, 0usize);
 
         let mut rows = Vec::with_capacity(images.len() + texts.len());
-        if let (Some(attribute), Some(vision)) = (self.image_attribute, models.vision.as_ref()) {
+        if self.content_attribute.is_some() {
             for (entity, handles) in &images {
                 let raw = *handles.first().expect("non-empty set");
                 let bytes: Bytes = reader
                     .get(Inline::<Handle<RawBytes>>::new(raw))
                     .map_err(|source| fatal(source.to_string()))?;
-                // Not every value under the attribute is a raster image (a
-                // PDF, an SVG); one that does not decode gets no row, which
-                // is the same answer every time for the same bytes.
-                let Ok(vector) = vision.embed_image(bytes.as_ref()) else {
-                    continue;
+                // The bytes say what they are; a kind this index has no
+                // model for gets no row, the same answer every time.
+                let kind = classify(bytes.as_ref());
+                match &kind {
+                    Content::Image => n_image += 1,
+                    Content::Pdf(_) => n_pdf += 1,
+                    Content::Text(_) => n_text += 1,
+                    Content::Other => n_other += 1,
+                }
+                // The row is keyed by the root of the model it went through.
+                let (vector, root) = match kind {
+                    Content::Image => match (models.vision.as_ref(), self.vision_root) {
+                        (Some(vision), Some(root)) => match vision.embed_image(bytes.as_ref()) {
+                            Ok(vector) => (vector, root),
+                            Err(_) => continue,
+                        },
+                        _ => continue,
+                    },
+                    Content::Pdf(text) | Content::Text(text) => {
+                        if text.trim().is_empty() {
+                            continue;
+                        }
+                        match (models.text.as_ref(), self.text_root) {
+                            (Some(text_model), Some(root)) => (
+                                text_model
+                                    .embed_document(&text)
+                                    .map_err(|source| fatal(format!("text model: {source:#}")))?,
+                                root,
+                            ),
+                            _ => continue,
+                        }
+                    }
+                    Content::Other => continue,
                 };
                 if vector.len() != self.dimension {
                     return Err(fatal(format!(
-                        "vision model produced {} dimensions, index has {}",
+                        "model produced {} dimensions, index has {}",
                         vector.len(),
                         self.dimension
                     )));
                 }
                 rows.push(
-                    StoredRow::quantize(Self::row_key(attribute, *entity), &vector, self.dimension)
+                    StoredRow::quantize(Self::row_key(root, *entity), &vector, self.dimension)
                         .map_err(|source| fatal(source.to_string()))?,
                 );
             }
@@ -569,6 +749,15 @@ where
                         .map_err(|source| fatal(source.to_string()))?,
                 );
             }
+        }
+        if trace {
+            eprintln!(
+                "semantic index: member with {} content value(s) ({n_image} image, {n_text} text, {n_pdf} pdf, {n_other} other) and {} text fact(s): {} row(s) in {:.1} s",
+                images.len(),
+                texts.len(),
+                rows.len(),
+                started.elapsed().as_secs_f64()
+            );
         }
         encode_rows::<E>(self.dimension, rows).map_err(|source| fatal(source.to_string()))
     }
@@ -630,6 +819,31 @@ mod tests {
         let (a, e) = SemanticIndex::<Embedding>::row_entity(&key).unwrap();
         assert_eq!(a, attribute);
         assert_eq!(&e[..], &entity);
+    }
+
+    #[test]
+    fn content_is_classified_by_its_bytes() {
+        let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+        assert_eq!(classify(png), Content::Image);
+        assert_eq!(classify(b"hello, world"), Content::Text("hello, world".to_owned()));
+        assert_eq!(classify(b"   \n"), Content::Other);
+        assert_eq!(classify(&[0xff, 0xfe, 0x00, 0x01]), Content::Other);
+        // Not a real PDF: still a PDF by its magic, with no text layer.
+        assert_eq!(classify(b"%PDF-1.7 garbage"), Content::Pdf(String::new()));
+    }
+
+    #[test]
+    fn html_is_reduced_to_its_text() {
+        let page = "<!DOCTYPE html><html><head><style>p{x:1}</style><script>var a=1;</script><title>Hydra</title></head><body><p>Two robot heads &amp; a desk.</p></body></html>";
+        assert_eq!(
+            classify(page.as_bytes()),
+            Content::Text("Hydra Two robot heads & a desk.".to_owned())
+        );
+        let long = "x".repeat(TEXT_HEAD_BYTES + 100);
+        match classify(long.as_bytes()) {
+            Content::Text(text) => assert_eq!(text.len(), TEXT_HEAD_BYTES),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

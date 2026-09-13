@@ -39,6 +39,12 @@ triblespace-core = { version = "0.47.0", path = "../triblespace-core", default-f
 # Mary owns reusable numerical representations and accelerator arithmetic.
 # This crate owns only their collection/storage integration and exact reranking.
 mary = { version = "0.1.0", path = "../../mary" }
+# PDF text layers for the semantic index (`semantic` feature only): a typed
+# document carries its text; a scanned one does not, and needs an OCR model.
+lopdf = { version = "0.44", default-features = false, optional = true }
+# Image format probing for the same classification; the decoders themselves
+# live in mary's embedder.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"], optional = true }
 anybytes = "0.20"
 # jerky — succinct data structures; optional for the v1 scaffold,
 # required once we flip from flat-array prototypes to the
@@ -60,7 +66,7 @@ unicode-segmentation = "=1.12.0"
 default = ["succinct"]
 # The semantic index: rows embedded straight from source facts through the
 # nomic models in the same pile (`semantic` module). Pulls mary's embedders.
-semantic = ["mary/embed"]
+semantic = ["mary/embed", "dep:lopdf", "dep:image"]
 # The production execution path targets the provisioned GB10/Spark appliance.
 nvfp4-cuda = ["mary/nvfp4-cuda"]
 # Swap the naive flat-array implementations for the succinct
