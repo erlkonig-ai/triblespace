@@ -516,11 +516,27 @@ to fetching another person's collection. Shallow hydration follows structurally
 valid records, including signed but WRITE-inert commits; obtaining bytes does
 not admit their claims. Exact WANTs and direct roots run before speculative
 recursive reads, sharing one time budget. The walker retains only positively
-reached `(root, blob)` pairs in a PATCH and one resumable byte cursor. Candidate
-work and speculative requests are bounded per pass; absent candidates do not
-become WANTs or an ever-growing negative frontier. Later sweeps retry them,
-because a DHT miss does not establish absence. Full mode does not recursively
-widen an explicit `WANT(H)` that lies outside the selected collection roots.
+reached `(root, blob)` pairs and their resumable offsets in a PATCH. Frozen
+regular rounds grant one bounded quantum per source, rather than draining one
+large blob before serving another. An alternating recent-positive lane gives
+new arrivals a bounded startup window; the lane turn survives tick and fetch
+deadline exits. Completed parents become eligible again on their own bounded
+backoff, independently of large partial sources and subsequent arrivals.
+Candidate work and speculative requests remain bounded per pass; at most one
+speculative request is issued in a quantum. Absent candidates do not become
+WANTs or an ever-growing negative frontier, because a DHT miss does not
+establish absence. Full mode does not recursively widen an explicit `WANT(H)`
+that lies outside the selected collection roots.
+
+This is service fairness, not a wall-clock hydration guarantee. A large initial
+burst cannot all receive immediate service, sustained arrivals can outgrow the
+recent lane, and exact WANT/root work may consume the shared fetch deadline.
+Recent work never takes away the reserved regular turns, including revisits;
+it only accelerates a finite prefix of newly observed positive sources. The
+recent lane is newest-first and retains a source for at most 128 aligned words;
+regular quanta inspect at most 64 words. For a finite burst of A newcomers, the
+last first-service bound is O(A times the startup window), not constant time or
+round-robin service within that burst.
 
 A producer can maintain an ordinary `ReferenceSummaryBlob` collection to make
 negative recursive probes cheap. Its mapping scans the complete source blob

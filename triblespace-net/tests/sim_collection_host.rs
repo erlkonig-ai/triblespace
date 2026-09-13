@@ -962,6 +962,135 @@ fn demand_shallow_full_preserve_exact_wants_and_only_hydrate_selected_record_roo
 }
 
 #[test]
+fn full_replication_fetches_a_recent_descriptor_name_before_old_blob_eof() {
+    let _guard = test_guard();
+    let clock = virtual_clock();
+    clock.reset();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    runtime.block_on(local.run_until(async {
+        let net = SimNet::new(0xC011_EC84, SimConfig::default());
+        let server_key = key(121);
+        let reader_key = key(122);
+        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+        let mut server_store = MemoryRepo::default();
+        let old = register(&mut server_store, policy.clone());
+        let metadata = server_store
+            .put::<SimpleArchive, _>(TribleSet::new().to_blob())
+            .unwrap();
+        let mut junk = Vec::new();
+        for word in 0_u64..8_192 {
+            junk.extend_from_slice(blake3::hash(&word.to_le_bytes()).as_bytes());
+        }
+        let (old_data, old_bytes) = (0_u64..10_000)
+            .find_map(|nonce| {
+                let mut bytes = junk.clone();
+                bytes.extend_from_slice(&nonce.to_le_bytes());
+                let hash = *blake3::hash(&bytes).as_bytes();
+                (hash < old.handle().raw && hash < metadata.raw).then_some((hash, bytes))
+            })
+            .expect("old binary sorts first in the original frozen sweep");
+        server_store
+            .put::<UnknownBlob, _>(Bytes::from_source(old_bytes.clone()))
+            .unwrap();
+        let old_record = CollectionRecord::Commit(CollectionCommit::sign(
+            &server_key,
+            old.handle(),
+            Inline::new(old_data),
+            metadata,
+        ));
+        server_store.insert(old_record).unwrap();
+        let (fresh, name, descriptor_bytes) = (0..100)
+            .find_map(|nonce| {
+                let text = format!("recent descriptor name, several words in: {nonce}");
+                let fresh = server_store.collection(&text, policy.clone()).unwrap();
+                let name = server_store
+                    .put::<UnknownBlob, _>(Bytes::from_source(text.into_bytes()))
+                    .unwrap();
+                let bytes = BlobStoreGet::get::<Bytes, UnknownBlob>(
+                    &server_store.snapshot().unwrap(),
+                    Inline::new(fresh.handle().raw),
+                )
+                .unwrap();
+                let word = bytes.chunks_exact(32).position(|word| word == name.raw)?;
+                (word >= 3 && word < 128).then_some((fresh, name, bytes))
+            })
+            .expect("a canonical descriptor whose name is beyond its first word");
+        let fresh_record = CollectionRecord::Commit(CollectionCommit::sign(
+            &server_key,
+            fresh.handle(),
+            metadata,
+            metadata,
+        ));
+        server_store.insert(fresh_record).unwrap();
+        let mut reader_store = MemoryRepo::default();
+        for handle in [old.handle().raw, old_data, metadata.raw] {
+            let bytes = BlobStoreGet::get::<Bytes, UnknownBlob>(
+                &server_store.snapshot().unwrap(),
+                Inline::new(handle),
+            )
+            .unwrap();
+            reader_store.put::<UnknownBlob, _>(bytes).unwrap();
+        }
+        reader_store.insert(old_record).unwrap();
+        let mut server = bring_up_with_publication_budget(
+            &net,
+            &server_key,
+            server_store,
+            Vec::new(),
+            ReconcileDirection::WriteOnly,
+            Some(0),
+        );
+        let mut reader = bring_up_with_publication_budget(
+            &net,
+            &reader_key,
+            reader_store,
+            vec![server_key.verifying_key().to_bytes()],
+            ReconcileDirection::ReadOnly,
+            Some(0),
+        );
+        advance(&clock, &mut [&mut server, &mut reader], 4).await;
+        let mut reconciler = Reconciler::with_backoff(
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_secs(1),
+        )
+        .with_replication(ReplicationMode::Full, [old.handle(), fresh.handle()])
+        .with_fetch_budget(std::time::Duration::from_secs(2));
+        let first = reconcile_once(&clock, &mut reconciler, &mut reader, &mut [&mut server]).await;
+        assert!(first.replication.speculative_misses > 0);
+        assert!(reader.try_local(name.raw).is_none());
+        reader
+            .store()
+            .put::<UnknownBlob, _>(descriptor_bytes)
+            .unwrap();
+        reader.store().insert(fresh_record).unwrap();
+        reader.refresh();
+        for _ in 0..48 {
+            let stats =
+                reconcile_once(&clock, &mut reconciler, &mut reader, &mut [&mut server]).await;
+            assert!(
+                stats.replication.speculative_attempted <= RECONCILE_SPECULATIVE_FETCHES_PER_TICK
+            );
+            if reader.try_local(name.raw).is_some() {
+                break;
+            }
+            advance(&clock, &mut [&mut server, &mut reader], 1).await;
+        }
+        assert!(
+            reader.try_local(name.raw).is_some(),
+            "the new name must not await 8,192 old speculative words"
+        );
+        let snapshot = reader.snapshot().unwrap();
+        assert_eq!(snapshot.wants().unwrap().count(), 0);
+        assert_eq!(snapshot.records().unwrap().count(), 2);
+    }));
+}
+
+#[test]
 fn full_replication_retries_a_missing_child_after_unchanged_parent_progress() {
     let _guard = test_guard();
     let clock = virtual_clock();

@@ -23,7 +23,7 @@ use triblespace_core::collection::{
     CollectionSnapshotExt, CollectionStore,
 };
 use triblespace_core::inline::Inline;
-use triblespace_core::patch::{Entry as PatchEntry, PATCH};
+use triblespace_core::patch::{Entry as PatchEntry, IdentitySchema, PATCH};
 use triblespace_core::repo::{
     BlobChildren, BlobStore, BlobStoreGet, CapabilityProofStore, SnapshotSource, StorageFlush,
     StoreRead, WantRead, WantRequest, WantStore,
@@ -99,6 +99,11 @@ pub const RECONCILE_FETCH_DEADLINE: Duration = Duration::from_secs(30);
 pub const RECONCILE_SCAN_CANDIDATES_PER_TICK: usize = 16 * 1024;
 /// Speculation cannot turn one large binary into an unbounded burst of DHT work.
 pub const RECONCILE_SPECULATIVE_FETCHES_PER_TICK: usize = 16;
+
+/// Yield even when a source contains only local or summary-filtered words.
+const SCAN_WORDS_PER_QUANTUM: usize = 64;
+/// New positive sources get a small head start, not an unlimited priority scan.
+const SCAN_STARTUP_WORDS: usize = 128;
 
 impl Default for Reconciler {
     fn default() -> Self {
@@ -435,8 +440,10 @@ impl Reconciler {
         while scan_steps < RECONCILE_SCAN_CANDIDATES_PER_TICK && !self.remaining(started).is_zero()
         {
             scan_steps += 1;
-            let Some(cursor) = self.scan.next(self.initial_backoff, self.max_backoff) else {
-                break;
+            let cursor = match self.scan.next() {
+                ScanStep::Ready(cursor) => cursor,
+                ScanStep::Skip => continue,
+                ScanStep::Idle => break,
             };
             let (root, source) = cursor.handles();
             let bytes =
@@ -446,7 +453,7 @@ impl Reconciler {
                         // Forgetting or temporary local unavailability is not a
                         // closed edge. Roots and later parent sweeps rediscover it.
                         self.scan.sources.remove(&cursor.key);
-                        self.scan.finish_source();
+                        self.scan.cursor = None;
                         continue;
                     }
                 };
@@ -455,7 +462,8 @@ impl Reconciler {
                 .get(cursor.offset..)
                 .and_then(|tail| tail.get(..32))
             else {
-                self.scan.finish_source();
+                self.scan
+                    .finish_source(self.initial_backoff, self.max_backoff);
                 continue;
             };
             let candidate: RawHash = chunk.try_into().expect("one complete aligned word");
@@ -484,9 +492,12 @@ impl Reconciler {
             }
             let local =
                 BlobStoreGet::get::<Bytes, UnknownBlob>(&snapshot, Inline::new(candidate)).ok();
+            let speculative_budget = self.remaining(started);
             if local.is_none()
                 && !negative.contains(&candidate)
-                && stats.replication.speculative_attempted >= RECONCILE_SPECULATIVE_FETCHES_PER_TICK
+                && (stats.replication.speculative_attempted
+                    >= RECONCILE_SPECULATIVE_FETCHES_PER_TICK
+                    || speculative_budget.is_zero())
             {
                 // Leave this exact offset for the next tick. No candidate
                 // array or absent-handle frontier is ever materialized.
@@ -512,7 +523,10 @@ impl Reconciler {
                 continue;
             }
             stats.replication.speculative_attempted += 1;
-            if fetch_and_land(peer, candidate, self.remaining(started))
+            // A request may consume the entire deadline. Persist the next lane
+            // and this source's exact progress before awaiting it.
+            self.scan.yield_source();
+            if fetch_and_land(peer, candidate, speculative_budget)
                 .await
                 .is_none()
             {
@@ -534,6 +548,9 @@ impl Reconciler {
             // discovered resident child before calling it positive work.
             snapshot_flushed = false;
         }
+        // CPU/time exits are quantum boundaries too. A selected but wholly
+        // unexamined word stays active, so quota exhaustion cannot skip its turn.
+        self.scan.yield_source();
         stats
     }
 
@@ -562,26 +579,46 @@ impl Reconciler {
 
 /// Positive traversal state only: one key per (direct root, readable source).
 ///
-/// The root half preserves the scope of a future covering reference summary.
+/// The root half preserves the scope of a covering reference summary.
 /// Shared descendants may therefore be scanned separately for several roots;
 /// these are traversal observations, not distinct acquired blobs. Arbitrary
 /// absent words never enter this PATCH or the exact-demand retry map.
 #[derive(Default)]
 struct FullScan {
-    sources: PATCH<64>,
-    /// Freeze each sweep cheaply; continuous positive growth cannot starve a
-    /// rescan of older parents whose previously absent children arrived later.
-    pass: Option<PATCH<64>>,
+    sources: PATCH<64, IdentitySchema, SourceProgress>,
+    /// A frozen round grants one quantum per positive source, not a whole blob.
+    /// New insertions cannot lengthen the round ahead of older work.
+    pass: Option<PATCH<64, IdentitySchema, SourceProgress>>,
     cursor: Option<ScanCursor>,
     after: Option<[u8; 64]>,
-    retry: Option<WantState>,
-    progress: bool,
+    /// A bounded startup window, newest arrivals first. Every entry also gets
+    /// ordinary rounds, so sustained arrivals cannot starve older sources.
+    recent: Vec<[u8; 64]>,
+    /// Deliberately retained across ticks, including a fetch timeout.
+    prefer_recent: bool,
+}
+
+#[derive(Clone, Copy)]
+struct SourceProgress {
+    offset: usize,
+    startup_left: usize,
+    last_scan: Option<crate::clock::Mono>,
+    backoff: Duration,
+}
+
+enum ScanStep {
+    Ready(ScanCursor),
+    /// One bounded scheduling step (round boundary, stale entry, or cooldown).
+    Skip,
+    Idle,
 }
 
 #[derive(Clone, Copy)]
 struct ScanCursor {
     key: [u8; 64],
     offset: usize,
+    words: usize,
+    recent: bool,
 }
 
 impl ScanCursor {
@@ -599,59 +636,103 @@ impl FullScan {
         key[..32].copy_from_slice(&root);
         key[32..].copy_from_slice(&source);
         if self.sources.get(&key).is_none() {
-            self.sources.insert(&PatchEntry::new(&key));
-            self.progress = true;
-            self.retry = None;
+            self.sources.insert(&PatchEntry::with_value(
+                &key,
+                SourceProgress {
+                    offset: 0,
+                    startup_left: SCAN_STARTUP_WORDS,
+                    last_scan: None,
+                    backoff: Duration::ZERO,
+                },
+            ));
+            self.recent.push(key);
         }
     }
 
-    fn next(&mut self, initial: Duration, max: Duration) -> Option<ScanCursor> {
+    fn next(&mut self) -> ScanStep {
         if let Some(cursor) = self.cursor {
-            return Some(cursor);
+            return ScanStep::Ready(cursor);
         }
-        if self.sources.is_empty()
-            || self.retry.as_ref().is_some_and(|retry| {
-                crate::clock::mono_now().duration_since(retry.last_attempt) < retry.backoff
-            })
-        {
-            return None;
+        if self.sources.is_empty() {
+            return ScanStep::Idle;
         }
-        let pass = self.pass.get_or_insert_with(|| self.sources.clone());
-        let next = match self.after {
-            Some(after) => pass.next_infix_after(&[], &after, &[u8::MAX; 64]),
-            None => pass.first_infix_range(&[], &[0; 64], &[u8::MAX; 64]),
-        };
-        if let Some(key) = next {
-            let cursor = ScanCursor { key, offset: 0 };
-            self.cursor = Some(cursor);
-            return Some(cursor);
-        }
-        // A complete pass only means these exact bytes were examined. Missing
-        // candidates may become available without changing any parent bytes,
-        // so every source is eligible again after this one shared backoff.
-        let backoff = if self.progress {
-            initial
+        let recent = self.prefer_recent && !self.recent.is_empty();
+        self.prefer_recent = !self.prefer_recent;
+        let key = if recent {
+            self.recent.pop().expect("nonempty recent lane")
         } else {
-            self.retry
-                .as_ref()
-                .map_or(initial, |retry| retry.backoff.saturating_mul(2).min(max))
+            let pass = self.pass.get_or_insert_with(|| self.sources.clone());
+            let next = match self.after {
+                Some(after) => pass.next_infix_after(&[], &after, &[u8::MAX; 64]),
+                None => pass.first_infix_range(&[], &[0; 64], &[u8::MAX; 64]),
+            };
+            let Some(key) = next else {
+                self.after = None;
+                self.pass = None;
+                return ScanStep::Skip;
+            };
+            self.after = Some(key);
+            key
         };
-        self.retry = Some(WantState {
-            last_attempt: crate::clock::mono_now(),
-            backoff,
-        });
-        self.after = None;
-        self.pass = None;
-        self.progress = false;
-        None
+        let Some(progress) = self.sources.get(&key) else {
+            return ScanStep::Skip;
+        };
+        if recent && progress.startup_left == 0 {
+            return ScanStep::Skip;
+        }
+        if progress
+            .last_scan
+            .is_some_and(|last| crate::clock::mono_now().duration_since(last) < progress.backoff)
+        {
+            return ScanStep::Skip;
+        }
+        let cursor = ScanCursor {
+            key,
+            offset: progress.offset,
+            words: 0,
+            recent,
+        };
+        self.cursor = Some(cursor);
+        ScanStep::Ready(cursor)
     }
 
     fn advance(&mut self) {
-        self.cursor.as_mut().expect("active scan").offset += 32;
+        let cursor = self.cursor.as_mut().expect("active scan");
+        cursor.offset += 32;
+        cursor.words += 1;
+        if cursor.words >= SCAN_WORDS_PER_QUANTUM {
+            self.yield_source();
+        }
     }
 
-    fn finish_source(&mut self) {
-        self.after = self.cursor.take().map(|cursor| cursor.key);
+    fn yield_source(&mut self) {
+        let Some(cursor) = self.cursor.filter(|cursor| cursor.words != 0) else {
+            return;
+        };
+        self.cursor = None;
+        let mut progress = *self.sources.get(&cursor.key).expect("positive source");
+        progress.offset = cursor.offset;
+        progress.startup_left = progress.startup_left.saturating_sub(cursor.words);
+        self.sources
+            .replace(&PatchEntry::with_value(&cursor.key, progress));
+        if cursor.recent && progress.startup_left != 0 {
+            self.recent.push(cursor.key);
+        }
+    }
+
+    fn finish_source(&mut self, initial: Duration, max: Duration) {
+        let cursor = self.cursor.take().expect("active scan");
+        let mut progress = *self.sources.get(&cursor.key).expect("positive source");
+        progress.offset = 0;
+        progress.startup_left = 0;
+        progress.last_scan = Some(crate::clock::mono_now());
+        progress.backoff = if progress.backoff.is_zero() {
+            initial
+        } else {
+            progress.backoff.saturating_mul(2).min(max)
+        };
+        self.sources
+            .replace(&PatchEntry::with_value(&cursor.key, progress));
     }
 }
 
@@ -846,34 +927,162 @@ mod tests {
         assert!(direct_roots(&FailingCollectionRead, &selectors).is_err());
     }
 
+    fn next_ready(scan: &mut FullScan) -> ScanCursor {
+        for _ in 0..20_000 {
+            match scan.next() {
+                ScanStep::Ready(cursor) => return cursor,
+                ScanStep::Skip => {}
+                ScanStep::Idle => panic!("expected positive work"),
+            }
+        }
+        panic!("positive work did not receive service");
+    }
+
+    fn scan_key(root: RawHash, source: RawHash) -> [u8; 64] {
+        let mut key = [0; 64];
+        key[..32].copy_from_slice(&root);
+        key[32..].copy_from_slice(&source);
+        key
+    }
+
     #[test]
-    fn full_scan_freezes_each_positive_sweep_and_revisits_old_parents() {
+    fn full_scan_regular_rounds_preserve_offsets_and_yield_before_eof() {
         let mut scan = FullScan::default();
         let root = [5; 32];
         scan.observe(root, [20; 32]);
-        let first = scan.next(Duration::ZERO, Duration::ZERO).unwrap();
-        assert_eq!(first.handles(), (root, [20; 32]));
-        scan.advance();
-        assert_eq!(
-            scan.next(Duration::ZERO, Duration::ZERO).unwrap().offset,
-            32
-        );
-        scan.observe(root, [10; 32]);
         scan.observe(root, [30; 32]);
-        scan.finish_source();
-        assert!(scan.next(Duration::ZERO, Duration::ZERO).is_none());
-        for source in [[10; 32], [20; 32], [30; 32]] {
-            let cursor = scan.next(Duration::ZERO, Duration::ZERO).unwrap();
-            assert_eq!(cursor.handles(), (root, source));
-            assert_eq!(cursor.offset, 0);
-            scan.finish_source();
+        scan.recent.clear();
+        let first = next_ready(&mut scan);
+        assert_eq!(first.handles(), (root, [20; 32]));
+        for _ in 0..SCAN_WORDS_PER_QUANTUM {
+            scan.advance();
         }
-        assert!(scan.next(Duration::ZERO, Duration::ZERO).is_none());
-        assert_eq!(
-            scan.next(Duration::ZERO, Duration::ZERO).unwrap().handles(),
-            (root, [10; 32]),
-            "a completed sweep never permanently closes absent-child edges",
+        assert!(
+            scan.cursor.is_none(),
+            "a large source must yield before EOF"
         );
+        assert_eq!(next_ready(&mut scan).handles(), (root, [30; 32]));
+        scan.advance();
+        scan.yield_source();
+        let resumed = next_ready(&mut scan);
+        assert_eq!(resumed.handles(), (root, [20; 32]));
+        assert_eq!(resumed.offset, SCAN_WORDS_PER_QUANTUM * 32);
+    }
+
+    #[test]
+    fn full_scan_recent_descriptor_gets_a_window_beyond_its_first_word() {
+        let mut scan = FullScan::default();
+        let old = [1; 32];
+        for ordinal in 0_u32..4_096 {
+            let mut source = [0; 32];
+            source[..4].copy_from_slice(&ordinal.to_be_bytes());
+            scan.observe(old, source);
+        }
+        next_ready(&mut scan);
+        scan.advance();
+        scan.yield_source();
+        // This newly observed descriptor sorts after the entire frozen round.
+        let descriptor = [250; 32];
+        scan.observe(descriptor, descriptor);
+        let mut descriptor_offsets = Vec::new();
+        let mut regular_turns = 0;
+        for _ in 0..16 {
+            let cursor = next_ready(&mut scan);
+            if cursor.handles() == (descriptor, descriptor) {
+                descriptor_offsets.push(cursor.offset);
+            } else {
+                regular_turns += 1;
+            }
+            // One speculative request per turn, including deadline exits.
+            scan.advance();
+            scan.yield_source();
+        }
+        assert_eq!(
+            descriptor_offsets,
+            (0..8).map(|word| word * 32).collect::<Vec<_>>(),
+            "a name in word eight must not wait behind the old root backlog",
+        );
+        assert_eq!(regular_turns, 8);
+    }
+
+    #[test]
+    fn full_scan_request_deadline_and_untouched_quota_word_keep_the_owed_turn() {
+        let mut scan = FullScan::default();
+        scan.observe([1; 32], [1; 32]);
+        scan.observe([2; 32], [2; 32]);
+        let first = next_ready(&mut scan);
+        // A quota exit before examining this word must not silently skip it.
+        scan.yield_source();
+        assert_eq!(next_ready(&mut scan).key, first.key);
+        assert_eq!(next_ready(&mut scan).offset, 0);
+        scan.advance();
+        // tick does this BEFORE awaiting a request that can use all its time.
+        scan.yield_source();
+        assert!(scan.prefer_recent);
+        assert_eq!(next_ready(&mut scan).handles(), ([2; 32], [2; 32]));
+        scan.advance();
+        scan.yield_source();
+        // A new arrival cannot steal the regular turn owed after the timeout.
+        scan.observe([3; 32], [3; 32]);
+        assert!(!scan.prefer_recent);
+        let regular = next_ready(&mut scan);
+        assert_eq!(regular.handles(), ([2; 32], [2; 32]));
+        assert_eq!(regular.offset, 32, "recent and regular share one offset");
+    }
+
+    #[test]
+    fn full_scan_global_request_cap_preserves_the_next_unattempted_word() {
+        let mut scan = FullScan::default();
+        scan.observe([1; 32], [1; 32]);
+        scan.observe([2; 32], [2; 32]);
+        for _ in 0..RECONCILE_SPECULATIVE_FETCHES_PER_TICK {
+            next_ready(&mut scan);
+            scan.advance();
+            scan.yield_source();
+        }
+        let pending = next_ready(&mut scan);
+        assert_eq!(pending.words, 0);
+        scan.yield_source();
+        let next_tick = next_ready(&mut scan);
+        assert_eq!(next_tick.key, pending.key);
+        assert_eq!(next_tick.offset, pending.offset);
+        scan.advance();
+        scan.yield_source();
+        assert_eq!(
+            scan.sources.get(&pending.key).unwrap().offset,
+            pending.offset + 32,
+        );
+    }
+
+    #[test]
+    fn full_scan_arrivals_do_not_postpone_partial_work_or_completed_parent_revisits() {
+        let mut scan = FullScan::default();
+        scan.observe([1; 32], [1; 32]);
+        scan.observe([2; 32], [2; 32]);
+        scan.recent.clear();
+        let mut partial_turns = 0;
+        let mut parent_visits = 0;
+        for ordinal in 3_u8..80 {
+            scan.observe([ordinal; 32], [ordinal; 32]);
+            let cursor = next_ready(&mut scan);
+            match cursor.handles().0[0] {
+                1 => partial_turns += 1,
+                2 => {
+                    parent_visits += 1;
+                    assert_eq!(cursor.offset, 0);
+                    scan.finish_source(Duration::ZERO, Duration::ZERO);
+                    continue;
+                }
+                _ => {}
+            }
+            scan.advance();
+            scan.yield_source();
+        }
+        assert!(
+            partial_turns >= 2,
+            "large sources keep advancing under arrivals"
+        );
+        assert!(parent_visits >= 2, "EOF is not a permanent closed edge");
     }
 
     fn local_peer(store: MemoryRepo) -> Peer<MemoryRepo> {
@@ -904,6 +1113,37 @@ mod tests {
                 Inline::new(metadata),
             )))
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_scan_deadline_expiring_during_filter_does_not_consume_a_word() {
+        let mut store = MemoryRepo::default();
+        let descriptor = put(&mut store, b"descriptor".to_vec());
+        let metadata = put(&mut store, Vec::new());
+        let data = put(&mut store, vec![42; 32]);
+        raw_commit(&mut store, descriptor, data, metadata);
+        let mut peer = local_peer(store);
+        let mut reconciler = Reconciler::new()
+            .with_replication(ReplicationMode::Full, [Inline::new(descriptor)])
+            .with_fetch_budget(Duration::from_millis(50));
+        let stats = reconciler
+            .tick_with_reference_filter(&mut peer, |_, _| {
+                std::thread::sleep(Duration::from_millis(60));
+                None
+            })
+            .await;
+        assert_eq!(stats.replication.speculative_attempted, 0);
+        assert_eq!(stats.replication.candidates, 0);
+        assert_eq!(
+            reconciler
+                .scan
+                .sources
+                .get(&scan_key(data, data))
+                .unwrap()
+                .offset,
+            0
+        );
+        assert_eq!(peer.snapshot().unwrap().wants().unwrap().count(), 0);
     }
 
     #[tokio::test]
@@ -961,12 +1201,13 @@ mod tests {
             .await;
         assert!(first.replication.candidates > RECONCILE_SCAN_CANDIDATES_PER_TICK / 2);
         assert!(first.replication.candidates <= RECONCILE_SCAN_CANDIDATES_PER_TICK);
-        let before = reconciler.scan.cursor.unwrap().offset;
+        let key = scan_key(data, data);
+        let before = reconciler.scan.sources.get(&key).unwrap().offset;
         let second = reconciler
             .tick_with_reference_filter(&mut peer, |_, _| Some(false))
             .await;
         assert!(second.replication.candidates <= RECONCILE_SCAN_CANDIDATES_PER_TICK);
-        assert!(reconciler.scan.cursor.unwrap().offset > before);
+        assert!(reconciler.scan.sources.get(&key).unwrap().offset > before);
         assert_eq!(reconciler.scan.sources.len(), 3);
         assert!(reconciler.states.is_empty());
         assert_eq!(peer.snapshot().unwrap().wants().unwrap().count(), 0);
