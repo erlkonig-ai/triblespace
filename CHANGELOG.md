@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Schedule full-replication scans in fair resumable positive-source quanta,
+  with a bounded recent-arrival startup window and lane turns retained across
+  fetch deadlines. Retry completed parents independently of large unfinished
+  blobs; preserve aggregate budgets and keep speculative negatives out of
+  persistent traversal state and WANTs.
+
 - Add explicitly selected demand/shallow/full blob replication without changing
   record repair, bearer authorization, or WANT semantics. Bound recursive work
   with a resumable positive PATCH frontier and retry speculative misses without
