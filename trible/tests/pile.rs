@@ -422,10 +422,10 @@ fn compact_copies_source_permissions_after_rewrite() {
 }
 
 #[test]
-fn compact_refuses_opaque_records_before_creating_destination() {
+fn compact_carries_opaque_records_exactly_and_says_so() {
     let dir = tempdir().unwrap();
     let source_path = dir.path().join("opaque-source.pile");
-    let destination_path = dir.path().join("must-not-survive.pile");
+    let destination_path = dir.path().join("carried.pile");
     let source_bytes = opaque_envelope(None);
     std::fs::write(&source_path, &source_bytes).unwrap();
 
@@ -436,11 +436,13 @@ fn compact_refuses_opaque_records_before_creating_destination() {
         .arg("--into")
         .arg(&destination_path)
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("opaque record"));
+        .success()
+        .stdout(predicate::str::contains(
+            "frames of unknown kind: 1 (256 bytes) -> 1 (256 bytes) (carried exactly)",
+        ));
 
     assert_eq!(std::fs::read(&source_path).unwrap(), source_bytes);
-    assert!(!destination_path.exists());
+    assert_eq!(std::fs::read(&destination_path).unwrap(), source_bytes);
 }
 
 #[test]

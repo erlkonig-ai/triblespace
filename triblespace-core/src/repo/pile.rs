@@ -2691,6 +2691,10 @@ pub struct Pile {
     /// unknown kind names; a later binary that knows the kind reads them from
     /// the rewritten pile exactly as it would have from the source.
     opaque_frames: Vec<(usize, usize)>,
+    /// BLAKE3 digests of the exact bytes of those frames, so a rewrite into a
+    /// pile that already carries one appends nothing, at a set lookup per
+    /// frame rather than a scan of every earlier one.
+    opaque_digests: BTreeSet<[u8; 32]>,
     /// Current grow-only typed request set. Retired weak-pin and typed LWW-log
     /// records are deliberately absent: they are raw input to the explicit
     /// WANT cutover migration, not live state that stale pile concatenation can
@@ -3354,6 +3358,7 @@ impl Pile {
             legacy_collection_headers: LegacyCollectionHeaderIndex::new(),
             opaque_records: 0,
             opaque_frames: Vec::new(),
+            opaque_digests: BTreeSet::new(),
             wants: PATCH::<WANT_REQUEST_BYTES_LEN, IdentitySchema>::new(),
             applied_length: 0,
         })
@@ -3541,8 +3546,10 @@ impl Pile {
                     .opaque_records
                     .checked_add(1)
                     .expect("opaque pile-record count overflow");
-                self.opaque_frames
-                    .push((start_offset, next_applied_length - start_offset));
+                let frame_len = next_applied_length - start_offset;
+                self.opaque_frames.push((start_offset, frame_len));
+                self.opaque_digests
+                    .insert(*blake3::hash(&slice[..frame_len]).as_bytes());
                 Applied::Opaque
             }
         };
@@ -3691,6 +3698,7 @@ impl Pile {
             std::ptr::drop_in_place(&mut this.capability_proofs);
             std::ptr::drop_in_place(&mut this.legacy_collection_headers);
             std::ptr::drop_in_place(&mut this.opaque_frames);
+            std::ptr::drop_in_place(&mut this.opaque_digests);
             std::ptr::drop_in_place(&mut this.wants);
         }
 
@@ -3993,28 +4001,15 @@ impl Pile {
         let result = (|| {
             self.refresh_locked()?;
 
-            let already = self.opaque_frames.iter().any(|(offset, len)| {
-                *len == frame.len() && {
-                    let existing = unsafe {
-                        slice_from_raw_parts(self.mmap.as_ptr().add(*offset), *len)
-                            .as_ref()
-                            .expect("mapped opaque frame")
-                    };
-                    existing == frame
-                }
-            });
-            if already {
+            if self
+                .opaque_digests
+                .contains(blake3::hash(frame).as_bytes())
+            {
                 return Ok(());
             }
 
             self.dirty = true;
-            let written = self.file.write(frame)?;
-            if written != frame.len() {
-                return Err(CollectionInsertError::Io(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "failed to write complete opaque frame",
-                )));
-            }
+            self.file.write_all(frame)?;
 
             match self.apply_next()? {
                 Some(Applied::Opaque) => Ok(()),
@@ -5158,6 +5153,16 @@ impl Pile {
         };
 
         let mut roots = explicit.clone();
+        // A frame this binary cannot read may name any resident blob, so its
+        // presence widens retention to every resident blob, whatever the
+        // caller's policy selected: the frame keeps its meaning along with
+        // its bytes.
+        if !opaque_frames.is_empty() {
+            for info in reader.blobs() {
+                let info = info.expect("PileSnapshot blob listing is infallible");
+                roots.retain_direct(info.handle);
+            }
+        }
         if !strong_pins.is_empty() {
             retain_record_kind_if_resident(&mut roots, &reader, pin_head_record_kind());
         }
@@ -7393,6 +7398,48 @@ mod tests {
     }
 
     #[test]
+    fn opaque_frame_widens_retention_to_every_resident_blob() {
+        // The same rewrite, with no explicit roots, drops an unrooted blob
+        // from a source without unknown frames and keeps it from a source
+        // with one: a frame this binary cannot read may name any blob.
+        let dir = tempfile::tempdir().unwrap();
+        for planted in [false, true] {
+            let source_path = fresh_empty_pile_path(&dir, &format!("widen-{planted}-source.pile"));
+            let destination_path =
+                fresh_empty_pile_path(&dir, &format!("widen-{planted}-destination.pile"));
+            let mut source = Pile::open(&source_path).unwrap();
+            let unrooted = source
+                .put::<UnknownBlob, _>(Bytes::from_source(b"named by no known record".to_vec()))
+                .unwrap();
+            source.flush().unwrap();
+            if planted {
+                append_test_bytes(
+                    &source_path,
+                    &test_envelope_bytes(TEST_UNKNOWN_KIND_A, 1, ENVELOPE_BLOCK_LEN),
+                );
+            }
+            let mut destination = Pile::open(&destination_path).unwrap();
+            let stats = source
+                .rewrite_retained_into(
+                    &mut destination,
+                    &RetentionRoots::new(),
+                    WantRewritePolicy::Drop,
+                )
+                .unwrap();
+            assert_eq!(stats.opaque_frames, usize::from(planted));
+            assert_eq!(stats.retained_blobs, usize::from(planted));
+            let kept = destination
+                .snapshot()
+                .unwrap()
+                .get::<Blob<UnknownBlob>, _>(unrooted)
+                .is_ok();
+            assert_eq!(kept, planted);
+            destination.close().unwrap();
+            source.close().unwrap();
+        }
+    }
+
+    #[test]
     fn opaque_frames_are_carried_by_rewrite_and_refused_by_yard() {
         let dir = tempfile::tempdir().unwrap();
         let source_path = fresh_empty_pile_path(&dir, "opaque-source.pile");
@@ -7425,14 +7472,17 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stats.opaque_frames, 1);
+        // The unknown frame widens retention: the blob no known record names
+        // travels too, and the frame itself lands last, byte for byte.
+        assert_eq!(stats.retained_blobs, 1);
         let destination_after = std::fs::read(&destination_path).unwrap();
         assert!(destination_after.starts_with(&destination_before));
-        assert_eq!(&destination_after[destination_before.len()..], &frame[..]);
+        assert!(destination_after.ends_with(&frame));
+        let frame_offset = destination_after.len() - frame.len();
         assert_eq!(destination.opaque_records, 1);
-        assert_eq!(
-            destination.opaque_frames,
-            vec![(destination_before.len(), frame.len())]
-        );
+        assert_eq!(destination.opaque_frames, vec![(frame_offset, frame.len())]);
+        let carried: Blob<UnknownBlob> = destination.snapshot().unwrap().get(retained).unwrap();
+        assert_eq!(carried.bytes.as_ref(), b"possibly owned");
         let stats = source
             .rewrite_retained_into(
                 &mut destination,
@@ -7449,10 +7499,7 @@ mod tests {
         let mut reopened = Pile::open(&destination_path).unwrap();
         reopened.refresh().unwrap();
         assert_eq!(reopened.opaque_records, 1);
-        assert_eq!(
-            reopened.opaque_frames,
-            vec![(destination_before.len(), frame.len())]
-        );
+        assert_eq!(reopened.opaque_frames, vec![(frame_offset, frame.len())]);
         reopened.close().unwrap();
 
         // The fence is Yard-wide: an opaque record in the young generation
