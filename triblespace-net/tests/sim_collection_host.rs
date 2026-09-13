@@ -962,6 +962,174 @@ fn demand_shallow_full_preserve_exact_wants_and_only_hydrate_selected_record_roo
 }
 
 #[test]
+fn full_replication_fair_selection_reaches_a_child_beyond_the_startup_window() {
+    selection_fairness_case(false);
+}
+
+#[test]
+fn full_replication_fair_selection_recurses_through_a_resident_child() {
+    selection_fairness_case(true);
+}
+
+fn selection_fairness_case(resident_child: bool) {
+    let _guard = test_guard();
+    let clock = virtual_clock();
+    clock.reset();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    runtime.block_on(local.run_until(async {
+        let net = SimNet::new(0xC011_EC85, SimConfig::default());
+        let server_key = key(123);
+        let reader_key = key(124);
+        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+        let mut server_store = MemoryRepo::default();
+        let large = server_store
+            .collection("large selection", policy.clone())
+            .unwrap();
+        let small = server_store.collection("small selection", policy).unwrap();
+        let metadata = server_store
+            .put::<SimpleArchive, _>(TribleSet::new().to_blob())
+            .unwrap();
+        let leaf = server_store
+            .put::<UnknownBlob, _>(Bytes::from_source(b"fair selection leaf".to_vec()))
+            .unwrap();
+        let mut words = Vec::new();
+        for word in 0_u64..128 {
+            words.extend_from_slice(blake3::hash(&word.to_be_bytes()).as_bytes());
+        }
+        let mut reader_store = MemoryRepo::default();
+        let target = if resident_child {
+            let mut bytes = words.clone();
+            bytes.extend_from_slice(&leaf.raw);
+            let bytes = Bytes::from_source(bytes);
+            let child = server_store.put::<UnknownBlob, _>(bytes.clone()).unwrap();
+            reader_store.put::<UnknownBlob, _>(bytes).unwrap();
+            child
+        } else {
+            leaf
+        };
+        words.extend_from_slice(&target.raw);
+        // Put the small payload in the middle of the initial global H sweep.
+        let (data, data_bytes) = (0_u64..100_000)
+            .find_map(|nonce| {
+                let mut bytes = words.clone();
+                bytes.extend_from_slice(&nonce.to_le_bytes());
+                let hash = *blake3::hash(&bytes).as_bytes();
+                (hash[0] >= 96 && hash[0] < 160).then_some((hash, Bytes::from_source(bytes)))
+            })
+            .unwrap();
+        server_store
+            .put::<UnknownBlob, _>(data_bytes.clone())
+            .unwrap();
+        reader_store.put::<UnknownBlob, _>(data_bytes).unwrap();
+        for handle in [large.handle().raw, small.handle().raw, metadata.raw] {
+            let bytes = BlobStoreGet::get::<Bytes, UnknownBlob>(
+                &server_store.snapshot().unwrap(),
+                Inline::new(handle),
+            )
+            .unwrap();
+            reader_store.put::<UnknownBlob, _>(bytes).unwrap();
+        }
+        // Shared roots must not be assigned exclusively to the large selection.
+        for collection in [large.handle(), small.handle()] {
+            let record = CollectionRecord::Commit(CollectionCommit::sign(
+                &server_key,
+                collection,
+                Inline::new(data),
+                metadata,
+            ));
+            server_store.insert(record).unwrap();
+            reader_store.insert(record).unwrap();
+        }
+        let mut lower = 0;
+        let mut higher = 0;
+        for nonce in 0_u64..100_000 {
+            let mut bytes = Vec::new();
+            for word in 0_u64..256 {
+                let mut seed = [0; 16];
+                seed[..8].copy_from_slice(&nonce.to_le_bytes());
+                seed[8..].copy_from_slice(&word.to_le_bytes());
+                bytes.extend_from_slice(blake3::hash(&seed).as_bytes());
+            }
+            let hash = *blake3::hash(&bytes).as_bytes();
+            let count = if hash < data { &mut lower } else { &mut higher };
+            if *count == 256 {
+                continue;
+            }
+            *count += 1;
+            let bytes = Bytes::from_source(bytes);
+            server_store.put::<UnknownBlob, _>(bytes.clone()).unwrap();
+            reader_store.put::<UnknownBlob, _>(bytes).unwrap();
+            let record = CollectionRecord::Commit(CollectionCommit::sign(
+                &server_key,
+                large.handle(),
+                Inline::new(hash),
+                metadata,
+            ));
+            server_store.insert(record).unwrap();
+            reader_store.insert(record).unwrap();
+            if lower == 256 && higher == 256 {
+                break;
+            }
+        }
+        assert_eq!((lower, higher), (256, 256));
+        let mut server = bring_up_with_publication_budget(
+            &net,
+            &server_key,
+            server_store,
+            Vec::new(),
+            ReconcileDirection::WriteOnly,
+            Some(0),
+        );
+        let mut reader = bring_up_with_publication_budget(
+            &net,
+            &reader_key,
+            reader_store,
+            vec![server_key.verifying_key().to_bytes()],
+            ReconcileDirection::ReadOnly,
+            Some(0),
+        );
+        advance(&clock, &mut [&mut server, &mut reader], 4).await;
+        let mut reconciler = Reconciler::with_backoff(
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_secs(1),
+        )
+        .with_replication(ReplicationMode::Full, [large.handle(), small.handle()])
+        .with_fetch_budget(std::time::Duration::from_secs(2));
+        for _ in 0..128 {
+            let stats =
+                reconcile_once(&clock, &mut reconciler, &mut reader, &mut [&mut server]).await;
+            assert_eq!(
+                stats.replication.roots, 516,
+                "physical roots stay deduplicated"
+            );
+            assert_eq!(stats.replication.pending, 0);
+            assert!(
+                stats.replication.speculative_attempted <= RECONCILE_SPECULATIVE_FETCHES_PER_TICK
+            );
+            assert!(
+                stats.replication.candidates
+                    <= triblespace_net::reconcile::RECONCILE_SCAN_CANDIDATES_PER_TICK
+            );
+            if reader.try_local(leaf.raw).is_some() {
+                break;
+            }
+            advance(&clock, &mut [&mut server, &mut reader], 1).await;
+        }
+        assert!(
+            reader.try_local(leaf.raw).is_some(),
+            "a small selection must reach word 129 without draining another selection's roots"
+        );
+        assert_eq!(reader.snapshot().unwrap().wants().unwrap().count(), 0);
+        assert_eq!(reader.snapshot().unwrap().records().unwrap().count(), 514);
+    }));
+}
+
+#[test]
 fn full_replication_fetches_a_recent_descriptor_name_before_old_blob_eof() {
     descriptor_name_case(false);
 }

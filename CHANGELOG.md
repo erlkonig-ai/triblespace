@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Give explicitly selected Full-replication collections sustained scan quanta,
+  including work beyond the recent startup window. Preserve shared exact demand,
+  physical roots and aggregate budgets; shared closures retain per-selection
+  positive progress without a priority registry or persistent negative frontier.
+
 - Add a bounded in-memory exact-fetch diagnostic using normal DHT discovery
   and bearer transport, with an ephemeral key and no publication or WANTs.
 

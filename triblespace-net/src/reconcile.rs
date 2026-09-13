@@ -90,7 +90,7 @@ pub struct Reconciler {
     collections: BTreeSet<CollectionRecordSelector>,
     last_want_attempt: Option<RawHash>,
     last_root_attempt: Option<RawHash>,
-    scan: FullScan,
+    scan: SelectionScans,
 }
 
 pub const RECONCILE_FETCH_DEADLINE: Duration = Duration::from_secs(30);
@@ -127,7 +127,7 @@ impl Reconciler {
             collections: BTreeSet::new(),
             last_want_attempt: None,
             last_root_attempt: None,
-            scan: FullScan::default(),
+            scan: SelectionScans::default(),
         }
     }
 
@@ -153,7 +153,7 @@ impl Reconciler {
             .into_iter()
             .map(CollectionRecordSelector::Collection)
             .collect();
-        self.scan = FullScan::default();
+        self.scan = SelectionScans::new(self.collections.iter().copied());
         self.last_root_attempt = None;
         self
     }
@@ -261,20 +261,28 @@ impl Reconciler {
             .iter()
             .filter_map(|request| request.blob_handle().map(|handle| handle.raw))
             .collect();
-        let roots = if self.mode == ReplicationMode::Demand {
-            BTreeSet::new()
+        let selected_roots = if self.mode == ReplicationMode::Demand {
+            Vec::new()
         } else {
-            match direct_roots(&snapshot, &self.collections) {
+            // One indexed read per selection retains membership only for this
+            // tick. COMMIT signatures are checked once, before physical union.
+            let observed = self
+                .collections
+                .iter()
+                .map(|selector| direct_roots(&snapshot, &BTreeSet::from([*selector])))
+                .collect::<Result<Vec<_>, _>>();
+            match observed {
                 Ok(roots) => roots,
                 Err(error) => {
                     tracing::warn!(
                         ?error,
                         "hydration record observation failed; skipping roots"
                     );
-                    BTreeSet::new()
+                    Vec::new()
                 }
             }
         };
+        let roots: BTreeSet<_> = selected_roots.iter().flatten().copied().collect();
         stats.replication.roots = roots.len();
         let exact_handles: BTreeSet<_> = wanted_blob_handles.union(&roots).copied().collect();
         let visible_blobs: HashSet<_> = exact_handles
@@ -385,8 +393,6 @@ impl Reconciler {
         if self.mode != ReplicationMode::Full {
             return stats;
         }
-        self.scan
-            .observe_roots(&roots, &self.collections, &self.durable_blob_answers);
         snapshot = match peer.snapshot() {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -394,6 +400,8 @@ impl Reconciler {
                 return stats;
             }
         };
+        self.scan
+            .observe_roots(&selected_roots, &self.durable_blob_answers);
         // Summaries are ordinary, explicitly selected derived collections.
         // Observe only their resident realization; never ensure/map here:
         // this consumer need not possess the producer's complete blob closure.
@@ -449,8 +457,7 @@ impl Reconciler {
                     Err(_) => {
                         // Forgetting or temporary local unavailability is not a
                         // closed edge. Roots and later parent sweeps rediscover it.
-                        self.scan.sources.remove(&cursor.key);
-                        self.scan.cursor = None;
+                        self.scan.forget_source(&cursor.key);
                         continue;
                     }
                 };
@@ -571,6 +578,92 @@ impl Reconciler {
                 });
             }
         }
+    }
+}
+
+/// One sustained quantum per explicit selection, including regular revisits.
+/// Only process-local traversal is partitioned: exact demand, physical roots,
+/// deadlines, counters and per-tick negative observations remain shared.
+#[derive(Default)]
+struct SelectionScans {
+    lanes: Vec<(CollectionRecordSelector, FullScan)>,
+    next_lane: usize,
+    active: Option<usize>,
+    last_lane: usize,
+}
+
+impl SelectionScans {
+    fn new(selectors: impl IntoIterator<Item = CollectionRecordSelector>) -> Self {
+        Self {
+            lanes: selectors
+                .into_iter()
+                .map(|selector| (selector, FullScan::default()))
+                .collect(),
+            ..Self::default()
+        }
+    }
+
+    fn observe_roots(&mut self, selected_roots: &[BTreeSet<RawHash>], resident: &HashSet<RawHash>) {
+        for ((selector, scan), roots) in self.lanes.iter_mut().zip(selected_roots) {
+            // Reuse this tick's native discovery without rechecking signatures.
+            // Shared roots get service in each selecting lane, while physical
+            // acquisition and negative-request deduplication remain global.
+            let selected = BTreeSet::from([*selector]);
+            scan.observe_roots(roots, &selected, resident);
+        }
+    }
+
+    fn next(&mut self) -> ScanStep {
+        if let Some(lane) = self.active {
+            return self.lanes[lane].1.next();
+        }
+        if self.lanes.iter().all(|(_, scan)| scan.sources.is_empty()) {
+            return ScanStep::Idle;
+        }
+        let lane = self.next_lane;
+        self.next_lane = (lane + 1) % self.lanes.len();
+        self.last_lane = lane;
+        match self.lanes[lane].1.next() {
+            ScanStep::Ready(cursor) => {
+                self.active = Some(lane);
+                ScanStep::Ready(cursor)
+            }
+            ScanStep::Skip | ScanStep::Idle => ScanStep::Skip,
+        }
+    }
+
+    fn advance(&mut self) {
+        self.lanes[self.last_lane].1.advance();
+        self.release_finished_quantum();
+    }
+
+    fn yield_source(&mut self) {
+        if self.active.is_some() {
+            self.lanes[self.last_lane].1.yield_source();
+            self.release_finished_quantum();
+        }
+    }
+
+    fn release_finished_quantum(&mut self) {
+        if self.lanes[self.last_lane].1.cursor.is_none() {
+            self.active = None;
+        }
+    }
+
+    fn observe(&mut self, root: RawHash, source: RawHash) {
+        self.lanes[self.last_lane].1.observe(root, source);
+    }
+
+    fn finish_source(&mut self, initial: Duration, max: Duration) {
+        self.lanes[self.last_lane].1.finish_source(initial, max);
+        self.active = None;
+    }
+
+    fn forget_source(&mut self, key: &[u8; 64]) {
+        let scan = &mut self.lanes[self.last_lane].1;
+        scan.sources.remove(key);
+        scan.cursor = None;
+        self.active = None;
     }
 }
 
@@ -969,6 +1062,96 @@ mod tests {
         key
     }
 
+    fn next_selection(scan: &mut SelectionScans) -> ScanCursor {
+        for _ in 0..20_000 {
+            match scan.next() {
+                ScanStep::Ready(cursor) => return cursor,
+                ScanStep::Skip => {}
+                ScanStep::Idle => panic!("expected positive selection work"),
+            }
+        }
+        panic!("selection did not receive service");
+    }
+
+    #[test]
+    fn selection_scans_sustain_all_28_lanes_beyond_the_startup_window() {
+        let mut scans = SelectionScans::new(
+            (1_u8..=28).map(|byte| CollectionRecordSelector::Collection(Inline::new([byte; 32]))),
+        );
+        for ordinal in 0_u32..4_096 {
+            let mut source = [0; 32];
+            source[..4].copy_from_slice(&ordinal.to_be_bytes());
+            scans.lanes[0].1.observe([1; 32], source);
+        }
+        for byte in 2_u8..=28 {
+            scans.lanes[usize::from(byte - 1)]
+                .1
+                .observe([byte; 32], [byte; 32]);
+        }
+        let mut words = [0; 28];
+        for _ in 0..28 * 300 {
+            let cursor = next_selection(&mut scans);
+            words[scans.last_lane] += 1;
+            if cursor.handles().0 == [2; 32] {
+                assert_eq!(cursor.offset, (words[1] - 1) * 32);
+            }
+            scans.advance();
+            // One network attempt/deadline exit is one completed quantum.
+            scans.yield_source();
+        }
+        assert!(words.iter().all(|words| *words > SCAN_STARTUP_WORDS));
+        let old_sources = &scans.lanes[0].1.sources;
+        assert!(
+            old_sources
+                .iter()
+                .filter(|key| old_sources.get(*key).unwrap().offset > 0)
+                .count()
+                > 64
+        );
+    }
+
+    #[test]
+    fn selection_scans_keep_deadline_turns_and_attach_children_to_the_parent_lane() {
+        let selectors =
+            [1_u8, 2].map(|byte| CollectionRecordSelector::Collection(Inline::new([byte; 32])));
+        let mut scans = SelectionScans::new(selectors);
+        for byte in [1_u8, 2] {
+            scans.lanes[usize::from(byte - 1)]
+                .1
+                .observe([byte; 32], [byte; 32]);
+        }
+        assert_eq!(next_selection(&mut scans).handles().0, [1; 32]);
+        scans.advance();
+        scans.yield_source();
+        let owed = next_selection(&mut scans);
+        assert_eq!(owed.handles().0, [2; 32]);
+        // Global quota/deadline expired before attempting this word.
+        scans.yield_source();
+        assert_eq!(next_selection(&mut scans).key, owed.key);
+        assert_eq!(next_selection(&mut scans).offset, owed.offset);
+        for _ in 0..SCAN_WORDS_PER_QUANTUM {
+            scans.advance();
+        }
+        assert!(scans.active.is_none());
+        // A resident child on the last word of a quantum still belongs to B.
+        scans.observe([2; 32], [3; 32]);
+        assert!(
+            scans.lanes[1]
+                .1
+                .sources
+                .get(&scan_key([2; 32], [3; 32]))
+                .is_some()
+        );
+        assert!(
+            scans.lanes[0]
+                .1
+                .sources
+                .get(&scan_key([2; 32], [3; 32]))
+                .is_none()
+        );
+        assert_eq!(next_selection(&mut scans).handles().0, [1; 32]);
+    }
+
     #[test]
     fn full_scan_regular_rounds_preserve_offsets_and_yield_before_eof() {
         let mut scan = FullScan::default();
@@ -1260,8 +1443,8 @@ mod tests {
         assert_eq!(stats.replication.speculative_attempted, 0);
         assert_eq!(stats.replication.candidates, 0);
         assert_eq!(
-            reconciler
-                .scan
+            reconciler.scan.lanes[0]
+                .1
                 .sources
                 .get(&scan_key(data, data))
                 .unwrap()
@@ -1304,9 +1487,9 @@ mod tests {
         let mut key = [0; 64];
         key[..32].copy_from_slice(&data);
         key[32..].copy_from_slice(&child);
-        assert!(reconciler.scan.sources.get(&key).is_none());
+        assert!(reconciler.scan.lanes[0].1.sources.get(&key).is_none());
         key[..32].copy_from_slice(&metadata);
-        assert!(reconciler.scan.sources.get(&key).is_some());
+        assert!(reconciler.scan.lanes[0].1.sources.get(&key).is_some());
         assert_eq!(peer.snapshot().unwrap().wants().unwrap().count(), 1);
     }
 
@@ -1327,13 +1510,13 @@ mod tests {
         assert!(first.replication.candidates > RECONCILE_SCAN_CANDIDATES_PER_TICK / 2);
         assert!(first.replication.candidates <= RECONCILE_SCAN_CANDIDATES_PER_TICK);
         let key = scan_key(data, data);
-        let before = reconciler.scan.sources.get(&key).unwrap().offset;
+        let before = reconciler.scan.lanes[0].1.sources.get(&key).unwrap().offset;
         let second = reconciler
             .tick_with_reference_filter(&mut peer, |_, _| Some(false))
             .await;
         assert!(second.replication.candidates <= RECONCILE_SCAN_CANDIDATES_PER_TICK);
-        assert!(reconciler.scan.sources.get(&key).unwrap().offset > before);
-        assert_eq!(reconciler.scan.sources.len(), 3);
+        assert!(reconciler.scan.lanes[0].1.sources.get(&key).unwrap().offset > before);
+        assert_eq!(reconciler.scan.lanes[0].1.sources.len(), 3);
         assert!(reconciler.states.is_empty());
         assert_eq!(peer.snapshot().unwrap().wants().unwrap().count(), 0);
     }

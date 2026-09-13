@@ -538,6 +538,20 @@ regular quanta inspect at most 64 words. For a finite burst of A newcomers, the
 last first-service bound is O(A times the startup window), not constant time or
 round-robin service within that burst.
 
+Full scans grant sustained quanta round-robin between the explicitly selected
+collections, each retaining the regular/recent walk above. A large selection's
+root inventory cannot consume a small selection's regular share after its
+startup window ends. Exact WANTs, the physical root union, the fetch deadline,
+CPU steps and speculative-request allowance remain global. A selected but
+unattempted word retains its collection turn across budget exits. Native record
+indexes supply each selection's roots; there is no separate membership catalog.
+Shared roots have separate positive traversal observations in their actual
+selecting collections, but physical acquisition and per-tick negative-request
+deduplication remain shared. This trades duplicate traversal of genuinely shared
+closures for sustained service without an arbitrary root owner. The selection's
+own large closure, resident-child expansion, provider failures and exhausted
+exact-demand budgets still prevent a general finite hydration deadline.
+
 When seeding a full scan, ordinary resident record roots are observed before
 explicitly selected collection descriptors. A descriptor already present in
 both that root set and the durable resident set therefore receives its finite
