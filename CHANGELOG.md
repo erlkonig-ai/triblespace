@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Seed full scans with positively resident selected descriptor roots after
+  ordinary roots, so the existing finite recent window also serves descriptors
+  promptly at cold startup. Preserve root membership and idempotent progress.
+
 - Schedule full-replication scans in fair resumable positive-source quanta,
   with a bounded recent-arrival startup window and lane turns retained across
   fetch deadlines. Retry completed parents independently of large unfinished

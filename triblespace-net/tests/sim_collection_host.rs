@@ -963,6 +963,15 @@ fn demand_shallow_full_preserve_exact_wants_and_only_hydrate_selected_record_roo
 
 #[test]
 fn full_replication_fetches_a_recent_descriptor_name_before_old_blob_eof() {
+    descriptor_name_case(false);
+}
+
+#[test]
+fn full_replication_fetches_a_startup_descriptor_name_before_the_resident_backlog() {
+    descriptor_name_case(true);
+}
+
+fn descriptor_name_case(at_startup: bool) {
     let _guard = test_guard();
     let clock = virtual_clock();
     clock.reset();
@@ -982,28 +991,6 @@ fn full_replication_fetches_a_recent_descriptor_name_before_old_blob_eof() {
         let metadata = server_store
             .put::<SimpleArchive, _>(TribleSet::new().to_blob())
             .unwrap();
-        let mut junk = Vec::new();
-        for word in 0_u64..8_192 {
-            junk.extend_from_slice(blake3::hash(&word.to_le_bytes()).as_bytes());
-        }
-        let (old_data, old_bytes) = (0_u64..10_000)
-            .find_map(|nonce| {
-                let mut bytes = junk.clone();
-                bytes.extend_from_slice(&nonce.to_le_bytes());
-                let hash = *blake3::hash(&bytes).as_bytes();
-                (hash < old.handle().raw && hash < metadata.raw).then_some((hash, bytes))
-            })
-            .expect("old binary sorts first in the original frozen sweep");
-        server_store
-            .put::<UnknownBlob, _>(Bytes::from_source(old_bytes.clone()))
-            .unwrap();
-        let old_record = CollectionRecord::Commit(CollectionCommit::sign(
-            &server_key,
-            old.handle(),
-            Inline::new(old_data),
-            metadata,
-        ));
-        server_store.insert(old_record).unwrap();
         let (fresh, name, descriptor_bytes) = (0..100)
             .find_map(|nonce| {
                 let text = format!("recent descriptor name, several words in: {nonce}");
@@ -1017,9 +1004,36 @@ fn full_replication_fetches_a_recent_descriptor_name_before_old_blob_eof() {
                 )
                 .unwrap();
                 let word = bytes.chunks_exact(32).position(|word| word == name.raw)?;
-                (word >= 3 && word < 128).then_some((fresh, name, bytes))
+                (word >= 3 && word < 32).then_some((fresh, name, bytes))
             })
             .expect("a canonical descriptor whose name is beyond its first word");
+        let mut junk = Vec::new();
+        for word in 0_u64..8_192 {
+            junk.extend_from_slice(blake3::hash(&word.to_le_bytes()).as_bytes());
+        }
+        let (old_data, old_bytes) = (0_u64..10_000)
+            .find_map(|nonce| {
+                let mut bytes = junk.clone();
+                bytes.extend_from_slice(&nonce.to_le_bytes());
+                let hash = *blake3::hash(&bytes).as_bytes();
+                let sorted = if at_startup {
+                    hash > old.handle().raw && hash > metadata.raw && hash > fresh.handle().raw
+                } else {
+                    hash < old.handle().raw && hash < metadata.raw
+                };
+                sorted.then_some((hash, bytes))
+            })
+            .expect("old binary sorts first in the baseline lane under test");
+        server_store
+            .put::<UnknownBlob, _>(Bytes::from_source(old_bytes.clone()))
+            .unwrap();
+        let old_record = CollectionRecord::Commit(CollectionCommit::sign(
+            &server_key,
+            old.handle(),
+            Inline::new(old_data),
+            metadata,
+        ));
+        server_store.insert(old_record).unwrap();
         let fresh_record = CollectionRecord::Commit(CollectionCommit::sign(
             &server_key,
             fresh.handle(),
@@ -1037,6 +1051,38 @@ fn full_replication_fetches_a_recent_descriptor_name_before_old_blob_eof() {
             reader_store.put::<UnknownBlob, _>(bytes).unwrap();
         }
         reader_store.insert(old_record).unwrap();
+        let mut background_records = 0;
+        if at_startup {
+            reader_store
+                .put::<UnknownBlob, _>(descriptor_bytes.clone())
+                .unwrap();
+            reader_store.insert(fresh_record).unwrap();
+            // These resident roots keep the regular cursor ahead of the
+            // descriptor; the large highest-H binary holds the old recent lane.
+            for nonce in 0_u64..100_000 {
+                let bytes =
+                    Bytes::from_source(blake3::hash(&nonce.to_le_bytes()).as_bytes().to_vec());
+                let hash = *blake3::hash(&bytes).as_bytes();
+                if hash >= fresh.handle().raw {
+                    continue;
+                }
+                server_store.put::<UnknownBlob, _>(bytes.clone()).unwrap();
+                reader_store.put::<UnknownBlob, _>(bytes).unwrap();
+                let record = CollectionRecord::Commit(CollectionCommit::sign(
+                    &server_key,
+                    old.handle(),
+                    Inline::new(hash),
+                    metadata,
+                ));
+                server_store.insert(record).unwrap();
+                reader_store.insert(record).unwrap();
+                background_records += 1;
+                if background_records == 512 {
+                    break;
+                }
+            }
+            assert_eq!(background_records, 512);
+        }
         let mut server = bring_up_with_publication_budget(
             &net,
             &server_key,
@@ -1060,16 +1106,20 @@ fn full_replication_fetches_a_recent_descriptor_name_before_old_blob_eof() {
         )
         .with_replication(ReplicationMode::Full, [old.handle(), fresh.handle()])
         .with_fetch_budget(std::time::Duration::from_secs(2));
-        let first = reconcile_once(&clock, &mut reconciler, &mut reader, &mut [&mut server]).await;
-        assert!(first.replication.speculative_misses > 0);
         assert!(reader.try_local(name.raw).is_none());
-        reader
-            .store()
-            .put::<UnknownBlob, _>(descriptor_bytes)
-            .unwrap();
-        reader.store().insert(fresh_record).unwrap();
-        reader.refresh();
-        for _ in 0..48 {
+        if !at_startup {
+            let first =
+                reconcile_once(&clock, &mut reconciler, &mut reader, &mut [&mut server]).await;
+            assert!(first.replication.speculative_misses > 0);
+            assert!(reader.try_local(name.raw).is_none());
+            reader
+                .store()
+                .put::<UnknownBlob, _>(descriptor_bytes)
+                .unwrap();
+            reader.store().insert(fresh_record).unwrap();
+            reader.refresh();
+        }
+        for _ in 0..if at_startup { 12 } else { 48 } {
             let stats =
                 reconcile_once(&clock, &mut reconciler, &mut reader, &mut [&mut server]).await;
             assert!(
@@ -1086,7 +1136,7 @@ fn full_replication_fetches_a_recent_descriptor_name_before_old_blob_eof() {
         );
         let snapshot = reader.snapshot().unwrap();
         assert_eq!(snapshot.wants().unwrap().count(), 0);
-        assert_eq!(snapshot.records().unwrap().count(), 2);
+        assert_eq!(snapshot.records().unwrap().count(), 2 + background_records);
     }));
 }
 
