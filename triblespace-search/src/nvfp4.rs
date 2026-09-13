@@ -906,7 +906,8 @@ impl<E: BlobEncoding> NvFp4CosineIndex<E> {
         self.members.len()
     }
 
-    fn is_empty(&self) -> bool {
+    /// Whether the cover has no rows at all.
+    pub fn is_empty(&self) -> bool {
         self.members.iter().all(|member| member.layout.rows == 0)
     }
 }
