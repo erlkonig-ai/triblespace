@@ -940,7 +940,8 @@ mod tests {
         assert_eq!(derived_empty.bytes, canonical_empty.bytes);
         assert_eq!(derived_empty.get_handle(), canonical_empty.get_handle());
 
-        let derive = CollectionDerive::new(
+        let derive = CollectionDerive::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&target_descriptor),
             data_identity(&source_empty),
             data_identity(&canonical_empty),
@@ -961,7 +962,8 @@ mod tests {
         assert_eq!(joined.get_handle(), element.get_handle());
 
         let (low, high) = ordered(&canonical_empty, &element);
-        let merge = CollectionMerge::new(
+        let merge = CollectionMerge::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&target_descriptor),
             data_identity(low),
             data_identity(high),
@@ -995,7 +997,8 @@ mod tests {
             (&right, &derived_right),
             (&source_union, &derive_after_merge),
         ] {
-            let claim = CollectionDerive::new(
+            let claim = CollectionDerive::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 identity_for_tests(&target_descriptor),
                 data_identity(input),
                 data_identity(output),
@@ -1011,7 +1014,8 @@ mod tests {
         }
 
         let (low, high) = ordered(&derived_left, &derived_right);
-        let merge = CollectionMerge::new(
+        let merge = CollectionMerge::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&target_descriptor),
             data_identity(low),
             data_identity(high),
@@ -1123,7 +1127,8 @@ mod tests {
         let input = archive([row(1, 9, 3)]);
         let wrong_source = archive([row(2, 9, 4)]);
         let wrong_output = derive_element(&wrong_source).unwrap();
-        let claim = CollectionDerive::new(
+        let claim = CollectionDerive::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&target_descriptor),
             data_identity(&input),
             data_identity(&wrong_output),
@@ -1145,7 +1150,8 @@ mod tests {
         let correct = join(&left, &right).unwrap();
         let wrong = empty();
         let (low, high) = ordered(&left, &right);
-        let merge = CollectionMerge::new(
+        let merge = CollectionMerge::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&target_descriptor),
             data_identity(low),
             data_identity(high),
@@ -1164,7 +1170,8 @@ mod tests {
         let target_descriptor = descriptor(identity_for_tests(&raw_root("first")), direct_policy());
         let input = archive([row(1, 9, 3)]);
         let malformed = Blob::<SuccinctArchiveBlob>::new(Bytes::from(vec![0xAA; 17]));
-        let claim = CollectionDerive::new(
+        let claim = CollectionDerive::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&target_descriptor),
             data_identity(&input),
             data_identity(&malformed),

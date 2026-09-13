@@ -1003,7 +1003,8 @@ mod tests {
         let prepared = PreparedCollectionCommit::from_fragment(fragment.clone());
         let repeated = PreparedCollectionCommit::from_fragment(fragment);
 
-        let derive = CollectionDerive::new(
+        let derive = CollectionDerive::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&target),
             expected.data(),
             Inline::new([0x42; 32]),
@@ -1485,7 +1486,8 @@ mod tests {
         let left = archive([row(1, 1, 1), row(3, 1, 3)]);
         let right = archive([row(2, 1, 2), row(3, 1, 3)]);
         let result = join(&left, &right).unwrap();
-        let claim = CollectionMerge::new(
+        let claim = CollectionMerge::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&descriptor),
             data(&left),
             data(&right),
@@ -1494,7 +1496,8 @@ mod tests {
         let (low, high) = ordered_inputs(&left, &right);
         validate_merge(&descriptor, &claim, low, high, &result).unwrap();
 
-        let wrong_collection = CollectionMerge::new(
+        let wrong_collection = CollectionMerge::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&root("ninth")),
             data(low),
             data(high),
@@ -1523,7 +1526,8 @@ mod tests {
         ));
 
         let wrong_result = archive([row(1, 1, 1), row(2, 1, 2)]);
-        let wrong_claim = CollectionMerge::new(
+        let wrong_claim = CollectionMerge::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&descriptor),
             data(low),
             data(high),
@@ -1535,7 +1539,8 @@ mod tests {
         );
 
         let invalid_result = raw_archive(vec![row(2, 1, 2), row(1, 1, 1)]);
-        let invalid_claim = CollectionMerge::new(
+        let invalid_claim = CollectionMerge::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&descriptor),
             data(low),
             data(high),
@@ -1595,7 +1600,7 @@ mod tests {
 
                 prop_assert_eq!(&actual, &expected);
                 let collection = root("first");
-                let claim = CollectionMerge::new(
+                let claim = CollectionMerge::sign(&ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                     identity_for_tests(&collection),
                     data(&left),
                     data(&right),

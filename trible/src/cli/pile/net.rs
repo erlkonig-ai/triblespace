@@ -403,8 +403,8 @@ fn run_health(pile_path: PathBuf, key_path: Option<PathBuf>, max_age: u64) -> Re
         // Pile is local-only: missing report bytes cannot start acquisition.
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
         runtime.block_on(async {
-            drop(pile.maintain(facts).await?);
-            drop(pile.maintain(latest).await?);
+            drop(pile.maintain(facts, &signer).await?);
+            drop(pile.maintain(latest, &signer).await?);
             Ok::<_, anyhow::Error>(())
         })?;
         let snapshot = pile.snapshot()?;

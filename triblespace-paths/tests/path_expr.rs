@@ -109,7 +109,7 @@ fn compiled_expression_roundtrips_through_native_collection_and_query_constraint
 
     let snapshot = store.snapshot().unwrap();
     let support = source.admitted(&snapshot).unwrap();
-    let snapshot = block_on(store.maintain_exact(target, &support)).unwrap();
+    let snapshot = block_on(store.maintain_exact(target, &signing_key, &support)).unwrap();
     let index: Arc<PathIndex> = snapshot
         .collection_exact(target, &support)
         .unwrap()

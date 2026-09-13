@@ -64,8 +64,9 @@ fn main() {
     let accelerated = pile
         .derive::<Rank9AcceleratedSuccinctArchiveBlob>(raw, (), policy)
         .expect("register Rank9-accelerated projection");
-    block_on(pile.maintain_exact(raw, &support)).expect("maintain exact raw Succinct collection");
-    let snapshot = block_on(pile.maintain_exact(accelerated, &support))
+    block_on(pile.maintain_exact(raw, &signing_key, &support))
+        .expect("maintain exact raw Succinct collection");
+    let snapshot = block_on(pile.maintain_exact(accelerated, &signing_key, &support))
         .expect("maintain exact Rank9-accelerated collection");
     let archive = snapshot
         .collection_exact(accelerated, &support)

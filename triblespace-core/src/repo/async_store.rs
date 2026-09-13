@@ -785,7 +785,8 @@ mod tests {
             &format!("tagged-{tag}"),
             Id::new([tag.wrapping_add(1).max(1); 16]).unwrap(),
         );
-        CollectionRecord::Merge(CollectionMerge::new(
+        CollectionRecord::Merge(CollectionMerge::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&descriptor),
             Inline::new([tag.wrapping_add(3); 32]),
             Inline::new([tag.wrapping_add(4); 32]),

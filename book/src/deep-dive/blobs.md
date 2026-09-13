@@ -86,7 +86,7 @@ source commits.
 
 Every retained current native record other than a `BLOB` strongly retains each
 resident blob it references directly, together with that blob's resident child
-closure. This includes unsigned `MERGE` and `DERIVE` equations: their
+closure. This includes signed `MERGE` and `DERIVE` equations: their
 descriptors, inputs, and results are roots just as a `COMMIT`'s descriptor,
 data, and metadata are. Preserved WANT records likewise own their referenced
 blobs; self-contained authorization proofs have no payload blob references.

@@ -780,9 +780,9 @@ fn main() {
             drop(snapshot);
 
             let t = Instant::now();
-            block_on(store.maintain_exact(raw, &support))
+            block_on(store.maintain_exact(raw, &signing_key, &support))
                 .expect("maintain exact raw Succinct cover");
-            let snapshot = block_on(store.maintain_exact(accelerated, &support))
+            let snapshot = block_on(store.maintain_exact(accelerated, &signing_key, &support))
                 .expect("maintain exact accelerated Succinct cover");
             let attached = snapshot
                 .collection_exact(accelerated, &support)

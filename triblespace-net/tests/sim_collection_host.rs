@@ -1473,7 +1473,7 @@ fn full_replication_reuses_a_known_summary_without_filtering_later_source_suppor
             .unwrap();
         // Only this complete producer performs maintenance. The later
         // consumer must acquire its known output, never derive a partial image.
-        let maintained = server_store.maintain(summaries).await.unwrap();
+        let maintained = server_store.maintain(summaries, &server_key).await.unwrap();
         let produced = maintained.collection(summaries).unwrap();
         assert_eq!(produced.support().len(), 1);
         assert!(
@@ -1697,7 +1697,8 @@ fn full_replication_does_not_apply_a_projected_summary_to_foundational_payloads(
             .put::<SimpleArchive, _>(TribleSet::new().to_blob())
             .unwrap();
         server_store
-            .insert(CollectionRecord::Derive(CollectionDerive::new(
+            .insert(CollectionRecord::Derive(CollectionDerive::sign(
+                &server_key,
                 projection.handle(),
                 commit.data(),
                 Handle::<SimpleArchive>::to_hash(projected),
@@ -1706,7 +1707,7 @@ fn full_replication_does_not_apply_a_projected_summary_to_foundational_payloads(
         let summaries = server_store
             .derive::<ReferenceSummaryBlob>(projection, ReferenceSummaryLayout::default(), policy)
             .unwrap();
-        let producer = server_store.maintain(summaries).await.unwrap();
+        let producer = server_store.maintain(summaries, &server_key).await.unwrap();
         let observed = producer.collection(summaries).unwrap();
         assert_eq!(
             observed.support().collection().handle(),

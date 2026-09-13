@@ -688,9 +688,10 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use ed25519_dalek::VerifyingKey;
     use triblespace_core::blob::IntoBlob;
+    use triblespace_core::capability::policy::resource_policy;
     use triblespace_core::collection::records::{
-        collection_mapping, collection_name, collection_read_policy, collection_representation,
-        collection_source, collection_write_policy, CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
+        collection_mapping, collection_name, collection_representation, collection_source,
+        CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
     };
     use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy};
     use triblespace_core::id::ExclusiveId;
@@ -734,8 +735,7 @@ mod tests {
         entity! { _ @
             metadata::tag: KIND_COLLECTION_DESCRIPTOR,
             collection_name: name.to_owned(),
-            collection_read_policy*: policy.read().fragment(),
-            collection_write_policy*: policy.write().fragment(),
+            resource_policy*: policy.fragment(),
             collection_representation*: <SimpleArchive as MetaDescribe>::describe(),
         }
     }
@@ -745,8 +745,7 @@ mod tests {
         entity! { _ @
             metadata::tag: KIND_COLLECTION_DESCRIPTOR,
             collection_source: source,
-            collection_read_policy*: policy.read().fragment(),
-            collection_write_policy*: policy.write().fragment(),
+            resource_policy*: policy.fragment(),
             collection_representation*: <PathSummaryBlob as MetaDescribe>::describe(),
             collection_mapping*: mapping_fragment(automaton),
         }
@@ -761,8 +760,7 @@ mod tests {
         entity! { _ @
             metadata::tag: KIND_COLLECTION_DESCRIPTOR,
             collection_source: source,
-            collection_read_policy*: policy.read().fragment(),
-            collection_write_policy*: policy.write().fragment(),
+            resource_policy*: policy.fragment(),
             collection_representation*: <PathSummaryBlob as MetaDescribe>::describe(),
             collection_mapping*: mapping_fragment_with_fingerprint(automaton, fingerprint),
         }

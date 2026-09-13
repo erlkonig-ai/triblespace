@@ -198,17 +198,18 @@ derived IDs, `Fragment::empty()` to start accumulation, and spread (`*`) to pass
 child fragments into parent entities, giving Merkle trees for free.
 
 ### Derive
-An unsigned exact equation mapping one source element into a derived collection.
+A signed endorsement of an exact mapping from one source element into a derived collection.
 The target descriptor names both source and concrete mapping, so the
-record needs only the target, input, and output identities. Derivations are
-reusable materialized work, not authority. Every successful mapping is stored
+record carries the target, input, output, signer, and signature. Target WRITE
+admits its producer; the source's WRITE policy does not. Derivations are
+reusable materialized work, not new membership. Every successful mapping is stored
 with its equation; Yard/GC decides later whether its bytes remain resident.
 
 ### Merge
-An unsigned exact equation `a ⊔ b = c` inside one collection. A resident stored
+A signed endorsement of `a ⊔ b = c` inside one collection. A resident stored
 result can replace its inputs in a physical cover without changing the logical
-value or creating new authority. Warm resolution trusts the stored equation and
-does not recompute the join.
+value or creating new membership. Warm resolution admits the producer by that
+collection's WRITE policy and does not recompute the join.
 
 ### PATCH
 The **Persistent Adaptive Trie with Cuckoo-compression and Hash-maintenance**.

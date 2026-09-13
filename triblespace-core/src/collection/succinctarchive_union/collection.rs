@@ -358,7 +358,8 @@ mod tests {
                 .unwrap();
         }
         store
-            .insert(CollectionRecord::Merge(CollectionMerge::new(
+            .insert(CollectionRecord::Merge(CollectionMerge::sign(
+                &SigningKey::from_bytes(&[7; 32]),
                 accelerated_collection.handle(),
                 fa_data,
                 fb_data,
@@ -367,7 +368,8 @@ mod tests {
             .unwrap();
         for (input, output) in [(a_data, fa_data), (b_data, fb_data)] {
             store
-                .insert(CollectionRecord::Derive(CollectionDerive::new(
+                .insert(CollectionRecord::Derive(CollectionDerive::sign(
+                    &SigningKey::from_bytes(&[7; 32]),
                     accelerated_collection.handle(),
                     input,
                     output,
@@ -465,7 +467,8 @@ mod tests {
             .put::<Rank9AcceleratedSuccinctArchiveBlob, _>(fb)
             .unwrap();
         store
-            .insert(CollectionRecord::Merge(CollectionMerge::new(
+            .insert(CollectionRecord::Merge(CollectionMerge::sign(
+                &SigningKey::from_bytes(&[7; 32]),
                 accelerated_collection.handle(),
                 fa_data,
                 fb_data,
@@ -500,7 +503,8 @@ mod tests {
             .put::<Rank9AcceleratedSuccinctArchiveBlob, _>(fa)
             .unwrap();
         partial
-            .insert(CollectionRecord::Merge(CollectionMerge::new(
+            .insert(CollectionRecord::Merge(CollectionMerge::sign(
+                &SigningKey::from_bytes(&[7; 32]),
                 accelerated_collection.handle(),
                 fa_data,
                 fb_data,
@@ -623,8 +627,14 @@ mod tests {
             [Handle::<SimpleArchive>::to_hash(source.get_handle())],
         );
 
-        block_on(store.ensure_exact(raw_collection, &support)).unwrap();
-        let snapshot = block_on(store.ensure_exact(accelerated_collection, &support)).unwrap();
+        block_on(store.ensure_exact(raw_collection, &SigningKey::from_bytes(&[7; 32]), &support))
+            .unwrap();
+        let snapshot = block_on(store.ensure_exact(
+            accelerated_collection,
+            &SigningKey::from_bytes(&[7; 32]),
+            &support,
+        ))
+        .unwrap();
         let attached = snapshot
             .collection_exact(accelerated_collection, &support)
             .unwrap();
@@ -685,17 +695,36 @@ mod tests {
         let first_support = Support::from_data(source_collection, [first.data()]);
         let full_support = Support::from_data(source_collection, [first.data(), second.data()]);
 
-        block_on(store.ensure_exact(raw_collection, &first_support)).unwrap();
-        let snapshot =
-            block_on(store.ensure_exact(accelerated_collection, &first_support)).unwrap();
+        block_on(store.ensure_exact(
+            raw_collection,
+            &SigningKey::from_bytes(&[7; 32]),
+            &first_support,
+        ))
+        .unwrap();
+        let snapshot = block_on(store.ensure_exact(
+            accelerated_collection,
+            &SigningKey::from_bytes(&[7; 32]),
+            &first_support,
+        ))
+        .unwrap();
         let observed = snapshot.collection(accelerated_collection).unwrap();
         assert_eq!(observed.support(), &first_support);
         assert!(snapshot
             .collection_exact(accelerated_collection, &full_support)
             .is_err());
 
-        block_on(store.ensure_exact(raw_collection, &full_support)).unwrap();
-        let snapshot = block_on(store.ensure_exact(accelerated_collection, &full_support)).unwrap();
+        block_on(store.ensure_exact(
+            raw_collection,
+            &SigningKey::from_bytes(&[7; 32]),
+            &full_support,
+        ))
+        .unwrap();
+        let snapshot = block_on(store.ensure_exact(
+            accelerated_collection,
+            &SigningKey::from_bytes(&[7; 32]),
+            &full_support,
+        ))
+        .unwrap();
         let observed = snapshot.collection(accelerated_collection).unwrap();
         assert_eq!(observed.support(), &full_support);
         let view: UnionArchive<OrderedUniverse> = observed.view().unwrap();
@@ -712,7 +741,11 @@ mod tests {
         let support = Support::from_data(source_collection, [source_data]);
 
         assert!(matches!(
-            block_on(store.ensure_exact(accelerated_collection, &support)),
+            block_on(store.ensure_exact(
+                accelerated_collection,
+                &SigningKey::from_bytes(&[7; 32]),
+                &support
+            )),
             Err(CollectionRealizationError::IncompleteCover { .. })
         ));
         let before_raw = store.snapshot().unwrap();
@@ -728,8 +761,14 @@ mod tests {
                     if derive.collection() == raw_collection.handle()
             )));
 
-        block_on(store.ensure_exact(raw_collection, &support)).unwrap();
-        let snapshot = block_on(store.ensure_exact(accelerated_collection, &support)).unwrap();
+        block_on(store.ensure_exact(raw_collection, &SigningKey::from_bytes(&[7; 32]), &support))
+            .unwrap();
+        let snapshot = block_on(store.ensure_exact(
+            accelerated_collection,
+            &SigningKey::from_bytes(&[7; 32]),
+            &support,
+        ))
+        .unwrap();
         let attached = snapshot
             .collection_exact(accelerated_collection, &support)
             .unwrap();
@@ -764,7 +803,8 @@ mod tests {
             .put::<Rank9AcceleratedSuccinctArchiveBlob, _>(fc)
             .unwrap();
         store
-            .insert(CollectionRecord::Merge(CollectionMerge::new(
+            .insert(CollectionRecord::Merge(CollectionMerge::sign(
+                &SigningKey::from_bytes(&[7; 32]),
                 raw_collection.handle(),
                 a_data,
                 b_data,
@@ -773,7 +813,8 @@ mod tests {
             .unwrap();
         for (input, output) in [(source_a_data, a_data), (source_b_data, b_data)] {
             store
-                .insert(CollectionRecord::Derive(CollectionDerive::new(
+                .insert(CollectionRecord::Derive(CollectionDerive::sign(
+                    &SigningKey::from_bytes(&[7; 32]),
                     raw_collection.handle(),
                     input,
                     output,
@@ -781,7 +822,8 @@ mod tests {
                 .unwrap();
         }
         store
-            .insert(CollectionRecord::Derive(CollectionDerive::new(
+            .insert(CollectionRecord::Derive(CollectionDerive::sign(
+                &SigningKey::from_bytes(&[7; 32]),
                 accelerated_collection.handle(),
                 c_data,
                 fc_data,

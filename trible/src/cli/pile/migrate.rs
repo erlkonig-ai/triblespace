@@ -7,6 +7,7 @@ use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::{BlobStoreGet, SnapshotSource};
 
 mod branch_to_collection;
+mod endorse_unsigned_equations;
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Migration {
@@ -54,6 +55,22 @@ pub enum Command {
         #[arg(long)]
         signing_key: PathBuf,
     },
+    /// Endorse resident historical unsigned equations with a current writer's key.
+    ///
+    /// Appends new signatures without changing old bytes, identities, or
+    /// endpoints. This does not recompute equations or recover their original
+    /// authorship: the supplied signer takes responsibility for the results.
+    EndorseUnsignedEquations {
+        /// Exact target collection descriptor, as blake3:HEX or 64 hex digits.
+        #[arg(long)]
+        collection: String,
+        /// Existing durable signing-key file; must hold target WRITE authority.
+        #[arg(long)]
+        signing_key: PathBuf,
+        /// Report eligible endorsements without appending anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Run one explicitly named migration.
     Run {
         /// Migration name. `monotone-wants` is deliberately never implicit:
@@ -77,6 +94,11 @@ pub fn run(pile_path: PathBuf, cmd: Command) -> Result<()> {
             authority,
             signing_key,
         } => branch_to_collection::run(pile_path, branch, collection_name, authority, signing_key),
+        Command::EndorseUnsignedEquations {
+            collection,
+            signing_key,
+            dry_run,
+        } => endorse_unsigned_equations::run(pile_path, collection, signing_key, dry_run),
         Command::Run { migration, dry_run } => {
             match migration {
                 Migration::MonotoneWants => migrate_monotone_wants(&pile_path, dry_run)?,

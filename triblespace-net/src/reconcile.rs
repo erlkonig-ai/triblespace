@@ -862,13 +862,8 @@ where
 {
     let mut roots = BTreeSet::new();
     for record in snapshot.select_records(selectors)? {
-        // The same structural boundary as collection repair. WRITE-inert
-        // signed records remain eligible; malformed signatures do not.
-        if let CollectionRecord::Commit(commit) = record {
-            if commit.verify_strict().is_err() {
-                continue;
-            }
-        }
+        // Records are trusted local evidence; foreign signatures were checked
+        // at ingress. WRITE admission does not govern structural ownership.
         roots.extend(record.blob_references().map(|handle| handle.raw));
     }
     Ok(roots)
@@ -971,14 +966,21 @@ mod tests {
         let b = Inline::new([4; 32]);
         let result = Inline::new([5; 32]);
         assert_eq!(
-            want_request_for_record(CollectionRecord::Merge(CollectionMerge::new(
-                collection, b, a, result,
+            want_request_for_record(CollectionRecord::Merge(CollectionMerge::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                collection,
+                b,
+                a,
+                result,
             ))),
             Some(WantRequest::merge(collection, a, b))
         );
         assert_eq!(
-            want_request_for_record(CollectionRecord::Derive(CollectionDerive::new(
-                target, a, result,
+            want_request_for_record(CollectionRecord::Derive(CollectionDerive::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                target,
+                a,
+                result,
             ))),
             Some(WantRequest::derive(target, a))
         );
@@ -997,13 +999,15 @@ mod tests {
                 Inline::new([2; 32]),
                 Inline::new([3; 32]),
             )),
-            CollectionRecord::Merge(CollectionMerge::new(
+            CollectionRecord::Merge(CollectionMerge::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 collection,
                 Inline::new([4; 32]),
                 Inline::new([5; 32]),
                 Inline::new([6; 32]),
             )),
-            CollectionRecord::Derive(CollectionDerive::new(
+            CollectionRecord::Derive(CollectionDerive::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 collection,
                 Inline::new([6; 32]),
                 Inline::new([7; 32]),
@@ -1017,19 +1021,6 @@ mod tests {
         ] {
             store.insert(record).unwrap();
         }
-        let mut invalid = CollectionCommit::sign(
-            &key,
-            collection,
-            Inline::new([12; 32]),
-            Inline::new([13; 32]),
-        )
-        .to_bytes();
-        invalid[191] ^= 1;
-        store
-            .insert(CollectionRecord::Commit(CollectionCommit::from_bytes(
-                invalid,
-            )))
-            .unwrap();
         let snapshot = store.snapshot().unwrap();
         let selectors = BTreeSet::from([CollectionRecordSelector::Collection(collection)]);
         assert_eq!(

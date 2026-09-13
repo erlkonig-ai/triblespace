@@ -2,16 +2,20 @@
 //!
 //! Vertical realization is complete before this module runs.  Carries only
 //! join target members and publish target `MERGE` equations.  A capacity limit
-//! or a missing optional join dependency keeps the finer cover; it never
-//! triggers construction in an upstream lattice.
+//! or a missing optional join dependency keeps the finer cover, as does a
+//! producer without target WRITE authority. None triggers upstream construction.
 
 use std::collections::{BTreeMap, BTreeSet};
+
+use ed25519_dalek::SigningKey;
 
 use crate::blob::Blob;
 use crate::inline::encodings::hash::Handle;
 use crate::repo::{BlobStoreGet, Store};
 
-use super::exact_derived::{attach_collection_exact, data_identity, CollectionRealizationError};
+use super::exact_derived::{
+    attach_collection_exact, data_identity, producer_is_admitted, CollectionRealizationError,
+};
 use super::operation_snapshot::{OperationFrontier, OperationSnapshot};
 use super::{
     Collection, CollectionData, CollectionEncoding, CollectionMerge, CollectionOperationError,
@@ -19,7 +23,7 @@ use super::{
 };
 
 /// Carry one exact target realization to its deterministic dyadic LSM fixed
-/// point.
+/// point feasible under the producer's target WRITE authority.
 ///
 /// One semantic probe selects a complete target cover.  The lowest actionable
 /// colliding tier is then carried as one batch of pairwise-disjoint inputs
@@ -31,6 +35,7 @@ use super::{
 pub(super) fn maintain_target<S, E>(
     store: &mut S,
     target: Collection<E>,
+    signing_key: &SigningKey,
     support: &Support,
     frontier: &mut OperationFrontier<S::Snapshot>,
 ) -> Result<(), CollectionRealizationError>
@@ -41,6 +46,7 @@ where
     maintain_target_with(
         store,
         target,
+        signing_key,
         support,
         frontier,
         |descriptor, low, high, reader| E::join_members(descriptor, low, high, reader).map(Some),
@@ -52,6 +58,7 @@ where
 pub(super) fn maintain_target_with<S, E, J>(
     store: &mut S,
     target: Collection<E>,
+    signing_key: &SigningKey,
     support: &Support,
     frontier: &mut OperationFrontier<S::Snapshot>,
     mut join: J,
@@ -79,6 +86,9 @@ where
             return Err(CollectionRealizationError::Stalled { cover: identity });
         }
         let prepared = prepare_carry_round(&snapshot, target, &cover)?;
+        if prepared.is_some() && !producer_is_admitted(&snapshot, target, signing_key)? {
+            return Ok(());
+        }
         drop(snapshot);
 
         let Some((descriptor, tiers)) = prepared else {
@@ -87,6 +97,7 @@ where
         if !publish_carry_round(
             store,
             target,
+            signing_key,
             &descriptor,
             tiers,
             &mut blocked,
@@ -159,6 +170,7 @@ where
 fn publish_carry_round<S, E, J>(
     store: &mut S,
     target: Collection<E>,
+    signing_key: &SigningKey,
     descriptor: &crate::trible::Fragment,
     tiers: BTreeMap<u32, BTreeSet<CollectionData>>,
     blocked: &mut BTreeSet<(CollectionData, CollectionData)>,
@@ -209,7 +221,8 @@ where
                     store.put::<E, _>(output).map_err(|error| {
                         CollectionRealizationError::storage("store merged target member", error)
                     })?;
-                    let record = CollectionRecord::Merge(CollectionMerge::new(
+                    let record = CollectionRecord::Merge(CollectionMerge::sign(
+                        signing_key,
                         target.handle(),
                         low_data,
                         high_data,

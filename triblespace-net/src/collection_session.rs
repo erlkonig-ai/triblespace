@@ -286,6 +286,7 @@ where
         send_repair_node_request(send, &request, component).await?;
         let response = recv_repair_node_response(recv, component).await?;
         *response_bytes = response_bytes.saturating_add(node_response_wire_len(&response));
+        let mut verified_leaf = None;
         validate_response(
             &request,
             component,
@@ -296,19 +297,26 @@ where
                 if record.fingerprint().raw().as_slice() != key {
                     bail!("collection record body does not match its PATCH leaf key");
                 }
+                verified_leaf = Some(record);
                 Ok(())
             },
         )?;
-        if let Some(leaf) = walker.accept(&request, response, |_, key| {
-            let Ok(key) = <[u8; 32]>::try_from(key) else {
-                return false;
-            };
-            local
-                .records()
-                .get(triblespace_core::collection::CollectionRecordFingerprint::from_raw(key))
-                .is_some()
-        })? {
-            missing.push(decode_record(local.collection(), &leaf.value)?);
+        if walker
+            .accept(&request, response, |_, key| {
+                let Ok(key) = <[u8; 32]>::try_from(key) else {
+                    return false;
+                };
+                local
+                    .records()
+                    .get(triblespace_core::collection::CollectionRecordFingerprint::from_raw(key))
+                    .is_some()
+            })?
+            .is_some()
+        {
+            missing.push(
+                verified_leaf
+                    .ok_or_else(|| anyhow::anyhow!("accepted collection leaf was not verified"))?,
+            );
         }
     }
     if complete {

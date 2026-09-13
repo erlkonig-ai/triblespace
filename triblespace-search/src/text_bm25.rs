@@ -140,8 +140,9 @@ impl CollectionDerivation for PortableBM25Blob {
         _source: &Fragment,
         target: &Fragment,
     ) -> Result<Self::Argument, CollectionOperationError> {
-        let descriptor = triblespace_core::collection::descriptor::mapping_algorithm(target.facts())
-            .map_err(|source| fatal(source.to_string()))?;
+        let descriptor =
+            triblespace_core::collection::descriptor::mapping_algorithm(target.facts())
+                .map_err(|source| fatal(source.to_string()))?;
         if descriptor != Some(TEXT_ATTRIBUTE_TO_BM25) {
             return Err(fatal(format!(
                 "BM25 mapping algorithm {:?} does not match {TEXT_ATTRIBUTE_TO_BM25:X}",
@@ -209,9 +210,11 @@ impl CollectionDerivation for PortableBM25Blob {
                     .metadata(handle)
                     .map_err(|source| fatal(source.to_string()))?;
                 if resident.is_none() {
-                    return Err(CollectionOperationError::MissingDependency(
-                        Handle::<UTF8String>::to_hash(handle),
-                    ));
+                    return Err(CollectionOperationError::MissingDependency(Handle::<
+                        UTF8String,
+                    >::to_hash(
+                        handle
+                    )));
                 }
                 let blob: Blob<UTF8String> = reader
                     .get(handle)
@@ -219,7 +222,9 @@ impl CollectionDerivation for PortableBM25Blob {
                 let text: View<str> = View::try_from_blob(blob).map_err(|source| {
                     fatal(format!(
                         "text {} is not UTF-8: {source:?}",
-                        raw.iter().map(|byte| format!("{byte:02X}")).collect::<String>()
+                        raw.iter()
+                            .map(|byte| format!("{byte:02X}"))
+                            .collect::<String>()
                     ))
                 })?;
                 let mut in_this_text: BTreeMap<RawInline, u32> = BTreeMap::new();
@@ -244,9 +249,9 @@ impl CollectionDerivation for PortableBM25Blob {
         let index = match argument.tokenizer {
             Bm25Tokenizer::Bigram => PortableBM25Index::<GenId, BigramHash>::from_exact_counts(
                 documents,
-                counts
-                    .into_iter()
-                    .map(|(document, term, frequency)| (document, Inline::<BigramHash>::new(term), frequency)),
+                counts.into_iter().map(|(document, term, frequency)| {
+                    (document, Inline::<BigramHash>::new(term), frequency)
+                }),
             )
             .map_err(|source| fatal(source.to_string()))?
             .bytes()
@@ -254,9 +259,9 @@ impl CollectionDerivation for PortableBM25Blob {
             Bm25Tokenizer::Word | Bm25Tokenizer::Code => {
                 PortableBM25Index::<GenId, WordHash>::from_exact_counts(
                     documents,
-                    counts
-                        .into_iter()
-                        .map(|(document, term, frequency)| (document, Inline::<WordHash>::new(term), frequency)),
+                    counts.into_iter().map(|(document, term, frequency)| {
+                        (document, Inline::<WordHash>::new(term), frequency)
+                    }),
                 )
                 .map_err(|source| fatal(source.to_string()))?
                 .bytes()
@@ -334,7 +339,7 @@ mod tests {
         drop(snapshot);
 
         // Maintenance realises one member holding the one document.
-        let snapshot = block_on(store.maintain(target)).unwrap();
+        let snapshot = block_on(store.maintain(target, &authority)).unwrap();
         let collection = snapshot.collection(target).unwrap();
         let members: Vec<_> = collection.cover().members().collect();
         assert_eq!(members.len(), 1);
@@ -356,7 +361,9 @@ mod tests {
         let apples = store
             .put::<UTF8String, _>(String::from("apples and pears, apples"))
             .unwrap();
-        let pears = store.put::<UTF8String, _>(String::from("pears only")).unwrap();
+        let pears = store
+            .put::<UTF8String, _>(String::from("pears only"))
+            .unwrap();
         let empty = store.put::<UTF8String, _>(String::from("")).unwrap();
         let snapshot = store.snapshot().unwrap();
 
@@ -374,8 +381,8 @@ mod tests {
                 .unwrap();
         assert_eq!(mapped_union.bytes.as_ref(), joined.bytes.as_ref());
 
-        let index = PortableBM25Index::<GenId, WordHash>::from_bytes(mapped_union.bytes.clone())
-            .unwrap();
+        let index =
+            PortableBM25Index::<GenId, WordHash>::from_bytes(mapped_union.bytes.clone()).unwrap();
         assert_eq!(index.doc_count(), 3);
         let two: Inline<GenId> = GenId::encode([2u8; 16]);
         let apple_terms = hash_tokens("apples");

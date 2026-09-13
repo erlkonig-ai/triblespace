@@ -143,7 +143,8 @@ fn compact_uses_valid_blob_occurrence_without_collecting_blobs_or_equations() {
     let blob = source
         .put::<UTF8String, _>("keep every resident blob")
         .unwrap();
-    let equation = CollectionRecord::Merge(CollectionMerge::new(
+    let equation = CollectionRecord::Merge(CollectionMerge::sign(
+        &SigningKey::from_bytes(&[1; 32]),
         Inline::new([1; 32]),
         Inline::new([2; 32]),
         Inline::new([3; 32]),

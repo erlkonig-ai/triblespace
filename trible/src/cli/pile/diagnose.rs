@@ -643,6 +643,7 @@ fn print_record(bytes: &[u8], file_len: usize, record: triblespace_core::repo::p
                 println!("  low: {}", hex::encode_upper(low.raw));
                 println!("  high: {}", hex::encode_upper(high.raw));
                 println!("  result: {}", hex::encode_upper(merge.result().raw));
+                println!("  author: {}", hex::encode_upper(merge.public_key().raw));
             }
             CollectionRecord::Derive(derive) => {
                 let (input, output) = (derive.input(), derive.output());
@@ -650,6 +651,7 @@ fn print_record(bytes: &[u8], file_len: usize, record: triblespace_core::repo::p
                 println!("  target: {}", hex::encode_upper(derive.collection().raw));
                 println!("  input: {}", hex::encode_upper(input.raw));
                 println!("  output: {}", hex::encode_upper(output.raw));
+                println!("  author: {}", hex::encode_upper(derive.public_key().raw));
             }
         },
         PileRecordContent::LegacyCollectionV3 { kind } => {
@@ -670,6 +672,9 @@ fn print_record(bytes: &[u8], file_len: usize, record: triblespace_core::repo::p
         }
         PileRecordContent::RetiredCollectionDeriveV4 => {
             println!("  classification: retired-v4-collection-derive (inert)");
+        }
+        PileRecordContent::LegacyUnsignedCollectionEquation { .. } => {
+            println!("  classification: legacy-unsigned-collection-equation (inert)");
         }
         PileRecordContent::RetiredPeerEvidenceV1 => {
             println!("  classification: retired-peer-evidence-v1 (inert)");
@@ -809,6 +814,7 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
                 }
             }
             PileRecordContent::Collection { .. }
+            | PileRecordContent::LegacyUnsignedCollectionEquation { .. }
             | PileRecordContent::LegacyCollectionV3 { .. }
             | PileRecordContent::RetiredCollectionDeriveV4 => {
                 let raw = &bytes[record.offset..record.offset + record.len];
@@ -854,7 +860,8 @@ fn census(path: &Path) -> Result<()> {
     use std::collections::BTreeMap;
     use triblespace_core::repo::pile::{PileRecordContent, PileRecords};
 
-    let mut records = PileRecords::open(path).map_err(|error| super::pile_read_error(path, error))?;
+    let mut records =
+        PileRecords::open(path).map_err(|error| super::pile_read_error(path, error))?;
     let total = records.bytes().len() as u64;
     let mut kinds: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     let mut opaque: BTreeMap<String, (u64, u64)> = BTreeMap::new();
@@ -864,7 +871,10 @@ fn census(path: &Path) -> Result<()> {
     let mut duplicates_by_day: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
     while let Some(record) = records.next() {
         let record = record.map_err(|error| super::pile_read_error(path, error))?;
-        if let PileRecordContent::Blob { hash, timestamp, .. } = &record.content {
+        if let PileRecordContent::Blob {
+            hash, timestamp, ..
+        } = &record.content
+        {
             if !seen.insert(hash.raw) {
                 duplicate_blobs.0 += 1;
                 duplicate_blobs.1 += record.len as u64;
@@ -877,19 +887,26 @@ fn census(path: &Path) -> Result<()> {
         let (kind, is_opaque) = match &record.content {
             PileRecordContent::Blob { .. } => ("BLOB", None),
             PileRecordContent::Collection { .. } => ("COLLECTION", None),
+            PileRecordContent::LegacyUnsignedCollectionEquation { .. } => {
+                ("legacy UNSIGNED_COLLECTION_EQUATION", None)
+            }
             PileRecordContent::CapabilityProof { .. } => ("CAPABILITY_PROOF", None),
             PileRecordContent::Want { .. } => ("WANT", None),
             PileRecordContent::Branch { .. } => ("legacy BRANCH", None),
             PileRecordContent::BranchTombstone { .. } => ("legacy BRANCH_TOMBSTONE", None),
             PileRecordContent::LegacyCollectionV3 { .. } => ("legacy COLLECTION_V3", None),
             PileRecordContent::RetiredCapabilityProof { .. } => ("retired CAPABILITY_PROOF", None),
-            PileRecordContent::RetiredCollectionDeriveV4 { .. } => ("retired COLLECTION_DERIVE_V4", None),
+            PileRecordContent::RetiredCollectionDeriveV4 { .. } => {
+                ("retired COLLECTION_DERIVE_V4", None)
+            }
             PileRecordContent::RetiredPeerEvidenceV1 => ("retired PEER_EVIDENCE_V1", None),
             PileRecordContent::RetiredStoreScopeV1 => ("retired STORE_SCOPE_V1", None),
             PileRecordContent::RetiredArtifactOfferV1 => ("retired ARTIFACT_OFFER_V1", None),
             PileRecordContent::RetiredWantAssert { .. } => ("retired WANT_ASSERT", None),
             PileRecordContent::RetiredWantRetract { .. } => ("retired WANT_RETRACT", None),
-            PileRecordContent::Opaque { kind, .. } => ("OPAQUE", Some(hex::encode_upper(kind.as_ref()))),
+            PileRecordContent::Opaque { kind, .. } => {
+                ("OPAQUE", Some(hex::encode_upper(kind.as_ref())))
+            }
             _ => ("other", None),
         };
         let entry = kinds.entry(kind.to_owned()).or_insert((0, 0));
@@ -903,7 +920,10 @@ fn census(path: &Path) -> Result<()> {
         }
     }
     println!("{} bytes in {}", total, path.display());
-    println!("{:<34} {:>10} {:>16} {:>7}", "kind", "records", "bytes", "share");
+    println!(
+        "{:<34} {:>10} {:>16} {:>7}",
+        "kind", "records", "bytes", "share"
+    );
     for (kind, (count, bytes)) in &kinds {
         println!(
             "{:<34} {:>10} {:>16} {:>6.1}%",

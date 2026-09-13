@@ -96,7 +96,7 @@ fn succinct_cover_materializes_as_a_typed_union_archive() {
         .unwrap();
     let snapshot = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
     let source_cover = source.admitted(&snapshot).unwrap();
-    let ensured = block_on(store.ensure(target)).unwrap();
+    let ensured = block_on(store.ensure(target, &authority)).unwrap();
     let collection = ensured.collection_exact(target, &source_cover).unwrap();
 
     // Later source growth cannot silently change the support paired with the
@@ -115,9 +115,9 @@ fn succinct_cover_materializes_as_a_typed_union_archive() {
 
     // The explicit-support ensure and admitted-support maintenance paths share
     // the same immutable snapshot result shape.
-    block_on(store.ensure_exact(target, &source_cover)).unwrap();
-    block_on(store.maintain(target)).unwrap();
-    let maintained = block_on(store.maintain_exact(target, &source_cover)).unwrap();
+    block_on(store.ensure_exact(target, &authority, &source_cover)).unwrap();
+    block_on(store.maintain(target, &authority)).unwrap();
+    let maintained = block_on(store.maintain_exact(target, &authority, &source_cover)).unwrap();
     let collection = maintained.collection_exact(target, &source_cover).unwrap();
     assert_eq!(collection.support(), &source_cover);
     assert_eq!(
@@ -155,9 +155,9 @@ fn exact_apis_accept_a_derived_source_encoding() {
     // member realizes it yet. Neither exact operation may construct raw input.
     for compact in [false, true] {
         let result = if compact {
-            block_on(store.maintain_exact(accelerated, &support))
+            block_on(store.maintain_exact(accelerated, &authority, &support))
         } else {
-            block_on(store.ensure_exact(accelerated, &support))
+            block_on(store.ensure_exact(accelerated, &authority, &support))
         };
         match result {
             Err(CollectionRealizationError::IncompleteCover {
@@ -174,13 +174,13 @@ fn exact_apis_accept_a_derived_source_encoding() {
             Ok(_) => panic!("exact Rank9 realization must not construct its missing raw input"),
         }
     }
-    block_on(store.ensure_exact(raw, &support)).unwrap();
-    let ensured = block_on(store.ensure_exact(accelerated, &support)).unwrap();
+    block_on(store.ensure_exact(raw, &authority, &support)).unwrap();
+    let ensured = block_on(store.ensure_exact(accelerated, &authority, &support)).unwrap();
     let observed = ensured.collection_exact(accelerated, &support).unwrap();
     assert_eq!(observed.support(), &support);
     assert_eq!(observed.cover().len(), 1);
 
-    let maintained = block_on(store.maintain_exact(accelerated, &support)).unwrap();
+    let maintained = block_on(store.maintain_exact(accelerated, &authority, &support)).unwrap();
     let materialized = maintained
         .collection_exact(accelerated, &support)
         .unwrap()
@@ -220,8 +220,8 @@ fn maintenance_follows_a_resident_source_union_across_target_size_tiers() {
             .commit(source, &authority, Fragment::from(facts))
             .unwrap();
     }
-    block_on(store.ensure(raw)).unwrap();
-    let children = block_on(store.ensure(accelerated)).unwrap();
+    block_on(store.ensure(raw, &authority)).unwrap();
+    let children = block_on(store.ensure(accelerated, &authority)).unwrap();
     let support = source.admitted(&children).unwrap();
     let raw_cover = children.collection(raw).unwrap();
     let inputs = raw_cover
@@ -253,7 +253,8 @@ fn maintenance_follows_a_resident_source_union_across_target_size_tiers() {
         SuccinctArchive::<OrderedUniverse>::build_accelerated_root(union.clone()).unwrap();
     let union_handle = store.put(union).unwrap();
     store
-        .insert(CollectionRecord::Merge(CollectionMerge::new(
+        .insert(CollectionRecord::Merge(CollectionMerge::sign(
+            &authority,
             raw.handle(),
             Handle::<SuccinctArchiveBlob>::to_hash(inputs[0].get_handle()),
             Handle::<SuccinctArchiveBlob>::to_hash(inputs[1].get_handle()),
@@ -270,7 +271,7 @@ fn maintenance_follows_a_resident_source_union_across_target_size_tiers() {
         .collect::<BTreeSet<_>>();
 
     // Coverage is already complete: ensure does not perform upkeep.
-    let ensured = block_on(store.ensure(accelerated)).unwrap();
+    let ensured = block_on(store.ensure(accelerated, &authority)).unwrap();
     assert_eq!(ensured.collection(accelerated).unwrap().cover().len(), 2);
     assert_eq!(
         ensured
@@ -293,7 +294,7 @@ fn maintenance_follows_a_resident_source_union_across_target_size_tiers() {
         records_before
     );
 
-    let after = block_on(store.maintain(accelerated)).unwrap();
+    let after = block_on(store.maintain(accelerated, &authority)).unwrap();
     let observed = after.collection(accelerated).unwrap();
     assert_eq!(observed.support(), &support);
     assert_eq!(
@@ -325,6 +326,11 @@ fn maintenance_follows_a_resident_source_union_across_target_size_tiers() {
         .collect::<Result<BTreeSet<_>, _>>()
         .unwrap();
     for record in records_after.difference(&records_before) {
+        record.verify_strict().unwrap();
+        assert_eq!(
+            record.public_key().raw,
+            authority.verifying_key().to_bytes()
+        );
         let collection = match record {
             CollectionRecord::Derive(record) => record.collection(),
             CollectionRecord::Merge(record) => record.collection(),
@@ -339,7 +345,7 @@ fn maintenance_follows_a_resident_source_union_across_target_size_tiers() {
     assert_eq!(children.collection(raw).unwrap().cover().len(), 2);
     assert_eq!(children.collection(accelerated).unwrap().cover().len(), 2);
 
-    let again = block_on(store.maintain(accelerated)).unwrap();
+    let again = block_on(store.maintain(accelerated, &authority)).unwrap();
     assert_eq!(
         again
             .blobs()
@@ -395,7 +401,7 @@ fn ordinary_derived_operations_use_only_resident_immediate_source_support() {
                 .commit(source, &authority, Fragment::from(facts))
                 .unwrap();
         }
-        let warmed = block_on(store.maintain(raw)).unwrap();
+        let warmed = block_on(store.maintain(raw, &authority)).unwrap();
         let initial_support = source.admitted(&warmed).unwrap();
         assert_eq!(initial_support.len(), 2);
         assert_eq!(warmed.collection(raw).unwrap().support(), &initial_support);
@@ -415,9 +421,9 @@ fn ordinary_derived_operations_use_only_resident_immediate_source_support() {
             .unwrap();
 
         let after = if compact {
-            block_on(store.maintain(accelerated))
+            block_on(store.maintain(accelerated, &authority))
         } else {
-            block_on(store.ensure(accelerated))
+            block_on(store.ensure(accelerated, &authority))
         }
         .expect("ordinary Rank9 work must stop at the resident raw-source frontier");
         let observed = after.collection(accelerated).unwrap();
@@ -452,9 +458,9 @@ fn ordinary_derived_operations_use_only_resident_immediate_source_support() {
             );
         }
 
-        let raw_after = block_on(store.maintain(raw)).unwrap();
+        let raw_after = block_on(store.maintain(raw, &authority)).unwrap();
         assert_eq!(raw_after.collection(raw).unwrap().support(), &full_support);
-        let caught_up = block_on(store.maintain(accelerated)).unwrap();
+        let caught_up = block_on(store.maintain(accelerated, &authority)).unwrap();
         let observed = caught_up.collection(accelerated).unwrap();
         assert_eq!(observed.support(), &full_support);
         assert_eq!(
@@ -495,12 +501,13 @@ fn ordinary_derived_operations_ignore_pending_immediate_source_output() {
     store
         .commit(source, &authority, Fragment::from(first.clone()))
         .unwrap();
-    let warmed = block_on(store.maintain(raw)).unwrap();
+    let warmed = block_on(store.maintain(raw, &authority)).unwrap();
     let initial_support = source.admitted(&warmed).unwrap();
     let later_commit = store
         .commit(source, &authority, Fragment::from(later))
         .unwrap();
-    let pending = CollectionDerive::new(
+    let pending = CollectionDerive::sign(
+        &authority,
         raw.handle(),
         later_commit.data(),
         Handle::<SuccinctArchiveBlob>::to_hash(missing_raw),
@@ -519,9 +526,9 @@ fn ordinary_derived_operations_ignore_pending_immediate_source_output() {
 
     for compact in [false, true] {
         let after = if compact {
-            block_on(store.maintain(accelerated))
+            block_on(store.maintain(accelerated, &authority))
         } else {
-            block_on(store.ensure(accelerated))
+            block_on(store.ensure(accelerated, &authority))
         }
         .expect("a dangling raw output is not a required Rank9 input");
         let observed = after.collection(accelerated).unwrap();
@@ -584,7 +591,7 @@ fn ordinary_derived_operations_exclude_resident_but_unauthorized_source_members(
     store
         .commit(source, &authority, Fragment::from(admitted.clone()))
         .unwrap();
-    let warmed = block_on(store.maintain(raw)).unwrap();
+    let warmed = block_on(store.maintain(raw, &authority)).unwrap();
     let admitted_support = source.admitted(&warmed).unwrap();
 
     // Reusable physical work does not confer WRITE authority on its root.
@@ -595,7 +602,8 @@ fn ordinary_derived_operations_exclude_resident_but_unauthorized_source_members(
         .put::<SuccinctArchiveBlob, _>(denied_raw_blob)
         .unwrap();
     store
-        .insert(CollectionRecord::Derive(CollectionDerive::new(
+        .insert(CollectionRecord::Derive(CollectionDerive::sign(
+            &authority,
             raw.handle(),
             denied_commit.data(),
             Handle::<SuccinctArchiveBlob>::to_hash(denied_raw),
@@ -608,9 +616,9 @@ fn ordinary_derived_operations_exclude_resident_but_unauthorized_source_members(
 
     for compact in [false, true] {
         let after = if compact {
-            block_on(store.maintain(accelerated))
+            block_on(store.maintain(accelerated, &authority))
         } else {
-            block_on(store.ensure(accelerated))
+            block_on(store.ensure(accelerated, &authority))
         }
         .unwrap();
         let observed = after.collection(accelerated).unwrap();
@@ -715,7 +723,7 @@ fn collection_returns_the_maximal_resident_partial_realization() {
         .unwrap();
     let snapshot = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
     let first_support = source.admitted(&snapshot).unwrap();
-    block_on(store.ensure_exact(target, &first_support)).unwrap();
+    block_on(store.ensure_exact(target, &authority, &first_support)).unwrap();
     store
         .commit(source, &authority, Fragment::from(second))
         .unwrap();

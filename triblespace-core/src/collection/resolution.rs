@@ -1,7 +1,7 @@
 //! Stateless semantic resolution for discovered collection records.
 //!
-//! Discovery establishes canonical record structure and strict commit
-//! self-signatures. This module deliberately starts one layer later: the
+//! Discovery selects canonical records from trusted local storage; foreign
+//! signatures are checked at ingress. This module starts one layer later: the
 //! caller chooses whether membership roots come from authorized commits or an
 //! explicit payload cover, and supplies concrete encoding and mapping
 //! validation for every eligible claim. Only chosen roots and positively
@@ -26,9 +26,15 @@ use super::{
 };
 
 type MemberKey = (CollectionHandle, CollectionData);
-type MergeProducer = (CollectionData, CollectionData, CollectionMerge);
-type DeriveProducer = (CollectionHandle, CollectionData, CollectionDerive);
-type DeriveOutput = (CollectionData, CollectionDerive);
+type MergeEquation = (
+    CollectionHandle,
+    CollectionData,
+    CollectionData,
+    CollectionData,
+);
+type DeriveEquation = (CollectionHandle, CollectionData, CollectionData);
+type MergeProducer = (CollectionData, CollectionData);
+type DeriveProducer = (CollectionHandle, CollectionData);
 
 /// One claim presented for concrete semantic validation.
 ///
@@ -48,7 +54,7 @@ type DeriveOutput = (CollectionData, CollectionDerive);
 /// re-prove order consistency among accepted claims.
 #[derive(Clone, Copy, Debug)]
 pub enum CollectionValidationRequest<'a> {
-    /// An authorized, strictly self-signed commit whose descriptor and element
+    /// An authorized, locally trusted commit whose descriptor and element
     /// still need concrete validation. Returning `Accepted` without inspecting
     /// the bytes is an explicit stronger trust decision by the callback, not a
     /// guarantee supplied by this resolver.
@@ -103,12 +109,11 @@ pub enum CollectionClaimValidation<D> {
 /// One deterministic output witness in a functional conflict.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConflictingCollectionOutput {
-    /// Exact accepted or homomorphically implied equation.
+    /// An actual accepted record witnessing this output, when one exists.
     ///
-    /// An implied equation is represented by the canonical `MERGE` or
-    /// `DERIVE` record that would state the theorem explicitly; it need not be
-    /// physically present.
-    pub record: CollectionRecord,
+    /// A homomorphically implied output needs no signed record. Its complete
+    /// equation is given by the enclosing conflict's inputs and [`Self::data`].
+    pub record: Option<CollectionRecord>,
     /// Output asserted by that claim.
     pub data: CollectionData,
 }
@@ -159,27 +164,31 @@ impl fmt::Display for CollectionFunctionalConflict {
         match self {
             Self::Merge {
                 collection,
+                low,
+                high,
                 first,
                 second,
-                ..
             } => write!(
                 f,
-                "collection {collection} has conflicting merge claims {first_claim:X} and {second_claim:X}",
+                "collection {collection} has conflicting merge outputs {first} and {second} for ({low}, {high})",
                 collection = hex::encode_upper(collection.raw),
-                first_claim = first.record.fingerprint(),
-                second_claim = second.record.fingerprint(),
+                low = hex::encode_upper(low.raw),
+                high = hex::encode_upper(high.raw),
+                first = hex::encode_upper(first.data.raw),
+                second = hex::encode_upper(second.data.raw),
             ),
             Self::Derive {
                 target,
+                input,
                 first,
                 second,
-                ..
             } => write!(
                 f,
-                "derivation into {target} has conflicting derive claims {first_claim:X} and {second_claim:X}",
+                "derivation into {target} has conflicting outputs {first} and {second} for {input}",
                 target = hex::encode_upper(target.raw),
-                first_claim = first.record.fingerprint(),
-                second_claim = second.record.fingerprint(),
+                input = hex::encode_upper(input.raw),
+                first = hex::encode_upper(first.data.raw),
+                second = hex::encode_upper(second.data.raw),
             ),
         }
     }
@@ -295,7 +304,7 @@ pub struct CollectionSemantics {
     derive_inputs_by_output: BTreeMap<MemberKey, BTreeSet<DeriveProducer>>,
     derive_outputs_by_input: BTreeMap<
         (CollectionHandle, CollectionHandle),
-        BTreeMap<CollectionData, BTreeSet<DeriveOutput>>,
+        BTreeMap<CollectionData, BTreeSet<CollectionData>>,
     >,
 }
 
@@ -355,7 +364,7 @@ impl CollectionSemantics {
                 if !seen.insert(member) {
                     continue;
                 }
-                for (image, _) in mappings.get(&member).into_iter().flatten() {
+                for image in mappings.get(&member).into_iter().flatten() {
                     if target_cover.contains(image)
                         || self
                             .first_strict_subsumer_in(target, *image, target_cover)
@@ -386,13 +395,7 @@ impl CollectionSemantics {
                 if !seen_source.insert(member) {
                     continue;
                 }
-                pending_target.extend(
-                    mappings
-                        .get(&member)
-                        .into_iter()
-                        .flatten()
-                        .map(|(image, _)| *image),
-                );
+                pending_target.extend(mappings.get(&member).into_iter().flatten().copied());
                 pending_source.extend(predecessors.get(&(source, member)).into_iter().flatten());
             }
             let mut seen_target = BTreeSet::new();
@@ -411,14 +414,14 @@ impl CollectionSemantics {
             }
 
             let mut image_pairs = BTreeSet::new();
-            for (low, high, _) in self
+            for (low, high) in self
                 .merge_inputs_by_result
                 .get(&(source, *upper))
                 .into_iter()
                 .flatten()
             {
-                for (left, _) in mappings.get(low).into_iter().flatten() {
-                    for (right, _) in mappings.get(high).into_iter().flatten() {
+                for left in mappings.get(low).into_iter().flatten() {
+                    for right in mappings.get(high).into_iter().flatten() {
                         image_pairs.insert(ordered(*left, *right));
                     }
                 }
@@ -458,13 +461,13 @@ impl CollectionSemantics {
             );
 
             if let Some(producers) = self.merge_inputs_by_result.get(&member) {
-                for (low, high, _) in producers {
+                for (low, high) in producers {
                     pending.push((member.0, *low));
                     pending.push((member.0, *high));
                 }
             }
             if let Some(producers) = self.derive_inputs_by_output.get(&member) {
-                for (source, input, _) in producers {
+                for (source, input) in producers {
                     pending.push((*source, *input));
                 }
             }
@@ -519,13 +522,13 @@ impl CollectionSemantics {
             }
 
             if let Some(producers) = self.merge_inputs_by_result.get(&member) {
-                for (low, high, _) in producers {
+                for (low, high) in producers {
                     pending.push((member.0, *low));
                     pending.push((member.0, *high));
                 }
             }
             if let Some(producers) = self.derive_inputs_by_output.get(&member) {
-                for (source, input, _) in producers {
+                for (source, input) in producers {
                     pending.push((*source, *input));
                 }
             }
@@ -613,7 +616,7 @@ impl CollectionSemantics {
             return None;
         }
 
-        for (low, high, _) in self
+        for (low, high) in self
             .merge_inputs_by_result
             .get(&(collection, element))
             .into_iter()
@@ -941,8 +944,22 @@ where
         }
     }
 
-    check_functional(&accepted_merges, &accepted_derives)
-        .map_err(CollectionResolutionError::Conflict)?;
+    check_functional(
+        accepted_merges.iter().map(|claim| {
+            let (low, high) = claim.inputs();
+            (
+                (claim.collection(), low, high, claim.result()),
+                Some(**claim),
+            )
+        }),
+        accepted_derives.iter().map(|claim| {
+            (
+                (claim.collection(), claim.input(), claim.output()),
+                Some(**claim),
+            )
+        }),
+    )
+    .map_err(CollectionResolutionError::Conflict)?;
 
     let admitted_claims = accepted_commits
         .iter()
@@ -1021,8 +1038,8 @@ where
         .collect();
 
     let mut activation_pending = BTreeSet::new();
-    let mut active_merges = BTreeMap::new();
-    let mut active_derives = BTreeMap::new();
+    let mut active_merges = BTreeMap::<MergeEquation, Option<CollectionMerge>>::new();
+    let mut active_derives = BTreeMap::<DeriveEquation, Option<CollectionDerive>>::new();
 
     for claim in &accepted_merges {
         let collection = claim.collection();
@@ -1033,7 +1050,10 @@ where
             activation_pending.insert(CollectionRecord::Merge(**claim));
             continue;
         }
-        active_merges.insert(**claim, **claim);
+        active_merges
+            .entry((collection, low, high, claim.result()))
+            .and_modify(|record| *record = (*record).min(Some(**claim)))
+            .or_insert(Some(**claim));
     }
 
     for claim in &accepted_derives {
@@ -1049,7 +1069,10 @@ where
             continue;
         }
         debug_assert!(contains_member(&members, claim.collection(), output));
-        active_derives.insert(**claim, **claim);
+        active_derives
+            .entry((claim.collection(), input, output))
+            .and_modify(|record| *record = (*record).min(Some(**claim)))
+            .or_insert(Some(**claim));
     }
 
     close_homomorphic_squares(&homomorphisms, &mut active_merges, &mut active_derives)
@@ -1063,15 +1086,12 @@ where
         ..CollectionSemantics::default()
     };
 
-    for claim in active_merges.values() {
-        let collection = claim.collection();
-        let (low, high) = claim.inputs();
-        let result = claim.result();
+    for &(collection, low, high, result) in active_merges.keys() {
         semantics
             .merge_inputs_by_result
             .entry((collection, result))
             .or_default()
-            .insert((low, high, *claim));
+            .insert((low, high));
         for input in [low, high] {
             if input != result {
                 semantics
@@ -1083,24 +1103,22 @@ where
         }
     }
 
-    for claim in active_derives.values() {
-        let target = claim.collection();
+    for &(target, input, output) in active_derives.keys() {
         let Some(source) = lineage.get(&target).copied() else {
             continue;
         };
-        let (input, output) = (claim.input(), claim.output());
         semantics
             .derive_inputs_by_output
             .entry((target, output))
             .or_default()
-            .insert((source, input, *claim));
+            .insert((source, input));
         semantics
             .derive_outputs_by_input
             .entry((source, target))
             .or_default()
             .entry(input)
             .or_default()
-            .insert((output, *claim));
+            .insert(output);
     }
 
     close_homomorphic_order(
@@ -1145,7 +1163,7 @@ where
 fn close_homomorphic_order(
     mappings_by_homomorphism: &BTreeMap<
         (CollectionHandle, CollectionHandle),
-        BTreeMap<CollectionData, BTreeSet<DeriveOutput>>,
+        BTreeMap<CollectionData, BTreeSet<CollectionData>>,
     >,
     order_results_by_input: &mut BTreeMap<MemberKey, BTreeSet<CollectionData>>,
 ) {
@@ -1170,12 +1188,12 @@ fn close_homomorphic_order(
 fn nearest_mapped_order_edges(
     source: CollectionHandle,
     target: CollectionHandle,
-    mappings: &BTreeMap<CollectionData, BTreeSet<DeriveOutput>>,
+    mappings: &BTreeMap<CollectionData, BTreeSet<CollectionData>>,
     order_results_by_input: &BTreeMap<MemberKey, BTreeSet<CollectionData>>,
 ) -> BTreeSet<(CollectionData, CollectionData)> {
     let mut pending = Vec::new();
     for (input, outputs) in mappings {
-        for (output, _) in outputs {
+        for output in outputs {
             for successor in order_results_by_input
                 .get(&(source, *input))
                 .into_iter()
@@ -1194,7 +1212,7 @@ fn nearest_mapped_order_edges(
         }
 
         if let Some(upper_outputs) = mappings.get(&source_member) {
-            for (upper_output, _) in upper_outputs {
+            for upper_output in upper_outputs {
                 if lower_output != *upper_output
                     && !order_results_by_input
                         .get(&(target, lower_output))
@@ -1230,29 +1248,34 @@ fn nearest_mapped_order_edges(
 /// x join y = z
 /// ```
 ///
-/// when the other three edges are known. The completed edge is represented by
-/// the ordinary canonical record value, but is not admitted as a stored claim.
-/// The exact value lets conflict diagnostics and lineage indexes consume
-/// asserted and implied equations uniformly without inventing a second
-/// identity layer.
+/// when the other three edges are known. Equations are endpoint tuples, not
+/// signed records: an inferred theorem needs no author and is never published
+/// or admitted as a stored claim. Actual records remain optional diagnostic
+/// witnesses, outside equation identity.
 fn close_homomorphic_squares(
     homomorphisms: &BTreeSet<(CollectionHandle, CollectionHandle)>,
-    active_merges: &mut BTreeMap<CollectionMerge, CollectionMerge>,
-    active_derives: &mut BTreeMap<CollectionDerive, CollectionDerive>,
+    active_merges: &mut BTreeMap<MergeEquation, Option<CollectionMerge>>,
+    active_derives: &mut BTreeMap<DeriveEquation, Option<CollectionDerive>>,
 ) -> Result<(), Box<CollectionFunctionalConflict>> {
     loop {
-        let joins = index_merge_outputs(active_merges.values());
-        let maps = index_derive_outputs(active_derives.values());
-        let mut merge_theorems = BTreeMap::new();
-        let mut derive_theorems = BTreeMap::new();
+        let joins = index_merge_outputs(
+            active_merges
+                .iter()
+                .map(|(equation, record)| (*equation, *record)),
+        );
+        let maps = index_derive_outputs(
+            active_derives
+                .iter()
+                .map(|(equation, record)| (*equation, *record)),
+        );
+        let mut merge_theorems = BTreeSet::new();
+        let mut derive_theorems = BTreeSet::new();
 
         for (source, target) in homomorphisms {
-            for source_merge in active_merges
-                .values()
-                .filter(|claim| claim.collection() == *source)
-            {
-                let (left, right) = source_merge.inputs();
-                let result = source_merge.result();
+            for &(collection, left, right, result) in active_merges.keys() {
+                if collection != *source {
+                    continue;
+                }
                 let Some(left_outputs) = maps.get(&(*target, left)) else {
                     continue;
                 };
@@ -1268,8 +1291,7 @@ fn close_homomorphic_squares(
                         // mapping of the source result.
                         if let Some(outputs) = joins.get(&(*target, target_low, target_high)) {
                             for output in outputs.keys() {
-                                let theorem = CollectionDerive::new(*target, result, *output);
-                                derive_theorems.insert(theorem, theorem);
+                                derive_theorems.insert((*target, result, *output));
                             }
                         }
 
@@ -1277,13 +1299,7 @@ fn close_homomorphic_squares(
                         // imply the exact target join.
                         if let Some(outputs) = maps.get(&(*target, result)) {
                             for output in outputs.keys() {
-                                let theorem = CollectionMerge::new(
-                                    *target,
-                                    *left_output,
-                                    *right_output,
-                                    *output,
-                                );
-                                merge_theorems.insert(theorem, theorem);
+                                merge_theorems.insert((*target, target_low, target_high, *output));
                             }
                         }
                     }
@@ -1292,23 +1308,29 @@ fn close_homomorphic_squares(
         }
 
         let mut changed = false;
-        for (record, theorem) in merge_theorems {
-            if let std::collections::btree_map::Entry::Vacant(entry) = active_merges.entry(record) {
-                entry.insert(theorem);
+        for theorem in merge_theorems {
+            if let std::collections::btree_map::Entry::Vacant(entry) = active_merges.entry(theorem)
+            {
+                entry.insert(None);
                 changed = true;
             }
         }
-        for (record, theorem) in derive_theorems {
-            if let std::collections::btree_map::Entry::Vacant(entry) = active_derives.entry(record)
+        for theorem in derive_theorems {
+            if let std::collections::btree_map::Entry::Vacant(entry) = active_derives.entry(theorem)
             {
-                entry.insert(theorem);
+                entry.insert(None);
                 changed = true;
             }
         }
 
-        let merges: Vec<_> = active_merges.values().collect();
-        let derives: Vec<_> = active_derives.values().collect();
-        check_functional(&merges, &derives)?;
+        check_functional(
+            active_merges
+                .iter()
+                .map(|(equation, record)| (*equation, *record)),
+            active_derives
+                .iter()
+                .map(|(equation, record)| (*equation, *record)),
+        )?;
         if !changed {
             return Ok(());
         }
@@ -1325,45 +1347,52 @@ fn ordered(
     (left, right)
 }
 
-fn index_merge_outputs<'a>(
-    merges: impl IntoIterator<Item = &'a CollectionMerge>,
+fn index_merge_outputs(
+    merges: impl IntoIterator<Item = (MergeEquation, Option<CollectionMerge>)>,
 ) -> BTreeMap<
     (CollectionHandle, CollectionData, CollectionData),
-    BTreeMap<CollectionData, CollectionMerge>,
+    BTreeMap<CollectionData, Option<CollectionMerge>>,
 > {
     let mut outputs: BTreeMap<
         (CollectionHandle, CollectionData, CollectionData),
-        BTreeMap<CollectionData, CollectionMerge>,
+        BTreeMap<CollectionData, Option<CollectionMerge>>,
     > = BTreeMap::new();
-    for claim in merges {
-        let (low, high) = claim.inputs();
+    for ((collection, low, high, result), claim) in merges {
         outputs
-            .entry((claim.collection(), low, high))
+            .entry((collection, low, high))
             .or_default()
-            .entry(claim.result())
-            .and_modify(|record| *record = (*record).min(*claim))
-            .or_insert(*claim);
+            .entry(result)
+            .and_modify(|record| {
+                if let Some(claim) = claim {
+                    *record = Some(record.map_or(claim, |known| known.min(claim)));
+                }
+            })
+            .or_insert(claim);
     }
     outputs
 }
 
-fn index_derive_outputs<'a>(
-    derives: impl IntoIterator<Item = &'a CollectionDerive>,
-) -> BTreeMap<(CollectionHandle, CollectionData), BTreeMap<CollectionData, CollectionDerive>> {
+fn index_derive_outputs(
+    derives: impl IntoIterator<Item = (DeriveEquation, Option<CollectionDerive>)>,
+) -> BTreeMap<(CollectionHandle, CollectionData), BTreeMap<CollectionData, Option<CollectionDerive>>>
+{
     // Keyed on the target alone: a target has one source, stated by its
     // descriptor, so naming the source here would only repeat it.
     let mut outputs: BTreeMap<
         (CollectionHandle, CollectionData),
-        BTreeMap<CollectionData, CollectionDerive>,
+        BTreeMap<CollectionData, Option<CollectionDerive>>,
     > = BTreeMap::new();
-    for claim in derives {
-        let (input, output) = (claim.input(), claim.output());
+    for ((target, input, output), claim) in derives {
         outputs
-            .entry((claim.collection(), input))
+            .entry((target, input))
             .or_default()
             .entry(output)
-            .and_modify(|record| *record = (*record).min(*claim))
-            .or_insert(*claim);
+            .and_modify(|record| {
+                if let Some(claim) = claim {
+                    *record = Some(record.map_or(claim, |known| known.min(claim)));
+                }
+            })
+            .or_insert(claim);
     }
     outputs
 }
@@ -1390,23 +1419,10 @@ fn contains_member(
 }
 
 fn check_functional(
-    merges: &[&CollectionMerge],
-    derives: &[&CollectionDerive],
+    merges: impl IntoIterator<Item = (MergeEquation, Option<CollectionMerge>)>,
+    derives: impl IntoIterator<Item = (DeriveEquation, Option<CollectionDerive>)>,
 ) -> Result<(), Box<CollectionFunctionalConflict>> {
-    let mut merge_outputs: BTreeMap<
-        (CollectionHandle, CollectionData, CollectionData),
-        BTreeMap<CollectionData, CollectionMerge>,
-    > = BTreeMap::new();
-    for claim in merges {
-        let (low, high) = claim.inputs();
-        merge_outputs
-            .entry((claim.collection(), low, high))
-            .or_default()
-            .entry(claim.result())
-            .and_modify(|record| *record = (*record).min(**claim))
-            .or_insert(**claim);
-    }
-    for ((collection, low, high), outputs) in merge_outputs {
+    for ((collection, low, high), outputs) in index_merge_outputs(merges) {
         if outputs.len() > 1 {
             let mut outputs = outputs.into_iter();
             let (first_data, first_claim) = outputs.next().expect("conflict has first output");
@@ -1416,31 +1432,18 @@ fn check_functional(
                 low,
                 high,
                 first: ConflictingCollectionOutput {
-                    record: CollectionRecord::Merge(first_claim),
+                    record: first_claim.map(CollectionRecord::Merge),
                     data: first_data,
                 },
                 second: ConflictingCollectionOutput {
-                    record: CollectionRecord::Merge(second_claim),
+                    record: second_claim.map(CollectionRecord::Merge),
                     data: second_data,
                 },
             }));
         }
     }
 
-    let mut derive_outputs: BTreeMap<
-        (CollectionHandle, CollectionData),
-        BTreeMap<CollectionData, CollectionDerive>,
-    > = BTreeMap::new();
-    for claim in derives {
-        let (input, output) = (claim.input(), claim.output());
-        derive_outputs
-            .entry((claim.collection(), input))
-            .or_default()
-            .entry(output)
-            .and_modify(|record| *record = (*record).min(**claim))
-            .or_insert(**claim);
-    }
-    for ((target, input), outputs) in derive_outputs {
+    for ((target, input), outputs) in index_derive_outputs(derives) {
         if outputs.len() > 1 {
             let mut outputs = outputs.into_iter();
             let (first_data, first_claim) = outputs.next().expect("conflict has first output");
@@ -1449,11 +1452,11 @@ fn check_functional(
                 target,
                 input,
                 first: ConflictingCollectionOutput {
-                    record: CollectionRecord::Derive(first_claim),
+                    record: first_claim.map(CollectionRecord::Derive),
                     data: first_data,
                 },
                 second: ConflictingCollectionOutput {
-                    record: CollectionRecord::Derive(second_claim),
+                    record: second_claim.map(CollectionRecord::Derive),
                     data: second_data,
                 },
             }));
@@ -1533,6 +1536,29 @@ mod tests {
         Inline::new([byte; 32])
     }
 
+    fn signed_merge(
+        collection: CollectionHandle,
+        left: CollectionData,
+        right: CollectionData,
+        result: CollectionData,
+    ) -> CollectionMerge {
+        CollectionMerge::sign(
+            &SigningKey::from_bytes(&[31; 32]),
+            collection,
+            left,
+            right,
+            result,
+        )
+    }
+
+    fn signed_derive(
+        target: CollectionHandle,
+        input: CollectionData,
+        output: CollectionData,
+    ) -> CollectionDerive {
+        CollectionDerive::sign(&SigningKey::from_bytes(&[31; 32]), target, input, output)
+    }
+
     fn commit(definition: &Fragment, element: CollectionData, key: u8) -> CollectionCommit {
         CollectionCommit::sign(
             &SigningKey::from_bytes(&[key; 32]),
@@ -1600,7 +1626,7 @@ mod tests {
         if !path.insert(element) {
             return None;
         }
-        for (low, high, _) in semantics
+        for (low, high) in semantics
             .merge_inputs_by_result
             .get(&(collection, element))
             .into_iter()
@@ -1686,17 +1712,17 @@ mod tests {
         let unauthorized = commit(&definition, data(2), 2);
         let missing_descriptor_commit = commit(&missing_collection, data(3), 3);
         let rejected_merge =
-            CollectionMerge::new(identity_for_tests(&definition), data(4), data(5), data(6));
+            signed_merge(identity_for_tests(&definition), data(4), data(5), data(6));
         let callback_pending_merge =
-            CollectionMerge::new(identity_for_tests(&definition), data(7), data(8), data(9));
-        let missing_descriptor_merge = CollectionMerge::new(
+            signed_merge(identity_for_tests(&definition), data(7), data(8), data(9));
+        let missing_descriptor_merge = signed_merge(
             identity_for_tests(&missing_collection),
             data(10),
             data(11),
             data(12),
         );
         let missing_descriptor_derive =
-            CollectionDerive::new(identity_for_tests(&missing_collection), data(1), data(13));
+            signed_derive(identity_for_tests(&missing_collection), data(1), data(13));
         let records = discover(
             &[definition.clone()],
             &[
@@ -1785,8 +1811,8 @@ mod tests {
         let target = named_for_tests("target", id(4));
         let source_handle = identity_for_tests(&source);
         let target_handle = identity_for_tests(&target);
-        let merge = CollectionMerge::new(source_handle, data(1), data(2), data(3));
-        let derive = CollectionDerive::new(target_handle, data(3), data(4));
+        let merge = signed_merge(source_handle, data(1), data(2), data(3));
+        let derive = signed_derive(target_handle, data(3), data(4));
         let records = discover(
             &[source, target],
             &[],
@@ -1832,7 +1858,7 @@ mod tests {
         let collection = identity_for_tests(&definition);
         let first = commit(&definition, data(1), 1);
         let duplicate = commit(&definition, data(1), 2);
-        let merge = CollectionMerge::new(collection, data(1), data(2), data(3));
+        let merge = signed_merge(collection, data(1), data(2), data(3));
         let merge_record = merge_record(merge);
         let roots = BTreeSet::from([(collection, data(1)), (collection, data(2))]);
         let with_duplicates = discover(
@@ -1943,10 +1969,9 @@ mod tests {
         let raw_one = commit(&raw, data(1), 1);
         let raw_two = commit(&raw, data(2), 2);
         let rollup_four = commit(&rollup, data(4), 3);
-        let raw_merge = CollectionMerge::new(identity_for_tests(&raw), data(1), data(2), data(3));
-        let derive = CollectionDerive::new(identity_for_tests(&rollup), data(3), data(5));
-        let rollup_merge =
-            CollectionMerge::new(identity_for_tests(&rollup), data(4), data(5), data(6));
+        let raw_merge = signed_merge(identity_for_tests(&raw), data(1), data(2), data(3));
+        let derive = signed_derive(identity_for_tests(&rollup), data(3), data(5));
+        let rollup_merge = signed_merge(identity_for_tests(&rollup), data(4), data(5), data(6));
         let definitions = [raw.clone(), rollup.clone()];
         let commits = [raw_one.clone(), raw_two.clone(), rollup_four.clone()];
         let merges = [raw_merge, rollup_merge];
@@ -2002,10 +2027,9 @@ mod tests {
         let target = named_for_tests("c4", id(5));
         let first = commit(&source, data(1), 1);
         let second = commit(&source, data(2), 2);
-        let source_merge =
-            CollectionMerge::new(identity_for_tests(&source), data(1), data(2), data(3));
-        let lower = CollectionDerive::new(identity_for_tests(&target), data(1), data(11));
-        let upper = CollectionDerive::new(identity_for_tests(&target), data(3), data(13));
+        let source_merge = signed_merge(identity_for_tests(&source), data(1), data(2), data(3));
+        let lower = signed_derive(identity_for_tests(&target), data(1), data(11));
+        let upper = signed_derive(identity_for_tests(&target), data(3), data(13));
         let records = discover(
             &[source.clone(), target.clone()],
             &[first.clone(), second.clone()],
@@ -2050,12 +2074,12 @@ mod tests {
             commit(&source, data(4), 3),
         ];
         let merges = [
-            CollectionMerge::new(identity_for_tests(&source), data(1), data(2), data(3)),
-            CollectionMerge::new(identity_for_tests(&source), data(3), data(4), data(7)),
+            signed_merge(identity_for_tests(&source), data(1), data(2), data(3)),
+            signed_merge(identity_for_tests(&source), data(3), data(4), data(7)),
         ];
         let derives = [
-            CollectionDerive::new(identity_for_tests(&target), data(1), data(11)),
-            CollectionDerive::new(identity_for_tests(&target), data(7), data(17)),
+            signed_derive(identity_for_tests(&target), data(1), data(11)),
+            signed_derive(identity_for_tests(&target), data(7), data(17)),
         ];
         let records = discover(
             &[source.clone(), target.clone()],
@@ -2093,13 +2117,13 @@ mod tests {
             commit(&source, data(4), 3),
         ];
         let merges = [
-            CollectionMerge::new(source_id, data(1), data(2), data(3)),
-            CollectionMerge::new(source_id, data(3), data(4), data(7)),
+            signed_merge(source_id, data(1), data(2), data(3)),
+            signed_merge(source_id, data(3), data(4), data(7)),
         ];
         let derives = [
-            CollectionDerive::new(target_id, data(1), data(11)),
-            CollectionDerive::new(target_id, data(2), data(12)),
-            CollectionDerive::new(target_id, data(4), data(14)),
+            signed_derive(target_id, data(1), data(11)),
+            signed_derive(target_id, data(2), data(12)),
+            signed_derive(target_id, data(4), data(14)),
         ];
         let records = discover(&[source, target], &commits, &merges, &derives, false);
         let resolution = resolve_with_derive_lineage(
@@ -2144,14 +2168,14 @@ mod tests {
             commit(&source, data(4), 3),
         ];
         let merges = [
-            CollectionMerge::new(source_id, data(1), data(2), data(3)),
-            CollectionMerge::new(target_id, data(13), data(14), data(19)),
+            signed_merge(source_id, data(1), data(2), data(3)),
+            signed_merge(target_id, data(13), data(14), data(19)),
         ];
         let derives = [
-            CollectionDerive::new(target_id, data(1), data(11)),
-            CollectionDerive::new(target_id, data(2), data(12)),
-            CollectionDerive::new(target_id, data(3), data(13)),
-            CollectionDerive::new(target_id, data(4), data(14)),
+            signed_derive(target_id, data(1), data(11)),
+            signed_derive(target_id, data(2), data(12)),
+            signed_derive(target_id, data(3), data(13)),
+            signed_derive(target_id, data(4), data(14)),
         ];
         let records = discover(&[source, target], &commits, &merges, &derives, false);
         let resolution = resolve_with_derive_lineage(
@@ -2198,16 +2222,16 @@ mod tests {
             commit(&source, data(8), 4),
         ];
         let merges = [
-            CollectionMerge::new(identity_for_tests(&source), data(1), data(2), data(3)),
-            CollectionMerge::new(identity_for_tests(&source), data(4), data(8), data(12)),
-            CollectionMerge::new(identity_for_tests(&source), data(3), data(12), data(15)),
+            signed_merge(identity_for_tests(&source), data(1), data(2), data(3)),
+            signed_merge(identity_for_tests(&source), data(4), data(8), data(12)),
+            signed_merge(identity_for_tests(&source), data(3), data(12), data(15)),
         ];
         let derives = [
-            CollectionDerive::new(identity_for_tests(&target), data(1), data(21)),
-            CollectionDerive::new(identity_for_tests(&target), data(2), data(22)),
-            CollectionDerive::new(identity_for_tests(&target), data(4), data(24)),
-            CollectionDerive::new(identity_for_tests(&target), data(8), data(28)),
-            CollectionDerive::new(identity_for_tests(&target), data(15), data(35)),
+            signed_derive(identity_for_tests(&target), data(1), data(21)),
+            signed_derive(identity_for_tests(&target), data(2), data(22)),
+            signed_derive(identity_for_tests(&target), data(4), data(24)),
+            signed_derive(identity_for_tests(&target), data(8), data(28)),
+            signed_derive(identity_for_tests(&target), data(15), data(35)),
         ];
         let records = discover(
             &[source.clone(), target.clone()],
@@ -2241,17 +2265,17 @@ mod tests {
         let middle = named_for_tests("c4", id(5));
         let target = named_for_tests("c7", id(8));
         let commits = [commit(&source, data(1), 1), commit(&source, data(2), 2)];
-        let merges = [CollectionMerge::new(
+        let merges = [signed_merge(
             identity_for_tests(&source),
             data(1),
             data(2),
             data(3),
         )];
         let derives = [
-            CollectionDerive::new(identity_for_tests(&middle), data(1), data(11)),
-            CollectionDerive::new(identity_for_tests(&middle), data(3), data(13)),
-            CollectionDerive::new(identity_for_tests(&target), data(11), data(21)),
-            CollectionDerive::new(identity_for_tests(&target), data(13), data(23)),
+            signed_derive(identity_for_tests(&middle), data(1), data(11)),
+            signed_derive(identity_for_tests(&middle), data(3), data(13)),
+            signed_derive(identity_for_tests(&target), data(11), data(21)),
+            signed_derive(identity_for_tests(&target), data(13), data(23)),
         ];
         let records = discover(
             &[source.clone(), middle.clone(), target.clone()],
@@ -2287,12 +2311,11 @@ mod tests {
         let target = named_for_tests("c4", id(5));
         let first = commit(&source, data(1), 1);
         let second = commit(&source, data(2), 2);
-        let source_merge =
-            CollectionMerge::new(identity_for_tests(&source), data(1), data(2), data(3));
+        let source_merge = signed_merge(identity_for_tests(&source), data(1), data(2), data(3));
         let derives = [
-            CollectionDerive::new(identity_for_tests(&target), data(1), data(11)),
-            CollectionDerive::new(identity_for_tests(&target), data(2), data(12)),
-            CollectionDerive::new(identity_for_tests(&target), data(3), data(13)),
+            signed_derive(identity_for_tests(&target), data(1), data(11)),
+            signed_derive(identity_for_tests(&target), data(2), data(12)),
+            signed_derive(identity_for_tests(&target), data(3), data(13)),
         ];
         let records = discover(
             &[source.clone(), target.clone()],
@@ -2333,13 +2356,10 @@ mod tests {
         let target = named_for_tests("c4", id(5));
         let first = commit(&source, data(1), 1);
         let second = commit(&source, data(2), 2);
-        let source_merge =
-            CollectionMerge::new(identity_for_tests(&source), data(1), data(2), data(3));
-        let lower = CollectionDerive::new(identity_for_tests(&target), data(1), data(11));
-        let upper = CollectionDerive::new(identity_for_tests(&target), data(2), data(12));
-        let target_merge =
-            CollectionMerge::new(identity_for_tests(&target), data(11), data(12), data(13));
-        let implied = CollectionDerive::new(identity_for_tests(&target), data(3), data(13));
+        let source_merge = signed_merge(identity_for_tests(&source), data(1), data(2), data(3));
+        let lower = signed_derive(identity_for_tests(&target), data(1), data(11));
+        let upper = signed_derive(identity_for_tests(&target), data(2), data(12));
+        let target_merge = signed_merge(identity_for_tests(&target), data(11), data(12), data(13));
         let records = discover(
             &[source.clone(), target.clone()],
             &[first.clone(), second.clone()],
@@ -2360,8 +2380,15 @@ mod tests {
             .derive_inputs_by_output
             .get(&(identity_for_tests(&target), data(13)))
             .is_some_and(|producers| {
-                producers.contains(&(identity_for_tests(&source), data(3), implied))
+                producers.contains(&(identity_for_tests(&source), data(3)))
             }));
+        assert!(
+            !resolution.admitted_claims().iter().any(|record| {
+                matches!(record, CollectionRecord::Derive(claim)
+                if claim.collection() == identity_for_tests(&target) && claim.input() == data(3))
+            }),
+            "an inferred equation must not manufacture a signed record"
+        );
     }
 
     #[test]
@@ -2370,14 +2397,12 @@ mod tests {
         let target = named_for_tests("c4", id(5));
         let first = commit(&source, data(1), 1);
         let second = commit(&source, data(2), 2);
-        let source_merge =
-            CollectionMerge::new(identity_for_tests(&source), data(1), data(2), data(3));
-        let target_merge =
-            CollectionMerge::new(identity_for_tests(&target), data(11), data(12), data(13));
+        let source_merge = signed_merge(identity_for_tests(&source), data(1), data(2), data(3));
+        let target_merge = signed_merge(identity_for_tests(&target), data(11), data(12), data(13));
         let derives = [
-            CollectionDerive::new(identity_for_tests(&target), data(1), data(11)),
-            CollectionDerive::new(identity_for_tests(&target), data(2), data(12)),
-            CollectionDerive::new(identity_for_tests(&target), data(3), data(14)),
+            signed_derive(identity_for_tests(&target), data(1), data(11)),
+            signed_derive(identity_for_tests(&target), data(2), data(12)),
+            signed_derive(identity_for_tests(&target), data(3), data(14)),
         ];
         let records = discover(
             &[source.clone(), target.clone()],
@@ -2387,24 +2412,93 @@ mod tests {
             false,
         );
 
-        assert!(matches!(
+        assert_eq!(
             resolve_with_derive_lineage(
                 &records,
                 &[(identity_for_tests(&target), identity_for_tests(&source))],
                 &BTreeSet::from([first, second]),
                 accepted,
-            ),
-            Err(CollectionResolutionError::Conflict(_))
-        ));
+            )
+            .unwrap_err(),
+            CollectionResolutionError::Conflict(Box::new(CollectionFunctionalConflict::Merge {
+                collection: identity_for_tests(&target),
+                low: data(11),
+                high: data(12),
+                first: ConflictingCollectionOutput {
+                    record: Some(merge_record(target_merge)),
+                    data: data(13),
+                },
+                second: ConflictingCollectionOutput {
+                    record: None,
+                    data: data(14),
+                },
+            }))
+        );
+    }
+
+    #[test]
+    fn distinct_signed_endorsements_are_one_semantic_equation() {
+        let source = named_for_tests("endorsed-source", id(2));
+        let target = named_for_tests("endorsed-target", id(5));
+        let source_handle = identity_for_tests(&source);
+        let target_handle = identity_for_tests(&target);
+        let commits = [commit(&source, data(1), 1), commit(&source, data(2), 2)];
+        let source_merge = signed_merge(source_handle, data(1), data(2), data(3));
+        let derives = [
+            signed_derive(target_handle, data(1), data(11)),
+            signed_derive(target_handle, data(2), data(12)),
+            signed_derive(target_handle, data(3), data(13)),
+        ];
+        let other_key = SigningKey::from_bytes(&[32; 32]);
+        let second_merge =
+            CollectionMerge::sign(&other_key, source_handle, data(1), data(2), data(3));
+        let second_derive = CollectionDerive::sign(&other_key, target_handle, data(1), data(11));
+        assert_ne!(source_merge, second_merge);
+        assert_ne!(derives[0], second_derive);
+        second_merge.verify_strict().unwrap();
+        second_derive.verify_strict().unwrap();
+
+        let definitions = [source, target];
+        let once = discover(&definitions, &commits, &[source_merge], &derives, false);
+        let twice = discover(
+            &definitions,
+            &commits,
+            &[source_merge, second_merge],
+            &[derives[0], derives[1], derives[2], second_derive],
+            true,
+        );
+        let roots = BTreeSet::from(commits);
+        let once =
+            resolve_with_derive_lineage(&once, &[(target_handle, source_handle)], &roots, accepted)
+                .unwrap();
+        let twice = resolve_with_derive_lineage(
+            &twice,
+            &[(target_handle, source_handle)],
+            &roots,
+            accepted,
+        )
+        .unwrap();
+
+        assert_eq!(once.semantics(), twice.semantics());
+        assert_eq!(
+            twice.admitted_claims().len(),
+            once.admitted_claims().len() + 2
+        );
+        assert_eq!(
+            twice.semantics().merge_inputs_by_result[&(target_handle, data(13))],
+            BTreeSet::from([(data(11), data(12))]),
+        );
+        assert_eq!(
+            twice.semantics().derive_inputs_by_output[&(target_handle, data(11))],
+            BTreeSet::from([(source_handle, data(1))]),
+        );
     }
 
     #[test]
     fn accepted_pending_merge_conflict_is_hard_and_permutation_independent() {
         let definition = named_for_tests("c1", id(2));
-        let first =
-            CollectionMerge::new(identity_for_tests(&definition), data(1), data(2), data(3));
-        let second =
-            CollectionMerge::new(identity_for_tests(&definition), data(1), data(2), data(4));
+        let first = signed_merge(identity_for_tests(&definition), data(1), data(2), data(3));
+        let second = signed_merge(identity_for_tests(&definition), data(1), data(2), data(4));
         let definitions = [definition.clone()];
         let merges = [first.clone(), second.clone()];
         let forward = discover(&definitions, &[], &merges, &[], false);
@@ -2422,11 +2516,11 @@ mod tests {
                 low: data(1),
                 high: data(2),
                 first: ConflictingCollectionOutput {
-                    record: merge_record(first),
+                    record: Some(merge_record(first)),
                     data: data(3),
                 },
                 second: ConflictingCollectionOutput {
-                    record: merge_record(second),
+                    record: Some(merge_record(second)),
                     data: data(4),
                 },
             }))
@@ -2437,8 +2531,8 @@ mod tests {
     fn derive_conflicts_are_functional_by_exact_collection_pair_and_input() {
         let source = named_for_tests("c1", id(2));
         let target = named_for_tests("c4", id(5));
-        let first = CollectionDerive::new(identity_for_tests(&target), data(1), data(2));
-        let second = CollectionDerive::new(identity_for_tests(&target), data(1), data(3));
+        let first = signed_derive(identity_for_tests(&target), data(1), data(2));
+        let second = signed_derive(identity_for_tests(&target), data(1), data(3));
         let records = discover(
             &[source.clone(), target.clone()],
             &[],
@@ -2459,11 +2553,11 @@ mod tests {
                 target: identity_for_tests(&target),
                 input: data(1),
                 first: ConflictingCollectionOutput {
-                    record: derive_record(first),
+                    record: Some(derive_record(first)),
                     data: data(2),
                 },
                 second: ConflictingCollectionOutput {
-                    record: derive_record(second),
+                    record: Some(derive_record(second)),
                     data: data(3),
                 },
             }))
@@ -2473,10 +2567,8 @@ mod tests {
     #[test]
     fn rejected_equations_do_not_conflict_or_activate() {
         let definition = named_for_tests("c1", id(2));
-        let first =
-            CollectionMerge::new(identity_for_tests(&definition), data(1), data(2), data(3));
-        let second =
-            CollectionMerge::new(identity_for_tests(&definition), data(1), data(2), data(4));
+        let first = signed_merge(identity_for_tests(&definition), data(1), data(2), data(3));
+        let second = signed_merge(identity_for_tests(&definition), data(1), data(2), data(4));
         let records = discover(
             &[definition],
             &[],
@@ -2508,8 +2600,7 @@ mod tests {
         let definition = named_for_tests("c1", id(2));
         let first = commit(&definition, data(1), 1);
         let second = commit(&definition, data(2), 2);
-        let merge =
-            CollectionMerge::new(identity_for_tests(&definition), data(1), data(2), data(3));
+        let merge = signed_merge(identity_for_tests(&definition), data(1), data(2), data(3));
         let records = discover(
             &[definition.clone()],
             &[first.clone(), second.clone()],
@@ -2568,10 +2659,8 @@ mod tests {
         let first = commit(&definition, data(1), 1);
         let same_data_other_commit = commit(&definition, data(1), 3);
         let second = commit(&definition, data(2), 2);
-        let self_merge =
-            CollectionMerge::new(identity_for_tests(&definition), data(1), data(1), data(1));
-        let subsuming =
-            CollectionMerge::new(identity_for_tests(&definition), data(1), data(2), data(2));
+        let self_merge = signed_merge(identity_for_tests(&definition), data(1), data(1), data(1));
+        let subsuming = signed_merge(identity_for_tests(&definition), data(1), data(2), data(2));
         let records = discover(
             &[definition.clone()],
             &[
@@ -2654,11 +2743,9 @@ mod tests {
         let first = commit(&source, data(1), 1);
         let second = commit(&source, data(2), 2);
         let target_root = commit(&target, data(5), 3);
-        let source_merge =
-            CollectionMerge::new(identity_for_tests(&source), data(1), data(2), data(3));
-        let derive = CollectionDerive::new(identity_for_tests(&target), data(3), data(4));
-        let target_merge =
-            CollectionMerge::new(identity_for_tests(&target), data(4), data(5), data(6));
+        let source_merge = signed_merge(identity_for_tests(&source), data(1), data(2), data(3));
+        let derive = signed_derive(identity_for_tests(&target), data(3), data(4));
+        let target_merge = signed_merge(identity_for_tests(&target), data(4), data(5), data(6));
         let records = discover(
             &[source.clone(), target.clone()],
             &[first.clone(), second.clone(), target_root.clone()],
@@ -2690,9 +2777,9 @@ mod tests {
             .map(|(element, key)| commit(&definition, data(element), key))
             .collect();
         let merges = [
-            CollectionMerge::new(identity_for_tests(&definition), data(1), data(2), data(3)),
-            CollectionMerge::new(identity_for_tests(&definition), data(2), data(4), data(6)),
-            CollectionMerge::new(identity_for_tests(&definition), data(6), data(8), data(14)),
+            signed_merge(identity_for_tests(&definition), data(1), data(2), data(3)),
+            signed_merge(identity_for_tests(&definition), data(2), data(4), data(6)),
+            signed_merge(identity_for_tests(&definition), data(6), data(8), data(14)),
         ];
         let records = discover(&[definition.clone()], &commits, &merges, &[], false);
         let authorized = commits.iter().copied().collect();
@@ -2798,7 +2885,7 @@ mod tests {
         let source = named_for_tests("c1", id(2));
         let target = named_for_tests("c9", id(4));
         let root = commit(&source, data(1), 1);
-        let derive = CollectionDerive::new(identity_for_tests(&target), data(1), data(2));
+        let derive = signed_derive(identity_for_tests(&target), data(1), data(2));
         let records = discover(
             &[source.clone(), target.clone()],
             &[root.clone()],
@@ -2848,9 +2935,9 @@ mod tests {
         let target = named_for_tests("c4", id(5));
         let first = commit(&source, data(1), 1);
         let second = commit(&source, data(2), 2);
-        let merge = CollectionMerge::new(identity_for_tests(&source), data(1), data(2), data(3));
-        let forward = CollectionDerive::new(identity_for_tests(&target), data(3), data(4));
-        let backward = CollectionDerive::new(identity_for_tests(&source), data(4), data(3));
+        let merge = signed_merge(identity_for_tests(&source), data(1), data(2), data(3));
+        let forward = signed_derive(identity_for_tests(&target), data(3), data(4));
+        let backward = signed_derive(identity_for_tests(&source), data(4), data(3));
         let records = discover(
             &[source.clone(), target.clone()],
             &[first.clone(), second.clone()],
@@ -2969,7 +3056,7 @@ mod tests {
         let result = simplearchive_union::join(&left, &right).unwrap();
         let first = commit(&definition, archive_data(&left), 1);
         let second = commit(&definition, archive_data(&right), 2);
-        let merge = CollectionMerge::new(
+        let merge = signed_merge(
             identity_for_tests(&definition),
             archive_data(&left),
             archive_data(&right),

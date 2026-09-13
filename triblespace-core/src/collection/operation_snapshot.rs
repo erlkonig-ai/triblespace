@@ -320,7 +320,8 @@ mod tests {
     use crate::repo::{BlobStorePut, CapabilityProofStore, SnapshotSource, WantRequest, WantStore};
 
     fn record(byte: u8) -> CollectionRecord {
-        CollectionRecord::Derive(CollectionDerive::new(
+        CollectionRecord::Derive(CollectionDerive::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             Inline::<Handle<SimpleArchive>>::new([1; 32]),
             Inline::new([byte; 32]),
             Inline::new([byte.wrapping_add(1); 32]),

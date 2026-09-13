@@ -25,7 +25,7 @@ The boundaries are deliberately small:
 know C           -> join C's wake topic and learn (origin, opaque state root)
 prove READ(C)    -> receive and repair C's authorization evidence
 know H           -> derive its opaque locator, discover providers, and authorize H
-satisfy WRITE(C) -> make a signed COMMIT active in C
+satisfy WRITE(C) -> make a signed COMMIT, MERGE, or DERIVE active in C
 ```
 
 `C` is the exact 32-byte collection descriptor handle. `H` is an exact blob
@@ -52,8 +52,8 @@ proof evidence may activate an old commit without rewriting or retracting it.
 For one collection, semantic repair derives two independent grow-only sets:
 
 - every structurally valid native collection record naming exact C: signed
-  `COMMIT`s independent of current WRITE(C) admission, plus unsigned `MERGE`
-  and `DERIVE` equations; and
+  `COMMIT`, `MERGE`, and `DERIVE` records independent of current WRITE(C)
+  admission; and
 - every self-contained native proof for a capability declared by C's descriptor,
   scoped to exact C and beginning at that capability policy's roots.
 
@@ -92,12 +92,23 @@ scoped to C. The receiver always derives its admitted view locally; record and
 proof arrival therefore commute, and a publisher need not possess or present
 its own WRITE grant merely to replicate an inert signed record.
 
-Unsigned MERGE and DERIVE records remain computation evidence, but they are
+Signed MERGE and DERIVE records remain computation evidence, but they are
 first-class members of the exact-C record PATCH and ordinary collection
 repair. Once present in a record store, an equation is reusable materialized
 LSM work; warm readers do not execute its join or mapping again. A frozen
-semantic view nevertheless ignores a repaired equation until all of its direct
-blob references were resident in that same snapshot.
+semantic view ignores an equation until its producer satisfies the target's
+WRITE policy and all direct blob references are resident. READ permission to
+participate in repair is not permission to endorse an equation. Signature
+verification happens when decoding foreign record bytes, not when rebuilding
+the local repair PATCH or observing the local store again.
+
+This signed-equation format uses `/triblespace/pile-sync/25`. Dense record tag
+4 carries a 224-byte MERGE body and tag 5 a 192-byte DERIVE body; each wire
+value has one additional tag byte. Old unsigned tags 2 and 3 are retired, not
+alternate encodings of an endorsement. COMMIT's 192-byte body and signature
+transcript are unchanged. Native piles preserve known old equations as inert
+evidence; an authorised producer must explicitly endorse a historical result
+before it can participate in the new repair algebra.
 
 ## Opaque wakes over stock gossip
 
@@ -149,8 +160,8 @@ On admission it returns record and authorization-evidence PATCH summaries plus
 the same opaque root. The client may then walk only differing prefixes and
 receive missing leaf bodies:
 
-- canonical signature-valid `COMMIT(C)` records, whether active or inert,
-  and structurally valid native `MERGE`/`DERIVE` equations naming C;
+- canonical signature-valid `COMMIT`, `MERGE`, and `DERIVE` records naming C,
+  whether active or inert;
 - native structurally relevant proofs for C's declared capabilities.
 
 Each proof leaf already contains the complete path and all of its restrictions.
@@ -482,9 +493,12 @@ A node can repair the small semantic overlay and use its resident exact merge
 and derivation results while planning a cover. Missing derived results are
 computed by the ordinary live `ensure` path, which may acquire exact missing
 dependencies and publishes missing `DERIVE` work only. `maintain` additionally
-publishes deterministic size-tiered `MERGE` work. Those unsigned equations
-repair as reusable computation evidence but grant no remote publication
-authority; their referenced artifact blobs remain separate exact-H content.
+publishes deterministic size-tiered `MERGE` work. These operations take an
+explicit signing key. Newly required derivation work needs target WRITE;
+reuse needs no new authority, and optional maintenance without WRITE preserves
+the existing finer cover. The signed equations repair as reusable computation
+evidence but grant no new membership; their referenced artifact blobs remain
+separate exact-H content.
 Evidence and computation still converge by union; no central scheduler or
 query planner is required.
 
@@ -582,7 +596,7 @@ let summaries = storage.derive::<ReferenceSummaryBlob>(
 )?;
 // Producer only: all recursively reachable attachments were stored before
 // the source COMMIT. This scan cannot infer that precondition on a replica.
-storage.maintain(summaries).await?;
+storage.maintain(summaries, &writer).await?;
 ```
 
 The source archive's own handle is not automatically inserted: it is a

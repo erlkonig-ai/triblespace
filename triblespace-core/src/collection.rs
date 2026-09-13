@@ -93,3 +93,6 @@ pub use view::*;
 
 #[cfg(test)]
 mod oracle;
+
+#[cfg(test)]
+mod equation_admission_tests;

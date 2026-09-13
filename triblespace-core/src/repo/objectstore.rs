@@ -26,7 +26,10 @@ use crate::blob::Blob;
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
-use crate::collection::{CollectionRecord, CollectionRecordFingerprint, RecordDecodeError};
+use crate::collection::{
+    CollectionRecord, CollectionRecordFingerprint, LegacyUnsignedCollectionEquation,
+    RecordDecodeError,
+};
 #[cfg(test)]
 use crate::id::Id;
 use crate::inline::encodings::hash::{Blake3, Handle, Hash};
@@ -44,6 +47,12 @@ const COLLECTION_RECORD_INFIX: &str = "collection-records";
 /// type is **async-native**: it implements the
 /// [`super::async_store::AsyncBlobStore`] family
 /// directly, awaiting each operation, with no owned runtime.
+///
+/// This is a trusted persistence backend, not foreign-record ingress. Typed
+/// inserts must already be locally signed or checked at their import boundary.
+/// Replay checks canonical structure and the content-addressed object key,
+/// without repeating signature verification. Retired unsigned equation objects
+/// remain untouched as evidence but are absent from the current record view.
 ///
 /// Synchronous callers wrap it in
 /// [`Blocking`](super::async_store::Blocking), which carries the single
@@ -208,9 +217,11 @@ impl AsyncSnapshotSource for ObjectStoreRemote {
             let mut listed_records = self.store.list(Some(&record_prefix));
             while let Some(item) = listed_records.next().await {
                 let meta = item.map_err(ListCollectionRecordsErr::List)?;
-                let record =
-                    read_collection_record(&*self.store, &record_prefix, meta.location).await?;
-                collection_records.insert(record.fingerprint(), record);
+                if let Some(record) =
+                    read_collection_record(&*self.store, &record_prefix, meta.location).await?
+                {
+                    collection_records.insert(record.fingerprint(), record);
+                }
             }
             let collection_records = collection_records.into_values().collect();
 
@@ -433,7 +444,7 @@ async fn read_collection_record(
     store: &dyn ObjectStore,
     prefix: &Path,
     location: Path,
-) -> Result<CollectionRecord, ListCollectionRecordsErr> {
+) -> Result<Option<CollectionRecord>, ListCollectionRecordsErr> {
     let path_fingerprint = collection_record_fingerprint_from_path(prefix, &location)?;
     let object = store
         .get(&location)
@@ -443,8 +454,15 @@ async fn read_collection_record(
         .bytes()
         .await
         .map_err(ListCollectionRecordsErr::Get)?;
-    let record = CollectionRecord::from_bytes(&bytes).map_err(ListCollectionRecordsErr::Decode)?;
-    let record_fingerprint = record.fingerprint();
+    let (record, record_fingerprint) = if matches!(bytes.first(), Some(2 | 3)) {
+        let legacy = LegacyUnsignedCollectionEquation::from_bytes(&bytes)
+            .map_err(ListCollectionRecordsErr::Decode)?;
+        (None, legacy.fingerprint())
+    } else {
+        let record = CollectionRecord::from_bytes_trusted(&bytes)
+            .map_err(ListCollectionRecordsErr::Decode)?;
+        (Some(record), record.fingerprint())
+    };
     if record_fingerprint != path_fingerprint {
         return Err(ListCollectionRecordsErr::FingerprintMismatch {
             path: path_fingerprint,
@@ -713,7 +731,7 @@ mod tests {
     use crate::collection::descriptor::{identity_for_tests, named_for_tests};
     use crate::collection::{
         CollectionMerge, CollectionRead, CollectionStore, COLLECTION_MERGE_BYTES_LEN,
-        COLLECTION_RECORD_KIND_MERGE_V1,
+        COLLECTION_RECORD_KIND_MERGE_V2,
     };
     use crate::repo::async_store::{
         AsyncBlobStoreGet, AsyncBlobStoreList, AsyncBlobStorePut, AsyncCollectionRead,
@@ -733,7 +751,8 @@ mod tests {
             &format!("tagged-{tag}"),
             Id::new([tag.wrapping_add(1).max(1); 16]).unwrap(),
         );
-        CollectionRecord::Merge(CollectionMerge::new(
+        CollectionRecord::Merge(CollectionMerge::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&descriptor),
             Inline::new([tag.wrapping_add(3); 32]),
             Inline::new([tag.wrapping_add(4); 32]),
@@ -772,7 +791,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(stored.len(), 1 + COLLECTION_MERGE_BYTES_LEN);
-            assert_eq!(stored[0], COLLECTION_RECORD_KIND_MERGE_V1);
+            assert_eq!(stored[0], COLLECTION_RECORD_KIND_MERGE_V2);
 
             let snapshot = AsyncSnapshotSource::snapshot(&mut store).await.unwrap();
             assert!(AsyncCollectionRead::records(&before)
@@ -786,6 +805,67 @@ mod tests {
             let changes = snapshot.changes_since(&before);
             assert!(changes.contains(StoreChanges::COLLECTION_RECORDS));
             assert!(!changes.contains(StoreChanges::BLOBS));
+        });
+    }
+
+    #[test]
+    fn trusted_object_replay_does_not_reverify_signatures() {
+        block_on(async {
+            let mut store = remote();
+            let mut bytes = record(1).to_bytes();
+            *bytes.last_mut().unwrap() ^= 1;
+            assert!(CollectionRecord::from_bytes(&bytes).is_err());
+            let evidence = CollectionRecord::from_bytes_trusted(&bytes).unwrap();
+            AsyncCollectionStore::insert(&mut store, evidence)
+                .await
+                .unwrap();
+            let snapshot = AsyncSnapshotSource::snapshot(&mut store).await.unwrap();
+            assert_eq!(
+                AsyncCollectionRead::records(&snapshot).await.unwrap(),
+                vec![evidence]
+            );
+            assert!(evidence.verify_strict().is_err());
+        });
+    }
+
+    #[test]
+    fn retired_dense_equation_objects_stay_present_but_semantically_inert() {
+        block_on(async {
+            let mut store = remote();
+            let current = record(1);
+            AsyncCollectionStore::insert(&mut store, current)
+                .await
+                .unwrap();
+            for (tag, fields) in [
+                (2, vec![[1; 32], [2; 32], [3; 32], [4; 32]]),
+                (3, vec![[1; 32], [2; 32], [4; 32]]),
+            ] {
+                let mut bytes = vec![tag];
+                bytes.extend(fields.into_iter().flatten());
+                let legacy = LegacyUnsignedCollectionEquation::from_bytes(&bytes).unwrap();
+                let path = store
+                    .prefix
+                    .child(COLLECTION_RECORD_INFIX)
+                    .child(hex::encode(legacy.fingerprint().raw()));
+                store.store.put(&path, bytes.clone().into()).await.unwrap();
+                let snapshot = AsyncSnapshotSource::snapshot(&mut store).await.unwrap();
+                assert_eq!(
+                    AsyncCollectionRead::records(&snapshot).await.unwrap(),
+                    vec![current]
+                );
+                assert_eq!(
+                    store
+                        .store
+                        .get(&path)
+                        .await
+                        .unwrap()
+                        .bytes()
+                        .await
+                        .unwrap()
+                        .as_ref(),
+                    bytes
+                );
+            }
         });
     }
 

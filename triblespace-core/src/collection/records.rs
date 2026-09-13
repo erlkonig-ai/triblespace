@@ -8,11 +8,11 @@
 //! that blob's handle is the collection identity. See
 //! [`descriptor`](crate::collection::descriptor) for reading one.
 //!
-//! Structural decoding and semantic verification are deliberately separate.
-//! Every fixed-width commit or derive payload has a structural representation;
-//! a merge additionally rejects noncanonical input order. A decoded commit can
-//! still carry an invalid public key or signature; [`CollectionCommit::verify_strict`]
-//! performs that cryptographic check over a fixed, domain-separated transcript.
+//! Public byte decoding verifies the embedded signature before admitting
+//! foreign evidence. Trusted native replay uses crate-private structural
+//! decoding instead: local persisted records are not cryptographically checked
+//! again on every read. Signatures prove authorship; WRITE authorization is a
+//! separate observation-time policy.
 
 use std::error::Error;
 use std::fmt;
@@ -56,14 +56,18 @@ pub const KIND_COLLECTION_MAPPING: Id = id_hex!("8725AF624FE719B70289A67B21174FE
 ///
 /// Minted with `trible genid` on 2026-08-11.
 pub const KIND_COLLECTION_COMMIT: Id = id_hex!("B34817308188C4515A3C51967A91A603");
-/// Stable semantic kind of an unsigned commutative `MERGE` equation.
-///
-/// Minted with `trible genid` on 2026-08-11.
-pub const KIND_COLLECTION_MERGE: Id = id_hex!("5F20FFC64313969B7E046A7677874D39");
-/// Stable semantic kind of an unsigned `DERIVE` equation.
-///
-/// Minted with `trible genid` on 2026-08-11.
-pub const KIND_COLLECTION_DERIVE: Id = id_hex!("46C621338B6DD5B71C8E1E6DD74B087C");
+/// Stable semantic kind of a signed commutative `MERGE` equation.
+/// Minted with `trible genid` on 2026-09-13.
+pub const KIND_COLLECTION_MERGE: Id = id_hex!("1E5277B23D177FD692B074FBF0EF28F1");
+/// Stable semantic kind of a signed `DERIVE` equation.
+/// Minted with `trible genid` on 2026-09-13.
+pub const KIND_COLLECTION_DERIVE: Id = id_hex!("CE6A838612D0AA0812C05A50CCD11DC1");
+/// Retired unsigned MERGE kind; never interpreted as a signed equation.
+/// Minted with `trible genid` on 2026-08-11, retired 2026-09-13.
+pub const KIND_COLLECTION_MERGE_UNSIGNED: Id = id_hex!("5F20FFC64313969B7E046A7677874D39");
+/// Retired unsigned DERIVE kind; never interpreted as a signed equation.
+/// Minted with `trible genid` on 2026-08-11, retired 2026-09-13.
+pub const KIND_COLLECTION_DERIVE_UNSIGNED: Id = id_hex!("46C621338B6DD5B71C8E1E6DD74B087C");
 
 /// The three-field derive's predecessor, which also named its source.
 ///
@@ -96,9 +100,9 @@ pub const KIND_COLLECTION_GOSSIP_V1: Id = id_hex!("9BB5B1F4D6FD8FB850B494C2CF51B
 /// Byte length of a dense signed commit.
 pub const COLLECTION_COMMIT_BYTES_LEN: usize = 6 * 32;
 /// Byte length of a dense merge equation.
-pub const COLLECTION_MERGE_BYTES_LEN: usize = 4 * 32;
+pub const COLLECTION_MERGE_BYTES_LEN: usize = 7 * 32;
 /// Byte length of a dense derive equation.
-pub const COLLECTION_DERIVE_BYTES_LEN: usize = 3 * 32;
+pub const COLLECTION_DERIVE_BYTES_LEN: usize = 6 * 32;
 
 attributes! {
     /// The human-readable name of a root collection.
@@ -219,6 +223,11 @@ pub const COMMIT_TRANSCRIPT_LEN: usize = COMMIT_TRANSCRIPT_DOMAIN.len()
     + 32 // data hash
     + 32; // metadata handle
 
+/// Signature domain for signed MERGE equations.
+pub const MERGE_TRANSCRIPT_DOMAIN: &[u8] = b"triblespace.collection.merge.transcript";
+/// Signature domain for signed DERIVE equations.
+pub const DERIVE_TRANSCRIPT_DOMAIN: &[u8] = b"triblespace.collection.derive.transcript";
+
 /// Return the canonical handle of an empty metadata archive.
 ///
 /// Metadata is mandatory in a [`CollectionCommit`]. Callers with no metadata
@@ -228,7 +237,7 @@ pub fn empty_metadata_handle() -> Inline<Handle<SimpleArchive>> {
     encode_archive(TribleSet::new()).get_handle()
 }
 
-/// Structural decoding failure for a collection record.
+/// Canonical decoding or foreign-signature verification failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RecordDecodeError {
     /// The bytes were not a canonical `SimpleArchive`.
@@ -245,6 +254,8 @@ pub enum RecordDecodeError {
     UnknownKind(u8),
     /// A merge payload did not carry its inputs in ascending digest order.
     NonCanonicalMergeInputs,
+    /// Public ingress rejected the embedded key or signature.
+    Verification(RecordVerificationError),
 }
 
 impl fmt::Display for RecordDecodeError {
@@ -266,6 +277,7 @@ impl fmt::Display for RecordDecodeError {
             Self::NonCanonicalMergeInputs => {
                 write!(f, "collection merge inputs are not canonically ordered")
             }
+            Self::Verification(error) => error.fmt(f),
         }
     }
 }
@@ -274,6 +286,7 @@ impl Error for RecordDecodeError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Archive(error) => Some(error),
+            Self::Verification(error) => Some(error),
             _ => None,
         }
     }
@@ -285,25 +298,31 @@ impl From<UnarchiveError> for RecordDecodeError {
     }
 }
 
-/// Semantic verification failure for a signed collection commit.
+/// Signature verification failure for any signed collection record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CommitVerificationError {
-    /// The public-key bytes do not encode an Ed25519 verifying key.
+pub enum RecordVerificationError {
+    /// The public-key bytes do not encode a canonical non-weak Ed25519 key.
     InvalidPublicKey,
     /// Strict Ed25519 verification rejected the transcript/signature pair.
     InvalidSignature,
 }
 
-impl fmt::Display for CommitVerificationError {
+impl fmt::Display for RecordVerificationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidPublicKey => write!(f, "collection commit has an invalid public key"),
-            Self::InvalidSignature => write!(f, "collection commit signature is invalid"),
+            Self::InvalidPublicKey => write!(f, "collection record has an invalid public key"),
+            Self::InvalidSignature => write!(f, "collection record signature is invalid"),
         }
     }
 }
 
-impl Error for CommitVerificationError {}
+impl Error for RecordVerificationError {}
+
+impl From<RecordVerificationError> for RecordDecodeError {
+    fn from(error: RecordVerificationError) -> Self {
+        Self::Verification(error)
+    }
+}
 
 /// Signed exogenous membership assertion.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -355,11 +374,15 @@ impl CollectionCommit {
         }
     }
 
-    /// Decode one exact dense payload without trusting its signature.
-    ///
-    /// Every byte string of this fixed size has a structural representation;
-    /// invalid public keys and signatures are rejected by [`verify_strict`](Self::verify_strict).
-    pub fn from_bytes(bytes: [u8; COLLECTION_COMMIT_BYTES_LEN]) -> Self {
+    /// Decode foreign dense bytes and strictly verify their signature.
+    pub fn from_bytes(bytes: [u8; COLLECTION_COMMIT_BYTES_LEN]) -> Result<Self, RecordDecodeError> {
+        let record = Self::from_bytes_trusted(bytes);
+        record.verify_strict()?;
+        Ok(record)
+    }
+
+    /// Structural decoding for explicitly trusted persisted bytes and audits.
+    pub(crate) fn from_bytes_trusted(bytes: [u8; COLLECTION_COMMIT_BYTES_LEN]) -> Self {
         Self::from_parts(
             Inline::new(field(&bytes, 0)),
             Inline::new(field(&bytes, 1)),
@@ -374,37 +397,10 @@ impl CollectionCommit {
     ///
     /// This proves only that the embedded public key signed the record. Key
     /// authorization is a separate caller policy.
-    pub fn verify_strict(&self) -> Result<(), CommitVerificationError> {
-        let public_key = VerifyingKey::from_bytes(&self.public_key.raw)
-            .map_err(|_| CommitVerificationError::InvalidPublicKey)?;
-        self.verify_signature_strict(&public_key)
-    }
-
-    /// Verify with an already parsed key when it matches this record's key.
-    ///
-    /// Scoped collection discovery compares the raw key field before calling
-    /// this helper. The equality check here keeps that optimization local and
-    /// fail-safe if another caller ever violates the precondition.
-    pub(crate) fn verify_strict_with_key(
-        &self,
-        public_key: &VerifyingKey,
-    ) -> Result<(), CommitVerificationError> {
-        if public_key.to_bytes() != self.public_key.raw {
-            return self.verify_strict();
-        }
-        self.verify_signature_strict(public_key)
-    }
-
-    fn verify_signature_strict(
-        &self,
-        public_key: &VerifyingKey,
-    ) -> Result<(), CommitVerificationError> {
-        let signature = Signature::from_components(self.signature_r.raw, self.signature_s.raw);
+    pub fn verify_strict(&self) -> Result<(), RecordVerificationError> {
         let transcript =
             commit_transcript(self.public_key, self.collection, self.data, self.metadata);
-        public_key
-            .verify_strict(&transcript, &signature)
-            .map_err(|_| CommitVerificationError::InvalidSignature)
+        verify_record_signature(self.public_key, self.signature(), &transcript)
     }
 
     /// Exact bytes attested by this commit's signature.
@@ -464,18 +460,22 @@ impl CollectionCommit {
     }
 }
 
-/// Unsigned exact join equation inside one collection lattice.
+/// Signed exact join equation inside one collection lattice.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct CollectionMerge {
     collection: CollectionHandle,
     low: CollectionData,
     high: CollectionData,
     result: CollectionData,
+    public_key: Inline<ED25519PublicKey>,
+    signature_r: Inline<ED25519RComponent>,
+    signature_s: Inline<ED25519SComponent>,
 }
 
 impl CollectionMerge {
-    /// Construct a commutative merge record, sorting its two inputs by digest.
-    pub fn new(
+    /// Sign a commutative equation after sorting its inputs by digest.
+    pub fn sign(
+        signing_key: &SigningKey,
         collection: CollectionHandle,
         mut left: CollectionData,
         mut right: CollectionData,
@@ -484,37 +484,105 @@ impl CollectionMerge {
         if right < left {
             std::mem::swap(&mut left, &mut right);
         }
-        Self::from_ordered(collection, left, right, result)
+        let public_key = Inline::new(signing_key.verifying_key().to_bytes());
+        let transcript = equation_transcript(
+            MERGE_TRANSCRIPT_DOMAIN,
+            KIND_COLLECTION_MERGE,
+            public_key,
+            [collection.raw, left.raw, right.raw, result.raw],
+        );
+        let signature: Signature = signing_key.sign(&transcript);
+        Self::from_parts(
+            collection,
+            left,
+            right,
+            result,
+            public_key,
+            Inline::new(*signature.r_bytes()),
+            Inline::new(*signature.s_bytes()),
+        )
     }
 
-    fn from_ordered(
+    pub(crate) fn from_parts(
         collection: CollectionHandle,
         low: CollectionData,
         high: CollectionData,
         result: CollectionData,
+        public_key: Inline<ED25519PublicKey>,
+        signature_r: Inline<ED25519RComponent>,
+        signature_s: Inline<ED25519SComponent>,
     ) -> Self {
         Self {
             collection,
             low,
             high,
             result,
+            public_key,
+            signature_r,
+            signature_s,
         }
     }
 
-    /// Decode one exact, canonically ordered dense merge payload.
+    /// Decode foreign dense bytes, requiring canonical order and a strict signature.
     pub fn from_bytes(bytes: [u8; COLLECTION_MERGE_BYTES_LEN]) -> Result<Self, RecordDecodeError> {
+        let record = Self::from_bytes_trusted(bytes)?;
+        record.verify_strict()?;
+        Ok(record)
+    }
+
+    /// Structural decoding for explicitly trusted persisted bytes and audits.
+    pub(crate) fn from_bytes_trusted(
+        bytes: [u8; COLLECTION_MERGE_BYTES_LEN],
+    ) -> Result<Self, RecordDecodeError> {
         let collection = Inline::new(field(&bytes, 0));
         let low = Inline::new(field(&bytes, 1));
         let high = Inline::new(field(&bytes, 2));
         if high < low {
             return Err(RecordDecodeError::NonCanonicalMergeInputs);
         }
-        Ok(Self::from_ordered(
+        Ok(Self::from_parts(
             collection,
             low,
             high,
             Inline::new(field(&bytes, 3)),
+            Inline::new(field(&bytes, 4)),
+            Inline::new(field(&bytes, 5)),
+            Inline::new(field(&bytes, 6)),
         ))
+    }
+
+    /// Prove authorship only; WRITE admission remains a separate policy query.
+    pub fn verify_strict(&self) -> Result<(), RecordVerificationError> {
+        verify_record_signature(
+            self.public_key,
+            self.signature(),
+            &self.signing_transcript(),
+        )
+    }
+
+    /// Exact domain-separated bytes signed by the author.
+    pub fn signing_transcript(&self) -> Vec<u8> {
+        equation_transcript(
+            MERGE_TRANSCRIPT_DOMAIN,
+            KIND_COLLECTION_MERGE,
+            self.public_key,
+            [
+                self.collection.raw,
+                self.low.raw,
+                self.high.raw,
+                self.result.raw,
+            ],
+        )
+    }
+
+    /// Author's public key.
+    pub fn public_key(&self) -> Inline<ED25519PublicKey> {
+        self.public_key
+    }
+
+    /// Exact signature components.
+    pub fn signature(&self) -> (Inline<ED25519RComponent>, Inline<ED25519SComponent>) {
+        (self.signature_r, self.signature_s)
     }
 
     /// Collection whose join law is asserted.
@@ -545,48 +613,128 @@ impl CollectionMerge {
         ]
     }
 
-    /// Encode this equation into its exact dense 128-byte layout.
+    /// Encode this equation into its exact dense 224-byte layout.
     pub fn to_bytes(&self) -> [u8; COLLECTION_MERGE_BYTES_LEN] {
-        merge_bytes(self.collection, self.low, self.high, self.result)
+        concat_fields([
+            self.collection.raw,
+            self.low.raw,
+            self.high.raw,
+            self.result.raw,
+            self.public_key.raw,
+            self.signature_r.raw,
+            self.signature_s.raw,
+        ])
     }
 }
 
-/// One unsigned exact observation of the canonical mapping from a source
+/// One signed exact observation of the canonical mapping from a source
 /// collection member to a target collection member.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct CollectionDerive {
     collection: CollectionHandle,
     input: CollectionData,
     output: CollectionData,
+    public_key: Inline<ED25519PublicKey>,
+    signature_r: Inline<ED25519RComponent>,
+    signature_s: Inline<ED25519SComponent>,
 }
 
 impl CollectionDerive {
-    /// Construct a canonical `DERIVE(collection, input, output)` record.
+    /// Sign a canonical `DERIVE(collection, input, output)` record.
     ///
     /// The output collection is named by descriptor handle, exactly as a commit names its
     /// collection, and that descriptor already says which collection is the
     /// source and embeds the exact mapping facts. A derive therefore
     /// says *which input/output equation* was computed, never restates the
     /// mapping definition.
-    pub fn new(
+    pub fn sign(
+        signing_key: &SigningKey,
         collection: CollectionHandle,
         input: CollectionData,
         output: CollectionData,
+    ) -> Self {
+        let public_key = Inline::new(signing_key.verifying_key().to_bytes());
+        let transcript = equation_transcript(
+            DERIVE_TRANSCRIPT_DOMAIN,
+            KIND_COLLECTION_DERIVE,
+            public_key,
+            [collection.raw, input.raw, output.raw],
+        );
+        let signature: Signature = signing_key.sign(&transcript);
+        Self::from_parts(
+            collection,
+            input,
+            output,
+            public_key,
+            Inline::new(*signature.r_bytes()),
+            Inline::new(*signature.s_bytes()),
+        )
+    }
+
+    pub(crate) fn from_parts(
+        collection: CollectionHandle,
+        input: CollectionData,
+        output: CollectionData,
+        public_key: Inline<ED25519PublicKey>,
+        signature_r: Inline<ED25519RComponent>,
+        signature_s: Inline<ED25519SComponent>,
     ) -> Self {
         Self {
             collection,
             input,
             output,
+            public_key,
+            signature_r,
+            signature_s,
         }
     }
 
-    /// Decode one exact dense derive payload.
-    pub fn from_bytes(bytes: [u8; COLLECTION_DERIVE_BYTES_LEN]) -> Self {
-        Self::new(
+    /// Decode foreign dense bytes and strictly verify their signature.
+    pub fn from_bytes(bytes: [u8; COLLECTION_DERIVE_BYTES_LEN]) -> Result<Self, RecordDecodeError> {
+        let record = Self::from_bytes_trusted(bytes);
+        record.verify_strict()?;
+        Ok(record)
+    }
+
+    /// Structural decoding for explicitly trusted persisted bytes and audits.
+    pub(crate) fn from_bytes_trusted(bytes: [u8; COLLECTION_DERIVE_BYTES_LEN]) -> Self {
+        Self::from_parts(
             Inline::new(field(&bytes, 0)),
             Inline::new(field(&bytes, 1)),
             Inline::new(field(&bytes, 2)),
+            Inline::new(field(&bytes, 3)),
+            Inline::new(field(&bytes, 4)),
+            Inline::new(field(&bytes, 5)),
         )
+    }
+
+    /// Prove authorship only; WRITE admission remains a separate policy query.
+    pub fn verify_strict(&self) -> Result<(), RecordVerificationError> {
+        verify_record_signature(
+            self.public_key,
+            self.signature(),
+            &self.signing_transcript(),
+        )
+    }
+
+    /// Exact domain-separated bytes signed by the author.
+    pub fn signing_transcript(&self) -> Vec<u8> {
+        equation_transcript(
+            DERIVE_TRANSCRIPT_DOMAIN,
+            KIND_COLLECTION_DERIVE,
+            self.public_key,
+            [self.collection.raw, self.input.raw, self.output.raw],
+        )
+    }
+
+    /// Author's public key.
+    pub fn public_key(&self) -> Inline<ED25519PublicKey> {
+        self.public_key
+    }
+
+    /// Exact signature components.
+    pub fn signature(&self) -> (Inline<ED25519RComponent>, Inline<ED25519SComponent>) {
+        (self.signature_r, self.signature_s)
     }
 
     /// Collection containing the output member.
@@ -616,24 +764,161 @@ impl CollectionDerive {
         ]
     }
 
-    /// Encode this equation into its exact dense 96-byte layout.
+    /// Encode this equation into its exact dense 192-byte layout.
     pub fn to_bytes(&self) -> [u8; COLLECTION_DERIVE_BYTES_LEN] {
-        derive_bytes(self.collection, self.input, self.output)
+        concat_fields([
+            self.collection.raw,
+            self.input.raw,
+            self.output.raw,
+            self.public_key.raw,
+            self.signature_r.raw,
+            self.signature_s.raw,
+        ])
     }
 }
 
-/// A structurally canonical native collection record.
+/// Historical unsigned computation evidence, never a current collection record.
+///
+/// Only an explicitly authorized writer may endorse this evidence by signing a
+/// new equation. Decoding or receiving it never manufactures an endorsement.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum LegacyUnsignedCollectionEquation {
+    Merge {
+        collection: CollectionHandle,
+        low: CollectionData,
+        high: CollectionData,
+        result: CollectionData,
+    },
+    Derive {
+        collection: CollectionHandle,
+        input: CollectionData,
+        output: CollectionData,
+    },
+}
+
+impl LegacyUnsignedCollectionEquation {
+    /// Structurally decode an exact retired dense value for explicit migration.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, RecordDecodeError> {
+        let Some((&kind, payload)) = bytes.split_first() else {
+            return Err(RecordDecodeError::InvalidLength {
+                expected: 1,
+                actual: 0,
+            });
+        };
+        match kind {
+            COLLECTION_RECORD_KIND_MERGE_V1 => {
+                let bytes = exact_array::<128>(payload)?;
+                let low = Inline::new(field(&bytes, 1));
+                let high = Inline::new(field(&bytes, 2));
+                if high < low {
+                    return Err(RecordDecodeError::NonCanonicalMergeInputs);
+                }
+                Ok(Self::Merge {
+                    collection: Inline::new(field(&bytes, 0)),
+                    low,
+                    high,
+                    result: Inline::new(field(&bytes, 3)),
+                })
+            }
+            COLLECTION_RECORD_KIND_DERIVE_V1 => {
+                let bytes = exact_array::<96>(payload)?;
+                Ok(Self::Derive {
+                    collection: Inline::new(field(&bytes, 0)),
+                    input: Inline::new(field(&bytes, 1)),
+                    output: Inline::new(field(&bytes, 2)),
+                })
+            }
+            unknown => Err(RecordDecodeError::UnknownKind(unknown)),
+        }
+    }
+
+    /// The exact collection (target for DERIVE) requiring writer endorsement.
+    pub fn collection(&self) -> CollectionHandle {
+        match self {
+            Self::Merge { collection, .. } | Self::Derive { collection, .. } => *collection,
+        }
+    }
+
+    /// Historical content key, used only to check persisted dense evidence.
+    pub fn fingerprint(&self) -> CollectionRecordFingerprint {
+        match self {
+            Self::Merge {
+                collection,
+                low,
+                high,
+                result,
+            } => collection_record_fingerprint(
+                KIND_COLLECTION_MERGE_UNSIGNED,
+                &concat_fields::<4, 128>([collection.raw, low.raw, high.raw, result.raw]),
+            ),
+            Self::Derive {
+                collection,
+                input,
+                output,
+            } => collection_record_fingerprint(
+                KIND_COLLECTION_DERIVE_UNSIGNED,
+                &concat_fields::<3, 96>([collection.raw, input.raw, output.raw]),
+            ),
+        }
+    }
+
+    /// Every direct dependency remains a physical retention root when resident.
+    pub fn blob_references(&self) -> impl ExactSizeIterator<Item = Inline<Handle<UnknownBlob>>> {
+        let mut references = arrayvec::ArrayVec::<_, 4>::new();
+        references.push(self.collection().transmute());
+        match self {
+            Self::Merge {
+                low, high, result, ..
+            } => {
+                references.extend([*low, *high, *result].map(Handle::<UnknownBlob>::from_hash));
+            }
+            Self::Derive { input, output, .. } => {
+                references.extend([*input, *output].map(Handle::<UnknownBlob>::from_hash));
+            }
+        }
+        references.into_iter()
+    }
+}
+
+/// A canonical signed native collection record.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum CollectionRecord {
     /// Signed membership assertion whose embedded signature can be verified.
     Commit(CollectionCommit),
-    /// Unsigned exact join equation.
+    /// Signed exact join equation.
     Merge(CollectionMerge),
-    /// Unsigned exact mapping equation.
+    /// Signed exact mapping equation.
     Derive(CollectionDerive),
 }
 
 impl CollectionRecord {
+    /// The exact collection named by this record (the target for a DERIVE).
+    pub fn collection(&self) -> CollectionHandle {
+        match self {
+            Self::Commit(record) => record.collection(),
+            Self::Merge(record) => record.collection(),
+            Self::Derive(record) => record.collection(),
+        }
+    }
+
+    /// The principal whose signed assertion this record carries.
+    pub fn public_key(&self) -> Inline<ED25519PublicKey> {
+        match self {
+            Self::Commit(record) => record.public_key(),
+            Self::Merge(record) => record.public_key(),
+            Self::Derive(record) => record.public_key(),
+        }
+    }
+
+    /// Verify foreign evidence or explicitly audit trusted persisted bytes.
+    pub fn verify_strict(&self) -> Result<(), RecordVerificationError> {
+        match self {
+            Self::Commit(record) => record.verify_strict(),
+            Self::Merge(record) => record.verify_strict(),
+            Self::Derive(record) => record.verify_strict(),
+        }
+    }
+
     /// Blob handles named directly by this native record.
     ///
     /// The returned handles express physical ownership only. Callers must not
@@ -649,12 +934,20 @@ impl CollectionRecord {
         references.into_iter()
     }
 
-    /// Decode the self-tagged dense form used by generic record stores.
+    /// Decode the self-tagged dense form and strictly verify its signature.
     ///
     /// The first byte identifies the variant; the remainder is that variant's
     /// exact untagged payload. Typed protocols should use the concrete record
     /// codecs directly and avoid this extra byte.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, RecordDecodeError> {
+        let record = Self::from_bytes_trusted(bytes)?;
+        record.verify_strict()?;
+        Ok(record)
+    }
+
+    /// Decode explicitly trusted persisted values without repeating crypto.
+    /// This is not an ingress boundary for external imports or repair.
+    pub(crate) fn from_bytes_trusted(bytes: &[u8]) -> Result<Self, RecordDecodeError> {
         let Some((&kind, payload)) = bytes.split_first() else {
             return Err(RecordDecodeError::InvalidLength {
                 expected: 1,
@@ -664,15 +957,15 @@ impl CollectionRecord {
         match kind {
             COLLECTION_RECORD_KIND_COMMIT_V1 => {
                 let bytes = exact_array::<COLLECTION_COMMIT_BYTES_LEN>(payload)?;
-                Ok(Self::Commit(CollectionCommit::from_bytes(bytes)))
+                Ok(Self::Commit(CollectionCommit::from_bytes_trusted(bytes)))
             }
-            COLLECTION_RECORD_KIND_MERGE_V1 => {
+            COLLECTION_RECORD_KIND_MERGE_V2 => {
                 let bytes = exact_array::<COLLECTION_MERGE_BYTES_LEN>(payload)?;
-                Ok(Self::Merge(CollectionMerge::from_bytes(bytes)?))
+                Ok(Self::Merge(CollectionMerge::from_bytes_trusted(bytes)?))
             }
-            COLLECTION_RECORD_KIND_DERIVE_V1 => {
+            COLLECTION_RECORD_KIND_DERIVE_V2 => {
                 let bytes = exact_array::<COLLECTION_DERIVE_BYTES_LEN>(payload)?;
-                Ok(Self::Derive(CollectionDerive::from_bytes(bytes)))
+                Ok(Self::Derive(CollectionDerive::from_bytes_trusted(bytes)))
             }
             unknown => Err(RecordDecodeError::UnknownKind(unknown)),
         }
@@ -700,10 +993,10 @@ impl CollectionRecord {
                 tagged_bytes(COLLECTION_RECORD_KIND_COMMIT_V1, &record.to_bytes())
             }
             Self::Merge(record) => {
-                tagged_bytes(COLLECTION_RECORD_KIND_MERGE_V1, &record.to_bytes())
+                tagged_bytes(COLLECTION_RECORD_KIND_MERGE_V2, &record.to_bytes())
             }
             Self::Derive(record) => {
-                tagged_bytes(COLLECTION_RECORD_KIND_DERIVE_V1, &record.to_bytes())
+                tagged_bytes(COLLECTION_RECORD_KIND_DERIVE_V2, &record.to_bytes())
             }
         }
     }
@@ -714,10 +1007,14 @@ impl CollectionRecord {
 /// A future payload layout allocates a new tag rather than reinterpreting this
 /// one, so stored bytes remain self-versioning without a second prefix byte.
 pub const COLLECTION_RECORD_KIND_COMMIT_V1: u8 = 1;
-/// Dense generic-store tag for the version-1 [`CollectionRecord::Merge`] layout.
+/// Retired dense tag for the unsigned MERGE layout. Never reused.
 pub const COLLECTION_RECORD_KIND_MERGE_V1: u8 = 2;
-/// Dense generic-store tag for the version-1 [`CollectionRecord::Derive`] layout.
+/// Retired dense tag for the unsigned DERIVE layout. Never reused.
 pub const COLLECTION_RECORD_KIND_DERIVE_V1: u8 = 3;
+/// Dense generic-store tag for the signed MERGE layout.
+pub const COLLECTION_RECORD_KIND_MERGE_V2: u8 = 4;
+/// Dense generic-store tag for the signed DERIVE layout.
+pub const COLLECTION_RECORD_KIND_DERIVE_V2: u8 = 5;
 
 fn commit_bytes(
     collection: CollectionHandle,
@@ -737,21 +1034,34 @@ fn commit_bytes(
     ])
 }
 
-fn merge_bytes(
-    collection: CollectionHandle,
-    low: CollectionData,
-    high: CollectionData,
-    result: CollectionData,
-) -> [u8; COLLECTION_MERGE_BYTES_LEN] {
-    concat_fields([collection.raw, low.raw, high.raw, result.raw])
+fn verify_record_signature(
+    public_key: Inline<ED25519PublicKey>,
+    (r, s): (Inline<ED25519RComponent>, Inline<ED25519SComponent>),
+    transcript: &[u8],
+) -> Result<(), RecordVerificationError> {
+    let key = VerifyingKey::from_bytes(&public_key.raw)
+        .map_err(|_| RecordVerificationError::InvalidPublicKey)?;
+    if !crate::capability::is_valid_capability_principal(&key) {
+        return Err(RecordVerificationError::InvalidPublicKey);
+    }
+    key.verify_strict(transcript, &Signature::from_components(r.raw, s.raw))
+        .map_err(|_| RecordVerificationError::InvalidSignature)
 }
 
-fn derive_bytes(
-    target: CollectionHandle,
-    input: CollectionData,
-    output: CollectionData,
-) -> [u8; COLLECTION_DERIVE_BYTES_LEN] {
-    concat_fields([target.raw, input.raw, output.raw])
+fn equation_transcript<const N: usize>(
+    domain: &[u8],
+    kind: Id,
+    public_key: Inline<ED25519PublicKey>,
+    fields: [[u8; 32]; N],
+) -> Vec<u8> {
+    let mut transcript = Vec::with_capacity(domain.len() + 16 + 32 + N * 32);
+    transcript.extend_from_slice(domain);
+    transcript.extend_from_slice(&kind.raw());
+    transcript.extend_from_slice(&public_key.raw);
+    for field in fields {
+        transcript.extend_from_slice(&field);
+    }
+    transcript
 }
 
 fn collection_record_fingerprint(kind: Id, payload: &[u8]) -> CollectionRecordFingerprint {
@@ -894,13 +1204,16 @@ mod tests {
     }
 
     #[test]
-    fn signed_commit_decodes_before_it_verifies_and_retries_identically() {
+    fn signed_commit_checks_foreign_bytes_and_retries_identically() {
         let key = fixture_key();
         let first = CollectionCommit::sign(&key, collection(1), hash(2), empty_metadata_handle());
         let retry = CollectionCommit::sign(&key, collection(1), hash(2), empty_metadata_handle());
         assert_eq!(first, retry);
         assert_eq!(first.to_bytes(), retry.to_bytes());
-        assert_eq!(CollectionCommit::from_bytes(first.to_bytes()), first);
+        assert_eq!(
+            CollectionCommit::from_bytes(first.to_bytes()).unwrap(),
+            first
+        );
         first.verify_strict().unwrap();
 
         let mut bad_s = first.signature_s;
@@ -913,10 +1226,16 @@ mod tests {
             first.signature_r,
             bad_s,
         );
-        let decoded = CollectionCommit::from_bytes(bad.to_bytes());
+        let decoded = CollectionCommit::from_bytes_trusted(bad.to_bytes());
         assert_eq!(
             decoded.verify_strict(),
-            Err(CommitVerificationError::InvalidSignature)
+            Err(RecordVerificationError::InvalidSignature)
+        );
+        assert_eq!(
+            CollectionCommit::from_bytes(bad.to_bytes()),
+            Err(RecordDecodeError::Verification(
+                RecordVerificationError::InvalidSignature
+            ))
         );
 
         let mut bad_r = first.signature_r;
@@ -931,7 +1250,7 @@ mod tests {
         );
         assert_eq!(
             bad.verify_strict(),
-            Err(CommitVerificationError::InvalidSignature)
+            Err(RecordVerificationError::InvalidSignature)
         );
 
         let mut invalid_key = [0; 32];
@@ -944,10 +1263,16 @@ mod tests {
             first.signature_r,
             first.signature_s,
         );
-        let decoded = CollectionCommit::from_bytes(invalid_key.to_bytes());
+        let decoded = CollectionCommit::from_bytes_trusted(invalid_key.to_bytes());
         assert_eq!(
             decoded.verify_strict(),
-            Err(CommitVerificationError::InvalidPublicKey)
+            Err(RecordVerificationError::InvalidPublicKey)
+        );
+        assert_eq!(
+            CollectionCommit::from_bytes(invalid_key.to_bytes()),
+            Err(RecordDecodeError::Verification(
+                RecordVerificationError::InvalidPublicKey
+            ))
         );
     }
 
@@ -1000,8 +1325,10 @@ mod tests {
 
     #[test]
     fn merge_is_commutative_in_dense_encoding() {
-        let forward = CollectionMerge::new(collection(1), hash(2), hash(3), hash(4));
-        let reverse = CollectionMerge::new(collection(1), hash(3), hash(2), hash(4));
+        let forward =
+            CollectionMerge::sign(&fixture_key(), collection(1), hash(2), hash(3), hash(4));
+        let reverse =
+            CollectionMerge::sign(&fixture_key(), collection(1), hash(3), hash(2), hash(4));
         assert_eq!(forward, reverse);
         assert_eq!(forward.to_bytes(), reverse.to_bytes());
         assert_eq!(
@@ -1012,8 +1339,11 @@ mod tests {
 
     #[test]
     fn derive_roundtrips() {
-        let record = CollectionDerive::new(collection(2), hash(3), hash(4));
-        assert_eq!(CollectionDerive::from_bytes(record.to_bytes()), record);
+        let record = CollectionDerive::sign(&fixture_key(), collection(2), hash(3), hash(4));
+        assert_eq!(
+            CollectionDerive::from_bytes(record.to_bytes()).unwrap(),
+            record
+        );
     }
 
     #[test]
@@ -1024,8 +1354,8 @@ mod tests {
             hash(2),
             empty_metadata_handle(),
         );
-        let merge = CollectionMerge::new(collection(1), hash(2), hash(3), hash(4));
-        let derive = CollectionDerive::new(collection(2), hash(3), hash(4));
+        let merge = CollectionMerge::sign(&fixture_key(), collection(1), hash(2), hash(3), hash(4));
+        let derive = CollectionDerive::sign(&fixture_key(), collection(2), hash(3), hash(4));
         for record in [
             CollectionRecord::Commit(commit),
             CollectionRecord::Merge(merge),
@@ -1046,8 +1376,8 @@ mod tests {
     fn native_records_enumerate_every_direct_blob_reference() {
         let metadata = Inline::<Handle<SimpleArchive>>::new([3; 32]);
         let commit = CollectionCommit::sign(&fixture_key(), collection(1), hash(2), metadata);
-        let merge = CollectionMerge::new(collection(4), hash(5), hash(6), hash(7));
-        let derive = CollectionDerive::new(collection(8), hash(9), hash(10));
+        let merge = CollectionMerge::sign(&fixture_key(), collection(4), hash(5), hash(6), hash(7));
+        let derive = CollectionDerive::sign(&fixture_key(), collection(8), hash(9), hash(10));
 
         assert_eq!(
             CollectionRecord::Commit(commit)
@@ -1085,7 +1415,8 @@ mod tests {
 
     #[test]
     fn merge_decoder_rejects_noncanonical_input_order() {
-        let record = CollectionMerge::new(collection(1), hash(2), hash(3), hash(4));
+        let record =
+            CollectionMerge::sign(&fixture_key(), collection(1), hash(2), hash(3), hash(4));
         let mut bytes = record.to_bytes();
         bytes[32..64].fill(9);
         bytes[64..96].fill(1);
@@ -1093,6 +1424,121 @@ mod tests {
             CollectionMerge::from_bytes(bytes),
             Err(RecordDecodeError::NonCanonicalMergeInputs)
         );
+    }
+
+    #[test]
+    fn equations_bind_every_field_and_reject_weak_authors_at_ingress() {
+        let records = [
+            CollectionRecord::Merge(CollectionMerge::sign(
+                &fixture_key(),
+                collection(1),
+                hash(2),
+                hash(3),
+                hash(4),
+            )),
+            CollectionRecord::Derive(CollectionDerive::sign(
+                &fixture_key(),
+                collection(2),
+                hash(3),
+                hash(4),
+            )),
+        ];
+        for record in records {
+            let encoded = record.to_bytes();
+            for field_start in (1..encoded.len()).step_by(32) {
+                let mut altered = encoded.clone();
+                altered[field_start] ^= 1;
+                assert!(CollectionRecord::from_bytes(&altered).is_err());
+                // Structural native/audit replay must retain the evidence.
+                let retained = CollectionRecord::from_bytes_trusted(&altered).unwrap();
+                assert!(retained.verify_strict().is_err());
+            }
+            let key_start = match record {
+                CollectionRecord::Merge(_) => 1 + 4 * 32,
+                CollectionRecord::Derive(_) => 1 + 3 * 32,
+                CollectionRecord::Commit(_) => unreachable!(),
+            };
+            let mut weak = encoded;
+            weak[key_start..key_start + 32].fill(0);
+            weak[key_start] = 1; // Canonical Edwards identity: a weak principal.
+            assert_eq!(
+                CollectionRecord::from_bytes(&weak),
+                Err(RecordDecodeError::Verification(
+                    RecordVerificationError::InvalidPublicKey
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn distinct_writers_endorse_distinct_equation_records() {
+        let first = CollectionMerge::sign(&fixture_key(), collection(1), hash(2), hash(3), hash(4));
+        let second = CollectionMerge::sign(
+            &SigningKey::from_bytes(&[8; 32]),
+            collection(1),
+            hash(2),
+            hash(3),
+            hash(4),
+        );
+        assert_ne!(first, second);
+        assert_ne!(
+            CollectionRecord::Merge(first).fingerprint(),
+            CollectionRecord::Merge(second).fingerprint()
+        );
+        first.verify_strict().unwrap();
+        second.verify_strict().unwrap();
+    }
+
+    #[test]
+    fn retired_dense_equations_are_inert_exact_evidence() {
+        let merge = tagged_bytes(
+            COLLECTION_RECORD_KIND_MERGE_V1,
+            &concat_fields::<4, 128>([collection(1).raw, hash(2).raw, hash(3).raw, hash(4).raw]),
+        );
+        let derive = tagged_bytes(
+            COLLECTION_RECORD_KIND_DERIVE_V1,
+            &concat_fields::<3, 96>([collection(2).raw, hash(3).raw, hash(4).raw]),
+        );
+        for (bytes, fingerprint, references) in [
+            (
+                merge,
+                hex!("92A19C12DAF4046397A43C607051ECCB1DD1EFB74D8B977B8A19AE7846521170"),
+                vec![[1; 32], [2; 32], [3; 32], [4; 32]],
+            ),
+            (
+                derive,
+                hex!("2CF7BBFA3A8567AECED029BC0A0A74925501AC0E60D51CC5AAA32E5225F54B4B"),
+                vec![[2; 32], [3; 32], [4; 32]],
+            ),
+        ] {
+            let legacy = LegacyUnsignedCollectionEquation::from_bytes(&bytes).unwrap();
+            assert_eq!(legacy.fingerprint().raw(), fingerprint);
+            assert_eq!(
+                legacy
+                    .blob_references()
+                    .map(|handle| handle.raw)
+                    .collect::<Vec<_>>(),
+                references
+            );
+            assert_eq!(
+                CollectionRecord::from_bytes(&bytes),
+                Err(RecordDecodeError::UnknownKind(bytes[0]))
+            );
+            let mut trailing = bytes.clone();
+            trailing.push(0);
+            assert!(LegacyUnsignedCollectionEquation::from_bytes(&trailing).is_err());
+        }
+        assert!(LegacyUnsignedCollectionEquation::from_bytes(
+            &CollectionRecord::Merge(CollectionMerge::sign(
+                &fixture_key(),
+                collection(1),
+                hash(2),
+                hash(3),
+                hash(4)
+            ),)
+            .to_bytes()
+        )
+        .is_err());
     }
 
     #[test]
@@ -1110,12 +1556,22 @@ mod tests {
         );
         let commit =
             CollectionCommit::sign(&fixture_key(), collection(1), hash(2), Inline::new([3; 32]));
-        let merge = CollectionMerge::new(collection(1), hash(2), hash(3), hash(4));
-        let derive = CollectionDerive::new(collection(2), hash(3), hash(4));
+        let merge = CollectionMerge::sign(&fixture_key(), collection(1), hash(2), hash(3), hash(4));
+        let derive = CollectionDerive::sign(&fixture_key(), collection(2), hash(3), hash(4));
 
         assert_eq!(commit.to_bytes().len(), COLLECTION_COMMIT_BYTES_LEN);
         assert_eq!(merge.to_bytes().len(), COLLECTION_MERGE_BYTES_LEN);
         assert_eq!(derive.to_bytes().len(), COLLECTION_DERIVE_BYTES_LEN);
+        assert_eq!(merge.signing_transcript().len(), 215);
+        assert_eq!(derive.signing_transcript().len(), 184);
+        assert_eq!(
+            concat_fields::<2, 64>([merge.signature().0.raw, merge.signature().1.raw]),
+            hex!("39D1BE8DC91EE25298CD4B03D4CDD9D1D021994A0B5999EFCD86F1BB4D87EE08A64EE5C40BBBAA21F01C6963BCF2F259CD76D93CBBB4D4351879CB7167ADB00B")
+        );
+        assert_eq!(
+            concat_fields::<2, 64>([derive.signature().0.raw, derive.signature().1.raw]),
+            hex!("10325E15C286E263AFE7D7219F4F637F852F1EB61ECA68916DA4793C6BE9BAB5287380B741FF9D1AE6AD5FA36329785AAA36C6FAABFEB759A7E5387F1F2D140B")
+        );
 
         assert_eq!(commit.signing_transcript().len(), COMMIT_TRANSCRIPT_LEN);
         assert_eq!(
@@ -1132,11 +1588,11 @@ mod tests {
         );
         assert_eq!(
             CollectionRecord::Merge(merge).fingerprint().raw(),
-            hex!("92A19C12DAF4046397A43C607051ECCB1DD1EFB74D8B977B8A19AE7846521170")
+            hex!("BF31C64514D9721278866D2AD87819D0C4282D5AC59A7AEBC37729D078038BDC")
         );
         assert_eq!(
             CollectionRecord::Derive(derive).fingerprint().raw(),
-            hex!("2CF7BBFA3A8567AECED029BC0A0A74925501AC0E60D51CC5AAA32E5225F54B4B")
+            hex!("2CEC0E4B0A78362E7EC93F5951B4FE6B1BB8233A1A6377C51ECF455A5B945672")
         );
         assert_eq!(
             commit.signing_transcript(),

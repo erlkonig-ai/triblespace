@@ -10,13 +10,13 @@ use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::{Blob, BlobEncoding, Bytes, IntoBlob, TryFromBlob};
 use triblespace_core::capability::{
-    Capability, CapabilityAction, CapabilityMode, CapabilityProof, CapabilityResource,
+    Capability, CapabilityMode, CapabilityProof, CapabilityResource,
 };
 use triblespace_core::collection::simplearchive_union;
 use triblespace_core::collection::{
-    Collection, CollectionCommit, CollectionDerive, CollectionEncoding, CollectionMerge,
-    CollectionPolicy, CollectionRead, CollectionRealizationError, CollectionRecord,
-    CollectionSnapshotExt, CollectionStore, CollectionStoreExt, Support, ACTION_WRITE,
+    write_capability, Collection, CollectionCommit, CollectionDerive, CollectionEncoding,
+    CollectionMerge, CollectionPolicy, CollectionRead, CollectionRealizationError,
+    CollectionRecord, CollectionSnapshotExt, CollectionStore, CollectionStoreExt, Support,
 };
 use triblespace_core::id::ExclusiveId;
 use triblespace_core::inline::encodings::hash::Handle;
@@ -93,8 +93,12 @@ fn id(byte: u8) -> triblespace_core::id::Id {
     triblespace_core::id::Id::new([byte; 16]).unwrap()
 }
 
+fn authority_key() -> SigningKey {
+    SigningKey::from_bytes(&[1; 32])
+}
+
 fn authority() -> VerifyingKey {
-    SigningKey::from_bytes(&[1; 32]).verifying_key()
+    authority_key().verifying_key()
 }
 
 fn policy(authority: VerifyingKey) -> CollectionPolicy {
@@ -166,7 +170,7 @@ fn support(
     collection: Collection<SimpleArchive>,
     commits: impl IntoIterator<Item = CollectionCommit>,
 ) -> Support {
-    let root = SigningKey::from_bytes(&[1; 32]);
+    let root = authority_key();
     let mut writers: Vec<_> = commits
         .into_iter()
         .map(|commit| VerifyingKey::from_bytes(&commit.public_key().raw).unwrap())
@@ -178,7 +182,7 @@ fn support(
         let proof = CapabilityProof::issue_root(
             &root,
             CapabilityResource::from(collection.handle()),
-            Capability::new(CapabilityAction::new(ACTION_WRITE), CapabilityMode::Invoke),
+            Capability::new(write_capability(), CapabilityMode::Invoke),
             None,
             writer,
         );
@@ -279,7 +283,7 @@ fn empty_support_is_local_bottom_and_writes_nothing() {
     let blobs = store.0.blobs.len();
     let record_count = records(&mut store).len();
     let support = support(&mut store, source, []);
-    let snapshot = block_on(store.maintain_exact(target, &support)).unwrap();
+    let snapshot = block_on(store.maintain_exact(target, &authority_key(), &support)).unwrap();
     assert_eq!(index(&snapshot, target, &support).accepted_pair_count(), 0);
     assert_eq!(store.0.blobs.len(), blobs);
     assert_eq!(records(&mut store).len(), record_count);
@@ -305,7 +309,7 @@ fn missing_then_maintain_closes_cross_fragment_path() {
         }) if unsupported_members.len() == 2
     ));
 
-    let after = block_on(store.maintain_exact(target, &support)).unwrap();
+    let after = block_on(store.maintain_exact(target, &authority_key(), &support)).unwrap();
     assert_cross_fragment_path(&index(&after, target, &support));
 }
 
@@ -321,7 +325,7 @@ fn exact_old_support_ignores_a_later_commit_and_equation() {
     publish(&mut store, first);
     publish(&mut store, second);
     let old_support = support(&mut store, source, [first, second]);
-    block_on(store.maintain_exact(target, &old_support)).unwrap();
+    block_on(store.maintain_exact(target, &authority_key(), &old_support)).unwrap();
 
     let later = put_data(&mut store, &edge(3, 4));
     let third = signed_commit(&mut store, source, 3, &later);
@@ -331,7 +335,8 @@ fn exact_old_support_ignores_a_later_commit_and_equation() {
         .put::<PathSummaryBlob, _>(later_summary.clone())
         .unwrap();
     store
-        .insert(CollectionRecord::Derive(CollectionDerive::new(
+        .insert(CollectionRecord::Derive(CollectionDerive::sign(
+            &authority_key(),
             target.handle(),
             third.data(),
             Handle::<PathSummaryBlob>::to_hash(later_summary.get_handle()),
@@ -353,7 +358,7 @@ fn duplicate_payload_provenance_shares_one_derive() {
     publish(&mut store, first);
     publish(&mut store, second);
     let support = support(&mut store, source, [first, first, second]);
-    block_on(store.ensure_exact(target, &support)).unwrap();
+    block_on(store.ensure_exact(target, &authority_key(), &support)).unwrap();
     let derives = records(&mut store)
         .into_iter()
         .filter(|record| {
@@ -378,7 +383,8 @@ fn resident_source_merge_is_lowered_once() {
     store.put::<SimpleArchive, _>(joined.clone()).unwrap();
     let joined_data = Handle::<SimpleArchive>::to_hash(joined.get_handle());
     store
-        .insert(CollectionRecord::Merge(CollectionMerge::new(
+        .insert(CollectionRecord::Merge(CollectionMerge::sign(
+            &authority_key(),
             source.handle(),
             first.data(),
             second.data(),
@@ -387,7 +393,7 @@ fn resident_source_merge_is_lowered_once() {
         .unwrap();
     let support = support(&mut store, source, [first, second]);
 
-    let snapshot = block_on(store.maintain_exact(target, &support)).unwrap();
+    let snapshot = block_on(store.maintain_exact(target, &authority_key(), &support)).unwrap();
     assert_cross_fragment_path(&index(&snapshot, target, &support));
     let inputs: Vec<_> = records(&mut store)
         .into_iter()
@@ -417,7 +423,8 @@ fn existing_target_merge_is_selected_as_one_physical_member() {
     for (input, output) in [(&left, &left_summary), (&right, &right_summary)] {
         store.put::<PathSummaryBlob, _>(output.clone()).unwrap();
         store
-            .insert(CollectionRecord::Derive(CollectionDerive::new(
+            .insert(CollectionRecord::Derive(CollectionDerive::sign(
+                &authority_key(),
                 target.handle(),
                 Handle::<SimpleArchive>::to_hash(input.get_handle()),
                 Handle::<PathSummaryBlob>::to_hash(output.get_handle()),
@@ -428,7 +435,8 @@ fn existing_target_merge_is_selected_as_one_physical_member() {
     store.put::<PathSummaryBlob, _>(joined.clone()).unwrap();
     let joined_data = Handle::<PathSummaryBlob>::to_hash(joined.get_handle());
     store
-        .insert(CollectionRecord::Merge(CollectionMerge::new(
+        .insert(CollectionRecord::Merge(CollectionMerge::sign(
+            &authority_key(),
             target.handle(),
             Handle::<PathSummaryBlob>::to_hash(left_summary.get_handle()),
             Handle::<PathSummaryBlob>::to_hash(right_summary.get_handle()),

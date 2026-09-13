@@ -17,19 +17,19 @@ narrow usage pattern keeps these failure modes manageable. Appends happen
 sequentially and validation walks new bytes before readers observe them, so the
 memory map never exposes half-written records.
 
-## Record model: one frame, uniform 256-byte records
+## Record model: one frame, 256-byte-aligned records
 
 Every record the pile writes begins with the same **64-byte common prefix** and
-occupies a **256-byte multiple**. Fixed records fit in one 256-byte frame; blobs
-and variable capability proofs continue after it and are zero-padded to their
-declared span:
+occupies a **256-byte multiple**. Most fixed records fit in one block; signed
+MERGE uses two. Blobs and variable capability proofs also continue after the
+first block and are zero-padded to their declared span:
 
 | Offset | Width | Field |
 |---:|---:|---|
 | `0..28` | 28 | Framing magic `0371B249F0626B2ABDDB80E23EA969059D9656A5EA5A497320351F3B` |
 | `28..32` | 4 | Total record span in 256-byte blocks, unsigned little-endian |
 | `32..64` | 32 | Record kind: the handle of a description of this record's layout |
-| `64..256` | 192 | First kind-specific body block; bounded variable records may continue |
+| `64..256` | 192 | First kind-specific body block; longer records continue after it |
 
 The magic was minted on 2026-08-20 as two `trible genid` calls,
 `0371B249F0626B2ABDDB80E23EA96905` and `9D9656A5EA5A497320351F3BE712CF82`,
@@ -135,7 +135,9 @@ legacy envelope. None of it is a writable compatibility commitment. The
 current reader still recognizes each exact historical boundary so old piles
 can be inspected or migrated without guessing. `trible pile migrate <pile>
 reframe --into <dest>` re-encodes the whole pile into the current framing and
-drops known inert records; genuinely unknown frames are never reinterpreted.
+drops only explicitly disposable inert records. Retired unsigned equations are
+preserved exactly; genuinely unknown kinds fail a full preflight before any
+destination write.
 
 WANT has a cheaper in-place cutover when a whole-file reframe is unnecessary:
 before first starting a current binary on a pre-cutover pile, explicitly run
@@ -155,19 +157,26 @@ The re-encode is semantic and in source order, which is what makes it faithful:
   union with that projection.
 - Collection records and capability proofs are grow-only sets, so order is
   irrelevant and re-insertion is idempotent.
-- Records that never carried live state are dropped and counted: inert legacy
-  V3 collection headers, retired PEER, STORE_SCOPE and pile-artifact-offer
-  state, retired local cells, and kinds no longer interpreted. This includes retired derivation
+- Retired unsigned equations stay inert but retain their exact source frames
+  and each independently resident direct blob reference recursively. Reframe
+  never turns old unsigned bytes into a receiver-signed endorsement.
+- Earlier V3 definition-ID collection frames also survive byte-for-byte. This
+  does not add a new interpretation of their historical dependency fields.
+- Records that no longer carry retained evidence are dropped and counted:
+  retired PEER, STORE_SCOPE and pile-artifact-offer
+  state. This includes older retired derivation
   record generations whose old wire shape cannot express the current
   collection algebra. Current native `MERGE` and `DERIVE` records are grow-only
   materialized work and are preserved exactly; like every retained current
   native record, they strongly own each independently resident direct blob
   reference recursively.
 
-A commit's signature covers a domain-separated transcript over its fields, not
-the bytes of its frame, so re-encoding cannot invalidate one. That is a claim
-spanning two layers, so the reframe verifies every commit in the result instead
-of reasoning about it, and fails rather than reporting success if any does not.
+Every current collection record's signature covers a domain-separated
+transcript over its fields, not its frame. Structural replay and semantic
+reframe preserve those exact signed fields without repeating crypto. Explicit
+audit verifies the raw records separately, including bad-signature evidence
+that a trusted local pile may already contain. Opaque ownership, including
+retired local cells, makes semantic reframe fail closed.
 
 ### An unknown frame is corruption, not a record from the future
 
@@ -433,10 +442,11 @@ explains how to query these fields through the `PileSnapshot` API.
 
 ## Native Collection Records
 
-`CollectionStore` is a grow-only set of typed collection-calculus records:
-signed `COMMIT` assertions and unsigned `MERGE` and `DERIVE` equations. The
-pile stores these three kinds directly as fixed one-block enveloped records.
-Their pile record-kind markers retain the V4 values. They are
+`CollectionStore` is a grow-only set of signed typed collection-calculus
+records: `COMMIT` assertions and `MERGE` and `DERIVE` equations. The pile stores
+them directly as fixed enveloped records: COMMIT and DERIVE occupy 256 bytes;
+MERGE occupies 512. COMMIT's signed bytes and kind are unchanged, while signed
+equations have new kinds distinct from their unsigned predecessors. They are
 **not blob records**, have no following payload, and carry no insertion
 timestamp. They are also distinct from operational wants and historical pins:
 collection records have no head, tombstone, or
@@ -501,8 +511,42 @@ these algebra records.
 | Kind | Record kind (rooted at) | Kind-specific byte layout after the common prefix |
 |---|---|---|
 | Commit | `A1322BB3F5214287C314D42AFCC1A97CB264FACD9A22B4938838BE78DB31AA59` (`CBF2CF97D52A3486E16C12D70D397C66`) | `64..96` descriptor handle, `96..128` data digest, `128..160` metadata handle, `160..192` Ed25519 public key, `192..224` signature R, `224..256` signature S — no reserved bytes |
-| Merge | `0CEE320DE0BDA40A6A6F52221C5E4E4D2CE3B165B69C858673FD13D98F655379` (`9F5D028D4C423620D6957A5F726FA727`) | `64..96` descriptor handle, `96..128` lower input digest, `128..160` higher input digest, `160..192` result digest, `192..256` reserved zeros |
-| Derive | `7ACE1ED10F3EBC632627058CC461DC1CC171CD2E56C52E5DCE60EA4C8DC23C36` (`ED6B46F7286D4556B076C17B79FD8315`) | `64..96` target descriptor handle, `96..128` input digest, `128..160` output digest, `160..256` reserved zeros |
+| Merge | `9D9B962D46FA42168AB3A11FB367AC14692D4F51B5190196F2BDB08D5BC2BA07` (`BC68266A511EC292D815A30C8DFBA82D`) | `64..96` descriptor handle, `96..128` lower input digest, `128..160` higher input digest, `160..192` result digest, `192..224` Ed25519 public key, `224..256` signature R, `256..288` signature S, `288..512` reserved zeros |
+| Derive | `B2EE8382C70161379E387D692B822946A60B602A909EED66B7D6DA2A62F36232` (`7FDDB25BB2B40E002A7B0EC40E316232`) | `64..96` target descriptor handle, `96..128` input digest, `128..160` output digest, `160..192` Ed25519 public key, `192..224` signature R, `224..256` signature S — no reserved bytes |
+
+The new MERGE and DERIVE description anchors above were minted with installed
+`trible genid` on 2026-09-13. Their signed semantic kind IDs, independently
+minted in the same session, are `1E5277B23D177FD692B074FBF0EF28F1` and
+`CE6A838612D0AA0812C05A50CCD11DC1`, respectively. COMMIT retains semantic kind
+`B34817308188C4515A3C51967A91A603` and its historical version-2 transcript.
+
+Generic stores and collection repair use a one-byte dense tag followed by the
+same ordered 32-byte body fields, without native framing or reserved padding:
+
+| Record | Dense tag | Payload bytes | Total dense bytes |
+|---|---:|---:|---:|
+| COMMIT | 1 | 192 | 193 |
+| signed MERGE | 4 | 224 | 225 |
+| signed DERIVE | 5 | 192 | 193 |
+
+Tags 2 and 3 are retired unsigned layouts, not aliases for the signed records.
+The changed collection wire grammar uses ALPN `/triblespace/pile-sync/25`.
+An equation signs its domain bytes (`triblespace.collection.merge.transcript`
+or `triblespace.collection.derive.transcript`), the corresponding new semantic
+kind ID, author public key, and its ordered collection/operand/result fields.
+The newly minted kind versions this grammar; there is no extra equation version
+integer. COMMIT's historical domain, kind, version integer, field order, and
+signature bytes are unchanged.
+
+Public dense `from_bytes` constructors perform strict signature verification,
+including canonical non-weak author keys. Network ingress uses that checked
+boundary once. Locally signed constructors build their typed values directly;
+typed store inserts, adapters, local repair indexes, and outbound encoding do
+not re-verify. Native replay and explicit raw audit decode structurally. The
+object-store backend is likewise trusted persistence: it checks canonical
+structure and the exact content-addressed key without repeating signatures.
+Foreign pile/import bytes need an explicit checked ingress or a user-approved
+trusted-source boundary; structural open alone is not an import verifier.
 
 These are the complete native collection-record family: there is no
 accelerator-specific fourth variant. A Rank9-accelerated member is an ordinary
@@ -529,10 +573,10 @@ commutative equation.
 
 No record ID exists in these headers or in the semantic model. On replay, the
 decoder reconstructs the record's exact dense typed payload: 192 bytes for a
-commit, 128 bytes for a merge, and 96 bytes for a derive. Where a fixed-width
+commit, 224 bytes for a merge, and 192 bytes for a derive. Where a fixed-width
 physical key is required, the store hashes the stable semantic kind ID followed
 by every canonical payload byte with BLAKE3 and retains the full 32-byte digest
-as a `CollectionRecordFingerprint`. For a commit the payload includes the
+as a `CollectionRecordFingerprint`. Every current payload includes the
 public key and both signature components. The fingerprint is an index key, not
 a materialized entity or a substitute for the exact record value.
 
@@ -544,6 +588,52 @@ change the discovered collection calculus. Current operational WANTs are
 likewise a grow-only set. Historical pins remain ordered evidence; retired
 WANT logs are only explicit migration input and do not participate in ordinary
 replay.
+
+### Retired unsigned equations and reader cutover
+
+The preceding described MERGE kind was
+`0CEE320DE0BDA40A6A6F52221C5E4E4D2CE3B165B69C858673FD13D98F655379`, with
+collection/low/high/result at `64..192` and zeros through byte 256. DERIVE was
+`7ACE1ED10F3EBC632627058CC461DC1CC171CD2E56C52E5DCE60EA4C8DC23C36`, with
+target/input/output at `64..160` and zeros through byte 256. Their retired dense
+tags 2/3 carry 128/96 payload bytes and retain historical semantic kinds
+`5F20FFC64313969B7E046A7677874D39` / `46C621338B6DD5B71C8E1E6DD74B087C`.
+The earlier 36-byte-envelope forms, and unenveloped MERGE V4, are recognized
+as the same unsigned evidence rather than current equations.
+
+`PileSnapshot::legacy_unsigned_collection_equations()` exposes their exact
+equations for explicit migration, separate from `CollectionRead` and ordinary
+repair. GC and semantic reframe preserve their raw source frames, and retained
+rewrites preserve all resident descriptor/input/output reference closures.
+Object-store listing omits these equations from current semantics while leaving
+their immutable objects untouched and checking their historical content keys.
+An endorsement migration must append a new signature by a writer authorized
+for that exact collection (the target for DERIVE). It must not use every
+receiver's key or delete unsigned evidence that cannot yet be endorsed.
+
+The explicit same-pile command is:
+
+```bash
+trible pile migrate <PILE> endorse-unsigned-equations \
+  --collection blake3:<COLLECTION_HANDLE> \
+  --signing-key <EXISTING_WRITER_KEY> --dry-run
+```
+
+Remove `--dry-run` only to make that writer's new endorsement. The command
+freezes WRITE admission and direct-reference residency once, skips absent
+dependencies without fetching, and appends only missing identical endorsements.
+It does not recompute results, change entity identities, or remove old evidence.
+Use `trible pile verify <PILE>` for the separate native-signature audit before
+accepting an unfamiliar pile as a trusted local store. That audit does not prove
+the mathematical correctness of historical unsigned equations.
+
+An older reader that understands the generic native frame can open a pile with
+new signed kinds: it crosses them as opaque, at their declared spans. This is
+not rewrite compatibility. Old retained GC refuses opaque ownership, and the
+old semantic `reframe` implementation may silently drop unknown records. Do not
+use an old installed reframe on signed-equation piles. The new implementation
+preflights truly unknown kinds and refuses before writing output; it explicitly
+preserves known unsigned evidence.
 
 ## Native Capability Proof Records
 
@@ -708,6 +798,10 @@ do not identify the current descriptor-handle semantics. The reader recognizes
 all four old markers so it can validate record boundaries and preserve their
 bytes during conservative rewrites, but treats them as inert physical evidence:
 they never enter `CollectionStore`, assert membership, or retain blobs.
+Semantic reframe preserves these raw V3 headers too. This narrower historical
+guarantee does not reconstruct their definition-ID semantics or add GC roots;
+the descriptor-handle unsigned equations above have the stronger direct-reference
+retention needed by the signed-equation endorsement transition.
 
 | Legacy kind | V3 magic marker | Exact byte layout |
 |---|---|---|

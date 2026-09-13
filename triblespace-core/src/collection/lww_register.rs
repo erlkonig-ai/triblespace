@@ -1134,7 +1134,7 @@ mod tests {
             .unwrap();
         let support = Support::from_data(source, [identity_commit.data(), order_commit.data()]);
 
-        let snapshot = block_on(store.maintain_exact(target, &support)).unwrap();
+        let snapshot = block_on(store.maintain_exact(target, &signing_key, &support)).unwrap();
         let ensured: LwwIndex = snapshot
             .collection_exact(target, &support)
             .unwrap()

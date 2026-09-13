@@ -24,7 +24,7 @@
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
-use ed25519_dalek::VerifyingKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -240,7 +240,8 @@ pub enum Command {
     /// A collection nobody has maintained is read by loading every commit it
     /// ever received and unioning them; a maintained one is read from a
     /// handful of merged members plus the commits since. Deterministic and
-    /// idempotent: run again, it publishes nothing new. Equations are unsigned.
+    /// idempotent: run again, it publishes nothing new. New equations are
+    /// signed by the supplied durable key and admitted under target WRITE.
     /// Reference summaries must be maintained only on a producer holding the
     /// complete source blob closure; consumers fetch the existing results.
     Maintain {
@@ -1540,24 +1541,24 @@ fn run_log(path: PathBuf, reference: String, limit: usize, long: bool) -> Result
             }
             printed += 1;
             let fingerprint = record.fingerprint();
+            let signature = match record.verify_strict() {
+                Ok(()) => "ok".to_owned(),
+                Err(error) => format!("INVALID ({error})"),
+            };
+            let signer = abbrev(&hex::encode_upper(record.public_key().raw), long);
             match record {
                 CollectionRecord::Commit(commit) => {
-                    let signature = match commit.verify_strict() {
-                        Ok(()) => "ok".to_owned(),
-                        Err(e) => format!("INVALID ({e})"),
-                    };
                     println!(
-                        "commit  {:X}  data={}  meta={}  signer={}  signature={signature}",
+                        "commit  {:X}  data={}  meta={}  signer={signer}  signature={signature}",
                         fingerprint,
                         short(commit.data().raw),
                         short(commit.metadata().raw),
-                        abbrev(&hex::encode_upper(commit.public_key().raw), long),
                     );
                 }
                 CollectionRecord::Merge(merge) => {
                     let (low, high) = merge.inputs();
                     println!(
-                        "merge   {:X}  low={}  high={}  result={}",
+                        "merge   {:X}  low={}  high={}  result={}  signer={signer}  signature={signature}",
                         fingerprint,
                         short(low.raw),
                         short(high.raw),
@@ -1567,7 +1568,7 @@ fn run_log(path: PathBuf, reference: String, limit: usize, long: bool) -> Result
                 CollectionRecord::Derive(derive) => {
                     let (input, output) = (derive.input(), derive.output());
                     println!(
-                        "derive  {:X}  input={}  output={}",
+                        "derive  {:X}  input={}  output={}  signer={signer}  signature={signature}",
                         fingerprint,
                         short(input.raw),
                         short(output.raw),
@@ -1721,13 +1722,19 @@ mod tests {
         }
 
         let records = vec![
-            CollectionRecord::Merge(CollectionMerge::new(
+            CollectionRecord::Merge(CollectionMerge::sign(
+                &SigningKey::from_bytes(&[1; 32]),
                 collection(1),
                 data(10),
                 data(11),
                 data(12),
             )),
-            CollectionRecord::Derive(CollectionDerive::new(collection(3), data(20), data(21))),
+            CollectionRecord::Derive(CollectionDerive::sign(
+                &SigningKey::from_bytes(&[1; 32]),
+                collection(3),
+                data(20),
+                data(21),
+            )),
         ];
 
         assert_eq!(
@@ -1873,13 +1880,19 @@ mod tests {
         }
 
         let records = vec![
-            CollectionRecord::Merge(CollectionMerge::new(
+            CollectionRecord::Merge(CollectionMerge::sign(
+                &SigningKey::from_bytes(&[1; 32]),
                 collection(1),
                 data(10),
                 data(11),
                 data(12),
             )),
-            CollectionRecord::Derive(CollectionDerive::new(collection(3), data(20), data(21))),
+            CollectionRecord::Derive(CollectionDerive::sign(
+                &SigningKey::from_bytes(&[1; 32]),
+                collection(3),
+                data(20),
+                data(21),
+            )),
         ];
 
         for handle in referenced_ids(&records) {
@@ -1930,12 +1943,18 @@ fn maintain_by_representation(
     snapshot: &PileSnapshot,
     handle: CollectionHandle,
     representation: Id,
+    signer: &SigningKey,
 ) -> Result<()> {
     use triblespace_core::collection::latest::LatestBlob;
     use triblespace_core::collection::lww_register::LwwRegisterBlob;
     use triblespace_core::collection::CollectionRealization;
 
-    fn go<T>(pile: &mut Pile, snapshot: &PileSnapshot, handle: CollectionHandle) -> Result<()>
+    fn go<T>(
+        pile: &mut Pile,
+        snapshot: &PileSnapshot,
+        handle: CollectionHandle,
+        signer: &SigningKey,
+    ) -> Result<()>
     where
         T: CollectionRealization + MetaDescribe,
         Handle<T>: triblespace_core::inline::InlineEncoding,
@@ -1944,35 +1963,35 @@ fn maintain_by_representation(
             .map_err(|error| anyhow!("open collection descriptor: {error}"))?;
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
         let maintained = runtime
-            .block_on(async { pile.maintain(collection).await })
+            .block_on(async { pile.maintain(collection, signer).await })
             .map_err(|error| anyhow!("maintain collection: {error}"))?;
         drop(maintained);
         Ok(())
     }
 
     if representation == <SimpleArchive as MetaDescribe>::id() {
-        go::<SimpleArchive>(pile, snapshot, handle)
+        go::<SimpleArchive>(pile, snapshot, handle, signer)
     } else if representation == <SuccinctArchiveBlob as MetaDescribe>::id() {
-        go::<SuccinctArchiveBlob>(pile, snapshot, handle)
+        go::<SuccinctArchiveBlob>(pile, snapshot, handle, signer)
     } else if representation == <Rank9AcceleratedSuccinctArchiveBlob as MetaDescribe>::id() {
-        go::<Rank9AcceleratedSuccinctArchiveBlob>(pile, snapshot, handle)
+        go::<Rank9AcceleratedSuccinctArchiveBlob>(pile, snapshot, handle, signer)
     } else if representation == <LatestBlob as MetaDescribe>::id() {
-        go::<LatestBlob>(pile, snapshot, handle)
+        go::<LatestBlob>(pile, snapshot, handle, signer)
     } else if representation == <LwwRegisterBlob as MetaDescribe>::id() {
-        go::<LwwRegisterBlob>(pile, snapshot, handle)
+        go::<LwwRegisterBlob>(pile, snapshot, handle, signer)
     } else if representation == <ReferenceSummaryBlob as MetaDescribe>::id() {
         eprintln!("reference summary: assuming complete producer-side blob closure");
-        go::<ReferenceSummaryBlob>(pile, snapshot, handle)
+        go::<ReferenceSummaryBlob>(pile, snapshot, handle, signer)
     } else if representation == <triblespace_paths::PathSummaryBlob as MetaDescribe>::id() {
-        go::<triblespace_paths::PathSummaryBlob>(pile, snapshot, handle)
+        go::<triblespace_paths::PathSummaryBlob>(pile, snapshot, handle, signer)
     } else if nvfp4_embedding_set_id().is_some_and(|nvfp4| representation == nvfp4) {
         // The vector set is generic over the embedding blob encoding, and the
         // descriptor names that encoding as well; each instantiation has its
         // own representation id, so this arm covers exactly the f32 Embedding
         // rows the faculties write. Only built with the `search` feature.
-        maintain_nvfp4_embedding_set(pile, snapshot, handle)
+        maintain_nvfp4_embedding_set(pile, snapshot, handle, signer)
     } else if bm25_carrier_id().is_some_and(|bm25| representation == bm25) {
-        maintain_bm25(pile, snapshot, handle)
+        maintain_bm25(pile, snapshot, handle, signer)
     } else {
         Err(anyhow!(
             "representation {representation:X} is not implemented by this binary; \
@@ -1983,7 +2002,7 @@ fn maintain_by_representation(
 
 fn run_maintain(path: PathBuf, reference: String, key: Option<PathBuf>) -> Result<()> {
     let key_path = triblespace_core::signing_key_file::resolve_path(key.as_deref(), &path);
-    let _signer = triblespace_core::signing_key_file::load_existing(&key_path)
+    let signer = triblespace_core::signing_key_file::load_existing(&key_path)
         .map_err(|error| anyhow!("load signing key {}: {error}", key_path.display()))?;
     let mut pile = open_refreshed(&path)?;
     let res = (|| -> Result<()> {
@@ -2002,7 +2021,7 @@ fn run_maintain(path: PathBuf, reference: String, key: Option<PathBuf>) -> Resul
         };
         let before = cover_census(&snapshot, handle)?;
         let started = std::time::Instant::now();
-        maintain_by_representation(&mut pile, &snapshot, handle, representation)?;
+        maintain_by_representation(&mut pile, &snapshot, handle, representation, &signer)?;
         drop(snapshot);
         let elapsed = started.elapsed();
         let snapshot = pile
@@ -2031,6 +2050,7 @@ fn maintain_nvfp4_embedding_set(
     pile: &mut Pile,
     snapshot: &PileSnapshot,
     handle: CollectionHandle,
+    signer: &SigningKey,
 ) -> Result<()> {
     use triblespace_core::collection::CollectionStoreExt as _;
     let collection: Collection<
@@ -2039,7 +2059,7 @@ fn maintain_nvfp4_embedding_set(
         .map_err(|error| anyhow!("open collection descriptor: {error}"))?;
     let runtime = tokio::runtime::Builder::new_current_thread().build()?;
     let maintained = runtime
-        .block_on(async { pile.maintain(collection).await })
+        .block_on(async { pile.maintain(collection, signer).await })
         .map_err(|error| anyhow!("maintain collection: {error}"))?;
     drop(maintained);
     Ok(())
@@ -2050,6 +2070,7 @@ fn maintain_nvfp4_embedding_set(
     _pile: &mut Pile,
     _snapshot: &PileSnapshot,
     _handle: CollectionHandle,
+    _signer: &SigningKey,
 ) -> Result<()> {
     unreachable!("the NVFP4 representation is only recognised with the search feature")
 }
@@ -2224,14 +2245,19 @@ fn derive_nvfp4(
 }
 
 #[cfg(feature = "search")]
-fn maintain_bm25(pile: &mut Pile, snapshot: &PileSnapshot, handle: CollectionHandle) -> Result<()> {
+fn maintain_bm25(
+    pile: &mut Pile,
+    snapshot: &PileSnapshot,
+    handle: CollectionHandle,
+    signer: &SigningKey,
+) -> Result<()> {
     use triblespace_core::collection::CollectionStoreExt as _;
     let collection: Collection<triblespace_search::portable_bm25::PortableBM25Blob> =
         Collection::open(snapshot, handle)
             .map_err(|error| anyhow!("open collection descriptor: {error}"))?;
     let runtime = tokio::runtime::Builder::new_current_thread().build()?;
     let maintained = runtime
-        .block_on(async { pile.maintain(collection).await })
+        .block_on(async { pile.maintain(collection, signer).await })
         .map_err(|error| anyhow!("maintain collection: {error}"))?;
     drop(maintained);
     Ok(())
@@ -2242,6 +2268,7 @@ fn maintain_bm25(
     _pile: &mut Pile,
     _snapshot: &PileSnapshot,
     _handle: CollectionHandle,
+    _signer: &SigningKey,
 ) -> Result<()> {
     unreachable!("the BM25 representation is only recognised with the search feature")
 }
@@ -2291,7 +2318,13 @@ fn derive_bm25(
 }
 
 #[cfg(feature = "search")]
-fn run_search(path: PathBuf, reference: String, query: String, top: usize, snippet: bool) -> Result<()> {
+fn run_search(
+    path: PathBuf,
+    reference: String,
+    query: String,
+    top: usize,
+    snippet: bool,
+) -> Result<()> {
     use anybytes::View;
     use triblespace_core::blob::encodings::utf8string::UTF8String;
     use triblespace_core::collection::{CollectionDerivation, CollectionSnapshotExt};
@@ -2299,7 +2332,9 @@ fn run_search(path: PathBuf, reference: String, query: String, top: usize, snipp
     use triblespace_core::trible::TRIBLE_LEN;
     use triblespace_search::portable_bm25::{PortableBM25Blob, PortableBM25Index};
     use triblespace_search::text_bm25::Bm25Tokenizer;
-    use triblespace_search::tokens::{bigram_tokens, code_tokens, hash_tokens, BigramHash, WordHash};
+    use triblespace_search::tokens::{
+        bigram_tokens, code_tokens, hash_tokens, BigramHash, WordHash,
+    };
 
     let mut pile = open_refreshed(&path)?;
     let res = (|| -> Result<()> {
@@ -2446,7 +2481,13 @@ fn clip_chars(text: &str, limit: usize) -> String {
 }
 
 #[cfg(not(feature = "search"))]
-fn run_search(_path: PathBuf, _reference: String, _query: String, _top: usize, _snippet: bool) -> Result<()> {
+fn run_search(
+    _path: PathBuf,
+    _reference: String,
+    _query: String,
+    _top: usize,
+    _snippet: bool,
+) -> Result<()> {
     Err(anyhow!(
         "this binary was built without the search feature and cannot search BM25 collections"
     ))

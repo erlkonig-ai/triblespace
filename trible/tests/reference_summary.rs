@@ -94,6 +94,14 @@ fn reference_summary_cli_registers_maintains_and_reuses_ordinary_derived_records
                 .unwrap()
                 .map(Result::unwrap)
                 .collect::<Vec<_>>();
+            assert!(records.iter().any(|record| matches!(
+                record,
+                triblespace_core::collection::CollectionRecord::Derive(_)
+            )));
+            for record in &records {
+                record.verify_strict().unwrap();
+                assert_eq!(record.public_key().raw, signer.verifying_key().to_bytes());
+            }
             if let Some(previous) = &first_records {
                 assert_eq!(&records, previous, "warm maintenance adds no new equations");
             } else {

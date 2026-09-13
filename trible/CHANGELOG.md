@@ -13,6 +13,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
+- Add explicit `pile migrate <PILE> endorse-unsigned-equations` with an exact
+  `--collection`, an existing `--signing-key`, and optional `--dry-run`. Require
+  target WRITE at one frozen instant, skip missing direct references, and
+  append deterministic signed equations without rewriting old bytes or
+  claiming to recover their original producer. Identical retries append
+  nothing and no equation is recomputed.
+
+- Add read-only `pile verify <PILE>` to recheck every physical native
+  COMMIT/MERGE/DERIVE signature and AUTH proof's signatures and path-local
+  attenuation without resident dependencies, a signing key, clock validity,
+  or collection-policy admission. Report unsigned legacy equations and opaque
+  records as unchecked; blob hashes and legacy chains remain the separate
+  `pile diagnose check` audit.
+
 - Add local `pile net health` and opt-in `pile net sync --health-key` reporting
   as timestamped facts in a private collection. Distinguish missing, stale,
   and future reports from fresh observations without initiating any network
@@ -23,6 +37,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   exact descriptor.
 
 ### Changed
+
+- Pass the explicitly loaded signing key through collection and local health
+  maintenance so newly materialized MERGE/DERIVE equations carry its signature.
+- Show MERGE/DERIVE authors in raw record inspection and verify their signatures
+  alongside COMMITs in explicit `pile collection log` output.
 
 - Let health readers select `--max-age SECONDS` (default 180, or
   `TRIBLESPACE_HEALTH_MAX_AGE_SECS`). Reports carry only `created_at`;

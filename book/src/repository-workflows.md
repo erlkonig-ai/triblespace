@@ -208,8 +208,8 @@ as a trible archive. The algebra records are fixed-width native records:
 
 ```text
 COMMIT(collection, data, metadata, author, signature)  // 192 bytes
-MERGE(collection, low, high, result)                   // 128 bytes
-DERIVE(target, input, output)                          //  96 bytes
+MERGE(collection, low, high, result, author, signature) // 224 bytes
+DERIVE(target, input, output, author, signature)        // 192 bytes
 ```
 
 `COMMIT` is a signed exogenous assertion: no machine can recompute whether an
@@ -225,10 +225,12 @@ no synthetic entity identity; a backend may compute a full-width fingerprint
 as a nonsemantic lookup key, but support, provenance, authorization, and
 deduplication are defined over the exact records and payload handles.
 
-Unsigned equations are materialized computation, not authority. Publishing a
+Signed equations endorse materialized computation, not new membership. Publishing a
 `MERGE` or `DERIVE` records work which has already been performed; warm
 resolution follows that equation without executing the join or mapping again.
-Equation trust belongs at the store/synchronization boundary. Blob residency
+Foreign bytes are signature-checked at the store/synchronization boundary;
+the producer must satisfy target WRITE at the observation's frozen instant.
+A trusted local store is not reverified on every read. Blob residency
 is independent: an absent result is a cache miss and cannot suppress an
 available explicit cover member.
 
@@ -408,9 +410,9 @@ let accelerated = storage.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
     accelerated_policy,
 )?;
 
-storage.ensure(source).await?;
-storage.maintain(raw).await?;
-let after = storage.maintain(accelerated).await?;
+storage.ensure(source, &writer).await?;
+storage.maintain(raw, &writer).await?;
+let after = storage.maintain(accelerated, &writer).await?;
 
 let observed = after.collection(accelerated)?;
 let facts: UnionArchive<OrderedUniverse> = observed.view()?;
@@ -424,12 +426,12 @@ advances the two lattices again. Source support is still expressed in the same
 foundational coordinates; only the selection of currently usable input changes.
 
 When a caller specifically needs matching representations for one selected
-support, use `maintain_exact(raw, &support)` and
-`maintain_exact(accelerated, &support)`, then
+support, use `maintain_exact(raw, &writer, &support)` and
+`maintain_exact(accelerated, &writer, &support)`, then
 `collection_exact(accelerated, &support)`. Those are explicit requirements,
 not necessary boilerplate for an ordinary multi-hop read.
 
-- `ensure(source)` freezes collection records, capability proofs, and the
+- `ensure(source, &writer)` freezes collection records, capability proofs, and the
   authorization instant before acquiring exact missing descriptor, data, and
   metadata bytes needed for that root frontier. Concurrent records and proofs
   do not extend its work. The returned snapshot is a fresh observation; select
@@ -449,7 +451,7 @@ not necessary boilerplate for an ordinary multi-hop read.
 
 An ensure may follow existing `MERGE` equations to reuse a resident
 support-equivalent target decomposition, but newly executed work crosses only
-the mapping. It stores each target artifact before its unsigned `DERIVE`
+the mapping. It stores each target artifact before its signed `DERIVE`
 record. It never creates a source or target `MERGE`.
 
 Maintenance starts from that derive-complete target cover. If a member `c` of
@@ -467,6 +469,13 @@ outputs. If a target join cannot run because an optional immutable dependency
 is absent or the encoding has reached a capacity limit, the finer exact target
 cover remains the answer. A downstream operation never constructs an upstream
 member as a side effect.
+
+The signing key is explicit on every ensure/maintain call. A call which only
+reuses existing work does not need WRITE. If missing support requires a new
+derivation, an unauthorized producer receives `UnauthorizedProducer` before
+the mapping runs. Optional compaction without WRITE leaves the finer cover
+unchanged. Raw local `sign` and `insert` remain unconditional; typed publication
+does not reverify signatures it just produced.
 
 The subsequent target-only LSM policy has no knob: a target member belongs to
 `floor(log2(max(1, serialized_len)))`, and the lowest two content handles in
@@ -593,9 +602,9 @@ branch. New code publishes directly to collections.
   expressed as a subset in those coordinates; physical decomposition stays
   private to same-snapshot materialization. Signed commits and metadata remain
   lazy provenance queried separately.
-- Treat stored unsigned equations as reusable materialized LSM work. Never
-  replay algebra merely to trust a local equation; apply future trust/quorum
-  policy at record admission instead.
+- Treat stored signed equations as reusable materialized LSM work. Never
+  replay algebra merely to trust a local equation; apply target WRITE at
+  record admission instead.
 - Persist every successful join or mapping. Yard/GC policy alone decides when
   its result bytes leave local storage.
 - Keep admission, retention, and WANT policy orthogonal.

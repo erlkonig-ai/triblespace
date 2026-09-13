@@ -31,11 +31,17 @@ ambient current value.
 
 ### Authority and computation are separate
 
-A signed `COMMIT` says that an author places one element in a collection. An
-unsigned `MERGE` or `DERIVE` says that reproducible computation connected known
-elements. The former is irreducible authority; the latter is materialized LSM
-work which a reader reuses without executing the encoding join or mapping
-again. Trust policy belongs at equation ingress, not in every read.
+A signed `COMMIT` says that an author places one element in a collection.
+A signed `MERGE` or `DERIVE` endorses a reproducible computation connecting
+known elements. The former introduces membership; the latter lets a reader
+reuse materialized work from a producer admitted by the target's WRITE policy.
+A signature identifies the endorser; it does not prove the equation correct.
+Readers do not repeat the encoding join or mapping to check it.
+
+Foreign record bytes are signature-checked once at ingress. Typed local
+publication and trusted store replay do not repeat that check. Admission still
+uses the proofs and time of each frozen snapshot: a later grant may activate
+an old equation, and expiry may leave a finer cover readable instead.
 
 That separation is why a materialized index does not become ground truth merely
 because it is convenient, and why collecting an accelerator does not erase the
@@ -142,16 +148,17 @@ interpretable without a separate registry entry.
 | Record | Meaning | Dense payload |
 |---|---|---:|
 | `COMMIT(C, x, metadata, author, signature)` | The author asserts `x` as an independent member of `C`. | 192 bytes |
-| `MERGE(C, a, b, c)` | Under `C`'s join law, `a ⊔ b = c`. | 128 bytes |
-| `DERIVE(T, a, b)` | The mapping named by target `T` maps source element `a` to target element `b`. | 96 bytes |
+| `MERGE(C, a, b, c, author, signature)` | The author endorses `a ⊔ b = c` under `C`'s join law. | 224 bytes |
+| `DERIVE(T, a, b, author, signature)` | The author endorses the mapping named by `T` from `a` to `b`. | 192 bytes |
 
 The exact canonical record value is the semantic object; none of the three has
 a synthetic entity ID. A repeat insert is a no-op. Fixed-width physical indexes
 and the network PATCH use a full-width BLAKE3 fingerprint of the kind and
-canonical payload, but that key is not collection semantics. `COMMIT` is signed
-because its assertion cannot be recomputed; `MERGE` and `DERIVE` are unsigned
-because correctness comes from the encoding or mapping plus exact bytes, not
-the identity of the machine that performed the work.
+canonical payload, but that key is not collection semantics. All three records
+are signed and admitted by WRITE on the collection they name. Multiple
+endorsers can sign the same equation: these are distinct provenance records
+but one semantic equation. Inferred equations carry only endpoints, not
+fabricated signatures or provenance records.
 
 The algebra has no distinguished head. Several commits coexist, and the value
 of a selected collection view is the join of its admitted members. This makes a

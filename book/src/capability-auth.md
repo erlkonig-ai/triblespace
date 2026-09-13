@@ -157,11 +157,20 @@ READ/WRITE operation IDs are facts inside those stable definition blobs, not
 special cases in the proof grammar. Extra capabilities use the same binding
 relation without changing the kernel.
 
-WRITE admission decides which strictly signed COMMIT records contribute to an
-observed collection. Local insertion remains unconditional: an inactive commit
-may arrive before its proof and become visible monotonically when enough proof
-paths arrive. READ admission decides which authenticated peers may participate
-in that collection's repair session. Exact blob retrieval remains orthogonal;
+WRITE admission decides which signed COMMIT records contribute membership and
+which signed MERGE/DERIVE records may be reused as computation evidence. An
+equation uses the WRITE policy of its target collection; permission to write
+its source alone is insufficient. A signature identifies the producer, not a
+mathematical proof of the result. Readers trust authorised producers rather
+than routinely repeating their computation.
+
+Local typed insertion remains unconditional: an inactive record may arrive
+before its proof and become visible when enough valid proof paths arrive.
+Admission uses the snapshot's frozen instant, including validity intervals.
+Foreign collection-record decoding verifies signatures once; trusted native
+replay does not recheck them. AUTH path verification remains a separate check.
+READ admission decides which authenticated peers may participate in that
+collection's repair session. Exact blob retrieval remains orthogonal;
 knowledge of a blob handle is the read capability for those bytes.
 
 The common root-grant helpers are:

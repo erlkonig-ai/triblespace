@@ -10,6 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
+use ed25519_dalek::SigningKey;
+
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::Blob;
@@ -26,7 +28,7 @@ use super::operation_snapshot::OperationFrontier;
 use super::{
     collection_complete_physical_cover, descriptor, resolve_collection_semantics_from_roots,
     Collection, CollectionClaimValidation, CollectionData, CollectionDerive, CollectionEncoding,
-    CollectionHandle, CollectionMapping, CollectionMerge, CollectionOperationError, CollectionRead,
+    CollectionHandle, CollectionMapping, CollectionMerge, CollectionOperationError,
     CollectionRecord, CollectionResolutionError, CollectionSemantics, Cover, Support,
 };
 #[cfg(test)]
@@ -55,6 +57,12 @@ pub enum CollectionRealizationError {
         missing: Vec<CollectionData>,
         /// Foundational members not represented by the selected target cover.
         unsupported_members: Vec<CollectionData>,
+    },
+    /// Missing support requires a new equation, but the supplied producer is
+    /// not admitted by the target's frozen WRITE policy.
+    UnauthorizedProducer {
+        /// Target whose realization needs an authorized producer.
+        collection: CollectionHandle,
     },
     /// Canonical source-to-target construction failed.
     Derive {
@@ -120,6 +128,11 @@ impl fmt::Display for CollectionRealizationError {
                 missing.len(),
                 unsupported_members.len(),
             ),
+            Self::UnauthorizedProducer { collection } => write!(
+                formatter,
+                "collection {} requires an admitted WRITE producer to realize missing support",
+                hex::encode_upper(collection.raw),
+            ),
             Self::Derive { input, reason } => write!(
                 formatter,
                 "derive source element {}: {reason}",
@@ -158,6 +171,22 @@ impl Error for CollectionRealizationError {
             _ => None,
         }
     }
+}
+
+pub(super) fn producer_is_admitted<R, E>(
+    snapshot: &R,
+    target: Collection<E>,
+    signing_key: &SigningKey,
+) -> Result<bool, CollectionRealizationError>
+where
+    R: StoreRead,
+    E: CollectionEncoding,
+{
+    target
+        .writer_is_admitted(snapshot, signing_key.verifying_key())
+        .map_err(|error| {
+            CollectionRealizationError::storage("check target producer WRITE authority", error)
+        })
 }
 
 /// Runtime descriptor ancestry from one `SimpleArchive` foundation to a
@@ -312,22 +341,42 @@ fn resolve_lineage<R>(
     support: &Support,
 ) -> Result<CollectionSemantics, CollectionRealizationError>
 where
-    R: BlobStoreList + CollectionRead,
+    R: StoreRead,
 {
     require_support(lineage, support)?;
     let discovered = discover_collection_equations_for_lineage(snapshot, &lineage.collections)
         .map_err(|error| {
             CollectionRealizationError::storage("discover collection lineage", error)
         })?;
-    resolve_discovered_lineage(lineage, support, &discovered)
+    resolve_discovered_lineage(snapshot, lineage, support, &discovered)
+        .map(super::CollectionResolution::into_semantics)
 }
 
-fn resolve_discovered_lineage(
+fn resolve_discovered_lineage<R>(
+    snapshot: &R,
     lineage: &Lineage,
     support: &Support,
     discovered: &super::DiscoveredCollectionRecords,
-) -> Result<CollectionSemantics, CollectionRealizationError> {
+) -> Result<super::CollectionResolution<()>, CollectionRealizationError>
+where
+    R: StoreRead,
+{
     require_support(lineage, support)?;
+    let mut evidence = BTreeMap::new();
+    for (collection, descriptor) in &lineage.descriptors {
+        let writers = super::api::discover_admission_evidence(
+            snapshot,
+            descriptor::admission_policies(descriptor.facts(), super::write_capability(), None),
+            super::write_capability(),
+            crate::capability::CapabilityMode::Invoke,
+            *collection,
+        )
+        .map_err(|error| {
+            CollectionRealizationError::storage("discover equation WRITE admission", error)
+        })?;
+        evidence.insert(*collection, writers);
+    }
+    let mut admitted = BTreeMap::new();
     let roots: BTreeSet<_> = support
         .data_members()
         .map(|member| (lineage.foundation.handle(), member))
@@ -338,7 +387,7 @@ fn resolve_discovered_lineage(
         &lineage.source_by_target,
         &roots,
         |request| {
-            let accepted = match request {
+            let in_lineage = match request {
                 super::CollectionValidationRequest::Merge { claim } => {
                     lineage.collections.contains(&claim.collection())
                 }
@@ -347,6 +396,19 @@ fn resolve_discovered_lineage(
                 }
                 super::CollectionValidationRequest::Commit { .. } => false,
             };
+            let record = request.record();
+            let accepted = in_lineage
+                && *admitted
+                    .entry((record.collection(), record.public_key().raw))
+                    .or_insert_with(|| {
+                        ed25519_dalek::VerifyingKey::from_bytes(&record.public_key().raw)
+                            .ok()
+                            .is_some_and(|subject| {
+                                evidence.get(&record.collection()).is_some_and(|writers| {
+                                    writers.authorizes(subject, snapshot.instant())
+                                })
+                            })
+                    });
             Ok::<CollectionClaimValidation<()>, std::convert::Infallible>(if accepted {
                 CollectionClaimValidation::Accepted
             } else {
@@ -356,7 +418,7 @@ fn resolve_discovered_lineage(
     );
 
     match resolution {
-        Ok(resolution) => Ok(resolution.into_semantics()),
+        Ok(resolution) => Ok(resolution),
         Err(CollectionResolutionError::Validation { source, .. }) => match source {},
         Err(CollectionResolutionError::Conflict(conflict)) => {
             Err(CollectionRealizationError::Resolution(conflict.to_string()))
@@ -379,29 +441,22 @@ fn relevant_missing_dependency<R>(
     unavailable: &BTreeSet<CollectionData>,
 ) -> Result<Option<CollectionData>, CollectionRealizationError>
 where
-    R: BlobStoreList + CollectionRead,
+    R: StoreRead,
 {
     let discovered = discover_collection_equations_for_lineage_raw(snapshot, &lineage.collections)
         .map_err(|error| {
             CollectionRealizationError::storage("discover raw collection frontier", error)
         })?;
-    let Ok(semantics) = resolve_discovered_lineage(lineage, support, &discovered) else {
+    let Ok(resolution) = resolve_discovered_lineage(snapshot, lineage, support, &discovered) else {
         return Ok(None);
     };
+    let semantics = resolution.semantics();
     let requested: BTreeSet<_> = support.data_members().collect();
 
-    let mut records = discovered
-        .merges()
+    let mut records = resolution
+        .admitted_claims()
         .iter()
         .copied()
-        .map(CollectionRecord::Merge)
-        .chain(
-            discovered
-                .derives()
-                .iter()
-                .copied()
-                .map(CollectionRecord::Derive),
-        )
         .collect::<Vec<_>>();
     records.sort_unstable_by_key(CollectionRecord::fingerprint);
 
@@ -483,7 +538,7 @@ fn resolve_target<R, E>(
     requested: &Support,
 ) -> Result<TargetResolution<E>, CollectionRealizationError>
 where
-    R: BlobStoreGet + BlobStoreList + BlobStoreMeta + CollectionRead,
+    R: StoreRead,
     E: CollectionEncoding,
 {
     let semantics = resolve_lineage(snapshot, lineage, requested)?;
@@ -729,6 +784,7 @@ where
 fn ensure_exact_resident_with<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
+    signing_key: &SigningKey,
     support: &Support,
 ) -> Result<(), CollectionRealizationError>
 where
@@ -742,6 +798,7 @@ where
     ensure_exact_resident_in_frontier_with::<S, M>(
         store,
         target,
+        signing_key,
         support,
         &BTreeSet::new(),
         &mut frontier,
@@ -752,18 +809,20 @@ where
 fn ensure_exact_resident<S, T>(
     store: &mut S,
     target: Collection<T>,
+    signing_key: &SigningKey,
     support: &Support,
 ) -> Result<(), CollectionRealizationError>
 where
     S: Store,
     T: CollectionDerivation,
 {
-    ensure_exact_resident_with::<S, CanonicalDerivation<T>>(store, target, support)
+    ensure_exact_resident_with::<S, CanonicalDerivation<T>>(store, target, signing_key, support)
 }
 
 fn ensure_exact_resident_in_frontier_with<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
+    signing_key: &SigningKey,
     support: &Support,
     unavailable: &BTreeSet<CollectionData>,
     frontier: &mut OperationFrontier<S::Snapshot>,
@@ -787,11 +846,16 @@ where
         let residual = source_residual(&snapshot, &probe, support, &blocked)?;
         let mapping = probe.mapping;
         let incomplete = probe.target_resolution.incomplete_error(support);
-        drop(snapshot);
 
         if residual.is_empty() {
             return Err(incomplete);
         }
+        if !producer_is_admitted(&snapshot, target, signing_key)? {
+            return Err(CollectionRealizationError::UnauthorizedProducer {
+                collection: target.handle(),
+            });
+        }
+        drop(snapshot);
 
         let mut replan = false;
         for (input_data, input) in residual {
@@ -826,7 +890,8 @@ where
             store.put::<M::Target, _>(output).map_err(|error| {
                 CollectionRealizationError::storage("store derived target member", error)
             })?;
-            let record = CollectionRecord::Derive(CollectionDerive::new(
+            let record = CollectionRecord::Derive(CollectionDerive::sign(
+                signing_key,
                 target.handle(),
                 input_data,
                 output_data,
@@ -849,6 +914,7 @@ where
 fn maintain_exact_resident_with<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
+    signing_key: &SigningKey,
     support: &Support,
 ) -> Result<(), CollectionRealizationError>
 where
@@ -862,6 +928,7 @@ where
     maintain_exact_resident_in_frontier_with::<S, M>(
         store,
         target,
+        signing_key,
         support,
         &BTreeSet::new(),
         &mut frontier,
@@ -872,18 +939,20 @@ where
 fn maintain_exact_resident<S, T>(
     store: &mut S,
     target: Collection<T>,
+    signing_key: &SigningKey,
     support: &Support,
 ) -> Result<(), CollectionRealizationError>
 where
     S: Store,
     T: CollectionDerivation,
 {
-    maintain_exact_resident_with::<S, CanonicalDerivation<T>>(store, target, support)
+    maintain_exact_resident_with::<S, CanonicalDerivation<T>>(store, target, signing_key, support)
 }
 
 fn maintain_exact_resident_in_frontier_with<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
+    signing_key: &SigningKey,
     support: &Support,
     unavailable: &BTreeSet<CollectionData>,
     frontier: &mut OperationFrontier<S::Snapshot>,
@@ -892,12 +961,26 @@ where
     S: Store,
     M: CollectionMapping,
 {
-    ensure_exact_resident_in_frontier_with::<S, M>(store, target, support, unavailable, frontier)?;
-    let mapping =
-        coarsen_from_resident_source::<S, M>(store, target, support, unavailable, frontier)?;
+    ensure_exact_resident_in_frontier_with::<S, M>(
+        store,
+        target,
+        signing_key,
+        support,
+        unavailable,
+        frontier,
+    )?;
+    let mapping = coarsen_from_resident_source::<S, M>(
+        store,
+        target,
+        signing_key,
+        support,
+        unavailable,
+        frontier,
+    )?;
     super::exact_target_compaction::maintain_target_with(
         store,
         target,
+        signing_key,
         support,
         frontier,
         |descriptor, low, high, reader| mapping.join_images(descriptor, None, low, high, reader),
@@ -907,10 +990,12 @@ where
 /// Reuse coarsening already paid for by the immediate source. This is optional
 /// maintenance over an exact target, never coverage repair or upstream work.
 /// Only the coarsest complete resident source cover is considered; unavailable
-/// child images do not cause intermediate images to be constructed.
+/// child images do not cause intermediate images to be constructed. Without
+/// target WRITE authority, the existing exact finer realization is retained.
 fn coarsen_from_resident_source<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
+    signing_key: &SigningKey,
     support: &Support,
     unavailable: &BTreeSet<CollectionData>,
     frontier: &mut OperationFrontier<S::Snapshot>,
@@ -958,6 +1043,9 @@ where
         let Some((input_data, image_pairs)) = candidate else {
             return Ok(probe.mapping);
         };
+        if !producer_is_admitted(&snapshot, target, signing_key)? {
+            return Ok(probe.mapping);
+        }
         attempted.insert(input_data);
         let input: Blob<M::Source> = snapshot
             .get(Handle::<M::Source>::from_hash(input_data))
@@ -1042,7 +1130,8 @@ where
             CollectionRealizationError::storage("store source-guided target member", error)
         })?;
         if let Some((low, high)) = pair {
-            let record = CollectionRecord::Merge(CollectionMerge::new(
+            let record = CollectionRecord::Merge(CollectionMerge::sign(
+                signing_key,
                 target.handle(),
                 low,
                 high,
@@ -1053,7 +1142,8 @@ where
             })?;
             frontier.include_record(record);
         }
-        let record = CollectionRecord::Derive(CollectionDerive::new(
+        let record = CollectionRecord::Derive(CollectionDerive::sign(
+            signing_key,
             target.handle(),
             input_data,
             output_data,
@@ -1142,6 +1232,7 @@ where
 pub(crate) async fn ensure_exact_in_frontier_with<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
+    signing_key: &SigningKey,
     support: &Support,
     frontier: &mut OperationFrontier<S::Snapshot>,
 ) -> Result<(), CollectionRealizationError>
@@ -1155,6 +1246,7 @@ where
         match ensure_exact_resident_in_frontier_with::<S, M>(
             store,
             target,
+            signing_key,
             support,
             &unavailable,
             frontier,
@@ -1175,6 +1267,7 @@ where
 pub(crate) async fn maintain_exact_in_frontier_with<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
+    signing_key: &SigningKey,
     support: &Support,
     frontier: &mut OperationFrontier<S::Snapshot>,
 ) -> Result<(), CollectionRealizationError>
@@ -1188,6 +1281,7 @@ where
         match maintain_exact_resident_in_frontier_with::<S, M>(
             store,
             target,
+            signing_key,
             support,
             &unavailable,
             frontier,

@@ -1,4 +1,5 @@
 use anybytes::Bytes;
+use ed25519_dalek::SigningKey;
 use proptest::prelude::*;
 use std::collections::HashMap;
 use triblespace::core::blob::encodings::UnknownBlob;
@@ -119,6 +120,9 @@ proptest! {
         let mut expected_blobs: HashMap<Inline<Handle<UnknownBlob>>, Vec<u8>> = HashMap::new();
         let mut handles: Vec<Inline<Handle<UnknownBlob>>> = Vec::new();
         let mut expected_records: HashMap<CollectionRecordFingerprint, CollectionRecord> = HashMap::new();
+        // This tests physical record union, without descriptors or admission.
+        // One fixture signer preserves identical-record dedup across actors.
+        let signing_key = SigningKey::from_bytes(&[1; 32]);
 
         for actor_op in scenario.ops {
             match actor_op {
@@ -155,7 +159,8 @@ proptest! {
                     Op::MergeRecord { collection, left, right, result } => {
                         if !handles.is_empty() {
                             let at = |index: usize| handles[index % handles.len()].transmute();
-                            let record = CollectionRecord::Merge(CollectionMerge::new(
+                            let record = CollectionRecord::Merge(CollectionMerge::sign(
+                                &signing_key,
                                 at(collection),
                                 at(left).into(),
                                 at(right).into(),

@@ -1322,7 +1322,8 @@ mod tests {
         let before = collection_repair_overlay(&before_snapshot, collection.handle()).unwrap();
 
         store
-            .insert(CollectionRecord::Merge(CollectionMerge::new(
+            .insert(CollectionRecord::Merge(CollectionMerge::sign(
+                &writer,
                 collection.handle(),
                 data(31),
                 data(32),
@@ -1330,7 +1331,8 @@ mod tests {
             )))
             .unwrap();
         store
-            .insert(CollectionRecord::Derive(CollectionDerive::new(
+            .insert(CollectionRecord::Derive(CollectionDerive::sign(
+                &writer,
                 collection.handle(),
                 data(33),
                 data(34),

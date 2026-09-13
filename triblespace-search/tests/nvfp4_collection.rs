@@ -65,7 +65,7 @@ fn simplearchive_mapping_lazy_view_and_exact_queries_compose() {
     let snapshot = store.snapshot().unwrap();
     let support = source.admitted(&snapshot).unwrap();
     drop(snapshot);
-    let snapshot = block_on(store.maintain_exact(target, &support)).unwrap();
+    let snapshot = block_on(store.maintain_exact(target, &authority, &support)).unwrap();
     let collection = snapshot.collection_exact(target, &support).unwrap();
     let index: NvFp4CosineIndex<Embedding> = collection.view().unwrap();
     let snapshot = collection.snapshot();

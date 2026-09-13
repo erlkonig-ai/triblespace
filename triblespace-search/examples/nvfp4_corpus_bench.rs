@@ -200,7 +200,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     drop(snapshot);
 
     let construction_start = Instant::now();
-    let snapshot = block_on(store.maintain_exact(target, &support))?;
+    let snapshot = block_on(store.maintain_exact(target, &authority, &support))?;
     let construction = construction_start.elapsed();
     let collection = snapshot.collection_exact(target, &support)?;
     let snapshot = collection.snapshot();

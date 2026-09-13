@@ -573,6 +573,16 @@ impl Yard {
                 }
             }
         }
+        // Retired unsigned equations remain inert, but their evidence owns
+        // resident dependencies across every generation until explicit writer
+        // endorsement is possible. Do not project these as current records.
+        for generation in &snapshot.generations {
+            for handle in generation.snapshot.legacy_unsigned_collection_references() {
+                if present.get(&handle.raw).is_some() {
+                    combined.retain_recursive(handle);
+                }
+            }
+        }
         Ok(combined)
     }
 
@@ -1730,7 +1740,8 @@ mod tests {
 
     fn merge_record(tag: u8) -> CollectionRecord {
         let descriptor = named_for_tests(&format!("tagged-{tag}"), pin_id(tag.wrapping_add(1)));
-        CollectionRecord::Merge(CollectionMerge::new(
+        CollectionRecord::Merge(CollectionMerge::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&descriptor),
             Inline::new([tag.wrapping_add(3); 32]),
             Inline::new([tag.wrapping_add(4); 32]),
@@ -1938,11 +1949,20 @@ mod tests {
         let (_dir, paths, mut yard) = yard_with_paths(2, config);
         let target = Inline::new([42; 32]);
         let input = Inline::new([43; 32]);
-        let first =
-            CollectionRecord::Derive(CollectionDerive::new(target, input, Inline::new([44; 32])));
-        let conflicting =
-            CollectionRecord::Derive(CollectionDerive::new(target, input, Inline::new([45; 32])));
-        let unrelated = CollectionRecord::Derive(CollectionDerive::new(
+        let first = CollectionRecord::Derive(CollectionDerive::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+            target,
+            input,
+            Inline::new([44; 32]),
+        ));
+        let conflicting = CollectionRecord::Derive(CollectionDerive::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+            target,
+            input,
+            Inline::new([45; 32]),
+        ));
+        let unrelated = CollectionRecord::Derive(CollectionDerive::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             Inline::new([46; 32]),
             input,
             Inline::new([47; 32]),
@@ -1992,6 +2012,58 @@ mod tests {
     }
 
     #[test]
+    fn unsigned_equation_retention_crosses_generation_boundaries() {
+        let (_dir, paths, mut yard) = yard_with_paths(2, YardConfig::default());
+        let child = yard
+            .put_in_generation::<RawBytes, _>(0, raw_blob(b"unsigned equation child"))
+            .unwrap();
+        let input = yard
+            .put_in_generation::<RawBytes, _>(0, Bytes::from_source(child.raw.to_vec()))
+            .unwrap();
+        let orphan = yard
+            .put_in_generation::<RawBytes, _>(0, raw_blob(b"unowned old cache"))
+            .unwrap();
+        yard.close().unwrap();
+
+        // Exact published unenveloped unsigned MERGE V4 layout. It is inert
+        // and lives in a different generation from every resident dependency.
+        let mut header = [0u8; 256];
+        header[..16].copy_from_slice(&hex_literal::hex!("9F5D028D4C423620D6957A5F726FA727"));
+        header[16..48].fill(91); // Absent collection descriptor.
+        header[80..112].copy_from_slice(&input.raw); // low stays zero.
+        header[112..144].fill(92); // Absent output.
+        {
+            let mut file = OpenOptions::new().append(true).open(&paths[1]).unwrap();
+            file.write_all(&header).unwrap();
+            file.sync_all().unwrap();
+        }
+        let mut yard = Yard::open(paths.clone(), YardConfig::default()).unwrap();
+        assert!(yard.snapshot().unwrap().records().unwrap().next().is_none());
+        yard.collect(&RetentionRoots::new()).unwrap();
+        yard.reclaim().unwrap();
+        let reader = yard.snapshot().unwrap();
+        assert!(get_raw(&reader, child).is_ok());
+        assert!(get_raw(&reader, input).is_ok());
+        assert!(get_raw(&reader, orphan).is_err());
+        assert!(reader.records().unwrap().next().is_none());
+        drop(reader);
+        yard.close().unwrap();
+        assert!(std::fs::read(&paths[1])
+            .unwrap()
+            .windows(header.len())
+            .any(|bytes| bytes == header));
+        let mut old = Pile::open(&paths[1]).unwrap();
+        assert_eq!(
+            old.snapshot()
+                .unwrap()
+                .legacy_unsigned_collection_equations()
+                .count(),
+            1
+        );
+        old.close().unwrap();
+    }
+
+    #[test]
     fn native_commits_root_owned_blobs_and_reclaim_preserves_every_record_kind() {
         let (_dir, mut yard) = yard_with(1, YardConfig::default());
         publish_record_kind_descriptions(&mut yard);
@@ -2006,7 +2078,7 @@ mod tests {
             .unwrap();
         assert_eq!(metadata, empty_metadata_handle());
         let equation_owned = yard
-            .put::<RawBytes, _>(raw_blob(b"owned by unsigned equations"))
+            .put::<RawBytes, _>(raw_blob(b"owned by signed equations"))
             .unwrap();
 
         let descriptor = named_for_tests("retained", pin_id(32));
@@ -2020,13 +2092,15 @@ mod tests {
         commit.verify_strict().unwrap();
         let records = vec![
             CollectionRecord::Commit(commit),
-            CollectionRecord::Merge(CollectionMerge::new(
+            CollectionRecord::Merge(CollectionMerge::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 collection,
                 Inline::new(equation_owned.raw),
                 Inline::new([35; 32]),
                 Inline::new([36; 32]),
             )),
-            CollectionRecord::Derive(CollectionDerive::new(
+            CollectionRecord::Derive(CollectionDerive::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 identity_for_tests(&named_for_tests("derived", pin_id(38))),
                 Inline::new([36; 32]),
                 Inline::new(equation_owned.raw),

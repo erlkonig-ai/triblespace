@@ -337,7 +337,7 @@ fn annotations_and_opaque_ids_preserve_ordinary_maintenance() {
     store.commit(source, &authority, first).unwrap();
     store.commit(source, &authority, second).unwrap();
 
-    let maintained = block_on(store.maintain(target)).unwrap();
+    let maintained = block_on(store.maintain(target, &authority)).unwrap();
     let observed_policy = source.policy(&maintained).unwrap();
     assert_eq!(observed_policy.read(), expected_policy.read());
     assert_eq!(observed_policy.write(), expected_policy.write());
@@ -364,7 +364,7 @@ fn annotations_and_opaque_ids_preserve_ordinary_maintenance() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    let after = block_on(store.maintain(target)).unwrap();
+    let after = block_on(store.maintain(target, &authority)).unwrap();
     assert_eq!(
         after
             .records()
@@ -686,7 +686,7 @@ fn missing_policies_leave_ordinary_root_maintenance_inert() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    let after = block_on(store.maintain(collection)).unwrap();
+    let after = block_on(store.maintain(collection, &authority)).unwrap();
     assert_eq!(
         after
             .records()

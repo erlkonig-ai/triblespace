@@ -40,6 +40,10 @@ fn policy() -> CollectionPolicy {
     CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open)
 }
 
+fn equation_signer() -> SigningKey {
+    SigningKey::from_bytes(&[31; 32])
+}
+
 fn row(entity: u8, value: u8) -> Trible {
     let mut raw = [value; TRIBLE_LEN];
     raw[..16].fill(entity);
@@ -220,6 +224,7 @@ impl CollectionEncoding for SecondEncoding {
     where
         R: BlobStoreGet + BlobStoreMeta,
     {
+        SECOND_JOIN_CALLS.set(SECOND_JOIN_CALLS.get() + 1);
         let low = decode_first(&decode_second(low)?)?;
         let high = decode_first(&decode_second(high)?)?;
         let joined = crate::collection::simplearchive_union::join(&low, &high)
@@ -246,6 +251,7 @@ impl MetaDescribe for FirstMappingAlgorithm {
 thread_local! {
     static FIRST_MAP_CALLS: Cell<usize> = const { Cell::new(0) };
     static SECOND_MAP_CALLS: Cell<usize> = const { Cell::new(0) };
+    static SECOND_JOIN_CALLS: Cell<usize> = const { Cell::new(0) };
     static FIRST_MAP_MISSING: Cell<bool> = const { Cell::new(false) };
     static FIRST_MAP_CAPACITY: RefCell<Option<CollectionData>> = const { RefCell::new(None) };
 }
@@ -253,6 +259,7 @@ thread_local! {
 fn reset_mapping_calls() {
     FIRST_MAP_CALLS.set(0);
     SECOND_MAP_CALLS.set(0);
+    SECOND_JOIN_CALLS.set(0);
     FIRST_MAP_MISSING.set(false);
     FIRST_MAP_CAPACITY.replace(None);
 }
@@ -724,7 +731,12 @@ fn downstream_ensure_requires_an_existing_immediate_source_realization() {
     store.put::<SimpleArchive, _>(source.clone()).unwrap();
     let support = support(root, std::slice::from_ref(&source));
 
-    let result = ensure_exact_resident::<_, SecondEncoding>(&mut store, second, &support);
+    let result = ensure_exact_resident::<_, SecondEncoding>(
+        &mut store,
+        second,
+        &equation_signer(),
+        &support,
+    );
     assert!(matches!(
         result,
         Err(CollectionRealizationError::IncompleteCover { .. })
@@ -743,8 +755,10 @@ fn two_hops_reuse_one_invariant_foundational_support() {
     store.put::<SimpleArchive, _>(source.clone()).unwrap();
     let support = support(root, std::slice::from_ref(&source));
 
-    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &support).unwrap();
-    ensure_exact_resident::<_, SecondEncoding>(&mut store, second, &support).unwrap();
+    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &support)
+        .unwrap();
+    ensure_exact_resident::<_, SecondEncoding>(&mut store, second, &equation_signer(), &support)
+        .unwrap();
     let snapshot = store.snapshot().unwrap();
     let (observed_support, cover) = attach_collection_exact(&snapshot, second, &support).unwrap();
 
@@ -773,7 +787,8 @@ fn ordinary_attachment_reports_only_support_realized_in_its_snapshot() {
     publish_root(&mut store, root, &left, 1);
     publish_root(&mut store, root, &right, 2);
     let left_support = support(root, std::slice::from_ref(&left));
-    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &left_support).unwrap();
+    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &left_support)
+        .unwrap();
 
     let snapshot = store.snapshot().unwrap();
     let (observed, cover) = attach_collection(&snapshot, first).unwrap();
@@ -803,7 +818,8 @@ fn ensure_drops_every_residency_snapshot_and_stores_the_blob_before_derive() {
     let support = support(root, &[source]);
     let mut store = GuardStore::new(inner);
 
-    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &support).unwrap();
+    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &support)
+        .unwrap();
 
     assert_eq!(store.live.load(Ordering::SeqCst), 0);
     let (insert_position, derive) = store
@@ -815,6 +831,11 @@ fn ensure_drops_every_residency_snapshot_and_stores_the_blob_before_derive() {
             _ => None,
         })
         .expect("ensure must publish one DERIVE");
+    derive.verify_strict().unwrap();
+    assert_eq!(
+        derive.public_key().raw,
+        equation_signer().verifying_key().to_bytes()
+    );
     let put_position = store
         .events
         .iter()
@@ -831,7 +852,7 @@ fn exact_ensure_acquires_explicit_foundational_support_without_want() {
     let mut store = GuardStore::new(inner);
     store.offer(&source);
 
-    let snapshot = block_on(store.ensure_exact(first, &support)).unwrap();
+    let snapshot = block_on(store.ensure_exact(first, &equation_signer(), &support)).unwrap();
 
     assert_eq!(store.acquired, vec![data(&source)]);
     assert_eq!(snapshot.wants().unwrap().count(), 0);
@@ -848,7 +869,8 @@ fn exact_ensure_fetches_a_known_derive_output_without_recomputing() {
     let support = support(root, std::slice::from_ref(&source));
     let output = FirstEncoding::map(&(), &source, &inner.snapshot().unwrap()).unwrap();
     let output_data = data(&output);
-    let pending = CollectionRecord::Derive(CollectionDerive::new(
+    let pending = CollectionRecord::Derive(CollectionDerive::sign(
+        &equation_signer(),
         first.handle(),
         data(&source),
         output_data,
@@ -858,7 +880,7 @@ fn exact_ensure_fetches_a_known_derive_output_without_recomputing() {
     let mut store = GuardStore::new(inner);
     store.offer(&output);
     reset_mapping_calls();
-    let snapshot = block_on(store.ensure_exact(first, &support)).unwrap();
+    let snapshot = block_on(store.ensure_exact(first, &equation_signer(), &support)).unwrap();
 
     assert_eq!(store.acquired, vec![output_data]);
     assert_eq!(FIRST_MAP_CALLS.get(), 0);
@@ -883,7 +905,8 @@ fn passive_derived_snapshot_keeps_dangling_output_as_raw_evidence_only() {
     publish_root(&mut inner, root, &source, 42);
     let support = support(root, std::slice::from_ref(&source));
     let output = FirstEncoding::map(&(), &source, &inner.snapshot().unwrap()).unwrap();
-    let pending = CollectionRecord::Derive(CollectionDerive::new(
+    let pending = CollectionRecord::Derive(CollectionDerive::sign(
+        &equation_signer(),
         first.handle(),
         data(&source),
         data(&output),
@@ -921,13 +944,18 @@ fn exact_maintenance_recovers_a_pending_derive_with_a_missing_output() {
     let output = FirstEncoding::map(&(), &source, &snapshot).unwrap();
     drop(snapshot);
     let output_data = data(&output);
-    let pending = CollectionDerive::new(first.handle(), data(&source), output_data);
+    let pending = CollectionDerive::sign(
+        &equation_signer(),
+        first.handle(),
+        data(&source),
+        output_data,
+    );
     inner.insert(CollectionRecord::Derive(pending)).unwrap();
     drop(output);
 
     let mut store = GuardStore::new(inner);
     reset_mapping_calls();
-    let snapshot = block_on(store.maintain_exact(first, &support)).unwrap();
+    let snapshot = block_on(store.maintain_exact(first, &equation_signer(), &support)).unwrap();
 
     assert_eq!(store.acquired, vec![output_data]);
     assert_eq!(FIRST_MAP_CALLS.get(), 1);
@@ -978,7 +1006,7 @@ fn ordinary_derived_ensure_leaves_cold_source_records_for_explicit_root_acquisit
         metadata,
     )));
 
-    let snapshot = block_on(store.ensure(first)).unwrap();
+    let snapshot = block_on(store.ensure(first, &equation_signer())).unwrap();
 
     assert!(store.acquired.is_empty());
     assert_eq!(snapshot.wants().unwrap().count(), 0);
@@ -991,10 +1019,10 @@ fn ordinary_derived_ensure_leaves_cold_source_records_for_explicit_root_acquisit
     // Acquisition belongs to the root. The subsequent downstream operation
     // observes its own immediate-source snapshot, including the concurrently
     // published member now that both inputs are resident and admitted.
-    drop(block_on(store.ensure(root)).unwrap());
+    drop(block_on(store.ensure(root, &equation_signer())).unwrap());
     assert_eq!(store.acquired, vec![data(&source)]);
     assert!(store.inject_record_on_acquire.is_none());
-    let snapshot = block_on(store.ensure(first)).unwrap();
+    let snapshot = block_on(store.ensure(first, &equation_signer())).unwrap();
     let observed = snapshot.collection(first).unwrap();
     assert_eq!(observed.support(), &support(root, &[source, concurrent]));
     assert_eq!(observed.cover().len(), 2);
@@ -1051,7 +1079,7 @@ fn root_ensure_hydrates_admitted_commit_closure_and_defers_concurrent_authority(
     }
     store.inject_proof_on_acquire = Some(proof(&concurrent_writer));
 
-    let first_snapshot = block_on(store.ensure(root)).unwrap();
+    let first_snapshot = block_on(store.ensure(root, &equation_signer())).unwrap();
     assert_eq!(
         store.acquired,
         vec![
@@ -1072,7 +1100,7 @@ fn root_ensure_hydrates_admitted_commit_closure_and_defers_concurrent_authority(
     );
     drop(first_snapshot);
 
-    let second_snapshot = block_on(store.ensure(root)).unwrap();
+    let second_snapshot = block_on(store.ensure(root, &equation_signer())).unwrap();
     assert_eq!(
         second_snapshot.collection(root).unwrap().support(),
         &support(root, &[first_source, concurrent_source.clone()]),
@@ -1092,7 +1120,7 @@ fn root_ensure_exact_fetches_selected_payload_without_commits() {
     let mut store = GuardStore::new(inner);
     store.offer(&source);
 
-    let snapshot = block_on(store.ensure_exact(root, &requested)).unwrap();
+    let snapshot = block_on(store.ensure_exact(root, &equation_signer(), &requested)).unwrap();
     let selected = snapshot.collection_exact(root, &requested).unwrap();
     assert_eq!(selected.view::<TribleSet>().unwrap().len(), 1);
     assert_eq!(store.acquired, vec![data(&source)]);
@@ -1111,7 +1139,7 @@ fn root_maintenance_only_merges_and_warm_ensure_is_write_free() {
     inner.put::<SimpleArchive, _>(right).unwrap();
     let mut store = GuardStore::new(inner);
 
-    let maintained = block_on(store.maintain_exact(root, &requested)).unwrap();
+    let maintained = block_on(store.maintain_exact(root, &equation_signer(), &requested)).unwrap();
     assert_eq!(
         maintained
             .collection_exact(root, &requested)
@@ -1130,7 +1158,7 @@ fn root_maintenance_only_merges_and_warm_ensure_is_write_free() {
     )));
     drop(maintained);
     store.events.clear();
-    let ensured = block_on(store.ensure_exact(root, &requested)).unwrap();
+    let ensured = block_on(store.ensure_exact(root, &equation_signer(), &requested)).unwrap();
     assert_eq!(
         ensured
             .collection_exact(root, &requested)
@@ -1177,7 +1205,7 @@ fn active_read_audience_acquires_a_cold_descriptor() {
     let mut store = GuardStore::new(inner);
     store.offer(&descriptor);
 
-    let snapshot = block_on(store.ensure(collection)).unwrap();
+    let snapshot = block_on(store.ensure(collection, &equation_signer())).unwrap();
     let audience = collection_read_audience(&snapshot, collection.handle()).unwrap();
 
     assert_eq!(store.acquired, vec![data(&descriptor)]);
@@ -1233,7 +1261,7 @@ fn active_read_audience_ignores_irrelevant_or_forged_proofs() {
 
     let mut store = GuardStore::new(inner);
 
-    let snapshot = block_on(store.ensure(collection)).unwrap();
+    let snapshot = block_on(store.ensure(collection, &equation_signer())).unwrap();
     let audience = collection_read_audience(&snapshot, collection.handle()).unwrap();
 
     assert!(store.acquired.is_empty());
@@ -1279,7 +1307,7 @@ fn active_read_audience_walks_a_valid_delegated_proof_path() {
 
     let mut store = GuardStore::new(inner);
 
-    let snapshot = block_on(store.ensure(collection)).unwrap();
+    let snapshot = block_on(store.ensure(collection, &equation_signer())).unwrap();
     let audience = collection_read_audience(&snapshot, collection.handle()).unwrap();
 
     assert!(store.acquired.is_empty());
@@ -1331,7 +1359,7 @@ fn active_read_audience_stops_before_a_signed_but_semantically_impossible_tail()
 
     let mut store = GuardStore::new(inner);
 
-    let snapshot = block_on(store.ensure(collection)).unwrap();
+    let snapshot = block_on(store.ensure(collection, &equation_signer())).unwrap();
     let audience = collection_read_audience(&snapshot, collection.handle()).unwrap();
 
     assert!(store.acquired.is_empty());
@@ -1377,7 +1405,7 @@ fn snapshot_read_audience_defers_later_proofs_after_descriptor_acquisition() {
     let mut store = GuardStore::new(inner);
     store.offer(&descriptor);
 
-    let before = block_on(store.ensure(collection)).unwrap();
+    let before = block_on(store.ensure(collection, &equation_signer())).unwrap();
     let first_audience = collection_read_audience(&before, collection.handle()).unwrap();
     let mut expected = vec![authority.verifying_key(), first_reader.verifying_key()];
     expected.sort_unstable_by_key(VerifyingKey::to_bytes);
@@ -1433,11 +1461,14 @@ fn maintenance_drops_every_residency_snapshot_and_stores_the_blob_before_merge()
         inner.put::<SimpleArchive, _>(blob.clone()).unwrap();
     }
     let support = support(root, &[left, right]);
-    ensure_exact_resident::<_, FirstEncoding>(&mut inner, first, &support).unwrap();
-    ensure_exact_resident::<_, SecondEncoding>(&mut inner, second, &support).unwrap();
+    ensure_exact_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer(), &support)
+        .unwrap();
+    ensure_exact_resident::<_, SecondEncoding>(&mut inner, second, &equation_signer(), &support)
+        .unwrap();
     let mut store = GuardStore::new(inner);
 
-    maintain_exact_resident::<_, SecondEncoding>(&mut store, second, &support).unwrap();
+    maintain_exact_resident::<_, SecondEncoding>(&mut store, second, &equation_signer(), &support)
+        .unwrap();
 
     assert_eq!(store.live.load(Ordering::SeqCst), 0);
     let (insert_position, merge) = store
@@ -1449,6 +1480,11 @@ fn maintenance_drops_every_residency_snapshot_and_stores_the_blob_before_merge()
             _ => None,
         })
         .expect("maintenance must publish one MERGE");
+    merge.verify_strict().unwrap();
+    assert_eq!(
+        merge.public_key().raw,
+        equation_signer().verifying_key().to_bytes()
+    );
     let put_position = store
         .events
         .iter()
@@ -1469,11 +1505,14 @@ fn target_maintenance_reprobes_once_per_tier_not_per_carry() {
         inner.put::<SimpleArchive, _>(member.clone()).unwrap();
     }
     let support = support(root, &members);
-    ensure_exact_resident::<_, FirstEncoding>(&mut inner, first, &support).unwrap();
-    ensure_exact_resident::<_, SecondEncoding>(&mut inner, second, &support).unwrap();
+    ensure_exact_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer(), &support)
+        .unwrap();
+    ensure_exact_resident::<_, SecondEncoding>(&mut inner, second, &equation_signer(), &support)
+        .unwrap();
 
     let mut store = GuardStore::new(inner);
-    maintain_exact_resident::<_, SecondEncoding>(&mut store, second, &support).unwrap();
+    maintain_exact_resident::<_, SecondEncoding>(&mut store, second, &equation_signer(), &support)
+        .unwrap();
 
     let merges = store
         .events
@@ -1501,8 +1540,15 @@ fn failed_target_batch_preserves_every_published_prefix_carry() {
             inner.put::<SimpleArchive, _>(member.clone()).unwrap();
         }
         let support = support(root, &members);
-        ensure_exact_resident::<_, FirstEncoding>(&mut inner, first, &support).unwrap();
-        ensure_exact_resident::<_, SecondEncoding>(&mut inner, second, &support).unwrap();
+        ensure_exact_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer(), &support)
+            .unwrap();
+        ensure_exact_resident::<_, SecondEncoding>(
+            &mut inner,
+            second,
+            &equation_signer(),
+            &support,
+        )
+        .unwrap();
 
         let mut store = GuardStore::new(inner);
         if fail_insert {
@@ -1512,7 +1558,12 @@ fn failed_target_batch_preserves_every_published_prefix_carry() {
         }
 
         assert!(matches!(
-            maintain_exact_resident::<_, SecondEncoding>(&mut store, second, &support),
+            maintain_exact_resident::<_, SecondEncoding>(
+                &mut store,
+                second,
+                &equation_signer(),
+                &support
+            ),
             Err(CollectionRealizationError::Storage { .. })
         ));
         assert_eq!(store.live.load(Ordering::SeqCst), 0);
@@ -1544,7 +1595,12 @@ fn later_put_or_insert_failure_preserves_the_published_prefix() {
         }
 
         assert!(matches!(
-            ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &support),
+            ensure_exact_resident::<_, FirstEncoding>(
+                &mut store,
+                first,
+                &equation_signer(),
+                &support
+            ),
             Err(CollectionRealizationError::Storage { .. })
         ));
         let derives = records(&mut store.inner)
@@ -1566,7 +1622,8 @@ fn missing_mapping_dependency_publishes_nothing() {
     let before = store.snapshot().unwrap();
     FIRST_MAP_MISSING.set(true);
 
-    let result = ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &support);
+    let result =
+        ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &support);
     FIRST_MAP_MISSING.set(false);
 
     assert!(matches!(
@@ -1587,7 +1644,8 @@ fn capacity_blocked_source_upper_falls_back_to_its_resident_children() {
     let joined = crate::collection::simplearchive_union::join(&left, &right).unwrap();
     store.put::<SimpleArchive, _>(joined.clone()).unwrap();
     store
-        .insert(CollectionRecord::Merge(CollectionMerge::new(
+        .insert(CollectionRecord::Merge(CollectionMerge::sign(
+            &equation_signer(),
             root.handle(),
             data(&left),
             data(&right),
@@ -1598,7 +1656,8 @@ fn capacity_blocked_source_upper_falls_back_to_its_resident_children() {
     reset_mapping_calls();
     FIRST_MAP_CAPACITY.replace(Some(data(&joined)));
 
-    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &support).unwrap();
+    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &support)
+        .unwrap();
     FIRST_MAP_CAPACITY.replace(None);
 
     assert_eq!(FIRST_MAP_CALLS.get(), 3);
@@ -1623,14 +1682,167 @@ fn warm_exact_ensure_is_a_zero_write_zero_algebra_observation() {
     let source = archive(1, 1);
     store.put::<SimpleArchive, _>(source.clone()).unwrap();
     let support = support(root, &[source]);
-    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &support).unwrap();
+    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &support)
+        .unwrap();
 
     reset_mapping_calls();
     let before = store.snapshot().unwrap();
-    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &support).unwrap();
+    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &support)
+        .unwrap();
     let after = store.snapshot().unwrap();
     assert!(after.changes_since(&before).is_empty());
     assert_eq!(FIRST_MAP_CALLS.get(), 0);
+}
+
+#[test]
+fn complete_realization_is_reused_without_write_authority() {
+    let (mut inner, root, _first, _second) = collections();
+    let owner = equation_signer();
+    let reader = SigningKey::from_bytes(&[32; 32]);
+    let target = inner
+        .derive::<FirstEncoding>(
+            root,
+            (),
+            CollectionPolicy::new(
+                AdmissionPolicy::Open,
+                AdmissionPolicy::direct(owner.verifying_key()),
+            ),
+        )
+        .unwrap();
+    let source = archive(1, 1);
+    inner.put::<SimpleArchive, _>(source.clone()).unwrap();
+    let support = support(root, &[source]);
+    block_on(inner.ensure_exact(target, &owner, &support)).unwrap();
+    let mut store = GuardStore::new(inner);
+    reset_mapping_calls();
+
+    for maintain in [false, true] {
+        let snapshot = if maintain {
+            block_on(store.maintain_exact(target, &reader, &support))
+        } else {
+            block_on(store.ensure_exact(target, &reader, &support))
+        }
+        .unwrap();
+        assert_eq!(
+            snapshot
+                .collection_exact(target, &support)
+                .unwrap()
+                .cover()
+                .len(),
+            1
+        );
+    }
+    assert!(store.events.is_empty());
+    assert!(store.acquired.is_empty());
+    assert_eq!(FIRST_MAP_CALLS.get(), 0);
+}
+
+#[test]
+fn missing_realization_requires_write_before_computation_or_publication() {
+    let (mut inner, root, _first, _second) = collections();
+    let owner = equation_signer();
+    let reader = SigningKey::from_bytes(&[32; 32]);
+    let target = inner
+        .derive::<FirstEncoding>(
+            root,
+            (),
+            CollectionPolicy::new(
+                AdmissionPolicy::Open,
+                AdmissionPolicy::direct(owner.verifying_key()),
+            ),
+        )
+        .unwrap();
+    let source = archive(1, 1);
+    inner.put::<SimpleArchive, _>(source.clone()).unwrap();
+    let support = support(root, &[source]);
+    let mut store = GuardStore::new(inner);
+    reset_mapping_calls();
+
+    for maintain in [false, true] {
+        let result = if maintain {
+            block_on(store.maintain_exact(target, &reader, &support))
+        } else {
+            block_on(store.ensure_exact(target, &reader, &support))
+        };
+        assert!(matches!(result,
+            Err(CollectionRealizationError::UnauthorizedProducer { collection })
+                if collection == target.handle()
+        ));
+    }
+    assert!(store.events.is_empty());
+    assert!(store.acquired.is_empty());
+    assert_eq!(FIRST_MAP_CALLS.get(), 0);
+}
+
+#[test]
+fn optional_maintenance_without_write_keeps_the_fine_cover_without_algebra() {
+    let owner = equation_signer();
+    let reader = SigningKey::from_bytes(&[32; 32]);
+    let private_write = CollectionPolicy::new(
+        AdmissionPolicy::Open,
+        AdmissionPolicy::direct(owner.verifying_key()),
+    );
+    let mut inner = MemoryRepo::default();
+    let root = inner.collection("read-only-maintenance", policy()).unwrap();
+    let first = inner
+        .derive::<FirstEncoding>(root, (), private_write.clone())
+        .unwrap();
+    let second = inner
+        .derive::<SecondEncoding>(first, (), private_write)
+        .unwrap();
+    let left = archive(1, 1);
+    let right = archive(2, 2);
+    for member in [&left, &right] {
+        inner.put::<SimpleArchive, _>(member.clone()).unwrap();
+    }
+    let support = support(root, &[left.clone(), right.clone()]);
+    block_on(inner.ensure_exact(first, &owner, &support)).unwrap();
+    block_on(inner.ensure_exact(second, &owner, &support)).unwrap();
+    let upper = crate::collection::simplearchive_union::join(&left, &right).unwrap();
+    inner.put::<SimpleArchive, _>(upper.clone()).unwrap();
+    inner
+        .insert(CollectionRecord::Merge(CollectionMerge::sign(
+            &owner,
+            root.handle(),
+            data(&left),
+            data(&right),
+            data(&upper),
+        )))
+        .unwrap();
+    let mut store = GuardStore::new(inner);
+    reset_mapping_calls();
+
+    let snapshot = block_on(store.maintain_exact(first, &reader, &support)).unwrap();
+    assert_eq!(
+        snapshot
+            .collection_exact(first, &support)
+            .unwrap()
+            .cover()
+            .len(),
+        2
+    );
+    drop(snapshot);
+    assert!(store.events.is_empty());
+    assert_eq!(FIRST_MAP_CALLS.get(), 0);
+
+    // The authorized source producer can pay for its upper image. A downstream
+    // reader still must not join or republish it under an unauthorized key.
+    drop(block_on(store.maintain_exact(first, &owner, &support)).unwrap());
+    store.events.clear();
+    reset_mapping_calls();
+    let snapshot = block_on(store.maintain_exact(second, &reader, &support)).unwrap();
+    assert_eq!(
+        snapshot
+            .collection_exact(second, &support)
+            .unwrap()
+            .cover()
+            .len(),
+        2
+    );
+    assert!(store.events.is_empty());
+    assert!(store.acquired.is_empty());
+    assert_eq!(SECOND_MAP_CALLS.get(), 0);
+    assert_eq!(SECOND_JOIN_CALLS.get(), 0);
 }
 
 #[test]
@@ -1642,11 +1854,13 @@ fn existing_target_support_is_not_mapped_again_when_support_grows() {
         store.put::<SimpleArchive, _>(blob.clone()).unwrap();
     }
     let left_support = support(root, std::slice::from_ref(&left));
-    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &left_support).unwrap();
+    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &left_support)
+        .unwrap();
 
     reset_mapping_calls();
     let full_support = support(root, &[left, right]);
-    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &full_support).unwrap();
+    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &full_support)
+        .unwrap();
     assert_eq!(FIRST_MAP_CALLS.get(), 1);
 }
 
@@ -1659,7 +1873,8 @@ fn resident_source_upper_is_mapped_instead_of_its_finer_children() {
         store.put::<SimpleArchive, _>(blob.clone()).unwrap();
     }
     let support = support(root, &[left, right]);
-    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &support).unwrap();
+    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &support)
+        .unwrap();
 
     let snapshot = store.snapshot().unwrap();
     let (_, first_cover) = attach_collection_exact(&snapshot, first, &support).unwrap();
@@ -1674,7 +1889,8 @@ fn resident_source_upper_is_mapped_instead_of_its_finer_children() {
     let upper = join_first(&low, &high).unwrap();
     store.put::<FirstEncoding, _>(upper.clone()).unwrap();
     store
-        .insert(CollectionRecord::Merge(CollectionMerge::new(
+        .insert(CollectionRecord::Merge(CollectionMerge::sign(
+            &equation_signer(),
             first.handle(),
             data(&low),
             data(&high),
@@ -1683,7 +1899,8 @@ fn resident_source_upper_is_mapped_instead_of_its_finer_children() {
         .unwrap();
 
     reset_mapping_calls();
-    ensure_exact_resident::<_, SecondEncoding>(&mut store, second, &support).unwrap();
+    ensure_exact_resident::<_, SecondEncoding>(&mut store, second, &equation_signer(), &support)
+        .unwrap();
     assert_eq!(SECOND_MAP_CALLS.get(), 1);
     assert!(records(&mut store).iter().any(|record| matches!(
         record,
@@ -1702,13 +1919,15 @@ fn optional_target_dependency_keeps_the_finer_cover() {
     }
     let support = support(root, &[left, right]);
 
-    maintain_exact_resident::<_, FirstEncoding>(&mut store, first, &support).unwrap();
+    maintain_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &support)
+        .unwrap();
     let snapshot = store.snapshot().unwrap();
     let (_, cover) = attach_collection_exact(&snapshot, first, &support).unwrap();
     assert_eq!(cover.len(), 2);
     drop(snapshot);
     let first_result = store.snapshot().unwrap();
-    maintain_exact_resident::<_, FirstEncoding>(&mut store, first, &support).unwrap();
+    maintain_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &support)
+        .unwrap();
     assert!(store
         .snapshot()
         .unwrap()
@@ -1728,11 +1947,12 @@ fn source_guidance_maps_only_the_resident_coarsest_upper_and_repeats_without_wor
         inner.put::<SimpleArchive, _>(member.clone()).unwrap();
     }
     let support = support(root, &members);
-    ensure_exact_resident::<_, FirstEncoding>(&mut inner, first, &support).unwrap();
+    ensure_exact_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer(), &support)
+        .unwrap();
     let mut store = GuardStore::new(inner);
 
     reset_mapping_calls();
-    block_on(store.maintain_exact(first, &support)).unwrap();
+    block_on(store.maintain_exact(first, &equation_signer(), &support)).unwrap();
     assert!(
         store.events.is_empty(),
         "missing source unions stay missing"
@@ -1760,7 +1980,8 @@ fn source_guidance_maps_only_the_resident_coarsest_upper_and_repeats_without_wor
     ] {
         store
             .inner
-            .insert(CollectionRecord::Merge(CollectionMerge::new(
+            .insert(CollectionRecord::Merge(CollectionMerge::sign(
+                &equation_signer(),
                 root.handle(),
                 data(low),
                 data(high),
@@ -1769,7 +1990,7 @@ fn source_guidance_maps_only_the_resident_coarsest_upper_and_repeats_without_wor
             .unwrap();
     }
 
-    let after = block_on(store.maintain_exact(first, &support)).unwrap();
+    let after = block_on(store.maintain_exact(first, &equation_signer(), &support)).unwrap();
     assert_eq!(
         after
             .collection_exact(first, &support)
@@ -1798,7 +2019,7 @@ fn source_guidance_maps_only_the_resident_coarsest_upper_and_repeats_without_wor
 
     store.events.clear();
     reset_mapping_calls();
-    block_on(store.maintain_exact(first, &support)).unwrap();
+    block_on(store.maintain_exact(first, &equation_signer(), &support)).unwrap();
     assert!(store.events.is_empty());
     assert_eq!(
         FIRST_MAP_CALLS.get(),
@@ -1816,8 +2037,10 @@ fn target_maintenance_publishes_only_horizontal_target_merges() {
         store.put::<SimpleArchive, _>(blob.clone()).unwrap();
     }
     let support = support(root, &[left, right]);
-    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &support).unwrap();
-    maintain_exact_resident::<_, SecondEncoding>(&mut store, second, &support).unwrap();
+    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &support)
+        .unwrap();
+    maintain_exact_resident::<_, SecondEncoding>(&mut store, second, &equation_signer(), &support)
+        .unwrap();
 
     let snapshot = store.snapshot().unwrap();
     let (_, cover) = attach_collection_exact(&snapshot, second, &support).unwrap();
@@ -1842,11 +2065,14 @@ fn target_maintenance_is_deterministic_and_repeatedly_idempotent() {
         store.put::<SimpleArchive, _>(blob.clone()).unwrap();
     }
     let support = support(root, &[left, right]);
-    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &support).unwrap();
-    maintain_exact_resident::<_, SecondEncoding>(&mut store, second, &support).unwrap();
+    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &support)
+        .unwrap();
+    maintain_exact_resident::<_, SecondEncoding>(&mut store, second, &equation_signer(), &support)
+        .unwrap();
     let first_result = store.snapshot().unwrap();
 
-    maintain_exact_resident::<_, SecondEncoding>(&mut store, second, &support).unwrap();
+    maintain_exact_resident::<_, SecondEncoding>(&mut store, second, &equation_signer(), &support)
+        .unwrap();
     let second_result = store.snapshot().unwrap();
     assert!(second_result.changes_since(&first_result).is_empty());
 }

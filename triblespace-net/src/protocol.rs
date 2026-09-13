@@ -15,11 +15,11 @@ use crate::transport::Conn;
 use crate::transport::PeerId;
 
 /// Clean collection-scoped protocol generation.
-pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/24";
+pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/25";
 
 // Operation types — first byte on each stream.
 // 0x01 was branch-list; 0x03 was blob-children; 0x04 was branch-head;
-// 0x05 was connection AUTH. None are accepted in v24.
+// 0x05 was connection AUTH. None are accepted in v25.
 pub const OP_GET_BLOB: u8 = 0x02;
 pub const OP_PROVIDER_PUT: u8 = 0x06;
 pub const OP_PROVIDER_GET: u8 = 0x07;

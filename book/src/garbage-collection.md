@@ -62,10 +62,15 @@ caller asked for that exact copy and silently weakening the request would be
 incorrect.
 
 There is no collection-specific retention planner. In particular, admission
-results do not select lifetime roots and unsigned `MERGE` or `DERIVE` records
+results do not select lifetime roots and `MERGE` or `DERIVE` records
 are not treated as weaker cache hints. A retained equation owns its resident
 inputs, output, and descriptor exactly as a retained commit owns its resident
 descriptor, data, and metadata.
+
+Known retired unsigned equations remain inert in semantic readers, but their
+direct references still retain resident blobs. Reframing preserves their exact
+bytes. Unknown opaque kinds cannot safely be reclaimed or semantically
+reframed because their ownership edges are unknown.
 
 ## Backend Boundaries
 

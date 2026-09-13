@@ -1552,7 +1552,8 @@ mod tests {
         let source_snapshot = source_store.snapshot().unwrap();
         let support = source.admitted(&source_snapshot).unwrap();
         drop(source_snapshot);
-        let source_snapshot = block_on(source_store.maintain_exact(target, &support)).unwrap();
+        let source_snapshot =
+            block_on(source_store.maintain_exact(target, &authority, &support)).unwrap();
         let collection = source_snapshot.collection_exact(target, &support).unwrap();
         let target_cover = collection.cover().clone();
         let source_snapshot = collection.snapshot();

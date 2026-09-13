@@ -185,7 +185,7 @@ let before = store.snapshot()?;
 let support = source.admitted(&before)?;
 drop(before);
 
-let after = store.maintain_exact(paths, &support).await?;
+let after = store.maintain_exact(paths, &writer, &support).await?;
 let observed = after.collection_exact(paths, &support)?;
 let index: Arc<PathIndex> = observed.view()?;
 ```
@@ -233,8 +233,12 @@ dependencies and publishes missing `DERIVE` work only; `maintain{_exact}`
 additionally performs deterministic size-tiered target `MERGE` work. Both
 return a fresh store snapshot rather than pretending that mutation itself
 selected one final physical cover. Every successful artifact is persisted
-before its unsigned equation, no implicit durability flush or durable `WANT`
+before its producer-signed equation, no implicit durability flush or durable `WANT`
 is performed, and an unchanged warm call executes no maps or joins.
+
+The explicit `writer` key must satisfy the derived descriptor's WRITE policy
+to publish missing derivations. Reusing an admitted result needs no new grant;
+optional compaction may leave the existing finer cover in place.
 
 An empty cover returns the automaton-indexed bottom relation locally and
 appends nothing.

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Sign native MERGE and DERIVE equations and admit their producers through the
+  target collection's WRITE policy. Foreign dense record decoding verifies each
+  signature once; trusted local replay and attachment do not repeat that work.
+  COMMIT's signed bytes are unchanged. The repair protocol advances to epoch 25;
+  legacy unsigned equations remain inert, byte-preserved evidence with their
+  resident references retained. Re-endorsing them is an explicit migration, not
+  an automatic receiver-side signature.
+- Pass an explicit signing key to ensure/maintain operations. Reuse needs no
+  producer grant; missing derivations require target WRITE, while optional
+  compaction may retain a finer cover. Add `trible pile verify` for a read-only
+  physical-record signature audit without loading collection payloads.
+
 - Give explicitly selected Full-replication collections sustained scan quanta,
   including work beyond the recent startup window. Preserve shared exact demand,
   physical roots and aggregate budgets; shared closures retain per-selection

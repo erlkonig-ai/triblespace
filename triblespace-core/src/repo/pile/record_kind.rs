@@ -89,6 +89,13 @@ pub const KIND_AUTH_PROOF_V1: RawInline =
 pub const KIND_AUTH_PROOF_V2: RawInline =
     hex_literal::hex!("334D7A044E5F9ED4F3E51618A3FB1752120F37BB5CDBC6B9F6497FB9E338E8D5");
 
+/// Retired unsigned equations. Their exact frames and resident references are
+/// preserved for explicit writer endorsement, but ordinary replay is inert.
+pub const KIND_COLLECTION_MERGE_UNSIGNED: RawInline =
+    hex_literal::hex!("0CEE320DE0BDA40A6A6F52221C5E4E4D2CE3B165B69C858673FD13D98F655379");
+pub const KIND_COLLECTION_DERIVE_UNSIGNED: RawInline =
+    hex_literal::hex!("7ACE1ED10F3EBC632627058CC461DC1CC171CD2E56C52E5DCE60EA4C8DC23C36");
+
 /// Archive one description fragment and take its content identity.
 ///
 /// Only the fragment's facts are archived, exactly as a collection descriptor
@@ -175,17 +182,17 @@ record_kinds! {
         "pile-collection-commit-v4",
         "A signed COMMIT(collection, data, metadata) assertion. Envelope bytes 64..96 hold the collection descriptor handle, 96..128 the data digest, 128..160 the metadata archive handle, 160..192 the author Ed25519 public key, 192..224 the signature R component, and 224..256 the signature S component. This is the tightest record the pile writes: it fills the block exactly and reserves nothing. The signature covers a domain-separated transcript, not these bytes, so a commit survives reframing unchanged.";
 
-    /// An unsigned merge equation.
-    CollectionMergeRecordV4 = KIND_ID_COLLECTION_MERGE "9F5D028D4C423620D6957A5F726FA727",
-        KIND_COLLECTION_MERGE hex_literal::hex!("0CEE320DE0BDA40A6A6F52221C5E4E4D2CE3B165B69C858673FD13D98F655379"),
-        "pile-collection-merge-v4",
-        "An unsigned MERGE equation asserting that two element digests join to a third under the collection's recipe. Envelope bytes 64..96 hold the collection descriptor handle, 96..128 the lexicographically lower input digest, 128..160 the higher input digest, 160..192 the result digest, and 192..256 are zeros. Storing the inputs in order means operand order cannot produce a second representation of the same commutative equation.";
+    /// A signed merge equation. Anchor minted with `trible genid` on 2026-09-13.
+    CollectionMergeRecordV5 = KIND_ID_COLLECTION_MERGE "BC68266A511EC292D815A30C8DFBA82D",
+        KIND_COLLECTION_MERGE hex_literal::hex!("9D9B962D46FA42168AB3A11FB367AC14692D4F51B5190196F2BDB08D5BC2BA07"),
+        "pile-collection-merge-v5",
+        "A signed MERGE(collection, low, high, result) equation. Envelope bytes 64..96 hold the collection descriptor handle, 96..128 the lexicographically lower input digest, 128..160 the higher input digest, 160..192 the result digest, 192..224 the author Ed25519 public key, 224..256 the signature R component, 256..288 the signature S component, and 288..512 zeros. The record spans exactly two 256-byte blocks. The signature covers a domain-separated transcript containing the semantic kind, author, collection, ordered inputs, and result, not the pile framing. WRITE admission on the named collection decides whether the equation is usable; storing it preserves evidence independently of admission.";
 
-    /// An unsigned derive equation.
-    CollectionDeriveRecordV5 = KIND_ID_COLLECTION_DERIVE "ED6B46F7286D4556B076C17B79FD8315",
-        KIND_COLLECTION_DERIVE hex_literal::hex!("7ACE1ED10F3EBC632627058CC461DC1CC171CD2E56C52E5DCE60EA4C8DC23C36"),
-        "pile-collection-derive-v5",
-        "An unsigned DERIVE equation asserting that an input state of a derived collection's source maps to an output state of that collection. Envelope bytes 64..96 hold the target collection's descriptor handle, 96..128 the input digest, 128..160 the output digest, and 160..256 are zeros. The source is not named here because the target's descriptor already names it, and naming it twice only creates a way for the two to disagree.";
+    /// A signed derive equation. Anchor minted with `trible genid` on 2026-09-13.
+    CollectionDeriveRecordV6 = KIND_ID_COLLECTION_DERIVE "7FDDB25BB2B40E002A7B0EC40E316232",
+        KIND_COLLECTION_DERIVE hex_literal::hex!("B2EE8382C70161379E387D692B822946A60B602A909EED66B7D6DA2A62F36232"),
+        "pile-collection-derive-v6",
+        "A signed DERIVE(target, input, output) equation. Envelope bytes 64..96 hold the target collection descriptor handle, 96..128 the input digest, 128..160 the output digest, 160..192 the author Ed25519 public key, 192..224 the signature R component, and 224..256 the signature S component. The record spans exactly one 256-byte block with no reserved bytes. The signature covers a domain-separated transcript containing the semantic kind, author, target, input, and output, not the pile framing. The target descriptor names the source and mapping. WRITE admission on the target collection decides whether the equation is usable; storing it preserves evidence independently of admission.";
 
     /// A self-contained prefix-signed capability proof.
     ///
@@ -264,5 +271,7 @@ mod tests {
         assert!(!writable.contains(&KIND_BLOB_WANT_RETRACT));
         assert!(!writable.contains(&KIND_WANT_ASSERT));
         assert!(!writable.contains(&KIND_WANT_RETRACT));
+        assert!(!writable.contains(&KIND_COLLECTION_MERGE_UNSIGNED));
+        assert!(!writable.contains(&KIND_COLLECTION_DERIVE_UNSIGNED));
     }
 }

@@ -67,6 +67,7 @@ fn changes(
 // ANCHOR: collection_pattern_changes_observe
 fn observe(
     store: &mut MemoryRepo,
+    signing_key: &SigningKey,
     collection: Collection<SimpleArchive>,
     raw: Collection<SuccinctArchiveBlob>,
     accelerated: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
@@ -87,11 +88,11 @@ fn observe(
     // Every mapping edge receives the same foundational support. Maintaining
     // the delta first lets complete maintenance reuse all persisted work.
     if let Some(changed) = changed_support.as_ref() {
-        block_on(store.maintain_exact(raw, changed))?;
-        block_on(store.maintain_exact(accelerated, changed))?;
+        block_on(store.maintain_exact(raw, signing_key, changed))?;
+        block_on(store.maintain_exact(accelerated, signing_key, changed))?;
     }
-    block_on(store.maintain_exact(raw, &current_support))?;
-    let snapshot = block_on(store.maintain_exact(accelerated, &current_support))?;
+    block_on(store.maintain_exact(raw, signing_key, &current_support))?;
+    let snapshot = block_on(store.maintain_exact(accelerated, signing_key, &current_support))?;
     let next = snapshot.collection_exact(accelerated, &current_support)?;
 
     let titles = match changed_support {
@@ -147,6 +148,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let first = observe(
         &mut store,
+        &signing_key,
         collection,
         raw,
         accelerated,
@@ -169,6 +171,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .map(|snapshot| snapshot.support().clone());
     let failed = observe(
         &mut store,
+        &signing_key,
         collection,
         raw,
         accelerated,
@@ -185,6 +188,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let retry = observe(
         &mut store,
+        &signing_key,
         collection,
         raw,
         accelerated,
@@ -195,6 +199,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let unchanged = observe(
         &mut store,
+        &signing_key,
         collection,
         raw,
         accelerated,

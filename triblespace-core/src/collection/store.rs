@@ -102,6 +102,11 @@ pub(crate) fn selectors_match_record(
 /// Implementations enumerate one coherent store snapshot in deterministic
 /// fingerprint order. Mutation lives on [`CollectionStore`], so admission and
 /// physical-cover resolution cannot accidentally observe different prefixes.
+/// Signatures are trusted here: foreign dense records are checked at ingress,
+/// and local constructors sign their own records. Opening or concatenating a
+/// raw pile is an explicit trust decision; audit unfamiliar piles before using
+/// them as trusted storage. This contract does not grant WRITE authority,
+/// which is evaluated against each snapshot's policy, proofs, and instant.
 pub trait CollectionRead {
     /// Failure while enumerating stored records.
     type RecordsError: Error + Debug + Send + Sync + 'static;
@@ -201,6 +206,13 @@ pub trait CollectionStore {
     ///
     /// Re-inserting a record with the same canonical bytes is success and does not
     /// add another logical set member.
+    ///
+    /// This is the trusted typed boundary, not a foreign-byte decoder. The
+    /// public dense record decoder verifies signatures before returning a
+    /// value; local signing constructs one directly. Backends and transparent
+    /// adapters must not repeat that cryptographic work. No capability proof
+    /// is required for insertion: a signed record can arrive before the proof
+    /// that later authorizes its producer.
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError>;
 }
 
@@ -248,12 +260,44 @@ mod tests {
                 data(4),
                 empty_metadata_handle(),
             )),
-            CollectionRecord::Merge(CollectionMerge::new(source, data(4), data(5), data(6))),
-            CollectionRecord::Merge(CollectionMerge::new(other, data(4), data(5), data(7))),
-            CollectionRecord::Derive(CollectionDerive::new(target, input, data(11))),
-            CollectionRecord::Derive(CollectionDerive::new(target, input, data(12))),
-            CollectionRecord::Derive(CollectionDerive::new(target, data(13), data(14))),
-            CollectionRecord::Derive(CollectionDerive::new(other, input, data(15))),
+            CollectionRecord::Merge(CollectionMerge::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                source,
+                data(4),
+                data(5),
+                data(6),
+            )),
+            CollectionRecord::Merge(CollectionMerge::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                other,
+                data(4),
+                data(5),
+                data(7),
+            )),
+            CollectionRecord::Derive(CollectionDerive::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                target,
+                input,
+                data(11),
+            )),
+            CollectionRecord::Derive(CollectionDerive::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                target,
+                input,
+                data(12),
+            )),
+            CollectionRecord::Derive(CollectionDerive::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                target,
+                data(13),
+                data(14),
+            )),
+            CollectionRecord::Derive(CollectionDerive::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                other,
+                input,
+                data(15),
+            )),
         ];
         records.sort_unstable_by_key(CollectionRecord::fingerprint);
         records
@@ -408,16 +452,38 @@ mod tests {
                 data(1),
                 empty_metadata_handle(),
             )),
-            CollectionRecord::Merge(CollectionMerge::new(expected, data(1), data(2), data(3))),
-            CollectionRecord::Derive(CollectionDerive::new(expected, data(3), data(4))),
+            CollectionRecord::Merge(CollectionMerge::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                expected,
+                data(1),
+                data(2),
+                data(3),
+            )),
+            CollectionRecord::Derive(CollectionDerive::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                expected,
+                data(3),
+                data(4),
+            )),
             CollectionRecord::Commit(CollectionCommit::sign(
                 &author,
                 other,
                 data(1),
                 empty_metadata_handle(),
             )),
-            CollectionRecord::Merge(CollectionMerge::new(other, data(1), data(2), data(3))),
-            CollectionRecord::Derive(CollectionDerive::new(other, data(3), data(4))),
+            CollectionRecord::Merge(CollectionMerge::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                other,
+                data(1),
+                data(2),
+                data(3),
+            )),
+            CollectionRecord::Derive(CollectionDerive::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                other,
+                data(3),
+                data(4),
+            )),
         ];
         records.sort_unstable_by_key(CollectionRecord::fingerprint);
         let store = FallbackStore {

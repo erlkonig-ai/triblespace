@@ -516,13 +516,15 @@ mod tests {
     fn collection_records_are_idempotent_and_fingerprint_ordered() {
         let descriptor = named_for_tests("merged", Id::new([2; 16]).unwrap());
         let target = named_for_tests("derived", Id::new([8; 16]).unwrap());
-        let merge = CollectionRecord::Merge(CollectionMerge::new(
+        let merge = CollectionRecord::Merge(CollectionMerge::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&descriptor),
             Inline::new([4; 32]),
             Inline::new([5; 32]),
             Inline::new([6; 32]),
         ));
-        let derive = CollectionRecord::Derive(CollectionDerive::new(
+        let derive = CollectionRecord::Derive(CollectionDerive::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&target),
             Inline::new([10; 32]),
             Inline::new([11; 32]),
@@ -554,12 +556,14 @@ mod tests {
     #[test]
     fn collection_index_rejects_a_different_body_under_an_existing_key() {
         let target = identity_for_tests(&named_for_tests("target", Id::new([12; 16]).unwrap()));
-        let expected = CollectionRecord::Derive(CollectionDerive::new(
+        let expected = CollectionRecord::Derive(CollectionDerive::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             target,
             Inline::new([14; 32]),
             Inline::new([15; 32]),
         ));
-        let mismatched = CollectionRecord::Derive(CollectionDerive::new(
+        let mismatched = CollectionRecord::Derive(CollectionDerive::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             target,
             Inline::new([16; 32]),
             Inline::new([17; 32]),
@@ -587,23 +591,37 @@ mod tests {
         let target = identity_for_tests(&named_for_tests("target", Id::new([25; 16]).unwrap()));
         let other = identity_for_tests(&named_for_tests("other", Id::new([28; 16]).unwrap()));
         let input = Inline::new([30; 32]);
-        let merge = CollectionRecord::Merge(CollectionMerge::new(
+        let merge = CollectionRecord::Merge(CollectionMerge::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             source,
             Inline::new([31; 32]),
             Inline::new([32; 32]),
             Inline::new([33; 32]),
         ));
-        let first =
-            CollectionRecord::Derive(CollectionDerive::new(target, input, Inline::new([34; 32])));
-        let conflicting =
-            CollectionRecord::Derive(CollectionDerive::new(target, input, Inline::new([35; 32])));
-        let sibling = CollectionRecord::Derive(CollectionDerive::new(
+        let first = CollectionRecord::Derive(CollectionDerive::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+            target,
+            input,
+            Inline::new([34; 32]),
+        ));
+        let conflicting = CollectionRecord::Derive(CollectionDerive::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+            target,
+            input,
+            Inline::new([35; 32]),
+        ));
+        let sibling = CollectionRecord::Derive(CollectionDerive::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             target,
             Inline::new([36; 32]),
             Inline::new([37; 32]),
         ));
-        let unrelated =
-            CollectionRecord::Derive(CollectionDerive::new(other, input, Inline::new([38; 32])));
+        let unrelated = CollectionRecord::Derive(CollectionDerive::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+            other,
+            input,
+            Inline::new([38; 32]),
+        ));
         let mut repo = MemoryRepo::default();
         for record in [unrelated, conflicting, merge, first, sibling, first] {
             repo.insert(record).unwrap();
@@ -699,7 +717,8 @@ mod tests {
             .put::<UnknownBlob, _>(Bytes::from_source(b"orphan".to_vec()))
             .unwrap();
 
-        repo.insert(CollectionRecord::Merge(CollectionMerge::new(
+        repo.insert(CollectionRecord::Merge(CollectionMerge::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             descriptor.transmute(),
             Inline::new(merge_input.raw),
             Inline::new([0xff; 32]),
@@ -806,7 +825,8 @@ mod tests {
             "revision-target",
             Id::new([71; 16]).unwrap(),
         ));
-        repo.insert(CollectionRecord::Derive(CollectionDerive::new(
+        repo.insert(CollectionRecord::Derive(CollectionDerive::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             target,
             handle(73).into(),
             handle(74).into(),
@@ -850,7 +870,8 @@ mod tests {
             "snapshot-target",
             Id::new([81; 16]).unwrap(),
         ));
-        let record = CollectionRecord::Derive(CollectionDerive::new(
+        let record = CollectionRecord::Derive(CollectionDerive::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             target,
             handle(82).into(),
             handle(83).into(),

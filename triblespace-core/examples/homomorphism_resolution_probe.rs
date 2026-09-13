@@ -134,7 +134,8 @@ fn build(
                     step as u64,
                     &[leaves.trailing_zeros() as u8],
                 );
-                merges.push(CollectionMerge::new(
+                merges.push(CollectionMerge::sign(
+                    &signing_key,
                     source_collection,
                     current,
                     next,
@@ -157,7 +158,8 @@ fn build(
                         &[leaves.trailing_zeros() as u8],
                     );
                     node += 1;
-                    merges.push(CollectionMerge::new(
+                    merges.push(CollectionMerge::sign(
+                        &signing_key,
                         source_collection,
                         pair[0],
                         pair[1],
@@ -180,7 +182,9 @@ fn build(
     };
     let derives: Vec<_> = mapped_inputs
         .iter()
-        .map(|input| CollectionDerive::new(target_collection, *input, mapped(*input)))
+        .map(|input| {
+            CollectionDerive::sign(&signing_key, target_collection, *input, mapped(*input))
+        })
         .collect();
 
     for record in &commits {

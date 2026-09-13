@@ -739,7 +739,7 @@ mod tests {
         store
             .commit(source, &key, Fragment::from(edge(&b, &a)))
             .unwrap();
-        let early = block_on(store.maintain(target))
+        let early = block_on(store.maintain(target, &key))
             .unwrap()
             .collection(target)
             .unwrap();
@@ -747,13 +747,13 @@ mod tests {
         store
             .commit(source, &key, Fragment::from(edge(&c, &b)))
             .unwrap();
-        let after = block_on(store.maintain(target)).unwrap();
+        let after = block_on(store.maintain(target, &key)).unwrap();
         let frozen = after.collection(target).unwrap();
         assert_eq!(frozen.view::<LatestIndex>().unwrap().states(), &[*c]);
         store
             .commit(source, &key, Fragment::from(state(&a)))
             .unwrap();
-        let caught_up = block_on(store.maintain(target)).unwrap();
+        let caught_up = block_on(store.maintain(target, &key)).unwrap();
         let live: LatestIndex = caught_up.collection(target).unwrap().view().unwrap();
         assert_eq!(live.states(), &[*c]);
         assert_eq!(early.view::<LatestIndex>().unwrap().states(), &[*b]);

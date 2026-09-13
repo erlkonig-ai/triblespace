@@ -100,6 +100,23 @@ The command validates the full frozen legacy closure before registering the
 target, preserves every existing fact and metadata entity id, and does not
 create, advance, merge, or delete branches.
 
+Historical unsigned equations can be explicitly endorsed for one existing collection:
+
+```bash
+trible pile migrate <PILE> endorse-unsigned-equations \
+  --collection blake3:<COLLECTION_HANDLE> \
+  --signing-key <EXISTING_KEY_PATH> [--dry-run]
+```
+
+The signer must have WRITE authority for that exact collection in the command's
+frozen snapshot. The command appends signed MERGE/DERIVE records with the same
+endpoints, preserving every old byte and identity. It does not recompute the
+equations or recover their original authorship: the supplied signer endorses
+the historical results. Missing direct references are skipped without fetching;
+existing identical endorsements are reported and not appended again. No keys,
+descriptors, blobs, or other legacy conversions are created. `--dry-run` leaves
+the pile unchanged.
+
 #### Blobs
 
 - `pile blob list [--metadata] <PILE>` — list stored blob handles. Pass `--metadata` to include timestamps and sizes.

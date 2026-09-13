@@ -54,6 +54,7 @@ type Row = (Entity, Entity, Title);
 #[derive(Clone)]
 struct Fixture {
     store: MemoryRepo,
+    signing_key: SigningKey,
     seed_cover: Support,
     covers: Vec<Support>,
     expected_batches: Vec<Vec<Row>>,
@@ -133,6 +134,7 @@ fn build_fixture(commits: usize, books_per_commit: usize) -> Fixture {
         .expect("register accelerated Succinct projection");
     Fixture {
         store,
+        signing_key,
         seed_cover,
         covers,
         expected_batches,
@@ -143,17 +145,20 @@ fn build_fixture(commits: usize, books_per_commit: usize) -> Fixture {
 
 fn maintain_succinct(
     store: &mut MemoryRepo,
+    signing_key: &SigningKey,
     raw: Collection<SuccinctArchiveBlob>,
     accelerated: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
     support: &Support,
 ) -> MemoryRepoSnapshot {
-    block_on(store.maintain_exact(raw, support)).expect("maintain exact raw Succinct cover");
-    block_on(store.maintain_exact(accelerated, support))
+    block_on(store.maintain_exact(raw, signing_key, support))
+        .expect("maintain exact raw Succinct cover");
+    block_on(store.maintain_exact(accelerated, signing_key, support))
         .expect("maintain exact accelerated Succinct cover")
 }
 
 struct FullState {
     store: MemoryRepo,
+    signing_key: SigningKey,
     raw: Collection<SuccinctArchiveBlob>,
     accelerated: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
     results: BTreeSet<Row>,
@@ -164,6 +169,7 @@ impl FullState {
         let mut store = fixture.store.clone();
         let snapshot = maintain_succinct(
             &mut store,
+            &fixture.signing_key,
             fixture.raw,
             fixture.accelerated,
             &fixture.seed_cover,
@@ -179,6 +185,7 @@ impl FullState {
         );
         Self {
             store,
+            signing_key: fixture.signing_key.clone(),
             raw: fixture.raw,
             accelerated: fixture.accelerated,
             results: BTreeSet::new(),
@@ -187,7 +194,13 @@ impl FullState {
 
     fn observe(&mut self, cover: &Support) -> Step {
         let start = Instant::now();
-        let snapshot = maintain_succinct(&mut self.store, self.raw, self.accelerated, cover);
+        let snapshot = maintain_succinct(
+            &mut self.store,
+            &self.signing_key,
+            self.raw,
+            self.accelerated,
+            cover,
+        );
         let full = snapshot
             .collection_exact(self.accelerated, cover)
             .expect("observe full-query view");
@@ -219,6 +232,7 @@ impl FullState {
 
 struct IncrementalState {
     store: MemoryRepo,
+    signing_key: SigningKey,
     raw: Collection<SuccinctArchiveBlob>,
     accelerated: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
     snapshot: CollectionSnapshot<MemoryRepoSnapshot, Rank9AcceleratedSuccinctArchiveBlob>,
@@ -230,6 +244,7 @@ impl IncrementalState {
         let mut store = fixture.store.clone();
         let snapshot = maintain_succinct(
             &mut store,
+            &fixture.signing_key,
             fixture.raw,
             fixture.accelerated,
             &fixture.seed_cover,
@@ -245,6 +260,7 @@ impl IncrementalState {
         );
         Self {
             store,
+            signing_key: fixture.signing_key.clone(),
             raw: fixture.raw,
             accelerated: fixture.accelerated,
             snapshot: seed,
@@ -260,11 +276,18 @@ impl IncrementalState {
         assert!(!changed_support.is_empty(), "benchmark cover did not grow");
         maintain_succinct(
             &mut self.store,
+            &self.signing_key,
             self.raw,
             self.accelerated,
             &changed_support,
         );
-        let snapshot = maintain_succinct(&mut self.store, self.raw, self.accelerated, cover);
+        let snapshot = maintain_succinct(
+            &mut self.store,
+            &self.signing_key,
+            self.raw,
+            self.accelerated,
+            cover,
+        );
         let next = snapshot
             .collection_exact(self.accelerated, cover)
             .expect("observe incremental full view");

@@ -1,7 +1,7 @@
 //! Policy-independent collection-record delta mechanics.
 //!
 //! This module owns only the immutable evidence boundary: strict framing,
-//! intrinsic collection matching, COMMIT signature verification, canonical
+//! intrinsic collection matching, ingress signature verification, canonical
 //! fingerprint ordering, and bounded `current - previous` selection. It deliberately
 //! does not resolve referenced blobs or decide READ/WRITE policy. A future
 //! authorized overlay can therefore store sparse MERGE/DERIVE equations as
@@ -13,7 +13,7 @@ use std::fmt;
 
 use triblespace_core::collection::{
     CollectionHandle, CollectionRead, CollectionRecord, CollectionRecordFingerprint,
-    CollectionRecordSelector, CommitVerificationError, RecordDecodeError,
+    CollectionRecordSelector, RecordDecodeError,
 };
 use triblespace_core::patch::{Blake3Merkle, Entry as PatchEntry, IdentitySchema, PATCH};
 
@@ -99,7 +99,6 @@ where
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CollectionDeltaError {
     Decode(RecordDecodeError),
-    InvalidCommit(CommitVerificationError),
     WrongCollection,
     FingerprintCollision(CollectionRecordFingerprint),
 }
@@ -108,7 +107,6 @@ impl fmt::Display for CollectionDeltaError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Decode(error) => write!(f, "decode collection record: {error}"),
-            Self::InvalidCommit(error) => write!(f, "verify collection COMMIT: {error}"),
             Self::WrongCollection => write!(f, "record names another collection"),
             Self::FingerprintCollision(fingerprint) => {
                 write!(
@@ -124,7 +122,6 @@ impl Error for CollectionDeltaError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Decode(error) => Some(error),
-            Self::InvalidCommit(error) => Some(error),
             _ => None,
         }
     }
@@ -156,8 +153,8 @@ where
     canonical_records(collection, records).map_err(CollectionRecordPatchError::Evidence)
 }
 
-/// Encode one sparse record after checking its intrinsic collection and the
-/// embedded COMMIT signature. WRITE authorization is intentionally absent: it
+/// Encode one trusted local record after checking its intrinsic collection.
+/// Signatures are not re-verified on output. WRITE authorization is absent: it
 /// governs derived admission, not whether canonical inert evidence may exist.
 pub fn encode_record(
     expected: CollectionHandle,
@@ -169,7 +166,7 @@ pub fn encode_record(
 
 /// Strictly decode one complete self-tagged record for an implicit collection
 /// overlay. Trailing bytes, noncanonical MERGE inputs, unknown tags, wrong
-/// collections, and invalid COMMIT signatures fail before insertion.
+/// collections, and invalid signatures fail before insertion.
 pub fn decode_record(
     expected: CollectionHandle,
     bytes: &[u8],
@@ -183,23 +180,10 @@ fn validate_record(
     expected: CollectionHandle,
     record: CollectionRecord,
 ) -> Result<(), CollectionDeltaError> {
-    if record_collection(record) != expected {
+    if record.collection() != expected {
         return Err(CollectionDeltaError::WrongCollection);
     }
-    if let CollectionRecord::Commit(commit) = record {
-        commit
-            .verify_strict()
-            .map_err(CollectionDeltaError::InvalidCommit)?;
-    }
     Ok(())
-}
-
-fn record_collection(record: CollectionRecord) -> CollectionHandle {
-    match record {
-        CollectionRecord::Commit(record) => record.collection(),
-        CollectionRecord::Merge(record) => record.collection(),
-        CollectionRecord::Derive(record) => record.collection(),
-    }
 }
 
 fn canonical_records(
@@ -232,7 +216,7 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
     use triblespace_core::collection::{
-        COLLECTION_RECORD_KIND_MERGE_V1, CollectionCommit, CollectionData, CollectionDerive,
+        COLLECTION_RECORD_KIND_MERGE_V2, CollectionCommit, CollectionData, CollectionDerive,
         CollectionMerge, empty_metadata_handle,
     };
     use triblespace_core::inline::Inline;
@@ -255,8 +239,19 @@ mod tests {
                 data(1),
                 empty_metadata_handle(),
             )),
-            CollectionRecord::Merge(CollectionMerge::new(expected, data(2), data(3), data(4))),
-            CollectionRecord::Derive(CollectionDerive::new(expected, data(4), data(5))),
+            CollectionRecord::Merge(CollectionMerge::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                expected,
+                data(2),
+                data(3),
+                data(4),
+            )),
+            CollectionRecord::Derive(CollectionDerive::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                expected,
+                data(4),
+                data(5),
+            )),
         ]
     }
 
@@ -270,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn framing_collection_and_commit_signature_fail_before_admission() {
+    fn framing_collection_and_signatures_fail_before_admission() {
         let expected = collection(1);
         let commit = records(expected)[0];
         let bytes = encode_record(expected, commit).unwrap();
@@ -279,12 +274,16 @@ mod tests {
             decode_record(collection(2), &bytes),
             Err(CollectionDeltaError::WrongCollection)
         );
-        let mut tampered = bytes.clone();
-        *tampered.last_mut().unwrap() ^= 1;
-        assert!(matches!(
-            decode_record(expected, &tampered),
-            Err(CollectionDeltaError::InvalidCommit(_))
-        ));
+        for record in records(expected) {
+            let mut tampered = encode_record(expected, record).unwrap();
+            *tampered.last_mut().unwrap() ^= 1;
+            assert!(matches!(
+                decode_record(expected, &tampered),
+                Err(CollectionDeltaError::Decode(
+                    RecordDecodeError::Verification(_)
+                ))
+            ));
+        }
         let mut trailing = bytes.clone();
         trailing.push(0);
         assert!(matches!(
@@ -296,14 +295,54 @@ mod tests {
     }
 
     #[test]
+    fn trusted_local_index_and_outbound_encoding_do_not_reverify() {
+        use triblespace_core::collection::CollectionStore;
+        use triblespace_core::repo::pile::{Pile, PileRecordContent, PileRecords};
+
+        let expected = collection(1);
+        let record = records(expected)[1];
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut pile = Pile::open(file.path()).unwrap();
+        pile.insert(record).unwrap();
+        pile.close().unwrap();
+        let physical = PileRecords::open(file.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let mut bytes = std::fs::read(file.path()).unwrap();
+        bytes[physical.offset + 64 + record.to_bytes().len() - 2] ^= 1;
+        std::fs::write(file.path(), bytes).unwrap();
+        let physical = PileRecords::open(file.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let PileRecordContent::Collection { record: evidence } = physical.content else {
+            panic!("native fixture is not a collection record");
+        };
+        assert!(evidence.verify_strict().is_err());
+        let patch = canonical_records(expected, [evidence]).unwrap();
+        assert_eq!(patch.get(evidence.fingerprint()), Some(evidence));
+        let outbound = encode_record(expected, evidence).unwrap();
+        assert!(decode_record(expected, &outbound).is_err());
+    }
+
+    #[test]
     fn noncanonical_merge_inputs_fail_before_admission() {
         let expected = collection(1);
-        let merge = CollectionMerge::new(expected, data(2), data(3), data(4));
+        let merge = CollectionMerge::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+            expected,
+            data(2),
+            data(3),
+            data(4),
+        );
         let mut bytes = merge.to_bytes();
         bytes[32..64].fill(9);
         bytes[64..96].fill(1);
         let mut tagged = Vec::with_capacity(1 + bytes.len());
-        tagged.push(COLLECTION_RECORD_KIND_MERGE_V1);
+        tagged.push(COLLECTION_RECORD_KIND_MERGE_V2);
         tagged.extend_from_slice(&bytes);
         assert!(matches!(
             decode_record(expected, &tagged),

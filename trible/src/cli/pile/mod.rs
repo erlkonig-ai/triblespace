@@ -13,6 +13,7 @@ mod migrate;
 pub mod net;
 mod path_text;
 mod signing;
+mod verify;
 
 #[derive(Parser)]
 pub enum PileCommand {
@@ -72,6 +73,18 @@ pub enum PileCommand {
     Diagnose {
         #[command(subcommand)]
         cmd: diagnose::Command,
+    },
+    /// Recheck native record signatures and AUTH proof attenuation, read-only.
+    ///
+    /// Audits every physical COMMIT, MERGE, DERIVE and current AUTH proof in
+    /// the observed file prefix, including duplicate occurrences. Referenced
+    /// blobs need not be resident. This does not check blob hashes, legacy
+    /// branch chains, clock validity, WRITE admission or collection policy;
+    /// use `pile diagnose check` for the separate blob/legacy-chain audit.
+    /// Unsigned legacy equations and opaque records are reported as unchecked.
+    Verify {
+        /// Path to the pile file to inspect.
+        pile: PathBuf,
     },
     /// DESTRUCTIVE: truncate a pile at its first malformed or torn record,
     /// deleting everything after it.
@@ -174,6 +187,7 @@ pub fn run(cmd: PileCommand) -> Result<()> {
         PileCommand::Compact { source, into } => compact::run(source, into),
         PileCommand::Net { cmd } => net::run(cmd),
         PileCommand::Diagnose { cmd } => diagnose::run(cmd),
+        PileCommand::Verify { pile } => verify::run(&pile),
         PileCommand::Amputate { path, truncate_to } => {
             let mut pile = Pile::open(&path)?;
             // Boundary comparison and truncation happen under the same

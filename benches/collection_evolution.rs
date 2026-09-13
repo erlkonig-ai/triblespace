@@ -243,6 +243,7 @@ struct TimedOperation {
 
 struct RunContext<'a> {
     cover: &'a Support,
+    signing_key: &'a SigningKey,
     total_rows: u64,
     newly_supported_rows: u64,
     expected: RelationIdentity,
@@ -253,10 +254,11 @@ fn maintain_succinct_exact(
     store: &mut MemoryRepo,
     support: &Support,
     collections: &Collections,
+    signing_key: &SigningKey,
 ) -> CollectionSnapshot<MemoryRepoSnapshot, Rank9AcceleratedSuccinctArchiveBlob> {
-    block_on(store.maintain_exact(collections.raw, support))
+    block_on(store.maintain_exact(collections.raw, signing_key, support))
         .expect("maintain exact raw Succinct collection");
-    let snapshot = block_on(store.maintain_exact(collections.accelerated, support))
+    let snapshot = block_on(store.maintain_exact(collections.accelerated, signing_key, support))
         .expect("maintain exact accelerated Succinct collection");
     snapshot
         .collection_exact(collections.accelerated, support)
@@ -267,9 +269,10 @@ fn time_ensure(
     store: &mut MemoryRepo,
     cover: &Support,
     collections: &Collections,
+    signing_key: &SigningKey,
 ) -> TimedOperation {
     let start = Instant::now();
-    let attached = maintain_succinct_exact(store, cover, collections);
+    let attached = maintain_succinct_exact(store, cover, collections, signing_key);
     let elapsed = start.elapsed();
     let union: UnionArchive<OrderedUniverse> =
         attached.view().expect("materialize exact Succinct view");
@@ -332,14 +335,24 @@ fn run_ensure_warm_pair(
     context: &RunContext<'_>,
     before: StoreShape,
 ) -> ([Sample; 2], StoreShape) {
-    let timed_warm = time_ensure(store, context.cover, context.collections);
+    let timed_warm = time_ensure(
+        store,
+        context.cover,
+        context.collections,
+        context.signing_key,
+    );
     let snapshot_after_warm = store
         .snapshot()
         .expect("freeze snapshot between warm and no-op calls");
 
     // Keep these public calls adjacent. In particular, do not materialize the
     // first result or inspect its raw cover before timing the unchanged call.
-    let timed_noop = time_ensure(store, context.cover, context.collections);
+    let timed_noop = time_ensure(
+        store,
+        context.cover,
+        context.collections,
+        context.signing_key,
+    );
     let snapshot_after_noop = store.snapshot().expect("freeze snapshot after no-op call");
     assert!(
         snapshot_after_noop
@@ -374,7 +387,12 @@ fn run_ensure_warm_pair(
 }
 
 fn run_ensure_cold(store: &mut MemoryRepo, context: &RunContext<'_>, before: StoreShape) -> Sample {
-    let timed = time_ensure(store, context.cover, context.collections);
+    let timed = time_ensure(
+        store,
+        context.cover,
+        context.collections,
+        context.signing_key,
+    );
     let after = store_shape(store, context.collections);
     let raw_cover = observe_raw_cover(store, context.cover, context.collections.raw);
     let cold = finish_sample(
@@ -414,11 +432,12 @@ fn time_snapshot(
     store: &mut MemoryRepo,
     cover: &Support,
     collections: &Collections,
+    signing_key: &SigningKey,
 ) -> (TimedOperation, SnapshotSupport) {
     let start = Instant::now();
     let (candidate, changed_members, reused_members) = match state.as_ref() {
         None => (
-            maintain_succinct_exact(store, cover, collections),
+            maintain_succinct_exact(store, cover, collections, signing_key),
             cover.len(),
             0,
         ),
@@ -439,8 +458,8 @@ fn time_snapshot(
         }
         Some(previous) => match cover.additions_since(previous.support()) {
             Ok(additions) => {
-                maintain_succinct_exact(store, &additions, collections);
-                let next = maintain_succinct_exact(store, cover, collections);
+                maintain_succinct_exact(store, &additions, collections, signing_key);
+                let next = maintain_succinct_exact(store, cover, collections, signing_key);
                 let changed = next
                     .snapshot()
                     .collection_exact(collections.accelerated, &additions)
@@ -453,7 +472,7 @@ fn time_snapshot(
                 (next, changed_members, previous.support().len())
             }
             Err(CoverAdvanceError::ResetRequired { .. }) => (
-                maintain_succinct_exact(store, cover, collections),
+                maintain_succinct_exact(store, cover, collections, signing_key),
                 cover.len(),
                 0,
             ),
@@ -484,8 +503,13 @@ fn run_snapshot_pair(
     context: &RunContext<'_>,
     before: StoreShape,
 ) -> ([Sample; 2], StoreShape) {
-    let (timed_advance, advance_work) =
-        time_snapshot(state, store, context.cover, context.collections);
+    let (timed_advance, advance_work) = time_snapshot(
+        state,
+        store,
+        context.cover,
+        context.collections,
+        context.signing_key,
+    );
     assert_eq!(advance_work.cover_members, context.cover.len());
     assert_eq!(
         advance_work.changed_members + advance_work.reused_members,
@@ -496,7 +520,13 @@ fn run_snapshot_pair(
         .snapshot()
         .expect("freeze store between snapshot advance and no-op");
 
-    let (timed_noop, noop_work) = time_snapshot(state, store, context.cover, context.collections);
+    let (timed_noop, noop_work) = time_snapshot(
+        state,
+        store,
+        context.cover,
+        context.collections,
+        context.signing_key,
+    );
     assert_eq!(
         noop_work,
         SnapshotSupport {
@@ -683,6 +713,7 @@ fn run_iteration(
         let expected_identity = relation_identity_set(&expected);
         let context = RunContext {
             cover: &cover,
+            signing_key: &signing_key,
             total_rows,
             newly_supported_rows,
             expected: expected_identity,

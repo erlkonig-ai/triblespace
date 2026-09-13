@@ -52,6 +52,7 @@ use crate::capability::{
     CAPABILITY_PROOF_MAGIC, MAX_CAPABILITY_PROOF_STEPS,
 };
 use crate::collection::store::{selectors_match_record, CollectionRead};
+pub use crate::collection::LegacyUnsignedCollectionEquation;
 use crate::collection::{
     CollectionCommit, CollectionDerive, CollectionHandle, CollectionMerge, CollectionRecord,
     CollectionRecordFingerprint, CollectionRecordSelector, CollectionStore,
@@ -1130,10 +1131,10 @@ impl CollectionCommitRecordHeader {
     }
 }
 
-/// Unsigned merge equation: `64..192` collection, low, high, result.
+/// Retired unsigned merge equation, preserved as exact inert evidence.
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
 #[repr(C)]
-struct CollectionMergeRecordHeader {
+struct LegacyCollectionMergeRecordHeader {
     magic: [u8; FRAME_MAGIC_LEN],
     span_blocks: [u8; 4],
     record_kind: RawInline,
@@ -1144,26 +1145,47 @@ struct CollectionMergeRecordHeader {
     reserved: [u8; 64],
 }
 
+/// Signed merge equation; the author and signature require a second block.
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
+struct CollectionMergeRecordHeader {
+    magic: [u8; FRAME_MAGIC_LEN],
+    span_blocks: [u8; 4],
+    record_kind: RawInline,
+    collection: RawInline,
+    low: RawInline,
+    high: RawInline,
+    result: RawInline,
+    public_key: RawInline,
+    signature_r: RawInline,
+    signature_s: RawInline,
+    reserved: [u8; 224],
+}
+
 impl CollectionMergeRecordHeader {
     fn new(record: &CollectionMerge) -> Self {
         let (low, high) = record.inputs();
+        let (signature_r, signature_s) = record.signature();
         Self {
             magic: FRAME_MAGIC,
-            span_blocks: ENVELOPE_HEADER_BLOCKS.to_le_bytes(),
+            span_blocks: 2u32.to_le_bytes(),
             record_kind: record_kind::KIND_COLLECTION_MERGE,
             collection: record.collection().raw,
             low: low.raw,
             high: high.raw,
             result: record.result().raw,
-            reserved: [0u8; 64],
+            public_key: record.public_key().raw,
+            signature_r: signature_r.raw,
+            signature_s: signature_s.raw,
+            reserved: [0u8; 224],
         }
     }
 }
 
-/// Unsigned derive equation: `64..160` target, input, output.
+/// Retired unsigned derive equation, preserved as exact inert evidence.
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
 #[repr(C)]
-struct CollectionDeriveRecordHeader {
+struct LegacyCollectionDeriveRecordHeader {
     magic: [u8; FRAME_MAGIC_LEN],
     span_blocks: [u8; 4],
     record_kind: RawInline,
@@ -1173,9 +1195,25 @@ struct CollectionDeriveRecordHeader {
     reserved: [u8; 96],
 }
 
+/// Signed derive equation, exactly filling one block.
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
+struct CollectionDeriveRecordHeader {
+    magic: [u8; FRAME_MAGIC_LEN],
+    span_blocks: [u8; 4],
+    record_kind: RawInline,
+    target: RawInline,
+    input: RawInline,
+    output: RawInline,
+    public_key: RawInline,
+    signature_r: RawInline,
+    signature_s: RawInline,
+}
+
 impl CollectionDeriveRecordHeader {
     fn new(record: &CollectionDerive) -> Self {
         let (input, output) = (record.input(), record.output());
+        let (signature_r, signature_s) = record.signature();
         Self {
             magic: FRAME_MAGIC,
             span_blocks: ENVELOPE_HEADER_BLOCKS.to_le_bytes(),
@@ -1183,7 +1221,9 @@ impl CollectionDeriveRecordHeader {
             target: record.collection().raw,
             input: input.raw,
             output: output.raw,
-            reserved: [0u8; 96],
+            public_key: record.public_key().raw,
+            signature_r: signature_r.raw,
+            signature_s: signature_s.raw,
         }
     }
 }
@@ -1246,24 +1286,21 @@ fn prefixed_payload_post_pad(prefix_len: usize, data_len: usize) -> Option<usize
     prefix_len.checked_add(data_len).map(block_post_pad)
 }
 
-fn collection_record_header(record: &CollectionRecord) -> [u8; ENVELOPE_HEADER_LEN] {
-    let mut bytes = [0u8; ENVELOPE_HEADER_LEN];
+fn collection_record_header(record: &CollectionRecord) -> Vec<u8> {
     match record {
-        CollectionRecord::Commit(record) => {
-            bytes.copy_from_slice(CollectionCommitRecordHeader::new(record).as_bytes())
-        }
+        CollectionRecord::Commit(record) => CollectionCommitRecordHeader::new(record)
+            .as_bytes()
+            .to_vec(),
         CollectionRecord::Merge(record) => {
-            bytes.copy_from_slice(CollectionMergeRecordHeader::new(record).as_bytes())
+            CollectionMergeRecordHeader::new(record).as_bytes().to_vec()
         }
-        CollectionRecord::Derive(record) => {
-            bytes.copy_from_slice(CollectionDeriveRecordHeader::new(record).as_bytes())
-        }
+        CollectionRecord::Derive(record) => CollectionDeriveRecordHeader::new(record)
+            .as_bytes()
+            .to_vec(),
     }
-    bytes
 }
 
-// Compile-time guarantee that every legacy and current fixed header is exactly
-// 256 bytes.
+// Compile-time guarantee of the fixed record spans (signed MERGE uses two blocks).
 const _: () = {
     assert!(std::mem::size_of::<BlobHeaderV3>() == V3_HEADER_LEN);
     assert!(std::mem::size_of::<BranchHeaderV3>() == V3_HEADER_LEN);
@@ -1298,7 +1335,9 @@ const _: () = {
     assert!(std::mem::size_of::<RetiredPeerEvidenceRecordHeader>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<RetiredStoreScopeRecordHeader>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<CollectionCommitRecordHeader>() == ENVELOPE_HEADER_LEN);
-    assert!(std::mem::size_of::<CollectionMergeRecordHeader>() == ENVELOPE_HEADER_LEN);
+    assert!(std::mem::size_of::<LegacyCollectionMergeRecordHeader>() == ENVELOPE_HEADER_LEN);
+    assert!(std::mem::size_of::<LegacyCollectionDeriveRecordHeader>() == ENVELOPE_HEADER_LEN);
+    assert!(std::mem::size_of::<CollectionMergeRecordHeader>() == 2 * ENVELOPE_BLOCK_LEN);
     assert!(std::mem::size_of::<CollectionDeriveRecordHeader>() == ENVELOPE_HEADER_LEN);
 };
 
@@ -1432,6 +1471,11 @@ pub enum PileRecordContent {
     Collection {
         /// Canonically reconstructed semantic record.
         record: CollectionRecord,
+    },
+    /// A known unsigned equation, inert to current reads and repair. Its exact
+    /// physical bytes and resident dependencies survive conservative rewrites.
+    LegacyUnsignedCollectionEquation {
+        equation: LegacyUnsignedCollectionEquation,
     },
     /// One canonical complete self-contained prefix-signed capability proof.
     /// Its content id is an exact-body index, not an authority token.
@@ -1764,7 +1808,9 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
             })
         }
         record_kind::KIND_COLLECTION_MERGE => {
-            fixed_header()?;
+            if declared_blocks != 2 {
+                return Err(corrupt());
+            }
             let (header, _) =
                 CollectionMergeRecordHeader::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
             if nonzero(&[&header.reserved[..]]) || header.high < header.low {
@@ -1774,11 +1820,14 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
                 offset,
                 len,
                 content: PileRecordContent::Collection {
-                    record: CollectionRecord::Merge(CollectionMerge::new(
+                    record: CollectionRecord::Merge(CollectionMerge::from_parts(
                         Inline::new(header.collection),
                         Inline::new(header.low),
                         Inline::new(header.high),
                         Inline::new(header.result),
+                        Inline::new(header.public_key),
+                        Inline::new(header.signature_r),
+                        Inline::new(header.signature_s),
                     )),
                 },
             })
@@ -1787,18 +1836,57 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
             fixed_header()?;
             let (header, _) =
                 CollectionDeriveRecordHeader::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+            Ok(PileRecord {
+                offset,
+                len,
+                content: PileRecordContent::Collection {
+                    record: CollectionRecord::Derive(CollectionDerive::from_parts(
+                        Inline::new(header.target),
+                        Inline::new(header.input),
+                        Inline::new(header.output),
+                        Inline::new(header.public_key),
+                        Inline::new(header.signature_r),
+                        Inline::new(header.signature_s),
+                    )),
+                },
+            })
+        }
+        record_kind::KIND_COLLECTION_MERGE_UNSIGNED => {
+            fixed_header()?;
+            let (header, _) = LegacyCollectionMergeRecordHeader::try_read_from_prefix(bytes)
+                .map_err(|_| corrupt())?;
+            if nonzero(&[&header.reserved[..]]) || header.high < header.low {
+                return Err(corrupt());
+            }
+            Ok(PileRecord {
+                offset,
+                len,
+                content: PileRecordContent::LegacyUnsignedCollectionEquation {
+                    equation: LegacyUnsignedCollectionEquation::Merge {
+                        collection: Inline::new(header.collection),
+                        low: Inline::new(header.low),
+                        high: Inline::new(header.high),
+                        result: Inline::new(header.result),
+                    },
+                },
+            })
+        }
+        record_kind::KIND_COLLECTION_DERIVE_UNSIGNED => {
+            fixed_header()?;
+            let (header, _) = LegacyCollectionDeriveRecordHeader::try_read_from_prefix(bytes)
+                .map_err(|_| corrupt())?;
             if nonzero(&[&header.reserved[..]]) {
                 return Err(corrupt());
             }
             Ok(PileRecord {
                 offset,
                 len,
-                content: PileRecordContent::Collection {
-                    record: CollectionRecord::Derive(CollectionDerive::new(
-                        Inline::new(header.target),
-                        Inline::new(header.input),
-                        Inline::new(header.output),
-                    )),
+                content: PileRecordContent::LegacyUnsignedCollectionEquation {
+                    equation: LegacyUnsignedCollectionEquation::Derive {
+                        collection: Inline::new(header.target),
+                        input: Inline::new(header.input),
+                        output: Inline::new(header.output),
+                    },
                 },
             })
         }
@@ -2007,13 +2095,13 @@ fn decode_enveloped_record_v1(bytes: &[u8], offset: usize) -> Result<PileRecord,
             Ok(PileRecord {
                 offset,
                 len,
-                content: PileRecordContent::Collection {
-                    record: CollectionRecord::Merge(CollectionMerge::new(
-                        Inline::new(header.collection),
-                        Inline::new(header.low),
-                        Inline::new(header.high),
-                        Inline::new(header.result),
-                    )),
+                content: PileRecordContent::LegacyUnsignedCollectionEquation {
+                    equation: LegacyUnsignedCollectionEquation::Merge {
+                        collection: Inline::new(header.collection),
+                        low: Inline::new(header.low),
+                        high: Inline::new(header.high),
+                        result: Inline::new(header.result),
+                    },
                 },
             })
         }
@@ -2040,12 +2128,12 @@ fn decode_enveloped_record_v1(bytes: &[u8], offset: usize) -> Result<PileRecord,
             Ok(PileRecord {
                 offset,
                 len,
-                content: PileRecordContent::Collection {
-                    record: CollectionRecord::Derive(CollectionDerive::new(
-                        Inline::new(header.target),
-                        Inline::new(header.input),
-                        Inline::new(header.output),
-                    )),
+                content: PileRecordContent::LegacyUnsignedCollectionEquation {
+                    equation: LegacyUnsignedCollectionEquation::Derive {
+                        collection: Inline::new(header.target),
+                        input: Inline::new(header.input),
+                        output: Inline::new(header.output),
+                    },
                 },
             })
         }
@@ -2333,13 +2421,13 @@ fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
             Ok(PileRecord {
                 offset,
                 len: V3_HEADER_LEN,
-                content: PileRecordContent::Collection {
-                    record: CollectionRecord::Merge(CollectionMerge::new(
-                        Inline::new(header.collection),
-                        Inline::new(header.low),
-                        Inline::new(header.high),
-                        Inline::new(header.result),
-                    )),
+                content: PileRecordContent::LegacyUnsignedCollectionEquation {
+                    equation: LegacyUnsignedCollectionEquation::Merge {
+                        collection: Inline::new(header.collection),
+                        low: Inline::new(header.low),
+                        high: Inline::new(header.high),
+                        result: Inline::new(header.result),
+                    },
                 },
             })
         }
@@ -2550,7 +2638,7 @@ enum Applied {
     RetiredCapabilityProof,
     RetiredTeamState,
     RetiredArtifactOffer,
-    LegacyCollectionV3,
+    LegacyCollectionEvidence,
     RetiredCollectionDeriveV4,
     Opaque,
 }
@@ -2586,7 +2674,7 @@ pub struct Pile {
     /// Complete canonical proofs keyed by the BLAKE3 identity of exact bytes.
     /// Each value owns its validated mmap-backed view, shared by snapshots and readers.
     capability_proofs: CapabilityProofIndex,
-    /// Exact byte-distinct legacy V3 collection headers accepted during replay.
+    /// Exact byte-distinct legacy V3 and unsigned collection headers accepted during replay.
     /// They remain inert but are conservatively carried through retained
     /// rewrites so an explicit future migration still has its source evidence.
     legacy_collection_headers: LegacyCollectionHeaderIndex,
@@ -2633,6 +2721,7 @@ pub struct PileSnapshot {
     blobs: PileBlobIndex,
     collection_records: CollectionRecordIndex,
     collection_records_by_collection: CollectionRecordCollectionIndex,
+    legacy_collection_headers: LegacyCollectionHeaderIndex,
     capability_proofs: CapabilityProofIndex,
     wants: PATCH<WANT_REQUEST_BYTES_LEN, IdentitySchema>,
 }
@@ -2664,6 +2753,7 @@ impl PileSnapshot {
         blobs: PileBlobIndex,
         collection_records: CollectionRecordIndex,
         collection_records_by_collection: CollectionRecordCollectionIndex,
+        legacy_collection_headers: LegacyCollectionHeaderIndex,
         capability_proofs: CapabilityProofIndex,
         wants: PATCH<WANT_REQUEST_BYTES_LEN, IdentitySchema>,
     ) -> Self {
@@ -2675,6 +2765,7 @@ impl PileSnapshot {
             blobs,
             collection_records,
             collection_records_by_collection,
+            legacy_collection_headers,
             capability_proofs,
             wants,
         }
@@ -2695,6 +2786,46 @@ impl PileSnapshot {
     /// Number of unknown generic-envelope records in this exact observation.
     pub(crate) const fn opaque_record_count(&self) -> usize {
         self.opaque_records
+    }
+
+    /// Exact historical unsigned equations for an explicit endorsement migration.
+    /// They are absent from `CollectionRead` and never participate in repair.
+    pub fn legacy_unsigned_collection_equations(
+        &self,
+    ) -> impl Iterator<Item = LegacyUnsignedCollectionEquation> + '_ {
+        self.legacy_collection_headers
+            .iter_ordered()
+            .filter_map(|header| {
+                match decode_record(header, 0)
+                    .expect("indexed legacy headers were structurally validated")
+                    .content
+                {
+                    PileRecordContent::LegacyUnsignedCollectionEquation { equation } => {
+                        Some(equation)
+                    }
+                    _ => None,
+                }
+            })
+    }
+
+    /// Direct references and resident description roots of retained unsigned evidence.
+    pub(crate) fn legacy_unsigned_collection_references(
+        &self,
+    ) -> impl Iterator<Item = Inline<Handle<UnknownBlob>>> + '_ {
+        self.legacy_unsigned_collection_equations()
+            .flat_map(|equation| {
+                let kind = match equation {
+                    LegacyUnsignedCollectionEquation::Merge { .. } => {
+                        record_kind::KIND_COLLECTION_MERGE_UNSIGNED
+                    }
+                    LegacyUnsignedCollectionEquation::Derive { .. } => {
+                        record_kind::KIND_COLLECTION_DERIVE_UNSIGNED
+                    }
+                };
+                equation
+                    .blob_references()
+                    .chain(std::iter::once(Inline::new(kind)))
+            })
     }
 
     /// Returns unvalidated listing metadata for a resident blob.
@@ -2829,6 +2960,7 @@ impl super::SnapshotSource for Pile {
             self.blobs.clone(),
             self.collection_records.clone(),
             self.collection_records_by_collection.clone(),
+            self.legacy_collection_headers.clone(),
             self.capability_proofs.clone(),
             self.wants.clone(),
         ))
@@ -3299,12 +3431,16 @@ impl Pile {
         // record format ever written (V1, unenveloped V3/V4, and envelope).
         let record = decode_record(slice, start_offset)?;
         let next_applied_length = start_offset + record.len;
-        let legacy_collection_header =
-            matches!(record.content, PileRecordContent::LegacyCollectionV3 { .. }).then(|| {
-                let mut header = [0u8; V3_HEADER_LEN];
-                header.copy_from_slice(&slice[..V3_HEADER_LEN]);
-                header
-            });
+        let legacy_collection_header = matches!(
+            record.content,
+            PileRecordContent::LegacyCollectionV3 { .. }
+                | PileRecordContent::LegacyUnsignedCollectionEquation { .. }
+        )
+        .then(|| {
+            let mut header = [0u8; V3_HEADER_LEN];
+            header.copy_from_slice(&slice[..V3_HEADER_LEN]);
+            header
+        });
         let applied = match record.content {
             PileRecordContent::Blob { hash, .. } => {
                 let candidate = IndexEntry::new(start_offset);
@@ -3385,11 +3521,12 @@ impl Pile {
                 Applied::RetiredTeamState
             }
             PileRecordContent::RetiredArtifactOfferV1 => Applied::RetiredArtifactOffer,
-            PileRecordContent::LegacyCollectionV3 { .. } => {
+            PileRecordContent::LegacyCollectionV3 { .. }
+            | PileRecordContent::LegacyUnsignedCollectionEquation { .. } => {
                 let header = legacy_collection_header
                     .expect("legacy collection record must retain its physical header");
                 self.legacy_collection_headers.insert(&Entry::new(&header));
-                Applied::LegacyCollectionV3
+                Applied::LegacyCollectionEvidence
             }
             PileRecordContent::RetiredCollectionDeriveV4 => Applied::RetiredCollectionDeriveV4,
             PileRecordContent::Opaque { .. } => {
@@ -3764,7 +3901,7 @@ impl Pile {
         Ok(self.opaque_records)
     }
 
-    /// Copy every byte-distinct inert legacy V3 collection header into
+    /// Copy every byte-distinct inert legacy collection header into
     /// `destination`.
     ///
     /// This is an internal physical-rewrite primitive. Legacy headers do not
@@ -3793,7 +3930,8 @@ impl Pile {
         debug_assert!(matches!(
             decode_record(&header, 0),
             Ok(PileRecord {
-                content: PileRecordContent::LegacyCollectionV3 { .. },
+                content: PileRecordContent::LegacyCollectionV3 { .. }
+                    | PileRecordContent::LegacyUnsignedCollectionEquation { .. },
                 ..
             })
         ));
@@ -3816,7 +3954,7 @@ impl Pile {
             }
 
             match self.apply_next()? {
-                Some(Applied::LegacyCollectionV3) => Ok(()),
+                Some(Applied::LegacyCollectionEvidence) => Ok(()),
                 Some(_) | None => Err(CollectionInsertError::UnexpectedReadback),
             }
         })();
@@ -3915,7 +4053,7 @@ impl CollectionStore for Pile {
 
             self.dirty = true;
             let written = self.file.write(&header)?;
-            if written != ENVELOPE_HEADER_LEN {
+            if written != header.len() {
                 return Err(CollectionInsertError::Io(std::io::Error::new(
                     std::io::ErrorKind::WriteZero,
                     "failed to write complete collection record",
@@ -4178,7 +4316,7 @@ impl Pile {
                     Some(Applied::RetiredCapabilityProof) => {}
                     Some(Applied::RetiredTeamState) => {}
                     Some(Applied::RetiredArtifactOffer) => {}
-                    Some(Applied::LegacyCollectionV3) => {}
+                    Some(Applied::LegacyCollectionEvidence) => {}
                     Some(Applied::RetiredCollectionDeriveV4) => {}
                     Some(Applied::Opaque) => {}
                     None => {
@@ -4526,12 +4664,14 @@ pub struct PileReframeStats {
     pub retired_want_records: usize,
     /// Collection-calculus records re-encoded.
     pub collection_records: usize,
+    /// Exact retired unsigned equation frames preserved for writer endorsement.
+    pub legacy_unsigned_equations: usize,
+    /// Earlier definition-ID collection frames preserved as raw evidence only.
+    pub legacy_v3_records: usize,
     /// Complete capability proofs re-encoded.
     pub capability_proofs: usize,
-    /// Records dropped because they no longer carry live state: inert legacy
-    /// V3 collection headers, retired capability proofs and team state,
-    /// retired local cells, and records of a kind this reader does not
-    /// interpret.
+    /// Disposable inert records, such as retired capability proofs and team
+    /// state. Opaque ownership fails closed before copying.
     pub dropped_inert: usize,
 }
 
@@ -4545,6 +4685,13 @@ pub enum PileReframeError {
     SourcePayload {
         /// Byte offset of the offending record.
         offset: usize,
+    },
+    /// An unknown record could carry semantics this rewrite cannot preserve.
+    OpaqueRecord {
+        /// Byte offset of the unknown record.
+        offset: usize,
+        /// Exact kind named by the source frame.
+        kind: OpaqueKind,
     },
     /// The destination rejected an appended record.
     Destination(InsertError),
@@ -4573,6 +4720,11 @@ impl std::fmt::Display for PileReframeError {
             Self::SourcePayload { offset } => {
                 write!(f, "record at byte {offset} has no readable payload")
             }
+            Self::OpaqueRecord { offset, kind } => write!(
+                f,
+                "unknown record kind {} at byte {offset}; refusing semantic reframe",
+                hex::encode_upper(kind.as_bytes())
+            ),
             Self::Destination(error) => write!(f, "failed to append to destination: {error}"),
             Self::Pin(error) => write!(f, "failed to replay a pin update: {error}"),
             Self::Want(error) => write!(f, "failed to replay a want: {error}"),
@@ -4600,7 +4752,9 @@ impl Error for PileReframeError {
             Self::Collection(error) => Some(error),
             Self::CapabilityProof(error) => Some(error),
             Self::Flush(error) => Some(error),
-            Self::SourcePayload { .. } | Self::DestinationNotEmpty { .. } => None,
+            Self::SourcePayload { .. }
+            | Self::OpaqueRecord { .. }
+            | Self::DestinationNotEmpty { .. } => None,
         }
     }
 }
@@ -4611,8 +4765,8 @@ impl Error for PileReframeError {
 /// This is the opt-in semantic rewrite for a pile written before the current
 /// frame. Historical records remain structurally readable after cutover so a
 /// stale pile concatenation cannot corrupt a current reader, but a reframed
-/// destination contains only current live state and no longer depends on those
-/// retired records for its meaning.
+/// destination preserves current live state and the exact unsigned equation
+/// evidence needed for a later authorized-writer endorsement.
 ///
 /// The re-encode is **semantic, in source order**, which is what makes it
 /// faithful rather than merely byte-preserving:
@@ -4629,21 +4783,22 @@ impl Error for PileReframeError {
 ///   Current monotone WANTs pass through idempotently and union with that
 ///   migrated projection.
 /// * Collection records are a grow-only set, so order does not
-///   matter and re-insertion is idempotent. A commit's signature covers a
+///   matter and re-insertion is idempotent. Every record's signature covers a
 ///   domain-separated transcript over its fields, not the bytes of its frame,
-///   so re-encoding cannot invalidate one — but verify rather than assume, and
-///   the tests and the CLI both do.
+///   so re-encoding preserves the signed bytes without re-verifying them.
+///   Explicit audit remains responsible for reporting invalid signatures.
+/// * Retired unsigned equations are inert but their exact source frames are
+///   preserved; reframe never manufactures an endorsement.
+///   Earlier definition-ID V3 frames are also preserved byte-for-byte without
+///   assigning them new collection semantics or GC reference interpretation.
 /// * Current self-contained capability proofs are another grow-only
 ///   content-addressed set. Their exact canonical bodies survive reframing;
 ///   proof ids are physical selectors and do not stand in for verification.
 ///   Retired claim-dependent proof records are inert and dropped.
-/// * Records that never carried live state are dropped and counted: inert
-///   legacy V3 collection headers, claim-dependent V1 capability proofs,
-///   retired PEER and STORE_SCOPE state, retired local cells, and kinds this
-///   reader does not interpret. Only retired derivation record generations are
-///   in this category: current native
-///   `MERGE` and `DERIVE` records enter through the `Collection` arm above and
-///   are preserved.
+/// * Disposable inert records are dropped and counted: claim-dependent V1
+///   capability proofs and retired PEER and STORE_SCOPE state. Opaque kinds,
+///   including retired local-cell ownership, fail closed in a full preflight
+///   before any destination write.
 ///
 /// `destination` must be empty; a partly-written destination would mix
 /// framings, which is exactly what this exists to eliminate.
@@ -4660,6 +4815,18 @@ pub fn reframe_into(
     }
 
     let mut records = PileRecords::open(source).map_err(PileReframeError::Source)?;
+    // Inspect the same immutable prefix we will copy. An unknown kind may own
+    // state or references, so discovering one after partial output is too late.
+    for record in records.by_ref() {
+        let record = record.map_err(PileReframeError::Source)?;
+        if let PileRecordContent::Opaque { kind } = record.content {
+            return Err(PileReframeError::OpaqueRecord {
+                offset: record.offset,
+                kind,
+            });
+        }
+    }
+    records.offset = 0;
     let mut stats = PileReframeStats::default();
     let mut retired_wants = PATCH::<WANT_REQUEST_BYTES_LEN, IdentitySchema, WantRequest>::new();
     let mut output_wants = PATCH::<WANT_REQUEST_BYTES_LEN, IdentitySchema>::new();
@@ -4719,6 +4886,20 @@ pub fn reframe_into(
                     .insert(record)
                     .map_err(PileReframeError::Collection)?;
                 stats.collection_records += 1;
+            }
+            PileRecordContent::LegacyUnsignedCollectionEquation { .. }
+            | PileRecordContent::LegacyCollectionV3 { .. } => {
+                let header = records.bytes()[record.offset..record.offset + V3_HEADER_LEN]
+                    .try_into()
+                    .expect("validated historical collection frames occupy one block");
+                destination
+                    .preserve_legacy_collection_header(header)
+                    .map_err(PileReframeError::Collection)?;
+                if matches!(record.content, PileRecordContent::LegacyCollectionV3 { .. }) {
+                    stats.legacy_v3_records += 1;
+                } else {
+                    stats.legacy_unsigned_equations += 1;
+                }
             }
             PileRecordContent::CapabilityProof {
                 data_offset,
@@ -4962,6 +5143,14 @@ impl Pile {
                 {
                     roots.retain_recursive(handle);
                 }
+            }
+        }
+        for handle in reader.legacy_unsigned_collection_references() {
+            if reader
+                .contains_blob(handle)
+                .expect("PileSnapshot residency lookup is infallible")
+            {
+                roots.retain_recursive(handle);
             }
         }
         for request in &preserved_wants {
@@ -5400,13 +5589,15 @@ mod tests {
                 collection_test_hash(6),
                 empty_metadata_handle(),
             )),
-            CollectionRecord::Merge(CollectionMerge::new(
+            CollectionRecord::Merge(CollectionMerge::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 source,
                 collection_test_hash(6),
                 collection_test_hash(7),
                 collection_test_hash(8),
             )),
-            CollectionRecord::Derive(CollectionDerive::new(
+            CollectionRecord::Derive(CollectionDerive::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 target,
                 collection_test_hash(8),
                 collection_test_hash(9),
@@ -5924,14 +6115,14 @@ mod tests {
         let expected = [
             // A commit's six 32-byte fields fill 64..256 exactly: the tightest
             // record the pile writes, and the one that fixes the body offset.
-            (record_kind::KIND_COLLECTION_COMMIT, None),
-            (record_kind::KIND_COLLECTION_MERGE, Some(192usize)),
-            (record_kind::KIND_COLLECTION_DERIVE, Some(160usize)),
+            (record_kind::KIND_COLLECTION_COMMIT, 1, None),
+            (record_kind::KIND_COLLECTION_MERGE, 2, Some(288usize)),
+            (record_kind::KIND_COLLECTION_DERIVE, 1, None),
         ];
 
-        for (record, (kind, reserved_start)) in records.into_iter().zip(expected) {
+        for (record, (kind, blocks, reserved_start)) in records.into_iter().zip(expected) {
             let header = collection_record_header(&record);
-            assert_eq!(header.len(), ENVELOPE_HEADER_LEN);
+            assert_eq!(header.len(), blocks as usize * ENVELOPE_BLOCK_LEN);
             assert_eq!(&header[..FRAME_MAGIC_LEN], FRAME_MAGIC.as_slice());
             assert_eq!(
                 u32::from_le_bytes(
@@ -5939,7 +6130,7 @@ mod tests {
                         .try_into()
                         .unwrap()
                 ),
-                ENVELOPE_HEADER_BLOCKS
+                blocks
             );
             assert_eq!(
                 &header[FRAME_BODY_OFFSET - 32..FRAME_BODY_OFFSET],
@@ -5947,7 +6138,7 @@ mod tests {
             );
 
             let decoded = decode_record(&header, 0).unwrap();
-            assert_eq!(decoded.len, ENVELOPE_HEADER_LEN);
+            assert_eq!(decoded.len, header.len());
             assert!(matches!(
                 decoded.content,
                 PileRecordContent::Collection { record: decoded } if decoded == record
@@ -5998,7 +6189,7 @@ mod tests {
             (record_kind::KIND_PIN_TOMBSTONE, 1),
             (record_kind::KIND_WANT, 1),
             (record_kind::KIND_COLLECTION_COMMIT, 1),
-            (record_kind::KIND_COLLECTION_MERGE, 1),
+            (record_kind::KIND_COLLECTION_MERGE, 2),
             (record_kind::KIND_COLLECTION_DERIVE, 1),
         ];
         let mut records = PileRecords::open(&path).unwrap();
@@ -6062,8 +6253,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let source_path = fresh_empty_pile_path(&dir, "mixed.pile");
 
-        // A retired V4 derivation and an unenveloped local cell: both inert,
-        // both must be dropped rather than carried into a clean file.
+        // A known retired V4 derivation carries no current state. Unknown
+        // opaque ownership is covered by the fail-closed test separately.
         let retired_derive = CollectionDeriveHeaderEnvelopeV1V4 {
             envelope_marker: MAGIC_MARKER_ENVELOPE,
             record_kind: MAGIC_MARKER_COLLECTION_DERIVE_V4,
@@ -6075,9 +6266,6 @@ mod tests {
             reserved: [0; 92],
         };
         append_test_bytes(&source_path, retired_derive.as_bytes());
-        let mut retired_cell = [0u8; V3_HEADER_LEN];
-        retired_cell[..16].copy_from_slice(&MAGIC_MARKER_LOCAL_CELL_V3);
-        append_test_bytes(&source_path, &retired_cell);
 
         let payloads: Vec<Vec<u8>> = vec![vec![7u8; 5], vec![8u8; ENVELOPE_BLOCK_LEN + 3]];
         let mut handles = Vec::new();
@@ -6169,7 +6357,7 @@ mod tests {
         assert_eq!(stats.wants, 3);
         assert_eq!(stats.retired_want_records, 5);
         assert_eq!(stats.collection_records, records.len());
-        assert_eq!(stats.dropped_inert, 2);
+        assert_eq!(stats.dropped_inert, 1);
         destination.close().unwrap();
 
         // Every record in the result carries the current frame.
@@ -6477,10 +6665,9 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v4_commit_and_merge_remain_readable_while_derive_is_retired() {
+    fn legacy_v4_commit_remains_current_and_unsigned_equations_are_inert() {
         for record in collection_test_records() {
             let mut header = [0u8; V3_HEADER_LEN];
-            let retired = matches!(record, CollectionRecord::Derive(_));
             match record {
                 CollectionRecord::Commit(commit) => {
                     let (signature_r, signature_s) = commit.signature();
@@ -6532,19 +6719,188 @@ mod tests {
             let original = header;
             let decoded = decode_record(&header, 0).unwrap();
             assert_eq!(decoded.len, V3_HEADER_LEN);
-            if retired {
-                assert!(matches!(
+            match record {
+                CollectionRecord::Derive(_) => assert!(matches!(
                     decoded.content,
                     PileRecordContent::RetiredCollectionDeriveV4
-                ));
-            } else {
-                assert!(matches!(
+                )),
+                CollectionRecord::Merge(merge) => {
+                    let (low, high) = merge.inputs();
+                    let expected = LegacyUnsignedCollectionEquation::Merge {
+                        collection: merge.collection(),
+                        low,
+                        high,
+                        result: merge.result(),
+                    };
+                    assert!(matches!(decoded.content,
+                        PileRecordContent::LegacyUnsignedCollectionEquation { equation }
+                            if equation == expected
+                    ));
+                }
+                CollectionRecord::Commit(_) => assert!(matches!(
                     decoded.content,
                     PileRecordContent::Collection { record: decoded } if decoded == record
-                ));
+                )),
             }
             assert_eq!(header, original);
         }
+    }
+
+    #[test]
+    fn signed_native_replay_and_reframe_preserve_bad_signature_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "signed-audit-source.pile");
+        for record in collection_test_records() {
+            let mut header = collection_record_header(&record);
+            // Alter S, not framing or MERGE padding. Raw replay is deliberately
+            // structural; checked dense ingress is a different boundary.
+            header[FRAME_BODY_OFFSET + record.to_bytes().len() - 2] ^= 1;
+            append_test_bytes(&source_path, &header);
+        }
+        let mut source = Pile::open(&source_path).unwrap();
+        let evidence = source
+            .snapshot()
+            .unwrap()
+            .records()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(evidence.len(), 3);
+        for record in &evidence {
+            assert!(record.verify_strict().is_err());
+            assert!(CollectionRecord::from_bytes(&record.to_bytes()).is_err());
+        }
+        let destination_path = fresh_empty_pile_path(&dir, "signed-audit-reframed.pile");
+        let mut destination = Pile::open(&destination_path).unwrap();
+        let stats = reframe_into(&source_path, &mut destination).unwrap();
+        assert_eq!(stats.collection_records, 3);
+        assert_eq!(
+            destination
+                .snapshot()
+                .unwrap()
+                .records()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            evidence
+        );
+        destination.close().unwrap();
+        source.close().unwrap();
+    }
+
+    #[test]
+    fn reframe_rejects_opaque_ownership_before_any_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "opaque-reframe-source.pile");
+        let destination_path = fresh_empty_pile_path(&dir, "opaque-reframe-destination.pile");
+        append_test_bytes(
+            &source_path,
+            &collection_record_header(&collection_test_records()[0]),
+        );
+        append_test_bytes(
+            &source_path,
+            &test_envelope_bytes(TEST_UNKNOWN_KIND_A, 1, ENVELOPE_BLOCK_LEN),
+        );
+        let mut destination = Pile::open(&destination_path).unwrap();
+        assert!(matches!(
+            reframe_into(&source_path, &mut destination),
+            Err(PileReframeError::OpaqueRecord {
+                offset: ENVELOPE_BLOCK_LEN,
+                ..
+            })
+        ));
+        assert_eq!(std::fs::metadata(&destination_path).unwrap().len(), 0);
+        destination.close().unwrap();
+    }
+
+    #[test]
+    fn unsigned_equations_survive_rewrite_with_resident_dependency_closure() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "unsigned-source.pile");
+        let mut source = Pile::open(&source_path).unwrap();
+        let child = source
+            .put::<UnknownBlob, _>(Bytes::from_source(b"legacy child".to_vec()))
+            .unwrap();
+        let input = source
+            .put::<UnknownBlob, _>(Bytes::from_source(child.raw.to_vec()))
+            .unwrap();
+        let output = source
+            .put::<UnknownBlob, _>(Bytes::from_source(b"legacy output".to_vec()))
+            .unwrap();
+        let collection = source
+            .put::<SimpleArchive, _>(TribleSet::new().to_blob())
+            .unwrap();
+        let orphan = source
+            .put::<UnknownBlob, _>(Bytes::from_source(b"unowned".to_vec()))
+            .unwrap();
+        source.close().unwrap();
+        let merge = LegacyCollectionMergeRecordHeader {
+            magic: FRAME_MAGIC,
+            span_blocks: ENVELOPE_HEADER_BLOCKS.to_le_bytes(),
+            record_kind: record_kind::KIND_COLLECTION_MERGE_UNSIGNED,
+            collection: collection.raw,
+            low: [0; 32],
+            high: input.raw,
+            result: output.raw,
+            reserved: [0; 64],
+        };
+        let derive = CollectionDeriveHeaderEnvelopeV1 {
+            envelope_marker: MAGIC_MARKER_ENVELOPE,
+            record_kind: MAGIC_MARKER_COLLECTION_DERIVE_V5,
+            span_blocks: ENVELOPE_HEADER_BLOCKS.to_le_bytes(),
+            target: collection.raw,
+            input: input.raw,
+            output: output.raw,
+            reserved: [0; 124],
+        };
+        append_test_bytes(&source_path, merge.as_bytes());
+        append_test_bytes(&source_path, derive.as_bytes());
+        let mut source = Pile::open(&source_path).unwrap();
+        let before = source.snapshot().unwrap();
+        assert_eq!(before.legacy_unsigned_collection_equations().count(), 2);
+        assert!(before.records().unwrap().next().is_none());
+        assert_eq!(before.opaque_record_count(), 0);
+        let original_headers = [
+            fixed_collection_header(merge.as_bytes()),
+            fixed_collection_header(derive.as_bytes()),
+        ];
+        for retained in [false, true] {
+            let path = fresh_empty_pile_path(
+                &dir,
+                if retained {
+                    "unsigned-retained.pile"
+                } else {
+                    "unsigned-reframed.pile"
+                },
+            );
+            let mut destination = Pile::open(&path).unwrap();
+            if retained {
+                source
+                    .rewrite_retained_into(
+                        &mut destination,
+                        &RetentionRoots::new(),
+                        WantRewritePolicy::Drop,
+                    )
+                    .unwrap();
+            } else {
+                let stats = reframe_into(&source_path, &mut destination).unwrap();
+                assert_eq!(stats.legacy_unsigned_equations, 2);
+                assert_eq!(stats.collection_records, 0);
+            }
+            let reader = destination.snapshot().unwrap();
+            assert!(reader.records().unwrap().next().is_none());
+            assert_eq!(reader.legacy_unsigned_collection_equations().count(), 2);
+            for handle in [child, input, output, collection.transmute()] {
+                assert!(reader.contains_blob(handle).unwrap());
+            }
+            assert_eq!(reader.contains_blob(orphan).unwrap(), !retained);
+            for header in original_headers {
+                assert!(reader.legacy_collection_headers.get(&header).is_some());
+            }
+            drop(reader);
+            destination.close().unwrap();
+        }
+        source.close().unwrap();
     }
 
     #[test]
@@ -7106,6 +7462,37 @@ mod tests {
     }
 
     #[test]
+    fn reframe_preserves_earlier_v3_collection_evidence_without_interpreting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "v3-reframe-source.pile");
+        let destination_path = fresh_empty_pile_path(&dir, "v3-reframe-destination.pile");
+        let expected = legacy_collection_test_headers();
+        for (_, header) in &expected {
+            append_test_bytes(&source_path, header);
+        }
+        let mut destination = Pile::open(&destination_path).unwrap();
+        let stats = reframe_into(&source_path, &mut destination).unwrap();
+        assert_eq!(stats.legacy_v3_records, expected.len());
+        assert_eq!(stats.legacy_unsigned_equations, 0);
+        assert_eq!(stats.collection_records, 0);
+        assert_eq!(stats.dropped_inert, 0);
+        assert!(destination
+            .snapshot()
+            .unwrap()
+            .records()
+            .unwrap()
+            .next()
+            .is_none());
+        assert_eq!(
+            legacy_collection_headers_at(&destination_path)
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            expected.into_iter().collect::<BTreeSet<_>>()
+        );
+        destination.close().unwrap();
+    }
+
+    #[test]
     fn yard_reclaim_preserves_inert_legacy_v3_collection_headers() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "legacy-yard.pile");
@@ -7196,19 +7583,22 @@ mod tests {
                 collection_test_hash(43),
                 empty_metadata_handle(),
             )),
-            CollectionRecord::Merge(CollectionMerge::new(
+            CollectionRecord::Merge(CollectionMerge::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 collection,
                 collection_test_hash(43),
                 collection_test_hash(44),
                 collection_test_hash(45),
             )),
-            CollectionRecord::Derive(CollectionDerive::new(
+            CollectionRecord::Derive(CollectionDerive::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 collection,
                 collection_test_hash(45),
                 collection_test_hash(46),
             )),
         ];
-        let unrelated = CollectionRecord::Derive(CollectionDerive::new(
+        let unrelated = CollectionRecord::Derive(CollectionDerive::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             unrelated_collection,
             collection_test_hash(45),
             collection_test_hash(47),
@@ -7335,12 +7725,14 @@ mod tests {
         let input = collection_test_hash(8);
         let records = collection_test_records();
         let first = records[2];
-        let conflicting = CollectionRecord::Derive(CollectionDerive::new(
+        let conflicting = CollectionRecord::Derive(CollectionDerive::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             target,
             input,
             collection_test_hash(10),
         ));
-        let unrelated = CollectionRecord::Derive(CollectionDerive::new(
+        let unrelated = CollectionRecord::Derive(CollectionDerive::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             collection_test_collection(3),
             input,
             collection_test_hash(11),
@@ -7749,13 +8141,15 @@ mod tests {
         commit.verify_strict().unwrap();
         let records = vec![
             CollectionRecord::Commit(commit),
-            CollectionRecord::Merge(CollectionMerge::new(
+            CollectionRecord::Merge(CollectionMerge::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 descriptor_handle,
                 Inline::new(equation_owned.raw),
                 collection_test_hash(15),
                 collection_test_hash(16),
             )),
-            CollectionRecord::Derive(CollectionDerive::new(
+            CollectionRecord::Derive(CollectionDerive::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 collection_test_collection(17),
                 collection_test_hash(16),
                 collection_test_hash(18),
@@ -8092,7 +8486,8 @@ mod tests {
         let collection = register_simplearchive_collection(&mut pile, "corrupt-compacted-cover");
         pile.put::<SimpleArchive, _>(a).unwrap();
         pile.put::<SimpleArchive, _>(b).unwrap();
-        pile.insert(CollectionRecord::Merge(CollectionMerge::new(
+        pile.insert(CollectionRecord::Merge(CollectionMerge::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             collection.handle(),
             Handle::<SimpleArchive>::to_hash(a_handle),
             Handle::<SimpleArchive>::to_hash(b_handle),
