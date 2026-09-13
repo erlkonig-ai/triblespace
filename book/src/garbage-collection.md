@@ -69,8 +69,10 @@ descriptor, data, and metadata.
 
 Known retired unsigned equations remain inert in semantic readers, but their
 direct references still retain resident blobs. Reframing preserves their exact
-bytes. Unknown opaque kinds cannot safely be reclaimed or semantically
-reframed because their ownership edges are unknown.
+bytes. Unknown opaque kinds cannot safely define a smaller live set because
+their ownership edges are unknown. A retained Pile rewrite instead preserves
+their bytes and every resident blob; semantic reframe and Yard reclamation
+still refuse them.
 
 ## Backend Boundaries
 
@@ -99,10 +101,18 @@ whose old identities cannot express the current algebra are inert evidence and
 own no current blobs.
 
 Opaque records form a harder boundary. Their span may be known while their
-ownership semantics are not. Pile retained rewrites and Yard collection,
-compaction, and reclaim therefore refuse before changing physical state when
-an opaque record is present. Tooling which understands that record kind, or an
-explicit migration which removes it, must run first.
+ownership semantics are not. `Pile::rewrite_retained_into` carries each
+byte-distinct opaque frame unchanged and widens retention to every blob in its
+observed resident snapshot, even when the caller selected fewer roots. This
+allows `trible pile compact` to remove redundant copies without interpreting
+or discarding unknown ownership. Repeating a copy does not append an opaque
+frame whose BLAKE3 digest is already present; this is set preservation, not
+preservation of physical offsets or duplicate occurrences.
+
+Yard collection, compaction, and reclaim still refuse before changing physical
+state when an opaque record is present. They cannot infer a safe eviction set
+from unknown ownership. Semantic `reframe` likewise retains its unknown-kind
+preflight refusal; it is a different operation from retained Pile copying.
 
 ## Conservative Reachability
 

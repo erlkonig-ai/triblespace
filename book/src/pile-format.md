@@ -399,10 +399,16 @@ suggests amputation; only a malformed or torn known record presents the
 explicit destructive-repair command.
 
 Semantic Pile and Yard reads may continue across opaque records, but destructive
-retention is different: `Pile::rewrite_retained_into`, Yard collection,
-compaction, and reclaim refuse before mutation when any opaque record is
-present. An older reader cannot know whether the unknown kind owns a known
-blob, so silently omitting it—or collecting its dependencies—would be unsafe.
+retention cannot guess their ownership. `Pile::rewrite_retained_into` carries
+each byte-distinct opaque frame unchanged and retains every resident blob in
+the observed prefix, regardless of the caller's narrower roots. Repeated
+copies use BLAKE3 digests to avoid appending the same frame again; physical
+offsets and duplicate occurrences are not preserved. `trible pile compact`
+uses this conservative path and reports the opaque frames it carries.
+
+Yard collection, compaction, and reclaim still refuse before mutation when any
+opaque record is present. Semantic `reframe` also refuses unknown kinds at its
+preflight. Neither can infer a smaller safe live set from unknown ownership.
 
 The retired V4 collection DERIVE kind is deliberately not opaque. Its former
 fields and semantics are known, and a derivation carried neither ownership nor
@@ -752,8 +758,8 @@ route from them: bootstrap endpoints, DHT referrals, liveness, and provider
 leases are process-local soft state, while collection policy is the sole
 admission and disclosure authority. Semantic reframe, retained rewrite, Yard
 reclaim, and `trible pile compact` deliberately drop both retired kinds.
-Genuinely unknown records remain opaque and still make destructive rewrites
-fail closed.
+Genuinely unknown records remain opaque. Retained Pile copying preserves them
+and all resident blobs; semantic reframe and Yard reclamation still fail closed.
 
 ## Retired: Collection Publication Grants
 
