@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add a bounded in-memory exact-fetch diagnostic using normal DHT discovery
+  and bearer transport, with an ephemeral key and no publication or WANTs.
+
 - Seed full scans with positively resident selected descriptor roots after
   ordinary roots, so the existing finite recent window also serves descriptors
   promptly at cold startup. Preserve root membership and idempotent progress.
