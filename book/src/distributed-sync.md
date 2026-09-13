@@ -538,6 +538,16 @@ regular quanta inspect at most 64 words. For a finite burst of A newcomers, the
 last first-service bound is O(A times the startup window), not constant time or
 round-robin service within that burst.
 
+When seeding a full scan, ordinary resident record roots are observed before
+explicitly selected collection descriptors. A descriptor already present in
+both that root set and the durable resident set therefore receives its finite
+recent startup window ahead of the bulk inventory. This is ordering only:
+selection alone never invents a closure root, repeated snapshots do not reset
+offsets or requeue descriptors, and regular turns still progress. Many selected
+descriptors, later arrivals, unavailable providers, and exhausted exact-demand
+budgets can still delay a descriptor child; no special blob authorization or
+publisher priority is implied.
+
 A producer can maintain an ordinary `ReferenceSummaryBlob` collection to make
 negative recursive probes cheap. Its mapping scans the complete source blob
 closure and projects referenced handles through the same opaque `KDF(H)` used

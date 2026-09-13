@@ -385,11 +385,8 @@ impl Reconciler {
         if self.mode != ReplicationMode::Full {
             return stats;
         }
-        for root in roots {
-            if self.durable_blob_answers.contains(&root) {
-                self.scan.observe(root, root);
-            }
-        }
+        self.scan
+            .observe_roots(&roots, &self.collections, &self.durable_blob_answers);
         snapshot = match peer.snapshot() {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -631,6 +628,33 @@ impl ScanCursor {
 }
 
 impl FullScan {
+    fn observe_roots(
+        &mut self,
+        roots: &BTreeSet<RawHash>,
+        selected: &BTreeSet<CollectionRecordSelector>,
+        resident: &HashSet<RawHash>,
+    ) {
+        // Seed ordinary roots first: the existing recent LIFO then gives the
+        // few selected descriptors their finite startup window. This changes
+        // only first-observation order, never closure membership or old offsets.
+        for &root in roots {
+            if !selected.contains(&CollectionRecordSelector::Collection(
+                CollectionHandle::new(root),
+            )) && resident.contains(&root)
+            {
+                self.observe(root, root);
+            }
+        }
+        for selector in selected {
+            if let CollectionRecordSelector::Collection(collection) = selector {
+                let root = collection.raw;
+                if roots.contains(&root) && resident.contains(&root) {
+                    self.observe(root, root);
+                }
+            }
+        }
+    }
+
     fn observe(&mut self, root: RawHash, source: RawHash) {
         let mut key = [0; 64];
         key[..32].copy_from_slice(&root);
@@ -1039,6 +1063,71 @@ mod tests {
             "newest-first is a finite window per arrival, not cohort round-robin",
         );
         assert!(scan.recent.is_empty());
+    }
+
+    #[test]
+    fn full_scan_startup_descriptors_reach_word_28_without_requeueing_or_widening_roots() {
+        let descriptor = [128; 32];
+        let missing_descriptor = [129; 32];
+        let unrelated_descriptor = [130; 32];
+        let selected = [descriptor, missing_descriptor, unrelated_descriptor]
+            .map(|root| CollectionRecordSelector::Collection(CollectionHandle::new(root)))
+            .into_iter()
+            .collect();
+        let mut roots = BTreeSet::from([descriptor, missing_descriptor, [255; 32]]);
+        for ordinal in 0_u32..4_096 {
+            let mut root = [0; 32];
+            root[..4].copy_from_slice(&ordinal.to_be_bytes());
+            roots.insert(root);
+        }
+        let mut resident: HashSet<_> = roots.iter().copied().collect();
+        resident.remove(&missing_descriptor);
+        resident.insert(unrelated_descriptor);
+        let mut scan = FullScan::default();
+        scan.observe_roots(&roots, &selected, &resident);
+        assert_eq!(scan.sources.len(), roots.len() as u64 - 1);
+        assert!(
+            scan.sources
+                .get(&scan_key(unrelated_descriptor, unrelated_descriptor))
+                .is_none()
+        );
+        let mut descriptor_words = Vec::new();
+        let mut regular_turns = 0;
+        for _ in 0..64 {
+            // Identical snapshots must not reset progress or push descriptors
+            // back above an owed regular turn.
+            scan.observe_roots(&roots, &selected, &resident);
+            let cursor = next_ready(&mut scan);
+            if cursor.handles().0 == descriptor {
+                descriptor_words.push(cursor.offset / 32);
+            } else {
+                regular_turns += 1;
+            }
+            scan.advance();
+            scan.yield_source();
+        }
+        assert_eq!(descriptor_words, (0..32).collect::<Vec<_>>());
+        assert!(
+            descriptor_words.contains(&27),
+            "the model name sits in word 28"
+        );
+        assert_eq!(regular_turns, 32);
+        // A completed descriptor is not promoted again by a steady snapshot.
+        let cursor = next_ready(&mut scan);
+        scan.advance();
+        scan.yield_source();
+        assert_ne!(cursor.handles().0, descriptor);
+        assert_eq!(next_ready(&mut scan).handles().0, descriptor);
+        scan.finish_source(Duration::from_secs(60), Duration::from_secs(60));
+        scan.observe_roots(&roots, &selected, &resident);
+        assert!(!scan.recent.contains(&scan_key(descriptor, descriptor)));
+        assert_eq!(
+            scan.sources
+                .get(&scan_key(descriptor, descriptor))
+                .unwrap()
+                .startup_left,
+            0
+        );
     }
 
     #[test]
