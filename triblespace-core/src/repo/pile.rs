@@ -2682,9 +2682,15 @@ pub struct Pile {
     /// safely interpret. This includes unknown generic-envelope kinds and
     /// retired local-cell encodings with former ownership semantics. Known
     /// retired V4 derives are not opaque because they carried no ownership or
-    /// authoritative state. Destructive physical rewrites refuse while this is
-    /// nonzero.
+    /// authoritative state. Yard reclamation refuses while this is nonzero; a
+    /// retained rewrite carries the frames exactly instead (`opaque_frames`).
     opaque_records: usize,
+    /// Byte ranges `(offset, len)` of every opaque frame in the applied prefix,
+    /// in file order. A retained rewrite copies them by their own length,
+    /// because it keeps every resident blob and so cannot orphan whatever an
+    /// unknown kind names; a later binary that knows the kind reads them from
+    /// the rewritten pile exactly as it would have from the source.
+    opaque_frames: Vec<(usize, usize)>,
     /// Current grow-only typed request set. Retired weak-pin and typed LWW-log
     /// records are deliberately absent: they are raw input to the explicit
     /// WANT cutover migration, not live state that stale pile concatenation can
@@ -3347,6 +3353,7 @@ impl Pile {
             capability_proofs: CapabilityProofIndex::new(),
             legacy_collection_headers: LegacyCollectionHeaderIndex::new(),
             opaque_records: 0,
+            opaque_frames: Vec::new(),
             wants: PATCH::<WANT_REQUEST_BYTES_LEN, IdentitySchema>::new(),
             applied_length: 0,
         })
@@ -3534,6 +3541,8 @@ impl Pile {
                     .opaque_records
                     .checked_add(1)
                     .expect("opaque pile-record count overflow");
+                self.opaque_frames
+                    .push((start_offset, next_applied_length - start_offset));
                 Applied::Opaque
             }
         };
@@ -3681,6 +3690,7 @@ impl Pile {
             std::ptr::drop_in_place(&mut this.collection_records_by_collection);
             std::ptr::drop_in_place(&mut this.capability_proofs);
             std::ptr::drop_in_place(&mut this.legacy_collection_headers);
+            std::ptr::drop_in_place(&mut this.opaque_frames);
             std::ptr::drop_in_place(&mut this.wants);
         }
 
@@ -3893,9 +3903,9 @@ impl Pile {
     }
 
     /// Return the number of unknown generic-envelope records in the coherent
-    /// applied prefix. Physical rewriting must refuse while this is nonzero,
-    /// because an older binary cannot compute an unknown kind's preservation
-    /// or retention semantics.
+    /// applied prefix. Reclamation must refuse while this is nonzero, because
+    /// an older binary cannot compute an unknown kind's retention semantics;
+    /// a retained rewrite, which drops no blob, carries the frames exactly.
     pub fn opaque_record_count(&mut self) -> Result<usize, ReadError> {
         self.refresh()?;
         Ok(self.opaque_records)
@@ -3955,6 +3965,59 @@ impl Pile {
 
             match self.apply_next()? {
                 Some(Applied::LegacyCollectionEvidence) => Ok(()),
+                Some(_) | None => Err(CollectionInsertError::UnexpectedReadback),
+            }
+        })();
+        let unlock = self.file.unlock();
+        result?;
+        unlock?;
+        Ok(())
+    }
+
+    /// Append one frame whose kind this binary does not model, exactly as it
+    /// was read, unless this pile already holds a byte-identical opaque frame.
+    ///
+    /// This is an internal physical-rewrite primitive. The frame is
+    /// self-delimiting, so a reader of this pile skips or decodes it exactly
+    /// as a reader of the source would; nothing about it is interpreted here.
+    fn preserve_opaque_frame(&mut self, frame: &[u8]) -> Result<(), CollectionInsertError> {
+        debug_assert!(matches!(
+            decode_record(frame, 0),
+            Ok(PileRecord {
+                content: PileRecordContent::Opaque { .. },
+                ..
+            })
+        ));
+
+        self.file.lock()?;
+        let result = (|| {
+            self.refresh_locked()?;
+
+            let already = self.opaque_frames.iter().any(|(offset, len)| {
+                *len == frame.len() && {
+                    let existing = unsafe {
+                        slice_from_raw_parts(self.mmap.as_ptr().add(*offset), *len)
+                            .as_ref()
+                            .expect("mapped opaque frame")
+                    };
+                    existing == frame
+                }
+            });
+            if already {
+                return Ok(());
+            }
+
+            self.dirty = true;
+            let written = self.file.write(frame)?;
+            if written != frame.len() {
+                return Err(CollectionInsertError::Io(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write complete opaque frame",
+                )));
+            }
+
+            match self.apply_next()? {
+                Some(Applied::Opaque) => Ok(()),
                 Some(_) | None => Err(CollectionInsertError::UnexpectedReadback),
             }
         })();
@@ -4949,6 +5012,8 @@ pub struct PileRewriteStats {
     pub wants: usize,
     /// Number of complete capability proofs preserved.
     pub capability_proofs: usize,
+    /// Number of frames of unknown kind carried exactly, by their own length.
+    pub opaque_frames: usize,
 }
 
 /// Failure while copying one policy-selected pile state into another pile.
@@ -4957,12 +5022,6 @@ pub struct PileRewriteStats {
 pub enum PileRewriteError {
     /// The source could not produce a coherent store snapshot.
     Source(ReadError),
-    /// The source contains opaque records, so a semantic rewrite could not
-    /// prove that it would preserve their bytes and retention laws.
-    OpaqueRecords {
-        /// Number of opaque records observed in the source snapshot.
-        count: usize,
-    },
     /// A selected blob was absent, invalid, or could not be stored.
     Transfer(super::TransferError<Infallible, GetBlobError<Infallible>, InsertError>),
     /// A strong-pin mapping could not be appended to the destination.
@@ -4988,11 +5047,7 @@ impl std::fmt::Display for PileRewriteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Source(error) => write!(f, "failed to snapshot source pile: {error}"),
-            Self::OpaqueRecords { count } => write!(
-                f,
-                "refusing to rewrite a pile containing {count} opaque record(s)"
-            ),
-            Self::Transfer(error) => write!(f, "failed to copy a retained blob: {error}"),
+                    Self::Transfer(error) => write!(f, "failed to copy a retained blob: {error}"),
             Self::StrongPin(error) => write!(f, "failed to recreate a strong pin: {error}"),
             Self::StrongPinConflict { id, current } => write!(
                 f,
@@ -5019,7 +5074,7 @@ impl Error for PileRewriteError {
             Self::Collection(error) => Some(error),
             Self::CapabilityProof(error) => Some(error),
             Self::Flush(error) => Some(error),
-            Self::StrongPinConflict { .. } | Self::OpaqueRecords { .. } => None,
+            Self::StrongPinConflict { .. } => None,
         }
     }
 }
@@ -5068,18 +5123,20 @@ impl Pile {
     ) -> Result<PileRewriteStats, PileRewriteError> {
         let reader = self.snapshot().map_err(PileRewriteError::Source)?;
         let strong_pins = self.branches.clone();
-        // Refresh once more after the source observation so a concurrently
-        // appended unknown kind cannot escape the earlier prefix and be
-        // projected away by the rewrite. Known retired team records are
-        // deliberately inert and do not participate in this guard.
-        let opaque_records = self
-            .physical_rewrite_guard()
+        // Frames whose kind this binary does not model are carried exactly,
+        // by their own length, from the observed prefix: this rewrite keeps
+        // every resident blob, so it cannot orphan whatever such a frame
+        // names, and a binary that knows the kind reads them unchanged. Yard
+        // reclamation, which does drop blobs, still refuses on them.
+        self.physical_rewrite_guard()
             .map_err(PileRewriteError::Source)?;
-        if opaque_records != 0 {
-            return Err(PileRewriteError::OpaqueRecords {
-                count: opaque_records,
-            });
-        }
+        let covered = reader.covered_len;
+        let opaque_frames: Vec<(usize, usize)> = self
+            .opaque_frames
+            .iter()
+            .copied()
+            .filter(|(offset, len)| offset + len <= covered)
+            .collect();
         let collection_records = reader.collection_records.clone();
         let capability_proofs = reader
             .proofs()
@@ -5208,6 +5265,17 @@ impl Pile {
                 .map_err(PileRewriteError::Collection)?;
         }
 
+        for (offset, len) in &opaque_frames {
+            let frame = unsafe {
+                slice_from_raw_parts(reader.mmap.as_ptr().add(*offset), *len)
+                    .as_ref()
+                    .expect("mapped opaque frame")
+            };
+            destination
+                .preserve_opaque_frame(frame)
+                .map_err(PileRewriteError::Collection)?;
+        }
+
         for key in collection_records.clone().into_iter_ordered() {
             let record = *collection_records
                 .get(&key)
@@ -5234,6 +5302,7 @@ impl Pile {
             strong_pins: strong_pins.len() as usize,
             wants: preserved_wants.len(),
             capability_proofs: capability_proof_count,
+            opaque_frames: opaque_frames.len(),
         })
     }
 }
@@ -7324,7 +7393,7 @@ mod tests {
     }
 
     #[test]
-    fn opaque_records_refuse_pile_and_yard_retention_before_mutation() {
+    fn opaque_frames_are_carried_by_rewrite_and_refused_by_yard() {
         let dir = tempfile::tempdir().unwrap();
         let source_path = fresh_empty_pile_path(&dir, "opaque-source.pile");
         let destination_path = fresh_empty_pile_path(&dir, "opaque-destination.pile");
@@ -7345,22 +7414,46 @@ mod tests {
         destination.flush().unwrap();
         let destination_before = std::fs::read(&destination_path).unwrap();
 
-        assert!(matches!(
-            source.rewrite_retained_into(
+        // The rewrite carries the unknown frame exactly, by its length, and
+        // says so; a second rewrite finds it already there and adds nothing.
+        let frame = test_envelope_bytes(TEST_UNKNOWN_KIND_A, 1, ENVELOPE_BLOCK_LEN);
+        let stats = source
+            .rewrite_retained_into(
                 &mut destination,
                 &RetentionRoots::new(),
                 WantRewritePolicy::Drop,
-            ),
-            Err(PileRewriteError::OpaqueRecords { count: 1 })
-        ));
+            )
+            .unwrap();
+        assert_eq!(stats.opaque_frames, 1);
+        let destination_after = std::fs::read(&destination_path).unwrap();
+        assert!(destination_after.starts_with(&destination_before));
+        assert_eq!(&destination_after[destination_before.len()..], &frame[..]);
+        assert_eq!(destination.opaque_records, 1);
         assert_eq!(
-            std::fs::read(&destination_path).unwrap(),
-            destination_before
+            destination.opaque_frames,
+            vec![(destination_before.len(), frame.len())]
         );
+        let stats = source
+            .rewrite_retained_into(
+                &mut destination,
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+            )
+            .unwrap();
+        assert_eq!(stats.opaque_frames, 1);
+        assert_eq!(std::fs::read(&destination_path).unwrap(), destination_after);
         let fetched: Blob<UnknownBlob> = source.snapshot().unwrap().get(retained).unwrap();
         assert_eq!(fetched.bytes.as_ref(), b"possibly owned");
         destination.close().unwrap();
         source.close().unwrap();
+        let mut reopened = Pile::open(&destination_path).unwrap();
+        reopened.refresh().unwrap();
+        assert_eq!(reopened.opaque_records, 1);
+        assert_eq!(
+            reopened.opaque_frames,
+            vec![(destination_before.len(), frame.len())]
+        );
+        reopened.close().unwrap();
 
         // The fence is Yard-wide: an opaque record in the young generation
         // may own a known blob physically resident only in an older one.
@@ -7872,6 +7965,7 @@ mod tests {
                 strong_pins: 1,
                 wants: 1,
                 capability_proofs: 0,
+                opaque_frames: 0,
             }
         );
 

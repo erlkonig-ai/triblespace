@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- `pile compact` no longer refuses a pile that holds frames of a kind this
+  binary does not know. They are carried exactly, by their own length, and the
+  report counts them and their bytes; migrating or dropping old records stays
+  an explicit, separate operation (JP, 2026-09-13).
+
 ### Fixed
 
 - Accept uppercase hexadecimal recipient keys in collection READ/WRITE grants,

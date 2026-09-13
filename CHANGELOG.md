@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `Pile::rewrite_retained_into` carries frames of unknown kind exactly, by
+  their own length, instead of refusing the whole rewrite: it keeps every
+  resident blob, so it cannot orphan whatever such a frame names, and a binary
+  that knows the kind reads it from the rewritten pile unchanged. The frames
+  are counted in `PileRewriteStats::opaque_frames`; retries dedupe them by
+  exact bytes. `PileRewriteError::OpaqueRecords` is gone. Yard reclamation,
+  which drops blobs, still fails closed on them (JP, 2026-09-13: copy them
+  whole, we have their length).
 - Sign native MERGE and DERIVE equations and admit their producers through the
   target collection's WRITE policy. Foreign dense record decoding verifies each
   signature once; trusted local replay and attachment do not repeat that work.

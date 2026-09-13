@@ -8,7 +8,10 @@
 //! retired records such as `RetiredCollectionDeriveV4`, historical PEER
 //! evidence, STORE_SCOPE assertions, and retired WANT logs. Repacked blob
 //! records receive fresh insertion timestamps. Distinct collection equations
-//! and commits are never inferred to be redundant.
+//! and commits are never inferred to be redundant. A frame whose kind this
+//! binary does not know is carried exactly, by its own length, and counted:
+//! nothing it could name is dropped here, and a binary that knows the kind
+//! reads it from the compacted pile unchanged (JP, 2026-09-13).
 //!
 //! Length checks reject ordinary concurrent appends observed during the work,
 //! but callers requiring an exact whole-file result must still quiesce writers:
@@ -33,6 +36,7 @@ struct RecordCensus {
     retired_want_records: usize,
     retired_team_records: usize,
     opaque: usize,
+    opaque_bytes: u64,
 }
 
 fn census(path: &Path) -> Result<RecordCensus> {
@@ -55,7 +59,10 @@ fn census(path: &Path) -> Result<RecordCensus> {
             PileRecordContent::RetiredPeerEvidenceV1
             | PileRecordContent::RetiredStoreScopeV1
             | PileRecordContent::RetiredArtifactOfferV1 => census.retired_team_records += 1,
-            PileRecordContent::Opaque { .. } => census.opaque += 1,
+            PileRecordContent::Opaque { .. } => {
+                census.opaque += 1;
+                census.opaque_bytes += u64::try_from(record.len).context("frame length exceeds u64")?;
+            }
             _ => {}
         }
     }
@@ -138,13 +145,6 @@ pub(super) fn run(source_path: PathBuf, destination_path: PathBuf) -> Result<()>
     }
 
     let source_census = census(&source_path)?;
-    if source_census.opaque != 0 {
-        bail!(
-            "refusing to compact {}: it contains {} opaque record(s); upgrade or migrate them first",
-            source_path.display(),
-            source_census.opaque,
-        );
-    }
 
     let mut source = super::open_refreshed(&source_path)?;
     let source_metadata = source.backing_file_metadata().context("stat source pile")?;
@@ -208,7 +208,7 @@ pub(super) fn run(source_path: PathBuf, destination_path: PathBuf) -> Result<()>
     drop(destination_file);
 
     println!(
-        "Compacted {} into {}:\n  bytes: {} -> {}\n  blob records: {} -> {}\n  collection records: {} -> {}\n  capability proofs: {} -> {}\n  current WANT records: {} -> {}\n  retired WANT log records: {} -> {} (dropped)\n  retired team records: {} -> {} (dropped)\n  active wants: {}\n  active legacy pins: {}",
+        "Compacted {} into {}:\n  bytes: {} -> {}\n  blob records: {} -> {}\n  collection records: {} -> {}\n  capability proofs: {} -> {}\n  current WANT records: {} -> {}\n  retired WANT log records: {} -> {} (dropped)\n  retired team records: {} -> {} (dropped)\n  frames of unknown kind: {} ({} bytes) -> {} ({} bytes) (carried exactly)\n  active wants: {}\n  active legacy pins: {}",
         source_path.display(),
         destination_path.display(),
         source_census.bytes,
@@ -225,6 +225,10 @@ pub(super) fn run(source_path: PathBuf, destination_path: PathBuf) -> Result<()>
         destination_census.retired_want_records,
         source_census.retired_team_records,
         destination_census.retired_team_records,
+        source_census.opaque,
+        source_census.opaque_bytes,
+        destination_census.opaque,
+        destination_census.opaque_bytes,
         stats.wants,
         stats.strong_pins,
     );
