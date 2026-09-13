@@ -6,6 +6,24 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## Unreleased
 
+### The semantic index (`semantic`, feature `semantic`)
+
+- Added `SemanticIndex`, a `CollectionMapping` from a `SimpleArchive` source
+  to `NvFp4CosineSet` whose rows are embedded straight from the source facts:
+  one attribute of image bytes through nomic-embed-vision-v1.5, any number of
+  text attributes through the document side of nomic-embed-text-v1.5, both
+  models pinned by the archive handles of their roots inside the pile's own
+  model collection. Rows are keyed `[attribute id | entity id]`, so a hit
+  names the entity and no per-entity vector is stored anywhere. The
+  descriptor names the compute class the index is canonical on; `map`
+  refuses to compute elsewhere, where the `DERIVE` results arrive by
+  replication. Minted the mapping id `B94732E5DA22EFE9A4961BE906F5C500` and
+  six argument attributes.
+- Added `NvFp4CosineIndex::reconstructed_top_k`: the best rows by the cosine
+  against each row's own two-stage reconstruction, without fetching a source
+  embedding; the whole search for an index whose rows are not blob handles.
+
+
 ### Canonical row-local NVFP4 cosine collection
 
 - Added an architecture-independent NVFP4 collection encoding whose sorted

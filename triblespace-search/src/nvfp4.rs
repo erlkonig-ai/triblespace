@@ -35,8 +35,8 @@ use std::num::NonZeroUsize;
 
 use anybytes::{Bytes, View};
 use mary::nn::nvfp4_cosine::{
-    CandidateCertificate, PreparedQuery, QuantizedRow, ScanSegment, ScanStage, UpperScanner,
-    FLOAT_BYTES, QUANT_BLOCK, QUANT_STAGES, ROTATION_BLOCK,
+    raw_dot_f64, CandidateCertificate, PreparedQuery, QuantizedRow, ScanSegment, ScanStage,
+    UpperScanner, FLOAT_BYTES, QUANT_BLOCK, QUANT_STAGES, ROTATION_BLOCK,
 };
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{Blob, BlobEncoding, TryFromBlob};
@@ -56,7 +56,7 @@ use triblespace_core::query::Variable;
 use triblespace_core::repo::{BlobStoreGet, BlobStoreMeta};
 use triblespace_core::trible::{Fragment, TribleSet, TRIBLE_LEN};
 
-const HANDLE_LEN: usize = 32;
+pub(crate) const HANDLE_LEN: usize = 32;
 const FLOAT_LEN: usize = FLOAT_BYTES;
 const FOOTER_LEN: usize = 16;
 
@@ -80,7 +80,7 @@ attributes! {
     /// `96ED6826E7FE88F1906D8C634A187C93`.
     /// Existing `metadata::attribute` and `metadata::blob_encoding` carry the
     /// other two parameters; this is the sole new mapping-field vocabulary.
-    "96ED6826E7FE88F1906D8C634A187C93" as nvfp4_dimension: U256BE;
+    "96ED6826E7FE88F1906D8C634A187C93" as pub(crate) nvfp4_dimension: U256BE;
 }
 
 /// Failure to decode, construct, or query a canonical NVFP4 cosine set.
@@ -346,7 +346,7 @@ struct StoredStage {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct StoredRow {
+pub(crate) struct StoredRow {
     handle: [u8; HANDLE_LEN],
     stages: [StoredStage; QUANT_STAGES],
     norm: [u8; FLOAT_LEN],
@@ -354,7 +354,7 @@ struct StoredRow {
 }
 
 impl StoredRow {
-    fn quantize(
+    pub(crate) fn quantize(
         handle: [u8; HANDLE_LEN],
         embedding: &[f32],
         dimension: usize,
@@ -376,7 +376,7 @@ impl StoredRow {
     }
 }
 
-fn encode_rows<E: BlobEncoding>(
+pub(crate) fn encode_rows<E: BlobEncoding>(
     dimension: usize,
     mut rows: Vec<StoredRow>,
 ) -> Result<Blob<NvFp4CosineSet<E>>, NvFp4Error> {
@@ -678,7 +678,7 @@ fn mapping_embedding_encoding(descriptor: &Fragment) -> Result<Id, CollectionOpe
         })
 }
 
-fn mapping_dimension(descriptor: &Fragment) -> Result<usize, CollectionOperationError> {
+pub(crate) fn mapping_dimension(descriptor: &Fragment) -> Result<usize, CollectionOperationError> {
     mapping_dimension_facts(descriptor.facts())
 }
 
@@ -1053,6 +1053,48 @@ where
         Ok(crate::constraint::SimilarTo::from_candidates(
             variable, candidates,
         ))
+    }
+
+    /// The `k` best rows by the cosine between `query` and each row's own
+    /// two-stage NVFP4 reconstruction, ranked by score then handle, without
+    /// fetching any source embedding.
+    ///
+    /// The whole answer for an index whose rows are not blob handles (the
+    /// semantic index keys rows by attribute and entity); an approximation
+    /// for one whose rows are, since [`Self::top_k`] then reranks exactly.
+    /// A two-stage row's reconstruction cosine sits within about 1e-4 of the
+    /// exact cosine (measured 2026-09-11 on 17,744 of our own texts).
+    pub fn reconstructed_top_k(
+        &self,
+        query: &[f32],
+        k: usize,
+    ) -> Result<Vec<([u8; HANDLE_LEN], f64)>, NvFp4Error> {
+        if k == 0 || self.is_empty() {
+            return Ok(Vec::new());
+        }
+        let prepared = PreparedQuery::new(query, self.dimension)?;
+        let coordinates = prepared.scan_coordinates();
+        let segments = self.scan_segments();
+        let mut scored = Vec::new();
+        self.for_each_unique_row(|handle, member_index, _member, row| {
+            let segment = segments[member_index];
+            let norm = segment.row_certificate(row)?.reconstruction_norm();
+            let score = if norm == 0.0 {
+                0.0
+            } else {
+                (raw_dot_f64(coordinates, segment, row) / norm).clamp(-1.0, 1.0)
+            };
+            scored.push((handle, score));
+            Ok(())
+        })?;
+        scored.sort_unstable_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        scored.truncate(k);
+        Ok(scored)
     }
 
     fn above_candidates<R>(

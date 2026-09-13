@@ -58,6 +58,9 @@ unicode-properties = "0.1.4"
 unicode-segmentation = "=1.12.0"
 [features]
 default = ["succinct"]
+# The semantic index: rows embedded straight from source facts through the
+# nomic models in the same pile (`semantic` module). Pulls mary's embedders.
+semantic = ["mary/embed"]
 # The production execution path targets the provisioned GB10/Spark appliance.
 nvfp4-cuda = ["mary/nvfp4-cuda"]
 # Swap the naive flat-array implementations for the succinct

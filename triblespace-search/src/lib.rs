@@ -111,6 +111,8 @@ pub mod portable_bm25;
 #[cfg(feature = "succinct")]
 pub mod ring;
 pub mod schemas;
+#[cfg(feature = "semantic")]
+pub mod semantic;
 #[cfg(feature = "succinct")]
 pub mod succinct;
 pub mod text_bm25;
