@@ -184,10 +184,15 @@ pub fn conditions(
                 peer.comparison.map(|comparison| comparison.observed_at),
                 PROGRESS_GRACE,
             );
-            // Unrelated local writes cannot disguise a peer that never answers.
+            // Comparison age alone is scheduler/observation churn. It becomes
+            // actionable only when the latest completed pull actually failed;
+            // a later success supersedes the retained historical failure.
+            let latest_repair_failed =
+                peer.last_failure_at.is_some() && peer.last_failure_at == peer.last_completed_at;
+            // Unrelated local writes cannot disguise persistent divergence.
             let alert = comparison != ComparisonState::NotApplicable
                 && !peer_starting
-                && (state == State::Stalled || !measured_recently);
+                && (state == State::Stalled || (!measured_recently && latest_repair_failed));
             conditions.push(Condition {
                 component: Component::Collection,
                 collection: Some(collection.collection),
@@ -469,6 +474,112 @@ mod tests {
             .unwrap();
         assert_eq!(pair.state, State::Stalled);
         assert!(pair.alert);
+    }
+
+    fn aged_matching_pair(
+        at: crate::clock::Mono,
+        now: crate::clock::Mono,
+    ) -> (
+        crate::health::Health,
+        CollectionHandle,
+        crate::transport::PeerId,
+    ) {
+        use crate::health::{CollectionHealth, Health, RepairComparison, RepairFrontier};
+        use crate::patch_repair::PatchSummary;
+
+        let mut sample = observed(at);
+        sample.observed_at = Some(now);
+        sample.store.last_snapshot_observed_at = Some(now);
+        let collection = Inline::new([3; 32]);
+        let remote_key = ed25519_dalek::SigningKey::from_bytes(&[7; 32])
+            .verifying_key()
+            .to_bytes();
+        let frontier = RepairFrontier {
+            wake_root: [5; 32],
+            records: PatchSummary::new(Some([5; 32]), 10).unwrap(),
+            authorization_evidence: PatchSummary::new(None, 0).unwrap(),
+        };
+        sample.collections.push(CollectionHealth {
+            collection,
+            local_frontier: Some(frontier),
+            last_local_change_at: Some(at),
+            peers: Vec::new(),
+        });
+        let health = Health::new(sample.node);
+        health.update(|value| *value = sample);
+        health.with_peer(collection, remote_key, |peer| {
+            peer.started(at);
+            peer.in_flight = false;
+            peer.compared(
+                RepairComparison {
+                    observed_at: at,
+                    local: frontier,
+                    remote: frontier,
+                    records_received: 0,
+                    proofs_received: 0,
+                    more: false,
+                },
+                at,
+            );
+            peer.last_completed_at = Some(at);
+        });
+        (health, collection, remote_key)
+    }
+
+    #[test]
+    fn an_aged_successful_comparison_is_unknown_but_not_actionable() {
+        let at = crate::clock::mono_now();
+        let now = at + PROGRESS_GRACE + Duration::from_secs(1);
+        let (health, _, _) = aged_matching_pair(at, now);
+
+        let conditions = super::conditions(&health.snapshot(), now);
+        let pair = conditions
+            .iter()
+            .find(|condition| condition.component == Component::Collection)
+            .unwrap();
+        assert_eq!(pair.state, State::Unknown);
+        assert!(!pair.alert);
+    }
+
+    #[test]
+    fn an_aged_comparison_alerts_after_failure_until_a_later_success() {
+        use crate::health::RepairFailure;
+
+        let at = crate::clock::mono_now();
+        let failed_at = at + PROGRESS_GRACE + Duration::from_secs(1);
+        let (health, collection, remote_key) = aged_matching_pair(at, failed_at);
+        health.with_peer(collection, remote_key, |peer| {
+            peer.last_completed_at = Some(failed_at);
+            peer.last_failure_at = Some(failed_at);
+            peer.last_failure = Some(RepairFailure::Failed);
+        });
+
+        let failed = super::conditions(&health.snapshot(), failed_at);
+        let pair = failed
+            .iter()
+            .find(|condition| condition.component == Component::Collection)
+            .unwrap();
+        assert_eq!(pair.state, State::Unknown);
+        assert!(pair.alert);
+
+        let recovered_at = failed_at + Duration::from_secs(1);
+        health.update(|health| {
+            health.observed_at = Some(recovered_at);
+            health.store.last_snapshot_observed_at = Some(recovered_at);
+        });
+        health.with_peer(collection, remote_key, |peer| {
+            let mut comparison = peer.comparison.unwrap();
+            comparison.observed_at = recovered_at;
+            peer.compared(comparison, recovered_at);
+            peer.last_completed_at = Some(recovered_at);
+        });
+        let recovered = super::conditions(&health.snapshot(), recovered_at);
+        let pair = recovered
+            .iter()
+            .find(|condition| condition.component == Component::Collection)
+            .unwrap();
+        assert_eq!(pair.state, State::Current);
+        assert!(!pair.alert);
     }
 
     #[test]

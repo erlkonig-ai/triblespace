@@ -299,6 +299,10 @@ prioritized for efficient zero-copy access.
 - Add a FAQ chapter to the book summarising common questions.
 
 ## Discovered Issues
+- Refine the sanitized collection-repair failure taxonomy beyond generic
+  `Failed`/`Deadline`, so operator health can distinguish transport loss from
+  authorization or protocol/version incompatibility without retaining error
+  strings, bearer handles, or other sensitive wire detail.
 - CubeCL 0.10's CUDA type registry does not advertise `f64`, even though the
   resident NVFP4 kernels compile and run correctly on GB10. Make the fork's
   capability report truthful before treating the scanner as portable across

@@ -61,6 +61,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pile net health` reads them locally. Stable alert/recovery episodes avoid
   heartbeat spam; no new wire protocol, eager blob probe, or global health claim.
 
+- Keep an aged collection-repair comparison non-actionable when the latest
+  completed pull succeeded. After startup grace, alert on a stale comparison
+  only when the latest pull failed or timed out; persistent differing frontiers
+  remain actionable independently.
+
 - Make swarm-health sample age a reader policy: reports carry `created_at`
   without producer expiry. `pile net health --max-age SECONDS` and
   `TRIBLESPACE_HEALTH_MAX_AGE_SECS` select the maximum age (default 180 seconds),
