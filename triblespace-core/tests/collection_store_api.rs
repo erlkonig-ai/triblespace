@@ -12,8 +12,8 @@ use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::{BlobEncoding, IntoBlob};
 use triblespace_core::capability::policy::{capability_handle, resource_policy};
 use triblespace_core::capability::{
-    Capability, CapabilityAtom, CapabilityHandle, CapabilityIssueError, CapabilityMode,
-    CapabilityProof, CapabilityResource,
+    capability_action, capability_delegate_action, CapabilityProof, CapabilityProofError,
+    CapabilityResource,
 };
 use triblespace_core::collection::descriptor;
 use triblespace_core::collection::records::{
@@ -23,13 +23,13 @@ use triblespace_core::collection::records::{
 };
 use triblespace_core::collection::succinctarchive_union::SIMPLE_TO_SUCCINCT_MAPPING_V1;
 use triblespace_core::collection::{
-    collection_capability_audience, collection_read_audience, grant_collection_capability,
+    collection_action_audience, collection_read_audience, grant_collection_capability,
     grant_collection_read, grant_collection_write, read_capability, write_capability,
     AdmissionPolicy, Collection, CollectionOpenError, CollectionPolicy, CollectionRead,
     CollectionReadAudience, CollectionReadGrantError, CollectionRecord,
     CollectionRegistrationError, CollectionSnapshotExt, CollectionStore, CollectionStoreExt,
-    CollectionTypeError, CollectionWriteGrantError, PreparedCollectionCommit,
-    KIND_ADMISSION_POLICY_QUORUM,
+    CollectionTypeError, CollectionWriteGrantError, PreparedCollectionCommit, ACTION_READ,
+    ACTION_WRITE, KIND_ADMISSION_POLICY_QUORUM,
 };
 use triblespace_core::id::rngid;
 use triblespace_core::inline::encodings::genid::GenId;
@@ -128,10 +128,6 @@ fn fragment(entity: u8) -> Fragment {
     let mut facts = TribleSet::new();
     facts.insert(&Trible::force_raw(row).unwrap());
     Fragment::from(facts)
-}
-
-fn atom(capability: CapabilityHandle, collection: Collection<SimpleArchive>) -> CapabilityAtom {
-    CapabilityAtom::new(capability, CapabilityResource::from(collection.handle()))
 }
 
 #[test]
@@ -309,6 +305,8 @@ fn annotations_and_opaque_ids_preserve_ordinary_maintenance() {
         resource_policy*: AdmissionPolicy::Open.binding(read_capability()),
         resource_policy*: AdmissionPolicy::Open.binding(write_capability()),
     };
+    descriptor.put::<SimpleArchive, _>(entity! { capability_action: ACTION_READ }.facts().clone());
+    descriptor.put::<SimpleArchive, _>(entity! { capability_action: ACTION_WRITE }.facts().clone());
     let mut store = MemoryRepo::default();
     let source = store
         .register_collection::<SimpleArchive>(descriptor)
@@ -427,6 +425,9 @@ fn unrecognized_policy_is_invisible_without_poisoning_other_collections() {
 fn missing_read_policy_does_not_hide_supported_write_admission() {
     let writer = key(45);
     let mut store = MemoryRepo::default();
+    store
+        .put::<SimpleArchive, _>(entity! { capability_action: ACTION_WRITE }.facts().clone())
+        .unwrap();
     let collection = store
         .register_collection::<SimpleArchive>(entity! {
             metadata::tag: KIND_COLLECTION_DESCRIPTOR,
@@ -458,7 +459,7 @@ fn multiple_policy_alternatives_union_admission_without_combining_quorum_shares(
     let d = key(50);
     let writer = key(51);
     let mut store = MemoryRepo::default();
-    let alternatives = entity! {
+    let mut alternatives = entity! {
         metadata::tag: KIND_COLLECTION_DESCRIPTOR,
         collection_representation: SimpleArchive::id(),
         resource_policy*: AdmissionPolicy::direct(a.verifying_key()).binding(read_capability())
@@ -466,6 +467,10 @@ fn multiple_policy_alternatives_union_admission_without_combining_quorum_shares(
         resource_policy*: AdmissionPolicy::quorum([a.verifying_key(), b.verifying_key()], 2, None).unwrap().binding(write_capability())
             + AdmissionPolicy::quorum([c.verifying_key(), d.verifying_key()], 2, None).unwrap().binding(write_capability()),
     };
+    alternatives
+        .put::<SimpleArchive, _>(entity! { capability_action: ACTION_READ }.facts().clone());
+    alternatives
+        .put::<SimpleArchive, _>(entity! { capability_action: ACTION_WRITE }.facts().clone());
     let collection = store
         .register_collection::<SimpleArchive>(alternatives)
         .unwrap();
@@ -473,11 +478,10 @@ fn multiple_policy_alternatives_union_admission_without_combining_quorum_shares(
     store.commit(collection, &writer, expected.clone()).unwrap();
     for root in [&a, &c] {
         store
-            .insert_proof(CapabilityProof::issue_root(
-                root,
+            .insert_proof(CapabilityProof::new(
                 CapabilityResource::from(collection.handle()),
-                Capability::new(write_capability(), CapabilityMode::Invoke),
-                None,
+                root,
+                write_capability(),
                 writer.verifying_key(),
             ))
             .unwrap();
@@ -503,11 +507,10 @@ fn multiple_policy_alternatives_union_admission_without_combining_quorum_shares(
     assert!(collection.policy(&before).is_err());
 
     store
-        .insert_proof(CapabilityProof::issue_root(
-            &b,
+        .insert_proof(CapabilityProof::new(
             CapabilityResource::from(collection.handle()),
-            Capability::new(write_capability(), CapabilityMode::Invoke),
-            None,
+            &b,
+            write_capability(),
             writer.verifying_key(),
         ))
         .unwrap();
@@ -536,6 +539,8 @@ fn typed_admission_cannot_borrow_policy_from_another_descriptor_entity() {
         resource_policy*: AdmissionPolicy::Open.binding(read_capability()),
         resource_policy*: AdmissionPolicy::Open.binding(write_capability()),
     };
+    facts.put::<SimpleArchive, _>(entity! { capability_action: ACTION_READ }.facts().clone());
+    facts.put::<SimpleArchive, _>(entity! { capability_action: ACTION_WRITE }.facts().clone());
     let mut store = MemoryRepo::default();
     let collection = store.register_collection::<SimpleArchive>(facts).unwrap();
     store.commit(collection, &authority, fragment(54)).unwrap();
@@ -558,7 +563,11 @@ fn custom_capability_grants_and_audiences_do_not_borrow_read_or_write_authority(
     let delivery_root = key(56);
     let transport_reader = key(57);
     let recipient = key(58);
-    let definition = entity! { metadata::name: "key delivery fixture" };
+    let delivery_action = rngid();
+    let definition = entity! {
+        capability_action: &delivery_action,
+        metadata::name: "key delivery fixture",
+    };
     let capability = IntoBlob::<SimpleArchive>::to_blob(definition.facts().clone()).get_handle();
     let policy = policy(transport_root.verifying_key()).with_capability(
         definition.clone(),
@@ -588,7 +597,7 @@ fn custom_capability_grants_and_audiences_do_not_borrow_read_or_write_authority(
     ));
     let before = store.snapshot().unwrap();
     assert_eq!(
-        collection_capability_audience(&before, source.handle(), capability).unwrap(),
+        collection_action_audience(&before, source.handle(), delivery_action.id).unwrap(),
         CollectionReadAudience::Restricted(vec![delivery_root.verifying_key()])
     );
     let proof = grant_collection_capability(
@@ -599,12 +608,10 @@ fn custom_capability_grants_and_audiences_do_not_borrow_read_or_write_authority(
         recipient.verifying_key(),
     )
     .unwrap();
-    assert!(proof
-        .capabilities()
-        .all(|restriction| restriction.handle() == capability));
+    assert!(proof.capabilities().all(|handle| handle == capability));
     let after = store.snapshot().unwrap();
     let CollectionReadAudience::Restricted(delivery) =
-        collection_capability_audience(&after, source.handle(), capability).unwrap()
+        collection_action_audience(&after, source.handle(), delivery_action.id).unwrap()
     else {
         panic!("key delivery is restricted")
     };
@@ -633,17 +640,104 @@ fn custom_capability_grants_and_audiences_do_not_borrow_read_or_write_authority(
         .unwrap();
     let derived_snapshot = store.snapshot().unwrap();
     assert_eq!(
-        collection_capability_audience(&derived_snapshot, derived.handle(), capability).unwrap(),
+        collection_action_audience(&derived_snapshot, derived.handle(), delivery_action.id)
+            .unwrap(),
         CollectionReadAudience::Restricted(vec![delivery_root.verifying_key()])
     );
     assert_eq!(
-        collection_capability_audience(&before, source.handle(), capability).unwrap(),
+        collection_action_audience(&before, source.handle(), delivery_action.id).unwrap(),
         CollectionReadAudience::Restricted(vec![delivery_root.verifying_key()])
     );
 }
 
 #[test]
-fn missing_custom_capability_does_not_inherit_open_standard_policies() {
+fn compound_policy_definitions_select_roots_per_action_not_grant_handle() {
+    let root = key(61);
+    let reader = key(62);
+    let mut store = MemoryRepo::default();
+    let compound = store
+        .put::<SimpleArchive, _>(
+            entity! {
+                capability_action*: [ACTION_READ, ACTION_WRITE],
+            }
+            .facts()
+            .clone(),
+        )
+        .unwrap();
+    store
+        .put::<SimpleArchive, _>(entity! { capability_action: ACTION_READ }.facts().clone())
+        .unwrap();
+    let collection = store
+        .register_collection::<SimpleArchive>(entity! {
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            collection_representation: SimpleArchive::id(),
+            resource_policy*: AdmissionPolicy::direct(root.verifying_key()).binding(compound),
+        })
+        .unwrap();
+    store
+        .insert_proof(CapabilityProof::new(
+            CapabilityResource::from(collection.handle()),
+            &root,
+            read_capability(),
+            reader.verifying_key(),
+        ))
+        .unwrap();
+    let snapshot = store.snapshot().unwrap();
+    assert_ne!(compound, read_capability());
+    assert!(collection
+        .reader_is_admitted(&snapshot, reader.verifying_key())
+        .unwrap());
+    assert!(!collection
+        .writer_is_admitted(&snapshot, reader.verifying_key())
+        .unwrap());
+    assert!(collection
+        .writer_is_admitted(&snapshot, root.verifying_key())
+        .unwrap());
+}
+
+#[test]
+fn a_compound_grant_cannot_borrow_another_actions_root() {
+    let read_root = key(63);
+    let write_root = key(64);
+    let subject = key(65);
+    let mut store = MemoryRepo::default();
+    let collection = store
+        .collection(
+            "action-local-roots",
+            CollectionPolicy::new(
+                AdmissionPolicy::direct(read_root.verifying_key()),
+                AdmissionPolicy::direct(write_root.verifying_key()),
+            ),
+        )
+        .unwrap();
+    let grant = store
+        .put::<SimpleArchive, _>(
+            entity! {
+                capability_action*: [ACTION_READ, ACTION_WRITE],
+            }
+            .facts()
+            .clone(),
+        )
+        .unwrap();
+    store
+        .insert_proof(CapabilityProof::new(
+            CapabilityResource::from(collection.handle()),
+            &read_root,
+            grant,
+            subject.verifying_key(),
+        ))
+        .unwrap();
+    let snapshot = store.snapshot().unwrap();
+    assert!(collection
+        .reader_is_admitted(&snapshot, subject.verifying_key())
+        .unwrap());
+    assert!(!collection
+        .writer_is_admitted(&snapshot, subject.verifying_key())
+        .unwrap());
+}
+
+#[test]
+fn unbound_custom_action_does_not_inherit_open_standard_policies() {
     let mut store = MemoryRepo::default();
     let source = store
         .collection(
@@ -651,10 +745,21 @@ fn missing_custom_capability_does_not_inherit_open_standard_policies() {
             CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
         )
         .unwrap();
-    let unknown = CapabilityHandle::new([0; 32]);
+    let unknown_action = rngid();
+    let unknown = store
+        .put::<SimpleArchive, _>(
+            entity! { capability_action: &unknown_action }
+                .facts()
+                .clone(),
+        )
+        .unwrap();
     assert_eq!(
-        collection_capability_audience(&store.snapshot().unwrap(), source.handle(), unknown)
-            .unwrap(),
+        collection_action_audience(
+            &store.snapshot().unwrap(),
+            source.handle(),
+            unknown_action.id
+        )
+        .unwrap(),
         CollectionReadAudience::Restricted(Vec::new())
     );
     assert!(matches!(
@@ -722,14 +827,13 @@ fn read_grant_is_root_checked_and_replay_deterministic() {
 
     assert_eq!(
         first.resource(),
-        atom(read_capability(), collection).resource()
+        CapabilityResource::from(collection.handle())
     );
     assert_eq!(first.root_key(), root.verifying_key());
     assert_eq!(
         first.capabilities().collect::<Vec<_>>(),
-        vec![Capability::new(read_capability(), CapabilityMode::Invoke,)]
+        vec![read_capability()]
     );
-    assert_eq!(first.validities().collect::<Vec<_>>(), vec![None]);
     assert_eq!(first.leaf_key(), reader.verifying_key());
 
     store.events.clear();
@@ -786,14 +890,13 @@ fn write_grant_is_root_checked_and_activates_recipient_commits() {
 
     assert_eq!(
         proof.resource(),
-        atom(write_capability(), collection).resource()
+        CapabilityResource::from(collection.handle())
     );
     assert_eq!(proof.root_key(), root.verifying_key());
     assert_eq!(
         proof.capabilities().collect::<Vec<_>>(),
-        vec![Capability::new(write_capability(), CapabilityMode::Invoke,)]
+        vec![write_capability()]
     );
-    assert_eq!(proof.validities().collect::<Vec<_>>(), vec![None]);
     assert_eq!(proof.leaf_key(), writer.verifying_key());
 
     let snapshot = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
@@ -840,6 +943,9 @@ fn read_grant_rejects_an_absent_binding_without_writing() {
     let root = key(32);
     let reader = key(33);
     let mut store = CountingRepo::default();
+    store
+        .put::<SimpleArchive, _>(entity! { capability_action: ACTION_READ }.facts().clone())
+        .unwrap();
     let invalid = store.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
     store.events.clear();
 
@@ -1045,26 +1151,27 @@ fn invoke_only_root_proof_admits_recipient_but_blocks_redelegation() {
             ),
         )
         .unwrap();
-    let write_atom = atom(write_capability(), collection);
-    let parent_proof = CapabilityProof::issue_root(
+    let parent_proof = CapabilityProof::new(
+        CapabilityResource::from(collection.handle()),
         &root,
-        write_atom.resource(),
-        Capability::new(write_atom.capability(), CapabilityMode::Invoke),
-        None,
+        write_capability(),
         intermediary.verifying_key(),
     );
-    let error = parent_proof
-        .extend(
-            &intermediary,
-            Capability::new(write_atom.capability(), CapabilityMode::Invoke),
-            None,
-            leaf.verifying_key(),
-        )
-        .unwrap_err();
-    assert_eq!(error, CapabilityIssueError::ParentCannotDelegate);
-    store.insert_proof(parent_proof).unwrap();
+    let child_proof = parent_proof
+        .delegate(&intermediary, write_capability(), leaf.verifying_key())
+        .unwrap();
+    // Signing an extension does not confer authority. The child is outside
+    // the parent's delegated action set, but the earlier grant remains valid.
+    store.insert_proof(child_proof.clone()).unwrap();
 
     let snapshot = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
+    assert_eq!(
+        child_proof.validate_delegation(&snapshot),
+        Err(CapabilityProofError::UndelegatedAction {
+            step: 1,
+            action: ACTION_WRITE
+        }),
+    );
     assert!(collection
         .writer_is_admitted(&snapshot, intermediary.verifying_key())
         .unwrap());
@@ -1087,13 +1194,11 @@ fn read_grants_use_the_distinct_read_action() {
             ),
         )
         .unwrap();
-    let read_atom = atom(read_capability(), collection);
     store
-        .insert_proof(CapabilityProof::issue_root(
+        .insert_proof(CapabilityProof::new(
+            CapabilityResource::from(collection.handle()),
             &root,
-            read_atom.resource(),
-            Capability::new(read_atom.capability(), CapabilityMode::Invoke),
-            None,
+            read_capability(),
             reader.verifying_key(),
         ))
         .unwrap();
@@ -1122,21 +1227,24 @@ fn read_audience_includes_valid_proof_prefixes() {
             ),
         )
         .unwrap();
-    let read_atom = atom(read_capability(), collection);
-    let parent_proof = CapabilityProof::issue_root(
+    let delegable_read = store
+        .put::<SimpleArchive, _>(
+            entity! {
+                capability_action: ACTION_READ,
+                capability_delegate_action: ACTION_READ,
+            }
+            .facts()
+            .clone(),
+        )
+        .unwrap();
+    let parent_proof = CapabilityProof::new(
+        CapabilityResource::from(collection.handle()),
         &root,
-        read_atom.resource(),
-        Capability::new(read_atom.capability(), CapabilityMode::InvokeAndDelegate),
-        None,
+        delegable_read,
         intermediary.verifying_key(),
     );
     let child_proof = parent_proof
-        .extend(
-            &intermediary,
-            Capability::new(read_atom.capability(), CapabilityMode::Invoke),
-            None,
-            leaf.verifying_key(),
-        )
+        .delegate(&intermediary, read_capability(), leaf.verifying_key())
         .unwrap();
     store.insert_proof(child_proof).unwrap();
 
@@ -1171,15 +1279,13 @@ fn collection_quorum_needs_support_from_distinct_roots() {
             ),
         )
         .unwrap();
-    let write_atom = atom(write_capability(), collection);
     let instant = Epoch::from_tai_seconds(0.0);
 
     store
-        .insert_proof(CapabilityProof::issue_root(
+        .insert_proof(CapabilityProof::new(
+            CapabilityResource::from(collection.handle()),
             &first_root,
-            write_atom.resource(),
-            Capability::new(write_atom.capability(), CapabilityMode::Invoke),
-            None,
+            write_capability(),
             writer.verifying_key(),
         ))
         .unwrap();
@@ -1188,11 +1294,10 @@ fn collection_quorum_needs_support_from_distinct_roots() {
         .unwrap());
 
     store
-        .insert_proof(CapabilityProof::issue_root(
+        .insert_proof(CapabilityProof::new(
+            CapabilityResource::from(collection.handle()),
             &second_root,
-            write_atom.resource(),
-            Capability::new(write_atom.capability(), CapabilityMode::Invoke),
-            None,
+            write_capability(),
             writer.verifying_key(),
         ))
         .unwrap();

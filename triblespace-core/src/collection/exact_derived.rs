@@ -366,9 +366,8 @@ where
     for (collection, descriptor) in &lineage.descriptors {
         let writers = super::api::discover_admission_evidence(
             snapshot,
-            descriptor::admission_policies(descriptor.facts(), super::write_capability(), None),
-            super::write_capability(),
-            crate::capability::CapabilityMode::Invoke,
+            descriptor::admission_policies(snapshot, descriptor.facts(), super::ACTION_WRITE, None),
+            super::ACTION_WRITE,
             *collection,
         )
         .map_err(|error| {
@@ -404,9 +403,9 @@ where
                         ed25519_dalek::VerifyingKey::from_bytes(&record.public_key().raw)
                             .ok()
                             .is_some_and(|subject| {
-                                evidence.get(&record.collection()).is_some_and(|writers| {
-                                    writers.authorizes(subject, snapshot.instant())
-                                })
+                                evidence
+                                    .get(&record.collection())
+                                    .is_some_and(|writers| writers.authorizes(snapshot, subject))
                             })
                     });
             Ok::<CollectionClaimValidation<()>, std::convert::Infallible>(if accepted {
@@ -587,9 +586,8 @@ where
 
 /// Attach one target collection for exact caller-supplied support.
 ///
-/// This fails unless all requested support is resident in the target. Exact
-/// support is independent of authorization time, so this frozen-snapshot path
-/// deliberately has no clock input.
+/// This fails unless all requested support is resident in the target. Authority
+/// and realization are interpreted from this immutable store snapshot.
 pub(crate) fn attach_collection_exact<R, E>(
     snapshot: &R,
     target: Collection<E>,
@@ -607,7 +605,7 @@ where
     Ok((resolved.support, resolved.cover))
 }
 
-/// Attach one target collection using its snapshot's frozen authorization time.
+/// Attach one target collection using its snapshot's proof and definition state.
 ///
 /// The foundation's admitted support is the search boundary, but the result
 /// contains only the maximal resident target antichain and exactly the
@@ -1173,6 +1171,75 @@ where
             CollectionRealizationError::storage("acquire exact blob dependency", error)
         })
         .map(|bytes| bytes.is_some())
+}
+
+/// Acquire the reusable authority definitions for an explicitly selected
+/// lineage. Records and proofs stay frozen; only byte availability advances.
+/// No member payload is followed until its producer has been admitted.
+pub(crate) async fn acquire_authority<S, E>(
+    store: &mut S,
+    target: Collection<E>,
+    frontier: &OperationFrontier<S::Snapshot>,
+) -> Result<(), CollectionRealizationError>
+where
+    S: Store + AsyncBlobStoreAcquire,
+    E: CollectionEncoding,
+{
+    let mut attempted = BTreeSet::new();
+    loop {
+        let snapshot = frontier.view(store.snapshot().map_err(|error| {
+            CollectionRealizationError::storage("observe authority definitions", error)
+        })?);
+        let lineage = match load_lineage(&snapshot, target) {
+            Ok(lineage) => lineage,
+            Err(CollectionRealizationError::MissingDependency { member }) => {
+                drop(snapshot);
+                if acquire_missing(store, &mut attempted, member).await? {
+                    continue;
+                }
+                return Err(CollectionRealizationError::MissingDependency { member });
+            }
+            Err(error) => return Err(error),
+        };
+        let mut definitions = BTreeSet::new();
+        let mut roots = BTreeSet::new();
+        for (collection, descriptor) in &lineage.descriptors {
+            for (definition, policy) in descriptor::capability_policies(descriptor.facts(), None) {
+                definitions.insert(Handle::<SimpleArchive>::to_hash(definition));
+                if let Some(keys) = policy.roots() {
+                    roots.extend(keys.iter().map(|key| (collection.raw, key.to_bytes())));
+                }
+            }
+        }
+        for proof in crate::repo::CapabilityProofRead::proofs(&snapshot).map_err(|error| {
+            CollectionRealizationError::storage("select authority proof definitions", error)
+        })? {
+            let proof = proof.map_err(|error| {
+                CollectionRealizationError::storage("read authority proof definitions", error)
+            })?;
+            if roots.contains(&(proof.resource().into_bytes(), proof.root_key().to_bytes())) {
+                definitions.extend(proof.blob_references().map(Handle::<UnknownBlob>::to_hash));
+            }
+        }
+        let missing = definitions
+            .into_iter()
+            .filter_map(|member| {
+                match snapshot.contains_blob(Handle::<UnknownBlob>::from_hash(member)) {
+                    Ok(true) => None,
+                    Ok(false) => Some(Ok(member)),
+                    Err(error) => Some(Err(CollectionRealizationError::storage(
+                        "inspect authority definition residency",
+                        error,
+                    ))),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(snapshot);
+        for member in missing {
+            let _ = acquire_missing(store, &mut attempted, member).await?;
+        }
+        return Ok(());
+    }
 }
 
 /// Make one explicit root support readable, without needing provenance records

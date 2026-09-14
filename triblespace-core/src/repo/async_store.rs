@@ -59,7 +59,7 @@ use crate::repo::{BlobChildren, StorageClose};
 /// snapshot's frozen record and authorization observation. A reader may fetch
 /// and cache the exact immutable bytes named by `handle`, including bytes which
 /// were not resident when the snapshot was taken. This must not advance the
-/// snapshot's records, authorization instant, or a previously selected cover,
+/// snapshot's records, query instant, or a previously selected cover,
 /// and must not implicitly record durable WANTs.
 pub trait AsyncBlobStoreGet {
     /// Error type for get operations, parameterised by the
@@ -253,17 +253,17 @@ pub trait AsyncSnapshotSource {
     /// Failure while refreshing and freezing an observation.
     type SnapshotError: Error + Debug + Send + Sync + 'static;
 
-    /// Sample the authorization clock once, then freeze the resulting prefix.
+    /// Sample the query clock once, then freeze the resulting prefix.
     fn snapshot(
         &mut self,
     ) -> impl Future<Output = Result<Self::Snapshot, Self::SnapshotError>> + Send {
         self.snapshot_at(crate::clock::epoch_now())
     }
 
-    /// Freeze newly observed content at one chosen authorization instant.
+    /// Freeze newly observed content at one chosen query instant.
     ///
-    /// As with [`SnapshotSource::snapshot_at`], this chooses authorization
-    /// time, not a historical content revision.
+    /// As with [`SnapshotSource::snapshot_at`], this chooses application query
+    /// time, not a historical content revision or expiring collection authority.
     fn snapshot_at(
         &mut self,
         instant: hifitime::Epoch,

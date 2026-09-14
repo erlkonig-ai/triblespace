@@ -1725,8 +1725,9 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
             let edges = padded
                 .get(CAPABILITY_PROOF_HEADER_LEN..)
                 .ok_or_else(corrupt)?;
-            // Every edge has a nonzero mode byte, so an all-zero edge can
-            // only be padding. Bound traversal before validating the frame.
+            // A canonical delegate is never the all-zero (weak) key, so an
+            // all-zero edge can only be padding. Bound traversal before
+            // validating the frame.
             let count = edges
                 .chunks_exact(CAPABILITY_PROOF_EDGE_LEN)
                 .take(MAX_CAPABILITY_PROOF_STEPS + 1)
@@ -3204,6 +3205,8 @@ impl From<std::io::Error> for CollectionInsertError {
 /// Failure while appending one canonical complete capability proof.
 #[derive(Debug)]
 pub enum CapabilityProofInsertError {
+    /// The proof's byte-only signature chain is invalid.
+    Invalid(crate::capability::CapabilityProofError),
     /// Existing pile state could not be refreshed or decoded.
     Read(ReadError),
     /// The record could not be appended or the file lock released.
@@ -3217,6 +3220,7 @@ pub enum CapabilityProofInsertError {
 impl std::fmt::Display for CapabilityProofInsertError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Invalid(error) => write!(f, "invalid capability proof: {error}"),
             Self::Read(error) => write!(f, "failed to refresh capability proofs: {error}"),
             Self::Io(error) => write!(f, "failed to append capability proof: {error}"),
             Self::IdCollision { id } => write!(
@@ -3234,6 +3238,7 @@ impl std::fmt::Display for CapabilityProofInsertError {
 impl Error for CapabilityProofInsertError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Invalid(error) => Some(error),
             Self::Read(error) => Some(error),
             Self::Io(error) => Some(error),
             Self::IdCollision { .. } | Self::UnexpectedReadback => None,
@@ -4001,10 +4006,7 @@ impl Pile {
         let result = (|| {
             self.refresh_locked()?;
 
-            if self
-                .opaque_digests
-                .contains(blake3::hash(frame).as_bytes())
-            {
+            if self.opaque_digests.contains(blake3::hash(frame).as_bytes()) {
                 return Ok(());
             }
 
@@ -4153,6 +4155,9 @@ impl CapabilityProofStore for Pile {
     type InsertError = CapabilityProofInsertError;
 
     fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
+        proof
+            .verify_signatures()
+            .map_err(CapabilityProofInsertError::Invalid)?;
         let bytes = proof.as_bytes();
         let data_len = bytes.len();
         let prefix_len = FRAME_KIND_OFFSET;
@@ -5042,7 +5047,7 @@ impl std::fmt::Display for PileRewriteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Source(error) => write!(f, "failed to snapshot source pile: {error}"),
-                    Self::Transfer(error) => write!(f, "failed to copy a retained blob: {error}"),
+            Self::Transfer(error) => write!(f, "failed to copy a retained blob: {error}"),
             Self::StrongPin(error) => write!(f, "failed to recreate a strong pin: {error}"),
             Self::StrongPinConflict { id, current } => write!(
                 f,
@@ -5326,8 +5331,7 @@ mod tests {
     use tempfile;
 
     use crate::capability::{
-        Capability, CapabilityMode, CapabilityResource, CAPABILITY_PROOF_HEADER_LEN,
-        MAX_CAPABILITY_PROOF_STEPS,
+        CapabilityResource, CAPABILITY_PROOF_HEADER_LEN, MAX_CAPABILITY_PROOF_STEPS,
     };
     use crate::collection::descriptor::named_for_tests;
     use crate::collection::{
@@ -5411,11 +5415,10 @@ mod tests {
         let root = SigningKey::from_bytes(&[seed; 32]);
         let leaf = SigningKey::from_bytes(&[seed.wrapping_add(1); 32]);
         let capability = Inline::new([seed.wrapping_add(2); 32]);
-        CapabilityProof::issue_root(
-            &root,
+        CapabilityProof::new(
             CapabilityResource::new(resource),
-            Capability::new(capability, CapabilityMode::InvokeAndDelegate),
-            None,
+            &root,
+            capability,
             leaf.verifying_key(),
         )
     }
@@ -5454,11 +5457,7 @@ mod tests {
             body.extend_from_slice(&edge);
             let frame = framed_capability_proof(&body);
             let padding = frame.len() - FRAME_KIND_OFFSET - body.len();
-            if count == 1 {
-                assert_eq!(padding, 223);
-            } else if count == 128 {
-                assert_eq!(padding, 0);
-            }
+            assert_eq!(padding, if count % 2 == 0 { 128 } else { 0 });
             let record = decode_enveloped_record(&frame, 0).unwrap();
             let PileRecordContent::CapabilityProof {
                 id,
@@ -5684,13 +5683,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "proof.pile");
         let proof = capability_fixture(11, [12; 32]);
-        assert_eq!(proof.as_bytes().len(), 257);
+        assert_eq!(proof.as_bytes().len(), 224);
 
         let mut pile = Pile::open(&path).unwrap();
         pile.insert_proof(proof.clone()).unwrap();
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), 512);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 256);
         pile.insert_proof(proof.clone()).unwrap();
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), 512);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 256);
         let snapshot = pile.snapshot().unwrap();
         assert_eq!(snapshot.proof(proof.id()).unwrap(), Some(proof.clone()));
         assert_eq!(snapshot.proof(Inline::new([0; 32])).unwrap(), None);
@@ -5924,10 +5923,9 @@ mod tests {
 
         let padded_path = fresh_empty_pile_path(&dir, "bad-padding.pile");
         let two_edge = one_edge
-            .extend(
+            .delegate(
                 &SigningKey::from_bytes(&[22; 32]),
-                Capability::new(Inline::new([23; 32]), CapabilityMode::Invoke),
-                None,
+                Inline::new([23; 32]),
                 SigningKey::from_bytes(&[24; 32]).verifying_key(),
             )
             .unwrap();
@@ -5993,25 +5991,21 @@ mod tests {
                     .clone(),
             )
             .unwrap();
-        let valid_proof = CapabilityProof::issue_root(
-            &SigningKey::from_bytes(&[41; 32]),
+        let valid_proof = CapabilityProof::new(
             CapabilityResource::new(valid_attachment.raw),
-            Capability::new(definition, CapabilityMode::Invoke),
-            None,
+            &SigningKey::from_bytes(&[41; 32]),
+            definition,
             SigningKey::from_bytes(&[42; 32]).verifying_key(),
         );
-        let invalid_source = CapabilityProof::issue_root(
-            &SigningKey::from_bytes(&[51; 32]),
+        let invalid_proof = CapabilityProof::new(
             CapabilityResource::new(invalid_attachment.raw),
-            Capability::new(invalid_definition, CapabilityMode::Invoke),
-            None,
+            &SigningKey::from_bytes(&[51; 32]),
+            invalid_definition,
             SigningKey::from_bytes(&[52; 32]).verifying_key(),
         );
-        let mut invalid_bytes = invalid_source.as_bytes().to_vec();
-        let last = invalid_bytes.len() - 1;
-        invalid_bytes[last] ^= 1;
-        let invalid_proof = CapabilityProof::from_bytes(&invalid_bytes).unwrap();
-        assert!(invalid_proof.verify_signatures().is_err());
+        // Transport and retention do not interpret an unknown definition.
+        // Both signatures are valid even though neither definition grants an action.
+        invalid_proof.verify_signatures().unwrap();
         source.insert_proof(valid_proof.clone()).unwrap();
         source.insert_proof(invalid_proof.clone()).unwrap();
 
@@ -6055,6 +6049,25 @@ mod tests {
         assert!(stored.contains(&invalid_proof));
         source.close().unwrap();
         destination.close().unwrap();
+    }
+
+    #[test]
+    fn capability_proof_insert_rejects_bad_signature_before_appending() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "bad-proof-signature.pile");
+        let proof = capability_fixture(71, [72; 32]);
+        let mut bytes = proof.as_bytes().to_vec();
+        *bytes.last_mut().unwrap() ^= 1;
+        let invalid = CapabilityProof::from_bytes(&bytes).unwrap();
+        let mut pile = Pile::open(&path).unwrap();
+        let before = std::fs::metadata(&path).unwrap().len();
+        assert!(matches!(
+            pile.insert_proof(invalid),
+            Err(CapabilityProofInsertError::Invalid(_))
+        ));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), before);
+        assert_eq!(pile.snapshot().unwrap().proofs().unwrap().count(), 0);
+        pile.close().unwrap();
     }
 
     fn fixed_collection_header(bytes: &[u8]) -> [u8; V3_HEADER_LEN] {

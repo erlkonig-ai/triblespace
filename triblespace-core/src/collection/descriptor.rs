@@ -36,9 +36,9 @@ use crate::inline::encodings::hash::Handle;
 use crate::inline::encodings::UnknownInline;
 use crate::inline::{Inline, IntoInline, RawInline};
 use crate::metadata::{self, MetaDescribe};
-use crate::prelude::{and, entity, find, or, pattern};
+use crate::prelude::{and, entity, exists, find, or, pattern};
 use crate::query::TriblePattern;
-use crate::repo::{BlobStorePut, SnapshotSource};
+use crate::repo::{BlobStoreGet, BlobStorePut, SnapshotSource};
 use crate::trible::{Fragment, TribleSet};
 
 use super::policy::{
@@ -301,19 +301,26 @@ pub fn capability_policies<'a>(
         .flat_map(move |descriptor| resource_policies(facts, descriptor, None))
 }
 
-/// Query supported policies for one exact descriptor-local capability.
+/// Query supported policies for an action declared by a bound capability.
 ///
 /// Every recognized alternative contributes independently. Unknown kinds,
 /// undecodable values, and unsupported thresholds supply no row; absence
-/// never supplies Open. Modes and time restrictions remain in proof records.
-pub fn admission_policies<'a>(
+/// never supplies Open. A binding names a reusable definition, not the exact
+/// handle a delegated grant must repeat. Unknown or unavailable definitions
+/// contribute no authority; unrelated facts do not invalidate a definition.
+pub fn admission_policies<'a, R: BlobStoreGet>(
+    reader: &'a R,
     facts: &'a TribleSet,
-    capability: CapabilityHandle,
+    action: Id,
     representation: Option<Id>,
 ) -> impl Iterator<Item = AdmissionPolicy> + 'a {
-    descriptor_entities(facts, representation)
-        .flat_map(move |descriptor| resource_policies(facts, descriptor, Some(capability)))
-        .map(|(_, policy)| policy)
+    capability_policies(facts, representation).filter_map(move |(handle, policy)| {
+        let definition: TribleSet = reader.get(handle).ok()?;
+        exists!(
+            pattern!(&definition, [{ _?definition @ crate::capability::capability_action: action }])
+        )
+        .then_some(policy)
+    })
 }
 
 fn descriptor_entities<'a>(
@@ -736,15 +743,21 @@ mod policy_tests {
             &admission_policy_root.id(),
             &Inline::<GenId>::new([0; 32]),
         ));
-        let policies: Vec<_> =
-            admission_policies(fragment.facts(), write_capability(), Some(representation))
-                .collect();
+        fragment.put::<SimpleArchive, _>(super::super::policy::write_definition().facts().clone());
+        let reader = crate::repo::SnapshotSource::snapshot(&mut fragment.blobs().clone()).unwrap();
+        let policies: Vec<_> = admission_policies(
+            &reader,
+            fragment.facts(),
+            super::super::ACTION_WRITE,
+            Some(representation),
+        )
+        .collect();
         assert_eq!(policies, vec![AdmissionPolicy::direct(key(13))]);
     }
 
     #[test]
     fn admission_queries_preserve_both_recognized_kinds() {
-        let fragment = entity! {
+        let mut fragment = entity! {
             metadata::tag: KIND_COLLECTION_DESCRIPTOR,
             collection_representation: <SimpleArchive as MetaDescribe>::id(),
             resource_policy*: entity! {
@@ -754,8 +767,11 @@ mod policy_tests {
                 admission_invoke_threshold: 1_u32,
             },
         };
+        fragment.put::<SimpleArchive, _>(super::super::policy::read_definition().facts().clone());
+        let reader = crate::repo::SnapshotSource::snapshot(&mut fragment.blobs().clone()).unwrap();
         let policies: Vec<_> =
-            admission_policies(fragment.facts(), read_capability(), None).collect();
+            admission_policies(&reader, fragment.facts(), super::super::ACTION_READ, None)
+                .collect();
         assert_eq!(policies.len(), 2);
         assert!(policies.contains(&AdmissionPolicy::Open));
         assert!(policies.contains(&AdmissionPolicy::direct(key(14))));

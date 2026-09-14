@@ -196,11 +196,11 @@ record_kinds! {
 
     /// A self-contained prefix-signed capability proof.
     ///
-    /// Kind id minted with `trible genid` on 2026-09-06.
-    CapabilityProofRecordV4 = KIND_ID_AUTH_PROOF "D81538DE724347280A6D97F51EDE08F6",
+    /// Kind id minted with `trible genid` on 2026-09-14.
+    CapabilityProofRecordV5 = KIND_ID_AUTH_PROOF "C7116B04EE6DA4BADFDE77D79692AEFF",
         KIND_AUTH_PROOF crate::capability::CAPABILITY_PROOF_MAGIC,
-        "pile-auth-proof-v4",
-        "A canonical self-contained prefix-signed capability proof. The proof starts at envelope byte 32: the 32-byte record kind is also its grammar magic, followed by a 32-byte opaque resource at 64..96 and the 32-byte root Ed25519 public key at 96..128. One to 255 fixed 161-byte edges follow. Each edge holds a 32-byte SimpleArchive capability-definition handle, one flags byte whose low two bits encode a nonempty invocation/delegation mode and whose bit 2 indicates bounded validity, two signed big-endian 16-byte TAI-nanosecond validity bounds (all zero when absent), a 32-byte delegate Ed25519 public key, and a 64-byte Ed25519 signature. Each signature covers the exact proof prefix from the record kind through its edge's delegate, including all preceding signatures. The unpadded proof length is exactly 96 + 161n bytes. There is no separate proof length or inner magic. The generic frame declares the minimal 256-byte block span; its trailing zero padding cannot form an edge because every edge has a nonzero mode. Generic framing and padding are not proof content and do not participate in signatures or its BLAKE3 content id. Capability definition handles are strong blob references; the resource remains opaque. Proof verification does not acquire or interpret those definitions.";
+        "pile-auth-proof-v5",
+        "A canonical self-contained prefix-signed capability proof. The proof starts at envelope byte 32: the 32-byte record kind is also its grammar magic, followed by a 32-byte opaque resource at 64..96 and the 32-byte root Ed25519 public key at 96..128. One to 255 fixed 128-byte edges follow. Each edge holds a 32-byte SimpleArchive capability-definition handle, a 32-byte delegate Ed25519 public key, and a 64-byte Ed25519 signature. Each signature covers the exact proof prefix from the record kind through its edge's delegate, including all preceding signatures. The unpadded proof length is exactly 96 + 128n bytes. There are no inline modes, flags, validity bounds, separate proof length, or inner magic. The generic frame declares the minimal 256-byte block span; trailing zero padding cannot form an edge because every delegate must be a canonical non-weak Ed25519 key. Generic framing and padding are not proof content and do not participate in signatures or its BLAKE3 content id. Capability definition handles are strong blob references; the resource remains opaque. Byte-only signature verification does not acquire or interpret those definitions; action and delegation authority are interpreted from resident capability definitions separately.";
 
 }
 

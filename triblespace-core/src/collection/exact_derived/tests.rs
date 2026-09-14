@@ -13,10 +13,7 @@ use futures::executor::block_on;
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::{BlobEncoding, IntoBlob, TryFromBlob};
-use crate::capability::{
-    Capability, CapabilityHandle, CapabilityMode, CapabilityProof, CapabilityProofId,
-    CapabilityResource, CapabilityValidity,
-};
+use crate::capability::{CapabilityHandle, CapabilityProof, CapabilityProofId, CapabilityResource};
 use crate::collection::{
     collection_read_audience, read_capability, write_capability, AdmissionPolicy, CollectionCommit,
     CollectionMerge, CollectionPolicy, CollectionRead, CollectionReadAudience,
@@ -72,8 +69,6 @@ fn append_adversarial_proof_edge(
 ) -> CapabilityProof {
     let mut bytes = proof.into_bytes();
     bytes.extend_from_slice(&action.raw);
-    bytes.push(1); // CapabilityMode::Invoke
-    bytes.extend_from_slice(&[0; 32]); // Unbounded validity.
     bytes.extend_from_slice(&delegate.to_bytes());
     let signature = issuer.sign(&bytes);
     bytes.extend_from_slice(&signature.to_bytes());
@@ -1044,15 +1039,27 @@ fn root_ensure_hydrates_admitted_commit_closure_and_defers_concurrent_authority(
         .unwrap();
     let descriptor: Blob<SimpleArchive> = registry.snapshot().unwrap().get(root.handle()).unwrap();
     let resource = CapabilityResource::from(root.handle());
-    let write = Capability::new(write_capability(), CapabilityMode::Invoke);
     let proof = |writer: &SigningKey| {
-        CapabilityProof::issue_root(&authority, resource, write, None, writer.verifying_key())
+        CapabilityProof::new(
+            resource,
+            &authority,
+            write_capability(),
+            writer.verifying_key(),
+        )
     };
     let first_source = archive(31, 31);
     let first_metadata = archive(32, 32);
     let concurrent_source = archive(33, 33);
     let concurrent_metadata = archive(34, 34);
     let mut inner = MemoryRepo::default();
+    for definition in [
+        crate::collection::policy::read_definition(),
+        crate::collection::policy::write_definition(),
+    ] {
+        inner
+            .put::<SimpleArchive, _>(definition.facts().clone())
+            .unwrap();
+    }
     inner.insert_proof(proof(&first_writer)).unwrap();
     for (writer, source, metadata) in [
         (&first_writer, &first_source, &first_metadata),
@@ -1110,6 +1117,89 @@ fn root_ensure_hydrates_admitted_commit_closure_and_defers_concurrent_authority(
         &[data(&concurrent_source), data(&concurrent_metadata)],
     );
     assert_eq!(second_snapshot.wants().unwrap().count(), 0);
+}
+
+#[test]
+fn root_ensure_acquires_shared_capability_definitions_once_without_wants() {
+    let authority = SigningKey::from_bytes(&[86; 32]);
+    let intermediate = SigningKey::from_bytes(&[87; 32]);
+    let writer = SigningKey::from_bytes(&[88; 32]);
+    let mut registry = MemoryRepo::default();
+    let root = registry
+        .collection(
+            "cold-authority-definitions",
+            CollectionPolicy::new(
+                AdmissionPolicy::Open,
+                AdmissionPolicy::direct(authority.verifying_key()),
+            ),
+        )
+        .unwrap();
+    let descriptor: Blob<SimpleArchive> = registry.snapshot().unwrap().get(root.handle()).unwrap();
+    let read: Blob<SimpleArchive> = crate::collection::policy::read_definition()
+        .facts()
+        .clone()
+        .to_blob();
+    let write: Blob<SimpleArchive> = crate::collection::policy::write_definition()
+        .facts()
+        .clone()
+        .to_blob();
+    let delegable: Blob<SimpleArchive> = crate::prelude::entity! {
+        crate::capability::capability_action: crate::collection::ACTION_WRITE,
+        crate::capability::capability_delegate_action: crate::collection::ACTION_WRITE,
+    }
+    .facts()
+    .clone()
+    .to_blob();
+    let proof = CapabilityProof::new(
+        CapabilityResource::from(root.handle()),
+        &authority,
+        delegable.get_handle(),
+        intermediate.verifying_key(),
+    )
+    .delegate(&intermediate, write.get_handle(), writer.verifying_key())
+    .unwrap();
+    let source = archive(35, 35);
+    let metadata = archive(36, 36);
+    let mut inner = MemoryRepo::default();
+    inner.put::<SimpleArchive, _>(descriptor).unwrap();
+    inner.insert_proof(proof).unwrap();
+    inner
+        .insert(CollectionRecord::Commit(CollectionCommit::sign(
+            &writer,
+            root.handle(),
+            data(&source),
+            metadata.get_handle(),
+        )))
+        .unwrap();
+    assert!(inner
+        .snapshot()
+        .unwrap()
+        .collection(root)
+        .unwrap()
+        .cover()
+        .is_empty());
+    let mut store = GuardStore::new(inner);
+    for blob in [&read, &write, &delegable, &source, &metadata] {
+        store.offer(blob);
+    }
+
+    let observed = block_on(store.ensure(root, &equation_signer())).unwrap();
+    assert_eq!(
+        observed.collection(root).unwrap().support(),
+        &support(root, &[source.clone()])
+    );
+    assert_eq!(observed.wants().unwrap().count(), 0);
+    assert_eq!(store.acquired.len(), 5);
+    assert_eq!(
+        store.acquired.iter().copied().collect::<BTreeSet<_>>(),
+        [&read, &write, &delegable, &source, &metadata]
+            .into_iter()
+            .map(data)
+            .collect(),
+    );
+    drop(observed);
+    drop(block_on(store.ensure(root, &equation_signer())).unwrap());
+    assert_eq!(store.acquired.len(), 5, "resident definitions are reused");
 }
 
 #[test]
@@ -1192,15 +1282,22 @@ fn active_read_audience_acquires_a_cold_descriptor() {
         .get(collection.handle())
         .unwrap();
 
-    let proof = CapabilityProof::issue_root(
-        &authority,
+    let proof = CapabilityProof::new(
         CapabilityResource::from(collection.handle()),
-        Capability::new(read_capability(), CapabilityMode::Invoke),
-        None,
+        &authority,
+        read_capability(),
         reader.verifying_key(),
     );
     let mut inner = MemoryRepo::default();
     inner.insert_proof(proof).unwrap();
+    for definition in [
+        crate::collection::policy::read_definition(),
+        crate::collection::policy::write_definition(),
+    ] {
+        inner
+            .put::<SimpleArchive, _>(definition.facts().clone())
+            .unwrap();
+    }
 
     let mut store = GuardStore::new(inner);
     store.offer(&descriptor);
@@ -1235,29 +1332,25 @@ fn active_read_audience_ignores_irrelevant_or_forged_proofs() {
         )
         .unwrap();
     let resource = CapabilityResource::from(collection.handle());
-    let read = Capability::new(read_capability(), CapabilityMode::Invoke);
-
-    let irrelevant_proof = CapabilityProof::issue_root(
-        &irrelevant_authority,
+    let irrelevant_proof = CapabilityProof::new(
         resource,
-        read,
-        None,
+        &irrelevant_authority,
+        read_capability(),
         irrelevant_reader.verifying_key(),
     );
     inner.insert_proof(irrelevant_proof).unwrap();
 
-    let forged_proof = CapabilityProof::issue_root(
-        &authority,
+    let forged_proof = CapabilityProof::new(
         resource,
-        read,
-        None,
+        &authority,
+        read_capability(),
         forged_reader.verifying_key(),
     );
     let mut forged_bytes = forged_proof.into_bytes();
     *forged_bytes.last_mut().unwrap() ^= 1;
-    inner
+    assert!(inner
         .insert_proof(CapabilityProof::from_bytes(&forged_bytes).unwrap())
-        .unwrap();
+        .is_err());
 
     let mut store = GuardStore::new(inner);
 
@@ -1288,20 +1381,20 @@ fn active_read_audience_walks_a_valid_delegated_proof_path() {
         )
         .unwrap();
     let resource = CapabilityResource::from(collection.handle());
-    let action = read_capability();
-    let proof = CapabilityProof::issue_root(
-        &authority,
+    let grant = crate::prelude::entity! {
+        crate::capability::capability_action: crate::collection::ACTION_READ,
+        crate::capability::capability_delegate_action: crate::collection::ACTION_READ,
+    };
+    let delegable = inner
+        .put::<SimpleArchive, _>(grant.facts().clone())
+        .unwrap();
+    let proof = CapabilityProof::new(
         resource,
-        Capability::new(action, CapabilityMode::InvokeAndDelegate),
-        None,
+        &authority,
+        delegable,
         intermediate.verifying_key(),
     )
-    .extend(
-        &intermediate,
-        Capability::new(action, CapabilityMode::Invoke),
-        None,
-        reader.verifying_key(),
-    )
+    .delegate(&intermediate, read_capability(), reader.verifying_key())
     .unwrap();
     inner.insert_proof(proof).unwrap();
 
@@ -1341,13 +1434,8 @@ fn active_read_audience_stops_before_a_signed_but_semantically_impossible_tail()
         .unwrap();
     let resource = CapabilityResource::from(collection.handle());
     let action = read_capability();
-    let root_proof = CapabilityProof::issue_root(
-        &authority,
-        resource,
-        Capability::new(action, CapabilityMode::Invoke),
-        None,
-        direct_reader.verifying_key(),
-    );
+    let root_proof =
+        CapabilityProof::new(resource, &authority, action, direct_reader.verifying_key());
     let proof = append_adversarial_proof_edge(
         root_proof,
         &direct_reader,
@@ -1365,7 +1453,11 @@ fn active_read_audience_stops_before_a_signed_but_semantically_impossible_tail()
     assert!(store.acquired.is_empty());
     assert_eq!(
         audience,
-        CollectionReadAudience::Restricted(vec![authority.verifying_key()])
+        CollectionReadAudience::Restricted({
+            let mut subjects = vec![authority.verifying_key(), direct_reader.verifying_key()];
+            subjects.sort_unstable_by_key(VerifyingKey::to_bytes);
+            subjects
+        })
     );
     assert_eq!(store.inner.snapshot().unwrap().wants().unwrap().count(), 0);
 }
@@ -1391,14 +1483,20 @@ fn snapshot_read_audience_defers_later_proofs_after_descriptor_acquisition() {
         .get(collection.handle())
         .unwrap();
     let resource = CapabilityResource::from(collection.handle());
-    let read = Capability::new(read_capability(), CapabilityMode::Invoke);
     let mut inner = MemoryRepo::default();
+    for definition in [
+        crate::collection::policy::read_definition(),
+        crate::collection::policy::write_definition(),
+    ] {
+        inner
+            .put::<SimpleArchive, _>(definition.facts().clone())
+            .unwrap();
+    }
     inner
-        .insert_proof(CapabilityProof::issue_root(
-            &authority,
+        .insert_proof(CapabilityProof::new(
             resource,
-            read,
-            None,
+            &authority,
+            read_capability(),
             first_reader.verifying_key(),
         ))
         .unwrap();
@@ -1417,17 +1515,10 @@ fn snapshot_read_audience_defers_later_proofs_after_descriptor_acquisition() {
 
     store
         .inner
-        .insert_proof(CapabilityProof::issue_root(
-            &authority,
+        .insert_proof(CapabilityProof::new(
             resource,
-            read,
-            Some(
-                CapabilityValidity::new(
-                    hifitime::Epoch::from_tai_seconds(-1.0),
-                    hifitime::Epoch::from_tai_seconds(1.0),
-                )
-                .unwrap(),
-            ),
+            &authority,
+            read_capability(),
             later_reader.verifying_key(),
         ))
         .unwrap();

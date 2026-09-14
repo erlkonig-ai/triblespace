@@ -132,12 +132,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 The descriptor's independent READ and WRITE policies participate in collection
 identity. Here both are one-root policies. Whether a recipient may extend its
-authority is carried by the mode signed into that recipient's proof prefix,
-not by a second collection-policy threshold.
+authority is described by the independent delegation-action facts in the
+capability definitions signed into its proof prefix, not by a second
+collection-policy threshold. Each child may invoke or delegate only actions
+its parent permits delegating; the definition handles may differ.
 Other strictly verified signers become visible only when
 `library.admitted(&snapshot)` observes sufficient root support for exact
-`ACTION_WRITE` on this descriptor handle at the same immutable store snapshot's
-frozen authorization instant.
+`ACTION_WRITE` on this descriptor handle through resident proof and definition
+evidence. Collection WRITE authority has no wall-clock expiry.
 Identical retries deduplicate by intrinsic record identity, distinct commits
 coexist, and `Cover::materialize` reconstructs every admitted author's union
 through the same snapshot. Call

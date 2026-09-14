@@ -12,9 +12,7 @@ use triblespace_core::blob::IntoBlob;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::locator::blob_locator;
-use triblespace_core::capability::{
-    Capability, CapabilityHandle, CapabilityMode, CapabilityProof, CapabilityResource,
-};
+use triblespace_core::capability::{CapabilityHandle, CapabilityProof, CapabilityResource};
 use triblespace_core::clock::{self, VirtualClock};
 use triblespace_core::collection::reference_summary::{
     ReferenceSummaryBlob, ReferenceSummaryLayout, ReferenceSummaryView,
@@ -70,11 +68,10 @@ fn proof(
     action: CapabilityHandle,
     collection: CollectionHandle,
 ) -> CapabilityProof {
-    CapabilityProof::issue_root(
-        root,
+    CapabilityProof::new(
         CapabilityResource::from(collection),
-        Capability::new(action, CapabilityMode::Invoke),
-        None,
+        root,
+        action,
         leaf.verifying_key(),
     )
 }

@@ -127,7 +127,7 @@ impl StoreChanges {
 ///
 /// A snapshot is its own local revision token. It owns every read capability
 /// needed to interpret the prefix it observed, and compares directly with an
-/// earlier snapshot from the same store lineage. Its authorization instant is
+/// earlier snapshot from the same store lineage. Its query instant is
 /// frozen with that observation and remains unchanged by cloning or reading.
 /// Record reads and residency observations are frozen and never perform work.
 /// A snapshot may additionally carry an asynchronous blob reader which fetches
@@ -135,10 +135,11 @@ impl StoreChanges {
 /// recording durable demand. The default change classification is deliberately
 /// conservative for backends that cannot classify changes cheaply.
 pub trait StoreSnapshot: Clone + Send + Sync + 'static {
-    /// The frozen instant used for every authorization decision in this observation.
+    /// The frozen instant for time-sensitive application queries.
     ///
     /// This is a stored value, never a fresh clock observation. A later instant
     /// requires another snapshot, even if the stored content has not changed.
+    /// Generic capability and collection authority do not depend on this clock.
     fn instant(&self) -> hifitime::Epoch;
 
     /// Conservatively classify changes since `previous`.
@@ -147,7 +148,7 @@ pub trait StoreSnapshot: Clone + Send + Sync + 'static {
     /// derived state, so implementations must report every component which may
     /// have changed. This compares stored content only: a different
     /// [`instant`](Self::instant) does not change any component. Consumers
-    /// caching authorization decisions must separately track validity
+    /// caching time-sensitive application queries must separately track their
     /// boundaries and clock rollback. Snapshots are local observations, not
     /// portable versions.
     fn changes_since(&self, _previous: &Self) -> StoreChanges {
@@ -158,7 +159,7 @@ pub trait StoreSnapshot: Clone + Send + Sync + 'static {
 /// A mutable store which can freeze one immutable read observation.
 ///
 /// Every semantic read capability implemented by a store shares this one
-/// associated snapshot. Records, proof evidence, and authorization time are
+/// associated snapshot. Records, proof evidence, and the query instant are
 /// frozen together. An attached asynchronous blob reader may resolve exact
 /// immutable handles later; that does not select a newer semantic observation.
 pub trait SnapshotSource {
@@ -167,13 +168,13 @@ pub trait SnapshotSource {
     /// Failure while refreshing and freezing an observation.
     type SnapshotError: Error + Debug + Send + Sync + 'static;
 
-    /// Sample the authorization clock once, then freeze the resulting prefix.
+    /// Sample the query clock once, then freeze the resulting prefix.
     fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
         self.snapshot_at(crate::clock::epoch_now())
     }
 
     /// Reobserve external changes and freeze the prefix at one chosen
-    /// authorization instant.
+    /// query instant.
     ///
     /// This chooses how to interpret the newly observed content, not a
     /// historical content revision. Composite stores pass the same instant to

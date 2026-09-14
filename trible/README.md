@@ -141,11 +141,11 @@ with the encoding and mapping-algorithm descriptions.
   READ and WRITE policies, representation, mapping, and referencing record
   counts. The handle is accepted with or without the `blake3:` prefix.
 - `pile collection grant-read <PILE> <COLLECTION> <RECIPIENT> [--key PATH]` —
-  issue one deterministic, unbounded READ/Invoke proof from a configured READ
+  issue one deterministic invoke-only READ grant from a configured READ
   root to an Ed25519 public key and insert that one self-contained proof;
   replaying the exact command is idempotent and writes no companion blobs.
 - `pile collection grant-write <PILE> <COLLECTION> <RECIPIENT> [--key PATH]` —
-  issue the symmetric deterministic WRITE/Invoke proof from a configured WRITE
+  issue the symmetric deterministic invoke-only WRITE grant from a configured WRITE
   root to an author key.
 
 #### Background maintenance
@@ -165,7 +165,8 @@ One pile stays open; unchanged snapshots do not rerun maintenance. A pass that
 overlaps content changes schedules a catch-up pass at the next interval, so a
 concurrent append cannot disappear behind the post-work snapshot. At rest, an
 idempotent pass publishes nothing and clears that pending work.
-Proof-validity boundaries are tracked separately from content changes.
+Generic collection authority has no wall-clock expiry; arriving proof or
+capability-definition evidence is a content change, not a separate timer.
 Ctrl-C closes the pile normally. Independent targets continue when one fails;
 watch mode reports that failure and retries when its observed inputs change.
 

@@ -7,9 +7,7 @@ use super::*;
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::succinctarchive::SuccinctArchiveBlob;
 use crate::blob::{Blob, IntoBlob};
-use crate::capability::{
-    Capability, CapabilityMode, CapabilityProof, CapabilityResource, CapabilityValidity,
-};
+use crate::capability::{CapabilityProof, CapabilityResource};
 use crate::inline::encodings::hash::Handle;
 use crate::repo::memoryrepo::MemoryRepo;
 use crate::repo::{BlobStorePut, CapabilityProofStore, SnapshotSource};
@@ -213,13 +211,13 @@ fn derive_before_write_proof_is_inert_then_admitted_without_reinsertion() {
 }
 
 #[test]
-fn equation_authority_uses_snapshot_time_and_expires_without_removing_records() {
+fn equation_authority_is_timeless_across_snapshot_clocks() {
     let root = SigningKey::from_bytes(&[31; 32]);
     let producer = SigningKey::from_bytes(&[32; 32]);
     let mut store = MemoryRepo::default();
     let collection = store
         .collection(
-            "expiring-equation-authority",
+            "timeless-equation-authority",
             CollectionPolicy::new(
                 AdmissionPolicy::Open,
                 AdmissionPolicy::delegable(root.verifying_key()),
@@ -243,24 +241,17 @@ fn equation_authority_uses_snapshot_time_and_expires_without_removing_records() 
         )))
         .unwrap();
     store
-        .insert_proof(CapabilityProof::issue_root(
-            &root,
+        .insert_proof(CapabilityProof::new(
             CapabilityResource::from(collection.handle()),
-            Capability::new(write_capability(), CapabilityMode::Invoke),
-            Some(
-                CapabilityValidity::new(
-                    Epoch::from_tai_seconds(10.0),
-                    Epoch::from_tai_seconds(20.0),
-                )
-                .unwrap(),
-            ),
+            &root,
+            write_capability(),
             producer.verifying_key(),
         ))
         .unwrap();
     let before = store.snapshot_at(Epoch::from_tai_seconds(9.0)).unwrap();
     let admitted = store.snapshot_at(Epoch::from_tai_seconds(15.0)).unwrap();
-    let expired = store.snapshot_at(Epoch::from_tai_seconds(21.0)).unwrap();
-    assert_eq!(before.collection(collection).unwrap().cover().len(), 2);
+    let later = store.snapshot_at(Epoch::from_tai_seconds(21.0)).unwrap();
+    assert_eq!(before.collection(collection).unwrap().cover().len(), 1);
     assert_eq!(
         admitted
             .collection(collection)
@@ -270,10 +261,10 @@ fn equation_authority_uses_snapshot_time_and_expires_without_removing_records() 
             .collect::<Vec<_>>(),
         vec![joined]
     );
-    assert_eq!(expired.collection(collection).unwrap().cover().len(), 2);
+    assert_eq!(later.collection(collection).unwrap().cover().len(), 1);
     assert_eq!(admitted.collection(collection).unwrap().cover().len(), 1);
     assert_eq!(
-        expired.records().unwrap().count(),
+        later.records().unwrap().count(),
         before.records().unwrap().count()
     );
 }

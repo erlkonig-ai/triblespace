@@ -54,12 +54,15 @@ For one collection, semantic repair derives two independent grow-only sets:
 - every structurally valid native collection record naming exact C: signed
   `COMMIT`, `MERGE`, and `DERIVE` records independent of current WRITE(C)
   admission; and
-- every self-contained native proof for a capability declared by C's descriptor,
-  scoped to exact C and beginning at that capability policy's roots.
+- every signature-valid native proof scoped to exact resource C and beginning
+  at a root named by C's supported policy bindings, without requiring its grant
+  handles to match those bindings. The subordinate-resource transport candidate
+  also includes proofs for R whose immutable descriptor declares C as its repair
+  audience, under R's own policy roots.
 
 Each set is represented by an immutable BLAKE3-Merkle PATCH. Collection
 records are keyed physically by the full 32-byte fingerprint of their exact
-canonical value; authorization evidence uses a `resource | proof_hash` PATCH
+canonical value; authorization evidence uses a `repair_collection | proof_hash` PATCH
 whose values share ownership of the original proof bytes. Only C's prefix is
 exposed; the wire leaf key is the 32-byte proof hash and its payload is the
 complete native proof body. The host currently keeps one such index per
@@ -67,22 +70,32 @@ overlay, not a shared global inventory. There is no companion claim blob or
 authorization closure to transfer. The opaque semantic repair root
 commits to C, both PATCH roots, and both leaf counts under a versioned domain.
 
-The authorization projection is structural rather than a snapshot of who is
-admitted now. Expired, not-yet-valid, delegate-only, and quorum-incomplete
-branches remain immutable evidence. Time, mode, and quorum are derived checks
-at the operation instant. Each root path is evaluated independently; no
-fixed-point over sibling paths can create delegation support.
+The authorization projection authenticates proof bytes rather than taking a
+snapshot of who is admitted. Unavailable definitions, delegate-only grants,
+and quorum-incomplete paths remain evidence. Admission separately interprets
+the definitions' invocation and delegation action sets under the requested
+action's policy roots. Generic authority has no clock. Each root path is
+evaluated independently; no fixed-point over sibling paths can create
+delegation support.
 
 The only initial handoff is the delegation itself: a grantor may give the new
 subject the self-contained proof bytes. That is the capability invitation
 boundary, not a Secrets-specific delivery channel. Once one collection
 participant has the proof, authorization-evidence repair distributes that one
-record to READ(C) peers without a second content-acquisition phase. A Secrets
-writer can therefore derive its current finite key-delivery audience from the
-same snapshot and materialize recipient envelopes without a separate envelope
-RPC or roster. That capability is distinct from READ: ciphertext replication
-does not imply decryption-key delivery. Open capabilities remain explicitly
-non-enumerable.
+record to READ(C) peers. Interpretation needs any referenced capability
+definitions to be resident, but this record-only repair stream neither fetches
+nor carries them. An application may use the same proof kernel for another
+resource, such as Secrets key delivery, without treating collection READ as
+decryption authority.
+
+The subordinate-resource transport candidate reads R's `resource_collection: C`
+and its policy bindings from the same descriptor entity, without requiring a
+mutable referencing fact in C. It defers a proof when R's descriptor is absent
+and marks AUTH repair incomplete, while C's record repair continues. Later
+ordinary blob arrival permits retry; AUTH does not fetch R or emit WANT.
+The session is still gated by READ(C), not by R's action. This extension remains
+a source candidate pending its validation and rollout. Open action policies
+remain explicitly non-enumerable.
 
 This product matters. Synchronizing only collection records would miss the
 case where a newly arrived proof activates an old COMMIT. Synchronizing a whole
@@ -150,21 +163,23 @@ proofs for cold bootstrap. The server admits the TLS-authenticated client only
 from READ(C) evidence in its pinned local projection before returning any
 manifest. Unknown hello proofs are signature/root checked and stored inertly.
 The current session remains rejected; a new coherent snapshot and session can
-admit the now-resident proof without fetching any companion blob. For `Open`
+admit the proof once its capability definitions are also resident. This stream
+does not acquire those blobs. For `Open`
 READ the bootstrap is empty. A WRITE-only publisher needs no READ authority
 merely to serve an authorized replica.
 
 The server loads one immutable repair overlay for C and applies the
-descriptor's exact READ policy at one instant. Rejection returns no manifest.
+descriptor's READ action policy against that frozen evidence. Rejection returns no manifest.
 On admission it returns record and authorization-evidence PATCH summaries plus
 the same opaque root. The client may then walk only differing prefixes and
 receive missing leaf bodies:
 
 - canonical signature-valid `COMMIT`, `MERGE`, and `DERIVE` records naming C,
   whether active or inert;
-- native structurally relevant proofs for C's declared capabilities.
+- native proofs relevant to C's repair audience and their resource's policy roots.
 
-Each proof leaf already contains the complete path and all of its restrictions.
+Each proof leaf contains the complete signed path and the handles of its
+capability definitions, not those definitions' facts.
 Records may land before sufficient WRITE proof evidence and remain harmlessly
 inactive until a later snapshot derives admission.
 

@@ -37,12 +37,12 @@ pub(super) fn run(path: &Path) -> Result<()> {
             } => {
                 checked[3] += 1;
                 // PileRecords established this exact body range. Validation
-                // checks the self-contained path, never the current clock,
-                // a chosen policy root, or the referenced definition blobs.
+                // checks only the self-contained signature chain, never a
+                // chosen policy root or the referenced definition blobs.
                 let bytes = records.bytes().slice(data_offset..data_offset + data_len);
                 let result = CapabilityProof::from_owned_bytes(bytes)
                     .map_err(anyhow::Error::from)
-                    .and_then(|proof| proof.validate_structure().map_err(anyhow::Error::from));
+                    .and_then(|proof| proof.verify_signatures().map_err(anyhow::Error::from));
                 ("AUTH", result)
             }
             PileRecordContent::LegacyUnsignedCollectionEquation { .. }
@@ -75,7 +75,7 @@ pub(super) fn run(path: &Path) -> Result<()> {
     println!(
         "Not checked: unsigned legacy equations={unsigned}, opaque records={opaque}, other records={other}"
     );
-    println!("Scope: signatures and AUTH path attenuation only; no blob hashes, clock or authorization policy");
+    println!("Scope: signatures only; no blob hashes or capability-definition interpretation");
     if invalid != 0 {
         return Err(anyhow!("{invalid} native record(s) failed verification"));
     }

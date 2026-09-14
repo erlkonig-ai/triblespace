@@ -8,7 +8,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use triblespace_core::capability::{CapabilityProof, CapabilityProofId};
 use triblespace_core::collection::{CollectionHandle, CollectionRecord};
 
-use crate::collection_activation::CollectionRepairOverlay;
+use crate::collection_activation::{CollectionAuthorizationEvidenceError, CollectionRepairOverlay};
 use crate::collection_delta::{decode_record, encode_record};
 use crate::collection_wire::{
     CollectionRepairAdmission, CollectionRepairCommand, CollectionRepairComponent,
@@ -68,15 +68,19 @@ where
     let bootstrap = hello
         .bootstrap_proofs
         .into_iter()
-        .filter(|proof| proof.leaf_key() == remote && evidence.validate_read_proof(proof).is_ok())
+        .filter(|proof| {
+            evidence.get(proof.id()).is_none()
+                && proof.resource().into_bytes() == collection.raw
+                && proof.prefixes().any(|prefix| prefix.subject() == remote)
+                && evidence.validate_proof(proof).is_ok()
+        })
         .collect::<Vec<_>>();
     let read_evidence = overlay
         .authorization_evidence()
         .proofs()
         .cloned()
         .collect::<Vec<_>>();
-    let admitted =
-        evidence.reader_is_admitted_by_at(remote, &read_evidence, crate::clock::epoch_now());
+    let admitted = evidence.reader_is_admitted_by(remote, &read_evidence);
     if !admitted {
         send_repair_admission(send, CollectionRepairAdmission::Rejected).await?;
         send.shutdown().await?;
@@ -342,6 +346,7 @@ where
     let mut missing = Vec::new();
     let mut requests = 0;
     let mut complete = false;
+    let mut deferred = false;
     loop {
         if requests >= MAX_REPAIR_NODE_REQUESTS
             || *remaining_requests == 0
@@ -366,7 +371,7 @@ where
             component,
             local.collection(),
             &response,
-            |key, bytes| validate_authorization_leaf(local, key, bytes),
+            |key, bytes| validate_authorization_leaf_bytes(local.collection(), key, bytes),
         )?;
         if let Some(leaf) = walker.accept(&request, response, |_, key| {
             let Ok(key) = <[u8; 32]>::try_from(key) else {
@@ -377,25 +382,38 @@ where
                 .get(CapabilityProofId::new(key))
                 .is_some()
         })? {
-            missing.push(CapabilityProof::from_bytes(&leaf.value)?);
+            let proof = CapabilityProof::from_bytes(&leaf.value)?;
+            match local.authorization_evidence().validate_proof(&proof) {
+                Ok(()) => missing.push(proof),
+                Err(
+                    CollectionAuthorizationEvidenceError::ResourceDescriptorUnavailable(_)
+                    | CollectionAuthorizationEvidenceError::WrongRoot,
+                ) if proof.resource().into_bytes() != local.collection().raw => {
+                    // R may arrive through ordinary blob acquisition after
+                    // this pinned observation. Do not ingest unrouted proofs,
+                    // block independent C records, or claim AUTH convergence.
+                    deferred = true;
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
     }
     if complete {
         walker.finish()?;
     }
-    Ok((missing, !complete))
+    Ok((missing, !complete || deferred))
 }
 
-fn validate_authorization_leaf(
-    local: &CollectionRepairOverlay,
+fn validate_authorization_leaf_bytes(
+    audience: CollectionHandle,
     key: &[u8],
     bytes: &[u8],
 ) -> Result<()> {
     let proof = CapabilityProof::from_bytes(bytes)?;
-    if key.len() != 64 || key[..32] != local.collection().raw || proof.id().raw != key[32..] {
+    if key.len() != 64 || key[..32] != audience.raw || proof.id().raw != key[32..] {
         bail!("authorization proof body does not match its scoped PATCH leaf key");
     }
-    local.authorization_evidence().validate_proof(&proof)?;
+    proof.verify_signatures()?;
     Ok(())
 }
 
@@ -442,11 +460,11 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace_core::capability::policy::resource_policy;
-    use triblespace_core::capability::{Capability, CapabilityMode, CapabilityResource};
+    use triblespace_core::capability::{CapabilityResource, capability_action};
     use triblespace_core::collection::{
-        AdmissionPolicy, CollectionCommit, CollectionData, CollectionPolicy, CollectionRecord,
-        CollectionStore, CollectionStoreExt, KIND_COLLECTION_DESCRIPTOR, empty_metadata_handle,
-        read_capability, write_capability,
+        ACTION_READ, ACTION_WRITE, AdmissionPolicy, CollectionCommit, CollectionData,
+        CollectionPolicy, CollectionRecord, CollectionStore, CollectionStoreExt,
+        KIND_COLLECTION_DESCRIPTOR, empty_metadata_handle, read_capability, write_capability,
     };
     use triblespace_core::metadata;
     use triblespace_core::prelude::entity;
@@ -475,16 +493,23 @@ mod tests {
                 resource_policy*: bindings,
             };
             let mut store = MemoryRepo::default();
+            store
+                .put::<SimpleArchive, _>(entity! { capability_action: ACTION_READ }.facts().clone())
+                .unwrap();
+            store
+                .put::<SimpleArchive, _>(
+                    entity! { capability_action: ACTION_WRITE }.facts().clone(),
+                )
+                .unwrap();
             let collection = store
                 .put::<SimpleArchive, _>(descriptor.facts().clone())
                 .unwrap();
             let before = store.snapshot().unwrap();
             let client = collection_repair_overlay(&before, collection).unwrap();
-            let proof = CapabilityProof::issue_root(
-                &root,
+            let proof = CapabilityProof::new(
                 CapabilityResource::from(collection),
-                Capability::new(custom, CapabilityMode::Invoke),
-                None,
+                &root,
+                custom,
                 reader.verifying_key(),
             );
             store.insert_proof(proof.clone()).unwrap();
@@ -539,8 +564,134 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn subordinate_proof_defers_until_its_resource_arrives_without_blocking_records() {
+        use triblespace_core::capability::policy::resource_collection;
+
+        async fn pull(
+            local: &CollectionRepairOverlay,
+            remote: Arc<CollectionRepairOverlay>,
+            reader: VerifyingKey,
+        ) -> Result<CollectionRepairDelta> {
+            let (server_io, client_io) = tokio::io::duplex(1 << 20);
+            let (mut server_recv, mut server_send) = tokio::io::split(server_io);
+            let (mut client_recv, mut client_send) = tokio::io::split(client_io);
+            let server = tokio::spawn(async move {
+                assert_eq!(
+                    recv_u8(&mut server_recv).await.unwrap(),
+                    crate::collection_wire::OP_COLLECTION_REPAIR
+                );
+                let retained = serve_collection_repair(
+                    &mut server_recv,
+                    &mut server_send,
+                    reader,
+                    |collection| (collection == remote.collection()).then_some(remote),
+                )
+                .await
+                .unwrap();
+                assert!(retained.is_empty());
+            });
+            let result =
+                pull_collection_stream(&mut client_send, &mut client_recv, local, vec![]).await;
+            server.await.unwrap();
+            result
+        }
+
+        let resource_root = SigningKey::from_bytes(&[97; 32]);
+        let reader = SigningKey::from_bytes(&[98; 32]).verifying_key();
+        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+        let mut server_store = MemoryRepo::default();
+        let collection = server_store
+            .collection("subordinate-repair", policy.clone())
+            .unwrap();
+        let mut client_store = MemoryRepo::default();
+        let client_collection = client_store
+            .collection("subordinate-repair", policy)
+            .unwrap();
+        assert_eq!(collection.handle(), client_collection.handle());
+        let capability = triblespace_core::inline::Inline::new([99; 32]);
+        let resource_facts = entity! {
+            resource_collection: collection.handle(),
+            resource_policy*: AdmissionPolicy::direct(resource_root.verifying_key()).binding(capability),
+        };
+        let resource = server_store
+            .put::<SimpleArchive, _>(resource_facts.facts().clone())
+            .unwrap();
+        let proof = CapabilityProof::new(
+            CapabilityResource::from(resource),
+            &resource_root,
+            capability,
+            reader,
+        );
+        server_store.insert_proof(proof.clone()).unwrap();
+        server_store
+            .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                &resource_root,
+                collection.handle(),
+                CollectionData::new(resource.raw),
+                empty_metadata_handle(),
+            )))
+            .unwrap();
+        let remote = Arc::new(
+            collection_repair_overlay(&server_store.snapshot().unwrap(), collection.handle())
+                .unwrap(),
+        );
+        assert_eq!(remote.authorization_evidence().len(), 1);
+
+        let before = client_store.snapshot().unwrap();
+        let local = collection_repair_overlay(&before, collection.handle()).unwrap();
+        let first = pull(&local, remote.clone(), reader).await.unwrap();
+        assert!(first.authorization_evidence.is_empty());
+        assert_eq!(
+            first.records.len(),
+            1,
+            "missing R must not suppress independent C records"
+        );
+        assert!(first.more, "skipped AUTH is not a reconciled remote root");
+        let after_wire = client_store.snapshot().unwrap();
+        assert_eq!(before.blobs().count(), after_wire.blobs().count());
+        assert!(!after_wire.contains_blob(resource).unwrap());
+        assert!(after_wire.wants().unwrap().next().is_none());
+        for record in first.records {
+            client_store.insert(record).unwrap();
+        }
+
+        // Stand in for the ordinary blob acquisition path, outside repair.
+        assert_eq!(
+            client_store
+                .put::<SimpleArchive, _>(resource_facts.facts().clone())
+                .unwrap(),
+            resource
+        );
+        let resident = client_store.snapshot().unwrap();
+        let local = collection_repair_overlay(&resident, collection.handle()).unwrap();
+        assert!(
+            local.authorization_evidence().is_empty(),
+            "first incoming R proof is not cached locally"
+        );
+        let second = pull(&local, remote.clone(), reader).await.unwrap();
+        assert_eq!(second.authorization_evidence, [proof.clone()]);
+        assert!(second.records.is_empty());
+        assert!(!second.more);
+        client_store.insert_proof(proof.clone()).unwrap();
+
+        let final_snapshot = client_store.snapshot().unwrap();
+        assert!(
+            !final_snapshot.contains_blob(capability).unwrap(),
+            "repair does not acquire capability definitions"
+        );
+        assert!(final_snapshot.wants().unwrap().next().is_none());
+        let local = collection_repair_overlay(&final_snapshot, collection.handle()).unwrap();
+        assert_eq!(local.authorization_evidence().get(proof.id()), Some(&proof));
+        assert_eq!(local.wake_root(), remote.wake_root());
+        let final_delta = pull(&local, remote, reader).await.unwrap();
+        assert!(final_delta.authorization_evidence.is_empty());
+        assert!(final_delta.records.is_empty());
+        assert!(!final_delta.more);
+    }
+
     #[test]
-    fn received_auth_leaf_rejects_wrong_resource_capability_or_root_even_with_valid_hash() {
+    fn received_auth_leaf_rejects_wrong_resource_root_or_signature_even_with_valid_hash() {
         use triblespace_core::patch::{Blake3Merkle, Entry, IdentitySchema, PATCH};
         let root = SigningKey::from_bytes(&[83; 32]);
         let stranger = SigningKey::from_bytes(&[84; 32]);
@@ -552,27 +703,36 @@ mod tests {
                 + AdmissionPolicy::direct(root.verifying_key()).binding(custom),
         };
         let mut store = MemoryRepo::default();
+        store
+            .put::<SimpleArchive, _>(entity! { capability_action: ACTION_READ }.facts().clone())
+            .unwrap();
+        store
+            .put::<SimpleArchive, _>(entity! { capability_action: ACTION_WRITE }.facts().clone())
+            .unwrap();
         let collection = store
             .put::<SimpleArchive, _>(descriptor.facts().clone())
             .unwrap();
         let local = collection_repair_overlay(&store.snapshot().unwrap(), collection).unwrap();
         let proof_for = |issuer: &SigningKey, capability, resource| {
-            CapabilityProof::issue_root(
-                issuer,
+            CapabilityProof::new(
                 CapabilityResource::from(resource),
-                Capability::new(capability, CapabilityMode::Invoke),
-                None,
+                issuer,
+                capability,
                 reader.verifying_key(),
             )
         };
+        let mut bad_bytes = proof_for(&root, custom, collection).as_bytes().to_vec();
+        *bad_bytes.last_mut().unwrap() ^= 1;
+        let bad_signature = CapabilityProof::from_bytes(&bad_bytes).unwrap();
         let cases = [
             (true, proof_for(&root, custom, collection)),
-            (false, proof_for(&root, write_capability(), collection)),
+            (true, proof_for(&root, write_capability(), collection)),
             (
                 false,
                 proof_for(&root, custom, CollectionHandle::new([87; 32])),
             ),
             (false, proof_for(&stranger, custom, collection)),
+            (false, bad_signature),
         ];
         for (valid, proof) in cases {
             let mut patch = PATCH::<64, IdentitySchema, CapabilityProof, Blake3Merkle>::new();
@@ -599,7 +759,13 @@ mod tests {
                 CollectionRepairComponent::AuthorizationEvidence,
                 collection,
                 &response,
-                |key, bytes| validate_authorization_leaf(&local, key, bytes),
+                |key, bytes| {
+                    validate_authorization_leaf_bytes(local.collection(), key, bytes)?;
+                    local
+                        .authorization_evidence()
+                        .validate_proof(&CapabilityProof::from_bytes(bytes)?)?;
+                    Ok(())
+                },
             );
             assert_eq!(accepted.is_ok(), valid);
         }
@@ -622,17 +788,21 @@ mod tests {
                 resource_policy*: alternatives + AdmissionPolicy::Open.binding(write_capability()),
             };
             let mut store = MemoryRepo::default();
+            store
+                .put::<SimpleArchive, _>(entity! { capability_action: ACTION_READ }.facts().clone())
+                .unwrap();
+            store
+                .put::<SimpleArchive, _>(
+                    entity! { capability_action: ACTION_WRITE }.facts().clone(),
+                )
+                .unwrap();
             let collection = store
                 .put::<SimpleArchive, _>(descriptor.facts().clone())
                 .unwrap();
-            let proof = CapabilityProof::issue_root(
-                &root_b,
+            let proof = CapabilityProof::new(
                 CapabilityResource::from(collection),
-                Capability::new(
-                    triblespace_core::collection::read_capability(),
-                    CapabilityMode::Invoke,
-                ),
-                None,
+                &root_b,
+                triblespace_core::collection::read_capability(),
                 reader.verifying_key(),
             );
             store.insert_proof(proof).unwrap();
@@ -748,14 +918,10 @@ mod tests {
         );
         let mut server_store = MemoryRepo::default();
         let server_collection = server_store.collection("private", policy.clone()).unwrap();
-        let proof = CapabilityProof::issue_root(
-            &root,
+        let proof = CapabilityProof::new(
             CapabilityResource::from(server_collection.handle()),
-            Capability::new(
-                triblespace_core::collection::read_capability(),
-                CapabilityMode::Invoke,
-            ),
-            None,
+            &root,
+            triblespace_core::collection::read_capability(),
             reader.verifying_key(),
         );
         server_store.insert_proof(proof.clone()).unwrap();
@@ -807,24 +973,16 @@ mod tests {
         );
         let mut server_store = MemoryRepo::default();
         let server_collection = server_store.collection("cold", policy.clone()).unwrap();
-        let proof = CapabilityProof::issue_root(
-            &root,
+        let proof = CapabilityProof::new(
             CapabilityResource::from(server_collection.handle()),
-            Capability::new(
-                triblespace_core::collection::read_capability(),
-                CapabilityMode::Invoke,
-            ),
-            None,
+            &root,
+            triblespace_core::collection::read_capability(),
             reader.verifying_key(),
         );
-        let other_proof = CapabilityProof::issue_root(
-            &root,
+        let other_proof = CapabilityProof::new(
             CapabilityResource::from(server_collection.handle()),
-            Capability::new(
-                triblespace_core::collection::read_capability(),
-                CapabilityMode::Invoke,
-            ),
-            None,
+            &root,
+            triblespace_core::collection::read_capability(),
             other_reader.verifying_key(),
         );
         let server_snapshot = server_store.snapshot().unwrap();

@@ -16,7 +16,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use iroh_base::EndpointId;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::{BlobEncoding, IntoBlob};
-use triblespace_core::collection::{CollectionHandle, CollectionStore, next_authorization_change};
+use triblespace_core::collection::{CollectionHandle, CollectionStore};
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::InlineEncoding;
 use triblespace_core::inline::encodings::hash::Handle;
@@ -202,11 +202,7 @@ where
     /// Equality is a cheap invalidation check supplied by the store; it is not
     /// a portable generation or a semantic version.
     last_store_snapshot: Option<S::Snapshot>,
-    last_authorization_change: Option<hifitime::Epoch>,
-    last_observed_at: Option<hifitime::Epoch>,
-    /// Last snapshot-bound provider set sent to the host. Rebuilding it
-    /// on every refresh lets proof expiry narrow publication even when the
-    /// store prefix itself did not change.
+    /// Last snapshot-bound provider set sent to the host.
     last_provider_observation: ProviderObservation,
     last_event_at: crate::clock::Mono,
     #[cfg(test)]
@@ -300,8 +296,6 @@ where
             active_dirty: true,
             pending_network_flush: false,
             last_store_snapshot: None,
-            last_authorization_change: None,
-            last_observed_at: None,
             last_provider_observation: ProviderObservation::default(),
             last_event_at: crate::clock::mono_now(),
             #[cfg(test)]
@@ -445,8 +439,6 @@ where
         if result.is_err() {
             self.sender.clear_snapshot();
             self.last_store_snapshot = None;
-            self.last_authorization_change = None;
-            self.last_observed_at = None;
             self.last_provider_observation = ProviderObservation::default();
         }
         result
@@ -570,33 +562,15 @@ where
                         snapshot.changes_since(previous)
                     })
             };
-            let now = snapshot.instant();
-            let authorization_inputs_changed = changes.contains(StoreChanges::BLOBS)
-                || changes.contains(StoreChanges::COLLECTION_RECORDS)
-                || changes.contains(StoreChanges::CAPABILITY_PROOFS);
-            let authorization_changed =
-                self.last_observed_at.is_some_and(|observed| now < observed)
-                    || self
-                        .last_authorization_change
-                        .is_some_and(|boundary| now >= boundary);
             if received == 0
                 && changes == StoreChanges::NONE
-                && !authorization_changed
                 && !self.active_dirty
                 && previous_snapshot.is_some()
             {
                 self.last_store_snapshot = Some(snapshot);
                 return Ok(());
             }
-            let next_authorization_change =
-                if !authorization_inputs_changed && !authorization_changed {
-                    self.last_authorization_change
-                } else {
-                    next_authorization_change(&snapshot)
-                        .map_err(anyhow::Error::new)
-                        .map_err(PeerSnapshotError::Overlay)?
-                };
-            // Even a semantic no-op installs the fresh read lease. Unchanged
+            // Even a semantic no-op installs the fresh read observation. Unchanged
             // semantic repair PATCHes retain their Arc while exact-GET advances to
             // the new immutable store observation.
             let serving = StoreSnapshot::from_store_changes(
@@ -607,8 +581,6 @@ where
                 self.last_store_snapshot.as_ref(),
                 previous_snapshot.as_deref(),
                 changes,
-                authorization_changed,
-                next_authorization_change,
             )
             .map_err(PeerSnapshotError::Overlay)?;
             let serves_collections = self.qos.direction.serves();
@@ -626,17 +598,12 @@ where
             }
             self.active_dirty = false;
             self.last_store_snapshot = Some(snapshot);
-            self.last_authorization_change = next_authorization_change;
-            self.last_observed_at = Some(now);
             Self::observe_provider_observation(
                 &self.sender,
                 &mut self.last_provider_observation,
                 provider_observation,
             );
         } else {
-            // A failed admission flush withholds a new snapshot, but the
-            // already-installed prefix remains a valid read lease. Recompute
-            // only its time-sensitive authorization boundary.
             // Keep the last immutable serving/provider observation until the
             // failed admission batch is retried successfully.
         }
@@ -865,9 +832,7 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
     use iroh_base::EndpointId;
-    use triblespace_core::capability::{
-        Capability, CapabilityMode, CapabilityProof, CapabilityResource,
-    };
+    use triblespace_core::capability::{CapabilityProof, CapabilityResource};
     use triblespace_core::collection::{
         AdmissionPolicy, CollectionPolicy, CollectionRead, CollectionSnapshotExt,
         CollectionStoreExt,
@@ -1044,14 +1009,10 @@ mod tests {
 
         peer.commit(collection, &key, entity! { metadata::name: "after" })
             .unwrap();
-        let proof = CapabilityProof::issue_root(
-            &key,
+        let proof = CapabilityProof::new(
             CapabilityResource::from(collection.handle()),
-            Capability::new(
-                triblespace_core::collection::read_capability(),
-                CapabilityMode::Invoke,
-            ),
-            None,
+            &key,
+            triblespace_core::collection::read_capability(),
             SigningKey::from_bytes(&[71; 32]).verifying_key(),
         );
         peer.insert_proof(proof).unwrap();
@@ -1518,14 +1479,10 @@ mod tests {
             sender,
             receiver,
         );
-        let proof = CapabilityProof::issue_root(
-            &key,
+        let proof = CapabilityProof::new(
             CapabilityResource::new([95; 32]),
-            Capability::new(
-                triblespace_core::collection::read_capability(),
-                CapabilityMode::Invoke,
-            ),
-            None,
+            &key,
+            triblespace_core::collection::read_capability(),
             SigningKey::from_bytes(&[96; 32]).verifying_key(),
         );
         let mut batch = NetEventBatch::default();

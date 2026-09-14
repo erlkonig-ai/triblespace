@@ -279,12 +279,12 @@ where
     let evidence = super::api::discover_admission_evidence(
         snapshot,
         super::descriptor::admission_policies(
+            snapshot,
             descriptor.fragment.facts(),
-            super::write_capability(),
+            super::ACTION_WRITE,
             Some(L::id()),
         ),
-        super::write_capability(),
-        crate::capability::CapabilityMode::Invoke,
+        super::ACTION_WRITE,
         collection,
     )
     .map_err(|source| CollectionDiscoveryError::Admission {
@@ -299,7 +299,7 @@ where
         *admitted.entry(record.public_key().raw).or_insert_with(|| {
             ed25519_dalek::VerifyingKey::from_bytes(&record.public_key().raw)
                 .ok()
-                .is_some_and(|subject| evidence.authorizes(subject, snapshot.instant()))
+                .is_some_and(|subject| evidence.authorizes(snapshot, subject))
         })
     });
     Ok(discovered)
@@ -425,12 +425,12 @@ where
 {
     let mut discovered = DiscoveredCollectionRecords::default();
     let mut matching_commits = Vec::new();
+    let selectors = BTreeSet::from([CollectionRecordSelector::Collection(collection)]);
     let records = snapshot
-        .records()
+        .select_records(&selectors)
         .map_err(CollectionDiscoveryError::Records)?;
 
     for record in records {
-        let record = record.map_err(CollectionDiscoveryError::Records)?;
         if record.collection() != collection
             || !is_member(&record.public_key())
             || !record_references_are_resident(snapshot, record)?
@@ -454,20 +454,23 @@ where
 mod tests {
     use super::*;
 
+    use std::cell::Cell;
+
     use anybytes::Bytes;
     use ed25519_dalek::{SigningKey, VerifyingKey};
 
     use crate::blob::encodings::simplearchive::SimpleArchive;
     use crate::blob::encodings::UnknownBlob;
-    use crate::blob::Blob;
+    use crate::blob::{Blob, BlobEncoding};
     use crate::collection::{
         empty_metadata_handle, AdmissionPolicy, Collection, CollectionData, CollectionPolicy,
         CollectionStore, CollectionStoreExt, Support,
     };
     use crate::inline::encodings::hash::Handle;
-    use crate::inline::Inline;
+    use crate::inline::{Inline, InlineEncoding};
     use crate::repo::memoryrepo::MemoryRepo;
-    use crate::repo::{BlobStorePut, SnapshotSource};
+    use crate::repo::pile::{Pile, PileSnapshot};
+    use crate::repo::{BlobInfo, BlobStorePut, SnapshotSource};
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct ProbeRecordsError(&'static str);
@@ -495,6 +498,64 @@ mod tests {
                 return Err(error);
             }
             Ok(self.records.clone().into_iter())
+        }
+    }
+
+    struct IndexedSelectionProbe {
+        snapshot: PileSnapshot,
+        collection: CollectionHandle,
+        enumerations: Cell<usize>,
+        selections: Cell<usize>,
+        selected_records: Cell<usize>,
+    }
+
+    impl CollectionRead for IndexedSelectionProbe {
+        type RecordsError = <PileSnapshot as CollectionRead>::RecordsError;
+        type RecordIter<'a> = <PileSnapshot as CollectionRead>::RecordIter<'a>;
+
+        fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+            self.enumerations.set(self.enumerations.get() + 1);
+            self.snapshot.records()
+        }
+
+        fn select_records(
+            &self,
+            selectors: &BTreeSet<CollectionRecordSelector>,
+        ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
+            assert_eq!(
+                selectors,
+                &BTreeSet::from([CollectionRecordSelector::Collection(self.collection)]),
+            );
+            self.selections.set(self.selections.get() + 1);
+            let records = self.snapshot.select_records(selectors)?;
+            self.selected_records
+                .set(self.selected_records.get() + records.len());
+            Ok(records)
+        }
+    }
+
+    impl BlobStoreList for IndexedSelectionProbe {
+        type Iter<'a> = <PileSnapshot as BlobStoreList>::Iter<'a>;
+        type Err = <PileSnapshot as BlobStoreList>::Err;
+
+        fn blobs<'a>(&'a self) -> Self::Iter<'a> {
+            self.snapshot.blobs()
+        }
+
+        fn contains_blob<S>(&self, handle: Inline<Handle<S>>) -> Result<bool, Self::Err>
+        where
+            S: BlobEncoding + 'static,
+            Handle<S>: InlineEncoding,
+        {
+            self.snapshot.contains_blob(handle)
+        }
+
+        fn blob_info<S>(&self, handle: Inline<Handle<S>>) -> Result<Option<BlobInfo>, Self::Err>
+        where
+            S: BlobEncoding + 'static,
+            Handle<S>: InlineEncoding,
+        {
+            self.snapshot.blob_info(handle)
         }
     }
 
@@ -681,6 +742,96 @@ mod tests {
             ],
             invalid_commit,
         )
+    }
+
+    #[test]
+    fn authorized_discovery_uses_the_collection_index_without_enumerating_other_records() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut store = Pile::open(file.path()).unwrap();
+        let target = store
+            .collection(
+                "authorized-selection",
+                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+            )
+            .unwrap();
+        let other = store
+            .collection(
+                "unrelated-selection",
+                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+            )
+            .unwrap();
+        let authorized_key = SigningKey::from_bytes(&[7; 32]);
+        let foreign_key = SigningKey::from_bytes(&[8; 32]);
+        let metadata = store
+            .put::<SimpleArchive, _>(crate::trible::TribleSet::new())
+            .unwrap();
+        let low = Handle::<UnknownBlob>::to_hash(
+            store
+                .put::<UnknownBlob, _>(Bytes::from_source(b"low".to_vec()))
+                .unwrap(),
+        );
+        let high = Handle::<UnknownBlob>::to_hash(
+            store
+                .put::<UnknownBlob, _>(Bytes::from_source(b"high".to_vec()))
+                .unwrap(),
+        );
+        let output = Handle::<UnknownBlob>::to_hash(
+            store
+                .put::<UnknownBlob, _>(Bytes::from_source(b"output".to_vec()))
+                .unwrap(),
+        );
+        let commit = CollectionCommit::sign(&authorized_key, target.handle(), low, metadata);
+        // Trusted native discovery must not add a signature audit to its
+        // existing author and residency checks.
+        let trusted_invalid = invalid_signature(commit);
+        let merge = CollectionMerge::sign(&authorized_key, target.handle(), low, high, output);
+        let derive = CollectionDerive::sign(&authorized_key, target.handle(), low, output);
+        let unauthorized = CollectionCommit::sign(&foreign_key, target.handle(), high, metadata);
+        let dangling = CollectionCommit::sign(&authorized_key, target.handle(), data(99), metadata);
+        for record in [
+            CollectionRecord::Commit(commit),
+            CollectionRecord::Commit(trusted_invalid),
+            CollectionRecord::Merge(merge),
+            CollectionRecord::Derive(derive),
+            CollectionRecord::Commit(unauthorized),
+            CollectionRecord::Commit(dangling),
+        ] {
+            store.insert(record).unwrap();
+        }
+        for byte in 0..64 {
+            store
+                .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                    &foreign_key,
+                    other.handle(),
+                    data(byte),
+                    metadata,
+                )))
+                .unwrap();
+        }
+        let probe = IndexedSelectionProbe {
+            snapshot: store.snapshot().unwrap(),
+            collection: target.handle(),
+            enumerations: Cell::new(0),
+            selections: Cell::new(0),
+            selected_records: Cell::new(0),
+        };
+        let mut authorization_checks = 0;
+        let discovered =
+            discover_collection_records_authorized(&probe, target.handle(), |public_key| {
+                authorization_checks += 1;
+                *public_key == signer(&authorized_key)
+            })
+            .unwrap();
+
+        let mut expected_commits = vec![commit, trusted_invalid];
+        expected_commits.sort_unstable();
+        assert_eq!(discovered.commits(), expected_commits);
+        assert_eq!(discovered.merges(), &[merge]);
+        assert_eq!(discovered.derives(), &[derive]);
+        assert_eq!(probe.enumerations.get(), 0);
+        assert_eq!(probe.selections.get(), 1);
+        assert_eq!(probe.selected_records.get(), 6);
+        assert_eq!(authorization_checks, 6);
     }
 
     #[test]

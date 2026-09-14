@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Interpret AUTH permissions from immutable capability-definition blobs. Proof
+  edges carry only a definition handle, delegate key, and prefix signature;
+  invocation and onward delegation are independent action sets, with attenuation
+  checked along each valid prefix. Collection READ/WRITE admission is timeless.
+  Generic subordinate resources advertise their own immutable repair audience
+  and policy without inheriting collection authority. Bootstrap discloses only
+  the needed subject prefix. This is a new AUTH record and pile-sync/26 epoch;
+  existing collection descriptors and entity identities are unchanged.
+  Minted anchors: delegation action `628AB41154C8BAE6F985591B58487374`, AUTH
+  descriptor `C7116B04EE6DA4BADFDE77D79692AEFF`, resource handle
+  `5059416BAF824B364FF52F56A0D1CF9F`, repair audience
+  `62E951EC3ABB7F9B7F123BB7DE2F9F99`.
+
+- Use the existing per-collection record selector for foundational admission,
+  avoiding a whole-store record enumeration for each collection attachment.
+  Preserve author admission, direct-reference residency, trusted local signature
+  handling, and canonical results; cover the indexed route with counters rather
+  than elapsed-time assertions.
+
 - Add descriptor-driven `trible pile collection maintain-all` and foreground
   `--watch` maintenance for explicitly selected collections. Schedule source
   dependencies with ordinary one-edge operations, deduplicate shared work, and

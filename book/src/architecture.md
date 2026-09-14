@@ -40,8 +40,9 @@ Readers do not repeat the encoding join or mapping to check it.
 
 Foreign record bytes are signature-checked once at ingress. Typed local
 publication and trusted store replay do not repeat that check. Admission still
-uses the proofs and time of each frozen snapshot: a later grant may activate
-an old equation, and expiry may leave a finer cover readable instead.
+uses the proofs and resident capability definitions of each frozen snapshot:
+a later grant or newly resident definition may activate an old equation.
+Generic collection authority does not expire as the clock advances.
 
 That separation is why a materialized index does not become ground truth merely
 because it is convenient, and why collecting an accelerator does not erase the
@@ -52,12 +53,14 @@ policy oracle. A descriptor carries independent READ and WRITE policies. Each
 is open or a canonical quorum over external trust roots with one semantic
 threshold.
 Each resident proof is one self-contained, prefix-signed path from one root:
-its header binds the exact resource, and every edge carries the action, mode,
-optional validity interval, delegate, and signature over the complete prefix.
-Ordinary collection operations count independently valid rooted paths at one
-clock instant against exact `ACTION_WRITE` on the descriptor. Sibling paths
-cannot lend one another delegation authority, and merely finding an unverified
-or irrelevant proof in storage grants nothing.
+its header binds the exact resource, and every edge carries a capability
+definition handle, delegate, and signature over the complete prefix. Definitions
+describe independent invocation and delegation action sets; a child's actions
+must all be delegated by its parent. The handles may differ. Ordinary collection
+operations count independently valid rooted prefixes against `ACTION_WRITE`
+on the descriptor, with roots selected for that action rather than the grant's
+exact handle. Sibling paths cannot lend one another delegation authority, and
+merely finding an unverified or irrelevant proof in storage grants nothing.
 
 ## Architectural layers
 
@@ -183,8 +186,8 @@ its own store.
 Reads are exact about what they observed, not magical about global time:
 
 - `store.snapshot()` freezes blob bytes, collection records, capability proofs,
-  and backend state from one coherent known prefix, plus one authorization
-  instant;
+  and backend state from one coherent known prefix, plus one interpretation
+  instant for application queries;
 - `collection.admitted(&snapshot)` applies the descriptor WRITE policy and
   resident capability evidence to obtain one semantic `Cover<E>` without
   fetching member data;
@@ -196,9 +199,11 @@ Reads are exact about what they observed, not magical about global time:
   `collection.read(&snapshot)` concisely observes and materializes the maximal
   resident collection view at that same frozen instant.
 
-Snapshot clones retain their instant. A later snapshot may change authorization
-without changing stored content, so content-change masks intentionally exclude
-time; caches track proof-validity boundaries separately.
+Snapshot clones retain their instant for application interpretations of time.
+Content-change masks intentionally exclude time, and collection authorization
+does not depend on it. An application action such as Secrets key delivery may
+interpret its own deadline facts before counting each root's proof prefix;
+that does not expire collection membership.
 
 Cover identity is the collection descriptor plus distinct payload handles.
 Signer, signature, and metadata attestations currently known to the store

@@ -41,7 +41,6 @@ pub fn write_capability() -> CapabilityHandle {
 
 /// Narrow write facade for a scoped fact collection.
 pub mod api;
-mod authorization_clock;
 /// Reading one collection descriptor's facts.
 pub mod descriptor;
 pub mod discovery;
@@ -80,7 +79,6 @@ pub mod view;
 pub use ed25519_dalek::VerifyingKey;
 
 pub use api::*;
-pub use authorization_clock::next_authorization_change;
 pub use discovery::*;
 pub use encoding::*;
 pub use exact_derived::CollectionRealizationError;

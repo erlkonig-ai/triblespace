@@ -71,12 +71,14 @@ when a reader learns these query semantics.
 ### Admission is a positive query
 
 Ordinary admission considers every supported policy interpretation for the
-requested capability handle. A typed consumer joins the encoding fact and policy link on
+requested action. The existing policy binding still names a capability
+definition handle; a reader queries that definition's invocation-action facts,
+not equality with a grant's handle. A typed consumer joins the encoding fact
+and policy link on
 the **same tagged descriptor entity**; it cannot borrow a policy from another
 entity merely because both occur in one archive. Representation-neutral network
-disclosure queries the tagged descriptor's generic bindings for the recognized
-READ capability handle. The linked
-policy must explicitly describe `Open` or a usable quorum. Unknown kinds,
+disclosure queries the tagged descriptor's generic bindings for `ACTION_READ`.
+The linked policy must explicitly describe `Open` or a usable quorum. Unknown kinds,
 undecodable values, and unsupported thresholds contribute no interpretation.
 
 A subject is admitted when at least one supported alternative authorizes it.
@@ -147,19 +149,21 @@ storage.flush()?;
 
 Local publication deliberately performs no authorization check: the local
 store is a grow-only record ledger, not an access-control boundary. Observation
-loads the independent policies from the descriptor. A policy root is admitted
-directly; every other author needs enough resident proof paths for exact
-`ACTION_WRITE` on this descriptor. The snapshot freezes the clock once, and
-each operation verifies every matching proof at that instant. Invalid, expired, or irrelevant
-candidate evidence grants nothing; inability to enumerate the proof store
-remains an error.
+loads the independent policies from the descriptor. A policy root contributes
+its own share; every author still needs the policy's distinct-root threshold for
+`ACTION_WRITE` on this descriptor. Interpreting the paths requires their resident
+capability definitions. Invalid or irrelevant candidate evidence grants nothing;
+inability to enumerate the proof store remains an error. Generic WRITE admission
+is clock-independent; advancing the snapshot instant does not expire a grant.
 
 READ and WRITE are explicit because both participate in collection identity.
 Either may be `Open` or a canonical quorum over capability roots, with
 one semantic threshold. Derived collections state their own policies rather
 than inheriting ambient authority from a source or a network-wide team scope.
-Whether a subject may delegate a share onward is carried by the signed mode of
-that independently rooted proof path, not by a second policy threshold.
+Whether a subject may delegate a share onward is carried by the independent
+delegation-action facts in that path's capability definitions, not by a second
+policy threshold. A child may invoke or delegate only actions its parent permits
+delegating; invocation alone never confers delegation.
 
 ### What publication writes
 
@@ -229,7 +233,8 @@ Signed equations endorse materialized computation, not new membership. Publishin
 `MERGE` or `DERIVE` records work which has already been performed; warm
 resolution follows that equation without executing the join or mapping again.
 Foreign bytes are signature-checked at the store/synchronization boundary;
-the producer must satisfy target WRITE at the observation's frozen instant.
+the producer must satisfy target WRITE through the observation's resident
+proof and capability-definition evidence.
 A trusted local store is not reverified on every read. Blob residency
 is independent: an absent result is a cache miss and cannot suppress an
 available explicit cover member.
@@ -245,7 +250,7 @@ collection commits or publishing anything.
 
 `store.snapshot()` freezes one immutable observation containing a resident blob
 index, collection records, and capability proofs from the same known prefix, together
-with one authorization instant. The
+with one interpretation instant for application queries. The
 snapshot, rather than a source frontier or a later materialization, is the
 watermark. Ask it what representation is actually readable at that instant:
 
@@ -257,21 +262,22 @@ let cover = observed.cover();
 let value: V = observed.view()?;
 ```
 
-`snapshot.collection(target)` admits the foundational commits at
-the snapshot's frozen authorization instant, selects the
+`snapshot.collection(target)` admits the foundational commits from
+the snapshot's proof and resident definition evidence, selects the
 maximal complete resident target antichain, and returns only the part of the
 foundational support represented by that antichain. Admitted but not yet
 derived data is absent: an immutable snapshot never promises work which will
 happen later. `snapshot.collection_exact(target, &support)` is the assertion
 form and fails unless that exact foundational support is completely realized.
 Neither observation method reads the clock: identical operations on one frozen
-store snapshot have identical results even while wall time passes. A later
-authorization decision requires a new snapshot. `store.snapshot_at(instant)`
-is the single construction seam for deterministic tests; it selects the
+store snapshot have identical results even while wall time passes. A decision
+using later-arriving proof or definition evidence requires a new snapshot.
+`store.snapshot_at(instant)` is the construction seam for deterministic tests;
+it selects the
 interpretation time of newly observed content, not a historical content revision.
 `changes_since` classifies content only, so a new instant alone reports no
-content change. Authorization caches separately account for the next proof
-validity boundary from `next_authorization_change(&snapshot)` and clock rollback.
+content change. Generic collection authorization has no proof-validity clock;
+action-specific deadlines belong to the application interpreting that action.
 
 Both forms keep the chosen target cover inseparable from the store snapshot
 which established its residency. `view` invokes `TryFromCover<E>` solely
@@ -294,9 +300,11 @@ the caller may then ask that snapshot for the collection it actually contains.
 Raw record readers still expose dangling native collection records and stored
 proof records for repair. A `COMMIT`, `MERGE`, or `DERIVE` is semantically
 invisible until all of its direct blob references are resident in that exact
-frozen snapshot. A capability proof's signatures and attenuation are already
-self-contained and have no definition-blob residency gate. These passive
-observations never acquire, wait, write, or emit `WANT`.
+frozen snapshot. A capability proof's signatures can be checked from its bytes
+alone; action and delegation interpretation also needs the referenced
+definition blobs. A missing definition does not erase the raw proof, but it
+cannot support an interpreted grant. These passive observations never acquire,
+wait, write, or emit `WANT`.
 
 Exact immutable payload reads are a separate capability of network-backed
 snapshots:
@@ -311,7 +319,7 @@ let bytes: Bytes = snapshot.get(attachment_handle).await?;
 
 `PeerSnapshot::get` and `ObjectStoreSnapshot`'s asynchronous `get` can fetch
 bytes which arrived after the snapshot. That cache operation changes neither
-the captured records/proofs, the authorization instant, the frozen residency
+the captured records/proofs, the interpretation instant, the frozen residency
 index, nor `observed.cover()`. Passive collection selection still uses the
 captured resident prefix; reading a newly acquired collection member requires
 another store snapshot. A synchronous consumer can use one `Blocking` adapter
@@ -451,9 +459,9 @@ support, use `maintain_exact(raw, &writer, &support)` and
 `collection_exact(accelerated, &support)`. Those are explicit requirements,
 not necessary boilerplate for an ordinary multi-hop read.
 
-- `ensure(source, &writer)` freezes collection records, capability proofs, and the
-  authorization instant before acquiring exact missing descriptor, data, and
-  metadata bytes needed for that root frontier. Concurrent records and proofs
+- `ensure(source, &writer)` freezes collection records, capability proofs, and
+  resident authorization evidence before acquiring exact missing descriptor,
+  data, and metadata bytes needed for that root frontier. Concurrent records and proofs
   do not extend its work. The returned snapshot is a fresh observation; select
   support from it once and pass that same support across the following edges.
 - `snapshot.collection` remains the purely read-only alternative: it

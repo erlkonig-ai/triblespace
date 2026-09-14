@@ -90,8 +90,6 @@ impl Fixture {
             None,
             None,
             StoreChanges::ALL,
-            false,
-            None,
         )
         .unwrap();
         let blob_reads = Arc::new(AtomicUsize::new(0));
@@ -319,8 +317,6 @@ async fn stale_provider_lease_survives_loss_alternate_fetch_and_same_endpoint_re
         None,
         None,
         StoreChanges::ALL,
-        false,
-        None,
     )
     .unwrap();
     let mut restarted = RecoveryNode::new(&fixture.net, &provider_key, Some(Arc::new(restored)));
@@ -527,8 +523,6 @@ async fn mid_transfer_crash_rejects_old_bytes_after_restart_and_allows_fresh_ret
         None,
         None,
         StoreChanges::ALL,
-        false,
-        None,
     )
     .unwrap();
     let mut restarted = RecoveryNode::new(&fixture.net, &provider_key, Some(Arc::new(restored)));
@@ -1017,8 +1011,6 @@ async fn resident_descriptor_is_not_a_collection_participant_hint() {
         None,
         None,
         StoreChanges::ALL,
-        false,
-        None,
     )
     .unwrap();
     *fixture.provider_snapshot.lock().unwrap() = Some(Arc::new(snapshot));
@@ -1166,8 +1158,6 @@ async fn zero_announcement_budget_still_answers_resident_self_hints() {
                 None,
                 None,
                 StoreChanges::ALL,
-                false,
-                None,
             )
             .unwrap();
             let observation =

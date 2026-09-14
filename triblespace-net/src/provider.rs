@@ -777,11 +777,8 @@ mod tests {
 
     use anybytes::Bytes;
     use ed25519_dalek::SigningKey;
-    use hifitime::Epoch;
     use triblespace_core::blob::encodings::UnknownBlob;
-    use triblespace_core::capability::{
-        Capability, CapabilityMode, CapabilityProof, CapabilityResource, CapabilityValidity,
-    };
+    use triblespace_core::capability::{CapabilityProof, CapabilityResource};
     use triblespace_core::collection::{
         AdmissionPolicy, CollectionCommit, CollectionData, CollectionHandle, CollectionPolicy,
         CollectionRecord, CollectionStore, CollectionStoreExt, write_capability,
@@ -957,7 +954,7 @@ mod tests {
     }
 
     #[test]
-    fn collection_participation_lease_is_independent_of_write_expiry() {
+    fn collection_participation_is_independent_of_write_authority() {
         let root = signing_key(31);
         let writer = signing_key(32);
         let mut store = MemoryRepo::default();
@@ -970,14 +967,10 @@ mod tests {
                 ),
             )
             .unwrap();
-        let validity =
-            CapabilityValidity::new(Epoch::from_tai_seconds(0.0), Epoch::from_tai_seconds(10.0))
-                .unwrap();
-        let proof = CapabilityProof::issue_root(
-            &root,
+        let proof = CapabilityProof::new(
             CapabilityResource::from(collection.handle()),
-            Capability::new(write_capability(), CapabilityMode::Invoke),
-            Some(validity),
+            &root,
+            write_capability(),
             writer.verifying_key(),
         );
         store.insert_proof(proof).unwrap();

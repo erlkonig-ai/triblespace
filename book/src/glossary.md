@@ -36,13 +36,14 @@ small capability traits for insertion, retrieval, metadata, and enumeration.
 ### Capability Proof
 A canonical self-contained, prefix-signed byte string. Its header contains a
 grammar magic, opaque resource, and one Ed25519 root. Each edge then contains
-an exact action, mode, optional inclusive validity interval, delegate, and a
-strict Ed25519 signature over the complete prefix through that delegate. Every
-signed prefix is therefore a proof for its intermediate subject. Its BLAKE3
-digest is the proof ID used for exact physical lookup. Verification also
-receives the external trust root, expected subject, explicit instant, and exact
-request; authority is the meet of the path's restrictions, never a consequence
-of proof presence.
+a capability-definition handle, delegate, and strict Ed25519 signature over
+the complete prefix through that delegate. Every signed prefix is therefore
+a proof for its intermediate subject. Definitions provide independent invocation
+and delegation action sets: a child's invocation and delegation actions must
+both be delegated by its parent. Its BLAKE3 digest is the proof ID used for
+exact physical lookup. Interpretation receives a definition reader, external
+trust root, expected subject, and resource/action request, with no generic
+clock or same-handle restriction. Proof presence alone grants no authority.
 
 ### Capability Proof Store
 A grow-only native set of canonical capability proofs. It supports
@@ -84,12 +85,12 @@ them rather than accepting caller-forged hash sets.
 
 ### Collection Admission
 The read-time signer decision performed by
-`collection.admitted(&store_snapshot)`. Each WRITE-policy root acts directly;
+`collection.admitted(&store_snapshot)`. Each WRITE-policy root supplies its own share;
 resident proof paths rooted in the policy's canonical root set are considered
-at the snapshot's frozen instant for the exact `ACTION_WRITE`/collection atom. A writer is
-admitted only when it has the policy's required distinct root support. Invalid,
-expired, or irrelevant candidates grant nothing without poisoning other
-evidence.
+for `ACTION_WRITE` on the collection's exact descriptor handle. A writer is
+admitted only when it has the policy's required distinct root support through
+resident definitions. Invalid or irrelevant candidates grant nothing without
+poisoning other evidence; collection membership has no generic expiry.
 
 ### Collection Descriptor
 A canonical `SimpleArchive` describing a collection's UTF-8 root name or exact
@@ -244,8 +245,10 @@ One Ed25519 key named by an admission policy. Roots have inherent support for
 their policy's action and may issue capability paths. A collection may name
 several roots and require one threshold; READ and WRITE have independent root
 sets and thresholds. Whether one root share remains delegable is carried by
-the signed mode on that path, not derived from sibling proofs. A root is not a
-network namespace, routing scope, roster, or mutable owner.
+the delegation-action facts of definitions signed into that path, not derived
+from sibling proofs. A root contributes one share, including to itself; it is
+not exempt from a multi-root threshold. A root is not a network namespace,
+routing scope, roster, or mutable owner.
 
 ### Collection WRITE
 The exact `ACTION_WRITE` capability over one collection descriptor handle.

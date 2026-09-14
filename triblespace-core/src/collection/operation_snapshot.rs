@@ -314,7 +314,7 @@ mod tests {
 
     use super::*;
     use crate::blob::encodings::{simplearchive::SimpleArchive, UnknownBlob};
-    use crate::capability::{Capability, CapabilityHandle, CapabilityMode, CapabilityResource};
+    use crate::capability::{CapabilityHandle, CapabilityResource};
     use crate::collection::{CollectionDerive, CollectionStore};
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::repo::{BlobStorePut, CapabilityProofStore, SnapshotSource, WantRequest, WantStore};
@@ -331,11 +331,10 @@ mod tests {
     fn proof(byte: u8) -> CapabilityProof {
         let root = SigningKey::from_bytes(&[byte; 32]);
         let leaf = SigningKey::from_bytes(&[byte.wrapping_add(1); 32]);
-        CapabilityProof::issue_root(
-            &root,
+        CapabilityProof::new(
             CapabilityResource::new([byte; 32]),
-            Capability::new(CapabilityHandle::new([byte; 32]), CapabilityMode::Invoke),
-            None,
+            &root,
+            CapabilityHandle::new([byte; 32]),
             leaf.verifying_key(),
         )
     }

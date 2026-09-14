@@ -1,9 +1,11 @@
-//! Descriptor-local admission policies for exact capability handles.
+//! Descriptor-local admission policies over capability definitions.
 //!
 //! A resource links its finite policy vocabulary through ordinary binding
 //! entities. Every binding names one immutable capability definition and an
-//! open or independently rooted quorum interpretation. Per-grant delegates,
-//! modes, and validity remain in proof records, not this immutable policy.
+//! open or independently rooted quorum interpretation. Consumers query the
+//! bound definition's invocation actions to select policy roots; proof grant
+//! handles need not equal this binding. Delegation rights and application
+//! restrictions live in grant definitions, never inline in proof records.
 
 use std::error::Error;
 use std::fmt;
@@ -32,6 +34,16 @@ attributes! {
     /// Anchor minted with installed `trible genid` on 2026-09-06:
     /// `2949050AA6092F5689EA7EAA52700CE9`.
     "2949050AA6092F5689EA7EAA52700CE9" as pub capability_handle: Handle<SimpleArchive>;
+    /// A governed resource descriptor referenced by ordinary collection facts.
+    /// Anchor minted with `trible genid` on 2026-09-14:
+    /// `5059416BAF824B364FF52F56A0D1CF9F`.
+    "5059416BAF824B364FF52F56A0D1CF9F" as pub resource_handle: Handle<SimpleArchive>;
+    /// Immutable declaration of the collection whose READ audience may repair
+    /// this resource's proofs. It does not inherit any collection authority or
+    /// require mutable collection facts naming the resource.
+    /// Anchor minted with `trible genid` on 2026-09-14:
+    /// `62E951EC3ABB7F9B7F123BB7DE2F9F99`.
+    "62E951EC3ABB7F9B7F123BB7DE2F9F99" as pub resource_collection: Handle<SimpleArchive>;
     /// One distinct canonical Ed25519 trust root of this binding.
     /// Anchor minted on 2026-08-30; unchanged encoding and identity.
     "E9AC4E4749FD219705E9533B02AAA405" as pub admission_policy_root: ED25519PublicKey;
@@ -172,9 +184,8 @@ impl AdmissionPolicy {
 
     /// One-root policy whose legacy delegation-threshold field is absent.
     ///
-    /// This constructor does not constrain proof delegation. A proof issued
-    /// with [`crate::capability::CapabilityMode::Invoke`] cannot be extended;
-    /// one issued with a delegating mode can.
+    /// This constructor does not constrain proof delegation. The independently
+    /// signed grant definitions state which actions their recipients may delegate.
     pub fn direct(root: VerifyingKey) -> Self {
         Self::quorum([root], 1, None).expect("one-root direct policy is valid")
     }
@@ -182,7 +193,7 @@ impl AdmissionPolicy {
     /// One-root policy retaining the legacy delegation-threshold value `1`.
     ///
     /// This remains available solely to reproduce existing descriptor
-    /// identities. Proof-prefix modes, not this field, govern delegation.
+    /// identities. Proof-prefix definitions, not this field, govern delegation.
     pub fn delegable(root: VerifyingKey) -> Self {
         Self::quorum([root], 1, Some(1)).expect("one-root delegable policy is valid")
     }

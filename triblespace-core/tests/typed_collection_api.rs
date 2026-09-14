@@ -9,14 +9,12 @@ use triblespace_core::blob::encodings::succinctarchive::{
     UnionArchive,
 };
 use triblespace_core::blob::{Blob, IntoBlob};
-use triblespace_core::capability::{
-    Capability, CapabilityMode, CapabilityProof, CapabilityResource, CapabilityValidity,
-};
+use triblespace_core::capability::{CapabilityProof, CapabilityResource};
 use triblespace_core::collection::succinctarchive_union;
 use triblespace_core::collection::{
-    AdmissionPolicy, CollectionCommit, CollectionDerive, CollectionMerge, CollectionPolicy,
-    CollectionRead, CollectionRealizationError, CollectionRecord, CollectionSnapshotExt,
-    CollectionStore, CollectionStoreExt,
+    write_capability, AdmissionPolicy, CollectionCommit, CollectionDerive, CollectionMerge,
+    CollectionPolicy, CollectionRead, CollectionRealizationError, CollectionRecord,
+    CollectionSnapshotExt, CollectionStore, CollectionStoreExt,
 };
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
@@ -33,13 +31,6 @@ fn one_fact(seed: u8) -> TribleSet {
     let mut facts = TribleSet::new();
     facts.insert(&Trible::force_raw(row).unwrap());
     facts
-}
-
-fn write_grant() -> Capability {
-    Capability::new(
-        triblespace_core::collection::write_capability(),
-        CapabilityMode::Invoke,
-    )
 }
 
 #[test]
@@ -641,7 +632,7 @@ fn ordinary_derived_operations_exclude_resident_but_unauthorized_source_members(
 }
 
 #[test]
-fn collection_uses_its_snapshots_frozen_authorization_instant() {
+fn collection_write_authority_is_independent_of_snapshot_instant() {
     let authority = SigningKey::from_bytes(&[44; 32]);
     let writer = SigningKey::from_bytes(&[45; 32]);
     let policy = CollectionPolicy::new(
@@ -656,21 +647,25 @@ fn collection_uses_its_snapshots_frozen_authorization_instant() {
         .commit(collection, &writer, Fragment::from(expected))
         .unwrap();
 
-    let validity =
-        CapabilityValidity::new(Epoch::from_tai_seconds(10.0), Epoch::from_tai_seconds(20.0))
-            .unwrap();
     store
-        .insert_proof(CapabilityProof::issue_root(
-            &authority,
+        .insert_proof(CapabilityProof::new(
             CapabilityResource::from(collection.handle()),
-            write_grant(),
-            Some(validity),
+            &authority,
+            write_capability(),
             writer.verifying_key(),
         ))
         .unwrap();
 
     let before = store.snapshot_at(Epoch::from_tai_seconds(9.0)).unwrap();
-    assert!(before.collection(collection).unwrap().support().is_empty());
+    assert_eq!(
+        before
+            .collection(collection)
+            .unwrap()
+            .support()
+            .members()
+            .collect::<Vec<_>>(),
+        vec![expected_member]
+    );
 
     let valid = store.snapshot_at(Epoch::from_tai_seconds(15.0)).unwrap();
     let frozen = valid.clone();
@@ -684,10 +679,13 @@ fn collection_uses_its_snapshots_frozen_authorization_instant() {
         vec![expected_member]
     );
 
-    let expired = store.snapshot_at(Epoch::from_tai_seconds(21.0)).unwrap();
-    assert!(expired.collection(collection).unwrap().support().is_empty());
+    let later = store.snapshot_at(Epoch::from_tai_seconds(21.0)).unwrap();
+    assert_eq!(
+        later.collection(collection).unwrap().support(),
+        admitted.support()
+    );
     assert_eq!(valid.changes_since(&before), StoreChanges::NONE);
-    assert_eq!(expired.changes_since(&valid), StoreChanges::NONE);
+    assert_eq!(later.changes_since(&valid), StoreChanges::NONE);
     assert_eq!(frozen.instant(), Epoch::from_tai_seconds(15.0));
     assert_eq!(
         frozen.collection(collection).unwrap().support(),
@@ -791,7 +789,7 @@ fn dangling_commit_is_raw_but_semantically_visible_only_in_a_later_snapshot() {
 }
 
 #[test]
-fn self_contained_capability_proof_activates_commit_without_blob_closure() {
+fn proof_with_resident_definition_activates_commit_without_recursive_blob_closure() {
     let root = SigningKey::from_bytes(&[48; 32]);
     let writer = SigningKey::from_bytes(&[49; 32]);
     let policy = CollectionPolicy::new(
@@ -811,11 +809,10 @@ fn self_contained_capability_proof_activates_commit_without_blob_closure() {
     let before = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
     assert!(collection.admitted(&before).unwrap().is_empty());
 
-    let proof = CapabilityProof::issue_root(
-        &root,
+    let proof = CapabilityProof::new(
         CapabilityResource::from(collection.handle()),
-        write_grant(),
-        None,
+        &root,
+        write_capability(),
         writer.verifying_key(),
     );
     store.insert_proof(proof.clone()).unwrap();

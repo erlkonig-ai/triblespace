@@ -9,9 +9,7 @@ use futures::executor::block_on;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::{Blob, BlobEncoding, Bytes, IntoBlob, TryFromBlob};
-use triblespace_core::capability::{
-    Capability, CapabilityMode, CapabilityProof, CapabilityResource,
-};
+use triblespace_core::capability::{CapabilityProof, CapabilityResource};
 use triblespace_core::collection::simplearchive_union;
 use triblespace_core::collection::{
     write_capability, Collection, CollectionCommit, CollectionDerive, CollectionEncoding,
@@ -179,11 +177,10 @@ fn support(
     writers.sort_unstable_by_key(VerifyingKey::to_bytes);
     writers.dedup();
     for writer in writers {
-        let proof = CapabilityProof::issue_root(
-            &root,
+        let proof = CapabilityProof::new(
             CapabilityResource::from(collection.handle()),
-            Capability::new(write_capability(), CapabilityMode::Invoke),
-            None,
+            &root,
+            write_capability(),
             writer,
         );
         store.insert_proof(proof).unwrap();

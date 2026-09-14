@@ -1565,7 +1565,7 @@ mod tests {
     use super::*;
     use crate::blob::encodings::rawbytes::RawBytes;
     use crate::blob::encodings::simplearchive::SimpleArchive;
-    use crate::capability::{Capability, CapabilityMode, CapabilityProof, CapabilityResource};
+    use crate::capability::{CapabilityProof, CapabilityResource};
     use crate::collection::descriptor::{identity_for_tests, named_for_tests};
     use crate::collection::{
         empty_metadata_handle, CollectionCommit, CollectionDerive, CollectionMerge,
@@ -1874,11 +1874,10 @@ mod tests {
         let root = SigningKey::from_bytes(&[71; 32]);
         let leaf = SigningKey::from_bytes(&[72; 32]);
         let definition = yard.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
-        let proof = CapabilityProof::issue_root(
-            &root,
+        let proof = CapabilityProof::new(
             CapabilityResource::new(coincident_resource_blob.raw),
-            Capability::new(definition, CapabilityMode::Invoke),
-            None,
+            &root,
+            definition,
             leaf.verifying_key(),
         );
 

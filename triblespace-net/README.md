@@ -3,8 +3,8 @@
 Collection-scoped anti-entropy for TribleSpace over
 [iroh](https://www.iroh.computer). A peer retains an immutable semantic repair
 overlay for each explicitly active collection. One repair stream reconciles
-the exact product of two grow-only PATCHes: signature-valid exact-C COMMITs and
-collection-scoped native proofs for descriptor-declared capability handles. It transfers
+the exact product of two grow-only PATCHes: signature-valid exact-C collection
+records and native proofs for exact resource C rooted in its declared policies. It transfers
 no blob bytes. Record inclusion is independent of WRITE admission; each
 receiver derives its active view locally after records and proofs arrive in
 either order.
@@ -60,28 +60,42 @@ The QUIC/TLS connection authenticates endpoint identities but grants no team
 or collection authority. Every collection repair request names exactly one
 collection. The repair client may present bounded native READ(C) proofs for
 cold bootstrap. Same-session admission uses only self-contained
-collection-scoped READ proofs already pinned in the server's local overlay. An
-unknown proof is ingested inertly and may authorize a later retry, but it never
-changes admission for the immutable current session and needs no companion
-blob acquisition. The server verifies the TLS client before revealing a
+collection-scoped READ proofs and capability definitions already pinned in the
+server's local overlay. An unknown proof is ingested inertly and may authorize
+a later retry, but it never changes admission for the immutable current session.
+Missing definition blobs must become resident through the separate blob layer;
+repair does not acquire them. The server verifies the TLS client before revealing a
 manifest or PATCH leaf; the publisher itself needs no READ(C). Proofs are
 non-secret authorization certificates. A caller without READ(C) receives no
 collection manifest, PATCH leaf, record, authorization evidence, or root;
 merely knowing C grants no disclosure.
 
-The AUTH inventory recognizes every supported capability-policy binding in the
-descriptor, not just READ and WRITE. Projection and receipt require the exact
-resource, capability handle, and configured root together. A custom capability
-proof never substitutes for READ(C), and quorum shares never combine across
-different capabilities. Capability definition blobs are not fetched by repair;
-the proof's signatures and structural attenuation are byte-local checks.
+The AUTH inventory recognizes roots from every supported capability-policy
+binding in the descriptor, not just READ and WRITE. Projection and receipt
+check the exact resource, configured root, and signatures without interpreting
+capability definitions. Grant handles may differ along a path and need not match
+the descriptor's binding handles. Admission separately queries the bound
+definition's invocation actions to select the requested action's roots, then
+interprets each proof's invocation/delegation action sets. A custom grant does
+not substitute for READ(C) unless it actually conveys READ under those roots;
+quorum shares never borrow another action's roots. Capability definition blobs
+are not fetched by repair.
 
-Each overlay currently owns a resource | proof-hash PATCH whose proof values
+The subordinate-resource transport candidate extends this overlay to proofs
+for R when R's immutable descriptor declares `resource_collection: C` beside
+its own policy bindings on the same entity. R's roots authenticate its proof;
+READ(C) still gates the repair session, without granting any action on R.
+A missing R descriptor defers the proof leaf with explicit incomplete AUTH
+state, while collection-record repair continues. Blob arrival enables retry;
+repair does not fetch R or require a mutable referencing fact in C. This is a
+source candidate, not a claim of completed validation or deployment.
+
+Each overlay currently owns a repair-collection | proof-hash PATCH whose proof values
 share the raw record's byte ownership. This is a validated membership projection,
 not validation during Pile replay and not a shared global host index. Summaries
 and repair nodes expose only C's fixed prefix; hashes bind the full keys while
 wire keys and compressed paths omit that prefix. The changed proof grammar and
-AUTH key hashing use `/triblespace/pile-sync/24`. No AUTH or collection-repair
+AUTH key hashing use `/triblespace/pile-sync/25`. No AUTH or collection-repair
 operation requests blobs or creates WANT; exact H remains the blob read capability.
 
 DHT `FIND_NODE` and provider-directory operations use two independent opaque

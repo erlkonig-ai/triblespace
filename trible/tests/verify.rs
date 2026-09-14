@@ -1,14 +1,10 @@
 use assert_cmd::Command;
-use ed25519_dalek::{Signer, SigningKey};
-use hifitime::Epoch;
+use ed25519_dalek::SigningKey;
 use predicates::prelude::*;
 use std::path::Path;
 use tempfile::tempdir;
 use triblespace_core::blob::encodings::utf8string::UTF8String;
-use triblespace_core::capability::{
-    Capability, CapabilityMode, CapabilityProof, CapabilityResource, CapabilityValidity,
-    CAPABILITY_PROOF_HEADER_LEN,
-};
+use triblespace_core::capability::{CapabilityProof, CapabilityResource};
 use triblespace_core::collection::{
     CollectionCommit, CollectionDerive, CollectionMerge, CollectionRecord, CollectionStore,
 };
@@ -59,14 +55,10 @@ fn verify_checks_physical_duplicates_without_blobs_keys_policy_or_clock() {
     write_records(&path);
     let root = SigningKey::from_bytes(&[2; 32]);
     let delegate = SigningKey::from_bytes(&[3; 32]);
-    let proof = CapabilityProof::issue_root(
-        &root,
+    let proof = CapabilityProof::new(
         CapabilityResource::new([4; 32]),
-        Capability::new(Inline::new([5; 32]), CapabilityMode::Invoke),
-        Some(
-            CapabilityValidity::new(Epoch::from_tai_seconds(1.0), Epoch::from_tai_seconds(2.0))
-                .unwrap(),
-        ),
+        &root,
+        Inline::new([5; 32]),
         delegate.verifying_key(),
     );
     let mut pile = Pile::open(&path).unwrap();
@@ -126,7 +118,7 @@ fn verify_reports_every_bad_collection_signature_without_mutating_the_pile() {
 }
 
 #[test]
-fn verify_checks_auth_signatures_and_path_local_attenuation() {
+fn verify_checks_auth_signatures_without_interpreting_definition_blobs() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("bad-auth.pile");
     std::fs::File::create(&path).unwrap();
@@ -134,30 +126,32 @@ fn verify_checks_auth_signatures_and_path_local_attenuation() {
     let delegate = SigningKey::from_bytes(&[3; 32]);
     let leaf = SigningKey::from_bytes(&[4; 32]);
     let resource = CapabilityResource::new([5; 32]);
-    let capability = Capability::new(Inline::new([6; 32]), CapabilityMode::Invoke);
-    let first =
-        CapabilityProof::issue_root(&root, resource, capability, None, delegate.verifying_key());
-    let child =
-        CapabilityProof::issue_root(&delegate, resource, capability, None, leaf.verifying_key());
-    let mut bad_path = first.as_bytes().to_vec();
-    bad_path.extend_from_slice(
-        &child.as_bytes()[CAPABILITY_PROOF_HEADER_LEN..child.as_bytes().len() - 64],
-    );
-    let signature = delegate.sign(&bad_path);
-    bad_path.extend_from_slice(&signature.to_bytes());
-    let bad_path = CapabilityProof::from_bytes(&bad_path).unwrap();
-    bad_path.verify_signatures().unwrap();
-    assert!(bad_path.validate_structure().is_err());
-
-    let mut bad_signature = first.into_bytes();
-    *bad_signature.last_mut().unwrap() ^= 0x80;
-    let bad_signature = CapabilityProof::from_bytes(&bad_signature).unwrap();
+    let capability = Inline::new([6; 32]);
+    let first = CapabilityProof::new(resource, &root, capability, delegate.verifying_key());
+    let child = first
+        .delegate(&delegate, Inline::new([7; 32]), leaf.verifying_key())
+        .unwrap();
+    // Neither referenced definition exists. Byte audit must still accept the
+    // valid signed chain, regardless of its later interpretation as authority.
+    child.verify_signatures().unwrap();
     let mut pile = Pile::open(&path).unwrap();
-    pile.insert_proof(bad_path).unwrap();
-    pile.insert_proof(bad_signature).unwrap();
+    pile.insert_proof(first).unwrap();
+    pile.insert_proof(child).unwrap();
     pile.close().unwrap();
-    let before = std::fs::read(&path).unwrap();
-
+    let offset = PileRecords::open(&path)
+        .unwrap()
+        .find_map(|raw| match raw.unwrap().content {
+            PileRecordContent::CapabilityProof {
+                data_offset,
+                data_len,
+                ..
+            } => Some(data_offset + data_len - 1),
+            _ => None,
+        })
+        .unwrap();
+    let mut before = std::fs::read(&path).unwrap();
+    before[offset] ^= 0x80;
+    std::fs::write(&path, &before).unwrap();
     Command::cargo_bin("trible")
         .unwrap()
         .args(["pile", "verify"])
@@ -166,12 +160,9 @@ fn verify_checks_auth_signatures_and_path_local_attenuation() {
         .failure()
         .stdout(
             predicate::str::contains("AUTH=2")
-                .and(predicate::str::contains("Invalid native records: 2")),
+                .and(predicate::str::contains("Invalid native records: 1")),
         )
-        .stderr(
-            predicate::str::contains("cannot delegate")
-                .and(predicate::str::contains("invalid signature")),
-        );
+        .stderr(predicate::str::contains("invalid signature"));
     assert_eq!(std::fs::read(&path).unwrap(), before);
 }
 

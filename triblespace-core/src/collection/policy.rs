@@ -60,8 +60,10 @@ impl CollectionPolicy {
 
     /// Add one custom capability definition and its descriptor-local policy.
     ///
-    /// The definition's facts are archived independently; its roots, delegates,
-    /// validity, and this resource's identity do not belong in those facts.
+    /// The definition's facts are archived independently. Its invocation actions
+    /// select this policy's roots and quorum; grant definitions may separately
+    /// permit delegation. A resource, issuer, and recipient belong to the proof,
+    /// not to the reusable definition.
     /// The complete supplied attachment store travels with the new binding.
     /// Repeating an identical definition/policy pair is idempotent.
     pub fn with_capability(mut self, definition: Fragment, policy: AdmissionPolicy) -> Self {

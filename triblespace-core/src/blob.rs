@@ -30,7 +30,7 @@ use std::marker::PhantomData;
 /// Re-export of the blob cache wrapper.
 pub use cache::BlobCache;
 /// Re-export of the in-memory blob store.
-pub use memoryblobstore::{MemoryBlobStore, MemoryBlobStoreSnapshot};
+pub use memoryblobstore::{MemoryBlobStore, MemoryBlobStoreSnapshot, MemoryStoreGetError};
 
 /// Re-export of `anybytes::Bytes` for blob payloads.
 pub use anybytes::Bytes;

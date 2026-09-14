@@ -157,6 +157,8 @@ impl Iterator for MemoryCapabilityProofIter {
 /// Failure while admitting a proof to [`MemoryRepo`].
 #[derive(Debug)]
 pub enum MemoryProofInsertError {
+    /// The proof's byte-only signature chain is invalid.
+    Invalid(crate::capability::CapabilityProofError),
     /// An infeasible BLAKE3 collision named different canonical proof bytes.
     IdCollision { id: CapabilityProofId },
 }
@@ -164,6 +166,7 @@ pub enum MemoryProofInsertError {
 impl fmt::Display for MemoryProofInsertError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Invalid(error) => write!(f, "invalid capability proof: {error}"),
             Self::IdCollision { id } => {
                 write!(f, "capability proof id {id:?} names different bytes")
             }
@@ -171,7 +174,14 @@ impl fmt::Display for MemoryProofInsertError {
     }
 }
 
-impl Error for MemoryProofInsertError {}
+impl Error for MemoryProofInsertError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Invalid(error) => Some(error),
+            Self::IdCollision { .. } => None,
+        }
+    }
+}
 
 /// Failure while inserting a collection record into [`MemoryRepo`].
 #[derive(Debug)]
@@ -218,6 +228,9 @@ impl CapabilityProofStore for MemoryRepo {
     type InsertError = MemoryProofInsertError;
 
     fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
+        proof
+            .verify_signatures()
+            .map_err(MemoryProofInsertError::Invalid)?;
         let id = proof.id();
         if let Some(existing) = self.capability_proofs.get(&id.raw) {
             return if existing.as_bytes() == proof.as_bytes() {
@@ -449,7 +462,7 @@ mod tests {
     use ed25519_dalek::SigningKey;
 
     use crate::blob::encodings::simplearchive::SimpleArchive;
-    use crate::capability::{Capability, CapabilityMode, CapabilityProof, CapabilityResource};
+    use crate::capability::{CapabilityProof, CapabilityResource};
     use crate::collection::descriptor::{identity_for_tests, named_for_tests};
     use crate::collection::{CollectionDerive, CollectionMerge, CollectionPolicy};
 
@@ -463,11 +476,10 @@ mod tests {
         let root = SigningKey::from_bytes(&[61; 32]);
         let leaf = SigningKey::from_bytes(&[62; 32]);
         let capability = Inline::new([63; 32]);
-        let proof = CapabilityProof::issue_root(
-            &root,
+        let proof = CapabilityProof::new(
             CapabilityResource::new([64; 32]),
-            Capability::new(capability, CapabilityMode::Invoke),
-            None,
+            &root,
+            capability,
             leaf.verifying_key(),
         );
 
@@ -484,6 +496,30 @@ mod tests {
                 .unwrap(),
             vec![proof]
         );
+    }
+
+    #[test]
+    fn capability_proof_insert_rejects_bad_signatures_without_mutation() {
+        let mut repo = MemoryRepo::default();
+        let root = SigningKey::from_bytes(&[65; 32]);
+        let leaf = SigningKey::from_bytes(&[66; 32]);
+        let proof = CapabilityProof::new(
+            CapabilityResource::new([67; 32]),
+            &root,
+            Inline::new([68; 32]),
+            leaf.verifying_key(),
+        );
+        let before = repo.snapshot().unwrap();
+        let mut bytes = proof.as_bytes().to_vec();
+        *bytes.last_mut().unwrap() ^= 1;
+        let invalid = CapabilityProof::from_bytes(&bytes).unwrap();
+        assert!(matches!(
+            repo.insert_proof(invalid),
+            Err(MemoryProofInsertError::Invalid(_))
+        ));
+        let after = repo.snapshot().unwrap();
+        assert_eq!(after.changes_since(&before), StoreChanges::NONE);
+        assert_eq!(after.proofs().unwrap().count(), 0);
     }
 
     /// Wants form an idempotent grow-only set. Enumeration is sorted (stable
@@ -741,8 +777,7 @@ mod tests {
     }
 
     #[test]
-    fn proof_expiry_requires_a_new_snapshot_without_changing_stored_content() {
-        use crate::capability::CapabilityValidity;
+    fn proof_admission_is_independent_of_the_snapshot_clock() {
         use crate::collection::{AdmissionPolicy, CollectionStoreExt};
 
         let root = SigningKey::from_bytes(&[91; 32]);
@@ -757,20 +792,10 @@ mod tests {
                 ),
             )
             .unwrap();
-        repo.insert_proof(CapabilityProof::issue_root(
-            &root,
+        repo.insert_proof(CapabilityProof::new(
             CapabilityResource::from(collection.handle()),
-            Capability::new(
-                crate::collection::write_capability(),
-                CapabilityMode::Invoke,
-            ),
-            Some(
-                CapabilityValidity::new(
-                    hifitime::Epoch::from_tai_seconds(10.0),
-                    hifitime::Epoch::from_tai_seconds(20.0),
-                )
-                .unwrap(),
-            ),
+            &root,
+            crate::collection::write_capability(),
             writer.verifying_key(),
         ))
         .unwrap();
@@ -780,18 +805,18 @@ mod tests {
             .unwrap();
         let instant = hifitime::Epoch::from_tai_seconds(15.0);
         let admitted = repo.snapshot_at(instant).unwrap();
-        assert!(!collection
+        assert!(collection
             .writer_is_admitted(&early, writer.verifying_key())
             .unwrap());
         assert!(collection
             .writer_is_admitted(&admitted, writer.verifying_key())
             .unwrap());
 
-        let expired = repo
+        let later = repo
             .snapshot_at(hifitime::Epoch::from_tai_seconds(21.0))
             .unwrap();
-        assert!(!collection
-            .writer_is_admitted(&expired, writer.verifying_key())
+        assert!(collection
+            .writer_is_admitted(&later, writer.verifying_key())
             .unwrap());
         let retained = admitted.clone();
         assert_eq!(retained.instant(), instant);
@@ -799,7 +824,7 @@ mod tests {
             .writer_is_admitted(&retained, writer.verifying_key())
             .unwrap());
         assert_eq!(admitted.changes_since(&early), StoreChanges::NONE);
-        assert_eq!(expired.changes_since(&admitted), StoreChanges::NONE);
+        assert_eq!(later.changes_since(&admitted), StoreChanges::NONE);
     }
 
     #[test]
@@ -841,11 +866,10 @@ mod tests {
 
         let root = SigningKey::from_bytes(&[75; 32]);
         let leaf = SigningKey::from_bytes(&[76; 32]);
-        let proof = CapabilityProof::issue_root(
-            &root,
+        let proof = CapabilityProof::new(
             CapabilityResource::new([78; 32]),
-            Capability::new(Inline::new([77; 32]), CapabilityMode::Invoke),
-            None,
+            &root,
+            Inline::new([77; 32]),
             leaf.verifying_key(),
         );
         repo.insert_proof(proof).unwrap();

@@ -41,9 +41,9 @@ signature component in a fixed record begins at a multiple of 32 — and because
 records themselves begin on 256-byte boundaries, the alignment holds at
 absolute file offsets, not merely within the record. The predecessor framing
 put a 36-byte prefix in front of the body, which left every such field four
-bytes short of a boundary and made each one straddle two. Capability proofs are
-the deliberate exception: their compact, length-delimited grammar packs
-161-byte edges and promises no internal field alignment.
+bytes short of a boundary and made each one straddle two. Capability proofs
+also preserve this alignment: their length-delimited grammar has a 96-byte
+header and 128-byte edges, with 32-byte handles and keys before each signature.
 
 **The record kind resolves.** 32 bytes is a blob handle, and the handle names a
 `SimpleArchive` describing the record kind: its name, the exact byte layout of
@@ -478,14 +478,18 @@ The descriptor archive holds a descriptor entity carrying:
   a lineage it does not have;
 - repeated `resource_policy` links to self-contained policy entities, each
   naming an exact `capability_handle`. The standard READ and WRITE definitions
-  and any application-specific definitions share this relation. An open policy
-  needs no proof. A quorum policy
-  carries a canonical nonempty set of Ed25519 roots and one semantic quorum
+  and any application-specific definitions share this relation. Consumers query
+  the bound definition's invocation-action facts to select the policy for a
+  requested action; a proof's grant handle need not equal the binding handle.
+  Existing bindings and standard definition blobs retain their byte identities.
+  An open policy needs no proof. A quorum policy carries a canonical nonempty
+  set of Ed25519 roots and one semantic quorum
   threshold. The byte-compatible descriptor may still contain the earlier
   optional delegation-threshold fact, but authorization ignores it; a signed
-  proof edge's mode alone determines whether its root share can be delegated
-  onward. Roots and derivations state both policies independently; source
-  walking never supplies authority. Their ordinary facts participate directly
+  proof edge's capability definition states which actions its recipient may
+  delegate onward, independently of which it may invoke. Roots and derivations
+  state both policies independently; source walking never supplies authority.
+  Their ordinary facts participate directly
   in the descriptor handle;
 - `collection_representation`, naming the canonical member encoding. The
   encoding owns validation and the intra-encoding join;
@@ -648,7 +652,7 @@ canonical self-contained prefix-signed proof body
 
 ```text
 magic32 | resource32 | root32 |
-    (capability_handle32 | flags1 | validity32 | delegate32 | signature64)+
+    (capability_handle32 | delegate32 | signature64)+
 ```
 
 Its logical key is
@@ -659,10 +663,10 @@ is not duplicated in the frame.
 |---:|---:|---|
 | `0..28` | 28 | Framing magic |
 | `28..32` | 4 | Minimal total 256-byte-block span, little-endian |
-| `32..64` | 32 | PROOF magic / record kind `CF346E81157B2169045EA8574896BAD23976A4A08D7DC70DDCADABA9AFF2442A`, rooted at `D81538DE724347280A6D97F51EDE08F6` |
+| `32..64` | 32 | PROOF magic / record kind `9E00F6EB8D63E5EB1A3ECFA284118F157B2F08CBDC95ECCEB8C2392AD794069D`, rooted at `C7116B04EE6DA4BADFDE77D79692AEFF` |
 | `64..96` | 32 | Opaque resource identity |
 | `96..128` | 32 | Root Ed25519 public key |
-| `128..128+161n` | variable | Delegation edges |
+| `128..128+128n` | variable | Delegation edges |
 | remainder | variable | Zero padding to the declared span |
 
 There is no proof-specific envelope, inner magic, or separate byte-length field.
@@ -674,29 +678,30 @@ The proof starts with the record kind itself. Its header is exactly 96 bytes:
 | `32..64` | 32 | Opaque resource identity |
 | `64..96` | 32 | Root Ed25519 public key |
 
-Each following edge is exactly 161 bytes:
+Each following edge is exactly 128 bytes:
 
 | Edge offset | Width | Field |
 |---:|---:|---|
 | `0..32` | 32 | Exact capability-definition `Handle<SimpleArchive>` |
-| `32..33` | 1 | Invoke/delegate mode bits plus validity-presence bit |
-| `33..65` | 32 | Two signed big-endian 128-bit TAI-nanosecond bounds, or canonical zeros |
-| `65..97` | 32 | Delegate Ed25519 public key |
-| `97..161` | 64 | Ed25519 signature over the exact body prefix through this delegate |
+| `32..64` | 32 | Delegate Ed25519 public key |
+| `64..128` | 64 | Ed25519 signature over the exact body prefix through this delegate |
 
-The body length must be exactly `96 + 161n` for `1 <= n <= 255`. Replay parses
-every Ed25519 key, requires a known nonempty mode on each
-edge, validates the optional inclusive interval encoding, requires the declared
+The body length must be exactly `96 + 128n` for `1 <= n <= 255`. Replay parses
+every Ed25519 key, requires canonical non-weak principals, requires the declared
 span to be the smallest span containing the body, and rejects any nonzero
-padding byte as corruption. The low two flag bits encode Invoke,
-Delegate, or both; bit 2 marks a present interval; all higher bits must be zero.
-A one-edge body is 257 bytes, so its pile record occupies two 256-byte blocks.
+padding byte as corruption. There are no inline modes, flags, or validity bytes.
+A one-edge body is 224 bytes, so its pile record fits one 256-byte block exactly.
 The generic framing declares only the block span. To recover the exact proof,
 the decoder walks fixed-width edges until the zero suffix: a valid edge cannot
-be all zero because its mode is nonempty. A bounded scan, the minimal-span
-check, and an entirely zero remainder make this unambiguous even when padding
-is longer than one edge. Zero bytes at the end of a signature remain part of
-the proof. A 128-edge proof fills its blocks exactly and has no padding.
+be all zero because an all-zero delegate key is weak. A bounded scan, the
+minimal-span check, and an entirely zero remainder make this unambiguous even
+when padding occupies one complete edge. Zero bytes at the end of a signature
+remain part of the proof. Odd edge counts fill their blocks exactly; even edge
+counts leave 128 bytes of padding.
+
+This grammar's description is named `pile-auth-proof-v5`. Its anchor above was
+minted with `trible genid` on 2026-09-14. Its incompatible wire identity changes
+proof bytes, not existing collection descriptors or their policy bindings.
 
 Insertion of identical bytes is idempotent. Different bytes reconstructing to
 the same proof ID are a collision and fail. Exact lookup is only by proof ID;
@@ -707,14 +712,24 @@ Generic framing and block padding are excluded. An exact prefix
 ending after any signature is therefore a complete proof for that intermediate
 delegate.
 
+Pile and MemoryRepo insertion verify every signature; trusted native replay
+checks framing and keys without repeating cryptography. Byte-only verification
+does not acquire or interpret capability definitions. Generic authorization
+separately reads those definitions: `capability_action` permits invocation and
+`capability_delegate_action` permits conferring invocation or onward delegation.
+For child Q following P, `I(Q) ∪ D(Q) ⊆ D(P)`. There is no same-handle rule.
+
 Conservative rewrites preserve every current canonical proof record and each
 resident capability definition it references, without fetching absent blobs
 or authoring WANTs. The opaque resource field is not interpreted as a blob
-handle by storage. Full semantic verification still
-needs the external trust root, expected subject, instant, and exact request;
-physical retention grants no authority.
+handle by storage. Semantic verification needs the external trust root,
+expected subject, resource/action request, and readable capability definitions,
+not a generic clock. Applications may interpret their own restrictions before
+quorum counting, as described in [Resource Capability Proofs](capability-auth.md).
+Physical retention grants no authority.
 
-The earlier `K(S,C,K)+` and 145-byte-edge action-ID proof kinds remain
+The earlier `K(S,C,K)+`, 145-byte-edge action-ID, and 161-byte-edge
+handle/mode/validity proof kinds remain
 structurally recognizable as inert frames so append-only piles can be traversed
 safely. Fresh writers do not emit them, replay projects no authority from them,
 and semantic rewrites may drop them. Their signatures cover other grammars and cannot be

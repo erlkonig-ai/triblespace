@@ -43,8 +43,8 @@ use triblespace_core::collection::reference_summary::{
 };
 use triblespace_core::collection::CollectionRead;
 use triblespace_core::collection::{
-    descriptor, grant_collection_read, grant_collection_write, next_authorization_change,
-    AdmissionPolicy, Collection, CollectionPolicy, CollectionRecordSelector, CollectionStoreExt,
+    descriptor, grant_collection_read, grant_collection_write, AdmissionPolicy, Collection,
+    CollectionPolicy, CollectionRecordSelector, CollectionStoreExt,
 };
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::{Blake3, Handle, Hash};
@@ -855,7 +855,7 @@ fn anchor(fields: &Fields) -> Anchor {
         Fields::Decoded { facts, name } => (facts, name),
         Fields::Missing => return Anchor::Unreadable("descriptor blob not in pile".to_owned()),
         Fields::Undecodable(e) => {
-            return Anchor::Unreadable(format!("descriptor undecodable: {e}"))
+            return Anchor::Unreadable(format!("descriptor undecodable: {e}"));
         }
     };
     match descriptor::source(facts) {
@@ -937,7 +937,7 @@ fn resolve(rows: &[Enumerated], reference: &str) -> Result<CollectionHandle> {
                     return Err(anyhow!(
                         "{reference:?} is both a collection name and a bare handle; use \
                          `name:{reference}` or `blake3:{reference}`"
-                    ))
+                    ));
                 }
             }
         }
@@ -1679,7 +1679,7 @@ mod tests {
             .put::<UTF8String, _>("arrived while maintenance ran")
             .unwrap();
         let after = store.snapshot().unwrap();
-        let catch_up = maintenance_changed(&before, &after, None);
+        let catch_up = maintenance_changed(&before, &after);
         assert!(
             catch_up,
             "post-work baseline must not swallow an in-flight append"
@@ -1689,14 +1689,14 @@ mod tests {
         // bit requests its bounded catch-up pass. With no further arrivals or
         // writes that pass clears the bit instead of becoming an idle loop.
         let poll = store.snapshot().unwrap();
-        assert!(!maintenance_changed(&after, &poll, None));
-        assert!(catch_up || maintenance_changed(&after, &poll, None));
+        assert!(!maintenance_changed(&after, &poll));
+        assert!(catch_up || maintenance_changed(&after, &poll));
         let after_catch_up = store.snapshot().unwrap();
-        assert!(!maintenance_changed(&poll, &after_catch_up, None));
+        assert!(!maintenance_changed(&poll, &after_catch_up));
     }
 
     #[test]
-    fn maintenance_observes_authorization_boundaries_and_clock_rollback() {
+    fn maintenance_ignores_clock_changes_without_content_changes() {
         let mut store = MemoryRepo::default();
         let at = |seconds| hifitime::Epoch::from_tai_seconds(seconds);
         let previous = store.snapshot_at(at(10.0)).unwrap();
@@ -1704,9 +1704,9 @@ mod tests {
         let boundary = store.snapshot_at(at(12.0)).unwrap();
         let rollback = store.snapshot_at(at(9.0)).unwrap();
 
-        assert!(!maintenance_changed(&previous, &unchanged, Some(at(12.0))));
-        assert!(maintenance_changed(&previous, &boundary, Some(at(12.0))));
-        assert!(maintenance_changed(&previous, &rollback, None));
+        assert!(!maintenance_changed(&previous, &unchanged));
+        assert!(!maintenance_changed(&previous, &boundary));
+        assert!(!maintenance_changed(&previous, &rollback));
     }
 
     fn direct_policy(root: ed25519_dalek::VerifyingKey) -> CollectionPolicy {
@@ -2251,51 +2251,52 @@ async fn maintenance_pass(
             // Give Ctrl-C and the runtime's I/O driver a boundary between
             // one-edge operations, including immediately-ready local stores.
             tokio::task::yield_now().await;
-            let result =
-                async {
-                    let snapshot = pile
-                        .snapshot()
-                        .map_err(|error| anyhow!("pile snapshot: {error:?}"))?;
-                    let facts: TribleSet = snapshot
-                        .get(handle)
-                        .map_err(|error| anyhow!("read collection descriptor: {error}"))?;
-                    let representation = descriptor::representation(&facts)?;
-                    let algorithm = descriptor::mapping_algorithm(&facts)?;
-                    let source = descriptor::source(&facts)?;
-                    let ensure_only =
-                        dependencies && source.is_none() && !selected.contains(&handle);
-                    let before = cover_census(&snapshot, handle)?;
-                    let started = Instant::now();
-                    let after = if ensure_only {
-                        let root: Collection<SimpleArchive> = Collection::open(&snapshot, handle)
-                            .map_err(|error| {
-                            anyhow!("open foundational collection: {error}")
-                        })?;
-                        pile.ensure(root, signer)
-                            .await
-                            .map_err(|error| anyhow!("ensure foundational collection: {error}"))?
-                    } else {
-                        maintain_by_representation(
-                            pile,
-                            &snapshot,
-                            handle,
-                            representation,
-                            algorithm,
-                            signer,
-                        )
-                        .await?
-                    };
-                    let after = cover_census(&after, handle)?;
-                    println!(
+            let result = async {
+                let snapshot = pile
+                    .snapshot()
+                    .map_err(|error| anyhow!("pile snapshot: {error:?}"))?;
+                let facts: TribleSet = snapshot
+                    .get(handle)
+                    .map_err(|error| anyhow!("read collection descriptor: {error}"))?;
+                let representation = descriptor::representation(&facts)?;
+                let algorithm = descriptor::mapping_algorithm(&facts)?;
+                let source = descriptor::source(&facts)?;
+                let ensure_only = dependencies && source.is_none() && !selected.contains(&handle);
+                let before = cover_census(&snapshot, handle)?;
+                let started = Instant::now();
+                let after = if ensure_only {
+                    let root: Collection<SimpleArchive> = Collection::open(&snapshot, handle)
+                        .map_err(|error| anyhow!("open foundational collection: {error}"))?;
+                    pile.ensure(root, signer)
+                        .await
+                        .map_err(|error| anyhow!("ensure foundational collection: {error}"))?
+                } else {
+                    maintain_by_representation(
+                        pile,
+                        &snapshot,
+                        handle,
+                        representation,
+                        algorithm,
+                        signer,
+                    )
+                    .await?
+                };
+                let after = cover_census(&after, handle)?;
+                println!(
                     "{} blake3:{} in {:.1} s: commits {} -> {}, merges {} -> {}, derives {} -> {}",
                     if ensure_only { "ensured" } else { "maintained" },
                     handle_hex(handle),
                     started.elapsed().as_secs_f64(),
-                    before.0, after.0, before.1, after.1, before.2, after.2,
+                    before.0,
+                    after.0,
+                    before.1,
+                    after.1,
+                    before.2,
+                    after.2,
                 );
-                    Ok::<(), anyhow::Error>(())
-                }
-                .await;
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
             if let Err(error) = result {
                 eprintln!("maintenance blake3:{}: {error:#}", handle_hex(handle));
                 failures += 1;
@@ -2307,14 +2308,8 @@ async fn maintenance_pass(
     Ok(failures)
 }
 
-fn maintenance_changed<S: StoreSnapshot>(
-    previous: &S,
-    current: &S,
-    next_authorization: Option<hifitime::Epoch>,
-) -> bool {
+fn maintenance_changed<S: StoreSnapshot>(previous: &S, current: &S) -> bool {
     !current.changes_since(previous).is_empty()
-        || current.instant() < previous.instant()
-        || next_authorization.is_some_and(|boundary| current.instant() >= boundary)
 }
 
 async fn maintenance_loop(
@@ -2328,7 +2323,6 @@ async fn maintenance_loop(
     let stop = tokio::signal::ctrl_c();
     tokio::pin!(stop);
     let mut baseline = None;
-    let mut next_authorization = None;
     let mut catch_up = true;
     loop {
         // Pile::snapshot refreshes its externally appended prefix before
@@ -2339,9 +2333,8 @@ async fn maintenance_loop(
         if catch_up
             || baseline
                 .as_ref()
-                .is_some_and(|previous| maintenance_changed(previous, &before, next_authorization))
+                .is_some_and(|previous| maintenance_changed(previous, &before))
         {
-            let boundary_before = next_authorization_change(&before)?;
             let failures = tokio::select! {
                 biased;
                 stopped = &mut stop => {
@@ -2358,8 +2351,7 @@ async fn maintenance_loop(
             // source. Retain one dirty bit across our post-work baseline, then
             // run another bounded pass at the next interval. Our own writes
             // may cause one no-op pass; they cannot sustain an idle loop.
-            catch_up = maintenance_changed(&before, &after, boundary_before);
-            next_authorization = next_authorization_change(&after)?;
+            catch_up = maintenance_changed(&before, &after);
             baseline = Some(after);
             if !watch {
                 return if failures == 0 {
