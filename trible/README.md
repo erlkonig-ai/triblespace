@@ -148,6 +148,49 @@ with the encoding and mapping-algorithm descriptions.
   issue the symmetric deterministic WRITE/Invoke proof from a configured WRITE
   root to an author key.
 
+#### Background maintenance
+
+`maintain` works on just the selected collections. `maintain-all` also follows
+their descriptor source links, preparing upstream collections first:
+
+```sh
+trible pile collection maintain self.pile blake3:<TARGET> --key self.key
+trible pile collection maintain-all self.pile blake3:<RANK9> blake3:<SEARCH> --key self.key
+trible pile collection maintain-all self.pile blake3:<RANK9> blake3:<SEARCH> --key self.key --watch
+```
+
+The final command stays in the foreground for a terminal, tmux, or a service
+manager to supervise. `--interval-ms` sets the refresh interval (default 1000).
+One pile stays open; unchanged snapshots do not rerun maintenance. A pass that
+overlaps content changes schedules a catch-up pass at the next interval, so a
+concurrent append cannot disappear behind the post-work snapshot. At rest, an
+idempotent pass publishes nothing and clears that pending work.
+Proof-validity boundaries are tracked separately from content changes.
+Ctrl-C closes the pile normally. Independent targets continue when one fails;
+watch mode reports that failure and retries when its observed inputs change.
+
+Targets are explicit, not every historical index in a pile. Use an exact
+descriptor handle for a newly registered target with no equations yet. A
+Rank9 target leads to Succinct maintenance and source ensure; it does not
+force merges in the foundational SimpleArchive unless that root was also
+explicitly selected. This is scheduling around the normal operations, not a
+mapping that secretly emits upstream artifacts.
+
+Self-description supplies parameters, not executable code. The binary must
+include the selected encoding and mapping implementation. The default build
+includes the current Nomic semantic mapping; execution still obeys its compute
+class and target WRITE policy. Application-specific mappings need their own
+linked implementation. The local pile must have the required blobs; a separate
+sync/custody process may bring them in, after which a watched pass can retry.
+Reference-summary maintenance requires the producer's complete blob closure.
+
+Readers can independently attach the resident rollup through
+`snapshot.collection(target)?.view()`. They see the support already realized
+in that snapshot, not a promise that a background pass has caught up.
+The BM25 `collection search` command follows that same rule: new unindexed
+source commits do not hide existing search results, and snippets come from
+the index's realized support.
+
 ### Distributed pile sync
 
 Built on `triblespace-net` (authenticated iroh QUIC, collection-scoped PATCH

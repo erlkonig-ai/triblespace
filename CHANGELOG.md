@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add descriptor-driven `trible pile collection maintain-all` and foreground
+  `--watch` maintenance for explicitly selected collections. Schedule source
+  dependencies with ordinary one-edge operations, deduplicate shared work, and
+  keep snapshot change detection separate from authorization time. Mapping
+  kernels, collection identities, and pile record formats are unchanged.
+
 - Semantic-index descriptors now reference the selected model and tokenizer
   root ids plus Mary's containing collection handle, never its member archive
   support. Extra observations, other models, and support repackaging leave the

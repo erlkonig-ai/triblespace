@@ -56,8 +56,8 @@ blake3 = "1.8.3"
 
 [features]
 default = ["search"]
-# Maintain and name NVFP4 vector sets. On by default so the one binary can create
-# and maintain every collection kind from the command line; the price is that
-# the search crate brings the model crate with it. Build with
+# Maintain both stored-vector and model-derived semantic indexes. On by default
+# so the CLI can dispatch the concrete mapping named by a search descriptor;
+# the price is that the search crate brings the model crate with it. Build with
 # --no-default-features for a lean daemon.
-search = ["dep:triblespace-search"]
+search = ["dep:triblespace-search", "triblespace-search/semantic"]

@@ -6,7 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `pile collection maintain-all` schedules explicitly selected targets and
+  their source dependencies in upstream order. Shared dependencies run once;
+  foundational sources are ensured without an unnecessary base-archive merge.
+  Both maintenance commands accept multiple targets and `--watch`, retaining
+  one pile and reacting to snapshot changes and authorization boundaries.
+  Fresh descriptor handles work before their first equation is published.
+
 ### Changed
+
+- Maintenance dispatch recognizes the concrete semantic-index mapping, not
+  just its NVFP4 representation. The default search-enabled CLI includes that
+  mapping; unsupported algorithms are reported without guessing their meaning.
 
 - `pile compact` no longer refuses a pile that holds frames of a kind this
   binary does not know. They are carried exactly, by their own length, and the
@@ -14,6 +27,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   an explicit, separate operation (JP, 2026-09-13).
 
 ### Fixed
+
+- BM25 search reads the index support already realized in its snapshot, even
+  when new source commits await maintenance. Snippets use that same support.
 
 - Accept uppercase hexadecimal recipient keys in collection READ/WRITE grants,
   matching the exact public-key spelling emitted by `pile signing-key init`.

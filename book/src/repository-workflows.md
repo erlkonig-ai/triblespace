@@ -425,6 +425,26 @@ exist; it does not demand an unbuilt raw image of that new commit. A later pass
 advances the two lattices again. Source support is still expressed in the same
 foundational coordinates; only the selection of currently usable input changes.
 
+For a command-line maintenance owner, `trible pile collection maintain-all`
+discovers this source order from explicitly selected descriptor handles and
+calls those same operations. Shared upstream dependencies run once per pass;
+a foundational dependency is ensured rather than needlessly compacted. The
+one-edge `maintain` command remains available. Either command accepts `--watch`
+to retain one open pile and repeat after snapshot content changes or an
+authorization boundary. This adds scheduling, not recursive effects inside a
+mapping kernel. Exact target selection prevents an old, superseded index from
+being restarted merely because its descriptor is still present.
+
+```sh
+trible pile collection maintain-all self.pile blake3:<RANK9_TARGET> --watch
+```
+
+The executable still needs the encoding and concrete mapping implementation;
+descriptors are data, not dynamically loaded code. This local maintainer and
+a network sync process can run independently over the same append-only pile.
+Readers attach the resident target from their own snapshot and do not wait
+for a global maintenance frontier.
+
 When a caller specifically needs matching representations for one selected
 support, use `maintain_exact(raw, &writer, &support)` and
 `maintain_exact(accelerated, &writer, &support)`, then
