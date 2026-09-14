@@ -23,7 +23,7 @@ use crate::blob::{Blob, BlobEncoding};
 use crate::inline::encodings::hash::Handle;
 use crate::metadata::{self, MetaDescribe};
 use crate::prelude::{exists, pattern};
-use crate::repo::{BlobStoreGet, BlobStoreList, BlobStoreMeta};
+use crate::repo::{BlobStoreGet, BlobStoreList, BlobStoreMeta, StoreRead};
 use crate::trible::Fragment;
 
 use super::{
@@ -238,18 +238,19 @@ pub trait CollectionDerivation: CollectionEncoding {
 
     /// Compute the canonical target image of one source member.
     ///
-    /// `reader` is the same frozen content-addressed boundary from which the
+    /// `reader` is the same frozen store observation from which the
     /// source was loaded. The mapping owns decoding and rejecting malformed
     /// input while it performs new work. It may use `reader` only to resolve
-    /// immutable dependencies named by `source`; ambient store contents are
-    /// not semantic inputs to the mapping.
+    /// dependencies named by `source` or its concrete argument. An explicit
+    /// collection reference is resolved using this observation's records and
+    /// authorization instant; unrelated store contents are not semantic input.
     fn map<R>(
         argument: &Self::Argument,
         source: &Blob<Self::Source>,
         reader: &R,
     ) -> Result<Blob<Self>, CollectionOperationError>
     where
-        R: BlobStoreGet + BlobStoreMeta;
+        R: StoreRead;
 
     /// Join two target images, optionally reusing their resident source union.
     ///
@@ -298,13 +299,18 @@ pub trait CollectionMapping: Sized {
     fn bind(source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError>;
 
     /// Compute the canonical target image of one source member.
+    ///
+    /// The reader freezes the source and any explicitly named dependencies
+    /// together, including collection records and authorization. A mapping may
+    /// resolve references carried by its descriptor or input, but must not
+    /// discover ambient inputs or advance the control-plane observation.
     fn map<R>(
         &self,
         source: &Blob<Self::Source>,
         reader: &R,
     ) -> Result<Blob<Self::Target>, CollectionOperationError>
     where
-        R: BlobStoreGet + BlobStoreMeta;
+        R: StoreRead;
 
     /// Join target images, optionally reusing a resident, witnessed source union.
     ///
@@ -359,7 +365,7 @@ impl<T: CollectionDerivation> CollectionMapping for CanonicalDerivation<T> {
         reader: &R,
     ) -> Result<Blob<Self::Target>, CollectionOperationError>
     where
-        R: BlobStoreGet + BlobStoreMeta,
+        R: StoreRead,
     {
         T::map(&self.argument, source, reader)
     }

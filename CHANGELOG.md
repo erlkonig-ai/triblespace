@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Semantic-index descriptors now reference the selected model and tokenizer
+  root ids plus Mary's containing collection handle, never its member archive
+  support. Extra observations, other models, and support repackaging leave the
+  same selected index identity unchanged. Mapping reads receive the existing
+  frozen `StoreRead` context so explicit collection dependencies share source
+  admission and authorization. A bounded thread cache reuses one attached
+  observation without inventing another model identity. No existing descriptor,
+  result, or live pile is rewritten. Minted with `trible genid` on 2026-09-14:
+  algorithm `2B69128192930EE0782CCA03B97677F5`, tokenizer-reference anchor
+  `E6A241C22B0457CD24AE65C1FC6AC177`. Collection references reuse Mary's anchor
+  `CC07F0AFB3DCFD254A54A883E86E2617`; independently minted
+  `CEB51BC9B3A56A0F29AEE923F13B3D71` was not used.
+
 - `Pile::rewrite_retained_into` carries frames of unknown kind exactly, by
   their own length, instead of refusing the whole rewrite: it keeps every
   resident blob, so it cannot orphan whatever such a frame names, and a binary
