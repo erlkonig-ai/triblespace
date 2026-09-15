@@ -182,7 +182,7 @@ impl From<anybytes::view::ViewError> for EmbeddingError {
 
 /// The blob's own tensor view: its dimension and its payload bytes.
 fn tensor_view(blob: Blob<Embedding>) -> Result<TensorView, EmbeddingError> {
-    let tensor: Blob<Tensor<F32, 1>> = Blob::new(blob.bytes);
+    let tensor: Blob<Tensor<F32, 1>> = blob.transmute();
     Ok(TensorView::try_from_blob(tensor)?)
 }
 
@@ -209,7 +209,7 @@ impl TryFromBlob<Embedding> for View<[f32]> {
 fn embedding_blob(dimension: usize, payload: Vec<u8>) -> Blob<Embedding> {
     let tensor = tensor_blob::<F32, 1>([dimension as u64], anybytes::Bytes::from_source(payload))
         .expect("a rank-1 f32 payload built from its own length always fits its header");
-    Blob::new(tensor.bytes)
+    tensor.transmute()
 }
 
 impl Encodes<View<[f32]>> for Embedding
@@ -381,6 +381,15 @@ mod embedding_tensor_tests {
     use triblespace_core::blob::encodings::tensor::TENSOR_HEADER_LEN;
 
     #[test]
+    fn embedding_read_retains_the_original_tensor_payload() {
+        let blob: Blob<Embedding> = Embedding::encode(vec![0.6_f32, 0.8, 0.0]);
+        let payload = blob.bytes[TENSOR_HEADER_LEN..].as_ptr();
+        let view = View::<[f32]>::try_from_blob(blob).unwrap();
+        assert_eq!(view.as_ptr().cast::<u8>(), payload);
+        assert_eq!(&view[..], &[0.6, 0.8, 0.0]);
+    }
+
+    #[test]
     fn an_embedding_is_a_rank_one_f32_tensor_with_its_dimension_in_the_header() {
         let blob: Blob<Embedding> = Embedding::encode(vec![0.6_f32, 0.8, 0.0]);
         assert_eq!(blob.bytes.len(), TENSOR_HEADER_LEN + 3 * 4);
@@ -413,7 +422,10 @@ mod embedding_tensor_tests {
     #[test]
     fn the_same_vector_is_the_same_blob_as_a_plain_tensor() {
         let embedding: Blob<Embedding> = Embedding::encode(&[1.0_f32, 0.0][..]);
-        let payload = [1.0_f32, 0.0].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+        let payload = [1.0_f32, 0.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>();
         let tensor = tensor_blob::<F32, 1>([2], anybytes::Bytes::from_source(payload)).unwrap();
         assert_eq!(&embedding.bytes[..], &tensor.bytes[..]);
     }

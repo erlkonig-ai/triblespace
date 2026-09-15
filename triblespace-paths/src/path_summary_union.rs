@@ -13,6 +13,17 @@
 //! Transitive closure is deliberately absent from the collection law. It is
 //! performed once when a [`PathIndex`](crate::PathIndex) is materialized, so
 //! paths whose edges live in different source fragments remain discoverable.
+//!
+//! Reading is split in three steps with different trust. Attaching a
+//! [`PathSummaryView`] is typed and structural: it keeps the resident members
+//! and the automaton they name and checks nothing but the 32-byte handle each
+//! member carries against the collection's. [`PathSummaryView::prepare`] is
+//! the query computation: it decodes the members structurally, merges the
+//! decoded summaries once and closes the union, so cross-member paths stay
+//! discoverable without encoding any intermediate join. The canonical audit
+//! is explicit: [`CollectionEncoding::validate_member`] and the producer's
+//! [`join_members`](CollectionEncoding::join_members) re-prove the bytes;
+//! a warm read never re-encodes or hashes to believe a stored equation.
 
 use std::convert::Infallible;
 use std::error::Error;
@@ -199,7 +210,7 @@ where
     let blob: Blob<PathAutomatonBlob> = reader
         .get(handle)
         .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?;
-    PathAutomatonBlob::decode(&blob)
+    PathAutomatonBlob::audit(&blob)
         .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
 }
 
@@ -228,7 +239,7 @@ impl CollectionEncoding for PathSummaryBlob {
     {
         let handle = require_member_automaton(descriptor, member)?;
         let automaton = resident_automaton(handle, reader)?;
-        PathSummaryBlob::decode(member.clone(), &automaton)
+        PathSummaryBlob::audit(member.clone(), &automaton)
             .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?;
         Ok(())
     }
@@ -335,17 +346,56 @@ fn summary_operation_error(source: PathSummaryBlobError) -> CollectionOperationE
 
 /// A lazy logical path-summary value retaining its exact physical members.
 ///
-/// Closure is intentionally not part of the collection law. Callers may keep
-/// this cheap view until they actually need to construct a [`PathIndex`].
+/// Attaching one is typed and structural: the resident members are kept as
+/// stored, each checked only for naming the collection's automaton by the
+/// 32-byte handle it carries, and that automaton is decoded once from its
+/// content-addressed blob. Closure is intentionally not part of the
+/// collection law; [`prepare`](Self::prepare) computes it when a query needs
+/// the [`PathIndex`].
 pub struct PathSummaryView {
     cover: Cover<PathSummaryBlob>,
     segments: Vec<(Inline<Handle<PathSummaryBlob>>, Blob<PathSummaryBlob>)>,
+    automaton_handle: Inline<Handle<PathAutomatonBlob>>,
+    automaton: Automaton,
 }
 
 impl PathSummaryView {
     /// Exact typed physical cover represented by this view.
     pub fn cover(&self) -> &Cover<PathSummaryBlob> {
         &self.cover
+    }
+
+    /// The canonical automaton every member of this view is a summary for.
+    pub fn automaton(&self) -> &Automaton {
+        &self.automaton
+    }
+
+    /// Content handle of the automaton blob the members and descriptor name.
+    pub fn automaton_handle(&self) -> Inline<Handle<PathAutomatonBlob>> {
+        self.automaton_handle
+    }
+
+    /// Compute the exact endpoint relation over every member: the query
+    /// computation, kept out of attachment.
+    ///
+    /// Each member is decoded structurally, the decoded summaries are merged
+    /// once as sets, and the union is closed. Paths that take their edges from
+    /// several members are found because closure follows the join; nothing is
+    /// re-encoded on the way. An empty view closes the automaton's bottom.
+    pub fn prepare(&self) -> Result<PathIndex, PathIndexViewError> {
+        let mut summaries = Vec::with_capacity(self.segments.len());
+        for (_, blob) in &self.segments {
+            summaries.push(
+                PathSummaryBlob::decode(blob.clone(), &self.automaton)
+                    .map_err(PathIndexViewError::Summary)?,
+            );
+        }
+        let summary = if summaries.is_empty() {
+            PathSummary::from_edges(self.automaton.clone(), std::iter::empty::<GraphEdge>())
+        } else {
+            PathSummary::merge_all(&summaries).map_err(PathIndexViewError::Index)?
+        };
+        PathIndex::from_summary(summary).map_err(PathIndexViewError::Index)
     }
 
     /// Number of physical path-summary members retained by this view.
@@ -380,27 +430,58 @@ impl PathSummaryView {
 }
 
 impl TryFromCover<PathSummaryBlob> for PathSummaryView {
-    type Error = Infallible;
+    type Error = PathIndexViewError;
 
     fn try_from_cover<R>(
         cover: &Cover<PathSummaryBlob>,
-        _descriptor: &Fragment,
+        descriptor: &Fragment,
         snapshot: &R,
     ) -> Result<Self, TryFromCoverError<R::GetError<Infallible>, Self::Error>>
     where
         R: triblespace_core::repo::BlobStoreGet,
     {
+        // The descriptor is the collection's admission expectation and names
+        // the automaton every member must be a summary for; a member's own
+        // header carries the same handle, compared as bytes, never rehashed.
+        let automaton_handle = descriptor_automaton_handle(descriptor)
+            .map_err(PathIndexViewError::Descriptor)
+            .map_err(TryFromCoverError::View)?;
         let mut segments = Vec::with_capacity(cover.len());
         for handle in cover.members() {
             let member = Handle::<PathSummaryBlob>::to_hash(handle);
             let blob = snapshot
                 .get(handle)
                 .map_err(|source| TryFromCoverError::MemberGet { member, source })?;
+            let named = PathSummaryBlob::automaton_handle(&blob)
+                .map_err(PathIndexViewError::Summary)
+                .map_err(TryFromCoverError::View)?;
+            if named != automaton_handle {
+                return Err(TryFromCoverError::View(PathIndexViewError::Descriptor(
+                    CollectionOperationError::Fatal(
+                        "path-summary member names an automaton outside its collection".to_owned(),
+                    ),
+                )));
+            }
             segments.push((handle, blob));
         }
+        // The automaton blob is a content-addressed representation dependency
+        // retained in the descriptor closure, so the empty cover has it too.
+        let automaton_member = Handle::<PathAutomatonBlob>::to_hash(automaton_handle);
+        let automaton_blob =
+            snapshot
+                .get(automaton_handle)
+                .map_err(|source| TryFromCoverError::MemberGet {
+                    member: automaton_member,
+                    source,
+                })?;
+        let automaton = PathAutomatonBlob::decode(&automaton_blob)
+            .map_err(PathIndexViewError::Automaton)
+            .map_err(TryFromCoverError::View)?;
         Ok(Self {
             cover: cover.clone(),
             segments,
+            automaton_handle,
+            automaton,
         })
     }
 }
@@ -443,6 +524,9 @@ impl Error for PathIndexViewError {
 impl TryFromCover<PathSummaryBlob> for Arc<PathIndex> {
     type Error = PathIndexViewError;
 
+    /// The structural attach of a [`PathSummaryView`] followed by its
+    /// [`prepare`](PathSummaryView::prepare), for callers that want the
+    /// closed relation in one step.
     fn try_from_cover<R>(
         cover: &Cover<PathSummaryBlob>,
         descriptor: &Fragment,
@@ -451,61 +535,9 @@ impl TryFromCover<PathSummaryBlob> for Arc<PathIndex> {
     where
         R: triblespace_core::repo::BlobStoreGet,
     {
-        let expected_automaton = descriptor_automaton_handle(descriptor)
-            .map_err(PathIndexViewError::Descriptor)
-            .map_err(TryFromCoverError::View)?;
-        // A non-empty physical cover carries its own representation context:
-        // follow the immutable child named by a member. The descriptor remains
-        // the collection's admission expectation and supplies the only
-        // possible anchor for the empty cover.
-        let automaton_handle = match cover.members().next() {
-            Some(handle) => {
-                let member = Handle::<PathSummaryBlob>::to_hash(handle);
-                let blob = snapshot
-                    .get(handle)
-                    .map_err(|source| TryFromCoverError::MemberGet { member, source })?;
-                let actual = PathSummaryBlob::automaton_handle(&blob)
-                    .map_err(PathIndexViewError::Summary)
-                    .map_err(TryFromCoverError::View)?;
-                if actual != expected_automaton {
-                    return Err(TryFromCoverError::View(PathIndexViewError::Descriptor(
-                        CollectionOperationError::Fatal(
-                            "path-summary member names an automaton outside its collection"
-                                .to_owned(),
-                        ),
-                    )));
-                }
-                actual
-            }
-            None => expected_automaton,
-        };
-        let automaton_member = Handle::<PathAutomatonBlob>::to_hash(automaton_handle);
-        let automaton_blob =
-            snapshot
-                .get(automaton_handle)
-                .map_err(|source| TryFromCoverError::MemberGet {
-                    member: automaton_member,
-                    source,
-                })?;
-        let automaton = PathAutomatonBlob::decode(&automaton_blob)
-            .map_err(PathIndexViewError::Automaton)
-            .map_err(TryFromCoverError::View)?;
-        let mut joined = PathSummaryBlob::empty(&automaton);
-        for handle in cover.members() {
-            let member = Handle::<PathSummaryBlob>::to_hash(handle);
-            let segment = snapshot
-                .get(handle)
-                .map_err(|source| TryFromCoverError::MemberGet { member, source })?;
-            joined = PathSummaryBlob::join(&joined, &segment, &automaton)
-                .map_err(PathIndexViewError::Summary)
-                .map_err(TryFromCoverError::View)?;
-        }
-        let summary = PathSummaryBlob::decode(joined, &automaton)
-            .map_err(PathIndexViewError::Summary)
-            .map_err(TryFromCoverError::View)?;
-        PathIndex::from_summary(summary)
+        let view = PathSummaryView::try_from_cover(cover, descriptor, snapshot)?;
+        view.prepare()
             .map(Arc::new)
-            .map_err(PathIndexViewError::Index)
             .map_err(TryFromCoverError::View)
     }
 }

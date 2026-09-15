@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Separate maintained-index attachment from canonical audits and query
+  preparation. Typed views retain persisted backing and check safe framing;
+  they do not reconstruct canonical data or serialize temporary cover unions.
+  Sparse reference summaries expose an explicit prepared membership query,
+  while dense summaries remain direct byte views. NVFP4 attachment no longer
+  scans every row, and SimpleArchive interpretation unions its archive-backed
+  PATCH leaves directly. BM25 and LWW expose query preparation for information
+  their wire formats do not store. Persisted bytes and identifiers are unchanged;
+  full representation audits remain explicit.
+
+- Path-summary attachment retains the stored carriers and their automaton.
+  Canonical automaton/summary audits are explicit; `PathSummaryView::prepare`
+  joins decoded summaries once and computes cross-member reachability without
+  re-encoding or hashing an expanding sequence of intermediate members.
+
 - Connect the existing CubeCL wavelet backend to canonical raw Succinct
   construction and target compaction through `BackendSuccinctMapping`.
   Collection identity remains backend-independent; CPU-reference plumbing tests

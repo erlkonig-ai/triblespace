@@ -190,6 +190,8 @@ struct Layout {
 }
 
 impl Layout {
+    // Attachment checks plane geometry, not the values stored in those planes.
+    // Canonicality is the producer's contract and `validate` is an explicit audit.
     fn parse(bytes: &[u8]) -> Result<Self, NvFp4Error> {
         if bytes.len() < FOOTER_LEN {
             return Err(NvFp4Error::new("NVFP4 member is shorter than its footer"));
@@ -247,7 +249,7 @@ impl Layout {
             )));
         }
 
-        let layout = Self {
+        Ok(Self {
             rows,
             dimension,
             blocks_per_row,
@@ -255,9 +257,7 @@ impl Layout {
             stages,
             norms,
             errors,
-        };
-        layout.validate(bytes)?;
-        Ok(layout)
+        })
     }
 
     fn validate(&self, bytes: &[u8]) -> Result<(), NvFp4Error> {
@@ -459,9 +459,7 @@ pub(crate) fn encode_rows<E: BlobEncoding>(
             .to_le_bytes(),
     );
     debug_assert_eq!(bytes.len(), capacity);
-    let blob = Blob::new(Bytes::from_source(bytes));
-    Layout::parse(blob.bytes.as_ref())?;
-    Ok(blob)
+    Ok(Blob::new(Bytes::from_source(bytes)))
 }
 
 fn owned_row(bytes: &[u8], layout: &Layout, row: usize) -> StoredRow {
@@ -820,14 +818,12 @@ where
                 layout.dimension,
             )));
         }
-        // Member admission validates the self-contained byte grammar only.
-        // Replaying the deterministic mapping here would fetch and requantize
-        // every exact source embedding, defeating both lazy reranking and
-        // persisted derivation work. Locally mapped members are canonical by
-        // construction. The network currently does not reuse unsigned remote
-        // DERIVE equations; introducing that would require an independent
-        // trust or recomputation boundary rather than stronger byte parsing.
-        Ok(())
+        // This explicit audit checks the stored representation, not whether
+        // its producer embedded or quantized the original sources correctly.
+        // Ordinary collection attachment does not invoke it.
+        layout
+            .validate(member.bytes.as_ref())
+            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
 
     fn join_members<R>(
@@ -1096,9 +1092,14 @@ where
             let score = if norm == 0.0 {
                 0.0
             } else {
-                (raw_dot_f64(coordinates, segment, row) / norm).clamp(-1.0, 1.0)
+                raw_dot_f64(coordinates, segment, row) / norm
             };
-            scored.push((handle, score));
+            if !score.is_finite() {
+                return Err(NvFp4Error::new(
+                    "NVFP4 reconstruction produced a nonfinite score",
+                ));
+            }
+            scored.push((handle, score.clamp(-1.0, 1.0)));
             Ok(())
         })?;
         scored.sort_unstable_by(|left, right| {
@@ -1578,6 +1579,7 @@ mod tests {
             Fragment::from(TribleSet::try_from_blob(descriptor.clone()).unwrap());
         let member_handle = target_cover.members().next().unwrap();
         let compact: Blob<NvFp4CosineSet<Embedding>> = source_snapshot.get(member_handle).unwrap();
+        let backing = compact.bytes.clone();
         let mut sparse = MemoryRepo::default();
         assert_eq!(
             sparse.put::<SimpleArchive, _>(descriptor).unwrap(),
@@ -1598,6 +1600,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(counted.gets(), target_cover.len());
+        assert_eq!(index.members[0].bytes.as_ptr(), backing.as_ptr());
         let prepared = PreparedQuery::new(&[1.0, 0.0, 0.0], DIMENSION).unwrap();
         assert_eq!(
             index
@@ -1667,7 +1670,26 @@ mod tests {
     }
 
     #[test]
-    fn malformed_or_conflicting_members_are_rejected() {
+    fn nonfinite_reconstruction_is_a_query_error_not_an_attachment_scan() {
+        let member = member([row(1, &[1.0, 0.0])], 2);
+        let layout = Layout::parse(member.bytes.as_ref()).unwrap();
+        let mut bytes = member.bytes.as_ref().to_vec();
+        bytes[layout.stages[0].globals.clone()].copy_from_slice(&f32::NAN.to_le_bytes());
+        let bytes = Bytes::from_source(bytes);
+        let index = NvFp4CosineIndex::<Embedding> {
+            members: vec![Member {
+                content_handle: member.get_handle().raw,
+                layout: Layout::parse(&bytes).unwrap(),
+                bytes,
+            }],
+            dimension: 2,
+            _encoding: PhantomData,
+        };
+        assert!(index.reconstructed_top_k(&[1.0, 0.0], 1).is_err());
+    }
+
+    #[test]
+    fn canonical_audit_is_separate_from_structural_attachment() {
         let one = row(1, &[1.0, 0.0]);
         let conflicting = row(1, &[0.0, 1.0]);
         assert!(encode_rows::<Embedding>(2, vec![one, conflicting]).is_err());
@@ -1677,6 +1699,11 @@ mod tests {
         assert!(Layout::parse(&malformed).is_ok());
         let last_code = Layout::parse(&malformed).unwrap().stages[0].codes.start;
         malformed[last_code] = 0x08;
+        let layout = Layout::parse(&malformed).unwrap();
+        assert!(layout.validate(&malformed).is_err());
+
+        // Impossible plane geometry still fails before any row is read.
+        malformed.pop();
         assert!(Layout::parse(&malformed).is_err());
     }
 }

@@ -88,7 +88,10 @@ fn reference_summary_cli_registers_maintains_and_reuses_ordinary_derived_records
                     ReferenceSummaryLayout::new(18, 3).unwrap()
                 }
             );
-            assert!(view.contains_locator(blob_locator(attachment.raw)));
+            assert!(view
+                .query()
+                .unwrap()
+                .contains_locator(blob_locator(attachment.raw)));
             let records = snapshot
                 .records()
                 .unwrap()

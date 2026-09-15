@@ -436,7 +436,12 @@ impl Reconciler {
                 continue;
             }
             if let Ok(view) = observed.view::<ReferenceSummaryView>() {
-                summaries.push((observed.support().clone(), view));
+                // Preparing one batch decodes sparse gaps once; attachment
+                // itself keeps the summary's original bytes. An unreadable
+                // optional hint supplies no negative answer.
+                if let Ok(query) = view.query() {
+                    summaries.push((observed.support().clone(), query));
+                }
             }
         }
         let mut snapshot_flushed = false;

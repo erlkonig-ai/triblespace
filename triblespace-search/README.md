@@ -59,8 +59,10 @@ remaining open items are perf/encoding refinements, not architecture.
   the engine filters.
 * **`PortableBM25Index`**: strict, canonical exact-TF carrier. Its bytes
   contain no native `usize`, padding, Jerky arena, persisted float, score, or
-  redundant document-length table; attachment derives the query caches and
-  speaks the same constraint surface.
+  redundant document-length table. Attachment retains the encoded backing;
+  `index.query()` prepares the omitted scoring statistics and speaks the
+  constraint surface. `PortableBM25View` does the same over a shared-member
+  cover without constructing a serialized union.
 * **`SuccinctBM25Index`**: jerky-backed zero-copy view — doc
   keys via `CompressedUniverse`, terms as a typed
   `View<[[u8; 32]]>` row table, doc-lengths + postings via

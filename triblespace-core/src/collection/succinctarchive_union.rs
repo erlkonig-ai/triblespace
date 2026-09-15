@@ -12,8 +12,8 @@
 //! This module can explicitly validate those `DERIVE` and `MERGE` equations at
 //! producer, ingress, or offline-audit boundaries. Warm collection resolution
 //! does not replay them. It does not authorize commits, select semantic roots,
-//! retain artifacts, or assign authority to construction records. `DERIVE` and
-//! `MERGE` remain unsigned, reusable materialized work.
+//! retain artifacts, or assign authority to construction records. Storage
+//! admits signed `DERIVE` and `MERGE` records as reusable materialized work.
 
 use super::descriptor as descriptor_facts;
 use super::records::{mapping_algorithm, RecordDecodeError, KIND_COLLECTION_MAPPING};
@@ -99,8 +99,7 @@ impl CollectionEncoding for SuccinctArchiveBlob {
     where
         R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
     {
-        SuccinctArchiveBlob::merge(std::slice::from_ref(member))
-            .map(|_| ())
+        SuccinctArchiveBlob::validate(member)
             .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
 
@@ -138,8 +137,7 @@ impl CollectionEncoding for Rank9AcceleratedSuccinctArchiveBlob {
         let source = Self::source_handle(member)
             .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?;
         let raw = resident_raw(source, reader)?;
-        SuccinctArchive::<OrderedUniverse>::from_accelerated_parts(raw, member.clone())
-            .map(|_| ())
+        SuccinctArchive::<OrderedUniverse>::validate_accelerated_parts(&raw, member)
             .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
 

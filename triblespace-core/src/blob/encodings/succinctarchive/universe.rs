@@ -12,6 +12,14 @@ use quick_cache::sync::Cache;
 /// Maps between raw 32-byte values and compact integer codes used by the
 /// [`SuccinctArchive`](super::SuccinctArchive) wavelet matrices.
 pub trait Universe: Serializable {
+    /// Interprets the portable ordered domain. Alternative universes may
+    /// explicitly transform this domain; [`OrderedUniverse`] borrows it.
+    fn from_ordered_values(values: View<[RawInline]>) -> Self {
+        let mut area = anybytes::area::ByteArea::new().expect("universe byte area");
+        let mut sections = area.sections();
+        Self::with_sorted_dedup(values.iter().copied(), &mut sections)
+    }
+
     /// Builds a universe from a sorted, deduplicated iterator of raw values.
     fn with_sorted_dedup<I>(values: I, sections: &mut SectionWriter<'_>) -> Self
     where
@@ -111,10 +119,17 @@ pub trait Universe: Serializable {
 #[derive(Debug, Clone)]
 pub struct OrderedUniverse {
     values: View<[RawInline]>,
-    handle: SectionHandle<RawInline>,
+    handle: Option<SectionHandle<RawInline>>,
 }
 
 impl Universe for OrderedUniverse {
+    fn from_ordered_values(values: View<[RawInline]>) -> Self {
+        Self {
+            values,
+            handle: None,
+        }
+    }
+
     fn with_sorted_dedup<I>(iter: I, sections: &mut SectionWriter<'_>) -> Self
     where
         I: Iterator<Item = RawInline>,
@@ -151,6 +166,11 @@ impl Universe for OrderedUniverse {
 }
 
 impl OrderedUniverse {
+    /// Borrows the stored ordered values without copying their byte backing.
+    pub fn values(&self) -> &[RawInline] {
+        self.values.as_ref()
+    }
+
     fn from_slice(values: &[RawInline], sections: &mut SectionWriter<'_>) -> Self {
         let mut section = sections.reserve::<RawInline>(values.len()).unwrap();
         section.as_mut_slice().copy_from_slice(values);
@@ -161,7 +181,10 @@ impl OrderedUniverse {
         let handle = section.handle();
         let bytes = section.freeze().unwrap();
         let values = bytes.view::<[RawInline]>().expect("view");
-        Self { values, handle }
+        Self {
+            values,
+            handle: Some(handle),
+        }
     }
 
     /// Returns the number of values in this universe.
@@ -183,13 +206,14 @@ impl Serializable for OrderedUniverse {
 
     fn metadata(&self) -> Self::Meta {
         self.handle
+            .expect("ordered universe has no serialized section handle")
     }
 
     fn from_bytes(meta: Self::Meta, bytes: Bytes) -> Result<Self, Self::Error> {
         let values = meta.view(&bytes).map_err(Self::Error::from)?;
         Ok(Self {
             values,
-            handle: meta,
+            handle: Some(meta),
         })
     }
 }
@@ -259,6 +283,24 @@ impl CompressedUniverse {
             .view(&bytes)
             .map_err(jerky::error::Error::from)?;
 
+        Ok(Self {
+            zero_prefix_len: meta.zero_prefix_len,
+            suffixes,
+            suffixes_handle: meta.suffixes,
+            nonzero_prefixes,
+            nonzero_prefixes_handle: meta.nonzero_prefixes,
+        })
+    }
+
+    /// Explicitly audits sortedness and the compressed-domain partition.
+    /// Ordinary typed attachment checks only metadata geometry.
+    pub fn validate(&self) -> Result<(), jerky::error::Error> {
+        let Self {
+            zero_prefix_len,
+            suffixes,
+            nonzero_prefixes,
+            ..
+        } = self;
         if nonzero_prefixes
             .first()
             .is_some_and(|prefix| *prefix == [0; 16])
@@ -267,7 +309,7 @@ impl CompressedUniverse {
                 "compressed-universe tail contains a zero prefix",
             ));
         }
-        if !suffixes[..meta.zero_prefix_len]
+        if !suffixes[..*zero_prefix_len]
             .windows(2)
             .all(|pair| pair[0] < pair[1])
         {
@@ -278,11 +320,11 @@ impl CompressedUniverse {
         if (1..nonzero_prefixes.len()).any(|position| {
             let previous = (
                 &nonzero_prefixes[position - 1],
-                &suffixes[meta.zero_prefix_len + position - 1],
+                &suffixes[*zero_prefix_len + position - 1],
             );
             let current = (
                 &nonzero_prefixes[position],
-                &suffixes[meta.zero_prefix_len + position],
+                &suffixes[*zero_prefix_len + position],
             );
             previous >= current
         }) {
@@ -291,13 +333,7 @@ impl CompressedUniverse {
             ));
         }
 
-        Ok(Self {
-            zero_prefix_len: meta.zero_prefix_len,
-            suffixes,
-            suffixes_handle: meta.suffixes,
-            nonzero_prefixes,
-            nonzero_prefixes_handle: meta.nonzero_prefixes,
-        })
+        Ok(())
     }
 
     #[inline]
@@ -476,6 +512,14 @@ impl<const ACCESS_CACHE: usize, const SEARCH_CACHE: usize, U> Universe
 where
     U: Universe,
 {
+    fn from_ordered_values(values: View<[RawInline]>) -> Self {
+        Self {
+            access_cache: Cache::new(ACCESS_CACHE),
+            search_cache: Cache::new(SEARCH_CACHE),
+            inner: U::from_ordered_values(values),
+        }
+    }
+
     fn with_sorted_dedup<I>(values: I, sections: &mut SectionWriter<'_>) -> Self
     where
         I: Iterator<Item = RawInline>,
@@ -690,12 +734,22 @@ mod tests {
         let mut zero_tail = bytes.as_ref().to_vec();
         let start = metadata.nonzero_prefixes.offset;
         zero_tail[start..start + 16].fill(0);
-        assert!(CompressedUniverse::from_bytes(metadata, Bytes::from_source(zero_tail)).is_err());
+        assert!(
+            CompressedUniverse::from_bytes(metadata, Bytes::from_source(zero_tail))
+                .unwrap()
+                .validate()
+                .is_err()
+        );
 
         let mut unordered = bytes.as_ref().to_vec();
         let prefixes = metadata.nonzero_prefixes.offset;
         unordered.swap(prefixes, prefixes + 16);
-        assert!(CompressedUniverse::from_bytes(metadata, Bytes::from_source(unordered)).is_err());
+        assert!(
+            CompressedUniverse::from_bytes(metadata, Bytes::from_source(unordered))
+                .unwrap()
+                .validate()
+                .is_err()
+        );
 
         assert!(
             CompressedUniverse::from_bytes(metadata, bytes.clone().slice(0..bytes.len() - 1),)

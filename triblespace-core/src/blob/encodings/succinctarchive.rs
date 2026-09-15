@@ -49,6 +49,7 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::convert::TryInto;
 use std::iter;
+use std::sync::{Arc, OnceLock};
 
 use itertools::Itertools;
 
@@ -63,6 +64,7 @@ use jerky::bit_vector::BitVectorDataMeta;
 use jerky::bit_vector::NumBits;
 use jerky::bit_vector::Rank;
 use jerky::bit_vector::Select;
+use jerky::bit_vector::{BitVectorIndex, NoIndex};
 use jerky::char_sequences::wavelet_matrix::WaveletMatrixMeta;
 use jerky::char_sequences::{WaveletMatrix, WaveletMatrixBuilder};
 use jerky::serialization::{Metadata, Serializable};
@@ -157,22 +159,22 @@ impl std::error::Error for SuccinctArchiveRawBuildError {
 /// [`SuccinctArchiveBlob`] artifacts.
 ///
 /// Input validation is deliberately distinct from output geometry. A
-/// capacity-looking failure while proving one persisted input is still an
-/// [`InvalidInput`](Self::InvalidInput); only growth of the already-validated
+/// capacity-looking failure while decoding one persisted input is still an
+/// [`InvalidInput`](Self::InvalidInput); only growth of the decoded
 /// union can produce [`DomainTooWide`](Self::DomainTooWide) or
 /// [`TooManyRows`](Self::TooManyRows).
 #[derive(Debug)]
 pub enum SuccinctArchiveRawMergeError {
-    /// One persisted input failed structural or canonical validation.
+    /// One persisted input failed framing or source decoding.
     InvalidInput {
         /// Zero-based input position in the supplied segment slice.
         index: usize,
         /// Exact validation failure for that input.
         source: SuccinctArchiveError,
     },
-    /// The validated union needs more than the raw format's `u32` domain.
+    /// The decoded union needs more than the raw format's `u32` domain.
     DomainTooWide,
-    /// The validated union needs more than the raw format's `u32` row space.
+    /// The decoded union needs more than the raw format's `u32` row space.
     TooManyRows,
     /// Encoding the representable merged result violated an internal format
     /// invariant.
@@ -334,8 +336,8 @@ impl SuccinctArchiveBlob {
 
     /// Computes the canonical set union of portable succinct archive blobs.
     ///
-    /// Every input is structurally validated and proved to be the exact
-    /// canonical derivation of its EAV source before it participates. Their
+    /// Every input receives checked framing and its EAV source is decoded,
+    /// without rederiving its other rotations or pair-change masks. Their
     /// ordered domains are merged once, archive-local EAV codes are remapped,
     /// and the sorted runs are k-way merged with duplicate rows removed. The
     /// shared raw writer emits the final portable bytes directly; no input or
@@ -352,7 +354,7 @@ impl SuccinctArchiveBlob {
 
     /// Computes the canonical raw union with accelerated wavelet packing.
     ///
-    /// Inputs receive exactly the same structural and canonical validation as
+    /// Inputs receive exactly the same framing and source decoding as
     /// [`Self::merge`]. Only the final wavelet packing uses the supplied backend;
     /// no native query arena or Rank9 accelerator is constructed.
     pub fn merge_with_backend<B>(
@@ -374,18 +376,14 @@ impl SuccinctArchiveBlob {
     ) -> Result<Blob<Self>, SuccinctArchiveRawMergeError> {
         let mut decoded = Vec::with_capacity(segments.len());
         for (index, segment) in segments.iter().enumerate() {
-            let view = portable::parse(segment.bytes.as_ref()).map_err(|error| {
-                SuccinctArchiveRawMergeError::InvalidInput {
-                    index,
-                    source: raw_merge_error(format!("structural validation failed: {error}")),
-                }
-            })?;
-            decoded.push(view.prove_canonical_eav_u32().map_err(|error| {
-                SuccinctArchiveRawMergeError::InvalidInput {
-                    index,
-                    source: raw_merge_error(format!("canonical proof failed: {error}")),
-                }
-            })?);
+            decoded.push(
+                portable::decode_eav(segment.bytes.as_ref()).map_err(|error| {
+                    SuccinctArchiveRawMergeError::InvalidInput {
+                        index,
+                        source: raw_merge_error(format!("source decoding failed: {error}")),
+                    }
+                })?,
+            );
         }
 
         let (domain, rows) = merge_raw_eav_parts(decoded)?;
@@ -393,6 +391,14 @@ impl SuccinctArchiveBlob {
             SuccinctArchiveRawMergeError::Construction(raw_merge_error(error.to_string()))
         })?;
         Ok(Blob::new(Bytes::from(bytes)))
+    }
+
+    /// Explicitly audits all semantic/canonical invariants of a raw archive.
+    /// Ordinary attachment and raw MERGE do not perform this rederivation.
+    pub fn validate(raw: &Blob<Self>) -> Result<(), SuccinctArchiveError> {
+        portable::parse(raw.bytes.as_ref())
+            .and_then(|view| view.prove_canonical())
+            .map_err(|error| SuccinctArchiveError(portable_codec_error(error)))
     }
 }
 
@@ -506,12 +512,6 @@ impl Rank9AcceleratedSuccinctArchiveBlob {
 /// not a compatibility format. The portable blob identity contains only the
 /// ordered raw domain and logical bit-vector words.
 struct SuccinctArchiveMeta<D: Metadata> {
-    /// Number of distinct entities in the archive.
-    pub entity_count: usize,
-    /// Number of distinct attributes in the archive.
-    pub attribute_count: usize,
-    /// Number of distinct values in the archive.
-    pub value_count: usize,
     /// Domain (universe) metadata — maps integer codes to raw values.
     pub domain: D,
     /// Entity-axis prefix bit vector metadata.
@@ -735,6 +735,46 @@ where
     builder.freeze::<Rank9SelIndex>()
 }
 
+/// Query-time rank/select strategy. Raw archives scan their stored words;
+/// accelerated archives borrow the explicitly supplied Rank9 index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SuccinctIndex {
+    /// No auxiliary index is constructed, including on first query.
+    Raw,
+    /// Existing source-bound Rank9/select bytes.
+    Rank9(Rank9SelIndex),
+}
+
+impl BitVectorIndex for SuccinctIndex {
+    fn build(_: &BitVectorData) -> Self {
+        Self::Raw
+    }
+    fn num_ones(&self, data: &BitVectorData) -> usize {
+        match self {
+            Self::Raw => NoIndex.rank1(data, data.len()).unwrap_or(0),
+            Self::Rank9(index) => index.num_ones(),
+        }
+    }
+    fn rank1(&self, data: &BitVectorData, pos: usize) -> Option<usize> {
+        match self {
+            Self::Raw => NoIndex.rank1(data, pos),
+            Self::Rank9(index) => index.rank1(data, pos),
+        }
+    }
+    fn select1(&self, data: &BitVectorData, k: usize) -> Option<usize> {
+        match self {
+            Self::Raw => NoIndex.select1(data, k).filter(|pos| *pos < data.len()),
+            Self::Rank9(index) => index.select1(data, k),
+        }
+    }
+    fn select0(&self, data: &BitVectorData, k: usize) -> Option<usize> {
+        match self {
+            Self::Raw => NoIndex.select0(data, k),
+            Self::Rank9(index) => index.select0(data, k),
+        }
+    }
+}
+
 /// Deserialized Ring index — two rings of wavelet matrices with prefix
 /// bit vectors and pair-change markers, backed by a shared `Bytes`
 /// buffer.
@@ -755,59 +795,55 @@ pub struct SuccinctArchive<U> {
     /// Cached identity of the canonical raw archive bytes.
     raw_handle: Inline<Handle<SuccinctArchiveBlob>>,
     /// Detached persisted Rank9/select accelerator bytes.
-    rank9_index_bytes: Bytes,
+    rank9_index_bytes: Option<Bytes>,
     /// Cached identity of the source-bound Rank9/select accelerator bytes.
-    rank9_handle: Inline<Handle<Rank9AcceleratedSuccinctArchiveBlob>>,
+    rank9_handle: Option<Inline<Handle<Rank9AcceleratedSuccinctArchiveBlob>>>,
+    /// Scalar query statistics, populated independently on first request and
+    /// shared by clones. Attachment does not inspect the unary prefixes.
+    distinct_counts: Arc<[OnceLock<usize>; 3]>,
     /// The universe — maps integer codes to raw 32-byte values (the
     /// domain of all distinct values appearing in E, A, or V positions).
     pub domain: U,
 
-    /// Number of distinct entities in the universe.
-    pub entity_count: usize,
-    /// Number of distinct attributes in the universe.
-    pub attribute_count: usize,
-    /// Number of distinct values in the universe.
-    pub value_count: usize,
-
     /// Entity-axis prefix bit vector: unary encoding of group sizes for
     /// the entity column, enabling rank/select navigation.
-    pub e_a: BitVector<Rank9SelIndex>,
+    pub e_a: BitVector<SuccinctIndex>,
     /// Attribute-axis prefix bit vector.
-    pub a_a: BitVector<Rank9SelIndex>,
+    pub a_a: BitVector<SuccinctIndex>,
     /// Inline-axis prefix bit vector.
-    pub v_a: BitVector<Rank9SelIndex>,
+    pub v_a: BitVector<SuccinctIndex>,
 
     /// Bit vector marking the first occurrence of each `(entity, attribute)` pair
     /// in `eav_c`.
-    pub changed_e_a: BitVector<Rank9SelIndex>,
+    pub changed_e_a: BitVector<SuccinctIndex>,
     /// Bit vector marking the first occurrence of each `(entity, value)` pair in
     /// `eva_c`.
-    pub changed_e_v: BitVector<Rank9SelIndex>,
+    pub changed_e_v: BitVector<SuccinctIndex>,
     /// Bit vector marking the first occurrence of each `(attribute, entity)` pair
     /// in `aev_c`.
-    pub changed_a_e: BitVector<Rank9SelIndex>,
+    pub changed_a_e: BitVector<SuccinctIndex>,
     /// Bit vector marking the first occurrence of each `(attribute, value)` pair
     /// in `ave_c`.
-    pub changed_a_v: BitVector<Rank9SelIndex>,
+    pub changed_a_v: BitVector<SuccinctIndex>,
     /// Bit vector marking the first occurrence of each `(value, entity)` pair in
     /// `vea_c`.
-    pub changed_v_e: BitVector<Rank9SelIndex>,
+    pub changed_v_e: BitVector<SuccinctIndex>,
     /// Bit vector marking the first occurrence of each `(value, attribute)` pair
     /// in `vae_c`.
-    pub changed_v_a: BitVector<Rank9SelIndex>,
+    pub changed_v_a: BitVector<SuccinctIndex>,
 
     /// Forward ring: last column of EAV-sorted rotation (values).
-    pub eav_c: WaveletMatrix<Rank9SelIndex>,
+    pub eav_c: WaveletMatrix<SuccinctIndex>,
     /// Forward ring: last column of VEA-sorted rotation (attributes).
-    pub vea_c: WaveletMatrix<Rank9SelIndex>,
+    pub vea_c: WaveletMatrix<SuccinctIndex>,
     /// Forward ring: last column of AVE-sorted rotation (entities).
-    pub ave_c: WaveletMatrix<Rank9SelIndex>,
+    pub ave_c: WaveletMatrix<SuccinctIndex>,
     /// Reverse ring: last column of VAE-sorted rotation (entities).
-    pub vae_c: WaveletMatrix<Rank9SelIndex>,
+    pub vae_c: WaveletMatrix<SuccinctIndex>,
     /// Reverse ring: last column of EVA-sorted rotation (attributes).
-    pub eva_c: WaveletMatrix<Rank9SelIndex>,
+    pub eva_c: WaveletMatrix<SuccinctIndex>,
     /// Reverse ring: last column of AEV-sorted rotation (values).
-    pub aev_c: WaveletMatrix<Rank9SelIndex>,
+    pub aev_c: WaveletMatrix<SuccinctIndex>,
 }
 
 fn top_level_bitvector_meta<D: Metadata>(
@@ -923,157 +959,123 @@ where
     .map_err(portable_codec_error)
 }
 
-fn write_runtime_bitvector(
-    words: &[u64],
-    len: usize,
-    writer: &mut SectionWriter<'_>,
-) -> Result<BitVectorDataMeta, jerky::error::Error> {
-    let mut section = writer.reserve::<u64>(words.len())?;
-    section.as_mut_slice().copy_from_slice(words);
-    let handle = section.handle();
-    section.freeze()?;
-    Ok(BitVectorDataMeta { handle, len })
+/// Borrowed query sections. This holds only typed byte views and small layer
+/// descriptors; no raw-domain/plane copy or canonical reconstruction occurs.
+struct QueryParts<U> {
+    domain: U,
+    top_level: Vec<BitVectorData>,
+    matrices: Vec<Vec<BitVectorData>>,
 }
 
-fn write_runtime_wavelet(
-    words: &[u64],
-    alphabet_size: usize,
-    len: usize,
-    writer: &mut SectionWriter<'_>,
-) -> Result<WaveletMatrixMeta, jerky::error::Error> {
-    let width = jerky::utils::alphabet_width(alphabet_size);
-    let row_words = len.div_ceil(u64::BITS as usize);
-    let expected = width
-        .checked_mul(row_words)
-        .ok_or_else(|| invalid_rank9_metadata("runtime wavelet word count overflow"))?;
-    if words.len() != expected {
-        return Err(invalid_rank9_metadata(format!(
-            "portable wavelet contains {} words, expected {expected}",
-            words.len()
-        )));
+impl<U: Universe + Serializable<Error = jerky::error::Error>> QueryParts<U> {
+    fn from_portable(bytes: &Bytes) -> Result<Self, jerky::error::Error> {
+        let layout = portable::parse_layout(bytes.as_ref()).map_err(portable_codec_error)?;
+        let values = bytes.slice(layout.domain.clone()).view::<[RawInline]>()?;
+        let domain = U::from_ordered_values(values);
+        let vector = |range: std::ops::Range<usize>, len| -> Result<_, jerky::error::Error> {
+            let section = bytes.slice(range);
+            // Portable words are little-endian. Native LE readers retain the
+            // exact original owner; a BE interpretation must convert words.
+            #[cfg(target_endian = "little")]
+            let words = section.view::<[u64]>()?;
+            #[cfg(target_endian = "big")]
+            let words = Bytes::from_source(
+                section
+                    .chunks_exact(8)
+                    .map(|word| u64::from_le_bytes(word.try_into().unwrap()))
+                    .collect::<Vec<_>>(),
+            )
+            .view::<[u64]>()?;
+            Ok(BitVectorData {
+                words,
+                len,
+                handle: None,
+            })
+        };
+        let mut top_level = Vec::with_capacity(TOP_LEVEL_RANK9_INDEX_COUNT);
+        for range in layout.prefixes {
+            top_level.push(vector(range, layout.prefix_bits)?);
+        }
+        for range in layout.changes {
+            top_level.push(vector(range, layout.triple_count)?);
+        }
+        let mut matrices = Vec::with_capacity(6);
+        for range in layout.wavelets {
+            let mut layers = Vec::with_capacity(layout.alphabet_width);
+            let plane_bytes = layout.row_words * std::mem::size_of::<u64>();
+            for depth in 0..layout.alphabet_width {
+                let start = range.start + depth * plane_bytes;
+                layers.push(vector(start..start + plane_bytes, layout.triple_count)?);
+            }
+            matrices.push(layers);
+        }
+        Ok(Self {
+            domain,
+            top_level,
+            matrices,
+        })
     }
 
-    let mut handles = writer.reserve::<SectionHandle<u64>>(width)?;
-    for depth in 0..width {
-        let start = depth * row_words;
-        let plane = &words[start..start + row_words];
-        let mut section = writer.reserve::<u64>(plane.len())?;
-        section.as_mut_slice().copy_from_slice(plane);
-        handles[depth] = section.handle();
-        section.freeze()?;
+    fn from_runtime(
+        meta: SuccinctArchiveMeta<U::Meta>,
+        bytes: &Bytes,
+    ) -> Result<Self, jerky::error::Error> {
+        validate_raw_rank9_sources(&meta, bytes, bytes.len())?;
+        let top_level = top_level_bitvector_meta(&meta)
+            .into_iter()
+            .map(|meta| BitVectorData::from_bytes(meta, bytes.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let matrices = wavelet_meta(&meta)
+            .into_iter()
+            .map(|matrix| {
+                matrix
+                    .layers
+                    .view(bytes)?
+                    .iter()
+                    .copied()
+                    .map(|handle| {
+                        BitVectorData::from_bytes(
+                            BitVectorDataMeta {
+                                handle,
+                                len: matrix.len,
+                            },
+                            bytes.clone(),
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, jerky::error::Error>>()?;
+        let domain = U::from_bytes(meta.domain, bytes.clone())?;
+        Ok(Self {
+            domain,
+            top_level,
+            matrices,
+        })
     }
-    let layers = handles.handle();
-    handles.freeze()?;
-    Ok(WaveletMatrixMeta {
-        alph_size: alphabet_size,
-        alph_width: width,
-        len,
-        layers,
-    })
+
+    fn data(&self) -> impl Iterator<Item = &BitVectorData> {
+        self.top_level.iter().chain(self.matrices.iter().flatten())
+    }
 }
 
-fn build_runtime_from_portable<U>(
-    parts: portable::RuntimeParts,
-) -> Result<(SuccinctArchiveMeta<U::Meta>, Bytes), jerky::error::Error>
+fn build_rank9_index<U>(
+    parts: &QueryParts<U>,
+    source: Inline<Handle<SuccinctArchiveBlob>>,
+) -> Result<Bytes, jerky::error::Error>
 where
     U: Universe + Serializable<Error = jerky::error::Error>,
 {
     let mut area = ByteArea::new()?;
     let mut sections = area.sections();
-    let expected_domain_len = parts.domain.len();
-    let domain = U::with_sorted_dedup(parts.domain.into_iter(), &mut sections);
-    let domain_len = domain.len();
-    if domain_len != expected_domain_len {
-        return Err(invalid_rank9_metadata(format!(
-            "runtime universe retained {domain_len} values, expected {expected_domain_len}"
-        )));
-    }
-
-    let [e_a_words, a_a_words, v_a_words] = parts.prefixes;
-    let prefix_len = parts
-        .triple_count
-        .checked_add(domain_len)
-        .and_then(|sum| sum.checked_add(1))
-        .ok_or_else(|| invalid_rank9_metadata("runtime prefix length overflow"))?;
-    let e_a = write_runtime_bitvector(&e_a_words, prefix_len, &mut sections)?;
-    let a_a = write_runtime_bitvector(&a_a_words, prefix_len, &mut sections)?;
-    let v_a = write_runtime_bitvector(&v_a_words, prefix_len, &mut sections)?;
-
-    let [eav_words, vea_words, ave_words, vae_words, eva_words, aev_words] = parts.wavelets;
-    let eav_c = write_runtime_wavelet(&eav_words, domain_len, parts.triple_count, &mut sections)?;
-    let vea_c = write_runtime_wavelet(&vea_words, domain_len, parts.triple_count, &mut sections)?;
-    let ave_c = write_runtime_wavelet(&ave_words, domain_len, parts.triple_count, &mut sections)?;
-    let vae_c = write_runtime_wavelet(&vae_words, domain_len, parts.triple_count, &mut sections)?;
-    let eva_c = write_runtime_wavelet(&eva_words, domain_len, parts.triple_count, &mut sections)?;
-    let aev_c = write_runtime_wavelet(&aev_words, domain_len, parts.triple_count, &mut sections)?;
-
-    // Keep changed_v_a physically last: its end is the compact runtime-arena
-    // boundary used by source-bound Rank9 validation.
-    let [changed_e_a_words, changed_e_v_words, changed_a_e_words, changed_a_v_words, changed_v_e_words, changed_v_a_words] =
-        parts.changes;
-    let changed_e_a =
-        write_runtime_bitvector(&changed_e_a_words, parts.triple_count, &mut sections)?;
-    let changed_e_v =
-        write_runtime_bitvector(&changed_e_v_words, parts.triple_count, &mut sections)?;
-    let changed_a_e =
-        write_runtime_bitvector(&changed_a_e_words, parts.triple_count, &mut sections)?;
-    let changed_a_v =
-        write_runtime_bitvector(&changed_a_v_words, parts.triple_count, &mut sections)?;
-    let changed_v_e =
-        write_runtime_bitvector(&changed_v_e_words, parts.triple_count, &mut sections)?;
-    let changed_v_a =
-        write_runtime_bitvector(&changed_v_a_words, parts.triple_count, &mut sections)?;
-
-    let meta = SuccinctArchiveMeta {
-        entity_count: parts.entity_count,
-        attribute_count: parts.attribute_count,
-        value_count: parts.value_count,
-        domain: domain.metadata(),
-        e_a,
-        a_a,
-        v_a,
-        changed_e_a,
-        changed_e_v,
-        changed_a_e,
-        changed_a_v,
-        changed_v_e,
-        changed_v_a,
-        eav_c,
-        vea_c,
-        ave_c,
-        vae_c,
-        eva_c,
-        aev_c,
-    };
-    let runtime_bytes = area.freeze()?;
-    Ok((meta, runtime_bytes))
-}
-
-fn build_runtime_rank9_index<D: Metadata>(
-    meta: &SuccinctArchiveMeta<D>,
-    runtime_bytes: &Bytes,
-    source: Inline<Handle<SuccinctArchiveBlob>>,
-) -> Result<Bytes, jerky::error::Error> {
-    let mut area = ByteArea::new()?;
-    let mut sections = area.sections();
     let mut header = reserve_rank9_index_header(&mut sections);
     header[0].source = source.raw;
-
-    let mut indexes = Vec::with_capacity(expected_rank9_index_count(meta)?);
-    for vector in top_level_bitvector_meta(meta) {
-        let vector = BitVector::<Rank9SelIndex>::from_bytes(vector, runtime_bytes.clone())?;
-        indexes.push(vector.index.persist(&mut sections)?);
-    }
-    for matrix in wavelet_meta(meta) {
-        let matrix = WaveletMatrix::<Rank9SelIndex>::from_bytes(matrix, runtime_bytes.clone())?;
-        indexes.extend(matrix.persist_layer_indexes(&mut sections)?);
-    }
-
+    let indexes = parts
+        .data()
+        .map(|data| Rank9SelIndex::<true, true>::new(data).persist(&mut sections))
+        .collect::<Result<Vec<_>, _>>()?;
     try_finalize_rank9_index(&mut sections, &indexes)?;
     header.freeze()?;
-    let bytes = area.freeze()?;
-    parse_rank9_index(meta, runtime_bytes, source, &bytes)?;
-    Ok(bytes)
+    area.freeze().map_err(Into::into)
 }
 
 fn bitvector_word_bytes(len: usize) -> Result<usize, jerky::error::Error> {
@@ -1081,24 +1083,6 @@ fn bitvector_word_bytes(len: usize) -> Result<usize, jerky::error::Error> {
         .map(|bits| bits / 64)
         .and_then(|words| words.checked_mul(std::mem::size_of::<u64>()))
         .ok_or_else(|| invalid_rank9_metadata("bit-vector raw section length overflow"))
-}
-
-fn expected_rank9_index_count<D: Metadata>(
-    meta: &SuccinctArchiveMeta<D>,
-) -> Result<usize, jerky::error::Error> {
-    let mut count = TOP_LEVEL_RANK9_INDEX_COUNT;
-    for matrix in wavelet_meta(meta) {
-        if matrix.alph_width != jerky::utils::alphabet_width(matrix.alph_size) {
-            return Err(invalid_rank9_metadata(format!(
-                "wavelet alphabet width {} does not match alphabet size {}",
-                matrix.alph_width, matrix.alph_size
-            )));
-        }
-        count = count
-            .checked_add(matrix.alph_width)
-            .ok_or_else(|| invalid_rank9_metadata("Rank9 index count overflow"))?;
-    }
-    Ok(count)
 }
 
 /// Preflights every runtime-arena handle before any AnyBytes/Jerky view
@@ -1183,14 +1167,12 @@ fn validate_raw_rank9_sources<D: Metadata>(
     Ok(raw_end)
 }
 
-fn validate_rank9_index_handles<D: Metadata>(
-    meta: &SuccinctArchiveMeta<D>,
-    raw_bytes: &Bytes,
+fn validate_rank9_index_handles(
+    expected_count: usize,
     index_bytes: &Bytes,
     handles: &[SectionHandle<usize>],
     index_limit: usize,
 ) -> Result<usize, jerky::error::Error> {
-    let expected_count = expected_rank9_index_count(meta)?;
     if handles.len() != expected_count {
         return Err(invalid_rank9_metadata(format!(
             "Rank9 index table has {} handles, expected {expected_count}",
@@ -1235,41 +1217,11 @@ fn validate_rank9_index_handles<D: Metadata>(
             checked_section_range(handle, index_limit, &format!("Rank9 index {position}"))?.end;
     }
 
-    // Rank9's own loader checks the exact native layout, rank totals, select
-    // hints, and unused bits against each corresponding raw bit-vector.
-    let mut handle_cursor = 0usize;
-    for raw_meta in top_level_bitvector_meta(meta) {
-        let data = BitVectorData::from_bytes(raw_meta, raw_bytes.clone())?;
-        Rank9SelIndex::<true, true>::from_bytes_for_data(
-            &data,
-            handles[handle_cursor].bytes(index_bytes),
-        )?;
-        handle_cursor += 1;
-    }
-    for matrix in wavelet_meta(meta) {
-        let layers = matrix.layers.view(raw_bytes)?;
-        for layer in layers.iter().copied() {
-            let data = BitVectorData::from_bytes(
-                BitVectorDataMeta {
-                    handle: layer,
-                    len: matrix.len,
-                },
-                raw_bytes.clone(),
-            )?;
-            Rank9SelIndex::<true, true>::from_bytes_for_data(
-                &data,
-                handles[handle_cursor].bytes(index_bytes),
-            )?;
-            handle_cursor += 1;
-        }
-    }
-    debug_assert_eq!(handle_cursor, handles.len());
     Ok(cursor)
 }
 
-fn parse_rank9_index<D: Metadata>(
-    meta: &SuccinctArchiveMeta<D>,
-    raw_bytes: &Bytes,
+fn parse_rank9_index(
+    expected_count: usize,
     source: Inline<Handle<SuccinctArchiveBlob>>,
     index_bytes: &Bytes,
 ) -> Result<Vec<SectionHandle<usize>>, jerky::error::Error> {
@@ -1318,7 +1270,6 @@ fn parse_rank9_index<D: Metadata>(
         )));
     }
 
-    let expected_count = expected_rank9_index_count(meta)?;
     let expected_table_len = expected_count
         .checked_mul(std::mem::size_of::<SectionHandle<usize>>())
         .ok_or_else(|| invalid_rank9_metadata("Rank9 index table length overflow"))?;
@@ -1337,13 +1288,8 @@ fn parse_rank9_index<D: Metadata>(
     }
     let handles_view = footer.indexes.view(index_bytes)?;
     let handles: Vec<_> = handles_view.iter().copied().collect();
-    let index_end = validate_rank9_index_handles(
-        meta,
-        raw_bytes,
-        index_bytes,
-        &handles,
-        footer.indexes.offset,
-    )?;
+    let index_end =
+        validate_rank9_index_handles(expected_count, index_bytes, &handles, footer.indexes.offset)?;
     if index_end != footer.indexes.offset {
         return Err(invalid_rank9_metadata(format!(
             "Rank9 indexes end at {index_end}, table starts at {}",
@@ -1357,8 +1303,23 @@ impl<U> SuccinctArchive<U>
 where
     U: Universe,
 {
+    /// Counts distinct entities on first request; clones reuse the scalar.
+    pub fn entity_count(&self) -> usize {
+        *self.distinct_counts[0].get_or_init(|| prefix_distinct_count(&self.e_a.data))
+    }
+
+    /// Counts distinct attributes on first request; clones reuse the scalar.
+    pub fn attribute_count(&self) -> usize {
+        *self.distinct_counts[1].get_or_init(|| prefix_distinct_count(&self.a_a.data))
+    }
+
+    /// Counts distinct values on first request; clones reuse the scalar.
+    pub fn value_count(&self) -> usize {
+        *self.distinct_counts[2].get_or_init(|| prefix_distinct_count(&self.v_a.data))
+    }
+
     /// Returns the last-column wavelet matrix of `rotation`.
-    pub fn ring_col(&self, rotation: SuccinctRotation) -> &WaveletMatrix<Rank9SelIndex> {
+    pub fn ring_col(&self, rotation: SuccinctRotation) -> &WaveletMatrix<SuccinctIndex> {
         match rotation {
             SuccinctRotation::Eav => &self.eav_c,
             SuccinctRotation::Vea => &self.vea_c,
@@ -1375,7 +1336,7 @@ where
     /// The returned vector has one bit per Ring row. A set bit starts a new
     /// pair in the sorted order named by `rotation`; its rank is therefore the
     /// compact pair code used by one-peer resident navigation.
-    pub fn pair_changes(&self, rotation: SuccinctRotation) -> &BitVector<Rank9SelIndex> {
+    pub fn pair_changes(&self, rotation: SuccinctRotation) -> &BitVector<SuccinctIndex> {
         self.rotation_view(rotation).changed_pair
     }
 
@@ -1476,7 +1437,7 @@ where
     /// index.
     pub fn distinct_in(
         &self,
-        bv: &BitVector<Rank9SelIndex>,
+        bv: &BitVector<SuccinctIndex>,
         range: &std::ops::Range<usize>,
     ) -> usize {
         bv.rank1(range.end).unwrap() - bv.rank1(range.start).unwrap()
@@ -1491,10 +1452,10 @@ where
     /// the middle component of each pair.
     pub fn enumerate_in<'a>(
         &'a self,
-        bv: &'a BitVector<Rank9SelIndex>,
+        bv: &'a BitVector<SuccinctIndex>,
         range: &std::ops::Range<usize>,
-        col: &'a WaveletMatrix<Rank9SelIndex>,
-        prefix: &'a BitVector<Rank9SelIndex>,
+        col: &'a WaveletMatrix<SuccinctIndex>,
+        prefix: &'a BitVector<SuccinctIndex>,
     ) -> impl Iterator<Item = usize> + 'a {
         let start = bv.rank1(range.start).unwrap();
         let end = bv.rank1(range.end).unwrap();
@@ -1509,7 +1470,7 @@ where
     /// jump directly to the next distinct prefix sum.
     pub fn enumerate_domain<'a>(
         &'a self,
-        prefix: &'a BitVector<Rank9SelIndex>,
+        prefix: &'a BitVector<SuccinctIndex>,
     ) -> impl Iterator<Item = RawInline> + 'a {
         let zero_count = prefix.num_bits() - (self.domain.len() + 1);
         let mut z = 0usize;
@@ -1534,7 +1495,7 @@ where
     /// occurrence on the indexed axis.
     pub fn enumerate_domain_in_range<'a>(
         &'a self,
-        prefix: &'a BitVector<Rank9SelIndex>,
+        prefix: &'a BitVector<SuccinctIndex>,
         code_range: std::ops::Range<usize>,
     ) -> impl Iterator<Item = RawInline> + 'a {
         let zero_count_total = prefix.num_bits() - (self.domain.len() + 1);
@@ -1562,6 +1523,31 @@ where
             Some(self.domain.access(id))
         })
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static PREFIX_DISTINCT_COUNT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn prefix_distinct_count(data: &BitVectorData) -> usize {
+    #[cfg(test)]
+    PREFIX_DISTINCT_COUNT_CALLS.with(|calls| calls.set(calls.get() + 1));
+    // Each nonempty unary group has exactly one 1→0 transition. No rank
+    // directory or domain-sized array is required.
+    let mut count = 0;
+    for (position, &word) in data.words().iter().enumerate() {
+        let start = position * 64;
+        let remaining = data.len().saturating_sub(start).saturating_sub(1);
+        let mask = if remaining >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << remaining) - 1
+        };
+        let next = (word >> 1) | (data.words().get(position + 1).copied().unwrap_or(0) << 63);
+        count += (word & !next & mask).count_ones() as usize;
+    }
+    count
 }
 
 /// One of the six sorted Ring rotations stored by a [`SuccinctArchive`].
@@ -1611,11 +1597,11 @@ impl SuccinctRotation {
 
 #[derive(Clone, Copy)]
 struct RotationView<'a> {
-    first_prefix: &'a BitVector<Rank9SelIndex>,
-    changed_pair: &'a BitVector<Rank9SelIndex>,
-    last_column: &'a WaveletMatrix<Rank9SelIndex>,
-    last_prefix: &'a BitVector<Rank9SelIndex>,
-    middle_column: &'a WaveletMatrix<Rank9SelIndex>,
+    first_prefix: &'a BitVector<SuccinctIndex>,
+    changed_pair: &'a BitVector<SuccinctIndex>,
+    last_column: &'a WaveletMatrix<SuccinctIndex>,
+    last_prefix: &'a BitVector<SuccinctIndex>,
+    middle_column: &'a WaveletMatrix<SuccinctIndex>,
 }
 
 impl<U> SuccinctArchive<U>
@@ -2882,7 +2868,7 @@ where
     let mut changed_v_a_builder =
         BitVectorBuilder::with_capacity(triple_count, &mut sections).unwrap();
 
-    let entity_count = fill_materialized_rotation(
+    fill_materialized_rotation(
         &rows,
         SuccinctRotation::Eav,
         &mut wavelets,
@@ -2892,7 +2878,7 @@ where
         domain_len,
     )?;
     stable_sort_materialized_rows(&mut rows, &mut row_scratch, &mut radix_counts, 2);
-    let value_count = fill_materialized_rotation(
+    fill_materialized_rotation(
         &rows,
         SuccinctRotation::Vea,
         &mut wavelets,
@@ -2902,7 +2888,7 @@ where
         domain_len,
     )?;
     stable_sort_materialized_rows(&mut rows, &mut row_scratch, &mut radix_counts, 1);
-    let attribute_count = fill_materialized_rotation(
+    fill_materialized_rotation(
         &rows,
         SuccinctRotation::Ave,
         &mut wavelets,
@@ -2972,9 +2958,6 @@ where
     index_handles.extend(wavelet_index_handles);
 
     let meta = SuccinctArchiveMeta {
-        entity_count,
-        attribute_count,
-        value_count,
         domain: domain.metadata(),
         e_a: e_a.metadata(),
         a_a: a_a.metadata(),
@@ -3108,10 +3091,6 @@ where
     F: MergedWaveletFactory,
 {
     let triple_count = set.eav.len() as usize;
-
-    let entity_count = set.eav.segmented_len(&[0; 0]) as usize;
-    let attribute_count = set.ave.segmented_len(&[0; 0]) as usize;
-    let value_count = set.vea.segmented_len(&[0; 0]) as usize;
 
     let e_iter = set
         .eav
@@ -3293,9 +3272,6 @@ where
     index_handles.extend(wavelet_index_handles);
 
     let meta = SuccinctArchiveMeta {
-        entity_count,
-        attribute_count,
-        value_count,
         domain: domain.metadata(),
         e_a: e_a.metadata(),
         a_a: a_a.metadata(),
@@ -3415,85 +3391,73 @@ impl<U> SuccinctArchive<U>
 where
     U: Universe + Serializable<Error = jerky::error::Error>,
 {
-    /// Attaches exact-validated persisted Rank9/select indexes to a runtime
-    /// arena that was freshly derived from canonical portable bytes.
+    /// Attaches producer-built native sections without auditing their contents.
     fn from_runtime_bytes_with_rank9_indexes(
         meta: SuccinctArchiveMeta<U::Meta>,
         runtime_bytes: Bytes,
         raw: Blob<SuccinctArchiveBlob>,
         rank9: Blob<Rank9AcceleratedSuccinctArchiveBlob>,
     ) -> Result<Self, jerky::error::Error> {
+        Self::from_query_parts(
+            QueryParts::from_runtime(meta, &runtime_bytes)?,
+            raw,
+            Some(rank9),
+        )
+    }
+
+    fn from_query_parts(
+        parts: QueryParts<U>,
+        raw: Blob<SuccinctArchiveBlob>,
+        rank9: Option<Blob<Rank9AcceleratedSuccinctArchiveBlob>>,
+    ) -> Result<Self, jerky::error::Error> {
         let source = raw.get_handle();
-        let rank9_handle = rank9.get_handle();
-        let bytes = raw.bytes;
-        let rank9_index_bytes = rank9.bytes;
-        let raw_end = validate_raw_rank9_sources(&meta, &runtime_bytes, runtime_bytes.len())?;
-        if raw_end != runtime_bytes.len() {
-            return Err(invalid_rank9_metadata(format!(
-                "runtime arena has {} trailing bytes after its raw sections",
-                runtime_bytes.len() - raw_end
-            )));
+        let rank9_handle = rank9.as_ref().map(Blob::get_handle);
+        let rank9_index_bytes = rank9.map(|blob| blob.bytes);
+        let mut indexes = match &rank9_index_bytes {
+            Some(bytes) => parse_rank9_index(parts.data().count(), source, bytes)?,
+            None => Vec::new(),
         }
-        let index_handles = parse_rank9_index(&meta, &runtime_bytes, source, &rank9_index_bytes)?;
-
-        let top_level_meta = top_level_bitvector_meta(&meta);
-        let wavelet_metadata = wavelet_meta(&meta);
-        let domain = U::from_bytes(meta.domain, runtime_bytes.clone())?;
-        let mut top_level = Vec::with_capacity(TOP_LEVEL_RANK9_INDEX_COUNT);
-        for (raw_meta, index_handle) in top_level_meta
+        .into_iter();
+        let mut vector = |data: BitVectorData| -> Result<_, jerky::error::Error> {
+            let index = match &rank9_index_bytes {
+                Some(bytes) => {
+                    let handle = indexes
+                        .next()
+                        .ok_or_else(|| invalid_rank9_metadata("missing Rank9 index"))?;
+                    SuccinctIndex::Rank9(Rank9SelIndex::from_bytes_with_len(
+                        data.len(),
+                        handle.bytes(bytes),
+                    )?)
+                }
+                None => SuccinctIndex::Raw,
+            };
+            Ok(BitVector::new(data, index))
+        };
+        let top_level = parts
+            .top_level
             .into_iter()
-            .zip(index_handles.iter().copied())
-        {
-            // `validate_rank9_index_handles` preflights this raw handle before
-            // BitVectorData/AnyBytes can slice with it.
-            let data = BitVectorData::from_bytes(raw_meta, runtime_bytes.clone())?;
-            let index =
-                Rank9SelIndex::from_bytes_for_data(&data, index_handle.bytes(&rank9_index_bytes))?;
-            top_level.push(BitVector::new(data, index));
+            .map(&mut vector)
+            .collect::<Result<Vec<_>, _>>()?;
+        let [e_a, a_a, v_a, changed_e_a, changed_e_v, changed_a_e, changed_a_v, changed_v_e, changed_v_a]:
+            [BitVector<SuccinctIndex>; TOP_LEVEL_RANK9_INDEX_COUNT] =
+            top_level.try_into().expect("nine top-level vectors");
+        let mut matrices = Vec::with_capacity(6);
+        for layers in parts.matrices {
+            let layers = layers
+                .into_iter()
+                .map(&mut vector)
+                .collect::<Result<Vec<_>, _>>()?;
+            matrices.push(WaveletMatrix::from_layers(parts.domain.len(), layers)?);
         }
-        let [
-            e_a,
-            a_a,
-            v_a,
-            changed_e_a,
-            changed_e_v,
-            changed_a_e,
-            changed_a_v,
-            changed_v_e,
-            changed_v_a,
-        ]: [BitVector<Rank9SelIndex>; TOP_LEVEL_RANK9_INDEX_COUNT] =
-            top_level.try_into().expect("nine top-level Rank9 indexes");
-
-        let mut wavelets = Vec::with_capacity(SuccinctRotation::ALL.len());
-        let mut handle_cursor = TOP_LEVEL_RANK9_INDEX_COUNT;
-        for matrix_meta in wavelet_metadata {
-            let handle_end = handle_cursor
-                .checked_add(matrix_meta.alph_width)
-                .ok_or_else(|| invalid_rank9_metadata("wavelet Rank9 handle range overflow"))?;
-            let matrix_handles = &index_handles[handle_cursor..handle_end];
-            let matrix = WaveletMatrix::from_bytes_with_persisted_indexes(
-                matrix_meta,
-                runtime_bytes.clone(),
-                matrix_handles
-                    .iter()
-                    .map(|handle| handle.bytes(&rank9_index_bytes)),
-            )?;
-            wavelets.push(matrix);
-            handle_cursor = handle_end;
-        }
-        debug_assert_eq!(handle_cursor, index_handles.len());
-        let [eav_c, vea_c, ave_c, vae_c, eva_c, aev_c]: [WaveletMatrix<Rank9SelIndex>; 6] =
-            wavelets.try_into().expect("six Ring wavelet matrices");
-
-        Ok(SuccinctArchive {
-            bytes,
+        let [eav_c, vea_c, ave_c, vae_c, eva_c, aev_c]: [WaveletMatrix<SuccinctIndex>; 6] =
+            matrices.try_into().expect("six Ring matrices");
+        Ok(Self {
+            bytes: raw.bytes,
             raw_handle: source,
             rank9_index_bytes,
             rank9_handle,
-            domain,
-            entity_count: meta.entity_count,
-            attribute_count: meta.attribute_count,
-            value_count: meta.value_count,
+            distinct_counts: Arc::default(),
+            domain: parts.domain,
             e_a,
             a_a,
             v_a,
@@ -3568,33 +3532,11 @@ impl<U> SuccinctArchive<U>
 where
     U: Universe + Serializable<Error = jerky::error::Error>,
 {
-    fn validated_runtime(
-        bytes: &Bytes,
-    ) -> Result<(SuccinctArchiveMeta<U::Meta>, Bytes), SuccinctArchiveError> {
-        let parts = {
-            let view = portable::parse(bytes.as_ref())
-                .map_err(|error| SuccinctArchiveError(portable_codec_error(error)))?;
-            view.prove_canonical()
-                .map_err(|error| SuccinctArchiveError(portable_codec_error(error)))?
-        };
-        build_runtime_from_portable::<U>(parts).map_err(SuccinctArchiveError)
-    }
-
-    /// Proves the portable bytes by independently deriving all prefixes,
-    /// changed masks, and rotations from the decoded EAV source ring before
-    /// constructing a runtime. No merely structural parse reaches query APIs.
+    /// Borrows the portable sections. Rank/select queries scan their source
+    /// words until the caller explicitly supplies or builds a Rank9 root.
     fn from_portable_blob(raw: Blob<SuccinctArchiveBlob>) -> Result<Self, SuccinctArchiveError> {
-        let source = raw.get_handle();
-        let (meta, runtime_bytes) = Self::validated_runtime(&raw.bytes)?;
-        let rank9_index_bytes = build_runtime_rank9_index(&meta, &runtime_bytes, source)
-            .map_err(SuccinctArchiveError)?;
-        Self::from_runtime_bytes_with_rank9_indexes(
-            meta,
-            runtime_bytes,
-            raw,
-            Blob::new(rank9_index_bytes),
-        )
-        .map_err(SuccinctArchiveError)
+        let parts = QueryParts::from_portable(&raw.bytes)?;
+        Self::from_query_parts(parts, raw, None).map_err(SuccinctArchiveError)
     }
 
     /// Builds a queryable archive and returns its raw and Rank9 artifacts.
@@ -3625,34 +3567,56 @@ where
         )
     }
 
-    /// Returns only this runtime's source-bound Rank9 accelerated root.
+    /// Explicitly obtains this archive's source-bound Rank9 accelerated root.
     ///
     /// This is useful when the caller already owns the canonical raw blob and
     /// must persist the accelerator without hashing the raw bytes again.
+    /// If this is an unaccelerated raw view, this method constructs a new
+    /// accelerator; ordinary query methods never do so.
     pub fn accelerated_root(&self) -> Blob<Rank9AcceleratedSuccinctArchiveBlob> {
-        Blob::with_handle(self.rank9_index_bytes.clone(), self.rank9_handle)
+        match (&self.rank9_index_bytes, self.rank9_handle) {
+            (Some(bytes), Some(handle)) => Blob::with_handle(bytes.clone(), handle),
+            _ => {
+                Self::build_accelerated_root(Blob::with_handle(self.bytes.clone(), self.raw_handle))
+                    .expect("explicit Rank9 construction failed")
+            }
+        }
     }
 
-    /// Rebuilds only the Rank9 accelerated root for a canonical raw archive.
-    /// The raw blob is exact-validated and its bytes/identity remain unchanged.
+    /// Explicitly constructs only the Rank9 accelerator from stored raw words.
+    /// The raw sections are structurally attached, not canonically rederived.
     pub fn build_accelerated_root(
         raw: Blob<SuccinctArchiveBlob>,
     ) -> Result<Blob<Rank9AcceleratedSuccinctArchiveBlob>, SuccinctArchiveError> {
         let source = raw.get_handle();
-        let (meta, runtime_bytes) = Self::validated_runtime(&raw.bytes)?;
-        let index = build_runtime_rank9_index(&meta, &runtime_bytes, source)
-            .map_err(SuccinctArchiveError)?;
+        let parts = QueryParts::<U>::from_portable(&raw.bytes)?;
+        let index = build_rank9_index(&parts, source).map_err(SuccinctArchiveError)?;
         Ok(Blob::new(index))
     }
 
-    /// Attaches an exact raw/index pair without rebuilding rank/select data.
+    /// Attaches a source-bound raw/index pair using only typed framing and
+    /// section geometry. Producer-endorsed rank/select contents are not reproved.
     pub fn from_accelerated_parts(
         raw: Blob<SuccinctArchiveBlob>,
         rank9: Blob<Rank9AcceleratedSuccinctArchiveBlob>,
     ) -> Result<Self, SuccinctArchiveError> {
-        let (meta, runtime_bytes) = Self::validated_runtime(&raw.bytes)?;
-        Self::from_runtime_bytes_with_rank9_indexes(meta, runtime_bytes, raw, rank9)
-            .map_err(SuccinctArchiveError)
+        let parts = QueryParts::from_portable(&raw.bytes)?;
+        Self::from_query_parts(parts, raw, Some(rank9)).map_err(SuccinctArchiveError)
+    }
+
+    /// Explicitly audits raw canonical bytes and every Rank9 directory/hint
+    /// against its corresponding raw words. Ordinary readers never call this.
+    pub fn validate_accelerated_parts(
+        raw: &Blob<SuccinctArchiveBlob>,
+        rank9: &Blob<Rank9AcceleratedSuccinctArchiveBlob>,
+    ) -> Result<(), SuccinctArchiveError> {
+        SuccinctArchiveBlob::validate(raw)?;
+        let parts = QueryParts::<U>::from_portable(&raw.bytes)?;
+        let handles = parse_rank9_index(parts.data().count(), raw.get_handle(), &rank9.bytes)?;
+        for (data, handle) in parts.data().zip(handles) {
+            Rank9SelIndex::<true, true>::from_bytes_for_data(data, handle.bytes(&rank9.bytes))?;
+        }
+        Ok(())
     }
 }
 
@@ -4155,6 +4119,229 @@ mod tests {
         assert_eq!(TribleSet::from(&paired), set);
     }
 
+    #[cfg(target_endian = "little")]
+    #[test]
+    fn raw_attachment_borrows_sections_and_never_builds_a_rank9_index() {
+        let set = varied_knights();
+        let source: Blob<SimpleArchive> = (&set).to_blob();
+        let raw = SuccinctArchiveBlob::build_from_simple_archive(&source).unwrap();
+        let start = raw.bytes.as_ptr() as usize;
+        let end = start + raw.bytes.len();
+        let parts = QueryParts::<OrderedUniverse>::from_portable(&raw.bytes).unwrap();
+        for data in parts.data() {
+            let pointer = data.words().as_ptr() as usize;
+            assert!((start..end).contains(&pointer));
+            assert!(pointer + std::mem::size_of_val(data.words()) <= end);
+        }
+        let archive: SuccinctArchive<OrderedUniverse> = raw.clone().try_from_blob().unwrap();
+        assert_eq!(archive.bytes.as_ptr(), raw.bytes.as_ptr());
+        assert_eq!(archive.domain.values().as_ptr() as usize, start);
+        for vector in [
+            &archive.e_a,
+            &archive.a_a,
+            &archive.v_a,
+            &archive.changed_e_a,
+            &archive.changed_e_v,
+            &archive.changed_a_e,
+            &archive.changed_a_v,
+            &archive.changed_v_e,
+            &archive.changed_v_a,
+        ] {
+            assert!(matches!(vector.index, SuccinctIndex::Raw));
+            let pointer = vector.data.words().as_ptr() as usize;
+            assert!((start..end).contains(&pointer));
+            assert!(pointer + std::mem::size_of_val(vector.data.words()) <= end);
+        }
+        assert!(archive.rank9_index_bytes.is_none());
+        assert!(archive.rank9_handle.is_none());
+        assert_eq!(TribleSet::from(&archive), set);
+        assert_eq!(
+            archive.entity_count(),
+            set.eav.segmented_len(&[0; 0]) as usize
+        );
+        assert_eq!(
+            archive.attribute_count(),
+            set.ave.segmented_len(&[0; 0]) as usize
+        );
+        assert_eq!(
+            archive.value_count(),
+            set.vea.segmented_len(&[0; 0]) as usize
+        );
+        // Querying did not defer a hidden whole-index construction.
+        assert!(archive.rank9_index_bytes.is_none());
+        assert!(matches!(archive.e_a.index, SuccinctIndex::Raw));
+
+        // Asking for the accelerator is an explicit construction operation.
+        let rank9 = archive.accelerated_root();
+        assert!(archive.rank9_index_bytes.is_none());
+        let rank_pointer = rank9.bytes.as_ptr();
+        let paired =
+            SuccinctArchive::<OrderedUniverse>::from_accelerated_parts(raw, rank9).unwrap();
+        assert_eq!(paired.bytes.as_ptr() as usize, start);
+        assert_eq!(paired.domain.values().as_ptr() as usize, start);
+        assert_eq!(
+            paired.rank9_index_bytes.as_ref().unwrap().as_ptr(),
+            rank_pointer
+        );
+        assert_eq!(
+            paired.e_a.data.words().as_ptr(),
+            archive.e_a.data.words().as_ptr()
+        );
+        assert!(matches!(paired.e_a.index, SuccinctIndex::Rank9(_)));
+        assert_eq!(TribleSet::from(&paired), set);
+    }
+
+    #[test]
+    fn distinct_counts_are_lazy_and_shared_across_clones() {
+        let set = varied_knights();
+        let source: Blob<SimpleArchive> = (&set).to_blob();
+        let raw = SuccinctArchiveBlob::build_from_simple_archive(&source).unwrap();
+        let before = PREFIX_DISTINCT_COUNT_CALLS.with(std::cell::Cell::get);
+        let archive: SuccinctArchive<OrderedUniverse> = raw.try_from_blob().unwrap();
+        let clone = archive.clone();
+        assert_eq!(
+            PREFIX_DISTINCT_COUNT_CALLS.with(std::cell::Cell::get),
+            before
+        );
+        assert!(archive
+            .distinct_counts
+            .iter()
+            .all(|count| count.get().is_none()));
+        assert!(Arc::ptr_eq(
+            &archive.distinct_counts,
+            &clone.distinct_counts
+        ));
+
+        let entities = set.eav.segmented_len(&[0; 0]) as usize;
+        assert_eq!(archive.entity_count(), entities);
+        assert_eq!(
+            PREFIX_DISTINCT_COUNT_CALLS.with(std::cell::Cell::get),
+            before + 1
+        );
+        assert_eq!(clone.distinct_counts[0].get(), Some(&entities));
+        assert!(clone.distinct_counts[1].get().is_none());
+        assert!(clone.distinct_counts[2].get().is_none());
+        for _ in 0..4 {
+            assert_eq!(clone.entity_count(), entities);
+            assert_eq!(archive.entity_count(), entities);
+        }
+        assert_eq!(
+            PREFIX_DISTINCT_COUNT_CALLS.with(std::cell::Cell::get),
+            before + 1
+        );
+
+        let attributes = set.ave.segmented_len(&[0; 0]) as usize;
+        let values = set.vea.segmented_len(&[0; 0]) as usize;
+        for _ in 0..4 {
+            assert_eq!(clone.attribute_count(), attributes);
+            assert_eq!(archive.attribute_count(), attributes);
+            assert_eq!(archive.value_count(), values);
+            assert_eq!(clone.value_count(), values);
+        }
+        assert_eq!(
+            PREFIX_DISTINCT_COUNT_CALLS.with(std::cell::Cell::get),
+            before + 3
+        );
+        assert!(archive.rank9_index_bytes.is_none());
+        assert!(matches!(archive.e_a.index, SuccinctIndex::Raw));
+        assert!(matches!(archive.a_a.index, SuccinctIndex::Raw));
+        assert!(matches!(archive.v_a.index, SuccinctIndex::Raw));
+    }
+
+    #[test]
+    fn typed_attachment_rejects_truncated_overflowing_and_misaligned_sections() {
+        let archive: SuccinctArchive<OrderedUniverse> = (&varied_knights()).into();
+        let (raw, rank9) = archive.to_accelerated_parts();
+        for length in 0..raw.bytes.len() {
+            let candidate = Blob::<SuccinctArchiveBlob>::new(raw.bytes.slice(..length));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                SuccinctArchive::<OrderedUniverse>::try_from_blob(candidate)
+            }));
+            assert!(result.is_ok(), "truncated raw framing panicked at {length}");
+        }
+        let mut overflowing = raw.bytes.as_ref().to_vec();
+        let footer = overflowing.len() - 16;
+        overflowing[footer..footer + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        let result: Result<SuccinctArchive<OrderedUniverse>, _> =
+            Blob::<SuccinctArchiveBlob>::new(Bytes::from(overflowing)).try_from_blob();
+        assert!(result.is_err());
+
+        let mut offset = vec![0u8];
+        offset.extend_from_slice(raw.bytes.as_ref());
+        let candidate = Blob::<SuccinctArchiveBlob>::new(Bytes::from(offset).slice(1..));
+        #[cfg(target_endian = "little")]
+        assert!(SuccinctArchive::<OrderedUniverse>::try_from_blob(candidate).is_err());
+        #[cfg(target_endian = "big")]
+        drop(candidate); // BE words require an explicit byte-order conversion.
+
+        for length in 0..rank9.bytes.len() {
+            let candidate =
+                Blob::<Rank9AcceleratedSuccinctArchiveBlob>::new(rank9.bytes.slice(..length));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                SuccinctArchive::<OrderedUniverse>::from_accelerated_parts(raw.clone(), candidate)
+            }));
+            assert!(
+                matches!(result, Ok(Err(_))),
+                "truncated Rank9 accepted or panicked at {length}"
+            );
+        }
+    }
+
+    #[cfg(target_endian = "little")]
+    #[test]
+    fn mmap_backing_survives_raw_and_accelerated_attachment() {
+        let set = varied_knights();
+        let (raw, rank9) = SuccinctArchive::<OrderedUniverse>::build_accelerated_parts(&set);
+        let map = |bytes: &Bytes| {
+            let mut area = memmap2::MmapMut::map_anon(bytes.len()).unwrap();
+            area.copy_from_slice(bytes.as_ref());
+            Bytes::from_source(area.make_read_only().unwrap())
+        };
+        let raw = Blob::<SuccinctArchiveBlob>::new(map(&raw.bytes));
+        let rank9 = Blob::<Rank9AcceleratedSuccinctArchiveBlob>::new(map(&rank9.bytes));
+        let raw_pointer = raw.bytes.as_ptr();
+        let rank9_pointer = rank9.bytes.as_ptr();
+        let raw_view: SuccinctArchive<OrderedUniverse> = raw.clone().try_from_blob().unwrap();
+        let paired =
+            SuccinctArchive::<OrderedUniverse>::from_accelerated_parts(raw, rank9).unwrap();
+        assert_eq!(raw_view.bytes.as_ptr(), raw_pointer);
+        assert_eq!(paired.bytes.as_ptr(), raw_pointer);
+        assert_eq!(
+            paired.rank9_index_bytes.as_ref().unwrap().as_ptr(),
+            rank9_pointer
+        );
+        assert_eq!(
+            raw_view.domain.values().as_ptr() as usize,
+            raw_pointer as usize
+        );
+        assert_eq!(
+            paired.e_a.data.words().as_ptr(),
+            raw_view.e_a.data.words().as_ptr()
+        );
+        // The Blob owners above were consumed; the typed query views own
+        // their mappings and remain usable independently.
+        assert_eq!(TribleSet::from(&raw_view), set);
+        assert_eq!(TribleSet::from(&paired), set);
+    }
+
+    #[test]
+    fn rank9_attachment_does_not_reprove_semantic_directory_contents() {
+        let archive: SuccinctArchive<OrderedUniverse> = (&varied_knights()).into();
+        let (raw, rank9) = archive.to_accelerated_parts();
+        let mut bytes = rank9.bytes.as_ref().to_vec();
+        let first_payload = std::mem::size_of::<Rank9IndexHeader>();
+        bytes[first_payload + 2 * std::mem::size_of::<usize>()] ^= 1;
+        let changed = Blob::<Rank9AcceleratedSuccinctArchiveBlob>::new(Bytes::from(bytes));
+        assert!(SuccinctArchive::<OrderedUniverse>::from_accelerated_parts(
+            raw.clone(),
+            changed.clone()
+        )
+        .is_ok());
+        assert!(
+            SuccinctArchive::<OrderedUniverse>::validate_accelerated_parts(&raw, &changed).is_err()
+        );
+    }
+
     fn two_by_two_permutation(swapped: bool) -> TribleSet {
         let e1 = ordered_id(1);
         let e2 = ordered_id(2);
@@ -4174,7 +4361,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_derivation_rejects_structurally_valid_changed_mask_drift() {
+    fn explicit_audit_rejects_changed_mask_drift_without_reproving_on_read_or_merge() {
         let archive: SuccinctArchive<OrderedUniverse> = (&two_by_two_permutation(false)).into();
         let mut bytes = archive.bytes.as_ref().to_vec();
         let n = 2usize;
@@ -4184,13 +4371,19 @@ mod tests {
         bytes[changed_start] ^= 1 << 1;
 
         let malformed = Blob::<SuccinctArchiveBlob>::new(Bytes::from(bytes));
-        assert!(SuccinctArchiveBlob::merge(&[malformed.clone()]).is_err());
+        assert!(SuccinctArchiveBlob::validate(&malformed).is_err());
+        assert_eq!(
+            SuccinctArchiveBlob::merge(&[malformed.clone()])
+                .unwrap()
+                .bytes,
+            archive.bytes
+        );
         let result: Result<SuccinctArchive<OrderedUniverse>, _> = malformed.try_from_blob();
-        assert!(result.is_err());
+        assert!(result.is_ok());
     }
 
     #[test]
-    fn exact_derivation_rejects_a_valid_but_foreign_secondary_rotation() {
+    fn explicit_audit_rejects_foreign_secondary_rotation_without_reproving_on_read_or_merge() {
         let left: SuccinctArchive<OrderedUniverse> = (&two_by_two_permutation(false)).into();
         let right: SuccinctArchive<OrderedUniverse> = (&two_by_two_permutation(true)).into();
         let mut bytes = left.bytes.as_ref().to_vec();
@@ -4210,13 +4403,19 @@ mod tests {
         // per-axis histograms, so the splice passes raw structural validation.
         portable::parse(&bytes).unwrap();
         let malformed = Blob::<SuccinctArchiveBlob>::new(Bytes::from(bytes));
-        assert!(SuccinctArchiveBlob::merge(&[malformed.clone()]).is_err());
+        assert!(SuccinctArchiveBlob::validate(&malformed).is_err());
+        assert_eq!(
+            SuccinctArchiveBlob::merge(&[malformed.clone()])
+                .unwrap()
+                .bytes,
+            left.bytes
+        );
         let result: Result<SuccinctArchive<OrderedUniverse>, _> = malformed.try_from_blob();
-        assert!(result.is_err());
+        assert!(result.is_ok());
     }
 
     #[test]
-    fn raw_merge_validation_matches_runtime_oracle_for_all_single_bit_mutations() {
+    fn explicit_canonical_audits_agree_for_all_single_bit_mutations() {
         let archive: SuccinctArchive<OrderedUniverse> = (&two_by_two_permutation(false)).into();
         let canonical = archive.bytes.as_ref();
 
@@ -4225,16 +4424,17 @@ mod tests {
                 let mut mutated = canonical.to_vec();
                 mutated[byte] ^= 1u8 << shift;
                 let candidate = Blob::<SuccinctArchiveBlob>::new(Bytes::from(mutated));
-                let raw = SuccinctArchiveBlob::merge(&[candidate.clone()]);
-                let runtime: Result<SuccinctArchive<OrderedUniverse>, _> =
-                    candidate.clone().try_from_blob();
+                let raw = portable::parse(candidate.bytes.as_ref())
+                    .and_then(|view| view.prove_canonical_eav_u32());
+                let runtime = SuccinctArchiveBlob::validate(&candidate);
 
                 assert_eq!(
                     raw.is_ok(),
                     runtime.is_ok(),
                     "validation disagreement at byte {byte}, bit {shift}"
                 );
-                if let Ok(merged) = raw {
+                if raw.is_ok() {
+                    let merged = SuccinctArchiveBlob::merge(&[candidate.clone()]).unwrap();
                     assert_eq!(
                         merged.bytes, candidate.bytes,
                         "canonical singleton changed at byte {byte}, bit {shift}"
@@ -4261,7 +4461,7 @@ mod tests {
         mutate(&mut bytes);
         let corrupted = Blob::<Rank9AcceleratedSuccinctArchiveBlob>::new(Bytes::from_source(bytes));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            SuccinctArchive::<OrderedUniverse>::from_accelerated_parts(raw, corrupted)
+            SuccinctArchive::<OrderedUniverse>::validate_accelerated_parts(&raw, &corrupted)
         }));
         assert!(matches!(result, Ok(Err(_))));
     }
@@ -4417,9 +4617,9 @@ mod tests {
         assert_eq!(merged_set, union);
         assert_eq!(merged.bytes.as_ref(), rebuilt.bytes.as_ref());
         assert_eq!(backend_merged.bytes.as_ref(), rebuilt.bytes.as_ref());
-        assert_eq!(merged.entity_count, rebuilt.entity_count);
-        assert_eq!(merged.attribute_count, rebuilt.attribute_count);
-        assert_eq!(merged.value_count, rebuilt.value_count);
+        assert_eq!(merged.entity_count(), rebuilt.entity_count());
+        assert_eq!(merged.attribute_count(), rebuilt.attribute_count());
+        assert_eq!(merged.value_count(), rebuilt.value_count());
     }
 
     #[test]

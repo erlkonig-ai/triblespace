@@ -6,6 +6,17 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## Unreleased
 
+- Portable BM25 attachment retains its encoded members and checks framing only.
+  `index.query()` / `view.query()` explicitly prepare the global scoring
+  statistics omitted by the wire format. Overlapping covers query a logical
+  document union and pointwise-maximum TF without serializing a merged carrier;
+  canonical table validation is an explicit audit. Existing bytes are unchanged.
+
+- NVFP4 index attachment checks plane geometry without scanning every stored
+  value. Canonical row checks remain in the explicit `validate_member` audit;
+  source embeddings are never requantized to read an existing member. The
+  constructor also stops re-reading its own freshly encoded output.
+
 ### The semantic index (`semantic`, feature `semantic`)
 
 - Added `SemanticIndex`, a `CollectionMapping` from a `SimpleArchive` source

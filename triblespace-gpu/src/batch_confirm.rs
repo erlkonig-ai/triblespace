@@ -83,7 +83,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use cubecl::prelude::*;
 use cubecl::wgpu::WgpuRuntime;
-use jerky::bit_vector::rank9sel::Rank9SelIndex;
+use jerky::bit_vector::BitVectorIndex;
 use jerky::bit_vector::{BitVector, Select};
 use jerky::gpu::{DeviceU32Buffer, GpuContext, GpuWaveletMatrix};
 use triblespace_core::blob::encodings::succinctarchive::{
@@ -820,9 +820,9 @@ where
     stats: ConfirmStats,
 }
 
-fn axis_bounds(
+fn axis_bounds<I: BitVectorIndex>(
     context: &WgpuContext,
-    prefix: &BitVector<Rank9SelIndex>,
+    prefix: &BitVector<I>,
     domain_len: usize,
     axis: &'static str,
 ) -> jerky::Result<DeviceU32Buffer<WgpuRuntime>> {

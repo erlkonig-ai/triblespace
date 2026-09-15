@@ -29,15 +29,10 @@
 //!
 //! # Semantic boundary
 //!
-//! Parsing these bytes does **not** make them queryable. This layer rejects
-//! malformed raw structure and locally impossible code histograms, but it does
-//! not prove that changed-pair masks are derived from their rotations or that
-//! all six rotations encode the same trible set. The public attachment path
-//! passes the bytes through the collection mapping's exact canonical
-//! derivation gate before constructing a query engine. Keeping that proof out
-//! of this layout module is deliberate. Public attachment decodes a candidate
-//! EAV source set, rebuilds the complete canonical payload, and requires exact
-//! byte equality before exposing the runtime.
+//! Ordinary attachment checks only section framing and typed-view geometry.
+//! The producer endorses the mathematical contents. Full domain, prefix,
+//! histogram and canonical-derivation checks remain an explicit audit, never
+//! a prerequisite for borrowing the stored query sections.
 
 use std::fmt;
 use std::ops::Range;
@@ -197,19 +192,6 @@ pub(crate) struct PortableView<'a> {
     prefix_counts: [Vec<usize>; PREFIX_COUNT],
 }
 
-/// Owned logical sections used to rebuild a process-local query arena.
-/// Offsets and native metadata are intentionally absent.
-pub(crate) struct RuntimeParts {
-    pub(crate) triple_count: usize,
-    pub(crate) domain: Vec<RawInline>,
-    pub(crate) entity_count: usize,
-    pub(crate) attribute_count: usize,
-    pub(crate) value_count: usize,
-    pub(crate) prefixes: [Vec<u64>; PREFIX_COUNT],
-    pub(crate) changes: [Vec<u64>; CHANGE_COUNT],
-    pub(crate) wavelets: [Vec<u64>; WAVELET_COUNT],
-}
-
 /// Exact, runtime-independent logical content of one canonical portable
 /// archive. Codes are local to `domain`; `rows` are strictly increasing EAV.
 pub(super) struct CanonicalEavU32 {
@@ -238,7 +220,7 @@ impl PortableView<'_> {
     /// all six masks, and all six wavelet matrices from those rows. Only exact
     /// byte equality succeeds. This makes the proof independent of Jerky's
     /// native runtime and its source-bound Rank9 accelerated root.
-    pub(crate) fn prove_canonical(&self) -> Result<RuntimeParts, PortableError> {
+    pub(crate) fn prove_canonical(&self) -> Result<(), PortableError> {
         let rows = self.candidate_eav_codes()?;
         if rows.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(PortableError::new(
@@ -246,14 +228,14 @@ impl PortableView<'_> {
             ));
         }
 
-        let (expected, parts) = canonical_bytes_from_eav(self, &rows)?;
+        let expected = canonical_bytes_from_eav(self, &rows)?;
         if expected != self.bytes {
             return Err(PortableError::new(
                 "payload is not the exact canonical derivation of its EAV source ring",
             ));
         }
 
-        Ok(parts)
+        Ok(())
     }
 
     /// Proves exact canonical bytes and returns only the logical EAV source.
@@ -261,8 +243,8 @@ impl PortableView<'_> {
     /// Unlike [`Self::prove_canonical`], this path never constructs native
     /// runtime sections or a second portable payload. It rederives every
     /// prefix run, pair-change bit, and stable wavelet plane from EAV and
-    /// compares them in place, so valid-looking but inconsistent secondary
-    /// rotations cannot enter raw MERGE.
+    /// compares them in place as an independent explicit-audit test oracle.
+    #[cfg(test)]
     pub(super) fn prove_canonical_eav_u32(&self) -> Result<CanonicalEavU32, PortableError> {
         if self.layout.triple_count > u32::MAX as usize {
             return Err(PortableError::new(format!(
@@ -277,6 +259,14 @@ impl PortableView<'_> {
             )));
         }
 
+        let source = self.decode_eav_u32()?;
+        verify_canonical_eav_u32(self, &source.rows)?;
+        Ok(source)
+    }
+
+    /// Decodes just the source ring needed by a raw union. Secondary
+    /// rotations and changed masks are not rederived or compared.
+    pub(super) fn decode_eav_u32(&self) -> Result<CanonicalEavU32, PortableError> {
         let rows = self.candidate_eav_codes_as(|code| {
             u32::try_from(code)
                 .map_err(|_| PortableError::new("archive-local code does not fit a u32 lane"))
@@ -290,7 +280,6 @@ impl PortableView<'_> {
             .map(|code| self.domain_value(code))
             .collect::<Vec<_>>();
 
-        verify_canonical_eav_u32(self, &rows)?;
         Ok(CanonicalEavU32 { domain, rows })
     }
 
@@ -326,7 +315,9 @@ impl PortableView<'_> {
             let value = eav.access(eav_position).ok_or_else(|| {
                 PortableError::new(format!("EAV wavelet cannot decode row {eav_position}"))
             })?;
-            let vea_position = value_starts[value]
+            let vea_position = value_starts
+                .get(value)
+                .ok_or_else(|| PortableError::new("EAV value code is outside the domain"))?
                 .checked_add(eav.rank(eav_position, value).ok_or_else(|| {
                     PortableError::new(format!(
                         "EAV rank cannot rotate row {eav_position} for value code {value}"
@@ -344,7 +335,9 @@ impl PortableView<'_> {
                     "VEA wavelet cannot decode rotated row {vea_position}"
                 ))
             })?;
-            let ave_position = attribute_starts[attribute]
+            let ave_position = attribute_starts
+                .get(attribute)
+                .ok_or_else(|| PortableError::new("VEA attribute code is outside the domain"))?
                 .checked_add(vea.rank(vea_position, attribute).ok_or_else(|| {
                     PortableError::new(format!(
                         "VEA rank cannot rotate row {vea_position} for attribute code {attribute}"
@@ -362,12 +355,16 @@ impl PortableView<'_> {
                     "AVE wavelet cannot decode rotated row {ave_position}"
                 ))
             })?;
+            if entity >= self.layout.domain_len {
+                return Err(PortableError::new("AVE entity code is outside the domain"));
+            }
             candidate.push([convert(entity)?, convert(attribute)?, convert(value)?]);
         }
         Ok(candidate)
     }
 }
 
+#[cfg(test)]
 fn verify_canonical_eav_u32(
     view: &PortableView<'_>,
     rows: &[[u32; 3]],
@@ -447,6 +444,7 @@ fn verify_canonical_eav_u32(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn verify_canonical_rotation(
     view: &PortableView<'_>,
     rows: &[[u32; 3]],
@@ -542,7 +540,7 @@ fn verify_canonical_rotation(
 fn canonical_bytes_from_eav(
     view: &PortableView<'_>,
     eav_rows: &[[usize; 3]],
-) -> Result<(Vec<u8>, RuntimeParts), PortableError> {
+) -> Result<Vec<u8>, PortableError> {
     let domain_len = view.layout.domain_len;
     let domain: Vec<_> = (0..domain_len)
         .map(|code| view.domain_value(code))
@@ -555,10 +553,6 @@ fn canonical_bytes_from_eav(
         axis_counts[PrefixAxis::Attribute.index()][attribute] += 1;
         axis_counts[PrefixAxis::Value.index()][value] += 1;
     }
-    let distinct = |counts: &[usize]| counts.iter().filter(|count| **count != 0).count();
-    let entity_count = distinct(&axis_counts[PrefixAxis::Entity.index()]);
-    let attribute_count = distinct(&axis_counts[PrefixAxis::Attribute.index()]);
-    let value_count = distinct(&axis_counts[PrefixAxis::Value.index()]);
     let prefixes = axis_counts.map(|counts| encode_prefix(&counts, eav_rows.len()));
 
     let mut rotations: [Vec<[usize; 3]>; WAVELET_COUNT] =
@@ -616,19 +610,7 @@ fn canonical_bytes_from_eav(
             &wavelets[Rotation::Aev.index()],
         ],
     })?;
-    Ok((
-        bytes,
-        RuntimeParts {
-            triple_count: eav_rows.len(),
-            domain,
-            entity_count,
-            attribute_count,
-            value_count,
-            prefixes,
-            changes,
-            wavelets,
-        },
-    ))
+    Ok(bytes)
 }
 
 fn encode_prefix(counts: &[usize], row_count: usize) -> Vec<u64> {
@@ -697,10 +679,8 @@ fn set_bit(words: &mut [u64], position: usize) {
     words[position / u64::BITS as usize] |= 1u64 << (position % u64::BITS as usize);
 }
 
-/// Small, validation-only rank directory over one portable wavelet matrix.
-/// It is intentionally not retained by the query runtime: exact derivation
-/// rebuilds the canonical native/CubeCL-facing representation and attaches the
-/// source-bound accelerated root there.
+/// Temporary rank directory used by explicit audits and EAV source decoding
+/// during MERGE. Ordinary query attachment neither constructs nor retains it.
 struct PortableWavelet<'a> {
     view: &'a PortableView<'a>,
     rotation: Rotation,
@@ -813,17 +793,17 @@ impl fmt::Display for PortableError {
 impl std::error::Error for PortableError {}
 
 #[derive(Debug, Clone)]
-struct Layout {
-    triple_count: usize,
-    domain_len: usize,
-    alphabet_width: usize,
-    prefix_bits: usize,
+pub(super) struct Layout {
+    pub(super) triple_count: usize,
+    pub(super) domain_len: usize,
+    pub(super) alphabet_width: usize,
+    pub(super) prefix_bits: usize,
     prefix_words: usize,
-    row_words: usize,
-    domain: Range<usize>,
-    prefixes: [Range<usize>; PREFIX_COUNT],
-    changes: [Range<usize>; CHANGE_COUNT],
-    wavelets: [Range<usize>; WAVELET_COUNT],
+    pub(super) row_words: usize,
+    pub(super) domain: Range<usize>,
+    pub(super) prefixes: [Range<usize>; PREFIX_COUNT],
+    pub(super) changes: [Range<usize>; CHANGE_COUNT],
+    pub(super) wavelets: [Range<usize>; WAVELET_COUNT],
     count_footer: Range<usize>,
     byte_len: usize,
 }
@@ -1383,17 +1363,31 @@ fn push_words(bytes: &mut Vec<u8>, words: &[u64]) {
     }
 }
 
-/// Parses and structurally validates one portable payload.
+/// Explicitly audits the local invariants of one portable payload.
 ///
 /// Validation scans every raw section once, then checks the `D` possible codes
 /// through `W(D)` rank steps per wavelet. Its temporary rank directories use
 /// `O(W(D) * ceil(N/64))` words for one wavelet at a time. It proves the exact
 /// gapless layout, ordered-domain and ID-role invariants, canonical unary
 /// prefixes and bit tails, in-domain wavelet codes, and last-column
-/// histograms. Changed-mask derivation and exact equality of all six rotations
-/// belong to the later collection derivation gate rather than this raw layout
-/// layer.
+/// histograms. Full canonical equality is the subsequent explicit
+/// `prove_canonical` audit. Ordinary readers use `parse_layout` instead.
 pub(crate) fn parse(bytes: &[u8]) -> Result<PortableView<'_>, PortableError> {
+    let layout = parse_layout(bytes)?;
+    let mut view = PortableView {
+        bytes,
+        layout,
+        prefix_counts: std::array::from_fn(|_| Vec::new()),
+    };
+    validate_domain(&view)?;
+    view.prefix_counts = validate_prefixes(&view)?;
+    validate_changes(&view)?;
+    validate_wavelets(&view, &view.prefix_counts)?;
+    Ok(view)
+}
+
+/// Exact framing and checked section ranges, without reading section contents.
+pub(super) fn parse_layout(bytes: &[u8]) -> Result<Layout, PortableError> {
     if bytes.len() < COUNT_FOOTER_LEN {
         return Err(PortableError::new(format!(
             "count footer is truncated: found {} bytes, need {COUNT_FOOTER_LEN}",
@@ -1415,16 +1409,26 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<PortableView<'_>, PortableError> {
     }
     debug_assert_eq!(layout.count_footer.start, footer_start);
 
+    Ok(layout)
+}
+
+/// Reads the unary group sizes needed to rotate EAV rows during MERGE.
+/// This is decoding the chosen source ring, not auditing secondary indexes.
+pub(super) fn decode_eav(bytes: &[u8]) -> Result<CanonicalEavU32, PortableError> {
+    let layout = parse_layout(bytes)?;
+    if layout.triple_count > u32::MAX as usize || layout.domain_len > u32::MAX as usize {
+        return Err(PortableError::new(
+            "raw MERGE input exceeds the u32 code/row domain",
+        ));
+    }
     let mut view = PortableView {
         bytes,
         layout,
         prefix_counts: std::array::from_fn(|_| Vec::new()),
     };
-    validate_domain(&view)?;
-    view.prefix_counts = validate_prefixes(&view)?;
-    validate_changes(&view)?;
-    validate_wavelets(&view, &view.prefix_counts)?;
-    Ok(view)
+    // The source rotation needs these counts; unrelated masks/columns stay unread.
+    view.prefix_counts = decode_prefixes(&view)?;
+    view.decode_eav_u32()
 }
 
 fn read_count_word(bytes: &[u8], offset: usize) -> u64 {
@@ -1466,12 +1470,10 @@ fn validate_domain(view: &PortableView<'_>) -> Result<(), PortableError> {
     Ok(())
 }
 
-fn validate_prefixes(view: &PortableView<'_>) -> Result<[Vec<usize>; PREFIX_COUNT], PortableError> {
+fn decode_prefixes(view: &PortableView<'_>) -> Result<[Vec<usize>; PREFIX_COUNT], PortableError> {
     let mut axis_counts = Vec::with_capacity(PREFIX_COUNT);
     for axis in PrefixAxis::ALL {
         let range = &view.layout.prefixes[axis.index()];
-        validate_tail(view.bytes, range, view.layout.prefix_bits, axis.name())?;
-
         let mut counts = vec![0usize; view.layout.domain_len];
         let mut separators = 0usize;
         for position in 0..view.layout.prefix_bits {
@@ -1507,8 +1509,19 @@ fn validate_prefixes(view: &PortableView<'_>) -> Result<[Vec<usize>; PREFIX_COUN
         axis_counts.push(counts);
     }
 
-    let axis_counts: [Vec<usize>; PREFIX_COUNT] =
-        axis_counts.try_into().expect("three prefix axes");
+    Ok(axis_counts.try_into().expect("three prefix axes"))
+}
+
+fn validate_prefixes(view: &PortableView<'_>) -> Result<[Vec<usize>; PREFIX_COUNT], PortableError> {
+    let axis_counts = decode_prefixes(view)?;
+    for axis in PrefixAxis::ALL {
+        validate_tail(
+            view.bytes,
+            &view.layout.prefixes[axis.index()],
+            view.layout.prefix_bits,
+            axis.name(),
+        )?;
+    }
     for (code, ((entity_uses, attribute_uses), value_uses)) in axis_counts
         [PrefixAxis::Entity.index()]
     .iter()

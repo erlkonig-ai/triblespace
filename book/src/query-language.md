@@ -707,9 +707,10 @@ the maintained counterpart for a stated last-write-wins register. Its target
 element keeps the identity and order fact halves in separate canonical row sets.
 That detail is essential: the two facts for one state may arrive in different
 source commits, so deriving only already-complete coordinates would not commute
-with source union. Once an exact target cover is joined, `LwwIndex` pairs the
-sets and selects the greatest `(order, state-id)` coordinate for every register.
-Its `.has(state)` constraint positively proposes and confirms only known
+with source union. `LwwIndex` attaches those row sets without copying them.
+Its explicit `query()` step pairs them across the cover and returns a `LwwQuery`
+selecting the greatest `(order, state-id)` coordinate for every register.
+The prepared query's `.has(state)` constraint positively proposes and confirms only known
 complete winners, excluding unknown and incomplete states. Its existing
 `RegisterOrder` implementation remains available for pure order-based reads.
 

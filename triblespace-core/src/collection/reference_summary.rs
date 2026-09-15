@@ -44,7 +44,7 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 
-use anybytes::Bytes;
+use anybytes::{Bytes, View};
 use itertools::Itertools;
 
 use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
@@ -244,15 +244,27 @@ enum SummaryBits {
     Dense(Bytes),
 }
 
-/// A validated summary with binary-search sparse or direct dense lookups.
+/// A shared byte view of one reference summary.
 ///
-/// Sparse decoding allocates one u32 per occupied bit. Dense decoding retains
-/// its byte view and never expands dense bits into a position vector.
+/// Attachment checks framing only. [`Self::query`] prepares membership access:
+/// sparse positive-gap bytes need a position index for binary search, while
+/// dense bits can be queried directly in their original backing storage.
 #[derive(Clone, Debug)]
 pub struct ReferenceSummary {
     layout: ReferenceSummaryLayout,
     occupied: u64,
-    bits: SummaryBits,
+    form: u8,
+    payload: Bytes,
+}
+
+/// Prepared membership access to one summary or the OR of a summary cover.
+///
+/// This is query scratch, not a new persisted member. It never serializes or
+/// hashes the logical union. Dense members retain their original byte views.
+#[derive(Clone, Debug)]
+pub struct ReferenceSummaryQuery {
+    layout: ReferenceSummaryLayout,
+    members: Vec<SummaryBits>,
 }
 
 fn dense_positions(bytes: &[u8]) -> impl Iterator<Item = u32> + Clone + '_ {
@@ -300,7 +312,9 @@ fn write_gap(mut gap: u64, bytes: &mut Vec<u8>) {
 }
 
 impl ReferenceSummary {
-    /// Validate canonical bytes and prepare a membership view.
+    /// Attach the encoded bytes without scanning their bit or gap payload.
+    ///
+    /// Use [`validate_element`] for an explicit canonical-encoding audit.
     pub fn decode(blob: &Blob<ReferenceSummaryBlob>) -> Result<Self, ReferenceSummaryError> {
         let bytes = blob.bytes.as_ref();
         if bytes.len() < HEADER_LEN {
@@ -312,69 +326,59 @@ impl ReferenceSummary {
         if occupied > layout.bit_count() {
             return Err(ReferenceSummaryError::InvalidCount);
         }
-        let payload = &bytes[HEADER_LEN..];
-        let bits = match bytes[2] {
+        let payload = blob.bytes.clone().slice(HEADER_LEN..);
+        let form = bytes[2];
+        match form {
             SPARSE => {
-                if occupied > payload.len() as u64 {
+                // Each of the declared gaps occupies one to five bytes.
+                // Decoding those gaps is query work, not attachment work.
+                if occupied > payload.len() as u64 || payload.len() as u64 > occupied * 5 {
                     return Err(ReferenceSummaryError::InvalidCount);
                 }
-                let mut positions = Vec::with_capacity(occupied as usize);
-                let mut offset = 0;
-                let mut next = 0_u64;
-                for _ in 0..occupied {
-                    next += read_gap(payload, &mut offset)?;
-                    if next > layout.bit_count() {
-                        return Err(ReferenceSummaryError::PositionOutOfRange);
-                    }
-                    positions.push((next - 1) as u32);
-                }
-                if offset != payload.len() {
-                    return Err(ReferenceSummaryError::BadLength);
-                }
-                if payload.len() > layout.dense_len() {
-                    return Err(ReferenceSummaryError::NoncanonicalForm);
-                }
-                SummaryBits::Sparse(positions)
             }
             DENSE => {
                 if payload.len() != layout.dense_len() {
                     return Err(ReferenceSummaryError::BadLength);
                 }
-                if layout.log2_bits < 3 && payload[0] >> layout.bit_count() != 0 {
-                    return Err(ReferenceSummaryError::PositionOutOfRange);
-                }
-                let actual: u64 = payload
-                    .iter()
-                    .map(|byte| u64::from(byte.count_ones()))
-                    .sum();
-                if actual != occupied {
-                    return Err(ReferenceSummaryError::InvalidCount);
-                }
-                // Every positive gap needs at least one byte. Dense members
-                // above that lower bound need no per-position canonicality pass.
-                if occupied <= payload.len() as u64 {
-                    let mut prior = 0_u64;
-                    let mut sparse_len = 0;
-                    for position in dense_positions(payload) {
-                        let next = u64::from(position) + 1;
-                        sparse_len += gap_len(next - prior);
-                        prior = next;
-                        if sparse_len > payload.len() {
-                            break;
-                        }
-                    }
-                    if sparse_len <= payload.len() {
-                        return Err(ReferenceSummaryError::NoncanonicalForm);
-                    }
-                }
-                SummaryBits::Dense(blob.bytes.clone().slice(HEADER_LEN..))
             }
             form => return Err(ReferenceSummaryError::UnknownForm(form)),
-        };
+        }
         Ok(Self {
             layout,
             occupied,
-            bits,
+            form,
+            payload,
+        })
+    }
+
+    fn query_bits(&self) -> Result<SummaryBits, ReferenceSummaryError> {
+        if self.form == DENSE {
+            return Ok(SummaryBits::Dense(self.payload.clone()));
+        }
+        let mut positions = Vec::with_capacity(self.occupied as usize);
+        let mut offset = 0;
+        let mut next = 0_u64;
+        for _ in 0..self.occupied {
+            next += read_gap(&self.payload, &mut offset)?;
+            if next > self.layout.bit_count() {
+                return Err(ReferenceSummaryError::PositionOutOfRange);
+            }
+            positions.push((next - 1) as u32);
+        }
+        if offset != self.payload.len() {
+            return Err(ReferenceSummaryError::BadLength);
+        }
+        Ok(SummaryBits::Sparse(positions))
+    }
+
+    /// Prepare binary-search sparse or direct dense membership lookups.
+    ///
+    /// Keep the returned query for a batch of probes. Sparse gap decoding is
+    /// performed once here, never once per locator or when attaching a cover.
+    pub fn query(&self) -> Result<ReferenceSummaryQuery, ReferenceSummaryError> {
+        Ok(ReferenceSummaryQuery {
+            layout: self.layout,
+            members: vec![self.query_bits()?],
         })
     }
 
@@ -392,7 +396,9 @@ impl ReferenceSummary {
     pub fn is_empty(&self) -> bool {
         self.occupied == 0
     }
+}
 
+impl ReferenceSummaryQuery {
     /// Whether an opaque locator might be referenced.
     ///
     /// False proves absence only from the encoded set, whose completeness is
@@ -404,10 +410,10 @@ impl ReferenceSummary {
     }
 
     fn contains_position(&self, position: u32) -> bool {
-        match &self.bits {
+        self.members.iter().any(|bits| match bits {
             SummaryBits::Sparse(positions) => positions.binary_search(&position).is_ok(),
             SummaryBits::Dense(bytes) => bytes[position as usize / 8] & (1 << (position % 8)) != 0,
-        }
+        })
     }
 }
 
@@ -500,7 +506,42 @@ pub fn from_locators(
 
 /// Validate only the canonical encoding, not producer completeness or authority.
 pub fn validate_element(blob: &Blob<ReferenceSummaryBlob>) -> Result<(), ReferenceSummaryError> {
-    ReferenceSummary::decode(blob).map(|_| ())
+    let summary = ReferenceSummary::decode(blob)?;
+    match summary.query_bits()? {
+        SummaryBits::Sparse(_) => {
+            if summary.payload.len() > summary.layout.dense_len() {
+                return Err(ReferenceSummaryError::NoncanonicalForm);
+            }
+        }
+        SummaryBits::Dense(payload) => {
+            if summary.layout.log2_bits < 3 && payload[0] >> summary.layout.bit_count() != 0 {
+                return Err(ReferenceSummaryError::PositionOutOfRange);
+            }
+            let actual: u64 = payload
+                .iter()
+                .map(|byte| u64::from(byte.count_ones()))
+                .sum();
+            if actual != summary.occupied {
+                return Err(ReferenceSummaryError::InvalidCount);
+            }
+            if summary.occupied <= payload.len() as u64 {
+                let mut prior = 0_u64;
+                let mut sparse_len = 0;
+                for position in dense_positions(&payload) {
+                    let next = u64::from(position) + 1;
+                    sparse_len += gap_len(next - prior);
+                    prior = next;
+                    if sparse_len > payload.len() {
+                        break;
+                    }
+                }
+                if sparse_len <= payload.len() {
+                    return Err(ReferenceSummaryError::NoncanonicalForm);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Join two canonical members by union of their occupied positions.
@@ -519,7 +560,7 @@ pub fn join(
     if left.is_empty() {
         return Ok(high.clone());
     }
-    match (&left.bits, &right.bits) {
+    match (&left.query_bits()?, &right.query_bits()?) {
         (SummaryBits::Sparse(a), SummaryBits::Sparse(b)) => Ok(encode_positions(
             left.layout,
             a.iter().copied().merge(b.iter().copied()).dedup(),
@@ -559,8 +600,13 @@ pub fn derive_element<R>(
 where
     R: BlobStoreGet + BlobStoreMeta,
 {
-    super::simplearchive_union::validate_element(source)
-        .map_err(ReferenceSummaryError::InvalidSource)?;
+    // The mapping scans value-sized candidates, not facts or their ordering.
+    // It needs the source's row framing, not another canonicality proof.
+    let _: View<[[u8; 64]]> = source
+        .bytes
+        .clone()
+        .view()
+        .map_err(|_| ReferenceSummaryError::InvalidSource(UnarchiveError::BadArchive))?;
     let mut reached = HashSet::from([source.get_handle().raw]);
     let mut pending = vec![source.clone().transmute::<UnknownBlob>()];
     let mut positions = Vec::new();
@@ -635,14 +681,15 @@ impl CollectionEncoding for ReferenceSummaryBlob {
         R: BlobStoreGet + BlobStoreMeta,
     {
         let layout = descriptor_layout(descriptor)?;
-        let member = ReferenceSummary::decode(member)
+        let decoded = ReferenceSummary::decode(member)
             .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?;
-        if member.layout != layout {
+        if decoded.layout != layout {
             return Err(CollectionOperationError::Fatal(
                 ReferenceSummaryError::LayoutMismatch.to_string(),
             ));
         }
-        Ok(())
+        // An explicit audit; ordinary view construction only attaches bytes.
+        validate_element(member).map_err(|error| CollectionOperationError::Fatal(error.to_string()))
     }
 
     fn join_members<R>(
@@ -700,9 +747,10 @@ impl CollectionDerivation for ReferenceSummaryBlob {
 
 /// A lazy logical union of already-produced summary members.
 ///
-/// Attaching a cover performs no mappings, joins, source scans, or hashing.
+/// Attaching a cover performs no mappings, joins, payload scans, or hashing.
 /// Probe bits may be contributed by different members, exactly as in the
-/// physical Bloom union. This view only reads the known summary outputs.
+/// physical Bloom union. [`Self::query`] prepares the sparse membership indexes
+/// when needed. This view only reads the known summary outputs.
 #[derive(Clone, Debug)]
 pub struct ReferenceSummaryView {
     layout: ReferenceSummaryLayout,
@@ -715,12 +763,15 @@ impl ReferenceSummaryView {
         self.layout
     }
 
-    /// Test an opaque locator against the logical OR of all member bit sets.
-    pub fn contains_locator(&self, locator: [u8; 32]) -> bool {
-        self.layout.positions(locator).all(|position| {
-            self.members
+    /// Prepare membership lookups without serializing a merged summary.
+    pub fn query(&self) -> Result<ReferenceSummaryQuery, ReferenceSummaryError> {
+        Ok(ReferenceSummaryQuery {
+            layout: self.layout,
+            members: self
+                .members
                 .iter()
-                .any(|member| member.contains_position(position))
+                .map(ReferenceSummary::query_bits)
+                .collect::<Result<_, _>>()?,
         })
     }
 }
@@ -892,12 +943,15 @@ mod tests {
         );
         let decoded = ReferenceSummary::decode(&member).unwrap();
         assert_eq!(decoded.occupied_bits(), 4);
+        let query = decoded.query().unwrap();
         for position in [0, 126, 127, 255] {
-            assert!(decoded.contains_position(position));
+            assert!(query.contains_position(position));
         }
         let maximum = encode_positions(ReferenceSummaryLayout::default(), [u32::MAX].into_iter());
         assert_eq!(&maximum.bytes[HEADER_LEN..], &[128, 128, 128, 128, 16]);
         assert!(ReferenceSummary::decode(&maximum)
+            .unwrap()
+            .query()
             .unwrap()
             .contains_position(u32::MAX));
     }
@@ -911,7 +965,10 @@ mod tests {
         assert_eq!(two.bytes[2], DENSE);
         assert_eq!(&two.bytes[HEADER_LEN..], &[3]);
         assert!(matches!(
-            ReferenceSummary::decode(&two).unwrap().bits,
+            ReferenceSummary::decode(&two)
+                .unwrap()
+                .query_bits()
+                .unwrap(),
             SummaryBits::Dense(_)
         ));
         assert!(validate_element(&raw_member(layout, DENSE, 1, &[1])).is_err());
@@ -923,7 +980,54 @@ mod tests {
     }
 
     #[test]
-    fn malformed_members_are_rejected_before_identity_fast_paths() {
+    fn attachment_retains_payloads_and_defers_sparse_preparation() {
+        let layout = ReferenceSummaryLayout::new(8, 1).unwrap();
+        for member in [
+            encode_positions(layout, [0, 126, 255].into_iter()),
+            encode_positions(layout, 0..256),
+        ] {
+            let decoded = ReferenceSummary::decode(&member).unwrap();
+            assert_eq!(
+                decoded.payload.as_ptr(),
+                member.bytes[HEADER_LEN..].as_ptr()
+            );
+            assert!(decoded.query().unwrap().contains_position(0));
+            if let SummaryBits::Dense(bytes) = decoded.query_bits().unwrap() {
+                assert_eq!(bytes.as_ptr(), decoded.payload.as_ptr());
+            }
+        }
+
+        // The framing is readable; the unterminated sparse gap is diagnosed
+        // only when a query actually decodes it, or by an explicit audit.
+        let malformed = raw_member(layout, SPARSE, 1, &[128]);
+        let decoded = ReferenceSummary::decode(&malformed).unwrap();
+        assert!(decoded.query().is_err());
+        assert!(validate_element(&malformed).is_err());
+    }
+
+    #[test]
+    fn dense_attachment_does_not_recount_or_reprove_shortest_form() {
+        let layout = ReferenceSummaryLayout::new(8, 1).unwrap();
+        let member = raw_member(layout, DENSE, 256, &[0; 32]);
+        let decoded = ReferenceSummary::decode(&member).unwrap();
+        assert_eq!(decoded.occupied_bits(), 256, "the header is not re-derived");
+        assert!(!decoded.query().unwrap().contains_locator([0; 32]));
+        assert!(validate_element(&member).is_err());
+
+        let noncanonical = raw_member(ReferenceSummaryLayout::new(3, 1).unwrap(), DENSE, 1, &[1]);
+        assert!(ReferenceSummary::decode(&noncanonical)
+            .unwrap()
+            .query()
+            .unwrap()
+            .contains_locator([0; 32]));
+        assert!(validate_element(&noncanonical).is_err());
+
+        let truncated = raw_member(layout, DENSE, 1, &[1]);
+        assert!(ReferenceSummary::decode(&truncated).is_err());
+    }
+
+    #[test]
+    fn explicit_audit_rejects_noncanonical_members() {
         let layout = ReferenceSummaryLayout::new(8, 1).unwrap();
         let malformed = [
             Blob::new(Bytes::from_source(Vec::<u8>::new())),
@@ -941,7 +1045,6 @@ mod tests {
         ];
         for member in malformed {
             assert!(validate_element(&member).is_err());
-            assert!(join(&member, &member).is_err());
         }
         let other = empty(ReferenceSummaryLayout::new(9, 1).unwrap());
         assert!(matches!(
@@ -1000,11 +1103,14 @@ mod tests {
             }
             assert_eq!(whole, joined);
             let decoded = ReferenceSummary::decode(&joined).unwrap();
+            let query = decoded.query().unwrap();
             for locator in &locators {
-                assert!(decoded.contains_locator(*locator));
+                assert!(query.contains_locator(*locator));
             }
             assert!(ReferenceSummary::decode(&empty(layout)).unwrap().is_empty());
             assert!(!ReferenceSummary::decode(&empty(layout))
+                .unwrap()
+                .query()
                 .unwrap()
                 .contains_locator(locators[0]));
         }
@@ -1159,8 +1265,12 @@ mod tests {
         let locator = [0; 32];
         assert!(!ReferenceSummary::decode(&left)
             .unwrap()
+            .query()
+            .unwrap()
             .contains_locator(locator));
         assert!(!ReferenceSummary::decode(&right)
+            .unwrap()
+            .query()
             .unwrap()
             .contains_locator(locator));
         let mut store = MemoryBlobStore::default();
@@ -1172,10 +1282,12 @@ mod tests {
         let view =
             ReferenceSummaryView::try_from_cover(&cover, &descriptor(layout), &reader).unwrap();
         assert!(
-            view.contains_locator(locator),
+            view.query().unwrap().contains_locator(locator),
             "probe bits may come from different members"
         );
         assert!(ReferenceSummary::decode(&join(&left, &right).unwrap())
+            .unwrap()
+            .query()
             .unwrap()
             .contains_locator(locator));
         assert_eq!(reader.gets.borrow().len(), 2);
@@ -1189,6 +1301,6 @@ mod tests {
             &reader,
         )
         .unwrap();
-        assert!(!none.contains_locator(locator));
+        assert!(!none.query().unwrap().contains_locator(locator));
     }
 }

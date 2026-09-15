@@ -35,11 +35,13 @@
 //! Tokenization is deliberately outside this type.  Callers supply typed term
 //! values produced by their own explicit recipe.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 use std::convert::Infallible;
 use std::fmt;
 use std::marker::PhantomData;
 use std::ops::Range;
+use std::sync::{Arc, OnceLock};
 
 use anybytes::Bytes;
 use triblespace_core::blob::{Blob, BlobEncoding, TryFromBlob};
@@ -95,12 +97,8 @@ impl CollectionEncoding for PortableBM25Blob {
     where
         R: triblespace_core::repo::BlobStoreGet + triblespace_core::repo::BlobStoreMeta,
     {
-        PortableBM25Index::<
-            triblespace_core::inline::encodings::UnknownInline,
-            triblespace_core::inline::encodings::UnknownInline,
-        >::try_from_blob(member.clone())
-        .map(|_| ())
-        .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
+        validate_canonical(member.bytes.as_ref())
+            .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
 
     fn join_members<R>(
@@ -160,18 +158,39 @@ struct Layout {
     ends: Range<usize>,
 }
 
-/// Attached, queryable view of one canonical [`PortableBM25Blob`].
+/// Attached view of one [`PortableBM25Blob`].
 ///
-/// The canonical bytes stay zero-copy.  Attachment validates the complete
-/// grammar and derives only per-document lengths plus the average length in
-/// memory.  These caches are reproducible and excluded from content identity.
+/// Attachment checks only the fixed-width framing and keeps the bytes shared.
+/// Canonicality belongs to [`validate_canonical`], not ordinary reading. The
+/// statistics absent from the wire are computed only when scoring needs them.
 pub struct PortableBM25Index<D: InlineEncoding = GenId, T: InlineEncoding = crate::tokens::WordHash>
 {
     bytes: Bytes,
     layout: Layout,
+    statistics: Arc<OnceLock<Result<Statistics, PortableBM25Error>>>,
+    _phantom: PhantomData<(D, T)>,
+}
+
+#[derive(Debug)]
+struct Statistics {
     doc_lens: Vec<u64>,
     avg_doc_len: f32,
-    _phantom: PhantomData<(D, T)>,
+}
+
+impl Statistics {
+    fn new(doc_lens: Vec<u64>) -> Self {
+        // Preserve the established BM25 runtime's rounding: sum in f64,
+        // round the total to f32, then divide in f32. Score parity is bitwise.
+        let avg_doc_len = if doc_lens.is_empty() {
+            0.0
+        } else {
+            doc_lens.iter().map(|&length| length as f64).sum::<f64>() as f32 / doc_lens.len() as f32
+        };
+        Self {
+            doc_lens,
+            avg_doc_len,
+        }
+    }
 }
 
 impl<D: InlineEncoding, T: InlineEncoding> Clone for PortableBM25Index<D, T> {
@@ -179,8 +198,7 @@ impl<D: InlineEncoding, T: InlineEncoding> Clone for PortableBM25Index<D, T> {
         Self {
             bytes: self.bytes.clone(),
             layout: self.layout.clone(),
-            doc_lens: self.doc_lens.clone(),
-            avg_doc_len: self.avg_doc_len,
+            statistics: self.statistics.clone(),
             _phantom: PhantomData,
         }
     }
@@ -192,7 +210,7 @@ impl<D: InlineEncoding, T: InlineEncoding> fmt::Debug for PortableBM25Index<D, T
             .field("doc_count", &self.layout.doc_count)
             .field("term_count", &self.layout.term_count)
             .field("posting_count", &self.layout.posting_count)
-            .field("avg_doc_len", &self.avg_doc_len)
+            .field("statistics", &self.statistics.get())
             .finish()
     }
 }
@@ -326,29 +344,17 @@ impl<D: InlineEncoding, T: InlineEncoding> PortableBM25Index<D, T> {
         Self::from_bytes(Bytes::from(encoded))
     }
 
-    /// Validate canonical bytes and attach a queryable resident view.
+    /// Attach shared bytes after fixed-width framing checks only.
+    ///
+    /// This does not scan document/term tables or postings, certify canonical
+    /// order, or compute scoring statistics. Use [`validate_canonical`] for an
+    /// explicit audit; scoring reports malformed offsets/ordinals on use.
     pub fn from_bytes(bytes: Bytes) -> Result<Self, PortableBM25Error> {
-        let layout = validate_layout(bytes.as_ref())?;
-        let mut doc_lens = vec![0u64; layout.doc_count];
-        for posting in 0..layout.posting_count {
-            let (document, frequency) = read_posting(bytes.as_ref(), &layout, posting);
-            doc_lens[document as usize] = doc_lens[document as usize]
-                .checked_add(u64::from(frequency))
-                .ok_or_else(|| PortableBM25Error::new("derived document length overflows u64"))?;
-        }
-        let avg_doc_len = if doc_lens.is_empty() {
-            0.0
-        } else {
-            // Preserve the established BM25 runtime's rounding: accumulate
-            // document lengths in f64, round the total to f32, then divide in
-            // f32. Query parity includes score bits.
-            doc_lens.iter().map(|&length| length as f64).sum::<f64>() as f32 / doc_lens.len() as f32
-        };
+        let layout = read_layout(bytes.as_ref())?;
         Ok(Self {
             bytes,
             layout,
-            doc_lens,
-            avg_doc_len,
+            statistics: Arc::new(OnceLock::new()),
             _phantom: PhantomData,
         })
     }
@@ -373,7 +379,8 @@ impl<D: InlineEncoding, T: InlineEncoding> PortableBM25Index<D, T> {
         let mut counts: BTreeMap<(RawInline, RawInline), u32> = BTreeMap::new();
         for index in indexes {
             documents.extend(index.raw_document_keys());
-            for (document, term, frequency) in index.raw_exact_frequencies() {
+            for row in index.raw_exact_frequencies() {
+                let (document, term, frequency) = row?;
                 counts
                     .entry((term, document))
                     .and_modify(|old| *old = (*old).max(frequency))
@@ -417,120 +424,88 @@ impl<D: InlineEncoding, T: InlineEncoding> PortableBM25Index<D, T> {
         (0..self.layout.doc_count).map(|code| self.document_raw(code))
     }
 
-    /// Iterate every positive exact frequency in term-major canonical order.
-    pub fn exact_frequencies(&self) -> impl Iterator<Item = (Inline<D>, Inline<T>, u32)> + '_ {
-        self.raw_exact_frequencies()
-            .map(|(document, term, frequency)| {
+    /// Iterate exact frequencies, checking offsets and document ordinals on use.
+    ///
+    /// Canonical input is term-major. Ordering/uniqueness and positive TF are
+    /// the explicit validator's contract, not prerequisites for memory safety.
+    pub fn exact_frequencies(
+        &self,
+    ) -> impl Iterator<Item = Result<(Inline<D>, Inline<T>, u32), PortableBM25Error>> + '_ {
+        self.raw_exact_frequencies().map(|row| {
+            row.map(|(document, term, frequency)| {
                 (Inline::new(document), Inline::new(term), frequency)
-            })
-    }
-
-    fn raw_exact_frequencies(&self) -> impl Iterator<Item = (RawInline, RawInline, u32)> + '_ {
-        (0..self.layout.term_count).flat_map(move |term_index| {
-            let term = self.term_raw(term_index);
-            self.posting_range(term_index).map(move |posting| {
-                let (document, frequency) = self.posting(posting);
-                (self.document_raw(document as usize), term, frequency)
             })
         })
     }
 
-    /// Derived token length for document ordinal `code`.
-    pub fn doc_len(&self, code: usize) -> Option<u64> {
-        self.doc_lens.get(code).copied()
-    }
-
-    /// Derived average document length under the joined logical corpus.
-    pub fn avg_doc_len(&self) -> f32 {
-        self.avg_doc_len
+    fn raw_exact_frequencies(&self) -> ExactFrequencies<'_, D, T> {
+        ExactFrequencies {
+            index: self,
+            next_term: 0,
+            term: [0; RAW_INLINE_LEN],
+            postings: 0..0,
+        }
     }
 
     /// Number of documents containing `term`.
-    pub fn doc_frequency(&self, term: &Inline<T>) -> usize {
+    pub fn doc_frequency(&self, term: &Inline<T>) -> Result<usize, PortableBM25Error> {
         self.find_term(&term.raw)
-            .map(|term_index| self.posting_range(term_index).len())
-            .unwrap_or(0)
+            .map(|term_index| {
+                self.checked_posting_range(term_index)
+                    .map(|range| range.len())
+            })
+            .unwrap_or(Ok(0))
     }
 
     /// Exact term frequency, or zero when the pair is absent.
-    pub fn term_frequency(&self, document: &Inline<D>, term: &Inline<T>) -> u32 {
+    pub fn term_frequency(
+        &self,
+        document: &Inline<D>,
+        term: &Inline<T>,
+    ) -> Result<u32, PortableBM25Error> {
         let (Some(document), Some(term)) =
             (self.find_document(&document.raw), self.find_term(&term.raw))
         else {
-            return 0;
+            return Ok(0);
         };
-        let range = self.posting_range(term);
+        let range = self.checked_posting_range(term)?;
         let mut low = range.start;
         let mut high = range.end;
         while low < high {
             let middle = low + (high - low) / 2;
-            match self.posting(middle).0.cmp(&(document as u32)) {
+            let (candidate, frequency) = self.checked_posting(middle)?;
+            match candidate.cmp(&(document as u32)) {
                 std::cmp::Ordering::Less => low = middle + 1,
                 std::cmp::Ordering::Greater => high = middle,
-                std::cmp::Ordering::Equal => return self.posting(middle).1,
+                std::cmp::Ordering::Equal => return Ok(frequency),
             }
         }
-        0
+        Ok(0)
     }
 
-    /// Iterate `(document, score)` for one typed term.
-    pub fn query_term<'a>(
-        &'a self,
-        term: &Inline<T>,
-    ) -> impl Iterator<Item = (Inline<D>, f32)> + 'a {
-        let range = self
-            .find_term(&term.raw)
-            .map(|term_index| self.posting_range(term_index))
-            .unwrap_or(0..0);
-        let document_frequency = range.len();
-        range.map(move |posting| {
-            let (document, frequency) = self.posting(posting);
-            let score = bm25_score(
-                self.layout.doc_count,
-                document_frequency,
-                frequency,
-                self.doc_lens[document as usize],
-                self.avg_doc_len,
-            );
-            (Inline::new(self.document_raw(document as usize)), score)
-        })
-    }
-
-    /// Rank a bag-of-words query under the attached corpus.
+    /// Prepare scoring, deriving the absent document lengths only on first use.
     ///
-    /// Repeated query terms contribute repeatedly.  Results sort by descending
-    /// score and then ascending canonical document key.
-    pub fn query_multi(&self, terms: &[Inline<T>]) -> Vec<(Inline<D>, f32)> {
-        let mut scores: HashMap<u32, f32> = HashMap::new();
-        for term in terms {
-            let Some(term_index) = self.find_term(&term.raw) else {
-                continue;
-            };
-            let range = self.posting_range(term_index);
-            let document_frequency = range.len();
-            for posting in range {
-                let (document, frequency) = self.posting(posting);
-                let score = bm25_score(
-                    self.layout.doc_count,
-                    document_frequency,
-                    frequency,
-                    self.doc_lens[document as usize],
-                    self.avg_doc_len,
-                );
-                *scores.entry(document).or_insert(0.0) += score;
+    /// The wire does not store lengths, so this necessarily visits all postings
+    /// once. This checks access bounds, not canonical order or semantic truth.
+    /// Clones share both the mapped bytes and this immutable result.
+    pub fn query(&self) -> Result<PortableBM25Query<'_, D, T>, PortableBM25Error> {
+        let statistics = self.statistics.get_or_init(|| {
+            let mut doc_lens = vec![0u64; self.layout.doc_count];
+            for term in 0..self.layout.term_count {
+                for posting in self.checked_posting_range(term)? {
+                    let (document, frequency) = self.checked_posting(posting)?;
+                    let length = &mut doc_lens[document as usize];
+                    *length = length.checked_add(u64::from(frequency)).ok_or_else(|| {
+                        PortableBM25Error::new("derived document length overflows u64")
+                    })?;
+                }
             }
-        }
-        let mut ranked: Vec<_> = scores.into_iter().collect();
-        ranked.sort_unstable_by(|left, right| {
-            right
-                .1
-                .total_cmp(&left.1)
-                .then_with(|| left.0.cmp(&right.0))
+            Ok(Statistics::new(doc_lens))
         });
-        ranked
-            .into_iter()
-            .map(|(document, score)| (Inline::new(self.document_raw(document as usize)), score))
-            .collect()
+        Ok(PortableBM25Query {
+            corpus: QueryCorpus::Single(self),
+            statistics: statistics.as_ref().map_err(Clone::clone)?,
+        })
     }
 
     fn document_raw(&self, code: usize) -> RawInline {
@@ -543,6 +518,39 @@ impl<D: InlineEncoding, T: InlineEncoding> PortableBM25Index<D, T> {
 
     fn posting(&self, posting: usize) -> (u32, u32) {
         read_posting(&self.bytes, &self.layout, posting)
+    }
+
+    fn checked_posting(&self, posting: usize) -> Result<(u32, u32), PortableBM25Error> {
+        if posting >= self.layout.posting_count {
+            return Err(PortableBM25Error::new(
+                "posting is outside the posting table",
+            ));
+        }
+        let pair = self.posting(posting);
+        if pair.0 as usize >= self.layout.doc_count {
+            return Err(PortableBM25Error::new(
+                "posting document ordinal is outside the document table",
+            ));
+        }
+        Ok(pair)
+    }
+
+    fn checked_posting_range(&self, term: usize) -> Result<Range<usize>, PortableBM25Error> {
+        let end = read_u64(&self.bytes, self.layout.ends.start + term * OFFSET_LEN);
+        let start = if term == 0 {
+            0
+        } else {
+            read_u64(
+                &self.bytes,
+                self.layout.ends.start + (term - 1) * OFFSET_LEN,
+            )
+        };
+        if start > end || end > self.layout.posting_count as u64 {
+            return Err(PortableBM25Error::new(
+                "posting offsets are outside the posting table",
+            ));
+        }
+        Ok(start as usize..end as usize)
     }
 
     fn posting_range(&self, term: usize) -> Range<usize> {
@@ -567,6 +575,325 @@ impl<D: InlineEncoding, T: InlineEncoding> PortableBM25Index<D, T> {
     }
 }
 
+/// A shard-preserving logical BM25 cover, without a synthesized physical blob.
+///
+/// Attachment owns only the small list of shared carrier views. The first
+/// [`query`](Self::query) derives global corpus statistics under document union
+/// and pointwise maximum TF. Neither attachment nor scoring serializes or
+/// hashes the logical union. Explicit [`PortableBM25Index::merge`] remains the
+/// producer operation when a persisted compacted carrier is actually wanted.
+pub struct PortableBM25View<D: InlineEncoding = GenId, T: InlineEncoding = crate::tokens::WordHash>
+{
+    segments: Vec<PortableBM25Index<D, T>>,
+    statistics: Arc<OnceLock<Result<JoinedStatistics, PortableBM25Error>>>,
+}
+
+struct JoinedStatistics {
+    documents: Vec<RawInline>,
+    statistics: Statistics,
+}
+
+impl<D: InlineEncoding, T: InlineEncoding> Clone for PortableBM25View<D, T> {
+    fn clone(&self) -> Self {
+        Self {
+            segments: self.segments.clone(),
+            statistics: self.statistics.clone(),
+        }
+    }
+}
+
+impl<D: InlineEncoding, T: InlineEncoding> PortableBM25View<D, T> {
+    /// Interpret already attached carriers as one logical union, without work
+    /// proportional to their postings or document domains.
+    pub fn from_segments(segments: impl IntoIterator<Item = PortableBM25Index<D, T>>) -> Self {
+        Self {
+            segments: segments.into_iter().collect(),
+            statistics: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// Inspect the exact backing carriers without preparing scoring statistics.
+    pub fn segments(&self) -> &[PortableBM25Index<D, T>] {
+        &self.segments
+    }
+
+    /// Prepare scoring under the entire logical corpus, not per-segment IDFs.
+    ///
+    /// The first call scans the carriers' frequencies with a streaming max
+    /// join. Only the union document domain and lengths are retained; there is
+    /// no owning copy of the full frequency relation. Later queries reuse the
+    /// immutable statistics and join only the requested term postings.
+    pub fn query(&self) -> Result<PortableBM25Query<'_, D, T>, PortableBM25Error> {
+        if let [segment] = self.segments.as_slice() {
+            return segment.query();
+        }
+        let joined = self
+            .statistics
+            .get_or_init(|| {
+                let mut lengths: BTreeMap<RawInline, u64> = self
+                    .segments
+                    .iter()
+                    .flat_map(|segment| segment.raw_document_keys())
+                    .map(|document| (document, 0))
+                    .collect();
+                for row in MergedFrequencies::new(&self.segments)? {
+                    let (document, _, frequency) = row?;
+                    let length = lengths
+                        .get_mut(&document)
+                        .expect("posting's checked document domain");
+                    *length = length.checked_add(u64::from(frequency)).ok_or_else(|| {
+                        PortableBM25Error::new("derived document length overflows u64")
+                    })?;
+                }
+                let (documents, doc_lens) = lengths.into_iter().unzip();
+                Ok(JoinedStatistics {
+                    documents,
+                    statistics: Statistics::new(doc_lens),
+                })
+            })
+            .as_ref()
+            .map_err(Clone::clone)?;
+        Ok(PortableBM25Query {
+            corpus: QueryCorpus::Union {
+                segments: &self.segments,
+                documents: &joined.documents,
+            },
+            statistics: &joined.statistics,
+        })
+    }
+}
+
+enum QueryCorpus<'a, D: InlineEncoding, T: InlineEncoding> {
+    Single(&'a PortableBM25Index<D, T>),
+    Union {
+        segments: &'a [PortableBM25Index<D, T>],
+        documents: &'a [RawInline],
+    },
+}
+
+/// A prepared, bounds-checked scoring view over one immutable logical corpus.
+///
+/// Construction is fallible through `Index::query` or `View::query`; after that
+/// the usual infallible BM25/query-constraint surface cannot conceal corrupt
+/// offsets as empty results. Canonical semantics remain the producer/auditor's
+/// responsibility, rather than being recomputed to trust every read.
+pub struct PortableBM25Query<
+    'a,
+    D: InlineEncoding = GenId,
+    T: InlineEncoding = crate::tokens::WordHash,
+> {
+    corpus: QueryCorpus<'a, D, T>,
+    statistics: &'a Statistics,
+}
+
+impl<D: InlineEncoding, T: InlineEncoding> PortableBM25Query<'_, D, T> {
+    /// Number of distinct documents, including empty documents.
+    pub fn doc_count(&self) -> usize {
+        self.statistics.doc_lens.len()
+    }
+
+    /// Token length for one document in canonical document-key order.
+    pub fn doc_len(&self, code: usize) -> Option<u64> {
+        self.statistics.doc_lens.get(code).copied()
+    }
+
+    /// Global average length, with the established BM25 rounding.
+    pub fn avg_doc_len(&self) -> f32 {
+        self.statistics.avg_doc_len
+    }
+
+    /// Iterate `(document, score)` for one term using global corpus statistics.
+    pub fn query_term<'q>(
+        &'q self,
+        term: &Inline<T>,
+    ) -> impl Iterator<Item = (Inline<D>, f32)> + 'q {
+        let (single, union) = match &self.corpus {
+            QueryCorpus::Single(index) => {
+                let range = index
+                    .find_term(&term.raw)
+                    .map(|code| index.posting_range(code))
+                    .unwrap_or(0..0);
+                (Some((*index, range)), None)
+            }
+            QueryCorpus::Union {
+                segments,
+                documents,
+            } => {
+                let mut frequencies: BTreeMap<RawInline, u32> = BTreeMap::new();
+                for segment in *segments {
+                    if let Some(code) = segment.find_term(&term.raw) {
+                        for posting in segment.posting_range(code) {
+                            let (document, frequency) = segment.posting(posting);
+                            frequencies
+                                .entry(segment.document_raw(document as usize))
+                                .and_modify(|old| *old = (*old).max(frequency))
+                                .or_insert(frequency);
+                        }
+                    }
+                }
+                (None, Some((*documents, frequencies)))
+            }
+        };
+        let single_frequency = single.as_ref().map(|(_, range)| range.len()).unwrap_or(0);
+        let union_frequency = union
+            .as_ref()
+            .map(|(_, frequencies)| frequencies.len())
+            .unwrap_or(0);
+        single
+            .into_iter()
+            .flat_map(move |(index, range)| {
+                range.map(move |posting| {
+                    let (document, frequency) = index.posting(posting);
+                    let score = bm25_score(
+                        self.doc_count(),
+                        single_frequency,
+                        frequency,
+                        self.statistics.doc_lens[document as usize],
+                        self.avg_doc_len(),
+                    );
+                    (Inline::new(index.document_raw(document as usize)), score)
+                })
+            })
+            .chain(union.into_iter().flat_map(move |(documents, frequencies)| {
+                frequencies.into_iter().map(move |(document, frequency)| {
+                    let code = documents
+                        .binary_search(&document)
+                        .expect("prepared document domain");
+                    let score = bm25_score(
+                        self.doc_count(),
+                        union_frequency,
+                        frequency,
+                        self.statistics.doc_lens[code],
+                        self.avg_doc_len(),
+                    );
+                    (Inline::new(document), score)
+                })
+            }))
+    }
+
+    /// Rank a bag-of-words query. Repeated terms contribute repeatedly; ties
+    /// resolve by ascending document key, independently of physical cover.
+    pub fn query_multi(&self, terms: &[Inline<T>]) -> Vec<(Inline<D>, f32)> {
+        let mut scores: HashMap<RawInline, f32> = HashMap::new();
+        for term in terms {
+            for (document, score) in self.query_term(term) {
+                *scores.entry(document.raw).or_insert(0.0) += score;
+            }
+        }
+        let mut ranked: Vec<_> = scores.into_iter().collect();
+        ranked.sort_unstable_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        ranked
+            .into_iter()
+            .map(|(document, score)| (Inline::new(document), score))
+            .collect()
+    }
+}
+
+struct ExactFrequencies<'a, D: InlineEncoding, T: InlineEncoding> {
+    index: &'a PortableBM25Index<D, T>,
+    next_term: usize,
+    term: RawInline,
+    postings: Range<usize>,
+}
+
+impl<D: InlineEncoding, T: InlineEncoding> Iterator for ExactFrequencies<'_, D, T> {
+    type Item = Result<(RawInline, RawInline, u32), PortableBM25Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(posting) = self.postings.next() {
+                return Some(
+                    self.index
+                        .checked_posting(posting)
+                        .map(|(document, frequency)| {
+                            (
+                                self.index.document_raw(document as usize),
+                                self.term,
+                                frequency,
+                            )
+                        }),
+                );
+            }
+            if self.next_term == self.index.layout.term_count {
+                return None;
+            }
+            let term = self.next_term;
+            self.next_term += 1;
+            self.term = self.index.term_raw(term);
+            match self.index.checked_posting_range(term) {
+                Ok(range) => self.postings = range,
+                Err(error) => {
+                    self.next_term = self.index.layout.term_count;
+                    return Some(Err(error));
+                }
+            }
+        }
+    }
+}
+
+/// Stream the canonical frequency union with one cursor/head per carrier.
+/// The head keys carry term and document, not a second owning frequency index.
+struct MergedFrequencies<'a, D: InlineEncoding, T: InlineEncoding> {
+    inputs: Vec<ExactFrequencies<'a, D, T>>,
+    heads: BinaryHeap<Reverse<(RawInline, RawInline, usize, u32)>>,
+}
+
+impl<'a, D: InlineEncoding, T: InlineEncoding> MergedFrequencies<'a, D, T> {
+    fn new(indexes: &'a [PortableBM25Index<D, T>]) -> Result<Self, PortableBM25Error> {
+        let mut merged = Self {
+            inputs: indexes
+                .iter()
+                .map(|index| index.raw_exact_frequencies())
+                .collect(),
+            heads: BinaryHeap::new(),
+        };
+        for index in 0..merged.inputs.len() {
+            merged.advance(index)?;
+        }
+        Ok(merged)
+    }
+
+    fn advance(&mut self, index: usize) -> Result<(), PortableBM25Error> {
+        if let Some(row) = self.inputs[index].next() {
+            let (document, term, frequency) = row?;
+            self.heads.push(Reverse((term, document, index, frequency)));
+        }
+        Ok(())
+    }
+}
+
+impl<D: InlineEncoding, T: InlineEncoding> Iterator for MergedFrequencies<'_, D, T> {
+    type Item = Result<(RawInline, RawInline, u32), PortableBM25Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let Reverse((term, document, index, mut frequency)) = self.heads.pop()?;
+        if let Err(error) = self.advance(index) {
+            self.heads.clear();
+            return Some(Err(error));
+        }
+        while self
+            .heads
+            .peek()
+            .is_some_and(|Reverse((next_term, next_document, _, _))| {
+                *next_term == term && *next_document == document
+            })
+        {
+            let Reverse((_, _, index, next_frequency)) = self.heads.pop().expect("peeked head");
+            frequency = frequency.max(next_frequency);
+            if let Err(error) = self.advance(index) {
+                self.heads.clear();
+                return Some(Err(error));
+            }
+        }
+        Some(Ok((document, term, frequency)))
+    }
+}
+
 fn binary_search_raw(
     len: usize,
     value: &RawInline,
@@ -585,7 +912,7 @@ fn binary_search_raw(
     None
 }
 
-fn validate_layout(bytes: &[u8]) -> Result<Layout, PortableBM25Error> {
+fn read_layout(bytes: &[u8]) -> Result<Layout, PortableBM25Error> {
     if bytes.len() < FOOTER_LEN {
         return Err(PortableBM25Error::new(
             "portable BM25 payload is shorter than its count footer",
@@ -640,7 +967,45 @@ fn validate_layout(bytes: &[u8]) -> Result<Layout, PortableBM25Error> {
             "portable BM25 section arithmetic does not reach the footer",
         ));
     }
+    if term_count == 0 {
+        if posting_count != 0 {
+            return Err(PortableBM25Error::new(
+                "a corpus without terms cannot contain postings",
+            ));
+        }
+    } else if read_u64(bytes, ends.end - OFFSET_LEN) != posting_count as u64 {
+        return Err(PortableBM25Error::new(
+            "the final posting offset must reach the count footer",
+        ));
+    }
 
+    Ok(Layout {
+        doc_count,
+        term_count,
+        posting_count,
+        documents,
+        terms,
+        postings,
+        ends,
+    })
+}
+
+/// Explicitly audit the complete canonical portable BM25 representation.
+///
+/// Unlike ordinary attachment, this scans both sorted domains and every
+/// posting, checking ordering, uniqueness, positive frequencies and framing.
+/// It does not retokenize source documents or reconstruct a new encoded blob.
+pub fn validate_canonical(bytes: &[u8]) -> Result<(), PortableBM25Error> {
+    let layout = read_layout(bytes)?;
+    let Layout {
+        doc_count,
+        term_count,
+        posting_count,
+        documents,
+        terms,
+        postings,
+        ends,
+    } = layout;
     validate_strict_table(bytes, &documents, doc_count, "document")?;
     validate_strict_table(bytes, &terms, term_count, "term")?;
 
@@ -694,15 +1059,7 @@ fn validate_layout(bytes: &[u8]) -> Result<Layout, PortableBM25Error> {
         }
     }
 
-    Ok(Layout {
-        doc_count,
-        term_count,
-        posting_count,
-        documents,
-        terms,
-        postings,
-        ends,
-    })
+    Ok(())
 }
 
 fn validate_strict_table(
@@ -810,7 +1167,7 @@ impl<D: InlineEncoding, T: InlineEncoding> TryFromBlob<PortableBM25Blob>
 }
 
 impl<D: InlineEncoding, T: InlineEncoding> TryFromCover<PortableBM25Blob>
-    for PortableBM25Index<D, T>
+    for PortableBM25View<D, T>
 {
     type Error = PortableBM25Error;
 
@@ -828,12 +1185,9 @@ impl<D: InlineEncoding, T: InlineEncoding> TryFromCover<PortableBM25Blob>
             let blob: Blob<PortableBM25Blob> = snapshot
                 .get(handle)
                 .map_err(|source| TryFromCoverError::MemberGet { member, source })?;
-            segments.push(Self::try_from_blob(blob).map_err(TryFromCoverError::View)?);
+            segments.push(PortableBM25Index::try_from_blob(blob).map_err(TryFromCoverError::View)?);
         }
-        match segments.len() {
-            1 => Ok(segments.pop().expect("one portable BM25 cover member")),
-            _ => Self::merge(segments.iter()).map_err(TryFromCoverError::View),
-        }
+        Ok(Self::from_segments(segments))
     }
 }
 
@@ -847,6 +1201,7 @@ mod tests {
     use triblespace_core::repo::SnapshotSource;
 
     type TestIndex = PortableBM25Index<UnknownInline, UnknownInline>;
+    type TestView = PortableBM25View<UnknownInline, UnknownInline>;
 
     fn value(last: u8) -> Inline<UnknownInline> {
         let mut raw = [0u8; RAW_INLINE_LEN];
@@ -890,6 +1245,233 @@ mod tests {
     }
 
     #[test]
+    fn attachment_and_singleton_cover_share_backing_and_do_not_prepare_scores() {
+        let bytes = Bytes::from(decode_hex(GOLDEN));
+        let pointer = bytes.as_ref().as_ptr();
+        let index = TestIndex::from_bytes(bytes.clone()).unwrap();
+        assert_eq!(index.bytes().as_ref().as_ptr(), pointer);
+        assert_eq!(index.doc_count(), 3);
+        assert_eq!(index.term_count(), 2);
+        assert_eq!(index.posting_count(), 3);
+        assert_eq!(index.document_keys().count(), 3);
+        assert!(index.statistics.get().is_none());
+
+        let cloned = index.clone();
+        let view = TestView::from_segments([index]);
+        assert_eq!(view.segments()[0].bytes().as_ref().as_ptr(), pointer);
+        assert!(view.statistics.get().is_none());
+        assert!(view.segments()[0].statistics.get().is_none());
+        assert!(cloned.statistics.get().is_none());
+        let query = view.query().unwrap();
+        assert_eq!(query.doc_len(0), Some(3));
+        assert_eq!(query.doc_len(2), Some(0));
+        assert!(
+            view.statistics.get().is_none(),
+            "singleton does not build union metadata"
+        );
+        assert!(
+            cloned.statistics.get().is_some(),
+            "clones share lazy statistics"
+        );
+        assert!(std::ptr::eq(
+            query.statistics,
+            cloned.query().unwrap().statistics
+        ));
+        assert!(std::ptr::eq(
+            query.statistics,
+            view.query().unwrap().statistics
+        ));
+        assert_eq!(view.segments()[0].bytes().as_ref().as_ptr(), pointer);
+    }
+
+    #[test]
+    fn canonical_audit_is_separate_from_attachment_and_scoring() {
+        let mut bytes = decode_hex(GOLDEN);
+        let layout = read_layout(&bytes).unwrap();
+        // Positive TF and table order are canonical semantic requirements, not
+        // memory-safety bounds. Ordinary reading does not certify them again.
+        bytes[layout.postings.start + 4..layout.postings.start + 8].fill(0);
+        bytes[..2 * RAW_INLINE_LEN].rotate_left(RAW_INLINE_LEN);
+        assert!(validate_canonical(&bytes).is_err());
+        let index = TestIndex::from_bytes(Bytes::from(bytes)).unwrap();
+        assert!(index.statistics.get().is_none());
+        assert!(index.query().is_ok());
+        let blob: Blob<PortableBM25Blob> = (&index).to_blob();
+        let mut store = MemoryRepo::default();
+        assert!(PortableBM25Blob::validate_member(
+            &Fragment::empty(),
+            &blob,
+            &store.snapshot().unwrap()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn malformed_query_bounds_fail_on_use_without_panics_or_empty_success() {
+        let baseline = decode_hex(GOLDEN);
+        let layout = read_layout(&baseline).unwrap();
+        assert!(TestIndex::from_bytes(Bytes::from(baseline[..FOOTER_LEN - 1].to_vec())).is_err());
+        assert!(
+            TestIndex::from_bytes(Bytes::from(baseline[..baseline.len() - 1].to_vec())).is_err()
+        );
+        for count_offset in [baseline.len() - FOOTER_LEN, baseline.len() - OFFSET_LEN] {
+            let mut oversized = baseline.clone();
+            oversized[count_offset..count_offset + OFFSET_LEN]
+                .copy_from_slice(&u64::MAX.to_le_bytes());
+            assert!(TestIndex::from_bytes(Bytes::from(oversized)).is_err());
+        }
+
+        let mut ordinal = baseline.clone();
+        ordinal[layout.postings.start..layout.postings.start + 4]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut offset = baseline.clone();
+        offset[layout.ends.start..layout.ends.start + OFFSET_LEN]
+            .copy_from_slice(&u64::MAX.to_le_bytes());
+        for bytes in [ordinal, offset] {
+            let index = TestIndex::from_bytes(Bytes::from(bytes)).unwrap();
+            assert!(
+                index.statistics.get().is_none(),
+                "attachment must not inspect posting contents"
+            );
+            assert!(index.query().is_err());
+            assert!(
+                index.query().is_err(),
+                "a cached failure never becomes empty success"
+            );
+            assert!(index
+                .exact_frequencies()
+                .collect::<Result<Vec<_>, _>>()
+                .is_err());
+            assert!(
+                TestIndex::merge([&index]).is_err(),
+                "maintenance must not silently omit malformed inputs"
+            );
+            let view = TestView::from_segments([golden_index(), index]);
+            assert!(view.statistics.get().is_none());
+            assert!(view.query().is_err());
+        }
+    }
+
+    #[test]
+    fn overlapping_cover_scores_match_canonical_union_without_building_a_carrier() {
+        let left = golden_index();
+        let right = TestIndex::from_exact_counts(
+            [value(1), value(4), value(5)],
+            [(value(1), value(0xa1), 7), (value(4), value(0xa2), 3)],
+        )
+        .unwrap();
+        let canonical = TestIndex::merge([&left, &right]).unwrap();
+        let expected = canonical.query().unwrap();
+        for segments in [
+            vec![left.clone(), right.clone()],
+            vec![right.clone(), left.clone(), right.clone()],
+        ] {
+            let pointers: Vec<_> = segments
+                .iter()
+                .map(|segment| segment.bytes().as_ref().as_ptr())
+                .collect();
+            let view = TestView::from_segments(segments);
+            assert!(view.statistics.get().is_none());
+            assert!(view
+                .segments()
+                .iter()
+                .all(|segment| segment.statistics.get().is_none()));
+            let actual = view.query().unwrap();
+            assert_eq!(actual.doc_count(), expected.doc_count());
+            assert_eq!(
+                actual.avg_doc_len().to_bits(),
+                expected.avg_doc_len().to_bits()
+            );
+            for code in 0..expected.doc_count() {
+                assert_eq!(actual.doc_len(code), expected.doc_len(code));
+            }
+            for query in [
+                vec![value(0xa1)],
+                vec![value(0xa2), value(0xa1), value(0xa2)],
+                vec![value(0xee)],
+            ] {
+                let bits = |hits: Vec<(Inline<UnknownInline>, f32)>| {
+                    hits.into_iter()
+                        .map(|(doc, score)| (doc.raw, score.to_bits()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(
+                    bits(actual.query_multi(&query)),
+                    bits(expected.query_multi(&query))
+                );
+            }
+            assert!(
+                view.segments()
+                    .iter()
+                    .all(|segment| segment.statistics.get().is_none()),
+                "union statistics do not first construct per-segment lengths"
+            );
+            assert_eq!(
+                pointers,
+                view.segments()
+                    .iter()
+                    .map(|segment| segment.bytes().as_ref().as_ptr())
+                    .collect::<Vec<_>>()
+            );
+            assert!(std::ptr::eq(
+                actual.statistics,
+                view.query().unwrap().statistics
+            ));
+        }
+        let empty = TestView::from_segments([]);
+        assert_eq!(empty.query().unwrap().doc_count(), 0);
+        assert!(empty
+            .query()
+            .unwrap()
+            .query_multi(&[value(0xa1)])
+            .is_empty());
+    }
+
+    #[test]
+    fn collection_cover_attachment_keeps_every_carrier_lazy() {
+        use crate::text_bm25::{Bm25Tokenizer, TextAttributeToBm25};
+        use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
+        use triblespace_core::repo::BlobStorePut;
+
+        let mut store = MemoryRepo::default();
+        let descriptor = Fragment::empty();
+        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+        let source = store.collection("test BM25", policy.clone()).unwrap();
+        let collection = store
+            .derive::<PortableBM25Blob>(
+                source,
+                TextAttributeToBm25 {
+                    attribute: metadata::name.id(),
+                    tokenizer: Bm25Tokenizer::Bigram,
+                },
+                policy,
+            )
+            .unwrap();
+        let left = golden_index();
+        let right = TestIndex::from_exact_counts([value(4)], [(value(4), value(0xa1), 1)]).unwrap();
+        let first = store.put::<PortableBM25Blob, _>(&left).unwrap();
+        let second = store.put::<PortableBM25Blob, _>(&right).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        for members in [vec![first], vec![first, second]] {
+            let cover = collection.cover(members);
+            let view = TestView::try_from_cover(&cover, &descriptor, &snapshot).unwrap();
+            assert_eq!(view.segments().len(), cover.len());
+            assert!(view.statistics.get().is_none());
+            assert!(view
+                .segments()
+                .iter()
+                .all(|segment| segment.statistics.get().is_none()));
+            for (member, segment) in cover.members().zip(view.segments()) {
+                let blob: Blob<PortableBM25Blob> = snapshot.get(member).unwrap();
+                assert_eq!(
+                    blob.bytes.as_ref().as_ptr(),
+                    segment.bytes().as_ref().as_ptr()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn canonical_empty_and_golden_bytes_are_fixed() {
         let empty = TestIndex::from_exact_counts([], []).unwrap();
         assert_eq!(empty.bytes().as_ref(), &[0u8; FOOTER_LEN]);
@@ -912,7 +1494,11 @@ mod tests {
         let index =
             TestIndex::from_exact_counts([value(1)], [(value(1), value(0xa1), u32::MAX)]).unwrap();
 
-        assert_eq!(index.term_frequency(&value(1), &value(0xa1)), u32::MAX);
+        assert_eq!(
+            index.term_frequency(&value(1), &value(0xa1)).unwrap(),
+            u32::MAX
+        );
+        let index = index.query().unwrap();
         assert_eq!(index.doc_len(0), Some(u64::from(u32::MAX)));
         assert!(index.query_term(&value(0xa1)).next().unwrap().1.is_finite());
     }
@@ -953,6 +1539,7 @@ mod tests {
         }
 
         let index = TestIndex::from_exact_counts(documents, counts).unwrap();
+        let index = index.query().unwrap();
         assert_eq!(index.avg_doc_len().to_bits(), 0x4f0e_2236);
         let score = index
             .query_term(&common)
@@ -965,6 +1552,7 @@ mod tests {
     #[test]
     fn attached_view_speaks_the_query_constraint_protocol() {
         let index = golden_index();
+        let index = index.query().unwrap();
         let mut context = VariableContext::new();
         let document = context.next_variable();
         let filter = index.matches(document, &[value(0xa1)], 0.0);
@@ -988,13 +1576,18 @@ mod tests {
         assert_eq!(parsed.doc_count(), 3);
         assert_eq!(parsed.term_count(), 2);
         assert_eq!(parsed.posting_count(), 3);
-        assert_eq!(parsed.doc_len(2), Some(0));
-        assert_eq!(parsed.term_frequency(&value(1), &value(0xa1)), 2);
-        assert_eq!(parsed.term_frequency(&value(3), &value(0xa1)), 0);
+        assert_eq!(parsed.query().unwrap().doc_len(2), Some(0));
+        assert_eq!(parsed.term_frequency(&value(1), &value(0xa1)).unwrap(), 2);
+        assert_eq!(parsed.term_frequency(&value(3), &value(0xa1)).unwrap(), 0);
 
-        let rebuilt =
-            TestIndex::from_exact_counts(parsed.document_keys(), parsed.exact_frequencies())
-                .unwrap();
+        let rebuilt = TestIndex::from_exact_counts(
+            parsed.document_keys(),
+            parsed
+                .exact_frequencies()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(rebuilt.bytes().as_ref(), golden);
 
         let blob: Blob<PortableBM25Blob> = (&parsed).to_blob();
@@ -1004,48 +1597,48 @@ mod tests {
     }
 
     #[test]
-    fn malformed_alternate_spellings_are_rejected() {
+    fn explicit_audit_rejects_noncanonical_alternate_spellings() {
         let baseline = decode_hex(GOLDEN);
-        let layout = validate_layout(&baseline).unwrap();
+        let layout = read_layout(&baseline).unwrap();
 
         let mut unsorted_docs = baseline.clone();
         unsorted_docs[..2 * RAW_INLINE_LEN].rotate_left(RAW_INLINE_LEN);
-        assert!(TestIndex::from_bytes(Bytes::from(unsorted_docs)).is_err());
+        assert!(validate_canonical(&unsorted_docs).is_err());
 
         let mut duplicate_doc = baseline.clone();
         duplicate_doc[RAW_INLINE_LEN..2 * RAW_INLINE_LEN]
             .copy_from_slice(&baseline[..RAW_INLINE_LEN]);
-        assert!(TestIndex::from_bytes(Bytes::from(duplicate_doc)).is_err());
+        assert!(validate_canonical(&duplicate_doc).is_err());
 
         let mut unsorted_terms = baseline.clone();
         unsorted_terms[layout.terms.clone()].rotate_left(RAW_INLINE_LEN);
-        assert!(TestIndex::from_bytes(Bytes::from(unsorted_terms)).is_err());
+        assert!(validate_canonical(&unsorted_terms).is_err());
 
         let mut duplicate_term = baseline.clone();
         duplicate_term[layout.terms.start + RAW_INLINE_LEN..layout.terms.end]
             .copy_from_slice(&baseline[layout.terms.start..layout.terms.start + RAW_INLINE_LEN]);
-        assert!(TestIndex::from_bytes(Bytes::from(duplicate_term)).is_err());
+        assert!(validate_canonical(&duplicate_term).is_err());
 
         let mut zero_frequency = baseline.clone();
         zero_frequency[layout.postings.start + 4..layout.postings.start + 8].fill(0);
-        assert!(TestIndex::from_bytes(Bytes::from(zero_frequency)).is_err());
+        assert!(validate_canonical(&zero_frequency).is_err());
 
         let mut duplicate_posting = baseline.clone();
         duplicate_posting[layout.postings.start + POSTING_LEN..layout.postings.start + 12].fill(0);
-        assert!(TestIndex::from_bytes(Bytes::from(duplicate_posting)).is_err());
+        assert!(validate_canonical(&duplicate_posting).is_err());
 
         let mut empty_term = baseline.clone();
         empty_term[layout.ends.start..layout.ends.start + OFFSET_LEN].fill(0);
-        assert!(TestIndex::from_bytes(Bytes::from(empty_term)).is_err());
+        assert!(validate_canonical(&empty_term).is_err());
 
         let mut unclaimed_posting = baseline.clone();
         unclaimed_posting[layout.ends.end - OFFSET_LEN..layout.ends.end]
             .copy_from_slice(&2u64.to_le_bytes());
-        assert!(TestIndex::from_bytes(Bytes::from(unclaimed_posting)).is_err());
+        assert!(validate_canonical(&unclaimed_posting).is_err());
 
         let mut trailing = baseline;
         trailing.push(0);
-        assert!(TestIndex::from_bytes(Bytes::from(trailing)).is_err());
+        assert!(validate_canonical(&trailing).is_err());
     }
 
     #[test]
@@ -1065,11 +1658,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(left.term_frequency(&value(1), &value(0xa1)), 7);
+        assert_eq!(left.term_frequency(&value(1), &value(0xa1)).unwrap(), 7);
         let joined = TestIndex::merge([&left, &right, &left]).unwrap();
-        assert_eq!(joined.term_frequency(&value(1), &value(0xa1)), 7);
-        assert_eq!(joined.term_frequency(&value(2), &value(0xa1)), 3);
-        assert_eq!(joined.doc_len(2), Some(0));
+        assert_eq!(joined.term_frequency(&value(1), &value(0xa1)).unwrap(), 7);
+        assert_eq!(joined.term_frequency(&value(2), &value(0xa1)).unwrap(), 3);
+        assert_eq!(joined.query().unwrap().doc_len(2), Some(0));
         assert_eq!(TestIndex::merge([&joined, &joined]).unwrap(), joined);
     }
 
@@ -1136,6 +1729,7 @@ mod tests {
         }
 
         let canonical = TestIndex::merge(leaves.iter()).unwrap();
+        let cover = TestView::from_segments(leaves.clone());
         let reverse = TestIndex::merge(leaves.iter().rev()).unwrap();
         assert_eq!(reverse, canonical);
 
@@ -1171,14 +1765,28 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         for code in 0..canonical.doc_count() {
-            assert_eq!(canonical.doc_len(code), oracle.doc_len(code).map(u64::from));
+            assert_eq!(
+                canonical.query().unwrap().doc_len(code),
+                oracle.doc_len(code).map(u64::from)
+            );
         }
         for query in [
             vec![terms[0]],
             vec![terms[1], terms[4]],
             vec![terms[2], terms[2], terms[6]],
         ] {
-            let portable = canonical.query_multi(&query);
+            let portable = canonical.query().unwrap().query_multi(&query);
+            let logical = cover.query().unwrap().query_multi(&query);
+            assert_eq!(
+                portable
+                    .iter()
+                    .map(|(doc, score)| (doc.raw, score.to_bits()))
+                    .collect::<Vec<_>>(),
+                logical
+                    .iter()
+                    .map(|(doc, score)| (doc.raw, score.to_bits()))
+                    .collect::<Vec<_>>()
+            );
             let resident = oracle.query_multi(&query);
             assert_eq!(portable.len(), resident.len());
             for ((portable_doc, portable_score), (resident_doc, resident_score)) in

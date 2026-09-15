@@ -83,17 +83,17 @@ fn domain_counts_are_the_distinct_values_in_each_position() {
     .collect();
 
     assert_eq!(
-        archive.entity_count,
+        archive.entity_count(),
         entities.len(),
         "entity_count must be the distinct entities in subject position"
     );
     assert_eq!(
-        archive.attribute_count,
+        archive.attribute_count(),
         attributes.len(),
         "attribute_count must be the distinct attributes"
     );
     assert_eq!(
-        archive.value_count,
+        archive.value_count(),
         values.len(),
         "value_count must be the distinct values"
     );

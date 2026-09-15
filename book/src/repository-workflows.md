@@ -307,6 +307,15 @@ shards. `collection.read::<V, _>(&snapshot)` remains a concise
 resident collection read when the intermediate support and physical cover are
 irrelevant.
 
+For maintained indexes, attachment checks safe typed framing and retains the
+stored sections; it does not rerun canonical construction or semantic audits.
+An interpretation can expose a separate fallible `query()` preparation step
+when its wire format omits data needed for querying, such as sparse-summary
+search positions or BM25 document lengths. Keep that prepared value for the
+queries which share it. Requesting a different representation can still be
+real work: `TribleSet` interpretation constructs PATCH indexes from raw facts,
+whereas attaching a persisted Succinct index uses its existing index sections.
+
 Physical compaction is support-aware. If distinct source members `a` and `b`
 map to the same payload `x`, an endorsement of `z` through `b` and `c` does not
 also endorse `a`, even when payload order says `x <= z`. A resident `x` must

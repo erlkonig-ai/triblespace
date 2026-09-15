@@ -24,6 +24,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+- BM25 search queries the stored shard cover directly. It no longer serializes
+  a temporary index union, rebuilds singleton indexes, or loads every document
+  into a snippet catalog; snippet lookups run only for selected results.
+
 - `pile collection maintain` and `maintain-all` order independent selected
   targets deterministically from the actual signing author's public key.
   Shared dependencies still run once, upstream first. Input order and repeated

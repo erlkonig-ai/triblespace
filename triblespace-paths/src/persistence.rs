@@ -291,8 +291,51 @@ impl PathSummaryBlob {
         Ok(Blob::new(bytes.into()))
     }
 
-    /// Validate and decode canonical bytes against the expected automaton.
+    /// Decode stored canonical bytes structurally for one fixed automaton.
+    ///
+    /// A collection member is trusted materialized work, so a read checks only
+    /// what safe interpretation needs: the header's lengths, the automaton's
+    /// state count, and every arc inside the product carrier. The vertex
+    /// order, the arc order and the domain are taken as stored. Nothing is
+    /// re-encoded or hashed; the automaton handle in the header is the
+    /// caller's to compare against the collection's, as a typed view does.
+    /// [`audit`](Self::audit) is the explicit canonical check.
     pub fn decode(
+        blob: Blob<Self>,
+        automaton: &Automaton,
+    ) -> Result<PathSummary, PathSummaryBlobError> {
+        let bytes = blob.bytes.as_ref();
+        let header = structural_header(bytes, automaton.state_count())?;
+        let vertex_count = header.vertex_count;
+        let vertex_bytes = header.vertex_bytes;
+        let product_count = header.product_count;
+
+        let mut vertices = Vec::with_capacity(vertex_count);
+        for chunk in bytes[HEADER_LEN..HEADER_LEN + vertex_bytes].chunks_exact(32) {
+            vertices.push(chunk.try_into().expect("chunks_exact yields 32 bytes"));
+        }
+        let mut arcs = Vec::with_capacity(header.arc_count);
+        for chunk in bytes[HEADER_LEN + vertex_bytes..].chunks_exact(8) {
+            let source = u32::from_le_bytes(chunk[..4].try_into().expect("four bytes"));
+            let target = u32::from_le_bytes(chunk[4..].try_into().expect("four bytes"));
+            if source as usize >= product_count || target as usize >= product_count {
+                return Err(PathSummaryBlobError::ArcOutOfBounds);
+            }
+            arcs.push((source, target));
+        }
+        PathSummary::from_canonical_ordinals(automaton.clone(), vertices, arcs)
+            .map_err(|_| PathSummaryBlobError::CapacityOverflow)
+    }
+
+    /// Audit canonical bytes against the expected automaton.
+    ///
+    /// Everything [`decode`](Self::decode) checks, and then the canonical law
+    /// itself: the header names exactly this automaton, vertices and arcs are
+    /// strictly ordered, every arc follows one of the automaton's transitions,
+    /// and the vertex domain is the canonical one for it. This is the
+    /// producer's, ingress's and offline auditor's check; a warm read of a
+    /// stored member does not run it.
+    pub fn audit(
         blob: Blob<Self>,
         automaton: &Automaton,
     ) -> Result<PathSummary, PathSummaryBlobError> {
@@ -343,13 +386,17 @@ impl PathSummaryBlob {
     }
 
     /// Compute the exact canonical join of two summaries for one automaton.
+    ///
+    /// This is new work by a producer, so both inputs are audited; a reader
+    /// joining resident members decodes them structurally and merges the
+    /// decoded summaries instead, without encoding a growing prefix.
     pub fn join(
         left: &Blob<Self>,
         right: &Blob<Self>,
         automaton: &Automaton,
     ) -> Result<Blob<Self>, PathSummaryBlobError> {
-        let left = Self::decode(left.clone(), automaton)?;
-        let right = Self::decode(right.clone(), automaton)?;
+        let left = Self::audit(left.clone(), automaton)?;
+        let right = Self::audit(right.clone(), automaton)?;
         let joined = left.merge(&right).map_err(PathSummaryBlobError::Join)?;
         Self::encode(&joined)
     }
@@ -363,6 +410,7 @@ struct ValidatedHeader {
     product_count: usize,
 }
 
+/// The audit's header check: the canonical automaton handle, then the shape.
 fn validate_header(
     bytes: &[u8],
     automaton: &Automaton,
@@ -374,8 +422,20 @@ fn validate_header(
     if bytes[..32] != expected_automaton.raw {
         return Err(PathSummaryBlobError::DifferentAutomaton);
     }
+    structural_header(bytes, automaton.state_count())
+}
+
+/// The shape a read needs: lengths that agree with the counts, and a product
+/// carrier the arcs can index. No hashing, no re-encoding.
+fn structural_header(
+    bytes: &[u8],
+    expected_state_count: u32,
+) -> Result<ValidatedHeader, PathSummaryBlobError> {
+    if bytes.len() < HEADER_LEN {
+        return Err(PathSummaryBlobError::BadLength);
+    }
     let state_count = read_u32(bytes, 32);
-    if state_count != automaton.state_count() {
+    if state_count != expected_state_count {
         return Err(PathSummaryBlobError::DifferentAutomaton);
     }
     let vertex_count = read_u32(bytes, 36) as usize;
@@ -553,7 +613,12 @@ impl PathAutomatonBlob {
         Blob::new(automaton_wire(automaton).into())
     }
 
-    /// Decode and verify one canonical automaton blob.
+    /// Decode one automaton blob structurally.
+    ///
+    /// The bytes are a content-addressed representation dependency of every
+    /// summary that names them; a read takes them as stored and builds the
+    /// automaton they describe. [`audit`](Self::audit) additionally proves
+    /// they are the canonical wire for that automaton.
     pub fn decode(blob: &Blob<Self>) -> Result<Automaton, PathAutomatonBlobError> {
         let bytes = blob.bytes.as_ref();
         if bytes.len() < AUTOMATON_BLOB_HEADER_LEN {
@@ -626,9 +691,14 @@ impl PathAutomatonBlob {
             return Err(PathAutomatonBlobError::BadLength);
         }
 
-        let automaton = Automaton::new(state_count, initial, accepting, transitions)
-            .map_err(PathAutomatonBlobError::InvalidAutomaton)?;
-        if automaton_wire(&automaton) != bytes {
+        Automaton::new(state_count, initial, accepting, transitions)
+            .map_err(PathAutomatonBlobError::InvalidAutomaton)
+    }
+
+    /// Decode one automaton blob and prove its bytes are the canonical wire.
+    pub fn audit(blob: &Blob<Self>) -> Result<Automaton, PathAutomatonBlobError> {
+        let automaton = Self::decode(blob)?;
+        if automaton_wire(&automaton) != blob.bytes.as_ref() {
             return Err(PathAutomatonBlobError::NonCanonical);
         }
         Ok(automaton)
@@ -716,8 +786,11 @@ mod tests {
         let mut noncanonical = canonical.bytes.as_ref().to_vec();
         noncanonical[40..44].copy_from_slice(&1u32.to_le_bytes());
         noncanonical[44..48].copy_from_slice(&0u32.to_le_bytes());
+        let noncanonical = Blob::<PathAutomatonBlob>::new(noncanonical.into());
+        // A structural read takes the wire as stored; only the audit re-encodes.
+        assert_eq!(PathAutomatonBlob::decode(&noncanonical).unwrap(), automaton);
         assert_eq!(
-            PathAutomatonBlob::decode(&Blob::new(noncanonical.into())).unwrap_err(),
+            PathAutomatonBlob::audit(&noncanonical).unwrap_err(),
             PathAutomatonBlobError::NonCanonical,
         );
 
@@ -776,49 +849,81 @@ mod tests {
         let summary = PathSummary::from_edges(automaton.clone(), [edge(1, 9, 2)]);
         let blob = PathSummaryBlob::encode(&summary).unwrap();
 
+        // The shape a read needs is checked by both the read and the audit.
         let mut bad = blob.bytes.as_ref().to_vec();
         bad.pop();
+        let bad = Blob::<PathSummaryBlob>::new(bad.into());
         assert_eq!(
-            PathSummaryBlob::decode(Blob::new(bad.into()), &automaton).unwrap_err(),
+            PathSummaryBlob::decode(bad.clone(), &automaton).unwrap_err(),
             PathSummaryBlobError::BadLength
         );
-
-        let mut bad = blob.bytes.as_ref().to_vec();
-        bad[0] ^= 1;
         assert_eq!(
-            PathSummaryBlob::decode(Blob::new(bad.into()), &automaton).unwrap_err(),
-            PathSummaryBlobError::DifferentAutomaton
-        );
-
-        let mut bad = blob.bytes.as_ref().to_vec();
-        bad[48..80].copy_from_slice(&vertex(2));
-        assert_eq!(
-            PathSummaryBlob::decode(Blob::new(bad.into()), &automaton).unwrap_err(),
-            PathSummaryBlobError::VertexOrder
+            PathSummaryBlob::audit(bad, &automaton).unwrap_err(),
+            PathSummaryBlobError::BadLength
         );
 
         let arc_offset = HEADER_LEN + 2 * 32;
         let mut bad = blob.bytes.as_ref().to_vec();
         bad[arc_offset + 4..arc_offset + 8].copy_from_slice(&4u32.to_le_bytes());
+        let bad = Blob::<PathSummaryBlob>::new(bad.into());
         assert_eq!(
-            PathSummaryBlob::decode(Blob::new(bad.into()), &automaton).unwrap_err(),
+            PathSummaryBlob::decode(bad.clone(), &automaton).unwrap_err(),
             PathSummaryBlobError::ArcOutOfBounds
+        );
+        assert_eq!(
+            PathSummaryBlob::audit(bad, &automaton).unwrap_err(),
+            PathSummaryBlobError::ArcOutOfBounds
+        );
+
+        // The canonical law is the audit's alone: a read takes the automaton
+        // handle, the orders and the transitions as stored.
+        let mut bad = blob.bytes.as_ref().to_vec();
+        bad[0] ^= 1;
+        let bad = Blob::<PathSummaryBlob>::new(bad.into());
+        assert!(PathSummaryBlob::decode(bad.clone(), &automaton).is_ok());
+        assert_eq!(
+            PathSummaryBlob::audit(bad, &automaton).unwrap_err(),
+            PathSummaryBlobError::DifferentAutomaton
+        );
+
+        let mut bad = blob.bytes.as_ref().to_vec();
+        bad[48..80].copy_from_slice(&vertex(2));
+        let bad = Blob::<PathSummaryBlob>::new(bad.into());
+        assert!(PathSummaryBlob::decode(bad.clone(), &automaton).is_ok());
+        assert_eq!(
+            PathSummaryBlob::audit(bad, &automaton).unwrap_err(),
+            PathSummaryBlobError::VertexOrder
         );
 
         let mut bad = blob.bytes.as_ref().to_vec();
         bad[arc_offset + 4..arc_offset + 8].copy_from_slice(&2u32.to_le_bytes());
+        let bad = Blob::<PathSummaryBlob>::new(bad.into());
+        assert!(PathSummaryBlob::decode(bad.clone(), &automaton).is_ok());
         assert_eq!(
-            PathSummaryBlob::decode(Blob::new(bad.into()), &automaton).unwrap_err(),
+            PathSummaryBlob::audit(bad, &automaton).unwrap_err(),
             PathSummaryBlobError::InvalidStatePair
         );
 
         let mut bad = blob.bytes.as_ref().to_vec();
         let first_arc = bad[arc_offset..arc_offset + 8].to_vec();
         bad[arc_offset + 8..arc_offset + 16].copy_from_slice(&first_arc);
+        let bad = Blob::<PathSummaryBlob>::new(bad.into());
+        assert!(PathSummaryBlob::decode(bad.clone(), &automaton).is_ok());
         assert_eq!(
-            PathSummaryBlob::decode(Blob::new(bad.into()), &automaton).unwrap_err(),
+            PathSummaryBlob::audit(bad, &automaton).unwrap_err(),
             PathSummaryBlobError::ArcOrder
         );
+    }
+
+    #[test]
+    fn a_read_and_an_audit_agree_on_canonical_bytes() {
+        let automaton = plus(9);
+        let summary = PathSummary::from_edges(automaton.clone(), [edge(1, 9, 2), edge(2, 9, 3)]);
+        let blob = PathSummaryBlob::encode(&summary).unwrap();
+        let read = PathSummaryBlob::decode(blob.clone(), &automaton).unwrap();
+        let audited = PathSummaryBlob::audit(blob, &automaton).unwrap();
+        assert_eq!(read, summary);
+        assert_eq!(audited, summary);
     }
 
     #[test]

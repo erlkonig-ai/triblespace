@@ -1591,7 +1591,11 @@ fn full_replication_reuses_a_known_summary_without_filtering_later_source_suppor
         );
         assert_eq!(produced.cover().len(), 1);
         let output = produced.cover().members().next().unwrap();
-        let produced_view = produced.view::<ReferenceSummaryView>().unwrap();
+        let produced_view = produced
+            .view::<ReferenceSummaryView>()
+            .unwrap()
+            .query()
+            .unwrap();
         assert!(produced_view.contains_locator(blob_locator(child_a.raw)));
         assert!(produced_view.contains_locator(blob_locator(leaf_a.raw)));
         assert!(!produced_view.contains_locator(blob_locator(absent.raw)));
@@ -1736,6 +1740,8 @@ fn full_replication_reuses_a_known_summary_without_filtering_later_source_suppor
             !observed
                 .view::<ReferenceSummaryView>()
                 .unwrap()
+                .query()
+                .unwrap()
                 .contains_locator(blob_locator(child_b.raw)),
             "B was hydrated despite the older summary's negative answer"
         );
@@ -1826,6 +1832,8 @@ fn full_replication_does_not_apply_a_projected_summary_to_foundational_payloads(
         assert!(
             !observed
                 .view::<ReferenceSummaryView>()
+                .unwrap()
+                .query()
                 .unwrap()
                 .contains_locator(blob_locator(child.raw)),
             "the correct summary of the empty projection cannot describe C's payload"

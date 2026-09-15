@@ -49,7 +49,7 @@ use crate::schemas::Embedding;
 /// [`BM25Filter`] constraint to work against it. Implemented
 /// for both the naive [`crate::bm25::BM25Index`] and the
 /// succinct [`crate::succinct::SuccinctBM25Index`], as well as the portable
-/// exact-TF [`crate::portable_bm25::PortableBM25Index`], so each
+/// exact-TF [`crate::portable_bm25::PortableBM25Query`], so each
 /// can plug into `find!` / `pattern!` without changes at the
 /// engine layer.
 pub trait BM25Queryable {
@@ -78,7 +78,7 @@ impl<D: triblespace_core::inline::InlineEncoding, T: triblespace_core::inline::I
 }
 
 impl<D: triblespace_core::inline::InlineEncoding, T: triblespace_core::inline::InlineEncoding>
-    BM25Queryable for crate::portable_bm25::PortableBM25Index<D, T>
+    BM25Queryable for crate::portable_bm25::PortableBM25Query<'_, D, T>
 {
     fn query_term_boxed<'a>(
         &'a self,
@@ -277,7 +277,7 @@ fn aggregate_above<I: BM25Queryable + ?Sized>(
 }
 
 impl<D: triblespace_core::inline::InlineEncoding, T: triblespace_core::inline::InlineEncoding>
-    crate::portable_bm25::PortableBM25Index<D, T>
+    crate::portable_bm25::PortableBM25Query<'_, D, T>
 {
     /// Build a query-engine filter from this portable exact-TF corpus.
     pub fn matches(

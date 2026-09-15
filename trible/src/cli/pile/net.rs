@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use clap::{Parser, ValueEnum};
 use ed25519_dalek::SigningKey;
 use iroh_base::{EndpointAddr, EndpointId};
@@ -10,7 +10,7 @@ use iroh_tickets::endpoint::EndpointTicket;
 use triblespace_core::collection::CollectionHandle;
 use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
 use triblespace_core::repo::pile::Pile;
-use triblespace_net::health_record::{self, DEFAULT_MAX_AGE, REPORT_EVERY, Recorder};
+use triblespace_net::health_record::{self, Recorder, DEFAULT_MAX_AGE, REPORT_EVERY};
 use triblespace_net::peer::{Peer, PeerConfig, ReconcileDirection, ReconcileQos};
 use triblespace_net::reconcile::{Reconciler, ReplicationMode};
 
@@ -718,7 +718,7 @@ fn run_sync(
 }
 
 fn run_health(pile_path: PathBuf, key_path: Option<PathBuf>, max_age: u64) -> Result<()> {
-    use health_record::{KIND_REPORT, attrs};
+    use health_record::{attrs, KIND_REPORT};
     use triblespace_core::blob::encodings::succinctarchive::{
         OrderedUniverse, SuccinctArchiveBlob, UnionArchive,
     };
@@ -753,7 +753,7 @@ fn run_health(pile_path: PathBuf, key_path: Option<PathBuf>, max_age: u64) -> Re
         let facts = snapshot
             .collection(facts)?
             .view::<UnionArchive<OrderedUniverse>>()?;
-        let latest = snapshot.collection(latest)?.view::<LwwIndex>()?;
+        let latest = snapshot.collection(latest)?.view::<LwwIndex>()?.query()?;
         let now = snapshot.instant().to_tai_duration().total_nanoseconds();
         let mut count = 0;
         for (report, node, session, endpoint, created) in find!(
@@ -878,18 +878,16 @@ mod tests {
         assert_eq!(parse(Some("demand")), ReplicationMode::Demand);
         assert_eq!(parse(Some("shallow")), ReplicationMode::Shallow);
         assert_eq!(parse(Some("full")), ReplicationMode::Full);
-        assert!(
-            Command::try_parse_from([
-                "net",
-                "sync",
-                "test.pile",
-                "--collection",
-                &handle,
-                "--replication",
-                "everything",
-            ])
-            .is_err()
-        );
+        assert!(Command::try_parse_from([
+            "net",
+            "sync",
+            "test.pile",
+            "--collection",
+            &handle,
+            "--replication",
+            "everything",
+        ])
+        .is_err());
     }
 
     #[test]

@@ -41,10 +41,9 @@ bytemuck = { version = "1.15.0", features = ["extern_crate_alloc"]}
 proptest = { version = "1.6.0", optional = true }
 hifitime = "4.1.2"
 f256 = "0.7.0"
-# `fc0be545` adds canonical minimal alphabet widths and explicit out-of-domain
-# query behavior atop the measured batched-rank lineage. Keep the exact rev
-# pinned so SuccinctArchive's CPU confirm has a reproducible substrate.
-jerky = { version = "0.9.0", git = "https://github.com/triblespace/jerky.git", rev = "fc0be54529f6bc0a6c5e7312cd649de21a7f3316" }
+# Structural borrowed attachment, canonical alphabet widths and the measured
+# batched-rank lineage. Pin the substrate so query behavior is reproducible.
+jerky = { version = "0.9.0", git = "https://github.com/triblespace/jerky.git", rev = "a03b927dc9d1fac0e6085f1275cd8f8504c36648" }
 itertools = "0.14.0"
 libc = "0.2"
 zeroize = "1.9"

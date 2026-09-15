@@ -151,7 +151,7 @@ The crate also ships with these blob encodings:
   data and EOF metadata for a SuccinctArchive set. It has no native query
   indexes. `SuccinctArchiveBlob::build_from_simple_archive` derives this raw
   member without constructing a query runtime, and
-  `SuccinctArchiveBlob::merge` computes its exact-validated set union.
+  `SuccinctArchiveBlob::merge` computes its canonical set union.
 - `Rank9AcceleratedSuccinctArchiveBlob`, an ABI-qualified Merkle root encoding
   for query-ready SuccinctArchive members. Its first 32 bytes name the exact
   portable `SuccinctArchiveBlob` child; the remaining bytes carry canonical
@@ -160,8 +160,12 @@ The crate also ships with these blob encodings:
   epoch. A change that can alter canonical bytes requires a newly minted id.
   This is a complete source-bound accelerated encoding, not a sidecar. Member
   validation follows the embedded handle and requires the raw child to be
-  resident. A cover-aware query view then loads that child through its store snapshot,
-  validates the exact raw/index pair, and reconstructs the runtime. The raw and
+  resident. A cover-aware query view then loads that child through its store snapshot
+  and attaches the persisted sections with safe bounds and alignment checks.
+  It does not reconstruct the raw archive or prove the Rank9 bits against it;
+  those are explicit audit operations. A raw archive uses unaccelerated query
+  access unless an accelerated member is requested, rather than constructing
+  Rank9 merely because someone opened it. The raw and
   accelerated encodings each own a canonical union. An accelerated join
   publishes only the accelerated result, but requires the matching raw union
   to be resident because its header names that exact child. It may consume an
@@ -184,11 +188,22 @@ limit, a multi-member `Cover<E>` retains the same logical value, so every
 collection remains a full join-semilattice. "Derived" describes provenance
 across a join-preserving mapping, not weaker algebraic capability; covers are
 lazy physical decompositions of the same join.
-Validation and joining share one immutable store snapshot, so Merkle-shaped
+Explicit validation and joining share one immutable store snapshot, so Merkle-shaped
 encodings can resolve children named by their members without consulting
 ambient mutable state.
 The maintained collection encodings implement the same contract directly;
 there is no separate public artifact or lattice wrapper to pair with them.
+
+Attaching a maintained index is not an audit of its producer. Ordinary readers
+retain typed views of the persisted bytes and perform the framing, bounds and
+alignment checks needed for safe access. Canonical ordering checks, count
+reproofs and reconstruction comparisons belong to explicit audits. Nor should
+a reader serialize and hash a new member just to interpret a multi-member cover.
+Query work remains query work: for example, a sparse reference summary needs
+its gap stream decoded into query scratch for repeated binary-search probes.
+Its `query()` method makes that preparation explicit; attaching the summary
+itself only retains the original bytes. No wire-format or collection identity
+change is needed to keep these operations separate.
 
 ```rust
 use triblespace::core::metadata::MetaDescribe;

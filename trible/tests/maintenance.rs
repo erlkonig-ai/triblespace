@@ -572,6 +572,97 @@ fn failed_upstream_upkeep_does_not_suppress_available_downstream_work() {
 
 #[cfg(feature = "search")]
 #[test]
+fn bm25_search_without_selected_snippets_does_not_load_source_payloads() {
+    use triblespace_core::blob::{Blob, IntoBlob};
+    use triblespace_core::collection::records::{CollectionCommit, CollectionDerive};
+    use triblespace_core::collection::CollectionStore;
+    use triblespace_core::inline::encodings::genid::GenId;
+    use triblespace_core::inline::encodings::hash::Handle;
+    use triblespace_core::inline::IntoInline;
+    use triblespace_core::repo::BlobStoreMeta;
+    use triblespace_search::portable_bm25::{PortableBM25Blob, PortableBM25Index};
+    use triblespace_search::text_bm25::{Bm25Tokenizer, TextAttributeToBm25};
+    use triblespace_search::tokens::{hash_tokens, WordHash};
+
+    let fixture = Fixture::new();
+    let mut pile = Pile::open(&fixture.path).unwrap();
+    let index = pile
+        .derive::<PortableBM25Blob>(
+            fixture.source,
+            TextAttributeToBm25 {
+                attribute: metadata::description.id(),
+                tokenizer: Bm25Tokenizer::Word,
+            },
+            policy(&fixture.signer),
+        )
+        .unwrap();
+    let cold = entity! { metadata::description: "cold" };
+    let document = cold.root().unwrap();
+    let data: Blob<SimpleArchive> = cold.facts().to_blob();
+    let data_handle = data.get_handle();
+    let metadata = pile.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
+    let commit = CollectionCommit::sign(
+        &fixture.signer,
+        fixture.source.handle(),
+        Handle::<SimpleArchive>::to_hash(data_handle),
+        metadata,
+    );
+    pile.insert(CollectionRecord::Commit(commit)).unwrap();
+    // A resident, properly witnessed image can be queried without its cold
+    // historical input archive. This is not a fabricated source fingerprint.
+    let carrier = PortableBM25Index::<GenId, WordHash>::from_exact_counts(
+        [(&document).to_inline()],
+        [((&document).to_inline(), hash_tokens("cold")[0], 1)],
+    )
+    .unwrap();
+    let output = pile.put::<PortableBM25Blob, _>(carrier).unwrap();
+    pile.insert(CollectionRecord::Derive(CollectionDerive::sign(
+        &fixture.signer,
+        index.handle(),
+        (commit.data(), commit.fingerprint()),
+        Handle::<PortableBM25Blob>::to_hash(output),
+    )))
+    .unwrap();
+    assert!(pile
+        .snapshot()
+        .unwrap()
+        .metadata(data_handle)
+        .unwrap()
+        .is_none());
+    pile.close().unwrap();
+
+    let before = records(&fixture.path);
+    let bytes = std::fs::metadata(&fixture.path).unwrap().len();
+    for args in [
+        vec!["cold"],
+        vec!["cold", "--snippet", "--top", "0"],
+        vec!["absent", "--snippet"],
+    ] {
+        let mut command = trible();
+        command
+            .args(["pile", "collection", "search"])
+            .arg(&fixture.path)
+            .arg(handle_text(index.handle()))
+            .args(&args);
+        let output = Command::from_std(command)
+            .timeout(Duration::from_secs(30))
+            .output()
+            .unwrap();
+        assert_success(&output);
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let expected_hits = if args.len() == 1 {
+            "1 hit(s)"
+        } else {
+            "0 hit(s)"
+        };
+        assert!(stdout.contains(expected_hits), "{stdout}");
+    }
+    assert_eq!(records(&fixture.path), before);
+    assert_eq!(std::fs::metadata(&fixture.path).unwrap().len(), bytes);
+}
+
+#[cfg(feature = "search")]
+#[test]
 fn search_reads_existing_bm25_support_and_snippets_after_source_growth() {
     use triblespace_search::portable_bm25::PortableBM25Blob;
     use triblespace_search::text_bm25::{Bm25Tokenizer, TextAttributeToBm25};

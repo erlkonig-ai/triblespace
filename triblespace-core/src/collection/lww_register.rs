@@ -4,8 +4,8 @@
 //! directly from a fact source. That is the right zero-setup path, but every
 //! read repeats the joins from a state to its identity and order value. This
 //! module projects exactly those two columns into an exact derived collection
-//! and builds an [`LwwIndex`](crate::collection::lww_register::LwwIndex) when a
-//! reader attaches a cover.
+//! and attaches its stored rows as an [`LwwIndex`] without copying them. A
+//! reader prepares [`LwwQuery`] when it needs the winners.
 //!
 //! # Why the maintained element contains both fact halves
 //!
@@ -22,7 +22,7 @@
 //! The target element instead contains two canonical sorted row sets, one of
 //! state/register pairs and one of state/raw-order pairs. Its join is set
 //! union. Pairing the halves and selecting the greatest `(key, state-id)`
-//! happens only after the exact target cover has been joined. Consequently:
+//! happens when a query is prepared over the exact target cover. Consequently:
 //!
 //! ```text
 //! project(C1 union C2) = project(C1) join project(C2)
@@ -38,7 +38,7 @@
 //! at most one well-formed identity and at most one order value under the
 //! mapping's two attributes. Repeating the same fact is harmless set
 //! idempotence. Distinct values are retained by the union law and rejected when
-//! attachment discovers that the state has become a complete coordinate.
+//! query preparation discovers that the state has become a complete coordinate.
 //! Multiplicity on an incomplete state is harmless open-world data: it remains
 //! retained and incomparable unless the missing half later arrives. Missing
 //! halves therefore match
@@ -51,7 +51,7 @@
 //! an order-preserving encoding, the same contract as
 //! [`StatedOrder::tiebreak_by_id`](crate::query::register::StatedOrder::tiebreak_by_id).
 //!
-//! [`LwwIndex`]'s `.has(state)` is ordinary positive query membership over its
+//! [`LwwQuery`]'s `.has(state)` is ordinary positive query membership over its
 //! known complete winners. It proposes those ids with their exact cardinality
 //! and confirms only them, excluding unknown and incomplete states. The pure
 //! [`RegisterOrder`] utility remains available separately; it does not promise
@@ -79,7 +79,8 @@ use crate::query::{
 };
 use crate::repo::BlobStoreGet;
 use crate::trible::{Fragment, Trible, A_START, E_START, TRIBLE_LEN, V_START};
-use anybytes::Bytes;
+use anybytes::{Bytes, View};
+use itertools::Itertools;
 
 #[cfg(test)]
 use super::records::CollectionHandle;
@@ -108,8 +109,8 @@ type RawKey = [u8; KEY_LEN];
 /// by order rows. Identity rows are `state[16] || register[16]`; order rows are
 /// `state[16] || key[32]`. Each section is strictly increasing by its complete
 /// row. Repeating a state with a distinct value is retained so target join is
-/// total and remains a plain set union; attachment enforces uniqueness only
-/// when both halves make that state a coordinate.
+/// total and remains a plain set union; query preparation enforces uniqueness
+/// only when both halves make that state a coordinate.
 pub struct LwwRegisterBlob;
 
 impl BlobEncoding for LwwRegisterBlob {}
@@ -233,35 +234,66 @@ fn checked_payload_len(identity_count: usize, order_count: usize) -> Option<usiz
         .checked_add(order_count.checked_mul(ORDER_ROW_LEN)?)
 }
 
-fn decode_projection(blob: &Blob<LwwRegisterBlob>) -> Result<Projection, LwwRegisterError> {
-    let bytes = blob.bytes.as_ref();
-    if bytes.len() < HEADER_LEN {
-        return Err(LwwRegisterError::BadLength {
-            expected: HEADER_LEN,
-            actual: bytes.len(),
-        });
-    }
-    let identity_count = usize::try_from(u64::from_be_bytes(
-        bytes[0..8].try_into().expect("eight-byte identity count"),
-    ))
-    .map_err(|_| LwwRegisterError::CountOverflow)?;
-    let order_count = usize::try_from(u64::from_be_bytes(
-        bytes[8..16].try_into().expect("eight-byte order count"),
-    ))
-    .map_err(|_| LwwRegisterError::CountOverflow)?;
-    let expected =
-        checked_payload_len(identity_count, order_count).ok_or(LwwRegisterError::CountOverflow)?;
-    if bytes.len() != expected {
-        return Err(LwwRegisterError::BadLength {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProjectionRows {
+    identities: View<[[u8; IDENTITY_ROW_LEN]]>,
+    orders: View<[[u8; ORDER_ROW_LEN]]>,
+}
+
+impl ProjectionRows {
+    fn decode(blob: &Blob<LwwRegisterBlob>) -> Result<Self, LwwRegisterError> {
+        let bytes = blob.bytes.as_ref();
+        if bytes.len() < HEADER_LEN {
+            return Err(LwwRegisterError::BadLength {
+                expected: HEADER_LEN,
+                actual: bytes.len(),
+            });
+        }
+        let identity_count = usize::try_from(u64::from_be_bytes(
+            bytes[0..8].try_into().expect("eight-byte identity count"),
+        ))
+        .map_err(|_| LwwRegisterError::CountOverflow)?;
+        let order_count = usize::try_from(u64::from_be_bytes(
+            bytes[8..16].try_into().expect("eight-byte order count"),
+        ))
+        .map_err(|_| LwwRegisterError::CountOverflow)?;
+        let expected = checked_payload_len(identity_count, order_count)
+            .ok_or(LwwRegisterError::CountOverflow)?;
+        if bytes.len() != expected {
+            return Err(LwwRegisterError::BadLength {
+                expected,
+                actual: bytes.len(),
+            });
+        }
+
+        let identity_end = HEADER_LEN + identity_count * IDENTITY_ROW_LEN;
+        // Framing establishes exact multiples of byte-aligned rows. Retain the
+        // original backing; canonical ordering and identifiers are audited by
+        // validate_element rather than scanned at ordinary attachment.
+        let bad_length = |_| LwwRegisterError::BadLength {
             expected,
             actual: bytes.len(),
-        });
+        };
+        Ok(Self {
+            identities: blob
+                .bytes
+                .slice(HEADER_LEN..identity_end)
+                .view()
+                .map_err(bad_length)?,
+            orders: blob
+                .bytes
+                .slice(identity_end..)
+                .view()
+                .map_err(bad_length)?,
+        })
     }
+}
 
-    let identity_end = HEADER_LEN + identity_count * IDENTITY_ROW_LEN;
+fn decode_projection(blob: &Blob<LwwRegisterBlob>) -> Result<Projection, LwwRegisterError> {
+    let rows = ProjectionRows::decode(blob)?;
     let mut projection = Projection::default();
     let mut previous_identity = None;
-    for row in bytes[HEADER_LEN..identity_end].chunks_exact(IDENTITY_ROW_LEN) {
+    for row in rows.identities.iter() {
         let state: RawId = row[0..ID_LEN].try_into().expect("16-byte state id");
         let register: RawId = row[ID_LEN..IDENTITY_ROW_LEN]
             .try_into()
@@ -281,7 +313,7 @@ fn decode_projection(blob: &Blob<LwwRegisterBlob>) -> Result<Projection, LwwRegi
     }
 
     let mut previous_order = None;
-    for row in bytes[identity_end..].chunks_exact(ORDER_ROW_LEN) {
+    for row in rows.orders.iter() {
         let state: RawId = row[0..ID_LEN].try_into().expect("16-byte state id");
         let key: RawKey = row[ID_LEN..ORDER_ROW_LEN]
             .try_into()
@@ -511,72 +543,158 @@ impl CollectionDerivation for LwwRegisterBlob {
     }
 }
 
-/// An attached last-write-wins index over one exact source cover.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// Shared persisted rows attached to one frozen last-write-wins cover.
+///
+/// Attachment checks framing only. [`Self::query`] pairs the stored rows and
+/// selects winners when a query actually needs that work.
+#[derive(Clone, Debug, Default)]
 pub struct LwwIndex {
-    coordinates: BTreeMap<RawId, (RawId, RawKey)>,
-    winners: BTreeMap<RawId, (RawKey, RawId)>,
-    unresolved: usize,
+    members: Vec<ProjectionRows>,
 }
 
 impl LwwIndex {
-    /// Decode one complete canonical projection and select each register's winner.
+    /// View one typed projection without revalidating its canonical contents.
     pub fn decode(blob: &Blob<LwwRegisterBlob>) -> Result<Self, LwwRegisterError> {
-        let projection = decode_projection(blob)?;
-        Self::from_projection(projection)
+        Ok(Self {
+            members: vec![ProjectionRows::decode(blob)?],
+        })
     }
 
-    fn from_projection(projection: Projection) -> Result<Self, LwwRegisterError> {
-        let mut identities = BTreeMap::<RawId, Vec<RawId>>::new();
-        for (state, register) in projection.identities {
-            identities.entry(state).or_default().push(register);
-        }
-        let mut orders = BTreeMap::<RawId, Vec<RawKey>>::new();
-        for (state, key) in projection.orders {
-            orders.entry(state).or_default().push(key);
-        }
-        let states: BTreeSet<RawId> = identities.keys().chain(orders.keys()).copied().collect();
-        let mut index = Self::default();
-        for state in states {
-            let Some(registers) = identities.get(&state) else {
-                index.unresolved += 1;
+    fn identity_rows(&self) -> impl Iterator<Item = &[u8; IDENTITY_ROW_LEN]> {
+        self.members
+            .iter()
+            .map(|member| member.identities.iter())
+            .kmerge()
+            .dedup()
+    }
+
+    fn order_rows(&self) -> impl Iterator<Item = &[u8; ORDER_ROW_LEN]> {
+        self.members
+            .iter()
+            .map(|member| member.orders.iter())
+            .kmerge()
+            .dedup()
+    }
+
+    fn coordinate(&self, state: &RawId) -> Option<(RawId, RawKey)> {
+        let register = self.members.iter().find_map(|member| {
+            let position = member
+                .identities
+                .partition_point(|row| row[..ID_LEN] < state[..]);
+            member.identities.get(position).and_then(|row| {
+                (row[..ID_LEN] == state[..])
+                    .then(|| row[ID_LEN..].try_into().expect("16-byte register id"))
+            })
+        })?;
+        let key = self.members.iter().find_map(|member| {
+            let position = member
+                .orders
+                .partition_point(|row| row[..ID_LEN] < state[..]);
+            member.orders.get(position).and_then(|row| {
+                (row[..ID_LEN] == state[..])
+                    .then(|| row[ID_LEN..].try_into().expect("32-byte order key"))
+            })
+        })?;
+        Some((register, key))
+    }
+
+    /// Pair complete coordinates and prepare their per-register winners.
+    ///
+    /// This is the fallible query boundary: distinct identities or order keys
+    /// on a complete state remain conflicts. Missing halves remain unresolved.
+    /// The prepared query retains shared rows and only the actual winner map;
+    /// it does not copy the projected facts into another owned relation.
+    pub fn query(&self) -> Result<LwwQuery, LwwRegisterError> {
+        let mut identities = self.identity_rows().peekable();
+        let mut orders = self.order_rows().peekable();
+        let mut winners = BTreeMap::<RawId, (RawKey, RawId)>::new();
+        let mut complete = 0;
+        let mut unresolved = 0;
+        loop {
+            let identity_state = identities.peek().map(|row| &row[..ID_LEN]);
+            let order_state = orders.peek().map(|row| &row[..ID_LEN]);
+            let state: RawId = match (identity_state, order_state) {
+                (None, None) => break,
+                (Some(state), None) | (None, Some(state)) => state,
+                (Some(left), Some(right)) => left.min(right),
+            }
+            .try_into()
+            .expect("16-byte state id");
+            if state == [0; ID_LEN] {
+                return Err(LwwRegisterError::NilState);
+            }
+
+            let mut register = None;
+            let mut identity_conflict = false;
+            while identities.peek().is_some_and(|row| row[..ID_LEN] == state) {
+                let row = identities.next().expect("peeked identity row");
+                let value: RawId = row[ID_LEN..].try_into().expect("16-byte register id");
+                if value == [0; ID_LEN] {
+                    return Err(LwwRegisterError::NilRegister);
+                }
+                identity_conflict |= register.is_some_and(|prior| prior != value);
+                register = Some(value);
+            }
+            let mut key = None;
+            let mut order_conflict = false;
+            while orders.peek().is_some_and(|row| row[..ID_LEN] == state) {
+                let row = orders.next().expect("peeked order row");
+                let value: RawKey = row[ID_LEN..].try_into().expect("32-byte order key");
+                order_conflict |= key.is_some_and(|prior| prior != value);
+                key = Some(value);
+            }
+            let (Some(register), Some(key)) = (register, key) else {
+                unresolved += 1;
                 continue;
             };
-            let Some(keys) = orders.get(&state) else {
-                index.unresolved += 1;
-                continue;
-            };
-            if registers.len() != 1 {
+            if identity_conflict {
                 return Err(LwwRegisterError::ConflictingIdentity(state));
             }
-            if keys.len() != 1 {
+            if order_conflict {
                 return Err(LwwRegisterError::ConflictingOrder(state));
             }
-            let register = registers[0];
-            let key = keys[0];
-            index.coordinates.insert(state, (register, key));
+            complete += 1;
             let candidate = (key, state);
-            index
-                .winners
+            winners
                 .entry(register)
-                .and_modify(|winner| {
-                    if candidate > *winner {
-                        *winner = candidate;
-                    }
-                })
+                .and_modify(|winner| *winner = (*winner).max(candidate))
                 .or_insert(candidate);
         }
-        Ok(index)
+        Ok(LwwQuery {
+            index: self.clone(),
+            winners,
+            complete,
+            unresolved,
+        })
     }
+}
 
+impl PartialEq for LwwIndex {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity_rows().eq(other.identity_rows()) && self.order_rows().eq(other.order_rows())
+    }
+}
+
+impl Eq for LwwIndex {}
+
+/// A prepared last-write-wins query over one frozen projection.
+#[derive(Clone, Debug, Default)]
+pub struct LwwQuery {
+    index: LwwIndex,
+    winners: BTreeMap<RawId, (RawKey, RawId)>,
+    complete: usize,
+    unresolved: usize,
+}
+
+impl LwwQuery {
     /// Number of complete state coordinates in the index.
     pub fn len(&self) -> usize {
-        self.coordinates.len()
+        self.complete
     }
 
     /// Whether the index has no complete state coordinates.
     pub fn is_empty(&self) -> bool {
-        self.coordinates.is_empty()
+        self.complete == 0
     }
 
     /// Number of registers with at least one complete state.
@@ -601,21 +719,44 @@ impl LwwIndex {
     /// Unknown states and states missing either coordinate half are excluded.
     pub fn contains(&self, state: Id) -> bool {
         let raw: RawId = state[..].try_into().expect("id is 16 bytes");
-        self.coordinates.get(&raw).is_some_and(|(register, _)| {
+        self.index.coordinate(&raw).is_some_and(|(register, _)| {
             self.winners
-                .get(register)
+                .get(&register)
                 .is_some_and(|(_, winner)| *winner == raw)
         })
     }
+
+    fn coordinates(&self) -> impl Iterator<Item = (RawId, RawId, RawKey)> + '_ {
+        self.index
+            .identity_rows()
+            .map(|row| row[..ID_LEN].try_into().expect("16-byte state id"))
+            .dedup()
+            .filter_map(|state| {
+                self.index
+                    .coordinate(&state)
+                    .map(|(register, key)| (state, register, key))
+            })
+    }
 }
+
+impl PartialEq for LwwQuery {
+    fn eq(&self, other: &Self) -> bool {
+        self.complete == other.complete
+            && self.unresolved == other.unresolved
+            && self.winners == other.winners
+            && self.coordinates().eq(other.coordinates())
+    }
+}
+
+impl Eq for LwwQuery {}
 
 /// Positive membership in an attached index's known complete winning states.
 pub struct LwwConstraint<'a> {
     variable: Variable<GenId>,
-    index: &'a LwwIndex,
+    index: &'a LwwQuery,
 }
 
-impl<'a> ContainsConstraint<'a, GenId> for &'a LwwIndex {
+impl<'a> ContainsConstraint<'a, GenId> for &'a LwwQuery {
     type Constraint = LwwConstraint<'a>;
 
     fn has(self, variable: Variable<GenId>) -> Self::Constraint {
@@ -683,14 +824,14 @@ impl<'a> Constraint<'a> for LwwConstraint<'a> {
     }
 }
 
-impl RegisterOrder for LwwIndex {
+impl RegisterOrder for LwwQuery {
     fn dominated(&self, state: Id) -> bool {
         let raw: RawId = state[..].try_into().expect("id is 16 bytes");
-        let Some((register, _)) = self.coordinates.get(&raw) else {
+        let Some((register, _)) = self.index.coordinate(&raw) else {
             return false;
         };
         self.winners
-            .get(register)
+            .get(&register)
             .is_some_and(|(_, winner)| *winner != raw)
     }
 }
@@ -706,16 +847,15 @@ impl TryFromCover<LwwRegisterBlob> for LwwIndex {
     where
         R: BlobStoreGet,
     {
-        let mut combined = Projection::default();
+        let mut members = Vec::new();
         for handle in cover.members() {
             let member = Handle::<LwwRegisterBlob>::to_hash(handle);
             let segment = reader
                 .get(handle)
                 .map_err(|source| TryFromCoverError::MemberGet { member, source })?;
-            combined =
-                combined.union(decode_projection(&segment).map_err(TryFromCoverError::View)?);
+            members.push(ProjectionRows::decode(&segment).map_err(TryFromCoverError::View)?);
         }
-        Self::from_projection(combined).map_err(TryFromCoverError::View)
+        Ok(Self { members })
     }
 }
 
@@ -773,6 +913,172 @@ mod tests {
         derive_element(&archive(facts), state_of.id(), written_at.id()).expect("valid projection")
     }
 
+    fn attach(members: &[Blob<LwwRegisterBlob>]) -> LwwIndex {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[19; 32]);
+        let mut store = MemoryRepo::default();
+        let source = store
+            .collection("lww-row-view", direct_policy(key.verifying_key()))
+            .unwrap();
+        let target = store
+            .derive::<LwwRegisterBlob>(
+                source,
+                (state_of.id(), written_at.id()),
+                direct_policy(key.verifying_key()),
+            )
+            .unwrap();
+        let handles = members
+            .iter()
+            .cloned()
+            .map(|member| store.put(member).unwrap())
+            .collect::<Vec<_>>();
+        let snapshot = store.snapshot().unwrap();
+        LwwIndex::try_from_cover(&target.cover(handles), &Fragment::empty(), &snapshot).unwrap()
+    }
+
+    #[test]
+    fn typed_attachment_keeps_shared_rows_and_query_prepares_winners() {
+        let register = ufoid();
+        let state = ufoid();
+        let blob = project(&coordinate(&state, &register, 1));
+        let identity_ptr = blob.bytes[HEADER_LEN..].as_ptr();
+        let order_ptr = blob.bytes[HEADER_LEN + IDENTITY_ROW_LEN..].as_ptr();
+        let index = attach(&[blob.clone()]);
+        assert_eq!(
+            index.members[0].identities.as_ptr().cast::<u8>(),
+            identity_ptr
+        );
+        assert_eq!(index.members[0].orders.as_ptr().cast::<u8>(), order_ptr);
+        let query = index.query().unwrap();
+        assert_eq!(
+            query.index.members[0].identities.as_ptr().cast::<u8>(),
+            identity_ptr
+        );
+        drop(blob);
+        drop(index);
+        assert_eq!(query.winner(*register), Some(*state));
+        assert!(query.contains(*state));
+    }
+
+    #[test]
+    fn attachment_checks_framing_while_full_validation_audits_rows() {
+        let nil = Projection {
+            identities: BTreeSet::from([([0; ID_LEN], [1; ID_LEN])]),
+            orders: BTreeSet::new(),
+        }
+        .encode();
+        assert!(LwwIndex::decode(&nil).is_ok());
+        assert_eq!(validate_element(&nil), Err(LwwRegisterError::NilState));
+        assert_eq!(
+            LwwIndex::decode(&nil).unwrap().query(),
+            Err(LwwRegisterError::NilState)
+        );
+
+        let canonical = Projection {
+            identities: BTreeSet::from([([1; ID_LEN], [3; ID_LEN]), ([2; ID_LEN], [3; ID_LEN])]),
+            orders: BTreeSet::new(),
+        }
+        .encode();
+        let mut bytes = canonical.bytes.as_ref().to_vec();
+        bytes[HEADER_LEN..HEADER_LEN + ID_LEN].fill(3);
+        let noncanonical = Blob::new(Bytes::from_source(bytes));
+        assert!(LwwIndex::decode(&noncanonical).is_ok());
+        assert_eq!(
+            validate_element(&noncanonical),
+            Err(LwwRegisterError::IdentityOrder)
+        );
+
+        for bytes in [
+            vec![0; HEADER_LEN - 1],
+            vec![0; HEADER_LEN + 1],
+            vec![255; HEADER_LEN],
+        ] {
+            let blob = Blob::new(Bytes::from_source(bytes));
+            assert_eq!(
+                LwwIndex::decode(&blob).unwrap_err(),
+                validate_element(&blob).unwrap_err()
+            );
+        }
+    }
+
+    #[test]
+    fn cover_query_pairs_split_rows_without_owning_the_projection() {
+        let register = ufoid();
+        let other = ufoid();
+        let old = ufoid();
+        let winner = ufoid();
+        let tied = ufoid();
+        let other_winner = ufoid();
+        let incomplete = ufoid();
+        let members = [
+            project(&(identity(&old, &register) + identity(&winner, &register))),
+            project(&(order(&old, 1) + order(&winner, 2))),
+            project(&coordinate(&tied, &register, 2)),
+            project(&coordinate(&other_winner, &other, 3)),
+            project(&(coordinate(&old, &register, 1) + identity(&incomplete, &register))),
+        ];
+        let index = attach(&members);
+        for member in &members {
+            let ptr = member.bytes[HEADER_LEN..].as_ptr();
+            assert!(index
+                .members
+                .iter()
+                .any(|rows| rows.identities.as_ptr().cast::<u8>() == ptr));
+        }
+        let query = index.query().unwrap();
+        let joined = members
+            .iter()
+            .fold(empty(), |joined, member| join(&joined, member).unwrap());
+        let expected = LwwIndex::decode(&joined).unwrap().query().unwrap();
+        assert_eq!(query, expected);
+        assert_eq!(query.len(), 4);
+        assert_eq!(query.unresolved_count(), 1);
+        assert_eq!(query.register_count(), 2);
+        assert_eq!(query.winner(*register), Some((*winner).max(*tied)));
+        assert_eq!(query.winner(*other), Some(*other_winner));
+        assert!(!query.dominated(*incomplete));
+        let winners = BTreeSet::from([(*winner).max(*tied), *other_winner]);
+        assert_eq!(
+            find!(state: Id, query.has(state)).collect::<BTreeSet<_>>(),
+            winners
+        );
+        for state in [*old, *winner, *tied, *other_winner, *incomplete] {
+            assert_eq!(query.contains(state), expected.contains(state));
+            assert_eq!(query.dominated(state), expected.dominated(state));
+        }
+        let reversed = members.into_iter().rev().collect::<Vec<_>>();
+        assert_eq!(attach(&reversed).query().unwrap(), expected);
+    }
+
+    #[test]
+    fn split_coordinate_conflicts_are_reported_only_when_a_query_is_prepared() {
+        let state = ufoid();
+        let one = ufoid();
+        let two = ufoid();
+        let identities = [
+            project(&identity(&state, &one)),
+            project(&identity(&state, &two)),
+        ];
+        let unresolved = attach(&identities);
+        assert_eq!(unresolved.query().unwrap().unresolved_count(), 1);
+        let mut complete = identities.to_vec();
+        complete.push(project(&order(&state, 1)));
+        let attached = attach(&complete);
+        assert_eq!(
+            attached.query(),
+            Err(LwwRegisterError::ConflictingIdentity(state.raw()))
+        );
+
+        let conflicting_orders = attach(&[
+            project(&identity(&state, &one)),
+            project(&order(&state, 1)),
+            project(&order(&state, 2)),
+        ]);
+        assert_eq!(
+            conflicting_orders.query(),
+            Err(LwwRegisterError::ConflictingOrder(state.raw()))
+        );
+    }
+
     #[test]
     fn positive_membership_proposes_known_winners_and_confirms_without_unknowns() {
         let register = ufoid();
@@ -786,7 +1092,7 @@ mod tests {
         facts += coordinate(&winner, &register, 2);
         facts += coordinate(&other_winner, &other_register, 1);
         facts += identity(&incomplete, &register);
-        let index = LwwIndex::decode(&project(&facts)).unwrap();
+        let index = LwwIndex::decode(&project(&facts)).unwrap().query().unwrap();
         let standalone: BTreeSet<_> = find!(state: Id, index.has(state)).collect();
         assert_eq!(standalone, BTreeSet::from([*winner, *other_winner]));
         facts += coordinate(&unknown, &register, 3);
@@ -801,7 +1107,7 @@ mod tests {
                 exists!((state: Id), and!(state.is(candidate.to_inline()), index.has(state)));
             assert_eq!(accepted, standalone.contains(&candidate));
         }
-        let empty = LwwIndex::default();
+        let empty = LwwIndex::default().query().unwrap();
         assert_eq!(find!(state: Id, empty.has(state)).count(), 0);
     }
 
@@ -814,11 +1120,14 @@ mod tests {
 
         let left = project(&identities);
         let right = project(&orders);
-        assert_eq!(LwwIndex::decode(&left).unwrap().len(), 0);
-        assert_eq!(LwwIndex::decode(&right).unwrap().len(), 0);
+        assert_eq!(LwwIndex::decode(&left).unwrap().query().unwrap().len(), 0);
+        assert_eq!(LwwIndex::decode(&right).unwrap().query().unwrap().len(), 0);
 
         let combined = join(&left, &right).expect("projection row sets join");
-        let index = LwwIndex::decode(&combined).expect("joined index decodes");
+        let index = LwwIndex::decode(&combined)
+            .expect("joined index decodes")
+            .query()
+            .unwrap();
         assert_eq!(index.len(), 1);
         assert_eq!(index.winner(*register), Some(*state));
 
@@ -924,7 +1233,7 @@ mod tests {
             *order_only,
         ];
 
-        let index = LwwIndex::decode(&project(&facts)).unwrap();
+        let index = LwwIndex::decode(&project(&facts)).unwrap().query().unwrap();
         let live = StatedOrder::<_, NsTAIInterval>::new(&facts, state_of.id(), written_at.id())
             .tiebreak_by_id();
         assert_eq!(resolve(&index, candidates), resolve(&live, candidates));
@@ -956,7 +1265,7 @@ mod tests {
         facts.insert(&malformed);
         facts += order(&state, 99);
 
-        let index = LwwIndex::decode(&project(&facts)).unwrap();
+        let index = LwwIndex::decode(&project(&facts)).unwrap().query().unwrap();
         let live = StatedOrder::<_, NsTAIInterval>::new(&facts, state_of.id(), written_at.id())
             .tiebreak_by_id();
         assert_eq!(resolve(&index, [*state]), resolve(&live, [*state]));
@@ -996,13 +1305,17 @@ mod tests {
             project(&identity_union).bytes.as_ref()
         );
         assert_eq!(
-            LwwIndex::decode(&identities).unwrap().unresolved_count(),
+            LwwIndex::decode(&identities)
+                .unwrap()
+                .query()
+                .unwrap()
+                .unresolved_count(),
             1,
             "identity-only multiplicity is unrelated open-world data"
         );
         let complete = join(&identities, &project(&order(&state, 1))).unwrap();
         assert_eq!(
-            LwwIndex::decode(&complete),
+            LwwIndex::decode(&complete).unwrap().query(),
             Err(LwwRegisterError::ConflictingIdentity(
                 (*state)[..].try_into().unwrap()
             ))
@@ -1015,13 +1328,17 @@ mod tests {
         order_union += order(&state, 2);
         assert_eq!(orders.bytes.as_ref(), project(&order_union).bytes.as_ref());
         assert_eq!(
-            LwwIndex::decode(&orders).unwrap().unresolved_count(),
+            LwwIndex::decode(&orders)
+                .unwrap()
+                .query()
+                .unwrap()
+                .unresolved_count(),
             1,
             "order-only multiplicity is unrelated open-world data"
         );
         let complete = join(&project(&identity(&state, &one)), &orders).unwrap();
         assert_eq!(
-            LwwIndex::decode(&complete),
+            LwwIndex::decode(&complete).unwrap().query(),
             Err(LwwRegisterError::ConflictingOrder(
                 (*state)[..].try_into().unwrap()
             ))
@@ -1140,7 +1457,7 @@ mod tests {
             .unwrap()
             .view()
             .unwrap();
-        assert_eq!(ensured.winner(*register), Some(*state));
+        assert_eq!(ensured.query().unwrap().winner(*register), Some(*state));
         let attached: LwwIndex = store
             .snapshot()
             .unwrap()
@@ -1148,7 +1465,7 @@ mod tests {
             .unwrap()
             .view()
             .unwrap();
-        assert_eq!(attached.winner(*register), Some(*state));
+        assert_eq!(attached.query().unwrap().winner(*register), Some(*state));
     }
 
     #[test]

@@ -20,14 +20,16 @@
 //! Cycles simply retire their members, independently of arrival order.
 //!
 //! [`LatestIndex`] exposes `H` through ordinary positive `.has(state)`
-//! membership: it proposes every known live state, estimates its exact count,
-//! and confirms membership by binary search. Unknown candidates do not survive.
+//! membership: it proposes every known live state, uses stored section counts
+//! as a planning bound, and confirms membership by binary search. Unknown
+//! candidates do not survive.
 //! The index belongs to the frozen collection observation which produced it;
 //! queries never acquire bytes or advance maintenance. Other fact views may
 //! have advanced independently, so positive membership is not a same-support
 //! requirement or a global-current guarantee.
 
-use anybytes::Bytes;
+use anybytes::{Bytes, View};
+use itertools::{Either, Itertools};
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
@@ -41,8 +43,10 @@ use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
 use crate::macros::entity;
 use crate::metadata::{self, MetaDescribe};
-use crate::query::sortedsliceconstraint::{SortedSlice, SortedSliceConstraint};
-use crate::query::{ContainsConstraint, Variable};
+use crate::query::{
+    Binding, Candidates, Constraint, ContainsConstraint, Frontier, ProposalBuffer, Variable,
+    VariableId, VariableSet,
+};
 use crate::repo::BlobStoreGet;
 use crate::trible::{Fragment, Trible, A_START, E_START, TRIBLE_LEN};
 
@@ -393,50 +397,198 @@ impl CollectionDerivation for LatestBlob {
 }
 
 /// Positive known-live membership attached to one frozen latest-state cover.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub struct LatestIndex {
-    live: Vec<Id>,
+    members: Vec<LatestRows>,
+}
+
+#[derive(Clone, Debug)]
+struct LatestRows {
+    live: View<[[u8; ID_LEN]]>,
+    retired: View<[[u8; ID_LEN]]>,
+}
+
+impl LatestRows {
+    fn decode(blob: &Blob<LatestBlob>) -> Result<Self, LatestError> {
+        let (live, _) = sections(blob)?;
+        let split = HEADER_LEN + live.len();
+        // The framing check establishes exact multiples of byte-aligned rows.
+        // Canonical ordering and lattice validity belong to validate_element.
+        Ok(Self {
+            live: blob
+                .bytes
+                .slice(HEADER_LEN..split)
+                .view()
+                .map_err(|_| LatestError::BadLength(blob.bytes.len()))?,
+            retired: blob
+                .bytes
+                .slice(split..)
+                .view()
+                .map_err(|_| LatestError::BadLength(blob.bytes.len()))?,
+        })
+    }
 }
 
 impl LatestIndex {
-    /// Decode a canonical element, exposing only its positive live set.
+    /// View a typed element, checking its framing without revalidating it.
+    ///
+    /// Both row sections retain the blob's shared backing. Use
+    /// [`validate_element`] to audit canonical ordering and lattice validity.
     pub fn decode(blob: &Blob<LatestBlob>) -> Result<Self, LatestError> {
-        validate_element(blob)?;
-        let (live, _) = sections(blob)?;
+        let member = LatestRows::decode(blob)?;
         Ok(Self {
-            live: live
-                .chunks_exact(ID_LEN)
-                .map(|id| Id::new(id.try_into().expect("16-byte id")).expect("validated nonnil id"))
-                .collect(),
+            members: vec![member],
         })
     }
 
+    fn raw_states(&self) -> impl Iterator<Item = [u8; ID_LEN]> + '_ {
+        if let [member] = self.members.as_slice() {
+            return Either::Left(member.live.iter().copied());
+        }
+        let mut retired = self
+            .members
+            .iter()
+            .map(|member| member.retired.iter().copied())
+            .kmerge()
+            .dedup()
+            .peekable();
+        Either::Right(
+            self.members
+                .iter()
+                .map(|member| member.live.iter().copied())
+                .kmerge()
+                .dedup()
+                .filter(move |state| {
+                    while retired.peek().is_some_and(|other| other < state) {
+                        retired.next();
+                    }
+                    retired.peek() != Some(state)
+                }),
+        )
+    }
+
     /// The exact number of known live states.
+    ///
+    /// A single member uses its header count. A multi-member cover is merged
+    /// lazily when this count is requested, not when its rows are attached.
     pub fn len(&self) -> usize {
-        self.live.len()
+        match self.members.as_slice() {
+            [] => 0,
+            [member] => member.live.len(),
+            _ => self.raw_states().count(),
+        }
     }
 
     /// Whether this observation has no known live states.
     pub fn is_empty(&self) -> bool {
-        self.live.is_empty()
+        self.raw_states().next().is_none()
     }
 
     /// The strictly sorted known live states.
-    pub fn states(&self) -> &[Id] {
-        &self.live
+    pub fn states(&self) -> impl Iterator<Item = Id> + '_ {
+        self.raw_states().filter_map(Id::new)
     }
 
     /// Positive membership; unknown and superseded states both return false.
     pub fn contains(&self, state: Id) -> bool {
-        self.live.binary_search(&state).is_ok()
+        let raw = state.raw();
+        !self
+            .members
+            .iter()
+            .any(|member| member.retired.binary_search(&raw).is_ok())
+            && self
+                .members
+                .iter()
+                .any(|member| member.live.binary_search(&raw).is_ok())
     }
 }
 
+impl PartialEq for LatestIndex {
+    fn eq(&self, other: &Self) -> bool {
+        self.raw_states().eq(other.raw_states())
+    }
+}
+
+impl Eq for LatestIndex {}
+
+/// Positive known-live membership over the frozen cover's stored row sets.
+pub struct LatestConstraint<'a> {
+    variable: Variable<GenId>,
+    index: &'a LatestIndex,
+}
+
 impl<'a> ContainsConstraint<'a, GenId> for &'a LatestIndex {
-    type Constraint = SortedSliceConstraint<'a, GenId, Id>;
+    type Constraint = LatestConstraint<'a>;
 
     fn has(self, variable: Variable<GenId>) -> Self::Constraint {
-        SortedSlice::new_unchecked(&self.live).has(variable)
+        LatestConstraint {
+            variable,
+            index: self,
+        }
+    }
+}
+
+impl<'a> Constraint<'a> for LatestConstraint<'a> {
+    fn variables(&self) -> VariableSet {
+        VariableSet::new_singleton(self.variable.index)
+    }
+
+    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
+        // Estimates guide planning, not correctness. Stored section lengths
+        // are a cheap upper bound; do not enumerate a cover union merely to
+        // decide which constraint should propose candidates.
+        (self.variable.index == variable).then(|| {
+            self.index.members.iter().fold(0usize, |total, member| {
+                total.saturating_add(member.live.len())
+            })
+        })
+    }
+
+    fn propose(
+        &self,
+        variable: VariableId,
+        frontier: &Frontier<'_>,
+        proposals: &mut ProposalBuffer,
+    ) {
+        use crate::inline::IntoInline;
+        if self.variable.index == variable {
+            for row in 0..frontier.len() {
+                proposals.open(row as u32);
+                proposals.extend(self.index.raw_states().map(|state| {
+                    let value: Inline<GenId> = state.to_inline();
+                    value.raw
+                }));
+            }
+        }
+    }
+
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _frontier: &Frontier<'_>,
+        candidates: &mut Candidates<'_>,
+    ) {
+        if self.variable.index == variable {
+            for i in 0..candidates.len() {
+                if !candidates.is_live(i) {
+                    continue;
+                }
+                let keep = Inline::<GenId>::as_transmute_raw(&candidates.values()[i])
+                    .try_from_inline::<Id>()
+                    .is_ok_and(|state| self.index.contains(state));
+                if !keep {
+                    candidates.kill(i);
+                }
+            }
+        }
+    }
+
+    fn satisfied(&self, binding: &Binding) -> bool {
+        binding.get(self.variable.index).is_none_or(|raw| {
+            Inline::<GenId>::as_transmute_raw(raw)
+                .try_from_inline::<Id>()
+                .is_ok_and(|state| self.index.contains(state))
+        })
     }
 }
 
@@ -451,15 +603,15 @@ impl TryFromCover<LatestBlob> for LatestIndex {
     where
         R: BlobStoreGet,
     {
-        let mut joined = empty();
+        let mut members = Vec::new();
         for handle in cover.members() {
             let member = Handle::<LatestBlob>::to_hash(handle);
             let segment = reader
                 .get(handle)
                 .map_err(|source| TryFromCoverError::MemberGet { member, source })?;
-            joined = join(&joined, &segment).map_err(TryFromCoverError::View)?;
+            members.push(LatestRows::decode(&segment).map_err(TryFromCoverError::View)?);
         }
-        Self::decode(&joined).map_err(TryFromCoverError::View)
+        Ok(Self { members })
     }
 }
 
@@ -494,6 +646,127 @@ mod tests {
             super::super::AdmissionPolicy::direct(key),
             super::super::AdmissionPolicy::direct(key),
         )
+    }
+
+    fn attach(members: &[Blob<LatestBlob>]) -> LatestIndex {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[19; 32]);
+        let mut store = MemoryRepo::default();
+        let source = store
+            .collection("latest-row-view", policy(key.verifying_key()))
+            .unwrap();
+        let target = store
+            .derive::<LatestBlob>(
+                source,
+                metadata::supersedes.id(),
+                policy(key.verifying_key()),
+            )
+            .unwrap();
+        let handles = members
+            .iter()
+            .cloned()
+            .map(|member| store.put(member).unwrap())
+            .collect::<Vec<_>>();
+        let snapshot = store.snapshot().unwrap();
+        LatestIndex::try_from_cover(&target.cover(handles), &Fragment::empty(), &snapshot).unwrap()
+    }
+
+    #[test]
+    fn typed_attachment_keeps_shared_rows_and_defers_canonical_audit() {
+        let old = ufoid();
+        let live = ufoid();
+        let blob = project(&edge(&live, &old));
+        let live_ptr = blob.bytes[HEADER_LEN..].as_ptr();
+        let retired_ptr = blob.bytes[HEADER_LEN + ID_LEN..].as_ptr();
+        let index = attach(&[blob.clone()]);
+        assert_eq!(index.members[0].live.as_ptr().cast::<u8>(), live_ptr);
+        assert_eq!(index.members[0].retired.as_ptr().cast::<u8>(), retired_ptr);
+        let retained = index.clone();
+        drop(blob);
+        drop(index);
+        assert_eq!(retained.states().collect::<Vec<_>>(), [*live]);
+        assert!(!retained.contains(*old));
+
+        // The typed read boundary checks shape, not semantic canonicality.
+        // Explicit audit still identifies each malformed element.
+        for (blob, error) in [
+            (
+                encode(&live[..], &live[..]),
+                LatestError::OverlappingSections,
+            ),
+            (encode(&[0; ID_LEN], &[]), LatestError::NilId),
+            (
+                encode(&[&live[..], &live[..]].concat(), &[]),
+                LatestError::NotStrictlyIncreasing,
+            ),
+        ] {
+            assert!(LatestIndex::decode(&blob).is_ok());
+            assert_eq!(validate_element(&blob), Err(error));
+        }
+        let nil = LatestIndex::decode(&encode(&[0; ID_LEN], &[])).unwrap();
+        assert_eq!(nil.states().next(), None);
+        assert_eq!(find!(state: Id, nil.has(state)).next(), None);
+        for bytes in [
+            vec![0; HEADER_LEN - 1],
+            vec![0; HEADER_LEN + 1],
+            vec![255; HEADER_LEN],
+        ] {
+            let blob = Blob::new(Bytes::from_source(bytes));
+            assert_eq!(
+                LatestIndex::decode(&blob).unwrap_err(),
+                validate_element(&blob).unwrap_err()
+            );
+        }
+    }
+
+    #[test]
+    fn cover_queries_merge_shared_rows_without_serializing_prefixes() {
+        let a = ufoid();
+        let b = ufoid();
+        let c = ufoid();
+        let d = ufoid();
+        let members = [
+            project(&edge(&b, &a)),
+            project(&edge(&c, &b)),
+            project(&state(&a)),
+            project(&state(&d)),
+            project(&(state(&c) + state(&d))),
+        ];
+        let index = attach(&members);
+        assert_eq!(index.members.len(), members.len());
+        for member in &members {
+            let ptr = member.bytes[HEADER_LEN..].as_ptr();
+            assert!(index
+                .members
+                .iter()
+                .any(|rows| rows.live.as_ptr().cast::<u8>() == ptr));
+        }
+        let joined = members
+            .iter()
+            .fold(empty(), |joined, member| join(&joined, member).unwrap());
+        let expected = LatestIndex::decode(&joined).unwrap();
+        assert_eq!(index, expected);
+        assert_eq!(index.len(), 2);
+        let state = Variable::<GenId>::new(0);
+        let constraint = index.has(state);
+        assert_eq!(
+            constraint.estimate(state.index, &Binding::default()),
+            Some(6)
+        );
+        assert_eq!(constraint.estimate(1, &Binding::default()), None);
+        assert_eq!(
+            index.states().collect::<BTreeSet<_>>(),
+            BTreeSet::from([*c, *d])
+        );
+        assert_eq!(
+            find!(state: Id, index.has(state)).collect::<BTreeSet<_>>(),
+            BTreeSet::from([*c, *d])
+        );
+        for candidate in [*a, *b, *c, *d] {
+            assert_eq!(index.contains(candidate), expected.contains(candidate));
+        }
+        let reversed = members.into_iter().rev().collect::<Vec<_>>();
+        assert_eq!(attach(&reversed), expected);
+        assert!(attach(&[]).is_empty());
     }
 
     #[test]
@@ -669,7 +942,7 @@ mod tests {
         let index = LatestIndex::decode(&project(&facts)).unwrap();
         assert_eq!(index.len(), 2);
         assert_eq!(
-            index.states().iter().copied().collect::<BTreeSet<_>>(),
+            index.states().collect::<BTreeSet<_>>(),
             BTreeSet::from([*live, *other])
         );
         // Advance the facts alone: this id is deliberately unknown to latest.
@@ -743,21 +1016,49 @@ mod tests {
             .unwrap()
             .collection(target)
             .unwrap();
-        assert_eq!(early.view::<LatestIndex>().unwrap().states(), &[*b]);
+        assert_eq!(
+            early
+                .view::<LatestIndex>()
+                .unwrap()
+                .states()
+                .collect::<Vec<_>>(),
+            [*b]
+        );
         store
             .commit(source, &key, Fragment::from(edge(&c, &b)))
             .unwrap();
         let after = block_on(store.maintain(target, &key)).unwrap();
         let frozen = after.collection(target).unwrap();
-        assert_eq!(frozen.view::<LatestIndex>().unwrap().states(), &[*c]);
+        assert_eq!(
+            frozen
+                .view::<LatestIndex>()
+                .unwrap()
+                .states()
+                .collect::<Vec<_>>(),
+            [*c]
+        );
         store
             .commit(source, &key, Fragment::from(state(&a)))
             .unwrap();
         let caught_up = block_on(store.maintain(target, &key)).unwrap();
         let live: LatestIndex = caught_up.collection(target).unwrap().view().unwrap();
-        assert_eq!(live.states(), &[*c]);
-        assert_eq!(early.view::<LatestIndex>().unwrap().states(), &[*b]);
-        assert_eq!(frozen.view::<LatestIndex>().unwrap().states(), &[*c]);
+        assert_eq!(live.states().collect::<Vec<_>>(), [*c]);
+        assert_eq!(
+            early
+                .view::<LatestIndex>()
+                .unwrap()
+                .states()
+                .collect::<Vec<_>>(),
+            [*b]
+        );
+        assert_eq!(
+            frozen
+                .view::<LatestIndex>()
+                .unwrap()
+                .states()
+                .collect::<Vec<_>>(),
+            [*c]
+        );
         assert_eq!(frozen.support().len(), 2);
         assert_eq!(caught_up.collection(target).unwrap().support().len(), 3);
         assert!(caught_up.records().unwrap().any(|record| matches!(record.unwrap(), super::super::CollectionRecord::Merge(merge) if merge.collection() == target.handle())));

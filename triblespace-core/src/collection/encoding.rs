@@ -12,8 +12,12 @@
 //!   descriptor.
 //!
 //! Logical interpretation is deliberately separate in
-//! [`TryFromCover`](crate::collection::TryFromCover). An interpretation may join every
-//! physical member eagerly or retain an exact cover of mmap-backed shards.
+//! [`TryFromCover`](crate::collection::TryFromCover). Maintained-index views
+//! retain their mmap-backed shards and check only the framing, bounds and
+//! alignment needed to access them safely. Attachment does not re-prove
+//! canonical contents, serialize a logical union, or construct an accelerator.
+//! Query preparation may derive scratch data the encoding does not persist;
+//! that work belongs to the requested query, not to attaching the index.
 
 use std::error::Error;
 use std::fmt;
@@ -94,7 +98,8 @@ pub trait CollectionEncoding: BlobEncoding + MetaDescribe + Sized + 'static {
     /// boundary. A Merkle encoding may inspect children through `reader`; a
     /// monolithic encoding normally ignores it. Warm collection resolution
     /// does not invoke this hook; it is available to producers, untrusted
-    /// ingress, and offline audits.
+    /// ingress, and offline audits. It is not part of ordinary typed-view
+    /// construction, nor a requirement to check locally produced output again.
     fn validate_member<R>(
         descriptor: &Fragment,
         member: &Blob<Self>,
