@@ -2,9 +2,10 @@ use anybytes::Bytes;
 use ed25519_dalek::SigningKey;
 use proptest::prelude::*;
 use std::collections::HashMap;
-use triblespace::core::blob::encodings::UnknownBlob;
+use triblespace::core::blob::encodings::{simplearchive::SimpleArchive, UnknownBlob};
 use triblespace::core::collection::{
-    CollectionMerge, CollectionRead, CollectionRecord, CollectionRecordFingerprint, CollectionStore,
+    CollectionCommit, CollectionMerge, CollectionRead, CollectionRecord,
+    CollectionRecordFingerprint, CollectionStore,
 };
 use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::*;
@@ -123,6 +124,9 @@ proptest! {
         // This tests physical record union, without descriptors or admission.
         // One fixture signer preserves identical-record dedup across actors.
         let signing_key = SigningKey::from_bytes(&[1; 32]);
+        let metadata_blob: Blob<SimpleArchive> = TribleSet::new().to_blob();
+        let metadata = piles[0].put::<SimpleArchive, _>(metadata_blob.clone()).unwrap();
+        expected_blobs.insert(metadata.transmute(), metadata_blob.bytes.as_ref().to_vec());
 
         for actor_op in scenario.ops {
             match actor_op {
@@ -159,11 +163,27 @@ proptest! {
                     Op::MergeRecord { collection, left, right, result } => {
                         if !handles.is_empty() {
                             let at = |index: usize| handles[index % handles.len()].transmute();
+                            let collection = at(collection);
+                            let [left, right] = [left, right].map(|index| {
+                                CollectionCommit::sign(
+                                    &signing_key,
+                                    collection,
+                                    at(index).into(),
+                                    metadata,
+                                )
+                            });
+                            // Persist the exact input witnesses before the endorsement;
+                            // their physical union is part of the state-machine oracle.
+                            for witness in [left, right] {
+                                let record = CollectionRecord::Commit(witness);
+                                piles[actor].insert(record).unwrap();
+                                expected_records.insert(record.fingerprint(), record);
+                            }
                             let record = CollectionRecord::Merge(CollectionMerge::sign(
                                 &signing_key,
-                                at(collection),
-                                at(left).into(),
-                                at(right).into(),
+                                collection,
+                                (left.data(), left.fingerprint()),
+                                (right.data(), right.fingerprint()),
                                 at(result).into(),
                             ));
                             piles[actor].insert(record).unwrap();

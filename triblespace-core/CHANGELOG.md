@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Remove support-redundant physical-cover repair members before LSM planning.
+  A later resident member may already carry every exact witness of an earlier
+  addition; retaining both could repeat a useless subsuming carry and report a
+  stalled collection. Selection preserves full witnessed support, and genuine
+  publication-progress failures remain errors.
+
 ### Added
 
 - Add witness-bound MERGE/DERIVE endorsements over actual native input-record
@@ -110,6 +118,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fetching missing blobs. Proof presence alone grants no authority.
 
 ### Changed
+
+- Construct aggregate endorsed collection support once from the selected
+  witness DAG's distinct COMMIT payloads, avoiding repeated unions of
+  overlapping certificates while preserving exact support alternatives,
+  requested-support filtering, and complete conflict checks.
 
 - Preflight each invocation and delegation action of a compound collection
   grant against that action's roots before publishing it. An open action may

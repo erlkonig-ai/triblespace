@@ -335,7 +335,7 @@ fn exact_old_support_ignores_a_later_commit_and_equation() {
         .insert(CollectionRecord::Derive(CollectionDerive::sign(
             &authority_key(),
             target.handle(),
-            third.data(),
+            (third.data(), third.fingerprint()),
             Handle::<PathSummaryBlob>::to_hash(later_summary.get_handle()),
         )))
         .unwrap();
@@ -383,8 +383,8 @@ fn resident_source_merge_is_lowered_once() {
         .insert(CollectionRecord::Merge(CollectionMerge::sign(
             &authority_key(),
             source.handle(),
-            first.data(),
-            second.data(),
+            (first.data(), first.fingerprint()),
+            (second.data(), second.fingerprint()),
             joined_data,
         )))
         .unwrap();
@@ -417,17 +417,17 @@ fn existing_target_merge_is_selected_as_one_physical_member() {
     publish(&mut store, second);
     let left_summary = path_summary_union::derive_element(&left, &automaton).unwrap();
     let right_summary = path_summary_union::derive_element(&right, &automaton).unwrap();
-    for (input, output) in [(&left, &left_summary), (&right, &right_summary)] {
+    let derives = [(first, &left_summary), (second, &right_summary)].map(|(input, output)| {
         store.put::<PathSummaryBlob, _>(output.clone()).unwrap();
-        store
-            .insert(CollectionRecord::Derive(CollectionDerive::sign(
-                &authority_key(),
-                target.handle(),
-                Handle::<SimpleArchive>::to_hash(input.get_handle()),
-                Handle::<PathSummaryBlob>::to_hash(output.get_handle()),
-            )))
-            .unwrap();
-    }
+        let record = CollectionDerive::sign(
+            &authority_key(),
+            target.handle(),
+            (input.data(), input.fingerprint()),
+            Handle::<PathSummaryBlob>::to_hash(output.get_handle()),
+        );
+        store.insert(CollectionRecord::Derive(record)).unwrap();
+        record
+    });
     let joined = PathSummaryBlob::join(&left_summary, &right_summary, &automaton).unwrap();
     store.put::<PathSummaryBlob, _>(joined.clone()).unwrap();
     let joined_data = Handle::<PathSummaryBlob>::to_hash(joined.get_handle());
@@ -435,8 +435,8 @@ fn existing_target_merge_is_selected_as_one_physical_member() {
         .insert(CollectionRecord::Merge(CollectionMerge::sign(
             &authority_key(),
             target.handle(),
-            Handle::<PathSummaryBlob>::to_hash(left_summary.get_handle()),
-            Handle::<PathSummaryBlob>::to_hash(right_summary.get_handle()),
+            (derives[0].output(), derives[0].fingerprint()),
+            (derives[1].output(), derives[1].fingerprint()),
             joined_data,
         )))
         .unwrap();
@@ -452,7 +452,7 @@ fn existing_target_merge_is_selected_as_one_physical_member() {
 }
 
 #[test]
-fn absent_source_bytes_hide_the_commit_from_admitted_support() {
+fn absent_source_bytes_delay_residency_but_not_record_admission() {
     let mut store = CollectionOnly::default();
     let (source, target) = test_paths(&mut store, "paths", plus());
     let absent = edge(1, 2).to_blob();
@@ -467,11 +467,41 @@ fn absent_source_bytes_hide_the_commit_from_admitted_support() {
     );
     publish(&mut store, commit);
     let support = support(&mut store, source, [commit]);
-    assert!(support.is_empty());
-    let snapshot = store.snapshot().unwrap();
-    assert!(snapshot
-        .collection_exact(target, &support)
-        .unwrap()
-        .cover()
-        .is_empty());
+    assert_eq!(support.len(), 1);
+    assert!(support.contains(absent.get_handle()));
+    let before_records = records(&mut store);
+    let before = store.snapshot().unwrap();
+    assert!(before.collection(source).unwrap().cover().is_empty());
+    assert!(before.collection(target).unwrap().cover().is_empty());
+    assert!(matches!(
+        before.collection_exact(source, &support),
+        Err(CollectionRealizationError::IncompleteCover {
+            unsupported_members,
+            ..
+        }) if unsupported_members == vec![commit.data()]
+    ));
+    assert!(matches!(
+        before.collection_exact(target, &support),
+        Err(CollectionRealizationError::IncompleteCover {
+            unsupported_members,
+            ..
+        }) if unsupported_members == vec![commit.data()]
+    ));
+
+    store.put::<SimpleArchive, _>(absent.clone()).unwrap();
+    let after = store.snapshot().unwrap();
+    assert_eq!(source.admitted(&after).unwrap(), support);
+    let source_view = after.collection_exact(source, &support).unwrap();
+    assert_eq!(source_view.view::<TribleSet>().unwrap(), edge(1, 2));
+    assert_eq!(records(&mut store), before_records);
+    assert!(before.collection(source).unwrap().cover().is_empty());
+    // Arriving source bytes need no new COMMIT, but do not manufacture a
+    // target DERIVE: the same exact request is still incomplete there.
+    assert!(matches!(
+        after.collection_exact(target, &support),
+        Err(CollectionRealizationError::IncompleteCover {
+            unsupported_members,
+            ..
+        }) if unsupported_members == vec![commit.data()]
+    ));
 }

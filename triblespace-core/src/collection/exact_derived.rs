@@ -438,6 +438,8 @@ where
         selected.physical.cover.iter().copied(),
         requested.collection(),
     );
+    let coarse_support = represented.clone();
+    let mut residuals = Vec::new();
     for member in resident {
         if requested.is_subset(&represented).expect("one foundation") {
             break;
@@ -456,9 +458,48 @@ where
             CollectionMemberAvailability::Complete => {
                 selected.physical.cover.insert(*member);
                 represented = represented.union(&member_support).expect("one foundation");
+                residuals.push((*member, member_support));
             }
             _ => {}
         }
+    }
+    // A later support-repair member can make an earlier one redundant even
+    // though both were needed when first visited. Keep the semantic physical
+    // cover, and prune only these additions before an LSM carry is planned.
+    // Cached suffix unions let each candidate see every other retained support
+    // without rebuilding the whole union per candidate. Compare FULL witnessed
+    // support, never its intersection with the requested slice.
+    if residuals.len() > 1 {
+        let mut remaining = Vec::with_capacity(residuals.len() + 1);
+        remaining.push(requested.collection().cover([]));
+        for (_, member_support) in residuals.iter().rev() {
+            remaining.push(
+                remaining
+                    .last()
+                    .expect("suffix union starts with the empty support")
+                    .union(member_support)
+                    .expect("one foundation"),
+            );
+        }
+        let mut retained_support = coarse_support;
+        for (member, member_support) in residuals {
+            remaining.pop();
+            let others = retained_support
+                .union(
+                    remaining
+                        .last()
+                        .expect("suffix retains its empty terminator"),
+                )
+                .expect("one foundation");
+            if member_support.is_subset(&others).expect("one foundation") {
+                selected.physical.cover.remove(&member);
+            } else {
+                retained_support = retained_support
+                    .union(&member_support)
+                    .expect("one foundation");
+            }
+        }
+        debug_assert_eq!(retained_support, represented);
     }
     if requested.is_subset(&represented).expect("one foundation") {
         selected.physical.missing.clear();
@@ -576,7 +617,6 @@ where
     })?;
     let mut closure = super::witness::WitnessClosure::default();
     let mut roots = BTreeSet::new();
-    let mut support = Support::from_data(lineage.foundation, []);
     let mut witnesses = InputWitnesses::new();
     let mut images = BTreeMap::<_, BTreeSet<_>>::new();
     for record in candidates {
@@ -621,7 +661,6 @@ where
             continue;
         }
         roots.insert(record.fingerprint());
-        support = support.union(&record_support).expect("one foundation");
     }
     let records = closure.records_for(roots);
     for record in &records {
@@ -649,6 +688,13 @@ where
         alternatives.push((record.fingerprint(), record_support));
     }
     let discovered = super::DiscoveredCollectionRecords::from_records(records);
+    // The selected closed DAG's distinct COMMIT payloads are exactly the
+    // union of its accepted roots' supports. Build that PATCH once rather
+    // than repeatedly unioning overlapping intermediate certificates.
+    let support = Support::from_data(
+        lineage.foundation,
+        discovered.commits().iter().map(|commit| commit.data()),
+    );
     let commits = discovered.commits().iter().copied().collect();
     let resolution =
         resolve_collection_semantics(&discovered, &lineage.source_by_target, &commits, |_| {
