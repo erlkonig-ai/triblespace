@@ -245,6 +245,8 @@ pub enum Command {
     /// Each target uses the immediate-source members already available. Use
     /// maintain-all to advance its source dependencies first. --watch keeps
     /// one pile open and retries after content or authorization changes.
+    /// Target priority is stable for the author's public key, spreading first
+    /// attempts across independent authors without changing the merge plan.
     /// Reference summaries require the complete producer-side blob closure.
     Maintain {
         /// Path to the pile file to modify
@@ -269,6 +271,8 @@ pub enum Command {
     /// scheduling over ordinary one-edge operations; mappings and joins do not
     /// acquire recursive construction side effects. Only the requested targets
     /// and their descriptor source chains are selected, not historical indexes.
+    /// The author's public key biases which selected chain runs first; each
+    /// chain still runs upstream first, independently of argument order.
     MaintainAll {
         /// Path to the pile file to modify
         pile: PathBuf,
@@ -2252,8 +2256,23 @@ async fn maintenance_pass(
     }
     drop(snapshot);
 
+    // Give independent authors different stable priorities over the same
+    // explicit selection. This is local scheduling, not exclusive ownership:
+    // nodes may still choose the same first target or perform overlapping work.
+    // Only the outer chain order changes; the dependency walk and canonical
+    // per-collection merge/derive plans below remain untouched.
+    let author = signer.verifying_key();
+    let mut targets: Vec<_> = selected.iter().copied().collect();
+    targets.sort_by_cached_key(|target| {
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"trible/maintenance-target-order");
+        hash.update(author.as_bytes());
+        hash.update(&target.raw);
+        (*hash.finalize().as_bytes(), target.raw)
+    });
+
     let mut attempted = BTreeSet::new();
-    for &target in &selected {
+    for target in targets {
         let snapshot = pile
             .snapshot()
             .map_err(|error| anyhow!("pile snapshot: {error:?}"))?;

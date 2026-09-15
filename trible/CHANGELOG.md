@@ -18,6 +18,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+- `pile collection maintain` and `maintain-all` order independent selected
+  targets deterministically from the actual signing author's public key.
+  Shared dependencies still run once, upstream first. Input order and repeated
+  target arguments do not change the schedule; the collection merge plan and
+  signed record format are unchanged.
+
 - Use `/triblespace/pile-sync/26` for the combined AUTH-v5 and witness-bound
   equation epoch. MERGE/DERIVE dense tags 6/7 carry 288/224-byte bodies and
   signatures bind exact input-record fingerprints. Retired unsigned and

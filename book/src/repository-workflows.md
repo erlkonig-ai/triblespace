@@ -481,6 +481,14 @@ This adds scheduling, not recursive effects inside a mapping kernel. Exact
 target selection prevents an old, superseded index from
 being restarted merely because its descriptor is still present.
 
+The signing author's public key deterministically biases the order of the
+explicitly selected targets, independently of argument order or duplicate
+selections. Independent authors therefore tend to attempt different chains
+first; each chain still runs upstream first, and shared dependencies run once
+per pass. This is priority rather than exclusive ownership: duplicate work is
+still possible, no distributed lock is introduced, and each collection's
+canonical merge/derive plan remains unchanged.
+
 ```sh
 trible pile collection maintain-all self.pile blake3:<RANK9_TARGET> --watch
 ```

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Bias explicitly selected CLI maintenance targets by the author's public key.
+  Each author retains deterministic priority independent of argument order;
+  dependency-first scheduling, once-per-pass deduplication, and canonical
+  collection equation plans are unchanged. This spreads first attempts, not
+  exclusive ownership or a guarantee of no duplicate computation.
+
 - Pin AnyBytes `066c32a7` so freezing an immutable section no longer flushes
   its temporary mmap. Persistence retains an explicit durability barrier.
 
