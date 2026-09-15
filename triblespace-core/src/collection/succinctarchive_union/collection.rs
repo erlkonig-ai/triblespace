@@ -740,7 +740,7 @@ mod tests {
         ))
         .unwrap();
         let observed = snapshot.collection(accelerated_collection).unwrap();
-        assert_eq!(observed.support(), &first_support);
+        assert_eq!(observed.support().unwrap(), &first_support);
         assert!(snapshot
             .collection_exact(accelerated_collection, &full_support)
             .is_err());
@@ -758,7 +758,7 @@ mod tests {
         ))
         .unwrap();
         let observed = snapshot.collection(accelerated_collection).unwrap();
-        assert_eq!(observed.support(), &full_support);
+        assert_eq!(observed.support().unwrap(), &full_support);
         let view: UnionArchive<OrderedUniverse> = observed.view().unwrap();
         assert_eq!(view.iter().count(), 2);
     }
@@ -882,7 +882,7 @@ mod tests {
             .collection_exact(accelerated_collection, &support)
             .unwrap();
 
-        assert_eq!(attached.support(), &support);
+        assert_eq!(attached.support().unwrap(), &support);
         assert_eq!(
             attached.cover().data_members().collect::<Vec<_>>(),
             vec![fc_data],

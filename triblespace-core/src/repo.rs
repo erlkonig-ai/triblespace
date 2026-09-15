@@ -123,6 +123,39 @@ impl StoreChanges {
     }
 }
 
+/// The raw read-set of one retained immutable-store observation.
+///
+/// These are lookup interests, including absent records and blobs, rather
+/// than copies of their contents or a second catalog. A later matching record
+/// or physical blob occurrence can invalidate an earlier miss. Whole-component
+/// flags cover readers that enumerate rather than perform exact lookups.
+/// Query time and external provider availability are not stored dependencies;
+/// callers retain their existing deadline and exact-acquisition behavior.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StoreDependencies {
+    /// Raw record selection routes consulted by the observation.
+    pub records: BTreeSet<CollectionRecordSelector>,
+    /// Exact blob hashes consulted, whether resident, missing, or unreadable.
+    pub blobs: BTreeSet<CollectionData>,
+    /// Whether complete capability proof evidence was consulted.
+    pub capability_proofs: bool,
+    /// Whether an unrestricted record enumeration was consulted.
+    pub all_records: bool,
+    /// Whether an unrestricted blob enumeration was consulted.
+    pub all_blobs: bool,
+}
+
+impl StoreDependencies {
+    /// Whether no store component was consulted.
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+            && self.blobs.is_empty()
+            && !self.capability_proofs
+            && !self.all_records
+            && !self.all_blobs
+    }
+}
+
 /// One immutable observation of a storage backend.
 ///
 /// A snapshot is its own local revision token. It owns every read capability
@@ -153,6 +186,132 @@ pub trait StoreSnapshot: Clone + Send + Sync + 'static {
     /// portable versions.
     fn changes_since(&self, _previous: &Self) -> StoreChanges {
         StoreChanges::ALL
+    }
+
+    /// Conservatively classify changes relevant to a retained raw read-set.
+    ///
+    /// An unchanged result must cover misses as well as successful reads.
+    /// Backends may narrow comparison using shared indexes; this default only
+    /// masks [`changes_since`](Self::changes_since) by the components that
+    /// were consulted, so wrappers without scoped comparison remain safe.
+    /// Blob changes include additional physical occurrences of an existing
+    /// hash, which may recover a previously unreadable payload. WANT changes
+    /// and the query clock are deliberately outside this read-set.
+    fn changes_for(&self, previous: &Self, dependencies: &StoreDependencies) -> StoreChanges {
+        if dependencies.is_empty() {
+            return StoreChanges::NONE;
+        }
+        let observed = self.changes_since(previous);
+        let mut relevant = StoreChanges::NONE;
+        if (dependencies.all_records || !dependencies.records.is_empty())
+            && observed.contains(StoreChanges::COLLECTION_RECORDS)
+        {
+            relevant = relevant.union(StoreChanges::COLLECTION_RECORDS);
+        }
+        if (dependencies.all_blobs || !dependencies.blobs.is_empty())
+            && observed.contains(StoreChanges::BLOBS)
+        {
+            relevant = relevant.union(StoreChanges::BLOBS);
+        }
+        if dependencies.capability_proofs && observed.contains(StoreChanges::CAPABILITY_PROOFS) {
+            relevant = relevant.union(StoreChanges::CAPABILITY_PROOFS);
+        }
+        relevant
+    }
+}
+
+#[cfg(test)]
+mod store_dependency_tests {
+    use super::*;
+
+    #[derive(Clone)]
+    struct UnclassifiedSnapshot;
+
+    impl StoreSnapshot for UnclassifiedSnapshot {
+        fn instant(&self) -> hifitime::Epoch {
+            hifitime::Epoch::from_tai_seconds(0.0)
+        }
+    }
+
+    #[derive(Clone)]
+    struct ClassifiedSnapshot(StoreChanges);
+
+    impl StoreSnapshot for ClassifiedSnapshot {
+        fn instant(&self) -> hifitime::Epoch {
+            hifitime::Epoch::from_tai_seconds(0.0)
+        }
+
+        fn changes_since(&self, _previous: &Self) -> StoreChanges {
+            self.0
+        }
+    }
+
+    #[test]
+    fn scoped_default_keeps_unclassified_wrappers_conservative() {
+        let snapshot = UnclassifiedSnapshot;
+        let mut dependencies = StoreDependencies::default();
+        assert!(dependencies.is_empty());
+        assert_eq!(
+            snapshot.changes_for(&snapshot, &dependencies),
+            StoreChanges::NONE
+        );
+
+        dependencies
+            .records
+            .insert(CollectionRecordSelector::Collection(CollectionHandle::new(
+                [1; INLINE_LEN],
+            )));
+        assert!(!dependencies.is_empty());
+        assert_eq!(
+            snapshot.changes_for(&snapshot, &dependencies),
+            StoreChanges::COLLECTION_RECORDS
+        );
+        dependencies
+            .blobs
+            .insert(CollectionData::new([2; INLINE_LEN]));
+        dependencies.capability_proofs = true;
+        let all_reads = StoreChanges::COLLECTION_RECORDS
+            .union(StoreChanges::BLOBS)
+            .union(StoreChanges::CAPABILITY_PROOFS);
+        assert_eq!(snapshot.changes_for(&snapshot, &dependencies), all_reads);
+        assert!(!all_reads.contains(StoreChanges::WANTS));
+
+        dependencies.records.clear();
+        dependencies.blobs.clear();
+        dependencies.all_records = true;
+        dependencies.all_blobs = true;
+        assert_eq!(snapshot.changes_for(&snapshot, &dependencies), all_reads);
+    }
+
+    #[test]
+    fn scoped_default_filters_only_uninterested_components() {
+        let before = ClassifiedSnapshot(StoreChanges::NONE);
+        let mut dependencies = StoreDependencies {
+            all_records: true,
+            ..StoreDependencies::default()
+        };
+        for observed in [StoreChanges::NONE, StoreChanges::BLOBS, StoreChanges::WANTS] {
+            assert_eq!(
+                ClassifiedSnapshot(observed).changes_for(&before, &dependencies),
+                StoreChanges::NONE
+            );
+        }
+        assert_eq!(
+            ClassifiedSnapshot(StoreChanges::ALL).changes_for(&before, &dependencies),
+            StoreChanges::COLLECTION_RECORDS
+        );
+        dependencies.capability_proofs = true;
+        assert_eq!(
+            ClassifiedSnapshot(StoreChanges::CAPABILITY_PROOFS).changes_for(&before, &dependencies),
+            StoreChanges::CAPABILITY_PROOFS
+        );
+        dependencies
+            .blobs
+            .insert(CollectionData::new([3; INLINE_LEN]));
+        assert_eq!(
+            ClassifiedSnapshot(StoreChanges::BLOBS).changes_for(&before, &dependencies),
+            StoreChanges::BLOBS
+        );
     }
 }
 
@@ -227,7 +386,9 @@ use crate::blob::encodings::UnknownBlob;
 use crate::blob::Blob;
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
-use crate::collection::{CollectionData, CollectionHandle, CollectionRead, CollectionStore};
+use crate::collection::{
+    CollectionData, CollectionHandle, CollectionRead, CollectionRecordSelector, CollectionStore,
+};
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
 use crate::inline::InlineEncoding;

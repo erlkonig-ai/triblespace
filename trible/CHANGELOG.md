@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
+- `pile collection derive PILE SOURCE entity-id-set --attribute ID` registers
+  the canonical projection of an attribute's GenId values. Ordinary `maintain`
+  and `maintain-all` dispatch it without changing the source's SimpleArchive
+  COMMITs; timestamps and receipt assertion IDs are not projected values.
+
 - Add the optional `succinct-cuda` feature and explicit
   `--succinct-backend cpu|cuda` selection for collection maintenance. CUDA uses
   the same descriptor and raw bytes for DERIVE and target MERGE, with canonical

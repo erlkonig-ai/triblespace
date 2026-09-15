@@ -77,8 +77,11 @@ fn reference_summary_cli_registers_maintains_and_reuses_ordinary_derived_records
             let target =
                 Collection::<ReferenceSummaryBlob>::open(&snapshot, Inline::new(raw)).unwrap();
             let observed = snapshot.collection(target).unwrap();
-            assert_eq!(observed.support().len(), 1);
-            assert!(observed.support().contains(Inline::new(commit.data().raw)));
+            assert_eq!(observed.support().unwrap().len(), 1);
+            assert!(observed
+                .support()
+                .unwrap()
+                .contains(Inline::new(commit.data().raw)));
             let view = observed.view::<ReferenceSummaryView>().unwrap();
             assert_eq!(
                 view.layout(),

@@ -17,6 +17,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Attach ordinary collection snapshots from admitted target endorsements and
+  resident outputs without eagerly expanding historical COMMIT support.
+  `CollectionSnapshot::support()` is now a fallible, lazy exact-provenance
+  query shared across clones; missing or mismatched historical routes do not
+  hide a readable endorsed target. Explicit `collection_exact` still requires
+  complete requested support. `is_current` compares the observation's tracked
+  record, proof, and exact blob dependencies, including misses, so unrelated
+  pile appends need not reconstruct the collection.
+
+- Add `StoreDependencies` and conservative `StoreSnapshot::changes_for`
+  comparison for retained read-sets, including absent records and blobs. Pile
+  narrows comparison through shared record relationship prefixes and physical
+  blob-occurrence prefixes, so unrelated changes can be ignored without losing
+  same-hash payload recovery. Unoptimized backends remain component-conservative.
+
+- Add `EntityIdSetBlob`, a canonical grow-only set of opaque, nonnil 16-byte
+  entity IDs, and its shard-backed `EntityIdSet` cover view. Authored encoding
+  sorts/deduplicates; collection joins use sorted union. Ordinary attachment
+  checks framing without re-auditing, copying, or hashing content; membership
+  and lazy merged iteration use the persisted rows. Explicit canonical audits
+  remain separate. The encoding ID `0BF639287590CFC9CE0E2B83D9FBC1E3` was minted
+  with installed `trible genid` on 2026-09-15. Its ordinary `SimpleArchive`
+  derivation projects the individually typed nonnil `GenId` VALUES of one
+  configured attribute, never assertion subjects or multi-fact qualifiers.
+  Configuration reuses `metadata::attribute`; algorithm
+  `7E4257A14880E8B4855B6282B337B4B5` was minted with installed `trible genid` on
+  2026-09-15. Split facts, duplicate assertions, and optional timestamps retain
+  the union law. No generic root-publication API, record format, or implicit
+  blob dependency is added.
+
+- Add raw `ProducedMember(C, H)` and `ReferencingRecord(FP)` collection-record
+  selectors. Pile maintains snapshot-shared producer and immediate-witness
+  PATCH indexes during replay, including consumers whose inputs have not
+  arrived. Mixed selections use primary/relationship/collection indexes and
+  preserve the scan fallback's fingerprint-sorted, deduplicated union without
+  authorization, support resolution, or payload reads during refresh.
+
+- Add crate-private PATCH prefix-sharing checks for scoped snapshot
+  invalidation. They compare shared node bodies, including physical occurrence
+  suffixes and attached-value replacements, without exposing hashes or treating
+  equal key counts as unchanged inputs.
+
 - Add opt-in raw Succinct build/merge wavelet backends, sharing the canonical
   CPU domain/rotation preparation and portable writer. Backend output uses the
   existing prefix/tail checks and explicit little-endian serialization; there

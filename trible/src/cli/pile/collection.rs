@@ -29,6 +29,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use triblespace_core::blob::encodings::entity_id_set::{
+    EntityIdSetBlob, GENID_ATTRIBUTE_VALUES_MAPPING_V1,
+};
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
@@ -199,11 +202,11 @@ pub enum Command {
         pile: PathBuf,
         /// Source collection: name, or descriptor handle
         source: String,
-        /// What to derive. succinct and rank9 take no arguments; latest takes
-        /// --observes; lww takes --identity and --orders; nvfp4 takes
-        /// --attribute and --dimension. reference-summary takes --log2-bits
-        /// and --probes (defaults: 32 and 4); bm25 takes --text and --tokenizer;
-        /// path takes --expr.
+        /// What to derive. succinct and rank9 take no arguments; entity-id-set
+        /// takes --attribute; latest takes --observes; lww takes --identity and
+        /// --orders; nvfp4 takes --attribute and --dimension. reference-summary
+        /// takes --log2-bits and --probes (defaults: 32 and 4); bm25 takes --text
+        /// and --tokenizer; path takes --expr.
         #[arg(value_enum)]
         kind: DeriveKind,
         /// latest: the attribute whose GenId values name the state observed
@@ -215,7 +218,8 @@ pub enum Command {
         /// lww: the attribute carrying the register order coordinate
         #[arg(long)]
         orders: Option<String>,
-        /// nvfp4: the attribute carrying f32 embedding blobs
+        /// entity-id-set: the attribute carrying GenId values; nvfp4: the
+        /// attribute carrying f32 embedding blobs
         #[arg(long)]
         attribute: Option<String>,
         /// nvfp4: the embedding dimension
@@ -369,6 +373,8 @@ pub enum DeriveKind {
     Succinct,
     /// Rank9AcceleratedSuccinctArchiveBlob over a SuccinctArchiveBlob source
     Rank9,
+    /// EntityIdSetBlob over one attribute's GenId values in a SimpleArchive source
+    EntityIdSet,
     /// LatestBlob over a SimpleArchive source
     Latest,
     /// LwwRegisterBlob over a SimpleArchive source
@@ -592,6 +598,8 @@ fn representation_name(id: Id) -> Option<&'static str> {
         Some("SuccinctArchiveBlob")
     } else if id == <Rank9AcceleratedSuccinctArchiveBlob as MetaDescribe>::id() {
         Some("Rank9AcceleratedSuccinctArchiveBlob")
+    } else if id == <EntityIdSetBlob as MetaDescribe>::id() {
+        Some("EntityIdSetBlob")
     } else if id == <triblespace_core::collection::latest::LatestBlob as MetaDescribe>::id() {
         Some("LatestBlob")
     } else if id
@@ -686,6 +694,8 @@ fn mapping_algorithm_name(id: Id) -> Option<&'static str> {
         Some("RAW_TO_RANK9_ACCELERATED_MAPPING_V1_64_LE")
     } else if id == RAW_TO_RANK9_ACCELERATED_MAPPING_V1_64_BE {
         Some("RAW_TO_RANK9_ACCELERATED_MAPPING_V1_64_BE")
+    } else if id == GENID_ATTRIBUTE_VALUES_MAPPING_V1 {
+        Some("GENID_ATTRIBUTE_VALUES_MAPPING_V1")
     } else if id == LATEST_STATES_MAPPING_V1 {
         Some("LATEST_STATES_MAPPING_V1")
     } else if id == REGISTER_COORDINATES_MAPPING_V1 {
@@ -2168,6 +2178,8 @@ async fn maintain_by_representation(
         go::<SuccinctArchiveBlob>(pile, snapshot, handle, signer).await
     } else if representation == <Rank9AcceleratedSuccinctArchiveBlob as MetaDescribe>::id() {
         go::<Rank9AcceleratedSuccinctArchiveBlob>(pile, snapshot, handle, signer).await
+    } else if representation == <EntityIdSetBlob as MetaDescribe>::id() {
+        go::<EntityIdSetBlob>(pile, snapshot, handle, signer).await
     } else if representation == <LatestBlob as MetaDescribe>::id() {
         go::<LatestBlob>(pile, snapshot, handle, signer).await
     } else if representation == <LwwRegisterBlob as MetaDescribe>::id() {
@@ -2638,6 +2650,13 @@ fn run_derive(
                     .map_err(registered)?
                     .handle()
             }
+            DeriveKind::EntityIdSet => {
+                let attribute = parse_attribute_id("--attribute", arguments.attribute.as_deref())?;
+                let source: Collection<SimpleArchive> = open_source(&mut pile, source_handle)?;
+                pile.derive::<EntityIdSetBlob>(source, attribute, policy)
+                    .map_err(registered)?
+                    .handle()
+            }
             DeriveKind::Latest => {
                 let observes = parse_attribute_id("--observes", arguments.observes.as_deref())?;
                 let source: Collection<SimpleArchive> = open_source(&mut pile, source_handle)?;
@@ -2814,6 +2833,7 @@ fn run_search(
     snippet: bool,
 ) -> Result<()> {
     use anybytes::View;
+    use anyhow::Context;
     use triblespace_core::blob::encodings::utf8string::UTF8String;
     use triblespace_core::collection::{CollectionDerivation, CollectionSnapshotExt};
     use triblespace_core::inline::encodings::genid::GenId;
@@ -2894,9 +2914,12 @@ fn run_search(
         let source_facts: Option<TribleSet> = if snippet && !hits.is_empty() {
             let source_collection: Collection<SimpleArchive> = Collection::open(&snapshot, source)
                 .map_err(|error| anyhow!("open source descriptor: {error}"))?;
+            let support = view
+                .support()
+                .context("resolve indexed support for snippets")?;
             Some(
                 snapshot
-                    .collection_exact(source_collection, view.support())
+                    .collection_exact(source_collection, support)
                     .map_err(|error| anyhow!("attach source: {error:?}"))?
                     .view::<TribleSet>()
                     .map_err(|error| anyhow!("view source: {error:?}"))?,

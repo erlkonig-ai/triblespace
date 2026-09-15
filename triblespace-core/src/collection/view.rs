@@ -2,38 +2,42 @@
 //! covers.
 //!
 //! A [`CollectionSnapshot`] owns the store observation against which its
-//! frozen support and realized target cover are valid. Logical values remain
-//! caller-chosen projections reconstructed through [`TryFromCover`].
+//! realized target cover is valid. Foundational support is a separate, lazy
+//! provenance query. Logical values remain caller-chosen projections
+//! reconstructed through [`TryFromCover`].
 
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
+use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::repo::{BlobStoreGet, StoreSnapshot};
+use crate::repo::{BlobStoreGet, StoreChanges, StoreDependencies, StoreRead, StoreSnapshot};
 use crate::trible::Fragment;
 
+use super::observed_store::{DependencyTracker, ObservedStore};
 use super::{
-    CollectionData, CollectionDescriptorError, CollectionEncoding, CollectionHandle, Cover,
-    RecordDecodeError, Support,
+    CollectionData, CollectionDescriptorError, CollectionEncoding, CollectionHandle,
+    CollectionRealizationError, CollectionRecord, Cover, RecordDecodeError, Support,
 };
 
 /// One immutable collection observation and its exact realized target cover.
 ///
-/// `support` is the snapshot-valid foundational support represented by
-/// `cover`, invariant across every intervening `DERIVE` and `MERGE`. It is
-/// admitted support for the ordinary collection path and caller-requested
-/// support for the explicit path. Keeping both values with the store
-/// observation prevents a caller from accidentally interpreting a physical
-/// realization through a different snapshot. Logical views are reconstructed
-/// on demand with [`Self::view`].
+/// The target's admitted producer endorsements determine its resident cover.
+/// Reading that value does not require the historical inputs to be present.
+/// [`Self::support`] explicitly resolves the foundational support through the
+/// exact endorsed record routes, using this same frozen store observation.
+/// Logical views are reconstructed on demand with [`Self::view`].
 pub struct CollectionSnapshot<R, E>
 where
     R: StoreSnapshot,
     E: CollectionEncoding,
 {
     snapshot: R,
-    support: Support,
+    support: Arc<OnceLock<Support>>,
     cover: Cover<E>,
+    descriptor: Option<Fragment>,
+    witnesses: Arc<[CollectionRecord]>,
+    dependencies: DependencyTracker,
 }
 
 impl<R, E> Clone for CollectionSnapshot<R, E>
@@ -46,6 +50,9 @@ where
             snapshot: self.snapshot.clone(),
             support: self.support.clone(),
             cover: self.cover.clone(),
+            descriptor: self.descriptor.clone(),
+            witnesses: self.witnesses.clone(),
+            dependencies: self.dependencies.clone(),
         }
     }
 }
@@ -59,22 +66,89 @@ where
     pub(crate) fn new(snapshot: R, support: Support, cover: Cover<E>) -> Self {
         Self {
             snapshot,
-            support,
+            support: Arc::new(OnceLock::from(support)),
             cover,
+            descriptor: None,
+            witnesses: Arc::from([]),
+            // Exact observations constructed without a tracked reader remain
+            // conservative. Ordinary attachment supplies its exact read-set.
+            dependencies: Arc::new(Mutex::new(StoreDependencies {
+                all_records: true,
+                all_blobs: true,
+                capability_proofs: true,
+                ..StoreDependencies::default()
+            })),
         }
     }
 
-    /// Immutable store observation against which both covers are valid.
+    /// Retain accepted target endorsements without expanding their ancestry.
+    pub(crate) fn from_endorsements(
+        snapshot: R,
+        cover: Cover<E>,
+        descriptor: Fragment,
+        witnesses: Vec<CollectionRecord>,
+        dependencies: DependencyTracker,
+    ) -> Self {
+        Self {
+            snapshot,
+            support: Arc::new(OnceLock::new()),
+            cover,
+            descriptor: Some(descriptor),
+            witnesses: witnesses.into(),
+            dependencies,
+        }
+    }
+
+    pub(crate) fn with_dependencies(mut self, dependencies: DependencyTracker) -> Self {
+        self.dependencies = dependencies;
+        self
+    }
+
+    /// Immutable store observation against which the cover and provenance are valid.
     pub fn snapshot(&self) -> &R {
         &self.snapshot
     }
 
-    /// Snapshot-valid foundational support represented by this snapshot.
-    pub fn support(&self) -> &Support {
-        &self.support
+    /// Whether all consulted store dependencies are unchanged in `snapshot`.
+    ///
+    /// Missing records and blobs are dependencies too. Unrelated appends do
+    /// not invalidate an observation on backends with scoped indexes. A false
+    /// result is conservative: a reattachment may still select the same cover.
+    /// Application deadlines and the snapshot's query clock are independent.
+    /// Reading a view or requesting support extends the tracked read-set.
+    pub fn is_current(&self, snapshot: &R) -> bool {
+        let dependencies = self
+            .dependencies
+            .lock()
+            .expect("dependency tracker poisoned");
+        snapshot.changes_for(&self.snapshot, &dependencies) == StoreChanges::NONE
     }
 
-    /// Exact target cover realized for [`Self::support`].
+    /// Resolve the exact foundational support endorsed by this observation.
+    ///
+    /// This is an explicit provenance query, independent of reading the target
+    /// value. Missing historical records make support unavailable, not empty,
+    /// and do not prevent [`Self::view`]. Successful expansion is shared by
+    /// clones of this immutable collection observation.
+    pub fn support(&self) -> Result<&Support, CollectionRealizationError>
+    where
+        R: StoreRead,
+    {
+        if let Some(support) = self.support.get() {
+            return Ok(support);
+        }
+        let observed =
+            ObservedStore::with_tracker(self.snapshot.clone(), self.dependencies.clone());
+        let support = super::exact_derived::support_of_records(
+            &observed,
+            self.cover.collection(),
+            &self.witnesses,
+        )?;
+        let _ = self.support.set(support);
+        Ok(self.support.get().expect("resolved support was installed"))
+    }
+
+    /// Resident target cover selected from the admitted producer endorsements.
     pub fn cover(&self) -> &Cover<E> {
         &self.cover
     }
@@ -85,17 +159,28 @@ where
         R: BlobStoreGet,
         V: TryFromCover<E>,
     {
-        let descriptor = super::api::load_collection_descriptor(
-            &self.snapshot,
-            self.cover.collection().handle(),
-        )
-        .map_err(TryFromCoverError::from)?;
-        V::try_from_cover(&self.cover, &descriptor.fragment, &self.snapshot)
+        let observed =
+            ObservedStore::with_tracker(self.snapshot.clone(), self.dependencies.clone());
+        match &self.descriptor {
+            Some(descriptor) => V::try_from_cover(&self.cover, descriptor, &observed),
+            None => {
+                let descriptor = super::api::load_collection_descriptor(
+                    &observed,
+                    self.cover.collection().handle(),
+                )
+                .map_err(TryFromCoverError::from)?;
+                V::try_from_cover(&self.cover, &descriptor.fragment, &observed)
+            }
+        }
     }
 
     /// Consume this snapshot into its store observation and exact covers.
-    pub fn into_parts(self) -> (R, Support, Cover<E>) {
-        (self.snapshot, self.support, self.cover)
+    pub fn into_parts(self) -> Result<(R, Support, Cover<E>), CollectionRealizationError>
+    where
+        R: StoreRead,
+    {
+        let support = self.support()?.clone();
+        Ok((self.snapshot, support, self.cover))
     }
 }
 
@@ -231,10 +316,10 @@ mod tests {
         let snapshot =
             CollectionSnapshot::new(store_snapshot.clone(), support.clone(), cover.clone());
         assert!(snapshot.snapshot() == &store_snapshot);
-        assert_eq!(snapshot.support(), &support);
+        assert_eq!(snapshot.support().unwrap(), &support);
         assert_eq!(snapshot.cover(), &cover);
 
-        let (actual_store, actual_support, actual_cover) = snapshot.into_parts();
+        let (actual_store, actual_support, actual_cover) = snapshot.into_parts().unwrap();
         assert!(actual_store == store_snapshot);
         assert_eq!(actual_support, support);
         assert_eq!(actual_cover, cover);

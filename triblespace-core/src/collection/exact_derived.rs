@@ -84,6 +84,12 @@ pub enum CollectionRealizationError {
         /// Exact missing content identity.
         member: CollectionData,
     },
+    /// The selected target is readable, but one or more exact endorsed
+    /// historical record routes cannot be reconstructed in this snapshot.
+    IncompleteSupport {
+        /// Target endorsements with missing or mismatched witness ancestry.
+        records: Vec<CollectionRecordFingerprint>,
+    },
     /// No resident physical source cover remains after deterministic capacity
     /// failures exclude members which cannot be represented downstream.
     UnrepresentableCover {
@@ -146,6 +152,11 @@ impl fmt::Display for CollectionRealizationError {
                 formatter,
                 "mapping requires resident blob {}",
                 hex::encode_upper(member.raw),
+            ),
+            Self::IncompleteSupport { records } => write!(
+                formatter,
+                "collection support is unavailable ({} incomplete endorsed record route(s))",
+                records.len(),
             ),
             Self::UnrepresentableCover { blocked, missing } => write!(
                 formatter,
@@ -965,6 +976,46 @@ where
     let represented = certified.support.clone();
     let resolved = resolve_certified_target(snapshot, target, &lineage, &represented, certified)?;
     Ok((resolved.support, resolved.cover))
+}
+
+/// Expand only the exact endorsements retained by an immutable target read.
+/// Ancestor authority and payloads remain the admitted producer's responsibility.
+pub(crate) fn support_of_records<R, E>(
+    snapshot: &R,
+    target: Collection<E>,
+    records: &[CollectionRecord],
+) -> Result<Support, CollectionRealizationError>
+where
+    R: StoreRead,
+    E: CollectionEncoding,
+{
+    let lineage = load_lineage(snapshot, target)?;
+    let mut closure = super::witness::WitnessClosure::default();
+    let mut support = Support::from_data(lineage.foundation, []);
+    let mut incomplete = Vec::new();
+    for record in records {
+        match closure
+            .support(
+                snapshot,
+                lineage.foundation,
+                &lineage.source_by_target,
+                *record,
+            )
+            .map_err(|error| CollectionRealizationError::storage("read support witnesses", error))?
+        {
+            Some(represented) => {
+                support = support.union(&represented).expect("one foundation");
+            }
+            None => incomplete.push(record.fingerprint()),
+        }
+    }
+    if incomplete.is_empty() {
+        Ok(support)
+    } else {
+        Err(CollectionRealizationError::IncompleteSupport {
+            records: incomplete,
+        })
+    }
 }
 
 struct MappingProbe<M: CollectionMapping> {

@@ -441,7 +441,7 @@ fn time_snapshot(
             cover.len(),
             0,
         ),
-        Some(previous) if cover == previous.support() => {
+        Some(previous) if cover == previous.support().unwrap() => {
             let elapsed = start.elapsed();
             let union: UnionArchive<OrderedUniverse> = previous
                 .view()
@@ -456,7 +456,7 @@ fn time_snapshot(
                 },
             );
         }
-        Some(previous) => match cover.additions_since(previous.support()) {
+        Some(previous) => match cover.additions_since(previous.support().unwrap()) {
             Ok(additions) => {
                 maintain_succinct_exact(store, &additions, collections, signing_key);
                 let next = maintain_succinct_exact(store, cover, collections, signing_key);
@@ -464,12 +464,12 @@ fn time_snapshot(
                     .snapshot()
                     .collection_exact(collections.accelerated, &additions)
                     .expect("observe changed exact Succinct snapshot");
-                let changed_members = changed.support().len();
+                let changed_members = changed.support().unwrap().len();
                 let changed_view: UnionArchive<OrderedUniverse> = changed
                     .view()
                     .expect("materialize changed Succinct snapshot");
                 black_box(changed_view.segment_count());
-                (next, changed_members, previous.support().len())
+                (next, changed_members, previous.support().unwrap().len())
             }
             Err(CoverAdvanceError::ResetRequired { .. }) => (
                 maintain_succinct_exact(store, cover, collections, signing_key),

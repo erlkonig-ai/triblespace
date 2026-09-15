@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Separate target-first collection reading from lazy exact support queries.
+  Accepted target endorsements remain readable before their historical source
+  records arrive. Collection observations track their consulted dependencies
+  and expose `is_current`; Pile and Peer snapshots preserve scoped comparison
+  through native record and physical blob-occurrence indexes.
+
+- Add a compact grow-only entity-ID set encoding with canonical authored union,
+  structural shared-byte attachment, and lazy logical cover iteration. Audits
+  stay explicit, and entity IDs do not become blob dependencies. The encoding
+  ID `0BF639287590CFC9CE0E2B83D9FBC1E3` was minted with `trible genid` on
+  2026-09-15. An ordinary `SimpleArchive` derivation projects the typed `GenId`
+  values of one configured attribute, not assertion subjects or qualifiers;
+  receipt COMMITs remain unchanged. Configuration reuses `metadata::attribute`.
+  Mapping algorithm `7E4257A14880E8B4855B6282B337B4B5` was minted with installed
+  `trible genid` on 2026-09-15; encoding bytes and identity are unchanged.
+
 - Separate maintained-index attachment from canonical audits and query
   preparation. Typed views retain persisted backing and check safe framing;
   they do not reconstruct canonical data or serialize temporary cover unions.

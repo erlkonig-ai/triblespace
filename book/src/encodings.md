@@ -146,6 +146,10 @@ The crate also ships with these blob encodings:
 
 - `UTF8String` for arbitrarily long UTF‑8 strings.
 - `RawBytes` for opaque file-backed byte payloads.
+- `EntityIdSetBlob` for a grow-only set of opaque entity IDs: strictly sorted,
+  unique, nonnil 16-byte IDs with no header or padding; empty is zero bytes.
+  `EntityIdSet` retains typed views of a cover's members and performs membership
+  and ordered set iteration without serializing a temporary union.
 - `SimpleArchive` which stores a raw sequence of tribles.
 - `SuccinctArchiveBlob` which stores the portable deterministic Ring/wavelet
   data and EOF metadata for a SuccinctArchive set. It has no native query
@@ -220,6 +224,54 @@ whose facts tag the encoding entity with `metadata::KIND_INLINE_ENCODING` or
 `metadata::KIND_BLOB_ENCODING` and may attach a `metadata::name` and
 `metadata::description` (UTF8String handles). Persist the description blobs
 alongside the metadata tribles if you want the text to remain readable.
+
+### Grow-only entity-ID sets
+
+`blob::encodings::entity_id_set::encode` sorts and deduplicates authored `Id`
+values into the portable `EntityIdSetBlob` format. `join` merges two sorted
+members into their canonical union. It checks fixed-width framing while doing
+new producer work, without running a second canonical audit of its inputs.
+`validate_element` is the explicit linear check for framing, nonnil IDs, strict
+ordering, and uniqueness.
+
+Ordinary `TryFromBlob` attachment retains an AnyBytes `View<[[u8; 16]]>` and
+checks only that the length contains complete rows. `TryFromCover` retains one
+such view per resident member. No read rebuilds, hashes, or copies a physical
+set. `contains` binary-searches each member; `iter` merges and deduplicates sorted
+member streams lazily. Exact `len` is constant-time for one member, but overlaps
+require enumerating the logical union. These operations rely on the canonical
+ordering contract; they are not replacement audits. Typed iteration never
+constructs an invalid nil Rust `Id` from unaudited bytes.
+
+The IDs are opaque set elements, not blob handles or edges that cause dependency
+acquisition. The encoding differs from a flat typed array, whose order and
+duplicates are meaningful, and from `LatestBlob`, whose join also tracks
+retired states.
+
+`EntityIdSetBlob` also implements `CollectionDerivation` from `SimpleArchive`.
+Its `Id` argument names one `GenId`-valued attribute; the concrete mapping stores
+that argument under the existing `metadata::attribute` convention. The source
+collection handle is already part of the ordinary derived descriptor. Each
+well-formed, nonnil value under the selected attribute becomes a set element;
+the assertion's subject does not. Nil and malformed `GenId` values are not typed
+matches. Source row framing/layout is checked without re-auditing canonical
+ordering, and the produced set is sorted and deduplicated.
+
+This projection commutes with source union, including facts split across
+members, multiple values on one assertion, and duplicate values asserted by
+different entities. No type/persona/timestamp join qualifies a value. For
+example, a zooid-scoped receipt source can keep its ordinary `SimpleArchive`
+COMMITs, with optional `created_at`, and derive only the event attribute's
+values. A source mixing several observers projects their union; observer scope
+belongs to the selected source collection, not an implicit filter in this
+mapping. The target uses ordinary collection maintenance and foundational
+support; no generic authored-root or COMMIT API change is involved.
+
+The encoding ID is `0BF639287590CFC9CE0E2B83D9FBC1E3`, minted with the installed
+`trible genid` on 2026-09-15. Its bytes and identity are unchanged by adding the
+projection. The mapping algorithm ID is `7E4257A14880E8B4855B6282B337B4B5`,
+minted with installed `trible genid` on the same date. There is no new pile
+record kind or configuration attribute.
 
 ## Choosing the right encoding
 

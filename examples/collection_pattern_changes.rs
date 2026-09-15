@@ -79,8 +79,13 @@ fn observe(
     let snapshot = store.snapshot()?;
     let current_support = collection.admitted(&snapshot)?;
     let changed_support = match checkpoint.as_ref() {
-        Some(previous) if previous.support() == &current_support => return Ok(Vec::new()),
-        Some(previous) => current_support.additions_since(previous.support()).ok(),
+        Some(previous) => {
+            let previous_support = previous.support()?;
+            if previous_support == &current_support {
+                return Ok(Vec::new());
+            }
+            current_support.additions_since(previous_support).ok()
+        }
         None => None,
     };
     drop(snapshot);
@@ -168,7 +173,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let before_failure = checkpoint
         .as_ref()
-        .map(|snapshot| snapshot.support().clone());
+        .map(|snapshot| snapshot.support().cloned())
+        .transpose()?;
     let failed = observe(
         &mut store,
         &signing_key,
@@ -182,7 +188,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     assert_eq!(
         checkpoint
             .as_ref()
-            .map(|snapshot| snapshot.support().clone()),
+            .map(|snapshot| snapshot.support().cloned())
+            .transpose()?,
         before_failure,
     );
 

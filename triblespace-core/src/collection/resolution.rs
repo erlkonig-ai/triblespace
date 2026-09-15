@@ -1418,7 +1418,7 @@ fn contains_member(
         .is_some_and(|elements| elements.contains(&data))
 }
 
-fn check_functional(
+pub(super) fn check_functional(
     merges: impl IntoIterator<Item = (MergeEquation, Option<CollectionMerge>)>,
     derives: impl IntoIterator<Item = (DeriveEquation, Option<CollectionDerive>)>,
 ) -> Result<(), Box<CollectionFunctionalConflict>> {

@@ -204,7 +204,7 @@ impl FullState {
         let full = snapshot
             .collection_exact(self.accelerated, cover)
             .expect("observe full-query view");
-        assert_eq!(full.support(), cover);
+        assert_eq!(full.support().unwrap(), cover);
         let full_view: UnionArchive<OrderedUniverse> =
             full.view().expect("materialize full-query view");
         let mut raw_rows = 0usize;
@@ -271,7 +271,7 @@ impl IncrementalState {
     fn observe(&mut self, cover: &Support) -> Step {
         let start = Instant::now();
         let changed_support = cover
-            .additions_since(self.snapshot.support())
+            .additions_since(self.snapshot.support().unwrap())
             .expect("benchmark cover grows monotonically");
         assert!(!changed_support.is_empty(), "benchmark cover did not grow");
         maintain_succinct(
@@ -295,7 +295,7 @@ impl IncrementalState {
             .collection_exact(self.accelerated, &changed_support)
             .expect("observe incremental changed view");
         assert_eq!(
-            changed.support().len(),
+            changed.support().unwrap().len(),
             1,
             "one payload is observed per step"
         );
@@ -412,7 +412,7 @@ fn run_incremental(fixture: &Fixture, checkpoints: &BTreeSet<usize>) -> Run {
         assert_eq!(step.raw_rows, batch.len());
         assert_eq!(step.distinct_rows, batch.len());
         assert_eq!(state.results, expected);
-        assert_eq!(state.snapshot.support(), cover);
+        assert_eq!(state.snapshot.support().unwrap(), cover);
         let commits = index + 1;
         if checkpoints.contains(&commits) {
             samples.push(Sample {

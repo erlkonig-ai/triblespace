@@ -14,11 +14,12 @@ use crate::repo::WantRequest;
 
 use super::{CollectionData, CollectionHandle, CollectionRecord, CollectionRecordFingerprint};
 
-/// One semantic route into the grow-only collection-record set.
+/// One raw selection route into the grow-only collection-record set.
 ///
 /// A batch of selectors is interpreted as set union. Exact operation lookup
 /// deliberately names only the inputs: every distinct asserted result remains
-/// visible to callers as conflicting evidence.
+/// visible to callers as conflicting evidence. Selection does not establish
+/// authority, output residency, or the validity of an input witness closure.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum CollectionRecordSelector {
     /// Select one record by its non-semantic canonical-byte fingerprint.
@@ -35,6 +36,17 @@ pub enum CollectionRecordSelector {
     /// Several authors or metadata archives may attest the same data member;
     /// all of those claims remain provenance over one payload identity.
     CommitMember(CollectionHandle, CollectionData),
+    /// Select every raw record producing one exact collection member.
+    ///
+    /// This matches `COMMIT.data`, `MERGE.result`, and `DERIVE.output` at
+    /// exactly `(C, H)`. Distinct producers and input witnesses remain distinct
+    /// records; neither authority nor witness closure is evaluated here.
+    ProducedMember(CollectionHandle, CollectionData),
+    /// Select every `MERGE` or `DERIVE` naming one exact input record.
+    ///
+    /// The referenced fingerprint need not be present in this snapshot. This
+    /// is an immediate raw relationship, not transitive ancestry or admission.
+    ReferencingRecord(CollectionRecordFingerprint),
     /// Select every `MERGE` asserted for one collection descriptor.
     MergeCollection(CollectionHandle),
     /// Select every `DERIVE` into one exact target descriptor.
@@ -75,6 +87,18 @@ pub(crate) fn selectors_match_record(
         CollectionRecord::Derive(derive) => derive.collection(),
     };
     if selectors.contains(&CollectionRecordSelector::Collection(collection)) {
+        return true;
+    }
+    let output = match record {
+        CollectionRecord::Commit(commit) => commit.data(),
+        CollectionRecord::Merge(merge) => merge.result(),
+        CollectionRecord::Derive(derive) => derive.output(),
+    };
+    if selectors.contains(&CollectionRecordSelector::ProducedMember(
+        collection, output,
+    )) || record.record_references().any(|fingerprint| {
+        selectors.contains(&CollectionRecordSelector::ReferencingRecord(fingerprint))
+    }) {
         return true;
     }
     match record {
@@ -140,7 +164,7 @@ pub trait CollectionRead {
         Ok(None)
     }
 
-    /// Select one deterministic union of semantic record routes.
+    /// Select one deterministic union of raw record routes.
     ///
     /// The default implementation performs exactly one ordinary enumeration
     /// and filters it. Backends with primary or secondary indexes may override
@@ -388,6 +412,53 @@ mod tests {
             self.records.dedup_by_key(|record| record.fingerprint());
             Ok(())
         }
+    }
+
+    #[test]
+    fn default_relationship_selection_does_not_require_present_witnesses() {
+        let records = fixture();
+        let derive = records
+            .iter()
+            .find_map(|record| match record {
+                CollectionRecord::Derive(derive)
+                    if derive.collection() == collection(2) && derive.output() == data(11) =>
+                {
+                    Some(*derive)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let witness = derive.input_witness();
+        assert!(records.iter().all(|record| record.fingerprint() != witness));
+        let store = FallbackStore {
+            records: records.clone(),
+            ..FallbackStore::default()
+        };
+        let selectors = BTreeSet::from([
+            CollectionRecordSelector::ProducedMember(collection(1), data(4)),
+            CollectionRecordSelector::ProducedMember(collection(1), data(6)),
+            CollectionRecordSelector::ProducedMember(collection(2), data(11)),
+            CollectionRecordSelector::ReferencingRecord(witness),
+            CollectionRecordSelector::Fingerprint(derive.fingerprint()),
+        ]);
+        let selected = store.select_records(&selectors).unwrap();
+        assert_eq!(store.enumerations.get(), 1);
+        let expected: Vec<_> = records
+            .into_iter()
+            .filter(|record| match record {
+                CollectionRecord::Commit(commit) => {
+                    commit.collection() == collection(1) && commit.data() == data(4)
+                }
+                CollectionRecord::Merge(merge) => {
+                    merge.collection() == collection(1) && merge.result() == data(6)
+                }
+                CollectionRecord::Derive(derive) => derive.input_witness() == witness,
+            })
+            .collect();
+        assert_eq!(selected, expected);
+        assert!(selected
+            .windows(2)
+            .all(|pair| pair[0].fingerprint() < pair[1].fingerprint()));
     }
 
     #[test]

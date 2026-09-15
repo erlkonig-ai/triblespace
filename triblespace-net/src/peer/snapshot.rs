@@ -19,7 +19,8 @@ use triblespace_core::inline::{Inline, InlineEncoding};
 use triblespace_core::repo::async_store::AsyncBlobStoreGet;
 use triblespace_core::repo::{
     BlobChildren, BlobInfo, BlobMetadata, BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut,
-    CapabilityProofRead, MissingBlob, SnapshotSource, StoreChanges, StoreSnapshot, WantRead,
+    CapabilityProofRead, MissingBlob, SnapshotSource, StoreChanges, StoreDependencies,
+    StoreSnapshot, WantRead,
 };
 
 use super::{PeerAcquireError, SharedHost};
@@ -219,6 +220,10 @@ impl<S: SnapshotSource + Send + 'static> StoreSnapshot for PeerSnapshot<S> {
     fn changes_since(&self, previous: &Self) -> StoreChanges {
         self.frozen.changes_since(&previous.frozen)
     }
+
+    fn changes_for(&self, previous: &Self, dependencies: &StoreDependencies) -> StoreChanges {
+        self.frozen.changes_for(&previous.frozen, dependencies)
+    }
 }
 
 impl<S: SnapshotSource> BlobStoreGet for PeerSnapshot<S>
@@ -359,5 +364,106 @@ where
 {
     fn children(&self, handle: Inline<Handle<UnknownBlob>>) -> Vec<Inline<Handle<UnknownBlob>>> {
         self.frozen.children(handle)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ed25519_dalek::SigningKey;
+    use triblespace_core::blob::Blob;
+    use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
+    use triblespace_core::repo::pile::Pile;
+    use triblespace_core::trible::Fragment;
+
+    use super::*;
+
+    #[test]
+    fn pile_scoped_changes_survive_peer_snapshot_wrapping() {
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let mut pile = Pile::open(path.path()).unwrap();
+        let signer = SigningKey::from_bytes(&[19; 32]);
+        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+        let target = pile.collection("observed target", policy.clone()).unwrap();
+        let other = pile.collection("unrelated target", policy).unwrap();
+        let missing = Blob::<UnknownBlob>::new(Bytes::from_source(b"arrives later".to_vec()));
+        let missing_handle = missing.get_handle();
+        let dependencies = StoreDependencies {
+            records: BTreeSet::from([CollectionRecordSelector::Collection(target.handle())]),
+            blobs: BTreeSet::from([Handle::<UnknownBlob>::to_hash(missing_handle)]),
+            ..StoreDependencies::default()
+        };
+        // No peer host or live store is installed: these snapshots can only
+        // observe their captured local pile prefixes, never start networking.
+        let freeze = |pile: &mut Pile| PeerSnapshot::<Pile> {
+            frozen: pile.snapshot().unwrap(),
+            store: Arc::new(Mutex::new(None)),
+            host: Weak::new(),
+        };
+        let before = freeze(&mut pile);
+        assert!(!before.contains_blob(missing_handle).unwrap());
+        assert!(
+            before
+                .select_records(&dependencies.records)
+                .unwrap()
+                .is_empty()
+        );
+
+        pile.put::<UnknownBlob, _>(Bytes::from_source(b"unrelated blob".to_vec()))
+            .unwrap();
+        pile.commit(other, &signer, Fragment::empty()).unwrap();
+        let unrelated = freeze(&mut pile);
+        assert!(
+            unrelated
+                .changes_since(&before)
+                .contains(StoreChanges::BLOBS)
+        );
+        assert!(
+            unrelated
+                .changes_since(&before)
+                .contains(StoreChanges::COLLECTION_RECORDS)
+        );
+        assert_eq!(
+            unrelated.changes_for(&before, &dependencies),
+            StoreChanges::NONE,
+            "unrelated physical appends must not broaden the scoped observation",
+        );
+
+        pile.put::<UnknownBlob, _>(missing).unwrap();
+        let arrived = freeze(&mut pile);
+        assert!(arrived.contains_blob(missing_handle).unwrap());
+        assert_eq!(
+            arrived.changes_for(&unrelated, &dependencies),
+            StoreChanges::BLOBS,
+            "an exact earlier miss is still a dependency",
+        );
+
+        pile.commit(target, &signer, Fragment::empty()).unwrap();
+        let published = freeze(&mut pile);
+        assert_eq!(
+            published
+                .select_records(&dependencies.records)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            published.changes_for(&arrived, &dependencies),
+            StoreChanges::COLLECTION_RECORDS,
+            "the selected collection's first record activates the observation",
+        );
+        assert_eq!(
+            published.changes_for(&before, &dependencies),
+            StoreChanges::BLOBS.union(StoreChanges::COLLECTION_RECORDS),
+        );
+        assert!(!before.contains_blob(missing_handle).unwrap());
+        assert!(
+            before
+                .select_records(&dependencies.records)
+                .unwrap()
+                .is_empty()
+        );
+
+        drop((before, unrelated, arrived, published));
+        pile.close().unwrap();
     }
 }

@@ -95,7 +95,7 @@ fn succinct_cover_materializes_as_a_typed_union_archive() {
     store
         .commit(source, &authority, Fragment::from(one_fact(12)))
         .unwrap();
-    assert_eq!(collection.support(), &source_cover);
+    assert_eq!(collection.support().unwrap(), &source_cover);
     let cover = collection.cover();
     assert_eq!(cover.collection(), target);
     assert_eq!(cover.members().collect::<Vec<_>>(), vec![raw_handle]);
@@ -110,7 +110,7 @@ fn succinct_cover_materializes_as_a_typed_union_archive() {
     block_on(store.maintain(target, &authority)).unwrap();
     let maintained = block_on(store.maintain_exact(target, &authority, &source_cover)).unwrap();
     let collection = maintained.collection_exact(target, &source_cover).unwrap();
-    assert_eq!(collection.support(), &source_cover);
+    assert_eq!(collection.support().unwrap(), &source_cover);
     assert_eq!(
         collection.cover().members().collect::<Vec<_>>(),
         vec![raw_handle]
@@ -168,7 +168,7 @@ fn exact_apis_accept_a_derived_source_encoding() {
     block_on(store.ensure_exact(raw, &authority, &support)).unwrap();
     let ensured = block_on(store.ensure_exact(accelerated, &authority, &support)).unwrap();
     let observed = ensured.collection_exact(accelerated, &support).unwrap();
-    assert_eq!(observed.support(), &support);
+    assert_eq!(observed.support().unwrap(), &support);
     assert_eq!(observed.cover().len(), 1);
 
     let maintained = block_on(store.maintain_exact(accelerated, &authority, &support)).unwrap();
@@ -303,7 +303,7 @@ fn maintenance_follows_a_resident_source_union_across_target_size_tiers() {
 
     let after = block_on(store.maintain(accelerated, &authority)).unwrap();
     let observed = after.collection(accelerated).unwrap();
-    assert_eq!(observed.support(), &support);
+    assert_eq!(observed.support().unwrap(), &support);
     assert_eq!(
         observed.cover().members().collect::<Vec<_>>(),
         vec![expected_root.get_handle()]
@@ -411,7 +411,10 @@ fn ordinary_derived_operations_use_only_resident_immediate_source_support() {
         let warmed = block_on(store.maintain(raw, &authority)).unwrap();
         let initial_support = source.admitted(&warmed).unwrap();
         assert_eq!(initial_support.len(), 2);
-        assert_eq!(warmed.collection(raw).unwrap().support(), &initial_support);
+        assert_eq!(
+            warmed.collection(raw).unwrap().support().unwrap(),
+            &initial_support
+        );
 
         store
             .commit(source, &authority, Fragment::from(third))
@@ -419,7 +422,10 @@ fn ordinary_derived_operations_use_only_resident_immediate_source_support() {
         let before = store.snapshot().unwrap();
         let full_support = source.admitted(&before).unwrap();
         assert_eq!(full_support.len(), 3);
-        assert_eq!(before.collection(raw).unwrap().support(), &initial_support);
+        assert_eq!(
+            before.collection(raw).unwrap().support().unwrap(),
+            &initial_support
+        );
         assert!(!before.contains_blob(raw_third).unwrap());
         let records_before = before
             .records()
@@ -434,7 +440,7 @@ fn ordinary_derived_operations_use_only_resident_immediate_source_support() {
         }
         .expect("ordinary Rank9 work must stop at the resident raw-source frontier");
         let observed = after.collection(accelerated).unwrap();
-        assert_eq!(observed.support(), &initial_support);
+        assert_eq!(observed.support().unwrap(), &initial_support);
         assert_eq!(
             observed
                 .view::<UnionArchive<OrderedUniverse>>()
@@ -443,7 +449,10 @@ fn ordinary_derived_operations_use_only_resident_immediate_source_support() {
                 .collect::<TribleSet>(),
             expected_initial
         );
-        assert_eq!(after.collection(raw).unwrap().support(), &initial_support);
+        assert_eq!(
+            after.collection(raw).unwrap().support().unwrap(),
+            &initial_support
+        );
         assert!(!after.contains_blob(raw_third).unwrap());
         assert_eq!(after.wants().unwrap().count(), 0);
         let records_after = after
@@ -466,10 +475,13 @@ fn ordinary_derived_operations_use_only_resident_immediate_source_support() {
         }
 
         let raw_after = block_on(store.maintain(raw, &authority)).unwrap();
-        assert_eq!(raw_after.collection(raw).unwrap().support(), &full_support);
+        assert_eq!(
+            raw_after.collection(raw).unwrap().support().unwrap(),
+            &full_support
+        );
         let caught_up = block_on(store.maintain(accelerated, &authority)).unwrap();
         let observed = caught_up.collection(accelerated).unwrap();
-        assert_eq!(observed.support(), &full_support);
+        assert_eq!(observed.support().unwrap(), &full_support);
         assert_eq!(
             observed
                 .view::<UnionArchive<OrderedUniverse>>()
@@ -478,7 +490,10 @@ fn ordinary_derived_operations_use_only_resident_immediate_source_support() {
                 .collect::<TribleSet>(),
             expected_final
         );
-        assert_eq!(warmed.collection(raw).unwrap().support(), &initial_support);
+        assert_eq!(
+            warmed.collection(raw).unwrap().support().unwrap(),
+            &initial_support
+        );
     }
 }
 
@@ -525,7 +540,10 @@ fn ordinary_derived_operations_ignore_pending_immediate_source_output() {
     store.insert(CollectionRecord::Derive(pending)).unwrap();
     let before = store.snapshot().unwrap();
     assert_eq!(source.admitted(&before).unwrap().len(), 2);
-    assert_eq!(before.collection(raw).unwrap().support(), &initial_support);
+    assert_eq!(
+        before.collection(raw).unwrap().support().unwrap(),
+        &initial_support
+    );
     assert!(!before.contains_blob(missing_raw).unwrap());
     let records_before = before
         .records()
@@ -542,7 +560,7 @@ fn ordinary_derived_operations_ignore_pending_immediate_source_output() {
         }
         .expect("a dangling raw output is not a required Rank9 input");
         let observed = after.collection(accelerated).unwrap();
-        assert_eq!(observed.support(), &initial_support);
+        assert_eq!(observed.support().unwrap(), &initial_support);
         assert_eq!(
             observed
                 .view::<UnionArchive<OrderedUniverse>>()
@@ -551,7 +569,10 @@ fn ordinary_derived_operations_ignore_pending_immediate_source_output() {
                 .collect::<TribleSet>(),
             first
         );
-        assert_eq!(after.collection(raw).unwrap().support(), &initial_support);
+        assert_eq!(
+            after.collection(raw).unwrap().support().unwrap(),
+            &initial_support
+        );
         assert!(!after.contains_blob(missing_raw).unwrap());
         let records_after = after
             .records()
@@ -626,7 +647,10 @@ fn ordinary_derived_operations_exclude_unauthorized_immediate_source_equations()
     let before = store.snapshot().unwrap();
     assert!(before.contains_blob(denied_raw).unwrap());
     assert_eq!(source.admitted(&before).unwrap(), admitted_support);
-    assert_eq!(before.collection(raw).unwrap().support(), &admitted_support);
+    assert_eq!(
+        before.collection(raw).unwrap().support().unwrap(),
+        &admitted_support
+    );
 
     for compact in [false, true] {
         let after = if compact {
@@ -636,7 +660,7 @@ fn ordinary_derived_operations_exclude_unauthorized_immediate_source_equations()
         }
         .unwrap();
         let observed = after.collection(accelerated).unwrap();
-        assert_eq!(observed.support(), &admitted_support);
+        assert_eq!(observed.support().unwrap(), &admitted_support);
         assert_eq!(
             observed
                 .view::<UnionArchive<OrderedUniverse>>()
@@ -685,6 +709,7 @@ fn collection_write_authority_is_independent_of_snapshot_instant() {
             .collection(collection)
             .unwrap()
             .support()
+            .unwrap()
             .members()
             .collect::<Vec<_>>(),
         vec![expected_member]
@@ -694,7 +719,7 @@ fn collection_write_authority_is_independent_of_snapshot_instant() {
     let frozen = valid.clone();
     let admitted = valid.collection(collection).unwrap();
     assert_eq!(
-        admitted.support().members().collect::<Vec<_>>(),
+        admitted.support().unwrap().members().collect::<Vec<_>>(),
         vec![expected_member]
     );
     assert_eq!(
@@ -704,19 +729,19 @@ fn collection_write_authority_is_independent_of_snapshot_instant() {
 
     let later = store.snapshot_at(Epoch::from_tai_seconds(21.0)).unwrap();
     assert_eq!(
-        later.collection(collection).unwrap().support(),
-        admitted.support()
+        later.collection(collection).unwrap().support().unwrap(),
+        admitted.support().unwrap()
     );
     assert_eq!(valid.changes_since(&before), StoreChanges::NONE);
     assert_eq!(later.changes_since(&valid), StoreChanges::NONE);
     assert_eq!(frozen.instant(), Epoch::from_tai_seconds(15.0));
     assert_eq!(
-        frozen.collection(collection).unwrap().support(),
-        admitted.support()
+        frozen.collection(collection).unwrap().support().unwrap(),
+        admitted.support().unwrap()
     );
     assert_eq!(
-        valid.collection(collection).unwrap().support(),
-        admitted.support()
+        valid.collection(collection).unwrap().support().unwrap(),
+        admitted.support().unwrap()
     );
 }
 
@@ -756,7 +781,7 @@ fn collection_returns_the_maximal_resident_partial_realization() {
     assert!(admitted_source.contains(second_member));
 
     let observed = snapshot.collection(target).unwrap();
-    assert_eq!(observed.support(), &first_support);
+    assert_eq!(observed.support().unwrap(), &first_support);
     assert_eq!(observed.cover().len(), 1);
     assert_eq!(
         observed

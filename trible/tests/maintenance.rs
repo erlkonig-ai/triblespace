@@ -169,6 +169,238 @@ fn scheduled_handles(output: &Output) -> Vec<String> {
 }
 
 #[test]
+fn entity_id_set_cli_projects_receipt_values_without_changing_source_records() {
+    use triblespace_core::blob::encodings::entity_id_set::{
+        EntityIdSet, EntityIdSetBlob, GENID_ATTRIBUTE_VALUES_MAPPING_V1,
+    };
+    use triblespace_core::collection::descriptor;
+    use triblespace_core::id::fucid;
+    use triblespace_core::inline::encodings::genid::GenId;
+    use triblespace_core::inline::encodings::time::NsTAIInterval;
+    use triblespace_core::inline::{Encodes, Inline};
+    use triblespace_core::repo::BlobStoreGet;
+
+    let fixture = Fixture::new();
+    let mut pile = Pile::open(&fixture.path).unwrap();
+    let source = pile
+        .collection("receipts", policy(&fixture.signer))
+        .unwrap();
+    let first_receipt = fucid();
+    let second_receipt = fucid();
+    let first_event = *fucid();
+    let second_event = *fucid();
+    // Reuse an existing GenId-valued attribute in this isolated fixture. The
+    // event edge and its optional timestamp need not share a COMMIT.
+    let attribute = metadata::supersedes.id();
+    let fragments = [
+        entity! { &first_receipt @ metadata::supersedes: first_event },
+        entity! { &first_receipt @
+            metadata::created_at: Inline::<NsTAIInterval>::new([0; 32]),
+        },
+        entity! { &second_receipt @
+            metadata::supersedes*: [first_event, second_event],
+            metadata::created_at: Inline::<NsTAIInterval>::new([1; 32]),
+        },
+    ];
+    let mut expected_facts = TribleSet::new();
+    for fragment in fragments {
+        expected_facts += fragment.facts().clone();
+        pile.commit(source, &fixture.signer, fragment).unwrap();
+    }
+    pile.close().unwrap();
+    let before = records(&fixture.path);
+    let source_records = before
+        .iter()
+        .copied()
+        .filter(|record| record.collection() == source.handle())
+        .collect::<Vec<_>>();
+    assert_eq!(source_records.len(), 3);
+    assert!(source_records
+        .iter()
+        .all(|record| matches!(record, CollectionRecord::Commit(_))));
+
+    let derive = || {
+        let mut command = trible();
+        command
+            .args(["pile", "collection", "derive"])
+            .arg(&fixture.path)
+            .arg(handle_text(source.handle()))
+            .args(["entity-id-set", "--attribute"])
+            .arg(format!("{attribute:X}"))
+            .arg("--key")
+            .arg(&fixture.key);
+        let output = Command::from_std(command)
+            .timeout(Duration::from_secs(30))
+            .output()
+            .unwrap();
+        assert_success(&output);
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    let target_text = derive();
+    assert_eq!(derive(), target_text, "registration is idempotent");
+    assert_eq!(
+        records(&fixture.path),
+        before,
+        "registration publishes no records"
+    );
+    let target_handle = CollectionHandle::new(
+        hex::decode(target_text.strip_prefix("blake3:").unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    );
+    let mut previous_records = None;
+    for verb in ["maintain-all", "maintain-all", "maintain"] {
+        let output = fixture.run(verb, &[target_handle]);
+        assert_success(&output);
+        let expected_order = if verb == "maintain-all" {
+            vec![handle_text(source.handle()), target_text.clone()]
+        } else {
+            vec![target_text.clone()]
+        };
+        assert_eq!(scheduled_handles(&output), expected_order);
+        let after = records(&fixture.path);
+        assert_eq!(
+            after
+                .iter()
+                .copied()
+                .filter(|record| record.collection() == source.handle())
+                .collect::<Vec<_>>(),
+            source_records,
+            "the dependency is ensured, not rewritten or base-merged",
+        );
+        let target_records = after
+            .iter()
+            .filter(|record| record.collection() == target_handle)
+            .collect::<Vec<_>>();
+        assert!(target_records
+            .iter()
+            .any(|record| matches!(record, CollectionRecord::Derive(_))));
+        assert!(target_records
+            .iter()
+            .all(|record| !matches!(record, CollectionRecord::Commit(_))));
+        for record in target_records {
+            record.verify_strict().unwrap();
+        }
+        if let Some(previous) = &previous_records {
+            assert_eq!(&after, previous, "warm upkeep publishes no new equations");
+        }
+        previous_records = Some(after);
+
+        let mut pile = Pile::open(&fixture.path).unwrap();
+        let snapshot = pile.snapshot().unwrap();
+        let target = Collection::<EntityIdSetBlob>::open(&snapshot, target_handle).unwrap();
+        let facts: TribleSet = snapshot.get(target_handle).unwrap();
+        assert_eq!(descriptor::source(&facts).unwrap(), Some(source.handle()));
+        assert_eq!(
+            descriptor::mapping_algorithm(&facts).unwrap(),
+            Some(GENID_ATTRIBUTE_VALUES_MAPPING_V1)
+        );
+        assert_eq!(
+            descriptor::mapping_argument(&facts, metadata::attribute.id()).unwrap(),
+            Some(GenId::encode(attribute).raw)
+        );
+        let observed = snapshot.collection(target).unwrap();
+        let projected = observed.view::<EntityIdSet>().unwrap();
+        assert_eq!(
+            projected.iter().collect::<BTreeSet<_>>(),
+            BTreeSet::from([first_event, second_event])
+        );
+        assert!(!projected.contains(*first_receipt));
+        assert!(!projected.contains(*second_receipt));
+        assert_eq!(
+            snapshot
+                .collection(source)
+                .unwrap()
+                .view::<TribleSet>()
+                .unwrap(),
+            expected_facts
+        );
+        drop(observed);
+        drop(snapshot);
+        pile.close().unwrap();
+    }
+}
+
+#[test]
+fn entity_id_set_cli_uses_the_existing_attribute_argument_conventions() {
+    use triblespace_core::blob::encodings::entity_id_set::{EntityIdSet, EntityIdSetBlob};
+    use triblespace_core::collection::descriptor;
+    use triblespace_core::id::fucid;
+    use triblespace_core::inline::encodings::genid::GenId;
+    use triblespace_core::inline::Encodes;
+    use triblespace_core::repo::BlobStoreGet;
+
+    let fixture = Fixture::new();
+    let derive = |arguments: &[&str]| {
+        let mut command = trible();
+        command
+            .args(["pile", "collection", "derive"])
+            .arg(&fixture.path)
+            .arg(handle_text(fixture.source.handle()))
+            .arg("entity-id-set")
+            .args(arguments)
+            .arg("--key")
+            .arg(&fixture.key);
+        Command::from_std(command)
+            .timeout(Duration::from_secs(30))
+            .output()
+            .unwrap()
+    };
+    let before = records(&fixture.path);
+    let before_bytes = std::fs::metadata(&fixture.path).unwrap().len();
+    for (arguments, expected_error) in [
+        (vec![], "--attribute is required for this kind"),
+        (vec!["--attribute", "not-an-id"], "is not a 32-hex-digit id"),
+        (
+            vec!["--attribute", "00000000000000000000000000000000"],
+            "is not a 32-hex-digit id",
+        ),
+    ] {
+        let output = derive(&arguments);
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected_error), "{stderr}");
+        assert_eq!(records(&fixture.path), before);
+        assert_eq!(
+            std::fs::metadata(&fixture.path).unwrap().len(),
+            before_bytes
+        );
+    }
+
+    // A fresh opaque attribute ID needs no schema registration or occurrence in
+    // the source. Its correct projection is the empty set, not a parser error.
+    let attribute = *fucid();
+    let output = derive(&["--attribute", &format!("{attribute:X}")]);
+    assert_success(&output);
+    let target_text = String::from_utf8(output.stdout).unwrap().trim().to_owned();
+    let lower = derive(&["--attribute", &format!("{attribute:x}")]);
+    assert_success(&lower);
+    assert_eq!(String::from_utf8(lower.stdout).unwrap().trim(), target_text);
+    let target_handle = CollectionHandle::new(
+        hex::decode(target_text.strip_prefix("blake3:").unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    );
+    assert_success(&fixture.run("maintain-all", &[target_handle]));
+    let mut pile = Pile::open(&fixture.path).unwrap();
+    let snapshot = pile.snapshot().unwrap();
+    let target = Collection::<EntityIdSetBlob>::open(&snapshot, target_handle).unwrap();
+    let facts: TribleSet = snapshot.get(target_handle).unwrap();
+    assert_eq!(
+        descriptor::mapping_argument(&facts, metadata::attribute.id()).unwrap(),
+        Some(GenId::encode(attribute).raw)
+    );
+    let observed = snapshot.collection(target).unwrap();
+    assert_eq!(observed.support().unwrap().len(), 2);
+    assert!(observed.view::<EntityIdSet>().unwrap().is_empty());
+    drop(observed);
+    drop(snapshot);
+    pile.close().unwrap();
+}
+
+#[test]
 fn author_key_priorities_are_stable_across_argument_order_and_maintenance_modes() {
     let fixture = Fixture::new();
     let mut pile = Pile::open(&fixture.path).unwrap();
@@ -270,7 +502,7 @@ fn maintain_is_one_edge_and_accepts_descriptor_only_targets() {
     let snapshot = pile.snapshot().unwrap();
     let observed = snapshot.collection(fixture.rank9).unwrap();
     assert_eq!(
-        observed.support(),
+        observed.support().unwrap(),
         &fixture.source.admitted(&snapshot).unwrap()
     );
     let facts = observed.view::<UnionArchive<OrderedUniverse>>().unwrap();
@@ -326,7 +558,7 @@ fn maintain_all_follows_dependencies_without_merging_the_unselected_root() {
         assert_eq!(len, 1, "the equal-size inputs should be rolled up");
     }
     let observed = snapshot.collection(fixture.rank9).unwrap();
-    assert_eq!(observed.support(), &support);
+    assert_eq!(observed.support().unwrap(), &support);
     assert_eq!(support.len(), 2);
     let facts = observed.view::<UnionArchive<OrderedUniverse>>().unwrap();
     assert_eq!(facts.iter().collect::<TribleSet>(), fixture.expected);
@@ -397,7 +629,7 @@ fn maintain_all_schedules_a_shared_upstream_once() {
     let support = fixture.source.admitted(&snapshot).unwrap();
     for target in [fixture.rank9, second] {
         let observed = snapshot.collection(target).unwrap();
-        assert_eq!(observed.support(), &support);
+        assert_eq!(observed.support().unwrap(), &support);
         let facts = observed.view::<UnionArchive<OrderedUniverse>>().unwrap();
         assert_eq!(facts.iter().collect::<TribleSet>(), fixture.expected);
     }
@@ -514,13 +746,18 @@ fn failed_upstream_upkeep_does_not_suppress_available_downstream_work() {
         .block_on(pile.ensure_exact(succinct, &other, &first))
         .unwrap();
     let available = seeded.collection(succinct).unwrap();
-    assert_eq!(available.support(), &first);
+    assert_eq!(available.support().unwrap(), &first);
     let expected = available
         .view::<UnionArchive<OrderedUniverse>>()
         .unwrap()
         .iter()
         .collect::<TribleSet>();
-    assert!(seeded.collection(rank9).unwrap().support().is_empty());
+    assert!(seeded
+        .collection(rank9)
+        .unwrap()
+        .support()
+        .unwrap()
+        .is_empty());
     pile.close().unwrap();
     let upstream_before = records(&fixture.path)
         .into_iter()
@@ -562,9 +799,12 @@ fn failed_upstream_upkeep_does_not_suppress_available_downstream_work() {
     let mut pile = Pile::open(&fixture.path).unwrap();
     let snapshot = pile.snapshot().unwrap();
     assert_eq!(fixture.source.admitted(&snapshot).unwrap(), all);
-    assert_eq!(snapshot.collection(succinct).unwrap().support(), &first);
+    assert_eq!(
+        snapshot.collection(succinct).unwrap().support().unwrap(),
+        &first
+    );
     let available = snapshot.collection(rank9).unwrap();
-    assert_eq!(available.support(), &first);
+    assert_eq!(available.support().unwrap(), &first);
     let facts = available.view::<UnionArchive<OrderedUniverse>>().unwrap();
     assert_eq!(facts.iter().collect::<TribleSet>(), expected);
     pile.close().unwrap();
@@ -692,7 +932,10 @@ fn search_reads_existing_bm25_support_and_snippets_after_source_growth() {
         .unwrap();
     let snapshot = writer.snapshot().unwrap();
     assert_eq!(fixture.source.admitted(&snapshot).unwrap().len(), 3);
-    assert_eq!(snapshot.collection(index).unwrap().support().len(), 2);
+    assert_eq!(
+        snapshot.collection(index).unwrap().support().unwrap().len(),
+        2
+    );
     writer.close().unwrap();
     let before = records(&fixture.path);
     let bytes = std::fs::metadata(&fixture.path).unwrap().len();
@@ -784,7 +1027,7 @@ fn watch_follows_an_external_append_and_exits_cleanly_on_sigint() {
             let mut pile = Pile::open(&fixture.path).unwrap();
             let snapshot = pile.snapshot().unwrap();
             let observed = snapshot.collection(fixture.rank9).unwrap();
-            if observed.support().len() == count {
+            if observed.support().unwrap().len() == count {
                 let facts = observed.view::<UnionArchive<OrderedUniverse>>().unwrap();
                 assert_eq!(facts.iter().collect::<TribleSet>(), fixture.expected);
                 pile.close().unwrap();

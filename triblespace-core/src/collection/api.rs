@@ -1724,16 +1724,17 @@ impl<L: CollectionEncoding> Cover<L> {
 /// Immutable collection observations implemented by every complete store snapshot.
 ///
 /// A snapshot is the temporal boundary. The returned [`CollectionSnapshot`]
-/// therefore owns this exact store observation together with invariant
-/// foundational [`Support`] and the physical target cover selected inside it.
+/// therefore owns this exact store observation and the physical target cover
+/// selected inside it. Foundational [`Support`] is available separately through
+/// the observation's fallible provenance query.
 pub trait CollectionSnapshotExt: StoreRead + Sized {
     /// Observe what one collection contains in this immutable snapshot.
     ///
     /// Capability decisions use this snapshot's immutable proof and definition
     /// state, independently of its clock.
     /// Physical target realization is selected entirely from this immutable
-    /// store snapshot and may represent only a proper subset of the admitted
-    /// support.
+    /// store snapshot. Accepted target endorsements do not depend on the
+    /// residency of their historical source records or source payloads.
     fn collection<E>(
         &self,
         target: Collection<E>,
@@ -1742,8 +1743,7 @@ pub trait CollectionSnapshotExt: StoreRead + Sized {
         E: CollectionEncoding,
         Handle<E>: InlineEncoding,
     {
-        let (support, cover) = super::exact_derived::attach_collection(self, target)?;
-        Ok(CollectionSnapshot::new(self.clone(), support, cover))
+        super::observation::attach(self, target)
     }
 
     /// Observe the complete target realization for one explicit support.
@@ -1759,9 +1759,11 @@ pub trait CollectionSnapshotExt: StoreRead + Sized {
         E: CollectionEncoding,
         Handle<E>: InlineEncoding,
     {
+        let observed = super::observed_store::ObservedStore::new(self.clone());
         let (support, cover) =
-            super::exact_derived::attach_collection_exact(self, target, support)?;
-        Ok(CollectionSnapshot::new(self.clone(), support, cover))
+            super::exact_derived::attach_collection_exact(&observed, target, support)?;
+        Ok(CollectionSnapshot::new(self.clone(), support, cover)
+            .with_dependencies(observed.tracker()))
     }
 }
 

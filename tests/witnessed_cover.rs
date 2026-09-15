@@ -195,6 +195,7 @@ fn a_resident_payload_subsumer_cannot_erase_another_witnesses_support() {
     );
     assert_eq!(
         view.support()
+            .unwrap()
             .members()
             .map(Handle::<SimpleArchive>::to_hash)
             .collect::<BTreeSet<_>>(),
@@ -208,7 +209,7 @@ fn a_resident_payload_subsumer_cannot_erase_another_witnesses_support() {
     let exact = snapshot
         .collection_exact(fixture.target, &requested)
         .unwrap();
-    assert_eq!(exact.support(), &requested);
+    assert_eq!(exact.support().unwrap(), &requested);
     assert_eq!(exact.cover(), view.cover());
 }
 
@@ -225,6 +226,7 @@ fn a_missing_alias_is_not_recovered_by_unioning_another_records_provenance() {
     assert_eq!(view.cover().members().collect::<Vec<_>>(), vec![fixture.z]);
     assert_eq!(
         view.support()
+            .unwrap()
             .members()
             .map(Handle::<SimpleArchive>::to_hash)
             .collect::<BTreeSet<_>>(),
@@ -250,7 +252,7 @@ fn a_missing_alias_is_not_recovered_by_unioning_another_records_provenance() {
     // The older immutable snapshot still has x, even though the mutable
     // store's later residency cannot realize the same complete support.
     let before = before_eviction.collection(fixture.target).unwrap();
-    assert_eq!(before.support(), &requested);
+    assert_eq!(before.support().unwrap(), &requested);
     assert_eq!(
         before.cover().members().collect::<BTreeSet<_>>(),
         BTreeSet::from([fixture.x, fixture.z])

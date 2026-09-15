@@ -194,6 +194,7 @@ fn derive_before_write_proof_is_inert_then_admitted_without_reinsertion() {
             .collection(target)
             .unwrap()
             .support()
+            .unwrap()
             .members()
             .collect::<Vec<_>>(),
         vec![a.get_handle()]
@@ -270,7 +271,7 @@ fn equation_authority_is_timeless_across_snapshot_clocks() {
 }
 
 #[test]
-fn selected_endorsement_needs_exact_records_not_ancestor_payloads_or_proofs() {
+fn selected_endorsement_reads_without_ancestry_but_support_needs_exact_records() {
     let source_owner = SigningKey::from_bytes(&[41; 32]);
     let source_writer = SigningKey::from_bytes(&[42; 32]);
     let target_owner = SigningKey::from_bytes(&[43; 32]);
@@ -314,16 +315,12 @@ fn selected_endorsement_needs_exact_records_not_ancestor_payloads_or_proofs() {
         Handle::<SuccinctArchiveBlob>::to_hash(output),
     ));
     store.insert(selected).unwrap();
-    assert!(
-        store
-            .snapshot()
-            .unwrap()
-            .collection(target)
-            .unwrap()
-            .cover()
-            .is_empty(),
-        "missing witness records remain unknown, not an empty admitted support"
-    );
+    let missing = store.snapshot().unwrap().collection(target).unwrap();
+    assert_eq!(missing.cover().members().collect::<Vec<_>>(), vec![output]);
+    assert!(matches!(
+        missing.support(),
+        Err(CollectionRealizationError::IncompleteSupport { .. })
+    ));
 
     // An existing record in the wrong collection cannot satisfy a witness.
     let wrong_collection = CollectionRecord::Commit(CollectionCommit::sign(
@@ -341,13 +338,15 @@ fn selected_endorsement_needs_exact_records_not_ancestor_payloads_or_proofs() {
             Handle::<SuccinctArchiveBlob>::to_hash(output),
         )))
         .unwrap();
-    assert!(store
-        .snapshot()
-        .unwrap()
-        .collection(target)
-        .unwrap()
-        .cover()
-        .is_empty());
+    let mismatched = store.snapshot().unwrap().collection(target).unwrap();
+    assert_eq!(
+        mismatched.cover().members().collect::<Vec<_>>(),
+        vec![output]
+    );
+    assert!(matches!(
+        mismatched.support(),
+        Err(CollectionRealizationError::IncompleteSupport { .. })
+    ));
 
     // A source record with a different output is not evidence for this input.
     let other_data = Handle::<SimpleArchive>::to_hash(archive(8).get_handle());
@@ -366,13 +365,15 @@ fn selected_endorsement_needs_exact_records_not_ancestor_payloads_or_proofs() {
             Handle::<SuccinctArchiveBlob>::to_hash(output),
         )))
         .unwrap();
-    assert!(store
-        .snapshot()
-        .unwrap()
-        .collection(target)
-        .unwrap()
-        .cover()
-        .is_empty());
+    let mismatched = store.snapshot().unwrap().collection(target).unwrap();
+    assert_eq!(
+        mismatched.cover().members().collect::<Vec<_>>(),
+        vec![output]
+    );
+    assert!(matches!(
+        mismatched.support(),
+        Err(CollectionRealizationError::IncompleteSupport { .. })
+    ));
 
     store.insert(ancestor).unwrap();
     let snapshot = store.snapshot().unwrap();
@@ -386,10 +387,16 @@ fn selected_endorsement_needs_exact_records_not_ancestor_payloads_or_proofs() {
     assert!(source.admitted(&snapshot).unwrap().is_empty());
     let attached = snapshot.collection(target).unwrap();
     assert_eq!(attached.cover().members().collect::<Vec<_>>(), vec![output]);
-    assert_eq!(
-        attached.support().members().collect::<Vec<_>>(),
-        vec![input.get_handle()]
-    );
+    // Ordinary attachment retained every independent target endorsement.
+    // A good route does not fill in the other malformed routes' provenance.
+    assert!(matches!(
+        attached.support(),
+        Err(CollectionRealizationError::IncompleteSupport { .. })
+    ));
+    // An explicit support request can choose the now-complete exact route.
+    let requested = source.cover([input.get_handle()]);
+    let exact = snapshot.collection_exact(target, &requested).unwrap();
+    assert_eq!(exact.support().unwrap(), &requested);
     assert_eq!(
         attached
             .view::<UnionArchive<OrderedUniverse>>()

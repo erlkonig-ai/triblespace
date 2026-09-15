@@ -1132,7 +1132,7 @@ fn exact_ensure_fetches_a_known_derive_output_without_recomputing() {
     );
     assert_eq!(snapshot.wants().unwrap().count(), 0);
     let observed = snapshot.collection_exact(first, &support).unwrap();
-    assert_eq!(observed.support(), &support);
+    assert_eq!(observed.support().unwrap(), &support);
     assert_eq!(
         observed.cover().data_members().collect::<Vec<_>>(),
         vec![output_data],
@@ -1173,7 +1173,7 @@ fn exact_ensure_reendorses_a_resident_image_from_a_different_support_without_map
     let requested = support(root, std::slice::from_ref(&b));
     let before = inner.snapshot().unwrap();
     assert_eq!(
-        before.collection(first).unwrap().support(),
+        before.collection(first).unwrap().support().unwrap(),
         &support(root, &[a, b.clone()]),
     );
     assert!(matches!(
@@ -1191,7 +1191,7 @@ fn exact_ensure_reendorses_a_resident_image_from_a_different_support_without_map
     assert_eq!(SECOND_JOIN_CALLS.get(), 0);
     assert!(store.acquired.is_empty());
     let selected = after.collection_exact(first, &requested).unwrap();
-    assert_eq!(selected.support(), &requested);
+    assert_eq!(selected.support().unwrap(), &requested);
     assert_eq!(
         selected.cover().data_members().collect::<Vec<_>>(),
         vec![data(&output)],
@@ -1361,7 +1361,7 @@ fn passive_derived_snapshot_keeps_dangling_output_as_raw_evidence_only() {
     let snapshot = store.snapshot().unwrap();
     assert_eq!(root.admitted(&snapshot).unwrap(), support);
     let observed = snapshot.collection(first).unwrap();
-    assert!(observed.support().is_empty());
+    assert!(observed.support().unwrap().is_empty());
     assert!(observed.cover().is_empty());
     assert!(matches!(
         snapshot.collection_exact(first, &support),
@@ -1456,7 +1456,7 @@ fn ordinary_derived_ensure_leaves_cold_source_records_for_explicit_root_acquisit
     assert!(store.acquired.is_empty());
     assert_eq!(snapshot.wants().unwrap().count(), 0);
     let observed = snapshot.collection(first).unwrap();
-    assert!(observed.support().is_empty());
+    assert!(observed.support().unwrap().is_empty());
     assert!(observed.cover().is_empty());
     drop(observed);
     drop(snapshot);
@@ -1469,7 +1469,10 @@ fn ordinary_derived_ensure_leaves_cold_source_records_for_explicit_root_acquisit
     assert!(store.inject_record_on_acquire.is_none());
     let snapshot = block_on(store.ensure(first, &equation_signer())).unwrap();
     let observed = snapshot.collection(first).unwrap();
-    assert_eq!(observed.support(), &support(root, &[source, concurrent]));
+    assert_eq!(
+        observed.support().unwrap(),
+        &support(root, &[source, concurrent])
+    );
     assert_eq!(observed.cover().len(), 2);
     assert_eq!(snapshot.wants().unwrap().count(), 0);
 }
@@ -1539,7 +1542,7 @@ fn root_ensure_hydrates_admitted_payloads_and_defers_concurrent_authority() {
     let first_snapshot = block_on(store.ensure(root, &equation_signer())).unwrap();
     assert_eq!(store.acquired, vec![data(&descriptor), data(&first_source)]);
     assert_eq!(
-        first_snapshot.collection(root).unwrap().support(),
+        first_snapshot.collection(root).unwrap().support().unwrap(),
         &support(root, std::slice::from_ref(&first_source)),
         "a grant arriving during descriptor acquisition must not initiate more acquisition",
     );
@@ -1552,7 +1555,7 @@ fn root_ensure_hydrates_admitted_payloads_and_defers_concurrent_authority() {
 
     let second_snapshot = block_on(store.ensure(root, &equation_signer())).unwrap();
     assert_eq!(
-        second_snapshot.collection(root).unwrap().support(),
+        second_snapshot.collection(root).unwrap().support().unwrap(),
         &support(root, &[first_source, concurrent_source.clone()]),
     );
     assert_eq!(&store.acquired[2..], &[data(&concurrent_source)],);
@@ -1625,7 +1628,7 @@ fn root_ensure_acquires_shared_capability_definitions_once_without_wants() {
 
     let observed = block_on(store.ensure(root, &equation_signer())).unwrap();
     assert_eq!(
-        observed.collection(root).unwrap().support(),
+        observed.collection(root).unwrap().support().unwrap(),
         &support(root, &[source.clone()])
     );
     assert_eq!(observed.wants().unwrap().count(), 0);
@@ -1680,7 +1683,7 @@ fn root_ensure_reuses_a_signed_union_without_fetching_ancestor_bytes() {
     let snapshot = block_on(store.ensure(root, &equation_signer())).unwrap();
     let attached = snapshot.collection(root).unwrap();
     assert_eq!(
-        attached.support(),
+        attached.support().unwrap(),
         &support(root, &[left.clone(), right.clone()])
     );
     assert_eq!(
@@ -2399,7 +2402,7 @@ fn cold_source_authority_fixture(
         .writer_is_admitted(&observed, first_writer.verifying_key())
         .unwrap());
     assert_eq!(
-        observed.collection(target).unwrap().support(),
+        observed.collection(target).unwrap().support().unwrap(),
         &if target_ready {
             selected.clone()
         } else {
@@ -2444,7 +2447,10 @@ fn exact_warm_target_reuse_does_not_acquire_or_admit_its_source() {
                     "reuse authenticates the target, not its ancestral producers",
                 );
             }
-            assert_eq!(after.collection(target).unwrap().support(), &selected);
+            assert_eq!(
+                after.collection(target).unwrap().support().unwrap(),
+                &selected
+            );
             assert_eq!(after.wants().unwrap().count(), 0);
             assert!(store.acquired.is_empty());
             assert!(store.events.is_empty());
@@ -2469,7 +2475,10 @@ fn exact_new_work_still_requires_the_immediate_source_grant_definition() {
         assert_eq!(FIRST_MAP_CALLS.get(), 0, "never rebuild the source");
         if available_definition {
             let after = result.unwrap();
-            assert_eq!(after.collection(target).unwrap().support(), &selected);
+            assert_eq!(
+                after.collection(target).unwrap().support().unwrap(),
+                &selected
+            );
             assert_eq!(SECOND_MAP_CALLS.get(), 1);
         } else {
             assert!(matches!(
@@ -3035,7 +3044,7 @@ fn target_maintenance_reendorses_a_resident_upper_without_joining_again() {
     assert_eq!(x.bytes.len().ilog2(), z.bytes.len().ilog2());
     let before = inner.snapshot().unwrap();
     let selected = before.collection_exact(second, &requested).unwrap();
-    assert_eq!(selected.support(), &requested);
+    assert_eq!(selected.support().unwrap(), &requested);
     assert_eq!(
         selected.cover().data_members().collect::<BTreeSet<_>>(),
         BTreeSet::from([data(&x), data(&z)]),
@@ -3052,7 +3061,7 @@ fn target_maintenance_reendorses_a_resident_upper_without_joining_again() {
     assert_eq!(SECOND_JOIN_CALLS.get(), 0);
     assert!(store.acquired.is_empty());
     let selected = after.collection_exact(second, &requested).unwrap();
-    assert_eq!(selected.support(), &requested);
+    assert_eq!(selected.support().unwrap(), &requested);
     assert_eq!(
         selected.cover().data_members().collect::<Vec<_>>(),
         vec![data(&z)],
@@ -3163,7 +3172,7 @@ fn support_repair_removes_an_earlier_member_made_redundant_by_a_later_one() {
     let requested = support(collection, &blobs);
     let snapshot = store.snapshot().unwrap();
     let selected = snapshot.collection_exact(collection, &requested).unwrap();
-    assert_eq!(selected.support(), &requested);
+    assert_eq!(selected.support().unwrap(), &requested);
     // Starting with Z [b,z], a forward support-repair walk adds A [a], then
     // B [a,b,d] for d. B makes A redundant without enlarging the support.
     assert_eq!(
@@ -3187,7 +3196,7 @@ fn target_maintenance_does_not_repeat_a_support_redundant_carry() {
     // witnesses already cover A, then errors on the same three-member cover.
     let after = block_on(store.maintain_exact(collection, &equation_signer(), &requested)).unwrap();
     let selected = after.collection_exact(collection, &requested).unwrap();
-    assert_eq!(selected.support(), &requested);
+    assert_eq!(selected.support().unwrap(), &requested);
     assert_eq!(
         selected.cover().data_members().collect::<Vec<_>>(),
         vec![data(z)]
@@ -3212,7 +3221,8 @@ fn target_maintenance_does_not_repeat_a_support_redundant_carry() {
         after
             .collection_exact(collection, &requested)
             .unwrap()
-            .support(),
+            .support()
+            .unwrap(),
         &requested
     );
     assert!(
@@ -3231,7 +3241,7 @@ fn support_repair_does_not_clip_a_wider_certificate_to_the_requested_support() {
     let requested = support(collection, &[a.clone(), b.clone(), z.clone()]);
     let snapshot = store.snapshot().unwrap();
     let selected = snapshot.collection_exact(collection, &requested).unwrap();
-    assert_eq!(selected.support(), &requested);
+    assert_eq!(selected.support().unwrap(), &requested);
     // B's [a,d] certificate is not a [a] certificate when d is unselected.
     // Reusing B [b] and Z [b,z] therefore cannot justify removing A [a].
     assert_eq!(
@@ -3259,7 +3269,8 @@ fn equal_payload_commit_does_not_restart_completed_target_maintenance() {
         after
             .collection_exact(collection, &requested)
             .unwrap()
-            .support(),
+            .support()
+            .unwrap(),
         &requested
     );
     assert!(store.events.is_empty());

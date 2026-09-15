@@ -2,6 +2,8 @@
 
 /// Flat typed array blob encoding.
 pub mod array;
+/// Canonical grow-only sets of opaque entity IDs.
+pub mod entity_id_set;
 /// Opaque raw bytes blob encoding (positive choice, distinct from UnknownBlob).
 pub mod rawbytes;
 /// Canonical trible sequence blob encoding.

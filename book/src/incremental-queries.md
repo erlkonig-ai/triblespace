@@ -94,12 +94,12 @@ does, to make a failed fold retry the same support.
 
 The two pattern inputs need not share a representation. The runnable example
 (`cargo run --example collection_pattern_changes`) uses immutable
-`CollectionSnapshot<R, E>` values which own the store observation,
-foundational support, and realized target cover. Their shard-preserving query
-values are reconstructed later with `view`.
+`CollectionSnapshot<R, E>` values which own the store observation and realized
+target cover. Their foundational support is a fallible, lazy provenance query;
+their shard-preserving query values are reconstructed separately with `view`.
 
 For a strict extension, compute `changed_support =
-current_support.additions_since(previous.support())`. Await `ensure_exact` or
+current_support.additions_since(previous.support()?)`. Await `ensure_exact` or
 `maintain_exact` for that same foundational support through each desired
 mapping edge, then ask the returned store snapshot for
 `collection_exact(target, &changed_support)`. Do the same for complete

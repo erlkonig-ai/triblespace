@@ -4,6 +4,8 @@
 pub use crate::blob::encodings::array::elements;
 /// Re-export of [`Array`] and [`ArrayElement`].
 pub use crate::blob::encodings::array::{Array, ArrayElement};
+/// Canonical entity-ID set encoding and its shard-backed logical view.
+pub use crate::blob::encodings::entity_id_set::{EntityIdSet, EntityIdSetBlob};
 /// Re-export of [`RawBytes`].
 pub use crate::blob::encodings::rawbytes::RawBytes;
 /// Re-export of [`SimpleArchive`].

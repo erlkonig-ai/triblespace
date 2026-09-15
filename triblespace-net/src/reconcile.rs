@@ -424,6 +424,11 @@ impl Reconciler {
             else {
                 continue;
             };
+            // A resident summary can be readable without complete historical
+            // provenance. Unavailable support cannot justify a negative hint.
+            let Ok(support) = observed.support() else {
+                continue;
+            };
             // Foundational support is not necessarily the mapping's immediate
             // input: a SimpleArchive projection may have dropped references.
             // This walker starts at COMMIT payloads, so only a summary mapped
@@ -431,7 +436,7 @@ impl Reconciler {
             if triblespace_core::collection::descriptor::source(&descriptor)
                 .ok()
                 .flatten()
-                != Some(observed.support().collection().handle())
+                != Some(support.collection().handle())
             {
                 continue;
             }
@@ -440,7 +445,7 @@ impl Reconciler {
                 // itself keeps the summary's original bytes. An unreadable
                 // optional hint supplies no negative answer.
                 if let Ok(query) = view.query() {
-                    summaries.push((observed.support().clone(), query));
+                    summaries.push((support.clone(), query));
                 }
             }
         }

@@ -246,12 +246,14 @@ Foreign bytes are signature-checked at the store/synchronization boundary;
 the producer must satisfy target WRITE through the observation's resident
 proof and capability-definition evidence.
 A trusted local store is not reverified on every read. Once a target producer
-is admitted, attachment follows its exact witness DAG without re-admitting
-each ancestor or reading ancestral payloads, metadata, and capability proofs.
-The descriptor lineage and referenced native records establish the support;
-only selected outputs and their encoding-required dependencies must be resident.
-A missing result cannot suppress an available finer realization. A missing or
-mismatched witness route is unknown support, not empty support.
+is admitted, attachment selects its resident output without expanding the
+historical support. Exact record relationships order the physical cover; only
+selected outputs and their encoding-required dependencies must be resident.
+A missing result cannot suppress an available finer realization. An explicit
+`support()` query follows the exact witness DAG and descriptor lineage without
+re-admitting ancestors or reading ancestral payloads, metadata, and proofs.
+A missing or mismatched witness route makes that query fail, not return empty
+support, and does not prevent reading the endorsed target value.
 
 This deliberately trusts authorized producers to validate inputs and compute
 correctly. Signatures identify who endorsed that claim; they do not prevent an
@@ -276,19 +278,21 @@ watermark. Ask it what representation is actually readable at that instant:
 ```rust,ignore
 let snapshot = store.snapshot()?;
 let observed = snapshot.collection(collection)?;
-let support = observed.support();
 let cover = observed.cover();
 let value: V = observed.view()?;
+// Only a consumer which needs provenance asks for historical support.
+let support = observed.support()?;
 ```
 
 `snapshot.collection(target)` admits producers of target records from the
-snapshot's proof and resident definition evidence, resolves their exact native
-witness closures, and chooses a complete resident target cover. It returns only
-the foundational support certified by that physical realization, not a fresh
-admission query over every source COMMIT. Admitted but not yet
-derived data is absent: an immutable snapshot never promises work which will
-happen later. `snapshot.collection_exact(target, &support)` is the assertion
-form and fails unless that exact foundational support is completely realized.
+snapshot's proof and resident definition evidence and chooses their resident
+target cover. Neither upstream descriptor residency nor a complete historical
+witness closure is a prerequisite for this read. The observation retains exact
+endorsements for its lazy `support()` query, not a fresh admission query over
+every source COMMIT. Admitted but not yet derived data is absent: an immutable
+snapshot never promises work which will happen later.
+`snapshot.collection_exact(target, &support)` is the assertion form and fails
+unless that exact foundational support is completely realized.
 Neither observation method reads the clock: identical operations on one frozen
 store snapshot have identical results even while wall time passes. A decision
 using later-arriving proof or definition evidence requires a new snapshot.
@@ -298,6 +302,13 @@ interpretation time of newly observed content, not a historical content revision
 `changes_since` classifies content only, so a new instant alone reports no
 content change. Generic collection authorization has no proof-validity clock;
 action-specific deadlines belong to the application interpreting that action.
+
+`observed.is_current(&later_snapshot)` compares the raw dependencies actually
+consulted by attachment, views, and explicit support queries. Indexed backends
+ignore unrelated collection and blob appends. Missing lookups count too: a
+later matching record or a recoverable physical occurrence of a blob triggers
+a refresh. This is conservative dependency comparison, not a global sequence
+number or another materialized catalog. Query deadlines remain caller-owned.
 
 Both forms keep the chosen target cover inseparable from the store snapshot
 which established its residency. `view` invokes `TryFromCover<E>` solely
@@ -337,8 +348,9 @@ Raw record readers still expose dangling native collection records and stored
 proof records for repair. A member is readable only when its selected payload
 and representation dependencies are resident in that exact frozen snapshot.
 An endorsed result does not need its historical input payloads or COMMIT
-metadata to remain resident. Its exact record witnesses must still close;
-merely holding the result blob does not establish collection support.
+metadata to remain resident. Its exact record witnesses must still close when
+support is requested; merely holding the result blob does not establish that
+provenance.
 A capability proof's signatures can be checked from its bytes
 alone; action and delegation interpretation also needs the referenced
 definition blobs. A missing definition does not erase the raw proof, but it

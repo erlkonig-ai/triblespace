@@ -9,7 +9,8 @@ use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::collection::{
     empty_metadata_handle, simplearchive_union, AdmissionPolicy, Collection, CollectionCommit,
     CollectionData, CollectionMaterializationError, CollectionMerge, CollectionPolicy,
-    CollectionRecord, CollectionSnapshotExt, CollectionStore, CollectionStoreExt,
+    CollectionRealizationError, CollectionRecord, CollectionSnapshotExt, CollectionStore,
+    CollectionStoreExt,
 };
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
@@ -92,12 +93,17 @@ fn raw_cover_reuses_an_endorsed_merge_without_ancestor_write_authority() {
     let cover = target.cover([a.get_handle(), b.get_handle(), c.get_handle()]);
 
     assert_eq!(cover.available(&snapshot).unwrap(), cover);
+    let attached = snapshot.collection(target).unwrap();
+    assert_eq!(attached.cover(), &target.cover([z.get_handle()]));
     let expected: TribleSet = z.try_from_blob().unwrap();
     assert_eq!(
         cover.materialize::<TribleSet, _>(&snapshot).unwrap(),
         expected
     );
-    assert!(snapshot.collection(target).unwrap().support().is_empty());
+    assert!(matches!(
+        attached.support(),
+        Err(CollectionRealizationError::IncompleteSupport { .. })
+    ));
     assert!(store
         .snapshot()
         .unwrap()
@@ -132,7 +138,12 @@ fn raw_cover_decomposes_a_nonresident_result_into_both_resident_inputs() {
         cover.materialize::<TribleSet, _>(&snapshot).unwrap(),
         expected
     );
-    assert!(snapshot.collection(target).unwrap().support().is_empty());
+    assert!(snapshot
+        .collection(target)
+        .unwrap()
+        .support()
+        .unwrap()
+        .is_empty());
     assert!(store
         .snapshot()
         .unwrap()

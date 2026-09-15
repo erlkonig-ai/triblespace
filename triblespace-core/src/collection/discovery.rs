@@ -665,7 +665,7 @@ mod tests {
         let after = store.snapshot().unwrap();
         let attached = after.collection(target).unwrap();
         assert_eq!(attached.cover().len(), 1);
-        assert_eq!(attached.support().len(), 2);
+        assert_eq!(attached.support().unwrap().len(), 2);
         assert_eq!(
             attached
                 .view::<UnionArchive<OrderedUniverse>>()

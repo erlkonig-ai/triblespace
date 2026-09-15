@@ -348,7 +348,7 @@ fn annotations_and_opaque_ids_preserve_ordinary_maintenance() {
         target
     );
     let observed = maintained.collection(target).unwrap();
-    assert_eq!(observed.support().len(), 2);
+    assert_eq!(observed.support().unwrap().len(), 2);
     assert_eq!(
         observed
             .view::<UnionArchive<OrderedUniverse>>()
@@ -801,7 +801,7 @@ fn missing_policies_leave_ordinary_root_maintenance_inert() {
         records
     );
     let observed = after.collection(collection).unwrap();
-    assert!(observed.support().is_empty());
+    assert!(observed.support().unwrap().is_empty());
     assert!(observed.cover().is_empty());
     assert!(observed.view::<TribleSet>().unwrap().is_empty());
 }

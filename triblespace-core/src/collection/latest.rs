@@ -1059,8 +1059,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             [*c]
         );
-        assert_eq!(frozen.support().len(), 2);
-        assert_eq!(caught_up.collection(target).unwrap().support().len(), 3);
+        assert_eq!(frozen.support().unwrap().len(), 2);
+        assert_eq!(
+            caught_up
+                .collection(target)
+                .unwrap()
+                .support()
+                .unwrap()
+                .len(),
+            3
+        );
         assert!(caught_up.records().unwrap().any(|record| matches!(record.unwrap(), super::super::CollectionRecord::Merge(merge) if merge.collection() == target.handle())));
     }
 

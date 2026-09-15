@@ -623,6 +623,19 @@ likewise a grow-only set. Historical pins remain ordered evidence; retired
 WANT logs are only explicit migration input and do not participate in ordinary
 replay.
 
+The immutable record read surface also provides raw relationship selectors.
+`ProducedMember(C, H)` selects every COMMIT data, MERGE result, or DERIVE output
+matching the exact collection and payload. `ReferencingRecord(FP)` selects
+every immediate MERGE/DERIVE consumer of that exact input-record fingerprint,
+even before the input arrives. Pile replay maintains snapshot-shared PATCH
+indexes keyed by `C | output | fingerprint` (96 bytes) and
+`input fingerprint | consumer fingerprint` (64 bytes), alongside the primary
+and per-collection indexes. Mixed selectors return one fingerprint-sorted,
+deduplicated union; unindexed backends retain the same scan-based contract.
+These indexes only project stored record fields: refresh performs no capability
+admission, witness resolution, signature recheck, or blob read for them. They
+change no record bytes, fingerprints, or encoding identities.
+
 ### Retired payload-only equations and reader cutover
 
 The first signed payload-only MERGE kind was

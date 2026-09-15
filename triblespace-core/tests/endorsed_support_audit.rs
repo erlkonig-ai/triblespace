@@ -66,6 +66,7 @@ fn later_alternative_equations_cannot_change_an_endorsed_results_support() {
         );
         attached
             .support()
+            .unwrap()
             .members()
             .map(Handle::<SimpleArchive>::to_hash)
             .collect::<BTreeSet<_>>()

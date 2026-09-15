@@ -650,7 +650,7 @@ fn native_read_proof_bootstraps_on_retry_and_rejects_writer_only_peer() {
         assert!(!dangling.contains_blob(payload_handle).unwrap());
         let unavailable = dangling.collection(reader_collection).unwrap();
         assert!(unavailable.cover().is_empty());
-        assert!(unavailable.support().is_empty());
+        assert!(unavailable.support().unwrap().is_empty());
         assert!(reader_collection.read::<TribleSet, _>(&dangling).unwrap().is_empty());
         assert_eq!(dangling.wants().unwrap().count(), 0);
         assert!(
@@ -669,7 +669,7 @@ fn native_read_proof_bootstraps_on_retry_and_rejects_writer_only_peer() {
         assert_eq!(reader_collection.admitted(&reader_snapshot).unwrap(), admitted);
         let available = reader_snapshot.collection(reader_collection).unwrap();
         assert_eq!(available.cover().len(), 1);
-        assert_eq!(available.support(), &admitted);
+        assert_eq!(available.support().unwrap(), &admitted);
         assert_eq!(reader_collection.read::<TribleSet, _>(&reader_snapshot).unwrap(), payload_facts);
         assert!(!dangling.contains_blob(payload_handle).unwrap());
         assert!(dangling.collection(reader_collection).unwrap().cover().is_empty());
@@ -1583,10 +1583,11 @@ fn full_replication_reuses_a_known_summary_without_filtering_later_source_suppor
         // consumer must acquire its known output, never derive a partial image.
         let maintained = server_store.maintain(summaries, &server_key).await.unwrap();
         let produced = maintained.collection(summaries).unwrap();
-        assert_eq!(produced.support().len(), 1);
+        assert_eq!(produced.support().unwrap().len(), 1);
         assert!(
             produced
                 .support()
+                .unwrap()
                 .contains(Inline::new(commit_a.data().raw))
         );
         assert_eq!(produced.cover().len(), 1);
@@ -1644,7 +1645,14 @@ fn full_replication_reuses_a_known_summary_without_filtering_later_source_suppor
             reader_store.insert(*record).unwrap();
         }
         let before = reader_store.snapshot().unwrap();
-        assert!(before.collection(summaries).unwrap().support().is_empty());
+        assert!(
+            before
+                .collection(summaries)
+                .unwrap()
+                .support()
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(before.wants().unwrap().count(), 0);
         assert_eq!(before.proofs().unwrap().count(), 0);
         for handle in &omitted {
@@ -1724,15 +1732,17 @@ fn full_replication_reuses_a_known_summary_without_filtering_later_source_suppor
         assert!(reader.try_local(absent.raw).is_none());
         let after = reader.snapshot().unwrap();
         let observed = after.collection(summaries).unwrap();
-        assert_eq!(observed.support().len(), 1);
+        assert_eq!(observed.support().unwrap().len(), 1);
         assert!(
             observed
                 .support()
+                .unwrap()
                 .contains(Inline::new(commit_a.data().raw))
         );
         assert!(
             !observed
                 .support()
+                .unwrap()
                 .contains(Inline::new(commit_b.data().raw))
         );
         assert_eq!(observed.cover().members().collect::<Vec<_>>(), [output]);
@@ -1824,10 +1834,15 @@ fn full_replication_does_not_apply_a_projected_summary_to_foundational_payloads(
         let producer = server_store.maintain(summaries, &server_key).await.unwrap();
         let observed = producer.collection(summaries).unwrap();
         assert_eq!(
-            observed.support().collection().handle(),
+            observed.support().unwrap().collection().handle(),
             collection.handle()
         );
-        assert!(observed.support().contains(Inline::new(commit.data().raw)));
+        assert!(
+            observed
+                .support()
+                .unwrap()
+                .contains(Inline::new(commit.data().raw))
+        );
         assert_eq!(observed.cover().len(), 1);
         assert!(
             !observed
