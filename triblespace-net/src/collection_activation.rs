@@ -264,6 +264,44 @@ impl CollectionRepairOverlay {
         update_summary(&mut hasher, self.authorization_evidence.summary());
         *hasher.finalize().as_bytes()
     }
+
+    /// Reobserve authorization with the current resident reader, retaining the
+    /// independent record component when the store certifies it unchanged.
+    pub(crate) fn observe<R>(
+        snapshot: &R,
+        collection: CollectionHandle,
+        previous_records: Option<&CollectionRecordPatch>,
+    ) -> Result<
+        Self,
+        CollectionRepairOverlayError<R::RecordsError, R::ProofsError, R::GetError<Infallible>>,
+    >
+    where
+        R: BlobStoreGet + CapabilityProofRead + CollectionRead + Clone + Send + 'static,
+    {
+        let descriptor = load_collection_descriptor_facts(snapshot, collection)
+            .map_err(CollectionRepairOverlayError::Descriptor)?;
+        let authorization_evidence = collection_authorization_evidence_patch_for_descriptor(
+            snapshot, collection, descriptor,
+        )
+        .map_err(|error| match error {
+            AuthorizationEvidenceBuildError::Proofs(source) => {
+                CollectionRepairOverlayError::Proofs(source)
+            }
+            AuthorizationEvidenceBuildError::Evidence(source) => {
+                CollectionRepairOverlayError::Evidence(source)
+            }
+        })?;
+        let records = match previous_records {
+            Some(records) => records.clone(),
+            None => collection_record_patch(snapshot, collection)
+                .map_err(CollectionRepairOverlayError::Records)?,
+        };
+        Ok(Self {
+            collection,
+            records,
+            authorization_evidence,
+        })
+    }
 }
 
 fn update_summary(hasher: &mut blake3::Hasher, summary: PatchSummary) {
@@ -501,25 +539,7 @@ pub fn collection_repair_overlay<R>(
 where
     R: BlobStoreGet + CapabilityProofRead + CollectionRead + Clone + Send + 'static,
 {
-    let descriptor = load_collection_descriptor_facts(snapshot, collection)
-        .map_err(CollectionRepairOverlayError::Descriptor)?;
-    let authorization_evidence =
-        collection_authorization_evidence_patch_for_descriptor(snapshot, collection, descriptor)
-            .map_err(|error| match error {
-                AuthorizationEvidenceBuildError::Proofs(source) => {
-                    CollectionRepairOverlayError::Proofs(source)
-                }
-                AuthorizationEvidenceBuildError::Evidence(source) => {
-                    CollectionRepairOverlayError::Evidence(source)
-                }
-            })?;
-    let records = collection_record_patch(snapshot, collection)
-        .map_err(CollectionRepairOverlayError::Records)?;
-    Ok(CollectionRepairOverlay {
-        collection,
-        records,
-        authorization_evidence,
-    })
+    CollectionRepairOverlay::observe(snapshot, collection, None)
 }
 
 fn load_collection_descriptor_facts<R>(

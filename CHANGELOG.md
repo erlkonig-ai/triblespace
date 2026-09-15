@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Pin AnyBytes `066c32a7` so freezing an immutable section no longer flushes
+  its temporary mmap. Persistence retains an explicit durability barrier.
+
+- Reuse the collection-repair record PATCH when only blobs or authorization
+  proofs change. Hydrating one blob no longer enumerates and rehashes every
+  active collection's unchanged records. Authorization still observes current
+  resident capability definitions, and newly activated collections construct
+  their own record component.
+
 - Interpret AUTH permissions from immutable capability-definition blobs. Proof
   edges carry only a definition handle, delegate key, and prefix signature;
   invocation and onward delegation are independent action sets, with attenuation

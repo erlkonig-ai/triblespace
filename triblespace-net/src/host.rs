@@ -225,7 +225,14 @@ impl StoreSnapshot {
                         Ok,
                     )
             } else {
-                collection_repair_overlay(&snapshot, collection).map(|fresh| {
+                // Blob arrival may enable a capability definition, but cannot
+                // change the record set. Keep its already-built Merkle PATCH
+                // while updating the authorization reader to this snapshot.
+                let records = prior
+                    .as_ref()
+                    .filter(|_| !changes.contains(StoreChanges::COLLECTION_RECORDS))
+                    .map(|prior| prior.repair.records());
+                CollectionRepairOverlay::observe(&snapshot, collection, records).map(|fresh| {
                     prior
                         .as_ref()
                         .filter(|prior| {
@@ -2378,6 +2385,9 @@ fn op_name(op: u8) -> &'static str {
 
 #[cfg(all(test, feature = "sim"))]
 mod acquisition_tests;
+
+#[cfg(test)]
+mod observation_tests;
 
 #[cfg(all(test, feature = "sim"))]
 mod pool_tests;

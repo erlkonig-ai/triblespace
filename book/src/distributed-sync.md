@@ -105,6 +105,13 @@ scoped to C. The receiver always derives its admitted view locally; record and
 proof arrival therefore commute, and a publisher need not possess or present
 its own WRITE grant merely to replicate an inert signed record.
 
+The host also updates these components independently. When a store snapshot
+reports unchanged collection records, its existing record PATCH is shared into
+the next repair overlay without re-enumeration or Merkle hashing. Blob arrival
+still refreshes the authorization observation: a newly resident capability or
+subordinate-resource descriptor can enable admission or proof routing without
+changing any record. Cold collection activation constructs both components.
+
 Signed MERGE and DERIVE records are input-record-bound endorsements and
 first-class members of the exact-C record PATCH and ordinary collection
 repair. Once present in a record store, an equation is reusable materialized
