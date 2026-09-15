@@ -219,14 +219,21 @@ exactly the foundational support represented by it.
    payload set; and
 2. the target frontier has a complete resident target `Cover`.
 
-Only then does `view::<Arc<PathIndex>>()` load the canonical automaton blob
-named by every selected summary, join those summaries, and close them once
-into the endpoint relation. For the empty cover, the descriptor names the same
+Only then does `view::<PathSummaryView>()` attach the selected summaries: it
+keeps them as stored, checks that each names the descriptor's automaton by
+the handle in its header, and decodes that automaton once from its blob.
+Nothing is re-encoded or hashed to believe a stored equation. Closing the
+relation is an explicit step, `PathSummaryView::prepare`, which decodes the
+members structurally, merges the decoded summaries once and closes the union
+into the endpoint relation; `view::<Arc<PathIndex>>()` is that attach
+followed by `prepare`. For the empty cover, the descriptor names the same
 blob so the canonical bottom remains available. The mapping descriptor carries
 the automaton facts for source-to-target derivation and retains its blob in the
 descriptor closure; interpretation otherwise uses the immutable
 content-addressed representation dependency rather than mutable state retained
-in a lifecycle facade.
+in a lifecycle facade. The canonical audit of a member (`PathSummaryBlob::audit`,
+`PathAutomatonBlob::audit`) is explicit: `validate_member` and the producer's
+`join_members` run it, a warm read does not.
 
 `CollectionStoreExt::ensure{_exact}` asynchronously acquires exact missing
 dependencies and publishes missing `DERIVE` work only; `maintain{_exact}`

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Read regular-path summaries structurally. Attaching a `PathSummaryView`
+  keeps the resident members and decodes their automaton once, comparing each
+  member's stored automaton handle to the descriptor's as bytes; its new
+  `prepare` step decodes the members structurally, merges the decoded
+  summaries once and closes the union, so paths across members stay
+  discoverable and no intermediate join is re-encoded. The canonical checks
+  (automaton re-encoding, vertex and arc order, transition membership, the
+  canonical domain) moved to explicit `PathSummaryBlob::audit` and
+  `PathAutomatonBlob::audit`, which `validate_member` and the producer's
+  `join_members` still run. Wire bytes, descriptors and identities are
+  unchanged; `view::<Arc<PathIndex>>()` is now attach followed by `prepare`.
+
 - Connect the existing CubeCL wavelet backend to canonical raw Succinct
   construction and target compaction through `BackendSuccinctMapping`.
   Collection identity remains backend-independent; CPU-reference plumbing tests
