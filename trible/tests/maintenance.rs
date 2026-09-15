@@ -646,6 +646,26 @@ fn zero_interval_is_rejected_before_maintenance() {
     }
 }
 
+#[cfg(not(feature = "succinct-cuda"))]
+#[test]
+fn unavailable_cuda_is_rejected_without_opening_the_pile() {
+    let fixture = Fixture::new();
+    let before = records(&fixture.path);
+    let bytes = std::fs::metadata(&fixture.path).unwrap().len();
+    for verb in ["maintain", "maintain-all"] {
+        let mut command = fixture.command(verb, &[fixture.succinct.handle()]);
+        command.args(["--succinct-backend", "cuda"]);
+        let output = Command::from_std(command)
+            .timeout(Duration::from_secs(5))
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("succinct-cuda build feature"));
+        assert_eq!(records(&fixture.path), before);
+        assert_eq!(std::fs::metadata(&fixture.path).unwrap().len(), bytes);
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn watch_follows_an_external_append_and_exits_cleanly_on_sigint() {

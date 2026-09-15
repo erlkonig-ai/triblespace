@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Connect the existing CubeCL wavelet backend to canonical raw Succinct
+  construction and target compaction through `BackendSuccinctMapping`.
+  Collection identity remains backend-independent; CPU-reference plumbing tests
+  and explicit, ignored CUDA byte/hash/union and signed-maintenance gates cover
+  the execution choice. CUDA maintenance is opt-in, not a new rollup lifecycle.
+
 - Bias explicitly selected CLI maintenance targets by the author's public key.
   Each author retains deterministic priority independent of argument order;
   dependency-first scheduling, once-per-pass deduplication, and canonical

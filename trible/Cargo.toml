@@ -32,6 +32,7 @@ hex = "0.4.3"
 memchr = "2.7.6"
 triblespace = { version = "0.47.0", path = "..", default-features = false }
 triblespace-core = { version = "0.47.0", path = "../triblespace-core", default-features = false, features = ["object-store"] }
+triblespace-gpu = { version = "0.47.0", path = "../triblespace-gpu", default-features = false, optional = true }
 triblespace-paths = { path = "../triblespace-paths" }
 anybytes = "0.20"
 triblespace-search = { path = "../triblespace-search", optional = true }
@@ -61,3 +62,6 @@ default = ["search"]
 # the price is that the search crate brings the model crate with it. Build with
 # --no-default-features for a lean daemon.
 search = ["dep:triblespace-search", "triblespace-search/semantic"]
+# Explicit execution choice for bounded, externally reserved CUDA maintenance.
+# CPU remains the command default, including when this feature is compiled.
+succinct-cuda = ["dep:triblespace-gpu", "triblespace-gpu/cuda"]

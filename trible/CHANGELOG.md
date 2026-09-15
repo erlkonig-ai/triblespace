@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
+- Add the optional `succinct-cuda` feature and explicit
+  `--succinct-backend cpu|cuda` selection for collection maintenance. CUDA uses
+  the same descriptor and raw bytes for DERIVE and target MERGE, with canonical
+  CPU retry on returned backend failures. CPU remains the default. Device and
+  shared-memory reservation are caller obligations; this does not catch OOM.
+
 - `pile collection maintain-all` schedules explicitly selected targets and
   their source dependencies in upstream order. Shared dependencies run once;
   foundational sources are ensured without an unnecessary base-archive merge.

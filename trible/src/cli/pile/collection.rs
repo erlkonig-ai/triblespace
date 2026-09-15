@@ -62,6 +62,35 @@ use super::open_refreshed;
 /// collide, and short enough that a row stays one terminal line.
 const ABBREV: usize = 16;
 
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+pub enum SuccinctBackend {
+    #[default]
+    Cpu,
+    /// CUDA wavelet packing; requires the succinct-cuda build feature and a
+    /// separately reserved device/shared-memory budget. Rank9 stays on CPU.
+    Cuda,
+}
+
+impl SuccinctBackend {
+    fn check_available(self) -> Result<()> {
+        match self {
+            Self::Cpu => Ok(()),
+            Self::Cuda => {
+                #[cfg(feature = "succinct-cuda")]
+                {
+                    Ok(())
+                }
+                #[cfg(not(feature = "succinct-cuda"))]
+                {
+                    Err(anyhow!(
+                        "CUDA Succinct maintenance requires the succinct-cuda build feature"
+                    ))
+                }
+            }
+        }
+    }
+}
+
 #[derive(Parser)]
 pub enum Command {
     /// Register one named root collection and print its exact handle.
@@ -263,6 +292,9 @@ pub enum Command {
         /// Poll interval in milliseconds (positive; only used with --watch)
         #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u64).range(1..))]
         interval_ms: u64,
+        /// Raw Succinct execution backend; this does not reserve the device
+        #[arg(long, value_enum, default_value_t = SuccinctBackend::Cpu)]
+        succinct_backend: SuccinctBackend,
     },
     /// Maintain selected targets and their source dependencies, upstream first.
     ///
@@ -288,6 +320,9 @@ pub enum Command {
         /// Poll interval in milliseconds (positive; only used with --watch)
         #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u64).range(1..))]
         interval_ms: u64,
+        /// Raw Succinct execution backend; this does not reserve the device
+        #[arg(long, value_enum, default_value_t = SuccinctBackend::Cpu)]
+        succinct_backend: SuccinctBackend,
     },
     /// Grant one endpoint unbounded READ access to an existing collection.
     ///
@@ -418,14 +453,32 @@ pub fn run(cmd: Command) -> Result<()> {
             key,
             watch,
             interval_ms,
-        } => run_maintain(pile, collections, key, false, watch, interval_ms),
+            succinct_backend,
+        } => run_maintain(
+            pile,
+            collections,
+            key,
+            false,
+            watch,
+            interval_ms,
+            succinct_backend,
+        ),
         Command::MaintainAll {
             pile,
             collections,
             key,
             watch,
             interval_ms,
-        } => run_maintain(pile, collections, key, true, watch, interval_ms),
+            succinct_backend,
+        } => run_maintain(
+            pile,
+            collections,
+            key,
+            true,
+            watch,
+            interval_ms,
+            succinct_backend,
+        ),
         Command::GrantRead {
             pile,
             collection,
@@ -2070,6 +2123,7 @@ async fn maintain_by_representation(
     representation: Id,
     algorithm: Option<Id>,
     signer: &SigningKey,
+    succinct_backend: SuccinctBackend,
 ) -> Result<PileSnapshot> {
     use triblespace_core::collection::latest::LatestBlob;
     use triblespace_core::collection::lww_register::LwwRegisterBlob;
@@ -2100,6 +2154,17 @@ async fn maintain_by_representation(
         }
         go::<SimpleArchive>(pile, snapshot, handle, signer).await
     } else if representation == <SuccinctArchiveBlob as MetaDescribe>::id() {
+        #[cfg(feature = "succinct-cuda")]
+        if matches!(succinct_backend, SuccinctBackend::Cuda) {
+            let collection = Collection::<SuccinctArchiveBlob>::open(snapshot, handle)
+                .map_err(|error| anyhow!("open collection descriptor: {error}"))?;
+            return pile
+                .maintain_with::<triblespace_gpu::CudaSuccinctMapping>(collection, signer)
+                .await
+                .map_err(|error| anyhow!("maintain CUDA Succinct collection: {error}"));
+        }
+        #[cfg(not(feature = "succinct-cuda"))]
+        succinct_backend.check_available()?;
         go::<SuccinctArchiveBlob>(pile, snapshot, handle, signer).await
     } else if representation == <Rank9AcceleratedSuccinctArchiveBlob as MetaDescribe>::id() {
         go::<Rank9AcceleratedSuccinctArchiveBlob>(pile, snapshot, handle, signer).await
@@ -2237,6 +2302,7 @@ async fn maintenance_pass(
     references: &[String],
     signer: &SigningKey,
     dependencies: bool,
+    succinct_backend: SuccinctBackend,
 ) -> Result<usize> {
     let snapshot = pile
         .snapshot()
@@ -2320,6 +2386,7 @@ async fn maintenance_pass(
                         representation,
                         algorithm,
                         signer,
+                        succinct_backend,
                     )
                     .await?
                 };
@@ -2361,6 +2428,7 @@ async fn maintenance_loop(
     dependencies: bool,
     watch: bool,
     interval: Duration,
+    succinct_backend: SuccinctBackend,
 ) -> Result<()> {
     let stop = tokio::signal::ctrl_c();
     tokio::pin!(stop);
@@ -2384,7 +2452,7 @@ async fn maintenance_loop(
                     eprintln!("maintenance stopped; closing pile");
                     return Ok(());
                 }
-                result = maintenance_pass(pile, references, signer, dependencies) => result?,
+                result = maintenance_pass(pile, references, signer, dependencies, succinct_backend) => result?,
             };
             let after = pile
                 .snapshot()
@@ -2426,7 +2494,10 @@ fn run_maintain(
     dependencies: bool,
     watch: bool,
     interval_ms: u64,
+    succinct_backend: SuccinctBackend,
 ) -> Result<()> {
+    // Reject an unavailable implementation before opening/mutating the pile.
+    succinct_backend.check_available()?;
     let key_path = triblespace_core::signing_key_file::resolve_path(key.as_deref(), &path);
     let signer = triblespace_core::signing_key_file::load_existing(&key_path)
         .map_err(|error| anyhow!("load signing key {}: {error}", key_path.display()))?;
@@ -2441,6 +2512,7 @@ fn run_maintain(
         dependencies,
         watch,
         Duration::from_millis(interval_ms),
+        succinct_backend,
     ));
     let close_res = pile
         .close()

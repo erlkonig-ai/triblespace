@@ -2,6 +2,11 @@
 
 use std::fmt;
 
+mod succinct_mapping;
+pub use succinct_mapping::BackendSuccinctMapping;
+#[cfg(feature = "cuda")]
+pub use succinct_mapping::CudaSuccinctMapping;
+
 #[cfg(feature = "wgpu")]
 mod batch_confirm;
 #[cfg(any(feature = "wgpu", feature = "cuda"))]
