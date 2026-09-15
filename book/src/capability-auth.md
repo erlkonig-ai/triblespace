@@ -174,11 +174,22 @@ WRITE(C) = request(resource C, ACTION_WRITE)
 ```
 
 WRITE admission decides which signed COMMITs contribute membership and which
-signed MERGE/DERIVE equations may be reused. An equation needs WRITE on its
-target; source WRITE alone is insufficient. Its signature identifies a
-producer, not a mathematical proof. Readers do not replay the computation.
-This is still record-level equation admission and lineage discovery, not a
-claim that independent cover-level endorsements have been implemented.
+signed MERGE/DERIVE endorsements may be reused. An equation needs WRITE on its
+target; source WRITE alone is insufficient. It signs both the computation's
+payload handles and fingerprints of the exact input records whose support the
+producer validated. Readers admit target producers, then follow those native
+witnesses without repeating ancestor authorization or loading ancestral data,
+metadata, or proof definitions. Descriptor lineage and exact record closure
+are still required to establish `Support`; selected output blobs and their
+encoding dependencies are required to read the value.
+
+The signature identifies a producer, not a mathematical proof. An authorized
+incorrect producer can still endorse a false computation or bad input
+validation. Readers do not replay that computation. Conversely, another record
+with the same payload does not inherit this signature's endorsement: exact
+witness references prevent alternate decompositions from inflating support.
+Current collection-record signatures are checked at foreign ingress or explicit
+audit, not again by ordinary trusted-local attachment.
 
 Local publication can retain an inactive record before a suitable proof
 arrives. Later proof or definition residency can activate it. Generic WRITE
@@ -230,14 +241,31 @@ the frozen proof set before disclosing a repair manifest.
 Repair transfers records only, not capability-definition blobs, payload closure,
 or WANT bookkeeping. The blob layer handles demand for definition bytes.
 
-The subordinate-resource transport candidate also routes proofs naming R when
+Subordinate-resource transport also routes proofs naming R when
 R's immutable descriptor contains `resource_collection: C` and `resource_policy`
 on the same entity. It checks R's policy roots and signatures, while the repair
 session remains gated by READ(C). No mutable fact in C can create or revoke the
 route. A missing R descriptor defers that proof leaf and leaves the AUTH component
 explicitly incomplete without blocking C's collection-record repair. Ordinary
-blob arrival permits a later retry; AUTH repair does not fetch R. This extension
-is a source candidate, not a claim of completed validation or live deployment.
+blob arrival permits a later retry; AUTH repair does not fetch R. A deferred
+leaf does not make the peer's AUTH root reconciled. Its repair PATCH prefix
+names the routing audience C, not necessarily the proof's signed resource R.
+
+## Explicit protocol cutover
+
+AUTH v5 and witness-bound equations use `/triblespace/pile-sync/26`; older
+protocol peers are not a compatibility bridge. Before switching a replica,
+provision the selected descriptor and capability-definition blobs together with
+the required fresh proofs through an explicitly authorized handoff. Otherwise
+both endpoints may need READ evidence which record repair cannot yet disclose.
+
+Reissuing a grant is a new signature, not translating an old proof. Preserve
+the intended resources, roots, recipients, actions, delegation rights, and
+quorums. Generic `grant-read`/`grant-write` issue invoke-only, non-expiring
+collection grants; they are not a migration for bounded Secrets delivery or
+other application restrictions. Audit old prefixes, including expired ones,
+before deciding what the appropriate owners may reissue. Neither a descriptor
+being selected for sync nor a blob being resident authorizes a broader grant.
 
 The boundaries remain independent: proof presence is not authority; routing,
 gossip, and DHT presence are not authority; WANT records durable local demand;

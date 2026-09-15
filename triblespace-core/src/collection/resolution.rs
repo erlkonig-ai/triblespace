@@ -536,8 +536,8 @@ impl CollectionSemantics {
         supporting
     }
 
-    #[cfg(test)]
-    fn subsumes(
+    /// Whether the sparse accepted order already proves `lower <= upper`.
+    pub(crate) fn subsumes(
         &self,
         collection: CollectionHandle,
         lower: CollectionData,
@@ -1545,8 +1545,8 @@ mod tests {
         CollectionMerge::sign(
             &SigningKey::from_bytes(&[31; 32]),
             collection,
-            left,
-            right,
+            witnessed_input(collection, left),
+            witnessed_input(collection, right),
             result,
         )
     }
@@ -1556,7 +1556,31 @@ mod tests {
         input: CollectionData,
         output: CollectionData,
     ) -> CollectionDerive {
-        CollectionDerive::sign(&SigningKey::from_bytes(&[31; 32]), target, input, output)
+        CollectionDerive::sign(
+            &SigningKey::from_bytes(&[31; 32]),
+            target,
+            witnessed_input(target, input),
+            output,
+        )
+    }
+
+    // These tests exercise payload-lattice closure directly, not collection
+    // attachment. Still use addresses of concrete records, never synthetic
+    // entity identities, for their otherwise uninterpreted witness fields.
+    fn witnessed_input(
+        collection: CollectionHandle,
+        data: CollectionData,
+    ) -> (
+        CollectionData,
+        crate::collection::CollectionRecordFingerprint,
+    ) {
+        let record = CollectionRecord::Commit(CollectionCommit::sign(
+            &SigningKey::from_bytes(&[31; 32]),
+            collection,
+            data,
+            super::super::empty_metadata_handle(),
+        ));
+        (data, record.fingerprint())
     }
 
     fn commit(definition: &Fragment, element: CollectionData, key: u8) -> CollectionCommit {
@@ -2450,9 +2474,19 @@ mod tests {
             signed_derive(target_handle, data(3), data(13)),
         ];
         let other_key = SigningKey::from_bytes(&[32; 32]);
-        let second_merge =
-            CollectionMerge::sign(&other_key, source_handle, data(1), data(2), data(3));
-        let second_derive = CollectionDerive::sign(&other_key, target_handle, data(1), data(11));
+        let second_merge = CollectionMerge::sign(
+            &other_key,
+            source_handle,
+            witnessed_input(source_handle, data(1)),
+            witnessed_input(source_handle, data(2)),
+            data(3),
+        );
+        let second_derive = CollectionDerive::sign(
+            &other_key,
+            target_handle,
+            witnessed_input(target_handle, data(1)),
+            data(11),
+        );
         assert_ne!(source_merge, second_merge);
         assert_ne!(derives[0], second_derive);
         second_merge.verify_strict().unwrap();

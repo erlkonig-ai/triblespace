@@ -46,8 +46,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uses one endpoint-bound KDF(C) lease per active served collection. Exact
   content has a separate global KDF(H) directory populated from resident
   blobs; exact GET consults neither collection identity nor READ(C).
-- Move the incompatible direct protocol, including self-contained proof
-  payloads, to ALPN `/triblespace/pile-sync/23`. Anti-entropy is
+- Move the incompatible direct protocol, including descriptor-defined AUTH
+  paths and witness-bound signed equations, to ALPN `/triblespace/pile-sync/26`. Anti-entropy is
   receiver-authorized by READ(C).
   Exact bearer GET instead uses a provider-first, requester-second mutual
   proof of H bound to both authenticated endpoint identities; raw H never
@@ -55,6 +55,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   artifacts are not mirrored.
 
 ### Fixed
+
+- Keep missing subordinate-resource descriptors from hot-looping AUTH repair
+  or starving independent collection records. AUTH retains an explicit
+  incomplete result and a bounded share of each stream; immediate continuation
+  requires actual ingested evidence, otherwise the ordinary periodic repair
+  cadence retries. No blob acquisition or WANT is added to repair.
 
 - Reopen a collection's stock-gossip topic through its configured and learned
   bootstrap routes when every repair participant is lost. Recovery shares the

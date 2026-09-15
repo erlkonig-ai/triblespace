@@ -20,16 +20,14 @@ use crate::repo::async_store::AsyncBlobStoreAcquire;
 use crate::repo::{BlobStoreGet, BlobStoreList, BlobStoreMeta, Store, StoreRead};
 use crate::trible::Fragment;
 
-use super::discovery::{
-    discover_collection_equations_for_lineage, discover_collection_equations_for_lineage_raw,
-};
 use super::encoding::{collection_member_availability, CollectionMemberAvailability};
 use super::operation_snapshot::OperationFrontier;
 use super::{
-    collection_complete_physical_cover, descriptor, resolve_collection_semantics_from_roots,
-    Collection, CollectionClaimValidation, CollectionData, CollectionDerive, CollectionEncoding,
+    collection_complete_physical_cover, descriptor, resolve_collection_semantics, Collection,
+    CollectionClaimValidation, CollectionData, CollectionDerive, CollectionEncoding,
     CollectionHandle, CollectionMapping, CollectionMerge, CollectionOperationError,
-    CollectionRecord, CollectionResolutionError, CollectionSemantics, Cover, Support,
+    CollectionRecord, CollectionRecordFingerprint, CollectionRecordSelector,
+    CollectionResolutionError, CollectionSemantics, Cover, Support,
 };
 #[cfg(test)]
 use super::{CanonicalDerivation, CollectionDerivation};
@@ -195,7 +193,6 @@ struct Lineage {
     foundation: Collection<SimpleArchive>,
     descriptors: BTreeMap<CollectionHandle, Fragment>,
     source_by_target: BTreeMap<CollectionHandle, CollectionHandle>,
-    collections: BTreeSet<CollectionHandle>,
 }
 
 impl Lineage {
@@ -214,11 +211,28 @@ where
     R: BlobStoreGet + BlobStoreList,
     E: CollectionEncoding,
 {
+    let lineage = load_record_lineage(snapshot, target.handle())?;
+    super::encoding::validate_descriptor_type::<E>(lineage.descriptor(target.handle())).map_err(
+        |error| {
+            CollectionRealizationError::Resolution(format!(
+                "target descriptor has the wrong representation: {error}"
+            ))
+        },
+    )?;
+    Ok(lineage)
+}
+
+fn load_record_lineage<R>(
+    snapshot: &R,
+    target: CollectionHandle,
+) -> Result<Lineage, CollectionRealizationError>
+where
+    R: BlobStoreGet + BlobStoreList,
+{
     let mut descriptors = BTreeMap::new();
     let mut source_by_target = BTreeMap::new();
     let mut collections = BTreeSet::new();
-    let mut cursor = target.handle();
-    let mut target_descriptor = true;
+    let mut cursor = target;
 
     loop {
         if !collections.insert(cursor) {
@@ -242,15 +256,6 @@ where
                 hex::encode_upper(cursor.raw),
             ))
         })?;
-        if target_descriptor {
-            super::encoding::validate_descriptor_type::<E>(&loaded.fragment).map_err(|error| {
-                CollectionRealizationError::Resolution(format!(
-                    "target descriptor has the wrong representation: {error}"
-                ))
-            })?;
-            target_descriptor = false;
-        }
-
         let source = descriptor::source(loaded.fragment.facts()).map_err(|error| {
             CollectionRealizationError::Resolution(format!(
                 "decode collection source for {}: {error}",
@@ -279,7 +284,6 @@ where
                     foundation: Collection::from_handle(cursor),
                     descriptors,
                     source_by_target,
-                    collections,
                 });
             }
         }
@@ -287,6 +291,7 @@ where
 }
 
 /// Find the ultimate canonical fact collection beneath a typed target.
+#[cfg(test)]
 pub(crate) fn foundation<R, E>(
     snapshot: &R,
     target: Collection<E>,
@@ -335,35 +340,220 @@ fn require_support(lineage: &Lineage, support: &Support) -> Result<(), Collectio
     )))
 }
 
-fn resolve_lineage<R>(
-    snapshot: &R,
-    lineage: &Lineage,
-    support: &Support,
-) -> Result<CollectionSemantics, CollectionRealizationError>
-where
-    R: StoreRead,
-{
-    require_support(lineage, support)?;
-    let discovered = discover_collection_equations_for_lineage(snapshot, &lineage.collections)
-        .map_err(|error| {
-            CollectionRealizationError::storage("discover collection lineage", error)
-        })?;
-    resolve_discovered_lineage(snapshot, lineage, support, &discovered)
-        .map(super::CollectionResolution::into_semantics)
+pub(super) type InputWitnesses =
+    BTreeMap<(CollectionHandle, CollectionData), Vec<(CollectionRecordFingerprint, Support)>>;
+
+fn witness_cover(
+    alternatives: &[(CollectionRecordFingerprint, Support)],
+    mut represented: Support,
+) -> Vec<CollectionRecordFingerprint> {
+    let mut ordered: Vec<_> = alternatives.iter().collect();
+    ordered.sort_by(|(left_id, left), (right_id, right)| {
+        right.len().cmp(&left.len()).then(left_id.cmp(right_id))
+    });
+    let mut selected = Vec::new();
+    for (id, support) in ordered {
+        if !support.is_subset(&represented).expect("one foundation") {
+            represented = represented.union(support).expect("one foundation");
+            selected.push(*id);
+        }
+    }
+    selected
 }
 
-fn resolve_discovered_lineage<R>(
+pub(super) fn merge_witness_pairs(
+    witnesses: &InputWitnesses,
+    collection: CollectionHandle,
+    low: CollectionData,
+    high: CollectionData,
+) -> Result<
+    Vec<(
+        (CollectionData, CollectionRecordFingerprint),
+        (CollectionData, CollectionRecordFingerprint),
+    )>,
+    CollectionRealizationError,
+> {
+    let alternatives = |member| {
+        witnesses
+            .get(&(collection, member))
+            .filter(|witnesses| !witnesses.is_empty())
+            .ok_or_else(|| {
+                CollectionRealizationError::InvalidCover(
+                    "a published MERGE needs an endorsed record for each input".into(),
+                )
+            })
+    };
+    let low_witnesses = alternatives(low)?;
+    let high_witnesses = alternatives(high)?;
+    let foundation = low_witnesses[0].1.collection();
+    let low_witnesses = witness_cover(low_witnesses, foundation.cover([]));
+    let high_witnesses = witness_cover(high_witnesses, foundation.cover([]));
+    // One joined blob, enough paired certificates to preserve every distinct
+    // input support. A Cartesian product adds no denotational information.
+    Ok((0..low_witnesses.len().max(high_witnesses.len()))
+        .map(|index| {
+            (
+                (low, low_witnesses[index % low_witnesses.len()]),
+                (high, high_witnesses[index % high_witnesses.len()]),
+            )
+        })
+        .collect())
+}
+
+fn witnessed_support(
+    witnesses: &InputWitnesses,
+    collection: CollectionHandle,
+    members: impl IntoIterator<Item = CollectionData>,
+    foundation: Collection<SimpleArchive>,
+) -> Support {
+    let mut support = Support::from_data(foundation, []);
+    for member in members {
+        for (_, input_support) in witnesses.get(&(collection, member)).into_iter().flatten() {
+            support = support.union(input_support).expect("one foundation");
+        }
+    }
+    support
+}
+
+/// Payload order chooses the coarse physical shape. Exact certificates choose
+/// its denotation: with a lossy mapping, x <= z does not imply that z's signed
+/// witness covers every independently signed support of x.
+fn witnessed_physical_cover<E, R>(
     snapshot: &R,
-    lineage: &Lineage,
-    support: &Support,
-    discovered: &super::DiscoveredCollectionRecords,
-) -> Result<super::CollectionResolution<()>, CollectionRealizationError>
+    semantics: &CollectionSemantics,
+    witnesses: &InputWitnesses,
+    collection: CollectionHandle,
+    resident: &BTreeSet<CollectionData>,
+    requested: &Support,
+) -> Result<(super::resolution::CollectionCompletePhysicalCover, Support), CollectionRealizationError>
+where
+    E: CollectionEncoding,
+    R: BlobStoreGet + BlobStoreMeta,
+{
+    let mut selected =
+        collection_complete_physical_cover::<E, _>(semantics, collection, resident, snapshot);
+    let mut represented = witnessed_support(
+        witnesses,
+        collection,
+        selected.physical.cover.iter().copied(),
+        requested.collection(),
+    );
+    for member in resident {
+        if requested.is_subset(&represented).expect("one foundation") {
+            break;
+        }
+        let member_support =
+            witnessed_support(witnesses, collection, [*member], requested.collection());
+        if member_support
+            .is_subset(&represented)
+            .expect("one foundation")
+        {
+            continue;
+        }
+        match collection_member_availability::<E, _>(*member, snapshot).map_err(|error| {
+            CollectionRealizationError::storage("inspect residual witness realization", error)
+        })? {
+            CollectionMemberAvailability::Complete => {
+                selected.physical.cover.insert(*member);
+                represented = represented.union(&member_support).expect("one foundation");
+            }
+            _ => {}
+        }
+    }
+    if requested.is_subset(&represented).expect("one foundation") {
+        selected.physical.missing.clear();
+        selected.dependencies.clear();
+        selected.unusable = None;
+    }
+    Ok((selected, represented))
+}
+
+struct CertifiedResolution {
+    resolution: super::CollectionResolution<()>,
+    support: Support,
+    witnesses: InputWitnesses,
+    images: BTreeMap<(CollectionHandle, CollectionData), BTreeSet<CollectionData>>,
+}
+
+/// Enumerate exact admitted input witnesses for explicit equation imports.
+///
+/// This diagnostic/migration surface preserves distinct supports of a lossy
+/// mapping. It does not load member payloads, publish records, or choose among
+/// ambiguous historical provenance. Endorsed descendants are usable witnesses
+/// even when their original authority proof is no longer locally available.
+pub fn admitted_record_witnesses<R>(
+    snapshot: &R,
+    collection: CollectionHandle,
+) -> Result<Vec<(CollectionRecord, Support)>, CollectionRealizationError>
 where
     R: StoreRead,
 {
-    require_support(lineage, support)?;
+    let lineage = load_record_lineage(snapshot, collection)?;
+    let certified =
+        resolve_endorsed_lineage(snapshot, &lineage, &BTreeSet::from([collection]), None)?;
+    let mut records = Vec::new();
+    for ((owner, _), alternatives) in certified.witnesses {
+        if owner != collection {
+            continue;
+        }
+        for (id, support) in alternatives {
+            if let Some(record) = snapshot.record(id).map_err(|error| {
+                CollectionRealizationError::storage("read admitted input witness", error)
+            })? {
+                records.push((record, support));
+            }
+        }
+    }
+    Ok(records)
+}
+
+/// Preview equation imports against one frozen store without publishing them.
+///
+/// This diagnostic/migration operation overlays actual signed MERGE and DERIVE
+/// records, then uses ordinary admission and witness resolution. Existing native
+/// records whose missing witnesses are supplied by the preview participate too.
+/// Functional and commuting-square conflicts are reported before any append;
+/// payloads are neither loaded nor recomputed. The returned witnesses include
+/// the complete admitted collection in this preview, not just the proposed rows.
+/// COMMIT publication remains a separate operation and is not previewed here.
+pub fn preview_record_witnesses<R>(
+    snapshot: &R,
+    collection: CollectionHandle,
+    records: impl IntoIterator<Item = CollectionRecord>,
+) -> Result<Vec<(CollectionRecord, Support)>, CollectionRealizationError>
+where
+    R: StoreRead,
+{
+    let mut frontier = OperationFrontier::new(snapshot.clone());
+    for record in records {
+        if matches!(record, CollectionRecord::Commit(_)) {
+            return Err(CollectionRealizationError::InvalidCover(
+                "equation preview does not publish COMMIT records".to_owned(),
+            ));
+        }
+        frontier.include_record(record);
+    }
+    admitted_record_witnesses(&frontier.view(snapshot.clone()), collection)
+}
+
+/// Admit selected producers, then follow only their immutable witness DAGs.
+/// Read attachment selects only the target; maintenance additionally admits
+/// immediate-source candidates it may use to publish new equations.
+fn resolve_endorsed_lineage<R>(
+    snapshot: &R,
+    lineage: &Lineage,
+    collections: &BTreeSet<CollectionHandle>,
+    requested: Option<&Support>,
+) -> Result<CertifiedResolution, CollectionRealizationError>
+where
+    R: StoreRead,
+{
+    if let Some(requested) = requested {
+        require_support(lineage, requested)?;
+    }
     let mut evidence = BTreeMap::new();
-    for (collection, descriptor) in &lineage.descriptors {
+    for collection in collections {
+        let descriptor = lineage.descriptor(*collection);
         let writers = super::api::discover_admission_evidence(
             snapshot,
             descriptor::admission_policies(snapshot, descriptor.facts(), super::ACTION_WRITE, None),
@@ -376,48 +566,104 @@ where
         evidence.insert(*collection, writers);
     }
     let mut admitted = BTreeMap::new();
-    let roots: BTreeSet<_> = support
-        .data_members()
-        .map(|member| (lineage.foundation.handle(), member))
+    let selectors = collections
+        .iter()
+        .copied()
+        .map(CollectionRecordSelector::Collection)
         .collect();
-
-    let resolution = resolve_collection_semantics_from_roots(
-        &discovered,
-        &lineage.source_by_target,
-        &roots,
-        |request| {
-            let in_lineage = match request {
-                super::CollectionValidationRequest::Merge { claim } => {
-                    lineage.collections.contains(&claim.collection())
-                }
-                super::CollectionValidationRequest::Derive { claim } => {
-                    lineage.source_by_target.contains_key(&claim.collection())
-                }
-                super::CollectionValidationRequest::Commit { .. } => false,
-            };
-            let record = request.record();
-            let accepted = in_lineage
-                && *admitted
-                    .entry((record.collection(), record.public_key().raw))
-                    .or_insert_with(|| {
-                        ed25519_dalek::VerifyingKey::from_bytes(&record.public_key().raw)
-                            .ok()
-                            .is_some_and(|subject| {
-                                evidence
-                                    .get(&record.collection())
-                                    .is_some_and(|writers| writers.authorizes(snapshot, subject))
-                            })
-                    });
-            Ok::<CollectionClaimValidation<()>, std::convert::Infallible>(if accepted {
-                CollectionClaimValidation::Accepted
-            } else {
-                CollectionClaimValidation::Pending
-            })
-        },
-    );
+    let candidates = snapshot.select_records(&selectors).map_err(|error| {
+        CollectionRealizationError::storage("select endorsed collection records", error)
+    })?;
+    let mut closure = super::witness::WitnessClosure::default();
+    let mut roots = BTreeSet::new();
+    let mut support = Support::from_data(lineage.foundation, []);
+    let mut witnesses = InputWitnesses::new();
+    let mut images = BTreeMap::<_, BTreeSet<_>>::new();
+    for record in candidates {
+        let accepted = *admitted
+            .entry((record.collection(), record.public_key().raw))
+            .or_insert_with(|| {
+                ed25519_dalek::VerifyingKey::from_bytes(&record.public_key().raw)
+                    .ok()
+                    .is_some_and(|subject| {
+                        evidence
+                            .get(&record.collection())
+                            .is_some_and(|writers| writers.authorizes(snapshot, subject))
+                    })
+            });
+        if !accepted {
+            continue;
+        }
+        let Some(record_support) = closure
+            .support(
+                snapshot,
+                lineage.foundation,
+                &lineage.source_by_target,
+                record,
+            )
+            .map_err(|error| {
+                CollectionRealizationError::storage("read endorsed input records", error)
+            })?
+        else {
+            continue;
+        };
+        // Reusing a computed image is independent of which exact support the
+        // caller wants to endorse today. Keep this index before that filter.
+        if let CollectionRecord::Derive(derive) = record {
+            images
+                .entry((derive.collection(), derive.input()))
+                .or_default()
+                .insert(derive.output());
+        }
+        if requested
+            .is_some_and(|requested| !record_support.is_subset(requested).expect("one foundation"))
+        {
+            continue;
+        }
+        roots.insert(record.fingerprint());
+        support = support.union(&record_support).expect("one foundation");
+    }
+    let records = closure.records_for(roots);
+    for record in &records {
+        if let CollectionRecord::Derive(derive) = record {
+            images
+                .entry((derive.collection(), derive.input()))
+                .or_default()
+                .insert(derive.output());
+        }
+        let record_support = closure
+            .support(
+                snapshot,
+                lineage.foundation,
+                &lineage.source_by_target,
+                *record,
+            )
+            .map_err(|error| CollectionRealizationError::storage("read endorsed support", error))?
+            .expect("accepted roots have closed witness DAGs");
+        let alternatives = witnesses
+            .entry((record.collection(), super::witness::output(*record)))
+            .or_default();
+        // Retain actual records, including equal-support signatures/routes.
+        // Publication selects a small covering witness set when needed;
+        // diagnostics and migrations must still see every persisted identity.
+        alternatives.push((record.fingerprint(), record_support));
+    }
+    let discovered = super::DiscoveredCollectionRecords::from_records(records);
+    let commits = discovered.commits().iter().copied().collect();
+    let resolution =
+        resolve_collection_semantics(&discovered, &lineage.source_by_target, &commits, |_| {
+            Ok::<CollectionClaimValidation<()>, std::convert::Infallible>(
+                CollectionClaimValidation::Accepted,
+            )
+        });
 
     match resolution {
-        Ok(resolution) => Ok(resolution),
+        Ok(resolution) => Ok(CertifiedResolution {
+            resolution,
+            support,
+            witnesses,
+            images,
+        }),
         Err(CollectionResolutionError::Validation { source, .. }) => match source {},
         Err(CollectionResolutionError::Conflict(conflict)) => {
             Err(CollectionRealizationError::Resolution(conflict.to_string()))
@@ -425,91 +671,77 @@ where
     }
 }
 
-/// Find one absent direct dependency of a raw equation which contributes to
-/// the requested foundational support.
-///
-/// This is acquisition planning only. Dangling equations remain invisible to
-/// semantic resolution until a later snapshot observes all of their direct
-/// references. A contradictory raw frontier is therefore ignored here and is
-/// diagnosed only if its records become complete enough to enter semantics.
-fn relevant_missing_dependency<R>(
+/// Fetch an existing target result before computing it, then only missing
+/// immediate-source realizations. Historical foundation payloads and COMMIT
+/// metadata are not dependencies of an endorsed result.
+fn relevant_missing_dependency<R, M>(
     snapshot: &R,
-    lineage: &Lineage,
-    target: CollectionHandle,
-    support: &Support,
+    target: Collection<M::Target>,
+    source: CollectionHandle,
+    resolved: &TargetResolution<M::Target>,
     unavailable: &BTreeSet<CollectionData>,
 ) -> Result<Option<CollectionData>, CollectionRealizationError>
 where
     R: StoreRead,
+    M: CollectionMapping,
 {
-    let discovered = discover_collection_equations_for_lineage_raw(snapshot, &lineage.collections)
-        .map_err(|error| {
-            CollectionRealizationError::storage("discover raw collection frontier", error)
-        })?;
-    let Ok(resolution) = resolve_discovered_lineage(snapshot, lineage, support, &discovered) else {
-        return Ok(None);
-    };
-    let semantics = resolution.semantics();
-    let requested: BTreeSet<_> = support.data_members().collect();
-
-    let mut records = resolution
-        .admitted_claims()
-        .iter()
-        .copied()
-        .collect::<Vec<_>>();
-    records.sort_unstable_by_key(CollectionRecord::fingerprint);
-
-    for record in records {
-        if let CollectionRecord::Derive(derive) = record {
-            let input = Handle::<UnknownBlob>::from_hash(derive.input());
-            if derive.collection() == target
-                && unavailable.contains(&derive.output())
-                && snapshot.contains_blob(input).map_err(|error| {
-                    CollectionRealizationError::storage(
-                        "inspect recoverable target DERIVE input residency",
-                        error,
-                    )
-                })?
-            {
-                // An absent output is useful acquisition evidence, but it is
-                // not an obligation. Once exact acquisition has failed, a
-                // resident immediate input lets the canonical mapping
-                // reproduce the output. Ignore this unusable equation so the
-                // ordinary source-residual path gets that chance.
-                continue;
-            }
-        }
-        let (collection, result) = match record {
-            CollectionRecord::Merge(merge) => (merge.collection(), merge.result()),
-            CollectionRecord::Derive(derive) => (derive.collection(), derive.output()),
-            CollectionRecord::Commit(_) => unreachable!("equation frontier excludes COMMIT"),
-        };
-        if semantics
-            .supporting_data(collection, result)
-            .is_disjoint(&requested)
-        {
-            continue;
-        }
-        for reference in record.blob_references() {
-            if !snapshot.contains_blob(reference).map_err(|error| {
-                CollectionRealizationError::storage(
-                    "inspect raw equation dependency residency",
-                    error,
-                )
-            })? {
-                return Ok(Some(
-                    Handle::<crate::blob::encodings::UnknownBlob>::to_hash(reference),
-                ));
-            }
+    for member in &resolved.dependencies {
+        if !unavailable.contains(member) {
+            return Ok(Some(*member));
         }
     }
-    Ok(None)
+    for ((collection, member), witnesses) in &resolved.witnesses {
+        if *collection != target.handle() || unavailable.contains(member) {
+            continue;
+        }
+        if witnesses.iter().all(|(_, support)| {
+            support
+                .is_subset(&resolved.support)
+                .expect("one foundation")
+        }) {
+            continue;
+        }
+        if !snapshot
+            .contains_blob(Handle::<M::Target>::from_hash(*member))
+            .map_err(|error| {
+                CollectionRealizationError::storage("inspect existing target output", error)
+            })?
+        {
+            return Ok(Some(*member));
+        }
+    }
+    let mut resident = BTreeSet::new();
+    for member in resolved.semantics.members(source).into_iter().flatten() {
+        if snapshot
+            .metadata(Handle::<M::Source>::from_hash(*member))
+            .map_err(|error| {
+                CollectionRealizationError::storage("inspect immediate-source output", error)
+            })?
+            .is_some()
+        {
+            resident.insert(*member);
+        }
+    }
+    let selected = collection_complete_physical_cover::<M::Source, _>(
+        &resolved.semantics,
+        source,
+        &resident,
+        snapshot,
+    );
+    Ok(selected
+        .dependencies
+        .into_iter()
+        .chain(selected.physical.missing)
+        .find(|member| !unavailable.contains(member)))
 }
 
-struct TargetResolution<E: CollectionEncoding> {
-    semantics: CollectionSemantics,
+pub(super) struct TargetResolution<E: CollectionEncoding> {
+    pub(super) semantics: CollectionSemantics,
+    pub(super) witnesses: InputWitnesses,
+    images: BTreeMap<(CollectionHandle, CollectionData), BTreeSet<CollectionData>>,
+    dependencies: BTreeSet<CollectionData>,
     support: Support,
-    cover: Cover<E>,
+    pub(super) cover: Cover<E>,
     missing: BTreeSet<CollectionData>,
 }
 
@@ -540,7 +772,27 @@ where
     R: StoreRead,
     E: CollectionEncoding,
 {
-    let semantics = resolve_lineage(snapshot, lineage, requested)?;
+    let certified = resolve_endorsed_lineage(
+        snapshot,
+        lineage,
+        &BTreeSet::from([target.handle()]),
+        Some(requested),
+    )?;
+    resolve_certified_target(snapshot, target, lineage, requested, certified)
+}
+
+fn resolve_certified_target<R, E>(
+    snapshot: &R,
+    target: Collection<E>,
+    lineage: &Lineage,
+    requested: &Support,
+    certified: CertifiedResolution,
+) -> Result<TargetResolution<E>, CollectionRealizationError>
+where
+    R: StoreRead,
+    E: CollectionEncoding,
+{
+    let semantics = certified.resolution.into_semantics();
     let target_handle = target.handle();
     let mut resident = BTreeSet::new();
     for member in semantics
@@ -560,26 +812,27 @@ where
         }
     }
 
-    let selected =
-        collection_complete_physical_cover::<E, _>(&semantics, target_handle, &resident, snapshot);
-    let represented: BTreeSet<_> = semantics.supporting_data_for(
-        selected
-            .physical
-            .cover
-            .iter()
-            .copied()
-            .map(|member| (target_handle, member)),
-    );
+    let (selected, represented) = witnessed_physical_cover::<E, _>(
+        snapshot,
+        &semantics,
+        &certified.witnesses,
+        target_handle,
+        &resident,
+        requested,
+    )?;
 
     Ok(TargetResolution {
         support: Cover::from_data(
             lineage.foundation,
             requested
                 .data_members()
-                .filter(|member| represented.contains(member)),
+                .filter(|member| represented.contains_data(*member)),
         ),
         cover: Cover::from_data(target, selected.physical.cover.iter().copied()),
         missing: selected.physical.missing,
+        dependencies: selected.dependencies,
+        witnesses: certified.witnesses,
+        images: certified.images,
         semantics,
     })
 }
@@ -597,20 +850,61 @@ where
     R: StoreRead,
     E: CollectionEncoding,
 {
+    let resolved = attach_exact_resolution(snapshot, target, requested)?;
+    Ok((resolved.support, resolved.cover))
+}
+
+pub(super) fn attach_exact_resolution<R, E>(
+    snapshot: &R,
+    target: Collection<E>,
+    requested: &Support,
+) -> Result<TargetResolution<E>, CollectionRealizationError>
+where
+    R: StoreRead,
+    E: CollectionEncoding,
+{
     let lineage = load_lineage(snapshot, target)?;
-    let resolved = resolve_target(snapshot, target, &lineage, requested)?;
+    let mut resolved = resolve_target(snapshot, target, &lineage, requested)?;
+    // An explicit root cover is also a low-level content selection: its
+    // directly resident members need no COMMIT to be read. This does not
+    // manufacture admission or an input witness. Ordinary collection
+    // attachment and every equation publication still require real records.
+    if target.handle() == lineage.foundation.handle() {
+        for member in requested.data_members() {
+            if !resolved.support.contains_data(member)
+                && matches!(
+                    collection_member_availability::<E, _>(member, snapshot).map_err(|error| {
+                        CollectionRealizationError::storage("inspect explicit root member", error)
+                    })?,
+                    CollectionMemberAvailability::Complete
+                )
+            {
+                resolved.support = resolved
+                    .support
+                    .union(&lineage.foundation.cover([Handle::from_hash(member)]))
+                    .expect("one foundation");
+                resolved.cover = resolved
+                    .cover
+                    .union(&target.cover([Handle::from_hash(member)]))
+                    .expect("one target");
+            }
+        }
+        if resolved.support == *requested {
+            resolved.missing.clear();
+            resolved.dependencies.clear();
+        }
+    }
     if !resolved.is_exact_for(requested) {
         return Err(resolved.incomplete_error(requested));
     }
-    Ok((resolved.support, resolved.cover))
+    Ok(resolved)
 }
 
 /// Attach one target collection using its snapshot's proof and definition state.
 ///
-/// The foundation's admitted support is the search boundary, but the result
-/// contains only the maximal resident target antichain and exactly the
-/// foundational support it represents. A static snapshot never promises a
-/// future derivation.
+/// The target's endorsed records define the search boundary. The result
+/// contains only resident target members and the exact foundational support
+/// their record witnesses establish. A static snapshot promises no future work.
 pub(crate) fn attach_collection<R, E>(
     snapshot: &R,
     target: Collection<E>,
@@ -620,10 +914,10 @@ where
     E: CollectionEncoding,
 {
     let lineage = load_lineage(snapshot, target)?;
-    let admitted = lineage.foundation.admitted(snapshot).map_err(|error| {
-        CollectionRealizationError::storage("admit foundational support", error)
-    })?;
-    let resolved = resolve_target(snapshot, target, &lineage, &admitted)?;
+    let certified =
+        resolve_endorsed_lineage(snapshot, &lineage, &BTreeSet::from([target.handle()]), None)?;
+    let represented = certified.support.clone();
+    let resolved = resolve_certified_target(snapshot, target, &lineage, &represented, certified)?;
     Ok((resolved.support, resolved.cover))
 }
 
@@ -638,6 +932,7 @@ fn probe_mapping<R, M>(
     target: Collection<M::Target>,
     support: &Support,
     unavailable: &BTreeSet<CollectionData>,
+    admit_source: bool,
 ) -> Result<MappingProbe<M>, CollectionRealizationError>
 where
     R: StoreRead,
@@ -645,18 +940,6 @@ where
 {
     let lineage = load_lineage(snapshot, target)?;
     require_support(&lineage, support)?;
-    // Explicit foundational support is itself an exact-H acquisition plan.
-    // A frozen snapshot never fetches it, but it must report the first absent
-    // member precisely so the active async runner can acquire and resnapshot
-    // instead of collapsing absence into a generic incomplete-cover result.
-    for member in support.data_members() {
-        let reference = Handle::<SimpleArchive>::from_hash(member);
-        if !snapshot.contains_blob(reference).map_err(|error| {
-            CollectionRealizationError::storage("inspect foundational support residency", error)
-        })? {
-            return Err(CollectionRealizationError::MissingDependency { member });
-        }
-    }
     let source_handle = lineage
         .source_by_target
         .get(&target.handle())
@@ -678,15 +961,51 @@ where
             "target descriptor does not bind the requested mapping: {error}"
         ))
     })?;
-    let target_resolution = resolve_target(snapshot, target, &lineage, support)?;
+    let mut selected = BTreeSet::from([target.handle()]);
+    if admit_source {
+        selected.insert(source_handle);
+    }
+    let certified = resolve_endorsed_lineage(snapshot, &lineage, &selected, Some(support))?;
+    // Image reuse crosses support witnesses, so its functional check must do
+    // the same. A cold or support-pruned claim is still a certified equation;
+    // residency must never decide which conflicting image we endorse next.
+    // Only inputs admitted into this requested source slice are relevant.
+    for input in certified
+        .resolution
+        .semantics()
+        .members(source_handle)
+        .into_iter()
+        .flatten()
+    {
+        let mut outputs = certified
+            .images
+            .get(&(target.handle(), *input))
+            .into_iter()
+            .flatten();
+        if let (Some(first), Some(second)) = (outputs.next(), outputs.next()) {
+            return Err(CollectionRealizationError::Resolution(format!(
+                "derivation into {} has conflicting outputs {} and {} for {}",
+                hex::encode_upper(target.handle().raw),
+                hex::encode_upper(first.raw),
+                hex::encode_upper(second.raw),
+                hex::encode_upper(input.raw),
+            )));
+        }
+    }
+    let target_resolution =
+        resolve_certified_target(snapshot, target, &lineage, support, certified)?;
     // A warm exact target needs no acquisition planning. Consult the raw
     // dangling equation frontier only after the semantic snapshot proves that
     // work remains; this keeps resident maintenance at one indexed semantic
     // probe per LSM round.
-    if !target_resolution.is_exact_for(support) {
-        if let Some(member) =
-            relevant_missing_dependency(snapshot, &lineage, target.handle(), support, unavailable)?
-        {
+    if admit_source && !target_resolution.is_exact_for(support) {
+        if let Some(member) = relevant_missing_dependency::<_, M>(
+            snapshot,
+            target,
+            source_handle,
+            &target_resolution,
+            unavailable,
+        )? {
             return Err(CollectionRealizationError::MissingDependency { member });
         }
     }
@@ -702,7 +1021,14 @@ fn source_residual<R, M>(
     probe: &MappingProbe<M>,
     requested: &Support,
     blocked: &BTreeMap<CollectionData, String>,
-) -> Result<Vec<(CollectionData, Blob<M::Source>)>, CollectionRealizationError>
+) -> Result<
+    Vec<(
+        CollectionData,
+        Blob<M::Source>,
+        Vec<CollectionRecordFingerprint>,
+    )>,
+    CollectionRealizationError,
+>
 where
     R: BlobStoreGet + BlobStoreMeta,
     M: CollectionMapping,
@@ -725,21 +1051,22 @@ where
         }
     }
 
-    let selected =
-        collection_complete_physical_cover::<M::Source, _>(semantics, source, &resident, snapshot);
-    let source_support = semantics.supporting_data_for(
-        selected
-            .physical
-            .cover
-            .iter()
-            .copied()
-            .map(|member| (source, member)),
-    );
-    let missing: Vec<_> = requested
+    let needed = requested
+        .difference(&probe.target_resolution.support)
+        .expect("one foundation");
+    let (selected, source_support) = witnessed_physical_cover::<M::Source, _>(
+        snapshot,
+        semantics,
+        &probe.target_resolution.witnesses,
+        source,
+        &resident,
+        &needed,
+    )?;
+    let missing: Vec<_> = needed
         .data_members()
-        .filter(|member| !source_support.contains(member))
+        .filter(|member| !source_support.contains_data(*member))
         .collect();
-    if !selected.physical.missing.is_empty() || !missing.is_empty() {
+    if !missing.is_empty() {
         if blocked.is_empty() {
             return Err(CollectionRealizationError::IncompleteCover {
                 missing: selected.physical.missing.iter().copied().collect(),
@@ -755,11 +1082,16 @@ where
         });
     }
 
-    let represented: BTreeSet<_> = probe.target_resolution.support.data_members().collect();
     let mut residual = Vec::new();
     for member in selected.physical.cover.iter().copied() {
-        let member_support = semantics.supporting_data(source, member);
-        if member_support.is_subset(&represented) {
+        let alternatives = probe
+            .target_resolution
+            .witnesses
+            .get(&(source, member))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let witnesses = witness_cover(alternatives, probe.target_resolution.support.clone());
+        if witnesses.is_empty() {
             continue;
         }
         let blob = snapshot
@@ -767,7 +1099,7 @@ where
             .map_err(|error| {
                 CollectionRealizationError::storage("load source member for mapping", error)
             })?;
-        residual.push((member, blob));
+        residual.push((member, blob, witnesses));
     }
     Ok(residual)
 }
@@ -830,13 +1162,13 @@ where
     M: CollectionMapping,
 {
     let mut blocked = BTreeMap::<CollectionData, String>::new();
-    let mut published = BTreeSet::<CollectionData>::new();
+    let mut published = BTreeSet::<CollectionRecordFingerprint>::new();
 
     loop {
         let snapshot = frontier.view(store.snapshot().map_err(|error| {
             CollectionRealizationError::storage("open exact mapping snapshot", error)
         })?);
-        let probe = probe_mapping::<_, M>(&snapshot, target, support, unavailable)?;
+        let probe = probe_mapping::<_, M>(&snapshot, target, support, unavailable, true)?;
         if probe.target_resolution.is_exact_for(support) {
             return Ok(());
         }
@@ -856,8 +1188,8 @@ where
         drop(snapshot);
 
         let mut replan = false;
-        for (input_data, input) in residual {
-            if published.contains(&input_data) {
+        for (input_data, input, witnesses) in residual {
+            if witnesses.iter().any(|witness| published.contains(witness)) {
                 return Err(CollectionRealizationError::Stalled {
                     cover: repeated_cover,
                 });
@@ -865,7 +1197,41 @@ where
             let snapshot = frontier.view(store.snapshot().map_err(|error| {
                 CollectionRealizationError::storage("open mapping dependency snapshot", error)
             })?);
-            let output = mapping.map(&input, &snapshot);
+            let mut reusable = None;
+            for member in probe
+                .target_resolution
+                .images
+                .get(&(target.handle(), input_data))
+                .into_iter()
+                .flatten()
+                .copied()
+            {
+                if matches!(
+                    collection_member_availability::<M::Target, _>(member, &snapshot).map_err(
+                        |error| CollectionRealizationError::storage(
+                            "inspect existing mapping image",
+                            error
+                        )
+                    )?,
+                    CollectionMemberAvailability::Complete
+                ) {
+                    reusable = Some(
+                        snapshot
+                            .get(Handle::<M::Target>::from_hash(member))
+                            .map_err(|error| {
+                                CollectionRealizationError::storage(
+                                    "reuse existing mapping image",
+                                    error,
+                                )
+                            })?,
+                    );
+                    break;
+                }
+            }
+            let output = match reusable {
+                Some(output) => Ok(output),
+                None => mapping.map(&input, &snapshot),
+            };
             drop(snapshot);
             let output = match output {
                 Ok(output) => output,
@@ -888,17 +1254,19 @@ where
             store.put::<M::Target, _>(output).map_err(|error| {
                 CollectionRealizationError::storage("store derived target member", error)
             })?;
-            let record = CollectionRecord::Derive(CollectionDerive::sign(
-                signing_key,
-                target.handle(),
-                input_data,
-                output_data,
-            ));
-            store.insert(record).map_err(|error| {
-                CollectionRealizationError::storage("publish target DERIVE", error)
-            })?;
-            frontier.include_record(record);
-            published.insert(input_data);
+            for witness in witnesses {
+                let record = CollectionRecord::Derive(CollectionDerive::sign(
+                    signing_key,
+                    target.handle(),
+                    (input_data, witness),
+                    output_data,
+                ));
+                store.insert(record).map_err(|error| {
+                    CollectionRealizationError::storage("publish target DERIVE", error)
+                })?;
+                frontier.include_record(record);
+                published.insert(witness);
+            }
         }
         if replan {
             continue;
@@ -1007,7 +1375,7 @@ where
         let snapshot = frontier.view(store.snapshot().map_err(|error| {
             CollectionRealizationError::storage("open source-guided maintenance snapshot", error)
         })?);
-        let probe = probe_mapping::<_, M>(&snapshot, target, support, unavailable)?;
+        let probe = probe_mapping::<_, M>(&snapshot, target, support, unavailable, true)?;
         let semantics = &probe.target_resolution.semantics;
         let source = probe.source.handle();
         let mut resident = BTreeSet::new();
@@ -1025,9 +1393,14 @@ where
                 resident.insert(member);
             }
         }
-        let selected = collection_complete_physical_cover::<M::Source, _>(
-            semantics, source, &resident, &snapshot,
-        );
+        let (selected, _) = witnessed_physical_cover::<M::Source, _>(
+            &snapshot,
+            semantics,
+            &probe.target_resolution.witnesses,
+            source,
+            &resident,
+            support,
+        )?;
         let target_cover = probe.target_resolution.cover.data_members().collect();
         let candidate = semantics
             .source_coarsenings(
@@ -1041,6 +1414,17 @@ where
         let Some((input_data, image_pairs)) = candidate else {
             return Ok(probe.mapping);
         };
+        let input_alternatives = probe
+            .target_resolution
+            .witnesses
+            .get(&(source, input_data))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let input_witnesses = witness_cover(input_alternatives, support.collection().cover([]));
+        if input_witnesses.is_empty() {
+            attempted.insert(input_data);
+            continue;
+        }
         if !producer_is_admitted(&snapshot, target, signing_key)? {
             return Ok(probe.mapping);
         }
@@ -1122,12 +1506,22 @@ where
                 }
             },
         };
+        let merge_witnesses = pair
+            .map(|(low, high)| {
+                merge_witness_pairs(
+                    &probe.target_resolution.witnesses,
+                    target.handle(),
+                    low,
+                    high,
+                )
+            })
+            .transpose()?;
         drop(snapshot);
         let output_data = data_identity::<M::Target>(&output);
         store.put::<M::Target, _>(output).map_err(|error| {
             CollectionRealizationError::storage("store source-guided target member", error)
         })?;
-        if let Some((low, high)) = pair {
+        for (low, high) in merge_witnesses.into_iter().flatten() {
             let record = CollectionRecord::Merge(CollectionMerge::sign(
                 signing_key,
                 target.handle(),
@@ -1140,16 +1534,18 @@ where
             })?;
             frontier.include_record(record);
         }
-        let record = CollectionRecord::Derive(CollectionDerive::sign(
-            signing_key,
-            target.handle(),
-            input_data,
-            output_data,
-        ));
-        store.insert(record).map_err(|error| {
-            CollectionRealizationError::storage("publish source-guided target DERIVE", error)
-        })?;
-        frontier.include_record(record);
+        for witness in input_witnesses {
+            let record = CollectionRecord::Derive(CollectionDerive::sign(
+                signing_key,
+                target.handle(),
+                (input_data, witness),
+                output_data,
+            ));
+            store.insert(record).map_err(|error| {
+                CollectionRealizationError::storage("publish source-guided target DERIVE", error)
+            })?;
+            frontier.include_record(record);
+        }
     }
 }
 
@@ -1203,7 +1599,10 @@ where
         };
         let mut definitions = BTreeSet::new();
         let mut roots = BTreeSet::new();
-        for (collection, descriptor) in &lineage.descriptors {
+        let mut selected = BTreeSet::from([target.handle()]);
+        selected.extend(lineage.source_by_target.get(&target.handle()).copied());
+        for collection in selected {
+            let descriptor = lineage.descriptor(collection);
             for (definition, policy) in descriptor::capability_policies(descriptor.facts(), None) {
                 definitions.insert(Handle::<SimpleArchive>::to_hash(definition));
                 if let Some(keys) = policy.roots() {
@@ -1268,10 +1667,26 @@ where
             require_support(&lineage, support)?;
             let resolved = resolve_target(&snapshot, target, &lineage, support)?;
             if resolved.is_exact_for(support) {
-                Ok(())
-            } else {
-                Err(resolved.incomplete_error(support))
+                return Ok(());
             }
+            // Explicit root covers remain useful for reading content without
+            // publishing a COMMIT. New equations still require record witnesses.
+            if support.available(&snapshot).map_err(|error| {
+                CollectionRealizationError::storage("inspect explicit root cover", error)
+            })? == *support
+            {
+                return Ok(());
+            }
+            if let Some(member) = resolved
+                .dependencies
+                .iter()
+                .chain(&resolved.missing)
+                .find(|member| !attempted.contains(*member))
+                .copied()
+            {
+                return Err(CollectionRealizationError::MissingDependency { member });
+            }
+            Err(resolved.incomplete_error(support))
         })();
         drop(snapshot);
         let missing = match result {
@@ -1283,17 +1698,48 @@ where
             }) => unsupported_members,
             Err(error) => return Err(error),
         };
-        let mut acquired = false;
+        let previous_attempts = attempted.len();
         for member in missing {
-            acquired |= acquire_missing(store, &mut attempted, member).await?;
+            let _ = acquire_missing(store, &mut attempted, member).await?;
         }
-        if !acquired {
+        if attempted.len() == previous_attempts {
             let snapshot = frontier.view(store.snapshot().map_err(|error| {
                 CollectionRealizationError::storage("observe incomplete root realization", error)
             })?);
             return attach_collection_exact(&snapshot, target, support).map(|_| ());
         }
     }
+}
+
+/// A resident target endorsement is sufficient for reuse. Binding still checks
+/// the requested encoding, mapping, and support foundation, but no immediate-
+/// source producer or capability definition is needed until new work remains.
+async fn prepare_exact_mapping<S, M>(
+    store: &mut S,
+    target: Collection<M::Target>,
+    support: &Support,
+    frontier: &OperationFrontier<S::Snapshot>,
+) -> Result<bool, CollectionRealizationError>
+where
+    S: Store + AsyncBlobStoreAcquire,
+    M: CollectionMapping,
+{
+    let resident = {
+        let snapshot = frontier.view(store.snapshot().map_err(|error| {
+            CollectionRealizationError::storage("observe exact target before acquisition", error)
+        })?);
+        match probe_mapping::<_, M>(&snapshot, target, support, &BTreeSet::new(), false) {
+            Ok(probe) => probe.target_resolution.is_exact_for(support),
+            // A missing descriptor can still be acquired through the ordinary
+            // active path. Semantic/type/mapping errors must not become misses.
+            Err(CollectionRealizationError::MissingDependency { .. }) => false,
+            Err(error) => return Err(error),
+        }
+    };
+    if !resident {
+        acquire_authority(store, target, frontier).await?;
+    }
+    Ok(resident)
 }
 
 pub(crate) async fn ensure_exact_in_frontier_with<S, M>(
@@ -1307,6 +1753,9 @@ where
     S: Store + AsyncBlobStoreAcquire,
     M: CollectionMapping,
 {
+    if prepare_exact_mapping::<S, M>(store, target, support, frontier).await? {
+        return Ok(());
+    }
     let mut attempted = BTreeSet::new();
     let mut unavailable = BTreeSet::new();
     loop {
@@ -1342,6 +1791,9 @@ where
     S: Store + AsyncBlobStoreAcquire,
     M: CollectionMapping,
 {
+    // Warm maintenance may still coarsen the target, but source-guided
+    // opportunities are optional and must use only already resident evidence.
+    prepare_exact_mapping::<S, M>(store, target, support, frontier).await?;
     let mut attempted = BTreeSet::new();
     let mut unavailable = BTreeSet::new();
     loop {

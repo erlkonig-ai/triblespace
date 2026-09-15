@@ -243,12 +243,28 @@ fn maintenance_follows_a_resident_source_union_across_target_size_tiers() {
     let expected_root =
         SuccinctArchive::<OrderedUniverse>::build_accelerated_root(union.clone()).unwrap();
     let union_handle = store.put(union).unwrap();
+    let input_records = inputs
+        .iter()
+        .map(|input| {
+            let data = Handle::<SuccinctArchiveBlob>::to_hash(input.get_handle());
+            let record = children
+                .records()
+                .unwrap()
+                .map(Result::unwrap)
+                .find(|record| {
+                    matches!(record, CollectionRecord::Derive(derive)
+                if derive.collection() == raw.handle() && derive.output() == data)
+                })
+                .expect("ensure published each raw input's DERIVE");
+            (data, record.fingerprint())
+        })
+        .collect::<Vec<_>>();
     store
         .insert(CollectionRecord::Merge(CollectionMerge::sign(
             &authority,
             raw.handle(),
-            Handle::<SuccinctArchiveBlob>::to_hash(inputs[0].get_handle()),
-            Handle::<SuccinctArchiveBlob>::to_hash(inputs[1].get_handle()),
+            input_records[0],
+            input_records[1],
             Handle::<SuccinctArchiveBlob>::to_hash(union_handle),
         )))
         .unwrap();
@@ -500,7 +516,10 @@ fn ordinary_derived_operations_ignore_pending_immediate_source_output() {
     let pending = CollectionDerive::sign(
         &authority,
         raw.handle(),
-        later_commit.data(),
+        (
+            later_commit.data(),
+            CollectionRecord::Commit(later_commit).fingerprint(),
+        ),
         Handle::<SuccinctArchiveBlob>::to_hash(missing_raw),
     );
     store.insert(CollectionRecord::Derive(pending)).unwrap();
@@ -557,7 +576,7 @@ fn ordinary_derived_operations_ignore_pending_immediate_source_output() {
 }
 
 #[test]
-fn ordinary_derived_operations_exclude_resident_but_unauthorized_source_members() {
+fn ordinary_derived_operations_exclude_unauthorized_immediate_source_equations() {
     let authority = SigningKey::from_bytes(&[52; 32]);
     let unauthorized = SigningKey::from_bytes(&[53; 32]);
     let policy = CollectionPolicy::new(
@@ -585,7 +604,8 @@ fn ordinary_derived_operations_exclude_resident_but_unauthorized_source_members(
     let warmed = block_on(store.maintain(raw, &authority)).unwrap();
     let admitted_support = source.admitted(&warmed).unwrap();
 
-    // Reusable physical work does not confer WRITE authority on its root.
+    // Reusable physical work does not confer WRITE on its producer. The
+    // immediate source equation must itself have an authorized endorser.
     let denied_commit = store
         .commit(source, &unauthorized, Fragment::from(denied))
         .unwrap();
@@ -594,9 +614,12 @@ fn ordinary_derived_operations_exclude_resident_but_unauthorized_source_members(
         .unwrap();
     store
         .insert(CollectionRecord::Derive(CollectionDerive::sign(
-            &authority,
+            &unauthorized,
             raw.handle(),
-            denied_commit.data(),
+            (
+                denied_commit.data(),
+                CollectionRecord::Commit(denied_commit).fingerprint(),
+            ),
             Handle::<SuccinctArchiveBlob>::to_hash(denied_raw),
         )))
         .unwrap();
@@ -746,7 +769,7 @@ fn collection_returns_the_maximal_resident_partial_realization() {
 }
 
 #[test]
-fn dangling_commit_is_raw_but_semantically_visible_only_in_a_later_snapshot() {
+fn dangling_commit_is_admitted_before_its_payload_becomes_readable() {
     let authority = SigningKey::from_bytes(&[47; 32]);
     let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
     let payload = one_fact(17).to_blob();
@@ -773,7 +796,9 @@ fn dangling_commit_is_raw_but_semantically_visible_only_in_a_later_snapshot() {
             .unwrap(),
         vec![CollectionRecord::Commit(commit)]
     );
-    assert!(collection.admitted(&before).unwrap().is_empty());
+    let admitted = collection.admitted(&before).unwrap();
+    assert_eq!(admitted.members().collect::<Vec<_>>(), vec![payload_handle]);
+    assert!(before.collection(collection).unwrap().cover().is_empty());
 
     store.put::<SimpleArchive, _>(payload).unwrap();
     let after = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
@@ -785,7 +810,9 @@ fn dangling_commit_is_raw_but_semantically_visible_only_in_a_later_snapshot() {
             .collect::<Vec<_>>(),
         vec![payload_handle]
     );
-    assert!(collection.admitted(&before).unwrap().is_empty());
+    assert_eq!(collection.admitted(&after).unwrap(), admitted);
+    assert_eq!(after.collection(collection).unwrap().cover().len(), 1);
+    assert!(before.collection(collection).unwrap().cover().is_empty());
 }
 
 #[test]

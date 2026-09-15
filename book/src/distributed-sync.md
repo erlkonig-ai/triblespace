@@ -56,7 +56,7 @@ For one collection, semantic repair derives two independent grow-only sets:
   admission; and
 - every signature-valid native proof scoped to exact resource C and beginning
   at a root named by C's supported policy bindings, without requiring its grant
-  handles to match those bindings. The subordinate-resource transport candidate
+  handles to match those bindings. Subordinate-resource transport
   also includes proofs for R whose immutable descriptor declares C as its repair
   audience, under R's own policy roots.
 
@@ -88,13 +88,13 @@ nor carries them. An application may use the same proof kernel for another
 resource, such as Secrets key delivery, without treating collection READ as
 decryption authority.
 
-The subordinate-resource transport candidate reads R's `resource_collection: C`
+Subordinate-resource transport reads R's `resource_collection: C`
 and its policy bindings from the same descriptor entity, without requiring a
 mutable referencing fact in C. It defers a proof when R's descriptor is absent
 and marks AUTH repair incomplete, while C's record repair continues. Later
 ordinary blob arrival permits retry; AUTH does not fetch R or emit WANT.
-The session is still gated by READ(C), not by R's action. This extension remains
-a source candidate pending its validation and rollout. Open action policies
+The session is still gated by READ(C), not by R's action. A deferred AUTH leaf
+does not mark the peer's authorization root reconciled. Open action policies
 remain explicitly non-enumerable.
 
 This product matters. Synchronizing only collection records would miss the
@@ -105,23 +105,37 @@ scoped to C. The receiver always derives its admitted view locally; record and
 proof arrival therefore commute, and a publisher need not possess or present
 its own WRITE grant merely to replicate an inert signed record.
 
-Signed MERGE and DERIVE records remain computation evidence, but they are
+Signed MERGE and DERIVE records are input-record-bound endorsements and
 first-class members of the exact-C record PATCH and ordinary collection
 repair. Once present in a record store, an equation is reusable materialized
 LSM work; warm readers do not execute its join or mapping again. A frozen
-semantic view ignores an equation until its producer satisfies the target's
-WRITE policy and all direct blob references are resident. READ permission to
+semantic view admits target producers under WRITE and follows only the exact
+native records their witnesses name. That closure establishes foundational
+support without rechecking ancestral producer authority or loading ancestral
+payloads, metadata, or proof definitions. Materialization needs the selected
+output and its encoding-required dependencies, not every historical input.
+Missing or mismatched witnesses remain unknown support. READ permission to
 participate in repair is not permission to endorse an equation. Signature
 verification happens when decoding foreign record bytes, not when rebuilding
 the local repair PATCH or observing the local store again.
 
-This signed-equation format uses `/triblespace/pile-sync/25`. Dense record tag
-4 carries a 224-byte MERGE body and tag 5 a 192-byte DERIVE body; each wire
-value has one additional tag byte. Old unsigned tags 2 and 3 are retired, not
-alternate encodings of an endorsement. COMMIT's 192-byte body and signature
-transcript are unchanged. Native piles preserve known old equations as inert
-evidence; an authorised producer must explicitly endorse a historical result
-before it can participate in the new repair algebra.
+This combined equation/AUTH-v5 epoch uses `/triblespace/pile-sync/26`. Dense
+record tag 6 carries a 288-byte MERGE body and tag 7 a 224-byte DERIVE body;
+each wire value has one additional tag byte. MERGE signs two input-record
+fingerprints paired with its payloads; DERIVE signs one. Unsigned tags 2/3 and
+payload-only signed tags 4/5 are retired, not alternate encodings of the new
+endorsement. COMMIT's 192-byte body and signature transcript are unchanged.
+Native piles retain historical equations as inert or opaque evidence; an
+authorized producer must explicitly issue a witness-bound endorsement before
+that historical work participates in the current repair algebra.
+
+Repair still transfers only records naming exact C. A DERIVE's source witness
+does not authorize disclosing another collection's records to a READ(C)-only
+recipient. The witness fingerprint is not a blob handle and is not fetched
+through the blob DHT. A replica lacking that record closure cannot claim exact
+support merely because it received the output endorsement; source-record
+provisioning remains a separately authorized concern. In particular, the current
+protocol does not automatically transport a cross-collection witness closure.
 
 ## Opaque wakes over stock gossip
 
@@ -182,6 +196,11 @@ Each proof leaf contains the complete signed path and the handles of its
 capability definitions, not those definitions' facts.
 Records may land before sufficient WRITE proof evidence and remain harmlessly
 inactive until a later snapshot derives admission.
+
+Bounded streams reserve request and response-byte capacity for collection
+records even when AUTH has deferred leaves. An incomplete pass continues
+immediately only when it adds records or proofs; unchanged deferrals retry on
+the ordinary cadence, without claiming convergence or initiating blob fetches.
 
 The exact-repair scheduler samples at a 30-second cadence. Participant leases
 last five minutes and every successful repair, including an identical result,
@@ -512,8 +531,8 @@ publishes deterministic size-tiered `MERGE` work. These operations take an
 explicit signing key. Newly required derivation work needs target WRITE;
 reuse needs no new authority, and optional maintenance without WRITE preserves
 the existing finer cover. The signed equations repair as reusable computation
-evidence but grant no new membership; their referenced artifact blobs remain
-separate exact-H content.
+and input-validation endorsements, not new exogenous membership; their
+referenced artifact blobs remain separate exact-H content.
 Evidence and computation still converge by union; no central scheduler or
 query planner is required.
 
@@ -649,7 +668,7 @@ not collection identity, authorization, or the union semantics of repair.
 
 ## Wire surface
 
-Protocol version 24 keeps the direct operation set narrow:
+Protocol version 26 keeps the direct operation set narrow:
 
 | Operation | Code | Meaning |
 |---|---:|---|
@@ -688,7 +707,9 @@ collection identity or change which evidence is semantically valid.
   readers.
 - An invalid wake, record, proof, PATCH node, or blob fails that input and
   cannot retract previously accepted evidence.
-- Missing blobs leave a semantic cover known but not yet materializable.
+- Missing selected output/dependency blobs leave that realization unavailable;
+  complete finer members remain usable. Missing witness records leave support
+  unknown, not empty, and do not authorize cross-collection disclosure.
 - A DHT miss says only that no live provider was found; it says nothing about
   whether H or its collection exists.
 - Concurrent writers and offline replicas reconverge without preserving pile

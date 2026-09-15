@@ -55,11 +55,18 @@ pub enum Command {
         #[arg(long)]
         signing_key: PathBuf,
     },
-    /// Endorse resident historical unsigned equations with a current writer's key.
+    /// Endorse historical payload equations with real admitted input witnesses.
     ///
-    /// Appends new signatures without changing old bytes, identities, or
-    /// endpoints. This does not recompute equations or recover their original
-    /// authorship: the supplied signer takes responsibility for the results.
+    /// Handles both unsigned and retired signed MERGE/DERIVE frames. Plans
+    /// this exact collection topologically, then appends current writer
+    /// endorsements without changing old frames or payload identities.
+    /// Small witness covers preserve total admitted support without enumerating
+    /// every exact-subset alternative. Repeated runs certify only newly available
+    /// support. Missing or ungrounded cyclic witnesses are reported; conflicting
+    /// outputs abort before publication. Upstream collections must be migrated
+    /// explicitly first. Results are not recomputed: this signer takes
+    /// responsibility for their correctness in a fresh endorsement, not a
+    /// reconstruction of the original historical provenance.
     EndorseUnsignedEquations {
         /// Exact target collection descriptor, as blake3:HEX or 64 hex digits.
         #[arg(long)]

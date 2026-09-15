@@ -55,8 +55,8 @@ pub enum PileCommand {
     /// distinct current native COMMIT/MERGE/DERIVE records remain. Retired
     /// PEER and STORE_SCOPE records are recognized and dropped.
     /// The source is never modified, the destination must not exist, and
-    /// opaque record kinds make the operation fail rather than guess at their
-    /// semantics. Quiesce writers when the output must cover the exact whole
+    /// opaque framed records are carried byte-for-byte without interpreting
+    /// them. Quiesce writers when the output must cover the exact whole
     /// file: a sufficiently late append may remain outside the valid observed
     /// prefix. On Unix the fresh destination starts no broader than mode 0600;
     /// source permissions are applied through its open file handle only after
@@ -74,7 +74,7 @@ pub enum PileCommand {
         #[command(subcommand)]
         cmd: diagnose::Command,
     },
-    /// Recheck native record signatures and AUTH proof attenuation, read-only.
+    /// Recheck native record and AUTH proof signatures, read-only.
     ///
     /// Audits every physical COMMIT, MERGE, DERIVE and current AUTH proof in
     /// the observed file prefix, including duplicate occurrences. Referenced

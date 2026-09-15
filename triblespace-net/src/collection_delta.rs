@@ -211,12 +211,31 @@ fn canonical_records(
 
 #[cfg(test)]
 mod tests {
+    // Canonical but deliberately uninserted COMMIT witnesses keep these
+    // physical-storage fixtures independent of ancestor arrival order.
+    fn witnessed(
+        signer: &ed25519_dalek::SigningKey,
+        collection: triblespace_core::collection::CollectionHandle,
+        data: triblespace_core::collection::CollectionData,
+    ) -> (
+        triblespace_core::collection::CollectionData,
+        triblespace_core::collection::CollectionRecordFingerprint,
+    ) {
+        let record = triblespace_core::collection::CollectionCommit::sign(
+            signer,
+            collection,
+            data,
+            triblespace_core::collection::empty_metadata_handle(),
+        );
+        (data, record.fingerprint())
+    }
+
     use std::cell::Cell;
     use std::convert::Infallible;
 
     use ed25519_dalek::SigningKey;
     use triblespace_core::collection::{
-        COLLECTION_RECORD_KIND_MERGE_V2, CollectionCommit, CollectionData, CollectionDerive,
+        COLLECTION_RECORD_KIND_MERGE_V3, CollectionCommit, CollectionData, CollectionDerive,
         CollectionMerge, empty_metadata_handle,
     };
     use triblespace_core::inline::Inline;
@@ -242,14 +261,26 @@ mod tests {
             CollectionRecord::Merge(CollectionMerge::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 expected,
-                data(2),
-                data(3),
+                witnessed(
+                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                    expected,
+                    data(2),
+                ),
+                witnessed(
+                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                    expected,
+                    data(3),
+                ),
                 data(4),
             )),
             CollectionRecord::Derive(CollectionDerive::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 expected,
-                data(4),
+                witnessed(
+                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                    expected,
+                    data(4),
+                ),
                 data(5),
             )),
         ]
@@ -329,20 +360,55 @@ mod tests {
     }
 
     #[test]
+    fn witness_bound_derives_roundtrip_before_witnesses_or_proofs_are_present() {
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[43; 32]);
+        let source = collection(44);
+        let target = collection(45);
+        let commit = CollectionCommit::sign(&signer, source, data(46), empty_metadata_handle());
+        let derive = CollectionRecord::Derive(CollectionDerive::sign(
+            &signer,
+            target,
+            (commit.data(), commit.fingerprint()),
+            data(47),
+        ));
+        let bytes = encode_record(target, derive).unwrap();
+        let decoded = decode_record(target, &bytes).unwrap();
+        assert_eq!(decoded, derive);
+        assert_eq!(
+            decoded.record_references().collect::<Vec<_>>(),
+            [commit.fingerprint()]
+        );
+        assert_eq!(canonical_records(target, [decoded]).unwrap().len(), 1);
+        let mut tampered = bytes;
+        // The witness is in the signature transcript, not an unauthenticated
+        // retrieval hint. Alter only its bytes and leave the payloads intact.
+        tampered[1 + 3 * 32] ^= 1;
+        assert!(decode_record(target, &tampered).is_err());
+    }
+
+    #[test]
     fn noncanonical_merge_inputs_fail_before_admission() {
         let expected = collection(1);
         let merge = CollectionMerge::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             expected,
-            data(2),
-            data(3),
+            witnessed(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                expected,
+                data(2),
+            ),
+            witnessed(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                expected,
+                data(3),
+            ),
             data(4),
         );
         let mut bytes = merge.to_bytes();
         bytes[32..64].fill(9);
         bytes[64..96].fill(1);
         let mut tagged = Vec::with_capacity(1 + bytes.len());
-        tagged.push(COLLECTION_RECORD_KIND_MERGE_V2);
+        tagged.push(COLLECTION_RECORD_KIND_MERGE_V3);
         tagged.extend_from_slice(&bytes);
         assert!(matches!(
             decode_record(expected, &tagged),

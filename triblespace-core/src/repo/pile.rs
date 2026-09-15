@@ -1156,15 +1156,18 @@ struct CollectionMergeRecordHeader {
     low: RawInline,
     high: RawInline,
     result: RawInline,
+    low_witness: RawInline,
+    high_witness: RawInline,
     public_key: RawInline,
     signature_r: RawInline,
     signature_s: RawInline,
-    reserved: [u8; 224],
+    reserved: [u8; 160],
 }
 
 impl CollectionMergeRecordHeader {
     fn new(record: &CollectionMerge) -> Self {
         let (low, high) = record.inputs();
+        let (low_witness, high_witness) = record.input_witnesses();
         let (signature_r, signature_s) = record.signature();
         Self {
             magic: FRAME_MAGIC,
@@ -1174,10 +1177,12 @@ impl CollectionMergeRecordHeader {
             low: low.raw,
             high: high.raw,
             result: record.result().raw,
+            low_witness: low_witness.raw(),
+            high_witness: high_witness.raw(),
             public_key: record.public_key().raw,
             signature_r: signature_r.raw,
             signature_s: signature_s.raw,
-            reserved: [0u8; 224],
+            reserved: [0u8; 160],
         }
     }
 }
@@ -1195,7 +1200,7 @@ struct LegacyCollectionDeriveRecordHeader {
     reserved: [u8; 96],
 }
 
-/// Signed derive equation, exactly filling one block.
+/// Witness-bound signed derive equation, spanning two blocks.
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
 #[repr(C)]
 struct CollectionDeriveRecordHeader {
@@ -1205,9 +1210,11 @@ struct CollectionDeriveRecordHeader {
     target: RawInline,
     input: RawInline,
     output: RawInline,
+    input_witness: RawInline,
     public_key: RawInline,
     signature_r: RawInline,
     signature_s: RawInline,
+    reserved: [u8; 224],
 }
 
 impl CollectionDeriveRecordHeader {
@@ -1216,14 +1223,16 @@ impl CollectionDeriveRecordHeader {
         let (signature_r, signature_s) = record.signature();
         Self {
             magic: FRAME_MAGIC,
-            span_blocks: ENVELOPE_HEADER_BLOCKS.to_le_bytes(),
+            span_blocks: 2u32.to_le_bytes(),
             record_kind: record_kind::KIND_COLLECTION_DERIVE,
             target: record.collection().raw,
             input: input.raw,
             output: output.raw,
+            input_witness: record.input_witness().raw(),
             public_key: record.public_key().raw,
             signature_r: signature_r.raw,
             signature_s: signature_s.raw,
+            reserved: [0u8; 224],
         }
     }
 }
@@ -1300,7 +1309,7 @@ fn collection_record_header(record: &CollectionRecord) -> Vec<u8> {
     }
 }
 
-// Compile-time guarantee of the fixed record spans (signed MERGE uses two blocks).
+// Compile-time guarantee of fixed spans (witness-bound equations use two blocks).
 const _: () = {
     assert!(std::mem::size_of::<BlobHeaderV3>() == V3_HEADER_LEN);
     assert!(std::mem::size_of::<BranchHeaderV3>() == V3_HEADER_LEN);
@@ -1338,7 +1347,7 @@ const _: () = {
     assert!(std::mem::size_of::<LegacyCollectionMergeRecordHeader>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<LegacyCollectionDeriveRecordHeader>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<CollectionMergeRecordHeader>() == 2 * ENVELOPE_BLOCK_LEN);
-    assert!(std::mem::size_of::<CollectionDeriveRecordHeader>() == ENVELOPE_HEADER_LEN);
+    assert!(std::mem::size_of::<CollectionDeriveRecordHeader>() == 2 * ENVELOPE_BLOCK_LEN);
 };
 
 /// A single record decoded from a pile file.
@@ -1814,7 +1823,9 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
             }
             let (header, _) =
                 CollectionMergeRecordHeader::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
-            if nonzero(&[&header.reserved[..]]) || header.high < header.low {
+            if nonzero(&[&header.reserved[..]])
+                || (header.high, header.high_witness) < (header.low, header.low_witness)
+            {
                 return Err(corrupt());
             }
             Ok(PileRecord {
@@ -1823,8 +1834,14 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
                 content: PileRecordContent::Collection {
                     record: CollectionRecord::Merge(CollectionMerge::from_parts(
                         Inline::new(header.collection),
-                        Inline::new(header.low),
-                        Inline::new(header.high),
+                        (
+                            Inline::new(header.low),
+                            CollectionRecordFingerprint::from_raw(header.low_witness),
+                        ),
+                        (
+                            Inline::new(header.high),
+                            CollectionRecordFingerprint::from_raw(header.high_witness),
+                        ),
                         Inline::new(header.result),
                         Inline::new(header.public_key),
                         Inline::new(header.signature_r),
@@ -1834,16 +1851,24 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
             })
         }
         record_kind::KIND_COLLECTION_DERIVE => {
-            fixed_header()?;
+            if declared_blocks != 2 {
+                return Err(corrupt());
+            }
             let (header, _) =
                 CollectionDeriveRecordHeader::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+            if nonzero(&[&header.reserved[..]]) {
+                return Err(corrupt());
+            }
             Ok(PileRecord {
                 offset,
                 len,
                 content: PileRecordContent::Collection {
                     record: CollectionRecord::Derive(CollectionDerive::from_parts(
                         Inline::new(header.target),
-                        Inline::new(header.input),
+                        (
+                            Inline::new(header.input),
+                            CollectionRecordFingerprint::from_raw(header.input_witness),
+                        ),
                         Inline::new(header.output),
                         Inline::new(header.public_key),
                         Inline::new(header.signature_r),
@@ -5319,6 +5344,25 @@ impl Pile {
 
 #[cfg(test)]
 mod tests {
+    // Canonical but deliberately uninserted COMMIT witnesses keep these
+    // physical-storage fixtures independent of ancestor arrival order.
+    fn witnessed(
+        signer: &ed25519_dalek::SigningKey,
+        collection: crate::collection::CollectionHandle,
+        data: crate::collection::CollectionData,
+    ) -> (
+        crate::collection::CollectionData,
+        crate::collection::CollectionRecordFingerprint,
+    ) {
+        let record = crate::collection::CollectionCommit::sign(
+            signer,
+            collection,
+            data,
+            crate::collection::empty_metadata_handle(),
+        );
+        (data, record.fingerprint())
+    }
+
     use super::*;
 
     use ed25519_dalek::SigningKey;
@@ -5665,14 +5709,26 @@ mod tests {
             CollectionRecord::Merge(CollectionMerge::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 source,
-                collection_test_hash(6),
-                collection_test_hash(7),
+                witnessed(
+                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                    source,
+                    collection_test_hash(6),
+                ),
+                witnessed(
+                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                    source,
+                    collection_test_hash(7),
+                ),
                 collection_test_hash(8),
             )),
             CollectionRecord::Derive(CollectionDerive::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 target,
-                collection_test_hash(8),
+                witnessed(
+                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                    target,
+                    collection_test_hash(8),
+                ),
                 collection_test_hash(9),
             )),
         ]
@@ -6197,14 +6253,96 @@ mod tests {
     }
 
     #[test]
+    fn retired_signed_equation_frames_are_opaque_inert_and_carried_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "retired-signed-source.pile");
+        let destination_path = fresh_empty_pile_path(&dir, "retired-signed-retained.pile");
+        let frames = [
+            test_envelope_bytes(record_kind::KIND_COLLECTION_MERGE_SIGNED_V2, 2, 512),
+            test_envelope_bytes(record_kind::KIND_COLLECTION_DERIVE_SIGNED_V2, 1, 256),
+        ];
+        for frame in &frames {
+            append_test_bytes(&source_path, frame);
+        }
+        let mut source = Pile::open(&source_path).unwrap();
+        let unmodeled_dependency = source
+            .put::<UnknownBlob, _>(Bytes::from_source(b"retired record may own this".to_vec()))
+            .unwrap();
+        let snapshot = source.snapshot().unwrap();
+        assert_eq!(snapshot.opaque_record_count(), 2);
+        assert_eq!(snapshot.records().unwrap().count(), 0);
+        let mut destination = Pile::open(&destination_path).unwrap();
+        let stats = source
+            .rewrite_retained_into(
+                &mut destination,
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+            )
+            .unwrap();
+        assert_eq!(stats.opaque_frames, 2);
+        let retained = destination.snapshot().unwrap();
+        assert_eq!(retained.records().unwrap().count(), 0);
+        assert!(retained
+            .get::<Blob<UnknownBlob>, _>(unmodeled_dependency)
+            .is_ok());
+        let mut physical = PileRecords::open(&destination_path).unwrap();
+        let carried: Vec<_> = physical
+            .by_ref()
+            .filter_map(|record| {
+                let record = record.unwrap();
+                matches!(record.content, PileRecordContent::Opaque { .. })
+                    .then_some((record.offset, record.len))
+            })
+            .collect();
+        assert_eq!(carried.len(), frames.len());
+        for ((offset, len), expected) in carried.into_iter().zip(&frames) {
+            assert_eq!(&physical.bytes()[offset..offset + len], expected);
+        }
+        drop((snapshot, retained, physical));
+        destination.close().unwrap();
+        source.close().unwrap();
+    }
+
+    #[test]
+    fn merge_framing_orders_equal_payloads_by_their_witness_fingerprints() {
+        let signer = SigningKey::from_bytes(&[81; 32]);
+        let collection = collection_test_collection(82);
+        let data = collection_test_hash(83);
+        let first = CollectionCommit::sign(&signer, collection, data, empty_metadata_handle());
+        let second = CollectionCommit::sign(
+            &SigningKey::from_bytes(&[84; 32]),
+            collection,
+            data,
+            empty_metadata_handle(),
+        );
+        let merge = CollectionRecord::Merge(CollectionMerge::sign(
+            &signer,
+            collection,
+            (data, first.fingerprint()),
+            (data, second.fingerprint()),
+            data,
+        ));
+        let mut frame = collection_record_header(&merge);
+        let low_witness: [u8; 32] = frame[192..224].try_into().unwrap();
+        let high_witness: [u8; 32] = frame[224..256].try_into().unwrap();
+        assert!(low_witness < high_witness);
+        frame[192..224].copy_from_slice(&high_witness);
+        frame[224..256].copy_from_slice(&low_witness);
+        assert!(matches!(
+            decode_record(&frame, 0),
+            Err(ReadError::CorruptPile { valid_length: 0 })
+        ));
+    }
+
+    #[test]
     fn enveloped_collection_record_headers_are_fixed_zero_padded_and_roundtrip() {
         let records = collection_test_records();
         let expected = [
             // A commit's six 32-byte fields fill 64..256 exactly: the tightest
             // record the pile writes, and the one that fixes the body offset.
             (record_kind::KIND_COLLECTION_COMMIT, 1, None),
-            (record_kind::KIND_COLLECTION_MERGE, 2, Some(288usize)),
-            (record_kind::KIND_COLLECTION_DERIVE, 1, None),
+            (record_kind::KIND_COLLECTION_MERGE, 2, Some(352usize)),
+            (record_kind::KIND_COLLECTION_DERIVE, 2, Some(288usize)),
         ];
 
         for (record, (kind, blocks, reserved_start)) in records.into_iter().zip(expected) {
@@ -6277,7 +6415,7 @@ mod tests {
             (record_kind::KIND_WANT, 1),
             (record_kind::KIND_COLLECTION_COMMIT, 1),
             (record_kind::KIND_COLLECTION_MERGE, 2),
-            (record_kind::KIND_COLLECTION_DERIVE, 1),
+            (record_kind::KIND_COLLECTION_DERIVE, 2),
         ];
         let mut records = PileRecords::open(&path).unwrap();
         let decoded = (&mut records).collect::<Result<Vec<_>, _>>().unwrap();
@@ -7739,21 +7877,37 @@ mod tests {
             CollectionRecord::Merge(CollectionMerge::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 collection,
-                collection_test_hash(43),
-                collection_test_hash(44),
+                witnessed(
+                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                    collection,
+                    collection_test_hash(43),
+                ),
+                witnessed(
+                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                    collection,
+                    collection_test_hash(44),
+                ),
                 collection_test_hash(45),
             )),
             CollectionRecord::Derive(CollectionDerive::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 collection,
-                collection_test_hash(45),
+                witnessed(
+                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                    collection,
+                    collection_test_hash(45),
+                ),
                 collection_test_hash(46),
             )),
         ];
         let unrelated = CollectionRecord::Derive(CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             unrelated_collection,
-            collection_test_hash(45),
+            witnessed(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                unrelated_collection,
+                collection_test_hash(45),
+            ),
             collection_test_hash(47),
         ));
         let selector = BTreeSet::from([CollectionRecordSelector::Collection(collection)]);
@@ -7881,13 +8035,21 @@ mod tests {
         let conflicting = CollectionRecord::Derive(CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             target,
-            input,
+            witnessed(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                target,
+                input,
+            ),
             collection_test_hash(10),
         ));
         let unrelated = CollectionRecord::Derive(CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             collection_test_collection(3),
-            input,
+            witnessed(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                collection_test_collection(3),
+                input,
+            ),
             collection_test_hash(11),
         ));
         let exact = [CollectionRecordSelector::Operation(WantRequest::derive(
@@ -8255,6 +8417,78 @@ mod tests {
     }
 
     #[test]
+    fn retained_rewrite_keeps_witness_records_without_treating_fingerprints_as_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "witness-source.pile");
+        let destination_path = fresh_empty_pile_path(&dir, "witness-retained.pile");
+        let mut source = Pile::open(&source_path).unwrap();
+        let mut destination = Pile::open(&destination_path).unwrap();
+        let input = source
+            .put::<UnknownBlob, _>(Bytes::from_source(b"witness-owned input".to_vec()))
+            .unwrap();
+        let output = source
+            .put::<UnknownBlob, _>(Bytes::from_source(b"selected output".to_vec()))
+            .unwrap();
+        let orphan = source
+            .put::<UnknownBlob, _>(Bytes::from_source(b"not a record".to_vec()))
+            .unwrap();
+        let signer = SigningKey::from_bytes(&[87; 32]);
+        let base = collection_test_collection(88);
+        let target = collection_test_collection(89);
+        let commit = CollectionCommit::sign(
+            &signer,
+            base,
+            Inline::new(input.raw),
+            empty_metadata_handle(),
+        );
+        let derive = CollectionDerive::sign(
+            &signer,
+            target,
+            (commit.data(), commit.fingerprint()),
+            Inline::new(output.raw),
+        );
+        // The second fingerprint is deliberately dangling and happens to name
+        // a resident blob. It owns no blob bytes: record and blob namespaces
+        // remain distinct even when their raw 32-byte values are equal.
+        let merge = CollectionMerge::sign(
+            &signer,
+            target,
+            (derive.output(), derive.fingerprint()),
+            (
+                derive.output(),
+                CollectionRecordFingerprint::from_raw(orphan.raw),
+            ),
+            derive.output(),
+        );
+        source.insert(CollectionRecord::Merge(merge)).unwrap();
+        let before_witnesses = source.snapshot().unwrap();
+        assert_eq!(before_witnesses.record(commit.fingerprint()).unwrap(), None);
+        assert_eq!(before_witnesses.record(derive.fingerprint()).unwrap(), None);
+        assert_eq!(before_witnesses.proofs().unwrap().count(), 0);
+        source.insert(CollectionRecord::Derive(derive)).unwrap();
+        source.insert(CollectionRecord::Commit(commit)).unwrap();
+        let mut selected = RetentionRoots::new();
+        selected.retain_direct(output);
+        source
+            .rewrite_retained_into(&mut destination, &selected, WantRewritePolicy::Drop)
+            .unwrap();
+        let retained = destination.snapshot().unwrap();
+        for record in [
+            CollectionRecord::Commit(commit),
+            CollectionRecord::Derive(derive),
+            CollectionRecord::Merge(merge),
+        ] {
+            assert_eq!(retained.record(record.fingerprint()).unwrap(), Some(record));
+        }
+        assert!(retained.get::<Blob<UnknownBlob>, _>(input).is_ok());
+        assert!(retained.get::<Blob<UnknownBlob>, _>(output).is_ok());
+        assert!(retained.get::<Blob<UnknownBlob>, _>(orphan).is_err());
+        drop((before_witnesses, retained));
+        destination.close().unwrap();
+        source.close().unwrap();
+    }
+
+    #[test]
     fn retained_rewrite_preserves_native_records_and_their_owned_blobs() {
         let dir = tempfile::tempdir().unwrap();
         let source_path = fresh_empty_pile_path(&dir, "collection-source.pile");
@@ -8298,14 +8532,26 @@ mod tests {
             CollectionRecord::Merge(CollectionMerge::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 descriptor_handle,
-                Inline::new(equation_owned.raw),
-                collection_test_hash(15),
+                witnessed(
+                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                    descriptor_handle,
+                    Inline::new(equation_owned.raw),
+                ),
+                witnessed(
+                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                    descriptor_handle,
+                    collection_test_hash(15),
+                ),
                 collection_test_hash(16),
             )),
             CollectionRecord::Derive(CollectionDerive::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 collection_test_collection(17),
-                collection_test_hash(16),
+                witnessed(
+                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                    collection_test_collection(17),
+                    collection_test_hash(16),
+                ),
                 collection_test_hash(18),
             )),
         ];
@@ -8643,8 +8889,16 @@ mod tests {
         pile.insert(CollectionRecord::Merge(CollectionMerge::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             collection.handle(),
-            Handle::<SimpleArchive>::to_hash(a_handle),
-            Handle::<SimpleArchive>::to_hash(b_handle),
+            witnessed(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                collection.handle(),
+                Handle::<SimpleArchive>::to_hash(a_handle),
+            ),
+            witnessed(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                collection.handle(),
+                Handle::<SimpleArchive>::to_hash(b_handle),
+            ),
             Handle::<SimpleArchive>::to_hash(c_handle),
         )))
         .unwrap();

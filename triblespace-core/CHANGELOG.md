@@ -9,21 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Resource-scoped capability definition handles and generic descriptor policy
-  bindings. PROOF edges now carry a 32-byte `Handle<SimpleArchive>` plus the
-  existing mode/time attenuation; the kernel verifies signatures without
-  fetching or interpreting definitions. READ/WRITE are collection consumers of
-  the same mechanism as custom capabilities. Pile indexes share owning proof
-  byte views; GC retains resident definitions, not opaque resource identities.
-  The new grammar/record kind requires explicit proof reissuance and descriptor
-  transition, not entity-ID rewriting or signature translation.
+- Add witness-bound MERGE/DERIVE endorsements over actual native input-record
+  fingerprints as well as payload handles. Their new dense tags are 6/7 with
+  288/224-byte bodies; both native frames occupy 512 bytes. New semantic kinds,
+  signature domains, and pinned record descriptions prevent old payload-only
+  signatures from acquiring the stronger meaning. COMMIT is byte-identical.
 
-- Freeze one authorization instant in every `StoreSnapshot`, with
+- Resource-scoped capability definition handles and generic descriptor policy
+  bindings. AUTH-v5 has a 96-byte header and 128-byte handle/delegate/signature
+  edges, with no inline flags or time bounds. Immutable definitions describe
+  independent invocation and delegation action sets; child invocation and
+  delegation must be contained in the parent's delegation set. Policy bindings
+  select actions from definitions rather than requiring grant-handle equality.
+  Standard READ/WRITE definitions and existing collection descriptors keep
+  their identities. Pile indexes share owning proof byte views; GC retains
+  resident definitions, not opaque resource identities. Old proofs require
+  explicit owner reissuance, not signature translation or silent removal of
+  application-specific restrictions.
+
+- Freeze one interpretation instant in every `StoreSnapshot`, with
   `SnapshotSource::snapshot_at` as the single explicit-time construction seam.
-  Collection observation and admission use that frozen instant; content-change
-  masks exclude time, and authorization caches track proof-validity boundaries
-  separately. Snapshot reads remain resident-only and inert; active acquisition
-  belongs to the store's asynchronous ensure and maintain operations.
+  Application queries can use that instant; generic collection authorization
+  has no validity clock, and content-change masks exclude time. Passive
+  collection observation remains resident-only and inert; active acquisition
+  belongs to asynchronous store operations or exact-handle networked reads.
 
 - Use the same `ensure` and `maintain` operations for root and derived
   collections. Roots fetch their exact admitted dependencies without a
@@ -33,15 +42,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the resident `snapshot.collection(collection)?.view()` path.
 
 - Make canonical `WantRequest::Blob(H)` the sole durable exact-content
-  request. Repository implementations retain its exact identity, and Yard
-  charges one bounded-retention slot per requested handle.
+  request. Repository implementations retain its exact identity and every
+  independently resident reference while the WANT remains retained.
 
 - Add independent descriptor-local READ and WRITE admission policies. Each is
   `Open` or a canonical multi-root quorum with one invocation threshold. The
   evaluator counts independently valid paths from distinct roots and adds
   exact `ACTION_READ` authorization beside `ACTION_WRITE`; delegation comes
-  only from the mode signed into each path. The byte-compatible legacy
-  delegation-threshold descriptor field is ignored by authorization.
+  only from delegation-action facts in each signed grant's definition. The
+  byte-compatible legacy delegation-threshold descriptor field is ignored by
+  authorization.
 
 - Add store-owned collection construction:
   `collection(name, policy)`, `derive(source, mapping, policy)`, and the raw
@@ -56,9 +66,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it unchanged across every mapping hop. `CollectionSnapshot<R, E>` pairs one
   store watermark with that support and its resident target cover. Remove the
   lifecycle facades and synthetic collection-record entity IDs; exact native
-  records carry semantics and provenance, while full-width fingerprints remain
-  nonsemantic storage and transport keys. `Collection::cover` names a typed
-  exact coordinate without store access so durable manifests can preserve a
+  records carry semantics and provenance, while full-width fingerprints name
+  those records for storage, transport, and signed witness references.
+  `Collection::cover` names a typed exact coordinate without store access so
+  durable manifests can preserve a
   cover; later admission and resolution still decide whether it is usable in a
   particular immutable snapshot.
 
@@ -80,26 +91,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CollectionMapping<Source, Target>` whose law is a join homomorphism.
 
 - Add top-level `capability`, a direct authorization kernel. One canonical
-  self-contained proof encodes
-  `magic16 | resource32 | root32 |`
-  `N*(action16 | flags1 | validity32 | delegate32 | signature64)`. Each strict
+  proof encodes `magic32 | resource32 | root32 |`
+  `N*(capability_handle32 | delegate32 | signature64)`. Each strict
   Ed25519 signature is last and covers the exact prefix through its delegate,
   so every signed prefix is itself a proof and paths cannot be grafted or
   reordered. Root and delegate encodings are canonical non-weak principals;
-  validity remains exact over the signed `i128` nanosecond domain without
-  silently saturating clock boundaries. BLAKE3 over the exact proof bytes is
-  its stable identity.
-  Verification takes an external trust root, expected leaf, explicit instant,
-  and request, then computes the path-local action, mode, and validity meet
-  without ambient or blob lookup.
+  a bad later suffix cannot invalidate an earlier valid subject prefix. BLAKE3
+  over the exact proof bytes is its stable identity. Byte-only signature checks
+  need no blobs; action authorization takes an external trust root, expected
+  subject, resource/action request, and a reader for capability definitions.
+  Application restrictions may filter each validated prefix before quorum
+  counting; the generic kernel does not impose an expiry interpretation.
 - Add `CapabilityProofStore` to `MemoryRepo`, `Pile`, and `Yard` as a native
   grow-only set of self-contained proofs with deterministic enumeration and
-  exact proof-ID lookup. V2 pile records use bounded canonical framing.
-  Conservative collection preserves exact proof records directly; there is no
-  companion blob closure or retention traversal, and proof presence alone
-  grants no authority.
+  exact proof-ID lookup. Native records use bounded canonical framing.
+  Conservative collection preserves exact proof records and resident referenced
+  capability definitions, without following the opaque resource identity or
+  fetching missing blobs. Proof presence alone grants no authority.
 
 ### Changed
+
+- Preflight each invocation and delegation action of a compound collection
+  grant against that action's roots before publishing it. An open action may
+  accompany useful restricted actions, but one action's authority cannot make
+  an unrelated or unknown action's grant construction succeed.
+
+- Attach a collection by admitting its target producers, then walking only
+  their exact signed witness DAGs. Preserve the trusted-local/checked-ingress
+  boundary: attachment does not repeat collection-record signature checks,
+  ancestor capability admission, or ancestral payload/metadata reads.
+  Selected outputs still require their encoding dependency closure; missing
+  native witnesses leave support unknown. Immediate-source maintenance uses
+  the same witness mechanism without recursively constructing upstream work.
+
+- Keep physical cover selection support-aware under non-injective mappings.
+  Different certified routes to one payload retain their exact supports; a
+  coarser payload does not discard a finer resident member whose extra support
+  it did not endorse. Fingerprint-bound traversal prevents unrelated equations
+  sharing a handle from inflating an existing endorsement's support.
+
+- Treat retired signed payload-only equation kinds as opaque native frames,
+  outside current collection semantics and repair. Conservative Pile copying
+  preserves them and every resident blob; Yard and semantic reframe continue
+  to refuse opaque ownership. Record witnesses are native-record references,
+  never blob references or a new persistent validation ledger.
 
 - Restore bounded target-carry batching under invariant foundational support.
   Maintenance resolves collection semantics once per actionable dyadic tier
@@ -111,10 +146,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   live-set unions, so exact-provider locator refresh is proportional to changed
   handles instead of relisting the complete Yard twice.
 
-- Project every resident descriptor, data, metadata, and aligned attachment in
-  a strictly signed, WRITE-admitted COMMIT closure into a collection-scoped
-  snapshot index. Exact-content availability remains a separate,
-  collection-independent property of resident blobs.
+- Keep structural record retention independent of WRITE admission and chosen
+  physical covers. Exact-content availability remains a separate,
+  collection-independent property of resident blobs; read-time endorsement
+  reuse does not weaken ownership of already-resident historical references.
 
 - Make store registration the sole source of typed collection values.
   `register_collection` validates a raw descriptor and returns the exact handle

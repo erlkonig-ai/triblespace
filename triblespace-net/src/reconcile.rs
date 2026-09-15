@@ -927,6 +927,25 @@ fn want_request_for_record(record: CollectionRecord) -> Option<WantRequest> {
 
 #[cfg(test)]
 mod tests {
+    // Canonical but deliberately uninserted COMMIT witnesses keep these
+    // physical-storage fixtures independent of ancestor arrival order.
+    fn witnessed(
+        signer: &ed25519_dalek::SigningKey,
+        collection: triblespace_core::collection::CollectionHandle,
+        data: triblespace_core::collection::CollectionData,
+    ) -> (
+        triblespace_core::collection::CollectionData,
+        triblespace_core::collection::CollectionRecordFingerprint,
+    ) {
+        let record = triblespace_core::collection::CollectionCommit::sign(
+            signer,
+            collection,
+            data,
+            triblespace_core::collection::empty_metadata_handle(),
+        );
+        (data, record.fingerprint())
+    }
+
     use super::*;
     use ed25519_dalek::SigningKey;
     use triblespace_core::collection::{CollectionCommit, CollectionDerive, CollectionMerge};
@@ -969,8 +988,16 @@ mod tests {
             want_request_for_record(CollectionRecord::Merge(CollectionMerge::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 collection,
-                b,
-                a,
+                witnessed(
+                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                    collection,
+                    b
+                ),
+                witnessed(
+                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                    collection,
+                    a
+                ),
                 result,
             ))),
             Some(WantRequest::merge(collection, a, b))
@@ -979,7 +1006,7 @@ mod tests {
             want_request_for_record(CollectionRecord::Derive(CollectionDerive::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 target,
-                a,
+                witnessed(&ed25519_dalek::SigningKey::from_bytes(&[7; 32]), target, a),
                 result,
             ))),
             Some(WantRequest::derive(target, a))
@@ -1002,14 +1029,26 @@ mod tests {
             CollectionRecord::Merge(CollectionMerge::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 collection,
-                Inline::new([4; 32]),
-                Inline::new([5; 32]),
+                witnessed(
+                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                    collection,
+                    Inline::new([4; 32]),
+                ),
+                witnessed(
+                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                    collection,
+                    Inline::new([5; 32]),
+                ),
                 Inline::new([6; 32]),
             )),
             CollectionRecord::Derive(CollectionDerive::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 collection,
-                Inline::new([6; 32]),
+                witnessed(
+                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                    collection,
+                    Inline::new([6; 32]),
+                ),
                 Inline::new([7; 32]),
             )),
             CollectionRecord::Commit(CollectionCommit::sign(

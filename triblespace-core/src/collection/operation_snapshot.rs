@@ -315,15 +315,24 @@ mod tests {
     use super::*;
     use crate::blob::encodings::{simplearchive::SimpleArchive, UnknownBlob};
     use crate::capability::{CapabilityHandle, CapabilityResource};
-    use crate::collection::{CollectionDerive, CollectionStore};
+    use crate::collection::{
+        empty_metadata_handle, CollectionCommit, CollectionDerive, CollectionStore,
+    };
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::repo::{BlobStorePut, CapabilityProofStore, SnapshotSource, WantRequest, WantStore};
 
     fn record(byte: u8) -> CollectionRecord {
-        CollectionRecord::Derive(CollectionDerive::sign(
-            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-            Inline::<Handle<SimpleArchive>>::new([1; 32]),
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let input = CollectionRecord::Commit(CollectionCommit::sign(
+            &key,
+            Inline::<Handle<SimpleArchive>>::new([2; 32]),
             Inline::new([byte; 32]),
+            empty_metadata_handle(),
+        ));
+        CollectionRecord::Derive(CollectionDerive::sign(
+            &key,
+            Inline::<Handle<SimpleArchive>>::new([1; 32]),
+            (Inline::new([byte; 32]), input.fingerprint()),
             Inline::new([byte.wrapping_add(1); 32]),
         ))
     }

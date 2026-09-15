@@ -1562,6 +1562,25 @@ impl Error for YardReclaimError {}
 
 #[cfg(test)]
 mod tests {
+    // Canonical but deliberately uninserted COMMIT witnesses keep these
+    // physical-storage fixtures independent of ancestor arrival order.
+    fn witnessed(
+        signer: &ed25519_dalek::SigningKey,
+        collection: crate::collection::CollectionHandle,
+        data: crate::collection::CollectionData,
+    ) -> (
+        crate::collection::CollectionData,
+        crate::collection::CollectionRecordFingerprint,
+    ) {
+        let record = crate::collection::CollectionCommit::sign(
+            signer,
+            collection,
+            data,
+            crate::collection::empty_metadata_handle(),
+        );
+        (data, record.fingerprint())
+    }
+
     use super::*;
     use crate::blob::encodings::rawbytes::RawBytes;
     use crate::blob::encodings::simplearchive::SimpleArchive;
@@ -1743,8 +1762,16 @@ mod tests {
         CollectionRecord::Merge(CollectionMerge::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&descriptor),
-            Inline::new([tag.wrapping_add(3); 32]),
-            Inline::new([tag.wrapping_add(4); 32]),
+            witnessed(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                identity_for_tests(&descriptor),
+                Inline::new([tag.wrapping_add(3); 32]),
+            ),
+            witnessed(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                identity_for_tests(&descriptor),
+                Inline::new([tag.wrapping_add(4); 32]),
+            ),
             Inline::new([tag.wrapping_add(5); 32]),
         ))
     }
@@ -1951,19 +1978,31 @@ mod tests {
         let first = CollectionRecord::Derive(CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             target,
-            input,
+            witnessed(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                target,
+                input,
+            ),
             Inline::new([44; 32]),
         ));
         let conflicting = CollectionRecord::Derive(CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             target,
-            input,
+            witnessed(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                target,
+                input,
+            ),
             Inline::new([45; 32]),
         ));
         let unrelated = CollectionRecord::Derive(CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             Inline::new([46; 32]),
-            input,
+            witnessed(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                Inline::new([46; 32]),
+                input,
+            ),
             Inline::new([47; 32]),
         ));
         yard.generations[1]
@@ -2063,6 +2102,53 @@ mod tests {
     }
 
     #[test]
+    fn reclaim_keeps_cross_generation_equation_witnesses_with_subset_blob_roots() {
+        let (_dir, mut yard) = yard_with(2, YardConfig::default());
+        let input = yard
+            .put_in_generation::<RawBytes, _>(1, raw_blob(b"older witness input"))
+            .unwrap();
+        let output = yard
+            .put::<RawBytes, _>(raw_blob(b"younger equation output"))
+            .unwrap();
+        let signer = SigningKey::from_bytes(&[86; 32]);
+        let commit = CollectionCommit::sign(
+            &signer,
+            Inline::new([87; 32]),
+            Inline::new(input.raw),
+            empty_metadata_handle(),
+        );
+        let derive = CollectionDerive::sign(
+            &signer,
+            Inline::new([88; 32]),
+            (commit.data(), commit.fingerprint()),
+            Inline::new(output.raw),
+        );
+        // Young evidence can arrive first; the later witness belongs to an
+        // older generation, not to the equation's local pile segment.
+        yard.insert(CollectionRecord::Derive(derive)).unwrap();
+        yard.generations[1]
+            .active_mut()
+            .pile_mut()
+            .insert(CollectionRecord::Commit(commit))
+            .unwrap();
+        let mut roots = RetentionRoots::new();
+        roots.retain_direct::<UnknownBlob>(output.transmute());
+        yard.collect(&roots).unwrap();
+        yard.reclaim().unwrap();
+        let retained = yard.snapshot().unwrap();
+        assert_eq!(
+            retained.record(commit.fingerprint()).unwrap(),
+            Some(CollectionRecord::Commit(commit))
+        );
+        assert_eq!(
+            retained.record(derive.fingerprint()).unwrap(),
+            Some(CollectionRecord::Derive(derive))
+        );
+        assert!(get_raw(&retained, input).is_ok());
+        assert!(get_raw(&retained, output).is_ok());
+    }
+
+    #[test]
     fn native_commits_root_owned_blobs_and_reclaim_preserves_every_record_kind() {
         let (_dir, mut yard) = yard_with(1, YardConfig::default());
         publish_record_kind_descriptions(&mut yard);
@@ -2094,14 +2180,26 @@ mod tests {
             CollectionRecord::Merge(CollectionMerge::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 collection,
-                Inline::new(equation_owned.raw),
-                Inline::new([35; 32]),
+                witnessed(
+                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                    collection,
+                    Inline::new(equation_owned.raw),
+                ),
+                witnessed(
+                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                    collection,
+                    Inline::new([35; 32]),
+                ),
                 Inline::new([36; 32]),
             )),
             CollectionRecord::Derive(CollectionDerive::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 identity_for_tests(&named_for_tests("derived", pin_id(38))),
-                Inline::new([36; 32]),
+                witnessed(
+                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                    identity_for_tests(&named_for_tests("derived", pin_id(38))),
+                    Inline::new([36; 32]),
+                ),
                 Inline::new(equation_owned.raw),
             )),
         ];

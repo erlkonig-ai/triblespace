@@ -33,11 +33,23 @@ pub(crate) struct CollectionRepairDelta {
     pub(crate) more: bool,
 }
 
+impl CollectionRepairDelta {
+    /// Incompleteness alone is not progress: absent resource descriptors can
+    /// leave AUTH deferred indefinitely. Retry those on the ordinary cadence,
+    /// while immediately continuing a bounded pass that actually added data.
+    pub(crate) fn retry_immediately(&self) -> bool {
+        self.more && (!self.records.is_empty() || !self.authorization_evidence.is_empty())
+    }
+}
+
 const MAX_REPAIR_RECORD_ITEMS: usize = 4_096;
 const MAX_REPAIR_AUTHORIZATION_EVIDENCE_ITEMS: usize = 16;
 const MAX_REPAIR_NODE_REQUESTS: usize = 16_384;
 const MAX_SERVER_REPAIR_COMMANDS: usize = 512;
 const MAX_SERVER_NODE_RESPONSE_BYTES: usize = 64 << 20;
+// AUTH runs first, but deferred leaves must not consume the entire stream and
+// prevent independent collection records from making progress.
+const MAX_AUTHORIZATION_REPAIR_NODE_REQUESTS: usize = (MAX_SERVER_REPAIR_COMMANDS - 1) / 2;
 
 /// Serve the body of one collection-repair operation after its operation byte
 /// has already been consumed.
@@ -348,9 +360,9 @@ where
     let mut complete = false;
     let mut deferred = false;
     loop {
-        if requests >= MAX_REPAIR_NODE_REQUESTS
+        if requests >= MAX_AUTHORIZATION_REPAIR_NODE_REQUESTS
             || *remaining_requests == 0
-            || *response_bytes >= MAX_SERVER_NODE_RESPONSE_BYTES
+            || *response_bytes >= MAX_SERVER_NODE_RESPONSE_BYTES / 2
             || missing.len() >= MAX_REPAIR_AUTHORIZATION_EVIDENCE_ITEMS
         {
             break;
@@ -478,6 +490,33 @@ mod tests {
 
     use super::*;
 
+    async fn pull(
+        local: &CollectionRepairOverlay,
+        remote: Arc<CollectionRepairOverlay>,
+        reader: VerifyingKey,
+    ) -> Result<CollectionRepairDelta> {
+        let (server_io, client_io) = tokio::io::duplex(1 << 20);
+        let (mut server_recv, mut server_send) = tokio::io::split(server_io);
+        let (mut client_recv, mut client_send) = tokio::io::split(client_io);
+        let server = tokio::spawn(async move {
+            assert_eq!(
+                recv_u8(&mut server_recv).await.unwrap(),
+                crate::collection_wire::OP_COLLECTION_REPAIR
+            );
+            let retained =
+                serve_collection_repair(&mut server_recv, &mut server_send, reader, |collection| {
+                    (collection == remote.collection()).then_some(remote)
+                })
+                .await
+                .unwrap();
+            assert!(retained.is_empty());
+        });
+        let result =
+            pull_collection_stream(&mut client_send, &mut client_recv, local, vec![]).await;
+        server.await.unwrap();
+        result
+    }
+
     #[tokio::test]
     async fn custom_capability_repairs_without_definition_blobs_but_never_admits_read() {
         for open_read in [false, true] {
@@ -568,35 +607,6 @@ mod tests {
     async fn subordinate_proof_defers_until_its_resource_arrives_without_blocking_records() {
         use triblespace_core::capability::policy::resource_collection;
 
-        async fn pull(
-            local: &CollectionRepairOverlay,
-            remote: Arc<CollectionRepairOverlay>,
-            reader: VerifyingKey,
-        ) -> Result<CollectionRepairDelta> {
-            let (server_io, client_io) = tokio::io::duplex(1 << 20);
-            let (mut server_recv, mut server_send) = tokio::io::split(server_io);
-            let (mut client_recv, mut client_send) = tokio::io::split(client_io);
-            let server = tokio::spawn(async move {
-                assert_eq!(
-                    recv_u8(&mut server_recv).await.unwrap(),
-                    crate::collection_wire::OP_COLLECTION_REPAIR
-                );
-                let retained = serve_collection_repair(
-                    &mut server_recv,
-                    &mut server_send,
-                    reader,
-                    |collection| (collection == remote.collection()).then_some(remote),
-                )
-                .await
-                .unwrap();
-                assert!(retained.is_empty());
-            });
-            let result =
-                pull_collection_stream(&mut client_send, &mut client_recv, local, vec![]).await;
-            server.await.unwrap();
-            result
-        }
-
         let resource_root = SigningKey::from_bytes(&[97; 32]);
         let reader = SigningKey::from_bytes(&[98; 32]).verifying_key();
         let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
@@ -648,6 +658,10 @@ mod tests {
             "missing R must not suppress independent C records"
         );
         assert!(first.more, "skipped AUTH is not a reconciled remote root");
+        assert!(
+            first.retry_immediately(),
+            "new C records are useful progress"
+        );
         let after_wire = client_store.snapshot().unwrap();
         assert_eq!(before.blobs().count(), after_wire.blobs().count());
         assert!(!after_wire.contains_blob(resource).unwrap());
@@ -655,6 +669,22 @@ mod tests {
         for record in first.records {
             client_store.insert(record).unwrap();
         }
+
+        let still_cold = client_store.snapshot().unwrap();
+        let local = collection_repair_overlay(&still_cold, collection.handle()).unwrap();
+        for _ in 0..3 {
+            let deferred = pull(&local, remote.clone(), reader).await.unwrap();
+            assert!(deferred.more, "AUTH remains explicitly incomplete");
+            assert!(deferred.authorization_evidence.is_empty());
+            assert!(deferred.records.is_empty());
+            assert!(
+                !deferred.retry_immediately(),
+                "unchanged deferred evidence waits for periodic repair"
+            );
+        }
+        assert_eq!(before.blobs().count(), still_cold.blobs().count());
+        assert!(!still_cold.contains_blob(resource).unwrap());
+        assert!(still_cold.wants().unwrap().next().is_none());
 
         // Stand in for the ordinary blob acquisition path, outside repair.
         assert_eq!(
@@ -688,6 +718,92 @@ mod tests {
         assert!(final_delta.authorization_evidence.is_empty());
         assert!(final_delta.records.is_empty());
         assert!(!final_delta.more);
+    }
+
+    #[tokio::test]
+    async fn many_absent_resource_descriptors_cannot_starve_collection_records() {
+        use triblespace_core::capability::policy::resource_collection;
+        use triblespace_core::id::Id;
+
+        let root = SigningKey::from_bytes(&[100; 32]);
+        let reader = SigningKey::from_bytes(&[101; 32]).verifying_key();
+        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+        let mut server_store = MemoryRepo::default();
+        let collection = server_store
+            .collection("deferred-auth-budget", policy.clone())
+            .unwrap();
+        let mut client_store = MemoryRepo::default();
+        assert_eq!(
+            client_store
+                .collection("deferred-auth-budget", policy)
+                .unwrap()
+                .handle(),
+            collection.handle()
+        );
+        let capability = triblespace_core::inline::Inline::new([102; 32]);
+        let mut resources = Vec::new();
+        // Even the leaves alone exceed the complete stream's request budget.
+        // None can be ingested until its immutable routing descriptor arrives.
+        for index in 0..MAX_SERVER_REPAIR_COMMANDS {
+            let tag = Id::new((index as u128 + 1).to_le_bytes()).unwrap();
+            let facts = entity! {
+                metadata::tag: tag,
+                resource_collection: collection.handle(),
+                resource_policy*: AdmissionPolicy::direct(root.verifying_key()).binding(capability),
+            };
+            let resource = server_store
+                .put::<SimpleArchive, _>(facts.facts().clone())
+                .unwrap();
+            server_store
+                .insert_proof(CapabilityProof::new(
+                    CapabilityResource::from(resource),
+                    &root,
+                    capability,
+                    reader,
+                ))
+                .unwrap();
+            resources.push(resource);
+        }
+        let commit = CollectionRecord::Commit(CollectionCommit::sign(
+            &root,
+            collection.handle(),
+            CollectionData::new([103; 32]),
+            empty_metadata_handle(),
+        ));
+        server_store.insert(commit).unwrap();
+        let remote = Arc::new(
+            collection_repair_overlay(&server_store.snapshot().unwrap(), collection.handle())
+                .unwrap(),
+        );
+        assert_eq!(
+            remote.authorization_evidence().len(),
+            MAX_SERVER_REPAIR_COMMANDS as u64
+        );
+        let before = client_store.snapshot().unwrap();
+        let local = collection_repair_overlay(&before, collection.handle()).unwrap();
+        let first = pull(&local, remote.clone(), reader).await.unwrap();
+        assert_eq!(first.records, [commit], "AUTH reserves a C-record budget");
+        assert!(first.authorization_evidence.is_empty());
+        assert!(first.more);
+        assert!(first.retry_immediately());
+        client_store.insert(commit).unwrap();
+
+        let after = client_store.snapshot().unwrap();
+        let local = collection_repair_overlay(&after, collection.handle()).unwrap();
+        for _ in 0..2 {
+            let deferred = pull(&local, remote.clone(), reader).await.unwrap();
+            assert!(deferred.more);
+            assert!(deferred.records.is_empty());
+            assert!(deferred.authorization_evidence.is_empty());
+            assert!(!deferred.retry_immediately());
+        }
+        assert_eq!(before.blobs().count(), after.blobs().count());
+        assert!(
+            resources
+                .into_iter()
+                .all(|resource| !after.contains_blob(resource).unwrap())
+        );
+        assert!(after.wants().unwrap().next().is_none());
     }
 
     #[test]

@@ -410,6 +410,25 @@ where
 
 #[cfg(test)]
 mod tests {
+    // Canonical but deliberately uninserted COMMIT witnesses keep these
+    // physical-storage fixtures independent of ancestor arrival order.
+    fn witnessed(
+        signer: &ed25519_dalek::SigningKey,
+        collection: crate::collection::CollectionHandle,
+        data: crate::collection::CollectionData,
+    ) -> (
+        crate::collection::CollectionData,
+        crate::collection::CollectionRecordFingerprint,
+    ) {
+        let record = crate::collection::CollectionCommit::sign(
+            signer,
+            collection,
+            data,
+            crate::collection::empty_metadata_handle(),
+        );
+        (data, record.fingerprint())
+    }
+
     use super::*;
     use crate::id::Id;
 
@@ -460,8 +479,16 @@ mod tests {
         let record = CollectionRecord::Merge(CollectionMerge::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             collection,
-            Inline::new([4; 32]),
-            Inline::new([5; 32]),
+            witnessed(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                collection,
+                Inline::new([4; 32]),
+            ),
+            witnessed(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                collection,
+                Inline::new([5; 32]),
+            ),
             Inline::new([6; 32]),
         ));
         let mut hybrid = HybridStore::new(MemoryRepo::default(), MemoryRepo::default());

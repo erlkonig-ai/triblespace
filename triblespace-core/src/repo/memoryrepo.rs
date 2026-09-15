@@ -457,6 +457,25 @@ impl crate::repo::StorageClose for MemoryRepo {
 
 #[cfg(test)]
 mod tests {
+    // Canonical but deliberately uninserted COMMIT witnesses keep these
+    // physical-storage fixtures independent of ancestor arrival order.
+    fn witnessed(
+        signer: &ed25519_dalek::SigningKey,
+        collection: crate::collection::CollectionHandle,
+        data: crate::collection::CollectionData,
+    ) -> (
+        crate::collection::CollectionData,
+        crate::collection::CollectionRecordFingerprint,
+    ) {
+        let record = crate::collection::CollectionCommit::sign(
+            signer,
+            collection,
+            data,
+            crate::collection::empty_metadata_handle(),
+        );
+        (data, record.fingerprint())
+    }
+
     use super::*;
     use anybytes::Bytes;
     use ed25519_dalek::SigningKey;
@@ -555,14 +574,26 @@ mod tests {
         let merge = CollectionRecord::Merge(CollectionMerge::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&descriptor),
-            Inline::new([4; 32]),
-            Inline::new([5; 32]),
+            witnessed(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                identity_for_tests(&descriptor),
+                Inline::new([4; 32]),
+            ),
+            witnessed(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                identity_for_tests(&descriptor),
+                Inline::new([5; 32]),
+            ),
             Inline::new([6; 32]),
         ));
         let derive = CollectionRecord::Derive(CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&target),
-            Inline::new([10; 32]),
+            witnessed(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                identity_for_tests(&target),
+                Inline::new([10; 32]),
+            ),
             Inline::new([11; 32]),
         ));
         let mut expected = vec![derive, merge];
@@ -595,13 +626,21 @@ mod tests {
         let expected = CollectionRecord::Derive(CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             target,
-            Inline::new([14; 32]),
+            witnessed(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                target,
+                Inline::new([14; 32]),
+            ),
             Inline::new([15; 32]),
         ));
         let mismatched = CollectionRecord::Derive(CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             target,
-            Inline::new([16; 32]),
+            witnessed(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                target,
+                Inline::new([16; 32]),
+            ),
             Inline::new([17; 32]),
         ));
         let fingerprint = expected.fingerprint();
@@ -630,32 +669,56 @@ mod tests {
         let merge = CollectionRecord::Merge(CollectionMerge::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             source,
-            Inline::new([31; 32]),
-            Inline::new([32; 32]),
+            witnessed(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                source,
+                Inline::new([31; 32]),
+            ),
+            witnessed(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                source,
+                Inline::new([32; 32]),
+            ),
             Inline::new([33; 32]),
         ));
         let first = CollectionRecord::Derive(CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             target,
-            input,
+            witnessed(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                target,
+                input,
+            ),
             Inline::new([34; 32]),
         ));
         let conflicting = CollectionRecord::Derive(CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             target,
-            input,
+            witnessed(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                target,
+                input,
+            ),
             Inline::new([35; 32]),
         ));
         let sibling = CollectionRecord::Derive(CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             target,
-            Inline::new([36; 32]),
+            witnessed(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                target,
+                Inline::new([36; 32]),
+            ),
             Inline::new([37; 32]),
         ));
         let unrelated = CollectionRecord::Derive(CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             other,
-            input,
+            witnessed(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                other,
+                input,
+            ),
             Inline::new([38; 32]),
         ));
         let mut repo = MemoryRepo::default();
@@ -756,8 +819,16 @@ mod tests {
         repo.insert(CollectionRecord::Merge(CollectionMerge::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             descriptor.transmute(),
-            Inline::new(merge_input.raw),
-            Inline::new([0xff; 32]),
+            witnessed(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                descriptor.transmute(),
+                Inline::new(merge_input.raw),
+            ),
+            witnessed(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                descriptor.transmute(),
+                Inline::new([0xff; 32]),
+            ),
             Inline::new(merge_output.raw),
         )))
         .unwrap();
@@ -853,7 +924,11 @@ mod tests {
         repo.insert(CollectionRecord::Derive(CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             target,
-            handle(73).into(),
+            witnessed(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                target,
+                handle(73).into(),
+            ),
             handle(74).into(),
         )))
         .unwrap();
@@ -897,7 +972,11 @@ mod tests {
         let record = CollectionRecord::Derive(CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             target,
-            handle(82).into(),
+            witnessed(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                target,
+                handle(82).into(),
+            ),
             handle(83).into(),
         ));
         repo.insert(record).unwrap();

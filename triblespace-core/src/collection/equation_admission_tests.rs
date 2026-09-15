@@ -5,12 +5,12 @@ use hifitime::Epoch;
 
 use super::*;
 use crate::blob::encodings::simplearchive::SimpleArchive;
-use crate::blob::encodings::succinctarchive::SuccinctArchiveBlob;
+use crate::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchiveBlob, UnionArchive};
 use crate::blob::{Blob, IntoBlob};
 use crate::capability::{CapabilityProof, CapabilityResource};
 use crate::inline::encodings::hash::Handle;
 use crate::repo::memoryrepo::MemoryRepo;
-use crate::repo::{BlobStorePut, CapabilityProofStore, SnapshotSource};
+use crate::repo::{BlobStoreList, BlobStorePut, CapabilityProofStore, SnapshotSource};
 use crate::trible::{Trible, TribleSet, TRIBLE_LEN};
 
 fn archive(seed: u8) -> Blob<SimpleArchive> {
@@ -26,19 +26,19 @@ fn publish(
     collection: Collection<SimpleArchive>,
     signer: &SigningKey,
     blob: Blob<SimpleArchive>,
-) {
+) -> CollectionCommit {
     let data = store.put::<SimpleArchive, _>(blob).unwrap();
     let metadata = store
         .put::<SimpleArchive, _>(TribleSet::new().to_blob())
         .unwrap();
-    store
-        .insert(CollectionRecord::Commit(CollectionCommit::sign(
-            signer,
-            collection.handle(),
-            Handle::<SimpleArchive>::to_hash(data),
-            metadata,
-        )))
-        .unwrap();
+    let commit = CollectionCommit::sign(
+        signer,
+        collection.handle(),
+        Handle::<SimpleArchive>::to_hash(data),
+        metadata,
+    );
+    store.insert(CollectionRecord::Commit(commit)).unwrap();
+    commit
 }
 
 #[test]
@@ -58,8 +58,8 @@ fn read_rights_do_not_admit_merges_or_inject_conflicts() {
     let a = archive(2);
     let b = archive(3);
     let c = simplearchive_union::join(&a, &b).unwrap();
-    publish(&mut store, collection, &root, a.clone());
-    publish(&mut store, collection, &root, b.clone());
+    let ca = publish(&mut store, collection, &root, a.clone());
+    let cb = publish(&mut store, collection, &root, b.clone());
     let c_handle = store.put::<SimpleArchive, _>(c).unwrap();
     let wrong = store
         .put::<SimpleArchive, _>(TribleSet::new().to_blob())
@@ -78,8 +78,8 @@ fn read_rights_do_not_admit_merges_or_inject_conflicts() {
         .insert(CollectionRecord::Merge(CollectionMerge::sign(
             &root,
             collection.handle(),
-            low,
-            high,
+            (low, CollectionRecord::Commit(ca).fingerprint()),
+            (high, CollectionRecord::Commit(cb).fingerprint()),
             Handle::<SimpleArchive>::to_hash(c_handle),
         )))
         .unwrap();
@@ -87,8 +87,8 @@ fn read_rights_do_not_admit_merges_or_inject_conflicts() {
         .insert(CollectionRecord::Merge(CollectionMerge::sign(
             &reader,
             collection.handle(),
-            low,
-            high,
+            (low, CollectionRecord::Commit(ca).fingerprint()),
+            (high, CollectionRecord::Commit(cb).fingerprint()),
             Handle::<SimpleArchive>::to_hash(wrong),
         )))
         .unwrap();
@@ -141,14 +141,14 @@ fn derive_before_write_proof_is_inert_then_admitted_without_reinsertion() {
         )
         .unwrap();
     let a = archive(4);
-    publish(&mut store, source, &source_owner, a.clone());
+    let ca = publish(&mut store, source, &source_owner, a.clone());
     let output = store
         .put::<SuccinctArchiveBlob, _>(succinctarchive_union::derive_element(&a).unwrap())
         .unwrap();
     let equation = CollectionRecord::Derive(CollectionDerive::sign(
         &producer,
         target.handle(),
-        Handle::<SimpleArchive>::to_hash(a.get_handle()),
+        (ca.data(), CollectionRecord::Commit(ca).fingerprint()),
         Handle::<SuccinctArchiveBlob>::to_hash(output),
     ));
     store.insert(equation).unwrap();
@@ -161,7 +161,7 @@ fn derive_before_write_proof_is_inert_then_admitted_without_reinsertion() {
         .insert(CollectionRecord::Derive(CollectionDerive::sign(
             &source_owner,
             target.handle(),
-            Handle::<SimpleArchive>::to_hash(a.get_handle()),
+            (ca.data(), CollectionRecord::Commit(ca).fingerprint()),
             Handle::<SuccinctArchiveBlob>::to_hash(output),
         )))
         .unwrap();
@@ -226,8 +226,8 @@ fn equation_authority_is_timeless_across_snapshot_clocks() {
         .unwrap();
     let a = archive(5);
     let b = archive(6);
-    publish(&mut store, collection, &root, a.clone());
-    publish(&mut store, collection, &root, b.clone());
+    let ca = publish(&mut store, collection, &root, a.clone());
+    let cb = publish(&mut store, collection, &root, b.clone());
     let joined = store
         .put::<SimpleArchive, _>(simplearchive_union::join(&a, &b).unwrap())
         .unwrap();
@@ -235,8 +235,8 @@ fn equation_authority_is_timeless_across_snapshot_clocks() {
         .insert(CollectionRecord::Merge(CollectionMerge::sign(
             &producer,
             collection.handle(),
-            Handle::<SimpleArchive>::to_hash(a.get_handle()),
-            Handle::<SimpleArchive>::to_hash(b.get_handle()),
+            (ca.data(), CollectionRecord::Commit(ca).fingerprint()),
+            (cb.data(), CollectionRecord::Commit(cb).fingerprint()),
             Handle::<SimpleArchive>::to_hash(joined),
         )))
         .unwrap();
@@ -266,5 +266,136 @@ fn equation_authority_is_timeless_across_snapshot_clocks() {
     assert_eq!(
         later.records().unwrap().count(),
         before.records().unwrap().count()
+    );
+}
+
+#[test]
+fn selected_endorsement_needs_exact_records_not_ancestor_payloads_or_proofs() {
+    let source_owner = SigningKey::from_bytes(&[41; 32]);
+    let source_writer = SigningKey::from_bytes(&[42; 32]);
+    let target_owner = SigningKey::from_bytes(&[43; 32]);
+    let mut store = MemoryRepo::default();
+    let source = store
+        .collection(
+            "endorsed-source-without-bytes",
+            CollectionPolicy::new(
+                AdmissionPolicy::direct(source_owner.verifying_key()),
+                AdmissionPolicy::delegable(source_owner.verifying_key()),
+            ),
+        )
+        .unwrap();
+    let target = store
+        .derive::<SuccinctArchiveBlob>(
+            source,
+            (),
+            CollectionPolicy::new(
+                AdmissionPolicy::Open,
+                AdmissionPolicy::direct(target_owner.verifying_key()),
+            ),
+        )
+        .unwrap();
+    let input = archive(7);
+    let input_data = Handle::<SimpleArchive>::to_hash(input.get_handle());
+    let output = store
+        .put::<SuccinctArchiveBlob, _>(succinctarchive_union::derive_element(&input).unwrap())
+        .unwrap();
+    // The producing node validated this input. This receiving store has the
+    // signed record but neither its payload nor the source writer's grant.
+    let ancestor = CollectionRecord::Commit(CollectionCommit::sign(
+        &source_writer,
+        source.handle(),
+        input_data,
+        empty_metadata_handle(),
+    ));
+    let selected = CollectionRecord::Derive(CollectionDerive::sign(
+        &target_owner,
+        target.handle(),
+        (input_data, ancestor.fingerprint()),
+        Handle::<SuccinctArchiveBlob>::to_hash(output),
+    ));
+    store.insert(selected).unwrap();
+    assert!(
+        store
+            .snapshot()
+            .unwrap()
+            .collection(target)
+            .unwrap()
+            .cover()
+            .is_empty(),
+        "missing witness records remain unknown, not an empty admitted support"
+    );
+
+    // An existing record in the wrong collection cannot satisfy a witness.
+    let wrong_collection = CollectionRecord::Commit(CollectionCommit::sign(
+        &source_writer,
+        target.handle(),
+        input_data,
+        empty_metadata_handle(),
+    ));
+    store.insert(wrong_collection).unwrap();
+    store
+        .insert(CollectionRecord::Derive(CollectionDerive::sign(
+            &target_owner,
+            target.handle(),
+            (input_data, wrong_collection.fingerprint()),
+            Handle::<SuccinctArchiveBlob>::to_hash(output),
+        )))
+        .unwrap();
+    assert!(store
+        .snapshot()
+        .unwrap()
+        .collection(target)
+        .unwrap()
+        .cover()
+        .is_empty());
+
+    // A source record with a different output is not evidence for this input.
+    let other_data = Handle::<SimpleArchive>::to_hash(archive(8).get_handle());
+    let wrong_payload = CollectionRecord::Commit(CollectionCommit::sign(
+        &source_writer,
+        source.handle(),
+        other_data,
+        empty_metadata_handle(),
+    ));
+    store.insert(wrong_payload).unwrap();
+    store
+        .insert(CollectionRecord::Derive(CollectionDerive::sign(
+            &target_owner,
+            target.handle(),
+            (input_data, wrong_payload.fingerprint()),
+            Handle::<SuccinctArchiveBlob>::to_hash(output),
+        )))
+        .unwrap();
+    assert!(store
+        .snapshot()
+        .unwrap()
+        .collection(target)
+        .unwrap()
+        .cover()
+        .is_empty());
+
+    store.insert(ancestor).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    assert!(!snapshot.contains_blob(input.get_handle()).unwrap());
+    assert!(!source
+        .writer_is_admitted(&snapshot, source_writer.verifying_key())
+        .unwrap());
+    assert!(!source
+        .reader_is_admitted(&snapshot, target_owner.verifying_key())
+        .unwrap());
+    assert!(source.admitted(&snapshot).unwrap().is_empty());
+    let attached = snapshot.collection(target).unwrap();
+    assert_eq!(attached.cover().members().collect::<Vec<_>>(), vec![output]);
+    assert_eq!(
+        attached.support().members().collect::<Vec<_>>(),
+        vec![input.get_handle()]
+    );
+    assert_eq!(
+        attached
+            .view::<UnionArchive<OrderedUniverse>>()
+            .unwrap()
+            .iter()
+            .count(),
+        1
     );
 }

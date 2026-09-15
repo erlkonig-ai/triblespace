@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
@@ -122,6 +122,12 @@ fn build(
             )
         })
         .collect();
+    // Payloads are synthetic mathematical oracles; input witnesses are not.
+    // Every witness names the actual signed record inserted below.
+    let mut witnesses: BTreeMap<_, _> = commits
+        .iter()
+        .map(|record| (record.data(), record.fingerprint()))
+        .collect();
 
     let mut all_elements = leaf_data.clone();
     let mut merges = Vec::with_capacity(leaves - 1);
@@ -134,13 +140,15 @@ fn build(
                     step as u64,
                     &[leaves.trailing_zeros() as u8],
                 );
-                merges.push(CollectionMerge::sign(
+                let merge = CollectionMerge::sign(
                     &signing_key,
                     source_collection,
-                    current,
-                    next,
+                    (current, witnesses[&current]),
+                    (next, witnesses[&next]),
                     result,
-                ));
+                );
+                witnesses.insert(result, merge.fingerprint());
+                merges.push(merge);
                 all_elements.push(result);
                 current = result;
             }
@@ -158,13 +166,15 @@ fn build(
                         &[leaves.trailing_zeros() as u8],
                     );
                     node += 1;
-                    merges.push(CollectionMerge::sign(
+                    let merge = CollectionMerge::sign(
                         &signing_key,
                         source_collection,
-                        pair[0],
-                        pair[1],
+                        (pair[0], witnesses[&pair[0]]),
+                        (pair[1], witnesses[&pair[1]]),
                         result,
-                    ));
+                    );
+                    witnesses.insert(result, merge.fingerprint());
+                    merges.push(merge);
                     all_elements.push(result);
                     next_level.push(result);
                 }
@@ -183,7 +193,12 @@ fn build(
     let derives: Vec<_> = mapped_inputs
         .iter()
         .map(|input| {
-            CollectionDerive::sign(&signing_key, target_collection, *input, mapped(*input))
+            CollectionDerive::sign(
+                &signing_key,
+                target_collection,
+                (*input, witnesses[input]),
+                mapped(*input),
+            )
         })
         .collect();
 
@@ -270,4 +285,41 @@ fn main() {
         elapsed.as_nanos(),
         elapsed.as_nanos() as f64 / iterations as f64,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_probe_equation_names_its_actual_source_records() {
+        for shape in [Shape::Chain, Shape::Balanced] {
+            for mapping in [
+                Mapping::None,
+                Mapping::Endpoints,
+                Mapping::Leaves,
+                Mapping::All,
+            ] {
+                let (records, _, _, _, _) = build(8, shape, mapping);
+                let source = records.commits()[0].collection();
+                let witnesses: BTreeMap<_, _> = records
+                    .commits()
+                    .iter()
+                    .map(|record| (record.fingerprint(), (record.collection(), record.data())))
+                    .chain(records.merges().iter().map(|record| {
+                        (record.fingerprint(), (record.collection(), record.result()))
+                    }))
+                    .collect();
+                for record in records.merges() {
+                    let (low, high) = record.inputs();
+                    let (low_witness, high_witness) = record.input_witnesses();
+                    assert_eq!(witnesses[&low_witness], (record.collection(), low));
+                    assert_eq!(witnesses[&high_witness], (record.collection(), high));
+                }
+                for record in records.derives() {
+                    assert_eq!(witnesses[&record.input_witness()], (source, record.input()));
+                }
+            }
+        }
+    }
 }

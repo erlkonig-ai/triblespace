@@ -152,10 +152,10 @@ mod tests {
     use crate::blob::{Blob, IntoBlob};
     use crate::collection::descriptor;
     use crate::collection::{
-        Collection, CollectionDerivation, CollectionDerive, CollectionEncoding, CollectionMerge,
-        CollectionOperationError, CollectionPolicy, CollectionRead, CollectionRealizationError,
-        CollectionRecord, CollectionSnapshotExt, CollectionStore, CollectionStoreExt, Cover,
-        Support,
+        Collection, CollectionCommit, CollectionData, CollectionDerivation, CollectionDerive,
+        CollectionEncoding, CollectionHandle, CollectionMerge, CollectionOperationError,
+        CollectionPolicy, CollectionRead, CollectionRealizationError, CollectionRecord,
+        CollectionSnapshotExt, CollectionStore, CollectionStoreExt, Cover, Support,
     };
     use crate::inline::encodings::hash::Handle;
     use crate::metadata::MetaDescribe;
@@ -174,6 +174,15 @@ mod tests {
             crate::collection::AdmissionPolicy::direct(authority()),
             crate::collection::AdmissionPolicy::direct(authority()),
         )
+    }
+
+    fn input_record(collection: CollectionHandle, data: CollectionData) -> CollectionRecord {
+        CollectionRecord::Commit(CollectionCommit::sign(
+            &SigningKey::from_bytes(&[7; 32]),
+            collection,
+            data,
+            crate::collection::empty_metadata_handle(),
+        ))
     }
 
     fn collections(
@@ -334,7 +343,7 @@ mod tests {
     #[test]
     fn incomplete_compacted_rank9_member_does_not_hide_a_complete_finer_cover() {
         let mut store = MemoryRepo::default();
-        let (_, _, accelerated_collection) = collections(&mut store);
+        let (_, raw_collection, accelerated_collection) = collections(&mut store);
         let a = raw([row(1, 2, 3)]);
         let b = raw([row(4, 5, 6)]);
         let c = super::super::join(&a, &b).unwrap();
@@ -346,6 +355,17 @@ mod tests {
         let fa_data = Handle::<Rank9AcceleratedSuccinctArchiveBlob>::to_hash(fa.get_handle());
         let fb_data = Handle::<Rank9AcceleratedSuccinctArchiveBlob>::to_hash(fb.get_handle());
         let fc_data = Handle::<Rank9AcceleratedSuccinctArchiveBlob>::to_hash(fc.get_handle());
+        let fine_records = [(a_data, fa_data), (b_data, fb_data)].map(|(input, output)| {
+            CollectionRecord::Derive(CollectionDerive::sign(
+                &SigningKey::from_bytes(&[7; 32]),
+                accelerated_collection.handle(),
+                (
+                    input,
+                    input_record(raw_collection.handle(), input).fingerprint(),
+                ),
+                output,
+            ))
+        });
 
         // The compacted accelerated root arrived without its raw Merkle child.
         // Both finer accelerated members have complete closures.
@@ -361,20 +381,13 @@ mod tests {
             .insert(CollectionRecord::Merge(CollectionMerge::sign(
                 &SigningKey::from_bytes(&[7; 32]),
                 accelerated_collection.handle(),
-                fa_data,
-                fb_data,
+                (fa_data, fine_records[0].fingerprint()),
+                (fb_data, fine_records[1].fingerprint()),
                 fc_data,
             )))
             .unwrap();
-        for (input, output) in [(a_data, fa_data), (b_data, fb_data)] {
-            store
-                .insert(CollectionRecord::Derive(CollectionDerive::sign(
-                    &SigningKey::from_bytes(&[7; 32]),
-                    accelerated_collection.handle(),
-                    input,
-                    output,
-                )))
-                .unwrap();
+        for record in fine_records {
+            store.insert(record).unwrap();
         }
 
         let snapshot = store.snapshot().unwrap();
@@ -470,8 +483,14 @@ mod tests {
             .insert(CollectionRecord::Merge(CollectionMerge::sign(
                 &SigningKey::from_bytes(&[7; 32]),
                 accelerated_collection.handle(),
-                fa_data,
-                fb_data,
+                (
+                    fa_data,
+                    input_record(accelerated_collection.handle(), fa_data).fingerprint(),
+                ),
+                (
+                    fb_data,
+                    input_record(accelerated_collection.handle(), fb_data).fingerprint(),
+                ),
                 fc_data,
             )))
             .unwrap();
@@ -506,8 +525,14 @@ mod tests {
             .insert(CollectionRecord::Merge(CollectionMerge::sign(
                 &SigningKey::from_bytes(&[7; 32]),
                 accelerated_collection.handle(),
-                fa_data,
-                fb_data,
+                (
+                    fa_data,
+                    input_record(accelerated_collection.handle(), fa_data).fingerprint(),
+                ),
+                (
+                    fb_data,
+                    input_record(accelerated_collection.handle(), fb_data).fingerprint(),
+                ),
                 fc_data,
             )))
             .unwrap();
@@ -622,6 +647,13 @@ mod tests {
             .collect::<TribleSet>()
             .to_blob();
         store.put::<SimpleArchive, _>(source.clone()).unwrap();
+        store.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
+        store
+            .insert(input_record(
+                source_collection.handle(),
+                Handle::<SimpleArchive>::to_hash(source.get_handle()),
+            ))
+            .unwrap();
         let support = Support::from_data(
             source_collection,
             [Handle::<SimpleArchive>::to_hash(source.get_handle())],
@@ -738,6 +770,10 @@ mod tests {
         let source = simple([row(1, 2, 3)]);
         let source_data = Handle::<SimpleArchive>::to_hash(source.get_handle());
         store.put::<SimpleArchive, _>(source).unwrap();
+        store.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
+        store
+            .insert(input_record(source_collection.handle(), source_data))
+            .unwrap();
         let support = Support::from_data(source_collection, [source_data]);
 
         assert!(matches!(
@@ -796,36 +832,46 @@ mod tests {
         for member in [source_a, source_b] {
             store.put::<SimpleArchive, _>(member).unwrap();
         }
+        store.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
+        let source_records = [source_a_data, source_b_data]
+            .map(|data| input_record(source_collection.handle(), data));
+        for record in source_records {
+            store.insert(record).unwrap();
+        }
         for member in [a, b, c] {
             store.put::<SuccinctArchiveBlob, _>(member).unwrap();
         }
         store
             .put::<Rank9AcceleratedSuccinctArchiveBlob, _>(fc)
             .unwrap();
-        store
-            .insert(CollectionRecord::Merge(CollectionMerge::sign(
-                &SigningKey::from_bytes(&[7; 32]),
-                raw_collection.handle(),
-                a_data,
-                b_data,
-                c_data,
-            )))
-            .unwrap();
-        for (input, output) in [(source_a_data, a_data), (source_b_data, b_data)] {
-            store
-                .insert(CollectionRecord::Derive(CollectionDerive::sign(
+        let raw_records = [(source_a_data, a_data), (source_b_data, b_data)]
+            .into_iter()
+            .zip(source_records)
+            .map(|((input, output), source)| {
+                CollectionRecord::Derive(CollectionDerive::sign(
                     &SigningKey::from_bytes(&[7; 32]),
                     raw_collection.handle(),
-                    input,
+                    (input, source.fingerprint()),
                     output,
-                )))
-                .unwrap();
+                ))
+            })
+            .collect::<Vec<_>>();
+        for record in &raw_records {
+            store.insert(*record).unwrap();
         }
+        let merged = CollectionRecord::Merge(CollectionMerge::sign(
+            &SigningKey::from_bytes(&[7; 32]),
+            raw_collection.handle(),
+            (a_data, raw_records[0].fingerprint()),
+            (b_data, raw_records[1].fingerprint()),
+            c_data,
+        ));
+        store.insert(merged).unwrap();
         store
             .insert(CollectionRecord::Derive(CollectionDerive::sign(
                 &SigningKey::from_bytes(&[7; 32]),
                 accelerated_collection.handle(),
-                c_data,
+                (c_data, merged.fingerprint()),
                 fc_data,
             )))
             .unwrap();

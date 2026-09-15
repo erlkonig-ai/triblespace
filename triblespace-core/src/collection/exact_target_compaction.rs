@@ -14,12 +14,13 @@ use crate::inline::encodings::hash::Handle;
 use crate::repo::{BlobStoreGet, Store};
 
 use super::exact_derived::{
-    attach_collection_exact, data_identity, producer_is_admitted, CollectionRealizationError,
+    attach_exact_resolution, data_identity, merge_witness_pairs, producer_is_admitted,
+    CollectionRealizationError, InputWitnesses,
 };
 use super::operation_snapshot::{OperationFrontier, OperationSnapshot};
 use super::{
     Collection, CollectionData, CollectionEncoding, CollectionMerge, CollectionOperationError,
-    CollectionRecord, Cover, Support,
+    CollectionRecord, CollectionSemantics, Cover, Support,
 };
 
 /// Carry one exact target realization to its deterministic dyadic LSM fixed
@@ -80,12 +81,12 @@ where
         let snapshot = frontier.view(store.snapshot().map_err(|error| {
             CollectionRealizationError::storage("open target-maintenance snapshot", error)
         })?);
-        let (_, cover) = attach_collection_exact(&snapshot, target, support)?;
-        let identity = cover_identity(&cover);
+        let resolved = attach_exact_resolution(&snapshot, target, support)?;
+        let identity = cover_identity(&resolved.cover);
         if !seen.insert(identity.clone()) {
             return Err(CollectionRealizationError::Stalled { cover: identity });
         }
-        let prepared = prepare_carry_round(&snapshot, target, &cover)?;
+        let prepared = prepare_carry_round(&snapshot, target, &resolved.cover)?;
         if prepared.is_some() && !producer_is_admitted(&snapshot, target, signing_key)? {
             return Ok(());
         }
@@ -100,6 +101,8 @@ where
             signing_key,
             &descriptor,
             tiers,
+            &resolved.witnesses,
+            &resolved.semantics,
             &mut blocked,
             frontier,
             &mut join,
@@ -173,6 +176,8 @@ fn publish_carry_round<S, E, J>(
     signing_key: &SigningKey,
     descriptor: &crate::trible::Fragment,
     tiers: BTreeMap<u32, BTreeSet<CollectionData>>,
+    witnesses: &InputWitnesses,
+    semantics: &CollectionSemantics,
     blocked: &mut BTreeSet<(CollectionData, CollectionData)>,
     frontier: &mut OperationFrontier<S::Snapshot>,
     join: &mut J,
@@ -200,6 +205,7 @@ where
                 members.insert(high_data);
                 continue;
             }
+            let pairs = merge_witness_pairs(witnesses, target.handle(), low_data, high_data)?;
             let snapshot = frontier.view(store.snapshot().map_err(|error| {
                 CollectionRealizationError::storage("open target-carry snapshot", error)
             })?);
@@ -213,7 +219,13 @@ where
                 .map_err(|error| {
                     CollectionRealizationError::storage("load higher target-carry member", error)
                 })?;
-            let output = join(descriptor, &low, &high, &snapshot);
+            let output = if semantics.subsumes(target.handle(), low_data, high_data) {
+                Ok(Some(high))
+            } else if semantics.subsumes(target.handle(), high_data, low_data) {
+                Ok(Some(low))
+            } else {
+                join(descriptor, &low, &high, &snapshot)
+            };
             drop(snapshot);
             match output {
                 Ok(Some(output)) => {
@@ -221,17 +233,19 @@ where
                     store.put::<E, _>(output).map_err(|error| {
                         CollectionRealizationError::storage("store merged target member", error)
                     })?;
-                    let record = CollectionRecord::Merge(CollectionMerge::sign(
-                        signing_key,
-                        target.handle(),
-                        low_data,
-                        high_data,
-                        result,
-                    ));
-                    store.insert(record).map_err(|error| {
-                        CollectionRealizationError::storage("publish target MERGE", error)
-                    })?;
-                    frontier.include_record(record);
+                    for (low, high) in pairs {
+                        let record = CollectionRecord::Merge(CollectionMerge::sign(
+                            signing_key,
+                            target.handle(),
+                            low,
+                            high,
+                            result,
+                        ));
+                        store.insert(record).map_err(|error| {
+                            CollectionRealizationError::storage("publish target MERGE", error)
+                        })?;
+                        frontier.include_record(record);
+                    }
                     published = true;
                 }
                 Err(CollectionOperationError::Fatal(reason)) => {

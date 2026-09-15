@@ -4,7 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::error::Error;
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anybytes::Bytes;
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
@@ -84,19 +84,40 @@ fn publish_root(
     collection: Collection<SimpleArchive>,
     blob: &Blob<SimpleArchive>,
     key: u8,
-) {
+) -> CollectionCommit {
     store.put::<SimpleArchive, _>(blob.clone()).unwrap();
     let metadata = store
         .put::<SimpleArchive, _>(TribleSet::new().to_blob())
         .unwrap();
-    store
-        .insert(CollectionRecord::Commit(CollectionCommit::sign(
-            &SigningKey::from_bytes(&[key; 32]),
-            collection.handle(),
-            data(blob),
-            metadata,
-        )))
-        .unwrap();
+    let commit = CollectionCommit::sign(
+        &SigningKey::from_bytes(&[key; 32]),
+        collection.handle(),
+        data(blob),
+        metadata,
+    );
+    store.insert(CollectionRecord::Commit(commit)).unwrap();
+    commit
+}
+
+fn witnessed_input(
+    snapshot: &MemoryRepoSnapshot,
+    collection: crate::collection::CollectionHandle,
+    data: CollectionData,
+) -> (CollectionData, CollectionRecordFingerprint) {
+    let record = snapshot
+        .records()
+        .unwrap()
+        .map(Result::unwrap)
+        .find(|record| {
+            record.collection() == collection
+                && match record {
+                    CollectionRecord::Commit(commit) => commit.data() == data,
+                    CollectionRecord::Merge(merge) => merge.result() == data,
+                    CollectionRecord::Derive(derive) => derive.output() == data,
+                }
+        })
+        .expect("fixture input has an actual persisted predecessor");
+    (data, record.fingerprint())
 }
 
 /// Test encoding `SimpleArchive || 0xA5`; id originally minted for the old
@@ -413,6 +434,7 @@ struct GuardSnapshot {
     inner: MemoryRepoSnapshot,
     live: Arc<AtomicUsize>,
     semantic_probes: Arc<AtomicUsize>,
+    selected_collections: Arc<Mutex<Vec<BTreeSet<CollectionRecordSelector>>>>,
 }
 
 impl Clone for GuardSnapshot {
@@ -422,6 +444,7 @@ impl Clone for GuardSnapshot {
             inner: self.inner.clone(),
             live: Arc::clone(&self.live),
             semantic_probes: Arc::clone(&self.semantic_probes),
+            selected_collections: Arc::clone(&self.selected_collections),
         }
     }
 }
@@ -538,6 +561,10 @@ impl CollectionRead for GuardSnapshot {
         selectors: &std::collections::BTreeSet<CollectionRecordSelector>,
     ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
         self.semantic_probes.fetch_add(1, Ordering::SeqCst);
+        self.selected_collections
+            .lock()
+            .unwrap()
+            .push(selectors.clone());
         self.inner.select_records(selectors)
     }
 }
@@ -563,6 +590,7 @@ struct GuardStore {
     live: Arc<AtomicUsize>,
     expected_live_during_write: usize,
     semantic_probes: Arc<AtomicUsize>,
+    selected_collections: Arc<Mutex<Vec<BTreeSet<CollectionRecordSelector>>>>,
     events: Vec<WriteEvent>,
     put_calls: usize,
     insert_calls: usize,
@@ -581,6 +609,7 @@ impl GuardStore {
             live: Arc::new(AtomicUsize::new(0)),
             expected_live_during_write: 1,
             semantic_probes: Arc::new(AtomicUsize::new(0)),
+            selected_collections: Arc::new(Mutex::new(Vec::new())),
             events: Vec::new(),
             put_calls: 0,
             insert_calls: 0,
@@ -681,6 +710,7 @@ impl SnapshotSource for GuardStore {
             inner,
             live: Arc::clone(&self.live),
             semantic_probes: Arc::clone(&self.semantic_probes),
+            selected_collections: Arc::clone(&self.selected_collections),
         })
     }
 }
@@ -723,7 +753,7 @@ fn foundation_walks_the_complete_descriptor_ancestry() {
 fn downstream_ensure_requires_an_existing_immediate_source_realization() {
     let (mut store, root, first, second) = collections();
     let source = archive(1, 1);
-    store.put::<SimpleArchive, _>(source.clone()).unwrap();
+    publish_root(&mut store, root, &source, 31);
     let support = support(root, std::slice::from_ref(&source));
 
     let result = ensure_exact_resident::<_, SecondEncoding>(
@@ -747,7 +777,7 @@ fn downstream_ensure_requires_an_existing_immediate_source_realization() {
 fn two_hops_reuse_one_invariant_foundational_support() {
     let (mut store, root, first, second) = collections();
     let source = archive(1, 1);
-    store.put::<SimpleArchive, _>(source.clone()).unwrap();
+    publish_root(&mut store, root, &source, 31);
     let support = support(root, std::slice::from_ref(&source));
 
     ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &support)
@@ -809,7 +839,7 @@ fn duplicate_commit_fibers_collapse_to_one_support_member() {
 fn ensure_drops_every_residency_snapshot_and_stores_the_blob_before_derive() {
     let (mut inner, root, first, _second) = collections();
     let source = archive(1, 1);
-    inner.put::<SimpleArchive, _>(source.clone()).unwrap();
+    publish_root(&mut inner, root, &source, 31);
     let support = support(root, &[source]);
     let mut store = GuardStore::new(inner);
 
@@ -841,8 +871,17 @@ fn ensure_drops_every_residency_snapshot_and_stores_the_blob_before_derive() {
 
 #[test]
 fn exact_ensure_acquires_explicit_foundational_support_without_want() {
-    let (inner, root, first, _second) = collections();
+    let (mut inner, root, first, _second) = collections();
     let source = archive(1, 1);
+    let metadata = inner.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
+    inner
+        .insert(CollectionRecord::Commit(CollectionCommit::sign(
+            &equation_signer(),
+            root.handle(),
+            data(&source),
+            metadata,
+        )))
+        .unwrap();
     let support = support(root, std::slice::from_ref(&source));
     let mut store = GuardStore::new(inner);
     store.offer(&source);
@@ -860,14 +899,17 @@ fn exact_ensure_acquires_explicit_foundational_support_without_want() {
 fn exact_ensure_fetches_a_known_derive_output_without_recomputing() {
     let (mut inner, root, first, _second) = collections();
     let source = archive(1, 1);
-    inner.put::<SimpleArchive, _>(source.clone()).unwrap();
+    let source_commit = publish_root(&mut inner, root, &source, 31);
     let support = support(root, std::slice::from_ref(&source));
     let output = FirstEncoding::map(&(), &source, &inner.snapshot().unwrap()).unwrap();
     let output_data = data(&output);
     let pending = CollectionRecord::Derive(CollectionDerive::sign(
         &equation_signer(),
         first.handle(),
-        data(&source),
+        (
+            data(&source),
+            CollectionRecord::Commit(source_commit).fingerprint(),
+        ),
         output_data,
     ));
     inner.insert(pending).unwrap();
@@ -894,16 +936,217 @@ fn exact_ensure_fetches_a_known_derive_output_without_recomputing() {
 }
 
 #[test]
+fn exact_ensure_reendorses_a_resident_image_from_a_different_support_without_mapping() {
+    let (mut inner, root, first, _second) = collections();
+    let signer = equation_signer();
+    let a = archive(1, 1);
+    let b = crate::collection::simplearchive_union::join(&a, &archive(2, 2)).unwrap();
+    let a_commit = publish_root(&mut inner, root, &a, 31);
+    let b_commit = publish_root(&mut inner, root, &b, 31);
+    // The same payload b has two genuine witnesses: its own COMMIT [B], and
+    // join(a, b) = b [A, B]. No mapping result is invented for this fixture.
+    assert_eq!(
+        data(&crate::collection::simplearchive_union::join(&a, &b).unwrap()),
+        data(&b),
+    );
+    let ab = CollectionMerge::sign(
+        &signer,
+        root.handle(),
+        (data(&a), a_commit.fingerprint()),
+        (data(&b), b_commit.fingerprint()),
+        data(&b),
+    );
+    inner.insert(CollectionRecord::Merge(ab)).unwrap();
+    let output = FirstEncoding::map(&(), &b, &inner.snapshot().unwrap()).unwrap();
+    inner.put::<FirstEncoding, _>(output.clone()).unwrap();
+    let previous = CollectionDerive::sign(
+        &signer,
+        first.handle(),
+        (data(&b), ab.fingerprint()),
+        data(&output),
+    );
+    inner.insert(CollectionRecord::Derive(previous)).unwrap();
+    let requested = support(root, std::slice::from_ref(&b));
+    let before = inner.snapshot().unwrap();
+    assert_eq!(
+        before.collection(first).unwrap().support(),
+        &support(root, &[a, b.clone()]),
+    );
+    assert!(matches!(
+        before.collection_exact(first, &requested),
+        Err(CollectionRealizationError::IncompleteCover { .. })
+    ));
+    drop(before);
+
+    let mut store = GuardStore::new(inner);
+    reset_mapping_calls();
+    let after = block_on(store.ensure_exact(first, &signer, &requested)).unwrap();
+
+    assert_eq!(FIRST_MAP_CALLS.get(), 0);
+    assert_eq!(SECOND_MAP_CALLS.get(), 0);
+    assert_eq!(SECOND_JOIN_CALLS.get(), 0);
+    assert!(store.acquired.is_empty());
+    let selected = after.collection_exact(first, &requested).unwrap();
+    assert_eq!(selected.support(), &requested);
+    assert_eq!(
+        selected.cover().data_members().collect::<Vec<_>>(),
+        vec![data(&output)],
+    );
+    let published: Vec<_> = store
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            WriteEvent::Insert(record) => Some(*record),
+            WriteEvent::Put(_) => None,
+        })
+        .collect();
+    let expected = CollectionDerive::sign(
+        &signer,
+        first.handle(),
+        (data(&b), b_commit.fingerprint()),
+        data(&output),
+    );
+    assert_eq!(published, vec![CollectionRecord::Derive(expected)]);
+    assert_eq!(
+        after.record(previous.fingerprint()).unwrap(),
+        Some(CollectionRecord::Derive(previous)),
+    );
+}
+
+#[test]
+fn exact_ensure_rejects_conflicting_images_before_reusing_a_pruned_support() {
+    let (mut inner, root, first, _second) = collections();
+    let signer = equation_signer();
+    let a = archive(1, 1);
+    let b = crate::collection::simplearchive_union::join(&a, &archive(2, 2)).unwrap();
+    let a_commit = publish_root(&mut inner, root, &a, 31);
+    let b_commit = publish_root(&mut inner, root, &b, 31);
+    let ab = CollectionMerge::sign(
+        &signer,
+        root.handle(),
+        (data(&a), a_commit.fingerprint()),
+        (data(&b), b_commit.fingerprint()),
+        data(&b),
+    );
+    inner.insert(CollectionRecord::Merge(ab)).unwrap();
+    let right = FirstEncoding::map(&(), &b, &inner.snapshot().unwrap()).unwrap();
+    let wrong = FirstEncoding::map(&(), &a, &inner.snapshot().unwrap()).unwrap();
+    assert_ne!(data(&right), data(&wrong));
+    for output in [&right, &wrong] {
+        inner.put::<FirstEncoding, _>(output.clone()).unwrap();
+        inner
+            .insert(CollectionRecord::Derive(CollectionDerive::sign(
+                &signer,
+                first.handle(),
+                (data(&b), ab.fingerprint()),
+                data(output),
+            )))
+            .unwrap();
+    }
+    let requested = support(root, std::slice::from_ref(&b));
+    // Neither conflicting target claim has support [B]; both are [A, B].
+    // The exact snapshot excludes them, but maintenance may otherwise reuse
+    // their resident images under b's COMMIT witness.
+    assert!(matches!(
+        inner
+            .snapshot()
+            .unwrap()
+            .collection_exact(first, &requested),
+        Err(CollectionRealizationError::IncompleteCover { .. })
+    ));
+    let mut store = GuardStore::new(inner);
+    reset_mapping_calls();
+
+    let error = match block_on(store.ensure_exact(first, &signer, &requested)) {
+        Err(error) => error,
+        Ok(_) => panic!("conflicting certified images must not be reused"),
+    };
+
+    assert!(matches!(
+        error,
+        CollectionRealizationError::Resolution(reason) if reason.contains("conflicting outputs")
+    ));
+    assert_eq!(FIRST_MAP_CALLS.get(), 0);
+    assert_eq!(SECOND_MAP_CALLS.get(), 0);
+    assert_eq!(SECOND_JOIN_CALLS.get(), 0);
+    assert!(store.acquired.is_empty());
+    assert!(store.events.is_empty(), "a conflict must publish nothing");
+}
+
+#[test]
+fn exact_ensure_rejects_a_cold_conflicting_image_before_fetch_or_publication() {
+    let (mut inner, root, first, _second) = collections();
+    let signer = equation_signer();
+    let a = archive(1, 1);
+    let b = crate::collection::simplearchive_union::join(&a, &archive(2, 2)).unwrap();
+    let a_commit = publish_root(&mut inner, root, &a, 31);
+    let b_commit = publish_root(&mut inner, root, &b, 31);
+    let ab = CollectionMerge::sign(
+        &signer,
+        root.handle(),
+        (data(&a), a_commit.fingerprint()),
+        (data(&b), b_commit.fingerprint()),
+        data(&b),
+    );
+    inner.insert(CollectionRecord::Merge(ab)).unwrap();
+    let right = FirstEncoding::map(&(), &b, &inner.snapshot().unwrap()).unwrap();
+    let wrong = FirstEncoding::map(&(), &a, &inner.snapshot().unwrap()).unwrap();
+    assert_ne!(data(&right), data(&wrong));
+    // The existing [B] claim's image is cold; only the incompatible [A, B]
+    // image is resident. Residency cannot make that image safe to re-endorse.
+    inner.put::<FirstEncoding, _>(wrong.clone()).unwrap();
+    for (witness, output) in [(b_commit.fingerprint(), &right), (ab.fingerprint(), &wrong)] {
+        inner
+            .insert(CollectionRecord::Derive(CollectionDerive::sign(
+                &signer,
+                first.handle(),
+                (data(&b), witness),
+                data(output),
+            )))
+            .unwrap();
+    }
+    let requested = support(root, std::slice::from_ref(&b));
+    let before = inner.snapshot().unwrap();
+    assert!(!before.contains_blob(right.get_handle()).unwrap());
+    assert!(before.contains_blob(wrong.get_handle()).unwrap());
+    assert!(matches!(
+        before.collection_exact(first, &requested),
+        Err(CollectionRealizationError::IncompleteCover { .. })
+    ));
+    drop(before);
+    let mut store = GuardStore::new(inner);
+    reset_mapping_calls();
+
+    let error = match block_on(store.ensure_exact(first, &signer, &requested)) {
+        Err(error) => error,
+        Ok(_) => panic!("cold conflicting images must not be replaced by resident ones"),
+    };
+
+    assert!(matches!(
+        error,
+        CollectionRealizationError::Resolution(reason) if reason.contains("conflicting outputs")
+    ));
+    assert_eq!(FIRST_MAP_CALLS.get(), 0);
+    assert_eq!(SECOND_MAP_CALLS.get(), 0);
+    assert_eq!(SECOND_JOIN_CALLS.get(), 0);
+    assert!(store.acquired.is_empty());
+    assert!(store.events.is_empty(), "a conflict must publish nothing");
+}
+
+#[test]
 fn passive_derived_snapshot_keeps_dangling_output_as_raw_evidence_only() {
     let (mut inner, root, first, _second) = collections();
     let source = archive(1, 1);
-    publish_root(&mut inner, root, &source, 42);
+    let source_commit = publish_root(&mut inner, root, &source, 42);
     let support = support(root, std::slice::from_ref(&source));
     let output = FirstEncoding::map(&(), &source, &inner.snapshot().unwrap()).unwrap();
     let pending = CollectionRecord::Derive(CollectionDerive::sign(
         &equation_signer(),
         first.handle(),
-        data(&source),
+        (
+            data(&source),
+            CollectionRecord::Commit(source_commit).fingerprint(),
+        ),
         data(&output),
     ));
     inner.insert(pending).unwrap();
@@ -933,7 +1176,7 @@ fn passive_derived_snapshot_keeps_dangling_output_as_raw_evidence_only() {
 fn exact_maintenance_recovers_a_pending_derive_with_a_missing_output() {
     let (mut inner, root, first, _second) = collections();
     let source = archive(1, 1);
-    inner.put::<SimpleArchive, _>(source.clone()).unwrap();
+    let source_commit = publish_root(&mut inner, root, &source, 31);
     let support = support(root, std::slice::from_ref(&source));
     let snapshot = inner.snapshot().unwrap();
     let output = FirstEncoding::map(&(), &source, &snapshot).unwrap();
@@ -942,7 +1185,10 @@ fn exact_maintenance_recovers_a_pending_derive_with_a_missing_output() {
     let pending = CollectionDerive::sign(
         &equation_signer(),
         first.handle(),
-        data(&source),
+        (
+            data(&source),
+            CollectionRecord::Commit(source_commit).fingerprint(),
+        ),
         output_data,
     );
     inner.insert(CollectionRecord::Derive(pending)).unwrap();
@@ -1025,7 +1271,7 @@ fn ordinary_derived_ensure_leaves_cold_source_records_for_explicit_root_acquisit
 }
 
 #[test]
-fn root_ensure_hydrates_admitted_commit_closure_and_defers_concurrent_authority() {
+fn root_ensure_hydrates_admitted_payloads_and_defers_concurrent_authority() {
     let authority = SigningKey::from_bytes(&[83; 32]);
     let first_writer = SigningKey::from_bytes(&[84; 32]);
     let concurrent_writer = SigningKey::from_bytes(&[85; 32]);
@@ -1087,14 +1333,7 @@ fn root_ensure_hydrates_admitted_commit_closure_and_defers_concurrent_authority(
     store.inject_proof_on_acquire = Some(proof(&concurrent_writer));
 
     let first_snapshot = block_on(store.ensure(root, &equation_signer())).unwrap();
-    assert_eq!(
-        store.acquired,
-        vec![
-            data(&descriptor),
-            data(&first_source),
-            data(&first_metadata)
-        ]
-    );
+    assert_eq!(store.acquired, vec![data(&descriptor), data(&first_source)]);
     assert_eq!(
         first_snapshot.collection(root).unwrap().support(),
         &support(root, std::slice::from_ref(&first_source)),
@@ -1112,10 +1351,7 @@ fn root_ensure_hydrates_admitted_commit_closure_and_defers_concurrent_authority(
         second_snapshot.collection(root).unwrap().support(),
         &support(root, &[first_source, concurrent_source.clone()]),
     );
-    assert_eq!(
-        &store.acquired[3..],
-        &[data(&concurrent_source), data(&concurrent_metadata)],
-    );
+    assert_eq!(&store.acquired[2..], &[data(&concurrent_source)],);
     assert_eq!(second_snapshot.wants().unwrap().count(), 0);
 }
 
@@ -1189,17 +1425,71 @@ fn root_ensure_acquires_shared_capability_definitions_once_without_wants() {
         &support(root, &[source.clone()])
     );
     assert_eq!(observed.wants().unwrap().count(), 0);
-    assert_eq!(store.acquired.len(), 5);
+    assert_eq!(store.acquired.len(), 4);
     assert_eq!(
         store.acquired.iter().copied().collect::<BTreeSet<_>>(),
-        [&read, &write, &delegable, &source, &metadata]
+        [&read, &write, &delegable, &source]
             .into_iter()
             .map(data)
             .collect(),
     );
     drop(observed);
     drop(block_on(store.ensure(root, &equation_signer())).unwrap());
-    assert_eq!(store.acquired.len(), 5, "resident definitions are reused");
+    assert_eq!(store.acquired.len(), 4, "resident definitions are reused");
+}
+
+#[test]
+fn root_ensure_reuses_a_signed_union_without_fetching_ancestor_bytes() {
+    let (mut inner, root, _, _) = collections();
+    let left = archive(46, 46);
+    let right = archive(47, 47);
+    let metadata = archive(48, 48);
+    let a = CollectionRecord::Commit(CollectionCommit::sign(
+        &equation_signer(),
+        root.handle(),
+        data(&left),
+        metadata.get_handle(),
+    ));
+    let b = CollectionRecord::Commit(CollectionCommit::sign(
+        &equation_signer(),
+        root.handle(),
+        data(&right),
+        metadata.get_handle(),
+    ));
+    inner.insert(a).unwrap();
+    inner.insert(b).unwrap();
+    let joined = crate::collection::simplearchive_union::join(&left, &right).unwrap();
+    inner.put::<SimpleArchive, _>(joined.clone()).unwrap();
+    inner
+        .insert(CollectionRecord::Merge(CollectionMerge::sign(
+            &equation_signer(),
+            root.handle(),
+            (data(&left), a.fingerprint()),
+            (data(&right), b.fingerprint()),
+            data(&joined),
+        )))
+        .unwrap();
+    let mut store = GuardStore::new(inner);
+    for blob in [&left, &right, &metadata] {
+        store.offer(blob);
+    }
+    let snapshot = block_on(store.ensure(root, &equation_signer())).unwrap();
+    let attached = snapshot.collection(root).unwrap();
+    assert_eq!(
+        attached.support(),
+        &support(root, &[left.clone(), right.clone()])
+    );
+    assert_eq!(
+        attached.cover().members().collect::<Vec<_>>(),
+        vec![joined.get_handle()]
+    );
+    assert_eq!(attached.view::<TribleSet>().unwrap().len(), 2);
+    for blob in [&left, &right, &metadata] {
+        assert!(!snapshot.contains_blob(blob.get_handle()).unwrap());
+    }
+    assert!(store.acquired.is_empty());
+    assert!(store.events.is_empty());
+    assert_eq!(snapshot.wants().unwrap().count(), 0);
 }
 
 #[test]
@@ -1213,6 +1503,7 @@ fn root_ensure_exact_fetches_selected_payload_without_commits() {
     let snapshot = block_on(store.ensure_exact(root, &equation_signer(), &requested)).unwrap();
     let selected = snapshot.collection_exact(root, &requested).unwrap();
     assert_eq!(selected.view::<TribleSet>().unwrap().len(), 1);
+    assert!(snapshot.collection(root).unwrap().cover().is_empty());
     assert_eq!(store.acquired, vec![data(&source)]);
     assert!(snapshot.records().unwrap().next().is_none());
     assert_eq!(snapshot.wants().unwrap().count(), 0);
@@ -1225,8 +1516,8 @@ fn root_maintenance_only_merges_and_warm_ensure_is_write_free() {
     let left = archive(36, 36);
     let right = archive(37, 37);
     let requested = support(root, &[left.clone(), right.clone()]);
-    inner.put::<SimpleArchive, _>(left).unwrap();
-    inner.put::<SimpleArchive, _>(right).unwrap();
+    publish_root(&mut inner, root, &left, 31);
+    publish_root(&mut inner, root, &right, 31);
     let mut store = GuardStore::new(inner);
 
     let maintained = block_on(store.maintain_exact(root, &equation_signer(), &requested)).unwrap();
@@ -1549,7 +1840,7 @@ fn maintenance_drops_every_residency_snapshot_and_stores_the_blob_before_merge()
     let left = archive(1, 1);
     let right = archive(2, 2);
     for blob in [&left, &right] {
-        inner.put::<SimpleArchive, _>(blob.clone()).unwrap();
+        publish_root(&mut inner, root, blob, 31);
     }
     let support = support(root, &[left, right]);
     ensure_exact_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer(), &support)
@@ -1593,7 +1884,7 @@ fn target_maintenance_reprobes_once_per_tier_not_per_carry() {
         .map(|member| archive(member as u8 + 1, member as u8 + 1))
         .collect();
     for member in &members {
-        inner.put::<SimpleArchive, _>(member.clone()).unwrap();
+        publish_root(&mut inner, root, member, 31);
     }
     let support = support(root, &members);
     ensure_exact_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer(), &support)
@@ -1628,7 +1919,7 @@ fn failed_target_batch_preserves_every_published_prefix_carry() {
         let (mut inner, root, first, second) = collections();
         let members: Vec<_> = (1..=4).map(|member| archive(member, member)).collect();
         for member in &members {
-            inner.put::<SimpleArchive, _>(member.clone()).unwrap();
+            publish_root(&mut inner, root, member, 31);
         }
         let support = support(root, &members);
         ensure_exact_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer(), &support)
@@ -1675,7 +1966,7 @@ fn later_put_or_insert_failure_preserves_the_published_prefix() {
         let left = archive(1, 1);
         let right = archive(2, 2);
         for blob in [&left, &right] {
-            inner.put::<SimpleArchive, _>(blob.clone()).unwrap();
+            publish_root(&mut inner, root, blob, 31);
         }
         let support = support(root, &[left, right]);
         let mut store = GuardStore::new(inner);
@@ -1708,7 +1999,7 @@ fn later_put_or_insert_failure_preserves_the_published_prefix() {
 fn missing_mapping_dependency_publishes_nothing() {
     let (mut store, root, first, _second) = collections();
     let source = archive(1, 1);
-    store.put::<SimpleArchive, _>(source.clone()).unwrap();
+    publish_root(&mut store, root, &source, 31);
     let support = support(root, &[source]);
     let before = store.snapshot().unwrap();
     FIRST_MAP_MISSING.set(true);
@@ -1730,16 +2021,20 @@ fn capacity_blocked_source_upper_falls_back_to_its_resident_children() {
     let left = archive(1, 1);
     let right = archive(2, 2);
     for blob in [&left, &right] {
-        store.put::<SimpleArchive, _>(blob.clone()).unwrap();
+        publish_root(&mut store, root, blob, 31);
     }
     let joined = crate::collection::simplearchive_union::join(&left, &right).unwrap();
     store.put::<SimpleArchive, _>(joined.clone()).unwrap();
+    let before = store.snapshot().unwrap();
+    let left_witness = witnessed_input(&before, root.handle(), data(&left));
+    let right_witness = witnessed_input(&before, root.handle(), data(&right));
+    drop(before);
     store
         .insert(CollectionRecord::Merge(CollectionMerge::sign(
             &equation_signer(),
             root.handle(),
-            data(&left),
-            data(&right),
+            left_witness,
+            right_witness,
             data(&joined),
         )))
         .unwrap();
@@ -1771,7 +2066,7 @@ fn capacity_blocked_source_upper_falls_back_to_its_resident_children() {
 fn warm_exact_ensure_is_a_zero_write_zero_algebra_observation() {
     let (mut store, root, first, _second) = collections();
     let source = archive(1, 1);
-    store.put::<SimpleArchive, _>(source.clone()).unwrap();
+    publish_root(&mut store, root, &source, 31);
     let support = support(root, &[source]);
     ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &support)
         .unwrap();
@@ -1783,6 +2078,294 @@ fn warm_exact_ensure_is_a_zero_write_zero_algebra_observation() {
     let after = store.snapshot().unwrap();
     assert!(after.changes_since(&before).is_empty());
     assert_eq!(FIRST_MAP_CALLS.get(), 0);
+}
+
+/// Produce a genuine two-hop endorsement, then replicate only the records and
+/// bytes needed at the chosen boundary. The first-hop grant remains in the
+/// replica but its definition does not; the root writer's proof is absent.
+fn cold_source_authority_fixture(
+    target_ready: bool,
+) -> (
+    GuardStore,
+    Collection<SimpleArchive>,
+    Collection<FirstEncoding>,
+    Collection<SecondEncoding>,
+    Support,
+    Blob<SimpleArchive>,
+) {
+    let authority = SigningKey::from_bytes(&[90; 32]);
+    let root_writer = SigningKey::from_bytes(&[91; 32]);
+    let first_writer = SigningKey::from_bytes(&[92; 32]);
+    let owner = equation_signer();
+    let source_policy = CollectionPolicy::new(
+        AdmissionPolicy::Open,
+        AdmissionPolicy::direct(authority.verifying_key()),
+    );
+    let mut staging = MemoryRepo::default();
+    let root = staging
+        .collection("warm-target-cold-source-authority", source_policy.clone())
+        .unwrap();
+    let first = staging
+        .derive::<FirstEncoding>(root, (), source_policy)
+        .unwrap();
+    let target = staging
+        .derive::<SecondEncoding>(
+            first,
+            (),
+            CollectionPolicy::new(
+                AdmissionPolicy::Open,
+                AdmissionPolicy::direct(owner.verifying_key()),
+            ),
+        )
+        .unwrap();
+    let definition: Blob<SimpleArchive> = crate::prelude::entity! {
+        crate::capability::capability_action: crate::collection::ACTION_WRITE,
+        crate::metadata::name: "warm-target-source-grant",
+    }
+    .facts()
+    .clone()
+    .to_blob();
+    staging.put::<SimpleArchive, _>(definition.clone()).unwrap();
+    staging
+        .insert_proof(CapabilityProof::new(
+            CapabilityResource::from(root.handle()),
+            &authority,
+            write_capability(),
+            root_writer.verifying_key(),
+        ))
+        .unwrap();
+    let first_proof = CapabilityProof::new(
+        CapabilityResource::from(first.handle()),
+        &authority,
+        definition.get_handle(),
+        first_writer.verifying_key(),
+    );
+    staging.insert_proof(first_proof.clone()).unwrap();
+    let source = archive(44, 44);
+    let commit = publish_root(&mut staging, root, &source, 91);
+    let selected = support(root, std::slice::from_ref(&source));
+    drop(block_on(staging.ensure_exact(first, &first_writer, &selected)).unwrap());
+    drop(block_on(staging.ensure_exact(target, &owner, &selected)).unwrap());
+    let realized = staging.snapshot().unwrap();
+    let first_data = realized
+        .collection(first)
+        .unwrap()
+        .cover()
+        .data_members()
+        .next()
+        .unwrap();
+    let target_data = realized
+        .collection(target)
+        .unwrap()
+        .cover()
+        .data_members()
+        .next()
+        .unwrap();
+    let omitted = BTreeSet::from([
+        commit.data(),
+        Handle::<SimpleArchive>::to_hash(commit.metadata()),
+        data(&definition),
+        if target_ready {
+            first_data
+        } else {
+            target_data
+        },
+    ]);
+    let mut inner = MemoryRepo::default();
+    for info in realized.blobs() {
+        let info = info.unwrap();
+        if !omitted.contains(&Handle::<UnknownBlob>::to_hash(info.handle)) {
+            inner
+                .put::<UnknownBlob, _>(realized.get::<Blob<UnknownBlob>, _>(info.handle).unwrap())
+                .unwrap();
+        }
+    }
+    for record in realized.records().unwrap() {
+        let record = record.unwrap();
+        if target_ready || record.collection() != target.handle() {
+            inner.insert(record).unwrap();
+        }
+    }
+    inner.insert_proof(first_proof).unwrap();
+    let observed = inner.snapshot().unwrap();
+    assert!(!root
+        .writer_is_admitted(&observed, root_writer.verifying_key())
+        .unwrap());
+    assert!(!first
+        .writer_is_admitted(&observed, first_writer.verifying_key())
+        .unwrap());
+    assert_eq!(
+        observed.collection(target).unwrap().support(),
+        &if target_ready {
+            selected.clone()
+        } else {
+            root.cover([])
+        },
+    );
+    assert!(!observed.contains_blob(source.get_handle()).unwrap());
+    assert!(!observed.contains_blob(commit.metadata()).unwrap());
+    assert!(!observed.contains_blob(definition.get_handle()).unwrap());
+    (
+        GuardStore::new(inner),
+        root,
+        first,
+        target,
+        selected,
+        definition,
+    )
+}
+
+#[test]
+fn exact_warm_target_reuse_does_not_acquire_or_admit_its_source() {
+    for maintain in [false, true] {
+        for key in [equation_signer(), SigningKey::from_bytes(&[93; 32])] {
+            let (mut store, _root, _first, target, selected, definition) =
+                cold_source_authority_fixture(true);
+            // If authority preparation crosses into the source, this available
+            // definition makes that unnecessary acquisition observable.
+            store.offer(&definition);
+            reset_mapping_calls();
+            let after = if maintain {
+                block_on(store.maintain_exact(target, &key, &selected))
+            } else {
+                block_on(store.ensure_exact(target, &key, &selected))
+            }
+            .unwrap();
+            if !maintain {
+                assert_eq!(
+                    *store.selected_collections.lock().unwrap(),
+                    vec![BTreeSet::from([CollectionRecordSelector::Collection(
+                        target.handle(),
+                    )])],
+                    "reuse authenticates the target, not its ancestral producers",
+                );
+            }
+            assert_eq!(after.collection(target).unwrap().support(), &selected);
+            assert_eq!(after.wants().unwrap().count(), 0);
+            assert!(store.acquired.is_empty());
+            assert!(store.events.is_empty());
+            assert_eq!(FIRST_MAP_CALLS.get(), 0);
+            assert_eq!(SECOND_MAP_CALLS.get(), 0);
+            assert_eq!(SECOND_JOIN_CALLS.get(), 0);
+        }
+    }
+}
+
+#[test]
+fn exact_new_work_still_requires_the_immediate_source_grant_definition() {
+    for available_definition in [false, true] {
+        let (mut store, _root, _first, target, selected, definition) =
+            cold_source_authority_fixture(false);
+        if available_definition {
+            store.offer(&definition);
+        }
+        reset_mapping_calls();
+        let result = block_on(store.ensure_exact(target, &equation_signer(), &selected));
+        assert_eq!(store.acquired, vec![data(&definition)]);
+        assert_eq!(FIRST_MAP_CALLS.get(), 0, "never rebuild the source");
+        if available_definition {
+            let after = result.unwrap();
+            assert_eq!(after.collection(target).unwrap().support(), &selected);
+            assert_eq!(SECOND_MAP_CALLS.get(), 1);
+        } else {
+            assert!(matches!(
+                result,
+                Err(CollectionRealizationError::IncompleteCover { .. })
+            ));
+            assert!(store.events.is_empty());
+            assert_eq!(SECOND_MAP_CALLS.get(), 0);
+        }
+    }
+}
+
+#[test]
+fn warm_exact_reuse_keeps_foundation_representation_and_mapping_checks() {
+    struct WrongSecondMapping;
+
+    impl CollectionMapping for WrongSecondMapping {
+        type Source = FirstEncoding;
+        type Target = SecondEncoding;
+
+        fn fragment(&self) -> Fragment {
+            FirstEncoding::fragment(&())
+        }
+
+        fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
+            require_mapping(target, FIRST_MAPPING)?;
+            Ok(Self)
+        }
+
+        fn map<R>(
+            &self,
+            _source: &Blob<Self::Source>,
+            _reader: &R,
+        ) -> Result<Blob<Self::Target>, CollectionOperationError>
+        where
+            R: StoreRead,
+        {
+            panic!("a mismatched mapping must never execute")
+        }
+    }
+
+    for maintain in [false, true] {
+        let (mut store, _root, _first, target, selected, definition) =
+            cold_source_authority_fixture(true);
+        let unrelated = store
+            .inner
+            .collection("unrelated-support-foundation", policy())
+            .unwrap();
+        let foreign_support = unrelated.cover(
+            selected
+                .data_members()
+                .map(Handle::<SimpleArchive>::from_hash),
+        );
+        store.offer(&definition);
+        reset_mapping_calls();
+        let wrong_foundation = if maintain {
+            block_on(store.maintain_exact(target, &equation_signer(), &foreign_support))
+        } else {
+            block_on(store.ensure_exact(target, &equation_signer(), &foreign_support))
+        };
+        assert!(matches!(
+            wrong_foundation,
+            Err(CollectionRealizationError::InvalidCover(_)),
+        ));
+
+        let wrong_type = Collection::<FirstEncoding>::from_handle(target.handle());
+        let wrong_representation = if maintain {
+            block_on(store.maintain_exact(wrong_type, &equation_signer(), &selected))
+        } else {
+            block_on(store.ensure_exact(wrong_type, &equation_signer(), &selected))
+        };
+        assert!(matches!(
+            wrong_representation,
+            Err(CollectionRealizationError::Resolution(reason))
+                if reason.contains("target descriptor has the wrong representation"),
+        ));
+
+        let wrong_mapping = if maintain {
+            block_on(store.maintain_exact_with::<WrongSecondMapping>(
+                target,
+                &equation_signer(),
+                &selected,
+            ))
+        } else {
+            block_on(store.ensure_exact_with::<WrongSecondMapping>(
+                target,
+                &equation_signer(),
+                &selected,
+            ))
+        };
+        assert!(matches!(
+            wrong_mapping,
+            Err(CollectionRealizationError::Resolution(reason))
+                if reason.contains("does not bind the requested mapping"),
+        ));
+        assert!(store.acquired.is_empty());
+        assert!(store.events.is_empty());
+        assert_eq!(FIRST_MAP_CALLS.get(), 0);
+        assert_eq!(SECOND_MAP_CALLS.get(), 0);
+    }
 }
 
 #[test]
@@ -1801,7 +2384,7 @@ fn complete_realization_is_reused_without_write_authority() {
         )
         .unwrap();
     let source = archive(1, 1);
-    inner.put::<SimpleArchive, _>(source.clone()).unwrap();
+    publish_root(&mut inner, root, &source, 31);
     let support = support(root, &[source]);
     block_on(inner.ensure_exact(target, &owner, &support)).unwrap();
     let mut store = GuardStore::new(inner);
@@ -1844,7 +2427,7 @@ fn missing_realization_requires_write_before_computation_or_publication() {
         )
         .unwrap();
     let source = archive(1, 1);
-    inner.put::<SimpleArchive, _>(source.clone()).unwrap();
+    publish_root(&mut inner, root, &source, 31);
     let support = support(root, &[source]);
     let mut store = GuardStore::new(inner);
     reset_mapping_calls();
@@ -1884,19 +2467,23 @@ fn optional_maintenance_without_write_keeps_the_fine_cover_without_algebra() {
     let left = archive(1, 1);
     let right = archive(2, 2);
     for member in [&left, &right] {
-        inner.put::<SimpleArchive, _>(member.clone()).unwrap();
+        publish_root(&mut inner, root, member, 31);
     }
     let support = support(root, &[left.clone(), right.clone()]);
     block_on(inner.ensure_exact(first, &owner, &support)).unwrap();
     block_on(inner.ensure_exact(second, &owner, &support)).unwrap();
     let upper = crate::collection::simplearchive_union::join(&left, &right).unwrap();
     inner.put::<SimpleArchive, _>(upper.clone()).unwrap();
+    let before = inner.snapshot().unwrap();
+    let left_witness = witnessed_input(&before, root.handle(), data(&left));
+    let right_witness = witnessed_input(&before, root.handle(), data(&right));
+    drop(before);
     inner
         .insert(CollectionRecord::Merge(CollectionMerge::sign(
             &owner,
             root.handle(),
-            data(&left),
-            data(&right),
+            left_witness,
+            right_witness,
             data(&upper),
         )))
         .unwrap();
@@ -1942,7 +2529,7 @@ fn existing_target_support_is_not_mapped_again_when_support_grows() {
     let left = archive(1, 1);
     let right = archive(2, 2);
     for blob in [&left, &right] {
-        store.put::<SimpleArchive, _>(blob.clone()).unwrap();
+        publish_root(&mut store, root, blob, 31);
     }
     let left_support = support(root, std::slice::from_ref(&left));
     ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &left_support)
@@ -1961,7 +2548,7 @@ fn resident_source_upper_is_mapped_instead_of_its_finer_children() {
     let left = archive(1, 1);
     let right = archive(2, 2);
     for blob in [&left, &right] {
-        store.put::<SimpleArchive, _>(blob.clone()).unwrap();
+        publish_root(&mut store, root, blob, 31);
     }
     let support = support(root, &[left, right]);
     ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &support)
@@ -1976,6 +2563,8 @@ fn resident_source_upper_is_mapped_instead_of_its_finer_children() {
     });
     let low = children.next().unwrap();
     let high = children.next().unwrap();
+    let low_witness = witnessed_input(&snapshot, first.handle(), data(&low));
+    let high_witness = witnessed_input(&snapshot, first.handle(), data(&high));
     drop(snapshot);
     let upper = join_first(&low, &high).unwrap();
     store.put::<FirstEncoding, _>(upper.clone()).unwrap();
@@ -1983,8 +2572,8 @@ fn resident_source_upper_is_mapped_instead_of_its_finer_children() {
         .insert(CollectionRecord::Merge(CollectionMerge::sign(
             &equation_signer(),
             first.handle(),
-            data(&low),
-            data(&high),
+            low_witness,
+            high_witness,
             data(&upper),
         )))
         .unwrap();
@@ -2006,7 +2595,7 @@ fn optional_target_dependency_keeps_the_finer_cover() {
     let left = archive(1, 1);
     let right = archive(2, 2);
     for blob in [&left, &right] {
-        store.put::<SimpleArchive, _>(blob.clone()).unwrap();
+        publish_root(&mut store, root, blob, 31);
     }
     let support = support(root, &[left, right]);
 
@@ -2035,7 +2624,7 @@ fn source_guidance_maps_only_the_resident_coarsest_upper_and_repeats_without_wor
     let (mut inner, root, first, _second) = collections();
     let members = [archive(1, 1), archive(2, 2), archive(3, 3)];
     for member in &members {
-        inner.put::<SimpleArchive, _>(member.clone()).unwrap();
+        publish_root(&mut inner, root, member, 31);
     }
     let support = support(root, &members);
     ensure_exact_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer(), &support)
@@ -2060,6 +2649,7 @@ fn source_guidance_maps_only_the_resident_coarsest_upper_and_repeats_without_wor
     // A resident upper outside the requested foundational support must not
     // become a coarsening candidate merely because its bytes and record exist.
     let outside = archive(4, 4);
+    publish_root(&mut store.inner, root, &outside, 31);
     let overreach = crate::collection::simplearchive_union::join(&upper, &outside).unwrap();
     for member in [&intermediate, &upper, &outside, &overreach] {
         store.inner.put::<SimpleArchive, _>(member.clone()).unwrap();
@@ -2069,13 +2659,17 @@ fn source_guidance_maps_only_the_resident_coarsest_upper_and_repeats_without_wor
         (&intermediate, &members[2], &upper),
         (&upper, &outside, &overreach),
     ] {
+        let before = store.inner.snapshot().unwrap();
+        let low_witness = witnessed_input(&before, root.handle(), data(low));
+        let high_witness = witnessed_input(&before, root.handle(), data(high));
+        drop(before);
         store
             .inner
             .insert(CollectionRecord::Merge(CollectionMerge::sign(
                 &equation_signer(),
                 root.handle(),
-                data(low),
-                data(high),
+                low_witness,
+                high_witness,
                 data(result),
             )))
             .unwrap();
@@ -2125,7 +2719,7 @@ fn target_maintenance_publishes_only_horizontal_target_merges() {
     let left = archive(1, 1);
     let right = archive(2, 2);
     for blob in [&left, &right] {
-        store.put::<SimpleArchive, _>(blob.clone()).unwrap();
+        publish_root(&mut store, root, blob, 31);
     }
     let support = support(root, &[left, right]);
     ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &support)
@@ -2148,12 +2742,148 @@ fn target_maintenance_publishes_only_horizontal_target_merges() {
 }
 
 #[test]
+fn target_maintenance_reendorses_a_resident_upper_without_joining_again() {
+    let (mut inner, root, first, second) = collections();
+    let signer = equation_signer();
+    let a = archive(1, 1);
+    let b = crate::collection::simplearchive_union::join(&a, &archive(2, 2)).unwrap();
+    let c = archive(3, 3);
+    let a_commit = publish_root(&mut inner, root, &a, 31);
+    let b_commit = publish_root(&mut inner, root, &b, 31);
+    let c_commit = publish_root(&mut inner, root, &c, 31);
+    let ab = CollectionMerge::sign(
+        &signer,
+        root.handle(),
+        (data(&a), a_commit.fingerprint()),
+        (data(&b), b_commit.fingerprint()),
+        data(&b),
+    );
+    inner.insert(CollectionRecord::Merge(ab)).unwrap();
+    let snapshot = inner.snapshot().unwrap();
+    let first_b = FirstEncoding::map(&(), &b, &snapshot).unwrap();
+    let first_c = FirstEncoding::map(&(), &c, &snapshot).unwrap();
+    drop(snapshot);
+    inner.put::<FirstEncoding, _>(first_b.clone()).unwrap();
+    inner.put::<FirstEncoding, _>(first_c.clone()).unwrap();
+    let first_b_record = CollectionDerive::sign(
+        &signer,
+        first.handle(),
+        (data(&b), b_commit.fingerprint()),
+        data(&first_b),
+    );
+    let first_ab_record = CollectionDerive::sign(
+        &signer,
+        first.handle(),
+        (data(&b), ab.fingerprint()),
+        data(&first_b),
+    );
+    let first_c_record = CollectionDerive::sign(
+        &signer,
+        first.handle(),
+        (data(&c), c_commit.fingerprint()),
+        data(&first_c),
+    );
+    for record in [first_b_record, first_ab_record, first_c_record] {
+        inner.insert(CollectionRecord::Derive(record)).unwrap();
+    }
+    let snapshot = inner.snapshot().unwrap();
+    let x = SecondEncoding::map(&(), &first_b, &snapshot).unwrap();
+    let y = SecondEncoding::map(&(), &first_c, &snapshot).unwrap();
+    let z = SecondEncoding::join_members(&Fragment::empty(), &x, &y, &snapshot).unwrap();
+    drop(snapshot);
+    for blob in [&x, &y, &z] {
+        inner.put::<SecondEncoding, _>(blob.clone()).unwrap();
+    }
+    let x_b = CollectionDerive::sign(
+        &signer,
+        second.handle(),
+        (data(&first_b), first_b_record.fingerprint()),
+        data(&x),
+    );
+    let x_ab = CollectionDerive::sign(
+        &signer,
+        second.handle(),
+        (data(&first_b), first_ab_record.fingerprint()),
+        data(&x),
+    );
+    let y_c = CollectionDerive::sign(
+        &signer,
+        second.handle(),
+        (data(&first_c), first_c_record.fingerprint()),
+        data(&y),
+    );
+    for record in [x_b, x_ab, y_c] {
+        inner.insert(CollectionRecord::Derive(record)).unwrap();
+    }
+    let z_bc = CollectionMerge::sign(
+        &signer,
+        second.handle(),
+        (data(&x), x_b.fingerprint()),
+        (data(&y), y_c.fingerprint()),
+        data(&z),
+    );
+    inner.insert(CollectionRecord::Merge(z_bc)).unwrap();
+    // x carries [A, B] as well as [B], while this particular z certificate
+    // carries only [B, C]. Both resident blobs must remain selected until the
+    // producer endorses join(x[A, B], z[B, C]) = z [A, B, C]. Their payload
+    // order already proves that equality, so no new join is needed.
+    let requested = support(root, &[a, b, c]);
+    assert_eq!(x.bytes.len().ilog2(), z.bytes.len().ilog2());
+    let before = inner.snapshot().unwrap();
+    let selected = before.collection_exact(second, &requested).unwrap();
+    assert_eq!(selected.support(), &requested);
+    assert_eq!(
+        selected.cover().data_members().collect::<BTreeSet<_>>(),
+        BTreeSet::from([data(&x), data(&z)]),
+    );
+    drop(selected);
+    drop(before);
+
+    let mut store = GuardStore::new(inner);
+    reset_mapping_calls();
+    let after = block_on(store.maintain_exact(second, &signer, &requested)).unwrap();
+
+    assert_eq!(FIRST_MAP_CALLS.get(), 0);
+    assert_eq!(SECOND_MAP_CALLS.get(), 0);
+    assert_eq!(SECOND_JOIN_CALLS.get(), 0);
+    assert!(store.acquired.is_empty());
+    let selected = after.collection_exact(second, &requested).unwrap();
+    assert_eq!(selected.support(), &requested);
+    assert_eq!(
+        selected.cover().data_members().collect::<Vec<_>>(),
+        vec![data(&z)],
+    );
+    let published: Vec<_> = store
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            WriteEvent::Insert(record) => Some(*record),
+            WriteEvent::Put(_) => None,
+        })
+        .collect();
+    let [CollectionRecord::Merge(endorsement)] = published.as_slice() else {
+        panic!("maintenance must publish exactly one target MERGE: {published:?}");
+    };
+    assert_eq!(endorsement.collection(), second.handle());
+    assert_eq!(endorsement.result(), data(&z));
+    let (low_witness, high_witness) = endorsement.input_witnesses();
+    assert_eq!(
+        BTreeSet::from([low_witness, high_witness]),
+        BTreeSet::from([x_ab.fingerprint(), z_bc.fingerprint()]),
+    );
+    assert_eq!(
+        after.record(z_bc.fingerprint()).unwrap(),
+        Some(CollectionRecord::Merge(z_bc)),
+    );
+}
+
+#[test]
 fn target_maintenance_is_deterministic_and_repeatedly_idempotent() {
     let (mut store, root, first, second) = collections();
     let left = archive(1, 1);
     let right = archive(2, 2);
     for blob in [&left, &right] {
-        store.put::<SimpleArchive, _>(blob.clone()).unwrap();
+        publish_root(&mut store, root, blob, 31);
     }
     let support = support(root, &[left, right]);
     ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &support)

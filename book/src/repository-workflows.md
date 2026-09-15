@@ -29,10 +29,11 @@ merge or derivation equations preserve reusable physical work.
   `collection.cover(members)` names such a coordinate without store access,
   which lets a durable manifest preserve an exact cover; it does not by itself
   admit, evidence, or make those members resident.
-- **`Support`** — exactly `Cover<SimpleArchive>`: the distinct admitted
-  `COMMIT.data` handles at the foundational fact collection. It is the
-  denotational coordinate shared by every representation. `MERGE` and
-  `DERIVE` replace physical work without changing it.
+- **`Support`** — exactly `Cover<SimpleArchive>`: distinct `COMMIT.data`
+  handles at the foundational fact collection, admitted directly or through
+  an authorized producer's exact input-record endorsement. It is the
+  denotational coordinate shared by every representation. An equation preserves
+  its witnessed support; it does not endorse every other route to the same blob.
 - **`TryFromCover<E>`** — the encoding-specific reconstruction hook used by a
   collection snapshot. A view may join eagerly or retain mmap-backed shards
   and query their union lazily.
@@ -99,8 +100,9 @@ ancestry also remains singular: source, mapping, and argument ambiguity is
 diagnosed when that route is demanded. General plural lineage is unresolved,
 not silently selected by hash order or combined into a made-up foundation.
 `Support` still belongs to exactly one foundational collection, and native
-`DERIVE(target, input, output)` still names no separate mapping witness. This
-query-use improvement does not claim to define every possible descriptor
+`DERIVE(target, input, output, input_witness)` still names no separate mapping
+definition: the target descriptor supplies it. This query-use improvement does
+not claim to define every possible descriptor
 interpretation.
 
 ## Publish a root collection
@@ -211,9 +213,10 @@ The collection descriptor is the only collection-control structure represented
 as a trible archive. The algebra records are fixed-width native records:
 
 ```text
-COMMIT(collection, data, metadata, author, signature)  // 192 bytes
-MERGE(collection, low, high, result, author, signature) // 224 bytes
-DERIVE(target, input, output, author, signature)        // 192 bytes
+COMMIT(collection, data, metadata, author, signature)                  // 192 bytes
+MERGE(collection, low, high, result, low_witness, high_witness,
+      author, signature)                                             // 288 bytes
+DERIVE(target, input, output, input_witness, author, signature)         // 224 bytes
 ```
 
 `COMMIT` is a signed exogenous assertion: no machine can recompute whether an
@@ -222,24 +225,40 @@ one collection. `DERIVE` is one observation of the mapping linked by its
 target descriptor; that descriptor already names its source, mapping
 algorithm, and concrete mapping parameters.
 
-Merge inputs are canonically ordered and the exact native record is the set
-element. `CollectionStore::insert` therefore implements set insertion rather
-than an update. Concatenating stores unions evidence. Collection records have
-no synthetic entity identity; a backend may compute a full-width fingerprint
-as a nonsemantic lookup key, but support, provenance, authorization, and
-deduplication are defined over the exact records and payload handles.
+Each witness is the full fingerprint of an actual native input record, not a
+blob handle or synthetic entity. MERGE keeps `(payload, witness)` pairs together
+in canonical order; DERIVE's witness belongs to its descriptor's exact source
+collection. The referenced record must produce the signed input payload.
 
-Signed equations endorse materialized computation, not new membership. Publishing a
-`MERGE` or `DERIVE` records work which has already been performed; warm
-resolution follows that equation without executing the join or mapping again.
+The exact native record is the set element. `CollectionStore::insert`
+therefore implements set insertion rather than an update. Concatenating stores
+unions evidence. Collection records have
+no synthetic entity identity; their full-width fingerprints identify the exact
+persisted records for lookup, deduplication, and signed witness references.
+`Support` still contains payload handles, never record fingerprints.
+
+Signed equations endorse both materialized computation and validation of the
+exact input records' support. They do not create new exogenous membership.
+Publishing a `MERGE` or `DERIVE` records work which has already been performed;
+warm resolution follows that endorsement without executing the join or mapping
+again.
 Foreign bytes are signature-checked at the store/synchronization boundary;
 the producer must satisfy target WRITE through the observation's resident
 proof and capability-definition evidence.
-A trusted local store is not reverified on every read. Blob residency
-is independent: an absent result is a cache miss and cannot suppress an
-available explicit cover member.
+A trusted local store is not reverified on every read. Once a target producer
+is admitted, attachment follows its exact witness DAG without re-admitting
+each ancestor or reading ancestral payloads, metadata, and capability proofs.
+The descriptor lineage and referenced native records establish the support;
+only selected outputs and their encoding-required dependencies must be resident.
+A missing result cannot suppress an available finer realization. A missing or
+mismatched witness route is unknown support, not empty support.
 
-Local publication remains unconditional. A publisher which needs to predict
+This deliberately trusts authorized producers to validate inputs and compute
+correctly. Signatures identify who endorsed that claim; they do not prevent an
+authorized dishonest producer from lying. Read-time recomputation is not part
+of the contract.
+
+Low-level signing and store insertion remain unconditional. A publisher which needs to predict
 whether an authority-aware observation will admit a signer can freeze a store
 snapshot and call
 `collection.writer_is_admitted(&snapshot, signer)`: it checks
@@ -262,10 +281,11 @@ let cover = observed.cover();
 let value: V = observed.view()?;
 ```
 
-`snapshot.collection(target)` admits the foundational commits from
-the snapshot's proof and resident definition evidence, selects the
-maximal complete resident target antichain, and returns only the part of the
-foundational support represented by that antichain. Admitted but not yet
+`snapshot.collection(target)` admits producers of target records from the
+snapshot's proof and resident definition evidence, resolves their exact native
+witness closures, and chooses a complete resident target cover. It returns only
+the foundational support certified by that physical realization, not a fresh
+admission query over every source COMMIT. Admitted but not yet
 derived data is absent: an immutable snapshot never promises work which will
 happen later. `snapshot.collection_exact(target, &support)` is the assertion
 form and fails unless that exact foundational support is completely realized.
@@ -287,7 +307,14 @@ shards. `collection.read::<V, _>(&snapshot)` remains a concise
 resident collection read when the intermediate support and physical cover are
 irrelevant.
 
-`cover.commits(&snapshot)` returns strictly verified provenance over the
+Physical compaction is support-aware. If distinct source members `a` and `b`
+map to the same payload `x`, an endorsement of `z` through `b` and `c` does not
+also endorse `a`, even when payload order says `x <= z`. A resident `x` must
+remain alongside `z` to represent `{a,b,c}`. With only `z` resident, the snapshot
+reports `{b,c}`; it does not invent the missing support. The exact-record route,
+not an inverse walk over all equations sharing payload handles, decides this.
+
+`cover.commits(&snapshot)` queries available native provenance over the
 selected payloads. These attestations are not necessarily authorized membership
 claims: another signer can attest an already admitted payload without changing
 its support or becoming an authority root.
@@ -298,9 +325,12 @@ one. A mutating `ensure` or `maintain` operation returns a new store snapshot;
 the caller may then ask that snapshot for the collection it actually contains.
 
 Raw record readers still expose dangling native collection records and stored
-proof records for repair. A `COMMIT`, `MERGE`, or `DERIVE` is semantically
-invisible until all of its direct blob references are resident in that exact
-frozen snapshot. A capability proof's signatures can be checked from its bytes
+proof records for repair. A member is readable only when its selected payload
+and representation dependencies are resident in that exact frozen snapshot.
+An endorsed result does not need its historical input payloads or COMMIT
+metadata to remain resident. Its exact record witnesses must still close;
+merely holding the result blob does not establish collection support.
+A capability proof's signatures can be checked from its bytes
 alone; action and delegation interpretation also needs the referenced
 definition blobs. A missing definition does not erase the raw proof, but it
 cannot support an interpreted grant. These passive observations never acquire,
@@ -342,10 +372,17 @@ return a fresh snapshot; they never emit `WANT`. Local stores implement the same
 contract with immediately ready acquisition from their resident snapshot, while
 a networked store may await exact-H fetch.
 
-Exact replay does not need a publishing key, re-run admission, or retain any
-signed commit or metadata. The typed cover names the exact descriptor and
-payload identities. Use `cover.commits(&snapshot)` when currently resident
-authorship and metadata provenance matters; zero commits is a valid answer and
+Raw `Cover` value algebra is deliberately a lower-level operation than
+attaching a `CollectionSnapshot`. The caller already names exact descriptor
+and payload identities. Replaying those bytes needs no publishing key or
+foundational COMMIT/metadata records; algebraic alternatives may reuse
+authorized signed MERGE math without establishing authenticated foundational
+support. Such a resolved cover is not evidence that its members were admitted
+to the collection. Only the collection-snapshot path above claims `Support`
+and therefore requires closed exact witness records.
+
+Use `cover.commits(&snapshot)` when currently resident authorship and metadata
+provenance matters; zero commits is a valid answer and
 does not invalidate replay. Several admitted commits over the same payload are
 distinct provenance fibers but one member of `Support`.
 
@@ -438,9 +475,10 @@ discovers this source order from explicitly selected descriptor handles and
 calls those same operations. Shared upstream dependencies run once per pass;
 a foundational dependency is ensured rather than needlessly compacted. The
 one-edge `maintain` command remains available. Either command accepts `--watch`
-to retain one open pile and repeat after snapshot content changes or an
-authorization boundary. This adds scheduling, not recursive effects inside a
-mapping kernel. Exact target selection prevents an old, superseded index from
+to retain one open pile and repeat after snapshot content changes, including
+new proofs or resident definitions. There is no ambient AUTH-expiry timer.
+This adds scheduling, not recursive effects inside a mapping kernel. Exact
+target selection prevents an old, superseded index from
 being restarted merely because its descriptor is still present.
 
 ```sh
@@ -461,12 +499,14 @@ not necessary boilerplate for an ordinary multi-hop read.
 
 - `ensure(source, &writer)` freezes collection records, capability proofs, and
   resident authorization evidence before acquiring exact missing descriptor,
-  data, and metadata bytes needed for that root frontier. Concurrent records and proofs
-  do not extend its work. The returned snapshot is a fresh observation; select
+  selected data, and representation-dependency bytes needed for that root
+  frontier. Historical metadata is not a materialization dependency.
+  Concurrent records and proofs do not extend its work. The returned snapshot
+  is a fresh observation; select
   support from it once and pass that same support across the following edges.
 - `snapshot.collection` remains the purely read-only alternative: it
-  performs no acquisition or collection algebra and binds only the maximal
-  resident target cover visible in that immutable snapshot.
+  performs no acquisition or collection algebra and binds only the
+  support-aware resident target cover visible in that immutable snapshot.
   `collection_exact` requires a complete realization for explicit support.
 - For a derived target, `ensure` freezes the resident, admitted realization of
   its immediate source, while `ensure_exact` accepts explicit foundational
@@ -504,6 +544,12 @@ derivation, an unauthorized producer receives `UnauthorizedProducer` before
 the mapping runs. Optional compaction without WRITE leaves the finer cover
 unchanged. Raw local `sign` and `insert` remain unconditional; typed publication
 does not reverify signatures it just produced.
+
+New work authenticates the immediate source and target producers it actually
+uses. Its signed equation names those exact native input witnesses. It does
+not recursively acquire foundational data or re-run ancestral authorization
+merely because the immediate input was itself derived. A mapping remains one
+hop; `maintain-all` is the explicit scheduler for upstream work.
 
 The subsequent target-only LSM policy has no knob: a target member belongs to
 `floor(log2(max(1, serialized_len)))`, and the lowest two content handles in
@@ -631,8 +677,9 @@ branch. New code publishes directly to collections.
   private to same-snapshot materialization. Signed commits and metadata remain
   lazy provenance queried separately.
 - Treat stored signed equations as reusable materialized LSM work. Never
-  replay algebra merely to trust a local equation; apply target WRITE at
-  record admission instead.
+  replay algebra merely to trust a local equation; apply target WRITE and
+  follow its exact endorsed record route instead. Payload aliases must not
+  enlarge that route's support.
 - Persist every successful join or mapping. Yard/GC policy alone decides when
   its result bytes leave local storage.
 - Keep admission, retention, and WANT policy orthogonal.

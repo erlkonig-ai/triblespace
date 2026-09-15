@@ -968,7 +968,7 @@ struct RepairTarget {
 struct RepairOutcome {
     target: RepairTarget,
     success: bool,
-    more: bool,
+    retry_immediately: bool,
     completed_at: crate::clock::Mono,
     failure: Option<RepairFailure>,
 }
@@ -1434,7 +1434,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                     .entry(outcome.target.collection.raw)
                     .or_insert_with(|| DiscoveryState::new(now))
                     .observe_success(now);
-                if outcome.more {
+                if outcome.retry_immediately {
                     enqueue_repair(&mut immediate, &mut pending, outcome.target);
                 }
             } else {
@@ -1667,8 +1667,8 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                         ),
                     )
                     .await;
-                    let (success, more, failure) = match result {
-                        Ok(Ok(more)) => (true, more, None),
+                    let (success, retry_immediately, failure) = match result {
+                        Ok(Ok(retry_immediately)) => (true, retry_immediately, None),
                         Ok(Err(error)) => {
                             debug!(%error, "collection repair failed");
                             (false, false, Some(RepairFailure::Failed))
@@ -1678,7 +1678,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                     let _ = repair_tx.send(RepairOutcome {
                         target,
                         success,
-                        more,
+                        retry_immediately,
                         completed_at: crate::clock::mono_now(),
                         failure,
                     });
@@ -1844,6 +1844,10 @@ async fn reconcile_collection_peer<T: Transport>(
             now,
         );
     });
+    // Preserve `delta.more` in health above, but do not hot-loop a successful
+    // zero-progress pass over deferred AUTH. Periodic repair retries it after
+    // ordinary blob arrival without a second queue or an eager fetch.
+    let retry_immediately = delta.retry_immediately();
     let mut admissions = AdmissionBatcher::new(events);
     for proof in delta.authorization_evidence {
         admissions.push(NetEvent::CapabilityProof(proof)).await?;
@@ -1852,7 +1856,7 @@ async fn reconcile_collection_peer<T: Transport>(
         admissions.push(NetEvent::CollectionRecord(record)).await?;
     }
     admissions.flush().await?;
-    Ok(delta.more)
+    Ok(retry_immediately)
 }
 
 impl<T: Transport> ProviderClient<T> {

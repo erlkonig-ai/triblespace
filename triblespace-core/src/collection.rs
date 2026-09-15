@@ -70,6 +70,7 @@ pub mod store;
 pub mod succinctarchive_union;
 /// Logical values reconstructed from typed physical covers.
 pub mod view;
+mod witness;
 
 /// Ed25519 public key, re-exported for collection admission policies.
 ///
@@ -81,7 +82,9 @@ pub use ed25519_dalek::VerifyingKey;
 pub use api::*;
 pub use discovery::*;
 pub use encoding::*;
-pub use exact_derived::CollectionRealizationError;
+pub use exact_derived::{
+    admitted_record_witnesses, preview_record_witnesses, CollectionRealizationError,
+};
 pub use policy::*;
 pub use records::*;
 pub use resolution::*;

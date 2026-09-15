@@ -20,7 +20,7 @@ names directly:
 | `COMMIT` | collection descriptor, data, metadata |
 | `MERGE` | collection descriptor, low input, high input, result |
 | `DERIVE` | target descriptor, input, output |
-| authorization proof | none; the proof is self-contained |
+| authorization proof | each capability-definition handle in its signed path |
 | `WANT Blob(H)` | `H` |
 | `WANT Merge(C, A, B)` | `C`, `A`, `B` |
 | `WANT Derive(C, A)` | `C`, `A` |
@@ -38,9 +38,17 @@ collection admission, or decide whether an equation is algebraically useful.
 Those are semantic questions for a reader. Physical preservation must remain
 stable when later evidence changes what a record means, and it must not let an
 authorization bug silently destroy bytes. Conversely, retaining bytes grants
-no authority. A retained proof has no blob closure: its opaque resource bytes
-do not become a lifetime edge even when an application interprets them as a
-collection descriptor handle.
+no authority. A retained proof owns its resident capability-definition closure,
+but its opaque resource bytes do not become a lifetime edge even when an
+application interprets them as a collection descriptor handle.
+
+Witness-bound MERGE and DERIVE also name actual native input records through
+`record_references()`. Those fingerprints are record identities, not blob
+handles: do not feed them into the conservative blob walker or the DHT. The
+retained native ledger preserves the referenced records independently of whether
+their payloads are resident. Exact witness closure remains necessary to recover
+`Support`; eviction must not silently replace a missing record with another
+record producing the same payload.
 
 The typed reference enumeration lives on the records themselves. MemoryRepo,
 Pile rewrites, and Yard collection all consume the same enumeration rather
@@ -67,12 +75,26 @@ are not treated as weaker cache hints. A retained equation owns its resident
 inputs, output, and descriptor exactly as a retained commit owns its resident
 descriptor, data, and metadata.
 
+This ownership rule is deliberately stronger than read-time dependency
+selection. An authorized witness-bound output can be read without historical
+input payloads or metadata; nevertheless, if those blobs are already resident,
+the retained equation or COMMIT still owns them. Cheaper attachment is not an
+implicit permission to discard historical bytes or records.
+
 Known retired unsigned equations remain inert in semantic readers, but their
 direct references still retain resident blobs. Reframing preserves their exact
 bytes. Unknown opaque kinds cannot safely define a smaller live set because
 their ownership edges are unknown. A retained Pile rewrite instead preserves
 their bytes and every resident blob; semantic reframe and Yard reclamation
 still refuse them.
+
+The retired signed payload-only equation kinds are opaque to ordinary replay.
+Their old signatures are not input-record endorsements. Retained Pile copying
+therefore carries their frames and all resident blobs under the same opaque
+rule; Yard and semantic reframe refuse them. The explicit
+`endorse-unsigned-equations` command can author current witness-bound records
+from both retired epochs, but neither that command nor ordinary GC silently
+deletes the historical signed frames.
 
 ## Backend Boundaries
 

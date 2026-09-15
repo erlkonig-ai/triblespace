@@ -845,6 +845,23 @@ mod tests {
         simplearchive_union::descriptor(name, direct_policy())
     }
 
+    fn witnessed_input(
+        descriptor: &Fragment,
+        data: CollectionData,
+    ) -> (
+        CollectionData,
+        crate::collection::CollectionRecordFingerprint,
+    ) {
+        let record =
+            crate::collection::CollectionRecord::Commit(crate::collection::CollectionCommit::sign(
+                &SigningKey::from_bytes(&[7; 32]),
+                identity_for_tests(descriptor),
+                data,
+                crate::collection::empty_metadata_handle(),
+            ));
+        (data, record.fingerprint())
+    }
+
     fn row(entity: u8, attribute: u8, value: u8) -> [u8; TRIBLE_LEN] {
         let mut row = [value; TRIBLE_LEN];
         row[..16].fill(entity);
@@ -943,7 +960,7 @@ mod tests {
         let derive = CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&target_descriptor),
-            data_identity(&source_empty),
+            witnessed_input(&source_descriptor, data_identity(&source_empty)),
             data_identity(&canonical_empty),
         );
         validate_derive(
@@ -965,8 +982,8 @@ mod tests {
         let merge = CollectionMerge::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&target_descriptor),
-            data_identity(low),
-            data_identity(high),
+            witnessed_input(&target_descriptor, data_identity(low)),
+            witnessed_input(&target_descriptor, data_identity(high)),
             data_identity(&joined),
         );
         validate_merge(&target_descriptor, &merge, low, high, &joined).unwrap();
@@ -1000,7 +1017,7 @@ mod tests {
             let claim = CollectionDerive::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 identity_for_tests(&target_descriptor),
-                data_identity(input),
+                witnessed_input(&source_descriptor, data_identity(input)),
                 data_identity(output),
             );
             validate_derive(
@@ -1017,8 +1034,8 @@ mod tests {
         let merge = CollectionMerge::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&target_descriptor),
-            data_identity(low),
-            data_identity(high),
+            witnessed_input(&target_descriptor, data_identity(low)),
+            witnessed_input(&target_descriptor, data_identity(high)),
             data_identity(&merge_after_derive),
         );
         validate_merge(&target_descriptor, &merge, low, high, &merge_after_derive).unwrap();
@@ -1130,7 +1147,7 @@ mod tests {
         let claim = CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&target_descriptor),
-            data_identity(&input),
+            witnessed_input(&source_descriptor, data_identity(&input)),
             data_identity(&wrong_output),
         );
 
@@ -1153,8 +1170,8 @@ mod tests {
         let merge = CollectionMerge::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&target_descriptor),
-            data_identity(low),
-            data_identity(high),
+            witnessed_input(&target_descriptor, data_identity(low)),
+            witnessed_input(&target_descriptor, data_identity(high)),
             data_identity(&wrong),
         );
         assert_ne!(correct.bytes, wrong.bytes);
@@ -1173,7 +1190,7 @@ mod tests {
         let claim = CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&target_descriptor),
-            data_identity(&input),
+            witnessed_input(&source_descriptor, data_identity(&input)),
             data_identity(&malformed),
         );
 

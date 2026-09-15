@@ -20,9 +20,9 @@ memory map never exposes half-written records.
 ## Record model: one frame, 256-byte-aligned records
 
 Every record the pile writes begins with the same **64-byte common prefix** and
-occupies a **256-byte multiple**. Most fixed records fit in one block; signed
-MERGE uses two. Blobs and variable capability proofs also continue after the
-first block and are zero-padded to their declared span:
+occupies a **256-byte multiple**. COMMIT and WANT fit in one block; signed
+MERGE and DERIVE use two. Blobs and variable capability proofs may continue
+after the first block and are zero-padded to their declared span:
 
 | Offset | Width | Field |
 |---:|---:|---|
@@ -69,8 +69,8 @@ formats.
 
 The arithmetic works out exactly. A signed commit contains six 32-byte fields,
 so `64 + 6 × 32 = 256`: one block, nothing wasted. A one-edge capability
-proof is 257 bytes starting at the record-kind field at offset 32, so its
-289 unpadded bytes use two blocks. Longer proofs use the minimal additional
+proof is 224 bytes starting at the record-kind field at offset 32, so its
+256 unpadded bytes also fill one block. Longer proofs use the minimal additional
 whole blocks without changing their canonical body.
 
 A collection descriptor remains an ordinary blob. Capability proofs are
@@ -250,8 +250,8 @@ refreshing state.
    append immediately feeds the bytes back through the record scanner so
    in-memory indices stay synchronised without waiting for a manual `refresh`.
    Blob records use a single `write_vectored` call; fixed-width collection and
-   WANT records use one append of their 256-byte frame, and native proof records
-   append their complete bounded frame once.
+   WANT records use one append of their complete 256- or 512-byte frame, and
+   native proof records append their complete bounded frame once.
    Records larger than ~1&nbsp;GiB can't be appended in a single atomic
    `writev` because kernel `write_vectored` calls cap at `INT_MAX` bytes on
    macOS and `MAX_RW_COUNT` (~2&nbsp;GiB) on Linux. In that case `put` takes
@@ -449,10 +449,11 @@ explains how to query these fields through the `PileSnapshot` API.
 ## Native Collection Records
 
 `CollectionStore` is a grow-only set of signed typed collection-calculus
-records: `COMMIT` assertions and `MERGE` and `DERIVE` equations. The pile stores
-them directly as fixed enveloped records: COMMIT and DERIVE occupy 256 bytes;
-MERGE occupies 512. COMMIT's signed bytes and kind are unchanged, while signed
-equations have new kinds distinct from their unsigned predecessors. They are
+records: `COMMIT` assertions and witness-bound `MERGE` and `DERIVE`
+endorsements. The pile stores them directly as fixed enveloped records:
+COMMIT occupies 256 bytes; MERGE and DERIVE each occupy 512. COMMIT's signed
+bytes and kind are unchanged. The current equation kinds are distinct from
+both their unsigned and their signed payload-only predecessors. They are
 **not blob records**, have no following payload, and carry no insertion
 timestamp. They are also distinct from operational wants and historical pins:
 collection records have no head, tombstone, or
@@ -521,13 +522,15 @@ these algebra records.
 | Kind | Record kind (rooted at) | Kind-specific byte layout after the common prefix |
 |---|---|---|
 | Commit | `A1322BB3F5214287C314D42AFCC1A97CB264FACD9A22B4938838BE78DB31AA59` (`CBF2CF97D52A3486E16C12D70D397C66`) | `64..96` descriptor handle, `96..128` data digest, `128..160` metadata handle, `160..192` Ed25519 public key, `192..224` signature R, `224..256` signature S — no reserved bytes |
-| Merge | `9D9B962D46FA42168AB3A11FB367AC14692D4F51B5190196F2BDB08D5BC2BA07` (`BC68266A511EC292D815A30C8DFBA82D`) | `64..96` descriptor handle, `96..128` lower input digest, `128..160` higher input digest, `160..192` result digest, `192..224` Ed25519 public key, `224..256` signature R, `256..288` signature S, `288..512` reserved zeros |
-| Derive | `B2EE8382C70161379E387D692B822946A60B602A909EED66B7D6DA2A62F36232` (`7FDDB25BB2B40E002A7B0EC40E316232`) | `64..96` target descriptor handle, `96..128` input digest, `128..160` output digest, `160..192` Ed25519 public key, `192..224` signature R, `224..256` signature S — no reserved bytes |
+| Merge | `4D2087B6C4944A404E1D0BCF4898819267E00FCAE49B146F5955522CBE935909` (`3AB7D3C2BAB53C85CCA6108A30BB8930`) | `64..96` descriptor handle, `96..128` low input digest, `128..160` high input digest, `160..192` result digest, `192..224` low input-record fingerprint, `224..256` high input-record fingerprint, `256..288` Ed25519 public key, `288..320` signature R, `320..352` signature S, `352..512` reserved zeros |
+| Derive | `DBF641F31E772F6CE715087D954375AA44860BF411C0DE849C207B542ABDC583` (`D933002B5656620792BFD250AB5061AD`) | `64..96` target descriptor handle, `96..128` input digest, `128..160` output digest, `160..192` input-record fingerprint, `192..224` Ed25519 public key, `224..256` signature R, `256..288` signature S, `288..512` reserved zeros |
 
 The new MERGE and DERIVE description anchors above were minted with installed
-`trible genid` on 2026-09-13. Their signed semantic kind IDs, independently
-minted in the same session, are `1E5277B23D177FD692B074FBF0EF28F1` and
-`CE6A838612D0AA0812C05A50CCD11DC1`, respectively. COMMIT retains semantic kind
+`trible genid` on 2026-09-14. Their signed semantic kind IDs, independently
+minted in the same session, are `96AB9DE7389DD621D44C55E593898A69` and
+`529D8F57A20FCA0BC921121313DC619B`, respectively. The descriptions are named
+`pile-collection-merge-v6` and `pile-collection-derive-v7`; their handles above
+are pinned by the description-recomputation test. COMMIT retains semantic kind
 `B34817308188C4515A3C51967A91A603` and its historical version-2 transcript.
 
 Generic stores and collection repair use a one-byte dense tag followed by the
@@ -536,14 +539,16 @@ same ordered 32-byte body fields, without native framing or reserved padding:
 | Record | Dense tag | Payload bytes | Total dense bytes |
 |---|---:|---:|---:|
 | COMMIT | 1 | 192 | 193 |
-| signed MERGE | 4 | 224 | 225 |
-| signed DERIVE | 5 | 192 | 193 |
+| witness-bound MERGE | 6 | 288 | 289 |
+| witness-bound DERIVE | 7 | 224 | 225 |
 
-Tags 2 and 3 are retired unsigned layouts, not aliases for the signed records.
-The changed collection wire grammar uses ALPN `/triblespace/pile-sync/25`.
-An equation signs its domain bytes (`triblespace.collection.merge.transcript`
-or `triblespace.collection.derive.transcript`), the corresponding new semantic
-kind ID, author public key, and its ordered collection/operand/result fields.
+Tags 2/3 are retired unsigned layouts; tags 4/5 are retired signed payload-only
+layouts. None is an alias for a witness-bound endorsement. The combined
+equation/AUTH-v5 wire epoch uses ALPN `/triblespace/pile-sync/26`.
+An equation signs its domain bytes (`triblespace.collection.merge.endorsement`
+or `triblespace.collection.derive.endorsement`), the corresponding new semantic
+kind ID, author public key, and its ordered collection/operand/result/witness
+fields.
 The newly minted kind versions this grammar; there is no extra equation version
 integer. COMMIT's historical domain, kind, version integer, field order, and
 signature bytes are unchanged.
@@ -557,6 +562,24 @@ object-store backend is likewise trusted persistence: it checks canonical
 structure and the exact content-addressed key without repeating signatures.
 Foreign pile/import bytes need an explicit checked ingress or a user-approved
 trusted-source boundary; structural open alone is not an import verifier.
+
+An authorized equation producer endorses both the mathematical result and the
+validated support of its exact input records. Attachment applies WRITE to the
+target's candidate producers, then follows the selected records' fingerprint
+references to foundational COMMITs. The witness walk checks exact collection
+and output-handle matches, not ancestor signatures, grants, payloads, or
+metadata. It needs the descriptor lineage and the named native records to be
+available. A missing or mismatched witness does not stand for empty support.
+Only the selected output and its encoding-required blob dependencies need be
+resident for materialization; historical inputs may have been evicted.
+
+Fingerprints bind a particular support route even when distinct inputs map to
+the same output blob. Payload order still helps select a compact physical
+cover, but exact witness supports decide its denotation. A finer resident
+member remains necessary if a coarser payload does not endorse all of that
+member's support. Later unrelated equations cannot enlarge an existing
+signature's witness closure. This is producer trust, not proof of mathematical
+correctness: an authorized dishonest producer can still endorse a wrong result.
 
 These are the complete native collection-record family: there is no
 accelerator-specific fourth variant. A Rank9-accelerated member is an ordinary
@@ -577,18 +600,19 @@ scan found no live records requiring migration.
 
 Every reserved byte must be zero; a nonzero reserved byte makes replay fail as
 corrupt rather than silently assigning meaning to a format extension. Merge
-inputs are stored in lexicographic digest order (`low <= high`), so swapping
-the two operands cannot create a second representation of the same
-commutative equation.
+inputs are sorted as `(payload digest, record fingerprint)` pairs. Witnesses
+move with their payloads, including when the two payload digests are equal, so
+swapping operands cannot create a second representation of the same endorsement.
 
-No record ID exists in these headers or in the semantic model. On replay, the
-decoder reconstructs the record's exact dense typed payload: 192 bytes for a
-commit, 224 bytes for a merge, and 192 bytes for a derive. Where a fixed-width
-physical key is required, the store hashes the stable semantic kind ID followed
-by every canonical payload byte with BLAKE3 and retains the full 32-byte digest
+There is no synthetic trible entity or separately stored ID for the record.
+On replay, the decoder reconstructs its exact dense typed payload: 192 bytes
+for a commit, 288 bytes for a merge, and 224 bytes for a derive. The store hashes
+the stable semantic kind ID followed by every canonical payload byte with
+BLAKE3 and retains the full 32-byte digest
 as a `CollectionRecordFingerprint`. Every current payload includes the
-public key and both signature components. The fingerprint is an index key, not
-a materialized entity or a substitute for the exact record value.
+public key and both signature components. This fingerprint serves both exact
+lookup/deduplication and signed input-record references. It names the actual
+persisted record, not a blob, invented entity, or member of `Support`.
 
 Pile replay keeps the records in fingerprint order. Re-inserting an identical
 record is an idempotent success; a different record producing the same
@@ -599,9 +623,23 @@ likewise a grow-only set. Historical pins remain ordered evidence; retired
 WANT logs are only explicit migration input and do not participate in ordinary
 replay.
 
-### Retired unsigned equations and reader cutover
+### Retired payload-only equations and reader cutover
 
-The preceding described MERGE kind was
+The first signed payload-only MERGE kind was
+`9D9B962D46FA42168AB3A11FB367AC14692D4F51B5190196F2BDB08D5BC2BA07`
+(anchor `BC68266A511EC292D815A30C8DFBA82D`, semantic kind
+`1E5277B23D177FD692B074FBF0EF28F1`). Its dense tag 4 carried 224 bytes and its
+native frame occupied 512 bytes. DERIVE used
+`B2EE8382C70161379E387D692B822946A60B602A909EED66B7D6DA2A62F36232`
+(anchor `7FDDB25BB2B40E002A7B0EC40E316232`, semantic kind
+`CE6A838612D0AA0812C05A50CCD11DC1`), dense tag 5 with 192 bytes and a 256-byte
+frame. Their signature domains ended in `.transcript`, not `.endorsement`.
+They authenticated payload equations but no particular input-record route;
+their old signatures cannot be reinterpreted as the new endorsement. Ordinary
+native replay crosses these exact framed kinds as opaque evidence and does
+not put them in the current collection record index or repair stream.
+
+The earlier unsigned MERGE kind was
 `0CEE320DE0BDA40A6A6F52221C5E4E4D2CE3B165B69C858673FD13D98F655379`, with
 collection/low/high/result at `64..192` and zeros through byte 256. DERIVE was
 `7ACE1ED10F3EBC632627058CC461DC1CC171CD2E56C52E5DCE60EA4C8DC23C36`, with
@@ -629,10 +667,43 @@ trible pile migrate <PILE> endorse-unsigned-equations \
   --signing-key <EXISTING_WRITER_KEY> --dry-run
 ```
 
+Despite its historical name, this command accepts both retired epochs. It
+checks old signed-frame signatures before using those equations as migration
+input; that check does not supply their missing witness provenance.
+
 Remove `--dry-run` only to make that writer's new endorsement. The command
-freezes WRITE admission and direct-reference residency once, skips absent
-dependencies without fetching, and appends only missing identical endorsements.
-It does not recompute results, change entity identities, or remove old evidence.
+freezes target WRITE admission and plans the complete batch before appending.
+Results must be resident; historical input payloads and metadata need not be.
+The owner chooses a small deterministic covering set of actual admitted input
+record witnesses. Distinct legitimate supports for one payload are not a
+reason to recompute it: several new endorsements can together preserve their
+total support. For MERGE, input covers of sizes `k` and `l` require at most
+`max(k,l)` pairs, not their Cartesian product. This preserves total support,
+not every possible exact-subset realization.
+
+Every new record adds support not already certified for that exact payload
+equation. Retries and grounded payload cycles stop when that coverage stops
+growing; later admitted aliases can extend it. Missing or ungrounded cyclic
+witnesses remain unresolved. Missing outputs, missing/cyclic witnesses,
+unauthorized signing, and malformed or invalid old signed frames are reported
+separately. The report distinguishes new endorsement records from already-covered
+equations. Independent resolvable work may still be appended, with a nonzero
+exit when unresolved items remain. Migrate an upstream collection first when
+its new witnesses are needed downstream.
+
+Preflight resolves the complete planned overlay together with already-stored
+authorized records whose witness closures become available. Direct functional
+conflicts and ordinary commuting-square conflicts abort the entire plan before
+any append. Newly closed native support feeds back into the same worklist, so
+the first run reaches that closure rather than leaving it for a retry. This is
+not a global proof of order laws, a load of historical payloads, or a
+recomputation of the result.
+
+The operation does not fetch, recompute results, change collection/entity or
+payload identities, recover original authorship, or remove historical frames.
+Old signed opaque frames retain the ordinary
+conservative copying rule: preserve their bytes and all resident blobs; Yard
+and semantic reframe still refuse opaque ownership.
 Use `trible pile verify <PILE>` for the separate native-signature audit before
 accepting an unfamiliar pile as a trusted local store. That audit does not prove
 the mathematical correctness of historical unsigned equations.

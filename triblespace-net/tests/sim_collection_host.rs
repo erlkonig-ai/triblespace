@@ -198,8 +198,13 @@ fn issuer_held_read_proof_bootstraps_a_handle_only_recipient() {
             collection.handle(),
         );
         issuer_store.insert_proof(read_proof.clone()).unwrap();
+        let payload_facts = entity! {
+            triblespace_core::metadata::tag: triblespace_core::metadata::KIND_MULTI,
+        }
+        .facts()
+        .clone();
         let payload_handle = issuer_store
-            .put::<SimpleArchive, _>(TribleSet::new().to_blob())
+            .put::<SimpleArchive, _>(payload_facts.clone())
             .unwrap();
         issuer_store
             .insert(CollectionRecord::Commit(CollectionCommit::sign(
@@ -255,9 +260,9 @@ fn issuer_held_read_proof_bootstraps_a_handle_only_recipient() {
             Collection::<SimpleArchive>::open(&snapshot, collection.handle()).unwrap()
         };
 
-        // With C resident, normal collection repair uses the issuer's
-        // self-contained READ(C) proof to admit this endpoint and sends only
-        // native proof and collection records.
+        // With C resident, the issuer can authorize the endpoint using its
+        // resident READ definition. Repair sends only proof/collection records;
+        // the recipient still needs the named definitions to interpret them.
         advance(&clock, &mut [&mut issuer, &mut recipient], 32).await;
         let dangling = recipient.snapshot().unwrap();
         assert_eq!(dangling.records().unwrap().count(), 1);
@@ -267,14 +272,81 @@ fn issuer_held_read_proof_bootstraps_a_handle_only_recipient() {
             .map(Result::unwrap)
             .collect::<Vec<_>>();
         assert_eq!(received, [read_proof]);
+        assert!(!dangling.contains_blob(read_capability()).unwrap());
+        assert!(!dangling.contains_blob(write_capability()).unwrap());
+        assert!(!dangling.contains_blob(payload_handle).unwrap());
         assert!(
-            recipient_collection
+            !recipient_collection
                 .reader_is_admitted(&dangling, recipient_key.verifying_key())
                 .unwrap(),
-            "the repaired self-contained proof admits its recipient",
+            "proof bytes alone do not interpret a nonresident capability definition",
+        );
+        assert!(recipient_collection.admitted(&dangling).unwrap().is_empty());
+        assert!(
+            dangling
+                .collection(recipient_collection)
+                .unwrap()
+                .cover()
+                .is_empty()
         );
         assert_eq!(dangling.wants().unwrap().count(), 0);
-        drop(dangling);
+
+        assert!(
+            acquire_once(
+                &clock,
+                &mut recipient,
+                Inline::new(read_capability().raw),
+                &mut [&mut issuer],
+            )
+            .await
+            .is_some(),
+            "the named READ definition uses the ordinary exact-H DHT path",
+        );
+        let read_ready = recipient.snapshot().unwrap();
+        assert!(
+            recipient_collection
+                .reader_is_admitted(&read_ready, recipient_key.verifying_key())
+                .unwrap()
+        );
+        assert!(
+            !recipient_collection
+                .reader_is_admitted(&dangling, recipient_key.verifying_key())
+                .unwrap()
+        );
+        assert!(!read_ready.contains_blob(write_capability()).unwrap());
+        assert!(
+            recipient_collection
+                .admitted(&read_ready)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!read_ready.contains_blob(payload_handle).unwrap());
+        assert_eq!(read_ready.wants().unwrap().count(), 0);
+
+        assert!(
+            acquire_once(
+                &clock,
+                &mut recipient,
+                Inline::new(write_capability().raw),
+                &mut [&mut issuer],
+            )
+            .await
+            .is_some(),
+            "interpreting COMMIT producer authority fetches its definition, not its payload",
+        );
+        let admitted = recipient.snapshot().unwrap();
+        assert_eq!(recipient_collection.admitted(&admitted).unwrap().len(), 1);
+        assert!(!admitted.contains_blob(payload_handle).unwrap());
+        assert!(
+            admitted
+                .collection(recipient_collection)
+                .unwrap()
+                .cover()
+                .is_empty()
+        );
+        assert_eq!(admitted.records().unwrap().count(), 1);
+        assert_eq!(admitted.proofs().unwrap().count(), 1);
+        assert_eq!(admitted.wants().unwrap().count(), 0);
 
         // The committed payload remains an ordinary exact-H bearer read.
         // Repair manufactures no durable WANT.
@@ -297,8 +369,23 @@ fn issuer_held_read_proof_bootstraps_a_handle_only_recipient() {
                 .unwrap()
         );
         assert_eq!(recipient_collection.admitted(&ready).unwrap().len(), 1,);
+        assert_eq!(
+            ready
+                .collection(recipient_collection)
+                .unwrap()
+                .cover()
+                .len(),
+            1
+        );
         let facts = recipient_collection.read::<TribleSet, _>(&ready).unwrap();
-        assert!(facts.is_empty());
+        assert_eq!(facts, payload_facts);
+        assert!(
+            admitted
+                .collection(recipient_collection)
+                .unwrap()
+                .cover()
+                .is_empty()
+        );
         assert_eq!(ready.wants().unwrap().count(), 0);
     }));
 }
@@ -458,8 +545,14 @@ fn native_read_proof_bootstraps_on_retry_and_rejects_writer_only_peer() {
             collection.handle(),
         );
         server_store.insert_proof(write.clone()).unwrap();
-        let payload = TribleSet::new().to_blob();
-        let payload_handle = server_store.put::<SimpleArchive, _>(payload).unwrap();
+        let payload_facts = entity! {
+            triblespace_core::metadata::tag: triblespace_core::metadata::KIND_MULTI,
+        }
+        .facts()
+        .clone();
+        let payload_handle = server_store
+            .put::<SimpleArchive, _>(payload_facts.clone())
+            .unwrap();
         server_store
             .insert(CollectionRecord::Commit(CollectionCommit::sign(
                 &writer_key,
@@ -544,13 +637,22 @@ fn native_read_proof_bootstraps_on_retry_and_rejects_writer_only_peer() {
         assert_eq!(
             dangling.proofs().unwrap().count(),
             2,
-            "the self-contained WRITE proof repairs with the collection records",
+            "the signed WRITE proof repairs with the collection records",
         );
-        assert!(
-            reader_collection.admitted(&dangling).unwrap().is_empty(),
-            "a frozen snapshot hides a commit whose payload is absent",
+        assert!(dangling.contains_blob(write_capability()).unwrap());
+        let admitted = reader_collection.admitted(&dangling).unwrap();
+        assert_eq!(
+            admitted.len(),
+            1,
+            "resident policy definitions and the repaired proof admit the COMMIT independently of its payload",
         );
-        drop(dangling);
+        assert!(admitted.contains(payload_handle));
+        assert!(!dangling.contains_blob(payload_handle).unwrap());
+        let unavailable = dangling.collection(reader_collection).unwrap();
+        assert!(unavailable.cover().is_empty());
+        assert!(unavailable.support().is_empty());
+        assert!(reader_collection.read::<TribleSet, _>(&dangling).unwrap().is_empty());
+        assert_eq!(dangling.wants().unwrap().count(), 0);
         assert!(
             acquire_once(
                 &clock,
@@ -564,16 +666,25 @@ fn native_read_proof_bootstraps_on_retry_and_rejects_writer_only_peer() {
         );
         assert_eq!(reader.snapshot().unwrap().wants().unwrap().count(), 0);
         let reader_snapshot = reader.snapshot().unwrap();
-        assert_eq!(
-            reader_collection.admitted(&reader_snapshot).unwrap().len(),
-            1
-        );
+        assert_eq!(reader_collection.admitted(&reader_snapshot).unwrap(), admitted);
+        let available = reader_snapshot.collection(reader_collection).unwrap();
+        assert_eq!(available.cover().len(), 1);
+        assert_eq!(available.support(), &admitted);
+        assert_eq!(reader_collection.read::<TribleSet, _>(&reader_snapshot).unwrap(), payload_facts);
+        assert!(!dangling.contains_blob(payload_handle).unwrap());
+        assert!(dangling.collection(reader_collection).unwrap().cover().is_empty());
         let writer_snapshot = writer_only.snapshot().unwrap();
         assert_eq!(
             writer_snapshot.records().unwrap().count(),
             0,
             "WRITE(C) without READ(C) must not learn even the collection manifest"
         );
+        assert_eq!(writer_snapshot.proofs().unwrap().count(), 1);
+        assert!(!reader_collection
+            .reader_is_admitted(&writer_snapshot, writer_key.verifying_key())
+            .unwrap());
+        assert!(!writer_snapshot.contains_blob(payload_handle).unwrap());
+        assert_eq!(writer_snapshot.wants().unwrap().count(), 0);
     }));
 }
 
@@ -1697,7 +1808,7 @@ fn full_replication_does_not_apply_a_projected_summary_to_foundational_payloads(
             .insert(CollectionRecord::Derive(CollectionDerive::sign(
                 &server_key,
                 projection.handle(),
-                commit.data(),
+                (commit.data(), commit.fingerprint()),
                 Handle::<SimpleArchive>::to_hash(projected),
             )))
             .unwrap();

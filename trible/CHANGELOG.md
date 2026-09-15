@@ -12,10 +12,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   their source dependencies in upstream order. Shared dependencies run once;
   foundational sources are ensured without an unnecessary base-archive merge.
   Both maintenance commands accept multiple targets and `--watch`, retaining
-  one pile and reacting to snapshot changes and authorization boundaries.
+  one pile and reacting to snapshot changes, including proofs and definition
+  residency. Generic AUTH has no expiry timer.
   Fresh descriptor handles work before their first equation is published.
 
 ### Changed
+
+- Use `/triblespace/pile-sync/26` for the combined AUTH-v5 and witness-bound
+  equation epoch. MERGE/DERIVE dense tags 6/7 carry 288/224-byte bodies and
+  signatures bind exact input-record fingerprints. Retired unsigned and
+  payload-only signed tags are not accepted as current endorsements;
+  COMMIT bytes and signatures are unchanged.
+
+- Extend the existing `endorse-unsigned-equations` command to both retired
+  payload-only epochs. Plan small covers of actual admitted input records;
+  preserve total support without enumerating every exact-subset alternative
+  or recomputing payloads. Require resident outputs, not historical input
+  payloads or metadata. Report new endorsement records, already-covered
+  equations, missing/cyclic witnesses, missing outputs, unauthorized producers,
+  and malformed/invalid old signed frames independently. Preflight the full
+  planned overlay, including newly closed already-stored authorized records;
+  direct functional and ordinary commuting-square conflicts abort before any
+  append, and newly closed support feeds back into the same worklist. Preserve
+  collection/entity/payload IDs and historical frames; retries append only newly
+  covered support. Other resolvable work may be appended while missing
+  dependencies still produce a nonzero exit.
+
+- Issue AUTH-v5 proofs for invoke-only, non-expiring `grant-read` and
+  `grant-write` requests; remove generic TTL/mode flags. Existing resource policy
+  identities remain unchanged. This is not an automatic reissue of older
+  bounded or application-specific grants.
 
 - Maintenance dispatch recognizes the concrete semantic-index mapping, not
   just its NVFP4 representation. The default search-enabled CLI includes that
@@ -38,15 +64,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 - Add explicit `pile migrate <PILE> endorse-unsigned-equations` with an exact
   `--collection`, an existing `--signing-key`, and optional `--dry-run`. Require
-  target WRITE at one frozen instant, skip missing direct references, and
-  append deterministic signed equations without rewriting old bytes or
+  target WRITE in one frozen snapshot, skip unresolved output/witness routes,
+  and append deterministic witness-bound equations without rewriting old bytes or
   claiming to recover their original producer. Identical retries append
   nothing and no equation is recomputed.
 
 - Add read-only `pile verify <PILE>` to recheck every physical native
-  COMMIT/MERGE/DERIVE signature and AUTH proof's signatures and path-local
-  attenuation without resident dependencies, a signing key, clock validity,
-  or collection-policy admission. Report unsigned legacy equations and opaque
+  COMMIT/MERGE/DERIVE signature and AUTH proof's signatures without resident
+  dependencies, a signing key, or collection-policy admission. Definition-based
+  action attenuation and application restrictions are outside this byte-only
+  audit. Report unsigned legacy equations and opaque
   records as unchecked; blob hashes and legacy chains remain the separate
   `pile diagnose check` audit.
 

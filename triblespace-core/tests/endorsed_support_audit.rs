@@ -1,18 +1,15 @@
-//! Design probe only: payload identities do not bind a particular support path.
-//! This exercises the public stateless resolver, not a changed attach policy.
+//! An endorsed result's support follows its exact input records, not every
+//! alternative equation that happens to produce an equal payload.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::convert::Infallible;
+use std::collections::BTreeSet;
 
 use ed25519_dalek::SigningKey;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::succinctarchive::SuccinctArchiveBlob;
 use triblespace_core::blob::IntoBlob;
 use triblespace_core::collection::{
-    discover_collection_records, resolve_collection_semantics, simplearchive_union,
-    succinctarchive_union, AdmissionPolicy, CollectionClaimValidation, CollectionData,
-    CollectionDerive, CollectionMerge, CollectionPolicy, CollectionRecord, CollectionStore,
-    CollectionStoreExt, CollectionValidationRequest,
+    simplearchive_union, succinctarchive_union, AdmissionPolicy, CollectionDerive, CollectionMerge,
+    CollectionPolicy, CollectionRecord, CollectionSnapshotExt, CollectionStore, CollectionStoreExt,
 };
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::metadata;
@@ -21,7 +18,7 @@ use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{BlobStorePut, SnapshotSource};
 
 #[test]
-fn skipping_ancestor_admission_changes_support_without_changing_the_selected_derive() {
+fn later_alternative_equations_cannot_change_an_endorsed_results_support() {
     let owner = SigningKey::from_bytes(&[73; 32]);
     let unrelated = SigningKey::from_bytes(&[74; 32]);
     let policy = CollectionPolicy::new(
@@ -45,65 +42,53 @@ fn skipping_ancestor_admission_changes_support_without_changing_the_selected_der
     let c = Handle::<SimpleArchive>::to_hash(store.put::<SimpleArchive, _>(c).unwrap());
     let t =
         Handle::<SuccinctArchiveBlob>::to_hash(store.put::<SuccinctArchiveBlob, _>(raw).unwrap());
-    store
-        .insert(CollectionRecord::Merge(CollectionMerge::sign(
-            &owner,
-            source.handle(),
-            ca.data(),
-            cb.data(),
-            c,
-        )))
-        .unwrap();
-    let selected = CollectionDerive::sign(&owner, target.handle(), c, t);
+    let merged = CollectionRecord::Merge(CollectionMerge::sign(
+        &owner,
+        source.handle(),
+        (ca.data(), CollectionRecord::Commit(ca).fingerprint()),
+        (cb.data(), CollectionRecord::Commit(cb).fingerprint()),
+        c,
+    ));
+    store.insert(merged).unwrap();
+    let selected = CollectionDerive::sign(&owner, target.handle(), (c, merged.fingerprint()), t);
     store.insert(CollectionRecord::Derive(selected)).unwrap();
-    let roots = BTreeSet::from([ca, cb, cz]);
-    let lineage = BTreeMap::from([(target.handle(), source.handle())]);
 
-    let observe = |store: &mut MemoryRepo, skip_ancestor_admission: bool| {
+    let observe = |store: &mut MemoryRepo| {
         let snapshot = store.snapshot().unwrap();
-        let records = discover_collection_records(&snapshot).unwrap();
-        let resolved = resolve_collection_semantics(&records, &lineage, &roots, |request| {
-            let verdict = match request {
-                CollectionValidationRequest::Merge { claim }
-                    if !skip_ancestor_admission
-                        && claim.public_key().raw != owner.verifying_key().to_bytes() =>
-                {
-                    CollectionClaimValidation::Pending
-                }
-                _ => CollectionClaimValidation::Accepted,
-            };
-            Ok::<CollectionClaimValidation<()>, Infallible>(verdict)
-        })
-        .unwrap();
-        assert!(resolved
-            .admitted_claims()
-            .contains(&CollectionRecord::Derive(selected)));
+        let attached = snapshot.collection(target).unwrap();
         assert_eq!(
-            resolved.semantics().frontier(target.handle()),
-            Some(&BTreeSet::from([t])),
+            attached
+                .cover()
+                .members()
+                .map(Handle::<SuccinctArchiveBlob>::to_hash)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([t]),
         );
-        resolved.semantics().supporting_data(target.handle(), t)
+        attached
+            .support()
+            .members()
+            .map(Handle::<SimpleArchive>::to_hash)
+            .collect::<BTreeSet<_>>()
     };
 
-    let original: BTreeSet<CollectionData> = BTreeSet::from([ca.data(), cb.data()]);
-    assert_eq!(observe(&mut store, false), original);
-    assert_eq!(observe(&mut store, true), original);
+    let original = BTreeSet::from([ca.data(), cb.data()]);
+    assert_eq!(observe(&mut store), original);
 
     // Different operation inputs mean no functional-output conflict. This
     // false absorption is signed, but its producer has no source WRITE.
-    store
-        .insert(CollectionRecord::Merge(CollectionMerge::sign(
-            &unrelated,
-            source.handle(),
-            c,
-            cz.data(),
-            c,
-        )))
-        .unwrap();
-
-    assert_eq!(observe(&mut store, false), original);
-    assert_eq!(
-        observe(&mut store, true),
-        BTreeSet::from([ca.data(), cb.data(), cz.data()]),
-    );
+    // Even an authorized alternative cannot retroactively replace the
+    // selected DERIVE's exact witness. The signer of a false equation owns
+    // that lie; it does not taint a different, already-endorsed route.
+    for signer in [&unrelated, &owner] {
+        store
+            .insert(CollectionRecord::Merge(CollectionMerge::sign(
+                signer,
+                source.handle(),
+                (c, merged.fingerprint()),
+                (cz.data(), CollectionRecord::Commit(cz).fingerprint()),
+                c,
+            )))
+            .unwrap();
+        assert_eq!(observe(&mut store), original);
+    }
 }

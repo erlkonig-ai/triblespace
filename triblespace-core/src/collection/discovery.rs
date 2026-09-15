@@ -36,6 +36,19 @@ pub struct DiscoveredCollectionRecords {
 }
 
 impl DiscoveredCollectionRecords {
+    pub(crate) fn from_records(records: impl IntoIterator<Item = CollectionRecord>) -> Self {
+        let mut discovered = Self::default();
+        for record in records {
+            match record {
+                CollectionRecord::Commit(record) => discovered.commits.push(record),
+                CollectionRecord::Merge(record) => discovered.merges.push(record),
+                CollectionRecord::Derive(record) => discovered.derives.push(record),
+            }
+        }
+        discovered.canonicalize();
+        discovered
+    }
+
     /// Locally trusted signed commits, ordered canonically.
     ///
     /// Signature validity does not authorize the signing key. Callers apply
@@ -153,113 +166,12 @@ where
     Ok(discovered)
 }
 
-/// Whether every blob named directly by one raw collection record belongs to
-/// this immutable blob snapshot.
-///
-/// Raw record storage deliberately preserves dangling evidence for repair.
-/// Semantic discovery crosses the stronger boundary here: an equation or
-/// commit cannot affect a snapshot until its complete direct closure was
-/// already resident when that snapshot was frozen. Absence is inert; failure
-/// to observe the blob index is propagated rather than confused with a
-/// partial semantic result. The raw [`CollectionRead`] surface remains
-/// available to repair dangling records independently.
-fn record_references_are_resident<S>(
-    snapshot: &S,
-    record: CollectionRecord,
-) -> Result<bool, CollectionDiscoveryError<S::RecordsError>>
-where
-    S: BlobStoreList + CollectionRead,
-{
-    for reference in record.blob_references() {
-        let resident = snapshot.contains_blob(reference).map_err(|source| {
-            CollectionDiscoveryError::Residency {
-                reference,
-                source: Box::new(source),
-            }
-        })?;
-        if !resident {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-/// Discover every stored equation whose collection belongs to one descriptor
-/// lineage.
-///
-/// A foundational [`Cover`] has already crossed admission before this helper
-/// is called, so signed commits are deliberately absent.  `MERGE` equations
-/// are selected for every lattice in the lineage and `DERIVE` equations for
-/// every derived target.  Resolution can then seed only the foundational
-/// support and close the whole chain without treating an intermediate
-/// physical cover as a new denotational root.
-pub(crate) fn discover_collection_equations_for_lineage<S>(
-    snapshot: &S,
-    lineage: &BTreeSet<CollectionHandle>,
-) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
-where
-    S: BlobStoreList + CollectionRead,
-{
-    let raw = discover_collection_equations_for_lineage_raw(snapshot, lineage)?;
-    let mut discovered = DiscoveredCollectionRecords::default();
-    for record in raw.merges {
-        if record_references_are_resident(snapshot, CollectionRecord::Merge(record))? {
-            discovered.merges.push(record);
-        }
-    }
-    for record in raw.derives {
-        if record_references_are_resident(snapshot, CollectionRecord::Derive(record))? {
-            discovered.derives.push(record);
-        }
-    }
-    discovered.canonicalize();
-    Ok(discovered)
-}
-
-/// Discover the bounded raw equation frontier for active acquisition.
-///
-/// Unlike semantic discovery this intentionally preserves dangling records;
-/// callers use their direct references to acquire exact immutable content,
-/// then resnapshot before interpreting the equations.
-pub(crate) fn discover_collection_equations_for_lineage_raw<S>(
-    snapshot: &S,
-    lineage: &BTreeSet<CollectionHandle>,
-) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
-where
-    S: CollectionRead,
-{
-    let mut selectors = BTreeSet::new();
-    for collection in lineage {
-        // Whole-collection selection is the pile's indexed path. Selecting
-        // MERGE and DERIVE separately would force a full record scan merely
-        // to discard the same COMMITs below.
-        selectors.insert(CollectionRecordSelector::Collection(*collection));
-    }
-
-    let mut discovered = DiscoveredCollectionRecords::default();
-    for record in snapshot
-        .select_records(&selectors)
-        .map_err(CollectionDiscoveryError::Records)?
-    {
-        match record {
-            CollectionRecord::Commit(_) => {}
-            CollectionRecord::Merge(record) if lineage.contains(&record.collection()) => {
-                discovered.merges.push(record);
-            }
-            CollectionRecord::Derive(record) if lineage.contains(&record.collection()) => {
-                discovered.derives.push(record);
-            }
-            CollectionRecord::Merge(_) | CollectionRecord::Derive(_) => {}
-        }
-    }
-    discovered.canonicalize();
-    Ok(discovered)
-}
-
 /// Discover same-lattice equations that may physically realize one cover.
 ///
-/// The cover is already an opaque constructed value, so this
-/// path deliberately does not select or verify provenance commits.
+/// Caller-supplied hashes are payload coordinates, not provenance claims.
+/// Current WRITE producers supply trusted mathematical MERGE equations;
+/// their exact same-collection MERGE witnesses inherit that endorsement.
+/// COMMIT/DERIVE ancestry is deliberately unnecessary for this raw algebra.
 pub(crate) fn discover_collection_equations_for_cover<S, L>(
     snapshot: &S,
     cover: &Cover<L>,
@@ -302,6 +214,29 @@ where
                 .is_some_and(|subject| evidence.authorizes(snapshot, subject))
         })
     });
+
+    let mut pending = discovered.merges.clone();
+    let mut seen: BTreeSet<_> = pending.iter().map(CollectionMerge::fingerprint).collect();
+    while let Some(merge) = pending.pop() {
+        let (low, high) = merge.inputs();
+        let (low_witness, high_witness) = merge.input_witnesses();
+        for (input, witness) in [(low, low_witness), (high, high_witness)] {
+            let Some(CollectionRecord::Merge(predecessor)) = snapshot
+                .record(witness)
+                .map_err(CollectionDiscoveryError::Records)?
+            else {
+                continue;
+            };
+            if predecessor.collection() != collection || predecessor.result() != input {
+                continue;
+            }
+            if seen.insert(predecessor.fingerprint()) {
+                discovered.merges.push(predecessor);
+                pending.push(predecessor);
+            }
+        }
+    }
+    discovered.canonicalize();
     Ok(discovered)
 }
 
@@ -338,9 +273,6 @@ where
         .map_err(CollectionDiscoveryError::Records)?;
 
     for record in records {
-        if !record_references_are_resident(snapshot, record)? {
-            continue;
-        }
         match record {
             CollectionRecord::Commit(record)
                 if record.collection() == cover.collection().handle()
@@ -431,10 +363,7 @@ where
         .map_err(CollectionDiscoveryError::Records)?;
 
     for record in records {
-        if record.collection() != collection
-            || !is_member(&record.public_key())
-            || !record_references_are_resident(snapshot, record)?
-        {
+        if record.collection() != collection || !is_member(&record.public_key()) {
             continue;
         }
         match record {
@@ -461,10 +390,10 @@ mod tests {
 
     use crate::blob::encodings::simplearchive::SimpleArchive;
     use crate::blob::encodings::UnknownBlob;
-    use crate::blob::{Blob, BlobEncoding};
+    use crate::blob::{BlobEncoding, IntoBlob};
     use crate::collection::{
         empty_metadata_handle, AdmissionPolicy, Collection, CollectionData, CollectionPolicy,
-        CollectionStore, CollectionStoreExt, Support,
+        CollectionSnapshotExt, CollectionStore, CollectionStoreExt, Support,
     };
     use crate::inline::encodings::hash::Handle;
     use crate::inline::{Inline, InlineEncoding};
@@ -563,6 +492,23 @@ mod tests {
         Inline::new([byte; 32])
     }
 
+    // Discovery indexes stored records; it does not interpret witness closure.
+    fn witnessed_input(
+        collection: CollectionHandle,
+        data: CollectionData,
+    ) -> (
+        CollectionData,
+        crate::collection::CollectionRecordFingerprint,
+    ) {
+        let record = CollectionRecord::Commit(CollectionCommit::sign(
+            &SigningKey::from_bytes(&[7; 32]),
+            collection,
+            data,
+            empty_metadata_handle(),
+        ));
+        (data, record.fingerprint())
+    }
+
     fn member(byte: u8) -> Inline<Handle<SimpleArchive>> {
         Inline::new([byte; 32])
     }
@@ -659,55 +605,77 @@ mod tests {
     }
 
     #[test]
-    fn dangling_equations_are_raw_but_semantically_visible_only_later() {
+    fn endorsed_output_arrival_changes_only_later_snapshots() {
+        use crate::blob::encodings::succinctarchive::{
+            OrderedUniverse, SuccinctArchiveBlob, UnionArchive,
+        };
         let mut store = MemoryRepo::default();
-        let target = store
+        let source = store
             .collection(
                 "dangling-equations",
                 CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
             )
             .unwrap();
-        let low = store
-            .put::<UnknownBlob, _>(Bytes::from_source(b"low".to_vec()))
+        let target = store
+            .derive::<SuccinctArchiveBlob>(
+                source,
+                (),
+                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+            )
             .unwrap();
-        let high = store
-            .put::<UnknownBlob, _>(Bytes::from_source(b"high".to_vec()))
-            .unwrap();
-        let output = Bytes::from_source(b"output".to_vec());
-        let output_handle = Blob::<UnknownBlob>::new(output.clone()).get_handle();
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let a = crate::prelude::entity! { crate::metadata::name: "a" };
+        let b = crate::prelude::entity! { crate::metadata::name: "b" };
+        let joined = crate::collection::simplearchive_union::join(
+            &a.facts().clone().to_blob(),
+            &b.facts().clone().to_blob(),
+        )
+        .unwrap();
+        let output = crate::collection::succinctarchive_union::derive_element(&joined).unwrap();
+        let ca = store.commit(source, &key, a).unwrap();
+        let cb = store.commit(source, &key, b).unwrap();
         let merge = CollectionRecord::Merge(CollectionMerge::sign(
-            &SigningKey::from_bytes(&[7; 32]),
-            target.handle(),
-            Handle::<UnknownBlob>::to_hash(low),
-            Handle::<UnknownBlob>::to_hash(high),
-            Handle::<UnknownBlob>::to_hash(output_handle),
+            &key,
+            source.handle(),
+            (ca.data(), CollectionRecord::Commit(ca).fingerprint()),
+            (cb.data(), CollectionRecord::Commit(cb).fingerprint()),
+            Handle::<SimpleArchive>::to_hash(joined.get_handle()),
         ));
         let derive = CollectionRecord::Derive(CollectionDerive::sign(
-            &SigningKey::from_bytes(&[7; 32]),
+            &key,
             target.handle(),
-            Handle::<UnknownBlob>::to_hash(low),
-            Handle::<UnknownBlob>::to_hash(output_handle),
+            (
+                Handle::<SimpleArchive>::to_hash(joined.get_handle()),
+                merge.fingerprint(),
+            ),
+            Handle::<SuccinctArchiveBlob>::to_hash(output.get_handle()),
         ));
         store.insert(merge).unwrap();
         store.insert(derive).unwrap();
-        let lineage = BTreeSet::from([target.handle()]);
 
         let before = store.snapshot().unwrap();
-        let raw = discover_collection_equations_for_lineage_raw(&before, &lineage).unwrap();
+        let raw = discover_collection_records(&before).unwrap();
         assert_eq!(raw.merges().len(), 1);
         assert_eq!(raw.derives().len(), 1);
-        let semantic = discover_collection_equations_for_lineage(&before, &lineage).unwrap();
-        assert!(semantic.merges().is_empty());
-        assert!(semantic.derives().is_empty());
+        assert!(before.collection(target).unwrap().cover().is_empty());
 
-        store.put::<UnknownBlob, _>(output).unwrap();
+        // Only the selected output arrives. Its source MERGE payload need
+        // not become resident to read the exact endorsed witness route.
+        store.put::<SuccinctArchiveBlob, _>(output).unwrap();
         let after = store.snapshot().unwrap();
-        let semantic = discover_collection_equations_for_lineage(&after, &lineage).unwrap();
-        assert_eq!(semantic.merges().len(), 1);
-        assert_eq!(semantic.derives().len(), 1);
-        let still_before = discover_collection_equations_for_lineage(&before, &lineage).unwrap();
-        assert!(still_before.merges().is_empty());
-        assert!(still_before.derives().is_empty());
+        let attached = after.collection(target).unwrap();
+        assert_eq!(attached.cover().len(), 1);
+        assert_eq!(attached.support().len(), 2);
+        assert_eq!(
+            attached
+                .view::<UnionArchive<OrderedUniverse>>()
+                .unwrap()
+                .iter()
+                .count(),
+            2
+        );
+        assert!(!after.contains_blob(joined.get_handle()).unwrap());
+        assert!(before.collection(target).unwrap().cover().is_empty());
     }
 
     fn fixture_records() -> (Vec<CollectionRecord>, CollectionCommit) {
@@ -720,14 +688,14 @@ mod tests {
         let merge = CollectionMerge::sign(
             &SigningKey::from_bytes(&[7; 32]),
             collection(1).handle(),
-            data(4),
-            data(5),
+            (data(4), CollectionRecord::Commit(commit).fingerprint()),
+            witnessed_input(collection(1).handle(), data(5)),
             data(6),
         );
         let derive = CollectionDerive::sign(
             &SigningKey::from_bytes(&[7; 32]),
             collection(7).handle(),
-            data(4),
+            (data(4), CollectionRecord::Commit(commit).fingerprint()),
             data(8),
         );
 
@@ -782,10 +750,21 @@ mod tests {
         );
         let commit = CollectionCommit::sign(&authorized_key, target.handle(), low, metadata);
         // Trusted native discovery must not add a signature audit to its
-        // existing author and residency checks.
+        // author checks; payload residency is a separate physical projection.
         let trusted_invalid = invalid_signature(commit);
-        let merge = CollectionMerge::sign(&authorized_key, target.handle(), low, high, output);
-        let derive = CollectionDerive::sign(&authorized_key, target.handle(), low, output);
+        let merge = CollectionMerge::sign(
+            &authorized_key,
+            target.handle(),
+            (low, CollectionRecord::Commit(commit).fingerprint()),
+            witnessed_input(target.handle(), high),
+            output,
+        );
+        let derive = CollectionDerive::sign(
+            &authorized_key,
+            target.handle(),
+            (low, CollectionRecord::Commit(commit).fingerprint()),
+            output,
+        );
         let unauthorized = CollectionCommit::sign(&foreign_key, target.handle(), high, metadata);
         let dangling = CollectionCommit::sign(&authorized_key, target.handle(), data(99), metadata);
         for record in [
@@ -823,7 +802,7 @@ mod tests {
             })
             .unwrap();
 
-        let mut expected_commits = vec![commit, trusted_invalid];
+        let mut expected_commits = vec![commit, trusted_invalid, dangling];
         expected_commits.sort_unstable();
         assert_eq!(discovered.commits(), expected_commits);
         assert_eq!(discovered.merges(), &[merge]);
@@ -832,81 +811,6 @@ mod tests {
         assert_eq!(probe.selections.get(), 1);
         assert_eq!(probe.selected_records.get(), 6);
         assert_eq!(authorization_checks, 6);
-    }
-
-    #[test]
-    fn lineage_discovery_selects_only_equations_in_the_descriptor_lineage() {
-        let source = collection(1);
-        let target = collection(2);
-        let other = collection(3);
-        let commit = CollectionCommit::sign(
-            &SigningKey::from_bytes(&[7; 32]),
-            source.handle(),
-            data(4),
-            empty_metadata_handle(),
-        );
-        let source_merge = CollectionMerge::sign(
-            &SigningKey::from_bytes(&[7; 32]),
-            source.handle(),
-            data(4),
-            data(5),
-            data(6),
-        );
-        let target_merge = CollectionMerge::sign(
-            &SigningKey::from_bytes(&[7; 32]),
-            target.handle(),
-            data(7),
-            data(8),
-            data(9),
-        );
-        let derive = CollectionDerive::sign(
-            &SigningKey::from_bytes(&[7; 32]),
-            target.handle(),
-            data(6),
-            data(7),
-        );
-        let unrelated_merge = CollectionMerge::sign(
-            &SigningKey::from_bytes(&[7; 32]),
-            other.handle(),
-            data(10),
-            data(11),
-            data(12),
-        );
-        let unrelated_derive = CollectionDerive::sign(
-            &SigningKey::from_bytes(&[7; 32]),
-            other.handle(),
-            data(6),
-            data(13),
-        );
-        let unrelated_commit = invalid_signature(CollectionCommit::sign(
-            &SigningKey::from_bytes(&[8; 32]),
-            other.handle(),
-            data(14),
-            empty_metadata_handle(),
-        ));
-        let mut physical = vec![
-            CollectionRecord::Merge(unrelated_merge),
-            CollectionRecord::Derive(unrelated_derive),
-            CollectionRecord::Commit(unrelated_commit),
-            CollectionRecord::Merge(target_merge),
-            CollectionRecord::Commit(commit),
-            CollectionRecord::Derive(derive),
-            CollectionRecord::Merge(source_merge),
-        ];
-        physical.sort_unstable();
-        let store = ProbeStore {
-            records: physical.into_iter().map(Ok).collect(),
-            ..ProbeStore::default()
-        };
-
-        let lineage = BTreeSet::from([source.handle(), target.handle()]);
-        let discovered = discover_collection_equations_for_lineage_raw(&store, &lineage).unwrap();
-
-        let mut expected_merges = vec![source_merge, target_merge];
-        expected_merges.sort_unstable();
-        assert!(discovered.commits().is_empty());
-        assert_eq!(discovered.merges(), expected_merges);
-        assert_eq!(discovered.derives(), &[derive]);
     }
 
     #[test]
@@ -967,21 +871,24 @@ mod tests {
         let target_merge = CollectionMerge::sign(
             &SigningKey::from_bytes(&[7; 32]),
             target.handle(),
-            data(1),
-            data(2),
+            (data(1), CollectionRecord::Commit(valid).fingerprint()),
+            (
+                data(2),
+                CollectionRecord::Commit(relevant_invalid).fingerprint(),
+            ),
             data(5),
         );
         let other_merge = CollectionMerge::sign(
             &SigningKey::from_bytes(&[7; 32]),
             other.handle(),
-            data(3),
-            data(4),
+            witnessed_input(other.handle(), data(3)),
+            witnessed_input(other.handle(), data(4)),
             data(6),
         );
         let crossing_derive = CollectionDerive::sign(
             &SigningKey::from_bytes(&[7; 32]),
             other.handle(),
-            data(5),
+            (data(5), CollectionRecord::Merge(target_merge).fingerprint()),
             data(6),
         );
 
@@ -1078,15 +985,15 @@ mod tests {
             CollectionRecord::Merge(CollectionMerge::sign(
                 &SigningKey::from_bytes(&[7; 32]),
                 other.handle(),
-                data(3),
-                data(4),
+                witnessed_input(other.handle(), data(3)),
+                witnessed_input(other.handle(), data(4)),
                 data(5),
             )),
             CollectionRecord::Commit(matching[1]),
             CollectionRecord::Derive(CollectionDerive::sign(
                 &SigningKey::from_bytes(&[7; 32]),
                 target.handle(),
-                data(5),
+                witnessed_input(other.handle(), data(5)),
                 data(2),
             )),
             CollectionRecord::Commit(CollectionCommit::sign(
@@ -1099,8 +1006,8 @@ mod tests {
             CollectionRecord::Merge(CollectionMerge::sign(
                 &SigningKey::from_bytes(&[7; 32]),
                 target.handle(),
-                data(1),
-                data(2),
+                (data(1), CollectionRecord::Commit(matching[0]).fingerprint()),
+                (data(2), CollectionRecord::Commit(matching[1]).fingerprint()),
                 data(6),
             )),
         ];

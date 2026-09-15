@@ -758,6 +758,25 @@ impl crate::repo::StorageFlush for Blocking<crate::repo::objectstore::ObjectStor
 
 #[cfg(test)]
 mod tests {
+    // Canonical but deliberately uninserted COMMIT witnesses keep these
+    // physical-storage fixtures independent of ancestor arrival order.
+    fn witnessed(
+        signer: &ed25519_dalek::SigningKey,
+        collection: crate::collection::CollectionHandle,
+        data: crate::collection::CollectionData,
+    ) -> (
+        crate::collection::CollectionData,
+        crate::collection::CollectionRecordFingerprint,
+    ) {
+        let record = crate::collection::CollectionCommit::sign(
+            signer,
+            collection,
+            data,
+            crate::collection::empty_metadata_handle(),
+        );
+        (data, record.fingerprint())
+    }
+
     use super::*;
     use crate::blob::encodings::simplearchive::SimpleArchive;
     use crate::blob::Blob;
@@ -788,8 +807,16 @@ mod tests {
         CollectionRecord::Merge(CollectionMerge::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&descriptor),
-            Inline::new([tag.wrapping_add(3); 32]),
-            Inline::new([tag.wrapping_add(4); 32]),
+            witnessed(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                identity_for_tests(&descriptor),
+                Inline::new([tag.wrapping_add(3); 32]),
+            ),
+            witnessed(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                identity_for_tests(&descriptor),
+                Inline::new([tag.wrapping_add(4); 32]),
+            ),
             Inline::new([tag.wrapping_add(5); 32]),
         ))
     }

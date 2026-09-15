@@ -1610,21 +1610,25 @@ fn run_log(path: PathBuf, reference: String, limit: usize, long: bool) -> Result
                 }
                 CollectionRecord::Merge(merge) => {
                     let (low, high) = merge.inputs();
+                    let (low_witness, high_witness) = merge.input_witnesses();
                     println!(
-                        "merge   {:X}  low={}  high={}  result={}  signer={signer}  signature={signature}",
+                        "merge   {:X}  low={}  high={}  result={}  low_witness={}  high_witness={}  signer={signer}  signature={signature}",
                         fingerprint,
                         short(low.raw),
                         short(high.raw),
                         short(merge.result().raw),
+                        short(low_witness.raw()),
+                        short(high_witness.raw()),
                     );
                 }
                 CollectionRecord::Derive(derive) => {
                     let (input, output) = (derive.input(), derive.output());
                     println!(
-                        "derive  {:X}  input={}  output={}  signer={signer}  signature={signature}",
+                        "derive  {:X}  input={}  output={}  input_witness={}  signer={signer}  signature={signature}",
                         fingerprint,
                         short(input.raw),
                         short(output.raw),
+                        short(derive.input_witness().raw()),
                     );
                 }
             }
@@ -1661,6 +1665,25 @@ fn referenced_ids(records: &[CollectionRecord]) -> std::collections::BTreeSet<Co
 }
 #[cfg(test)]
 mod tests {
+    // Canonical but deliberately uninserted COMMIT witnesses keep these
+    // physical-storage fixtures independent of ancestor arrival order.
+    fn witnessed(
+        signer: &ed25519_dalek::SigningKey,
+        collection: triblespace_core::collection::CollectionHandle,
+        data: triblespace_core::collection::CollectionData,
+    ) -> (
+        triblespace_core::collection::CollectionData,
+        triblespace_core::collection::CollectionRecordFingerprint,
+    ) {
+        let record = triblespace_core::collection::CollectionCommit::sign(
+            signer,
+            collection,
+            data,
+            triblespace_core::collection::empty_metadata_handle(),
+        );
+        (data, record.fingerprint())
+    }
+
     use super::*;
     use ed25519_dalek::SigningKey;
     use std::collections::BTreeSet;
@@ -1818,14 +1841,14 @@ mod tests {
             CollectionRecord::Merge(CollectionMerge::sign(
                 &SigningKey::from_bytes(&[1; 32]),
                 collection(1),
-                data(10),
-                data(11),
+                witnessed(&SigningKey::from_bytes(&[1; 32]), collection(1), data(10)),
+                witnessed(&SigningKey::from_bytes(&[1; 32]), collection(1), data(11)),
                 data(12),
             )),
             CollectionRecord::Derive(CollectionDerive::sign(
                 &SigningKey::from_bytes(&[1; 32]),
                 collection(3),
-                data(20),
+                witnessed(&SigningKey::from_bytes(&[1; 32]), collection(3), data(20)),
                 data(21),
             )),
         ];
@@ -1976,14 +1999,14 @@ mod tests {
             CollectionRecord::Merge(CollectionMerge::sign(
                 &SigningKey::from_bytes(&[1; 32]),
                 collection(1),
-                data(10),
-                data(11),
+                witnessed(&SigningKey::from_bytes(&[1; 32]), collection(1), data(10)),
+                witnessed(&SigningKey::from_bytes(&[1; 32]), collection(1), data(11)),
                 data(12),
             )),
             CollectionRecord::Derive(CollectionDerive::sign(
                 &SigningKey::from_bytes(&[1; 32]),
                 collection(3),
-                data(20),
+                witnessed(&SigningKey::from_bytes(&[1; 32]), collection(3), data(20)),
                 data(21),
             )),
         ];

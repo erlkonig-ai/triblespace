@@ -30,7 +30,6 @@ use crate::capability::{
 use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
-use crate::metadata::MetaDescribe;
 use crate::patch::{Blake3Merkle, IdentitySchema, PATCH};
 use crate::repo::async_store::AsyncBlobStoreAcquire;
 use crate::repo::{BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut, CapabilityProofRead};
@@ -52,10 +51,9 @@ use super::{
     read_capability, resolve_collection_semantics_from_roots, write_capability, Collection,
     CollectionClaimValidation, CollectionCommit, CollectionData, CollectionDiscoveryError,
     CollectionEncoding, CollectionFunctionalConflict, CollectionHandle, CollectionOperationError,
-    CollectionRead, CollectionRecord, CollectionRecordSelector, CollectionResolutionError,
-    CollectionSemantics, CollectionSnapshot, CollectionStore, CollectionTypeError,
-    CollectionValidationRequest, DiscoveredCollectionRecords, RecordDecodeError, TryFromCover,
-    TryFromCoverError,
+    CollectionRead, CollectionResolutionError, CollectionSemantics, CollectionSnapshot,
+    CollectionStore, CollectionTypeError, CollectionValidationRequest, DiscoveredCollectionRecords,
+    RecordDecodeError, TryFromCover, TryFromCoverError,
 };
 use super::{
     AdmissionPolicy, CanonicalDerivation, CollectionDerivation, CollectionMapping, CollectionPolicy,
@@ -1231,7 +1229,9 @@ where
 ///
 /// The definition may combine invocation and delegation actions. Authority is
 /// still checked per requested action, against that action's configured roots;
-/// a broad grant cannot borrow an unrelated action's roots.
+/// a broad grant cannot borrow an unrelated action's roots. An open action may
+/// accompany a grant for a restricted action; an entirely open grant is
+/// redundant. One root contributes its share, not an entire multi-root quorum.
 pub fn grant_collection_capability<S>(
     store: &mut S,
     collection: CollectionHandle,
@@ -1265,31 +1265,44 @@ where
             )
         )
     );
-    let policies: Vec<_> = actions
-        .flat_map(|action| {
-            descriptor::admission_policies(&snapshot, descriptor.fragment.facts(), action, None)
-        })
-        .collect();
-    if !policies.is_empty()
-        && policies
-            .iter()
-            .all(|policy| matches!(policy, AdmissionPolicy::Open))
-    {
-        return Err(CollectionGrantError::OpenPolicy {
-            capability,
-            collection,
-        });
-    }
     let root_key = root.verifying_key();
-    if !policies.iter().any(|policy| {
-        policy
-            .roots()
-            .is_some_and(|roots| roots.contains(&root_key))
-    }) {
+    let mut has_action = false;
+    let mut needs_grant = false;
+    for action in actions {
+        has_action = true;
+        let mut open = false;
+        let mut root_is_authorized = false;
+        for policy in
+            descriptor::admission_policies(&snapshot, descriptor.fragment.facts(), action, None)
+        {
+            open |= matches!(policy, AdmissionPolicy::Open);
+            root_is_authorized |= policy
+                .roots()
+                .is_some_and(|roots| roots.contains(&root_key));
+        }
+        if open {
+            continue;
+        }
+        if !root_is_authorized {
+            return Err(CollectionGrantError::RootNotAuthorized {
+                capability,
+                collection,
+                root: root_key,
+            });
+        }
+        needs_grant = true;
+    }
+    if !has_action {
         return Err(CollectionGrantError::RootNotAuthorized {
             capability,
             collection,
             root: root_key,
+        });
+    }
+    if !needs_grant {
+        return Err(CollectionGrantError::OpenPolicy {
+            capability,
+            collection,
         });
     }
     drop(snapshot);
@@ -1708,107 +1721,6 @@ impl<L: CollectionEncoding> Cover<L> {
     }
 }
 
-async fn admitted_support_with_acquisition<S, E>(
-    store: &mut S,
-    target: Collection<E>,
-    frontier: &OperationFrontier<S::Snapshot>,
-) -> Result<Support, CollectionRealizationError>
-where
-    S: Store + AsyncBlobStoreAcquire,
-    E: CollectionEncoding,
-{
-    let mut attempted = BTreeSet::new();
-    let foundation = loop {
-        let snapshot = store.snapshot().map_err(|error| {
-            CollectionRealizationError::storage("open bounded admission snapshot", error)
-        })?;
-        let bounded = frontier.view(snapshot);
-        match super::exact_derived::foundation(&bounded, target) {
-            Ok(foundation) => break foundation,
-            Err(CollectionRealizationError::MissingDependency { member }) => {
-                drop(bounded);
-                if !super::exact_derived::acquire_missing(store, &mut attempted, member).await? {
-                    return Err(CollectionRealizationError::MissingDependency { member });
-                }
-            }
-            Err(error) => return Err(error),
-        }
-    };
-
-    // Decide authorization before acquiring any attacker-supplied payload.
-    // Self-contained proofs need no blob acquisition; only strictly signed
-    // COMMITs by an admitted writer can cause data or metadata acquisition.
-    let snapshot = store.snapshot().map_err(|error| {
-        CollectionRealizationError::storage("open bounded commit snapshot", error)
-    })?;
-    let bounded = frontier.view(snapshot);
-    let descriptor =
-        load_collection_descriptor(&bounded, foundation.handle()).map_err(|error| {
-            CollectionRealizationError::Resolution(format!(
-                "reload foundation descriptor for active admission: {error}"
-            ))
-        })?;
-    let evidence = discover_admission_evidence(
-        &bounded,
-        descriptor::admission_policies(
-            &bounded,
-            descriptor.fragment.facts(),
-            super::ACTION_WRITE,
-            Some(SimpleArchive::id()),
-        ),
-        super::ACTION_WRITE,
-        foundation.handle(),
-    )
-    .map_err(|error| {
-        CollectionRealizationError::storage("discover bounded WRITE evidence", error)
-    })?;
-    let selectors = BTreeSet::from([CollectionRecordSelector::Collection(foundation.handle())]);
-    let commit_references = bounded
-        .select_records(&selectors)
-        .map_err(|error| {
-            CollectionRealizationError::storage("select bounded foundation COMMITs", error)
-        })?
-        .into_iter()
-        .filter_map(|record| match record {
-            CollectionRecord::Commit(commit)
-                if VerifyingKey::from_bytes(&commit.public_key().raw)
-                    .map(|writer| evidence.authorizes(&bounded, writer))
-                    .unwrap_or(false) =>
-            {
-                Some(commit.blob_references())
-            }
-            CollectionRecord::Commit(_)
-            | CollectionRecord::Merge(_)
-            | CollectionRecord::Derive(_) => None,
-        })
-        .flatten()
-        .collect::<Vec<_>>();
-    drop(bounded);
-
-    for reference in commit_references {
-        let snapshot = store.snapshot().map_err(|error| {
-            CollectionRealizationError::storage("inspect COMMIT dependency snapshot", error)
-        })?;
-        let bounded = frontier.view(snapshot);
-        let resident = bounded.contains_blob(reference).map_err(|error| {
-            CollectionRealizationError::storage("inspect COMMIT dependency residency", error)
-        })?;
-        drop(bounded);
-        if !resident {
-            let member = Handle::<crate::blob::encodings::UnknownBlob>::to_hash(reference);
-            let _ = super::exact_derived::acquire_missing(store, &mut attempted, member).await?;
-        }
-    }
-
-    let snapshot = store.snapshot().map_err(|error| {
-        CollectionRealizationError::storage("freeze hydrated admission snapshot", error)
-    })?;
-    let bounded = frontier.view(snapshot);
-    foundation
-        .admitted(&bounded)
-        .map_err(|error| CollectionRealizationError::storage("admit hydrated support", error))
-}
-
 /// Immutable collection observations implemented by every complete store snapshot.
 ///
 /// A snapshot is the temporal boundary. The returned [`CollectionSnapshot`]
@@ -1982,7 +1894,18 @@ where
         .await?;
     let support = match support {
         Some(support) => support,
-        None => admitted_support_with_acquisition(store, target, &frontier).await?,
+        None => {
+            let snapshot = frontier.view(store.snapshot().map_err(|error| {
+                CollectionRealizationError::storage("observe root endorsements", error)
+            })?);
+            let mut support = target.cover([]);
+            for (_, witness_support) in
+                super::admitted_record_witnesses(&snapshot, target.handle())?
+            {
+                support = support.union(&witness_support).expect("one foundation");
+            }
+            support
+        }
     };
     super::exact_derived::ensure_root_in_frontier(store, target, &support, &frontier).await?;
     if compact {
@@ -2193,7 +2116,6 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
                 CollectionRealizationError::storage("freeze exact ensure frontier", error)
             })?;
             let mut frontier = OperationFrontier::new(before);
-            super::exact_derived::acquire_authority(self, target, &frontier).await?;
             super::exact_derived::ensure_exact_in_frontier_with::<Self, M>(
                 self,
                 target,
@@ -2305,7 +2227,6 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
                 CollectionRealizationError::storage("freeze exact maintenance frontier", error)
             })?;
             let mut frontier = OperationFrontier::new(before);
-            super::exact_derived::acquire_authority(self, target, &frontier).await?;
             super::exact_derived::maintain_exact_in_frontier_with::<Self, M>(
                 self,
                 target,
@@ -2356,15 +2277,57 @@ where
     L: CollectionEncoding,
 {
     let collection = cover.collection().handle();
-    let explicit_roots: BTreeSet<_> = cover
-        .data_members()
-        .map(|data| (collection, data))
-        .collect();
+    let mut members: BTreeSet<_> = cover.data_members().collect();
+    let mut equations_by_member = BTreeMap::<CollectionData, Vec<_>>::new();
+    for merge in discovered.merges() {
+        if merge.collection() != collection {
+            continue;
+        }
+        let (low, high) = merge.inputs();
+        for member in [low, high, merge.result()] {
+            equations_by_member.entry(member).or_default().push(merge);
+        }
+    }
+    // Each payload enters the worklist once. An equation has three indexed
+    // occurrences, so even a reverse-ordered chain needs at most three visits
+    // per equation instead of repeated whole-collection scans.
+    let mut pending: Vec<_> = members.iter().copied().collect();
+    while let Some(member) = pending.pop() {
+        for merge in equations_by_member.get(&member).into_iter().flatten() {
+            #[cfg(test)]
+            cover_resolution_tests::EQUATION_VISITS.with(|visits| visits.set(visits.get() + 1));
+            let (low, high) = merge.inputs();
+            // A known result licenses its exact decomposition; known inputs
+            // license their join. One input alone never introduces a sibling.
+            if members.contains(&merge.result())
+                || (members.contains(&low) && members.contains(&high))
+            {
+                for next in [low, high, merge.result()] {
+                    if members.insert(next) {
+                        pending.push(next);
+                    }
+                }
+            }
+        }
+    }
+    let equations = DiscoveredCollectionRecords::from_records(
+        discovered.merges().iter().copied().filter_map(|merge| {
+            let (low, high) = merge.inputs();
+            (merge.collection() == collection
+                && members.contains(&low)
+                && members.contains(&high)
+                && members.contains(&merge.result()))
+            .then_some(super::CollectionRecord::Merge(merge))
+        }),
+    );
+    // These are private payload coordinates licensed by the supplied cover
+    // and trusted equations, never inferred COMMIT membership or Support.
+    let explicit_roots = members.into_iter().map(|data| (collection, data)).collect();
 
     // MERGE records are materialized LSM equations. They are operational
     // evidence, not algebra which needs to be replayed during a read.
     let resolution = resolve_collection_semantics_from_roots(
-        discovered,
+        &equations,
         &BTreeMap::new(),
         &explicit_roots,
         |request| {
@@ -2399,10 +2362,12 @@ where
     L: CollectionEncoding,
 {
     let collection = cover.collection().handle();
-    let mut complete = Vec::new();
+    let mut complete = BTreeSet::new();
     for member in semantics.members(collection).into_iter().flatten().copied() {
         match collection_member_structural_availability::<L, _>(member, snapshot) {
-            Ok(CollectionMemberAvailability::Complete) => complete.push((collection, member)),
+            Ok(CollectionMemberAvailability::Complete) => {
+                complete.insert(member);
+            }
             Ok(CollectionMemberAvailability::Absent)
             | Ok(CollectionMemberAvailability::Incomplete)
             | Ok(CollectionMemberAvailability::Unusable) => {}
@@ -2412,12 +2377,15 @@ where
         }
     }
 
-    let supporting = semantics.supporting_data_for(complete);
+    let requested = cover.data_members().collect();
+    let physical = super::resolution::collection_physical_cover_for(
+        semantics, collection, &requested, &complete,
+    );
     Ok(Cover::from_data(
         cover.collection(),
         cover
             .data_members()
-            .filter(|member| supporting.contains(member)),
+            .filter(|member| !physical.missing.contains(member)),
     ))
 }
 
@@ -2495,12 +2463,12 @@ where
                 Ok(CollectionMemberAvailability::Complete)
             )
         })
-        .map(|member| (collection, member));
-    let supporting = semantics.supporting_data_for(complete);
-    let obligations = cover
-        .data_members()
-        .filter(|member| !supporting.contains(member))
         .collect();
+    let requested = cover.data_members().collect();
+    let obligations = super::resolution::collection_physical_cover_for(
+        &semantics, collection, &requested, &complete,
+    )
+    .missing;
 
     Err(CollectionMaterializationError::Missing {
         obligations,
@@ -2533,4 +2501,343 @@ where
         snapshot, discovered, cover,
     )?;
     V::try_from_cover(&physical, descriptor, snapshot).map_err(CollectionMaterializationError::from)
+}
+
+#[cfg(test)]
+mod grant_tests {
+    use super::*;
+    use crate::capability::{capability_action, capability_delegate_action};
+    use crate::collection::{ACTION_READ, ACTION_WRITE};
+    use crate::prelude::entity;
+    use crate::repo::memoryrepo::MemoryRepo;
+
+    #[test]
+    fn compound_grants_require_a_root_for_every_invocation_and_delegation_action() {
+        let read_root = SigningKey::from_bytes(&[71; 32]);
+        let write_root = SigningKey::from_bytes(&[72; 32]);
+        let recipient = SigningKey::from_bytes(&[73; 32]).verifying_key();
+        let mut store = MemoryRepo::default();
+        let collection = store
+            .collection(
+                "split action roots",
+                CollectionPolicy::new(
+                    AdmissionPolicy::direct(read_root.verifying_key()),
+                    AdmissionPolicy::direct(write_root.verifying_key()),
+                ),
+            )
+            .unwrap();
+        for definition in [
+            entity! { capability_action*: [ACTION_READ, ACTION_WRITE] },
+            entity! {
+                capability_action: ACTION_READ,
+                capability_delegate_action: ACTION_WRITE,
+            },
+            entity! { capability_delegate_action*: [ACTION_READ, ACTION_WRITE] },
+        ] {
+            let capability = store
+                .put::<SimpleArchive, _>(definition.facts().clone())
+                .unwrap();
+            for root in [&read_root, &write_root] {
+                assert!(matches!(
+                    grant_collection_capability(
+                        &mut store,
+                        collection.handle(),
+                        capability,
+                        root,
+                        recipient,
+                    ),
+                    Err(CollectionGrantError::RootNotAuthorized { .. })
+                ));
+            }
+        }
+        assert_eq!(store.snapshot().unwrap().proofs().unwrap().count(), 0);
+    }
+
+    #[test]
+    fn an_unknown_action_or_empty_definition_cannot_borrow_a_known_action_root() {
+        let root = SigningKey::from_bytes(&[74; 32]);
+        let recipient = SigningKey::from_bytes(&[75; 32]).verifying_key();
+        let mut store = MemoryRepo::default();
+        let collection = store
+            .collection(
+                "unknown grant actions",
+                CollectionPolicy::new(
+                    AdmissionPolicy::direct(root.verifying_key()),
+                    AdmissionPolicy::direct(root.verifying_key()),
+                ),
+            )
+            .unwrap();
+        let unknown = crate::id::genid().id;
+        for definition in [
+            entity! { capability_action*: [ACTION_READ, unknown] },
+            entity! {
+                capability_action: ACTION_READ,
+                capability_delegate_action: unknown,
+            },
+            Fragment::empty(),
+        ] {
+            let capability = store
+                .put::<SimpleArchive, _>(definition.facts().clone())
+                .unwrap();
+            assert!(matches!(
+                grant_collection_capability(
+                    &mut store,
+                    collection.handle(),
+                    capability,
+                    &root,
+                    recipient,
+                ),
+                Err(CollectionGrantError::RootNotAuthorized { .. })
+            ));
+        }
+        assert_eq!(store.snapshot().unwrap().proofs().unwrap().count(), 0);
+    }
+
+    #[test]
+    fn compound_grants_preserve_independent_quorum_shares() {
+        let first = SigningKey::from_bytes(&[76; 32]);
+        let second = SigningKey::from_bytes(&[77; 32]);
+        let recipient = SigningKey::from_bytes(&[78; 32]).verifying_key();
+        let mut store = MemoryRepo::default();
+        let quorum =
+            AdmissionPolicy::quorum([first.verifying_key(), second.verifying_key()], 2, None)
+                .unwrap();
+        let collection = store
+            .collection(
+                "compound quorum shares",
+                CollectionPolicy::new(quorum.clone(), quorum),
+            )
+            .unwrap();
+        let capability = store
+            .put::<SimpleArchive, _>(
+                entity! {
+                    capability_action*: [ACTION_READ, ACTION_WRITE],
+                    capability_delegate_action: ACTION_READ,
+                }
+                .facts()
+                .clone(),
+            )
+            .unwrap();
+        let first_proof = grant_collection_capability(
+            &mut store,
+            collection.handle(),
+            capability,
+            &first,
+            recipient,
+        )
+        .unwrap();
+        let one_share = store.snapshot().unwrap();
+        assert!(!collection
+            .reader_is_admitted(&one_share, recipient)
+            .unwrap());
+        assert!(!collection
+            .writer_is_admitted(&one_share, recipient)
+            .unwrap());
+        grant_collection_capability(
+            &mut store,
+            collection.handle(),
+            capability,
+            &second,
+            recipient,
+        )
+        .unwrap();
+        let repeated = grant_collection_capability(
+            &mut store,
+            collection.handle(),
+            capability,
+            &first,
+            recipient,
+        )
+        .unwrap();
+        assert_eq!(repeated, first_proof);
+        let both_shares = store.snapshot().unwrap();
+        assert_eq!(both_shares.proofs().unwrap().count(), 2);
+        assert!(collection
+            .reader_is_admitted(&both_shares, recipient)
+            .unwrap());
+        assert!(collection
+            .writer_is_admitted(&both_shares, recipient)
+            .unwrap());
+    }
+
+    #[test]
+    fn delegate_only_read_grant_can_confer_read_without_invoking_it() {
+        let root = SigningKey::from_bytes(&[79; 32]);
+        let delegate = SigningKey::from_bytes(&[80; 32]);
+        let reader = SigningKey::from_bytes(&[81; 32]).verifying_key();
+        let mut store = MemoryRepo::default();
+        let collection = store
+            .collection(
+                "delegate without invocation",
+                CollectionPolicy::new(
+                    AdmissionPolicy::direct(root.verifying_key()),
+                    AdmissionPolicy::direct(root.verifying_key()),
+                ),
+            )
+            .unwrap();
+        let capability = store
+            .put::<SimpleArchive, _>(
+                entity! { capability_delegate_action: ACTION_READ }
+                    .facts()
+                    .clone(),
+            )
+            .unwrap();
+        let proof = grant_collection_capability(
+            &mut store,
+            collection.handle(),
+            capability,
+            &root,
+            delegate.verifying_key(),
+        )
+        .unwrap();
+        let child = proof
+            .delegate(&delegate, read_capability(), reader)
+            .unwrap();
+        store.insert_proof(child).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        assert!(!collection
+            .reader_is_admitted(&snapshot, delegate.verifying_key())
+            .unwrap());
+        assert!(!collection
+            .writer_is_admitted(&snapshot, delegate.verifying_key())
+            .unwrap());
+        assert!(collection.reader_is_admitted(&snapshot, reader).unwrap());
+        assert!(!collection.writer_is_admitted(&snapshot, reader).unwrap());
+    }
+
+    #[test]
+    fn open_actions_can_accompany_a_restricted_grant_but_cannot_authorize_it() {
+        let root = SigningKey::from_bytes(&[82; 32]);
+        let outsider = SigningKey::from_bytes(&[83; 32]);
+        let recipient = SigningKey::from_bytes(&[84; 32]).verifying_key();
+        let mut store = MemoryRepo::default();
+        let collection = store
+            .collection(
+                "public reads private writes",
+                CollectionPolicy::new(
+                    AdmissionPolicy::Open,
+                    AdmissionPolicy::direct(root.verifying_key()),
+                ),
+            )
+            .unwrap();
+        let capability = store
+            .put::<SimpleArchive, _>(
+                entity! {
+                    capability_action*: [ACTION_READ, ACTION_WRITE],
+                    capability_delegate_action: ACTION_READ,
+                }
+                .facts()
+                .clone(),
+            )
+            .unwrap();
+        assert!(matches!(
+            grant_collection_capability(
+                &mut store,
+                collection.handle(),
+                capability,
+                &outsider,
+                recipient,
+            ),
+            Err(CollectionGrantError::RootNotAuthorized { .. })
+        ));
+        grant_collection_capability(
+            &mut store,
+            collection.handle(),
+            capability,
+            &root,
+            recipient,
+        )
+        .unwrap();
+        let snapshot = store.snapshot().unwrap();
+        assert!(collection.reader_is_admitted(&snapshot, recipient).unwrap());
+        assert!(collection.writer_is_admitted(&snapshot, recipient).unwrap());
+        assert!(matches!(
+            grant_collection_read(&mut store, collection.handle(), &root, recipient),
+            Err(CollectionGrantError::OpenPolicy { .. })
+        ));
+        let open = store
+            .collection(
+                "both actions open",
+                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+            )
+            .unwrap();
+        assert!(matches!(
+            grant_collection_capability(&mut store, open.handle(), capability, &root, recipient),
+            Err(CollectionGrantError::OpenPolicy { .. })
+        ));
+        assert_eq!(store.snapshot().unwrap().proofs().unwrap().count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod cover_resolution_tests {
+    use std::cell::Cell;
+
+    use super::*;
+    use crate::collection::{empty_metadata_handle, CollectionMerge, CollectionRecord};
+
+    thread_local! {
+        pub(super) static EQUATION_VISITS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn data(namespace: u8, index: u32) -> CollectionData {
+        let mut bytes = [0; 32];
+        bytes[0] = namespace;
+        bytes[28..].copy_from_slice(&index.to_be_bytes());
+        Inline::new(bytes)
+    }
+
+    #[test]
+    fn reverse_cover_chain_visits_each_equation_at_most_three_times() {
+        const LENGTH: u32 = 512;
+        let signer = SigningKey::from_bytes(&[17; 32]);
+        let collection = Collection::<SimpleArchive>::from_handle(Inline::new([7; 32]));
+        let mut previous = data(1, 0);
+        let mut previous_record = CollectionRecord::Commit(CollectionCommit::sign(
+            &signer,
+            collection.handle(),
+            previous,
+            empty_metadata_handle(),
+        ));
+        let mut records = Vec::new();
+        for index in 1..=LENGTH {
+            let atom = data(1, index);
+            let result = data(2, index);
+            let atom_record =
+                CollectionCommit::sign(&signer, collection.handle(), atom, empty_metadata_handle());
+            let merge = CollectionMerge::sign(
+                &signer,
+                collection.handle(),
+                (atom, atom_record.fingerprint()),
+                (previous, previous_record.fingerprint()),
+                result,
+            );
+            previous = result;
+            previous_record = CollectionRecord::Merge(merge);
+            records.push(previous_record);
+        }
+        let discovered = DiscoveredCollectionRecords::from_records(records);
+        // Canonical order runs opposite the requested reverse decomposition:
+        // a repeated full scan would unlock only one predecessor per pass.
+        assert_eq!(discovered.merges().first().unwrap().result(), data(2, 1));
+        assert_eq!(discovered.merges().last().unwrap().result(), previous);
+        let cover = Cover::from_data(collection, [previous]);
+        EQUATION_VISITS.with(|visits| visits.set(0));
+
+        let semantics = resolve_cover_semantics(&discovered, &cover).unwrap();
+
+        assert_eq!(
+            semantics.members(collection.handle()).unwrap().len(),
+            2 * LENGTH as usize + 1,
+        );
+        assert_eq!(
+            semantics.frontier(collection.handle()),
+            Some(&BTreeSet::from([previous])),
+        );
+        assert_eq!(
+            EQUATION_VISITS.with(Cell::get),
+            3 * LENGTH as usize,
+            "each equation is visited only for its three newly known payloads",
+        );
+    }
 }
