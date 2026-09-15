@@ -13,6 +13,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   and `maintain-all` dispatch it without changing the source's SimpleArchive
   COMMITs; timestamps and receipt assertion IDs are not projected values.
 
+- Cover current descriptor-based AUTH in the physical compaction CLI tests:
+  duplicate frames collapse without changing a delegated proof, its capability
+  blobs, or the permissions observed after reopening the destination.
+
 - Add the optional `succinct-cuda` feature and explicit
   `--succinct-backend cpu|cuda` selection for collection maintenance. CUDA uses
   the same descriptor and raw bytes for DERIVE and target MERGE, with canonical
