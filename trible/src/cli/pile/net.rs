@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use clap::{Parser, ValueEnum};
 use ed25519_dalek::SigningKey;
 use iroh_base::{EndpointAddr, EndpointId};
@@ -10,7 +10,7 @@ use iroh_tickets::endpoint::EndpointTicket;
 use triblespace_core::collection::CollectionHandle;
 use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
 use triblespace_core::repo::pile::Pile;
-use triblespace_net::health_record::{self, Recorder, DEFAULT_MAX_AGE, REPORT_EVERY};
+use triblespace_net::health_record::{self, DEFAULT_MAX_AGE, REPORT_EVERY, Recorder};
 use triblespace_net::peer::{Peer, PeerConfig, ReconcileDirection, ReconcileQos};
 use triblespace_net::reconcile::{Reconciler, ReplicationMode};
 
@@ -116,6 +116,37 @@ pub enum Command {
         )]
         max_age: u64,
     },
+    /// Inspect local blob/work evidence and replicated observer reports.
+    ///
+    /// The terminal view is the default. `--gui` launches the companion
+    /// `gorbie-cluster-health` renderer over the same immutable report model.
+    Dashboard {
+        pile: PathBuf,
+        /// Reporting author used to identify this pile's health collection.
+        #[arg(long)]
+        key: Option<PathBuf>,
+        /// Maximum report age accepted by this reader.
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            env = "TRIBLESPACE_HEALTH_MAX_AGE_SECS",
+            default_value_t = DEFAULT_MAX_AGE.as_secs()
+        )]
+        max_age: u64,
+        /// Maximum exact blob, missing-reference and pending-WANT rows shown.
+        #[arg(
+            long,
+            value_name = "COUNT",
+            default_value_t = triblespace_net::dashboard::DEFAULT_SAMPLE_LIMIT
+        )]
+        sample: usize,
+        /// Explicitly select the default terminal renderer.
+        #[arg(long, conflicts_with = "gui")]
+        tui: bool,
+        /// Launch the GORBIE renderer (`gorbie-cluster-health`).
+        #[arg(long, conflicts_with = "tui")]
+        gui: bool,
+    },
     /// Repair explicitly named collections with peers.
     Sync {
         pile: PathBuf,
@@ -161,6 +192,20 @@ pub fn run(command: Command) -> Result<()> {
     match command {
         Command::Identity { key } => run_identity(key),
         Command::Health { pile, key, max_age } => run_health(pile, key, max_age),
+        Command::Dashboard {
+            pile,
+            key,
+            max_age,
+            sample,
+            tui: _,
+            gui,
+        } => {
+            if gui {
+                run_dashboard_gui(pile, key, max_age, sample)
+            } else {
+                run_dashboard(pile, key, max_age, sample)
+            }
+        }
         Command::Sync {
             pile,
             peers,
@@ -186,6 +231,303 @@ pub fn run(command: Command) -> Result<()> {
             duration,
             quiescent_for,
         ),
+    }
+}
+
+fn run_dashboard_gui(
+    pile_path: PathBuf,
+    key_path: Option<PathBuf>,
+    max_age: u64,
+    sample: usize,
+) -> Result<()> {
+    use std::process::Command as ProcessCommand;
+
+    let executable = std::env::var_os("TRIBLESPACE_DASHBOARD_GUI")
+        .unwrap_or_else(|| "gorbie-cluster-health".into());
+    let mut command = ProcessCommand::new(&executable);
+    command
+        .arg("--pile")
+        .arg(&pile_path)
+        .arg("--max-age")
+        .arg(max_age.to_string())
+        .arg("--sample")
+        .arg(sample.to_string());
+    if let Some(key_path) = key_path {
+        command.arg("--key").arg(key_path);
+    }
+    let status = command.status().map_err(|error| {
+        anyhow!(
+            "launch GORBIE cluster dashboard {:?}: {error}; install gorbie-cluster-health or set TRIBLESPACE_DASHBOARD_GUI",
+            executable
+        )
+    })?;
+    if !status.success() {
+        return Err(anyhow!("GORBIE cluster dashboard exited with {status}"));
+    }
+    Ok(())
+}
+
+fn run_dashboard(
+    pile_path: PathBuf,
+    key_path: Option<PathBuf>,
+    max_age: u64,
+    sample: usize,
+) -> Result<()> {
+    use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+    use triblespace_core::collection::Collection;
+    use triblespace_core::repo::memoryrepo::MemoryRepo;
+    use triblespace_core::repo::{BlobStoreList, SnapshotSource, StoreSnapshot};
+
+    let signer = load_existing_key(key_path, &pile_path)?;
+    let authority = signer.verifying_key();
+    let policy = CollectionPolicy::new(
+        AdmissionPolicy::direct(authority),
+        AdmissionPolicy::direct(authority),
+    );
+    // Resolve the deterministic descriptor in an ephemeral store. This keeps
+    // a dashboard read from appending even the idempotent descriptor to the
+    // pile it is inspecting.
+    let mut descriptors = MemoryRepo::default();
+    let health: Collection<SimpleArchive> =
+        descriptors.collection(health_record::COLLECTION_NAME, policy)?;
+
+    let mut pile = open_pile(&pile_path)?;
+    let snapshot = pile.snapshot()?;
+    let health_facts = if snapshot.contains_blob(health.handle())? {
+        match health.read(&snapshot) {
+            Ok(facts) => Some(facts),
+            Err(error) => {
+                eprintln!("observer reports: unreadable ({error})");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let now_ns = snapshot.instant().to_tai_duration().total_nanoseconds();
+    let report = triblespace_net::dashboard::inspect(
+        &snapshot,
+        health_facts.as_ref(),
+        now_ns,
+        std::time::Duration::from_secs(max_age),
+        sample,
+    )?;
+    drop(snapshot);
+    pile.close()?;
+    render_dashboard(&report);
+    Ok(())
+}
+
+fn render_dashboard(report: &triblespace_net::dashboard::DashboardReport) {
+    use triblespace_net::dashboard::{CountMetric, Freshness, NativeSummary, WantSummary};
+
+    let local = &report.local;
+    println!("Cluster health — immutable local observation");
+    println!(
+        "blobs: {} resident, {}",
+        local.resident_blobs,
+        format_bytes(local.resident_bytes)
+    );
+    println!("native records: {} stored", local.stored_records);
+    println!("  kind       stored  refs-ready  result-here  missing-refs");
+    for (label, summary) in [
+        ("commit", local.commits),
+        ("merge", local.merges),
+        ("derive", local.derives),
+    ] {
+        render_native_row(label, summary);
+    }
+    println!(
+        "durable WANTs: {} total, {} answered, {} pending",
+        local.wants.total, local.wants.answered, local.wants.pending
+    );
+    println!("  kind       total  answered  pending");
+    for (label, summary) in [
+        ("blob", local.blob_wants),
+        ("merge", local.merge_wants),
+        ("derive", local.derive_wants),
+    ] {
+        render_want_row(label, summary);
+    }
+
+    if !local.collections.is_empty() {
+        println!("collections with native evidence:");
+        println!("  handle        commits  merges  derives  missing-refs");
+        for collection in &local.collections {
+            println!(
+                "  {:12}  {:7}  {:6}  {:7}  {}",
+                triblespace_net::dashboard::short_handle(&collection.collection),
+                collection.commits.stored,
+                collection.merges.stored,
+                collection.derives.stored,
+                collection
+                    .commits
+                    .missing_reference_occurrences
+                    .saturating_add(collection.merges.missing_reference_occurrences)
+                    .saturating_add(collection.derives.missing_reference_occurrences),
+            );
+        }
+    }
+
+    if !local.blob_sample.is_empty() {
+        println!("resident blob sample:");
+        for blob in &local.blob_sample {
+            println!("  {}  {} bytes", hex::encode(blob.handle), blob.bytes);
+        }
+        if local.blob_sample_truncated {
+            println!("  … sample truncated");
+        }
+    }
+    if !local.missing_reference_sample.is_empty() {
+        println!("missing direct-reference sample:");
+        for missing in &local.missing_reference_sample {
+            println!(
+                "  {:12} {:6} {}",
+                triblespace_net::dashboard::short_handle(&missing.collection),
+                missing.kind.label(),
+                hex::encode(missing.handle),
+            );
+        }
+        if local.missing_reference_sample_truncated {
+            println!("  … sample truncated");
+        }
+    }
+    if !local.pending_want_sample.is_empty() {
+        println!("pending durable-WANT sample:");
+        for pending in &local.pending_want_sample {
+            let collection = triblespace_net::dashboard::requested_collection(pending.request)
+                .map(|collection| triblespace_net::dashboard::short_handle(&collection.raw))
+                .unwrap_or_else(|| "—".to_owned());
+            println!(
+                "  {:6} collection {collection}  {:?}",
+                pending.kind.label(),
+                pending.request
+            );
+        }
+        if local.pending_want_sample_truncated {
+            println!("  … sample truncated");
+        }
+    }
+
+    println!("observer reports: {}", report.observers.len());
+    for observer in &report.observers {
+        let endpoint = observer
+            .endpoints
+            .first()
+            .map(|endpoint| hex::encode(&endpoint[..6]))
+            .unwrap_or_else(|| "unknown-node".to_owned());
+        let age = observer
+            .age_seconds
+            .map(|age| format!("{age}s ago"))
+            .unwrap_or_else(|| "future timestamp".to_owned());
+        let freshness = match observer.freshness {
+            Freshness::Fresh => "fresh",
+            Freshness::Stale => "stale",
+            Freshness::Future => "future",
+        };
+        println!("  node {endpoint}: {freshness} ({age})");
+        for condition in &observer.conditions {
+            let components = condition
+                .components
+                .iter()
+                .map(|component| format!("{component:?}").to_lowercase())
+                .collect::<Vec<_>>()
+                .join("|");
+            let states = condition
+                .states
+                .iter()
+                .map(|state| format!("{state:?}").to_lowercase())
+                .collect::<Vec<_>>()
+                .join("|");
+            let collection = condition
+                .collections
+                .first()
+                .map(|handle| format!(" {}", triblespace_net::dashboard::short_handle(handle)))
+                .unwrap_or_default();
+            let peer = condition
+                .peers
+                .first()
+                .map(|peer| format!(" ↔ {}", hex::encode(&peer[..6])))
+                .unwrap_or_default();
+            println!("    {components}{collection}{peer}: {states}");
+            let evidence = &condition.evidence;
+            if evidence.resident_blobs != CountMetric::Absent {
+                println!(
+                    "      resident blobs: {}",
+                    format_metric(&evidence.resident_blobs)
+                );
+            }
+            if evidence.local_records != CountMetric::Absent
+                || evidence.remote_records != CountMetric::Absent
+            {
+                println!(
+                    "      records local/remote: {}/{}; auth local/remote: {}/{}",
+                    format_metric(&evidence.local_records),
+                    format_metric(&evidence.remote_records),
+                    format_metric(&evidence.local_authorizations),
+                    format_metric(&evidence.remote_authorizations),
+                );
+            }
+            if evidence.publication_keys != CountMetric::Absent {
+                println!(
+                    "      publication keys {} · pending start/inc/retry {}/{}/{} · in-flight {}",
+                    format_metric(&evidence.publication_keys),
+                    format_metric(&evidence.publication_startup_pending),
+                    format_metric(&evidence.publication_incremental_pending),
+                    format_metric(&evidence.publication_retry_pending),
+                    format_metric(&evidence.publication_in_flight),
+                );
+            }
+        }
+    }
+    if report.observers.is_empty() {
+        println!("  not observed (or the health collection is not locally readable)");
+    }
+    println!(
+        "Scope: exact local residency and stored evidence; remote values are bounded observer reports."
+    );
+    println!(
+        "Record/root convergence does not prove blob availability. Missing is not pending without a durable WANT."
+    );
+
+    fn render_native_row(label: &str, summary: NativeSummary) {
+        println!(
+            "  {label:10} {:6}  {:10}  {:11}  {}",
+            summary.stored,
+            summary.all_references_resident,
+            summary.result_resident,
+            summary.missing_reference_occurrences,
+        );
+    }
+
+    fn render_want_row(label: &str, summary: WantSummary) {
+        println!(
+            "  {label:10} {:5}  {:8}  {}",
+            summary.total, summary.answered, summary.pending
+        );
+    }
+
+    fn format_metric(metric: &CountMetric) -> String {
+        match metric {
+            CountMetric::Absent => "unknown".to_owned(),
+            CountMetric::Value(value) => value.to_string(),
+            CountMetric::Ambiguous(values) => format!("ambiguous{values:?}"),
+        }
+    }
+}
+
+fn format_bytes(bytes: u128) -> String {
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 
@@ -324,9 +666,9 @@ fn run_sync(
             if let (Some(collection), Some(signer)) = (health_collection, reporting_key.as_ref()) {
                 if std::time::Instant::now() >= next_health {
                     let health = peer.health();
-                    let fragment = recorder.record(
+                    let fragment = recorder.record_measurements(
                         triblespace_core::clock::epoch_now(),
-                        health_record::conditions(&health, triblespace_core::clock::mono_now()),
+                        health_record::measurements(&health, triblespace_core::clock::mono_now()),
                     )?;
                     peer.store().commit(collection, signer, fragment)?;
                     next_health = std::time::Instant::now() + REPORT_EVERY;
@@ -376,7 +718,7 @@ fn run_sync(
 }
 
 fn run_health(pile_path: PathBuf, key_path: Option<PathBuf>, max_age: u64) -> Result<()> {
-    use health_record::{attrs, KIND_REPORT};
+    use health_record::{KIND_REPORT, attrs};
     use triblespace_core::blob::encodings::succinctarchive::{
         OrderedUniverse, SuccinctArchiveBlob, UnionArchive,
     };
@@ -536,16 +878,18 @@ mod tests {
         assert_eq!(parse(Some("demand")), ReplicationMode::Demand);
         assert_eq!(parse(Some("shallow")), ReplicationMode::Shallow);
         assert_eq!(parse(Some("full")), ReplicationMode::Full);
-        assert!(Command::try_parse_from([
-            "net",
-            "sync",
-            "test.pile",
-            "--collection",
-            &handle,
-            "--replication",
-            "everything",
-        ])
-        .is_err());
+        assert!(
+            Command::try_parse_from([
+                "net",
+                "sync",
+                "test.pile",
+                "--collection",
+                &handle,
+                "--replication",
+                "everything",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -593,6 +937,37 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn dashboard_defaults_to_terminal_and_modes_are_exclusive() {
+        let Command::Dashboard {
+            max_age,
+            sample,
+            tui,
+            gui,
+            ..
+        } = Command::try_parse_from(["net", "dashboard", "test.pile"]).unwrap()
+        else {
+            panic!("dashboard expected")
+        };
+        assert_eq!(max_age, DEFAULT_MAX_AGE.as_secs());
+        assert_eq!(sample, triblespace_net::dashboard::DEFAULT_SAMPLE_LIMIT);
+        assert!(!tui);
+        assert!(!gui);
+
+        assert!(matches!(
+            Command::try_parse_from(["net", "dashboard", "test.pile", "--gui", "--sample", "0",])
+                .unwrap(),
+            Command::Dashboard {
+                gui: true,
+                sample: 0,
+                ..
+            }
+        ));
+        assert!(
+            Command::try_parse_from(["net", "dashboard", "test.pile", "--tui", "--gui",]).is_err()
+        );
     }
 
     #[test]

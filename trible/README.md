@@ -215,6 +215,14 @@ changes admission for the immutable current session or creates blob WANTs.
   replication automatically. Reports distinguish a live host, serving
   snapshot, per-peer collection comparison, and DHT publication; matching
   records do not establish that every referenced blob is available.
+- `pile net dashboard <PILE> [--key REPORTING_KEY] [--max-age SECONDS]
+  [--sample COUNT] [--tui|--gui]` — freeze one read-only pile snapshot and show
+  exact local blob residency, native COMMIT/MERGE/DERIVE readiness, and durable
+  WANT completion beside the latest readable observer reports. The terminal
+  renderer is the default. `--gui` launches `gorbie-cluster-health` (override
+  its path with `TRIBLESPACE_DASHBOARD_GUI`). Missing outputs count as pending
+  only when a durable WANT names the work; pairwise record roots remain
+  separate from blob availability.
 - `pile net sync <PILE> --collection HANDLE [--collection HANDLE ...] [--peers ID_OR_TICKET,...] [--key PATH] [--direction bidirectional|read-only|write-only]` — activate the named collections and run periodic repair. `read-only` pulls but does not serve collection repair, while `write-only` serves admitted readers but does not pull collection repair. Every direction still services ordinary exact-blob WANTs. `--duration SECS` and `--quiescent-for SECS` provide optional process-lifecycle bounds.
 
 The exact repair state is the product of the collection's native-record and

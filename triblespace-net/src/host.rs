@@ -763,6 +763,7 @@ impl NetSender {
         let now = crate::clock::mono_now();
         self.health.update(|health| {
             health.store.serving_snapshot = true;
+            health.store.resident_blobs = snapshot.bearer_locators().len();
             health.store.last_snapshot_published_at = Some(now);
             for entry in &mut health.collections {
                 let frontier = snapshot

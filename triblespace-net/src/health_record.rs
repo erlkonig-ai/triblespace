@@ -47,6 +47,27 @@ pub mod attrs {
         /// Report -> current condition episode (repeated).
         "1564F6960F06D906CD895A9D3C8522F4" as condition: inlineencodings::GenId;
         "FA15D65DEA8480F799AD9210D516DF16" as state: inlineencodings::GenId;
+        /// Exact local blob count in the observer's frozen store snapshot.
+        "8593367EF64B9466AA37ABAD8CEE1BD0" as resident_blobs: inlineencodings::U256BE;
+        /// Locally observed collection-record leaves.
+        "1B8BAA2BC79AF3981143A3B505C11080" as local_records: inlineencodings::U256BE;
+        /// Locally observed authorization-evidence leaves.
+        "E30053A332B8DE94643A05F9F6FC5455" as local_authorizations: inlineencodings::U256BE;
+        /// Remotely reported collection-record leaves in one pairwise comparison.
+        "EBB986FACE961CB32B1276CCAF39A74D" as remote_records: inlineencodings::U256BE;
+        /// Remotely reported authorization-evidence leaves in one comparison.
+        "CA19BB7964D2F6DD562416CC39CA13AA" as remote_authorizations: inlineencodings::U256BE;
+        /// Opaque provider keys considered resident by the publication worker.
+        "7ECCF364F3C49A7F14341786D9D4C601" as publication_keys: inlineencodings::U256BE;
+        "C5FB5EBD91865A4FE7BA0AA9601CE165" as publication_startup_pending: inlineencodings::U256BE;
+        "99D3AC84E6C66D7948323A5FBD23E36B" as publication_incremental_pending: inlineencodings::U256BE;
+        "6FD08FDE74BFEB2EA616D0DE69924272" as publication_retry_pending: inlineencodings::U256BE;
+        "2EE8D9BB92F63B7E4DD85DE5DB28ED0F" as publication_renewal_remaining: inlineencodings::U256BE;
+        "B261CB11C1221C0C730BA3261A7C8F7B" as publication_in_flight: inlineencodings::U256BE;
+        "EB66C8D9ED7BE171C14B4F89527F7722" as publication_attempts: inlineencodings::U256BE;
+        "519C3B9557ABCDBA9E998954DFA1D86B" as publication_acknowledged: inlineencodings::U256BE;
+        "53FEF77F051518368F95D2D820B24BB0" as publication_rejected: inlineencodings::U256BE;
+        "148A0E8E56CB3193316960D7B40F013C" as publication_unavailable: inlineencodings::U256BE;
     }
 }
 
@@ -98,6 +119,36 @@ pub struct Condition {
     pub state: State,
     /// An actionable condition, after any startup/recovery grace period.
     pub alert: bool,
+}
+
+/// Optional quantitative evidence attached to one condition episode.
+///
+/// Absence remains distinct from zero: older reporters and components which
+/// cannot observe a quantity must not be rendered as empty or complete.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Evidence {
+    pub resident_blobs: Option<u64>,
+    pub local_records: Option<u64>,
+    pub local_authorizations: Option<u64>,
+    pub remote_records: Option<u64>,
+    pub remote_authorizations: Option<u64>,
+    pub publication_keys: Option<u64>,
+    pub publication_startup_pending: Option<u64>,
+    pub publication_incremental_pending: Option<u64>,
+    pub publication_retry_pending: Option<u64>,
+    pub publication_renewal_remaining: Option<u64>,
+    pub publication_in_flight: Option<u64>,
+    pub publication_attempts: Option<u64>,
+    pub publication_acknowledged: Option<u64>,
+    pub publication_rejected: Option<u64>,
+    pub publication_unavailable: Option<u64>,
+}
+
+/// A condition and the exact counters observed alongside it.
+#[derive(Clone, Debug)]
+pub struct Measurement {
+    pub condition: Condition,
+    pub evidence: Evidence,
 }
 
 /// Conservative reporting policy for a continuously running replica. These
@@ -246,12 +297,81 @@ pub fn conditions(
     conditions
 }
 
+/// Interpret qualitative conditions and retain their independently observed
+/// counters. This does not turn pairwise roots into blob availability claims.
+pub fn measurements(
+    health: &crate::health::HealthSnapshot,
+    now: crate::clock::Mono,
+) -> Vec<Measurement> {
+    conditions(health, now)
+        .into_iter()
+        .map(|condition| {
+            let evidence = match condition.component {
+                Component::Host => Evidence::default(),
+                Component::Store => Evidence {
+                    resident_blobs: Some(health.store.resident_blobs),
+                    ..Evidence::default()
+                },
+                Component::Collection => {
+                    let collection = condition.collection.and_then(|handle| {
+                        health
+                            .collections
+                            .iter()
+                            .find(|collection| collection.collection == handle)
+                    });
+                    let local = collection.and_then(|collection| collection.local_frontier);
+                    let remote = condition.peer.as_ref().and_then(|peer| {
+                        collection?
+                            .peers
+                            .iter()
+                            .find(|entry| entry.peer == peer.to_bytes())?
+                            .comparison
+                            .map(|comparison| comparison.remote)
+                    });
+                    Evidence {
+                        local_records: local.map(|frontier| frontier.records.leaf_count()),
+                        local_authorizations: local
+                            .map(|frontier| frontier.authorization_evidence.leaf_count()),
+                        remote_records: remote.map(|frontier| frontier.records.leaf_count()),
+                        remote_authorizations: remote
+                            .map(|frontier| frontier.authorization_evidence.leaf_count()),
+                        ..Evidence::default()
+                    }
+                }
+                Component::Dht => {
+                    let publication = &health.publication;
+                    Evidence {
+                        publication_keys: Some(publication.resident),
+                        publication_startup_pending: Some(publication.startup_pending),
+                        publication_incremental_pending: Some(publication.incremental_pending),
+                        publication_retry_pending: Some(publication.retry_pending),
+                        publication_renewal_remaining: Some(publication.renewal_remaining),
+                        publication_in_flight: Some(
+                            u64::try_from(publication.in_flight).unwrap_or(u64::MAX),
+                        ),
+                        publication_attempts: Some(publication.attempts),
+                        publication_acknowledged: Some(publication.acknowledged),
+                        publication_rejected: Some(publication.rejected),
+                        publication_unavailable: Some(publication.unavailable),
+                        ..Evidence::default()
+                    }
+                }
+            };
+            Measurement {
+                condition,
+                evidence,
+            }
+        })
+        .collect()
+}
+
 type Subject = (Component, Option<[u8; 32]>, Option<[u8; 32]>);
 
 #[derive(Clone)]
 struct Episode {
     state: State,
     alert: bool,
+    evidence: Evidence,
     facts: Fragment,
 }
 
@@ -285,9 +405,28 @@ impl Recorder {
         at: Epoch,
         conditions: impl IntoIterator<Item = Condition>,
     ) -> anyhow::Result<Fragment> {
+        self.record_measurements(
+            at,
+            conditions.into_iter().map(|condition| Measurement {
+                condition,
+                evidence: Evidence::default(),
+            }),
+        )
+    }
+
+    /// Construct one heartbeat with quantitative evidence. A counter change
+    /// starts a new episode even when the qualitative state is unchanged, so
+    /// the latest report never keeps stale measurements alive.
+    pub fn record_measurements(
+        &mut self,
+        at: Epoch,
+        measurements: impl IntoIterator<Item = Measurement>,
+    ) -> anyhow::Result<Fragment> {
         let created = point(at)?;
         let mut next = BTreeMap::new();
-        for condition in conditions {
+        for measurement in measurements {
+            let condition = measurement.condition;
+            let evidence = measurement.evidence;
             let subject = (
                 condition.component,
                 condition.collection.map(|handle| handle.raw),
@@ -296,7 +435,9 @@ impl Recorder {
             let previous = self.episodes.get(&subject);
             let episode = match previous {
                 Some(previous)
-                    if previous.state == condition.state && previous.alert == condition.alert =>
+                    if previous.state == condition.state
+                        && previous.alert == condition.alert
+                        && previous.evidence == evidence =>
                 {
                     previous.clone()
                 }
@@ -315,6 +456,7 @@ impl Recorder {
                     Episode {
                         state: condition.state,
                         alert: condition.alert,
+                        evidence: evidence.clone(),
                         facts: entity! {
                             metadata::tag*: tags.into_iter().flatten(),
                             attrs::node*: self.node.clone(),
@@ -322,6 +464,21 @@ impl Recorder {
                             attrs::collection?: condition.collection,
                             attrs::peer?: condition.peer,
                             attrs::state: &condition.state.tag(),
+                            attrs::resident_blobs?: evidence.resident_blobs,
+                            attrs::local_records?: evidence.local_records,
+                            attrs::local_authorizations?: evidence.local_authorizations,
+                            attrs::remote_records?: evidence.remote_records,
+                            attrs::remote_authorizations?: evidence.remote_authorizations,
+                            attrs::publication_keys?: evidence.publication_keys,
+                            attrs::publication_startup_pending?: evidence.publication_startup_pending,
+                            attrs::publication_incremental_pending?: evidence.publication_incremental_pending,
+                            attrs::publication_retry_pending?: evidence.publication_retry_pending,
+                            attrs::publication_renewal_remaining?: evidence.publication_renewal_remaining,
+                            attrs::publication_in_flight?: evidence.publication_in_flight,
+                            attrs::publication_attempts?: evidence.publication_attempts,
+                            attrs::publication_acknowledged?: evidence.publication_acknowledged,
+                            attrs::publication_rejected?: evidence.publication_rejected,
+                            attrs::publication_unavailable?: evidence.publication_unavailable,
                             metadata::started_at: created,
                         },
                     }
@@ -723,6 +880,51 @@ mod tests {
             conditions(&next, KIND_ALERT)
         );
         assert_eq!(conditions(&first, KIND_ALERT).len(), 1);
+    }
+
+    #[test]
+    fn changed_measurement_starts_a_new_episode_but_equal_measurement_reuses_it() {
+        let endpoint = ed25519_dalek::SigningKey::from_bytes(&[4; 32]).verifying_key();
+        let mut recorder = Recorder::new(endpoint);
+        let at = Epoch::from_unix_seconds(1_700_000_000.0);
+        let measurement = |resident_blobs| Measurement {
+            condition: Condition {
+                component: Component::Store,
+                collection: None,
+                peer: None,
+                state: State::Current,
+                alert: false,
+            },
+            evidence: Evidence {
+                resident_blobs: Some(resident_blobs),
+                ..Evidence::default()
+            },
+        };
+
+        let first = recorder.record_measurements(at, [measurement(17)]).unwrap();
+        let same = recorder
+            .record_measurements(at + 60.0, [measurement(17)])
+            .unwrap();
+        let changed = recorder
+            .record_measurements(at + 120.0, [measurement(18)])
+            .unwrap();
+
+        assert_eq!(
+            conditions(&first, KIND_CONDITION),
+            conditions(&same, KIND_CONDITION)
+        );
+        assert_ne!(
+            conditions(&same, KIND_CONDITION),
+            conditions(&changed, KIND_CONDITION)
+        );
+        let changed_condition = conditions(&changed, KIND_CONDITION)[0];
+        assert_eq!(
+            find!(count: u128, pattern!(changed.facts(), [{
+                changed_condition @ attrs::resident_blobs: ?count,
+            }]))
+            .collect::<Vec<_>>(),
+            vec![18]
+        );
     }
 
     #[test]

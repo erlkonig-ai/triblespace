@@ -74,6 +74,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
+- Add `pile net dashboard <PILE>` with a default terminal renderer and a
+  `--gui` handoff to `gorbie-cluster-health`. Both consume the same immutable
+  report and expose exact local blob/equation/WANT evidence alongside bounded
+  observer counters without initiating repair or writing the pile.
+
 - Add explicit `pile migrate <PILE> endorse-unsigned-equations` with an exact
   `--collection`, an existing `--signing-key`, and optional `--dry-run`. Require
   target WRITE in one frozen snapshot, skip unresolved output/witness routes,

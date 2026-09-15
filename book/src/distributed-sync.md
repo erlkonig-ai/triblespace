@@ -747,8 +747,9 @@ maximum sample age (default 180 seconds, also configurable through
 `TRIBLESPACE_HEALTH_MAX_AGE_SECS`). Readers use the creation interval's upper
 bound plus that duration and ignore any legacy `expires_at` annotations;
 future-created reports remain unknown, and zero accepts no arrived sample as
-fresh. Conditions use stable episode identities until their state changes; a
-reader can acknowledge an alert once without acknowledging each heartbeat.
+fresh. Conditions use stable episode identities until their state or attached
+quantitative evidence changes; a reader can acknowledge an unchanged alert
+once without acknowledging each heartbeat.
 When the reader's age limit is reached, the report itself supplies an attention
 event even when the daemon stops appending entirely.
 
@@ -760,6 +761,17 @@ only that a provider advertisement was accepted, not that a remote blob fetch
 works. Neither the observed participant set nor a pairwise matching frontier
 proves whole-swarm convergence. `pile net health` reads the local observations;
 Orient can consume the same maintained facts and presentation ledger.
+
+`pile net dashboard` projects one immutable snapshot into a shared report for
+terminal and graphical renderers. Its local side enumerates exact resident
+blobs, stored native equations and their direct-reference/output residency, and
+durable WANTs. Its observed side reads the latest locally available report per
+observer, including optional blob-count, pairwise record/proof, and provider
+publication counters. These remain distinct evidence planes: an equation can
+be stored while its output is absent, a missing output is not scheduled work
+without a WANT, and no pairwise root comparison establishes remote blob
+inventory. Exact samples are bounded and stable; running the dashboard neither
+maintains collections nor appends even a descriptor to the inspected pile.
 
 ## Directory representation experiment
 

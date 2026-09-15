@@ -152,6 +152,9 @@ pub struct StoreHealth {
     pub last_failure: Option<StoreFailure>,
     pub pending_flush: bool,
     pub serving_snapshot: bool,
+    /// Exact number of blobs in the most recently published immutable store
+    /// observation. This is local residency, not network availability.
+    pub resident_blobs: u64,
     pub withdrawn_at: Option<Mono>,
 }
 

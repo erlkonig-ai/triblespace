@@ -66,6 +66,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CC07F0AFB3DCFD254A54A883E86E2617`; independently minted
   `CEB51BC9B3A56A0F29AEE923F13B3D71` was not used.
 
+- Add a read-only cluster dashboard projection over one immutable pile
+  snapshot. It keeps exact local blob residency, stored COMMIT/MERGE/DERIVE
+  equations, durable requested work, and replicated observer reports as four
+  separate evidence planes. Swarm-health reports now carry optional counters
+  for local blob count, pairwise record/proof leaves, and DHT publication work;
+  absence remains distinct from zero and record convergence is never presented
+  as blob availability.
+
 - `Pile::rewrite_retained_into` carries frames of unknown kind exactly, by
   their own length, instead of refusing the whole rewrite: it keeps every
   resident blob, so it cannot orphan whatever such a frame names, and a binary
