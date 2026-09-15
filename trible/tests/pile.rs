@@ -252,6 +252,154 @@ fn compact_uses_valid_blob_occurrence_without_collecting_blobs_or_equations() {
 }
 
 #[test]
+fn compact_preserves_current_delegated_capability_proof_and_admission() {
+    use std::io::Write as _;
+    use triblespace_core::blob::IntoBlob;
+    use triblespace_core::capability::{
+        capability_action, capability_delegate_action, CapabilityProof, CapabilityResource,
+    };
+    use triblespace_core::collection::{ACTION_READ, ACTION_WRITE};
+    use triblespace_core::macros::entity;
+    use triblespace_core::repo::CapabilityProofStore;
+
+    let dir = tempdir().unwrap();
+    let source_path = dir.path().join("delegated-auth-source.pile");
+    let destination_path = dir.path().join("compacted.pile");
+    std::fs::File::create(&source_path).unwrap();
+    let [root, intermediary, recipient, stranger]: [SigningKey; 4] = std::array::from_fn(|_| {
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).unwrap();
+        SigningKey::from_bytes(&seed)
+    });
+    let subjects = [&root, &intermediary, &recipient, &stranger].map(SigningKey::verifying_key);
+
+    let mut source = Pile::open(&source_path).unwrap();
+    let collection = source
+        .collection(
+            "compact-current-auth",
+            CollectionPolicy::new(
+                AdmissionPolicy::direct(root.verifying_key()),
+                AdmissionPolicy::direct(root.verifying_key()),
+            ),
+        )
+        .unwrap();
+    let parent_blob: Blob<SimpleArchive> = entity! {
+        capability_action: ACTION_WRITE,
+        capability_delegate_action: ACTION_READ,
+    }
+    .facts()
+    .to_blob();
+    let child_blob: Blob<SimpleArchive> = entity! {
+        capability_action: ACTION_READ,
+    }
+    .facts()
+    .to_blob();
+    let parent_capability = source.put(parent_blob.clone()).unwrap();
+    let child_capability = source.put(child_blob.clone()).unwrap();
+    assert_ne!(parent_capability, child_capability);
+    let proof = CapabilityProof::new(
+        CapabilityResource::new(collection.handle().raw),
+        &root,
+        parent_capability,
+        intermediary.verifying_key(),
+    )
+    .delegate(&intermediary, child_capability, recipient.verifying_key())
+    .unwrap();
+    assert_eq!(
+        proof.capabilities().collect::<Vec<_>>(),
+        vec![parent_capability, child_capability]
+    );
+    proof.verify_signatures().unwrap();
+    // Store only the full chain: the intermediary's WRITE must still be
+    // authorized by its prefix, even though the final grant invokes only READ.
+    source.insert_proof(proof.clone()).unwrap();
+    let snapshot = source.snapshot().unwrap();
+    let opened = Collection::<SimpleArchive>::open(&snapshot, collection.handle()).unwrap();
+    let before_admission = subjects.map(|subject| {
+        (
+            opened.reader_is_admitted(&snapshot, subject).unwrap(),
+            opened.writer_is_admitted(&snapshot, subject).unwrap(),
+        )
+    });
+    assert_eq!(
+        before_admission,
+        [(true, true), (false, true), (true, false), (false, false)]
+    );
+    drop(snapshot);
+    source.close().unwrap();
+
+    // Concatenation repeats the physical AUTH frame, not the semantic proof.
+    let one_copy = std::fs::read(&source_path).unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&source_path)
+        .unwrap()
+        .write_all(&one_copy)
+        .unwrap();
+    let source_before = std::fs::read(&source_path).unwrap();
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "compact"])
+        .arg(&source_path)
+        .arg("--into")
+        .arg(&destination_path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("capability proofs: 2 -> 1"));
+    assert_eq!(std::fs::read(&source_path).unwrap(), source_before);
+
+    let mut records = PileRecords::open(&destination_path).unwrap();
+    let proof_frames: Vec<_> = records
+        .by_ref()
+        .filter_map(|record| match record.unwrap().content {
+            PileRecordContent::CapabilityProof {
+                id,
+                data_offset,
+                data_len,
+            } => Some((id, data_offset, data_len)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(proof_frames.len(), 1);
+    let (id, offset, len) = proof_frames[0];
+    assert_eq!(id, proof.id());
+    assert_eq!(&records.bytes()[offset..offset + len], proof.as_bytes());
+    drop(records);
+
+    let mut compacted = Pile::open(&destination_path).unwrap();
+    let snapshot = compacted.snapshot().unwrap();
+    assert_eq!(
+        snapshot
+            .proofs()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        vec![proof.clone()]
+    );
+    let retained = snapshot.proof(proof.id()).unwrap().unwrap();
+    assert_eq!(retained.id(), proof.id());
+    assert_eq!(retained.as_bytes(), proof.as_bytes());
+    retained.verify_signatures().unwrap();
+    for (handle, expected) in [
+        (parent_capability, parent_blob),
+        (child_capability, child_blob),
+    ] {
+        let actual: Blob<SimpleArchive> = snapshot.get(handle).unwrap();
+        assert_eq!(actual.bytes.as_ref(), expected.bytes.as_ref());
+    }
+    let opened = Collection::<SimpleArchive>::open(&snapshot, collection.handle()).unwrap();
+    let after_admission = subjects.map(|subject| {
+        (
+            opened.reader_is_admitted(&snapshot, subject).unwrap(),
+            opened.writer_is_admitted(&snapshot, subject).unwrap(),
+        )
+    });
+    assert_eq!(after_admission, before_admission);
+    drop(snapshot);
+    compacted.close().unwrap();
+}
+
+#[test]
 fn compact_drops_retired_team_records() {
     let dir = tempdir().unwrap();
     let source_path = dir.path().join("retired-team-source.pile");
