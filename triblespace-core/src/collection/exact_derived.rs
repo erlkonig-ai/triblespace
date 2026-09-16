@@ -38,6 +38,27 @@ use super::{CanonicalDerivation, CollectionDerivation};
 /// until its appends finish, so the chunk size is the ceiling on how many
 /// mapped payloads are resident at once. It is also the amortisation factor on
 /// the round's snapshots, which dominate a round on a large pile.
+/// Whether `TRIBLESPACE_DERIVE_TRACE` asked for phase timings on stderr.
+///
+/// A pass that is slow is slow somewhere, and this file has now been reasoned
+/// about twice on a guess about where. The trace exists so the next decision
+/// comes from a count rather than from the nearest plausible mechanism.
+pub(super) fn derive_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("TRIBLESPACE_DERIVE_TRACE").is_some_and(|value| value != "0")
+    })
+}
+
+pub(super) fn derive_trace(phase: &str, elapsed: std::time::Duration, count: usize) {
+    if derive_trace_enabled() {
+        eprintln!(
+            "derive-trace phase={phase} ms={:.1} n={count}",
+            elapsed.as_secs_f64() * 1000.0
+        );
+    }
+}
+
 const DERIVE_ROUND_CHUNK: usize = 64;
 
 type BoxError = Box<dyn Error + Send + Sync + 'static>;
@@ -1298,13 +1319,19 @@ where
         let snapshot = frontier.view(store.snapshot().map_err(|error| {
             CollectionRealizationError::storage("open exact mapping snapshot", error)
         })?);
+        let probe_start = std::time::Instant::now();
         let probe = probe_mapping::<_, M>(&snapshot, target, support, true)?;
+        derive_trace("probe_mapping", probe_start.elapsed(), 1);
+        let demand_start = std::time::Instant::now();
         demand_missing_dependency::<_, M>(&snapshot, target, &probe, support, unavailable)?;
+        derive_trace("demand_missing", demand_start.elapsed(), 1);
         if probe.target_resolution.is_exact_for(support) {
             return Ok(());
         }
         let repeated_cover = probe.target_resolution.cover.data_members().collect();
+        let residual_start = std::time::Instant::now();
         let residual = source_residual(&snapshot, &probe, support, &blocked)?;
+        derive_trace("source_residual", residual_start.elapsed(), residual.len());
         let mapping = probe.mapping;
         let incomplete = probe.target_resolution.incomplete_error(support);
 
@@ -1342,7 +1369,10 @@ where
         // Chunking keeps the memory bound the per-member snapshot gave us for
         // free: images are held only until the end of their own chunk, never
         // for the whole round.
+        let mut compute_total = std::time::Duration::ZERO;
+        let mut append_total = std::time::Duration::ZERO;
         for chunk in residual.chunks(DERIVE_ROUND_CHUNK) {
+            let compute_start = std::time::Instant::now();
             let mut images = Vec::with_capacity(chunk.len());
             {
                 let snapshot = frontier.view(store.snapshot().map_err(|error| {
@@ -1386,8 +1416,11 @@ where
                 }
             }
 
+            compute_total += compute_start.elapsed();
+
             // The append stays serial and stops at the first error, so a
             // failed round publishes exactly the maximal error-free prefix.
+            let append_start = std::time::Instant::now();
             for ((input_data, _, witnesses), output) in chunk.iter().zip(images) {
                 if witnesses.iter().any(|witness| published.contains(witness)) {
                     return Err(CollectionRealizationError::Stalled {
@@ -1429,10 +1462,13 @@ where
                     published.insert(*witness);
                 }
             }
+            append_total += append_start.elapsed();
             if replan {
                 break;
             }
         }
+        derive_trace("round_compute", compute_total, residual.len());
+        derive_trace("round_append", append_total, residual.len());
         if replan {
             continue;
         }
@@ -1540,8 +1576,12 @@ where
         let snapshot = frontier.view(store.snapshot().map_err(|error| {
             CollectionRealizationError::storage("open source-guided maintenance snapshot", error)
         })?);
+        let probe_start = std::time::Instant::now();
         let probe = probe_mapping::<_, M>(&snapshot, target, support, true)?;
+        derive_trace("probe_mapping", probe_start.elapsed(), 1);
+        let demand_start = std::time::Instant::now();
         demand_missing_dependency::<_, M>(&snapshot, target, &probe, support, unavailable)?;
+        derive_trace("demand_missing", demand_start.elapsed(), 1);
         let semantics = &probe.target_resolution.semantics;
         let source = probe.source.handle();
         let mut resident = BTreeSet::new();
@@ -1919,7 +1959,10 @@ where
     S: Store + AsyncBlobStoreAcquire,
     M: CollectionMapping,
 {
-    if prepare_exact_mapping::<S, M>(store, target, support, frontier).await? {
+    let prepare_start = std::time::Instant::now();
+    let prepared = prepare_exact_mapping::<S, M>(store, target, support, frontier).await?;
+    derive_trace("prepare_exact_mapping", prepare_start.elapsed(), 1);
+    if prepared {
         return Ok(());
     }
     let mut attempted = BTreeSet::new();
@@ -1959,7 +2002,9 @@ where
 {
     // Warm maintenance may still coarsen the target, but source-guided
     // opportunities are optional and must use only already resident evidence.
+    let prepare_start = std::time::Instant::now();
     prepare_exact_mapping::<S, M>(store, target, support, frontier).await?;
+    derive_trace("prepare_exact_mapping", prepare_start.elapsed(), 1);
     let mut attempted = BTreeSet::new();
     let mut unavailable = BTreeSet::new();
     loop {

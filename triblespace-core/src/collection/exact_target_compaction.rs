@@ -81,12 +81,24 @@ where
         let snapshot = frontier.view(store.snapshot().map_err(|error| {
             CollectionRealizationError::storage("open target-maintenance snapshot", error)
         })?);
+        let resolve_start = std::time::Instant::now();
         let resolved = attach_exact_resolution(&snapshot, target, support)?;
+        super::exact_derived::derive_trace(
+            "attach_exact_resolution",
+            resolve_start.elapsed(),
+            resolved.cover.len(),
+        );
         let identity = cover_identity(&resolved.cover);
         if !seen.insert(identity.clone()) {
             return Err(CollectionRealizationError::Stalled { cover: identity });
         }
+        let carry_start = std::time::Instant::now();
         let prepared = prepare_carry_round(&snapshot, target, &resolved.cover)?;
+        super::exact_derived::derive_trace(
+            "prepare_carry_round",
+            carry_start.elapsed(),
+            resolved.cover.len(),
+        );
         if prepared.is_some() && !producer_is_admitted(&snapshot, target, signing_key)? {
             return Ok(());
         }
