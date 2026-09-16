@@ -18,9 +18,9 @@ use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::Path;
 
+use GORBIE::{CaptureOptions, HeadlessTheme};
 use triblespace_core::prelude::*;
 use triblespace_core::{metadata, signing_key_file};
-use GORBIE::{CaptureOptions, HeadlessTheme};
 
 const MIB: u128 = 1024 * 1024;
 const SECOND: u128 = 1_000_000_000;
@@ -53,9 +53,15 @@ fn generated_frame(directory: &Path) -> Result<(Frame, i128)> {
     let mut facts = Fragment::empty();
     for (node, worker, role, stage) in [
         (nodes[0], "custody-busy", "custody", "body receive"),
+        (nodes[0], "maintenance-process", "process", ""),
         (nodes[0], "maintenance-busy", "maintenance", "derive"),
         (nodes[1], "maintenance-idle", "maintenance", "pass"),
-        (nodes[1], "maintenance-noop", "maintenance", "pass"),
+        (
+            nodes[1],
+            "no-publication-pass",
+            "maintenance",
+            "no-publication-pass",
+        ),
         (nodes[2], "maintenance-stale", "maintenance", "derive"),
         (nodes[3], "maintenance-unknown", "maintenance", "pass"),
         (nodes[0], "link-direct", "link", "transport"),
@@ -75,7 +81,7 @@ fn generated_frame(directory: &Path) -> Result<(Frame, i128)> {
                 (role == "maintenance").then_some(collection.handle()),
             telemetry::attrs::worker: worker,
             telemetry::attrs::role: role,
-            telemetry::attrs::stage: stage,
+            telemetry::attrs::stage?: (role != "process").then_some(stage),
         };
         for tick in 0_u128..2 {
             let report = genid();
@@ -104,7 +110,9 @@ fn generated_frame(directory: &Path) -> Result<(Frame, i128)> {
                     telemetry::attrs::failed: 0_u128,
                     telemetry::attrs::received_bytes: (64 + tick * 48) * MIB,
                     telemetry::attrs::sent_bytes: (32 + tick * 16) * MIB,
-                    telemetry::attrs::cpu_ns: 20 * SECOND + tick * 2_500_000_000,
+                },
+                "maintenance-process" => entity! { &report @
+                    telemetry::attrs::cpu_ns: 7 * SECOND + tick * 750_000_000,
                 },
                 "maintenance-busy" => entity! { &report @
                     telemetry::attrs::queued: 9_u128 - tick * 2,
@@ -120,7 +128,6 @@ fn generated_frame(directory: &Path) -> Result<(Frame, i128)> {
                     telemetry::attrs::completed_merges: 4_u128 + tick,
                     telemetry::attrs::completed_derives: 7_u128 + tick * 3,
                     telemetry::attrs::work_ns: (20 + tick * 2) * SECOND,
-                    telemetry::attrs::cpu_ns: 7 * SECOND + tick * 750_000_000,
                 },
                 "maintenance-idle" => entity! { &report @
                     telemetry::attrs::queued: 0_u128,
@@ -134,9 +141,10 @@ fn generated_frame(directory: &Path) -> Result<(Frame, i128)> {
                     telemetry::attrs::pending_derives: 0_u128,
                     telemetry::attrs::completed_merges: 8_u128,
                     telemetry::attrs::completed_derives: 12_u128,
-                    telemetry::attrs::cpu_ns: 5 * SECOND,
                 },
-                "maintenance-noop" => entity! { &report @
+                // Successful passes with no successful merge/derive publication
+                // calls may still spend time computing; this is not an idle row.
+                "no-publication-pass" => entity! { &report @
                     telemetry::attrs::queued: 0_u128,
                     telemetry::attrs::active: 0_u128,
                     telemetry::attrs::parallelism: 1_u128,
@@ -218,7 +226,7 @@ fn generated_frame(directory: &Path) -> Result<(Frame, i128)> {
 fn assert_mixed_states(frame: &Frame) {
     assert_eq!((frame.readable_sources, frame.selected_sources), (1, 1));
     assert_eq!(frame.nodes().len(), 5);
-    assert_eq!(frame.workers.len(), 8);
+    assert_eq!(frame.workers.len(), 9);
     assert_eq!(frame.health.len(), 1);
     assert!(frame.warnings.is_empty(), "{:?}", frame.warnings);
     let worker = |name| {
@@ -231,21 +239,30 @@ fn assert_mixed_states(frame: &Frame) {
     let busy = worker("custody-busy");
     assert_eq!(count(busy, Metric::Queued), "28");
     assert_eq!(count(busy, Metric::Active), "4");
-    assert_eq!(cpu(busy), "2.50 effective cores");
+    assert_eq!(process_effort(busy), None);
     assert_eq!(rate(busy, Metric::ReceivedBytes, true), "48.00 MiB/s");
+    let process = worker("maintenance-process");
+    assert!(process.stages.is_empty());
+    assert_eq!(
+        process_effort(process).as_deref(),
+        Some("0.75 effective cores")
+    );
     let maintenance = worker("maintenance-busy");
     assert_eq!(count(maintenance, Metric::Active), "1");
     assert_eq!(count(maintenance, Metric::Parallelism), "8");
     assert_eq!(compiled_parallel(maintenance), "no");
-    assert_eq!(cpu(maintenance), "0.75 effective cores");
+    assert_eq!(process_effort(maintenance), None);
+    assert!(serial_configuration_mismatch(maintenance));
+    assert!(execution_summary(maintenance).contains("active 1 · configured 8"));
+    assert!(execution_summary(maintenance).contains("PARALLEL PATH NOT COMPILED"));
     assert_eq!(wall_work(maintenance), "2.00 seconds/second");
     assert_eq!(rate(maintenance, Metric::CompletedDerives, false), "3.00/s");
     let idle = worker("maintenance-idle");
     assert_eq!(count(idle, Metric::Active), "0");
     assert_eq!(rate(idle, Metric::Completed, false), "0.00/s");
-    assert_eq!(cpu(idle), "0.00 effective cores");
+    assert_eq!(cpu(idle), "unmeasured");
     assert!(idle.backends.is_empty(), "idle has no executing backend");
-    let noop = worker("maintenance-noop");
+    let noop = worker("no-publication-pass");
     assert_eq!(rate(noop, Metric::Completed, false), "1.00/s");
     assert_eq!(rate(noop, Metric::CompletedDerives, false), "0.00/s");
     assert_eq!(wall_work(noop), "0.01 seconds/second");
@@ -259,6 +276,8 @@ fn assert_mixed_states(frame: &Frame) {
     assert_eq!(count(unknown, Metric::Active), "unknown");
     assert_eq!(count(unknown, Metric::PendingDerives), "unknown");
     assert_eq!(cpu(unknown), "unmeasured");
+    assert!(execution_summary(unknown).contains("active unknown · configured unknown"));
+    assert!(execution_summary(stale).starts_with("Historical / uncertain:"));
     assert_eq!(labels(&worker("link-direct").paths), "direct");
     assert_eq!(rtt(worker("link-direct")), "1.20 ms");
     assert_eq!(
@@ -272,14 +291,18 @@ fn assert_mixed_states(frame: &Frame) {
         "2.00 MiB/s"
     );
     assert_eq!(frame.health[0].freshness, Freshness::Fresh);
-    assert!(frame.health[0]
-        .conditions
-        .iter()
-        .any(|condition| condition.alert));
-    assert!(frame.health[0]
-        .endpoints
-        .iter()
-        .all(|node| frame.workers.iter().all(|worker| &worker.node != node)));
+    assert!(
+        frame.health[0]
+            .conditions
+            .iter()
+            .any(|condition| condition.alert)
+    );
+    assert!(
+        frame.health[0]
+            .endpoints
+            .iter()
+            .all(|node| frame.workers.iter().all(|worker| &worker.node != node))
+    );
     assert!(
         render_terminal(frame).contains("Health endpoint observed; worker telemetry not observed.")
     );
@@ -329,6 +352,7 @@ fn capture_generated_colony_dashboard() -> Result<()> {
     );
     let mut images = 0_usize;
     let mut encoded_bytes = 0_usize;
+    let mut rendered_height = 0_usize;
     let capture = NotebookConfig::new("Generated colony dashboard fixture")
         .with_headless_theme(HeadlessTheme::Dark)
         .capture(
@@ -373,6 +397,7 @@ fn capture_generated_colony_dashboard() -> Result<()> {
                 )?;
                 images += 1;
                 encoded_bytes += image.bytes.len();
+                rendered_height += image.height as usize;
                 Ok(())
             },
         );
@@ -382,8 +407,12 @@ fn capture_generated_colony_dashboard() -> Result<()> {
         "rendering must not mutate the generated pile"
     );
     use std::fmt::Write as _;
-    writeln!(manifest, "\nGenerated pile after BLAKE3: {}\nPile unchanged: true\nCapture succeeded: {}\nImages: {images}; encoded bytes: {encoded_bytes}",
-        blake3::hash(&after), capture.is_ok())?;
+    writeln!(
+        manifest,
+        "\nGenerated pile after BLAKE3: {}\nPile unchanged: true\nCapture succeeded: {}\nImages: {images}; encoded bytes: {encoded_bytes}; total height: {rendered_height}px",
+        blake3::hash(&after),
+        capture.is_ok()
+    )?;
     OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -396,5 +425,11 @@ fn capture_generated_colony_dashboard() -> Result<()> {
     );
     capture.map_err(|error| anyhow!("generated dashboard capture: {error}"))?;
     anyhow::ensure!(images != 0, "capture emitted no PNGs");
+    // Preserve failed screenshots first, so an expanded-layout regression can
+    // be inspected. The default nine-scope overview must not become a dump.
+    anyhow::ensure!(
+        rendered_height <= 1800,
+        "default generated overview is too tall: {rendered_height}px (budget 1800px)"
+    );
     Ok(())
 }

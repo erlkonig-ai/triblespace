@@ -10,15 +10,15 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::collection::{
     AdmissionPolicy, Collection, CollectionHandle, CollectionPolicy, CollectionSnapshot,
     CollectionSnapshotExt, CollectionStoreExt, TryFromCoverError,
 };
+use triblespace_core::repo::SnapshotSource;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::pile::{Pile, PileSnapshot};
-use triblespace_core::repo::SnapshotSource;
 use triblespace_core::trible::TribleSet;
 use triblespace_net::dashboard::{self, CountMetric, Freshness, ObserverReport};
 use triblespace_net::health_record;
@@ -503,12 +503,15 @@ fn render_terminal(frame: &Frame) -> String {
         frame.observation_time.as_secs_f64(),
         frame.sampled.elapsed().as_secs_f64()
     );
-    let _ = writeln!(out, "Coverage is partial; absent or stale telemetry is not idle. Rates are measured payload, not link capacity.\n");
+    let _ = writeln!(
+        out,
+        "Partial coverage: absent/stale reports are not idle. CPU is reported once per process; scopes are not summed.\n"
+    );
     for node in frame.nodes() {
         let workers: Vec<_> = frame
             .workers
             .iter()
-            .filter(|worker| worker.node == node)
+            .filter(|worker| worker.node == node && worker.role != "link")
             .collect();
         let _ = writeln!(
             out,
@@ -521,49 +524,61 @@ fn render_terminal(frame: &Frame) -> String {
                 .len()
         );
         if workers.is_empty() {
-            let _ = writeln!(
-                out,
-                "  Health endpoint observed; worker telemetry not observed."
-            );
+            if frame
+                .health
+                .iter()
+                .any(|observer| observer.endpoints.contains(&node))
+            {
+                out.push_str("  Health endpoint observed; worker telemetry not observed.\n");
+            } else {
+                out.push_str("  Link endpoint observed; worker effort not observed.\n");
+            }
         }
         for worker in workers {
             let _ = writeln!(
                 out,
-                "  {} / {} · {} · stage {} · backend {}",
+                "  {} / {} · {} · stage {}",
                 clean(&worker.worker, 36),
                 clean(&worker.role, 24),
                 observation_age(worker),
-                labels(&worker.stages),
-                labels(&worker.backends)
+                labels(&worker.stages)
             );
-            let _ = writeln!(
-                out,
-                "    compiled parallel {} · compiled backends {}",
-                compiled_parallel(worker),
-                labels(&worker.compiled_backends)
-            );
-            let _ = writeln!(
-                out,
-                "    queued {} · active {} · configured parallelism {} · CPU {}",
-                count(worker, Metric::Queued),
-                count(worker, Metric::Active),
-                count(worker, Metric::Parallelism),
-                cpu(worker)
-            );
-            let _ = writeln!(
-                out,
-                "    payload receive {} · send {} · completions {} · failures {}",
-                rate(worker, Metric::ReceivedBytes, true),
-                rate(worker, Metric::SentBytes, true),
-                rate(worker, Metric::Completed, false),
-                count(worker, Metric::Failed)
-            );
+            let mut effort = Vec::new();
+            for (metric, label) in [
+                (Metric::Queued, "queued"),
+                (Metric::Active, "active"),
+                (Metric::Parallelism, "configured concurrency"),
+                (Metric::Failed, "failures"),
+            ] {
+                if has_metric(worker, metric) {
+                    effort.push(format!("{label} {}", count(worker, metric)));
+                }
+            }
+            if worker.role == "process" {
+                effort.push(format!("CPU {}", cpu(worker)));
+            }
+            if effort.is_empty() {
+                effort.push("activity and effort not observed".into());
+            }
+            let _ = writeln!(out, "    {}", effort.join(" · "));
+
+            let mut progress = Vec::new();
+            for (metric, label, bytes) in [
+                (Metric::ReceivedBytes, "receive", true),
+                (Metric::SentBytes, "send", true),
+                (Metric::Completed, "completed", false),
+                (Metric::CompletedMerges, "merge publications", false),
+                (Metric::CompletedDerives, "derive publications", false),
+            ] {
+                if has_metric(worker, metric) {
+                    progress.push(format!("{label} {}", rate(worker, metric, bytes)));
+                }
+            }
             if has_metric(worker, Metric::WorkNs) {
-                let _ = writeln!(
-                    out,
-                    "    completed-operation wall work {} (may overlap; not CPU)",
-                    wall_work(worker)
-                );
+                progress.push(format!("wall work {} (not CPU)", wall_work(worker)));
+            }
+            if !progress.is_empty() {
+                let _ = writeln!(out, "    {}", progress.join(" · "));
             }
             if worker.role == "maintenance"
                 || has_metric(worker, Metric::PendingMerges)
@@ -571,20 +586,21 @@ fn render_terminal(frame: &Frame) -> String {
             {
                 let _ = writeln!(
                     out,
-                    "    merges pending {} / {} · derives pending {} / {}",
+                    "    pending merges {} · pending derives {}",
                     count(worker, Metric::PendingMerges),
-                    rate(worker, Metric::CompletedMerges, false),
-                    count(worker, Metric::PendingDerives),
-                    rate(worker, Metric::CompletedDerives, false)
+                    count(worker, Metric::PendingDerives)
                 );
             }
-            if !worker.peers.is_empty() || worker.role == "link" {
+            if !worker.parallel_compiled.is_empty()
+                || !worker.compiled_backends.is_empty()
+                || !worker.backends.is_empty()
+            {
                 let _ = writeln!(
                     out,
-                    "    peers {} · path {} · RTT {}",
-                    handles(&worker.peers),
-                    labels(&worker.paths),
-                    rtt(worker)
+                    "    backend {} · compiled {} · parallel path {}",
+                    labels(&worker.backends),
+                    labels(&worker.compiled_backends),
+                    compiled_parallel(worker)
                 );
             }
             if !worker.targets.is_empty() {
@@ -626,6 +642,34 @@ fn render_terminal(frame: &Frame) -> String {
             }
         }
         out.push('\n');
+    }
+    let links: Vec<_> = frame
+        .workers
+        .iter()
+        .filter(|worker| worker.role == "link" || !worker.peers.is_empty())
+        .collect();
+    if !links.is_empty() {
+        out.push_str("OBSERVED LINKS · payload throughput, not bandwidth capacity\n");
+        for link in links {
+            let _ = writeln!(
+                out,
+                "  {} -> {} · {} · {} · RTT {}",
+                short(&link.node),
+                handles(&link.peers),
+                labels(&link.paths),
+                observation_age(link),
+                rtt(link)
+            );
+            let _ = writeln!(
+                out,
+                "    from reporting node: receive {} · send {}",
+                rate(link, Metric::ReceivedBytes, true),
+                rate(link, Metric::SentBytes, true)
+            );
+        }
+        out.push('\n');
+    } else {
+        out.push_str("LINKS · path, RTT and per-link throughput not observed.\n");
     }
     if frame.workers.is_empty() {
         out.push_str("Worker effort/backlog/throughput are not observed. Select producer telemetry collections; health alone cannot establish them.\n");
@@ -768,7 +812,7 @@ fn rtt(worker: &WorkerReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use triblespace_core::collection::{empty_metadata_handle, CollectionCommit, CollectionRecord};
+    use triblespace_core::collection::{CollectionCommit, CollectionRecord, empty_metadata_handle};
     use triblespace_core::inline::encodings::hash::Handle;
     use triblespace_core::metadata;
     use triblespace_core::prelude::*;
@@ -934,6 +978,39 @@ mod tests {
         });
         assert_eq!(wall_work(&worker), "2.00 seconds/second");
         assert_eq!(cpu(&worker), "unmeasured");
+    }
+
+    #[test]
+    fn terminal_does_not_promote_stage_cpu_or_absent_link_data() {
+        let mut stage = worker();
+        stage.metrics.push(MetricValue {
+            metric: Metric::CpuNs,
+            value: CountMetric::Value(10_000_000_000),
+            per_second: Some(2_000_000_000.0),
+        });
+        let mut process = stage.clone();
+        process.role = "process".into();
+        let mut frame = Frame {
+            workers: vec![stage],
+            health: vec![],
+            warnings: vec![],
+            sampled: Instant::now(),
+            observation_time: Duration::ZERO,
+            readable_sources: 1,
+            selected_sources: 1,
+            max_age: Duration::from_secs(30),
+        };
+        let stage_only = render_terminal(&frame);
+        assert!(!stage_only.contains("CPU 2.00"));
+        assert!(stage_only.contains("activity and effort not observed"));
+        assert!(stage_only.contains("LINKS · path, RTT and per-link throughput not observed"));
+        frame.workers.push(process);
+        assert_eq!(
+            render_terminal(&frame)
+                .matches("CPU 2.00 effective cores")
+                .count(),
+            1
+        );
     }
 
     #[test]
