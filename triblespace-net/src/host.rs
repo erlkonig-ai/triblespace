@@ -2080,72 +2080,157 @@ impl<T: Transport> ProviderClient<T> {
         Ok(canonical_provider_subset(key, providers))
     }
 
-    async fn fetch_from_providers(
+    async fn fetch_from_provider(
         &self,
         hash: RawHash,
-        providers: Vec<PeerId>,
+        peer: PeerId,
     ) -> anyhow::Result<Option<Bytes>> {
-        let mut attempts = futures::stream::iter(providers)
-            .map(|peer| async move {
-                let connection = pool_get(&self.transport, &self.pool, peer).await?;
-                let response = tokio::time::timeout(
-                    OP_DEADLINE,
-                    op_get_blob(connection.conn(), self.my_id, &hash),
-                )
-                .await
-                .map_err(|_| anyhow::anyhow!("exact blob provider request deadline exceeded"))
-                .and_then(|response| response);
-                match response {
-                    Ok(Some(bytes)) => {
-                        self.candidates.lock().unwrap().promote_authenticated(peer);
-                        Ok(Some(bytes))
-                    }
-                    Ok(None) => Ok(None),
-                    Err(error) => {
-                        pool_invalidate(&self.pool, peer, &connection.entry);
-                        Err(error)
-                    }
-                }
-            })
-            .buffer_unordered(ALPHA);
-        let mut failure = None;
-        while let Some(result) = attempts.next().await {
-            match result {
-                Ok(Some(bytes)) => return Ok(Some(bytes)),
-                Ok(None) => {}
-                Err(error) => {
-                    failure.get_or_insert(error);
-                }
+        let connection = pool_get(&self.transport, &self.pool, peer).await?;
+        let response = tokio::time::timeout(
+            OP_DEADLINE,
+            op_get_blob(connection.conn(), self.my_id, &hash),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("exact blob provider request deadline exceeded"))
+        .and_then(|response| response);
+        match response {
+            Ok(Some(bytes)) => {
+                self.candidates.lock().unwrap().promote_authenticated(peer);
+                Ok(Some(bytes))
             }
-        }
-        match failure {
-            Some(error) => Err(error),
-            None => Ok(None),
+            Ok(None) => Ok(None),
+            Err(error) => {
+                pool_invalidate(&self.pool, peer, &connection.entry);
+                Err(error)
+            }
         }
     }
 
-    /// Discover candidates only from H, then complete the H-only handshake.
+    /// Discover candidates only from H and start verified providers without
+    /// waiting for every directory reply. Directory queries and exact GETs
+    /// share ALPHA slots; collection discovery retains its final-union path.
     async fn fetch_blob(
         &self,
         hash: RawHash,
         lookup_limit: Option<std::time::Duration>,
     ) -> anyhow::Result<Option<Bytes>> {
-        let providers = self
-            .find_key(blob_locator(hash), blob_provider_token, hash, lookup_limit)
-            .await?
-            .into_iter()
-            .filter(|peer| *peer != self.my_id)
-            .collect::<Vec<_>>();
-        self.fetch_from_providers(hash, providers).await
+        enum Progress {
+            Directory(PeerId, anyhow::Result<Vec<(PeerId, ProviderToken)>>),
+            Blob(anyhow::Result<Option<Bytes>>),
+        }
+
+        let key = blob_locator(hash);
+        let mut replicas = self.lookup_replicas(key, lookup_limit).await.into_iter();
+        let mut candidates = ProgressiveBlobProviders::new(key);
+        let mut requests: FuturesUnordered<futures::future::BoxFuture<'_, Progress>> =
+            FuturesUnordered::new();
+        let mut remote_responded = false;
+        let mut valid_hint = false;
+        let mut directory_failure = None;
+        let mut provider_failure = None;
+        loop {
+            while requests.len() < ALPHA {
+                if let Some(peer) = candidates.next() {
+                    requests.push(Box::pin(async move {
+                        Progress::Blob(self.fetch_from_provider(hash, peer).await)
+                    }));
+                } else if let Some(peer) = replicas.next() {
+                    requests.push(Box::pin(async move {
+                        Progress::Directory(peer, self.get(peer, key).await)
+                    }));
+                } else {
+                    break;
+                }
+            }
+            let Some(progress) = requests.next().await else {
+                break;
+            };
+            match progress {
+                Progress::Blob(Ok(Some(bytes))) => return Ok(Some(bytes)),
+                Progress::Blob(Ok(None)) => {}
+                Progress::Blob(Err(error)) => {
+                    provider_failure.get_or_insert(error);
+                }
+                Progress::Directory(peer, Ok(reply)) => {
+                    remote_responded |= peer != self.my_id;
+                    candidates.observe(reply.into_iter().filter_map(|(provider, token)| {
+                        if blob_provider_token(hash, provider) != token {
+                            return None;
+                        }
+                        valid_hint = true;
+                        (provider != self.my_id).then_some(provider)
+                    }));
+                }
+                Progress::Directory(_, Err(error)) => {
+                    directory_failure.get_or_insert(error);
+                }
+            }
+        }
+        if let Some(error) = provider_failure {
+            return Err(error);
+        }
+        if !valid_hint {
+            if let Some(error) = directory_failure {
+                return Err(error.context("DHT provider lookup incomplete"));
+            }
+            if !remote_responded {
+                anyhow::bail!("DHT provider lookup reached no remote replica");
+            }
+        }
+        Ok(None)
     }
 }
 
-/// Canonical globally bounded union of provider replies for one exact key.
+/// Per-fetch scheduling only. At most 64 distinct providers can be attempted;
+/// pending slots are XOR-ranked among hints which have arrived so far. A later
+/// reply may replace a pending candidate, never an already-started attempt.
+/// Thus transient attempts deliberately need not equal the canonical final
+/// union used by collection discovery, and remain bounded under hint floods.
+struct ProgressiveBlobProviders {
+    key: ProviderKey,
+    attempted: BTreeSet<PeerId>,
+    pending: Vec<PeerId>,
+}
+
+impl ProgressiveBlobProviders {
+    fn new(key: ProviderKey) -> Self {
+        Self {
+            key,
+            attempted: BTreeSet::new(),
+            pending: Vec::new(),
+        }
+    }
+
+    fn observe(&mut self, providers: impl IntoIterator<Item = PeerId>) {
+        self.pending = canonical_provider_subset(
+            self.key,
+            self.pending
+                .drain(..)
+                .chain(providers)
+                .filter(|peer| !self.attempted.contains(peer)),
+        );
+        self.pending
+            .truncate(crate::provider::MAX_PROVIDERS_PER_KEY - self.attempted.len());
+    }
+
+    fn next(&mut self) -> Option<PeerId> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let peer = self.pending.remove(0);
+        let newly_attempted = self.attempted.insert(peer);
+        debug_assert!(newly_attempted);
+        Some(peer)
+    }
+}
+
+/// Canonical globally bounded union of the supplied replies for one exact key.
 ///
 /// Each queried DHT replica independently bounds its response, but their union
 /// may still be `K` times larger. Ranking the deduplicated union by the same XOR
 /// order as routing makes the selected subset independent of asynchronous reply
-/// order and keeps one exact key's downstream connection fan-out bounded.
+/// order. Collection discovery supplies all replies; progressive exact fetches
+/// use the same ordering for their currently available, not-yet-attempted hints.
 fn canonical_provider_subset(
     key: ProviderKey,
     providers: impl IntoIterator<Item = PeerId>,
@@ -2409,9 +2494,10 @@ mod tests {
 
     use super::{
         COLLECTION_PARTICIPANT_LEASE, DescriptorFetches, DiscoveryState,
-        MAX_COLLECTION_PARTICIPANTS, MAX_PENDING_REPAIRS, ProviderPublicationBudget, RepairTarget,
-        WakeBootstrapPeers, canonical_provider_subset, enqueue_repair, forget_participant,
-        has_repair_candidate, live_participants, observe_participant, retain_active_repair_state,
+        MAX_COLLECTION_PARTICIPANTS, MAX_PENDING_REPAIRS, ProgressiveBlobProviders,
+        ProviderPublicationBudget, RepairTarget, WakeBootstrapPeers, canonical_provider_subset,
+        enqueue_repair, forget_participant, has_repair_candidate, live_participants,
+        observe_participant, retain_active_repair_state,
     };
 
     fn endpoint(byte: u8) -> EndpointId {
@@ -2737,6 +2823,43 @@ mod tests {
             budget.consume_attempt();
         }
         assert!(!budget.is_exhausted());
+    }
+
+    #[test]
+    fn progressive_provider_attempts_are_deduplicated_bounded_and_arrival_sensitive() {
+        let peer = |ordinal: u16| {
+            let mut id = [0; 32];
+            id[30..].copy_from_slice(&ordinal.to_be_bytes());
+            id
+        };
+        let mut candidates = ProgressiveBlobProviders::new([0; 32]);
+        candidates.observe((100..164).map(peer));
+        let early = candidates.next().unwrap();
+        assert_eq!(early, peer(100));
+        candidates.observe([early, peer(1), peer(1)]);
+        assert_eq!(candidates.next(), Some(peer(1)));
+        // The first request remains part of this fetch even though the final
+        // union would rank 64 later closer hints ahead of it.
+        candidates.observe((1..=64).map(peer));
+        let mut attempts = BTreeSet::from([early, peer(1)]);
+        while let Some(next) = candidates.next() {
+            assert!(attempts.insert(next));
+            candidates.observe((1..=64).map(peer));
+            assert!(candidates.attempted.len() + candidates.pending.len() <= 64);
+        }
+        assert_eq!(attempts.len(), crate::provider::MAX_PROVIDERS_PER_KEY);
+        assert!(attempts.contains(&early));
+        assert_ne!(
+            attempts,
+            canonical_provider_subset([0; 32], (1..=164).map(peer))
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+        );
+        candidates.observe((200..264).map(peer));
+        assert!(
+            candidates.next().is_none(),
+            "later replies cannot refill the attempt cap"
+        );
     }
 
     #[test]

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Start exact-H blob GETs from verified provider hints while other directory
+  replies remain pending. Directory and provider operations share the existing
+  three request slots and at most 64 distinct provider attempts. Transient
+  attempt selection is arrival-sensitive; canonical collection discovery,
+  bearer authorization, byte validation and caller deadlines are unchanged.
+
 - Rotate hydration service between eligible WANT, new direct-root, ordinary
   direct-root, and recursive-scan classes. First-attempt priority does not renew
   on re-observation; frozen ordinary rounds preserve old-demand service under

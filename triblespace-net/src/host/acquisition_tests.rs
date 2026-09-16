@@ -240,6 +240,288 @@ impl Drop for RecoveryNode {
     }
 }
 
+/// A directory which remains responsive to routing but delays its provider
+/// reply. This isolates the post-FIND_NODE barrier from cold-dial behavior.
+struct DelayedDirectory {
+    peer: PeerId,
+    queries: Arc<AtomicUsize>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl DelayedDirectory {
+    fn new(
+        net: &SimNet,
+        key: &SigningKey,
+        replies: Vec<(PeerId, ProviderToken)>,
+        delay: Option<Duration>,
+    ) -> Self {
+        let peer = key.verifying_key().to_bytes();
+        let mut harness = net.join(key);
+        let queries = Arc::new(AtomicUsize::new(0));
+        let counted = queries.clone();
+        let server = tokio::spawn(async move {
+            while let Some(incoming) = harness.incoming.recv().await {
+                let replies = replies.clone();
+                let queries = counted.clone();
+                tokio::spawn(async move {
+                    while let Some((mut send, mut recv)) = incoming.conn.accept_bi().await {
+                        let replies = replies.clone();
+                        let queries = queries.clone();
+                        tokio::spawn(async move {
+                            let op = recv_u8(&mut recv).await.unwrap();
+                            let _key = recv_exact_key(&mut recv).await.unwrap();
+                            match op {
+                                OP_FIND_NODE => send_u8(&mut send, 0).await.unwrap(),
+                                OP_PROVIDER_GET => {
+                                    queries.fetch_add(1, Ordering::Relaxed);
+                                    match delay {
+                                        Some(delay) => tokio::time::sleep(delay).await,
+                                        None => std::future::pending::<()>().await,
+                                    }
+                                    send_u8(&mut send, replies.len() as u8).await.unwrap();
+                                    for (provider, token) in replies {
+                                        send_hash(&mut send, &provider).await.unwrap();
+                                        send_hash(&mut send, &token).await.unwrap();
+                                    }
+                                }
+                                other => panic!("unexpected directory opcode {other:#x}"),
+                            }
+                            send.shutdown().await.unwrap();
+                        });
+                    }
+                });
+            }
+        });
+        Self {
+            peer,
+            queries,
+            server,
+        }
+    }
+}
+
+impl Drop for DelayedDirectory {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn verified_provider_fetch_does_not_wait_for_a_stalled_directory_reply() {
+    let _guard = crate::protocol::exact_blob_receive_test_guard();
+    let mut fixture = Fixture::new(false);
+    let slow = DelayedDirectory::new(
+        &fixture.net,
+        &SigningKey::from_bytes(&[133; 32]),
+        Vec::new(),
+        None,
+    );
+    *fixture.client.candidates.lock().unwrap() =
+        RoutingTable::new(fixture.client.my_id, [slow.peer, fixture.provider]);
+    for peer in [slow.peer, fixture.provider] {
+        fixture
+            .client
+            .find_node(peer, blob_locator(fixture.hash))
+            .await
+            .unwrap();
+    }
+
+    let budget = Duration::from_secs(2);
+    let started = tokio::time::Instant::now();
+    assert_eq!(
+        fixture.sender.fetch_blob(fixture.hash, budget).await,
+        Some(fixture.bytes.clone()),
+        "a verified provider is usable before unrelated directory replies complete",
+    );
+    assert!(started.elapsed() < budget);
+    assert_eq!(slow.queries.load(Ordering::Relaxed), 1);
+    assert_eq!(fixture.blob_reads.load(Ordering::Relaxed), 1);
+    fixture.assert_no_control_effects();
+}
+
+#[tokio::test(start_paused = true)]
+async fn later_directory_hint_recovers_from_an_unavailable_first_provider() {
+    later_directory_hint_case(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn later_directory_hint_recovers_from_a_stalled_first_provider() {
+    later_directory_hint_case(true).await;
+}
+
+async fn later_directory_hint_case(stalled: bool) {
+    let _guard = crate::protocol::exact_blob_receive_test_guard();
+    let mut fixture = Fixture::new(false);
+    let mut missing = RecoveryNode::new(&fixture.net, &SigningKey::from_bytes(&[134; 32]), None);
+    let first = DelayedDirectory::new(
+        &fixture.net,
+        &SigningKey::from_bytes(&[135; 32]),
+        vec![(
+            missing.peer,
+            blob_provider_token(fixture.hash, missing.peer),
+        )],
+        Some(Duration::ZERO),
+    );
+    let later = DelayedDirectory::new(
+        &fixture.net,
+        &SigningKey::from_bytes(&[136; 32]),
+        vec![(
+            fixture.provider,
+            blob_provider_token(fixture.hash, fixture.provider),
+        )],
+        Some(Duration::from_secs(1)),
+    );
+    for peer in [first.peer, later.peer, fixture.provider] {
+        pool_get(&fixture.client.transport, &fixture.client.pool, peer)
+            .await
+            .unwrap();
+    }
+    if stalled {
+        fixture.net.stall_dials(missing.peer);
+    } else {
+        pool_get(
+            &fixture.client.transport,
+            &fixture.client.pool,
+            missing.peer,
+        )
+        .await
+        .unwrap();
+    }
+    *fixture.client.candidates.lock().unwrap() =
+        RoutingTable::new(fixture.client.my_id, [first.peer, later.peer]);
+    let started = tokio::time::Instant::now();
+    assert_eq!(
+        fixture
+            .sender
+            .fetch_blob(fixture.hash, Duration::from_secs(2))
+            .await,
+        Some(fixture.bytes.clone()),
+    );
+    assert_eq!(started.elapsed(), Duration::from_secs(1));
+    assert_eq!(first.queries.load(Ordering::Relaxed), 1);
+    assert_eq!(later.queries.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        fixture.net.dial_count(fixture.client.my_id, missing.peer),
+        1
+    );
+    if stalled {
+        assert!(
+            !fixture
+                .client
+                .pool
+                .lock()
+                .unwrap()
+                .entries
+                .contains_key(&missing.peer),
+            "success cancels and releases the unrelated pending provider dial",
+        );
+    }
+    assert_eq!(fixture.blob_reads.load(Ordering::Relaxed), 1);
+    fixture.assert_no_control_effects();
+    missing.assert_no_events();
+}
+
+#[tokio::test(start_paused = true)]
+async fn progressive_fetch_distinguishes_empty_directory_from_incomplete_lookup() {
+    let _guard = crate::protocol::exact_blob_receive_test_guard();
+    let mut fixture = Fixture::new(false);
+    let empty = DelayedDirectory::new(
+        &fixture.net,
+        &SigningKey::from_bytes(&[137; 32]),
+        Vec::new(),
+        Some(Duration::ZERO),
+    );
+    *fixture.client.candidates.lock().unwrap() =
+        RoutingTable::new(fixture.client.my_id, [empty.peer]);
+    assert!(
+        fixture
+            .client
+            .fetch_blob(fixture.hash, None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let stalled = DelayedDirectory::new(
+        &fixture.net,
+        &SigningKey::from_bytes(&[138; 32]),
+        Vec::new(),
+        None,
+    );
+    *fixture.client.candidates.lock().unwrap() =
+        RoutingTable::new(fixture.client.my_id, [stalled.peer]);
+    let error = fixture
+        .client
+        .fetch_blob(fixture.hash, None)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("DHT provider lookup incomplete"));
+    assert_eq!(stalled.queries.load(Ordering::Relaxed), 1);
+    assert_eq!(fixture.blob_reads.load(Ordering::Relaxed), 0);
+    fixture.assert_no_control_effects();
+}
+
+#[tokio::test(start_paused = true)]
+async fn progressive_fetch_preserves_unavailable_and_failed_provider_outcomes() {
+    let _guard = crate::protocol::exact_blob_receive_test_guard();
+    let mut fixture = Fixture::new(false);
+    let mut absent = RecoveryNode::new(&fixture.net, &SigningKey::from_bytes(&[139; 32]), None);
+    let directory = DelayedDirectory::new(
+        &fixture.net,
+        &SigningKey::from_bytes(&[140; 32]),
+        vec![(absent.peer, blob_provider_token(fixture.hash, absent.peer))],
+        Some(Duration::ZERO),
+    );
+    *fixture.client.candidates.lock().unwrap() =
+        RoutingTable::new(fixture.client.my_id, [directory.peer]);
+    assert!(
+        fixture
+            .client
+            .fetch_blob(fixture.hash, None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    fixture.net.crash(absent.peer);
+    *fixture.client.candidates.lock().unwrap() =
+        RoutingTable::new(fixture.client.my_id, [directory.peer]);
+    assert!(fixture.client.fetch_blob(fixture.hash, None).await.is_err());
+    assert_eq!(fixture.blob_reads.load(Ordering::Relaxed), 0);
+    fixture.assert_no_control_effects();
+    absent.assert_no_events();
+}
+
+#[tokio::test(start_paused = true)]
+async fn progressive_fetch_does_not_dial_an_invalid_provider_hint() {
+    let _guard = crate::protocol::exact_blob_receive_test_guard();
+    let mut fixture = Fixture::new(false);
+    let mut token = blob_provider_token(fixture.hash, fixture.provider);
+    token[0] ^= 1;
+    let directory = DelayedDirectory::new(
+        &fixture.net,
+        &SigningKey::from_bytes(&[141; 32]),
+        vec![(fixture.provider, token)],
+        Some(Duration::ZERO),
+    );
+    *fixture.client.candidates.lock().unwrap() =
+        RoutingTable::new(fixture.client.my_id, [directory.peer]);
+    assert!(
+        fixture
+            .client
+            .fetch_blob(fixture.hash, None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        fixture
+            .net
+            .dial_count(fixture.client.my_id, fixture.provider),
+        0
+    );
+    assert_eq!(fixture.blob_reads.load(Ordering::Relaxed), 0);
+    fixture.assert_no_control_effects();
+}
+
 #[tokio::test(start_paused = true)]
 async fn stale_provider_lease_survives_loss_alternate_fetch_and_same_endpoint_restart() {
     let _guard = crate::protocol::exact_blob_receive_test_guard();

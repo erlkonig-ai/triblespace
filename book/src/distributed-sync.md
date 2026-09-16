@@ -286,6 +286,28 @@ token counts separately, alongside its existing totals, without logging handles
 or tokens. These classify hint sources, not cryptographic publication receipts;
 neither category proves that a subsequent GET will succeed.
 
+After routing selects the DHT replicas, an exact-H fetch starts verified
+provider GETs as directory replies arrive, without waiting for every directory
+to finish. Directory queries and provider GETs share three concurrent request
+slots; a usable provider takes the next free slot ahead of an unstarted
+directory query. At most 64 distinct providers can be attempted per fetch.
+Duplicate hints never spend another attempt. Pending providers are ranked by
+XOR distance among the hints received so far, bounded by the remaining attempt
+allowance. A later closer hint can replace pending work, not an already-started
+request. The transient attempt subset is therefore deliberately arrival-sensitive;
+it need not equal the closest 64 in the final reply union. Collection discovery
+still waits for its canonical, reply-order-independent union.
+
+This removes a barrier after a usable hint has arrived, not every possible
+head-of-line delay. Three stalled requests can still occupy the shared slots;
+in particular, three stalled first directory queries prevent an unstarted
+directory from supplying its hint within a shorter caller deadline. An early
+large set of valid but unavailable hints can also exhaust the 64-attempt cap
+before a later useful hint arrives. The caller's existing end-to-end timeout,
+per-operation deadlines, pooled-connection cancellation rules, provider-token
+checks, mutual bearer proof, body-receive memory bound, and final hash check
+are unchanged. No provider hint or result is persisted by this scheduling step.
+
 The direct stream also keeps H off the wire. The requester sends only L. The
 provider resolves L in its resident locator index and proves knowledge of H
 first, binding the proof to both authenticated endpoint IDs. Only after
