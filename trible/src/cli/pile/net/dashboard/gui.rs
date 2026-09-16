@@ -2,6 +2,7 @@
 //! the parent owns stop/join/close even if window creation fails.
 
 use super::*;
+use anyhow::anyhow;
 use GORBIE::cards::DEFAULT_CARD_PADDING;
 use GORBIE::widgets::{Column, TableBuilder};
 use GORBIE::NotebookConfig;
@@ -28,7 +29,7 @@ pub(super) fn run(options: Options) -> Result<()> {
                 ),
                 Some(Err(error)) => {
                     ctx.heading("Colony state unknown");
-                    ctx.label(clean(&error, 200));
+                    ctx.label(error.message());
                 }
                 None => {
                     ctx.heading("Observing colony");

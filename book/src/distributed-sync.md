@@ -893,6 +893,9 @@ observation; neither scans the blob/native-record inventory, probes links,
 acquires missing bodies, maintains a target nor appends a descriptor. GUI
 refresh retains one sampler with explicit stop/join/close ownership. A read
 failure remains visible; it is not replaced with an empty healthy colony.
+Reader failures cross into the display as fixed categories, never backend error
+text or source chains: those may contain a full bearer blob handle. Control
+stripping and truncation alone do not redact a read capability.
 
 Aggregate telemetry is ordinary relational data, not an external metrics
 database. `triblespace_net::telemetry` describes a **subject** (endpoint,

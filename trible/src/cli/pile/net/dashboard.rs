@@ -10,11 +10,11 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::collection::{
     AdmissionPolicy, Collection, CollectionHandle, CollectionPolicy, CollectionSnapshot,
-    CollectionSnapshotExt, CollectionStoreExt,
+    CollectionSnapshotExt, CollectionStoreExt, TryFromCoverError,
 };
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::pile::{Pile, PileSnapshot};
@@ -53,6 +53,59 @@ pub(super) fn run(mut options: Options) -> Result<()> {
     run_terminal(options, live)
 }
 
+// Storage error text (and its source chain) can contain a full bearer H. Drop
+// it at the reader boundary, before a frame, sampler result, or renderer can
+// retain it. Control stripping and truncation are not capability redaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReadFailure {
+    OpenPile,
+    RefreshPile,
+    ClosePile,
+    OpenCollection,
+    ObserveCollection,
+    MemberUnavailable,
+    InvalidFacts,
+    HealthDescriptor,
+    SamplerPanicked,
+}
+
+impl ReadFailure {
+    fn message(self) -> &'static str {
+        match self {
+            Self::OpenPile => "cannot open existing regular dashboard pile",
+            Self::RefreshPile => "cannot refresh dashboard pile",
+            Self::ClosePile => "cannot close dashboard pile",
+            Self::OpenCollection => "collection descriptor unavailable or invalid",
+            Self::ObserveCollection => "collection observation unavailable",
+            Self::MemberUnavailable => "selected member unavailable",
+            Self::InvalidFacts => "selected member cannot form a fact view",
+            Self::HealthDescriptor => "cannot prepare health descriptor",
+            Self::SamplerPanicked => "dashboard sampler panicked",
+        }
+    }
+}
+
+impl std::fmt::Display for ReadFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message())
+    }
+}
+
+impl std::error::Error for ReadFailure {}
+
+impl<GetError, ViewError> From<TryFromCoverError<GetError, ViewError>> for ReadFailure {
+    fn from(error: TryFromCoverError<GetError, ViewError>) -> Self {
+        match error {
+            TryFromCoverError::MemberGet { .. } => Self::MemberUnavailable,
+            TryFromCoverError::View(_) => Self::InvalidFacts,
+            TryFromCoverError::DescriptorGet { .. }
+            | TryFromCoverError::InvalidDescriptor { .. } => Self::OpenCollection,
+        }
+    }
+}
+
+type ReadResult<T> = std::result::Result<T, ReadFailure>;
+
 struct SelectedSource {
     handle: CollectionHandle,
     observed: Option<(CollectionSnapshot<PileSnapshot, SimpleArchive>, TribleSet)>,
@@ -66,15 +119,18 @@ impl SelectedSource {
         }
     }
 
-    fn facts(&mut self, snapshot: &PileSnapshot) -> Result<&TribleSet> {
+    fn facts(&mut self, snapshot: &PileSnapshot) -> ReadResult<&TribleSet> {
         if !self
             .observed
             .as_ref()
             .is_some_and(|(observed, _)| observed.is_current(snapshot))
         {
-            let collection = Collection::<SimpleArchive>::open(snapshot, self.handle)?;
-            let observed = snapshot.collection(collection)?;
-            let facts = observed.view::<TribleSet>()?;
+            let collection = Collection::<SimpleArchive>::open(snapshot, self.handle)
+                .map_err(|_| ReadFailure::OpenCollection)?;
+            let observed = snapshot
+                .collection(collection)
+                .map_err(|_| ReadFailure::ObserveCollection)?;
+            let facts = observed.view::<TribleSet>().map_err(ReadFailure::from)?;
             self.observed = Some((observed, facts));
         }
         Ok(&self.observed.as_ref().expect("observation installed").1)
@@ -90,32 +146,31 @@ struct Reader {
 }
 
 impl Reader {
-    fn open(options: &Options) -> Result<Self> {
+    fn open(options: &Options) -> ReadResult<Self> {
         if !std::fs::metadata(&options.pile)
-            .with_context(|| format!("inspect existing dashboard pile {}", options.pile.display()))?
+            .map_err(|_| ReadFailure::OpenPile)?
             .is_file()
         {
-            bail!("dashboard requires an existing regular pile file");
+            return Err(ReadFailure::OpenPile);
         }
         let mut setup_warnings = Vec::new();
         let health = match super::load_existing_key(options.key.clone(), &options.pile) {
             Ok(signer) => {
                 let authority = signer.verifying_key();
                 let mut descriptors = MemoryRepo::default();
-                let collection: Collection<SimpleArchive> = descriptors.collection(
-                    health_record::COLLECTION_NAME,
-                    CollectionPolicy::new(
-                        AdmissionPolicy::direct(authority),
-                        AdmissionPolicy::direct(authority),
-                    ),
-                )?;
+                let collection: Collection<SimpleArchive> = descriptors
+                    .collection(
+                        health_record::COLLECTION_NAME,
+                        CollectionPolicy::new(
+                            AdmissionPolicy::direct(authority),
+                            AdmissionPolicy::direct(authority),
+                        ),
+                    )
+                    .map_err(|_| ReadFailure::HealthDescriptor)?;
                 Some(SelectedSource::new(collection.handle()))
             }
-            Err(error) => {
-                setup_warnings.push(format!(
-                    "Health fallback unavailable: {}",
-                    clean(&error.to_string(), 140)
-                ));
+            Err(_) => {
+                setup_warnings.push("Health fallback unavailable: cannot read signing key".into());
                 None
             }
         };
@@ -123,7 +178,8 @@ impl Reader {
         handles.sort_unstable_by_key(|handle| handle.raw);
         handles.dedup();
         let sources = handles.into_iter().map(SelectedSource::new).collect();
-        let pile = crate::cli::pile::open_refreshed(&options.pile)?;
+        let pile =
+            crate::cli::pile::open_refreshed(&options.pile).map_err(|_| ReadFailure::OpenPile)?;
         Ok(Self {
             pile,
             sources,
@@ -133,9 +189,9 @@ impl Reader {
         })
     }
 
-    fn sample(&mut self) -> Result<Frame> {
+    fn sample(&mut self) -> ReadResult<Frame> {
         let started = Instant::now();
-        let snapshot = self.pile.snapshot().context("refresh dashboard pile")?;
+        let snapshot = self.pile.snapshot().map_err(|_| ReadFailure::RefreshPile)?;
         let now_ns = triblespace_core::clock::epoch_now()
             .to_tai_duration()
             .total_nanoseconds();
@@ -151,7 +207,7 @@ impl Reader {
                 Err(error) => warnings.push(format!(
                     "Telemetry {} unreadable: {}",
                     short(&source.handle.raw),
-                    clean(&error.to_string(), 140)
+                    error
                 )),
             }
         }
@@ -160,10 +216,7 @@ impl Reader {
             Some(source) => match source.facts(&snapshot) {
                 Ok(facts) => dashboard::observe_health(facts, now_ns, self.max_age),
                 Err(error) => {
-                    warnings.push(format!(
-                        "Health reports unreadable: {}",
-                        clean(&error.to_string(), 140)
-                    ));
+                    warnings.push(format!("Health reports unreadable: {error}"));
                     Vec::new()
                 }
             },
@@ -181,7 +234,7 @@ impl Reader {
         })
     }
 
-    fn close(self) -> Result<()> {
+    fn close(self) -> ReadResult<()> {
         // Release retained snapshots before the owning pile's true close boundary.
         let Self {
             pile,
@@ -191,7 +244,7 @@ impl Reader {
         } = self;
         drop(sources);
         drop(health);
-        pile.close().context("close dashboard pile")
+        pile.close().map_err(|_| ReadFailure::ClosePile)
     }
 }
 
@@ -280,14 +333,14 @@ struct Shared {
     stop: bool,
     finished: bool,
     revision: u64,
-    latest: Option<Result<Arc<Frame>, String>>,
+    latest: Option<ReadResult<Arc<Frame>>>,
 }
 
 type SharedState = Arc<(Mutex<Shared>, Condvar)>;
 
 struct Sampler {
     shared: SharedState,
-    worker: Option<JoinHandle<Result<()>>>,
+    worker: Option<JoinHandle<ReadResult<()>>>,
 }
 
 impl Sampler {
@@ -317,7 +370,8 @@ impl Sampler {
         match self.worker.take() {
             Some(worker) => worker
                 .join()
-                .map_err(|_| anyhow!("dashboard sampler panicked"))?,
+                .map_err(|_| ReadFailure::SamplerPanicked)?
+                .map_err(anyhow::Error::from),
             None => Ok(()),
         }
     }
@@ -331,15 +385,15 @@ impl Drop for Sampler {
     }
 }
 
-fn finish_sampling(shared: &SharedState, work: impl FnOnce() -> Result<()>) -> Result<()> {
+fn finish_sampling(shared: &SharedState, work: impl FnOnce() -> ReadResult<()>) -> ReadResult<()> {
     // GUI renderers cannot inspect the owning JoinHandle. Publish panics as
     // failures too, including before the first frame, rather than leaving an
     // apparently live "opening" view until the user closes the window.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
-        .unwrap_or_else(|_| Err(anyhow!("dashboard sampler panicked")));
+        .unwrap_or(Err(ReadFailure::SamplerPanicked));
     let mut state = shared.0.lock().unwrap_or_else(|error| error.into_inner());
     if let Err(error) = &result {
-        state.latest = Some(Err(error.to_string()));
+        state.latest = Some(Err(*error));
         state.revision += 1;
     }
     state.finished = true;
@@ -347,7 +401,7 @@ fn finish_sampling(shared: &SharedState, work: impl FnOnce() -> Result<()>) -> R
     result
 }
 
-fn sample_until_stopped(options: &Options, shared: &SharedState) -> Result<()> {
+fn sample_until_stopped(options: &Options, shared: &SharedState) -> ReadResult<()> {
     let mut reader = Reader::open(options)?;
     let mut once_error = None;
     loop {
@@ -359,10 +413,7 @@ fn sample_until_stopped(options: &Options, shared: &SharedState) -> Result<()> {
         {
             break;
         }
-        let observation = reader
-            .sample()
-            .map(Arc::new)
-            .map_err(|error| error.to_string());
+        let observation = reader.sample().map(Arc::new);
         if options.once {
             once_error = observation.as_ref().err().cloned();
         }
@@ -383,7 +434,7 @@ fn sample_until_stopped(options: &Options, shared: &SharedState) -> Result<()> {
     }
     reader.close()?;
     match once_error {
-        Some(error) => Err(anyhow!(error)),
+        Some(error) => Err(error),
         None => Ok(()),
     }
 }
@@ -416,7 +467,7 @@ fn run_terminal(options: Options, live: bool) -> Result<()> {
                             .to_tai_duration()
                             .total_nanoseconds()),
                     ),
-                    Some(Err(error)) => format!("Colony state unknown: {}\n", clean(&error, 200)),
+                    Some(Err(error)) => format!("Colony state unknown: {error}\n"),
                     None => String::new(),
                 };
                 let mut output = io::stdout().lock();
@@ -717,6 +768,8 @@ fn rtt(worker: &WorkerReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use triblespace_core::collection::{empty_metadata_handle, CollectionCommit, CollectionRecord};
+    use triblespace_core::inline::encodings::hash::Handle;
     use triblespace_core::metadata;
     use triblespace_core::prelude::*;
     use triblespace_net::telemetry::MetricValue;
@@ -831,9 +884,10 @@ mod tests {
         let state = shared.0.lock().unwrap();
         assert!(state.finished);
         assert_eq!(state.revision, 1);
-        assert!(
-            matches!(state.latest.as_ref(), Some(Err(error)) if error == "dashboard sampler panicked")
-        );
+        assert!(matches!(
+            state.latest,
+            Some(Err(ReadFailure::SamplerPanicked))
+        ));
     }
 
     #[test]
@@ -880,6 +934,160 @@ mod tests {
         });
         assert_eq!(wall_work(&worker), "2.00 seconds/second");
         assert_eq!(cpu(&worker), "unmeasured");
+    }
+
+    #[test]
+    fn admitted_malformed_member_warnings_never_expose_the_bearer_handle() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("malformed-member.pile");
+        std::fs::File::create(&path).unwrap();
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
+        let authority = signer.verifying_key();
+        let mut writer = Pile::open(&path).unwrap();
+        let collection: Collection<SimpleArchive> = writer
+            .collection(
+                "dashboard-malformed-member-test",
+                CollectionPolicy::new(
+                    AdmissionPolicy::direct(authority),
+                    AdmissionPolicy::direct(authority),
+                ),
+            )
+            .unwrap();
+        // A properly hashed blob and admitted COMMIT do not establish that its
+        // bytes form a SimpleArchive. No decoder or admission rule is bypassed.
+        let malformed = writer
+            .put::<SimpleArchive, _>(Blob::new(anybytes::Bytes::from(vec![1_u8; 63])))
+            .unwrap();
+        CollectionStore::insert(
+            &mut writer,
+            CollectionRecord::Commit(CollectionCommit::sign(
+                &signer,
+                collection.handle(),
+                Handle::<SimpleArchive>::to_hash(malformed),
+                empty_metadata_handle(),
+            )),
+        )
+        .unwrap();
+        let upper = hex::encode_upper(malformed.raw);
+        let lower = hex::encode(malformed.raw);
+        {
+            let snapshot = writer.snapshot().unwrap();
+            let observed = snapshot.collection(collection).unwrap();
+            let error = observed.view::<TribleSet>().unwrap_err();
+            assert!(matches!(
+                &error,
+                TryFromCoverError::View(error)
+                    if error.member == Handle::<SimpleArchive>::to_hash(malformed)
+            ));
+            // Positive control for the original leak: cleaning/truncation does
+            // not remove this generated capability from the backend's error.
+            assert!(clean(&error.to_string(), 140).contains(&upper));
+        }
+        writer.close().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let options = Options {
+            pile: path.clone(),
+            key: Some(directory.path().join("absent.key")),
+            telemetry: vec![collection.handle()],
+            max_age: Duration::from_secs(180),
+            interval: Duration::from_secs(1),
+            once: true,
+            gui: false,
+        };
+        let mut reader = Reader::open(&options).unwrap();
+        // Exercise the health warning arm over the same disposable bad member.
+        reader.health = Some(SelectedSource::new(collection.handle()));
+        let frame = reader.sample().unwrap();
+        assert_eq!((frame.selected_sources, frame.readable_sources), (1, 0));
+        assert!(frame.workers.is_empty() && frame.health.is_empty());
+        assert!(frame.warnings.iter().any(|warning| warning
+            == &format!(
+                "Telemetry {} unreadable: selected member cannot form a fact view",
+                short(&collection.handle().raw)
+            )));
+        assert!(frame.warnings.iter().any(|warning| warning
+            == "Health reports unreadable: selected member cannot form a fact view"));
+        // Both frontends consume these same warnings; check the common frame
+        // and the terminal rendering, not merely the conversion in isolation.
+        let rendered = render_terminal(&frame);
+        for text in frame.warnings.iter().chain(std::iter::once(&rendered)) {
+            assert!(!text.contains(&upper));
+            assert!(!text.contains(&lower));
+        }
+        reader.close().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn missing_member_failure_is_safe_through_shared_state_and_join() {
+        let mut store = MemoryRepo::default();
+        let snapshot = store.snapshot().unwrap();
+        let missing: Blob<SimpleArchive> = Blob::new(anybytes::Bytes::from(vec![7_u8; 63]));
+        let handle = missing.get_handle();
+        let mut descriptors = MemoryRepo::default();
+        let collection: Collection<SimpleArchive> = descriptors
+            .collection(
+                "dashboard-missing-member-test",
+                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+            )
+            .unwrap();
+        // Force a cover read at the same generic view boundary. A resident-only
+        // collection attachment may otherwise omit a member still in flight.
+        let error =
+            TribleSet::try_from_cover(&collection.cover([handle]), &Fragment::empty(), &snapshot)
+                .unwrap_err();
+        assert!(matches!(&error, TryFromCoverError::MemberGet { member, .. }
+            if *member == Handle::<SimpleArchive>::to_hash(handle)));
+        assert!(clean(&error.to_string(), 140).contains(&hex::encode_upper(handle.raw)));
+        let safe = ReadFailure::from(error);
+        assert_eq!(safe, ReadFailure::MemberUnavailable);
+        assert!(std::error::Error::source(&safe).is_none());
+        let shared = Arc::new((Mutex::new(Shared::default()), Condvar::new()));
+        let state = Arc::clone(&shared);
+        let mut sampler = Sampler {
+            shared,
+            worker: Some(thread::spawn(move || finish_sampling(&state, || Err(safe)))),
+        };
+        let failure = sampler.finish().unwrap_err();
+        assert_eq!(failure.to_string(), "selected member unavailable");
+        assert_eq!(failure.chain().count(), 1);
+        for rendered in [format!("{failure:#}"), format!("{failure:?}")] {
+            assert!(!rendered.contains(&hex::encode_upper(handle.raw)));
+            assert!(!rendered.contains(&hex::encode(handle.raw)));
+        }
+        let state = sampler.shared.0.lock().unwrap();
+        assert!(state.finished);
+        assert!(matches!(
+            state.latest,
+            Some(Err(ReadFailure::MemberUnavailable))
+        ));
+    }
+
+    #[test]
+    fn reader_open_failure_does_not_retain_a_sensitive_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let generated: Blob<SimpleArchive> = Blob::new(anybytes::Bytes::from(vec![9_u8; 63]));
+        let private_name = hex::encode_upper(generated.get_handle().raw);
+        let options = Options {
+            pile: directory.path().join(private_name),
+            key: None,
+            telemetry: vec![],
+            max_age: Duration::from_secs(180),
+            interval: Duration::from_secs(1),
+            once: true,
+            gui: false,
+        };
+        let failure = match Reader::open(&options) {
+            Err(error) => error,
+            Ok(_) => panic!("missing pile must not be opened or created"),
+        };
+        assert_eq!(failure, ReadFailure::OpenPile);
+        assert_eq!(
+            failure.to_string(),
+            "cannot open existing regular dashboard pile"
+        );
+        assert!(std::error::Error::source(&failure).is_none());
+        assert!(!options.pile.exists());
     }
 
     #[test]

@@ -124,6 +124,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Fixed
 
+- Keep dashboard reader failures in payload-free categories. Backend error text
+  and source chains can contain bearer blob handles and must not reach warning
+  frames, terminal/notebook renderers, or sampler shutdown errors.
+
 - `pile net sync` and collection maintenance handle Unix SIGINT and SIGTERM
   before opening their writable pile. Stop cancels the in-flight async work or
   idle wait and closes normally, including `maintain[-all] --watch` under a
