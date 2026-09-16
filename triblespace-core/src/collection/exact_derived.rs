@@ -214,6 +214,11 @@ impl Lineage {
     }
 }
 
+/// Diagnostic phase trace for residual selection and lineage resolution.
+fn trace_enabled() -> bool {
+    std::env::var_os("TRIBLESPACE_COLLECTION_TRACE").is_some()
+}
+
 fn load_lineage<R, E>(
     snapshot: &R,
     target: Collection<E>,
@@ -441,8 +446,12 @@ where
     E: CollectionEncoding,
     R: BlobStoreGet + BlobStoreMeta,
 {
+    let trace = trace_enabled();
+    let started = std::time::Instant::now();
     let mut selected =
         collection_complete_physical_cover::<E, _>(semantics, collection, resident, snapshot);
+    let coarse_at = started.elapsed();
+    let mut visited = 0usize;
     let mut represented = witnessed_support(
         witnesses,
         collection,
@@ -455,6 +464,7 @@ where
         if requested.is_subset(&represented).expect("one foundation") {
             break;
         }
+        visited += 1;
         let member_support =
             witnessed_support(witnesses, collection, [*member], requested.collection());
         if member_support
@@ -473,6 +483,18 @@ where
             }
             _ => {}
         }
+    }
+    if trace {
+        eprintln!(
+            "trace cover {}: coarse physical cover ({} member(s), {} missing) in {:.2?}, residual scan visited {visited} of {} resident, added {} in {:.2?}",
+            hex::encode_upper(collection.raw),
+            selected.physical.cover.len(),
+            selected.physical.missing.len(),
+            coarse_at,
+            resident.len(),
+            residuals.len(),
+            started.elapsed() - coarse_at
+        );
     }
     // A later support-repair member can make an earlier one redundant even
     // though both were needed when first visited. Keep the semantic physical
@@ -603,6 +625,8 @@ where
     if let Some(requested) = requested {
         require_support(lineage, requested)?;
     }
+    let trace = trace_enabled();
+    let started = std::time::Instant::now();
     let mut evidence = BTreeMap::new();
     for collection in collections {
         let descriptor = lineage.descriptor(*collection);
@@ -623,14 +647,18 @@ where
         .copied()
         .map(CollectionRecordSelector::Collection)
         .collect();
+    let evidence_at = started.elapsed();
     let candidates = snapshot.select_records(&selectors).map_err(|error| {
         CollectionRealizationError::storage("select endorsed collection records", error)
     })?;
+    let selected_at = started.elapsed();
+    let mut candidate_count = 0usize;
     let mut closure = super::witness::WitnessClosure::default();
     let mut roots = BTreeSet::new();
     let mut witnesses = InputWitnesses::new();
     let mut images = BTreeMap::<_, BTreeSet<_>>::new();
     for record in candidates {
+        candidate_count += 1;
         let accepted = *admitted
             .entry((record.collection(), record.public_key().raw))
             .or_insert_with(|| {
@@ -673,7 +701,10 @@ where
         }
         roots.insert(record.fingerprint());
     }
+    let roots_at = started.elapsed();
+    let root_count = roots.len();
     let records = closure.records_for(roots);
+    let closed_at = started.elapsed();
     for record in &records {
         if let CollectionRecord::Derive(derive) = record {
             images
@@ -698,6 +729,8 @@ where
         // diagnostics and migrations must still see every persisted identity.
         alternatives.push((record.fingerprint(), record_support));
     }
+    let witnessed_at = started.elapsed();
+    let record_count = records.len();
     let discovered = super::DiscoveredCollectionRecords::from_records(records);
     // The selected closed DAG's distinct COMMIT payloads are exactly the
     // union of its accepted roots' supports. Build that PATCH once rather
@@ -714,6 +747,24 @@ where
             )
         });
 
+    if trace {
+        eprintln!(
+            "trace endorsed lineage {} collection(s) [{}]: admission evidence in {:.2?}, select {candidate_count} record(s) in {:.2?}, {root_count} root(s) closed in {:.2?}, {record_count} record(s) collected in {:.2?}, witnessed in {:.2?}, support ({} commits) + semantics in {:.2?}",
+            collections.len(),
+            collections
+                .iter()
+                .map(|handle| hex::encode_upper(&handle.raw[..4]))
+                .collect::<Vec<_>>()
+                .join(","),
+            evidence_at,
+            selected_at - evidence_at,
+            roots_at - selected_at,
+            closed_at - roots_at,
+            witnessed_at - closed_at,
+            support.len(),
+            started.elapsed() - witnessed_at
+        );
+    }
     match resolution {
         Ok(resolution) => Ok(CertifiedResolution {
             resolution,
@@ -849,15 +900,19 @@ where
     R: StoreRead,
     E: CollectionEncoding,
 {
+    let trace = trace_enabled();
+    let started = std::time::Instant::now();
     let semantics = certified.resolution.into_semantics();
     let target_handle = target.handle();
     let mut resident = BTreeSet::new();
+    let mut member_count = 0usize;
     for member in semantics
         .members(target_handle)
         .into_iter()
         .flatten()
         .copied()
     {
+        member_count += 1;
         if snapshot
             .metadata(Handle::<E>::from_hash(member))
             .map_err(|error| {
@@ -868,6 +923,7 @@ where
             resident.insert(member);
         }
     }
+    let residency_at = started.elapsed();
 
     let (selected, represented) = witnessed_physical_cover::<E, _>(
         snapshot,
@@ -877,6 +933,16 @@ where
         &resident,
         requested,
     )?;
+    if trace {
+        eprintln!(
+            "trace target {}: residency of {member_count} member(s) ({} resident) in {:.2?}, witnessed physical cover ({} selected) in {:.2?}",
+            hex::encode_upper(target_handle.raw),
+            resident.len(),
+            residency_at,
+            selected.physical.cover.len(),
+            started.elapsed() - residency_at
+        );
+    }
 
     Ok(TargetResolution {
         support: Cover::from_data(
@@ -993,9 +1059,23 @@ where
     R: StoreRead,
     M: CollectionMapping,
 {
+    let trace = trace_enabled();
+    let started = std::time::Instant::now();
     let support = source_support::<R, M>(snapshot, target)?;
+    let support_at = started.elapsed();
     let probe = probe_mapping::<R, M>(snapshot, target, &support, true)?;
-    if probe.target_resolution.is_exact_for(&support) {
+    let probe_at = started.elapsed();
+    let exact = probe.target_resolution.is_exact_for(&support);
+    if trace {
+        eprintln!(
+            "trace residual {}: source support ({} members) in {:.2?}, probe in {:.2?}, exact={exact}",
+            hex::encode_upper(target.handle().raw),
+            support.len(),
+            support_at,
+            probe_at - support_at
+        );
+    }
+    if exact {
         return Ok(Vec::new());
     }
     source_residual(snapshot, &probe, &support, &BTreeMap::new())
@@ -1083,7 +1163,10 @@ where
     R: StoreRead,
     M: CollectionMapping,
 {
+    let trace = trace_enabled();
+    let started = std::time::Instant::now();
     let lineage = load_lineage(snapshot, target)?;
+    let lineage_at = started.elapsed();
     require_support(&lineage, support)?;
     let source_handle = lineage
         .source_by_target
@@ -1111,6 +1194,7 @@ where
         selected.insert(source_handle);
     }
     let certified = resolve_endorsed_lineage(snapshot, &lineage, &selected, Some(support))?;
+    let certified_at = started.elapsed();
     // Image reuse crosses support witnesses, so its functional check must do
     // the same. A cold or support-pruned claim is still a certified equation;
     // residency must never decide which conflicting image we endorse next.
@@ -1139,6 +1223,15 @@ where
     }
     let target_resolution =
         resolve_certified_target(snapshot, target, &lineage, support, certified)?;
+    if trace {
+        eprintln!(
+            "trace probe {} (admit_source={admit_source}): lineage in {:.2?}, endorsed lineage in {:.2?}, target resolution in {:.2?}",
+            hex::encode_upper(target.handle().raw),
+            lineage_at,
+            certified_at - lineage_at,
+            started.elapsed() - certified_at
+        );
+    }
     Ok(MappingProbe {
         source: Collection::from_handle(source_handle),
         mapping,
