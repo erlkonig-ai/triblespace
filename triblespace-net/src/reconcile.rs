@@ -2319,7 +2319,7 @@ mod tests {
             stats.received_bytes,
             (0..9)
                 .map(|ordinal| format!("exact root {ordinal}").len() as u64)
-                .sum()
+                .sum::<u64>()
         );
         assert_eq!(stats.pending_blobs, Some(0));
         assert_eq!(stats.replication.pending, 0);
@@ -2546,7 +2546,7 @@ mod tests {
         fixture
             .peer
             .store()
-            .want(WantRequest::blob(Inline::new(fixture.roots[0])))
+            .want(WantRequest::blob::<UnknownBlob>(Inline::new(fixture.roots[0])))
             .unwrap();
         let mut reconciler =
             Reconciler::new().with_replication(ReplicationMode::Shallow, [fixture.collection]);

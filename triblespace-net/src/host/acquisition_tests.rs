@@ -912,7 +912,7 @@ async fn serving_telemetry_counts_live_exchange_but_not_bytes_before_bearer_proo
     )
     .await
     .unwrap();
-    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    let (mut send, mut recv) = conn.connection.open_bi().await.unwrap();
     send_u8(&mut send, OP_GET_BLOB).await.unwrap();
     send_hash(&mut send, &blob_locator(fixture.hash))
         .await
