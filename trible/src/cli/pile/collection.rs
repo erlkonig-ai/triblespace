@@ -1835,6 +1835,7 @@ mod tests {
                 signer,
                 true,
                 SuccinctBackend::Cpu,
+                &mut MaintenanceState::default(),
             ))
             .unwrap();
         (failures, observed.dependencies())
@@ -2665,16 +2666,89 @@ fn maintenance_order<R: BlobStoreGet>(
     Ok(order)
 }
 
+/// Ephemeral recomputation boundaries, never interpreted collection answers.
+struct MaintenanceHop<R> {
+    before: R,
+    interests: StoreDependencies,
+    // An implicitly selected root is ensured, whereas an explicit root is
+    // maintained. Derived hops conservatively retry on this mode change too.
+    dependency_only: bool,
+    // Preserve the old retry opportunity whenever any selected input wakes
+    // this worker. An Err is not a valid cached answer, especially when its
+    // cause is runtime/provider state outside the stored dependency model.
+    retry_on_pass: bool,
+}
+
+struct MaintenanceState<R> {
+    planning: StoreDependencies,
+    hops: BTreeMap<CollectionHandle, MaintenanceHop<R>>,
+}
+
+impl<R> Default for MaintenanceState<R> {
+    fn default() -> Self {
+        Self {
+            planning: StoreDependencies::default(),
+            hops: BTreeMap::new(),
+        }
+    }
+}
+
+fn extend_maintenance_interests(into: &mut StoreDependencies, from: &StoreDependencies) {
+    into.records.extend(from.records.iter().copied());
+    into.blobs.extend(from.blobs.iter().copied());
+    into.capability_proofs |= from.capability_proofs;
+    into.all_records |= from.all_records;
+    into.all_blobs |= from.all_blobs;
+}
+
+impl<R: StoreSnapshot> MaintenanceState<R> {
+    fn interests(&self) -> StoreDependencies {
+        let mut interests = self.planning.clone();
+        // A pass triggered by one chain must not forget skipped chains' misses
+        // or record interests. Name lookup stays broad only at planning scope.
+        for hop in self.hops.values() {
+            extend_maintenance_interests(&mut interests, &hop.interests);
+        }
+        interests
+    }
+
+    fn rebase_unchanged(&mut self, current: &R) {
+        for hop in self.hops.values_mut() {
+            if !maintenance_changed(&hop.before, current, &hop.interests) {
+                hop.before = current.clone();
+            }
+        }
+    }
+
+    fn needs_work(&mut self, handle: CollectionHandle, dependency_only: bool, current: &R) -> bool {
+        let Some(hop) = self.hops.get_mut(&handle) else {
+            return true;
+        };
+        if hop.retry_on_pass
+            || hop.dependency_only != dependency_only
+            || maintenance_changed(&hop.before, current, &hop.interests)
+        {
+            return true;
+        }
+        // Rebase only after proving this hop unchanged, releasing older shared
+        // index versions without swallowing an unconsumed relevant arrival.
+        hop.before = current.clone();
+        false
+    }
+}
+
 async fn maintenance_pass<S: Store + AsyncBlobStoreAcquire + Send>(
     pile: &mut S,
     references: &[String],
     signer: &SigningKey,
     dependencies: bool,
     succinct_backend: SuccinctBackend,
+    state: &mut MaintenanceState<S::Snapshot>,
 ) -> Result<usize> {
-    let snapshot = pile
-        .snapshot()
-        .map_err(|error| anyhow!("pile snapshot: {error:?}"))?;
+    let snapshot = ObservedStore::new(
+        pile.snapshot()
+            .map_err(|error| anyhow!("pile snapshot: {error:?}"))?,
+    );
     let mut selected = BTreeSet::new();
     let mut failures = 0;
     for reference in references {
@@ -2688,6 +2762,7 @@ async fn maintenance_pass<S: Store + AsyncBlobStoreAcquire + Send>(
             }
         }
     }
+    state.planning = snapshot.dependencies();
     drop(snapshot);
 
     // Give independent authors different stable priorities over the same
@@ -2707,10 +2782,13 @@ async fn maintenance_pass<S: Store + AsyncBlobStoreAcquire + Send>(
 
     let mut attempted = BTreeSet::new();
     for target in targets {
-        let snapshot = pile
-            .snapshot()
-            .map_err(|error| anyhow!("pile snapshot: {error:?}"))?;
-        let order = match maintenance_order(&snapshot, target, dependencies, &attempted) {
+        let snapshot = ObservedStore::new(
+            pile.snapshot()
+                .map_err(|error| anyhow!("pile snapshot: {error:?}"))?,
+        );
+        let order = maintenance_order(&snapshot, target, dependencies, &attempted);
+        extend_maintenance_interests(&mut state.planning, &snapshot.dependencies());
+        let order = match order {
             Ok(order) => order,
             Err(error) => {
                 eprintln!(
@@ -2727,8 +2805,27 @@ async fn maintenance_pass<S: Store + AsyncBlobStoreAcquire + Send>(
             // Give shutdown and the runtime's I/O driver a boundary between
             // one-edge operations, including immediately-ready local stores.
             tokio::task::yield_now().await;
+            let before = match pile.snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    if let Some(hop) = state.hops.get_mut(&handle) {
+                        hop.retry_on_pass = true;
+                    }
+                    eprintln!(
+                        "maintenance blake3:{}: pile snapshot: {error:?}",
+                        handle_hex(handle)
+                    );
+                    failures += 1;
+                    continue;
+                }
+            };
+            let dependency_only = dependencies && !selected.contains(&handle);
+            if !state.needs_work(handle, dependency_only, &before) {
+                continue;
+            }
+            let mut observed = ObservedStore::new(&mut *pile);
             let result = async {
-                let snapshot = pile
+                let snapshot = observed
                     .snapshot()
                     .map_err(|error| anyhow!("pile snapshot: {error:?}"))?;
                 let facts: TribleSet = snapshot
@@ -2737,18 +2834,19 @@ async fn maintenance_pass<S: Store + AsyncBlobStoreAcquire + Send>(
                 let representation = descriptor::representation(&facts)?;
                 let algorithm = descriptor::mapping_algorithm(&facts)?;
                 let source = descriptor::source(&facts)?;
-                let ensure_only = dependencies && source.is_none() && !selected.contains(&handle);
+                let ensure_only = dependency_only && source.is_none();
                 let before = cover_census(&snapshot, handle)?;
                 let started = Instant::now();
                 let after = if ensure_only {
                     let root: Collection<SimpleArchive> = Collection::open(&snapshot, handle)
                         .map_err(|error| anyhow!("open foundational collection: {error}"))?;
-                    pile.ensure(root, signer)
+                    observed
+                        .ensure(root, signer)
                         .await
                         .map_err(|error| anyhow!("ensure foundational collection: {error}"))?
                 } else {
                     maintain_by_representation(
-                        pile,
+                        &mut observed,
                         &snapshot,
                         handle,
                         representation,
@@ -2774,6 +2872,21 @@ async fn maintenance_pass<S: Store + AsyncBlobStoreAcquire + Send>(
                 Ok::<(), anyhow::Error>(())
             }
             .await;
+            let interests = observed.dependencies();
+            drop(observed);
+            // Retain the start boundary even after an error or partial write.
+            // A later snapshot can contain records/proofs that the operation's
+            // frozen frontier did not consume. Its own writes also request one
+            // local catch-up; an unchanged sibling need not run again.
+            state.hops.insert(
+                handle,
+                MaintenanceHop {
+                    before,
+                    interests,
+                    dependency_only,
+                    retry_on_pass: result.is_err(),
+                },
+            );
             if let Err(error) = result {
                 eprintln!("maintenance blake3:{}: {error:#}", handle_hex(handle));
                 failures += 1;
@@ -2782,6 +2895,10 @@ async fn maintenance_pass<S: Store + AsyncBlobStoreAcquire + Send>(
             }
         }
     }
+    // Entries no longer reachable from this selection hold no useful work.
+    // Failed planning retains its exact misses above; when that route becomes
+    // available, absent entries run afresh rather than reusing an old answer.
+    state.hops.retain(|handle, _| attempted.contains(handle));
     Ok(failures)
 }
 
@@ -2805,6 +2922,7 @@ async fn maintenance_loop(
     let mut baseline = None;
     let mut catch_up = true;
     let mut interests = StoreDependencies::default();
+    let mut state = MaintenanceState::default();
     loop {
         // Pile::snapshot refreshes its externally appended prefix before
         // freezing all indexes. Blob arrivals count, not just new equations.
@@ -2816,20 +2934,16 @@ async fn maintenance_loop(
                 .as_ref()
                 .is_some_and(|previous| maintenance_changed(previous, &before, &interests))
         {
-            // A fresh observer owns only this pass's raw read-set. Snapshots,
-            // acquisitions, descriptor queries and per-collection census all
-            // contribute, including the failed reads of independent targets.
-            let mut observed = ObservedStore::new(&mut *pile);
             let failures = maintenance_pass(
-                &mut observed,
+                pile,
                 references,
                 signer,
                 dependencies,
                 succinct_backend,
+                &mut state,
             )
             .await?;
-            interests = observed.dependencies();
-            drop(observed);
+            interests = state.interests();
             let after = pile
                 .snapshot()
                 .map_err(|error| anyhow!("pile snapshot after maintenance: {error:?}"))?;
@@ -2851,6 +2965,11 @@ async fn maintenance_loop(
                     "{failures} maintenance selection(s) failed; waiting for relevant changes"
                 );
             }
+        } else {
+            // Even a wholly skipped poll can have ingested unrelated frames.
+            // Release old index versions only after each hop's own proof.
+            state.rebase_unchanged(&before);
+            baseline = Some(before);
         }
         tokio::time::sleep(interval).await;
     }

@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- Scope watched collection maintenance to each hop's actual stored dependencies.
+  Unchanged independent chains skip upkeep and census work; descriptor misses,
+  new receipt support, proof-component changes and in-flight arrivals still
+  trigger the affected work. Dependency order and canonical maintenance are
+  unchanged; retained state contains raw observations, read interests and attempt
+  scheduling, not interpreted collection answers.
+  Failed attempts retain their existing retry opportunity on any selected-input
+  wake; this does not add a retry clock for provider or runtime state changes.
+
 ### Added
 
 - Add test-only counted maintenance diagnostics for two independent chains:

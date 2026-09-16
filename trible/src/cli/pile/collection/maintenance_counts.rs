@@ -50,6 +50,15 @@ struct Counts {
 struct Counted<R> {
     inner: R,
     counts: Arc<Mutex<Counts>>,
+    selection_hook: Option<Arc<SelectionHook>>,
+    fail_snapshot_at: Option<usize>,
+}
+
+// A one-shot external append after one frozen selection, used only by the
+// scoped race control. It adds no queries and is absent from ordinary counts.
+struct SelectionHook {
+    collection: CollectionHandle,
+    action: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl<R> Counted<R> {
@@ -58,15 +67,27 @@ impl<R> Counted<R> {
     }
 }
 
-impl<S: SnapshotSource> SnapshotSource for Counted<S> {
+impl<S: SnapshotSource> SnapshotSource for Counted<S>
+where
+    S::SnapshotError: From<std::io::Error>,
+{
     type Snapshot = Counted<S::Snapshot>;
     type SnapshotError = S::SnapshotError;
 
     fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
-        self.count(|counts| counts.snapshots += 1);
+        let fail = {
+            let mut counts = self.counts.lock().unwrap();
+            counts.snapshots += 1;
+            self.fail_snapshot_at == Some(counts.snapshots)
+        };
+        if fail {
+            return Err(std::io::Error::other("one-shot counted snapshot failure").into());
+        }
         Ok(Counted {
             inner: self.inner.snapshot()?,
             counts: Arc::clone(&self.counts),
+            selection_hook: self.selection_hook.clone(),
+            fail_snapshot_at: self.fail_snapshot_at,
         })
     }
 }
@@ -235,6 +256,14 @@ impl<R: CollectionRead> CollectionRead for Counted<R> {
                 *counts.selected_rows.entry(record.collection()).or_default() += 1;
             }
         });
+        if let Some(hook) = &self.selection_hook {
+            if selectors.contains(&CollectionRecordSelector::Collection(hook.collection)) {
+                let action = hook.action.lock().unwrap().take();
+                if let Some(action) = action {
+                    action();
+                }
+            }
+        }
         Ok(records)
     }
 }
@@ -280,6 +309,8 @@ fn counted_pass(
     let mut observed = ObservedStore::new(Counted {
         inner: pile,
         counts: Arc::clone(&counts),
+        selection_hook: None,
+        fail_snapshot_at: None,
     });
     let references = selected
         .iter()
@@ -297,6 +328,7 @@ fn counted_pass(
                 signer,
                 true,
                 SuccinctBackend::Cpu,
+                &mut MaintenanceState::default(),
             ))
             .unwrap(),
         0
@@ -305,6 +337,8 @@ fn counted_pass(
     let recorded = counts.lock().unwrap().clone();
     (interests, recorded)
 }
+
+mod scoped;
 
 fn selected_records(
     snapshot: &PileSnapshot,
