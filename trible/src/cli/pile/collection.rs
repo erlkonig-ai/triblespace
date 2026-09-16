@@ -2746,6 +2746,7 @@ impl<R: StoreSnapshot> MaintenanceState<R> {
     }
 }
 
+#[cfg(test)]
 async fn maintenance_pass<S: Store + AsyncBlobStoreAcquire + Send>(
     pile: &mut S,
     references: &[String],

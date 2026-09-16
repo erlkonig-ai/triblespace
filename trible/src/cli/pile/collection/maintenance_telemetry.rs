@@ -54,6 +54,7 @@ pub(super) enum Failure {
     Key,
     Snapshot,
     Descriptor,
+    DerivedDestination,
     Authority,
     Publication,
 }
@@ -65,6 +66,9 @@ impl std::fmt::Display for Failure {
             Self::Key => "cannot read existing maintenance telemetry signing key",
             Self::Snapshot => "cannot observe maintenance telemetry store",
             Self::Descriptor => "maintenance telemetry descriptor unavailable or invalid",
+            Self::DerivedDestination => {
+                "maintenance telemetry destination must be a source collection"
+            }
             Self::Authority => "maintenance telemetry writer authority unavailable or denied",
             Self::Publication => "cannot publish maintenance telemetry",
         })
@@ -242,6 +246,17 @@ impl Telemetry {
         let snapshot = store.snapshot().map_err(|_| Failure::Snapshot)?;
         let collection = Collection::<SimpleArchive>::open(&snapshot, config.collection)
             .map_err(|_| Failure::Descriptor)?;
+        let facts: TribleSet = snapshot
+            .get(config.collection)
+            .map_err(|_| Failure::Descriptor)?;
+        if descriptor::source(&facts)
+            .map_err(|_| Failure::Descriptor)?
+            .is_some()
+        {
+            // A derived SimpleArchive can admit this writer but its reader
+            // does not consume root COMMITs. Reject before any sample append.
+            return Err(Failure::DerivedDestination);
+        }
         if !collection
             .writer_is_admitted(&snapshot, signer.verifying_key())
             .map_err(|_| Failure::Authority)?

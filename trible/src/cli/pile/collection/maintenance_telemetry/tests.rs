@@ -289,6 +289,72 @@ fn telemetry_preflight_does_not_create_authority_or_accept_the_wrong_writer() {
 }
 
 #[test]
+fn telemetry_rejects_derived_simple_archive_even_when_writer_is_admitted() {
+    use triblespace_core::capability::policy::resource_policy;
+    use triblespace_core::collection::{
+        collection_mapping, collection_representation, collection_source, mapping_algorithm,
+        KIND_COLLECTION_DESCRIPTOR, KIND_COLLECTION_MAPPING,
+    };
+    use triblespace_core::metadata::MetaDescribe;
+
+    let mut fixture = Fixture::new();
+    let algorithm = genid();
+    let mapping = entity! { metadata::tag: KIND_COLLECTION_MAPPING, mapping_algorithm: &algorithm };
+    let policy = CollectionPolicy::new(
+        AdmissionPolicy::direct(fixture.signer.verifying_key()),
+        AdmissionPolicy::direct(fixture.signer.verifying_key()),
+    );
+    let derived: Collection<SimpleArchive> = fixture
+        .store
+        .register_collection(entity! {
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            collection_source: fixture.source.handle(),
+            resource_policy*: policy.fragment(),
+            collection_representation*: SimpleArchive::describe(),
+            collection_mapping*: mapping,
+        })
+        .unwrap();
+    let before = fixture.store.snapshot().unwrap();
+    assert!(Collection::<SimpleArchive>::open(&before, derived.handle()).is_ok());
+    assert!(derived
+        .writer_is_admitted(&before, fixture.signer.verifying_key())
+        .unwrap());
+    let config = Options {
+        telemetry_collection: Some(hex::encode(derived.handle().raw)),
+        ..fixture.options()
+    }
+    .config()
+    .unwrap()
+    .unwrap();
+    assert!(matches!(
+        Telemetry::open(&mut fixture.store, config, &fixture.signer),
+        Err(Failure::DerivedDestination)
+    ));
+    assert!(fixture.store.snapshot().unwrap() == before);
+    // Control: the allowed append would be invisible through this derived
+    // collection, unlike the ordinary source destination used by our fixture.
+    fixture
+        .store
+        .commit(
+            derived,
+            &fixture.signer,
+            entity! { metadata::name: "invisible" },
+        )
+        .unwrap();
+    assert!(fixture
+        .store
+        .snapshot()
+        .unwrap()
+        .collection(derived)
+        .unwrap()
+        .view::<TribleSet>()
+        .unwrap()
+        .is_empty());
+    fixture.telemetry().emit_due(&mut fixture.store);
+    assert_eq!(fixture.reports().len(), 4);
+}
+
+#[test]
 fn process_cpu_is_not_duplicated_into_stage_samples_and_unknowns_stay_absent() {
     let mut fixture = Fixture::new();
     let mut producer = fixture.telemetry();
