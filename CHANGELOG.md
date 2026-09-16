@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Use an existential early exit when deciding resident collection-frontier
+  membership, without changing canonical cover selection, support, or admission.
+  This avoids traversing the complete upper history merely to prove one
+  resident subsumer exists.
+
 - Avoid recomputing collection-record fingerprints for field-only selectors.
   Mixed selector unions hash only when their field routes do not match;
   physical identities, result ordering and authentication are unchanged.

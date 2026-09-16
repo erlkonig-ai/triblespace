@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Stop resident-frontier membership searches at the first strict resident
+  subsumer. Canonical cover-witness selection is unchanged; counted regressions
+  cover merge chains, nonresident intermediates, and self/cycle exclusion.
+
 - Avoid hashing every record when selecting a collection or a raw record
   relationship. Exact fingerprint selectors still compare the canonical hash;
   counted tests cover field-only and mixed unions.

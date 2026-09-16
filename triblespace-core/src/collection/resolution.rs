@@ -36,6 +36,11 @@ type DeriveEquation = (CollectionHandle, CollectionData, CollectionData);
 type MergeProducer = (CollectionData, CollectionData);
 type DeriveProducer = (CollectionHandle, CollectionData);
 
+#[cfg(test)]
+thread_local! {
+    static EXISTENTIAL_SUBSUMER_EDGE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// One claim presented for concrete semantic validation.
 ///
 /// The claim carries its descriptor handle(s). The callback owns descriptor
@@ -567,6 +572,37 @@ impl CollectionSemantics {
         false
     }
 
+    /// Whether any candidate is strictly above `lower` in the sparse order.
+    /// Frontier membership needs only existence, not a canonical witness.
+    fn has_strict_subsumer_in(
+        &self,
+        collection: CollectionHandle,
+        lower: CollectionData,
+        candidates: &BTreeSet<CollectionData>,
+    ) -> bool {
+        let mut visited = BTreeSet::from([lower]);
+        let mut pending = vec![lower];
+        while let Some(input) = pending.pop() {
+            for result in self
+                .order_results_by_input
+                .get(&(collection, input))
+                .into_iter()
+                .flatten()
+            {
+                #[cfg(test)]
+                EXISTENTIAL_SUBSUMER_EDGE_VISITS.set(EXISTENTIAL_SUBSUMER_EDGE_VISITS.get() + 1);
+                if !visited.insert(*result) {
+                    continue;
+                }
+                if candidates.contains(result) {
+                    return true;
+                }
+                pending.push(*result);
+            }
+        }
+        false
+    }
+
     /// Return the first canonical candidate strictly above `lower` in the
     /// sparse generating order.
     ///
@@ -807,10 +843,7 @@ pub(crate) fn collection_physical_cover_for(
     let resident_members: BTreeSet<_> = resident.intersection(members).copied().collect();
     let mut resident_frontier = BTreeSet::new();
     for candidate in &resident_members {
-        if semantics
-            .first_strict_subsumer_in(collection, *candidate, &resident_members)
-            .is_none()
-        {
+        if !semantics.has_strict_subsumer_in(collection, *candidate, &resident_members) {
             resident_frontier.insert(*candidate);
         }
     }
@@ -2909,6 +2942,121 @@ mod tests {
             collection_physical_cover(&semantics, collection, &members),
             CollectionPhysicalCover {
                 cover: members,
+                missing: BTreeSet::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn resident_merge_chain_short_circuits_frontier_selection() {
+        const LEAVES: u32 = 64;
+        let collection = identity_for_tests(&named_for_tests("c1", id(2)));
+        let mut members: BTreeSet<_> = (1..=LEAVES).map(numbered_data).collect();
+        let mut semantics = CollectionSemantics::default();
+        let mut previous = numbered_data(1);
+        // Each next MERGE joins the accumulated result with one fresh leaf.
+        // All leaves and historical outputs are resident, so every nonmaximal
+        // member has an immediately resident upper neighbor.
+        for leaf in 2..=LEAVES {
+            let input = numbered_data(leaf);
+            let result = numbered_data(LEAVES + leaf - 1);
+            members.insert(result);
+            semantics.merge_inputs_by_result.insert(
+                (collection, result),
+                BTreeSet::from([ordered(previous, input)]),
+            );
+            for lower in [previous, input] {
+                semantics
+                    .order_results_by_input
+                    .entry((collection, lower))
+                    .or_default()
+                    .insert(result);
+            }
+            previous = result;
+        }
+        semantics.members.insert(collection, members.clone());
+        semantics
+            .frontier
+            .insert(collection, BTreeSet::from([previous]));
+
+        EXISTENTIAL_SUBSUMER_EDGE_VISITS.set(0);
+        let physical = collection_physical_cover(&semantics, collection, &members);
+        assert_eq!(EXISTENTIAL_SUBSUMER_EDGE_VISITS.get(), members.len() - 1);
+        assert_eq!(
+            physical,
+            CollectionPhysicalCover {
+                cover: BTreeSet::from([previous]),
+                missing: BTreeSet::new(),
+            }
+        );
+        assert_eq!(
+            physical,
+            reference_physical_cover(&semantics, collection, &members)
+        );
+    }
+
+    #[test]
+    fn existential_subsumption_crosses_nonresident_intermediates() {
+        let collection = identity_for_tests(&named_for_tests("c1", id(2)));
+        let [lower, middle, upper] = [data(1), data(2), data(3)];
+        let semantics = CollectionSemantics {
+            members: BTreeMap::from([(collection, BTreeSet::from([lower, middle, upper]))]),
+            frontier: BTreeMap::from([(collection, BTreeSet::from([upper]))]),
+            order_results_by_input: BTreeMap::from([
+                ((collection, lower), BTreeSet::from([middle])),
+                ((collection, middle), BTreeSet::from([upper])),
+            ]),
+            ..CollectionSemantics::default()
+        };
+        let resident = BTreeSet::from([lower, upper]);
+        EXISTENTIAL_SUBSUMER_EDGE_VISITS.set(0);
+        let physical = collection_physical_cover(&semantics, collection, &resident);
+        assert_eq!(EXISTENTIAL_SUBSUMER_EDGE_VISITS.get(), 2);
+        assert_eq!(physical.cover, BTreeSet::from([upper]));
+        assert_eq!(
+            physical,
+            reference_physical_cover(&semantics, collection, &resident)
+        );
+    }
+
+    #[test]
+    fn existential_subsumption_excludes_self_and_terminates_on_cycles() {
+        let collection = identity_for_tests(&named_for_tests("c1", id(2)));
+        let [lower, other] = [data(1), data(2)];
+        let semantics = CollectionSemantics {
+            order_results_by_input: BTreeMap::from([
+                ((collection, lower), BTreeSet::from([lower, other])),
+                ((collection, other), BTreeSet::from([lower])),
+            ]),
+            ..CollectionSemantics::default()
+        };
+        assert!(!semantics.has_strict_subsumer_in(collection, lower, &BTreeSet::from([lower])));
+        assert!(semantics.has_strict_subsumer_in(collection, lower, &BTreeSet::from([other])));
+        assert!(!semantics.has_strict_subsumer_in(collection, lower, &BTreeSet::new()));
+    }
+
+    #[test]
+    fn existential_frontier_keeps_canonical_cover_choice() {
+        let collection = identity_for_tests(&named_for_tests("c1", id(2)));
+        let [lower, canonical, other] = [data(1), data(2), data(3)];
+        let semantics = CollectionSemantics {
+            members: BTreeMap::from([(collection, BTreeSet::from([lower, canonical, other]))]),
+            order_results_by_input: BTreeMap::from([(
+                (collection, lower),
+                BTreeSet::from([canonical, other]),
+            )]),
+            ..CollectionSemantics::default()
+        };
+        let physical = collection_physical_cover_for(
+            &semantics,
+            collection,
+            &BTreeSet::from([lower]),
+            &BTreeSet::from([canonical, other]),
+        );
+        assert_eq!(
+            physical,
+            CollectionPhysicalCover {
+                cover: BTreeSet::from([canonical]),
                 missing: BTreeSet::new(),
             }
         );
