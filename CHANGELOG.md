@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add bounded test-only exact-H diagnostics: fresh versus retained routing
+  counts, repeated publication/acquisition opcode counts, routing-versus-directory
+  stall controls, and an exact bearer GET application-byte control. These use
+  production routing and RPC code but do not measure simulated link throughput
+  or change transport, scheduling, wire bytes, or live state.
+
 - Experiment with four concurrent exact-handle hydration fetches within one
   service class's existing deadline. Completed bodies land and flush serially;
   a stalled first request no longer blocks ready later answers. Owned lazy Peer

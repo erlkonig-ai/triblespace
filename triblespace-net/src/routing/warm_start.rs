@@ -14,6 +14,9 @@ use triblespace_core::patch::{Entry, PATCH};
 
 use super::*;
 
+#[path = "warm_start/exact_h_counts.rs"]
+mod exact_h_counts;
+
 const MAX_CACHE_BYTES: usize = ROUTING_CAPACITY * 32;
 
 /// Existing PATCH algebra supplies the canonical unary endpoint relation.
@@ -83,6 +86,7 @@ struct Observation {
     rounds: usize,
     winner_round: Option<usize>,
     first_batch: Vec<PeerId>,
+    contacted: BTreeSet<PeerId>,
     responders: Vec<PeerId>,
 }
 
@@ -93,6 +97,7 @@ impl std::fmt::Debug for Observation {
             .field("failures", &self.failed)
             .field("rounds", &self.rounds)
             .field("winner_round", &self.winner_round)
+            .field("distinct_contacts", &self.contacted.len())
             .field("responders", &self.responders.len())
             .finish()
     }
@@ -146,6 +151,10 @@ fn lookup(
             observed.first_batch = batch.clone();
         }
         for peer in batch {
+            assert!(
+                observed.contacted.insert(peer),
+                "one request per peer per lookup"
+            );
             if let Some(referrals) = network.links.get(&peer) {
                 if peer == network.winner && observed.winner_round.is_none() {
                     observed.winner_round = Some(observed.rounds);
