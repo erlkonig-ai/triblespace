@@ -847,6 +847,9 @@ where
 }
 
 #[cfg(test)]
+mod reader_counts;
+
+#[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 

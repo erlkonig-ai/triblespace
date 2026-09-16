@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add test-only foreground Peer lifecycle counters separating frozen exact
+  reads, bare blob-reader refresh, first full serving-inventory construction,
+  and subsequent locator-index deltas. Count enumerated handles rather than
+  payload hashes; production refresh and publication policies are unchanged.
+
 - Carry the existing `Blob<UnknownBlob>` through interactive, descriptor and
   bulk-replication landing. The wire constructs it once and checks its cached
   handle against the request; destination insertion no longer reconstructs and
