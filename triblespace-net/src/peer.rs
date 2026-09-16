@@ -398,6 +398,17 @@ where
         hash: RawHash,
         budget: std::time::Duration,
     ) -> impl Future<Output = Option<Bytes>> + Send + 'static + use<S> {
+        let fetch = self.fetch_verified_with_deadline(hash, budget);
+        async move { fetch.await.map(Bytes::from) }
+    }
+
+    /// The same fetch, keeping the wire proof with the bytes so an internal
+    /// landing can append them under `hash` without hashing them again.
+    pub(crate) fn fetch_verified_with_deadline(
+        &self,
+        hash: RawHash,
+        budget: std::time::Duration,
+    ) -> impl Future<Output = Option<VerifiedBlob>> + Send + 'static + use<S> {
         let host = self.host.clone();
         let sender = self.sender.clone();
         async move {
@@ -407,7 +418,7 @@ where
                 return None;
             }
             // No host or store guard crosses the network await.
-            sender.fetch_blob(hash, budget).await.map(Bytes::from)
+            sender.fetch_blob(hash, budget).await
         }
     }
 
@@ -1229,6 +1240,45 @@ mod tests {
         assert!(snapshot.get::<Bytes, UnknownBlob>(requested).await.is_err());
         assert!(!peer.snapshot().unwrap().contains_blob(requested).unwrap());
         assert_eq!(peer.snapshot().unwrap().wants().unwrap().count(), 0);
+        peer.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_never_caches_a_valid_payload_for_a_different_handle() {
+        struct AnyBlob {
+            bytes: Bytes,
+        }
+        impl host::NetCapability for AnyBlob {
+            fn fetch_blob(
+                &self,
+                _hash: RawHash,
+            ) -> futures::future::BoxFuture<'static, Option<VerifiedBlob>> {
+                // A valid payload, verified under its own handle, offered for
+                // whatever was asked.
+                let bytes = self.bytes.clone();
+                let own = *blake3::hash(&bytes[..]).as_bytes();
+                Box::pin(std::future::ready(VerifiedBlob::verify(bytes, own)))
+            }
+        }
+        let key = SigningKey::from_bytes(&[75; 32]);
+        let (sender, receiver, wiring) =
+            host::wire(crate::identity::iroh_secret(&key).public().into());
+        let bytes = Bytes::from_source(b"a payload for some other handle".to_vec());
+        let own = Inline::<Handle<UnknownBlob>>::new(*blake3::hash(&bytes[..]).as_bytes());
+        wiring.install_test_capability(Arc::new(AnyBlob { bytes }));
+        let requested = Inline::<Handle<UnknownBlob>>::new([0x5f; 32]);
+        let mut peer = Peer::with_wiring(
+            MemoryRepo::default(),
+            foreground_config().qos,
+            sender,
+            receiver,
+        );
+        let snapshot = peer.snapshot().unwrap();
+        assert!(snapshot.get::<Bytes, UnknownBlob>(requested).await.is_err());
+        let after = peer.snapshot().unwrap();
+        assert!(!after.contains_blob(requested).unwrap());
+        assert!(!after.contains_blob(own).unwrap());
+        assert_eq!(after.wants().unwrap().count(), 0);
         peer.close().unwrap();
     }
 

@@ -853,7 +853,22 @@ impl NetSender {
     pub async fn fetch_blob(&self, hash: RawHash, budget: std::time::Duration) -> Option<VerifiedBlob> {
         let fetch = async {
             match self.ready_capability().await {
-                Ok(capability) => capability.fetch_blob(hash).await,
+                Ok(capability) => match capability.fetch_blob(hash).await {
+                    Some(verified) if verified.hash() == hash => Some(verified),
+                    Some(verified) => {
+                        // A verified payload proves its bytes are its own
+                        // handle, not that it answers this request. One cheap
+                        // equality here keeps a valid payload for B from
+                        // landing as the answer for A.
+                        warn!(
+                            requested = %hex::encode(&hash[..4]),
+                            returned = %hex::encode(&verified.hash()[..4]),
+                            "network capability answered with a payload for a different handle"
+                        );
+                        None
+                    }
+                    None => None,
+                },
                 Err(error) => {
                     debug!(%error, "exact blob fetch could not start");
                     None
