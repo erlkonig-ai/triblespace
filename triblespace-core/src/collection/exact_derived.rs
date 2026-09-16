@@ -964,7 +964,11 @@ where
 /// A read-only planning step for an editor that must see facts the derived
 /// index has not carried yet: it maps nothing and publishes nothing. The
 /// selection is the one `ensure` would map next, chosen by the same cover and
-/// support algebra, so it is exactly the residual and never the whole source.
+/// support algebra: the coarsest complete resident source cover of the
+/// support the target lacks. It is therefore bounded by what the target
+/// lacks, not by what changed recently: with an empty or far-behind target it
+/// can be the whole resident source, and a selected physical member may
+/// carry support the target already represents beside the support it lacks.
 /// An empty result means the target is exact for the source's admitted
 /// support. Missing provenance stays visible: when the needed support cannot
 /// be represented by resident members, the incomplete-cover error names what

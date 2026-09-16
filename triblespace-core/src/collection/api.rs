@@ -1751,12 +1751,15 @@ pub trait CollectionSnapshotExt: StoreRead + Sized {
     /// payloads and input witnesses.
     ///
     /// Read-only: nothing is mapped or published. An editor that needs facts
-    /// the derived index has not carried yet queries these few payloads
-    /// beside the resident view (see [`crate::query::patternunion::PatternUnion`])
+    /// the derived index has not carried yet queries these payloads beside
+    /// the resident view (see [`crate::query::patternunion::PatternUnion`])
     /// instead of running maintenance. The selection is the same residual
-    /// `ensure` would map, so it is never the whole source. An incomplete
-    /// cover is an error naming the absent support, never a silent partial
-    /// delta.
+    /// `ensure` would map next: the coarsest complete resident source cover
+    /// of the support the target lacks. It is small when the target is close
+    /// behind, the whole resident source when the target is empty or far
+    /// behind, and a selected member may overlap support the target already
+    /// represents. An incomplete cover is an error naming the absent
+    /// support, never a silent partial delta.
     fn uncovered_source_members<T>(
         &self,
         target: Collection<T>,
