@@ -66,6 +66,7 @@ use super::open_refreshed;
 
 #[cfg(test)]
 mod maintenance_counts;
+mod maintenance_telemetry;
 
 /// Hex characters shown for a handle or key when the full value is not asked
 /// for. Sixteen is far past the point where two collections in one pile
@@ -306,6 +307,8 @@ pub enum Command {
         /// Raw Succinct execution backend; this does not reserve the device
         #[arg(long, value_enum, default_value_t = SuccinctBackend::Cpu)]
         succinct_backend: SuccinctBackend,
+        #[command(flatten)]
+        telemetry: maintenance_telemetry::Options,
     },
     /// Maintain selected targets and their source dependencies, upstream first.
     ///
@@ -334,6 +337,8 @@ pub enum Command {
         /// Raw Succinct execution backend; this does not reserve the device
         #[arg(long, value_enum, default_value_t = SuccinctBackend::Cpu)]
         succinct_backend: SuccinctBackend,
+        #[command(flatten)]
+        telemetry: maintenance_telemetry::Options,
     },
     /// Grant one endpoint unbounded READ access to an existing collection.
     ///
@@ -467,6 +472,7 @@ pub fn run(cmd: Command) -> Result<()> {
             watch,
             interval_ms,
             succinct_backend,
+            telemetry,
         } => run_maintain(
             pile,
             collections,
@@ -475,6 +481,7 @@ pub fn run(cmd: Command) -> Result<()> {
             watch,
             interval_ms,
             succinct_backend,
+            telemetry,
         ),
         Command::MaintainAll {
             pile,
@@ -483,6 +490,7 @@ pub fn run(cmd: Command) -> Result<()> {
             watch,
             interval_ms,
             succinct_backend,
+            telemetry,
         } => run_maintain(
             pile,
             collections,
@@ -491,6 +499,7 @@ pub fn run(cmd: Command) -> Result<()> {
             watch,
             interval_ms,
             succinct_backend,
+            telemetry,
         ),
         Command::GrantRead {
             pile,
@@ -2745,6 +2754,87 @@ async fn maintenance_pass<S: Store + AsyncBlobStoreAcquire + Send>(
     succinct_backend: SuccinctBackend,
     state: &mut MaintenanceState<S::Snapshot>,
 ) -> Result<usize> {
+    maintenance_pass_observed(
+        pile,
+        references,
+        signer,
+        dependencies,
+        succinct_backend,
+        state,
+        None,
+    )
+    .await
+}
+
+async fn maintenance_pass_observed<S: Store + AsyncBlobStoreAcquire + Send>(
+    pile: &mut S,
+    references: &[String],
+    signer: &SigningKey,
+    dependencies: bool,
+    succinct_backend: SuccinctBackend,
+    state: &mut MaintenanceState<S::Snapshot>,
+    mut telemetry: Option<&mut maintenance_telemetry::Telemetry>,
+) -> Result<usize> {
+    let started = telemetry
+        .as_deref_mut()
+        .map(|telemetry| telemetry.begin_pass());
+    let result = maintenance_pass_inner(
+        pile,
+        references,
+        signer,
+        dependencies,
+        succinct_backend,
+        state,
+        telemetry.as_deref_mut(),
+    )
+    .await;
+    if let (Some(telemetry), Some(started)) = (telemetry, started) {
+        telemetry.finish_pass(started, matches!(result, Ok(0)));
+        telemetry.emit_due(pile);
+    }
+    result
+}
+
+async fn maintenance_hop<S: Store + AsyncBlobStoreAcquire + Send>(
+    store: &mut S,
+    snapshot: &S::Snapshot,
+    handle: CollectionHandle,
+    representation: Id,
+    algorithm: Option<Id>,
+    signer: &SigningKey,
+    succinct_backend: SuccinctBackend,
+    ensure_only: bool,
+) -> Result<S::Snapshot> {
+    if ensure_only {
+        let root: Collection<SimpleArchive> = Collection::open(snapshot, handle)
+            .map_err(|error| anyhow!("open foundational collection: {error}"))?;
+        store
+            .ensure(root, signer)
+            .await
+            .map_err(|error| anyhow!("ensure foundational collection: {error}"))
+    } else {
+        maintain_by_representation(
+            store,
+            snapshot,
+            handle,
+            representation,
+            algorithm,
+            signer,
+            succinct_backend,
+        )
+        .await
+    }
+}
+
+async fn maintenance_pass_inner<S: Store + AsyncBlobStoreAcquire + Send>(
+    pile: &mut S,
+    references: &[String],
+    signer: &SigningKey,
+    dependencies: bool,
+    succinct_backend: SuccinctBackend,
+    state: &mut MaintenanceState<S::Snapshot>,
+    mut telemetry: Option<&mut maintenance_telemetry::Telemetry>,
+) -> Result<usize> {
     let snapshot = ObservedStore::new(
         pile.snapshot()
             .map_err(|error| anyhow!("pile snapshot: {error:?}"))?,
@@ -2823,6 +2913,11 @@ async fn maintenance_pass<S: Store + AsyncBlobStoreAcquire + Send>(
             if !state.needs_work(handle, dependency_only, &before) {
                 continue;
             }
+            let hop_started = telemetry.as_deref_mut().map(|telemetry| {
+                let started = telemetry.begin_hop();
+                telemetry.emit_due(pile);
+                started
+            });
             let mut observed = ObservedStore::new(&mut *pile);
             let result = async {
                 let snapshot = observed
@@ -2837,15 +2932,24 @@ async fn maintenance_pass<S: Store + AsyncBlobStoreAcquire + Send>(
                 let ensure_only = dependency_only && source.is_none();
                 let before = cover_census(&snapshot, handle)?;
                 let started = Instant::now();
-                let after = if ensure_only {
-                    let root: Collection<SimpleArchive> = Collection::open(&snapshot, handle)
-                        .map_err(|error| anyhow!("open foundational collection: {error}"))?;
-                    observed
-                        .ensure(root, signer)
-                        .await
-                        .map_err(|error| anyhow!("ensure foundational collection: {error}"))?
+                let after = if let Some(telemetry) = telemetry.as_deref_mut() {
+                    let mut counted = maintenance_telemetry::CountedStore {
+                        inner: &mut observed,
+                        counts: &mut telemetry.publications,
+                    };
+                    maintenance_hop(
+                        &mut counted,
+                        &snapshot,
+                        handle,
+                        representation,
+                        algorithm,
+                        signer,
+                        succinct_backend,
+                        ensure_only,
+                    )
+                    .await?
                 } else {
-                    maintain_by_representation(
+                    maintenance_hop(
                         &mut observed,
                         &snapshot,
                         handle,
@@ -2853,6 +2957,7 @@ async fn maintenance_pass<S: Store + AsyncBlobStoreAcquire + Send>(
                         algorithm,
                         signer,
                         succinct_backend,
+                        ensure_only,
                     )
                     .await?
                 };
@@ -2874,6 +2979,10 @@ async fn maintenance_pass<S: Store + AsyncBlobStoreAcquire + Send>(
             .await;
             let interests = observed.dependencies();
             drop(observed);
+            if let (Some(telemetry), Some(started)) = (telemetry.as_deref_mut(), hop_started) {
+                telemetry.finish_hop(started, result.is_ok());
+                telemetry.emit_due(pile);
+            }
             // Retain the start boundary even after an error or partial write.
             // A later snapshot can contain records/proofs that the operation's
             // frozen frontier did not consume. Its own writes also request one
@@ -2918,12 +3027,16 @@ async fn maintenance_loop(
     watch: bool,
     interval: Duration,
     succinct_backend: SuccinctBackend,
+    mut telemetry: Option<&mut maintenance_telemetry::Telemetry>,
 ) -> Result<()> {
     let mut baseline = None;
     let mut catch_up = true;
     let mut interests = StoreDependencies::default();
     let mut state = MaintenanceState::default();
     loop {
+        if let Some(telemetry) = telemetry.as_deref_mut() {
+            telemetry.emit_due(pile);
+        }
         // Pile::snapshot refreshes its externally appended prefix before
         // freezing all indexes. Blob arrivals count, not just new equations.
         let before = pile
@@ -2934,13 +3047,14 @@ async fn maintenance_loop(
                 .as_ref()
                 .is_some_and(|previous| maintenance_changed(previous, &before, &interests))
         {
-            let failures = maintenance_pass(
+            let failures = maintenance_pass_observed(
                 pile,
                 references,
                 signer,
                 dependencies,
                 succinct_backend,
                 &mut state,
+                telemetry.as_deref_mut(),
             )
             .await?;
             interests = state.interests();
@@ -2983,7 +3097,9 @@ fn run_maintain(
     watch: bool,
     interval_ms: u64,
     succinct_backend: SuccinctBackend,
+    telemetry_options: maintenance_telemetry::Options,
 ) -> Result<()> {
+    let telemetry_config = telemetry_options.config()?;
     // Reject an unavailable implementation before opening/mutating the pile.
     succinct_backend.check_available()?;
     let key_path = triblespace_core::signing_key_file::resolve_path(key.as_deref(), &path);
@@ -2997,6 +3113,19 @@ fn run_maintain(
         crate::cli::util::shutdown_signal()?
     };
     let mut pile = open_refreshed(&path)?;
+    let mut telemetry = match telemetry_config {
+        Some(config) => match maintenance_telemetry::Telemetry::open(&mut pile, config, &signer) {
+            Ok(telemetry) => Some(telemetry),
+            Err(error) => {
+                let close = pile.close();
+                if close.is_err() {
+                    eprintln!("maintenance telemetry setup: cannot close pile");
+                }
+                return Err(error.into());
+            }
+        },
+        None => None,
+    };
     let res = runtime.block_on(async {
         tokio::select! {
             biased;
@@ -3013,9 +3142,13 @@ fn run_maintain(
                 watch,
                 Duration::from_millis(interval_ms),
                 succinct_backend,
+                telemetry.as_mut(),
             ) => result,
         }
     });
+    if let Some(telemetry) = telemetry.as_mut() {
+        telemetry.finish(&mut pile);
+    }
     let close_res = pile
         .close()
         .map_err(|error| anyhow!("pile close: {error:?}"));
