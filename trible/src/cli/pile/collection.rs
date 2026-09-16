@@ -64,6 +64,9 @@ use triblespace_core::trible::TribleSet;
 
 use super::open_refreshed;
 
+#[cfg(test)]
+mod maintenance_counts;
+
 /// Hex characters shown for a handle or key when the full value is not asked
 /// for. Sixteen is far past the point where two collections in one pile
 /// collide, and short enough that a row stays one terminal line.

@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
+- Add test-only counted maintenance diagnostics for two independent chains:
+  idle/unrelated change gating, unchanged-chain revisits after selected-source
+  or proof changes, and receipt support growth without projected membership growth.
+  Production scheduling and publication behavior are unchanged.
+
 - `pile collection derive PILE SOURCE entity-id-set --attribute ID` registers
   the canonical projection of an attribute's GenId values. Ordinary `maintain`
   and `maintain-all` dispatch it without changing the source's SimpleArchive
