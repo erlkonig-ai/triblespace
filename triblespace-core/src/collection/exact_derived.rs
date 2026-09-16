@@ -17,11 +17,11 @@ use crate::blob::encodings::UnknownBlob;
 use crate::blob::Blob;
 use crate::inline::encodings::hash::Handle;
 use crate::repo::async_store::AsyncBlobStoreAcquire;
-use crate::repo::{BlobStoreGet, BlobStoreList, BlobStoreMeta, Store, StoreRead};
+use crate::repo::{BlobStoreGet, BlobStoreList, BlobStoreMeta, Store, StoreRead, StoreSnapshot};
 use crate::trible::Fragment;
 
 use super::encoding::{collection_member_availability, CollectionMemberAvailability};
-use super::operation_snapshot::OperationFrontier;
+use super::operation_snapshot::{OperationFrontier, OperationSnapshot};
 use super::{
     collection_complete_physical_cover, descriptor, resolve_collection_semantics, Collection,
     CollectionClaimValidation, CollectionData, CollectionDerive, CollectionEncoding,
@@ -1018,6 +1018,20 @@ where
     }
 }
 
+/// One resolution already paid for, offered to the next step of the SAME pass.
+///
+/// A pass is not one immutable observation: another owner or an acquisition
+/// can land bytes between two `store.snapshot` calls, and `OperationFrontier`
+/// freezes control facts and proofs rather than later residency. So the probe
+/// travels WITH the snapshot it was taken against, and the consumer reuses it
+/// only after its own fresh view reports no change since that one. An unknown
+/// backend answers `StoreChanges::ALL` and therefore re-probes, which is the
+/// safe direction.
+struct CarriedProbe<S: Store, M: CollectionMapping> {
+    observed: OperationSnapshot<S::Snapshot, S::Snapshot>,
+    probe: MappingProbe<M>,
+}
+
 struct MappingProbe<M: CollectionMapping> {
     source: Collection<M::Source>,
     mapping: M,
@@ -1271,6 +1285,14 @@ where
     ensure_exact_resident_with::<S, CanonicalDerivation<T>>(store, target, signing_key, support)
 }
 
+/// The ensure round, discarding any resolution it could have carried onward.
+///
+/// This wrapper exists for a specific reason: `CarriedProbe` contains `M`, and
+/// the asynchronous ensure entry point holds its callee's result across an
+/// `.await`. Returning the pair from THIS function would therefore put `M`
+/// inside a public `impl Future + Send`, requiring `M: Send` on an existing
+/// public signature. Only the synchronous maintain path wants the pair, so
+/// only it calls the carrying form.
 fn ensure_exact_resident_in_frontier_with<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
@@ -1279,6 +1301,29 @@ fn ensure_exact_resident_in_frontier_with<S, M>(
     unavailable: &BTreeSet<CollectionData>,
     frontier: &mut OperationFrontier<S::Snapshot>,
 ) -> Result<(), CollectionRealizationError>
+where
+    S: Store,
+    M: CollectionMapping,
+{
+    ensure_exact_resident_in_frontier_carrying::<S, M>(
+        store,
+        target,
+        signing_key,
+        support,
+        unavailable,
+        frontier,
+    )
+    .map(|_| ())
+}
+
+fn ensure_exact_resident_in_frontier_carrying<S, M>(
+    store: &mut S,
+    target: Collection<M::Target>,
+    signing_key: &SigningKey,
+    support: &Support,
+    unavailable: &BTreeSet<CollectionData>,
+    frontier: &mut OperationFrontier<S::Snapshot>,
+) -> Result<Option<CarriedProbe<S, M>>, CollectionRealizationError>
 where
     S: Store,
     M: CollectionMapping,
@@ -1293,7 +1338,15 @@ where
         let probe = probe_mapping::<_, M>(&snapshot, target, support, true)?;
         demand_missing_dependency::<_, M>(&snapshot, target, &probe, support, unavailable)?;
         if probe.target_resolution.is_exact_for(support) {
-            return Ok(());
+            // Offer this resolution onward only when THIS call has published
+            // nothing, so an exact return reached after earlier rounds already
+            // appended is not confused with the first one. A put is always
+            // accompanied by at least one witness record, so an empty
+            // `published` is exactly "this call wrote nothing".
+            return Ok(published.is_empty().then_some(CarriedProbe {
+                observed: snapshot,
+                probe,
+            }));
         }
         let repeated_cover = probe.target_resolution.cover.data_members().collect();
         let residual = source_residual(&snapshot, &probe, support, &blocked)?;
@@ -1450,7 +1503,7 @@ where
     S: Store,
     M: CollectionMapping,
 {
-    ensure_exact_resident_in_frontier_with::<S, M>(
+    let carried = ensure_exact_resident_in_frontier_carrying::<S, M>(
         store,
         target,
         signing_key,
@@ -1465,6 +1518,7 @@ where
         support,
         unavailable,
         frontier,
+        carried,
     )?;
     super::exact_target_compaction::maintain_target_with(
         store,
@@ -1488,17 +1542,27 @@ fn coarsen_from_resident_source<S, M>(
     support: &Support,
     unavailable: &BTreeSet<CollectionData>,
     frontier: &mut OperationFrontier<S::Snapshot>,
+    carried: Option<CarriedProbe<S, M>>,
 ) -> Result<M, CollectionRealizationError>
 where
     S: Store,
     M: CollectionMapping,
 {
     let mut attempted = BTreeSet::new();
+    let mut carried = carried;
     loop {
+        // The fresh view and its error boundary are unchanged: the carried
+        // resolution is only permitted to replace the PROBE, never the
+        // observation it is checked against.
         let snapshot = frontier.view(store.snapshot().map_err(|error| {
             CollectionRealizationError::storage("open source-guided maintenance snapshot", error)
         })?);
-        let probe = probe_mapping::<_, M>(&snapshot, target, support, true)?;
+        // Taken unconditionally, so a pair is offered to the first iteration
+        // only. Every later coarsening round probes for itself.
+        let probe = match carried.take() {
+            Some(carried) if snapshot.changes_since(&carried.observed).is_empty() => carried.probe,
+            _ => probe_mapping::<_, M>(&snapshot, target, support, true)?,
+        };
         demand_missing_dependency::<_, M>(&snapshot, target, &probe, support, unavailable)?;
         let semantics = &probe.target_resolution.semantics;
         let source = probe.source.handle();
