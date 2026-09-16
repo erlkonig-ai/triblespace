@@ -458,7 +458,10 @@ fn residual_selection_names_resident_source_members_without_demanding_absent_out
     let snapshot = store.snapshot().unwrap();
     let records_before = snapshot.records().unwrap().count();
     // Succinct is exact for the resident source: nothing residual there.
-    assert!(snapshot.uncovered_source_members(succinct).unwrap().is_empty());
+    assert!(snapshot
+        .uncovered_source_members(succinct)
+        .unwrap()
+        .is_empty());
     // Rank9 has nothing resident to read...
     assert!(snapshot.collection(rank9).unwrap().cover().is_empty());
     // ...and the residual names B, resident and readable, instead of failing

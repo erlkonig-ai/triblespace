@@ -994,8 +994,7 @@ where
     M: CollectionMapping,
 {
     let support = source_support::<R, M>(snapshot, target)?;
-    let probe =
-        probe_mapping::<R, M>(snapshot, target, &support, true)?;
+    let probe = probe_mapping::<R, M>(snapshot, target, &support, true)?;
     if probe.target_resolution.is_exact_for(&support) {
         return Ok(Vec::new());
     }

@@ -36,6 +36,8 @@ mod liveness;
 mod ordinal;
 /// [`PatchValueConstraint`](patchconstraint::PatchValueConstraint) and [`PatchIdConstraint`](patchconstraint::PatchIdConstraint) — constrains variables to PATCH entries.
 pub mod patchconstraint;
+/// [`PatternUnion`](patternunion::PatternUnion) — one source made of heterogeneous pattern arms.
+pub mod patternunion;
 #[doc(hidden)]
 /// [`InlineRange`](rangeconstraint::InlineRange) — restricts a variable to a byte-lexicographic range.
 pub mod rangeconstraint;
@@ -44,8 +46,6 @@ pub mod rangeconstraint;
 pub mod register;
 /// [`SortedSliceConstraint`](sortedsliceconstraint::SortedSliceConstraint) — constrains a variable to values in a sorted slice (binary search confirm).
 pub mod sortedsliceconstraint;
-/// [`PatternUnion`](patternunion::PatternUnion) — one source made of heterogeneous pattern arms.
-pub mod patternunion;
 /// [`UnionConstraint`](unionconstraint::UnionConstraint) — logical OR.
 pub mod unionconstraint;
 mod variableset;

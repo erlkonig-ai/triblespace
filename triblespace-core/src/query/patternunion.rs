@@ -175,22 +175,19 @@ mod tests {
         right += entity! { &b @ label: "right" };
 
         let both = PatternUnion::new(&left, vec![right.clone()]);
-        let mut labels: Vec<String> =
-            find!(l: String, pattern!(&both, [{ label: ?l }])).collect();
+        let mut labels: Vec<String> = find!(l: String, pattern!(&both, [{ label: ?l }])).collect();
         labels.sort();
         assert_eq!(labels, vec!["left".to_owned(), "right".to_owned()]);
 
         let only_left = PatternUnion::new(&left, Vec::<TribleSet>::new());
-        let labels: Vec<String> =
-            find!(l: String, pattern!(&only_left, [{ label: ?l }])).collect();
+        let labels: Vec<String> = find!(l: String, pattern!(&only_left, [{ label: ?l }])).collect();
         assert_eq!(labels, vec!["left".to_owned()]);
 
         // The same fact in both arms is one row: the union deduplicates.
         let mut duplicate = TribleSet::new();
         duplicate += entity! { &a @ label: "left" };
         let doubled = PatternUnion::new(&left, vec![duplicate]);
-        let labels: Vec<String> =
-            find!(l: String, pattern!(&doubled, [{ label: ?l }])).collect();
+        let labels: Vec<String> = find!(l: String, pattern!(&doubled, [{ label: ?l }])).collect();
         assert_eq!(labels, vec!["left".to_owned()]);
 
         let absent: Option<TribleSet> = None;
