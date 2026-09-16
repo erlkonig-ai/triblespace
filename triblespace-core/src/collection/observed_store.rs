@@ -96,14 +96,6 @@ impl<S: SnapshotSource> SnapshotSource for ObservedStore<S> {
         let snapshot = self.inner.snapshot()?;
         Ok(Self::Snapshot::with_tracker(snapshot, self.tracker()))
     }
-
-    fn snapshot_at(
-        &mut self,
-        instant: hifitime::Epoch,
-    ) -> Result<Self::Snapshot, Self::SnapshotError> {
-        let snapshot = self.inner.snapshot_at(instant)?;
-        Ok(Self::Snapshot::with_tracker(snapshot, self.tracker()))
-    }
 }
 
 impl<S: BlobStorePut> BlobStorePut for ObservedStore<S> {
@@ -149,10 +141,6 @@ impl<S: AsyncBlobStoreAcquire> AsyncBlobStoreAcquire for ObservedStore<S> {
 }
 
 impl<R: StoreSnapshot> StoreSnapshot for ObservedStore<R> {
-    fn instant(&self) -> hifitime::Epoch {
-        self.inner.instant()
-    }
-
     fn changes_since(&self, previous: &Self) -> StoreChanges {
         self.inner.changes_since(&previous.inner)
     }
@@ -403,8 +391,7 @@ mod tests {
             )
             .unwrap();
         let mut observed = ObservedStore::new(&mut store);
-        let at = hifitime::Epoch::from_tai_seconds(17.0);
-        let before = observed.snapshot_at(at).unwrap();
+        let before = observed.snapshot().unwrap();
         let handle = observed.put(blob("active member")).unwrap();
         let record = CollectionRecord::Commit(CollectionCommit::sign(
             &key,
@@ -420,10 +407,8 @@ mod tests {
             SigningKey::from_bytes(&[12; 32]).verifying_key(),
         );
         observed.insert_proof(proof.clone()).unwrap();
-        let after = observed.snapshot_at(at).unwrap();
+        let after = observed.snapshot().unwrap();
         assert!(observed.dependencies().is_empty(), "writes are not reads");
-        assert_eq!(before.instant(), at);
-        assert_eq!(after.instant(), at);
         assert!(!before.contains_blob(handle).unwrap());
         assert_eq!(
             after.get::<Bytes, _>(handle).unwrap().as_ref(),
@@ -661,10 +646,6 @@ mod tests {
         struct ScopedSnapshot(Arc<AtomicUsize>);
 
         impl StoreSnapshot for ScopedSnapshot {
-            fn instant(&self) -> hifitime::Epoch {
-                hifitime::Epoch::from_tai_seconds(7.0)
-            }
-
             fn changes_since(&self, _previous: &Self) -> StoreChanges {
                 StoreChanges::ALL
             }
@@ -687,7 +668,6 @@ mod tests {
             all_records: true,
             ..StoreDependencies::default()
         };
-        assert_eq!(after.instant(), before.inner().instant());
         assert_eq!(after.changes_since(&before), StoreChanges::ALL);
         assert_eq!(
             after.changes_for(&before, &dependencies),

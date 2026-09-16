@@ -56,14 +56,12 @@ impl Debug for MemoryBlobStore {
 /// `pattern!` / `and!` / `or!`.
 ///
 pub struct MemoryBlobStoreSnapshot {
-    instant: hifitime::Epoch,
     blobs: BlobIndex,
 }
 
 impl Clone for MemoryBlobStoreSnapshot {
     fn clone(&self) -> Self {
         MemoryBlobStoreSnapshot {
-            instant: self.instant,
             blobs: self.blobs.clone(),
         }
     }
@@ -71,15 +69,15 @@ impl Clone for MemoryBlobStoreSnapshot {
 
 impl PartialEq for MemoryBlobStoreSnapshot {
     fn eq(&self, other: &Self) -> bool {
-        self.instant == other.instant && self.blobs == other.blobs
+        self.blobs == other.blobs
     }
 }
 
 impl Eq for MemoryBlobStoreSnapshot {}
 
 impl MemoryBlobStoreSnapshot {
-    fn new(blobs: BlobIndex, instant: hifitime::Epoch) -> Self {
-        MemoryBlobStoreSnapshot { instant, blobs }
+    fn new(blobs: BlobIndex) -> Self {
+        MemoryBlobStoreSnapshot { blobs }
     }
 
     /// Number of blobs in this snapshot.
@@ -366,10 +364,6 @@ impl BlobStorePut for MemoryBlobStore {
 }
 
 impl StoreSnapshot for MemoryBlobStoreSnapshot {
-    fn instant(&self) -> hifitime::Epoch {
-        self.instant
-    }
-
     fn changes_since(&self, previous: &Self) -> crate::repo::StoreChanges {
         if self.blobs == previous.blobs {
             crate::repo::StoreChanges::NONE
@@ -383,11 +377,8 @@ impl SnapshotSource for MemoryBlobStore {
     type Snapshot = MemoryBlobStoreSnapshot;
     type SnapshotError = Infallible;
 
-    fn snapshot_at(
-        &mut self,
-        instant: hifitime::Epoch,
-    ) -> Result<Self::Snapshot, Self::SnapshotError> {
-        Ok(MemoryBlobStoreSnapshot::new(self.blobs.clone(), instant))
+    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+        Ok(MemoryBlobStoreSnapshot::new(self.blobs.clone()))
     }
 }
 
@@ -465,14 +456,10 @@ mod tests {
     #[test]
     fn snapshot_change_classification_uses_patch_identity() {
         let mut store = MemoryBlobStore::new();
-        let initial_instant = hifitime::Epoch::from_tai_seconds(10.0);
-        let later_instant = hifitime::Epoch::from_tai_seconds(20.0);
-        let before = store.snapshot_at(initial_instant).unwrap();
-        let unchanged = store.snapshot_at(later_instant).unwrap();
-        assert_eq!(before.instant(), initial_instant);
-        assert_eq!(before.clone().instant(), initial_instant);
-        assert_eq!(unchanged.instant(), later_instant);
-        assert_ne!(before, unchanged);
+        let before = store.snapshot().unwrap();
+        let unchanged = store.snapshot().unwrap();
+        assert_eq!(before, before.clone());
+        assert_eq!(before, unchanged);
         assert_eq!(
             unchanged.changes_since(&before),
             crate::repo::StoreChanges::NONE
@@ -482,6 +469,8 @@ mod tests {
             .put::<UTF8String, _>(Bytes::from_source("new".to_string()).view().unwrap())
             .unwrap();
         let after = store.snapshot().unwrap();
+        assert_ne!(after, before);
+        assert!(before.is_empty());
         assert_eq!(
             after.changes_since(&before),
             crate::repo::StoreChanges::BLOBS,

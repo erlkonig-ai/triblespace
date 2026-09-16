@@ -186,8 +186,7 @@ its own store.
 Reads are exact about what they observed, not magical about global time:
 
 - `store.snapshot()` freezes blob bytes, collection records, capability proofs,
-  and backend state from one coherent known prefix, plus one interpretation
-  instant for application queries;
+  and backend state from one coherent known prefix;
 - `collection.admitted(&snapshot)` applies the descriptor WRITE policy and
   resident capability evidence to obtain one semantic `Cover<E>` without
   fetching member data;
@@ -197,13 +196,13 @@ Reads are exact about what they observed, not magical about global time:
   support-equivalent physical decomposition and reconstructs the logical value
   through that same immutable observation.
   `collection.read(&snapshot)` concisely observes and materializes the maximal
-  resident collection view at that same frozen instant.
+  resident collection view at that same frozen prefix.
 
-Snapshot clones retain their instant for application interpretations of time.
-Content-change masks intentionally exclude time, and collection authorization
-does not depend on it. An application action such as Secrets key delivery may
-interpret its own deadline facts before counting each root's proof prefix;
-that does not expire collection membership.
+Snapshots carry no clock. Content-change masks compare stored evidence, and
+collection authorization does not expire with wall time. An application action
+such as Secrets key delivery supplies its own evaluation time and interprets
+its deadline facts before counting each root's proof prefix; that does not
+expire collection membership.
 
 Cover identity is the collection descriptor plus distinct payload handles.
 Signer, signature, and metadata attestations currently known to the store

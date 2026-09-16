@@ -59,7 +59,7 @@ use crate::repo::{BlobChildren, StorageClose};
 /// snapshot's frozen record and authorization observation. A reader may fetch
 /// and cache the exact immutable bytes named by `handle`, including bytes which
 /// were not resident when the snapshot was taken. This must not advance the
-/// snapshot's records, query instant, or a previously selected cover,
+/// snapshot's records or a previously selected cover,
 /// and must not implicitly record durable WANTs.
 pub trait AsyncBlobStoreGet {
     /// Error type for get operations, parameterised by the
@@ -253,20 +253,9 @@ pub trait AsyncSnapshotSource {
     /// Failure while refreshing and freezing an observation.
     type SnapshotError: Error + Debug + Send + Sync + 'static;
 
-    /// Sample the query clock once, then freeze the resulting prefix.
+    /// Reobserve external changes and freeze the resulting known prefix.
     fn snapshot(
         &mut self,
-    ) -> impl Future<Output = Result<Self::Snapshot, Self::SnapshotError>> + Send {
-        self.snapshot_at(crate::clock::epoch_now())
-    }
-
-    /// Freeze newly observed content at one chosen query instant.
-    ///
-    /// As with [`SnapshotSource::snapshot_at`], this chooses application query
-    /// time, not a historical content revision or expiring collection authority.
-    fn snapshot_at(
-        &mut self,
-        instant: hifitime::Epoch,
     ) -> impl Future<Output = Result<Self::Snapshot, Self::SnapshotError>> + Send;
 }
 
@@ -370,10 +359,6 @@ impl<S> StoreSnapshot for SyncAsAsync<S>
 where
     S: StoreSnapshot,
 {
-    fn instant(&self) -> hifitime::Epoch {
-        self.0.instant()
-    }
-
     fn changes_since(&self, previous: &Self) -> StoreChanges {
         self.0.changes_since(&previous.0)
     }
@@ -454,11 +439,10 @@ where
     type Snapshot = SyncAsAsync<S::Snapshot>;
     type SnapshotError = S::SnapshotError;
 
-    fn snapshot_at(
+    fn snapshot(
         &mut self,
-        instant: hifitime::Epoch,
     ) -> impl Future<Output = Result<Self::Snapshot, Self::SnapshotError>> + Send {
-        async move { self.0.snapshot_at(instant).map(SyncAsAsync) }
+        async move { self.0.snapshot().map(SyncAsAsync) }
     }
 }
 
@@ -573,10 +557,6 @@ impl<A> StoreSnapshot for Blocking<A>
 where
     A: StoreSnapshot,
 {
-    fn instant(&self) -> hifitime::Epoch {
-        self.inner.instant()
-    }
-
     fn changes_since(&self, previous: &Self) -> StoreChanges {
         self.inner.changes_since(&previous.inner)
     }
@@ -618,11 +598,8 @@ where
     type Snapshot = Blocking<A::Snapshot>;
     type SnapshotError = A::SnapshotError;
 
-    fn snapshot_at(
-        &mut self,
-        instant: hifitime::Epoch,
-    ) -> Result<Self::Snapshot, Self::SnapshotError> {
-        let snapshot = self.rt.block_on(self.inner.snapshot_at(instant))?;
+    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+        let snapshot = self.rt.block_on(self.inner.snapshot())?;
         Ok(Blocking {
             inner: snapshot,
             rt: self.rt.clone(),
@@ -822,18 +799,22 @@ mod tests {
     }
 
     #[test]
-    fn async_adapter_preserves_snapshot_time_without_content_changes() {
+    fn async_adapter_preserves_snapshot_content_changes() {
         let mut inner = MemoryBlobStore::new();
-        let instant = hifitime::Epoch::from_tai_seconds(10.0);
         let mut store = SyncAsAsync::new(&mut inner);
-        let before = block_on(store.snapshot_at(instant)).unwrap();
-        let later_instant = hifitime::Epoch::from_tai_seconds(20.0);
-        let after = block_on(store.snapshot_at(later_instant)).unwrap();
-        assert_eq!(before.clone().instant(), instant);
-        assert_eq!(before.0.instant(), instant);
-        assert_eq!(after.instant(), later_instant);
-        assert_eq!(after.0.instant(), later_instant);
-        assert_eq!(after.changes_since(&before), StoreChanges::NONE);
+        let before = block_on(store.snapshot()).unwrap();
+        let unchanged = block_on(store.snapshot()).unwrap();
+        assert_eq!(before.clone().changes_since(&before), StoreChanges::NONE);
+        assert_eq!(unchanged.changes_since(&before), StoreChanges::NONE);
+
+        let handle = block_on(store.put::<SimpleArchive, _>(blob(1))).unwrap();
+        let after = block_on(store.snapshot()).unwrap();
+        assert_eq!(after.changes_since(&before), StoreChanges::BLOBS);
+        assert!(block_on(before.blobs()).is_empty());
+        assert_eq!(
+            block_on(after.blobs())[0].as_ref().unwrap().handle.raw,
+            handle.raw
+        );
     }
 
     #[test]
@@ -889,17 +870,18 @@ mod tests {
 
     #[cfg(feature = "object-store")]
     #[test]
-    fn blocking_adapter_preserves_snapshot_time_without_content_changes() {
+    fn blocking_adapter_preserves_snapshot_content_changes() {
         let mut store = Blocking::new(SyncAsAsync::new(MemoryRepo::default())).unwrap();
-        let instant = hifitime::Epoch::from_tai_seconds(10.0);
-        let before = SnapshotSource::snapshot_at(&mut store, instant).unwrap();
-        let later_instant = hifitime::Epoch::from_tai_seconds(20.0);
-        let after = SnapshotSource::snapshot_at(&mut store, later_instant).unwrap();
-        assert_eq!(before.clone().instant(), instant);
-        assert_eq!(before.inner.instant(), instant);
-        assert_eq!(after.instant(), later_instant);
-        assert_eq!(after.inner.instant(), later_instant);
-        assert_eq!(after.changes_since(&before), StoreChanges::NONE);
+        let before = SnapshotSource::snapshot(&mut store).unwrap();
+        let unchanged = SnapshotSource::snapshot(&mut store).unwrap();
+        assert_eq!(before.clone().changes_since(&before), StoreChanges::NONE);
+        assert_eq!(unchanged.changes_since(&before), StoreChanges::NONE);
+
+        BlobStorePut::put::<SimpleArchive, _>(&mut store, blob(1)).unwrap();
+        let after = SnapshotSource::snapshot(&mut store).unwrap();
+        assert_eq!(after.changes_since(&before), StoreChanges::BLOBS);
+        assert_eq!(BlobStoreList::blobs(&before).count(), 0);
+        assert_eq!(BlobStoreList::blobs(&after).count(), 1);
     }
 
     #[cfg(feature = "object-store")]

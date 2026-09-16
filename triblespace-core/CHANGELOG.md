@@ -101,12 +101,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   explicit owner reissuance, not signature translation or silent removal of
   application-specific restrictions.
 
-- Freeze one interpretation instant in every `StoreSnapshot`, with
-  `SnapshotSource::snapshot_at` as the single explicit-time construction seam.
-  Application queries can use that instant; generic collection authorization
-  has no validity clock, and content-change masks exclude time. Passive
-  collection observation remains resident-only and inert; active acquisition
-  belongs to asynchronous store operations or exact-handle networked reads.
+- Freeze immutable content observations in `StoreSnapshot`, with required
+  `snapshot` methods on synchronous and asynchronous sources. Remove the
+  generic snapshot clock and explicit-time construction; applications own
+  any clock needed for their restrictions. Content revision comparisons and
+  timeless generic capability authority are unchanged. Passive collection
+  observation remains resident-only and inert; active acquisition belongs to
+  asynchronous store operations or exact-handle networked reads.
 
 - Use the same `ensure` and `maintain` operations for root and derived
   collections. Roots fetch their exact admitted dependencies without a

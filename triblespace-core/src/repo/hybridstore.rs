@@ -59,10 +59,6 @@ where
     B: StoreSnapshot,
     R: StoreSnapshot,
 {
-    fn instant(&self) -> hifitime::Epoch {
-        self.records.instant()
-    }
-
     fn changes_since(&self, previous: &Self) -> StoreChanges {
         let blob_changes = self.blobs.changes_since(&previous.blobs);
         let record_changes = self.records.changes_since(&previous.records);
@@ -208,22 +204,16 @@ where
     type Snapshot = HybridSnapshot<B::Snapshot, R::Snapshot>;
     type SnapshotError = HybridSnapshotError<B::SnapshotError, R::SnapshotError>;
 
-    fn snapshot_at(
-        &mut self,
-        instant: hifitime::Epoch,
-    ) -> Result<Self::Snapshot, Self::SnapshotError> {
+    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
         // Publication stores dependencies before the records which name them.
         // Reading in the opposite order makes the non-atomic split safe: a
         // record observed here cannot name a dependency published only after
         // the later blob observation.
         let records = self
             .records
-            .snapshot_at(instant)
+            .snapshot()
             .map_err(HybridSnapshotError::Records)?;
-        let blobs = self
-            .blobs
-            .snapshot_at(instant)
-            .map_err(HybridSnapshotError::Blobs)?;
+        let blobs = self.blobs.snapshot().map_err(HybridSnapshotError::Blobs)?;
         Ok(HybridSnapshot { blobs, records })
     }
 }
@@ -449,25 +439,31 @@ mod tests {
     }
 
     #[test]
-    fn snapshots_freeze_one_instant_across_both_halves() {
+    fn snapshots_freeze_content_from_both_halves() {
         let mut hybrid = HybridStore::new(MemoryRepo::default(), MemoryRepo::default());
-        let instant = hifitime::Epoch::from_tai_seconds(10.0);
-        let before = hybrid.snapshot_at(instant).unwrap();
-        assert_eq!(before.instant(), instant);
-        assert_eq!(before.blobs.instant(), instant);
-        assert_eq!(before.records.instant(), instant);
+        let before = hybrid.snapshot().unwrap();
+        let unchanged = hybrid.snapshot().unwrap();
+        assert_eq!(unchanged.changes_since(&before), StoreChanges::NONE);
 
-        let later_instant = hifitime::Epoch::from_tai_seconds(20.0);
-        let after = hybrid.snapshot_at(later_instant).unwrap();
-        assert_eq!(before.clone().instant(), instant);
-        assert_eq!(after.instant(), later_instant);
-        assert_eq!(after.blobs.instant(), later_instant);
-        assert_eq!(after.records.instant(), later_instant);
-        assert_eq!(after.changes_since(&before), StoreChanges::NONE);
+        let handle = hybrid.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
+        let record = CollectionRecord::Commit(crate::collection::CollectionCommit::sign(
+            &SigningKey::from_bytes(&[7; 32]),
+            CollectionHandle::new([2; 32]),
+            Handle::<SimpleArchive>::to_hash(handle),
+            crate::collection::empty_metadata_handle(),
+        ));
+        hybrid.insert(record).unwrap();
+        let after = hybrid.snapshot().unwrap();
+        assert_eq!(
+            after.changes_since(&before),
+            StoreChanges::BLOBS.union(StoreChanges::COLLECTION_RECORDS)
+        );
+        assert!(!before.contains_blob(handle).unwrap());
+        assert_eq!(before.clone().records().unwrap().count(), 0);
+        assert!(after.contains_blob(handle).unwrap());
+        assert_eq!(after.records().unwrap().count(), 1);
 
         let current = hybrid.snapshot().unwrap();
-        assert_eq!(current.blobs.instant(), current.instant());
-        assert_eq!(current.records.instant(), current.instant());
         assert_eq!(current.changes_since(&after), StoreChanges::NONE);
     }
 
@@ -531,9 +527,7 @@ mod tests {
         let commit = hybrid
             .commit(target, &signing_key, Fragment::empty())
             .unwrap();
-        let snapshot = hybrid
-            .snapshot_at(hifitime::Epoch::from_tai_seconds(0.0))
-            .unwrap();
+        let snapshot = hybrid.snapshot().unwrap();
         let facts: TribleSet = target.read(&snapshot).unwrap();
         assert_eq!(facts.len(), 0);
         assert_eq!(commit.collection(), target.handle());

@@ -25,7 +25,7 @@ use triblespace_core::repo::{
 use super::{PeerAcquireError, SharedHost};
 use crate::host::INTERACTIVE_FETCH_DEADLINE;
 
-/// A peer's frozen records, proofs, authorization instant, and residency index.
+/// A peer's frozen records, proofs, and residency index.
 ///
 /// Explicit [`get`](Self::get) reads may fetch and cache exact immutable bytes
 /// without a mutable borrow of the peer. Such reads do not replace this
@@ -51,9 +51,7 @@ impl<S: SnapshotSource> Clone for PeerSnapshot<S> {
 
 impl<S: SnapshotSource> fmt::Debug for PeerSnapshot<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PeerSnapshot")
-            .field("instant", &self.frozen.instant())
-            .finish_non_exhaustive()
+        f.debug_struct("PeerSnapshot").finish_non_exhaustive()
     }
 }
 
@@ -135,7 +133,7 @@ where
                 .as_mut()
                 .ok_or_else(|| PeerAcquireError("peer is closed".into()))?;
             let reader = store
-                .snapshot_at(self.frozen.instant())
+                .snapshot()
                 .map_err(|error| PeerAcquireError(format!("cannot observe blob cache: {error}")))?;
             if contains(&reader)? {
                 return Ok(Some(reader));
@@ -169,7 +167,7 @@ where
             .put::<UnknownBlob, _>(verified)
             .map_err(|error| PeerAcquireError(format!("cannot cache acquired blob: {error}")))?;
         store
-            .snapshot_at(self.frozen.instant())
+            .snapshot()
             .map(Some)
             .map_err(|error| PeerAcquireError(format!("cannot observe acquired blob: {error}")))
     }
@@ -209,10 +207,6 @@ where
 }
 
 impl<S: SnapshotSource + Send + 'static> StoreSnapshot for PeerSnapshot<S> {
-    fn instant(&self) -> hifitime::Epoch {
-        self.frozen.instant()
-    }
-
     fn changes_since(&self, previous: &Self) -> StoreChanges {
         self.frozen.changes_since(&previous.frozen)
     }

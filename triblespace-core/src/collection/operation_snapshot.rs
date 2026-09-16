@@ -127,10 +127,6 @@ where
     C: StoreSnapshot,
     R: StoreSnapshot,
 {
-    fn instant(&self) -> hifitime::Epoch {
-        self.control.instant()
-    }
-
     fn changes_since(&self, previous: &Self) -> StoreChanges {
         let control = self.control.changes_since(&previous.control);
         let residency = self.residency.changes_since(&previous.residency);
@@ -362,28 +358,23 @@ mod tests {
         store.insert(initial_record).unwrap();
         store.insert_proof(initial_proof.clone()).unwrap();
         store.want(initial_want).unwrap();
-        let instant = hifitime::Epoch::from_tai_seconds(10.0);
-        let control = store.snapshot_at(instant).unwrap();
+        let control = store.snapshot().unwrap();
 
         store.insert(concurrent_record).unwrap();
         store.insert_proof(concurrent_proof).unwrap();
         store.want(concurrent_want).unwrap();
         let bytes = Bytes::from_source(b"arrived after the control snapshot".to_vec());
         let arrived = store.put::<UnknownBlob, _>(bytes.clone()).unwrap();
-        let residency = store
-            .snapshot_at(hifitime::Epoch::from_tai_seconds(20.0))
-            .unwrap();
+        let residency = store.snapshot().unwrap();
 
         let mut frontier = OperationFrontier::new(control);
         frontier.include_record(authored_record);
         let observed = frontier.view(residency);
-        let later = frontier.view(
-            store
-                .snapshot_at(hifitime::Epoch::from_tai_seconds(30.0))
-                .unwrap(),
+        let later = frontier.view(store.snapshot().unwrap());
+        assert_eq!(
+            observed.clone().changes_since(&observed),
+            StoreChanges::NONE
         );
-        assert_eq!(observed.clone().instant(), instant);
-        assert_eq!(later.instant(), instant);
         assert_eq!(later.changes_since(&observed), StoreChanges::NONE);
 
         let records = observed

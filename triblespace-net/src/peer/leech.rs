@@ -113,11 +113,8 @@ where
     type Snapshot = PeerSnapshot<S>;
     type SnapshotError = PeerSnapshotError<S::SnapshotError>;
 
-    fn snapshot_at(
-        &mut self,
-        instant: hifitime::Epoch,
-    ) -> Result<Self::Snapshot, Self::SnapshotError> {
-        self.peer.snapshot_from_store_at(instant)
+    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+        self.peer.snapshot_from_store()
     }
 }
 

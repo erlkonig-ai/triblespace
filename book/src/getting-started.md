@@ -168,8 +168,7 @@ for (first, last, quote) in find!(
 ```
 
 `storage.snapshot()` freezes blobs, collection records, capability proofs, and
-backend state at one coherent known prefix, together with one authorization
-instant. `library.admitted(&snapshot)` then
+backend state at one coherent known prefix. `library.admitted(&snapshot)` then
 applies the descriptor's WRITE policy in that same observation and returns the
 exact semantic payload cover. `available` returns the greatest subset of those
 same semantic members which has a complete resident realization, so equality
@@ -177,10 +176,9 @@ with `admitted` means the full value is local and `difference` names missing
 semantic support. `materialize` privately selects a support-equivalent physical
 decomposition and constructs the logical value through the same immutable
 snapshot. `library.read(&snapshot)` concisely reads the maximal resident
-collection view at that same frozen instant. Repeating an observation or
-cloning the snapshot does not advance its clock; later authorization decisions
-require a new snapshot. Tests may choose the instant with
-`storage.snapshot_at(instant)` without changing the newly observed content.
+collection view at that same frozen prefix. Snapshots carry no clock: later
+proof or content arrivals require a new observation, while an application
+evaluates its own time-sensitive rules at an explicit instant.
 
 Provenance for an exact cover is available through `cover.commits(&snapshot)`.
 These are strictly verified attestations over its payloads, not necessarily

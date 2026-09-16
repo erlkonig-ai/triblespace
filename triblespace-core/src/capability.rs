@@ -1354,19 +1354,15 @@ mod tests {
         let subject = key(2);
         let proof = CapabilityProof::new(resource(9), &root, handle, subject.verifying_key());
         let request = CapabilityRequest::new(resource(9), ACTION_WRITE);
-        for seconds in [-1_000.0, 0.0, 100.0, 1_000_000.0] {
-            let snapshot = repo
-                .snapshot_at(hifitime::Epoch::from_tai_seconds(seconds))
-                .unwrap();
-            assert!(capability_quorum_authorizes(
-                &snapshot,
-                [&proof],
-                [root.verifying_key()],
-                subject.verifying_key(),
-                request,
-                threshold(1),
-            ));
-        }
+        let snapshot = repo.snapshot().unwrap();
+        assert!(capability_quorum_authorizes(
+            &snapshot,
+            [&proof],
+            [root.verifying_key()],
+            subject.verifying_key(),
+            request,
+            threshold(1),
+        ));
         assert!(proof
             .verify(
                 &repo.snapshot().unwrap(),

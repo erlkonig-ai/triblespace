@@ -1793,13 +1793,9 @@ mod tests {
     }
 
     #[test]
-    fn maintenance_ignores_clock_changes_without_content_changes() {
+    fn maintenance_ignores_repeated_observations_without_content_changes() {
         let mut store = MemoryRepo::default();
-        let at = |seconds| hifitime::Epoch::from_tai_seconds(seconds);
-        let previous = store.snapshot_at(at(10.0)).unwrap();
-        let unchanged = store.snapshot_at(at(11.0)).unwrap();
-        let boundary = store.snapshot_at(at(12.0)).unwrap();
-        let rollback = store.snapshot_at(at(9.0)).unwrap();
+        let previous = store.snapshot().unwrap();
         let interests = StoreDependencies {
             all_blobs: true,
             all_records: true,
@@ -1807,9 +1803,10 @@ mod tests {
             ..StoreDependencies::default()
         };
 
-        assert!(!maintenance_changed(&previous, &unchanged, &interests));
-        assert!(!maintenance_changed(&previous, &boundary, &interests));
-        assert!(!maintenance_changed(&previous, &rollback, &interests));
+        for _ in 0..3 {
+            let sampled = store.snapshot().unwrap();
+            assert!(!maintenance_changed(&previous, &sampled, &interests));
+        }
     }
 
     fn observed_maintenance_pass(

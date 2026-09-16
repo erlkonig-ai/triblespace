@@ -680,11 +680,8 @@ mod tests {
         type Snapshot = <MemoryRepo as crate::repo::SnapshotSource>::Snapshot;
         type SnapshotError = Infallible;
 
-        fn snapshot_at(
-            &mut self,
-            instant: hifitime::Epoch,
-        ) -> Result<Self::Snapshot, Self::SnapshotError> {
-            crate::repo::SnapshotSource::snapshot_at(&mut self.repo, instant)
+        fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+            crate::repo::SnapshotSource::snapshot(&mut self.repo)
         }
     }
 

@@ -456,10 +456,6 @@ impl Drop for GuardSnapshot {
 }
 
 impl StoreSnapshot for GuardSnapshot {
-    fn instant(&self) -> hifitime::Epoch {
-        self.inner.instant()
-    }
-
     fn changes_since(&self, previous: &Self) -> StoreChanges {
         self.inner.changes_since(&previous.inner)
     }
@@ -700,11 +696,8 @@ impl SnapshotSource for GuardStore {
     type Snapshot = GuardSnapshot;
     type SnapshotError = <MemoryRepo as SnapshotSource>::SnapshotError;
 
-    fn snapshot_at(
-        &mut self,
-        instant: hifitime::Epoch,
-    ) -> Result<Self::Snapshot, Self::SnapshotError> {
-        let inner = self.inner.snapshot_at(instant)?;
+    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+        let inner = self.inner.snapshot()?;
         self.live.fetch_add(1, Ordering::SeqCst);
         Ok(GuardSnapshot {
             inner,
@@ -2024,9 +2017,7 @@ fn snapshot_read_audience_defers_later_proofs_after_descriptor_acquisition() {
         collection_read_audience(&before, collection.handle()).unwrap(),
         first_audience
     );
-    let later = store
-        .snapshot_at(hifitime::Epoch::from_tai_seconds(0.0))
-        .unwrap();
+    let later = store.snapshot().unwrap();
     expected.push(later_reader.verifying_key());
     expected.sort_unstable_by_key(VerifyingKey::to_bytes);
     assert_eq!(

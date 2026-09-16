@@ -16,7 +16,6 @@ triblespace-core = { version = "0.47.0", path = "../triblespace-core", default-f
 [dev-dependencies]
 ed25519-dalek = "2.1.0"
 futures = "0.3"
-hifitime = "4.1.2"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

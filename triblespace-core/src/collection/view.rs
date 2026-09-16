@@ -114,7 +114,7 @@ where
     /// Missing records and blobs are dependencies too. Unrelated appends do
     /// not invalidate an observation on backends with scoped indexes. A false
     /// result is conservative: a reattachment may still select the same cover.
-    /// Application deadlines and the snapshot's query clock are independent.
+    /// Application clocks and deadlines are independent of this comparison.
     /// Reading a view or requesting support extends the tracked read-set.
     pub fn is_current(&self, snapshot: &R) -> bool {
         let dependencies = self

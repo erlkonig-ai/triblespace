@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Remove the generic storage-snapshot timestamp and `snapshot_at` APIs. A
+  snapshot is an immutable content observation; application deadlines use an
+  explicit evaluation time instead. Content change and dependency comparison
+  retain their existing semantics.
+
 - Handle both SIGINT and SIGTERM in the Unix CLI sync and maintenance workers.
   Register before writable pile open, cancel awaited work or idle waits on stop,
   and reach the existing explicit close boundary. Synchronous work remains

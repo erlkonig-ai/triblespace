@@ -52,11 +52,8 @@ impl SnapshotSource for CollectionOnly {
     type Snapshot = <MemoryRepo as SnapshotSource>::Snapshot;
     type SnapshotError = <MemoryRepo as SnapshotSource>::SnapshotError;
 
-    fn snapshot_at(
-        &mut self,
-        instant: hifitime::Epoch,
-    ) -> Result<Self::Snapshot, Self::SnapshotError> {
-        self.0.snapshot_at(instant)
+    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+        self.0.snapshot()
     }
 }
 

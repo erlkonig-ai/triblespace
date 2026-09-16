@@ -248,7 +248,7 @@ pub trait CollectionDerivation: CollectionEncoding {
     /// input while it performs new work. It may use `reader` only to resolve
     /// dependencies named by `source` or its concrete argument. An explicit
     /// collection reference is resolved using this observation's records and
-    /// authorization instant; unrelated store contents are not semantic input.
+    /// capability evidence; unrelated store contents are not semantic input.
     fn map<R>(
         argument: &Self::Argument,
         source: &Blob<Self::Source>,

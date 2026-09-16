@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use futures::executor::block_on;
-use hifitime::Epoch;
 
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::succinctarchive::{
@@ -96,8 +95,8 @@ impl SnapshotSource for CountingRepo {
     type Snapshot = <MemoryRepo as SnapshotSource>::Snapshot;
     type SnapshotError = <MemoryRepo as SnapshotSource>::SnapshotError;
 
-    fn snapshot_at(&mut self, instant: Epoch) -> Result<Self::Snapshot, Self::SnapshotError> {
-        self.inner.snapshot_at(instant)
+    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+        self.inner.snapshot()
     }
 }
 
@@ -847,7 +846,7 @@ fn read_grant_is_root_checked_and_replay_deterministic() {
     assert_eq!(replay, first);
     assert_eq!(store.events, vec![StoreEvent::Proof(first.id().raw)]);
 
-    let snapshot = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
+    let snapshot = store.snapshot().unwrap();
     let proofs = snapshot
         .proofs()
         .unwrap()
@@ -874,7 +873,7 @@ fn write_grant_is_root_checked_and_activates_recipient_commits() {
         )
         .unwrap();
     let commit = store.commit(collection, &writer, fragment(36)).unwrap();
-    let snapshot = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
+    let snapshot = store.snapshot().unwrap();
     assert!(collection.admitted(&snapshot).unwrap().is_empty());
     drop(snapshot);
     store.events.clear();
@@ -899,7 +898,7 @@ fn write_grant_is_root_checked_and_activates_recipient_commits() {
     );
     assert_eq!(proof.leaf_key(), writer.verifying_key());
 
-    let snapshot = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
+    let snapshot = store.snapshot().unwrap();
     assert!(collection
         .writer_is_admitted(&snapshot, writer.verifying_key())
         .unwrap());
@@ -1116,7 +1115,7 @@ fn read_and_write_policies_are_independent() {
     let unauthorized = store.commit(collection, &stranger, fragment(2)).unwrap();
     let attestation = store.commit(collection, &stranger, fragment(1)).unwrap();
 
-    let snapshot = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
+    let snapshot = store.snapshot().unwrap();
     assert!(collection
         .reader_is_admitted(&snapshot, stranger.verifying_key())
         .unwrap());
@@ -1164,7 +1163,7 @@ fn invoke_only_root_proof_admits_recipient_but_blocks_redelegation() {
     // the parent's delegated action set, but the earlier grant remains valid.
     store.insert_proof(child_proof.clone()).unwrap();
 
-    let snapshot = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
+    let snapshot = store.snapshot().unwrap();
     assert_eq!(
         child_proof.validate_delegation(&snapshot),
         Err(CapabilityProofError::UndelegatedAction {
@@ -1203,7 +1202,7 @@ fn read_grants_use_the_distinct_read_action() {
         ))
         .unwrap();
 
-    let snapshot = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
+    let snapshot = store.snapshot().unwrap();
     assert!(collection
         .reader_is_admitted(&snapshot, reader.verifying_key())
         .unwrap());
@@ -1248,7 +1247,7 @@ fn read_audience_includes_valid_proof_prefixes() {
         .unwrap();
     store.insert_proof(child_proof).unwrap();
 
-    let snapshot = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
+    let snapshot = store.snapshot().unwrap();
     let CollectionReadAudience::Restricted(readers) =
         collection_read_audience(&snapshot, collection.handle()).unwrap()
     else {
@@ -1279,7 +1278,6 @@ fn collection_quorum_needs_support_from_distinct_roots() {
             ),
         )
         .unwrap();
-    let instant = Epoch::from_tai_seconds(0.0);
 
     store
         .insert_proof(CapabilityProof::new(
@@ -1290,7 +1288,7 @@ fn collection_quorum_needs_support_from_distinct_roots() {
         ))
         .unwrap();
     assert!(!collection
-        .writer_is_admitted(&store.snapshot_at(instant).unwrap(), writer.verifying_key())
+        .writer_is_admitted(&store.snapshot().unwrap(), writer.verifying_key())
         .unwrap());
 
     store
@@ -1302,6 +1300,6 @@ fn collection_quorum_needs_support_from_distinct_roots() {
         ))
         .unwrap();
     assert!(collection
-        .writer_is_admitted(&store.snapshot_at(instant).unwrap(), writer.verifying_key())
+        .writer_is_admitted(&store.snapshot().unwrap(), writer.verifying_key())
         .unwrap());
 }

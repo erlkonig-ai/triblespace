@@ -2853,8 +2853,7 @@ mod tests {
     }
 
     #[test]
-    fn authorization_bootstrap_is_reused_across_clock_changes() {
-        use hifitime::Epoch;
+    fn authorization_bootstrap_is_reused_across_unchanged_observations() {
         use std::sync::Arc;
         use triblespace_core::capability::{CapabilityProof, CapabilityResource};
         use triblespace_core::collection::{
@@ -2870,7 +2869,7 @@ mod tests {
         let mut store = MemoryRepo::default();
         let collection = store
             .collection(
-                "snapshot-bootstrap-clock",
+                "snapshot-bootstrap",
                 CollectionPolicy::new(
                     AdmissionPolicy::direct(root.verifying_key()),
                     AdmissionPolicy::Open,
@@ -2886,7 +2885,7 @@ mod tests {
         store.insert_proof(proof.clone()).unwrap();
         let mut active = super::ActiveCollections::new();
         active.insert(&super::PatchEntry::new(&collection.handle().raw));
-        let before = store.snapshot_at(Epoch::from_tai_seconds(15.0)).unwrap();
+        let before = store.snapshot().unwrap();
         let serving_before = super::StoreSnapshot::from_store_changes(
             before.clone(),
             &active,
@@ -2898,8 +2897,8 @@ mod tests {
         .unwrap();
         let before_collection = serving_before.collection(collection.handle()).unwrap();
         assert_eq!(before_collection.read_bootstrap.as_ref(), &[proof.clone()]);
-        for instant in [21.0, 1.0] {
-            let after = store.snapshot_at(Epoch::from_tai_seconds(instant)).unwrap();
+        for _ in 0..2 {
+            let after = store.snapshot().unwrap();
             assert_eq!(after.changes_since(&before), StoreChanges::NONE);
             let serving_after = super::StoreSnapshot::from_store_changes(
                 after,

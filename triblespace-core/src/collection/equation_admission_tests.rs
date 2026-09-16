@@ -1,7 +1,6 @@
 //! Signed equation producers are admitted by the target's frozen WRITE policy.
 
 use ed25519_dalek::SigningKey;
-use hifitime::Epoch;
 
 use super::*;
 use crate::blob::encodings::simplearchive::SimpleArchive;
@@ -214,7 +213,7 @@ fn derive_before_write_proof_is_inert_then_admitted_without_reinsertion() {
 }
 
 #[test]
-fn equation_authority_is_timeless_across_snapshot_clocks() {
+fn equation_admission_uses_frozen_proof_evidence() {
     let root = SigningKey::from_bytes(&[31; 32]);
     let producer = SigningKey::from_bytes(&[32; 32]);
     let mut store = MemoryRepo::default();
@@ -243,6 +242,7 @@ fn equation_authority_is_timeless_across_snapshot_clocks() {
             Handle::<SimpleArchive>::to_hash(joined),
         )))
         .unwrap();
+    let before = store.snapshot().unwrap();
     store
         .insert_proof(CapabilityProof::new(
             CapabilityResource::from(collection.handle()),
@@ -251,10 +251,9 @@ fn equation_authority_is_timeless_across_snapshot_clocks() {
             producer.verifying_key(),
         ))
         .unwrap();
-    let before = store.snapshot_at(Epoch::from_tai_seconds(9.0)).unwrap();
-    let admitted = store.snapshot_at(Epoch::from_tai_seconds(15.0)).unwrap();
-    let later = store.snapshot_at(Epoch::from_tai_seconds(21.0)).unwrap();
-    assert_eq!(before.collection(collection).unwrap().cover().len(), 1);
+    let admitted = store.snapshot().unwrap();
+    let later = store.snapshot().unwrap();
+    assert_eq!(before.collection(collection).unwrap().cover().len(), 2);
     assert_eq!(
         admitted
             .collection(collection)

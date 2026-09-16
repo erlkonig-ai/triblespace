@@ -276,7 +276,7 @@ fn run_dashboard(
     use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace_core::collection::Collection;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
-    use triblespace_core::repo::{BlobStoreList, SnapshotSource, StoreSnapshot};
+    use triblespace_core::repo::{BlobStoreList, SnapshotSource};
 
     let signer = load_existing_key(key_path, &pile_path)?;
     let authority = signer.verifying_key();
@@ -292,6 +292,9 @@ fn run_dashboard(
         descriptors.collection(health_record::COLLECTION_NAME, policy)?;
 
     let mut pile = open_pile(&pile_path)?;
+    let now_ns = triblespace_core::clock::epoch_now()
+        .to_tai_duration()
+        .total_nanoseconds();
     let snapshot = pile.snapshot()?;
     let health_facts = if snapshot.contains_blob(health.handle())? {
         match health.read(&snapshot) {
@@ -304,7 +307,6 @@ fn run_dashboard(
     } else {
         None
     };
-    let now_ns = snapshot.instant().to_tai_duration().total_nanoseconds();
     let report = triblespace_net::dashboard::inspect(
         &snapshot,
         health_facts.as_ref(),
@@ -760,12 +762,14 @@ fn run_health(pile_path: PathBuf, key_path: Option<PathBuf>, max_age: u64) -> Re
             drop(pile.maintain(latest, &signer).await?);
             Ok::<_, anyhow::Error>(())
         })?;
+        let now = triblespace_core::clock::epoch_now()
+            .to_tai_duration()
+            .total_nanoseconds();
         let snapshot = pile.snapshot()?;
         let facts = snapshot
             .collection(facts)?
             .view::<UnionArchive<OrderedUniverse>>()?;
         let latest = snapshot.collection(latest)?.view::<LwwIndex>()?.query()?;
-        let now = snapshot.instant().to_tai_duration().total_nanoseconds();
         let mut count = 0;
         for (report, node, session, endpoint, created) in find!(
             (report: Id, node: Id, session: Id, endpoint: ed25519_dalek::VerifyingKey,

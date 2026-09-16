@@ -55,10 +55,6 @@ impl<R> CountedSnapshot<R> {
 }
 
 impl<R: CoreStoreSnapshot> CoreStoreSnapshot for CountedSnapshot<R> {
-    fn instant(&self) -> hifitime::Epoch {
-        self.inner.instant()
-    }
-
     fn changes_since(&self, previous: &Self) -> StoreChanges {
         self.inner.changes_since(&previous.inner)
     }

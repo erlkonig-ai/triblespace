@@ -94,22 +94,15 @@ impl<S: SnapshotSource> SnapshotSource for Counted<S> {
     type Snapshot = Counted<S::Snapshot>;
     type SnapshotError = S::SnapshotError;
 
-    fn snapshot_at(
-        &mut self,
-        instant: hifitime::Epoch,
-    ) -> Result<Self::Snapshot, Self::SnapshotError> {
+    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
         Ok(Counted {
-            inner: self.inner.snapshot_at(instant)?,
+            inner: self.inner.snapshot()?,
             counts: self.counts.clone(),
         })
     }
 }
 
 impl<R: CoreStoreSnapshot> CoreStoreSnapshot for Counted<R> {
-    fn instant(&self) -> hifitime::Epoch {
-        self.inner.instant()
-    }
-
     fn changes_since(&self, previous: &Self) -> StoreChanges {
         self.inner.changes_since(&previous.inner)
     }
@@ -392,12 +385,11 @@ async fn frozen_get_and_bare_reader_refresh_do_not_enumerate_inventory() {
         assert!(!frozen.contains_blob(handle).unwrap());
         // Same resident-reader operation used inside acquire_reader, not a new
         // public API. Do not expose its later control plane as the frozen view.
-        let reader = peer.store().snapshot_at(frozen.instant()).unwrap();
+        let reader = peer.store().snapshot().unwrap();
         assert_eq!(
             BlobStoreGet::get::<Bytes, UnknownBlob>(&reader, handle).unwrap(),
             remote.bytes
         );
-        assert_eq!(reader.instant(), frozen.instant());
         assert_eq!(
             frozen.get::<Bytes, UnknownBlob>(handle).await.unwrap(),
             remote.bytes
@@ -427,8 +419,8 @@ async fn first_peer_resnapshot_enumerates_all_handles_then_only_deltas() {
         let handle = remote.get_handle();
         frozen.get::<Bytes, UnknownBlob>(handle).await.unwrap();
         let reads = counts.get_calls.load(Ordering::Relaxed);
-        // This is the edge reached by storage::read after its first acquisition.
-        let refreshed = peer.snapshot_at(frozen.instant()).unwrap();
+        // An ordinary peer snapshot still refreshes serving after acquisition.
+        let refreshed = peer.snapshot().unwrap();
         assert!(refreshed.contains_blob(handle).unwrap());
         assert_eq!(counts.inventory(), [1, resident + 1, 0, 0]);
         assert_eq!(
@@ -449,14 +441,14 @@ async fn first_peer_resnapshot_enumerates_all_handles_then_only_deltas() {
             Some(&handle.raw)
         );
         for _ in 0..3 {
-            peer.snapshot_at(frozen.instant()).unwrap();
+            peer.snapshot().unwrap();
         }
         assert_eq!(counts.inventory(), [1, resident + 1, 0, 0]);
         counts.report("first-peer-resnapshot", resident);
 
         peer.put::<UnknownBlob, _>(Bytes::from_source(b"later local payload".to_vec()))
             .unwrap();
-        peer.snapshot_at(frozen.instant()).unwrap();
+        peer.snapshot().unwrap();
         assert_eq!(counts.inventory(), [1, resident + 1, 2, 1]);
         assert_eq!(counts.get_calls.load(Ordering::Relaxed), reads);
         assert_eq!(peer.serving_snapshot_rebuilds, 2);
@@ -526,7 +518,7 @@ fn memory_repo_conservative_delta_is_counted_without_claiming_native_pile_cost()
         let handle = store
             .put::<UnknownBlob, _>(Bytes::from_source(b"one later memory blob".to_vec()))
             .unwrap();
-        let after = store.snapshot_at(before.instant()).unwrap();
+        let after = store.snapshot().unwrap();
         let updated = crate::bearer::update_locator_index(&after, &before, &index).unwrap();
         assert_eq!(counts.inventory(), [1, resident, 2, 2 * resident + 1]);
         assert_eq!(counts.get_calls.load(Ordering::Relaxed), 0);
@@ -586,13 +578,13 @@ fn leech_public_lazy_resident_snapshots_and_writes_remain_dormant() {
 
         let frozen = leech.snapshot().unwrap();
         for _ in 0..3 {
-            leech.snapshot_at(frozen.instant()).unwrap();
+            leech.snapshot().unwrap();
         }
         let bytes = Bytes::from_source(b"local leech payload".to_vec());
         let handle = leech.put::<UnknownBlob, _>(bytes.clone()).unwrap();
         assert!(!frozen.contains_blob(handle).unwrap());
         assert_eq!(leech.try_local(handle.raw), Some(bytes.clone()));
-        let reader = leech.snapshot_at(frozen.instant()).unwrap();
+        let reader = leech.snapshot().unwrap();
         assert!(reader.contains_blob(handle).unwrap());
         assert_eq!(
             BlobStoreGet::get::<Bytes, UnknownBlob>(&reader, handle).unwrap(),
@@ -645,7 +637,7 @@ async fn leech_first_and_repeated_exact_acquire_never_build_serving_inventory() 
         assert_leech_has_no_serving_inventory(&leech, &counts);
 
         for _ in 0..3 {
-            let reader = leech.snapshot_at(frozen.instant()).unwrap();
+            let reader = leech.snapshot().unwrap();
             assert!(reader.contains_blob(handle).unwrap());
             assert_eq!(reader.wants().unwrap().count(), 0);
             assert_eq!(leech.try_local(handle.raw), Some(remote.bytes.clone()));

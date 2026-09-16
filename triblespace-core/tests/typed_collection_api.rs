@@ -1,6 +1,5 @@
 use ed25519_dalek::SigningKey;
 use futures::executor::block_on;
-use hifitime::Epoch;
 use std::collections::BTreeSet;
 
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
@@ -54,7 +53,7 @@ fn simplearchive_collection_round_trips_typed_views() {
         expected_member
     );
 
-    let snapshot = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
+    let snapshot = store.snapshot().unwrap();
     let cover = collection.admitted(&snapshot).unwrap();
     assert_eq!(cover.collection(), collection);
     assert_eq!(cover.members().collect::<Vec<_>>(), vec![expected_member]);
@@ -85,7 +84,7 @@ fn succinct_cover_materializes_as_a_typed_union_archive() {
     store
         .commit(source, &authority, Fragment::from(expected.clone()))
         .unwrap();
-    let snapshot = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
+    let snapshot = store.snapshot().unwrap();
     let source_cover = source.admitted(&snapshot).unwrap();
     let ensured = block_on(store.ensure(target, &authority)).unwrap();
     let collection = ensured.collection_exact(target, &source_cover).unwrap();
@@ -140,7 +139,7 @@ fn exact_apis_accept_a_derived_source_encoding() {
         .commit(source, &authority, Fragment::from(expected.clone()))
         .unwrap();
 
-    let snapshot = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
+    let snapshot = store.snapshot().unwrap();
     let support = source.admitted(&snapshot).unwrap();
     // Explicit support is a strict obligation, even when no immediate-source
     // member realizes it yet. Neither exact operation may construct raw input.
@@ -679,7 +678,7 @@ fn ordinary_derived_operations_exclude_unauthorized_immediate_source_equations()
 }
 
 #[test]
-fn collection_write_authority_is_independent_of_snapshot_instant() {
+fn collection_write_admission_is_frozen_with_proof_evidence() {
     let authority = SigningKey::from_bytes(&[44; 32]);
     let writer = SigningKey::from_bytes(&[45; 32]);
     let policy = CollectionPolicy::new(
@@ -689,10 +688,11 @@ fn collection_write_authority_is_independent_of_snapshot_instant() {
     let expected = one_fact(14);
     let expected_member = expected.clone().to_blob().get_handle();
     let mut store = MemoryRepo::default();
-    let collection = store.collection("typed-api-clock", policy).unwrap();
+    let collection = store.collection("typed-api-evidence", policy).unwrap();
     store
         .commit(collection, &writer, Fragment::from(expected))
         .unwrap();
+    let before = store.snapshot().unwrap();
 
     store
         .insert_proof(CapabilityProof::new(
@@ -703,19 +703,14 @@ fn collection_write_authority_is_independent_of_snapshot_instant() {
         ))
         .unwrap();
 
-    let before = store.snapshot_at(Epoch::from_tai_seconds(9.0)).unwrap();
-    assert_eq!(
-        before
-            .collection(collection)
-            .unwrap()
-            .support()
-            .unwrap()
-            .members()
-            .collect::<Vec<_>>(),
-        vec![expected_member]
-    );
+    assert!(before
+        .collection(collection)
+        .unwrap()
+        .support()
+        .unwrap()
+        .is_empty());
 
-    let valid = store.snapshot_at(Epoch::from_tai_seconds(15.0)).unwrap();
+    let valid = store.snapshot().unwrap();
     let frozen = valid.clone();
     let admitted = valid.collection(collection).unwrap();
     assert_eq!(
@@ -727,14 +722,16 @@ fn collection_write_authority_is_independent_of_snapshot_instant() {
         vec![expected_member]
     );
 
-    let later = store.snapshot_at(Epoch::from_tai_seconds(21.0)).unwrap();
+    let later = store.snapshot().unwrap();
     assert_eq!(
         later.collection(collection).unwrap().support().unwrap(),
         admitted.support().unwrap()
     );
-    assert_eq!(valid.changes_since(&before), StoreChanges::NONE);
+    assert_eq!(
+        valid.changes_since(&before),
+        StoreChanges::CAPABILITY_PROOFS
+    );
     assert_eq!(later.changes_since(&valid), StoreChanges::NONE);
-    assert_eq!(frozen.instant(), Epoch::from_tai_seconds(15.0));
     assert_eq!(
         frozen.collection(collection).unwrap().support().unwrap(),
         admitted.support().unwrap()
@@ -767,14 +764,14 @@ fn collection_returns_the_maximal_resident_partial_realization() {
     store
         .commit(source, &authority, Fragment::from(first.clone()))
         .unwrap();
-    let snapshot = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
+    let snapshot = store.snapshot().unwrap();
     let first_support = source.admitted(&snapshot).unwrap();
     block_on(store.ensure_exact(target, &authority, &first_support)).unwrap();
     store
         .commit(source, &authority, Fragment::from(second))
         .unwrap();
 
-    let snapshot = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
+    let snapshot = store.snapshot().unwrap();
     let admitted_source = source.admitted(&snapshot).unwrap();
     assert_eq!(admitted_source.len(), 2);
     assert!(admitted_source.contains(first_member));
@@ -812,7 +809,7 @@ fn dangling_commit_is_admitted_before_its_payload_becomes_readable() {
     );
     store.insert(CollectionRecord::Commit(commit)).unwrap();
 
-    let before = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
+    let before = store.snapshot().unwrap();
     assert_eq!(
         before
             .records()
@@ -826,7 +823,7 @@ fn dangling_commit_is_admitted_before_its_payload_becomes_readable() {
     assert!(before.collection(collection).unwrap().cover().is_empty());
 
     store.put::<SimpleArchive, _>(payload).unwrap();
-    let after = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
+    let after = store.snapshot().unwrap();
     assert_eq!(
         collection
             .admitted(&after)
@@ -858,7 +855,7 @@ fn proof_with_resident_definition_activates_commit_without_recursive_blob_closur
         .commit(collection, &writer, Fragment::from(expected))
         .unwrap();
 
-    let before = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
+    let before = store.snapshot().unwrap();
     assert!(collection.admitted(&before).unwrap().is_empty());
 
     let proof = CapabilityProof::new(
@@ -869,7 +866,7 @@ fn proof_with_resident_definition_activates_commit_without_recursive_blob_closur
     );
     store.insert_proof(proof.clone()).unwrap();
 
-    let after = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
+    let after = store.snapshot().unwrap();
     assert_eq!(
         after
             .proofs()

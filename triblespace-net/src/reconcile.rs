@@ -2036,17 +2036,14 @@ mod tests {
         type Snapshot = <MemoryRepo as SnapshotSource>::Snapshot;
         type SnapshotError = std::io::Error;
 
-        fn snapshot_at(
-            &mut self,
-            instant: hifitime::Epoch,
-        ) -> Result<Self::Snapshot, Self::SnapshotError> {
+        fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
             let mut trace = self.trace.lock().unwrap();
             trace.snapshots += 1;
             if std::mem::take(&mut trace.fail_next_snapshot) {
                 return Err(std::io::Error::other("test snapshot failed once"));
             }
             drop(trace);
-            Ok(self.inner.snapshot_at(instant).unwrap())
+            Ok(self.inner.snapshot().unwrap())
         }
     }
 

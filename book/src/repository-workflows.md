@@ -156,7 +156,7 @@ its own share; every author still needs the policy's distinct-root threshold for
 `ACTION_WRITE` on this descriptor. Interpreting the paths requires their resident
 capability definitions. Invalid or irrelevant candidate evidence grants nothing;
 inability to enumerate the proof store remains an error. Generic WRITE admission
-is clock-independent; advancing the snapshot instant does not expire a grant.
+is clock-independent; the passage of time does not expire a grant.
 
 READ and WRITE are explicit because both participate in collection identity.
 Either may be `Open` or a canonical quorum over capability roots, with
@@ -296,12 +296,11 @@ unless that exact foundational support is completely realized.
 Neither observation method reads the clock: identical operations on one frozen
 store snapshot have identical results even while wall time passes. A decision
 using later-arriving proof or definition evidence requires a new snapshot.
-`store.snapshot_at(instant)` is the construction seam for deterministic tests;
-it selects the
-interpretation time of newly observed content, not a historical content revision.
-`changes_since` classifies content only, so a new instant alone reports no
-content change. Generic collection authorization has no proof-validity clock;
-action-specific deadlines belong to the application interpreting that action.
+Storage snapshots have no timestamp or historical-time selector.
+`changes_since` classifies content only. Generic collection authorization has
+no proof-validity clock; action-specific deadlines belong to the application
+interpreting that action, with an explicit evaluation time separate from its
+immutable evidence snapshot.
 
 `observed.is_current(&later_snapshot)` compares the raw dependencies actually
 consulted by attachment, views, and explicit support queries. Indexed backends

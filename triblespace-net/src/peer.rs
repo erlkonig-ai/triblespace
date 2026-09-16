@@ -432,13 +432,6 @@ where
 
     /// Drain pending network evidence and publish one coherent store snapshot.
     pub fn try_refresh(&mut self) -> Result<(), PeerSnapshotError<S::SnapshotError>> {
-        self.try_refresh_at(crate::clock::epoch_now())
-    }
-
-    fn try_refresh_at(
-        &mut self,
-        instant: hifitime::Epoch,
-    ) -> Result<(), PeerSnapshotError<S::SnapshotError>> {
         // A local observation must not start networking, build bearer indexes,
         // or enqueue serving/provider notices for a dormant host.
         if !self.host_is_running() {
@@ -447,7 +440,7 @@ where
         self.sender.observe_store(|health| {
             health.last_refresh_started_at = Some(crate::clock::mono_now());
         });
-        let result = self.refresh_checked(instant);
+        let result = self.refresh_checked();
         self.sender.observe_store(|health| {
             let now = crate::clock::mono_now();
             health.last_refresh_completed_at = Some(now);
@@ -467,10 +460,7 @@ where
         result
     }
 
-    fn refresh_checked(
-        &mut self,
-        instant: hifitime::Epoch,
-    ) -> Result<(), PeerSnapshotError<S::SnapshotError>> {
+    fn refresh_checked(&mut self) -> Result<(), PeerSnapshotError<S::SnapshotError>> {
         let mut incoming = Vec::new();
         for _ in 0..MAX_ADMISSION_BRIDGE_BATCHES {
             let Some(event) = self.receiver.try_recv() else {
@@ -529,9 +519,7 @@ where
                 "collection repair admission applied"
             );
         }
-        let snapshot = store
-            .snapshot_at(instant)
-            .map_err(PeerSnapshotError::Store)?;
+        let snapshot = store.snapshot().map_err(PeerSnapshotError::Store)?;
         self.sender.observe_store(|health| {
             health.last_snapshot_observed_at = Some(crate::clock::mono_now());
         });
@@ -626,14 +614,10 @@ where
     }
 
     /// Freeze the backend without changing the host's serving observation.
-    fn snapshot_from_store_at(
+    fn snapshot_from_store(
         &mut self,
-        instant: hifitime::Epoch,
     ) -> Result<PeerSnapshot<S>, PeerSnapshotError<S::SnapshotError>> {
-        let frozen = self
-            .store()
-            .snapshot_at(instant)
-            .map_err(PeerSnapshotError::Store)?;
+        let frozen = self.store().snapshot().map_err(PeerSnapshotError::Store)?;
         Ok(PeerSnapshot {
             frozen,
             store: self.store.clone(),
@@ -767,12 +751,9 @@ where
     type Snapshot = PeerSnapshot<S>;
     type SnapshotError = PeerSnapshotError<S::SnapshotError>;
 
-    fn snapshot_at(
-        &mut self,
-        instant: hifitime::Epoch,
-    ) -> Result<Self::Snapshot, Self::SnapshotError> {
-        self.try_refresh_at(instant)?;
-        self.snapshot_from_store_at(instant)
+    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+        self.try_refresh()?;
+        self.snapshot_from_store()
     }
 }
 
@@ -1048,8 +1029,7 @@ mod tests {
                 Ok(None)
             })),
         );
-        let instant = hifitime::Epoch::from_tai_seconds(20.0);
-        let snapshot = peer.snapshot_at(instant).unwrap();
+        let snapshot = peer.snapshot().unwrap();
         let observed = snapshot.collection(collection).unwrap();
         let cover = observed.cover().clone();
 
@@ -1075,7 +1055,6 @@ mod tests {
         );
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         assert!(!snapshot.contains_blob(handle).unwrap());
-        assert_eq!(snapshot.instant(), instant);
         assert_eq!(snapshot.records().unwrap().count(), 1);
         assert_eq!(snapshot.proofs().unwrap().count(), 0);
         assert_eq!(snapshot.collection(collection).unwrap().cover(), &cover);
@@ -1454,7 +1433,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_at_preserves_the_chosen_instant_through_peer_refresh() {
+    fn unchanged_peer_snapshots_reuse_the_serving_observation() {
         let key = SigningKey::from_bytes(&[89; 32]);
         let id = EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap();
         let (sender, receiver, _wiring) = host::wire(id);
@@ -1465,21 +1444,14 @@ mod tests {
             sender,
             receiver,
         );
-        let instant = hifitime::Epoch::from_tai_seconds(15.0);
-
-        let snapshot = peer.snapshot_at(instant).unwrap();
-
-        assert_eq!(snapshot.instant(), instant);
+        let snapshot = peer.snapshot().unwrap();
         assert_eq!(
-            peer.last_store_snapshot.as_ref().unwrap().instant(),
-            instant
+            snapshot.clone().changes_since(&snapshot),
+            StoreChanges::NONE
         );
-        assert_eq!(snapshot.clone().instant(), instant);
 
         let serving = observer.current_snapshot().unwrap();
-        let later_instant = hifitime::Epoch::from_tai_seconds(16.0);
-        let later = peer.snapshot_at(later_instant).unwrap();
-        assert_eq!(later.instant(), later_instant);
+        let later = peer.snapshot().unwrap();
         assert_eq!(later.changes_since(&snapshot), StoreChanges::NONE);
         assert!(Arc::ptr_eq(&serving, &observer.current_snapshot().unwrap()));
     }

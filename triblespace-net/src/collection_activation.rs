@@ -819,7 +819,6 @@ mod tests {
     use std::num::NonZeroUsize;
 
     use ed25519_dalek::SigningKey;
-    use hifitime::Epoch;
     use triblespace_core::capability::policy::{capability_handle, resource_policy};
     use triblespace_core::capability::{
         CapabilityRequest, capability_action, capability_delegate_action,
@@ -1222,8 +1221,7 @@ mod tests {
             )))
             .unwrap();
 
-        let instant = Epoch::from_tai_seconds(0.0);
-        let before_snapshot = store.snapshot_at(instant).unwrap();
+        let before_snapshot = store.snapshot().unwrap();
         let before = collection_repair_overlay(&before_snapshot, collection.handle()).unwrap();
         assert!(
             !collection
@@ -1232,7 +1230,7 @@ mod tests {
         );
         let atom = write_scope(collection.handle());
         store_proof(&mut store, root_proof(&root, &writer, atom));
-        let after_snapshot = store.snapshot_at(instant).unwrap();
+        let after_snapshot = store.snapshot().unwrap();
         let after = collection_repair_overlay(&after_snapshot, collection.handle()).unwrap();
         assert!(
             collection
@@ -1398,13 +1396,13 @@ mod tests {
     }
 
     #[test]
-    fn evidence_and_admission_are_independent_of_the_snapshot_clock() {
+    fn unchanged_observations_preserve_evidence_and_admission() {
         let root = key(4);
         let reader = key(5);
         let mut store = MemoryRepo::default();
         let collection = store
             .collection(
-                "clock-independent",
+                "unchanged-observation",
                 CollectionPolicy::new(
                     AdmissionPolicy::direct(root.verifying_key()),
                     AdmissionPolicy::Open,
@@ -1417,8 +1415,8 @@ mod tests {
             scope(read_capability(), collection.handle()),
         );
         store.insert_proof(proof.clone()).unwrap();
-        let before = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
-        let after = store.snapshot_at(Epoch::from_tai_seconds(30.0)).unwrap();
+        let before = store.snapshot().unwrap();
+        let after = store.snapshot().unwrap();
         let first = collection_repair_overlay(&before, collection.handle()).unwrap();
         let second = collection_repair_overlay(&after, collection.handle()).unwrap();
         assert_eq!(first.wake_root(), second.wake_root());

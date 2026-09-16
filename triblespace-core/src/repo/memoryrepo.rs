@@ -61,10 +61,6 @@ pub struct MemoryRepoSnapshot {
 }
 
 impl StoreSnapshot for MemoryRepoSnapshot {
-    fn instant(&self) -> hifitime::Epoch {
-        self.blobs.instant()
-    }
-
     fn changes_since(&self, previous: &Self) -> StoreChanges {
         let mut changes = StoreChanges::NONE;
         if self
@@ -91,12 +87,9 @@ impl SnapshotSource for MemoryRepo {
     type Snapshot = MemoryRepoSnapshot;
     type SnapshotError = Infallible;
 
-    fn snapshot_at(
-        &mut self,
-        instant: hifitime::Epoch,
-    ) -> Result<Self::Snapshot, Self::SnapshotError> {
+    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
         Ok(MemoryRepoSnapshot {
-            blobs: self.blobs.snapshot_at(instant)?,
+            blobs: self.blobs.snapshot()?,
             collection_records: self.collection_records.clone(),
             capability_proofs: self.capability_proofs.clone(),
             wants: self.wants.clone(),
@@ -848,7 +841,7 @@ mod tests {
     }
 
     #[test]
-    fn proof_admission_is_independent_of_the_snapshot_clock() {
+    fn proof_admission_is_frozen_with_snapshot_evidence() {
         use crate::collection::{AdmissionPolicy, CollectionStoreExt};
 
         let root = SigningKey::from_bytes(&[91; 32]);
@@ -856,13 +849,14 @@ mod tests {
         let mut repo = MemoryRepo::default();
         let collection = repo
             .collection(
-                "snapshot-clock",
+                "snapshot-evidence",
                 CollectionPolicy::new(
                     AdmissionPolicy::direct(root.verifying_key()),
                     AdmissionPolicy::direct(root.verifying_key()),
                 ),
             )
             .unwrap();
+        let before = repo.snapshot().unwrap();
         repo.insert_proof(CapabilityProof::new(
             CapabilityResource::from(collection.handle()),
             &root,
@@ -871,30 +865,26 @@ mod tests {
         ))
         .unwrap();
 
-        let early = repo
-            .snapshot_at(hifitime::Epoch::from_tai_seconds(9.0))
-            .unwrap();
-        let instant = hifitime::Epoch::from_tai_seconds(15.0);
-        let admitted = repo.snapshot_at(instant).unwrap();
-        assert!(collection
-            .writer_is_admitted(&early, writer.verifying_key())
+        let admitted = repo.snapshot().unwrap();
+        assert!(!collection
+            .writer_is_admitted(&before, writer.verifying_key())
             .unwrap());
         assert!(collection
             .writer_is_admitted(&admitted, writer.verifying_key())
             .unwrap());
 
-        let later = repo
-            .snapshot_at(hifitime::Epoch::from_tai_seconds(21.0))
-            .unwrap();
+        let later = repo.snapshot().unwrap();
         assert!(collection
             .writer_is_admitted(&later, writer.verifying_key())
             .unwrap());
         let retained = admitted.clone();
-        assert_eq!(retained.instant(), instant);
         assert!(collection
             .writer_is_admitted(&retained, writer.verifying_key())
             .unwrap());
-        assert_eq!(admitted.changes_since(&early), StoreChanges::NONE);
+        assert_eq!(
+            admitted.changes_since(&before),
+            StoreChanges::CAPABILITY_PROOFS
+        );
         assert_eq!(later.changes_since(&admitted), StoreChanges::NONE);
     }
 
