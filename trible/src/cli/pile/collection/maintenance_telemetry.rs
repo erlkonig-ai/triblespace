@@ -22,7 +22,7 @@ use triblespace_core::repo::{BlobStorePut, CapabilityProofStore};
 use triblespace_net::{health_record, telemetry};
 
 #[derive(Clone, Debug, Default, clap::Args)]
-pub(super) struct Options {
+pub(crate) struct Options {
     /// Existing telemetry collection handle; never creates a descriptor or grant
     #[arg(long, requires_all = ["telemetry_node", "telemetry_worker"])]
     pub telemetry_collection: Option<String>,
