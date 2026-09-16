@@ -16,7 +16,7 @@ use triblespace_net::reconcile::ReconcileStats;
 use triblespace_net::telemetry as t;
 
 #[derive(clap::Args)]
-pub(super) struct Options {
+pub(crate) struct Options {
     /// Existing source collection receiving signed aggregate work samples.
     /// Does not create a descriptor or activate collection replication.
     #[arg(long, value_name = "HANDLE", requires = "telemetry_key")]
@@ -53,8 +53,8 @@ mod tests {
             .collection(
                 "test telemetry",
                 CollectionPolicy::new(
-                    AdmissionPolicy::direct(signer.verifying_key()),
                     AdmissionPolicy::Open,
+                    AdmissionPolicy::direct(signer.verifying_key()),
                 ),
             )
             .unwrap();
