@@ -53,6 +53,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 GORBIE = { version = "0.18.1", path = "../../GORBIE", default-features = false, optional = true }
 egui = { version = "0.34", optional = true }
 
+[target.'cfg(unix)'.dependencies]
+# Already in the frozen graph; process CPU measurement, not a new runtime.
+libc = "0.2"
+
 [dev-dependencies]
 assert_cmd = "2.1.2"
 predicates = "3.1.3"

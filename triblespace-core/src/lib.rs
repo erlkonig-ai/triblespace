@@ -10,6 +10,13 @@ extern crate proc_macro;
 #[cfg(not(all(target_pointer_width = "64", target_endian = "little")))]
 compile_error!("triblespace-rs requires a 64-bit little-endian target");
 
+/// Whether this exact Core build contains its parallel execution paths.
+///
+/// Cargo can unify dependency features across consumers, so a caller's own
+/// feature flags cannot answer this. This value does not initialize a Rayon
+/// pool, count threads, select a backend, or claim that parallel work is active.
+pub const PARALLEL_COMPILED: bool = cfg!(feature = "parallel");
+
 /// Shared structural attributes for signed records and attestations.
 pub mod attestation;
 pub mod attribute;
