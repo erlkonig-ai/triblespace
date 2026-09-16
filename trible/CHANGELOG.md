@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- Restore `triblespace-core/parallel`, which this crate's manifest had been
+  dropping through `default-features = false`. Every shipped `trible`, the
+  `pile collection maintain-all --watch` daemons included, was built without
+  rayon: PATCH union fell back to the serial `Head::union`, key construction
+  to `sort_unstable`, the Succinct builder lost its parallel wavelet freeze
+  and parallel EAV decode, and BLAKE3 hashed on one thread. No output changes;
+  `union_matches_insertion_reference` pins both union arms to the same trie
+  against a reference that uses neither. This is a defaults repair, not a
+  throughput one: measured on synthetic 16k/65k/262k-row sources, building two
+  archives and merging them took 0.080/0.420/2.160 s with rayon pinned to one
+  thread and 0.082/0.450/2.093 s across twenty cores.
+
 ### Added
 
 - `pile collection derive PILE SOURCE entity-id-set --attribute ID` registers
