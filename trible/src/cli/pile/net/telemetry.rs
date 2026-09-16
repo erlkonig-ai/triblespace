@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace_core::collection::{descriptor, Collection, CollectionStoreExt};
+use triblespace_core::metadata;
 use triblespace_core::prelude::*;
 use triblespace_core::repo::pile::Pile;
 use triblespace_net::health::HealthSnapshot;
@@ -116,7 +117,7 @@ mod tests {
 
     #[test]
     fn opening_disabled_or_rejected_reporting_never_appends_or_creates_authority() {
-        let (directory, mut pile, collection, key_path, signer) = fixture();
+        let (directory, pile, collection, key_path, signer) = fixture();
         pile.close().unwrap();
         let path = directory.path().join("telemetry.pile");
         let before = std::fs::read(&path).unwrap();
@@ -605,7 +606,9 @@ impl Publisher {
         elapsed: Duration,
         cpu_ns: Option<u128>,
     ) -> Result<Fragment> {
-        let created: Inline<inlineencodings::NsTAIInterval> = (now, now).try_to_inline()?;
+        let created: Inline<inlineencodings::NsTAIInterval> = (now, now)
+            .try_to_inline()
+            .map_err(|_| anyhow!("telemetry sample timestamp cannot be encoded"))?;
         let elapsed_ns = elapsed.as_nanos();
         let live = health.is_fresh(triblespace_core::clock::mono_now(), h::HOST_MAX_AGE);
         let serving = &health.blob_serving;
