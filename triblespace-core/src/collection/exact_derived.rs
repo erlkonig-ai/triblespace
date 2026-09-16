@@ -32,6 +32,14 @@ use super::{
 #[cfg(test)]
 use super::{CanonicalDerivation, CollectionDerivation};
 
+/// Members whose images one derive round computes under a single frozen view.
+///
+/// The bound exists for memory, not for scheduling: a chunk's images are held
+/// until its appends finish, so the chunk size is the ceiling on how many
+/// mapped payloads are resident at once. It is also the amortisation factor on
+/// the round's snapshots, which dominate a round on a large pile.
+const DERIVE_ROUND_CHUNK: usize = 64;
+
 type BoxError = Box<dyn Error + Send + Sync + 'static>;
 
 /// Failure to observe, ensure, or maintain one collection realization.
@@ -1311,84 +1319,118 @@ where
         drop(snapshot);
 
         let mut replan = false;
-        for (input_data, input, witnesses) in residual {
-            if witnesses.iter().any(|witness| published.contains(witness)) {
-                return Err(CollectionRealizationError::Stalled {
-                    cover: repeated_cover,
-                });
-            }
-            let snapshot = frontier.view(store.snapshot().map_err(|error| {
-                CollectionRealizationError::storage("open mapping dependency snapshot", error)
-            })?);
-            let mut reusable = None;
-            for member in probe
-                .target_resolution
-                .images
-                .get(&(target.handle(), input_data))
-                .into_iter()
-                .flatten()
-                .copied()
+        // One frozen view per bounded chunk instead of one per member.
+        //
+        // A mapping may only resolve dependencies named by its source or
+        // argument and must not discover ambient inputs, so no member's image
+        // can depend on another member's image published in the same round.
+        // The per-member snapshot was therefore incidental. It was NOT
+        // expensive, and this comment said so for one hour on the strength of
+        // a number that was never measured: `Pile::snapshot_at` refreshes and
+        // then clones index handles, and on the 22 GB custody pile it costs
+        // about 2 microseconds (measured by examples/snapshot_cost.rs, 200
+        // iterations, three repetitions). A round of two hundred members
+        // therefore spent well under a millisecond on snapshots.
+        //
+        // So chunking buys nothing by itself and is not claimed to. It exists
+        // because splitting the round into a compute phase and an append
+        // phase is what a parallel compute phase requires -- the append needs
+        // &mut store, which is exactly why the snapshot had to live inside
+        // the per-member loop -- and because the chunk bounds how many mapped
+        // images are resident at once when that phase does become parallel.
+        //
+        // Chunking keeps the memory bound the per-member snapshot gave us for
+        // free: images are held only until the end of their own chunk, never
+        // for the whole round.
+        for chunk in residual.chunks(DERIVE_ROUND_CHUNK) {
+            let mut images = Vec::with_capacity(chunk.len());
             {
-                if matches!(
-                    collection_member_availability::<M::Target, _>(member, &snapshot).map_err(
-                        |error| CollectionRealizationError::storage(
-                            "inspect existing mapping image",
-                            error
-                        )
-                    )?,
-                    CollectionMemberAvailability::Complete
-                ) {
-                    reusable = Some(
-                        snapshot
-                            .get(Handle::<M::Target>::from_hash(member))
-                            .map_err(|error| {
-                                CollectionRealizationError::storage(
-                                    "reuse existing mapping image",
-                                    error,
-                                )
-                            })?,
-                    );
-                    break;
-                }
-            }
-            let output = match reusable {
-                Some(output) => Ok(output),
-                None => mapping.map(&input, &snapshot),
-            };
-            drop(snapshot);
-            let output = match output {
-                Ok(output) => output,
-                Err(CollectionOperationError::Fatal(reason)) => {
-                    return Err(CollectionRealizationError::Derive {
-                        input: input_data,
-                        reason,
+                let snapshot = frontier.view(store.snapshot().map_err(|error| {
+                    CollectionRealizationError::storage("open mapping dependency snapshot", error)
+                })?);
+                for (input_data, input, _) in chunk {
+                    let mut reusable = None;
+                    for member in probe
+                        .target_resolution
+                        .images
+                        .get(&(target.handle(), *input_data))
+                        .into_iter()
+                        .flatten()
+                        .copied()
+                    {
+                        if matches!(
+                            collection_member_availability::<M::Target, _>(member, &snapshot)
+                                .map_err(|error| CollectionRealizationError::storage(
+                                    "inspect existing mapping image",
+                                    error
+                                ))?,
+                            CollectionMemberAvailability::Complete
+                        ) {
+                            reusable = Some(
+                                snapshot
+                                    .get(Handle::<M::Target>::from_hash(member))
+                                    .map_err(|error| {
+                                        CollectionRealizationError::storage(
+                                            "reuse existing mapping image",
+                                            error,
+                                        )
+                                    })?,
+                            );
+                            break;
+                        }
+                    }
+                    images.push(match reusable {
+                        Some(output) => Ok(output),
+                        None => mapping.map(input, &snapshot),
                     });
                 }
-                Err(CollectionOperationError::Capacity(reason)) => {
-                    blocked.insert(input_data, reason);
-                    replan = true;
-                    break;
+            }
+
+            // The append stays serial and stops at the first error, so a
+            // failed round publishes exactly the maximal error-free prefix.
+            for ((input_data, _, witnesses), output) in chunk.iter().zip(images) {
+                if witnesses.iter().any(|witness| published.contains(witness)) {
+                    return Err(CollectionRealizationError::Stalled {
+                        cover: repeated_cover,
+                    });
                 }
-                Err(CollectionOperationError::MissingDependency(member)) => {
-                    return Err(CollectionRealizationError::MissingDependency { member });
-                }
-            };
-            let output_data = data_identity::<M::Target>(&output);
-            store.put::<M::Target, _>(output).map_err(|error| {
-                CollectionRealizationError::storage("store derived target member", error)
-            })?;
-            for witness in witnesses {
-                let record = CollectionRecord::Derive(CollectionDerive::sign(
-                    signing_key,
-                    target.handle(),
-                    (input_data, witness),
-                    output_data,
-                ));
-                store.insert(record).map_err(|error| {
-                    CollectionRealizationError::storage("publish target DERIVE", error)
+                let output = match output {
+                    Ok(output) => output,
+                    Err(CollectionOperationError::Fatal(reason)) => {
+                        return Err(CollectionRealizationError::Derive {
+                            input: *input_data,
+                            reason,
+                        });
+                    }
+                    Err(CollectionOperationError::Capacity(reason)) => {
+                        blocked.insert(*input_data, reason);
+                        replan = true;
+                        break;
+                    }
+                    Err(CollectionOperationError::MissingDependency(member)) => {
+                        return Err(CollectionRealizationError::MissingDependency { member });
+                    }
+                };
+                let output_data = data_identity::<M::Target>(&output);
+                store.put::<M::Target, _>(output).map_err(|error| {
+                    CollectionRealizationError::storage("store derived target member", error)
                 })?;
-                frontier.include_record(record);
-                published.insert(witness);
+                for witness in witnesses {
+                    let record = CollectionRecord::Derive(CollectionDerive::sign(
+                        signing_key,
+                        target.handle(),
+                        (*input_data, *witness),
+                        output_data,
+                    ));
+                    store.insert(record).map_err(|error| {
+                        CollectionRealizationError::storage("publish target DERIVE", error)
+                    })?;
+                    frontier.include_record(record);
+                    published.insert(*witness);
+                }
+            }
+            if replan {
+                break;
             }
         }
         if replan {
