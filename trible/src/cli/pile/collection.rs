@@ -26,7 +26,7 @@ use anyhow::{anyhow, Result};
 use clap::Parser;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use triblespace_core::blob::encodings::entity_id_set::{
@@ -297,8 +297,10 @@ pub enum Command {
         /// Keep the pile open and maintain when its observed state changes
         #[arg(long)]
         watch: bool,
-        /// Poll interval in milliseconds (positive; only used with --watch)
-        #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u64).range(1..))]
+        /// Poll interval in milliseconds (positive; only used with --watch).
+        /// A pass is skipped entirely when the pile file has not grown, so a
+        /// short interval costs one stat rather than one snapshot.
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u64).range(1..))]
         interval_ms: u64,
         /// Raw Succinct execution backend; this does not reserve the device
         #[arg(long, value_enum, default_value_t = SuccinctBackend::Cpu)]
@@ -325,8 +327,10 @@ pub enum Command {
         /// Keep the pile open and maintain when its observed state changes
         #[arg(long)]
         watch: bool,
-        /// Poll interval in milliseconds (positive; only used with --watch)
-        #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u64).range(1..))]
+        /// Poll interval in milliseconds (positive; only used with --watch).
+        /// A pass is skipped entirely when the pile file has not grown, so a
+        /// short interval costs one stat rather than one snapshot.
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u64).range(1..))]
         interval_ms: u64,
         /// Raw Succinct execution backend; this does not reserve the device
         #[arg(long, value_enum, default_value_t = SuccinctBackend::Cpu)]
@@ -2795,6 +2799,7 @@ fn maintenance_changed<S: StoreSnapshot>(
 
 async fn maintenance_loop(
     pile: &mut Pile,
+    path: &Path,
     references: &[String],
     signer: &SigningKey,
     dependencies: bool,
@@ -2805,7 +2810,31 @@ async fn maintenance_loop(
     let mut baseline = None;
     let mut catch_up = true;
     let mut interests = StoreDependencies::default();
+    let mut observed_len: Option<u64> = None;
     loop {
+        // The pile is append-only, so its length is a sound and nearly free
+        // necessary condition for any observable change: no record and no blob
+        // can become visible without bytes having been appended. Checking one
+        // stat before snapshotting is what lets the poll interval be short
+        // without paying a snapshot on a quiet pile. A stat failure is not
+        // evidence of quiet, so it falls through and lets the snapshot report
+        // the real error rather than silently holding.
+        let appended = match std::fs::metadata(path) {
+            Ok(metadata) => {
+                let len = metadata.len();
+                let grew = observed_len != Some(len);
+                observed_len = Some(len);
+                grew
+            }
+            Err(_) => true,
+        };
+        if !catch_up && !appended {
+            if !watch {
+                return Ok(());
+            }
+            tokio::time::sleep(interval).await;
+            continue;
+        }
         // Pile::snapshot refreshes its externally appended prefix before
         // freezing all indexes. Blob arrivals count, not just new equations.
         let before = pile
@@ -2888,6 +2917,7 @@ fn run_maintain(
             }
             result = maintenance_loop(
                 &mut pile,
+                &path,
                 &references,
                 &signer,
                 dependencies,
