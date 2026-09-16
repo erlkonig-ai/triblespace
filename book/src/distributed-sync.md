@@ -976,13 +976,58 @@ sink. Neither facility invents a retention policy for append-only evidence.
 No raw H bearer capability, payload, locator-to-H inventory or bearer proof
 belongs in these colony observations.
 
+#### Sync producer
+
+`pile net sync` opts in with `--telemetry-collection <H>` and
+`--telemetry-key <PATH>`, optionally `--telemetry-worker <NAME>`. The destination
+must already be a resident SimpleArchive **source** collection admitting that
+writer. A derived SimpleArchive is not a source: its reader ignores root
+COMMITs. Reporting never creates a descriptor, key, grant, derived index or
+replication selection. To replicate these samples the operator separately
+selects their collection through the existing mechanisms.
+
+The producer attempts an ordinary signed append every sixty seconds at the
+existing sync-loop boundary. Five subjects distinguish the measurements:
+
+- `hydration`: successful verified reconciler puts and their payload bytes;
+  one landing shared by an explicit WANT and a selected root counts once.
+  Local hits, failed puts and speculative misses add no received bytes.
+  `queued` is the distinct unreadable exact WANT plus selected direct-root
+  set after that tick, not recursive descendants, operation WANTs or a global
+  blob inventory. Failed snapshot/root observations leave it absent.
+- `serve`: actual accepted inbound GET exchanges in flight, successfully
+  sent payloads/bytes and interrupted or failed exchanges. A payload counts
+  only after its write and stream shutdown succeed, not merely after lookup.
+  This is not a remote landing or persistence acknowledgement.
+- `repair`: currently executing collection-peer repair exchanges already
+  recorded by host health, not configured concurrency.
+- `publication`: active and completed provider-advertisement operations,
+  separate from body transfer; acknowledgement is not blob availability.
+- `process`: one cumulative user-plus-system CPU observation across all
+  process threads, absent if unsupported or unavailable. Core's compiled
+  parallel-path bit is separate from runtime pool size or actual CPU effort.
+
+These are boundary observations, not a new timer task inside an awaited
+hydration tick. A long tick delays sampling; only returned ticks contribute
+their landing counters and completed wall duration. Direct foreground reader
+acquisitions are outside the hydration subject. Unmeasured hydration in-flight
+counts, transport path/RTT and internal stage timings stay absent. Stale host
+health contributes no invented activity zeros. `work_ns` sums completed or
+interrupted GET durations in the serving scope and returned-tick durations in
+hydration, never CPU time. Reporting errors discard backend cause chains and
+leave older samples to age. No reporting append flushes the pile; the owner's
+existing close remains its persistence boundary. Same-pile writes remain real
+changes: scoped disjoint reads ignore them, while broad name lookup can still
+observe the new records.
+
 #### Maintenance producer
 
 `pile collection maintain` and `maintain-all` can opt in with
 `--telemetry-collection HANDLE --telemetry-node ENDPOINT --telemetry-worker LABEL`.
 The endpoint is explicit: a signing key is not a transport identity. The
 existing maintenance key signs samples unless `--telemetry-key EXISTING_KEY`
-is supplied. The collection must already exist and admit that writer; this
+is supplied. The collection must already exist as a SimpleArchive source and
+admit that writer; a derived view ignores root COMMITs and is rejected. This
 option does not create keys, descriptors, grants, maintenance targets or sync
 selections. After configuration is validated, publication errors use finite,
 payload-free categories and do not turn successful maintenance into a failure.

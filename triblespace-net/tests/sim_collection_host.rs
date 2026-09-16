@@ -851,6 +851,11 @@ fn durable_bearer_want_materializes_without_any_collection() {
             }
         };
         drop(tick);
+        let served = server.health().blob_serving.clone();
+        assert_eq!(served.in_flight, 0);
+        assert_eq!(served.completed, 1);
+        assert_eq!(served.sent_bytes, payload.len() as u64);
+        assert_eq!(served.failed, 0);
         assert_eq!(
             stats,
             ReconcileStats {
@@ -860,6 +865,9 @@ fn durable_bearer_want_materializes_without_any_collection() {
                 fulfilled: 1,
                 pending: 1,
                 replication: Default::default(),
+                landed: 1,
+                received_bytes: payload.len() as u64,
+                pending_blobs: Some(1),
             },
             "the exact resident H resolves globally while a wrong H stays pending"
         );

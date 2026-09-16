@@ -181,6 +181,22 @@ pub struct PublicationHealth {
     pub unacknowledged_since: Option<Mono>,
 }
 
+/// Process-lifetime observations of inbound exact-blob GETs. These are
+/// operations, not unique blob coverage. Bytes count only a payload whose
+/// existing write and stream shutdown both succeeded; this is not a remote
+/// landing or durability acknowledgement.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BlobServeHealth {
+    pub in_flight: u64,
+    pub completed: u64,
+    pub unavailable: u64,
+    /// Protocol/I/O errors and interrupted exchanges, including deadlines.
+    pub failed: u64,
+    pub sent_bytes: u64,
+    /// Sum of finished/interrupted GET wall durations, not process CPU time.
+    pub work_ns: u128,
+}
+
 impl PublicationHealth {
     pub(crate) fn completed(&mut self, at: Mono, result: crate::provider::PublicationResult) {
         use crate::provider::PublicationResult;
@@ -224,6 +240,7 @@ pub struct HealthSnapshot {
     /// Exactly the locally active interest set, including unavailable views.
     pub collections: Vec<CollectionHealth>,
     pub publication: PublicationHealth,
+    pub blob_serving: BlobServeHealth,
 }
 
 fn fresh(at: Option<Mono>, now: Mono, max_age: Duration) -> bool {
@@ -297,6 +314,7 @@ impl Health {
             store: StoreHealth::default(),
             collections: Vec::new(),
             publication: PublicationHealth::default(),
+            blob_serving: BlobServeHealth::default(),
         })))
     }
 
@@ -306,6 +324,15 @@ impl Health {
 
     pub(crate) fn update(&self, update: impl FnOnce(&mut HealthSnapshot)) {
         update(&mut self.0.lock().unwrap());
+    }
+
+    pub(crate) fn begin_blob_serve(&self) -> BlobServeGuard {
+        self.update(|health| health.blob_serving.in_flight += 1);
+        BlobServeGuard {
+            health: self.clone(),
+            started: crate::clock::mono_now(),
+            finished: false,
+        }
     }
 
     pub(crate) fn with_peer(
@@ -347,9 +374,71 @@ impl Health {
     }
 }
 
+/// Owns one accepted GET exchange until success, error or cancellation.
+/// It deliberately retains no handle, locator, peer key or backend error.
+pub(crate) struct BlobServeGuard {
+    health: Health,
+    started: Mono,
+    finished: bool,
+}
+
+impl BlobServeGuard {
+    pub(crate) fn complete(mut self, payload_bytes: Option<u64>) {
+        self.health.update(|health| match payload_bytes {
+            Some(bytes) => {
+                health.blob_serving.completed += 1;
+                health.blob_serving.sent_bytes =
+                    health.blob_serving.sent_bytes.saturating_add(bytes);
+            }
+            None => health.blob_serving.unavailable += 1,
+        });
+        self.finished = true;
+    }
+}
+
+impl Drop for BlobServeGuard {
+    fn drop(&mut self) {
+        let elapsed = crate::clock::mono_now()
+            .duration_since(self.started)
+            .as_nanos();
+        self.health.update(|health| {
+            health.blob_serving.in_flight -= 1;
+            health.blob_serving.work_ns = health.blob_serving.work_ns.saturating_add(elapsed);
+            if !self.finished {
+                health.blob_serving.failed += 1;
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serving_counts_success_unavailability_and_cancellation_separately() {
+        let (health, _, _, _) = fixture();
+        let successful = health.begin_blob_serve();
+        let cancelled = health.begin_blob_serve();
+        assert_eq!(health.snapshot().blob_serving.in_flight, 2);
+        successful.complete(Some(223));
+        let unavailable = health.begin_blob_serve();
+        unavailable.complete(None);
+        health.begin_blob_serve().complete(Some(0));
+        let pinned = health.snapshot();
+        assert_eq!(pinned.blob_serving.in_flight, 1);
+        assert_eq!(pinned.blob_serving.completed, 2);
+        assert_eq!(pinned.blob_serving.sent_bytes, 223);
+        assert_eq!(pinned.blob_serving.unavailable, 1);
+        assert_eq!(pinned.blob_serving.failed, 0);
+        drop(cancelled);
+        assert_eq!(health.snapshot().blob_serving.in_flight, 0);
+        assert_eq!(health.snapshot().blob_serving.failed, 1);
+        assert_eq!(
+            pinned.blob_serving.in_flight, 1,
+            "snapshots remain immutable"
+        );
+    }
 
     fn frontier(byte: u8, count: u64) -> RepairFrontier {
         RepairFrontier {

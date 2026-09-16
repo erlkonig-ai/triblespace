@@ -39,6 +39,7 @@ struct Fixture {
     provider_routes: Arc<Mutex<RoutingTable>>,
     provider_snapshot: SnapshotSlot,
     provider_directory: Arc<Mutex<ProviderDirectory>>,
+    provider_health: Health,
     blob_reads: Arc<AtomicUsize>,
     hash: RawHash,
     bytes: Bytes,
@@ -112,8 +113,10 @@ impl Fixture {
         let provider_routes = Arc::new(Mutex::new(RoutingTable::new(provider, [])));
         let provider_snapshot = Arc::new(Mutex::new(Some(Arc::new(snapshot))));
         let provider_directory = Arc::new(Mutex::new(providers));
+        let provider_health = Health::new(EndpointId::from_bytes(&provider).unwrap());
         let handler = SnapshotHandler {
             snapshot: provider_snapshot.clone(),
+            health: provider_health.clone(),
             candidates: provider_routes.clone(),
             providers: provider_directory.clone(),
             serve_collections: false,
@@ -144,6 +147,7 @@ impl Fixture {
             provider_routes,
             provider_snapshot,
             provider_directory,
+            provider_health,
             blob_reads,
             hash,
             bytes,
@@ -188,6 +192,7 @@ impl RecoveryNode {
         let (events_tx, events) = tokio::sync::mpsc::channel(16);
         let handler = SnapshotHandler {
             snapshot: Arc::new(Mutex::new(snapshot)),
+            health: Health::new(EndpointId::from_bytes(&peer).unwrap()),
             candidates: Arc::new(Mutex::new(RoutingTable::new(peer, []))),
             providers: directory.clone(),
             serve_collections: false,
@@ -883,6 +888,56 @@ async fn cold_exact_lookup_outlives_background_cap_within_caller_deadline() {
         Some(fixture.bytes.clone()),
     );
     assert_eq!(warmed.elapsed(), Duration::ZERO);
+    let serving = fixture.provider_health.snapshot().blob_serving.clone();
+    assert_eq!(serving.in_flight, 0);
+    assert_eq!(
+        serving.completed, 2,
+        "repeated reads are two operations, not unique coverage"
+    );
+    assert_eq!(serving.sent_bytes, 2 * fixture.bytes.len() as u64);
+    assert_eq!(serving.failed, 0);
+    fixture.assert_no_control_effects();
+}
+
+#[tokio::test(start_paused = true)]
+async fn serving_telemetry_counts_live_exchange_but_not_bytes_before_bearer_proof() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let _guard = crate::protocol::exact_blob_receive_test_guard();
+    let mut fixture = Fixture::new(false);
+    let conn = pool_get(
+        &fixture.client.transport,
+        &fixture.client.pool,
+        fixture.provider,
+    )
+    .await
+    .unwrap();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    send_u8(&mut send, OP_GET_BLOB).await.unwrap();
+    send_hash(&mut send, &blob_locator(fixture.hash))
+        .await
+        .unwrap();
+    assert_eq!(recv_u8(&mut recv).await.unwrap(), 1);
+    assert_eq!(
+        recv_hash(&mut recv).await.unwrap(),
+        crate::bearer::provider_proof(fixture.hash, fixture.client.my_id, fixture.provider)
+    );
+    let active = fixture.provider_health.snapshot().blob_serving.clone();
+    assert_eq!(active.in_flight, 1);
+    assert_eq!(active.completed, 0);
+    assert_eq!(active.sent_bytes, 0);
+    assert_eq!(fixture.blob_reads.load(Ordering::Relaxed), 0);
+    send_hash(&mut send, &[0; 32]).await.unwrap();
+    send.shutdown().await.unwrap();
+    let mut response = Vec::new();
+    recv.read_to_end(&mut response).await.unwrap();
+    assert!(response.is_empty());
+    let failed = fixture.provider_health.snapshot().blob_serving.clone();
+    assert_eq!(failed.in_flight, 0);
+    assert_eq!(failed.failed, 1);
+    assert_eq!(failed.completed, 0);
+    assert_eq!(failed.sent_bytes, 0);
+    assert_eq!(fixture.blob_reads.load(Ordering::Relaxed), 0);
     fixture.assert_no_control_effects();
 }
 
@@ -1378,6 +1433,7 @@ async fn known_resident_outside_selected_dht_replicas_is_not_directly_probed() {
         let mut harness = fixture.net.join(signer);
         let handler = SnapshotHandler {
             snapshot: Arc::new(Mutex::new(None)),
+            health: Health::new(EndpointId::from_bytes(&peer).unwrap()),
             candidates: Arc::new(Mutex::new(RoutingTable::new(peer, []))),
             providers: Arc::new(Mutex::new(ProviderDirectory::new(peer))),
             serve_collections: false,

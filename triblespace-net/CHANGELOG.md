@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Expose bounded inbound GET activity/completion/byte counters in host health,
+  and successful verified landing bytes plus optional observed exact backlog
+  in `ReconcileStats`. Shared WANT/root landings count once; failed puts and
+  local hits add no received bytes. Protocol, scheduling and durability remain
+  unchanged; these are operation counts, not unique availability coverage.
+
 - Add `peer::Leech<S>` for locally writable foreground stores which acquire
   exact blobs without constructing or advertising the pile's serving inventory.
   Reuse the existing store traits, PeerSnapshot and bearer path; ordinary Peer

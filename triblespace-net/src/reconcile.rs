@@ -73,6 +73,15 @@ pub struct ReconcileStats {
     pub fulfilled: usize,
     pub pending: usize,
     pub replication: ReplicationStats,
+    /// Verified network payloads successfully put during this completed tick,
+    /// including speculative successes. A payload shared by a WANT and a root
+    /// counts once. Neither local hits nor failed puts contribute.
+    pub landed: usize,
+    pub received_bytes: u64,
+    /// Distinct unreadable exact blob WANTs and selected direct roots after
+    /// this tick's puts. None means their observation failed. This excludes
+    /// operation WANTs and unknown recursive descendants, not a global backlog.
+    pub pending_blobs: Option<usize>,
 }
 
 struct WantState {
@@ -452,6 +461,7 @@ impl Reconciler {
             .iter()
             .filter_map(|request| request.blob_handle().map(|handle| handle.raw))
             .collect();
+        let mut roots_observed = true;
         let selected_roots = if self.mode == ReplicationMode::Demand {
             Vec::new()
         } else {
@@ -469,6 +479,7 @@ impl Reconciler {
                         ?error,
                         "hydration record observation failed; skipping roots"
                     );
+                    roots_observed = false;
                     Vec::new()
                 }
             }
@@ -557,13 +568,13 @@ impl Reconciler {
                 };
                 in_flight.remove(&handle);
                 let is_want = wanted_blob_handles.contains(&handle);
-                let landed = verified
-                    .and_then(|verified| land_exact(peer, verified))
-                    .is_some();
-                if !landed {
+                let landed = verified.and_then(|verified| land_exact(peer, verified));
+                let Some(bytes) = landed else {
                     self.record_unavailable(handle);
                     continue;
-                }
+                };
+                stats.landed += 1;
+                stats.received_bytes = stats.received_bytes.saturating_add(bytes);
                 // A successful put is visible before an optional durability
                 // boundary. Keep only this tick's completion delta; the next
                 // tick observes the actual store again, including bad imports.
@@ -595,6 +606,12 @@ impl Reconciler {
             .iter()
             .filter(|handle| !visible_blobs.contains(*handle))
             .count();
+        stats.pending_blobs = roots_observed.then(|| {
+            exact_handles
+                .iter()
+                .filter(|handle| !visible_blobs.contains(*handle))
+                .count()
+        });
 
         if !scan_turn {
             return stats;
@@ -732,13 +749,12 @@ impl Reconciler {
             // A request may consume the entire deadline. Persist the next lane
             // and this source's exact progress before awaiting it.
             self.scan.yield_source();
-            if fetch_and_land(peer, candidate, speculative_budget)
-                .await
-                .is_none()
-            {
+            let Some(bytes) = fetch_and_land(peer, candidate, speculative_budget).await else {
                 stats.replication.speculative_misses += 1;
                 continue;
-            }
+            };
+            stats.landed += 1;
+            stats.received_bytes = stats.received_bytes.saturating_add(bytes);
             stats.replication.acquired += 1;
             self.scan.observe(root, candidate);
             peer.refresh();
@@ -1103,7 +1119,7 @@ where
     Ok(roots)
 }
 
-async fn fetch_and_land<S>(peer: &mut Peer<S>, handle: RawHash, budget: Duration) -> Option<()>
+async fn fetch_and_land<S>(peer: &mut Peer<S>, handle: RawHash, budget: Duration) -> Option<u64>
 where
     S: BlobStore
         + CollectionStore
@@ -1118,7 +1134,7 @@ where
     land_exact(peer, verified)
 }
 
-fn land_exact<S>(peer: &Peer<S>, verified: Blob<UnknownBlob>) -> Option<()>
+fn land_exact<S>(peer: &Peer<S>, verified: Blob<UnknownBlob>) -> Option<u64>
 where
     S: BlobStore
         + CollectionStore
@@ -1131,6 +1147,7 @@ where
 {
     // Verified on the wire and matched against the requested handle at the
     // capability boundary. Put preserves its cached H; close owns persistence.
+    let bytes = verified.bytes.len() as u64;
     if let Err(error) = peer.store().put::<UnknownBlob, _>(verified) {
         tracing::warn!(
             ?error,
@@ -1138,7 +1155,7 @@ where
         );
         return None;
     }
-    Some(())
+    Some(bytes)
 }
 
 fn answered_operations<R>(
@@ -2022,6 +2039,7 @@ mod tests {
         flushes: usize,
         closes: usize,
         fail_next_snapshot: bool,
+        fail_snapshot: bool,
         fail_flush: bool,
         fail_close: bool,
         fail_put: bool,
@@ -2039,7 +2057,7 @@ mod tests {
         fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
             let mut trace = self.trace.lock().unwrap();
             trace.snapshots += 1;
-            if std::mem::take(&mut trace.fail_next_snapshot) {
+            if trace.fail_snapshot || std::mem::take(&mut trace.fail_next_snapshot) {
                 return Err(std::io::Error::other("test snapshot failed once"));
             }
             drop(trace);
@@ -2296,6 +2314,14 @@ mod tests {
         fixture.fetches.release();
         let stats = tick.await;
         assert_eq!(stats.replication.acquired, fixture.roots.len());
+        assert_eq!(stats.landed, fixture.roots.len());
+        assert_eq!(
+            stats.received_bytes,
+            (0..9)
+                .map(|ordinal| format!("exact root {ordinal}").len() as u64)
+                .sum()
+        );
+        assert_eq!(stats.pending_blobs, Some(0));
         assert_eq!(stats.replication.pending, 0);
         assert_eq!(stats.replication.speculative_attempted, 0);
         assert_eq!(fixture.fetches.trace.lock().unwrap().cancelled, 0);
@@ -2434,6 +2460,7 @@ mod tests {
     #[tokio::test]
     async fn exact_window_fulfills_without_flush_and_close_errors_still_propagate() {
         let bytes = Bytes::from_source(b"put visibility precedes persistence".to_vec());
+        let expected_bytes = bytes.len() as u64;
         let mut source = MemoryRepo::default();
         let handle = source.put::<UnknownBlob, _>(bytes.clone()).unwrap();
         let mut store = MemoryRepo::default();
@@ -2449,11 +2476,17 @@ mod tests {
         assert_eq!(first.attempted, 1);
         assert_eq!(first.fulfilled, 1);
         assert_eq!(first.pending, 0);
+        assert_eq!(first.landed, 1);
+        assert_eq!(first.received_bytes, expected_bytes);
+        assert_eq!(first.pending_blobs, Some(0));
         assert!(BlobStoreGet::get::<Bytes, UnknownBlob>(&peer.snapshot().unwrap(), handle).is_ok());
         assert!(reconciler.states.is_empty());
         let second = reconciler.tick(&mut peer).await;
         assert_eq!(second.pending, 0);
         assert_eq!(second.attempted, 0);
+        assert_eq!(second.landed, 0);
+        assert_eq!(second.received_bytes, 0);
+        assert_eq!(second.pending_blobs, Some(0));
         assert_eq!(fetches.trace.lock().unwrap().calls, [handle.raw]);
         assert_eq!(landings.lock().unwrap().put, [handle.raw]);
         assert_eq!(landings.lock().unwrap().flushes, 0);
@@ -2476,12 +2509,54 @@ mod tests {
         let first = reconciler.tick(&mut fixture.peer).await;
         assert_eq!(first.replication.acquired, 0);
         assert_eq!(first.replication.pending, 1);
+        assert_eq!(first.landed, 0);
+        assert_eq!(first.received_bytes, 0);
+        assert_eq!(first.pending_blobs, Some(1));
         assert!(fixture.landings.lock().unwrap().put.is_empty());
         fixture.landings.lock().unwrap().fail_put = false;
         let second = reconciler.tick(&mut fixture.peer).await;
         assert_eq!(second.replication.acquired, 1);
         assert_eq!(second.replication.pending, 0);
+        assert_eq!(second.landed, 1);
+        assert_eq!(second.received_bytes, b"exact root 0".len() as u64);
+        assert_eq!(second.pending_blobs, Some(0));
         assert_eq!(fixture.landings.lock().unwrap().flushes, 0);
+    }
+
+    #[tokio::test]
+    async fn telemetry_backlog_distinguishes_failed_observation_from_empty_selection() {
+        let (mut peer, _, landings) =
+            controlled_peer(MemoryRepo::default(), BTreeMap::new(), BTreeSet::new());
+        let mut reconciler = Reconciler::new();
+        landings.lock().unwrap().fail_snapshot = true;
+        let failed = reconciler.tick(&mut peer).await;
+        assert_eq!(failed.pending_blobs, None);
+        assert_eq!(failed.landed, 0);
+        assert_eq!(failed.received_bytes, 0);
+        landings.lock().unwrap().fail_snapshot = false;
+        let empty = reconciler.tick(&mut peer).await;
+        assert_eq!(empty.pending_blobs, Some(0));
+        assert_eq!(empty.landed, 0);
+        assert_eq!(empty.received_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn telemetry_counts_one_landing_for_a_shared_want_and_selected_root() {
+        let mut fixture = exact_fixture(1, 0);
+        fixture
+            .peer
+            .store()
+            .want(WantRequest::blob(Inline::new(fixture.roots[0])))
+            .unwrap();
+        let mut reconciler =
+            Reconciler::new().with_replication(ReplicationMode::Shallow, [fixture.collection]);
+        let stats = reconciler.tick(&mut fixture.peer).await;
+        assert_eq!(stats.fulfilled, 1);
+        assert_eq!(stats.replication.acquired, 1);
+        assert_eq!(stats.landed, 1);
+        assert_eq!(stats.received_bytes, b"exact root 0".len() as u64);
+        assert_eq!(stats.pending_blobs, Some(0));
+        assert_eq!(fixture.fetches.trace.lock().unwrap().calls.len(), 1);
     }
 
     #[tokio::test]

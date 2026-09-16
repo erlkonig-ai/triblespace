@@ -1279,6 +1279,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
 
     let handler = SnapshotHandler {
         snapshot: wiring.snapshot.clone(),
+        health: wiring.health.clone(),
         candidates: candidates.clone(),
         providers: providers.clone(),
         serve_collections: config.qos.direction.serves(),
@@ -2498,6 +2499,7 @@ fn canonical_provider_subset(
 #[derive(Clone)]
 struct SnapshotHandler {
     snapshot: SnapshotSlot,
+    health: Health,
     candidates: RoutingCandidates,
     providers: Arc<Mutex<ProviderDirectory>>,
     serve_collections: bool,
@@ -2604,8 +2606,10 @@ impl SnapshotHandler {
                 }
             }
             OP_GET_BLOB => {
+                let activity = self.health.begin_blob_serve();
                 let snapshot = self.snapshot.lock().unwrap().clone();
                 let blob_snapshot = snapshot.clone();
+                let mut payload_bytes = None;
                 serve_get_blob(
                     recv,
                     send,
@@ -2616,13 +2620,16 @@ impl SnapshotHandler {
                             .as_ref()
                             .and_then(|snapshot| snapshot.bearer_handle(locator))
                     },
-                    move |handle| {
-                        blob_snapshot
+                    |handle| {
+                        let bytes = blob_snapshot
                             .as_ref()
-                            .and_then(|snapshot| snapshot.get_blob(&handle))
+                            .and_then(|snapshot| snapshot.get_blob(&handle));
+                        payload_bytes = bytes.as_ref().map(|bytes| bytes.len() as u64);
+                        bytes
                     },
                 )
                 .await?;
+                activity.complete(payload_bytes);
             }
             OP_PROVIDER_PUT => {
                 let key = recv_hash(recv).await?;

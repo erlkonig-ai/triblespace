@@ -1,6 +1,7 @@
 //! CLI commands for collection-scoped pile repair.
 
 mod dashboard;
+mod telemetry;
 
 use std::path::PathBuf;
 
@@ -185,6 +186,8 @@ pub enum Command {
         /// The health collection is not automatically activated for sync.
         #[arg(long, value_name = "PATH")]
         health_key: Option<PathBuf>,
+        #[command(flatten)]
+        telemetry: telemetry::Options,
         /// Stop after at most N seconds.
         #[arg(long, value_name = "SECS")]
         duration: Option<u64>,
@@ -228,6 +231,7 @@ pub fn run(command: Command) -> Result<()> {
             replication,
             provider_publication_budget,
             health_key,
+            telemetry,
             duration,
             quiescent_for,
         } => run_sync(
@@ -241,6 +245,7 @@ pub fn run(command: Command) -> Result<()> {
             replication.into(),
             provider_publication_budget,
             health_key,
+            telemetry,
             duration,
             quiescent_for,
         ),
@@ -268,6 +273,7 @@ fn run_sync(
     replication: ReplicationMode,
     provider_publication_budget: Option<u64>,
     health_key_path: Option<PathBuf>,
+    telemetry_options: telemetry::Options,
     duration: Option<u64>,
     quiescent_for: Option<u64>,
 ) -> Result<()> {
@@ -286,6 +292,8 @@ fn run_sync(
         crate::cli::util::shutdown_signal()?
     };
     let mut pile = open_pile(&pile_path)?;
+    let mut telemetry =
+        telemetry::Publisher::open(&mut pile, key.verifying_key(), telemetry_options)?;
     let reporting_key = health_key_path
         .map(|path| load_existing_key(Some(path), &pile_path))
         .transpose()?;
@@ -366,6 +374,7 @@ fn run_sync(
     let reconcile_every = std::time::Duration::from_secs(1);
     let mut next_reconcile = std::time::Instant::now();
     let mut next_health = std::time::Instant::now();
+    let mut next_telemetry = std::time::Instant::now();
     let mut wants_fulfilled_total = 0_u64;
     let mut wants_pending = 0_usize;
     let mut last_pending_logged = None;
@@ -382,6 +391,20 @@ fn run_sync(
             }
 
             peer.refresh();
+            if let Some(telemetry) = telemetry.as_ref() {
+                if std::time::Instant::now() >= next_telemetry {
+                    // Sampling is passive and publication uses only the
+                    // explicitly selected destination. A failed observation
+                    // never becomes an empty or healthy replacement sample.
+                    if telemetry
+                        .publish(&mut *peer.store(), &peer.health())
+                        .is_err()
+                    {
+                        eprintln!("sync telemetry publication failed; previous samples will age");
+                    }
+                    next_telemetry = std::time::Instant::now() + REPORT_EVERY;
+                }
+            }
             if let (Some(collection), Some(signer)) = (health_collection, reporting_key.as_ref()) {
                 if std::time::Instant::now() >= next_health {
                     let health = peer.health();
@@ -394,7 +417,11 @@ fn run_sync(
                 }
             }
             if next_reconcile <= std::time::Instant::now() {
+                let measured = telemetry.as_ref().map(|_| std::time::Instant::now());
                 let stats = reconciler.tick(&mut peer).await;
+                if let (Some(telemetry), Some(measured)) = (telemetry.as_mut(), measured) {
+                    telemetry.reconciled(&stats, measured.elapsed());
+                }
                 next_reconcile = std::time::Instant::now() + reconcile_every;
                 wants_fulfilled_total += stats.fulfilled as u64;
                 wants_pending = stats.pending;

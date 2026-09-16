@@ -31,6 +31,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
+- Add opt-in `pile net sync --telemetry-collection --telemetry-key`
+  aggregate reporting to an existing admitted source collection. Successful
+  reconciler landings, inbound GET serving, actual repair/publication activity
+  and one process-CPU scope remain separate; failed observations stay unknown.
+  No implicit replication selection, authority, upkeep or flush is added.
+
 - Add opt-in maintenance telemetry in an existing authorized collection:
   process CPU, outer-hop/pass activity and elapsed work, successful local
   MERGE/DERIVE insertion calls, and successful passes with no such calls.
