@@ -14,6 +14,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use triblespace_core::blob::Blob;
+use triblespace_core::blob::encodings::UnknownBlob;
+use triblespace_core::inline::Inline;
 
 use crate::bearer::{blob_locator, proof_matches, provider_proof, requester_proof};
 use crate::transport::Conn;
@@ -133,6 +136,58 @@ unsafe impl anybytes::ByteSource for ReceivedExactBlob {
     }
 }
 
+/// Payload bytes the wire handshake proved hash to the handle that was asked
+/// for. `verify` is the one BLAKE3 pass over an acquired payload and the only
+/// constructor, so a store that receives one appends the bytes under that
+/// handle without hashing them again ([`Blob::with_handle`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VerifiedBlob {
+    bytes: Bytes,
+    hash: RawHash,
+}
+
+impl VerifiedBlob {
+    /// Keep the bytes only if they are `hash`.
+    pub(crate) fn verify(bytes: Bytes, hash: RawHash) -> Option<Self> {
+        (blake3::hash(&bytes[..]).as_bytes() == &hash).then_some(Self { bytes, hash })
+    }
+
+    pub(crate) fn hash(&self) -> RawHash {
+        self.hash
+    }
+
+    /// The blob under its verified handle, ready for a store's `put`.
+    pub(crate) fn into_blob(self) -> Blob<UnknownBlob> {
+        Blob::with_handle(self.bytes, Inline::new(self.hash))
+    }
+}
+
+impl std::ops::Deref for VerifiedBlob {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl AsRef<[u8]> for VerifiedBlob {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl PartialEq<Bytes> for VerifiedBlob {
+    fn eq(&self, other: &Bytes) -> bool {
+        self.bytes == *other
+    }
+}
+
+impl From<VerifiedBlob> for Bytes {
+    fn from(verified: VerifiedBlob) -> Bytes {
+        verified.bytes
+    }
+}
+
 pub async fn send_u8<W: AsyncWrite + Unpin>(send: &mut W, value: u8) -> Result<()> {
     send.write_all(&[value])
         .await
@@ -198,7 +253,7 @@ pub async fn op_get_blob<C: Conn>(
     conn: &C,
     requester: PeerId,
     hash: &RawHash,
-) -> Result<Option<Bytes>> {
+) -> Result<Option<VerifiedBlob>> {
     let provider = conn.remote_id();
     let (mut send, mut recv) = conn
         .open_bi()
@@ -214,7 +269,7 @@ async fn fetch_get_blob_stream<W, R>(
     requester: PeerId,
     provider: PeerId,
     hash: &RawHash,
-) -> Result<Option<Bytes>>
+) -> Result<Option<VerifiedBlob>>
 where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
@@ -239,13 +294,12 @@ where
     send.shutdown()
         .await
         .map_err(|error| anyhow!("finish: {error}"))?;
-    let bytes = recv_blob_response(recv).await?;
-    if let Some(bytes) = bytes.as_ref()
-        && blake3::hash(bytes).as_bytes() != hash
-    {
-        return Err(anyhow!("exact blob bytes do not match bearer handle"));
-    }
-    Ok(bytes)
+    let Some(bytes) = recv_blob_response(recv).await? else {
+        return Ok(None);
+    };
+    let verified = VerifiedBlob::verify(bytes, *hash)
+        .ok_or_else(|| anyhow!("exact blob bytes do not match bearer handle"))?;
+    Ok(Some(verified))
 }
 
 /// Serve one provider-first bearer key-confirmation exchange.

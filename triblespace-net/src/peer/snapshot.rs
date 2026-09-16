@@ -154,7 +154,7 @@ where
         };
         // No store/host lock is held across network I/O. Writers and other
         // snapshot readers remain free to make progress (or close the peer).
-        let Some(bytes) = sender
+        let Some(verified) = sender
             .fetch_blob(handle.raw, INTERACTIVE_FETCH_DEADLINE)
             .await
         else {
@@ -164,14 +164,11 @@ where
         let store = guard
             .as_mut()
             .ok_or_else(|| PeerAcquireError("peer closed during blob acquisition".into()))?;
-        let stored = store
-            .put::<UnknownBlob, Bytes>(bytes)
+        // The wire handshake verified these bytes against `handle`; they land
+        // under it without a second hash.
+        store
+            .put::<UnknownBlob, _>(verified.into_blob())
             .map_err(|error| PeerAcquireError(format!("cannot cache acquired blob: {error}")))?;
-        if stored != handle {
-            return Err(PeerAcquireError(
-                "peer returned bytes for a different content hash".into(),
-            ));
-        }
         store
             .snapshot_at(self.frozen.instant())
             .map(Some)

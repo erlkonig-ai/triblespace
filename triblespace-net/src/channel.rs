@@ -5,7 +5,7 @@
 //! available batches and crosses a single durability barrier.
 
 use crate::provider::ProviderObservation;
-use anybytes::Bytes;
+use crate::protocol::VerifiedBlob;
 use triblespace_core::capability::CapabilityProof;
 use triblespace_core::collection::{
     COLLECTION_COMMIT_BYTES_LEN, COLLECTION_DERIVE_BYTES_LEN, COLLECTION_MERGE_BYTES_LEN,
@@ -36,10 +36,8 @@ pub(crate) enum NetCommand {
 /// These values remain inert evidence until ordinary local derivation admits
 /// them for an exact collection action.
 pub(crate) enum NetEvent {
-    Blob {
-        expected: [u8; 32],
-        bytes: Bytes,
-    },
+    /// One payload verified on the wire against the handle it was fetched by.
+    Blob(VerifiedBlob),
     CollectionRecord(CollectionRecord),
     /// One native authorization proof. Named claims remain ordinary immutable
     /// dependencies and are fetched only when a consumer follows them.
@@ -49,7 +47,7 @@ pub(crate) enum NetEvent {
 impl NetEvent {
     fn admission_bytes(&self) -> usize {
         match self {
-            Self::Blob { bytes, .. } => bytes.len(),
+            Self::Blob(blob) => blob.len(),
             Self::CollectionRecord(CollectionRecord::Commit(_)) => 1 + COLLECTION_COMMIT_BYTES_LEN,
             Self::CollectionRecord(CollectionRecord::Merge(_)) => 1 + COLLECTION_MERGE_BYTES_LEN,
             Self::CollectionRecord(CollectionRecord::Derive(_)) => 1 + COLLECTION_DERIVE_BYTES_LEN,
@@ -61,10 +59,10 @@ impl NetEvent {
 impl std::fmt::Debug for NetEvent {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Blob { expected, bytes } => formatter
+            Self::Blob(blob) => formatter
                 .debug_struct("Blob")
-                .field("expected", expected)
-                .field("len", &bytes.len())
+                .field("hash", &blob.hash())
+                .field("len", &blob.len())
                 .finish(),
             Self::CollectionRecord(record) => formatter
                 .debug_tuple("CollectionRecord")

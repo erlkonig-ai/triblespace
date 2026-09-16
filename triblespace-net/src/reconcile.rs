@@ -2176,7 +2176,10 @@ mod tests {
     }
 
     impl crate::host::NetCapability for ControlledFetches {
-        fn fetch_blob(&self, hash: RawHash) -> futures::future::BoxFuture<'static, Option<Bytes>> {
+        fn fetch_blob(
+            &self,
+            hash: RawHash,
+        ) -> futures::future::BoxFuture<'static, Option<crate::protocol::VerifiedBlob>> {
             let answer = self.answers.get(&hash).cloned();
             let blocked = self.blocked.contains(&hash);
             let delay = *self.delay.lock().unwrap();
@@ -2206,7 +2209,7 @@ mod tests {
                     }
                 }
                 guard.completed = true;
-                answer
+                answer.and_then(|bytes| crate::protocol::VerifiedBlob::verify(bytes, hash))
             })
         }
     }
