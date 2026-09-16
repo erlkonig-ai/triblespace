@@ -969,10 +969,15 @@ where
 /// lacks, not by what changed recently: with an empty or far-behind target it
 /// can be the whole resident source, and a selected physical member may
 /// carry support the target already represents beside the support it lacks.
-/// An empty result means the target is exact for the source's admitted
-/// support. Missing provenance stays visible: when the needed support cannot
-/// be represented by resident members, the incomplete-cover error names what
-/// is absent instead of returning a delta that looks complete.
+/// The support in question is the source's resident admitted support, as
+/// `source_support` observes it: an admitted COMMIT whose payload has not
+/// landed is outside it, so an empty result means the target is exact for
+/// what is resident, not for every admitted record. A signed target equation
+/// whose own output has not landed does not block the selection: the
+/// resident source member it names is still returned. Missing provenance
+/// stays visible: when the needed support cannot be represented by resident
+/// members, the incomplete-cover error names what is absent instead of
+/// returning a delta that looks complete.
 pub(crate) fn uncovered_resident_source_members<R, M>(
     snapshot: &R,
     target: Collection<M::Target>,
@@ -989,7 +994,8 @@ where
     M: CollectionMapping,
 {
     let support = source_support::<R, M>(snapshot, target)?;
-    let probe = probe_mapping::<R, M>(snapshot, target, &support, &BTreeSet::new(), true)?;
+    let probe =
+        probe_mapping_with::<R, M>(snapshot, target, &support, &BTreeSet::new(), true, false)?;
     if probe.target_resolution.is_exact_for(&support) {
         return Ok(Vec::new());
     }
@@ -1074,6 +1080,29 @@ where
     R: StoreRead,
     M: CollectionMapping,
 {
+    probe_mapping_with::<R, M>(snapshot, target, support, unavailable, admit_source, admit_source)
+}
+
+/// As [`probe_mapping`], separating two things `admit_source` used to bundle:
+/// certifying the immediate source beside the target, and demanding the
+/// target's relevant missing dependency when the target is not exact. An
+/// acquisition step wants both. A read-only residual selection wants the
+/// first only: a signed target equation whose output payload has not landed
+/// yet must not stop a reader from selecting the resident source member it
+/// names, which is exactly the record-before-blob case the residual exists
+/// for.
+fn probe_mapping_with<R, M>(
+    snapshot: &R,
+    target: Collection<M::Target>,
+    support: &Support,
+    unavailable: &BTreeSet<CollectionData>,
+    admit_source: bool,
+    demand_dependencies: bool,
+) -> Result<MappingProbe<M>, CollectionRealizationError>
+where
+    R: StoreRead,
+    M: CollectionMapping,
+{
     let lineage = load_lineage(snapshot, target)?;
     require_support(&lineage, support)?;
     let source_handle = lineage
@@ -1134,7 +1163,7 @@ where
     // dangling equation frontier only after the semantic snapshot proves that
     // work remains; this keeps resident maintenance at one indexed semantic
     // probe per LSM round.
-    if admit_source && !target_resolution.is_exact_for(support) {
+    if demand_dependencies && !target_resolution.is_exact_for(support) {
         if let Some(member) = relevant_missing_dependency::<_, M>(
             snapshot,
             target,

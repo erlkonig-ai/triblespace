@@ -1758,8 +1758,12 @@ pub trait CollectionSnapshotExt: StoreRead + Sized {
     /// of the support the target lacks. It is small when the target is close
     /// behind, the whole resident source when the target is empty or far
     /// behind, and a selected member may overlap support the target already
-    /// represents. An incomplete cover is an error naming the absent
-    /// support, never a silent partial delta.
+    /// represents. The support compared is the source's resident admitted
+    /// support: an admitted COMMIT whose payload has not landed is not part
+    /// of it, so an empty result is exactness for what is resident. A signed
+    /// target equation whose output has not landed does not block the
+    /// selection. An incomplete cover is an error naming the absent support,
+    /// never a silent partial delta.
     fn uncovered_source_members<T>(
         &self,
         target: Collection<T>,
