@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Experiment with exact-H directory queries during authenticated routing
+  progress. FIND_NODE, directory and body requests share three slots; routing
+  retains one slot while open. At most K early directory attempts plus the
+  final K preserve a bounded final-replica query opportunity, not guaranteed
+  acquisition under the unchanged 64-provider cap. Caller deadlines, body
+  verification and final-union publication/collection discovery are unchanged.
+
 - Use an existential early exit when deciding resident collection-frontier
   membership, without changing canonical cover selection, support, or admission.
   This avoids traversing the complete upper history merely to prove one

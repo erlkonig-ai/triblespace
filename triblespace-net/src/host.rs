@@ -1936,25 +1936,22 @@ impl<T: Transport> ProviderClient<T> {
         limit: Option<std::time::Duration>,
     ) -> Vec<PeerId> {
         let seeds = self.candidates.lock().unwrap().closest(target, K);
-        let mut lookup = IterativeLookup::new(self.my_id, target, seeds);
+        let mut lookup = ReplicaLookup::new(self.my_id, target, seeds, limit);
         let mut pending: FuturesUnordered<
             futures::future::BoxFuture<'_, (PeerId, anyhow::Result<Vec<PeerId>>)>,
         > = FuturesUnordered::new();
-        let mut deadline = limit.map(|limit| tokio::time::Instant::now() + limit);
         loop {
-            for peer in lookup.next_batch() {
+            for peer in lookup.machine.next_batch() {
                 pending.push(Box::pin(async move {
                     let reply = self.find_node(peer, target).await;
                     (peer, reply)
                 }));
             }
-            let reply = match deadline {
+            let reply = match lookup.deadline {
                 Some(deadline) => match tokio::time::timeout_at(deadline, pending.next()).await {
                     Ok(reply) => reply,
                     Err(_) => {
-                        let timed_out =
-                            lookup.record_timeouts(&mut self.candidates.lock().unwrap());
-                        debug!(timed_out, "DHT replica lookup routing window exhausted");
+                        lookup.expire(&mut self.candidates.lock().unwrap());
                         break;
                     }
                 },
@@ -1963,36 +1960,13 @@ impl<T: Transport> ProviderClient<T> {
             let Some((peer, reply)) = reply else {
                 break;
             };
-            match reply {
-                Ok(peers) => {
-                    deadline.get_or_insert_with(|| {
-                        tokio::time::Instant::now() + BACKGROUND_LOOKUP_DEADLINE
-                    });
-                    let valid = peers
-                        .into_iter()
-                        .filter(|candidate| EndpointId::from_bytes(candidate).is_ok());
-                    lookup.record_authenticated_response(
-                        peer,
-                        valid,
-                        &mut self.candidates.lock().unwrap(),
-                    );
-                }
-                Err(error) => {
-                    debug!(%error, "DHT replica lookup request failed");
-                    lookup.record_failure(peer, &mut self.candidates.lock().unwrap());
-                }
-            }
-            if lookup.is_finished() && pending.is_empty() {
+            lookup.observe(peer, reply, &mut self.candidates.lock().unwrap());
+            if lookup.machine.is_finished() && pending.is_empty() {
                 break;
             }
         }
         drop(pending);
-        let mut replicas = lookup.closest_authenticated_responders().to_vec();
-        replicas.push(self.my_id);
-        replicas.sort_unstable_by(|a, b| crate::routing::distance_cmp(target, *a, *b));
-        replicas.dedup();
-        replicas.truncate(K);
-        replicas
+        lookup.replicas()
     }
 
     async fn put(&self, peer: PeerId, key: ProviderKey, token: ProviderToken) -> ProviderPutResult {
@@ -2152,59 +2126,154 @@ impl<T: Transport> ProviderClient<T> {
     }
 
     /// Discover candidates only from H and start verified providers without
-    /// waiting for every directory reply. Directory queries and exact GETs
-    /// share ALPHA slots; collection discovery retains its final-union path.
+    /// waiting for routing or every directory reply. All three stages share
+    /// ALPHA slots, with one slot reserved for routing while it remains open.
+    /// Publication and collection discovery retain their final-union path.
     async fn fetch_blob(
         &self,
         hash: RawHash,
         lookup_limit: Option<std::time::Duration>,
     ) -> anyhow::Result<Option<VerifiedBlob>> {
         enum Progress {
+            Routing(PeerId, anyhow::Result<Vec<PeerId>>),
+            RoutingExpired,
             Directory(PeerId, anyhow::Result<Vec<(PeerId, ProviderToken)>>),
             Blob(anyhow::Result<Option<VerifiedBlob>>),
         }
 
         let key = blob_locator(hash);
-        let mut replicas = self.lookup_replicas(key, lookup_limit).await.into_iter();
+        let seeds = self.candidates.lock().unwrap().closest(key, K);
+        let mut lookup = ReplicaLookup::new(self.my_id, key, seeds, lookup_limit);
+        let mut routing: FuturesUnordered<
+            futures::future::BoxFuture<'_, (PeerId, anyhow::Result<Vec<PeerId>>)>,
+        > = FuturesUnordered::new();
+        let mut routing_closed = false;
+        let mut replicas = ProgressiveBlobReplicas::new(key);
         let mut candidates = ProgressiveBlobProviders::new(key);
         let mut requests: FuturesUnordered<futures::future::BoxFuture<'_, Progress>> =
             FuturesUnordered::new();
+        let mut bodies_in_flight = 0;
+        let mut directory_body_turn = false;
         let mut remote_responded = false;
         let mut valid_hint = false;
         let mut directory_failure = None;
         let mut provider_failure = None;
         loop {
-            while requests.len() < ALPHA {
-                if let Some(peer) = candidates.next() {
-                    requests.push(Box::pin(async move {
-                        Progress::Blob(self.fetch_from_provider(hash, peer).await)
-                    }));
-                } else if let Some(peer) = replicas.next() {
-                    requests.push(Box::pin(async move {
-                        Progress::Directory(peer, self.get(peer, key).await)
-                    }));
-                } else {
-                    break;
+            // Closing the routing window never cancels an already progressing
+            // body/directory stream, nor manufactures a connection error.
+            // record_timeouts alone does not seal the lookup machine.
+            if !routing_closed {
+                let expired = lookup
+                    .deadline
+                    .is_some_and(|deadline| tokio::time::Instant::now() >= deadline);
+                if expired || lookup.machine.is_finished() {
+                    if expired {
+                        lookup.expire(&mut self.candidates.lock().unwrap());
+                        routing.clear();
+                    }
+                    routing_closed = true;
+                    replicas.finish(lookup.replicas());
                 }
             }
-            let Some(progress) = requests.next().await else {
+            while routing.len() + requests.len() < ALPHA {
+                // Two slow provider attempts must not occupy every routing
+                // slot. This reserves capacity, not extra concurrency, and
+                // cannot promise progress when the routing peer itself stalls.
+                let data_limit = if routing_closed { ALPHA } else { ALPHA - 1 };
+                if requests.len() < data_limit {
+                    // Preserve a directory slot even after routing closes:
+                    // early slow bodies must not occupy all ALPHA slots before
+                    // the final closest replicas can supply their hints. A
+                    // directory yielding retained untried hints earns the next body
+                    // turn, rather than waiting behind every later directory.
+                    let body_limit = if replicas.can_query() && !directory_body_turn {
+                        ALPHA - 1
+                    } else {
+                        ALPHA
+                    };
+                    if bodies_in_flight < body_limit {
+                        if let Some(peer) = candidates.next() {
+                            directory_body_turn = false;
+                            bodies_in_flight += 1;
+                            requests.push(Box::pin(async move {
+                                Progress::Blob(self.fetch_from_provider(hash, peer).await)
+                            }));
+                            continue;
+                        }
+                    }
+                    if let Some(peer) = replicas.next() {
+                        requests.push(Box::pin(async move {
+                            Progress::Directory(peer, self.get(peer, key).await)
+                        }));
+                        continue;
+                    }
+                }
+                if routing_closed {
+                    break;
+                }
+                let batch = lookup
+                    .machine
+                    .next_batch_up_to(ALPHA - routing.len() - requests.len());
+                if batch.is_empty() {
+                    break;
+                }
+                for peer in batch {
+                    routing.push(Box::pin(
+                        async move { (peer, self.find_node(peer, key).await) },
+                    ));
+                }
+            }
+            if routing.is_empty() && requests.is_empty() {
+                debug_assert!(routing_closed);
                 break;
+            }
+            let progress = tokio::select! {
+                reply = routing.next(), if !routing.is_empty() => {
+                    let (peer, reply) = reply.expect("nonempty routing requests");
+                    Progress::Routing(peer, reply)
+                }
+                reply = requests.next(), if !requests.is_empty() => {
+                    reply.expect("nonempty acquisition requests")
+                }
+                () = async {
+                    match lookup.deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                }, if !routing_closed => Progress::RoutingExpired,
             };
             match progress {
-                Progress::Blob(Ok(Some(bytes))) => return Ok(Some(bytes)),
-                Progress::Blob(Ok(None)) => {}
-                Progress::Blob(Err(error)) => {
-                    provider_failure.get_or_insert(error);
+                Progress::RoutingExpired => continue,
+                Progress::Routing(peer, reply) => {
+                    if lookup.observe(peer, reply, &mut self.candidates.lock().unwrap()) {
+                        // Referrals remain routing candidates. Only this
+                        // lookup's direct authenticated responders enter here.
+                        replicas.observe(lookup.replicas());
+                    }
+                }
+                Progress::Blob(reply) => {
+                    bodies_in_flight -= 1;
+                    match reply {
+                        Ok(Some(bytes)) => return Ok(Some(bytes)),
+                        Ok(None) => {}
+                        Err(error) => {
+                            provider_failure.get_or_insert(error);
+                        }
+                    }
                 }
                 Progress::Directory(peer, Ok(reply)) => {
                     remote_responded |= peer != self.my_id;
-                    candidates.observe(reply.into_iter().filter_map(|(provider, token)| {
-                        if blob_provider_token(hash, provider) != token {
-                            return None;
-                        }
-                        valid_hint = true;
-                        (provider != self.my_id).then_some(provider)
-                    }));
+                    directory_body_turn |=
+                        candidates.observe(reply.into_iter().filter_map(|(provider, token)| {
+                            if blob_provider_token(hash, provider) != token {
+                                return None;
+                            }
+                            valid_hint = true;
+                            if provider == self.my_id {
+                                return None;
+                            }
+                            Some(provider)
+                        }));
                 }
                 Progress::Directory(_, Err(error)) => {
                     directory_failure.get_or_insert(error);
@@ -2223,6 +2292,124 @@ impl<T: Transport> ProviderClient<T> {
             }
         }
         Ok(None)
+    }
+}
+
+/// Lookup-local scheduling state shared by final-union discovery and the
+/// progressive exact-H experiment. No result cache or detached work is kept.
+struct ReplicaLookup {
+    local: PeerId,
+    target: RoutingKey,
+    machine: IterativeLookup,
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl ReplicaLookup {
+    fn new(
+        local: PeerId,
+        target: RoutingKey,
+        seeds: Vec<PeerId>,
+        limit: Option<std::time::Duration>,
+    ) -> Self {
+        Self {
+            local,
+            target,
+            machine: IterativeLookup::new(local, target, seeds),
+            deadline: limit.map(|limit| tokio::time::Instant::now() + limit),
+        }
+    }
+
+    fn observe(
+        &mut self,
+        peer: PeerId,
+        reply: anyhow::Result<Vec<PeerId>>,
+        routes: &mut RoutingTable,
+    ) -> bool {
+        match reply {
+            Ok(peers) => {
+                self.deadline.get_or_insert_with(|| {
+                    tokio::time::Instant::now() + BACKGROUND_LOOKUP_DEADLINE
+                });
+                self.machine.record_authenticated_response(
+                    peer,
+                    peers
+                        .into_iter()
+                        .filter(|candidate| EndpointId::from_bytes(candidate).is_ok()),
+                    routes,
+                )
+            }
+            Err(error) => {
+                debug!(%error, "DHT replica lookup request failed");
+                self.machine.record_failure(peer, routes);
+                false
+            }
+        }
+    }
+
+    fn expire(&mut self, routes: &mut RoutingTable) {
+        let timed_out = self.machine.record_timeouts(routes);
+        debug!(timed_out, "DHT replica lookup routing window exhausted");
+    }
+
+    fn replicas(&self) -> Vec<PeerId> {
+        let mut replicas = self.machine.closest_authenticated_responders().to_vec();
+        replicas.push(self.local);
+        replicas.sort_unstable_by(|a, b| crate::routing::distance_cmp(self.target, *a, *b));
+        replicas.dedup();
+        replicas.truncate(K);
+        replicas
+    }
+}
+
+/// At most K speculative directory attempts plus the final closest K. Reserve
+/// the latter so early farther responders cannot spend a late closer replica's
+/// chance. Pending targets are bounded and XOR-ranked; no peer is queried twice.
+struct ProgressiveBlobReplicas {
+    key: ProviderKey,
+    attempted: BTreeSet<PeerId>,
+    pending: Vec<PeerId>,
+    finished: bool,
+}
+
+impl ProgressiveBlobReplicas {
+    fn new(key: ProviderKey) -> Self {
+        Self {
+            key,
+            attempted: BTreeSet::new(),
+            pending: Vec::new(),
+            finished: false,
+        }
+    }
+
+    fn observe(&mut self, peers: impl IntoIterator<Item = PeerId>) {
+        self.pending.extend(peers);
+        self.pending.retain(|peer| !self.attempted.contains(peer));
+        self.pending
+            .sort_unstable_by(|a, b| crate::routing::distance_cmp(self.key, *a, *b));
+        self.pending.dedup();
+        self.pending.truncate(K);
+    }
+
+    fn finish(&mut self, peers: Vec<PeerId>) {
+        self.finished = true;
+        self.pending.clear();
+        self.observe(peers);
+    }
+
+    fn can_query(&self) -> bool {
+        let limit = if self.finished { 2 * K } else { K };
+        !self.pending.is_empty() && self.attempted.len() < limit
+    }
+
+    fn next(&mut self) -> Option<PeerId> {
+        if !self.can_query() {
+            return None;
+        }
+        let peer = self.pending.remove(0);
+        let newly_attempted = self.attempted.insert(peer);
+        debug_assert!(newly_attempted);
+        debug_assert!(self.attempted.len() <= 2 * K);
+        Some(peer)
     }
 }
 
@@ -2246,16 +2433,22 @@ impl ProgressiveBlobProviders {
         }
     }
 
-    fn observe(&mut self, providers: impl IntoIterator<Item = PeerId>) {
+    /// Return whether this reply contributes an untried hint which survives
+    /// ranking and the remaining total attempt budget.
+    fn observe(&mut self, providers: impl IntoIterator<Item = PeerId>) -> bool {
+        let arrived = canonical_provider_subset(
+            self.key,
+            providers
+                .into_iter()
+                .filter(|peer| !self.attempted.contains(peer)),
+        );
         self.pending = canonical_provider_subset(
             self.key,
-            self.pending
-                .drain(..)
-                .chain(providers)
-                .filter(|peer| !self.attempted.contains(peer)),
+            self.pending.drain(..).chain(arrived.iter().copied()),
         );
         self.pending
             .truncate(crate::provider::MAX_PROVIDERS_PER_KEY - self.attempted.len());
+        arrived.iter().any(|peer| self.pending.contains(peer))
     }
 
     fn next(&mut self) -> Option<PeerId> {
@@ -2540,9 +2733,9 @@ mod tests {
     use super::{
         COLLECTION_PARTICIPANT_LEASE, DescriptorFetches, DiscoveryState,
         MAX_COLLECTION_PARTICIPANTS, MAX_PENDING_REPAIRS, ProgressiveBlobProviders,
-        ProviderPublicationBudget, RepairTarget, WakeBootstrapPeers, canonical_provider_subset,
-        enqueue_repair, forget_participant, has_repair_candidate, live_participants,
-        observe_participant, retain_active_repair_state,
+        ProgressiveBlobReplicas, ProviderPublicationBudget, RepairTarget, WakeBootstrapPeers,
+        canonical_provider_subset, enqueue_repair, forget_participant, has_repair_candidate,
+        live_participants, observe_participant, retain_active_repair_state,
     };
 
     fn endpoint(byte: u8) -> EndpointId {
@@ -2867,6 +3060,113 @@ mod tests {
             budget.consume_attempt();
         }
         assert!(!budget.is_exhausted());
+    }
+
+    #[test]
+    fn progressive_replica_queries_reserve_final_targets_and_deduplicate() {
+        let peer = |ordinal: u16| {
+            let mut id = [0; 32];
+            id[30..].copy_from_slice(&ordinal.to_be_bytes());
+            id
+        };
+        let mut replicas = ProgressiveBlobReplicas::new([0; 32]);
+        replicas.observe((100..100 + K as u16).map(peer));
+        let mut queried = BTreeSet::new();
+        for _ in 0..K {
+            let next = replicas.next().unwrap();
+            assert!(queried.insert(next));
+            // Repeated/frontier-shuffling evidence never refills this budget.
+            replicas.observe([next, next]);
+        }
+        replicas.observe((1..=K as u16).map(peer));
+        assert!(replicas.next().is_none());
+        assert_eq!(replicas.pending.len(), K);
+        replicas.finish((1..=K as u16).map(peer).collect());
+        while let Some(next) = replicas.next() {
+            assert!(queried.insert(next));
+        }
+        assert_eq!(queried.len(), 2 * K);
+        assert!((1..=K as u16).all(|n| queried.contains(&peer(n))));
+        replicas.observe((200..200 + K as u16).map(peer));
+        assert!(replicas.next().is_none(), "the total cap cannot refill");
+
+        let mut overlapping = ProgressiveBlobReplicas::new([0; 32]);
+        overlapping.observe([peer(2), peer(1), peer(2)]);
+        assert_eq!(overlapping.next(), Some(peer(1)));
+        overlapping.finish(vec![peer(1), peer(2)]);
+        assert_eq!(overlapping.next(), Some(peer(2)));
+        assert_eq!(overlapping.next(), None);
+    }
+
+    #[cfg(feature = "sim")]
+    #[tokio::test(start_paused = true)]
+    async fn replica_lookup_deadline_starts_once_and_never_restarts() {
+        use super::{BACKGROUND_LOOKUP_DEADLINE, ReplicaLookup};
+        use crate::routing::RoutingTable;
+        let local = SigningKey::from_bytes(&[101; 32])
+            .verifying_key()
+            .to_bytes();
+        let first = SigningKey::from_bytes(&[102; 32])
+            .verifying_key()
+            .to_bytes();
+        let second = SigningKey::from_bytes(&[103; 32])
+            .verifying_key()
+            .to_bytes();
+        let mut routes = RoutingTable::new(local, [first, second]);
+        let mut lookup = ReplicaLookup::new(local, local, vec![first, second], None);
+        assert!(lookup.deadline.is_none());
+        assert_eq!(lookup.machine.next_batch().len(), 2);
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        assert!(lookup.observe(first, Ok(vec![]), &mut routes));
+        let deadline = lookup.deadline.unwrap();
+        assert_eq!(
+            deadline,
+            tokio::time::Instant::now() + BACKGROUND_LOOKUP_DEADLINE
+        );
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        assert!(lookup.observe(second, Ok(vec![]), &mut routes));
+        assert_eq!(lookup.deadline, Some(deadline));
+
+        let mut background =
+            ReplicaLookup::new(local, local, vec![first], Some(BACKGROUND_LOOKUP_DEADLINE));
+        let deadline = background.deadline.unwrap();
+        assert_eq!(background.machine.next_batch(), vec![first]);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        assert!(background.observe(first, Ok(vec![]), &mut routes));
+        assert_eq!(background.deadline, Some(deadline));
+    }
+
+    #[test]
+    fn provider_body_turn_requires_a_retained_untried_hint() {
+        let peer = |ordinal: u16| {
+            let mut id = [0; 32];
+            id[30..].copy_from_slice(&ordinal.to_be_bytes());
+            id
+        };
+        let mut candidates = ProgressiveBlobProviders::new([0; 32]);
+        assert!(candidates.observe((100..164).map(peer)));
+        assert_eq!(candidates.next(), Some(peer(100)));
+        assert_eq!(candidates.next(), Some(peer(101)));
+        assert_eq!(candidates.pending.len(), 62);
+        assert!(
+            !candidates.observe([peer(200)]),
+            "discarded farther hint earns no body turn"
+        );
+        assert!(
+            !candidates.observe([peer(100)]),
+            "attempted provider earns no body turn"
+        );
+        assert!(
+            candidates.observe([peer(1)]),
+            "a retained closer hint earns a body turn"
+        );
+        assert_eq!(candidates.next(), Some(peer(1)));
+        while candidates.next().is_some() {}
+        assert_eq!(candidates.attempted.len(), MAX_PROVIDERS_PER_KEY);
+        assert!(
+            !candidates.observe([peer(2)]),
+            "exhausted budget earns no body turn"
+        );
     }
 
     #[test]

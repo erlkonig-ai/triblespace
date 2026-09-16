@@ -286,11 +286,33 @@ token counts separately, alongside its existing totals, without logging handles
 or tokens. These classify hint sources, not cryptographic publication receipts;
 neither category proves that a subsequent GET will succeed.
 
-After routing selects the DHT replicas, an exact-H fetch starts verified
-provider GETs as directory replies arrive, without waiting for every directory
-to finish. Directory queries and provider GETs share three concurrent request
-slots; a usable provider takes the next free slot ahead of an unstarted
-directory query. At most 64 distinct providers can be attempted per fetch.
+An experimental exact-H fetch can query a directory as soon as it directly
+answers an authenticated FIND_NODE, rather than waiting for the final routing
+barrier. Named referrals remain unverified candidates until they answer in
+turn. Early targets come from the current closest authenticated responder set
+(including the local endpoint); routing-free local fallback remains available
+when lookup completes. No cold lookup starts from a retained local provider
+lease before routing progress. Publication and collection discovery still
+select their final replica set before directory operations.
+
+FIND_NODE, directory queries and exact provider GETs share three concurrent
+request slots. While routing is open, acquisition occupies at most two, leaving
+capacity for fresh routing. While unstarted directory queries remain, bodies
+normally occupy at most two slots, including after routing finishes. A directory
+reply contributing a retained untried hint earns one body turn before the next
+directory, so a useful answer need not wait for every remaining directory.
+Already-attempted or discarded hints earn no such turn. Subject to these
+reservations, a usable provider takes the next free slot ahead of an unstarted
+directory query. At most K early directory
+attempts are admitted, then a final closest-K sweep supplies unqueried targets;
+the total is at most 2K distinct directories, including any local query. This
+can spend K more queries than waiting for the final set, and the one reserved
+routing slot can reduce acquisition concurrency. Conversely, two progressing
+acquisitions leave only one routing slot in the same unchanged routing window;
+this is not a proof of equal discovery coverage under every timing pattern.
+Empty early hints do not end
+a lookup whose routing remains open. At most 64 distinct providers can be
+attempted per fetch.
 Duplicate hints never spend another attempt. Pending providers are ranked by
 XOR distance among the hints received so far, bounded by the remaining attempt
 allowance. A later closer hint can replace pending work, not an already-started
@@ -298,15 +320,22 @@ request. The transient attempt subset is therefore deliberately arrival-sensitiv
 it need not equal the closest 64 in the final reply union. Collection discovery
 still waits for its canonical, reply-order-independent union.
 
-This removes a barrier after a usable hint has arrived, not every possible
-head-of-line delay. Three stalled requests can still occupy the shared slots;
+This removes routing's final barrier when early evidence is useful, not every
+possible head-of-line delay. Three stalled requests can still occupy the shared slots;
 in particular, three stalled first directory queries prevent an unstarted
 directory from supplying its hint within a shorter caller deadline. An early
 large set of valid but unavailable hints can also exhaust the 64-attempt cap
-before a later useful hint arrives. The caller's existing end-to-end timeout,
+before a later useful hint arrives. Early nonfinal directories can supply those
+hints too: reserving the final directory sweep does not reserve body attempts
+and does not prove baseline reachability is preserved for every reply order.
+The caller's existing end-to-end timeout,
 per-operation deadlines, pooled-connection cancellation rules, provider-token
 checks, mutual bearer proof, body-receive memory bound, and final hash check
-are unchanged. No provider hint or result is persisted by this scheduling step.
+are unchanged. Routing expiry drops only issued routing requests; a progressing
+directory/body stream continues within the original caller deadline. Early
+verified success or caller cancellation drops all owned futures without
+fabricating protocol failures or closing healthy pooled connections. No provider
+hint or result is persisted by this scheduling step.
 
 The direct stream also keeps H off the wire. The requester sends only L. The
 provider resolves L in its resident locator index and proves knowledge of H

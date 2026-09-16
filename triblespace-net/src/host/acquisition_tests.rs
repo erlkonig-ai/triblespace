@@ -902,7 +902,7 @@ async fn responsive_provider_is_not_held_behind_stalled_secondary_bootstrap() {
             .await.map(anybytes::Bytes::from),
         Some(fixture.bytes.clone()),
     );
-    assert_eq!(started.elapsed(), Duration::from_secs(7));
+    assert_eq!(started.elapsed(), Duration::from_secs(4));
     {
         let routes = fixture.client.candidates.lock().unwrap();
         assert_eq!(
@@ -913,7 +913,12 @@ async fn responsive_provider_is_not_held_behind_stalled_secondary_bootstrap() {
             routes.state(stalled),
             Some(crate::routing::RouteState::Candidate)
         );
-        assert_eq!(routes.state(learned), None);
+        // Early verified success cancels the remaining lookup; it does not
+        // fabricate a routing timeout or demote an unobserved learned peer.
+        assert_eq!(
+            routes.state(learned),
+            Some(crate::routing::RouteState::Verified)
+        );
     }
     fixture.assert_no_control_effects();
 }

@@ -317,6 +317,14 @@ impl IterativeLookup {
     /// concurrent requests. An empty batch with `is_finished() == false`
     /// means earlier requests are still in flight.
     pub(crate) fn next_batch(&mut self) -> Vec<PeerId> {
+        self.next_batch_up_to(ALPHA)
+    }
+
+    /// Mark and return only requests that fit the caller's available slots,
+    /// the remaining [`ALPHA`] capacity, and the lookup's query budget. Apply
+    /// these limits before marking any peer queried or in flight. An empty
+    /// batch can leave pending candidates when the caller has no capacity.
+    pub(crate) fn next_batch_up_to(&mut self, available: usize) -> Vec<PeerId> {
         if self.queried.len() >= MAX_LOOKUP_QUERIES {
             self.shortlist
                 .retain(|_, state| *state == LookupState::InFlight);
@@ -328,7 +336,7 @@ impl IterativeLookup {
             .values()
             .filter(|state| **state == LookupState::InFlight)
             .count();
-        let available = ALPHA.saturating_sub(in_flight);
+        let available = available.min(ALPHA.saturating_sub(in_flight));
         if available == 0 {
             return Vec::new();
         }
@@ -1015,6 +1023,91 @@ mod tests {
         assert_eq!(routes.configured_len(), K);
         assert_eq!(routes.len(), K);
         assert!((1..=K as u16).all(|n| routes.state(id(n)) == Some(RouteState::Candidate)));
+    }
+
+    #[test]
+    fn lookup_zero_capacity_leaves_candidates_unissued() {
+        let local = id(0);
+        let mut routes = RoutingTable::new(local, []);
+        for n in 1..=4 {
+            routes.promote_authenticated(id(n));
+        }
+        let mut lookup = IterativeLookup::new(local, local, routes.closest(local, K));
+
+        assert!(lookup.next_batch_up_to(0).is_empty());
+        assert!(lookup.queried.is_empty());
+        assert!(!lookup.is_finished());
+        assert_eq!(lookup.record_timeouts(&mut routes), 0);
+        assert!((1..=4).all(|n| routes.state(id(n)) == Some(RouteState::Verified)));
+        assert_eq!(lookup.next_batch(), vec![id(1), id(2), id(3)]);
+    }
+
+    #[test]
+    fn lookup_partial_capacity_never_times_out_unissued_peers() {
+        let local = id(0);
+        let mut routes = RoutingTable::new(local, []);
+        for n in 1..=5 {
+            routes.promote_authenticated(id(n));
+        }
+        let mut lookup = IterativeLookup::new(local, local, routes.closest(local, K));
+
+        assert_eq!(lookup.next_batch_up_to(1), vec![id(1)]);
+        assert!(lookup.next_batch_up_to(0).is_empty());
+        assert_eq!(lookup.queried, BTreeSet::from([id(1)]));
+        assert_eq!(lookup.record_timeouts(&mut routes), 1);
+        assert_eq!(routes.state(id(1)), None);
+        assert!((2..=5).all(|n| routes.state(id(n)) == Some(RouteState::Verified)));
+
+        assert_eq!(lookup.next_batch_up_to(2), vec![id(2), id(3)]);
+        assert!(lookup.record_authenticated_response(id(2), [], &mut routes));
+        assert_eq!(lookup.next_batch_up_to(1), vec![id(4)]);
+        assert!(!lookup.queried.contains(&id(5)));
+        assert!(!lookup.record_authenticated_response(id(5), [], &mut routes));
+        assert_eq!(lookup.record_timeouts(&mut routes), 2);
+        assert_eq!(routes.state(id(5)), Some(RouteState::Verified));
+        assert_eq!(lookup.next_batch_up_to(ALPHA), vec![id(5)]);
+    }
+
+    #[test]
+    fn lookup_shared_capacity_preserves_alpha_across_refills() {
+        let local = id(0);
+        let seeds = (1..=6).map(id).collect::<Vec<_>>();
+        let mut routes = RoutingTable::new(local, seeds.iter().copied());
+        let mut lookup = IterativeLookup::new(local, local, seeds);
+
+        assert_eq!(lookup.next_batch_up_to(2), vec![id(1), id(2)]);
+        assert_eq!(lookup.next_batch_up_to(usize::MAX), vec![id(3)]);
+        assert!(lookup.next_batch_up_to(1).is_empty());
+        assert!(lookup.record_authenticated_response(id(1), [], &mut routes));
+        assert_eq!(lookup.next_batch_up_to(1), vec![id(4)]);
+        assert!(lookup.next_batch_up_to(usize::MAX).is_empty());
+        assert!(lookup.record_authenticated_response(id(2), [], &mut routes));
+        assert_eq!(lookup.next_batch(), vec![id(5)]);
+        assert_eq!(lookup.record_timeouts(&mut routes), ALPHA);
+        assert_eq!(lookup.queried, (1..=5).map(id).collect::<BTreeSet<_>>());
+        assert_eq!(lookup.next_batch_up_to(usize::MAX), vec![id(6)]);
+    }
+
+    #[test]
+    fn lookup_shared_capacity_respects_remaining_query_budget() {
+        let local = id(0);
+        let seeds = [id(1), id(2), id(3)];
+        let mut routes = RoutingTable::new(local, seeds);
+        let mut lookup = IterativeLookup::new(local, local, seeds);
+        // Place the lookup at its hard budget boundary without thousands of
+        // preliminary request/completion pairs unrelated to this regression.
+        lookup
+            .queried
+            .extend((100..).map(id).take(MAX_LOOKUP_QUERIES - 1));
+
+        assert_eq!(lookup.next_batch_up_to(usize::MAX), vec![id(1)]);
+        assert_eq!(lookup.queried.len(), MAX_LOOKUP_QUERIES);
+        assert!(lookup.next_batch_up_to(usize::MAX).is_empty());
+        assert!(!lookup.is_finished());
+        assert!(!lookup.queried.contains(&id(2)));
+        assert!(!lookup.queried.contains(&id(3)));
+        assert_eq!(lookup.record_timeouts(&mut routes), 1);
+        assert!(lookup.is_finished());
     }
 
     #[test]

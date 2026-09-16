@@ -39,6 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Experiment with authenticated FIND_NODE progress feeding exact-H directory
+  and body discovery in a shared ALPHA window. Reserve routing capacity and a
+  final-replica directory sweep; bound and deduplicate speculative requests.
+  Expiry cancels only routing, while caller cancellation owns all work. No
+  wire, cache, authority, receive-limit or live-throughput claim changes.
+
 - Bound exact WANT/direct-root fetching to an experimental four-wide window
   within the current service class and shared deadline. Land each completed
   body through the unchanged serial hash/durability boundary; deadline expiry
