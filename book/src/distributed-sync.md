@@ -316,6 +316,25 @@ The provider then returns bytes, which the requester hashes and compares with
 H. A party which merely copied L therefore cannot learn H from a requester or
 successfully serve bytes for it.
 
+Exact body reception admits at most sixteen active body futures. They share one
+1 MiB scratch buffer, held only for a bounded ready-read batch and its local
+write, never while awaiting the network. Each batch also has a read-poll limit
+so a stream yielding tiny fragments cannot monopolize one executor turn.
+Received bytes grow a temporary file; one immutable mapping backs the completed
+`Bytes`. An idle or partial stream therefore does not block a healthy body from
+using the scratch buffer.
+
+The existing per-body bound is 64 GiB. A separate process-wide 64 GiB temporary
+backing budget accounts in rounded 1 MiB units, including partial files and
+completed `Bytes` until their last owner drops. Retaining many tiny completed
+bodies can exhaust this budget too. Body-slot and backing-budget exhaustion are
+local, immediate errors, not evidence against the provider: they preserve its
+pooled connection for a later attempt. Cancellation, truncation and other
+failures return their resources. Network waits remain inside the caller's
+deadline; synchronous local file writes cannot themselves be preempted by that
+async deadline. These limits neither guarantee throughput nor replace the
+final comparison of the received bytes' hash with H.
+
 Fetching neither asserts collection membership nor activates a commit. It does
 not consult C or READ(C), and creates a durable WANT only when the caller asks
 the `WantStore` to record `Blob(H)`. Provider leases are bounded soft state and
@@ -627,10 +646,14 @@ burst cannot all receive immediate service, sustained arrivals can outgrow the
 recent lane, and a slow request may consume its class's whole fetch deadline.
 Recent work never takes away the reserved regular turns, including revisits;
 it only accelerates a finite prefix of newly observed positive sources. The
-recent lane is newest-first and retains a source for at most 128 aligned words;
-regular quanta inspect at most 64 words. For a finite burst of A newcomers, the
-last first-service bound is O(A times the startup window), not constant time or
-round-robin service within that burst.
+recent lane chooses an unstarted source newest-first, then retains its remaining
+startup allowance across yields: later arrivals cannot displace that source's
+second word. The existing allowance is at most 128 aligned words, including any
+progress made in ordinary turns. EOF or local unavailability releases the
+startup position too. This continuation does not hold a collection lane or take
+an ordinary turn; regular quanta still inspect at most 64 words. For a finite
+burst of A newcomers, the last first-service bound is O(A times the startup
+window), not constant time or round-robin service within that burst.
 
 Full scans grant sustained quanta round-robin between the explicitly selected
 collections, each retaining the regular/recent walk above. A large selection's

@@ -6,8 +6,13 @@
 //! confirmation. Collection identity and collection authority do not
 //! participate in exact discovery or transfer.
 
-use anybytes::{ByteArea, Bytes};
+use anybytes::Bytes;
 use anyhow::{Result, anyhow};
+use std::future::poll_fn;
+use std::pin::Pin;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::Poll;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::bearer::{blob_locator, proof_matches, provider_proof, requester_proof};
@@ -33,10 +38,100 @@ const BLOB_UNAVAILABLE: u8 = 0x00;
 const BLOB_PROVIDER_PROOF: u8 = 0x01;
 
 pub type RawHash = [u8; 32];
-/// File-backed exact-transfer ceiling. Receives are serialized and land in a
-/// temporary mmap rather than allocating one in-memory `Vec` per route.
+/// File-backed exact-transfer ceiling. An idle body holds one admission slot,
+/// never the shared scratch buffer needed by another body's ready local work.
 pub(crate) const MAX_EXACT_BLOB_BYTES: u64 = 64 * 1024 * 1024 * 1024;
-static EXACT_BLOB_RECEIVES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+const EXACT_BLOB_CHUNK_BYTES: usize = 1 << 20;
+const EXACT_BLOB_POLLS_PER_CHUNK: usize = 128;
+const MAX_EXACT_BLOB_STORAGE_UNITS: usize =
+    (MAX_EXACT_BLOB_BYTES / EXACT_BLOB_CHUNK_BYTES as u64) as usize;
+// Bound live body futures and open receive files separately from byte storage.
+// Like the host's inbound request limit, sixteen is an admission policy, not a
+// throughput guarantee. Exhaustion is a local error, not an awaited FIFO queue.
+const MAX_EXACT_BLOB_RECEIVERS: usize = 16;
+static EXACT_BLOB_RECEIVES: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_EXACT_BLOB_RECEIVERS);
+static EXACT_BLOB_STORAGE_UNITS: AtomicUsize = AtomicUsize::new(0);
+static EXACT_BLOB_SCRATCH: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+/// Local saturation says nothing about the provider or its connection. Callers
+/// can distinguish it through anyhow::Error::is/downcast_ref without parsing text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExactBlobReceiveResourceError {
+    BodySlotsExhausted,
+    TemporaryStorageExhausted,
+}
+
+impl std::fmt::Display for ExactBlobReceiveResourceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::BodySlotsExhausted => "local exact-blob receive capacity exhausted",
+            Self::TemporaryStorageExhausted => {
+                "local exact-blob temporary storage capacity exhausted"
+            }
+        })
+    }
+}
+
+impl std::error::Error for ExactBlobReceiveResourceError {}
+
+/// Charge actual file growth, rounded up to a MiB per nonempty backing. An idle
+/// announcement reserves no disk; tiny completed mappings still cost one unit.
+/// The aggregate covers partial files AND returned mappings until their last
+/// owner drops. It bounds rounded logical lengths, not filesystem metadata,
+/// transport buffers, page-cache residency, or the caller's other allocations.
+/// A caller retaining returned Bytes (including cache-owned clones/slices) keeps
+/// its charge. Such retention can exhaust the budget until the owner is dropped;
+/// copying to an independent destination and dropping the receive releases it.
+#[derive(Default)]
+struct ExactBlobStorage {
+    units: usize,
+}
+
+impl ExactBlobStorage {
+    fn grow(&mut self, bytes: usize) -> Result<()> {
+        let units = bytes.div_ceil(EXACT_BLOB_CHUNK_BYTES);
+        let additional = units - self.units;
+        if additional == 0 {
+            return Ok(());
+        }
+        EXACT_BLOB_STORAGE_UNITS
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                used.checked_add(additional)
+                    .filter(|&next| next <= MAX_EXACT_BLOB_STORAGE_UNITS)
+            })
+            .map_err(|_| ExactBlobReceiveResourceError::TemporaryStorageExhausted)?;
+        self.units = units;
+        Ok(())
+    }
+}
+
+impl Drop for ExactBlobStorage {
+    fn drop(&mut self) {
+        EXACT_BLOB_STORAGE_UNITS.fetch_sub(self.units, Ordering::Relaxed);
+    }
+}
+
+struct ReceivedExactBlob {
+    // Declaration order matters: unmap the backing before returning its credit.
+    bytes: Bytes,
+    _storage: ExactBlobStorage,
+}
+
+// SAFETY: moving this owner only moves the immutable Bytes handle, never its
+// backing allocation. That handle and its storage charge remain owned together
+// through every clone/slice of the outer Bytes, until the final owner is dropped.
+unsafe impl anybytes::ByteSource for ReceivedExactBlob {
+    type Owner = Self;
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    fn get_owner(self) -> Self {
+        self
+    }
+}
 
 pub async fn send_u8<W: AsyncWrite + Unpin>(send: &mut W, value: u8) -> Result<()> {
     send.write_all(&[value])
@@ -325,32 +420,99 @@ pub(crate) async fn recv_exact_blob_body<R: AsyncRead + Unpin>(
     recv: &mut R,
     len: usize,
 ) -> Result<Bytes> {
-    let _permit = EXACT_BLOB_RECEIVES.acquire().await?;
-    let mut area = ByteArea::new().map_err(|error| anyhow!("create blob receive area: {error}"))?;
-    let mut remaining = len;
-    let mut chunk = vec![0_u8; remaining.min(1 << 20)];
-    while remaining != 0 {
-        let take = remaining.min(chunk.len());
-        recv.read_exact(&mut chunk[..take])
-            .await
-            .map_err(|error| anyhow!("recv blob body: {error}"))?;
-        {
-            let mut writer = area.sections();
-            let mut section = writer
-                .reserve::<u8>(take)
-                .map_err(|error| anyhow!("reserve file-backed blob response: {error}"))?;
-            section.as_mut_slice().copy_from_slice(&chunk[..take]);
-        }
-        remaining -= take;
+    if len as u64 > MAX_EXACT_BLOB_BYTES {
+        return Err(anyhow!(
+            "blob response exceeds the {MAX_EXACT_BLOB_BYTES}-byte transport bound"
+        ));
     }
-    area.freeze()
-        .map_err(|error| anyhow!("freeze blob receive area: {error}"))
+    if len == 0 {
+        return Ok(Bytes::default());
+    }
+    let _receiver = EXACT_BLOB_RECEIVES
+        .try_acquire()
+        .map_err(|_| ExactBlobReceiveResourceError::BodySlotsExhausted)?;
+    // On cancellation/error, reverse local drop order closes the file BEFORE
+    // its storage charge is returned. Success transfers the charge to Bytes.
+    let mut storage = ExactBlobStorage::default();
+    let mut file =
+        tempfile::tempfile().map_err(|error| anyhow!("create blob receive file: {error}"))?;
+    let mut remaining = len;
+    while remaining != 0 {
+        let take = poll_fn(|cx| {
+            // The mutex protects one process-wide scratch allocation only for
+            // a bounded batch of immediately-ready polls and one local write.
+            // AsyncRead::Pending consumes no bytes and registers its own wake;
+            // first stage any earlier Ready bytes, then release scratch. Do not
+            // replace this with read_exact, which retains partial bytes while
+            // waiting for more input.
+            let mut scratch = EXACT_BLOB_SCRATCH
+                .lock()
+                // Unwinding cannot invalidate the Vec or leave semantic state
+                // in scratch. Every poll starts with a fresh empty ReadBuf.
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            scratch.resize(EXACT_BLOB_CHUNK_BYTES, 0);
+            let take = remaining.min(scratch.len());
+            let mut buffer = tokio::io::ReadBuf::new(&mut scratch[..take]);
+            for _ in 0..EXACT_BLOB_POLLS_PER_CHUNK {
+                let before = buffer.filled().len();
+                match Pin::new(&mut *recv).poll_read(cx, &mut buffer) {
+                    Poll::Pending => {
+                        if buffer.filled().len() != before {
+                            return Poll::Ready(Err(anyhow!(
+                                "blob reader returned Pending after consuming bytes"
+                            )));
+                        }
+                        if before == 0 {
+                            return Poll::Pending;
+                        }
+                        break;
+                    }
+                    Poll::Ready(result) => {
+                        result.map_err(|error| anyhow!("recv blob body: {error}"))?;
+                        if buffer.filled().len() == before {
+                            return Poll::Ready(Err(anyhow!(
+                                "recv blob body: unexpected end of file"
+                            )));
+                        }
+                        if buffer.remaining() == 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+            let chunk = buffer.filled();
+            // Charge before extending the file. Refuse saturation rather than
+            // waiting while partial receives hold all the remaining capacity.
+            storage.grow(len - remaining + chunk.len())?;
+            // A ready read can be much smaller than a MiB. Append it without
+            // remapping the entire growing tail for every transport fragment.
+            std::io::Write::write_all(&mut file, chunk)
+                .map_err(|error| anyhow!("write file-backed blob response: {error}"))?;
+            Poll::Ready(Ok(chunk.len()))
+        })
+        .await?;
+        remaining -= take;
+        if remaining != 0 {
+            // Bound each ready-reader turn to one chunk and give cancellation
+            // and unrelated readers a scheduling point. Synchronous file I/O
+            // remains cooperative work, not a hard wall-clock timeout bound.
+            tokio::task::yield_now().await;
+        }
+    }
+    // SAFETY: this fresh anonymous file has no other writer or mutable mapping,
+    // and this function never writes it again. The immutable map outlives the
+    // file descriptor and is owned with the corresponding storage charge.
+    let bytes = unsafe { Bytes::map_file(&file) }
+        .map_err(|error| anyhow!("map completed blob response: {error}"))?;
+    Ok(Bytes::from_source(ReceivedExactBlob {
+        bytes,
+        _storage: storage,
+    }))
 }
 
-/// Independent test runtimes must not time each other's shared receive permit.
-/// A paused Tokio clock advances while a permit's owner on another test thread
-/// is still running. Hold this before exercising any body receive in a unit test;
-/// contention within that test's own runtime still uses the production semaphore.
+/// Independent test runtimes must not exhaust each other's process-wide receive
+/// budgets. Hold this before exercising a body receive in a unit test; contention
+/// within that test's own runtime still uses the production budgets.
 #[cfg(test)]
 pub(crate) fn exact_blob_receive_test_guard() -> std::sync::MutexGuard<'static, ()> {
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -362,10 +524,426 @@ pub(crate) fn exact_blob_receive_test_guard() -> std::sync::MutexGuard<'static, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::task::Context;
     use tokio::io::{AsyncReadExt, duplex, split};
+
+    struct Fragmented<'a> {
+        bytes: &'a [u8],
+        fragment: usize,
+        stall: bool,
+        pause: bool,
+    }
+
+    impl AsyncRead for Fragmented<'_> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.bytes.is_empty() && self.stall {
+                return Poll::Pending;
+            }
+            if self.pause {
+                self.pause = false;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            let take = self.bytes.len().min(buffer.remaining()).min(self.fragment);
+            buffer.put_slice(&self.bytes[..take]);
+            self.bytes = &self.bytes[take..];
+            self.pause = true;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn storage_units() -> usize {
+        EXACT_BLOB_STORAGE_UNITS.load(Ordering::Relaxed)
+    }
+
+    #[tokio::test]
+    async fn premature_eof_after_a_ready_prefix_is_not_polled_again() {
+        struct PrefixThenEof<'a>(&'a AtomicUsize);
+
+        impl AsyncRead for PrefixThenEof<'_> {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buffer: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                match self.0.fetch_add(1, Ordering::Relaxed) {
+                    0 => buffer.put_slice(b"ab"),
+                    1 => {}
+                    _ => panic!("body reader was polled after premature EOF"),
+                }
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let _guard = exact_blob_receive_test_guard();
+        let polls = AtomicUsize::new(0);
+        let error = recv_exact_blob_body(&mut PrefixThenEof(&polls), 4)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("unexpected end of file"));
+        assert_eq!(polls.load(Ordering::Relaxed), 2);
+        assert_eq!(storage_units(), 0);
+        assert_eq!(
+            EXACT_BLOB_RECEIVES.available_permits(),
+            MAX_EXACT_BLOB_RECEIVERS
+        );
+    }
+
+    #[tokio::test]
+    async fn immediately_ready_fragments_yield_at_the_poll_budget() {
+        struct ReadyBytes<'a>(&'a AtomicUsize);
+
+        impl AsyncRead for ReadyBytes<'_> {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buffer: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                buffer.put_slice(b"x");
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let _guard = exact_blob_receive_test_guard();
+        let polls = AtomicUsize::new(0);
+        let mut reader = ReadyBytes(&polls);
+        let len = 2 * EXACT_BLOB_POLLS_PER_CHUNK + 1;
+        let mut body = Box::pin(recv_exact_blob_body(&mut reader, len));
+        assert!(futures::poll!(&mut body).is_pending());
+        assert_eq!(polls.load(Ordering::Relaxed), EXACT_BLOB_POLLS_PER_CHUNK);
+        assert!(futures::poll!(&mut body).is_pending());
+        assert_eq!(
+            polls.load(Ordering::Relaxed),
+            2 * EXACT_BLOB_POLLS_PER_CHUNK
+        );
+        let bytes = match futures::poll!(&mut body) {
+            Poll::Ready(Ok(bytes)) => bytes,
+            other => panic!("final byte must complete the receive: {other:?}"),
+        };
+        assert_eq!(bytes.as_ref(), vec![b'x'; len]);
+        assert_eq!(polls.load(Ordering::Relaxed), len);
+        drop(body);
+        drop(bytes);
+        assert_eq!(storage_units(), 0);
+    }
+
+    #[tokio::test]
+    async fn storage_saturation_releases_an_already_staged_prefix() {
+        let _guard = exact_blob_receive_test_guard();
+        // Reserve accounting only, leaving room for precisely one real chunk.
+        let mut occupied = ExactBlobStorage::default();
+        occupied
+            .grow((MAX_EXACT_BLOB_STORAGE_UNITS - 1) * EXACT_BLOB_CHUNK_BYTES)
+            .unwrap();
+        let input = vec![b'x'; EXACT_BLOB_CHUNK_BYTES + 1];
+        let mut reader = input.as_slice();
+        let mut body = Box::pin(recv_exact_blob_body(&mut reader, input.len()));
+        assert!(futures::poll!(&mut body).is_pending());
+        assert_eq!(storage_units(), MAX_EXACT_BLOB_STORAGE_UNITS);
+        let error = match futures::poll!(&mut body) {
+            Poll::Ready(Err(error)) => error,
+            other => panic!("growth must fail without waiting for credit: {other:?}"),
+        };
+        assert_eq!(
+            error.downcast_ref::<ExactBlobReceiveResourceError>(),
+            Some(&ExactBlobReceiveResourceError::TemporaryStorageExhausted)
+        );
+        drop(body);
+        assert_eq!(storage_units(), MAX_EXACT_BLOB_STORAGE_UNITS - 1);
+        drop(occupied);
+        assert_eq!(storage_units(), 0);
+        assert_eq!(
+            EXACT_BLOB_RECEIVES.available_permits(),
+            MAX_EXACT_BLOB_RECEIVERS
+        );
+    }
+
+    #[tokio::test]
+    async fn panicking_reader_releases_budgets_and_does_not_disable_scratch() {
+        use futures::FutureExt as _;
+
+        struct PanickingReader;
+        impl AsyncRead for PanickingReader {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buffer: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                panic!("injected local reader panic");
+            }
+        }
+
+        let _guard = exact_blob_receive_test_guard();
+        assert!(
+            std::panic::AssertUnwindSafe(recv_exact_blob_body(&mut PanickingReader, 1))
+                .catch_unwind()
+                .await
+                .is_err()
+        );
+        assert_eq!(storage_units(), 0);
+        let bytes = recv_exact_blob_body(&mut b"ok".as_slice(), 2)
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), b"ok");
+        drop(bytes);
+        assert_eq!(storage_units(), 0);
+        assert_eq!(
+            EXACT_BLOB_RECEIVES.available_permits(),
+            MAX_EXACT_BLOB_RECEIVERS
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_pending_reader_is_rejected_without_losing_resource_credit() {
+        struct InvalidPendingReader;
+        impl AsyncRead for InvalidPendingReader {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buffer: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                buffer.put_slice(b"x");
+                Poll::Pending
+            }
+        }
+
+        let _guard = exact_blob_receive_test_guard();
+        let error = recv_exact_blob_body(&mut InvalidPendingReader, 1)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Pending after consuming bytes"));
+        assert_eq!(storage_units(), 0);
+        assert_eq!(
+            EXACT_BLOB_RECEIVES.available_permits(),
+            MAX_EXACT_BLOB_RECEIVERS
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_and_partial_bodies_do_not_block_a_ready_body() {
+        let _guard = exact_blob_receive_test_guard();
+        assert_eq!(storage_units(), 0);
+        for prefix in [b"".as_slice(), b"partial".as_slice()] {
+            let mut reader = Fragmented {
+                bytes: prefix,
+                fragment: EXACT_BLOB_CHUNK_BYTES,
+                stall: true,
+                pause: false,
+            };
+            let mut slow = Box::pin(recv_exact_blob_body(&mut reader, 1 << 30));
+            // The second poll passes any yield after the partial write and
+            // reaches network Pending. No timer controls this interleaving.
+            assert!(futures::poll!(&mut slow).is_pending());
+            assert!(futures::poll!(&mut slow).is_pending());
+            assert_eq!(storage_units(), usize::from(!prefix.is_empty()));
+            let ready = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                recv_exact_blob_body(&mut b"ready".as_slice(), 5),
+            )
+            .await
+            .expect("an idle network body must not own the shared scratch")
+            .unwrap();
+            assert_eq!(ready.as_ref(), b"ready");
+            drop(ready);
+            drop(slow);
+            assert_eq!(
+                storage_units(),
+                0,
+                "cancellation returns partial-file credit"
+            );
+            assert_eq!(
+                EXACT_BLOB_RECEIVES.available_permits(),
+                MAX_EXACT_BLOB_RECEIVERS
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fragmented_body_preserves_partial_reads_across_pending() {
+        let _guard = exact_blob_receive_test_guard();
+        for (len, fragment) in [(4099, 7), (EXACT_BLOB_CHUNK_BYTES + 17, 16384)] {
+            let input: Vec<_> = (0..len).map(|index| (index % 251) as u8).collect();
+            let mut reader = Fragmented {
+                bytes: &input,
+                fragment,
+                stall: false,
+                pause: false,
+            };
+            let bytes = recv_exact_blob_body(&mut reader, len).await.unwrap();
+            assert_eq!(bytes.as_ref(), input);
+            assert_eq!(storage_units(), len.div_ceil(EXACT_BLOB_CHUNK_BYTES));
+            drop(bytes);
+            assert_eq!(storage_units(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_slices_keep_storage_credit_and_saturation_fails_without_waiting() {
+        let _guard = exact_blob_receive_test_guard();
+        assert_eq!(storage_units(), 0);
+        // Reserve accounting units only: this test never allocates a huge file.
+        let mut occupied = ExactBlobStorage::default();
+        occupied
+            .grow((MAX_EXACT_BLOB_STORAGE_UNITS - 1) * EXACT_BLOB_CHUNK_BYTES)
+            .unwrap();
+        let bytes = recv_exact_blob_body(&mut b"ready".as_slice(), 5)
+            .await
+            .unwrap();
+        let retained = bytes.slice(1..3);
+        drop(bytes);
+        assert_eq!(storage_units(), MAX_EXACT_BLOB_STORAGE_UNITS);
+        let result = recv_exact_blob_body(&mut b"x".as_slice(), 1).await;
+        assert_eq!(
+            result
+                .unwrap_err()
+                .downcast_ref::<ExactBlobReceiveResourceError>(),
+            Some(&ExactBlobReceiveResourceError::TemporaryStorageExhausted)
+        );
+        assert_eq!(retained.as_ref(), b"ea");
+        drop(retained);
+        assert_eq!(storage_units(), MAX_EXACT_BLOB_STORAGE_UNITS - 1);
+        drop(occupied);
+        assert_eq!(storage_units(), 0);
+        assert_eq!(
+            EXACT_BLOB_RECEIVES.available_permits(),
+            MAX_EXACT_BLOB_RECEIVERS
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_body_admission_is_bounded_and_cancellation_reopens_it() {
+        let _guard = exact_blob_receive_test_guard();
+        let mut readers: Vec<_> = (0..MAX_EXACT_BLOB_RECEIVERS)
+            .map(|_| Fragmented {
+                bytes: b"",
+                fragment: 1,
+                stall: true,
+                pause: false,
+            })
+            .collect();
+        let mut bodies: Vec<_> = readers
+            .iter_mut()
+            .map(|reader| Box::pin(recv_exact_blob_body(reader, 1)))
+            .collect();
+        for body in &mut bodies {
+            assert!(futures::poll!(body).is_pending());
+        }
+        assert_eq!(storage_units(), 0, "an announcement alone reserves no disk");
+        assert_eq!(EXACT_BLOB_RECEIVES.available_permits(), 0);
+        let result = recv_exact_blob_body(&mut b"x".as_slice(), 1).await;
+        assert_eq!(
+            result
+                .unwrap_err()
+                .downcast_ref::<ExactBlobReceiveResourceError>(),
+            Some(&ExactBlobReceiveResourceError::BodySlotsExhausted)
+        );
+        drop(bodies);
+        let bytes = recv_exact_blob_body(&mut b"x".as_slice(), 1).await.unwrap();
+        assert_eq!(bytes.as_ref(), b"x");
+        drop(bytes);
+        assert_eq!(storage_units(), 0);
+        assert_eq!(
+            EXACT_BLOB_RECEIVES.available_permits(),
+            MAX_EXACT_BLOB_RECEIVERS
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_body_and_trailing_response_release_storage() {
+        let _guard = exact_blob_receive_test_guard();
+        assert!(
+            recv_exact_blob_body(&mut b"short".as_slice(), 9)
+                .await
+                .is_err()
+        );
+        assert_eq!(storage_units(), 0);
+        let mut response = 5_u64.to_be_bytes().to_vec();
+        response.extend_from_slice(b"short!");
+        assert!(recv_blob_response(&mut response.as_slice()).await.is_err());
+        assert_eq!(storage_units(), 0);
+        assert_eq!(
+            EXACT_BLOB_RECEIVES.available_permits(),
+            MAX_EXACT_BLOB_RECEIVERS
+        );
+        assert_eq!(
+            recv_exact_blob_body(&mut b"".as_slice(), 0)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(storage_units(), 0);
+    }
+
+    #[cfg(feature = "sim")]
+    #[tokio::test(start_paused = true)]
+    async fn stalled_body_still_obeys_the_callers_deadline() {
+        let _guard = exact_blob_receive_test_guard();
+        let mut reader = Fragmented {
+            bytes: b"partial",
+            fragment: 7,
+            stall: true,
+            pause: false,
+        };
+        let budget = std::time::Duration::from_secs(10);
+        let started = tokio::time::Instant::now();
+        assert!(
+            tokio::time::timeout(budget, recv_exact_blob_body(&mut reader, 100))
+                .await
+                .is_err()
+        );
+        assert_eq!(started.elapsed(), budget);
+        assert_eq!(storage_units(), 0);
+        assert_eq!(
+            EXACT_BLOB_RECEIVES.available_permits(),
+            MAX_EXACT_BLOB_RECEIVERS
+        );
+    }
 
     fn handle(bytes: &[u8]) -> RawHash {
         *blake3::hash(bytes).as_bytes()
+    }
+
+    #[tokio::test]
+    async fn pile_put_releases_receive_credit_without_losing_stored_bytes() {
+        use triblespace_core::blob::encodings::UnknownBlob;
+        use triblespace_core::repo::pile::Pile;
+        use triblespace_core::repo::{BlobStoreGet, BlobStorePut, SnapshotSource};
+
+        let _guard = exact_blob_receive_test_guard();
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let mut pile = Pile::open(path.path()).unwrap();
+        let content = b"independent pile backing";
+        let bytes = recv_exact_blob_body(&mut content.as_slice(), content.len())
+            .await
+            .unwrap();
+        assert_eq!(storage_units(), 1);
+        // This is PeerSnapshot's actual boundary: move the network Bytes into
+        // put, then get the stored bytes from a new destination snapshot.
+        let stored = pile.put::<UnknownBlob, _>(bytes).unwrap();
+        assert_eq!(storage_units(), 0);
+        let snapshot = pile.snapshot().unwrap();
+        let reread: Bytes = snapshot.get(stored).unwrap();
+        assert_eq!(reread.as_ref(), content);
+        assert_eq!(storage_units(), 0);
+
+        // An independent caller-held clone still owns receive credit even
+        // when Pile's duplicate-blob path has already consumed its argument.
+        let bytes = recv_exact_blob_body(&mut content.as_slice(), content.len())
+            .await
+            .unwrap();
+        let retained = bytes.clone();
+        assert_eq!(pile.put::<UnknownBlob, _>(bytes).unwrap(), stored);
+        assert_eq!(storage_units(), 1);
+        drop(retained);
+        assert_eq!(storage_units(), 0);
+        pile.close().unwrap();
+        assert_eq!(reread.as_ref(), content);
     }
 
     #[tokio::test]

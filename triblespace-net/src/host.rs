@@ -2100,7 +2100,11 @@ impl<T: Transport> ProviderClient<T> {
             }
             Ok(None) => Ok(None),
             Err(error) => {
-                pool_invalidate(&self.pool, peer, &connection.entry);
+                // Local receive saturation says nothing about the authenticated
+                // provider or this connection. Keep it warm for a later retry.
+                if !error.is::<crate::protocol::ExactBlobReceiveResourceError>() {
+                    pool_invalidate(&self.pool, peer, &connection.entry);
+                }
                 Err(error)
             }
         }

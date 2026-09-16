@@ -768,8 +768,9 @@ impl BlobSnapshotReader for SignallingBlobReader {
 #[tokio::test(start_paused = true)]
 async fn mid_transfer_crash_rejects_old_bytes_after_restart_and_allows_fresh_retry() {
     let _guard = crate::protocol::exact_blob_receive_test_guard();
-    // Larger than SimNet's bounded pipe, so the authenticated server must
-    // block partway through the body while this test owns the receive permit.
+    // Larger than SimNet's bounded pipe, so the authenticated server yields
+    // during the body. The signalled read gates this crash, not a global
+    // receive permit which would also block unrelated transfers.
     let mut fixture = Fixture::with_bytes(false, Bytes::from_source(vec![b'x'; 8 * 1024 * 1024]));
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     {
@@ -780,17 +781,13 @@ async fn mid_transfer_crash_rejects_old_bytes_after_restart_and_allows_fresh_ret
             started: Mutex::new(Some(started_tx)),
         });
     }
-    let (mut permit_writer, mut permit_reader) = tokio::io::duplex(1);
-    let held_receive = crate::protocol::recv_exact_blob_body(&mut permit_reader, 1);
-    tokio::pin!(held_receive);
-    assert!(futures::poll!(&mut held_receive).is_pending());
     let sender = fixture.sender.clone();
     let hash = fixture.hash;
     let fetch =
         tokio::spawn(async move { sender.fetch_blob(hash, INTERACTIVE_FETCH_DEADLINE).await });
     // get_blob runs after both bearer proofs. The server continues until pipe
     // backpressure yields; no timer or arbitrary scheduler-yield count gates
-    // this fault. The client cannot consume body bytes while the permit is held.
+    // this fault. Receiving may have started, but must not have completed.
     started_rx.await.unwrap();
     assert!(!fetch.is_finished());
     assert_eq!(fixture.blob_reads.load(Ordering::Relaxed), 1);
@@ -809,8 +806,6 @@ async fn mid_transfer_crash_rejects_old_bytes_after_restart_and_allows_fresh_ret
     .unwrap();
     let mut restarted = RecoveryNode::new(&fixture.net, &provider_key, Some(Arc::new(restored)));
     let failed_at = tokio::time::Instant::now();
-    permit_writer.write_all(b"x").await.unwrap();
-    held_receive.await.unwrap();
     assert!(
         fetch.await.unwrap().is_none(),
         "old connection supplied bytes after restart"
@@ -1542,7 +1537,7 @@ async fn stalled_bootstrap_still_exhausts_the_one_foreground_deadline() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn exact_receive_contention_remains_inside_the_caller_deadline() {
+async fn idle_exact_receive_does_not_block_an_independent_healthy_fetch() {
     use tokio::io::AsyncWriteExt as _;
 
     let _guard = crate::protocol::exact_blob_receive_test_guard();
@@ -1550,18 +1545,20 @@ async fn exact_receive_contention_remains_inside_the_caller_deadline() {
     let (mut writer, mut reader) = tokio::io::duplex(1);
     let blocked = crate::protocol::recv_exact_blob_body(&mut reader, 1);
     tokio::pin!(blocked);
-    // The receive owns the process-wide permit, then waits for its one byte.
+    // This admitted receive waits indefinitely for its one byte, but retains
+    // neither the process scratch buffer nor another receive's progress.
     assert!(futures::poll!(&mut blocked).is_pending());
 
     let started = tokio::time::Instant::now();
-    assert!(
+    assert_eq!(
         fixture
             .sender
             .fetch_blob(fixture.hash, INTERACTIVE_FETCH_DEADLINE)
-            .await
-            .is_none()
+            .await,
+        Some(fixture.bytes.clone()),
     );
-    assert_eq!(started.elapsed(), INTERACTIVE_FETCH_DEADLINE);
+    assert_eq!(started.elapsed(), Duration::from_secs(4));
+    assert!(futures::poll!(&mut blocked).is_pending());
     assert_eq!(
         fixture
             .client
@@ -1570,7 +1567,7 @@ async fn exact_receive_contention_remains_inside_the_caller_deadline() {
             .unwrap()
             .state(fixture.provider),
         Some(crate::routing::RouteState::Verified),
-        "bootstrap authenticated before waiting for the local receive slot"
+        "bootstrap and healthy transfer completed while the other body stalled"
     );
 
     writer.write_all(b"x").await.unwrap();
@@ -1584,5 +1581,67 @@ async fn exact_receive_contention_remains_inside_the_caller_deadline() {
         Some(fixture.bytes.clone()),
     );
     assert_eq!(started.elapsed(), Duration::ZERO);
+    fixture.assert_no_control_effects();
+}
+
+#[tokio::test(start_paused = true)]
+async fn local_receive_saturation_preserves_the_provider_connection() {
+    use crate::protocol::ExactBlobReceiveResourceError;
+
+    let _guard = crate::protocol::exact_blob_receive_test_guard();
+    let mut fixture = Fixture::new(true);
+    let mut writers = Vec::new();
+    let mut stalled = FuturesUnordered::new();
+    // Exercise the fixed sixteen-body admission bound with actual receives,
+    // not a mock error injected after the provider operation.
+    for _ in 0..16 {
+        let (writer, mut reader) = tokio::io::duplex(1);
+        writers.push(writer);
+        stalled.push(async move { crate::protocol::recv_exact_blob_body(&mut reader, 1).await });
+    }
+    assert!(futures::poll!(stalled.next()).is_pending());
+    let error = fixture
+        .client
+        .fetch_from_provider(fixture.hash, fixture.provider)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<ExactBlobReceiveResourceError>(),
+        Some(&ExactBlobReceiveResourceError::BodySlotsExhausted)
+    );
+    assert!(
+        fixture
+            .client
+            .pool
+            .lock()
+            .unwrap()
+            .entries
+            .contains_key(&fixture.provider)
+    );
+    assert_eq!(
+        fixture
+            .net
+            .dial_count(fixture.client.my_id, fixture.provider),
+        1
+    );
+
+    drop(stalled);
+    drop(writers);
+    let started = tokio::time::Instant::now();
+    assert_eq!(
+        fixture
+            .client
+            .fetch_from_provider(fixture.hash, fixture.provider)
+            .await
+            .unwrap(),
+        Some(fixture.bytes.clone()),
+    );
+    assert_eq!(started.elapsed(), Duration::ZERO);
+    assert_eq!(
+        fixture
+            .net
+            .dial_count(fixture.client.my_id, fixture.provider),
+        1
+    );
     fixture.assert_no_control_effects();
 }

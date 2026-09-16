@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Keep an already-started recursive hydration startup window across later
+  root arrivals, so its next word does not repeatedly lose priority. Enforce
+  its 128-word allowance even for partial local-word quanta; completion or
+  local unavailability releases it. Ordinary turns, collection rotation and
+  global fetch limits are unchanged.
+
+- Exact-body reception no longer holds shared scratch capacity across idle
+  network waits. Independent bodies use one 1 MiB scratch buffer, at most
+  sixteen admitted body attempts, and a 64 GiB rounded temporary-storage budget
+  retained through the last returned byte owner. Configured receive-limit
+  exhaustion fails without a queued permit or discarding the authenticated
+  provider connection; caller deadlines, bearer proofs and hashes are unchanged.
+
 - Start exact-H blob GETs from verified provider hints while other directory
   replies remain pending. Directory and provider operations share the existing
   three request slots and at most 64 distinct provider attempts. Transient
