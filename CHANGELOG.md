@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Rotate hydration service between eligible WANT, new direct-root, ordinary
+  direct-root, and recursive-scan classes. First-attempt priority does not renew
+  on re-observation; frozen ordinary rounds preserve old-demand service under
+  arrivals. Retry deadlines and exact-H acquisition remain unchanged. Service
+  uses whole fetch-budget quanta, not a low-latency or completion guarantee.
+
 - Separate target-first collection reading from lazy exact support queries.
   Accepted target endorsements remain readable before their historical source
   records arrive. Collection observations track their consulted dependencies

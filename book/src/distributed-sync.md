@@ -569,9 +569,26 @@ work, separately from Peer activation and collection authorization:
 The selection is explicit: possessing READ authority does not subscribe a node
 to fetching another person's collection. Shallow hydration follows structurally
 valid records, including signed but WRITE-inert commits; obtaining bytes does
-not admit their claims. Exact WANTs and direct roots run before speculative
-recursive reads, sharing one time budget. The walker retains only positively
-reached `(root, blob)` pairs and their resumable offsets in a PATCH. Frozen
+not admit their claims. One eligible service class receives each tick's existing
+fetch-budget quantum: explicit WANTs, newly observed direct roots, ordinary
+direct roots, then recursive scanning. The turn is retained before awaiting
+network work. Empty classes and classes whose entire work is in retry backoff
+are skipped without taking a quantum. These are whole-class turns, not extra
+concurrency or shorter per-request deadlines: with the default budget, several
+30-second quanta plus the caller's tick intervals may pass before a fresh root
+or its body receives service. There is no low-latency guarantee.
+
+A missing root gets one first-attempt priority when newly observed, newest
+observation first; repeated observations do not renew it. Ordinary WANT/root
+rounds freeze an observation-generation cutoff and retain their hash cursor, so
+continued arrivals cannot indefinitely lengthen a round ahead of old demand.
+The existing exact-handle retry map holds those scheduling fields only for
+positively named missing roots/WANTs. Failed attempts retain the same shared
+exponential backoff regardless of the class that attempted them. A pending
+direct-root backlog cannot consume recursive scanning's reserved turn.
+
+The walker retains only positively reached `(root, blob)` pairs and their
+resumable offsets in a PATCH. Frozen
 regular rounds grant one bounded quantum per source, rather than draining one
 large blob before serving another. An alternating recent-positive lane gives
 new arrivals a bounded startup window; the lane turn survives tick and fetch
@@ -585,7 +602,7 @@ that lies outside the selected collection roots.
 
 This is service fairness, not a wall-clock hydration guarantee. A large initial
 burst cannot all receive immediate service, sustained arrivals can outgrow the
-recent lane, and exact WANT/root work may consume the shared fetch deadline.
+recent lane, and a slow request may consume its class's whole fetch deadline.
 Recent work never takes away the reserved regular turns, including revisits;
 it only accelerates a finite prefix of newly observed positive sources. The
 recent lane is newest-first and retains a source for at most 128 aligned words;
@@ -605,7 +622,7 @@ selecting collections, but physical acquisition and per-tick negative-request
 deduplication remain shared. This trades duplicate traversal of genuinely shared
 closures for sustained service without an arbitrary root owner. The selection's
 own large closure, resident-child expansion, provider failures and exhausted
-exact-demand budgets still prevent a general finite hydration deadline.
+class quanta still prevent a general finite hydration deadline.
 
 When seeding a full scan, ordinary resident record roots are observed before
 explicitly selected collection descriptors. A descriptor already present in
@@ -613,8 +630,8 @@ both that root set and the durable resident set therefore receives its finite
 recent startup window ahead of the bulk inventory. This is ordering only:
 selection alone never invents a closure root, repeated snapshots do not reset
 offsets or requeue descriptors, and regular turns still progress. Many selected
-descriptors, later arrivals, unavailable providers, and exhausted exact-demand
-budgets can still delay a descriptor child; no special blob authorization or
+descriptors, later arrivals, unavailable providers, and exhausted scan quanta
+can still delay a descriptor child; no special blob authorization or
 publisher priority is implied.
 
 A producer can maintain an ordinary `ReferenceSummaryBlob` collection to make

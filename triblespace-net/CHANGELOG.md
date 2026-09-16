@@ -12,8 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add opt-in demand, shallow, and full acquisition policy to the external
   `Reconciler`. Shallow hydrates selected structural collection-record roots;
   full streams their aligned recursive references with bounded speculative
-  work and fair rescan passes. Explicit WANTs stay first, implicit dependencies
-  create no WANT records, and all bytes use the unchanged H-only bearer path.
+  work and fair rescan passes. Explicit WANTs have their own service turn;
+  implicit dependencies create no WANT records, and all bytes use the unchanged
+  H-only bearer path.
   Proof possession alone never selects a collection or grants semantic admission.
 
 - Add opt-in `triblespace_net::handoff` tracing across Iroh acceptance,
@@ -55,6 +56,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   artifacts are not mirrored.
 
 ### Fixed
+
+- Reserve whole fetch-budget turns for eligible WANTs, newly observed missing
+  direct roots, ordinary direct-root rounds, and recursive scans. An existing
+  root backlog cannot consume every recursive-scan turn; new roots get one
+  first-attempt priority without postponing frozen ordinary rounds indefinitely.
+  Re-observation does not renew priority, and all-backed-off classes are skipped.
+  The unchanged request deadline means several 30-second quanta may still pass
+  before a fresh root or nested body gets service; this is not a latency bound.
 
 - Keep missing subordinate-resource descriptors from hot-looping AUTH repair
   or starving independent collection records. AUTH retains an explicit

@@ -10,7 +10,6 @@
 //! Optional shallow/full hydration is local acquisition policy over selected
 //! structural records, not semantic admission or another Peer protocol.
 
-use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
@@ -75,8 +74,92 @@ pub struct ReconcileStats {
 }
 
 struct WantState {
-    last_attempt: crate::clock::Mono,
+    last_attempt: Option<crate::clock::Mono>,
     backoff: Duration,
+    wanted_since: Option<u64>,
+    root_since: Option<u64>,
+    first_root_attempt: bool,
+}
+
+impl WantState {
+    fn new() -> Self {
+        Self {
+            last_attempt: None,
+            backoff: Duration::ZERO,
+            wanted_since: None,
+            root_since: None,
+            first_root_attempt: false,
+        }
+    }
+
+    fn due(&self, now: crate::clock::Mono) -> bool {
+        self.last_attempt
+            .is_none_or(|last| now.duration_since(last) >= self.backoff)
+    }
+}
+
+/// An ordinary round has finite eligibility even while new demand arrives.
+/// Only scheduling cutoffs/cursors are retained, not a second root inventory.
+#[derive(Default)]
+struct ExactRound {
+    generation: u64,
+    after: Option<RawHash>,
+}
+
+impl ExactRound {
+    fn candidates(
+        &mut self,
+        handles: &BTreeSet<RawHash>,
+        states: &HashMap<RawHash, WantState>,
+        generation: u64,
+        now: crate::clock::Mono,
+        wanted: bool,
+    ) -> Vec<RawHash> {
+        let eligible = |round: &Self| {
+            handles
+                .iter()
+                .copied()
+                .filter(|handle| round.after.is_none_or(|after| *handle > after))
+                .filter(|handle| {
+                    states.get(handle).is_some_and(|state| {
+                        let seen = if wanted {
+                            state.wanted_since
+                        } else {
+                            state.root_since
+                        };
+                        seen.is_some_and(|seen| seen <= round.generation) && state.due(now)
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let candidates = eligible(self);
+        if !candidates.is_empty() {
+            return candidates;
+        }
+        self.generation = generation;
+        self.after = None;
+        eligible(self)
+    }
+}
+
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+enum ServiceTurn {
+    #[default]
+    Wants,
+    FreshRoots,
+    Roots,
+    Scan,
+}
+
+impl ServiceTurn {
+    fn next(self) -> Self {
+        match self {
+            Self::Wants => Self::FreshRoots,
+            Self::FreshRoots => Self::Roots,
+            Self::Roots => Self::Scan,
+            Self::Scan => Self::Wants,
+        }
+    }
 }
 
 /// Retry/traversal state only. Durable demand and all answers remain in the store.
@@ -88,8 +171,10 @@ pub struct Reconciler {
     fetch_budget: Duration,
     mode: ReplicationMode,
     collections: BTreeSet<CollectionRecordSelector>,
-    last_want_attempt: Option<RawHash>,
-    last_root_attempt: Option<RawHash>,
+    observation_generation: u64,
+    want_round: ExactRound,
+    root_round: ExactRound,
+    next_service: ServiceTurn,
     scan: SelectionScans,
 }
 
@@ -125,8 +210,10 @@ impl Reconciler {
             fetch_budget: RECONCILE_FETCH_DEADLINE,
             mode: ReplicationMode::Demand,
             collections: BTreeSet::new(),
-            last_want_attempt: None,
-            last_root_attempt: None,
+            observation_generation: 0,
+            want_round: ExactRound::default(),
+            root_round: ExactRound::default(),
+            next_service: ServiceTurn::default(),
             scan: SelectionScans::default(),
         }
     }
@@ -154,8 +241,111 @@ impl Reconciler {
             .map(CollectionRecordSelector::Collection)
             .collect();
         self.scan = SelectionScans::new(self.collections.iter().copied());
-        self.last_root_attempt = None;
+        self.root_round = ExactRound::default();
+        self.next_service = ServiceTurn::default();
+        for state in self.states.values_mut() {
+            state.root_since = None;
+            state.first_root_attempt = false;
+        }
         self
+    }
+
+    fn observe_missing(&mut self, wanted: &BTreeSet<RawHash>, roots: &BTreeSet<RawHash>) {
+        self.observation_generation = self
+            .observation_generation
+            .checked_add(1)
+            .expect("reconciler observation generation exhausted");
+        for handle in wanted.union(roots) {
+            if self.durable_blob_answers.contains(handle) {
+                continue;
+            }
+            let state = self.states.entry(*handle).or_insert_with(WantState::new);
+            if wanted.contains(handle) {
+                state
+                    .wanted_since
+                    .get_or_insert(self.observation_generation);
+            }
+            if roots.contains(handle) && state.root_since.is_none() {
+                state.root_since = Some(self.observation_generation);
+                state.first_root_attempt = true;
+            }
+        }
+    }
+
+    /// Grant one eligible class a fetch-budget quantum. The next class is
+    /// retained before any await, so even a request using the whole deadline
+    /// cannot repeatedly take scanning's or an older exact request's turn.
+    /// Empty or wholly backed-off classes borrow no time. A request keeps the
+    /// remaining existing budget; fairness does not divide its DHT/provider
+    /// deadline into smaller sub-budgets. Several whole quanta may therefore
+    /// pass before a fresh root or its descendant gets a turn.
+    fn next_work(
+        &mut self,
+        wanted: &BTreeSet<RawHash>,
+        roots: &BTreeSet<RawHash>,
+        now: crate::clock::Mono,
+    ) -> Option<(ServiceTurn, Vec<RawHash>)> {
+        for _ in 0..4 {
+            let turn = self.next_service;
+            self.next_service = turn.next();
+            let candidates = match turn {
+                ServiceTurn::Wants => self.want_round.candidates(
+                    wanted,
+                    &self.states,
+                    self.observation_generation,
+                    now,
+                    true,
+                ),
+                ServiceTurn::FreshRoots => {
+                    let mut candidates: Vec<_> = roots
+                        .iter()
+                        .copied()
+                        .filter(|handle| {
+                            self.states
+                                .get(handle)
+                                .is_some_and(|state| state.first_root_attempt && state.due(now))
+                        })
+                        .collect();
+                    // A newly observed cohort gets its bounded first attempt
+                    // ahead of an old startup burst. Regular frozen rounds
+                    // still serve the burst during sustained arrivals.
+                    candidates.sort_by_key(|handle| {
+                        (std::cmp::Reverse(self.states[handle].root_since), *handle)
+                    });
+                    candidates
+                }
+                ServiceTurn::Roots => self.root_round.candidates(
+                    roots,
+                    &self.states,
+                    self.observation_generation,
+                    now,
+                    false,
+                ),
+                ServiceTurn::Scan => {
+                    if self.mode == ReplicationMode::Full && self.scan.has_eligible_work(now) {
+                        return Some((turn, Vec::new()));
+                    }
+                    continue;
+                }
+            };
+            if !candidates.is_empty() {
+                return Some((turn, candidates));
+            }
+        }
+        None
+    }
+
+    fn begin_attempt(&mut self, turn: ServiceTurn, handle: RawHash) {
+        match turn {
+            ServiceTurn::Wants => self.want_round.after = Some(handle),
+            ServiceTurn::Roots => self.root_round.after = Some(handle),
+            ServiceTurn::FreshRoots => {}
+            ServiceTurn::Scan => unreachable!("scan has no exact candidate list"),
+        }
+        self.states
+            .get_mut(&handle)
+            .expect("observed missing exact handle")
+            .first_root_attempt = false;
     }
 
     pub async fn tick<S>(&mut self, peer: &mut Peer<S>) -> ReconcileStats
@@ -320,43 +510,25 @@ impl Reconciler {
         self.states.retain(|handle, _| {
             exact_handles.contains(handle) && !self.durable_blob_answers.contains(handle)
         });
+        self.observe_missing(&wanted_blob_handles, &roots);
+        if self.mode == ReplicationMode::Full {
+            self.scan
+                .observe_roots(&selected_roots, &self.durable_blob_answers);
+        }
 
         let started = crate::clock::mono_now();
-        // Durable explicit demand precedes direct hydration, which precedes
-        // speculation. Each priority class rotates so a deadline cannot let
-        // one slow lowest-H request monopolize every pass.
-        let mut attempted = HashSet::new();
-        for (is_want, handles, after) in [
-            (true, &wanted_blob_handles, self.last_want_attempt),
-            (false, &roots, self.last_root_attempt),
-        ] {
-            let mut missing: Vec<_> = handles
-                .iter()
-                .copied()
-                .filter(|handle| !self.durable_blob_answers.contains(handle))
-                .collect();
-            if let Some(after) = after {
-                let split = missing.partition_point(|handle| *handle <= after);
-                missing.rotate_left(split);
-            }
-            for handle in missing {
-                if attempted.contains(&handle)
-                    || self.states.get(&handle).is_some_and(|state| {
-                        crate::clock::mono_now().duration_since(state.last_attempt) < state.backoff
-                    })
-                {
-                    continue;
-                }
+        let work = self.next_work(&wanted_blob_handles, &roots, started);
+        let scan_turn = matches!(work, Some((ServiceTurn::Scan, _)));
+        if let Some((turn, handles)) = work {
+            for handle in handles {
                 let remaining = self.remaining(started);
                 if remaining.is_zero() {
                     break;
                 }
-                attempted.insert(handle);
+                let is_want = wanted_blob_handles.contains(&handle);
+                self.begin_attempt(turn, handle);
                 if is_want {
-                    self.last_want_attempt = Some(handle);
                     stats.attempted += 1;
-                } else {
-                    self.last_root_attempt = Some(handle);
                 }
                 // A failed durability barrier is retried locally, not turned
                 // into a needless network fetch of already-visible bytes.
@@ -390,7 +562,7 @@ impl Reconciler {
             .filter(|handle| !self.durable_blob_answers.contains(*handle))
             .count();
 
-        if self.mode != ReplicationMode::Full {
+        if !scan_turn {
             return stats;
         }
         snapshot = match peer.snapshot() {
@@ -400,13 +572,11 @@ impl Reconciler {
                 return stats;
             }
         };
-        self.scan
-            .observe_roots(&selected_roots, &self.durable_blob_answers);
         // Summaries are ordinary, explicitly selected derived collections.
         // Observe only their resident realization; never ensure/map here:
         // this consumer need not possess the producer's complete blob closure.
-        // Fetching their structural endpoints above can make a previously
-        // absent summary usable in this very pass.
+        // Structural endpoints landed during an earlier exact-service turn
+        // can now make a previously absent summary usable.
         let mut summaries = Vec::new();
         for selector in &self.collections {
             let CollectionRecordSelector::Collection(handle) = selector else {
@@ -575,19 +745,13 @@ impl Reconciler {
 
     fn record_unavailable(&mut self, handle: RawHash) {
         let now = crate::clock::mono_now();
-        match self.states.entry(handle) {
-            Entry::Occupied(mut entry) => {
-                let state = entry.get_mut();
-                state.last_attempt = now;
-                state.backoff = (state.backoff * 2).min(self.max_backoff);
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(WantState {
-                    last_attempt: now,
-                    backoff: self.initial_backoff,
-                });
-            }
-        }
+        let state = self.states.entry(handle).or_insert_with(WantState::new);
+        state.backoff = if state.last_attempt.is_some() {
+            (state.backoff * 2).min(self.max_backoff)
+        } else {
+            self.initial_backoff
+        };
+        state.last_attempt = Some(now);
     }
 }
 
@@ -621,6 +785,17 @@ impl SelectionScans {
             let selected = BTreeSet::from([*selector]);
             scan.observe_roots(roots, &selected, resident);
         }
+    }
+
+    fn has_eligible_work(&self, now: crate::clock::Mono) -> bool {
+        self.lanes.iter().any(|(_, scan)| {
+            scan.sources.iter().any(|key| {
+                let progress = scan.sources.get(key).expect("existing scan source");
+                progress
+                    .last_scan
+                    .is_none_or(|last| now.duration_since(last) >= progress.backoff)
+            })
+        })
     }
 
     fn next(&mut self) -> ScanStep {
@@ -962,6 +1137,151 @@ mod tests {
     use triblespace_core::inline::Inline;
     use triblespace_core::repo::BlobStorePut;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
+
+    // Scheduling tokens only; no record or blob is published by these tests.
+    fn scheduled_handle(class: u8, ordinal: u32) -> RawHash {
+        let mut handle = [0; 32];
+        handle[0] = class;
+        handle[1..5].copy_from_slice(&ordinal.to_be_bytes());
+        handle
+    }
+
+    #[test]
+    fn fresh_missing_root_bypasses_31k_startup_roots_without_renewing_priority() {
+        let mut reconciler = Reconciler::with_backoff(Duration::ZERO, Duration::ZERO);
+        let mut roots: BTreeSet<_> = (0..31_000)
+            .map(|ordinal| scheduled_handle(10, ordinal))
+            .collect();
+        let wanted = BTreeSet::new();
+        reconciler.observe_missing(&wanted, &roots);
+        let startup_generation = reconciler.observation_generation;
+        reconciler.root_round.generation = startup_generation;
+        reconciler.root_round.after = Some(scheduled_handle(9, 0));
+
+        // This root arrives after the startup observation, behind the cursor.
+        let fresh = scheduled_handle(8, 0);
+        roots.insert(fresh);
+        reconciler.observe_missing(&wanted, &roots);
+        let (turn, candidates) = reconciler
+            .next_work(&wanted, &roots, crate::clock::mono_now())
+            .unwrap();
+        assert_eq!(turn, ServiceTurn::FreshRoots);
+        assert_eq!(candidates[0], fresh);
+        assert!(reconciler.states[&fresh].first_root_attempt);
+        // Selection alone does not spend the attempt: a deadline can expire
+        // before the request starts.
+        let first_seen = reconciler.states[&fresh].root_since;
+        reconciler.begin_attempt(turn, fresh);
+        reconciler.record_unavailable(fresh);
+        reconciler.observe_missing(&wanted, &roots);
+        assert_eq!(reconciler.states[&fresh].root_since, first_seen);
+        assert!(!reconciler.states[&fresh].first_root_attempt);
+
+        reconciler.next_service = ServiceTurn::FreshRoots;
+        let (turn, candidates) = reconciler
+            .next_work(&wanted, &roots, crate::clock::mono_now())
+            .unwrap();
+        assert_eq!(turn, ServiceTurn::FreshRoots);
+        assert!(!candidates.contains(&fresh));
+        assert_eq!(candidates.len(), 31_000);
+    }
+
+    #[test]
+    fn service_turns_preserve_old_rounds_wants_and_scans_during_continuous_arrival() {
+        let mut reconciler = Reconciler::with_backoff(Duration::ZERO, Duration::ZERO)
+            .with_replication(
+                ReplicationMode::Full,
+                [Inline::new(scheduled_handle(30, 0))],
+            );
+        let old_roots: BTreeSet<_> = (0..64)
+            .map(|ordinal| scheduled_handle(10, ordinal))
+            .collect();
+        let old_wants: BTreeSet<_> = (0..7)
+            .map(|ordinal| scheduled_handle(20, ordinal))
+            .collect();
+        let mut roots = old_roots.clone();
+        let mut wanted = old_wants.clone();
+        reconciler.observe_missing(&wanted, &roots);
+        reconciler.root_round.generation = reconciler.observation_generation;
+        reconciler.want_round.generation = reconciler.observation_generation;
+        // A resident source remains eligible for scanner service throughout.
+        reconciler.scan.lanes[0]
+            .1
+            .observe(scheduled_handle(30, 0), scheduled_handle(30, 1));
+
+        let mut regular = Vec::new();
+        let mut want_attempts = Vec::new();
+        let mut scans = 0;
+        let mut fresh = 0;
+        for quantum in 0..64 * 4 {
+            roots.insert(scheduled_handle(9, quantum));
+            wanted.insert(scheduled_handle(19, quantum));
+            reconciler.observe_missing(&wanted, &roots);
+            let (turn, candidates) = reconciler
+                .next_work(&wanted, &roots, crate::clock::mono_now())
+                .unwrap();
+            assert_eq!(
+                turn,
+                [
+                    ServiceTurn::Wants,
+                    ServiceTurn::FreshRoots,
+                    ServiceTurn::Roots,
+                    ServiceTurn::Scan,
+                ][quantum as usize % 4],
+                "one request may exhaust a quantum, but cannot erase the next class's turn",
+            );
+            if turn == ServiceTurn::Scan {
+                assert!(candidates.is_empty());
+                scans += 1;
+                continue;
+            }
+            let handle = candidates[0];
+            reconciler.begin_attempt(turn, handle);
+            reconciler.record_unavailable(handle);
+            match turn {
+                ServiceTurn::Wants => want_attempts.push(handle),
+                ServiceTurn::FreshRoots => fresh += 1,
+                ServiceTurn::Roots => regular.push(handle),
+                ServiceTurn::Scan => unreachable!(),
+            }
+        }
+        assert_eq!(regular, old_roots.into_iter().collect::<Vec<_>>());
+        assert_eq!(
+            &want_attempts[..old_wants.len()],
+            old_wants.into_iter().collect::<Vec<_>>(),
+        );
+        assert_eq!(scans, 64);
+        assert_eq!(fresh, 64);
+    }
+
+    #[test]
+    fn roots_in_backoff_yield_to_scanning_and_keep_their_retry_deadline() {
+        let mut reconciler =
+            Reconciler::with_backoff(Duration::from_secs(60), Duration::from_secs(60))
+                .with_replication(
+                    ReplicationMode::Full,
+                    [Inline::new(scheduled_handle(30, 0))],
+                );
+        let root = scheduled_handle(10, 0);
+        let roots = BTreeSet::from([root]);
+        let wanted = BTreeSet::from([root]);
+        reconciler.observe_missing(&wanted, &BTreeSet::new());
+        reconciler.begin_attempt(ServiceTurn::Wants, root);
+        reconciler.record_unavailable(root);
+        // The same H becomes a selected root while its WANT attempt is still
+        // in cooldown. Fresh-root priority must not bypass that shared delay.
+        reconciler.observe_missing(&wanted, &roots);
+        let last_attempt = reconciler.states[&root].last_attempt;
+        reconciler.scan.lanes[0].1.observe(root, root);
+        reconciler.next_service = ServiceTurn::Wants;
+        let (turn, _) = reconciler
+            .next_work(&wanted, &roots, crate::clock::mono_now())
+            .unwrap();
+        assert_eq!(turn, ServiceTurn::Scan);
+        assert_eq!(reconciler.states[&root].last_attempt, last_attempt);
+        assert_eq!(reconciler.states[&root].backoff, Duration::from_secs(60));
+        assert!(reconciler.states[&root].first_root_attempt);
+    }
 
     struct FailingCollectionRead;
 

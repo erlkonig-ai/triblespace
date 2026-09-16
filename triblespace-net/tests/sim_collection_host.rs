@@ -1070,6 +1070,140 @@ fn demand_shallow_full_preserve_exact_wants_and_only_hydrate_selected_record_roo
 }
 
 #[test]
+fn full_replication_services_a_fresh_roots_body_while_direct_backlog_grows() {
+    let _guard = test_guard();
+    let clock = virtual_clock();
+    clock.reset();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    runtime.block_on(local.run_until(async {
+        let net = SimNet::new(0xC011_EC89, SimConfig::default());
+        let server_key = key(131);
+        let reader_key = key(132);
+        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+        let mut server_store = MemoryRepo::default();
+        let collection = register(&mut server_store, policy);
+        let metadata = server_store
+            .put::<SimpleArchive, _>(TribleSet::new().to_blob())
+            .unwrap();
+        let body_bytes = Bytes::from_source(b"fresh nested body".to_vec());
+        let body = server_store
+            .put::<UnknownBlob, _>(body_bytes.clone())
+            .unwrap();
+        let parent_bytes = (0_u64..100_000)
+            .find_map(|nonce| {
+                let mut bytes = body.raw.to_vec();
+                bytes.extend_from_slice(&nonce.to_le_bytes());
+                let hash = *blake3::hash(&bytes).as_bytes();
+                (hash < collection.handle().raw && hash < metadata.raw).then_some(bytes)
+            })
+            .expect("parent is the first regular scan source");
+        let parent = server_store
+            .put::<UnknownBlob, _>(Bytes::from_source(parent_bytes))
+            .unwrap();
+        let parent_record = CollectionRecord::Commit(CollectionCommit::sign(
+            &server_key,
+            collection.handle(),
+            parent.into(),
+            metadata,
+        ));
+        let mut reader_store = MemoryRepo::default();
+        for handle in [collection.handle().raw, metadata.raw] {
+            let bytes = BlobStoreGet::get::<Bytes, UnknownBlob>(
+                &server_store.snapshot().unwrap(),
+                Inline::new(handle),
+            )
+            .unwrap();
+            reader_store.put::<UnknownBlob, _>(bytes).unwrap();
+        }
+        let missing_record = |ordinal: u64| {
+            // Exact named but unavailable roots, not speculative words.
+            let hash = *blake3::hash(&ordinal.to_be_bytes()).as_bytes();
+            CollectionRecord::Commit(CollectionCommit::sign(
+                &server_key,
+                collection.handle(),
+                Inline::new(hash),
+                metadata,
+            ))
+        };
+        for ordinal in 0..128 {
+            reader_store.insert(missing_record(ordinal)).unwrap();
+        }
+        let mut server = bring_up_with_publication_budget(
+            &net,
+            &server_key,
+            server_store,
+            Vec::new(),
+            ReconcileDirection::WriteOnly,
+            Some(0),
+        );
+        let mut reader = bring_up_with_publication_budget(
+            &net,
+            &reader_key,
+            reader_store,
+            vec![server_key.verifying_key().to_bytes()],
+            ReconcileDirection::ReadOnly,
+            Some(0),
+        );
+        advance(&clock, &mut [&mut server, &mut reader], 4).await;
+        let mut reconciler =
+            Reconciler::with_backoff(std::time::Duration::ZERO, std::time::Duration::ZERO)
+                .with_replication(ReplicationMode::Full, [collection.handle()])
+                .with_fetch_budget(std::time::Duration::from_secs(2));
+        let startup =
+            reconcile_once(&clock, &mut reconciler, &mut reader, &mut [&mut server]).await;
+        assert_eq!(startup.replication.pending, 128);
+
+        // The available parent is not part of the startup cohort. It must get
+        // a first attempt without draining or satisfying the missing backlog.
+        reader.store().insert(parent_record).unwrap();
+        for _ in 0..8 {
+            let stats =
+                reconcile_once(&clock, &mut reconciler, &mut reader, &mut [&mut server]).await;
+            assert!(stats.replication.pending >= 128);
+            if reader.try_local(parent.raw).is_some() {
+                break;
+            }
+            advance(&clock, &mut [&mut server, &mut reader], 1).await;
+        }
+        assert!(reader.try_local(parent.raw).is_some());
+        assert!(reader.try_local(body.raw).is_none());
+
+        let mut records = 129;
+        let mut scan_attempts = 0;
+        for quantum in 0_u64..24 {
+            for ordinal in 128 + quantum * 8..128 + (quantum + 1) * 8 {
+                reader.store().insert(missing_record(ordinal)).unwrap();
+                records += 1;
+            }
+            let stats =
+                reconcile_once(&clock, &mut reconciler, &mut reader, &mut [&mut server]).await;
+            assert!(stats.replication.pending >= 136);
+            assert!(
+                stats.replication.speculative_attempted <= RECONCILE_SPECULATIVE_FETCHES_PER_TICK
+            );
+            scan_attempts += stats.replication.speculative_attempted;
+            if reader.try_local(body.raw).is_some() {
+                break;
+            }
+            advance(&clock, &mut [&mut server, &mut reader], 1).await;
+        }
+        assert!(
+            scan_attempts > 0,
+            "direct roots cannot take every scan turn"
+        );
+        assert_eq!(reader.try_local(body.raw), Some(body_bytes));
+        let snapshot = reader.snapshot().unwrap();
+        assert_eq!(snapshot.wants().unwrap().count(), 0);
+        assert_eq!(snapshot.records().unwrap().count(), records);
+    }));
+}
+
+#[test]
 fn full_replication_fair_selection_reaches_a_child_beyond_the_startup_window() {
     selection_fairness_case(false);
 }
