@@ -102,10 +102,12 @@ fn equations() -> [CollectionRecord; 3] {
         .unwrap();
     let low: Blob<SimpleArchive> = entity! { metadata::name: "low" }.facts().clone().to_blob();
     let high: Blob<SimpleArchive> = entity! { metadata::name: "high" }.facts().clone().to_blob();
-    let low = Handle::<SimpleArchive>::to_hash(low.get_handle());
-    let high = Handle::<SimpleArchive>::to_hash(high.get_handle());
-    let a = CollectionCommit::sign(&signer, collection.handle(), low, low);
-    let b = CollectionCommit::sign(&signer, collection.handle(), high, high);
+    let low_handle = low.get_handle();
+    let high_handle = high.get_handle();
+    let low = Handle::<SimpleArchive>::to_hash(low_handle);
+    let high = Handle::<SimpleArchive>::to_hash(high_handle);
+    let a = CollectionCommit::sign(&signer, collection.handle(), low, low_handle);
+    let b = CollectionCommit::sign(&signer, collection.handle(), high, high_handle);
     [
         CollectionRecord::Commit(a),
         CollectionRecord::Merge(CollectionMerge::sign(
@@ -205,7 +207,7 @@ async fn counter_preserves_snapshot_acquisition_and_proof_seams() {
         let same_type: triblespace_core::repo::memoryrepo::MemoryRepoSnapshot =
             counted.snapshot().unwrap();
         assert!(same_type == before);
-        let handle = counted.put(blob).unwrap();
+        let handle: Inline<Handle<UTF8String>> = counted.put(blob).unwrap();
         let acquired = counted.acquire(handle.transmute()).await.unwrap().unwrap();
         assert_eq!(acquired.as_ref(), expected.as_ref());
         // Proof insertion is delegated; it cannot become a maintenance output.
