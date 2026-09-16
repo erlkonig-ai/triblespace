@@ -65,6 +65,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Reuse selected collections' fixed repair components and READ bootstrap
+  witnesses when their observed raw inputs are unchanged. Missing descriptors
+  and definitions remain dependencies; record-only changes preserve authority
+  work, and bootstrap shares the existing evidence construction. Every fresh
+  host observation still advances its unobserved blob reader for later peer
+  requests. Signature, policy, and quorum checks remain unchanged.
+
 - Retain a started full-scan source's finite startup window across new positive
   arrivals and request/deadline yields. Its second word no longer falls behind
   a newer source on every turn. Ordinary rounds and collection rotation remain

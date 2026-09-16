@@ -214,6 +214,62 @@ impl CollectionAuthorizationEvidencePatch {
         }
         CollectionReadAudience::Restricted(readers.into_values().collect())
     }
+
+    /// Select the local READ witness from this already constructed evidence.
+    /// The caller applies its transport bound after quorum minimization.
+    pub(crate) fn read_bootstrap_proofs(&self, subject: VerifyingKey) -> Vec<CapabilityProof> {
+        if self
+            .read_policies()
+            .any(|policy| matches!(policy, AdmissionPolicy::Open))
+        {
+            return Vec::new();
+        }
+        let mut selected = self
+            .proofs()
+            .filter(|proof| {
+                proof.resource() == CapabilityResource::from(self.collection)
+                    && self
+                        .read_policies()
+                        .any(|policy| root_is_relevant(&policy, proof.root_key()))
+            })
+            .filter_map(|proof| {
+                proof
+                    .prefixes()
+                    .filter(|prefix| prefix.subject() == subject)
+                    .find_map(|prefix| {
+                        let witness = CapabilityProof::from_bytes(prefix.as_bytes())
+                            .expect("an exact prefix of a canonical proof is canonical");
+                        witness
+                            .verify(
+                                &self.reader,
+                                proof.root_key(),
+                                subject,
+                                CapabilityRequest::new(
+                                    CapabilityResource::from(self.collection),
+                                    ACTION_READ,
+                                ),
+                            )
+                            .is_ok()
+                            .then_some(witness)
+                    })
+            })
+            .collect::<Vec<_>>();
+        if !self.reader_is_admitted_by(subject, &selected) {
+            return Vec::new();
+        }
+        // Each witness ends at the earliest valid READ prefix for this subject;
+        // later delegates and their capability handles never enter bootstrap.
+        // Delete only proofs not required by the independently rooted quorum.
+        let mut index = selected.len();
+        while index > 0 {
+            index -= 1;
+            let removed = selected.remove(index);
+            if !self.reader_is_admitted_by(subject, &selected) {
+                selected.insert(index, removed);
+            }
+        }
+        selected
+    }
 }
 
 /// The two immutable components which determine collection repair semantics.
@@ -265,12 +321,13 @@ impl CollectionRepairOverlay {
         *hasher.finalize().as_bytes()
     }
 
-    /// Reobserve authorization with the current resident reader, retaining the
-    /// independent record component when the store certifies it unchanged.
+    /// Keep fixed components whose raw inputs the store certifies unchanged.
+    /// Request-dependent authorization always receives this snapshot's reader.
     pub(crate) fn observe<R>(
         snapshot: &R,
         collection: CollectionHandle,
         previous_records: Option<&CollectionRecordPatch>,
+        previous_authorization: Option<&CollectionAuthorizationEvidencePatch>,
     ) -> Result<
         Self,
         CollectionRepairOverlayError<R::RecordsError, R::ProofsError, R::GetError<Infallible>>,
@@ -278,19 +335,27 @@ impl CollectionRepairOverlay {
     where
         R: BlobStoreGet + CapabilityProofRead + CollectionRead + Clone + Send + 'static,
     {
-        let descriptor = load_collection_descriptor_facts(snapshot, collection)
-            .map_err(CollectionRepairOverlayError::Descriptor)?;
-        let authorization_evidence = collection_authorization_evidence_patch_for_descriptor(
-            snapshot, collection, descriptor,
-        )
-        .map_err(|error| match error {
-            AuthorizationEvidenceBuildError::Proofs(source) => {
-                CollectionRepairOverlayError::Proofs(source)
+        let authorization_evidence = match previous_authorization {
+            Some(evidence) => CollectionAuthorizationEvidencePatch {
+                reader: ResidentBlobReader::new(snapshot),
+                ..evidence.clone()
+            },
+            None => {
+                let descriptor = load_collection_descriptor_facts(snapshot, collection)
+                    .map_err(CollectionRepairOverlayError::Descriptor)?;
+                collection_authorization_evidence_patch_for_descriptor(
+                    snapshot, collection, descriptor,
+                )
+                .map_err(|error| match error {
+                    AuthorizationEvidenceBuildError::Proofs(source) => {
+                        CollectionRepairOverlayError::Proofs(source)
+                    }
+                    AuthorizationEvidenceBuildError::Evidence(source) => {
+                        CollectionRepairOverlayError::Evidence(source)
+                    }
+                })?
             }
-            AuthorizationEvidenceBuildError::Evidence(source) => {
-                CollectionRepairOverlayError::Evidence(source)
-            }
-        })?;
+        };
         let records = match previous_records {
             Some(records) => records.clone(),
             None => collection_record_patch(snapshot, collection)
@@ -301,6 +366,13 @@ impl CollectionRepairOverlay {
             records,
             authorization_evidence,
         })
+    }
+
+    /// Rebind future request-dependent reads without changing fixed evidence.
+    /// Existing sessions retain their original reader and immutable PATCHes.
+    pub(crate) fn with_reader(mut self, reader: ResidentBlobReader) -> Self {
+        self.authorization_evidence.reader = reader;
+        self
     }
 }
 
@@ -539,7 +611,7 @@ pub fn collection_repair_overlay<R>(
 where
     R: BlobStoreGet + CapabilityProofRead + CollectionRead + Clone + Send + 'static,
 {
-    CollectionRepairOverlay::observe(snapshot, collection, None)
+    CollectionRepairOverlay::observe(snapshot, collection, None, None)
 }
 
 fn load_collection_descriptor_facts<R>(
@@ -617,58 +689,7 @@ where
                 CollectionReadBootstrapError::Authorization(source)
             }
         })?;
-    if evidence
-        .read_policies()
-        .any(|policy| matches!(policy, AdmissionPolicy::Open))
-    {
-        return Ok(Vec::new());
-    }
-
-    let mut selected = evidence
-        .proofs()
-        .filter(|proof| {
-            proof.resource() == CapabilityResource::from(collection)
-                && evidence
-                    .read_policies()
-                    .any(|policy| root_is_relevant(&policy, proof.root_key()))
-        })
-        .filter_map(|proof| {
-            proof
-                .prefixes()
-                .filter(|prefix| prefix.subject() == subject)
-                .find_map(|prefix| {
-                    let witness = CapabilityProof::from_bytes(prefix.as_bytes())
-                        .expect("an exact prefix of a canonical proof is canonical");
-                    witness
-                        .verify(
-                            &evidence.reader,
-                            proof.root_key(),
-                            subject,
-                            CapabilityRequest::new(
-                                CapabilityResource::from(collection),
-                                ACTION_READ,
-                            ),
-                        )
-                        .is_ok()
-                        .then_some(witness)
-                })
-        })
-        .collect::<Vec<_>>();
-    if !evidence.reader_is_admitted_by(subject, &selected) {
-        return Ok(Vec::new());
-    }
-    // Each witness ends at the earliest valid READ prefix for this subject;
-    // later delegates and their capability handles never enter bootstrap.
-    // Delete every proof not required by the independently rooted quorum
-    // witness while withholding unrelated ambient grants from the endpoint.
-    let mut index = selected.len();
-    while index > 0 {
-        index -= 1;
-        let removed = selected.remove(index);
-        if !evidence.reader_is_admitted_by(subject, &selected) {
-            selected.insert(index, removed);
-        }
-    }
+    let selected = evidence.read_bootstrap_proofs(subject);
     if selected.len() > max_proofs {
         return Err(CollectionReadBootstrapError::TooMany {
             count: selected.len(),

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Avoid hashing every record when selecting a collection or a raw record
+  relationship. Exact fingerprint selectors still compare the canonical hash;
+  counted tests cover field-only and mixed unions.
+
 ### Fixed
 
 - Remove support-redundant physical-cover repair members before LSM planning.

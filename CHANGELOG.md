@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Avoid recomputing collection-record fingerprints for field-only selectors.
+  Mixed selector unions hash only when their field routes do not match;
+  physical identities, result ordering and authentication are unchanged.
+
 - Add bounded test-only exact-H diagnostics: fresh versus retained routing
   counts, repeated publication/acquisition opcode counts, routing-versus-directory
   stall controls, and an exact bearer GET application-byte control. These use
