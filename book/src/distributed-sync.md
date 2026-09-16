@@ -614,9 +614,20 @@ not admit their claims. One eligible service class receives each tick's existing
 fetch-budget quantum: explicit WANTs, newly observed direct roots, ordinary
 direct roots, then recursive scanning. The turn is retained before awaiting
 network work. Empty classes and classes whose entire work is in retry backoff
-are skipped without taking a quantum. These are whole-class turns, not extra
-concurrency or shorter per-request deadlines: with the default budget, several
-30-second quanta plus the caller's tick intervals may pass before a fresh root
+are skipped without taking a quantum. Exact WANT/root turns use an experimental
+window of at most four concurrent H-only fetches from that frozen candidate
+round. Ready bodies land one at a time through the existing hash check and
+durability barrier; a slow first request does not hold later ready answers.
+Refills share the original turn deadline rather than starting another budget.
+Expiry drops unfinished requests and charges their normal retry backoff, while
+unstarted candidates retain their priority. Cancelling the whole tick drops
+its owned futures without detached work or fabricated fulfillment; already
+admitted attempts retain their consumed cursor/first-attempt position, just as
+with a cancelled serial await. Peer fetch futures start the lazy host only when
+polled and hold no store or host guard across network I/O. This is bounded
+concurrency, not a measured throughput or end-to-end completion guarantee:
+synchronous landing/flush/refresh still takes serial time, and with the default
+budget, several 30-second quanta plus the caller's tick intervals may pass before a fresh root
 or its body receives service. There is no low-latency guarantee.
 
 A missing root gets one first-attempt priority when newly observed, newest

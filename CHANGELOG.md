@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Experiment with four concurrent exact-handle hydration fetches within one
+  service class's existing deadline. Completed bodies land and flush serially;
+  a stalled first request no longer blocks ready later answers. Owned lazy Peer
+  fetch futures start only when polled. Cancellation, retry accounting and
+  frozen rounds remain bounded; recursive speculation stays serial and keeps
+  its existing allowance. This is not a measured live-throughput claim.
+
 - Scope CLI maintenance-watch eligibility to the preceding active pass's raw
   record/blob/proof interests through opt-in `repo::ObservedStore` forwarding.
   Misses and relevant concurrent arrivals remain retry interests; unrelated

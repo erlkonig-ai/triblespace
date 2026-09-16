@@ -8,6 +8,7 @@
 
 use std::error::Error;
 use std::fmt;
+use std::future::Future;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -379,24 +380,35 @@ where
     }
 
     /// Discover and fetch the exact bytes named by bearer handle `H`.
-    /// This explicit network operation starts a dormant host.
-    pub async fn fetch_blob(&mut self, hash: RawHash) -> Option<Bytes> {
+    /// Polling this explicit network operation starts a dormant host. Merely
+    /// constructing or dropping its owned future starts no network work.
+    pub fn fetch_blob(
+        &self,
+        hash: RawHash,
+    ) -> impl Future<Output = Option<Bytes>> + Send + 'static + use<S> {
         self.fetch_blob_with_deadline(hash, host::INTERACTIVE_FETCH_DEADLINE)
-            .await
     }
 
     /// Discover and fetch the exact bytes named by bearer handle `H`, bounded
     /// by the caller's deadline.
-    pub async fn fetch_blob_with_deadline(
-        &mut self,
+    /// The future owns its network handles, not a borrow of the store. This
+    /// permits serial local landing while other exact fetches remain pending.
+    pub fn fetch_blob_with_deadline(
+        &self,
         hash: RawHash,
         budget: std::time::Duration,
-    ) -> Option<Bytes> {
-        if let Err(error) = self.start_host() {
-            tracing::warn!(%error, "cannot start exact-blob fetch");
-            return None;
+    ) -> impl Future<Output = Option<Bytes>> + Send + 'static + use<S> {
+        let host = self.host.clone();
+        let sender = self.sender.clone();
+        async move {
+            let started = host.lock().expect("host mutex").start();
+            if let Err(error) = started {
+                tracing::warn!(%error, "cannot start exact-blob fetch");
+                return None;
+            }
+            // No host or store guard crosses the network await.
+            sender.fetch_blob(hash, budget).await
         }
-        self.sender.fetch_blob(hash, budget).await
     }
 
     /// Drain authenticated collection progress, cross one durability barrier,
@@ -918,6 +930,57 @@ mod tests {
         assert!(peer.last_store_snapshot.is_none());
         assert_eq!(peer.serving_snapshot_rebuilds, 0);
         peer.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_fetch_futures_are_owned_lazy_and_do_not_borrow_the_writer() {
+        let key = SigningKey::from_bytes(&[82; 32]);
+        let bytes = Bytes::from_source(b"owned exact fetch".to_vec());
+        let mut source = MemoryRepo::default();
+        let handle = source.put::<UnknownBlob, _>(bytes.clone()).unwrap();
+        let starts = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (sender, receiver, wiring) =
+            host::wire(crate::identity::iroh_secret(&key).public().into());
+        let start_count = starts.clone();
+        let capability = Arc::new(ExactBlob {
+            hash: handle.raw,
+            bytes: bytes.clone(),
+            requests: requests.clone(),
+        });
+        let mut peer = Peer::assemble(
+            MemoryRepo::default(),
+            foreground_config().qos,
+            sender,
+            receiver,
+            None,
+            HostState::Dormant(Box::new(move || {
+                start_count.fetch_add(1, Ordering::SeqCst);
+                wiring.install_test_capability(capability);
+                Ok(None)
+            })),
+        );
+        drop(peer.fetch_blob(handle.raw));
+        drop(peer.fetch_blob_with_deadline(handle.raw, std::time::Duration::from_secs(1)));
+        let fetching = peer.fetch_blob(handle.raw);
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        // These mutable operations compile and remain local while an owned
+        // future exists. Polling, not preparation, starts the endpoint.
+        peer.put::<UnknownBlob, _>(Bytes::from_source(b"local write".to_vec()))
+            .unwrap();
+        peer.refresh();
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        assert_eq!(fetching.await, Some(bytes.clone()));
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert!(!peer.snapshot().unwrap().contains_blob(handle).unwrap());
+
+        let never_started = peer.fetch_blob(handle.raw);
+        peer.close().unwrap();
+        assert!(never_started.await.is_none());
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
