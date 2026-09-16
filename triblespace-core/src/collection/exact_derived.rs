@@ -957,6 +957,41 @@ where
     Ok(resolved)
 }
 
+/// Resident immediate-source members whose support the target's resident
+/// realization does not yet represent, each with its payload and the input
+/// witnesses an equation would cite.
+///
+/// A read-only planning step for an editor that must see facts the derived
+/// index has not carried yet: it maps nothing and publishes nothing. The
+/// selection is the one `ensure` would map next, chosen by the same cover and
+/// support algebra, so it is exactly the residual and never the whole source.
+/// An empty result means the target is exact for the source's admitted
+/// support. Missing provenance stays visible: when the needed support cannot
+/// be represented by resident members, the incomplete-cover error names what
+/// is absent instead of returning a delta that looks complete.
+pub(crate) fn uncovered_resident_source_members<R, M>(
+    snapshot: &R,
+    target: Collection<M::Target>,
+) -> Result<
+    Vec<(
+        CollectionData,
+        Blob<M::Source>,
+        Vec<CollectionRecordFingerprint>,
+    )>,
+    CollectionRealizationError,
+>
+where
+    R: StoreRead,
+    M: CollectionMapping,
+{
+    let support = source_support::<R, M>(snapshot, target)?;
+    let probe = probe_mapping::<R, M>(snapshot, target, &support, &BTreeSet::new(), true)?;
+    if probe.target_resolution.is_exact_for(&support) {
+        return Ok(Vec::new());
+    }
+    source_residual(snapshot, &probe, &support, &BTreeMap::new())
+}
+
 /// Attach one target collection using its snapshot's proof and definition state.
 ///
 /// The target's endorsed records define the search boundary. The result

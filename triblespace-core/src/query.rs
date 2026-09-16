@@ -45,6 +45,7 @@ pub mod register;
 /// [`SortedSliceConstraint`](sortedsliceconstraint::SortedSliceConstraint) — constrains a variable to values in a sorted slice (binary search confirm).
 pub mod sortedsliceconstraint;
 /// [`UnionConstraint`](unionconstraint::UnionConstraint) — logical OR.
+pub mod patternunion;
 pub mod unionconstraint;
 mod variableset;
 

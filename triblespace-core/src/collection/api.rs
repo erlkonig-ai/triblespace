@@ -1746,6 +1746,37 @@ pub trait CollectionSnapshotExt: StoreRead + Sized {
         super::observation::attach(self, target)
     }
 
+    /// Resident immediate-source members of a derived target whose support
+    /// the target's resident realization does not yet represent, with their
+    /// payloads and input witnesses.
+    ///
+    /// Read-only: nothing is mapped or published. An editor that needs facts
+    /// the derived index has not carried yet queries these few payloads
+    /// beside the resident view (see [`crate::query::patternunion::PatternUnion`])
+    /// instead of running maintenance. The selection is the same residual
+    /// `ensure` would map, so it is never the whole source. An incomplete
+    /// cover is an error naming the absent support, never a silent partial
+    /// delta.
+    fn uncovered_source_members<T>(
+        &self,
+        target: Collection<T>,
+    ) -> Result<
+        Vec<(
+            super::CollectionData,
+            Blob<T::Source>,
+            Vec<super::CollectionRecordFingerprint>,
+        )>,
+        CollectionRealizationError,
+    >
+    where
+        T: CollectionDerivation,
+        Handle<T>: InlineEncoding,
+    {
+        super::exact_derived::uncovered_resident_source_members::<Self, CanonicalDerivation<T>>(
+            self, target,
+        )
+    }
+
     /// Observe the complete target realization for one explicit support.
     ///
     /// Unlike [`Self::collection`], this is an assertion boundary: it fails
