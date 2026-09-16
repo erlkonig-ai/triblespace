@@ -7,6 +7,10 @@ use GORBIE::cards::DEFAULT_CARD_PADDING;
 use GORBIE::widgets::{Column, TableBuilder};
 use GORBIE::NotebookConfig;
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "gui_capture_tests.rs"]
+mod capture_tests;
+
 pub(super) fn run(options: Options) -> Result<()> {
     let mut sampler = Sampler::start(options)?;
     let shared = Arc::clone(&sampler.shared);
