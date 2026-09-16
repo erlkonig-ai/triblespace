@@ -616,3 +616,142 @@ fn telemetry_collection_roundtrip_is_an_ordinary_read_without_appends() {
     pile.close().unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), before);
 }
+
+// Explicitly selected generated-history diagnostic. This measures the in-memory
+// projection only, not attachment, cold I/O, or live colony cost.
+#[test]
+#[ignore = "bounded generated-history diagnostic; run explicitly with --ignored --nocapture"]
+fn generated_history_keeps_latest_reports_fixed_while_counting_header_work() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    const SUBJECTS: usize = 8;
+    const NOW_SECONDS: i128 = 10_011;
+    const MAX_AGE_SECONDS: u64 = 30;
+    const REPETITIONS: usize = 3;
+
+    // Opaque subject/session/latest-report IDs are made once and reused across
+    // every arm. Old history grows by a prefix; the latest two witnesses never
+    // change. The 2/64/1024 counts below EXCLUDE those two latest samples.
+    let mut latest = Fragment::empty();
+    let mut scopes = Vec::with_capacity(SUBJECTS);
+    for seed in 1..=SUBJECTS {
+        let (scope, subject_facts) = subject(seed as u8, "generated-history", "process");
+        let session = genid().id;
+        latest += subject_facts;
+        scopes.push((scope, session));
+        for (at, elapsed, completed, cpu_seconds) in [
+            (10_000_i128, 10_000_u128, 100_u128, 20_u128),
+            (10_010_i128, 10_010_u128, 120_u128, 45_u128),
+        ] {
+            let (id, sample_facts) = sample(scope, session, at, elapsed);
+            latest += sample_facts;
+            latest += entity! { &id @
+                attrs::active: 0_u128,
+                attrs::queued: 0_u128,
+                attrs::completed: completed,
+                attrs::received_bytes: completed * 1_048_576_u128,
+                attrs::cpu_ns: cpu_seconds * NS,
+            };
+        }
+    }
+    let expected = reports(&latest, NOW_SECONDS, MAX_AGE_SECONDS);
+    assert_eq!(expected.len(), SUBJECTS);
+    for report in &expected {
+        assert_eq!(report.freshness, Freshness::Fresh);
+        assert_eq!(metric(report, Metric::Completed).per_second, Some(2.0));
+        assert_eq!(metric(report, Metric::CpuNs).per_second, Some(2.5e9));
+    }
+
+    let measure = |arm: &str,
+                   input: &Fragment,
+                   old_per_subject: usize,
+                   expected_entities: usize,
+                   expected_witnesses: usize| {
+        let facts = input.facts();
+
+        // Count the actual typed header witnesses, not tags or report IDs.
+        // This separate query and its entity set are outside the timed region;
+        // they also warm the header path, so these are not cold-read timings.
+        let mut entities = std::collections::BTreeSet::new();
+        let mut witnesses = 0_usize;
+        for (report, _subject, _created, _session, _elapsed) in find!(
+            (report: Id, subject: Id, created: (i128, i128), session: Id, elapsed_ns: u128),
+            pattern!(facts, [{
+                ?report @ metadata::tag: &KIND_SAMPLE,
+                attrs::subject: ?subject,
+                metadata::created_at: ?created,
+                health_record::attrs::session: ?session,
+                attrs::elapsed_ns: ?elapsed_ns,
+            }])
+        ) {
+            witnesses += 1;
+            entities.insert(report);
+        }
+        assert_eq!(entities.len(), expected_entities, "{arm}: report entities");
+        assert_eq!(witnesses, expected_witnesses, "{arm}: header witnesses");
+        drop(entities);
+
+        let mut observe_ns = [0_u128; REPETITIONS];
+        for duration in &mut observe_ns {
+            let started = Instant::now();
+            let observed = observe(
+                black_box(facts),
+                NOW_SECONDS * NS as i128,
+                Duration::from_secs(MAX_AGE_SECONDS),
+            );
+            *duration = started.elapsed().as_nanos();
+            // Equality includes report/session identities, freshness, optional
+            // bags, counts and rates. Validation/output/drop are not timed.
+            assert_eq!(observed, expected, "{arm}: latest projection changed");
+        }
+        eprintln!(
+            "telemetry_history arm={arm} old_samples_per_subject={old_per_subject} \
+             report_entities={expected_entities} header_witnesses={witnesses} \
+             input_facts={} projected_workers={} observe_ns={observe_ns:?}",
+            facts.len(),
+            expected.len(),
+        );
+        // Deliberately no ordering or threshold assertion on the durations.
+    };
+
+    let mut facts = latest;
+    let mut built_per_subject = 0_usize;
+    let mut repeated_old = None;
+    for old_per_subject in [2_usize, 64, 1_024] {
+        // All allocation, entity construction and union happen before timing.
+        for &(scope, session) in &scopes {
+            for index in built_per_subject..old_per_subject {
+                let at = index as i128 + 1;
+                let elapsed = index as u128 + 1;
+                let (id, sample_facts) = sample(scope, session, at, elapsed);
+                if repeated_old.is_none() {
+                    repeated_old = Some(id.id);
+                }
+                facts += sample_facts;
+                facts += entity! { &id @ attrs::completed: index as u128 };
+            }
+        }
+        built_per_subject = old_per_subject;
+        let entity_count = SUBJECTS * (old_per_subject + 2);
+        measure("plain", &facts, old_per_subject, entity_count, entity_count);
+    }
+
+    // The first old report already has created_at=(1,1), elapsed_ns=NS.
+    // Two distinct intervals x two elapsed values give FOUR typed witnesses
+    // for that same report entity. Both interval uppers are still 1, far below
+    // the unchanged latest pair; the extra three witnesses cannot change it.
+    let old = repeated_old.expect("at least one old report was generated");
+    facts += entity! { &old @
+        metadata::created_at: interval(0, 1),
+        attrs::elapsed_ns: 2 * NS,
+    };
+    let entity_count = SUBJECTS * (built_per_subject + 2);
+    measure(
+        "old-header-2x2",
+        &facts,
+        built_per_subject,
+        entity_count,
+        entity_count + 3,
+    );
+}
