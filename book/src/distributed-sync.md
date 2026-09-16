@@ -993,8 +993,10 @@ existing sync-loop boundary. Five subjects distinguish the measurements:
   one landing shared by an explicit WANT and a selected root counts once.
   Local hits, failed puts and speculative misses add no received bytes.
   `queued` is the distinct unreadable exact WANT plus selected direct-root
-  set after that tick, not recursive descendants, operation WANTs or a global
-  blob inventory. Failed snapshot/root observations leave it absent.
+  set at the end of that tick's exact acquisition window, not recursive
+  descendants, operation WANTs or a global blob inventory. A failed exact-set
+  observation leaves it absent; a later scan-only snapshot failure does not
+  erase the earlier valid count.
 - `serve`: actual accepted inbound GET exchanges in flight, successfully
   sent payloads/bytes and interrupted or failed exchanges. A payload counts
   only after its write and stream shutdown succeed, not merely after lookup.

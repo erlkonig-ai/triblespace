@@ -78,9 +78,11 @@ pub struct ReconcileStats {
     /// counts once. Neither local hits nor failed puts contribute.
     pub landed: usize,
     pub received_bytes: u64,
-    /// Distinct unreadable exact blob WANTs and selected direct roots after
-    /// this tick's puts. None means their observation failed. This excludes
-    /// operation WANTs and unknown recursive descendants, not a global backlog.
+    /// Distinct unreadable exact blob WANTs and selected direct roots at the
+    /// end of this tick's exact acquisition window. None means that exact-set
+    /// observation failed; a later scan-only refresh does not invalidate it.
+    /// This excludes operation WANTs and unknown recursive descendants, not a
+    /// global backlog.
     pub pending_blobs: Option<usize>,
 }
 
