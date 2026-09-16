@@ -331,7 +331,7 @@ fn output_handles(snapshot: &PileSnapshot, collection: CollectionHandle) -> BTre
 fn receipt(value: Id, annotation: &str) -> Fragment {
     entity! {
         metadata::supersedes: value,
-        metadata::description: annotation,
+        metadata::description: annotation.to_owned(),
     }
 }
 
