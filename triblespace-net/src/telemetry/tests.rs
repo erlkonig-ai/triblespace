@@ -725,11 +725,13 @@ fn generated_history_keeps_latest_reports_fixed_while_counting_header_work() {
                 let at = index as i128 + 1;
                 let elapsed = index as u128 + 1;
                 let (id, sample_facts) = sample(scope, session, at, elapsed);
-                if repeated_old.is_none() {
-                    repeated_old = Some(id.id);
-                }
                 facts += sample_facts;
                 facts += entity! { &id @ attrs::completed: index as u128 };
+                if repeated_old.is_none() {
+                    // Keep the authored identity bearer for later annotation;
+                    // an opaque query Id does not grant entity construction.
+                    repeated_old = Some(id);
+                }
             }
         }
         built_per_subject = old_per_subject;
