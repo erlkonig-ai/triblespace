@@ -1003,6 +1003,29 @@ fn unavailable_cuda_is_rejected_without_opening_the_pile() {
 #[cfg(unix)]
 #[test]
 fn watch_follows_an_external_append_and_exits_cleanly_on_sigint() {
+    watch_follows_an_external_append_and_closes("maintain-all", "-INT");
+}
+
+#[cfg(unix)]
+#[test]
+fn maintain_all_watch_closes_on_sigterm() {
+    watch_follows_an_external_append_and_closes("maintain-all", "-TERM");
+}
+
+#[cfg(unix)]
+#[test]
+fn maintain_watch_closes_on_sigint() {
+    watch_follows_an_external_append_and_closes("maintain", "-INT");
+}
+
+#[cfg(unix)]
+#[test]
+fn maintain_watch_closes_on_sigterm() {
+    watch_follows_an_external_append_and_closes("maintain", "-TERM");
+}
+
+#[cfg(unix)]
+fn watch_follows_an_external_append_and_closes(verb: &str, signal: &str) {
     use std::process::{Child, Stdio};
     use std::time::Instant;
 
@@ -1044,9 +1067,12 @@ fn watch_follows_an_external_append_and_exits_cleanly_on_sigint() {
     }
 
     let mut fixture = Fixture::new();
+    if verb == "maintain" {
+        assert_success(&fixture.run("maintain", &[fixture.succinct.handle()]));
+    }
     let log_path = fixture.path.with_extension("watch.log");
     let log = std::fs::File::create(&log_path).unwrap();
-    let mut command = fixture.command("maintain-all", &[fixture.rank9.handle()]);
+    let mut command = fixture.command(verb, &[fixture.rank9.handle()]);
     command
         .args(["--watch", "--interval-ms", "10"])
         .stdin(Stdio::null())
@@ -1062,10 +1088,13 @@ fn watch_follows_an_external_append_and_exits_cleanly_on_sigint() {
         .commit(fixture.source, &fixture.signer, fragment)
         .unwrap();
     writer.close().unwrap();
+    if verb == "maintain" {
+        assert_success(&fixture.run("maintain", &[fixture.succinct.handle()]));
+    }
     wait_for_support(&fixture, &mut watcher, 3, &log_path);
 
     assert!(ProcessCommand::new("kill")
-        .args(["-INT", &watcher.0.id().to_string()])
+        .args([signal, &watcher.0.id().to_string()])
         .status()
         .unwrap()
         .success());
@@ -1074,12 +1103,30 @@ fn watch_follows_an_external_append_and_exits_cleanly_on_sigint() {
         if let Some(status) = watcher.0.try_wait().unwrap() {
             assert!(
                 status.success(),
-                "SIGINT did not close normally: {status}\n{}",
+                "{verb} {signal} did not close normally: {status}\n{}",
                 std::fs::read_to_string(&log_path).unwrap(),
             );
             break;
         }
-        assert!(Instant::now() < deadline, "SIGINT did not stop the watcher");
+        assert!(
+            Instant::now() < deadline,
+            "{verb} {signal} did not stop the watcher"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert!(log.contains("maintenance stopped; closing pile"), "{log}");
+    assert!(
+        !log.contains("Pile dropped without calling close()"),
+        "{log}"
+    );
+    let mut pile = Pile::open(&fixture.path).unwrap();
+    let snapshot = pile.snapshot().unwrap();
+    let facts = snapshot
+        .collection(fixture.rank9)
+        .unwrap()
+        .view::<UnionArchive<OrderedUniverse>>()
+        .unwrap();
+    assert_eq!(facts.iter().collect::<TribleSet>(), fixture.expected);
+    pile.close().unwrap();
 }

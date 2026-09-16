@@ -87,6 +87,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Fixed
 
+- `pile net sync` and collection maintenance handle Unix SIGINT and SIGTERM
+  before opening their writable pile. Stop cancels the in-flight async work or
+  idle wait and closes normally, including `maintain[-all] --watch` under a
+  service manager. Non-Unix keeps Ctrl-C handling. Synchronous CPU/store work
+  cannot be preempted, and no flush loop or shutdown grace timeout is added.
+
 - BM25 search reads the index support already realized in its snapshot, even
   when new source commits await maintenance. Snippets use that same support.
 

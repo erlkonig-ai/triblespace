@@ -167,8 +167,11 @@ concurrent append cannot disappear behind the post-work snapshot. At rest, an
 idempotent pass publishes nothing and clears that pending work.
 Generic collection authority has no wall-clock expiry; arriving proof or
 capability-definition evidence is a content change, not a separate timer.
-Ctrl-C closes the pile normally. Independent targets continue when one fails;
-watch mode reports that failure and retries when its observed inputs change.
+Ctrl-C, or SIGTERM on Unix, cancels the awaited pass or idle wait and closes the
+pile normally. Unix signal handlers are installed before opening the writable
+pile. Shutdown is cooperative: synchronous CPU work, store operations and close
+are not preempted. Independent targets continue when one fails; watch mode
+reports that failure and retries when its observed inputs change.
 
 Targets are explicit, not every historical index in a pile. Use an exact
 descriptor handle for a newly registered target with no equations yet. A
@@ -224,6 +227,12 @@ changes admission for the immutable current session or creates blob WANTs.
   only when a durable WANT names the work; pairwise record roots remain
   separate from blob availability.
 - `pile net sync <PILE> --collection HANDLE [--collection HANDLE ...] [--peers ID_OR_TICKET,...] [--key PATH] [--direction bidirectional|read-only|write-only]` — activate the named collections and run periodic repair. `read-only` pulls but does not serve collection repair, while `write-only` serves admitted readers but does not pull collection repair. Every direction still services ordinary exact-blob WANTs. `--duration SECS` and `--quiescent-for SECS` provide optional process-lifecycle bounds.
+
+  Ctrl-C, or SIGTERM on Unix, cancels awaited reconciliation or the idle wait,
+  withdraws the serving observation and explicitly closes the pile. Unix
+  handlers are registered before the writable pile is opened or the peer starts.
+  This is a cooperative stop boundary, not preemption of synchronous work or a
+  guarantee that close finishes within a service manager's timeout.
 
 The exact repair state is the product of the collection's native-record and
 collection-scoped authorization-evidence PATCHes.

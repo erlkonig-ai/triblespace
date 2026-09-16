@@ -521,6 +521,11 @@ unrelated writes sustain a watch loop. Generic backends without indexed
 `changes_for` remain component-conservative. External provider availability is
 not stored evidence: network callers still own retries and deadlines. There is
 no ambient AUTH-expiry timer.
+The CLI registers SIGINT and SIGTERM handlers on Unix before opening its
+writable pile (Ctrl-C on other platforms). A stop drops the awaited maintenance
+pass or idle wait and reaches the explicit pile close path. Synchronous store
+operations and CPU sections remain cooperative; shutdown adds neither a
+preemption guarantee nor a periodic flush.
 This adds scheduling, not recursive effects inside a mapping kernel. Exact
 target selection prevents an old, superseded index from
 being restarted merely because its descriptor is still present.

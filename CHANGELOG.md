@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Handle both SIGINT and SIGTERM in the Unix CLI sync and maintenance workers.
+  Register before writable pile open, cancel awaited work or idle waits on stop,
+  and reach the existing explicit close boundary. Synchronous work remains
+  cooperative; request limits, maintenance plans and persistence APIs are unchanged.
+
 - Remove the unused hybrid residual-read API and PatternUnion query wrapper.
   Reads expose the selected resident index cover; exact historical support and
   explicit maintenance remain separate operations. A record whose target blob

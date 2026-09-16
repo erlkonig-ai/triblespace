@@ -819,6 +819,13 @@ announce and serve resident exact blobs under bearer handle H, and may service
 durable `Blob(H)` WANTs through KDF(H). These QoS choices do not participate in
 collection identity or change which evidence is semantically valid.
 
+Before opening the writable pile or starting its peer, `pile net sync` registers
+Unix SIGINT and SIGTERM handlers; other platforms retain Ctrl-C handling. Stop
+drops in-flight awaited reconciliation or the idle wait, then withdraws the
+serving observation and explicitly closes the backend. It does not change
+request deadlines, QoS or the application's clocks. Synchronous work and close
+are not preemptible, so this cooperative boundary is not a shutdown-time bound.
+
 ## Convergence and failure model
 
 - Concatenation, local insertion, and remote repair all perform set union.

@@ -561,6 +561,14 @@ fn run_sync(
         .iter()
         .map(|value| parse_collection(value))
         .collect::<Result<Vec<_>>>()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| anyhow!("reconcile runtime: {error}"))?;
+    let stop = {
+        let _entered = runtime.enter();
+        crate::cli::util::shutdown_signal()?
+    };
     let mut pile = open_pile(&pile_path)?;
     let reporting_key = health_key_path
         .map(|path| load_existing_key(Some(path), &pile_path))
@@ -633,7 +641,7 @@ fn run_sync(
     if let Some(seconds) = quiescent_for {
         eprintln!("quiescent stop: {seconds}s without events");
     }
-    eprintln!("live collection repair active. (Ctrl-C to stop)\n");
+    eprintln!("live collection repair active. (Ctrl-C to stop; also SIGTERM on Unix)\n");
 
     let started = std::time::Instant::now();
     let duration_limit = duration.map(std::time::Duration::from_secs);
@@ -646,12 +654,7 @@ fn run_sync(
     let mut wants_pending = 0_usize;
     let mut last_pending_logged = None;
     let mut last_want_progress = std::time::Instant::now();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| anyhow!("reconcile runtime: {error}"))?;
-
-    let result = (|| -> Result<()> {
+    let work = async {
         loop {
             if duration_limit.is_some_and(|limit| started.elapsed() >= limit) {
                 break;
@@ -675,7 +678,7 @@ fn run_sync(
                 }
             }
             if next_reconcile <= std::time::Instant::now() {
-                let stats = runtime.block_on(reconciler.tick(&mut peer));
+                let stats = reconciler.tick(&mut peer).await;
                 next_reconcile = std::time::Instant::now() + reconcile_every;
                 wants_fulfilled_total += stats.fulfilled as u64;
                 wants_pending = stats.pending;
@@ -702,14 +705,22 @@ fn run_sync(
                     last_pending_logged = Some(stats.pending);
                 }
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-
-        eprintln!(
-            "wants: {wants_fulfilled_total} fulfilled this run; {wants_pending} still pending"
-        );
-        Ok(())
-    })();
+        Ok::<(), anyhow::Error>(())
+    };
+    let result = runtime.block_on(async {
+        tokio::select! {
+            biased;
+            stopped = stop => {
+                stopped?;
+                eprintln!("sync stopped; closing pile");
+                Ok(())
+            }
+            result = work => result,
+        }
+    });
+    eprintln!("wants: {wants_fulfilled_total} fulfilled this run; {wants_pending} still pending");
     let close = peer
         .into_store()
         .close()

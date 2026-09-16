@@ -2724,7 +2724,7 @@ async fn maintenance_pass<S: Store + AsyncBlobStoreAcquire + Send>(
         drop(snapshot);
         for handle in order {
             attempted.insert(handle);
-            // Give Ctrl-C and the runtime's I/O driver a boundary between
+            // Give shutdown and the runtime's I/O driver a boundary between
             // one-edge operations, including immediately-ready local stores.
             tokio::task::yield_now().await;
             let result = async {
@@ -2802,8 +2802,6 @@ async fn maintenance_loop(
     interval: Duration,
     succinct_backend: SuccinctBackend,
 ) -> Result<()> {
-    let stop = tokio::signal::ctrl_c();
-    tokio::pin!(stop);
     let mut baseline = None;
     let mut catch_up = true;
     let mut interests = StoreDependencies::default();
@@ -2822,15 +2820,14 @@ async fn maintenance_loop(
             // acquisitions, descriptor queries and per-collection census all
             // contribute, including the failed reads of independent targets.
             let mut observed = ObservedStore::new(&mut *pile);
-            let failures = tokio::select! {
-                biased;
-                stopped = &mut stop => {
-                    stopped?;
-                    eprintln!("maintenance stopped; closing pile");
-                    return Ok(());
-                }
-                result = maintenance_pass(&mut observed, references, signer, dependencies, succinct_backend) => result?,
-            };
+            let failures = maintenance_pass(
+                &mut observed,
+                references,
+                signer,
+                dependencies,
+                succinct_backend,
+            )
+            .await?;
             interests = observed.dependencies();
             drop(observed);
             let after = pile
@@ -2855,14 +2852,7 @@ async fn maintenance_loop(
                 );
             }
         }
-        tokio::select! {
-            stopped = &mut stop => {
-                stopped?;
-                eprintln!("maintenance stopped; closing pile");
-                return Ok(());
-            }
-            _ = tokio::time::sleep(interval) => {}
-        }
+        tokio::time::sleep(interval).await;
     }
 }
 
@@ -2883,16 +2873,30 @@ fn run_maintain(
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
+    let stop = {
+        let _entered = runtime.enter();
+        crate::cli::util::shutdown_signal()?
+    };
     let mut pile = open_refreshed(&path)?;
-    let res = runtime.block_on(maintenance_loop(
-        &mut pile,
-        &references,
-        &signer,
-        dependencies,
-        watch,
-        Duration::from_millis(interval_ms),
-        succinct_backend,
-    ));
+    let res = runtime.block_on(async {
+        tokio::select! {
+            biased;
+            stopped = stop => {
+                stopped?;
+                eprintln!("maintenance stopped; closing pile");
+                Ok(())
+            }
+            result = maintenance_loop(
+                &mut pile,
+                &references,
+                &signer,
+                dependencies,
+                watch,
+                Duration::from_millis(interval_ms),
+                succinct_backend,
+            ) => result,
+        }
+    });
     let close_res = pile
         .close()
         .map_err(|error| anyhow!("pile close: {error:?}"));
