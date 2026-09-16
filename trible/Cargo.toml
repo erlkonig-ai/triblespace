@@ -31,15 +31,10 @@ getrandom = "0.4.1"
 hex = "0.4.3"
 memchr = "2.7.6"
 triblespace = { version = "0.47.0", path = "..", default-features = false }
-# `parallel` is a default feature of triblespace-core that this manifest had
-# been silently dropping via `default-features = false`: the daemons that run
-# `pile collection maintain --watch` were built without rayon, so PATCH union
-# fell back to `Head::union`, key construction to `sort_unstable`, and BLAKE3
-# hashed on one thread. On a 20-core Spark that is the whole machine idle
-# behind one core. It changes no output: `Head::par_union` and `Head::union`
-# compute the same trie, and a parallel sort of distinct keys is the same
-# order. Re-enable it explicitly so a future `default-features = false` cannot
-# turn the cores off again by omission.
+# Select Core's parallel PATCH, archive-construction and large-Pile-validation
+# paths explicitly, including lean CLI builds. Ordinary Blob::new hashing is
+# unchanged. Available parallelism is still bounded by the runtime pool and
+# deployment quota; enabling these paths alone is not a throughput claim.
 triblespace-core = { version = "0.47.0", path = "../triblespace-core", default-features = false, features = ["object-store", "parallel"] }
 triblespace-gpu = { version = "0.47.0", path = "../triblespace-gpu", default-features = false, optional = true }
 triblespace-paths = { path = "../triblespace-paths" }

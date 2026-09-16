@@ -7244,9 +7244,9 @@ mod tests {
             tree
         };
 
-        // Interleaved rather than disjoint: the two sides share every
-        // prefix but the last byte, so the equal-depth branch arm has
-        // "both" pairs to drain and the budget has somewhere to go.
+        // The disjoint even/odd key sets have interleaved ranges and shared
+        // byte prefixes, so the equal-depth branch arm has "both" pairs to
+        // drain. Root-level scatter is exercised; child pairs are smaller.
         let mut united = build(0, 2);
         united.union(build(1, 2));
 
@@ -7260,9 +7260,13 @@ mod tests {
         assert_eq!(united, reference);
 
         let mut united_keys = Vec::new();
-        united.infixes(&[0u8; 0], &mut |&key: &[u8; KEY_SIZE]| united_keys.push(key));
+        united.infixes(&[0u8; 0], &mut |&key: &[u8; KEY_SIZE]| {
+            united_keys.push(key)
+        });
         let mut reference_keys = Vec::new();
-        reference.infixes(&[0u8; 0], &mut |&key: &[u8; KEY_SIZE]| reference_keys.push(key));
+        reference.infixes(&[0u8; 0], &mut |&key: &[u8; KEY_SIZE]| {
+            reference_keys.push(key)
+        });
         united_keys.sort_unstable();
         reference_keys.sort_unstable();
         assert_eq!(united_keys, reference_keys);
