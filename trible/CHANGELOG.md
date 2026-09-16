@@ -17,14 +17,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   Failed attempts retain their existing retry opportunity on any selected-input
   wake; this does not add a retry clock for provider or runtime state changes.
 
-- Retain the CLI's serial Core feature selection after testing explicit
-  `triblespace-core/parallel` enablement. Three rotated unchanged-maintenance
-  passes on caught-up pile copies had median wall times of 70.15 seconds without
-  the feature, 77.31 seconds with it at one thread, and 102.21 seconds at twenty
-  threads; all published zero bytes. Faster large-Pile first-touch validation
-  did not establish a whole-pass improvement. These measurements do not
-  attribute the regression to an individual phase or measure useful catch-up
-  work. Runtime CPU quotas remain a separate deployment choice.
+- Retain the CLI's serial Core feature selection conservatively, pending a
+  matched-input comparison of `triblespace-core/parallel` enablement. The
+  feature-off runs had a 70.15-second median, but their pile copy differed from
+  the feature-on input by 111,616 bytes; this comparison does not isolate the
+  feature's effect. With the same feature-on binary and pile copy, three rotated
+  unchanged-maintenance passes had median wall times of 77.31 seconds with
+  `RAYON_NUM_THREADS=1` and 102.21 seconds with the default pool. The latter's
+  actual thread count was not recorded. All nine passes published zero bytes;
+  they neither measure useful catch-up work nor identify a responsible phase.
+  Faster large-Pile first-touch validation likewise did not establish a
+  whole-pass improvement. Runtime CPU quotas remain a separate deployment
+  choice. This corrects the earlier controlled-comparison and twenty-thread
+  descriptions without changing code, features, binaries, or worker settings.
 
 - Add `union_matches_insertion_reference`, run with and without Core's parallel
   feature, to compare one heap-backed interleaved-key union with direct insertion.

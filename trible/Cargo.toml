@@ -31,8 +31,9 @@ getrandom = "0.4.1"
 hex = "0.4.3"
 memchr = "2.7.6"
 triblespace = { version = "0.47.0", path = "..", default-features = false }
-# Keep Core's serial paths for the CLI: parallel currently regresses measured
-# maintenance passes. This selection is independent of runtime CPU quotas.
+# Keep the CLI's serial Core selection pending matched-input feature measurements.
+# The observed default-pool slowdown does not isolate the feature's effect.
+# This selection is independent of runtime CPU quotas.
 triblespace-core = { version = "0.47.0", path = "../triblespace-core", default-features = false, features = ["object-store"] }
 triblespace-gpu = { version = "0.47.0", path = "../triblespace-gpu", default-features = false, optional = true }
 triblespace-paths = { path = "../triblespace-paths" }
