@@ -1001,6 +1001,135 @@ where
     source_residual(snapshot, &probe, &support, &BTreeMap::new())
 }
 
+/// Resident immediate-source members an edit reads beside the target's
+/// resident view, selected at the immediate boundary from the target-first
+/// observations of source and target. Every resident source cover member is
+/// retained unless an exact selected target witness route proves its mapped
+/// value covered. No foundational record or payload is read, no support is
+/// expanded, no ancestor is re-admitted, and nothing is mapped or published.
+///
+/// A source member is proved covered only by a route from a selected target
+/// witness, downward through the target's own same-lattice merge inputs by
+/// exact input-witness identity, to a `DERIVE` whose input witness is that
+/// member's exact selected source record. The mapped value is a function of
+/// the bytes, so equal payloads under different witnesses are one member: a
+/// route reaching any of its accepted witnesses proves that value covered,
+/// while the distinct identities are kept apart in what is returned and no
+/// support is merged. A missing, mismatched or cyclic route proves nothing.
+/// Unmatched coarse members are retained even when finer
+/// members they contain are covered: the selection is conservative and may
+/// overlap what the target already represents. The law is mapped-value
+/// containment, which holds for every fact-preserving mapping.
+pub(crate) fn edit_residual_source_members<R, M>(
+    snapshot: &R,
+    target: Collection<M::Target>,
+) -> Result<
+    Vec<(
+        CollectionData,
+        Blob<M::Source>,
+        Vec<CollectionRecordFingerprint>,
+    )>,
+    CollectionRealizationError,
+>
+where
+    R: StoreRead,
+    M: CollectionMapping,
+{
+    let loaded = super::api::load_collection_descriptor(snapshot, target.handle())
+        .map_err(|error| CollectionRealizationError::storage("read target descriptor", error))?;
+    let source = descriptor::source(loaded.fragment.facts())
+        .map_err(|error| CollectionRealizationError::Resolution(error.to_string()))?
+        .ok_or_else(|| {
+            CollectionRealizationError::Resolution(
+                "edit residual requires a derived target descriptor".to_owned(),
+            )
+        })?;
+    let source_observation = super::observation::attach::<R, M::Source>(
+        snapshot,
+        Collection::from_handle(source),
+    )?;
+    let target_observation = super::observation::attach::<R, M::Target>(snapshot, target)?;
+
+    // Selected source witnesses by exact record identity, grouped by member.
+    let mut selected_source: BTreeMap<CollectionRecordFingerprint, CollectionData> =
+        BTreeMap::new();
+    let mut members: BTreeMap<CollectionData, Vec<CollectionRecordFingerprint>> = BTreeMap::new();
+    for record in source_observation.witnesses() {
+        let member = super::witness::output(*record);
+        selected_source.insert(record.fingerprint(), member);
+        members.entry(member).or_default().push(record.fingerprint());
+    }
+
+    // Walk the target's routes downward by exact witness identity.
+    let mut covered = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    let mut pending: Vec<CollectionRecord> = target_observation.witnesses().to_vec();
+    while let Some(record) = pending.pop() {
+        if !visited.insert(record.fingerprint()) {
+            continue;
+        }
+        match record {
+            CollectionRecord::Derive(derive) => {
+                if derive.collection() == target.handle()
+                    && selected_source
+                        .get(&derive.input_witness())
+                        .is_some_and(|member| *member == derive.input())
+                {
+                    covered.insert(derive.input_witness());
+                }
+            }
+            CollectionRecord::Merge(merge) => {
+                if merge.collection() != target.handle() {
+                    continue;
+                }
+                let (low, high) = merge.inputs();
+                let (low_witness, high_witness) = merge.input_witnesses();
+                for (witness, data) in [(low_witness, low), (high_witness, high)] {
+                    let Some(input) = snapshot.record(witness).map_err(|error| {
+                        CollectionRealizationError::storage("read target route input", error)
+                    })?
+                    else {
+                        continue;
+                    };
+                    if input.collection() == target.handle()
+                        && super::witness::output(input) == data
+                    {
+                        pending.push(input);
+                    }
+                }
+            }
+            CollectionRecord::Commit(_) => {}
+        }
+    }
+
+    let trace = std::env::var_os("TRIBLESPACE_COLLECTION_TRACE").is_some();
+    let mut residual = Vec::new();
+    let member_count = members.len();
+    for (member, witnesses) in members {
+        if witnesses.iter().any(|witness| covered.contains(witness)) {
+            continue;
+        }
+        let blob = snapshot
+            .get(Handle::<M::Source>::from_hash(member))
+            .map_err(|error| {
+                CollectionRealizationError::storage("load source member for edit", error)
+            })?;
+        residual.push((member, blob, witnesses));
+    }
+    if trace {
+        eprintln!(
+            "trace edit residual {}: source cover {member_count} member(s) with {} witness(es), target {} witness(es), {} route record(s) visited, {} source witness(es) covered, {} member(s) retained",
+            hex::encode_upper(target.handle().raw),
+            selected_source.len(),
+            target_observation.witnesses().len(),
+            visited.len(),
+            covered.len(),
+            residual.len()
+        );
+    }
+    Ok(residual)
+}
+
 /// Attach one target collection using its snapshot's proof and definition state.
 ///
 /// The target's endorsed records define the search boundary. The result

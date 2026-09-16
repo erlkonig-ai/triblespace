@@ -1784,6 +1784,36 @@ pub trait CollectionSnapshotExt: StoreRead + Sized {
         )
     }
 
+    /// Resident immediate-source members an edit reads beside the target's
+    /// resident view, selected at the immediate boundary from the target-first
+    /// observations of source and target, without expanding support or
+    /// reading any foundational record or payload. Conservative: every
+    /// resident source cover member is retained unless an exact selected
+    /// target witness route proves its mapped value covered, so the result
+    /// may overlap what the target already represents and is never smaller
+    /// than the residual an edit needs. Read-only, like
+    /// [`Self::uncovered_source_members`], whose exact-support selection stays
+    /// available for callers that need it.
+    fn edit_residual_source_members<T>(
+        &self,
+        target: Collection<T>,
+    ) -> Result<
+        Vec<(
+            super::CollectionData,
+            Blob<T::Source>,
+            Vec<super::CollectionRecordFingerprint>,
+        )>,
+        CollectionRealizationError,
+    >
+    where
+        T: CollectionDerivation,
+        Handle<T>: InlineEncoding,
+    {
+        super::exact_derived::edit_residual_source_members::<Self, CanonicalDerivation<T>>(
+            self, target,
+        )
+    }
+
     /// Observe the complete target realization for one explicit support.
     ///
     /// Unlike [`Self::collection`], this is an assertion boundary: it fails

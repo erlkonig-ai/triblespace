@@ -6,9 +6,10 @@ use hifitime::Epoch;
 use super::*;
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::succinctarchive::{
-    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
+    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchive, SuccinctArchiveBlob,
+    UnionArchive,
 };
-use crate::blob::{Blob, IntoBlob};
+use crate::blob::{Blob, IntoBlob, TryFromBlob};
 use crate::capability::{CapabilityProof, CapabilityResource};
 use crate::inline::encodings::hash::Handle;
 use crate::repo::memoryrepo::MemoryRepo;
@@ -480,4 +481,393 @@ fn residual_selection_names_resident_source_members_without_demanding_absent_out
         store.snapshot().unwrap().records().unwrap().count(),
         records_before
     );
+}
+
+/// A Message-shaped chain with open admission: raw facts, their Succinct
+/// elements, and Rank9 acceleration. Every helper below publishes exactly the
+/// records it names and nothing else.
+fn edit_chain() -> (
+    MemoryRepo,
+    Collection<SimpleArchive>,
+    Collection<SuccinctArchiveBlob>,
+    Collection<Rank9AcceleratedSuccinctArchiveBlob>,
+) {
+    let mut store = MemoryRepo::default();
+    let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+    let source = store.collection("edit-source", policy.clone()).unwrap();
+    let succinct = store
+        .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+        .unwrap();
+    let rank9 = store
+        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+        .unwrap();
+    (store, source, succinct, rank9)
+}
+
+fn raw_data(blob: &Blob<SimpleArchive>) -> CollectionData {
+    Handle::<SimpleArchive>::to_hash(blob.get_handle())
+}
+
+fn succinct_data(blob: &Blob<SuccinctArchiveBlob>) -> CollectionData {
+    Handle::<SuccinctArchiveBlob>::to_hash(blob.get_handle())
+}
+
+/// A resident raw union of two published facts, with its MERGE record.
+fn merge_raw(
+    store: &mut MemoryRepo,
+    collection: Collection<SimpleArchive>,
+    signer: &SigningKey,
+    low: (&Blob<SimpleArchive>, CollectionRecordFingerprint),
+    high: (&Blob<SimpleArchive>, CollectionRecordFingerprint),
+) -> (Blob<SimpleArchive>, CollectionRecord) {
+    let union = simplearchive_union::join(low.0, high.0).unwrap();
+    store.put::<SimpleArchive, _>(union.clone()).unwrap();
+    let record = CollectionRecord::Merge(CollectionMerge::sign(
+        signer,
+        collection.handle(),
+        (raw_data(low.0), low.1),
+        (raw_data(high.0), high.1),
+        raw_data(&union),
+    ));
+    store.insert(record).unwrap();
+    (union, record)
+}
+
+/// A resident Succinct element derived from one raw member, with its DERIVE.
+fn derive_succinct(
+    store: &mut MemoryRepo,
+    succinct: Collection<SuccinctArchiveBlob>,
+    signer: &SigningKey,
+    input: (&Blob<SimpleArchive>, CollectionRecordFingerprint),
+) -> (Blob<SuccinctArchiveBlob>, CollectionRecord) {
+    let element = succinctarchive_union::derive_element(input.0).unwrap();
+    store
+        .put::<SuccinctArchiveBlob, _>(element.clone())
+        .unwrap();
+    let record = CollectionRecord::Derive(CollectionDerive::sign(
+        signer,
+        succinct.handle(),
+        (raw_data(input.0), input.1),
+        succinct_data(&element),
+    ));
+    store.insert(record).unwrap();
+    (element, record)
+}
+
+fn residual_members<E>(residual: &[(CollectionData, Blob<E>, Vec<CollectionRecordFingerprint>)]) -> Vec<CollectionData>
+where
+    E: crate::blob::BlobEncoding,
+{
+    let mut members: Vec<_> = residual.iter().map(|(member, _, _)| *member).collect();
+    members.sort();
+    members
+}
+
+#[test]
+fn edit_residual_keeps_distinct_witnesses_apart_behind_an_equal_payload() {
+    // Two admitted producers publish the same payload a; the target consumed
+    // it through one of them, and the mapped value of those bytes is covered
+    // whichever identity the route names. The same two producers publish b,
+    // which no route reaches: b is retained and both identities are reported
+    // apart, never merged into one witness.
+    let first = SigningKey::from_bytes(&[51; 32]);
+    let second = SigningKey::from_bytes(&[52; 32]);
+    let (mut store, source, succinct, _) = edit_chain();
+    let a = archive(4);
+    let b = archive(5);
+    let c1 = publish(&mut store, source, &first, a.clone());
+    publish(&mut store, source, &second, a.clone());
+    let cb1 = publish(&mut store, source, &first, b.clone());
+    let cb2 = publish(&mut store, source, &second, b.clone());
+    derive_succinct(
+        &mut store,
+        succinct,
+        &first,
+        (&a, CollectionRecord::Commit(c1).fingerprint()),
+    );
+    let snapshot = store.snapshot().unwrap();
+    let residual = snapshot.edit_residual_source_members(succinct).unwrap();
+    assert_eq!(residual_members(&residual), vec![raw_data(&b)]);
+    let mut witnesses = residual[0].2.clone();
+    witnesses.sort();
+    let mut expected = vec![
+        CollectionRecord::Commit(cb1).fingerprint(),
+        CollectionRecord::Commit(cb2).fingerprint(),
+    ];
+    expected.sort();
+    assert_eq!(witnesses, expected);
+}
+
+#[test]
+fn edit_residual_retains_a_coarse_member_whose_finer_part_is_covered() {
+    // Source cover is the resident union ab; the target carried only a. The
+    // route reaches a's commit, not the union's merge, so ab stays.
+    let owner = SigningKey::from_bytes(&[53; 32]);
+    let (mut store, source, succinct, _) = edit_chain();
+    let a = archive(4);
+    let b = archive(5);
+    let ca = publish(&mut store, source, &owner, a.clone());
+    let cb = publish(&mut store, source, &owner, b.clone());
+    let (ab, merge) = merge_raw(
+        &mut store,
+        source,
+        &owner,
+        (&a, CollectionRecord::Commit(ca).fingerprint()),
+        (&b, CollectionRecord::Commit(cb).fingerprint()),
+    );
+    derive_succinct(
+        &mut store,
+        succinct,
+        &owner,
+        (&a, CollectionRecord::Commit(ca).fingerprint()),
+    );
+    let snapshot = store.snapshot().unwrap();
+    let residual = snapshot.edit_residual_source_members(succinct).unwrap();
+    assert_eq!(residual_members(&residual), vec![raw_data(&ab)]);
+    assert_eq!(residual[0].2, vec![merge.fingerprint()]);
+}
+
+#[test]
+fn edit_residual_retains_redundant_fine_members_under_a_coarser_target() {
+    // The union's payload never landed, so the source cover is the fine pair
+    // a and b, while the target carried the union through the merge record.
+    // The route reaches the merge, not the commits: a and b stay, redundant
+    // for the value and safe.
+    let owner = SigningKey::from_bytes(&[54; 32]);
+    let (mut store, source, succinct, _) = edit_chain();
+    let a = archive(4);
+    let b = archive(5);
+    let ca = publish(&mut store, source, &owner, a.clone());
+    let cb = publish(&mut store, source, &owner, b.clone());
+    let union = simplearchive_union::join(&a, &b).unwrap();
+    let merge = CollectionRecord::Merge(CollectionMerge::sign(
+        &owner,
+        source.handle(),
+        (raw_data(&a), CollectionRecord::Commit(ca).fingerprint()),
+        (raw_data(&b), CollectionRecord::Commit(cb).fingerprint()),
+        raw_data(&union),
+    ));
+    store.insert(merge).unwrap();
+    let element = succinctarchive_union::derive_element(&union).unwrap();
+    store
+        .put::<SuccinctArchiveBlob, _>(element.clone())
+        .unwrap();
+    store
+        .insert(CollectionRecord::Derive(CollectionDerive::sign(
+            &owner,
+            succinct.handle(),
+            (raw_data(&union), merge.fingerprint()),
+            succinct_data(&element),
+        )))
+        .unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let residual = snapshot.edit_residual_source_members(succinct).unwrap();
+    let mut expected = vec![raw_data(&a), raw_data(&b)];
+    expected.sort();
+    assert_eq!(residual_members(&residual), expected);
+}
+
+#[test]
+fn edit_residual_retains_an_unmatched_coarse_member_across_commuting_paths() {
+    // The target holds the union's value through derive-then-merge; the
+    // source cover is the raw union. No route reaches the raw merge record,
+    // so the coarse member is retained: conservative, overlapping, allowed.
+    let owner = SigningKey::from_bytes(&[55; 32]);
+    let (mut store, source, succinct, _) = edit_chain();
+    let a = archive(4);
+    let b = archive(5);
+    let ca = publish(&mut store, source, &owner, a.clone());
+    let cb = publish(&mut store, source, &owner, b.clone());
+    let (ab, _) = merge_raw(
+        &mut store,
+        source,
+        &owner,
+        (&a, CollectionRecord::Commit(ca).fingerprint()),
+        (&b, CollectionRecord::Commit(cb).fingerprint()),
+    );
+    let (sa, da) = derive_succinct(
+        &mut store,
+        succinct,
+        &owner,
+        (&a, CollectionRecord::Commit(ca).fingerprint()),
+    );
+    let (sb, db) = derive_succinct(
+        &mut store,
+        succinct,
+        &owner,
+        (&b, CollectionRecord::Commit(cb).fingerprint()),
+    );
+    let sab = succinctarchive_union::join(&sa, &sb).unwrap();
+    store.put::<SuccinctArchiveBlob, _>(sab.clone()).unwrap();
+    store
+        .insert(CollectionRecord::Merge(CollectionMerge::sign(
+            &owner,
+            succinct.handle(),
+            (succinct_data(&sa), da.fingerprint()),
+            (succinct_data(&sb), db.fingerprint()),
+            succinct_data(&sab),
+        )))
+        .unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let residual = snapshot.edit_residual_source_members(succinct).unwrap();
+    assert_eq!(residual_members(&residual), vec![raw_data(&ab)]);
+}
+
+#[test]
+fn edit_residual_lets_missing_or_mismatched_route_edges_prove_nothing() {
+    // Two resident target merges: one names a missing input witness beside a
+    // valid one, the other names a real witness with the wrong payload. The
+    // valid edge covers a; nothing covers b; nothing fails.
+    let owner = SigningKey::from_bytes(&[56; 32]);
+    let (mut store, source, succinct, _) = edit_chain();
+    let a = archive(4);
+    let b = archive(5);
+    let ca = publish(&mut store, source, &owner, a.clone());
+    let cb = publish(&mut store, source, &owner, b.clone());
+    let (sa, da) = derive_succinct(
+        &mut store,
+        succinct,
+        &owner,
+        (&a, CollectionRecord::Commit(ca).fingerprint()),
+    );
+    let sb = succinctarchive_union::derive_element(&b).unwrap();
+    let sab = succinctarchive_union::join(&sa, &sb).unwrap();
+    store.put::<SuccinctArchiveBlob, _>(sab.clone()).unwrap();
+    let missing = CollectionRecordFingerprint::from_raw([0x77; 32]);
+    store
+        .insert(CollectionRecord::Merge(CollectionMerge::sign(
+            &owner,
+            succinct.handle(),
+            (succinct_data(&sa), da.fingerprint()),
+            (succinct_data(&sb), missing),
+            succinct_data(&sab),
+        )))
+        .unwrap();
+    let sabb = succinctarchive_union::join(&sab, &sb).unwrap();
+    store.put::<SuccinctArchiveBlob, _>(sabb.clone()).unwrap();
+    store
+        .insert(CollectionRecord::Merge(CollectionMerge::sign(
+            &owner,
+            succinct.handle(),
+            // Names a's real derive but claims b's payload came out of it.
+            (succinct_data(&sb), da.fingerprint()),
+            (succinct_data(&sab), missing),
+            succinct_data(&sabb),
+        )))
+        .unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let residual = snapshot.edit_residual_source_members(succinct).unwrap();
+    assert_eq!(residual_members(&residual), vec![raw_data(&b)]);
+    assert_eq!(
+        residual[0].2,
+        vec![CollectionRecord::Commit(cb).fingerprint()]
+    );
+}
+
+#[test]
+fn edit_residual_keeps_the_source_available_until_the_target_output_lands() {
+    // Record before blob at the Rank9 step: the accelerated output is signed
+    // but absent, so its route proves nothing and the Succinct member stays
+    // available; once the bytes land the residual is empty. No raw record or
+    // payload is consulted for the Rank9 arm.
+    let owner = SigningKey::from_bytes(&[57; 32]);
+    let (mut store, source, succinct, rank9) = edit_chain();
+    let a = archive(4);
+    let ca = publish(&mut store, source, &owner, a.clone());
+    let (sa, da) = derive_succinct(
+        &mut store,
+        succinct,
+        &owner,
+        (&a, CollectionRecord::Commit(ca).fingerprint()),
+    );
+    let accelerated = SuccinctArchive::<OrderedUniverse>::build_accelerated_root(sa.clone()).unwrap();
+    let r_data = Handle::<Rank9AcceleratedSuccinctArchiveBlob>::to_hash(accelerated.get_handle());
+    store
+        .insert(CollectionRecord::Derive(CollectionDerive::sign(
+            &owner,
+            rank9.handle(),
+            (succinct_data(&sa), da.fingerprint()),
+            r_data,
+        )))
+        .unwrap();
+    assert!(store
+        .snapshot()
+        .unwrap()
+        .edit_residual_source_members(succinct)
+        .unwrap()
+        .is_empty());
+    // The Rank9 arm on its own observation: the raw collection is neither
+    // enumerated nor read, and no raw payload hash is consulted.
+    let observed = super::observed_store::ObservedStore::new(store.snapshot().unwrap());
+    let residual = observed.edit_residual_source_members(rank9).unwrap();
+    assert_eq!(residual_members(&residual), vec![succinct_data(&sa)]);
+    assert_eq!(residual[0].2, vec![da.fingerprint()]);
+    let dependencies = observed.dependencies();
+    assert!(!dependencies.all_records && !dependencies.all_blobs);
+    assert!(!dependencies.blobs.contains(&raw_data(&a)), "raw payload read");
+    assert!(
+        !dependencies
+            .records
+            .contains(&CollectionRecordSelector::Collection(source.handle())),
+        "raw collection enumerated"
+    );
+    assert!(
+        !dependencies
+            .records
+            .contains(&CollectionRecordSelector::Fingerprint(
+                CollectionRecord::Commit(ca).fingerprint()
+            )),
+        "raw record read"
+    );
+    store
+        .put::<Rank9AcceleratedSuccinctArchiveBlob, _>(accelerated)
+        .unwrap();
+    assert!(store
+        .snapshot()
+        .unwrap()
+        .edit_residual_source_members(rank9)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn edit_residual_union_answers_the_facts_of_the_whole_source() {
+    // The target carried the union ab; c is resident and uncarried. The
+    // target view joined with the residual answers every fact the source
+    // holds, and nothing the source lacks.
+    let owner = SigningKey::from_bytes(&[58; 32]);
+    let (mut store, source, succinct, _) = edit_chain();
+    let a = archive(4);
+    let b = archive(5);
+    let c = archive(6);
+    let ca = publish(&mut store, source, &owner, a.clone());
+    let cb = publish(&mut store, source, &owner, b.clone());
+    publish(&mut store, source, &owner, c.clone());
+    let (ab, merge) = merge_raw(
+        &mut store,
+        source,
+        &owner,
+        (&a, CollectionRecord::Commit(ca).fingerprint()),
+        (&b, CollectionRecord::Commit(cb).fingerprint()),
+    );
+    derive_succinct(&mut store, succinct, &owner, (&ab, merge.fingerprint()));
+    let snapshot = store.snapshot().unwrap();
+    let residual = snapshot.edit_residual_source_members(succinct).unwrap();
+    assert_eq!(residual_members(&residual), vec![raw_data(&c)]);
+    let mut answered: std::collections::BTreeSet<Trible> = snapshot
+        .collection(succinct)
+        .unwrap()
+        .view::<UnionArchive<OrderedUniverse>>()
+        .unwrap()
+        .iter()
+        .collect();
+    for (_, blob, _) in &residual {
+        let facts = TribleSet::try_from_blob(blob.clone()).unwrap();
+        answered.extend(facts.iter());
+    }
+    let mut expected = std::collections::BTreeSet::new();
+    for blob in [&a, &b, &c] {
+        expected.extend(TribleSet::try_from_blob(blob.clone()).unwrap().iter());
+    }
+    assert_eq!(answered, expected);
 }

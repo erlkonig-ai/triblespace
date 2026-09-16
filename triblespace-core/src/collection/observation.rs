@@ -51,7 +51,9 @@ where
         .map_err(|error| CollectionRealizationError::storage("read target records", error))?;
     let mut admitted = BTreeMap::new();
     let mut records = BTreeMap::new();
+    let mut candidate_count = 0usize;
     for record in candidates {
+        candidate_count += 1;
         if matches!(record, CollectionRecord::Commit(_)) && source.is_some()
             || matches!(record, CollectionRecord::Derive(_)) && source.is_none()
         {
@@ -155,8 +157,28 @@ where
         }
     }
 
+    let selected_before_coarsening = selected.len();
     if let Some(source) = source {
         coarsen_images(snapshot, target.handle(), source, &records, &mut selected)?;
+    }
+    if std::env::var_os("TRIBLESPACE_COLLECTION_TRACE").is_some() {
+        let merges = records
+            .values()
+            .filter(|record| matches!(record, CollectionRecord::Merge(_)))
+            .count();
+        let derives = records
+            .values()
+            .filter(|record| matches!(record, CollectionRecord::Derive(_)))
+            .count();
+        let complete = available.values().filter(|complete| **complete).count();
+        eprintln!(
+            "trace attach {}: {candidate_count} candidate(s), {} admitted ({merges} merge, {derives} derive), {} output(s) inspected ({complete} complete), {} suppressed by resident merges, {selected_before_coarsening} selected before image coarsening, {} after",
+            hex::encode_upper(target.handle().raw),
+            records.len(),
+            available.len(),
+            suppressed.len(),
+            selected.len()
+        );
     }
     let witnesses: Vec<_> = selected.into_iter().map(|id| records[&id]).collect();
     let cover = Cover::from_data(

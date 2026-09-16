@@ -153,6 +153,12 @@ where
         &self.cover
     }
 
+    /// The accepted producer endorsements whose outputs form the cover, by
+    /// their exact record identities.
+    pub(crate) fn witnesses(&self) -> &[CollectionRecord] {
+        &self.witnesses
+    }
+
     /// Reconstruct one caller-chosen logical value from the realized cover.
     pub fn view<V>(&self) -> Result<V, TryFromCoverError<R::GetError<Infallible>, V::Error>>
     where

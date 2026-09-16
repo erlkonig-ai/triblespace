@@ -873,3 +873,152 @@ fn pile_observation_tracks_missing_target_write_definition_without_new_records()
         facts(1, 21)
     );
 }
+
+/// Live-pile probe for one derived collection's target-first frontier: why
+/// attachment selects what it selects. Ignored unless `TRIBLESPACE_PROBE_PILE`
+/// names a pile; `TRIBLESPACE_PROBE_SUCCINCT` and `TRIBLESPACE_PROBE_RANK9`
+/// name the two collection handles in hex. Reads only; nothing is published.
+fn probe_frontier<E>(snapshot: &crate::repo::pile::PileSnapshot, label: &str, handle_hex: &str)
+where
+    E: crate::collection::CollectionEncoding,
+    Handle<E>: InlineEncoding,
+{
+    use crate::collection::encoding::CollectionMemberAvailability;
+    let mut raw = [0u8; 32];
+    hex::decode_to_slice(handle_hex, &mut raw).unwrap();
+    let target = Collection::<E>::from_handle(Inline::new(raw));
+    let loaded = crate::collection::api::load_collection_descriptor(snapshot, target.handle()).unwrap();
+    let evidence = crate::collection::api::discover_admission_evidence(
+        snapshot,
+        descriptor::admission_policies(
+            snapshot,
+            loaded.fragment.facts(),
+            crate::collection::ACTION_WRITE,
+            Some(E::id()),
+        ),
+        crate::collection::ACTION_WRITE,
+        target.handle(),
+    )
+    .unwrap();
+    let candidates = snapshot
+        .select_records(&BTreeSet::from([CollectionRecordSelector::Collection(
+            target.handle(),
+        )]))
+        .unwrap();
+    let mut admitted = std::collections::BTreeMap::new();
+    let mut by_kind = [0usize; 3];
+    let mut unadmitted = 0usize;
+    let mut records = std::collections::BTreeMap::new();
+    for record in candidates {
+        let kind = match record {
+            CollectionRecord::Commit(_) => 0,
+            CollectionRecord::Merge(_) => 1,
+            CollectionRecord::Derive(_) => 2,
+        };
+        by_kind[kind] += 1;
+        let ok = *admitted
+            .entry(record.public_key().raw)
+            .or_insert_with(|| {
+                ed25519_dalek::VerifyingKey::from_bytes(&record.public_key().raw)
+                    .ok()
+                    .is_some_and(|key| evidence.authorizes(snapshot, key))
+            });
+        if ok {
+            records.insert(record.fingerprint(), record);
+        } else {
+            unadmitted += 1;
+        }
+    }
+    let mut availability = [0usize; 4];
+    let mut consumed_by_complete = BTreeSet::new();
+    let mut consumed_by_any = BTreeSet::new();
+    let mut examples = Vec::new();
+    for record in records.values() {
+        let CollectionRecord::Merge(merge) = record else {
+            continue;
+        };
+        let (low_witness, high_witness) = merge.input_witnesses();
+        consumed_by_any.insert(low_witness);
+        consumed_by_any.insert(high_witness);
+        let availability_kind = match crate::collection::encoding::collection_member_availability::<
+            E,
+            _,
+        >(merge.result(), snapshot)
+        .unwrap()
+        {
+            CollectionMemberAvailability::Absent => 0,
+            CollectionMemberAvailability::Incomplete => 1,
+            CollectionMemberAvailability::Unusable => 2,
+            CollectionMemberAvailability::Complete => 3,
+        };
+        availability[availability_kind] += 1;
+        if availability_kind == 3 {
+            consumed_by_complete.insert(low_witness);
+            consumed_by_complete.insert(high_witness);
+        } else if examples.len() < 3 {
+            let missing = E::missing_representation_dependencies(merge.result(), snapshot)
+                .map(|missing| missing.len())
+                .unwrap_or(usize::MAX);
+            examples.push((
+                hex::encode_upper(&record.fingerprint().raw()[..6]),
+                hex::encode_upper(&merge.result().raw[..6]),
+                availability_kind,
+                missing,
+            ));
+        }
+    }
+    let attached = crate::collection::observation::attach::<_, E>(snapshot, target).unwrap();
+    let mut selected_kinds = [0usize; 3];
+    let mut selected_consumed_complete = 0usize;
+    let mut selected_consumed_any = 0usize;
+    for witness in attached.witnesses() {
+        let kind = match witness {
+            CollectionRecord::Commit(_) => 0,
+            CollectionRecord::Merge(_) => 1,
+            CollectionRecord::Derive(_) => 2,
+        };
+        selected_kinds[kind] += 1;
+        if consumed_by_complete.contains(&witness.fingerprint()) {
+            selected_consumed_complete += 1;
+        }
+        if consumed_by_any.contains(&witness.fingerprint()) {
+            selected_consumed_any += 1;
+        }
+    }
+    eprintln!(
+        "probe {label} {}: records commit {} merge {} derive {}, unadmitted {}; merge outputs absent {} incomplete {} unusable {} complete {}; selected {} (commit {}, merge {}, derive {}); selected witnesses consumed by an admitted merge: {} (by one with a complete output: {}); incomplete examples (record, result, kind, missing deps): {:?}",
+        &handle_hex[..8],
+        by_kind[0],
+        by_kind[1],
+        by_kind[2],
+        unadmitted,
+        availability[0],
+        availability[1],
+        availability[2],
+        availability[3],
+        attached.witnesses().len(),
+        selected_kinds[0],
+        selected_kinds[1],
+        selected_kinds[2],
+        selected_consumed_any,
+        selected_consumed_complete,
+        examples
+    );
+}
+
+#[test]
+#[ignore]
+fn probe_live_frontier() {
+    let Some(path) = std::env::var_os("TRIBLESPACE_PROBE_PILE") else {
+        return;
+    };
+    let mut pile = Pile::open(std::path::Path::new(&path)).unwrap();
+    pile.refresh().unwrap();
+    let snapshot = pile.snapshot().unwrap();
+    if let Ok(handle) = std::env::var("TRIBLESPACE_PROBE_SUCCINCT") {
+        probe_frontier::<SuccinctArchiveBlob>(&snapshot, "succinct", &handle);
+    }
+    if let Ok(handle) = std::env::var("TRIBLESPACE_PROBE_RANK9") {
+        probe_frontier::<Rank9AcceleratedSuccinctArchiveBlob>(&snapshot, "rank9", &handle);
+    }
+}
