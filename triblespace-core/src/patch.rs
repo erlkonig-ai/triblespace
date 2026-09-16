@@ -7213,6 +7213,61 @@ mod tests {
         assert_eq!(left.len(), 2);
     }
 
+    /// Both union arms must produce the same trie.
+    ///
+    /// `PATCH::union` dispatches to the work-stealing `Head::par_union`
+    /// when the `parallel` feature is compiled, and to the serial
+    /// `Head::union` when it is not, so no single build exercises both.
+    /// This compares whichever arm the build selected against a
+    /// reference that uses neither: the same key set inserted directly.
+    /// Running it under both feature settings pins the two arms to the
+    /// same trie without either of them being the other's oracle.
+    ///
+    /// It exists because `trible`'s manifest dropped the feature for
+    /// months, so a rollout that restores it changes which arm the
+    /// maintenance daemons run. That is only safe if the arms agree,
+    /// and agreeing is a claim a test should make rather than a reader.
+    #[test]
+    fn union_matches_insertion_reference() {
+        const KEY_SIZE: usize = 8;
+        // Comfortably past PARALLEL_PATCH_UNION_THRESHOLD (4096) so the
+        // parallel build takes its scatter-and-spawn arm rather than the
+        // per-key fallback that a small asymmetric merge would take.
+        const KEYS: u64 = 12_000;
+
+        let build = |start: u64, step: u64| {
+            let mut tree = PATCH::<KEY_SIZE, IdentitySchema, ()>::new();
+            for index in 0..KEYS {
+                let key = (start + index * step).to_be_bytes();
+                tree.insert(&Entry::new(&key));
+            }
+            tree
+        };
+
+        // Interleaved rather than disjoint: the two sides share every
+        // prefix but the last byte, so the equal-depth branch arm has
+        // "both" pairs to drain and the budget has somewhere to go.
+        let mut united = build(0, 2);
+        united.union(build(1, 2));
+
+        let mut reference = PATCH::<KEY_SIZE, IdentitySchema, ()>::new();
+        for index in 0..(2 * KEYS) {
+            reference.insert(&Entry::new(&index.to_be_bytes()));
+        }
+
+        assert_eq!(united.len(), 2 * KEYS);
+        assert_eq!(united.len(), reference.len());
+        assert_eq!(united, reference);
+
+        let mut united_keys = Vec::new();
+        united.infixes(&[0u8; 0], &mut |&key: &[u8; KEY_SIZE]| united_keys.push(key));
+        let mut reference_keys = Vec::new();
+        reference.infixes(&[0u8; 0], &mut |&key: &[u8; KEY_SIZE]| reference_keys.push(key));
+        united_keys.sort_unstable();
+        reference_keys.sort_unstable();
+        assert_eq!(united_keys, reference_keys);
+    }
+
     // Small unit tests that ensure BranchMut-based editing is used by
     // the higher-level set operations like intersect/difference. These are
     // ordinary unit tests (not proptest) and must appear outside the
