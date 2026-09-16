@@ -42,7 +42,7 @@ use crate::identity::iroh_secret;
 use crate::inventory::ReconcileQos;
 use crate::protocol::{
     OP_FIND_NODE, OP_GET_BLOB, OP_PROVIDER_GET, OP_PROVIDER_PUT, PILE_SYNC_ALPN, PROVIDER_PUT_FULL,
-    PROVIDER_PUT_OK, RawHash, op_find_node, op_get_blob, op_provider_get, op_provider_put,
+    PROVIDER_PUT_OK, RawHash, VerifiedBlob, op_find_node, op_get_blob, op_provider_get, op_provider_put,
     recv_hash, recv_u8, send_hash, send_u8, serve_get_blob,
 };
 use crate::provider::{
@@ -348,7 +348,7 @@ type SnapshotSlot = Arc<Mutex<Option<SharedSnapshot>>>;
 
 /// The async capability cloned into lazy readers.
 pub(crate) trait NetCapability: Send + Sync {
-    fn fetch_blob(&self, hash: RawHash) -> futures::future::BoxFuture<'static, Option<Bytes>>;
+    fn fetch_blob(&self, hash: RawHash) -> futures::future::BoxFuture<'static, Option<VerifiedBlob>>;
 }
 
 type RoutingCandidates = Arc<Mutex<RoutingTable>>;
@@ -697,7 +697,7 @@ struct NetCap<T: Transport> {
 }
 
 impl<T: Transport> NetCapability for NetCap<T> {
-    fn fetch_blob(&self, hash: RawHash) -> futures::future::BoxFuture<'static, Option<Bytes>> {
+    fn fetch_blob(&self, hash: RawHash) -> futures::future::BoxFuture<'static, Option<VerifiedBlob>> {
         let client = self.client.clone();
         Box::pin(async move {
             match client.fetch_blob(hash, None).await {
@@ -850,7 +850,7 @@ impl NetSender {
         }
     }
 
-    pub async fn fetch_blob(&self, hash: RawHash, budget: std::time::Duration) -> Option<Bytes> {
+    pub async fn fetch_blob(&self, hash: RawHash, budget: std::time::Duration) -> Option<VerifiedBlob> {
         let fetch = async {
             match self.ready_capability().await {
                 Ok(capability) => capability.fetch_blob(hash).await,
@@ -1593,12 +1593,9 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                                 .fetch_blob(collection.raw, Some(BACKGROUND_LOOKUP_DEADLINE))
                                 .await
                             {
-                                Ok(Some(bytes)) => {
+                                Ok(Some(verified)) => {
                                     let mut batch = NetEventBatch::default();
-                                    let _ = batch.try_push(NetEvent::Blob {
-                                        expected: collection.raw,
-                                        bytes,
-                                    });
+                                    let _ = batch.try_push(NetEvent::Blob(verified));
                                     let _ = events.send(batch).await;
                                 }
                                 Ok(None) => {}
@@ -2113,7 +2110,7 @@ impl<T: Transport> ProviderClient<T> {
         &self,
         hash: RawHash,
         peer: PeerId,
-    ) -> anyhow::Result<Option<Bytes>> {
+    ) -> anyhow::Result<Option<VerifiedBlob>> {
         let connection = pool_get(&self.transport, &self.pool, peer).await?;
         let response = tokio::time::timeout(
             OP_DEADLINE,
@@ -2146,10 +2143,10 @@ impl<T: Transport> ProviderClient<T> {
         &self,
         hash: RawHash,
         lookup_limit: Option<std::time::Duration>,
-    ) -> anyhow::Result<Option<Bytes>> {
+    ) -> anyhow::Result<Option<VerifiedBlob>> {
         enum Progress {
             Directory(PeerId, anyhow::Result<Vec<(PeerId, ProviderToken)>>),
-            Blob(anyhow::Result<Option<Bytes>>),
+            Blob(anyhow::Result<Option<VerifiedBlob>>),
         }
 
         let key = blob_locator(hash);
@@ -2562,12 +2559,11 @@ mod tests {
             fetches.start(collection, async move {
                 attempts.fetch_add(1, Ordering::Relaxed);
                 let mut batch = super::NetEventBatch::default();
-                batch
-                    .try_push(super::NetEvent::Blob {
-                        expected: collection,
-                        bytes: anybytes::Bytes::from_source(b"descriptor".to_vec()),
-                    })
-                    .unwrap();
+                let bytes = anybytes::Bytes::from_source(b"descriptor".to_vec());
+                let verified =
+                    crate::protocol::VerifiedBlob::verify(bytes.clone(), *blake3::hash(&bytes[..]).as_bytes())
+                        .unwrap();
+                batch.try_push(super::NetEvent::Blob(verified)).unwrap();
                 let _ = events.send(batch).await;
             });
             fetches.poll(&active);

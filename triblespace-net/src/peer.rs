@@ -31,7 +31,7 @@ use triblespace_core::repo::{
 
 use crate::channel::{MAX_ADMISSION_BRIDGE_BATCHES, NetEvent};
 use crate::host::{self, ActiveCollections, NetReceiver, NetSender, StoreSnapshot};
-use crate::protocol::RawHash;
+use crate::protocol::{RawHash, VerifiedBlob};
 use crate::provider::ProviderObservation;
 use crate::wake::CollectionWakePlane;
 
@@ -407,7 +407,7 @@ where
                 return None;
             }
             // No host or store guard crosses the network await.
-            sender.fetch_blob(hash, budget).await
+            sender.fetch_blob(hash, budget).await.map(Bytes::from)
         }
     }
 
@@ -476,15 +476,12 @@ where
         for batch in incoming {
             for event in batch.into_events() {
                 match event {
-                    NetEvent::Blob { expected, bytes } => {
-                        match store.put::<UnknownBlob, _>(bytes) {
-                            Ok(handle) => {
+                    NetEvent::Blob(verified) => {
+                        // Verified on the wire against the handle it was fetched
+                        // by; it lands under that handle without a second hash.
+                        match store.put::<UnknownBlob, _>(verified.into_blob()) {
+                            Ok(_) => {
                                 self.pending_network_flush = true;
-                                if handle.raw != expected {
-                                    return Err(PeerSnapshotError::Overlay(anyhow::anyhow!(
-                                        "network blob hash changed while landing"
-                                    )));
-                                }
                             }
                             Err(error) => {
                                 return Err(PeerSnapshotError::Overlay(anyhow::anyhow!(
@@ -876,10 +873,12 @@ mod tests {
     }
 
     impl host::NetCapability for ExactBlob {
-        fn fetch_blob(&self, hash: RawHash) -> futures::future::BoxFuture<'static, Option<Bytes>> {
+        fn fetch_blob(&self, hash: RawHash) -> futures::future::BoxFuture<'static, Option<VerifiedBlob>> {
             self.requests.fetch_add(1, Ordering::SeqCst);
             Box::pin(std::future::ready(
-                (hash == self.hash).then(|| self.bytes.clone()),
+                (hash == self.hash)
+                    .then(|| VerifiedBlob::verify(self.bytes.clone(), hash))
+                    .flatten(),
             ))
         }
     }
@@ -1136,15 +1135,15 @@ mod tests {
         impl host::NetCapability for GatedBlob {
             fn fetch_blob(
                 &self,
-                _hash: RawHash,
-            ) -> futures::future::BoxFuture<'static, Option<Bytes>> {
+                hash: RawHash,
+            ) -> futures::future::BoxFuture<'static, Option<VerifiedBlob>> {
                 let started = self.started.clone();
                 let finish = self.finish.clone();
                 let bytes = self.bytes.clone();
                 Box::pin(async move {
                     started.notify_one();
                     finish.notified().await;
-                    Some(bytes)
+                    VerifiedBlob::verify(bytes, hash)
                 })
             }
         }
@@ -1207,7 +1206,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_rejects_network_bytes_for_a_different_handle() {
+    async fn snapshot_never_caches_network_bytes_for_a_different_handle() {
         let key = SigningKey::from_bytes(&[74; 32]);
         let (sender, receiver, wiring) =
             host::wire(crate::identity::iroh_secret(&key).public().into());
@@ -1224,14 +1223,10 @@ mod tests {
             receiver,
         );
         let snapshot = peer.snapshot().unwrap();
-        assert!(
-            snapshot
-                .get::<Bytes, UnknownBlob>(requested)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("different content hash")
-        );
+        // A capability cannot hand back bytes for a different handle at all:
+        // the only constructor of a verified payload hashes them, so the fetch
+        // reports the blob unavailable and nothing is cached.
+        assert!(snapshot.get::<Bytes, UnknownBlob>(requested).await.is_err());
         assert!(!peer.snapshot().unwrap().contains_blob(requested).unwrap());
         assert_eq!(peer.snapshot().unwrap().wants().unwrap().count(), 0);
         peer.close().unwrap();
