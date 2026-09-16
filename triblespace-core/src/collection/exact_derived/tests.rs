@@ -3291,36 +3291,55 @@ fn equal_payload_commit_does_not_restart_completed_target_maintenance() {
     assert_eq!(records(&mut store.inner), before);
 }
 
-/// A maintain of an already-exact target resolves the same unchanged history
-/// more than once. The ensure round returns at `is_exact_for` having published
-/// nothing, and hands its resolution to coarsening rather than letting
-/// coarsening recompute it.
+/// Helper for the carry controls: drive maintenance to its fixed point, so a
+/// later pass is genuinely a no-op rather than merely one that maps nothing.
+///
+/// This exists because `SECOND_MAP_CALLS == 0` does NOT mean "published
+/// nothing": a maintain can publish a MERGE without calling `map` at all, and
+/// the two-member fixture these controls share does exactly that on its first
+/// pass. Publication is asserted from the store's own write events instead.
+fn drive_to_fixed_point(
+    store: &mut MemoryRepo,
+    second: Collection<SecondEncoding>,
+    support: &Support,
+) {
+    for _ in 0..8 {
+        maintain_exact_resident::<_, SecondEncoding>(store, second, &equation_signer(), support)
+            .unwrap();
+    }
+}
+
+/// A maintain of an already-exact target at its fixed point publishes nothing
+/// and resolves the same unchanged history. The ensure round returns at
+/// `is_exact_for` having published nothing, and hands its resolution to
+/// coarsening rather than letting coarsening recompute it.
 ///
 /// The count is binds, one per resolution, because `probe_mapping` binds the
 /// concrete mapping named by the target descriptor.
 #[test]
 fn coarsening_reuses_the_ensure_resolution_when_nothing_changed_between_them() {
-    let (mut store, root, first, second) = collections();
+    let (mut inner, root, first, second) = collections();
     let left = archive(1, 1);
     let right = archive(2, 2);
     for blob in [&left, &right] {
-        publish_root(&mut store, root, blob, 31);
+        publish_root(&mut inner, root, blob, 31);
     }
     let support = support(root, &[left, right]);
-    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &support)
+    ensure_exact_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer(), &support)
         .unwrap();
-    ensure_exact_resident::<_, SecondEncoding>(&mut store, second, &equation_signer(), &support)
+    ensure_exact_resident::<_, SecondEncoding>(&mut inner, second, &equation_signer(), &support)
         .unwrap();
+    drive_to_fixed_point(&mut inner, second, &support);
 
-    // From here the target is exact, so this maintain publishes nothing.
+    let mut store = GuardStore::new(inner);
     reset_mapping_calls();
     maintain_exact_resident::<_, SecondEncoding>(&mut store, second, &equation_signer(), &support)
         .unwrap();
 
-    assert_eq!(
-        SECOND_MAP_CALLS.get(),
-        0,
-        "an exact target maps nothing; this pass is resolution only"
+    assert!(
+        store.events.is_empty(),
+        "this pass must publish nothing, or it is not the no-op case: {:?}",
+        store.events
     );
     // Measured on this candidate against its own parent c0bd6042, same test,
     // same fixture: the unpatched round resolves TWICE here, once in ensure and
@@ -3337,18 +3356,19 @@ fn coarsening_reuses_the_ensure_resolution_when_nothing_changed_between_them() {
 /// itself, because the history moved underneath it.
 #[test]
 fn coarsening_resolves_for_itself_when_the_ensure_round_published() {
-    let (mut store, root, first, second) = collections();
+    let (mut inner, root, first, second) = collections();
     let left = archive(1, 1);
     let right = archive(2, 2);
     for blob in [&left, &right] {
-        publish_root(&mut store, root, blob, 31);
+        publish_root(&mut inner, root, blob, 31);
     }
     let support = support(root, &[left, right]);
-    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &support)
+    ensure_exact_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer(), &support)
         .unwrap();
 
     // `second` is deliberately NOT ensured, so the maintain's own ensure round
     // has to derive and publish before it can return exact.
+    let mut store = GuardStore::new(inner);
     reset_mapping_calls();
     maintain_exact_resident::<_, SecondEncoding>(&mut store, second, &equation_signer(), &support)
         .unwrap();
@@ -3356,6 +3376,10 @@ fn coarsening_resolves_for_itself_when_the_ensure_round_published() {
     assert!(
         SECOND_MAP_CALLS.get() > 0,
         "this pass must actually derive, or it is not the changeful case"
+    );
+    assert!(
+        !store.events.is_empty(),
+        "the changeful case must publish, or the eligibility it tests is vacuous"
     );
     // Unchanged from the unpatched parent, which is the point of this control:
     // eligibility is refused as soon as the ensure round publishes, so the
@@ -3389,18 +3413,19 @@ fn a_conservative_all_change_set_refuses_the_carried_resolution() {
         .unwrap();
     ensure_exact_resident::<_, SecondEncoding>(&mut inner, second, &equation_signer(), &support)
         .unwrap();
-    let mut store = GuardStore::new(inner);
+    drive_to_fixed_point(&mut inner, second, &support);
 
+    let mut store = GuardStore::new(inner);
     reset_mapping_calls();
     GUARD_CHANGES_ALL.set(true);
     maintain_exact_resident::<_, SecondEncoding>(&mut store, second, &equation_signer(), &support)
         .unwrap();
     GUARD_CHANGES_ALL.set(false);
 
-    assert_eq!(
-        SECOND_MAP_CALLS.get(),
-        0,
-        "the target is still exact; refusing the carry must not create work"
+    assert!(
+        store.events.is_empty(),
+        "refusing the carry must not create work: {:?}",
+        store.events
     );
     assert_eq!(
         SECOND_BIND_CALLS.get(),
