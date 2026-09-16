@@ -909,8 +909,9 @@ and operation wall time are different measurements.
 `parallel_compiled` explicitly records whether the relevant parallel path is
 in this binary; `compiled_backend` records available build capabilities. A
 lazy pool with one observed thread cannot tell disabled code from unused code.
-Keep no-op passes: completed zero with nonzero stage time exposes the cost of
-proving that there is no new work. Do not silently discard those samples.
+Keep successful passes that publish no equations: their nonzero elapsed time
+can expose the cost of proving that there is no new work. They are not the same
+as skipped polls, failed observations, or zero computation.
 
 Each sample carries a process session, explicit wall observation time and
 monotonic nanoseconds since that session began. Producers use `entity!` at the
@@ -974,6 +975,45 @@ The existing facade `telemetry` feature remains the explicit per-span profiling
 sink. Neither facility invents a retention policy for append-only evidence.
 No raw H bearer capability, payload, locator-to-H inventory or bearer proof
 belongs in these colony observations.
+
+#### Maintenance producer
+
+`pile collection maintain` and `maintain-all` can opt in with
+`--telemetry-collection HANDLE --telemetry-node ENDPOINT --telemetry-worker LABEL`.
+The endpoint is explicit: a signing key is not a transport identity. The
+existing maintenance key signs samples unless `--telemetry-key EXISTING_KEY`
+is supplied. The collection must already exist and admit that writer; this
+option does not create keys, descriptors, grants, maintenance targets or sync
+selections. After configuration is validated, publication errors use finite,
+payload-free categories and do not turn successful maintenance into a failure.
+Choose distinct worker labels for simultaneously running processes on one
+endpoint; restarting the same worker keeps its scope identity but starts a
+new session, so a rate never bridges that restart.
+
+Four scopes keep distinct quantities separate: process CPU, maintenance hops,
+passes, and successful passes with no merge/derive publication calls. Hop
+configuration reports outer-loop concurrency, not the size of a lazy Rayon
+pool; Core's compiled parallel-path capability is reported separately. The
+merge/derive counters increment after a local equation insertion succeeds.
+They include idempotent successful calls and multiple witness equations for
+one output. They are **not** counts of new physical records, unique outputs,
+kernel invocations, or changes in the collection census. Successful
+publications remain counted even if a later part of the pass fails.
+
+Sampling uses existing loop/hop boundaries, with a shared attempt limit of
+60 seconds by default (`--telemetry-interval-secs`) and one final close sample.
+There is no detached heartbeat or extra observer thread. A long synchronous
+hop can therefore leave a stale report; freshness must not be manufactured.
+Known merge/derive backlog and separate selection/certification/mapping/join
+timings are left absent until those operations provide measured seams.
+
+Appending telemetry never advances or filters the maintenance baseline.
+Disjoint exact-collection interests ignore the append. Broad name/all-record
+interests may wake once after an emission; all boundary attempts, including
+failed publications, share the rate limit. Do not hide such a wake by moving
+the baseline across the write: concurrent source changes must remain visible.
+An unchanged-file poll which never enters a pass must not increment pass or
+no-publication counters, and must still reach the telemetry cadence check.
 
 Schema anchors were minted with `trible genid` on 2026-09-16; their exact values
 and field meanings are pinned in `triblespace-net/src/telemetry.rs`.

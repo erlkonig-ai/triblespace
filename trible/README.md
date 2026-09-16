@@ -236,6 +236,12 @@ changes admission for the immutable current session or creates blob WANTs.
   throughput is not link capacity, and known work is not a complete denominator
   for an unknown colony. Producer instrumentation and explicit telemetry
   publication must be configured separately; the dashboard invents no values.
+  Maintenance can opt in with an existing `--telemetry-collection`, explicit
+  `--telemetry-node` and stable `--telemetry-worker`; an optional existing
+  `--telemetry-key` overrides the maintenance signer. Samples distinguish
+  process CPU, outer-hop work, successful equation-publication calls and
+  successful passes with no such calls. Neither record census nor a skipped
+  poll is counted as performed work. No telemetry source or grant is created.
 - `pile net sync <PILE> --collection HANDLE [--collection HANDLE ...] [--peers ID_OR_TICKET,...] [--key PATH] [--direction bidirectional|read-only|write-only]` — activate the named collections and run periodic repair. `read-only` pulls but does not serve collection repair, while `write-only` serves admitted readers but does not pull collection repair. Every direction still services ordinary exact-blob WANTs. `--duration SECS` and `--quiescent-for SECS` provide optional process-lifecycle bounds.
 
   Ctrl-C, or SIGTERM on Unix, cancels awaited reconciliation or the idle wait,

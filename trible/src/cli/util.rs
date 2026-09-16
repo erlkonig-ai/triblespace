@@ -96,7 +96,7 @@ mod cpu_tests {
 pub(super) fn shutdown_signal() -> io::Result<impl Future<Output = io::Result<()>>> {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{SignalKind, signal};
+        use tokio::signal::unix::{signal, SignalKind};
 
         let mut interrupt = signal(SignalKind::interrupt())?;
         let mut terminate = signal(SignalKind::terminate())?;

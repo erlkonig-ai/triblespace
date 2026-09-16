@@ -10,15 +10,15 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::collection::{
     AdmissionPolicy, Collection, CollectionHandle, CollectionPolicy, CollectionSnapshot,
     CollectionSnapshotExt, CollectionStoreExt, TryFromCoverError,
 };
-use triblespace_core::repo::SnapshotSource;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::pile::{Pile, PileSnapshot};
+use triblespace_core::repo::SnapshotSource;
 use triblespace_core::trible::TribleSet;
 use triblespace_net::dashboard::{self, CountMetric, Freshness, ObserverReport};
 use triblespace_net::health_record;
@@ -812,7 +812,7 @@ fn rtt(worker: &WorkerReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use triblespace_core::collection::{CollectionCommit, CollectionRecord, empty_metadata_handle};
+    use triblespace_core::collection::{empty_metadata_handle, CollectionCommit, CollectionRecord};
     use triblespace_core::inline::encodings::hash::Handle;
     use triblespace_core::metadata;
     use triblespace_core::prelude::*;

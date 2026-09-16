@@ -31,6 +31,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
+- Add opt-in maintenance telemetry in an existing authorized collection:
+  process CPU, outer-hop/pass activity and elapsed work, successful local
+  MERGE/DERIVE insertion calls, and successful passes with no such calls.
+  Keep record census, physical appends and skipped polls distinct. Reports
+  have an explicit endpoint/worker, fresh session and bounded boundary cadence;
+  no descriptor, grant, sync selection or scheduler change is implicit.
+
 - Add test-only counted maintenance diagnostics for two independent chains:
   idle/unrelated change gating, unchanged-chain revisits after selected-source
   or proof changes, and receipt support growth without projected membership growth.
@@ -39,6 +46,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Embed a live GORBIE colony-work dashboard behind the default `dashboard-gui`
   feature. Terminal and notebook query the same explicitly selected resident
   telemetry collections; no external renderer process or inventory scan.
+  Keep overview details collapsed, show CPU only for process scopes and render
+  measured directional links separately. A generated resident-pile fixture
+  exercises the actual reader and headless renderer without opening live data.
 
 - `pile collection derive PILE SOURCE entity-id-set --attribute ID` registers
   the canonical projection of an attribute's GenId values. Ordinary `maintain`

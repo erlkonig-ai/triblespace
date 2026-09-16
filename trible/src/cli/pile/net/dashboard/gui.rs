@@ -2,9 +2,9 @@
 //! the parent owns stop/join/close even if window creation fails.
 
 use super::*;
-use GORBIE::NotebookConfig;
-use GORBIE::cards::DEFAULT_CARD_PADDING;
 use anyhow::anyhow;
+use GORBIE::cards::DEFAULT_CARD_PADDING;
+use GORBIE::NotebookConfig;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[path = "gui_capture_tests.rs"]

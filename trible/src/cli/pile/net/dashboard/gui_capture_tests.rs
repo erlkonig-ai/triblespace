@@ -18,9 +18,9 @@ use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::Path;
 
-use GORBIE::{CaptureOptions, HeadlessTheme};
 use triblespace_core::prelude::*;
 use triblespace_core::{metadata, signing_key_file};
+use GORBIE::{CaptureOptions, HeadlessTheme};
 
 const MIB: u128 = 1024 * 1024;
 const SECOND: u128 = 1_000_000_000;
@@ -291,18 +291,14 @@ fn assert_mixed_states(frame: &Frame) {
         "2.00 MiB/s"
     );
     assert_eq!(frame.health[0].freshness, Freshness::Fresh);
-    assert!(
-        frame.health[0]
-            .conditions
-            .iter()
-            .any(|condition| condition.alert)
-    );
-    assert!(
-        frame.health[0]
-            .endpoints
-            .iter()
-            .all(|node| frame.workers.iter().all(|worker| &worker.node != node))
-    );
+    assert!(frame.health[0]
+        .conditions
+        .iter()
+        .any(|condition| condition.alert));
+    assert!(frame.health[0]
+        .endpoints
+        .iter()
+        .all(|node| frame.workers.iter().all(|worker| &worker.node != node)));
     assert!(
         render_terminal(frame).contains("Health endpoint observed; worker telemetry not observed.")
     );
