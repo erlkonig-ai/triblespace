@@ -268,6 +268,15 @@ thread_local! {
     static FIRST_MAP_CALLS: Cell<usize> = const { Cell::new(0) };
     static SECOND_MAP_CALLS: Cell<usize> = const { Cell::new(0) };
     static SECOND_JOIN_CALLS: Cell<usize> = const { Cell::new(0) };
+    /// One bind per resolution: `probe_mapping` binds the concrete mapping
+    /// named by the target descriptor, so a resolution that is carried forward
+    /// instead of recomputed is exactly a bind that does not happen.
+    static SECOND_BIND_CALLS: Cell<usize> = const { Cell::new(0) };
+    /// Forces `GuardSnapshot::changes_since` to answer `ALL`, standing in for a
+    /// backend without scoped comparison. A carried resolution must then be
+    /// refused, because ALL is the conservative answer and conservative means
+    /// re-resolve.
+    static GUARD_CHANGES_ALL: Cell<bool> = const { Cell::new(false) };
     static FIRST_MAP_MISSING: Cell<bool> = const { Cell::new(false) };
     static FIRST_MAP_CAPACITY: RefCell<Option<CollectionData>> = const { RefCell::new(None) };
 }
@@ -276,6 +285,8 @@ fn reset_mapping_calls() {
     FIRST_MAP_CALLS.set(0);
     SECOND_MAP_CALLS.set(0);
     SECOND_JOIN_CALLS.set(0);
+    SECOND_BIND_CALLS.set(0);
+    GUARD_CHANGES_ALL.set(false);
     FIRST_MAP_MISSING.set(false);
     FIRST_MAP_CAPACITY.replace(None);
 }
@@ -353,6 +364,7 @@ impl CollectionDerivation for SecondEncoding {
         target: &Fragment,
     ) -> Result<Self::Argument, CollectionOperationError> {
         require_mapping(target, SECOND_MAPPING)?;
+        SECOND_BIND_CALLS.set(SECOND_BIND_CALLS.get() + 1);
         Ok(())
     }
 
@@ -457,6 +469,9 @@ impl Drop for GuardSnapshot {
 
 impl StoreSnapshot for GuardSnapshot {
     fn changes_since(&self, previous: &Self) -> StoreChanges {
+        if GUARD_CHANGES_ALL.get() {
+            return StoreChanges::ALL;
+        }
         self.inner.changes_since(&previous.inner)
     }
 }
@@ -2100,10 +2115,16 @@ fn target_maintenance_reprobes_once_per_tier_not_per_carry() {
         .filter(|event| matches!(event, WriteEvent::Insert(CollectionRecord::Merge(_))))
         .count();
     assert_eq!(merges, MEMBERS - 1);
+    // Was 6 before the ensure round carried its resolution into coarsening:
+    // one ensure probe, one source-guidance probe, and one target-resolution
+    // probe per dyadic tier round. The ensure round now hands its resolution to
+    // source guidance, so the FIRST round's source-guidance probe is the one
+    // that disappears; every later round still resolves for itself, which is
+    // what keeps this count at 5 rather than dropping further.
     assert_eq!(
         store.semantic_probes.load(Ordering::SeqCst),
-        6,
-        "one ensure probe, one source-guidance probe, and one target-resolution probe for each dyadic tier round",
+        5,
+        "the ensure probe is carried into the first source-guidance step; every later tier round reprobes",
     );
 
     let snapshot = store.inner.snapshot().unwrap();
@@ -3268,4 +3289,122 @@ fn equal_payload_commit_does_not_restart_completed_target_maintenance() {
     assert!(store.acquired.is_empty());
     drop(after);
     assert_eq!(records(&mut store.inner), before);
+}
+
+/// A maintain of an already-exact target resolves the same unchanged history
+/// more than once. The ensure round returns at `is_exact_for` having published
+/// nothing, and hands its resolution to coarsening rather than letting
+/// coarsening recompute it.
+///
+/// The count is binds, one per resolution, because `probe_mapping` binds the
+/// concrete mapping named by the target descriptor.
+#[test]
+fn coarsening_reuses_the_ensure_resolution_when_nothing_changed_between_them() {
+    let (mut store, root, first, second) = collections();
+    let left = archive(1, 1);
+    let right = archive(2, 2);
+    for blob in [&left, &right] {
+        publish_root(&mut store, root, blob, 31);
+    }
+    let support = support(root, &[left, right]);
+    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &support)
+        .unwrap();
+    ensure_exact_resident::<_, SecondEncoding>(&mut store, second, &equation_signer(), &support)
+        .unwrap();
+
+    // From here the target is exact, so this maintain publishes nothing.
+    reset_mapping_calls();
+    maintain_exact_resident::<_, SecondEncoding>(&mut store, second, &equation_signer(), &support)
+        .unwrap();
+
+    assert_eq!(
+        SECOND_MAP_CALLS.get(),
+        0,
+        "an exact target maps nothing; this pass is resolution only"
+    );
+    // Measured on this candidate against its own parent c0bd6042, same test,
+    // same fixture: the unpatched round resolves TWICE here, once in ensure and
+    // once again in coarsening. Carrying the first forward makes it one.
+    assert_eq!(
+        SECOND_BIND_CALLS.get(),
+        1,
+        "a no-op maintain resolves once; it resolved twice before the carry"
+    );
+}
+
+/// The pair is offered only when the ensure round published nothing. A maintain
+/// that still has derive work to do must leave coarsening to resolve for
+/// itself, because the history moved underneath it.
+#[test]
+fn coarsening_resolves_for_itself_when_the_ensure_round_published() {
+    let (mut store, root, first, second) = collections();
+    let left = archive(1, 1);
+    let right = archive(2, 2);
+    for blob in [&left, &right] {
+        publish_root(&mut store, root, blob, 31);
+    }
+    let support = support(root, &[left, right]);
+    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &support)
+        .unwrap();
+
+    // `second` is deliberately NOT ensured, so the maintain's own ensure round
+    // has to derive and publish before it can return exact.
+    reset_mapping_calls();
+    maintain_exact_resident::<_, SecondEncoding>(&mut store, second, &equation_signer(), &support)
+        .unwrap();
+
+    assert!(
+        SECOND_MAP_CALLS.get() > 0,
+        "this pass must actually derive, or it is not the changeful case"
+    );
+    // Unchanged from the unpatched parent, which is the point of this control:
+    // eligibility is refused as soon as the ensure round publishes, so the
+    // changeful path resolves exactly as often as it always did.
+    assert_eq!(
+        SECOND_BIND_CALLS.get(),
+        3,
+        "a publishing maintain still resolves three times, as it did before the carry"
+    );
+}
+
+/// A backend without scoped comparison answers `StoreChanges::ALL`, and ALL is
+/// the conservative answer: the carried resolution must be refused and
+/// coarsening must resolve for itself. This is the fallback that makes the
+/// carry safe on stores this crate has never seen.
+///
+/// Note the two different NONEs this exercises, which must not be conflated:
+/// here a pair IS offered (`Option::Some`) and is refused because the change
+/// set is not `StoreChanges::NONE`. The separate case where no pair is offered
+/// at all is `Option::None`, covered by the publishing-ensure control above.
+#[test]
+fn a_conservative_all_change_set_refuses_the_carried_resolution() {
+    let (mut inner, root, first, second) = collections();
+    let left = archive(1, 1);
+    let right = archive(2, 2);
+    for blob in [&left, &right] {
+        publish_root(&mut inner, root, blob, 31);
+    }
+    let support = support(root, &[left, right]);
+    ensure_exact_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer(), &support)
+        .unwrap();
+    ensure_exact_resident::<_, SecondEncoding>(&mut inner, second, &equation_signer(), &support)
+        .unwrap();
+    let mut store = GuardStore::new(inner);
+
+    reset_mapping_calls();
+    GUARD_CHANGES_ALL.set(true);
+    maintain_exact_resident::<_, SecondEncoding>(&mut store, second, &equation_signer(), &support)
+        .unwrap();
+    GUARD_CHANGES_ALL.set(false);
+
+    assert_eq!(
+        SECOND_MAP_CALLS.get(),
+        0,
+        "the target is still exact; refusing the carry must not create work"
+    );
+    assert_eq!(
+        SECOND_BIND_CALLS.get(),
+        2,
+        "ALL refuses the carry, so coarsening resolves for itself as it did before"
+    );
 }
