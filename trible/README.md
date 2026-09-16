@@ -219,13 +219,23 @@ changes admission for the immutable current session or creates blob WANTs.
   snapshot, per-peer collection comparison, and DHT publication; matching
   records do not establish that every referenced blob is available.
 - `pile net dashboard <PILE> [--key REPORTING_KEY] [--max-age SECONDS]
-  [--sample COUNT] [--tui|--gui]` — freeze one read-only pile snapshot and show
-  exact local blob residency, native COMMIT/MERGE/DERIVE readiness, and durable
-  WANT completion beside the latest readable observer reports. The terminal
-  renderer is the default. `--gui` launches `gorbie-cluster-health` (override
-  its path with `TRIBLESPACE_DASHBOARD_GUI`). Missing outputs count as pending
-  only when a durable WANT names the work; pairwise record roots remain
-  separate from blob availability.
+  [--telemetry-collection HANDLE ...] [--interval SECONDS] [--once] [--tui|--gui]`
+  — show the work actually reported by colony workers: observed backlog,
+  active work versus configured parallelism, completed work and payload rates,
+  maintenance stages/backends, process CPU effort and observed links. The
+  terminal refreshes every two seconds; `--once` or redirected output produces
+  one frame. `--gui` embeds GORBIE directly (the default `dashboard-gui` build
+  feature), using the same observations. There is no external renderer command.
+  Each explicit telemetry collection must already be locally readable; this
+  command never creates it, grants authority, changes sync selection or fetches
+  a missing blob. It retains scoped collection observations and never performs
+  a blob/native-record inventory census to refresh the view. The private local
+  health collection remains a separate fallback when telemetry delivery fails.
+  Missing, stale and future observations are not idle/zero; two fresh samples
+  from the same worker session are needed for a rate. Observed payload
+  throughput is not link capacity, and known work is not a complete denominator
+  for an unknown colony. Producer instrumentation and explicit telemetry
+  publication must be configured separately; the dashboard invents no values.
 - `pile net sync <PILE> --collection HANDLE [--collection HANDLE ...] [--peers ID_OR_TICKET,...] [--key PATH] [--direction bidirectional|read-only|write-only]` — activate the named collections and run periodic repair. `read-only` pulls but does not serve collection repair, while `write-only` serves admitted readers but does not pull collection repair. Every direction still services ordinary exact-blob WANTs. `--duration SECS` and `--quiescent-for SECS` provide optional process-lifecycle bounds.
 
   Ctrl-C, or SIGTERM on Unix, cancels awaited reconciliation or the idle wait,

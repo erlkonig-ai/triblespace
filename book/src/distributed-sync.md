@@ -885,16 +885,95 @@ works. Neither the observed participant set nor a pairwise matching frontier
 proves whole-swarm convergence. `pile net health` reads the local observations;
 Orient can consume the same maintained facts and presentation ledger.
 
-`pile net dashboard` projects one immutable snapshot into a shared report for
-terminal and graphical renderers. Its local side enumerates exact resident
-blobs, stored native equations and their direct-reference/output residency, and
-durable WANTs. Its observed side reads the latest locally available report per
-observer, including optional blob-count, pairwise record/proof, and provider
-publication counters. These remain distinct evidence planes: an equation can
-be stored while its output is absent, a missing output is not scheduled work
-without a WANT, and no pairwise root comparison establishes remote blob
-inventory. Exact samples are bounded and stable; running the dashboard neither
-maintains collections nor appends even a descriptor to the inspected pile.
+### Colony work telemetry
+
+`pile net dashboard` reads explicit resident telemetry collections and the
+private local health fallback. Terminal and embedded GORBIE views share that
+observation; neither scans the blob/native-record inventory, probes links,
+acquires missing bodies, maintains a target nor appends a descriptor. GUI
+refresh retains one sampler with explicit stop/join/close ownership. A read
+failure remains visible; it is not replaced with an empty healthy colony.
+
+Aggregate telemetry is ordinary relational data, not an external metrics
+database. `triblespace_net::telemetry` describes a **subject** (endpoint,
+operator worker label, role, optional stage/target/peer) and timestamped samples
+linked to it. Use an opaque subject ID; readers never recompute or validate it.
+For example, selection, certification, mapping and joining are separate stage
+subjects, so a slow unchanged-target pass cannot be mislabelled a slow mapping.
+Actual runtime-selected backend is a sample annotation, not a claim inferred
+from compiled features. Configured parallelism, active operations, process CPU
+and operation wall time are different measurements.
+`parallel_compiled` explicitly records whether the relevant parallel path is
+in this binary; `compiled_backend` records available build capabilities. A
+lazy pool with one observed thread cannot tell disabled code from unused code.
+Keep no-op passes: completed zero with nonzero stage time exposes the cost of
+proving that there is no new work. Do not silently discard those samples.
+
+Each sample carries a process session, explicit wall observation time and
+monotonic nanoseconds since that session began. Producers use `entity!` at the
+existing work boundary, then the normal signed collection commit:
+
+```rust,ignore
+use triblespace_net::{health_record as h, telemetry as t};
+
+let subject = entity! {
+    h::attrs::endpoint: node,
+    t::attrs::worker: "rollups",
+    t::attrs::role: "maintenance",
+    t::attrs::stage: "mapping",
+    h::attrs::collection: target,
+};
+let sample = entity! {
+    metadata::tag: &t::KIND_SAMPLE,
+    t::attrs::subject*: subject,
+    h::attrs::session: &session,
+    metadata::created_at: (now, now).try_to_inline()?,
+    t::attrs::elapsed_ns: session_started.elapsed().as_nanos(),
+    t::attrs::active: 1_u64,
+    t::attrs::completed: completed_in_this_session,
+    t::attrs::backend: "cuda",
+};
+store.commit(telemetry_collection, reporting_key, sample)?;
+```
+
+This example is a producer seam, not automatic instrumentation. Do not publish
+zero-filled counters after a failed observation. Counters describe completed
+work in that session, not distinct blob coverage; queued work describes the
+observed selection, not all unknown descendants. Received bytes count verified
+payload successfully landed, while sent bytes count payload successfully sent;
+neither includes transport overhead. A peer-scoped link sample reports an
+actually observed path and RTT, not a DHT candidate or an invented link speed.
+Process CPU nanoseconds are reported once in a process scope. `work_ns` sums
+completed operation wall durations; concurrent durations can overlap, so its
+rate is not CPU cores. Never duplicate process CPU across target rows and add
+them together.
+
+The reader keeps two recent header witnesses per subject and queries metrics
+where needed. Unknown facts coexist; multiple observed values remain visible
+without invalidating the whole collection. A rate needs two fresh, distinct
+samples in the same session, increasing monotonic time and nondecreasing
+counters. Restart, reset, clock skew, missing or ambiguous data yields an
+unknown rate, not zero. The wall clock establishes sample age; it is not the
+rate denominator. Reported throughput is an interval average, not physical
+bandwidth capacity or proof that background hydration is keeping up.
+
+Publication uses an **explicit operator-selected collection and authority**.
+The dashboard's `--telemetry-collection` may name one shared authorized source
+or separate node sources. Merely naming an endpoint in a sample is not a proof
+that endpoint authored it; trust comes from the selected collection's admitted
+writers. This feature issues no grant, activates no shared sync selection and
+changes no service. The private local health stream stays independent so broken
+telemetry replication cannot hide its own warning. Coverage is only the
+observed participants, never an implicit roster of the whole colony.
+
+Sampling is aggregate and deliberately coarser than packet/operation tracing.
+The existing facade `telemetry` feature remains the explicit per-span profiling
+sink. Neither facility invents a retention policy for append-only evidence.
+No raw H bearer capability, payload, locator-to-H inventory or bearer proof
+belongs in these colony observations.
+
+Schema anchors were minted with `trible genid` on 2026-09-16; their exact values
+and field meanings are pinned in `triblespace-net/src/telemetry.rs`.
 
 ## Directory representation experiment
 

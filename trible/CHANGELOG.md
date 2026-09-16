@@ -36,6 +36,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   or proof changes, and receipt support growth without projected membership growth.
   Production scheduling and publication behavior are unchanged.
 
+- Embed a live GORBIE colony-work dashboard behind the default `dashboard-gui`
+  feature. Terminal and notebook query the same explicitly selected resident
+  telemetry collections; no external renderer process or inventory scan.
+
 - `pile collection derive PILE SOURCE entity-id-set --attribute ID` registers
   the canonical projection of an attribute's GenId values. Ordinary `maintain`
   and `maintain-all` dispatch it without changing the source's SimpleArchive
@@ -60,6 +64,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   Fresh descriptor handles work before their first equation is published.
 
 ### Changed
+
+- Focus `pile net dashboard` on reported worker backlog, activity, stage/backend,
+  payload throughput and resource effort. Remove arbitrary blob samples and
+  `TRIBLESPACE_DASHBOARD_GUI`. Missing/stale measurements remain unknown;
+  session-compatible counters produce rates without inferring link capacity.
 
 - Gate maintenance watch passes on the preceding pass's raw store interests,
   including descriptor/capability-definition misses, per-collection census,

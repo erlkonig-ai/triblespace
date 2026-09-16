@@ -50,6 +50,8 @@ triblespace-net = { version = "0.47.0", path = "../triblespace-net" }
 blake3 = "1.8"
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+GORBIE = { version = "0.18.1", path = "../../GORBIE", default-features = false, optional = true }
+egui = { version = "0.34", optional = true }
 
 [dev-dependencies]
 assert_cmd = "2.1.2"
@@ -58,7 +60,10 @@ tempfile = "3.24.0"
 blake3 = "1.8.3"
 
 [features]
-default = ["search"]
+default = ["search", "dashboard-gui"]
+# Embed the notebook in the CLI; no companion executable or subprocess.
+# Lean custody builds may omit this with --no-default-features.
+dashboard-gui = ["dep:GORBIE", "dep:egui"]
 # Maintain both stored-vector and model-derived semantic indexes. On by default
 # so the CLI can dispatch the concrete mapping named by a search descriptor;
 # the price is that the search crate brings the model crate with it. Build with

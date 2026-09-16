@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add native aggregate colony telemetry facts and point-of-use worker/rate
+  projections. Keep explicit collection authority/selection, process-session
+  counter lifetimes and stale/unknown evidence distinct. Embed GORBIE in the
+  CLI's live colony dashboard without a companion executable or blob census.
+  Runtime producers are separate instrumentation; reading cannot start them.
+
 - Remove the generic storage-snapshot timestamp and `snapshot_at` APIs. A
   snapshot is an immutable content observation; application deadlines use an
   explicit evaluation time instead. Content change and dependency comparison
