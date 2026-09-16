@@ -5,7 +5,9 @@ use hifitime::Epoch;
 
 use super::*;
 use crate::blob::encodings::simplearchive::SimpleArchive;
-use crate::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchiveBlob, UnionArchive};
+use crate::blob::encodings::succinctarchive::{
+    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
+};
 use crate::blob::{Blob, IntoBlob};
 use crate::capability::{CapabilityProof, CapabilityResource};
 use crate::inline::encodings::hash::Handle;
@@ -404,5 +406,75 @@ fn selected_endorsement_reads_without_ancestry_but_support_needs_exact_records()
             .iter()
             .count(),
         1
+    );
+}
+
+#[test]
+fn residual_selection_names_resident_source_members_without_demanding_absent_outputs() {
+    // Record before blob at the Rank9 step: Succinct member B is resident and
+    // admitted, its Rank9 equation B -> R is signed and admitted, but R's
+    // payload has not landed. A reader must still be offered B, the resident
+    // input it can query directly; the residual is a read, not an
+    // acquisition, and never demands R.
+    let owner = SigningKey::from_bytes(&[41; 32]);
+    let mut store = MemoryRepo::default();
+    let policy = CollectionPolicy::new(
+        AdmissionPolicy::Open,
+        AdmissionPolicy::direct(owner.verifying_key()),
+    );
+    let source = store.collection("residual-source", policy.clone()).unwrap();
+    let succinct = store
+        .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+        .unwrap();
+    let rank9 = store
+        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+        .unwrap();
+    let a = archive(4);
+    let ca = publish(&mut store, source, &owner, a.clone());
+    let b = store
+        .put::<SuccinctArchiveBlob, _>(succinctarchive_union::derive_element(&a).unwrap())
+        .unwrap();
+    let b_data = Handle::<SuccinctArchiveBlob>::to_hash(b);
+    let b_record = CollectionRecord::Derive(CollectionDerive::sign(
+        &owner,
+        succinct.handle(),
+        (ca.data(), CollectionRecord::Commit(ca).fingerprint()),
+        b_data,
+    ));
+    store.insert(b_record).unwrap();
+    // R: a signed output whose bytes never arrive.
+    let r_data = Handle::<Rank9AcceleratedSuccinctArchiveBlob>::to_hash(
+        Blob::<Rank9AcceleratedSuccinctArchiveBlob>::new(anybytes::Bytes::from(vec![7u8; 64]))
+            .get_handle(),
+    );
+    store
+        .insert(CollectionRecord::Derive(CollectionDerive::sign(
+            &owner,
+            rank9.handle(),
+            (b_data, b_record.fingerprint()),
+            r_data,
+        )))
+        .unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let records_before = snapshot.records().unwrap().count();
+    // Succinct is exact for the resident source: nothing residual there.
+    assert!(snapshot.uncovered_source_members(succinct).unwrap().is_empty());
+    // Rank9 has nothing resident to read...
+    assert!(snapshot.collection(rank9).unwrap().cover().is_empty());
+    // ...and the residual names B, resident and readable, instead of failing
+    // on the absent R.
+    let residual = snapshot.uncovered_source_members(rank9).unwrap();
+    assert_eq!(
+        residual
+            .iter()
+            .map(|(member, _, _)| *member)
+            .collect::<Vec<_>>(),
+        vec![b_data]
+    );
+    assert!(residual[0].2.contains(&b_record.fingerprint()));
+    // Asking published nothing.
+    assert_eq!(
+        store.snapshot().unwrap().records().unwrap().count(),
+        records_before
     );
 }

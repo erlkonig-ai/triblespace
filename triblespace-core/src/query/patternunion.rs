@@ -185,6 +185,14 @@ mod tests {
             find!(l: String, pattern!(&only_left, [{ label: ?l }])).collect();
         assert_eq!(labels, vec!["left".to_owned()]);
 
+        // The same fact in both arms is one row: the union deduplicates.
+        let mut duplicate = TribleSet::new();
+        duplicate += entity! { &a @ label: "left" };
+        let doubled = PatternUnion::new(&left, vec![duplicate]);
+        let labels: Vec<String> =
+            find!(l: String, pattern!(&doubled, [{ label: ?l }])).collect();
+        assert_eq!(labels, vec!["left".to_owned()]);
+
         let absent: Option<TribleSet> = None;
         let with_absent = PatternUnion::new(&left, PatternUnion::new(absent, vec![right]));
         let mut labels: Vec<String> =
