@@ -995,7 +995,7 @@ where
 {
     let support = source_support::<R, M>(snapshot, target)?;
     let probe =
-        probe_mapping_with::<R, M>(snapshot, target, &support, &BTreeSet::new(), true, false)?;
+        probe_mapping::<R, M>(snapshot, target, &support, true)?;
     if probe.target_resolution.is_exact_for(&support) {
         return Ok(Vec::new());
     }
@@ -1069,35 +1069,16 @@ struct MappingProbe<M: CollectionMapping> {
     target_resolution: TargetResolution<M::Target>,
 }
 
+/// Certify the target's lineage against the requested support and resolve
+/// what the target already realizes. Pure: it reads the snapshot and plans no
+/// acquisition. With `admit_source` the immediate source is certified beside
+/// the target so its members can be selected; without it only the target's
+/// own endorsement is read, the warm target-only path.
 fn probe_mapping<R, M>(
     snapshot: &R,
     target: Collection<M::Target>,
     support: &Support,
-    unavailable: &BTreeSet<CollectionData>,
     admit_source: bool,
-) -> Result<MappingProbe<M>, CollectionRealizationError>
-where
-    R: StoreRead,
-    M: CollectionMapping,
-{
-    probe_mapping_with::<R, M>(snapshot, target, support, unavailable, admit_source, admit_source)
-}
-
-/// As [`probe_mapping`], separating two things `admit_source` used to bundle:
-/// certifying the immediate source beside the target, and demanding the
-/// target's relevant missing dependency when the target is not exact. An
-/// acquisition step wants both. A read-only residual selection wants the
-/// first only: a signed target equation whose output payload has not landed
-/// yet must not stop a reader from selecting the resident source member it
-/// names, which is exactly the record-before-blob case the residual exists
-/// for.
-fn probe_mapping_with<R, M>(
-    snapshot: &R,
-    target: Collection<M::Target>,
-    support: &Support,
-    unavailable: &BTreeSet<CollectionData>,
-    admit_source: bool,
-    demand_dependencies: bool,
 ) -> Result<MappingProbe<M>, CollectionRealizationError>
 where
     R: StoreRead,
@@ -1159,26 +1140,47 @@ where
     }
     let target_resolution =
         resolve_certified_target(snapshot, target, &lineage, support, certified)?;
-    // A warm exact target needs no acquisition planning. Consult the raw
-    // dangling equation frontier only after the semantic snapshot proves that
-    // work remains; this keeps resident maintenance at one indexed semantic
-    // probe per LSM round.
-    if demand_dependencies && !target_resolution.is_exact_for(support) {
-        if let Some(member) = relevant_missing_dependency::<_, M>(
-            snapshot,
-            target,
-            source_handle,
-            &target_resolution,
-            unavailable,
-        )? {
-            return Err(CollectionRealizationError::MissingDependency { member });
-        }
-    }
     Ok(MappingProbe {
         source: Collection::from_handle(source_handle),
         mapping,
         target_resolution,
     })
+}
+
+/// The acquisition step an `ensure` owes once the pure probe has shown that
+/// the target is not exact for the requested support: fetch an existing
+/// target result before computing it, then only missing immediate-source
+/// realizations. A warm exact target needs no acquisition planning, so the
+/// raw dangling equation frontier is consulted only after the semantic
+/// snapshot proves that work remains; this keeps resident maintenance at one
+/// indexed semantic probe per LSM round. Read-only residual selection never
+/// calls this: a signed target equation whose output payload has not landed
+/// yet must not stop a reader from selecting the resident source member it
+/// names, which is the record-before-blob case the residual exists for.
+fn demand_missing_dependency<R, M>(
+    snapshot: &R,
+    target: Collection<M::Target>,
+    probe: &MappingProbe<M>,
+    support: &Support,
+    unavailable: &BTreeSet<CollectionData>,
+) -> Result<(), CollectionRealizationError>
+where
+    R: StoreRead,
+    M: CollectionMapping,
+{
+    if probe.target_resolution.is_exact_for(support) {
+        return Ok(());
+    }
+    if let Some(member) = relevant_missing_dependency::<_, M>(
+        snapshot,
+        target,
+        probe.source.handle(),
+        &probe.target_resolution,
+        unavailable,
+    )? {
+        return Err(CollectionRealizationError::MissingDependency { member });
+    }
+    Ok(())
 }
 
 fn source_residual<R, M>(
@@ -1333,7 +1335,8 @@ where
         let snapshot = frontier.view(store.snapshot().map_err(|error| {
             CollectionRealizationError::storage("open exact mapping snapshot", error)
         })?);
-        let probe = probe_mapping::<_, M>(&snapshot, target, support, unavailable, true)?;
+        let probe = probe_mapping::<_, M>(&snapshot, target, support, true)?;
+        demand_missing_dependency::<_, M>(&snapshot, target, &probe, support, unavailable)?;
         if probe.target_resolution.is_exact_for(support) {
             return Ok(());
         }
@@ -1540,7 +1543,8 @@ where
         let snapshot = frontier.view(store.snapshot().map_err(|error| {
             CollectionRealizationError::storage("open source-guided maintenance snapshot", error)
         })?);
-        let probe = probe_mapping::<_, M>(&snapshot, target, support, unavailable, true)?;
+        let probe = probe_mapping::<_, M>(&snapshot, target, support, true)?;
+        demand_missing_dependency::<_, M>(&snapshot, target, &probe, support, unavailable)?;
         let semantics = &probe.target_resolution.semantics;
         let source = probe.source.handle();
         let mut resident = BTreeSet::new();
@@ -1893,7 +1897,7 @@ where
         let snapshot = frontier.view(store.snapshot().map_err(|error| {
             CollectionRealizationError::storage("observe exact target before acquisition", error)
         })?);
-        match probe_mapping::<_, M>(&snapshot, target, support, &BTreeSet::new(), false) {
+        match probe_mapping::<_, M>(&snapshot, target, support, false) {
             Ok(probe) => probe.target_resolution.is_exact_for(support),
             // A missing descriptor can still be acquired through the ordinary
             // active path. Semantic/type/mapping errors must not become misses.
