@@ -31,11 +31,9 @@ getrandom = "0.4.1"
 hex = "0.4.3"
 memchr = "2.7.6"
 triblespace = { version = "0.47.0", path = "..", default-features = false }
-# Select Core's parallel PATCH, archive-construction and large-Pile-validation
-# paths explicitly, including lean CLI builds. Ordinary Blob::new hashing is
-# unchanged. Available parallelism is still bounded by the runtime pool and
-# deployment quota; enabling these paths alone is not a throughput claim.
-triblespace-core = { version = "0.47.0", path = "../triblespace-core", default-features = false, features = ["object-store", "parallel"] }
+# Keep Core's serial paths for the CLI: parallel currently regresses measured
+# maintenance passes. This selection is independent of runtime CPU quotas.
+triblespace-core = { version = "0.47.0", path = "../triblespace-core", default-features = false, features = ["object-store"] }
 triblespace-gpu = { version = "0.47.0", path = "../triblespace-gpu", default-features = false, optional = true }
 triblespace-paths = { path = "../triblespace-paths" }
 anybytes = "0.20"

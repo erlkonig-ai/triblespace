@@ -17,15 +17,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   Failed attempts retain their existing retry opportunity on any selected-input
   wake; this does not add a retry clock for provider or runtime state changes.
 
-- Restore `triblespace-core/parallel`, which this crate's manifest had been
-  dropping through `default-features = false`. The inspected ReadClose2886
-  maintenance build selected serial Core paths despite containing Rayon through
-  other dependencies. The feature enables parallel PATCH operations, archive
-  construction and large-Pile validation; ordinary `Blob::new` hashing is
-  unchanged. `union_matches_insertion_reference`, run with and without the
-  feature, checks one heap-backed interleaved-key union against direct insertion.
-  This does not establish a live speedup, and runtime pool size and deployment
-  CPU quotas still bound usable parallelism.
+- Retain the CLI's serial Core feature selection after testing explicit
+  `triblespace-core/parallel` enablement. Three rotated unchanged-maintenance
+  passes on caught-up pile copies had median wall times of 70.15 seconds without
+  the feature, 77.31 seconds with it at one thread, and 102.21 seconds at twenty
+  threads; all published zero bytes. Faster large-Pile first-touch validation
+  did not establish a whole-pass improvement. These measurements do not
+  attribute the regression to an individual phase or measure useful catch-up
+  work. Runtime CPU quotas remain a separate deployment choice.
+
+- Add `union_matches_insertion_reference`, run with and without Core's parallel
+  feature, to compare one heap-backed interleaved-key union with direct insertion.
 
 ### Added
 
