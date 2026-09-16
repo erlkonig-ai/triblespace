@@ -447,9 +447,13 @@ A foreground H-only reader need not activate any collection. It can use a distin
 ephemeral transport key, bootstrap endpoint routes, and a zero provider-publication
 budget without borrowing its authorship signer's or a running daemon's endpoint
 identity. Network acquisition requires an enabled Tokio runtime at the calling
-async boundary; local-only operations need no runtime. `flush` makes local writes
-durable, and explicit `close` withdraws host snapshots before closing the backend.
-Neither operation starts networking or authors WANT.
+async boundary; local-only operations need no runtime. Puts and incoming repair
+admissions become visible in a fresh local observation without an automatic disk
+flush. Explicit `close` withdraws host snapshots and closes the backend at the
+final persistence boundary; manual `flush` remains available at an application's
+chosen durability boundary. Neither operation starts networking or authors WANT.
+Failure to obtain a fresh store snapshot is returned by `try_refresh` and
+withdraws the previous serving observation; existing frozen readers stay frozen.
 
 Initial endpoint identities come from `PeerConfig` or the CLI. Configured relay
 URLs only provide iroh transport paths; they are not collection participants or
@@ -645,8 +649,9 @@ direct roots, then recursive scanning. The turn is retained before awaiting
 network work. Empty classes and classes whose entire work is in retry backoff
 are skipped without taking a quantum. Exact WANT/root turns use an experimental
 window of at most four concurrent H-only fetches from that frozen candidate
-round. Ready bodies land one at a time through the existing hash check and
-durability barrier; a slow first request does not hold later ready answers.
+round. Ready verified bodies land one at a time through ordinary local put,
+preserving their cached handles without a per-body disk flush; a slow first
+request does not hold later ready answers.
 Refills share the original turn deadline rather than starting another budget.
 Expiry drops unfinished requests and charges their normal retry backoff, while
 unstarted candidates retain their priority. Cancelling the whole tick drops
@@ -655,7 +660,7 @@ admitted attempts retain their consumed cursor/first-attempt position, just as
 with a cancelled serial await. Peer fetch futures start the lazy host only when
 polled and hold no store or host guard across network I/O. This is bounded
 concurrency, not a measured throughput or end-to-end completion guarantee:
-synchronous landing/flush/refresh still takes serial time, and with the default
+synchronous landing/refresh still takes serial time, and with the default
 budget, several 30-second quanta plus the caller's tick intervals may pass before a fresh root
 or its body receives service. There is no low-latency guarantee.
 
@@ -667,6 +672,15 @@ The existing exact-handle retry map holds those scheduling fields only for
 positively named missing roots/WANTs. Failed attempts retain the same shared
 exponential backoff regardless of the class that attempted them. A pending
 direct-root backlog cannot consume recursive scanning's reserved turn.
+
+There is no retained mirror of durable blob answers. The selected required set
+minus the current tick's readable resident observation supplies missing work;
+only genuine started futures occupy its in-flight set. A successful put satisfies
+local presence before persistence, and the next tick observes the store again.
+The existing selected-input reads remain, including Pile's lazy physical
+validation and valid-duplicate fallback: raw `contains_blob` membership alone
+cannot establish that a corrupt imported occurrence is readable. This is not yet
+a PATCH-only missing-set optimization and does not erase first-read hash costs.
 
 The walker retains only positively reached `(root, blob)` pairs and their
 resumable offsets in a PATCH. Frozen
@@ -711,7 +725,7 @@ class quanta still prevent a general finite hydration deadline.
 
 When seeding a full scan, ordinary resident record roots are observed before
 explicitly selected collection descriptors. A descriptor already present in
-both that root set and the durable resident set therefore receives its finite
+both that root set and the readable resident set therefore receives its finite
 recent startup window ahead of the bulk inventory. This is ordering only:
 selection alone never invents a closure root, repeated snapshots do not reset
 offsets or requeue descriptors, and regular turns still progress. Many selected

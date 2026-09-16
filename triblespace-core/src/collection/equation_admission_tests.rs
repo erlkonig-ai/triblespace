@@ -410,12 +410,11 @@ fn selected_endorsement_reads_without_ancestry_but_support_needs_exact_records()
 }
 
 #[test]
-fn residual_selection_names_resident_source_members_without_demanding_absent_outputs() {
+fn indexed_reads_do_not_replace_absent_target_outputs_with_source_members() {
     // Record before blob at the Rank9 step: Succinct member B is resident and
     // admitted, its Rank9 equation B -> R is signed and admitted, but R's
-    // payload has not landed. A reader must still be offered B, the resident
-    // input it can query directly; the residual is a read, not an
-    // acquisition, and never demands R.
+    // payload has not landed. Reading Rank9 observes its own resident cover;
+    // it neither substitutes B nor acquires or maintains an output.
     let owner = SigningKey::from_bytes(&[41; 32]);
     let mut store = MemoryRepo::default();
     let policy = CollectionPolicy::new(
@@ -457,24 +456,17 @@ fn residual_selection_names_resident_source_members_without_demanding_absent_out
         .unwrap();
     let snapshot = store.snapshot().unwrap();
     let records_before = snapshot.records().unwrap().count();
-    // Succinct is exact for the resident source: nothing residual there.
-    assert!(snapshot
-        .uncovered_source_members(succinct)
-        .unwrap()
-        .is_empty());
-    // Rank9 has nothing resident to read...
-    assert!(snapshot.collection(rank9).unwrap().cover().is_empty());
-    // ...and the residual names B, resident and readable, instead of failing
-    // on the absent R.
-    let residual = snapshot.uncovered_source_members(rank9).unwrap();
     assert_eq!(
-        residual
-            .iter()
-            .map(|(member, _, _)| *member)
+        snapshot
+            .collection(succinct)
+            .unwrap()
+            .cover()
+            .members()
             .collect::<Vec<_>>(),
-        vec![b_data]
+        vec![b],
     );
-    assert!(residual[0].2.contains(&b_record.fingerprint()));
+    // The resident source does not make a missing Rank9 output readable.
+    assert!(snapshot.collection(rank9).unwrap().cover().is_empty());
     // Asking published nothing.
     assert_eq!(
         store.snapshot().unwrap().records().unwrap().count(),

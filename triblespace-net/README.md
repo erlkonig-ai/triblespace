@@ -10,10 +10,13 @@ receiver derives its active view locally after records and proofs arrive in
 either order.
 
 The user-facing surface is `Peer<S>`, a synchronous store wrapper backed by an
-async host. `Peer::refresh` drains verified repair events, crosses one storage
-flush barrier, and only then replaces the immutable snapshots served to other
-peers. There is no global team inventory, remote mutable head, replica roster,
-or separate authority database.
+async host. `Peer::refresh` drains verified repair events and replaces the
+immutable snapshots served to other peers without flushing the backend.
+Successful local puts are visible before persistence; explicit `close` owns
+the final persistence boundary, and a caller may still explicitly `flush` at
+another chosen boundary. Refresh failures withdraw the serving observation;
+`try_refresh` returns the error. There is no global team inventory, remote mutable
+head, replica roster, or separate authority database.
 
 ## Getting started
 
@@ -173,6 +176,15 @@ satisfies the durable request locally; failed discovery leaves it pending.
 Collection membership, proof state, and admission are irrelevant to that
 exact-content operation.
 
+The reconciler retains retries and traversal cursors, not a second durable-answer
+set. Each tick derives missing work from its selected required handles and the
+store's readable contents; started futures own the in-flight set. It does not
+flush after blob puts, when it first observes a local answer, or before following
+a resident scan child. The existing selected-input `get` checks remain: a raw
+physical occurrence may be corrupt, and Pile's normal read can find a valid later
+duplicate. Thus this change removes durability policy/state, not the remaining
+first-read validation/hash cost or every per-tick membership lookup.
+
 The full model, wire formats, authorization boundaries, and CLI surface live
 in the book's [Distributed Sync](https://docs.rs/triblespace/latest/triblespace/)
 chapter.
@@ -199,7 +211,7 @@ visible without enabling broad packet-level tracing.
 - `collection_activation` — per-collection record and authorization-evidence PATCHes
 - `collection_session` / `collection_wire` — one READ-authorized repair stream
 - `patch_repair` — root-pinned Merkle difference walker
-- `peer` — synchronous store wrapper, durable admission, and local WANT intent
+- `peer` — synchronous store wrapper, monotone admission, and local WANT intent
 - `reconcile` — durable WANT observation and reproducible-operation fulfillment
 - `provider` / `routing` — bounded bearer provider directory and XOR routing
 - `protocol` — public direct-operation framing

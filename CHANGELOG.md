@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Remove the unused hybrid residual-read API and PatternUnion query wrapper.
+  Reads expose the selected resident index cover; exact historical support and
+  explicit maintenance remain separate operations. A record whose target blob
+  is absent does not make the reader fall back to raw source members.
+
+- Make Net admission and hydration visible after local put without automatic
+  disk flushes or a retained durable-answer cache. Explicit close remains the
+  persistence boundary; manual flush, put and refresh errors remain observable.
+  Keep physical corruption/valid-duplicate read semantics, frozen observations,
+  and existing request concurrency. Remove obsolete pending-flush health state.
+
 - Add an owning `Leech<S>` with the existing local store and exact-acquisition
   traits, but no serving-inventory refresh or collection activation. Keep
   ordinary Peer serving behavior and the exact-H bearer protocol unchanged;
@@ -45,7 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or change transport, scheduling, wire bytes, or live state.
 
 - Experiment with four concurrent exact-handle hydration fetches within one
-  service class's existing deadline. Completed bodies land and flush serially;
+  service class's existing deadline. Completed bodies land serially;
   a stalled first request no longer blocks ready later answers. Owned lazy Peer
   fetch futures start only when polled. Cancellation, retry accounting and
   frozen rounds remain bounded; recursive speculation stays serial and keeps

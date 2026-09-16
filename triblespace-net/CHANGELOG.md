@@ -44,6 +44,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Remove ordinary per-blob and repair-drain disk flushes and the reconciler's
+  retained durable-answer mirror. Local put/refresh visibility precedes the
+  explicit close persistence boundary; manual flush and close still propagate
+  their errors. Keep selected-input readable membership and corrupt-primary /
+  valid-duplicate semantics, without changing bearer verification or concurrency.
+  Failed snapshot refresh now returns its existing typed error and withdraws
+  the serving view; remove obsolete pending-flush health state.
+
 - Preserve the existing `Blob<UnknownBlob>` and its cached handle through
   interactive, descriptor and bulk landing, avoiding reconstruction and a
   second content hash. Bind capability responses to the requested handle;
@@ -57,7 +65,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Bound exact WANT/direct-root fetching to an experimental four-wide window
   within the current service class and shared deadline. Land each completed
-  body through the unchanged serial hash/durability boundary; deadline expiry
+  body through serial local insertion; deadline expiry
   cancels unfinished requests without consuming the unstarted tail. Peer fetch
   futures own network handles and remain inert until polled. Recursive scans
   retain their serial path and sixteen-attempt allowance; no throughput gain

@@ -957,50 +957,6 @@ where
     Ok(resolved)
 }
 
-/// Resident immediate-source members whose support the target's resident
-/// realization does not yet represent, each with its payload and the input
-/// witnesses an equation would cite.
-///
-/// A read-only planning step for an editor that must see facts the derived
-/// index has not carried yet: it maps nothing and publishes nothing. The
-/// selection is the one `ensure` would map next, chosen by the same cover and
-/// support algebra: the coarsest complete resident source cover of the
-/// support the target lacks. It is therefore bounded by what the target
-/// lacks, not by what changed recently: with an empty or far-behind target it
-/// can be the whole resident source, and a selected physical member may
-/// carry support the target already represents beside the support it lacks.
-/// The support in question is the source's resident admitted support, as
-/// `source_support` observes it: an admitted COMMIT whose payload has not
-/// landed is outside it, so an empty result means the target is exact for
-/// what is resident, not for every admitted record. A signed target equation
-/// whose own output has not landed does not block the selection: the
-/// resident source member it names is still returned. Missing provenance
-/// stays visible: when the needed support cannot be represented by resident
-/// members, the incomplete-cover error names what is absent instead of
-/// returning a delta that looks complete.
-pub(crate) fn uncovered_resident_source_members<R, M>(
-    snapshot: &R,
-    target: Collection<M::Target>,
-) -> Result<
-    Vec<(
-        CollectionData,
-        Blob<M::Source>,
-        Vec<CollectionRecordFingerprint>,
-    )>,
-    CollectionRealizationError,
->
-where
-    R: StoreRead,
-    M: CollectionMapping,
-{
-    let support = source_support::<R, M>(snapshot, target)?;
-    let probe = probe_mapping::<R, M>(snapshot, target, &support, true)?;
-    if probe.target_resolution.is_exact_for(&support) {
-        return Ok(Vec::new());
-    }
-    source_residual(snapshot, &probe, &support, &BTreeMap::new())
-}
-
 /// Attach one target collection using its snapshot's proof and definition state.
 ///
 /// The target's endorsed records define the search boundary. The result

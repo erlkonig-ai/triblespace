@@ -68,7 +68,6 @@ pub use crate::query::find;
 pub use crate::query::frontier::latest;
 pub use crate::query::intersectionconstraint::and;
 pub use crate::query::intersectionconstraint::IntersectionConstraint;
-pub use crate::query::patternunion::PatternUnion;
 pub use crate::query::rangeconstraint::{value_range, InlineRange};
 pub use crate::query::register::{
     maximal, resolve, sole, End, Maximal, ObservationOrder, RegisterOrder, StatedOrder, Unordered,
