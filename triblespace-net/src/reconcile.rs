@@ -30,7 +30,7 @@ use triblespace_core::repo::{
 };
 
 use crate::peer::Peer;
-use crate::protocol::RawHash;
+use crate::protocol::{RawHash, VerifiedBlob};
 
 /// How much content an explicit collection selection asks this process to obtain.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -547,14 +547,14 @@ impl Reconciler {
                     // A failed durability barrier is retried locally, not
                     // turned into a network fetch of already-visible bytes.
                     let fetch = (!visible_blobs.contains(&handle)).then(|| {
-                        peer.fetch_blob_with_deadline(
+                        peer.fetch_verified_with_deadline(
                             handle,
                             deadline.saturating_duration_since(tokio::time::Instant::now()),
                         )
                     });
                     in_flight.insert(handle);
                     pending.push(async move {
-                        let bytes = match fetch {
+                        let verified = match fetch {
                             Some(fetch) if tokio::time::Instant::now() < deadline => {
                                 tokio::time::timeout_at(deadline, fetch)
                                     .await
@@ -563,7 +563,7 @@ impl Reconciler {
                             }
                             _ => None,
                         };
-                        (handle, bytes)
+                        (handle, verified)
                     });
                 }
                 if pending.is_empty()
@@ -572,7 +572,7 @@ impl Reconciler {
                 {
                     break;
                 }
-                let Ok(Some((handle, bytes))) =
+                let Ok(Some((handle, verified))) =
                     tokio::time::timeout_at(deadline, pending.next()).await
                 else {
                     break;
@@ -582,8 +582,8 @@ impl Reconciler {
                 let landed = if visible_blobs.contains(&handle) {
                     peer.store().flush().is_ok()
                 } else {
-                    bytes
-                        .and_then(|bytes| land_exact(peer, handle, bytes))
+                    verified
+                        .and_then(|verified| land_exact(peer, verified))
                         .is_some()
                 };
                 if !landed {
@@ -1153,11 +1153,11 @@ where
         + 'static,
     S::Snapshot: StoreRead + BlobChildren,
 {
-    let bytes = peer.fetch_blob_with_deadline(handle, budget).await?;
-    land_exact(peer, handle, bytes)
+    let verified = peer.fetch_verified_with_deadline(handle, budget).await?;
+    land_exact(peer, verified)
 }
 
-fn land_exact<S>(peer: &Peer<S>, handle: RawHash, bytes: Bytes) -> Option<()>
+fn land_exact<S>(peer: &Peer<S>, verified: VerifiedBlob) -> Option<()>
 where
     S: BlobStore
         + CollectionStore
@@ -1170,11 +1170,13 @@ where
 {
     let landing = {
         let mut store = peer.store();
-        match store.put::<UnknownBlob, Bytes>(bytes) {
-            Ok(actual) if actual.raw == handle => store
+        // Verified on the wire and matched against the requested handle at
+        // the capability boundary; it lands under that handle without a
+        // second hash.
+        match store.put::<UnknownBlob, _>(verified.into_blob()) {
+            Ok(_) => store
                 .flush()
                 .map_err(|error| format!("flush failed: {error:?}")),
-            Ok(_) => Err("blob store returned a different handle".to_owned()),
             Err(error) => Err(format!("put failed: {error:?}")),
         }
     };
