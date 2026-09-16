@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add `peer::Leech<S>` for locally writable foreground stores which acquire
+  exact blobs without constructing or advertising the pile's serving inventory.
+  Reuse the existing store traits, PeerSnapshot and bearer path; ordinary Peer
+  publication/serving semantics and backend durability remain unchanged.
+
 - Add opt-in demand, shallow, and full acquisition policy to the external
   `Reconciler`. Shallow hydrates selected structural collection-record roots;
   full streams their aligned recursive references with bounded speculative

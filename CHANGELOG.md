@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add an owning `Leech<S>` with the existing local store and exact-acquisition
+  traits, but no serving-inventory refresh or collection activation. Keep
+  ordinary Peer serving behavior and the exact-H bearer protocol unchanged;
+  no new public reader adapter, cache, durability policy or background task.
+
 - Add test-only foreground Peer lifecycle counters separating frozen exact
   reads, bare blob-reader refresh, first full serving-inventory construction,
   and subsequent locator-index deltas. Count enumerated handles rather than

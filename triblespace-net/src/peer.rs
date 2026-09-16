@@ -41,6 +41,9 @@ pub use crate::inventory::{ReconcileDirection, ReconcileQos};
 mod snapshot;
 pub use snapshot::{PeerGetError, PeerSnapshot};
 
+mod leech;
+pub use leech::Leech;
+
 /// Failure while starting a production network host.
 #[derive(Debug)]
 pub enum PeerOpenError {
@@ -666,6 +669,22 @@ where
         store
     }
 
+    /// Freeze the backend without changing the host's serving observation.
+    fn snapshot_from_store_at(
+        &mut self,
+        instant: hifitime::Epoch,
+    ) -> Result<PeerSnapshot<S>, PeerSnapshotError<S::SnapshotError>> {
+        let frozen = self
+            .store()
+            .snapshot_at(instant)
+            .map_err(PeerSnapshotError::Store)?;
+        Ok(PeerSnapshot {
+            frozen,
+            store: self.store.clone(),
+            host: Arc::downgrade(&self.host),
+        })
+    }
+
     pub fn try_local(&mut self, hash: RawHash) -> Option<Bytes> {
         BlobStoreGet::get::<Bytes, UnknownBlob>(&self.snapshot().ok()?, Inline::new(hash)).ok()
     }
@@ -797,15 +816,7 @@ where
         instant: hifitime::Epoch,
     ) -> Result<Self::Snapshot, Self::SnapshotError> {
         self.try_refresh_at(instant)?;
-        let frozen = self
-            .store()
-            .snapshot_at(instant)
-            .map_err(PeerSnapshotError::Store)?;
-        Ok(PeerSnapshot {
-            frozen,
-            store: self.store.clone(),
-            host: Arc::downgrade(&self.host),
-        })
+        self.snapshot_from_store_at(instant)
     }
 }
 

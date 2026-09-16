@@ -9,6 +9,11 @@
 //! H remains a read capability, not a public inventory key: these diagnostics
 //! print only counts. The private L-to-H map and provider-first proof ordering
 //! are unchanged.
+//!
+//! Leech controls count enumeration and inspect retained serving/provider state,
+//! including after fake host startup. There is no command-processing host loop
+//! here, so these are not wire-advertisement or handshake measurements. Close
+//! may send an empty provider withdrawal without constructing an inventory.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -530,5 +535,155 @@ fn memory_repo_conservative_delta_is_counted_without_claiming_native_pile_cost()
             Some(&handle.raw)
         );
         counts.report("memoryrepo-conservative-diff", resident);
+    }
+}
+
+fn assert_leech_has_no_serving_inventory(leech: &Leech<Counted<Pile>>, counts: &Counts) {
+    assert_eq!(counts.inventory(), [0, 0, 0, 0]);
+    assert!(leech.peer.last_store_snapshot.is_none());
+    assert!(leech.peer.sender.current_snapshot().is_none());
+    assert_eq!(leech.peer.serving_snapshot_rebuilds, 0);
+    let providers = leech.peer.last_provider_observation.clone().into_set();
+    assert_eq!(providers.len(), 0);
+    let health = leech.health();
+    assert!(!health.store.serving_snapshot);
+    assert!(health.store.last_snapshot_published_at.is_none());
+}
+
+#[test]
+fn leech_public_lazy_resident_snapshots_and_writes_remain_dormant() {
+    for resident in [0, 8, 128] {
+        let counts = Arc::new(Counts::default());
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut inner = Pile::open(file.path()).unwrap();
+        for index in 0..resident {
+            inner
+                .put::<UnknownBlob, _>(Bytes::from_source((index as u64).to_le_bytes().to_vec()))
+                .unwrap();
+        }
+        // No zero-budget or read-only policy is needed for this boundary.
+        let mut leech = Leech::lazy(
+            Counted {
+                inner,
+                counts: counts.clone(),
+            },
+            SigningKey::from_bytes(&[87; 32]),
+            PeerConfig {
+                peers: Vec::new(),
+                qos: ReconcileQos::default(),
+                provider_publication_budget: Some(1),
+            },
+        );
+        assert_eq!(
+            leech.peer.qos().direction,
+            ReconcileDirection::Bidirectional
+        );
+        assert!(matches!(
+            leech.peer.host.lock().unwrap().state,
+            HostState::Dormant(_)
+        ));
+        assert_leech_has_no_serving_inventory(&leech, &counts);
+
+        let frozen = leech.snapshot().unwrap();
+        for _ in 0..3 {
+            leech.snapshot_at(frozen.instant()).unwrap();
+        }
+        let bytes = Bytes::from_source(b"local leech payload".to_vec());
+        let handle = leech.put::<UnknownBlob, _>(bytes.clone()).unwrap();
+        assert!(!frozen.contains_blob(handle).unwrap());
+        assert_eq!(leech.try_local(handle.raw), Some(bytes.clone()));
+        let reader = leech.snapshot_at(frozen.instant()).unwrap();
+        assert!(reader.contains_blob(handle).unwrap());
+        assert_eq!(
+            BlobStoreGet::get::<Bytes, UnknownBlob>(&reader, handle).unwrap(),
+            bytes
+        );
+        assert_eq!(reader.wants().unwrap().count(), 0);
+        assert_leech_has_no_serving_inventory(&leech, &counts);
+        assert!(matches!(
+            leech.peer.host.lock().unwrap().state,
+            HostState::Dormant(_)
+        ));
+
+        let sender = leech.peer.sender.clone();
+        let host = Arc::downgrade(&leech.peer.host);
+        leech.close().unwrap();
+        assert!(host.upgrade().is_none());
+        assert!(sender.current_snapshot().is_none());
+        assert!(sender.health().store.last_snapshot_published_at.is_none());
+        assert_eq!(counts.inventory(), [0, 0, 0, 0]);
+        counts.report("leech-public-lazy-resident-write-close", resident);
+    }
+}
+
+#[tokio::test]
+async fn leech_first_and_repeated_exact_acquire_never_build_serving_inventory() {
+    for resident in [0, 8, 128] {
+        let Fixture {
+            peer,
+            counts,
+            remote,
+            _file,
+        } = Fixture::new(resident, false);
+        // Only the dormant fixture is wrapped; no running-Peer conversion is
+        // exposed by the production API.
+        let mut leech = Leech { peer };
+        let frozen = leech.snapshot().unwrap();
+        let handle = remote.get_handle();
+        assert!(leech.try_local(handle.raw).is_none());
+        assert_eq!(counts.host_starts.load(Ordering::Relaxed), 0);
+        assert_eq!(counts.requests.load(Ordering::Relaxed), 0);
+        assert_leech_has_no_serving_inventory(&leech, &counts);
+
+        assert_eq!(
+            leech.acquire(handle).await.unwrap(),
+            Some(remote.bytes.clone())
+        );
+        assert_eq!(counts.host_starts.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.requests.load(Ordering::Relaxed), 1);
+        assert!(!frozen.contains_blob(handle).unwrap());
+        assert_leech_has_no_serving_inventory(&leech, &counts);
+
+        for _ in 0..3 {
+            let reader = leech.snapshot_at(frozen.instant()).unwrap();
+            assert!(reader.contains_blob(handle).unwrap());
+            assert_eq!(reader.wants().unwrap().count(), 0);
+            assert_eq!(leech.try_local(handle.raw), Some(remote.bytes.clone()));
+            assert_eq!(
+                AsyncBlobStoreAcquire::acquire(&mut leech, handle)
+                    .await
+                    .unwrap(),
+                Some(remote.bytes.clone())
+            );
+            assert_leech_has_no_serving_inventory(&leech, &counts);
+        }
+        assert_eq!(
+            frozen.get::<Bytes, UnknownBlob>(handle).await.unwrap(),
+            remote.bytes
+        );
+        assert!(!frozen.contains_blob(handle).unwrap());
+
+        let local_bytes = Bytes::from_source(b"local write after leech startup".to_vec());
+        let local = leech.put::<UnknownBlob, _>(local_bytes.clone()).unwrap();
+        assert!(!frozen.contains_blob(local).unwrap());
+        assert_eq!(leech.acquire(local).await.unwrap(), Some(local_bytes));
+        assert!(leech.snapshot().unwrap().contains_blob(local).unwrap());
+        assert_leech_has_no_serving_inventory(&leech, &counts);
+        assert_eq!(counts.host_starts.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.requests.load(Ordering::Relaxed), 1);
+
+        let sender = leech.peer.sender.clone();
+        let host = Arc::downgrade(&leech.peer.host);
+        leech.close().unwrap();
+        assert!(host.upgrade().is_none());
+        assert!(sender.current_snapshot().is_none());
+        assert!(sender.health().store.last_snapshot_published_at.is_none());
+        // This frozen observation never contained the acquired blob. After
+        // close it cannot consult the cache or restart the acquisition host.
+        assert!(frozen.get::<Bytes, UnknownBlob>(handle).await.is_err());
+        assert_eq!(counts.host_starts.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.requests.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.inventory(), [0, 0, 0, 0]);
+        counts.report("leech-exact-acquire-repeat-write-close", resident);
     }
 }

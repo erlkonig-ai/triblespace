@@ -15,6 +15,8 @@
 //! Semantic snapshots and local writes remain synchronous. Explicit exact-blob
 //! reads through [`PeerSnapshot`](peer::PeerSnapshot) await acquisition while
 //! keeping the captured collection and authorization observation unchanged.
+//! [`Leech<S>`](peer::Leech) provides the same local store and exact-acquisition
+//! operations without constructing or advertising a serving inventory.
 
 pub(crate) mod bearer;
 mod channel;
