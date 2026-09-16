@@ -1,36 +1,52 @@
-//! A transparent immutable reader which records its raw lookup interests.
+//! A transparent reader or active store which records its raw lookup interests.
 //!
 //! Misses and errors are dependencies too: a later exact record or physical
 //! blob occurrence can change their answers. The tracker retains no payloads,
 //! decoded values, or admission results. Clones share it so reads performed
 //! while interpreting an already attached view remain part of that observation.
+//! Snapshots and acquisitions of an observed active store share the same tracker.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
-use crate::blob::{BlobEncoding, TryFromBlob};
+use crate::blob::encodings::UnknownBlob;
+use crate::blob::{BlobEncoding, IntoBlob, TryFromBlob};
 use crate::capability::{CapabilityProof, CapabilityProofId};
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
+use crate::repo::async_store::AsyncBlobStoreAcquire;
 use crate::repo::{
-    BlobInfo, BlobMetadata, BlobStoreGet, BlobStoreList, BlobStoreMeta, CapabilityProofRead,
-    StoreChanges, StoreDependencies, StoreSnapshot, WantRead,
+    BlobInfo, BlobMetadata, BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut,
+    CapabilityProofRead, CapabilityProofStore, SnapshotSource, StoreChanges, StoreDependencies,
+    StoreSnapshot, WantRead,
 };
 
 use super::{
     CollectionRead, CollectionRecord, CollectionRecordFingerprint, CollectionRecordSelector,
+    CollectionStore,
 };
 
 pub(crate) type DependencyTracker = Arc<Mutex<StoreDependencies>>;
 
+/// Opt-in raw read-set observation without retaining interpreted results.
+///
+/// Reads, including misses and errors, accumulate across clones and snapshots.
+/// Active writes forward unchanged; acquisitions record their exact handle
+/// before forwarding. Drop the observer after an operation to bound this set,
+/// and compare later snapshots with [`StoreSnapshot::changes_for`].
+///
+/// Provider availability and deadlines are not stored dependencies. A network
+/// caller still owns its retry policy; this adapter performs no retries or WANT
+/// publication of its own.
 #[derive(Clone)]
-pub(crate) struct ObservedStore<R> {
+pub struct ObservedStore<R> {
     inner: R,
     tracker: DependencyTracker,
 }
 
 impl<R> ObservedStore<R> {
-    pub(crate) fn new(inner: R) -> Self {
+    /// Start a fresh observation around a reader or an active store.
+    pub fn new(inner: R) -> Self {
         Self::with_tracker(inner, Arc::new(Mutex::new(StoreDependencies::default())))
     }
 
@@ -42,12 +58,17 @@ impl<R> ObservedStore<R> {
         &self.inner
     }
 
-    #[cfg(test)]
-    pub(crate) fn dependencies(&self) -> StoreDependencies {
+    /// Copy the raw interests collected so far, including failed lookups.
+    pub fn dependencies(&self) -> StoreDependencies {
         self.tracker
             .lock()
             .expect("store dependency tracker is not poisoned")
             .clone()
+    }
+
+    /// Recover the wrapped reader or store without changing it.
+    pub fn into_inner(self) -> R {
+        self.inner
     }
 
     pub(crate) fn tracker(&self) -> DependencyTracker {
@@ -64,6 +85,66 @@ impl<R> ObservedStore<R> {
             .expect("store dependency tracker is not poisoned")
             .blobs
             .insert(Handle::<S>::to_hash(handle));
+    }
+}
+
+impl<S: SnapshotSource> SnapshotSource for ObservedStore<S> {
+    type Snapshot = ObservedStore<S::Snapshot>;
+    type SnapshotError = S::SnapshotError;
+
+    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+        let snapshot = self.inner.snapshot()?;
+        Ok(Self::Snapshot::with_tracker(snapshot, self.tracker()))
+    }
+
+    fn snapshot_at(
+        &mut self,
+        instant: hifitime::Epoch,
+    ) -> Result<Self::Snapshot, Self::SnapshotError> {
+        let snapshot = self.inner.snapshot_at(instant)?;
+        Ok(Self::Snapshot::with_tracker(snapshot, self.tracker()))
+    }
+}
+
+impl<S: BlobStorePut> BlobStorePut for ObservedStore<S> {
+    type PutError = S::PutError;
+
+    fn put<E, T>(&mut self, item: T) -> Result<Inline<Handle<E>>, Self::PutError>
+    where
+        E: BlobEncoding + 'static,
+        T: IntoBlob<E>,
+        Handle<E>: InlineEncoding,
+    {
+        self.inner.put(item)
+    }
+}
+
+impl<S: CollectionStore> CollectionStore for ObservedStore<S> {
+    type InsertError = S::InsertError;
+
+    fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
+        self.inner.insert(record)
+    }
+}
+
+impl<S: CapabilityProofStore> CapabilityProofStore for ObservedStore<S> {
+    type InsertError = S::InsertError;
+
+    fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
+        self.inner.insert_proof(proof)
+    }
+}
+
+impl<S: AsyncBlobStoreAcquire> AsyncBlobStoreAcquire for ObservedStore<S> {
+    type AcquireError = S::AcquireError;
+
+    fn acquire(
+        &mut self,
+        handle: Inline<Handle<UnknownBlob>>,
+    ) -> impl std::future::Future<Output = Result<Option<anybytes::Bytes>, Self::AcquireError>> + Send
+    {
+        self.observe_blob(handle);
+        self.inner.acquire(handle)
     }
 }
 
@@ -306,6 +387,143 @@ mod tests {
         assert!(ObservedStore::new(observed.inner().clone())
             .dependencies()
             .is_empty());
+    }
+
+    #[test]
+    fn active_writes_forward_and_fresh_snapshots_share_only_read_interests() {
+        let key = SigningKey::from_bytes(&[11; 32]);
+        let mut store = MemoryRepo::default();
+        let collection = store
+            .collection(
+                "observed active store",
+                CollectionPolicy::new(
+                    AdmissionPolicy::direct(key.verifying_key()),
+                    AdmissionPolicy::direct(key.verifying_key()),
+                ),
+            )
+            .unwrap();
+        let mut observed = ObservedStore::new(&mut store);
+        let at = hifitime::Epoch::from_tai_seconds(17.0);
+        let before = observed.snapshot_at(at).unwrap();
+        let handle = observed.put(blob("active member")).unwrap();
+        let record = CollectionRecord::Commit(CollectionCommit::sign(
+            &key,
+            collection.handle(),
+            Handle::<UnknownBlob>::to_hash(handle),
+            empty_metadata_handle(),
+        ));
+        observed.insert(record).unwrap();
+        let proof = CapabilityProof::new(
+            CapabilityResource::from(collection.handle()),
+            &key,
+            read_capability(),
+            SigningKey::from_bytes(&[12; 32]).verifying_key(),
+        );
+        observed.insert_proof(proof.clone()).unwrap();
+        let after = observed.snapshot_at(at).unwrap();
+        assert!(observed.dependencies().is_empty(), "writes are not reads");
+        assert_eq!(before.instant(), at);
+        assert_eq!(after.instant(), at);
+        assert!(!before.contains_blob(handle).unwrap());
+        assert_eq!(
+            after.get::<Bytes, _>(handle).unwrap().as_ref(),
+            b"active member"
+        );
+        assert!(before.record(record.fingerprint()).unwrap().is_none());
+        assert_eq!(after.record(record.fingerprint()).unwrap(), Some(record));
+        assert!(before.proof(proof.id()).unwrap().is_none());
+        assert_eq!(after.proof(proof.id()).unwrap(), Some(proof));
+        let expected = StoreDependencies {
+            blobs: BTreeSet::from([Handle::<UnknownBlob>::to_hash(handle)]),
+            records: BTreeSet::from([CollectionRecordSelector::Fingerprint(record.fingerprint())]),
+            capability_proofs: true,
+            ..StoreDependencies::default()
+        };
+        assert_eq!(observed.dependencies(), expected);
+        assert_eq!(before.dependencies(), expected);
+        assert_eq!(after.dependencies(), expected);
+        let native = after.into_inner();
+        assert_eq!(native.record(record.fingerprint()).unwrap(), Some(record));
+        assert_eq!(
+            observed
+                .into_inner()
+                .snapshot()
+                .unwrap()
+                .wants()
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn acquisition_misses_errors_and_cancelled_futures_retain_exact_interest() {
+        struct Acquirer {
+            tracker: DependencyTracker,
+            calls: Arc<AtomicUsize>,
+            fail: bool,
+        }
+
+        impl AsyncBlobStoreAcquire for Acquirer {
+            type AcquireError = std::io::Error;
+
+            fn acquire(
+                &mut self,
+                handle: Inline<Handle<UnknownBlob>>,
+            ) -> impl std::future::Future<Output = Result<Option<Bytes>, Self::AcquireError>> + Send
+            {
+                let interests = self
+                    .tracker
+                    .try_lock()
+                    .expect("forward without holding lock");
+                assert!(interests
+                    .blobs
+                    .contains(&Handle::<UnknownBlob>::to_hash(handle)));
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                std::future::ready(if self.fail {
+                    Err(std::io::Error::other("provider failed"))
+                } else {
+                    Ok(None)
+                })
+            }
+        }
+
+        for fail in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let tracker = Arc::new(Mutex::new(StoreDependencies::default()));
+            let mut observed = ObservedStore::with_tracker(
+                Acquirer {
+                    tracker: Arc::clone(&tracker),
+                    calls: Arc::clone(&calls),
+                    fail,
+                },
+                tracker,
+            );
+            let handle = blob("absent acquisition").get_handle();
+            let result = futures::executor::block_on(observed.acquire(handle));
+            if fail {
+                assert_eq!(result.unwrap_err().to_string(), "provider failed");
+            } else {
+                assert!(result.unwrap().is_none());
+            }
+            let cancelled_handle = blob("cancelled acquisition").get_handle();
+            drop(observed.acquire(cancelled_handle));
+            assert_eq!(
+                calls.load(Ordering::Relaxed),
+                2,
+                "one forwarding call per request"
+            );
+            assert_eq!(
+                observed.dependencies(),
+                StoreDependencies {
+                    blobs: [handle, cancelled_handle]
+                        .into_iter()
+                        .map(Handle::<UnknownBlob>::to_hash)
+                        .collect(),
+                    ..StoreDependencies::default()
+                }
+            );
+        }
     }
 
     #[test]

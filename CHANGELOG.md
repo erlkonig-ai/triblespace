@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Scope CLI maintenance-watch eligibility to the preceding active pass's raw
+  record/blob/proof interests through opt-in `repo::ObservedStore` forwarding.
+  Misses and relevant concurrent arrivals remain retry interests; unrelated
+  writes and WANTs need not repeat collection algebra. Native collection APIs,
+  canonical plans, publication and protocol formats are unchanged.
+
 - Keep an already-started recursive hydration startup window across later
   root arrivals, so its next word does not repeatedly lose priority. Enforce
   its 128-word allowance even for partial local-word quanta; completion or

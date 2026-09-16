@@ -53,8 +53,12 @@ use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::{Blake3, Handle, Hash};
 use triblespace_core::inline::Inline;
 use triblespace_core::metadata::{self, MetaDescribe};
+use triblespace_core::repo::async_store::AsyncBlobStoreAcquire;
 use triblespace_core::repo::pile::{Pile, PileSnapshot};
-use triblespace_core::repo::{BlobStoreGet, BlobStoreMeta, SnapshotSource, StoreSnapshot};
+use triblespace_core::repo::{
+    BlobStoreGet, BlobStoreMeta, ObservedStore, SnapshotSource, Store, StoreDependencies,
+    StoreRead, StoreSnapshot,
+};
 use triblespace_core::trible::Fragment;
 use triblespace_core::trible::TribleSet;
 
@@ -1756,20 +1760,23 @@ mod tests {
     use std::collections::BTreeSet;
     use triblespace_core::blob::IntoBlob;
     use triblespace_core::collection::succinctarchive_union::SIMPLE_TO_SUCCINCT_MAPPING_V1;
-    use triblespace_core::collection::{CollectionPolicy, CollectionStoreExt};
+    use triblespace_core::collection::{CollectionPolicy, CollectionStore, CollectionStoreExt};
     use triblespace_core::repo::memoryrepo::MemoryRepo;
+    use triblespace_core::repo::{BlobStoreList, BlobStorePut};
 
     #[test]
     fn maintenance_catches_arrivals_during_a_pass_without_self_sustaining_work() {
-        use triblespace_core::repo::BlobStorePut;
-
         let mut store = MemoryRepo::default();
         let before = store.snapshot().unwrap();
-        store
-            .put::<UTF8String, _>("arrived while maintenance ran")
-            .unwrap();
+        let observed = ObservedStore::new(before.clone());
+        let requested: Blob<UTF8String> = "arrived while maintenance ran".to_blob();
+        assert!(observed
+            .get::<Blob<UTF8String>, _>(requested.get_handle())
+            .is_err());
+        store.put::<UTF8String, _>(requested).unwrap();
+        let interests = observed.dependencies();
         let after = store.snapshot().unwrap();
-        let catch_up = maintenance_changed(&before, &after);
+        let catch_up = maintenance_changed(&before, &after, &interests);
         assert!(
             catch_up,
             "post-work baseline must not swallow an in-flight append"
@@ -1779,10 +1786,10 @@ mod tests {
         // bit requests its bounded catch-up pass. With no further arrivals or
         // writes that pass clears the bit instead of becoming an idle loop.
         let poll = store.snapshot().unwrap();
-        assert!(!maintenance_changed(&after, &poll));
-        assert!(catch_up || maintenance_changed(&after, &poll));
+        assert!(!maintenance_changed(&after, &poll, &interests));
+        assert!(catch_up || maintenance_changed(&after, &poll, &interests));
         let after_catch_up = store.snapshot().unwrap();
-        assert!(!maintenance_changed(&poll, &after_catch_up));
+        assert!(!maintenance_changed(&poll, &after_catch_up, &interests));
     }
 
     #[test]
@@ -1793,10 +1800,358 @@ mod tests {
         let unchanged = store.snapshot_at(at(11.0)).unwrap();
         let boundary = store.snapshot_at(at(12.0)).unwrap();
         let rollback = store.snapshot_at(at(9.0)).unwrap();
+        let interests = StoreDependencies {
+            all_blobs: true,
+            all_records: true,
+            capability_proofs: true,
+            ..StoreDependencies::default()
+        };
 
-        assert!(!maintenance_changed(&previous, &unchanged));
-        assert!(!maintenance_changed(&previous, &boundary));
-        assert!(!maintenance_changed(&previous, &rollback));
+        assert!(!maintenance_changed(&previous, &unchanged, &interests));
+        assert!(!maintenance_changed(&previous, &boundary, &interests));
+        assert!(!maintenance_changed(&previous, &rollback, &interests));
+    }
+
+    fn observed_maintenance_pass(
+        pile: &mut Pile,
+        targets: &[CollectionHandle],
+        signer: &SigningKey,
+        calls: &mut usize,
+    ) -> (usize, StoreDependencies) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let references = targets
+            .iter()
+            .map(|handle| format!("blake3:{}", handle_hex(*handle)))
+            .collect::<Vec<_>>();
+        let mut observed = ObservedStore::new(pile);
+        *calls += 1;
+        let failures = runtime
+            .block_on(maintenance_pass(
+                &mut observed,
+                &references,
+                signer,
+                true,
+                SuccinctBackend::Cpu,
+            ))
+            .unwrap();
+        (failures, observed.dependencies())
+    }
+
+    #[test]
+    fn maintenance_read_set_ignores_unrelated_arrivals_but_tracks_source_and_cold_blobs() {
+        use triblespace_core::capability::{CapabilityProof, CapabilityResource};
+        use triblespace_core::collection::{
+            empty_metadata_handle, read_capability, CollectionCommit, CollectionSnapshotExt,
+        };
+        use triblespace_core::macros::entity;
+        use triblespace_core::repo::{CapabilityProofStore, WantRead, WantRequest, WantStore};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("scoped-maintenance.pile");
+        std::fs::File::create(&path).unwrap();
+        let mut pile = Pile::open(&path).unwrap();
+        let mut writer = Pile::open(&path).unwrap();
+        let signer = SigningKey::from_bytes(&[61; 32]);
+        let policy = direct_policy(signer.verifying_key());
+        let source = pile.collection("scoped source", policy.clone()).unwrap();
+        let succinct = pile
+            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+            .unwrap();
+        let target = pile
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy.clone())
+            .unwrap();
+        let other = pile.collection("unrelated source", policy).unwrap();
+        for text in ["first scoped member", "second scoped member"] {
+            pile.commit(source, &signer, entity! { metadata::description: text })
+                .unwrap();
+        }
+        let selected = [target.handle()];
+        let mut calls = 0;
+        let before = pile.snapshot().unwrap();
+        let (failures, first_interests) =
+            observed_maintenance_pass(&mut pile, &selected, &signer, &mut calls);
+        assert_eq!(failures, 0);
+        let after = pile.snapshot().unwrap();
+        assert!(
+            maintenance_changed(&before, &after, &first_interests),
+            "own publication requests one catch-up"
+        );
+        let (failures, interests) =
+            observed_maintenance_pass(&mut pile, &selected, &signer, &mut calls);
+        assert_eq!(failures, 0);
+        let settled = pile.snapshot().unwrap();
+        assert!(!maintenance_changed(&after, &settled, &interests));
+        assert_eq!(calls, 2);
+        assert!(
+            !interests.all_records && !interests.all_blobs,
+            "exact selection and census stay scoped"
+        );
+        for handle in [source.handle(), succinct.handle(), target.handle()] {
+            assert!(interests
+                .records
+                .contains(&CollectionRecordSelector::Collection(handle)));
+            assert!(interests
+                .blobs
+                .contains(&Handle::<SimpleArchive>::to_hash(handle)));
+        }
+
+        writer.put::<UTF8String, _>("unrelated payload").unwrap();
+        let requested: Blob<UTF8String> = "unrelated request".to_blob();
+        writer
+            .want(WantRequest::blob(requested.get_handle()))
+            .unwrap();
+        writer
+            .commit(
+                other,
+                &signer,
+                entity! { metadata::description: "unrelated record" },
+            )
+            .unwrap();
+        let unrelated = pile.snapshot().unwrap();
+        assert!(!unrelated.changes_since(&settled).is_empty());
+        if maintenance_changed(&settled, &unrelated, &interests) {
+            observed_maintenance_pass(&mut pile, &selected, &signer, &mut calls);
+        }
+        assert_eq!(
+            calls, 2,
+            "no maintenance call for unrelated blob, WANT or record"
+        );
+
+        // Proof lookup is still component-wide, deliberately. A proof-only
+        // arrival retries once even when it concerns a different resource.
+        assert!(interests.capability_proofs);
+        writer
+            .insert_proof(CapabilityProof::new(
+                CapabilityResource::from(other.handle()),
+                &signer,
+                read_capability(),
+                SigningKey::from_bytes(&[65; 32]).verifying_key(),
+            ))
+            .unwrap();
+        let proof_arrived = pile.snapshot().unwrap();
+        assert!(maintenance_changed(&unrelated, &proof_arrived, &interests));
+        let (failures, interests) =
+            observed_maintenance_pass(&mut pile, &selected, &signer, &mut calls);
+        assert_eq!(failures, 0);
+        assert_eq!(calls, 3);
+        assert!(!maintenance_changed(
+            &proof_arrived,
+            &pile.snapshot().unwrap(),
+            &interests
+        ));
+
+        let cold: Blob<SimpleArchive> = entity! { metadata::description: "new cold source member" }
+            .facts()
+            .clone()
+            .to_blob();
+        writer
+            .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                &signer,
+                source.handle(),
+                Handle::<SimpleArchive>::to_hash(cold.get_handle()),
+                empty_metadata_handle(),
+            )))
+            .unwrap();
+        let source_arrived = pile.snapshot().unwrap();
+        assert!(maintenance_changed(
+            &proof_arrived,
+            &source_arrived,
+            &interests
+        ));
+        let (failures, cold_interests) =
+            observed_maintenance_pass(&mut pile, &selected, &signer, &mut calls);
+        assert!(
+            failures > 0,
+            "cold foundational input is still an explicit error"
+        );
+        assert_eq!(calls, 4);
+        assert!(cold_interests
+            .blobs
+            .contains(&Handle::<SimpleArchive>::to_hash(cold.get_handle())));
+        let absent = pile.snapshot().unwrap();
+        assert!(!absent.contains_blob(cold.get_handle()).unwrap());
+        assert_eq!(
+            absent.collection(target).unwrap().support().unwrap().len(),
+            2
+        );
+        let wants_before = absent.wants().unwrap().count();
+        assert_eq!(wants_before, 1, "maintenance did not manufacture a WANT");
+        assert!(!maintenance_changed(
+            &absent,
+            &pile.snapshot().unwrap(),
+            &cold_interests
+        ));
+
+        writer.put::<SimpleArchive, _>(cold).unwrap();
+        let resident = pile.snapshot().unwrap();
+        assert!(
+            maintenance_changed(&absent, &resident, &cold_interests),
+            "blob-only arrival retries the failed input"
+        );
+        let (failures, complete_interests) =
+            observed_maintenance_pass(&mut pile, &selected, &signer, &mut calls);
+        assert_eq!(failures, 0);
+        let complete = pile.snapshot().unwrap();
+        assert_eq!(
+            complete
+                .collection(target)
+                .unwrap()
+                .support()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert!(maintenance_changed(
+            &resident,
+            &complete,
+            &complete_interests
+        ));
+        let (failures, settled_interests) =
+            observed_maintenance_pass(&mut pile, &selected, &signer, &mut calls);
+        assert_eq!(failures, 0);
+        assert!(!maintenance_changed(
+            &complete,
+            &pile.snapshot().unwrap(),
+            &settled_interests
+        ));
+        assert_eq!(calls, 6, "one retry and one bounded self-write catch-up");
+        writer.close().unwrap();
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn maintenance_errors_keep_missing_descriptors_and_grant_definitions_as_interests() {
+        use triblespace_core::capability::{
+            capability_action, CapabilityProof, CapabilityResource,
+        };
+        use triblespace_core::collection::{CollectionSnapshotExt, ACTION_WRITE};
+        use triblespace_core::macros::entity;
+        use triblespace_core::repo::CapabilityProofStore;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("scoped-authority.pile");
+        std::fs::File::create(&path).unwrap();
+        let mut pile = Pile::open(&path).unwrap();
+        let root = SigningKey::from_bytes(&[62; 32]);
+        let signer = SigningKey::from_bytes(&[63; 32]);
+        let policy = direct_policy(root.verifying_key());
+        let source = pile.collection("delegated source", policy.clone()).unwrap();
+        let target = pile
+            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+            .unwrap();
+        pile.commit(
+            source,
+            &root,
+            entity! { metadata::description: "delegated member" },
+        )
+        .unwrap();
+        let definition: Blob<SimpleArchive> = entity! {
+            capability_action: ACTION_WRITE,
+            metadata::description: "scoped maintenance test grant",
+        }
+        .facts()
+        .clone()
+        .to_blob();
+        pile.insert_proof(CapabilityProof::new(
+            CapabilityResource::from(target.handle()),
+            &root,
+            definition.get_handle(),
+            signer.verifying_key(),
+        ))
+        .unwrap();
+
+        let mut elsewhere = MemoryRepo::default();
+        let late = elsewhere
+            .collection("late selected descriptor", policy)
+            .unwrap();
+        let late_blob: Blob<SimpleArchive> =
+            elsewhere.snapshot().unwrap().get(late.handle()).unwrap();
+        let targets = [target.handle(), late.handle()];
+        let mut calls = 0;
+        let (failures, interests) =
+            observed_maintenance_pass(&mut pile, &targets, &signer, &mut calls);
+        assert_eq!(
+            failures, 2,
+            "missing descriptor and unavailable target WRITE are independent failures"
+        );
+        assert!(interests.capability_proofs);
+        for handle in [late.handle(), definition.get_handle()] {
+            assert!(interests
+                .blobs
+                .contains(&Handle::<SimpleArchive>::to_hash(handle)));
+        }
+        assert!(!interests.all_records && !interests.all_blobs);
+        let failed = pile.snapshot().unwrap();
+        assert!(failed.collection(target).unwrap().cover().is_empty());
+        pile.put::<UTF8String, _>("unrelated between failures")
+            .unwrap();
+        let unrelated = pile.snapshot().unwrap();
+        assert!(!maintenance_changed(&failed, &unrelated, &interests));
+        pile.put::<SimpleArchive, _>(definition).unwrap();
+        pile.put::<SimpleArchive, _>(late_blob).unwrap();
+        let available = pile.snapshot().unwrap();
+        assert!(maintenance_changed(&unrelated, &available, &interests));
+        let (failures, settled_interests) =
+            observed_maintenance_pass(&mut pile, &targets, &signer, &mut calls);
+        assert_eq!(failures, 0);
+        let complete = pile.snapshot().unwrap();
+        assert_eq!(
+            complete
+                .collection(target)
+                .unwrap()
+                .support()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(calls, 2);
+        assert!(maintenance_changed(
+            &available,
+            &complete,
+            &settled_interests
+        ));
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn maintenance_name_lookup_remains_a_real_global_record_interest() {
+        use triblespace_core::macros::entity;
+
+        let mut pile = MemoryRepo::default();
+        let signer = SigningKey::from_bytes(&[64; 32]);
+        let source = pile
+            .collection(
+                "named maintenance target",
+                direct_policy(signer.verifying_key()),
+            )
+            .unwrap();
+        pile.commit(
+            source,
+            &signer,
+            entity! { metadata::description: "named member" },
+        )
+        .unwrap();
+        let snapshot = pile.snapshot().unwrap();
+        let exact = ObservedStore::new(snapshot.clone());
+        assert_eq!(
+            resolve_maintenance_target(&exact, &format!("blake3:{}", handle_hex(source.handle())))
+                .unwrap(),
+            source.handle()
+        );
+        assert!(
+            exact.dependencies().is_empty(),
+            "an explicit handle needs no name inventory"
+        );
+        let named = ObservedStore::new(snapshot);
+        assert_eq!(
+            resolve_maintenance_target(&named, "name:named maintenance target").unwrap(),
+            source.handle()
+        );
+        assert!(named.dependencies().all_records);
+        assert!(!named.dependencies().all_blobs);
     }
 
     fn direct_policy(root: ed25519_dalek::VerifyingKey) -> CollectionPolicy {
@@ -2095,8 +2450,8 @@ mod tests {
 }
 
 /// How many records of each kind name one collection, using its record index.
-fn cover_census(
-    snapshot: &PileSnapshot,
+fn cover_census<R: CollectionRead>(
+    snapshot: &R,
     collection: CollectionHandle,
 ) -> Result<(usize, usize, usize)> {
     let mut commits = 0usize;
@@ -2126,26 +2481,27 @@ fn cover_census(
 /// the dispatch asks each encoding this binary implements for its own id,
 /// exactly as [`representation_name`] does, and reports an unknown one
 /// rather than guessing.
-async fn maintain_by_representation(
-    pile: &mut Pile,
-    snapshot: &PileSnapshot,
+async fn maintain_by_representation<S: Store + AsyncBlobStoreAcquire + Send>(
+    pile: &mut S,
+    snapshot: &S::Snapshot,
     handle: CollectionHandle,
     representation: Id,
     algorithm: Option<Id>,
     signer: &SigningKey,
     succinct_backend: SuccinctBackend,
-) -> Result<PileSnapshot> {
+) -> Result<S::Snapshot> {
     use triblespace_core::collection::latest::LatestBlob;
     use triblespace_core::collection::lww_register::LwwRegisterBlob;
     use triblespace_core::collection::CollectionRealization;
 
-    async fn go<T>(
-        pile: &mut Pile,
-        snapshot: &PileSnapshot,
+    async fn go<S, T>(
+        pile: &mut S,
+        snapshot: &S::Snapshot,
         handle: CollectionHandle,
         signer: &SigningKey,
-    ) -> Result<PileSnapshot>
+    ) -> Result<S::Snapshot>
     where
+        S: Store + AsyncBlobStoreAcquire + Send,
         T: CollectionRealization + MetaDescribe,
         Handle<T>: triblespace_core::inline::InlineEncoding,
     {
@@ -2162,7 +2518,7 @@ async fn maintain_by_representation(
                 "derived SimpleArchive mappings are not implemented by this binary"
             ));
         }
-        go::<SimpleArchive>(pile, snapshot, handle, signer).await
+        go::<S, SimpleArchive>(pile, snapshot, handle, signer).await
     } else if representation == <SuccinctArchiveBlob as MetaDescribe>::id() {
         #[cfg(feature = "succinct-cuda")]
         if matches!(succinct_backend, SuccinctBackend::Cuda) {
@@ -2175,20 +2531,20 @@ async fn maintain_by_representation(
         }
         #[cfg(not(feature = "succinct-cuda"))]
         succinct_backend.check_available()?;
-        go::<SuccinctArchiveBlob>(pile, snapshot, handle, signer).await
+        go::<S, SuccinctArchiveBlob>(pile, snapshot, handle, signer).await
     } else if representation == <Rank9AcceleratedSuccinctArchiveBlob as MetaDescribe>::id() {
-        go::<Rank9AcceleratedSuccinctArchiveBlob>(pile, snapshot, handle, signer).await
+        go::<S, Rank9AcceleratedSuccinctArchiveBlob>(pile, snapshot, handle, signer).await
     } else if representation == <EntityIdSetBlob as MetaDescribe>::id() {
-        go::<EntityIdSetBlob>(pile, snapshot, handle, signer).await
+        go::<S, EntityIdSetBlob>(pile, snapshot, handle, signer).await
     } else if representation == <LatestBlob as MetaDescribe>::id() {
-        go::<LatestBlob>(pile, snapshot, handle, signer).await
+        go::<S, LatestBlob>(pile, snapshot, handle, signer).await
     } else if representation == <LwwRegisterBlob as MetaDescribe>::id() {
-        go::<LwwRegisterBlob>(pile, snapshot, handle, signer).await
+        go::<S, LwwRegisterBlob>(pile, snapshot, handle, signer).await
     } else if representation == <ReferenceSummaryBlob as MetaDescribe>::id() {
         eprintln!("reference summary: assuming complete producer-side blob closure");
-        go::<ReferenceSummaryBlob>(pile, snapshot, handle, signer).await
+        go::<S, ReferenceSummaryBlob>(pile, snapshot, handle, signer).await
     } else if representation == <triblespace_paths::PathSummaryBlob as MetaDescribe>::id() {
-        go::<triblespace_paths::PathSummaryBlob>(pile, snapshot, handle, signer).await
+        go::<S, triblespace_paths::PathSummaryBlob>(pile, snapshot, handle, signer).await
     } else if nvfp4_embedding_set_id().is_some_and(|nvfp4| representation == nvfp4) {
         // Both the ordinary embedding conversion and model inference produce
         // this encoding. Its algorithm, not just its representation, chooses
@@ -2208,8 +2564,8 @@ async fn maintain_by_representation(
 ///
 /// In particular, a descriptor handle does not need any record to name it yet:
 /// `derive` registers its blob before its first maintenance publishes equations.
-fn resolve_maintenance_target(
-    snapshot: &PileSnapshot,
+fn resolve_maintenance_target<R: StoreRead>(
+    snapshot: &R,
     reference: &str,
 ) -> Result<CollectionHandle> {
     use triblespace_core::collection::records::{collection_name, KIND_COLLECTION_DESCRIPTOR};
@@ -2277,8 +2633,8 @@ fn resolve_maintenance_target(
 
 /// A temporary call order, not a second model of the collection descriptors.
 /// Source links are queried in one immutable observation and discarded.
-fn maintenance_order(
-    snapshot: &PileSnapshot,
+fn maintenance_order<R: BlobStoreGet>(
+    snapshot: &R,
     target: CollectionHandle,
     dependencies: bool,
     attempted: &BTreeSet<CollectionHandle>,
@@ -2309,8 +2665,8 @@ fn maintenance_order(
     Ok(order)
 }
 
-async fn maintenance_pass(
-    pile: &mut Pile,
+async fn maintenance_pass<S: Store + AsyncBlobStoreAcquire + Send>(
+    pile: &mut S,
     references: &[String],
     signer: &SigningKey,
     dependencies: bool,
@@ -2429,8 +2785,12 @@ async fn maintenance_pass(
     Ok(failures)
 }
 
-fn maintenance_changed<S: StoreSnapshot>(previous: &S, current: &S) -> bool {
-    !current.changes_since(previous).is_empty()
+fn maintenance_changed<S: StoreSnapshot>(
+    previous: &S,
+    current: &S,
+    interests: &StoreDependencies,
+) -> bool {
+    !current.changes_for(previous, interests).is_empty()
 }
 
 async fn maintenance_loop(
@@ -2446,6 +2806,7 @@ async fn maintenance_loop(
     tokio::pin!(stop);
     let mut baseline = None;
     let mut catch_up = true;
+    let mut interests = StoreDependencies::default();
     loop {
         // Pile::snapshot refreshes its externally appended prefix before
         // freezing all indexes. Blob arrivals count, not just new equations.
@@ -2455,8 +2816,12 @@ async fn maintenance_loop(
         if catch_up
             || baseline
                 .as_ref()
-                .is_some_and(|previous| maintenance_changed(previous, &before))
+                .is_some_and(|previous| maintenance_changed(previous, &before, &interests))
         {
+            // A fresh observer owns only this pass's raw read-set. Snapshots,
+            // acquisitions, descriptor queries and per-collection census all
+            // contribute, including the failed reads of independent targets.
+            let mut observed = ObservedStore::new(&mut *pile);
             let failures = tokio::select! {
                 biased;
                 stopped = &mut stop => {
@@ -2464,8 +2829,10 @@ async fn maintenance_loop(
                     eprintln!("maintenance stopped; closing pile");
                     return Ok(());
                 }
-                result = maintenance_pass(pile, references, signer, dependencies, succinct_backend) => result?,
+                result = maintenance_pass(&mut observed, references, signer, dependencies, succinct_backend) => result?,
             };
+            interests = observed.dependencies();
+            drop(observed);
             let after = pile
                 .snapshot()
                 .map_err(|error| anyhow!("pile snapshot after maintenance: {error:?}"))?;
@@ -2473,7 +2840,7 @@ async fn maintenance_loop(
             // source. Retain one dirty bit across our post-work baseline, then
             // run another bounded pass at the next interval. Our own writes
             // may cause one no-op pass; they cannot sustain an idle loop.
-            catch_up = maintenance_changed(&before, &after);
+            catch_up = maintenance_changed(&before, &after, &interests);
             baseline = Some(after);
             if !watch {
                 return if failures == 0 {
@@ -2533,13 +2900,13 @@ fn run_maintain(
 }
 
 #[cfg(feature = "search")]
-async fn maintain_nvfp4_embedding_set(
-    pile: &mut Pile,
-    snapshot: &PileSnapshot,
+async fn maintain_nvfp4_embedding_set<S: Store + AsyncBlobStoreAcquire + Send>(
+    pile: &mut S,
+    snapshot: &S::Snapshot,
     handle: CollectionHandle,
     algorithm: Option<Id>,
     signer: &SigningKey,
-) -> Result<PileSnapshot> {
+) -> Result<S::Snapshot> {
     use triblespace_core::collection::CollectionStoreExt as _;
     use triblespace_search::nvfp4::EMBEDDING_ATTRIBUTE_TO_NVFP4;
     use triblespace_search::schemas::Embedding;
@@ -2568,13 +2935,13 @@ async fn maintain_nvfp4_embedding_set(
 }
 
 #[cfg(not(feature = "search"))]
-async fn maintain_nvfp4_embedding_set(
-    _pile: &mut Pile,
-    _snapshot: &PileSnapshot,
+async fn maintain_nvfp4_embedding_set<S: Store + AsyncBlobStoreAcquire + Send>(
+    _pile: &mut S,
+    _snapshot: &S::Snapshot,
     _handle: CollectionHandle,
     _algorithm: Option<Id>,
     _signer: &SigningKey,
-) -> Result<PileSnapshot> {
+) -> Result<S::Snapshot> {
     unreachable!("the NVFP4 representation is only recognised with the search feature")
 }
 
@@ -2755,12 +3122,12 @@ fn derive_nvfp4(
 }
 
 #[cfg(feature = "search")]
-async fn maintain_bm25(
-    pile: &mut Pile,
-    snapshot: &PileSnapshot,
+async fn maintain_bm25<S: Store + AsyncBlobStoreAcquire + Send>(
+    pile: &mut S,
+    snapshot: &S::Snapshot,
     handle: CollectionHandle,
     signer: &SigningKey,
-) -> Result<PileSnapshot> {
+) -> Result<S::Snapshot> {
     use triblespace_core::collection::CollectionStoreExt as _;
     let collection: Collection<triblespace_search::portable_bm25::PortableBM25Blob> =
         Collection::open(snapshot, handle)
@@ -2771,12 +3138,12 @@ async fn maintain_bm25(
 }
 
 #[cfg(not(feature = "search"))]
-async fn maintain_bm25(
-    _pile: &mut Pile,
-    _snapshot: &PileSnapshot,
+async fn maintain_bm25<S: Store + AsyncBlobStoreAcquire + Send>(
+    _pile: &mut S,
+    _snapshot: &S::Snapshot,
     _handle: CollectionHandle,
     _signer: &SigningKey,
-) -> Result<PileSnapshot> {
+) -> Result<S::Snapshot> {
     unreachable!("the BM25 representation is only recognised with the search feature")
 }
 

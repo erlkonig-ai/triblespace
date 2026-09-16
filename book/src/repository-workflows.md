@@ -496,8 +496,19 @@ discovers this source order from explicitly selected descriptor handles and
 calls those same operations. Shared upstream dependencies run once per pass;
 a foundational dependency is ensured rather than needlessly compacted. The
 one-edge `maintain` command remains available. Either command accepts `--watch`
-to retain one open pile and repeat after snapshot content changes, including
-new proofs or resident definitions. There is no ambient AUTH-expiry timer.
+to retain one open pile and repeat after changes to the previous active pass's
+raw read-set, including source records, exact acquired blobs, new proofs and
+resident definitions. `repo::ObservedStore` transparently tracks those reads
+across fresh snapshots and acquisitions, including misses and errors, without
+retaining interpreted values. Per-collection counts remain scoped interests;
+name-based selection really enumerates the record inventory and is therefore
+broader than selecting exact handles. Proof changes remain component-wide.
+Relevant changes during a pass retain one bounded catch-up pass after the
+post-work baseline; a quiescent no-op pass clears it. Neither WANT-only nor
+unrelated writes sustain a watch loop. Generic backends without indexed
+`changes_for` remain component-conservative. External provider availability is
+not stored evidence: network callers still own retries and deadlines. There is
+no ambient AUTH-expiry timer.
 This adds scheduling, not recursive effects inside a mapping kernel. Exact
 target selection prevents an old, superseded index from
 being restarted merely because its descriptor is still present.

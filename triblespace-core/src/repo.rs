@@ -21,6 +21,7 @@ pub mod objectstore;
 pub mod pile;
 /// Grow-only native storage for complete capability proofs.
 pub mod proof;
+pub use crate::collection::observed_store::ObservedStore;
 pub use proof::{CapabilityProofRead, CapabilityProofStore};
 /// Generational collection of piles for lazy-retention blob storage.
 pub mod yard;
