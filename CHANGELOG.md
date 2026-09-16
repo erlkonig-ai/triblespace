@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Carry the existing `Blob<UnknownBlob>` through interactive, descriptor and
+  bulk-replication landing. The wire constructs it once and checks its cached
+  handle against the request; destination insertion no longer reconstructs and
+  hashes that Blob again. Existing Pile first-read validation is unchanged.
+
 - Experiment with exact-H directory queries during authenticated routing
   progress. FIND_NODE, directory and body requests share three slots; routing
   retains one slot while open. At most K early directory attempts plus the

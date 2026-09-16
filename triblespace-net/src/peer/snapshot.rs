@@ -7,7 +7,6 @@ use std::future::Future;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, Weak};
 
-use anybytes::Bytes;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::{BlobEncoding, TryFromBlob};
 use triblespace_core::capability::{CapabilityProof, CapabilityProofId};
@@ -167,7 +166,7 @@ where
         // The wire handshake verified these bytes against `handle`; they land
         // under it without a second hash.
         store
-            .put::<UnknownBlob, _>(verified.into_blob())
+            .put::<UnknownBlob, _>(verified)
             .map_err(|error| PeerAcquireError(format!("cannot cache acquired blob: {error}")))?;
         store
             .snapshot_at(self.frozen.instant())
@@ -366,6 +365,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use anybytes::Bytes;
     use ed25519_dalek::SigningKey;
     use triblespace_core::blob::Blob;
     use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};

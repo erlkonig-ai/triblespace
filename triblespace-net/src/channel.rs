@@ -5,7 +5,8 @@
 //! available batches and crosses a single durability barrier.
 
 use crate::provider::ProviderObservation;
-use crate::protocol::VerifiedBlob;
+use triblespace_core::blob::Blob;
+use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::capability::CapabilityProof;
 use triblespace_core::collection::{
     COLLECTION_COMMIT_BYTES_LEN, COLLECTION_DERIVE_BYTES_LEN, COLLECTION_MERGE_BYTES_LEN,
@@ -37,7 +38,7 @@ pub(crate) enum NetCommand {
 /// them for an exact collection action.
 pub(crate) enum NetEvent {
     /// One payload verified on the wire against the handle it was fetched by.
-    Blob(VerifiedBlob),
+    Blob(Blob<UnknownBlob>),
     CollectionRecord(CollectionRecord),
     /// One native authorization proof. Named claims remain ordinary immutable
     /// dependencies and are fetched only when a consumer follows them.
@@ -47,7 +48,7 @@ pub(crate) enum NetEvent {
 impl NetEvent {
     fn admission_bytes(&self) -> usize {
         match self {
-            Self::Blob(blob) => blob.len(),
+            Self::Blob(blob) => blob.bytes.len(),
             Self::CollectionRecord(CollectionRecord::Commit(_)) => 1 + COLLECTION_COMMIT_BYTES_LEN,
             Self::CollectionRecord(CollectionRecord::Merge(_)) => 1 + COLLECTION_MERGE_BYTES_LEN,
             Self::CollectionRecord(CollectionRecord::Derive(_)) => 1 + COLLECTION_DERIVE_BYTES_LEN,
@@ -61,8 +62,8 @@ impl std::fmt::Debug for NetEvent {
         match self {
             Self::Blob(blob) => formatter
                 .debug_struct("Blob")
-                .field("hash", &blob.hash())
-                .field("len", &blob.len())
+                .field("hash", &blob.get_handle().raw)
+                .field("len", &blob.bytes.len())
                 .finish(),
             Self::CollectionRecord(record) => formatter
                 .debug_tuple("CollectionRecord")

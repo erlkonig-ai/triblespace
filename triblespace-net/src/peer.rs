@@ -16,7 +16,7 @@ use anybytes::Bytes;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use iroh_base::EndpointId;
 use triblespace_core::blob::encodings::UnknownBlob;
-use triblespace_core::blob::{BlobEncoding, IntoBlob};
+use triblespace_core::blob::{Blob, BlobEncoding, IntoBlob};
 use triblespace_core::collection::{CollectionHandle, CollectionStore};
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::InlineEncoding;
@@ -31,7 +31,7 @@ use triblespace_core::repo::{
 
 use crate::channel::{MAX_ADMISSION_BRIDGE_BATCHES, NetEvent};
 use crate::host::{self, ActiveCollections, NetReceiver, NetSender, StoreSnapshot};
-use crate::protocol::{RawHash, VerifiedBlob};
+use crate::protocol::RawHash;
 use crate::provider::ProviderObservation;
 use crate::wake::CollectionWakePlane;
 
@@ -399,16 +399,16 @@ where
         budget: std::time::Duration,
     ) -> impl Future<Output = Option<Bytes>> + Send + 'static + use<S> {
         let fetch = self.fetch_verified_with_deadline(hash, budget);
-        async move { fetch.await.map(Bytes::from) }
+        async move { fetch.await.map(|blob| blob.bytes) }
     }
 
-    /// The same fetch, keeping the wire proof with the bytes so an internal
-    /// landing can append them under `hash` without hashing them again.
+    /// The same fetch, keeping Blob's cached content handle so an internal
+    /// landing can append it without hashing the bytes again.
     pub(crate) fn fetch_verified_with_deadline(
         &self,
         hash: RawHash,
         budget: std::time::Duration,
-    ) -> impl Future<Output = Option<VerifiedBlob>> + Send + 'static + use<S> {
+    ) -> impl Future<Output = Option<Blob<UnknownBlob>>> + Send + 'static + use<S> {
         let host = self.host.clone();
         let sender = self.sender.clone();
         async move {
@@ -490,7 +490,7 @@ where
                     NetEvent::Blob(verified) => {
                         // Verified on the wire against the handle it was fetched
                         // by; it lands under that handle without a second hash.
-                        match store.put::<UnknownBlob, _>(verified.into_blob()) {
+                        match store.put::<UnknownBlob, _>(verified) {
                             Ok(_) => {
                                 self.pending_network_flush = true;
                             }
@@ -884,12 +884,15 @@ mod tests {
     }
 
     impl host::NetCapability for ExactBlob {
-        fn fetch_blob(&self, hash: RawHash) -> futures::future::BoxFuture<'static, Option<VerifiedBlob>> {
+        fn fetch_blob(
+            &self,
+            hash: RawHash,
+        ) -> futures::future::BoxFuture<'static, Option<Blob<UnknownBlob>>> {
             self.requests.fetch_add(1, Ordering::SeqCst);
             Box::pin(std::future::ready(
                 (hash == self.hash)
-                    .then(|| VerifiedBlob::verify(self.bytes.clone(), hash))
-                    .flatten(),
+                    .then(|| Blob::<UnknownBlob>::new(self.bytes.clone()))
+                    .filter(|blob| blob.get_handle().raw == hash),
             ))
         }
     }
@@ -1147,14 +1150,15 @@ mod tests {
             fn fetch_blob(
                 &self,
                 hash: RawHash,
-            ) -> futures::future::BoxFuture<'static, Option<VerifiedBlob>> {
+            ) -> futures::future::BoxFuture<'static, Option<Blob<UnknownBlob>>> {
                 let started = self.started.clone();
                 let finish = self.finish.clone();
                 let bytes = self.bytes.clone();
                 Box::pin(async move {
                     started.notify_one();
                     finish.notified().await;
-                    VerifiedBlob::verify(bytes, hash)
+                    let blob = Blob::<UnknownBlob>::new(bytes);
+                    (blob.get_handle().raw == hash).then_some(blob)
                 })
             }
         }
@@ -1234,9 +1238,9 @@ mod tests {
             receiver,
         );
         let snapshot = peer.snapshot().unwrap();
-        // A capability cannot hand back bytes for a different handle at all:
-        // the only constructor of a verified payload hashes them, so the fetch
-        // reports the blob unavailable and nothing is cached.
+        // This capability verifies against the requested handle, so these
+        // mismatched bytes cannot become a verified payload. The next test
+        // separately covers a valid payload offered for the wrong request.
         assert!(snapshot.get::<Bytes, UnknownBlob>(requested).await.is_err());
         assert!(!peer.snapshot().unwrap().contains_blob(requested).unwrap());
         assert_eq!(peer.snapshot().unwrap().wants().unwrap().count(), 0);
@@ -1252,12 +1256,11 @@ mod tests {
             fn fetch_blob(
                 &self,
                 _hash: RawHash,
-            ) -> futures::future::BoxFuture<'static, Option<VerifiedBlob>> {
+            ) -> futures::future::BoxFuture<'static, Option<Blob<UnknownBlob>>> {
                 // A valid payload, verified under its own handle, offered for
                 // whatever was asked.
-                let bytes = self.bytes.clone();
-                let own = *blake3::hash(&bytes[..]).as_bytes();
-                Box::pin(std::future::ready(VerifiedBlob::verify(bytes, own)))
+                let blob = Blob::<UnknownBlob>::new(self.bytes.clone());
+                Box::pin(std::future::ready(Some(blob)))
             }
         }
         let key = SigningKey::from_bytes(&[75; 32]);

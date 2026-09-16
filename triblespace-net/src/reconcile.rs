@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use anybytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
+use triblespace_core::blob::Blob;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::locator::blob_locator;
 use triblespace_core::collection::reference_summary::{ReferenceSummaryBlob, ReferenceSummaryView};
@@ -30,7 +31,7 @@ use triblespace_core::repo::{
 };
 
 use crate::peer::Peer;
-use crate::protocol::{RawHash, VerifiedBlob};
+use crate::protocol::RawHash;
 
 /// How much content an explicit collection selection asks this process to obtain.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1157,7 +1158,7 @@ where
     land_exact(peer, verified)
 }
 
-fn land_exact<S>(peer: &Peer<S>, verified: VerifiedBlob) -> Option<()>
+fn land_exact<S>(peer: &Peer<S>, verified: Blob<UnknownBlob>) -> Option<()>
 where
     S: BlobStore
         + CollectionStore
@@ -1173,7 +1174,7 @@ where
         // Verified on the wire and matched against the requested handle at
         // the capability boundary; it lands under that handle without a
         // second hash.
-        match store.put::<UnknownBlob, _>(verified.into_blob()) {
+        match store.put::<UnknownBlob, _>(verified) {
             Ok(_) => store
                 .flush()
                 .map_err(|error| format!("flush failed: {error:?}")),
@@ -2181,7 +2182,7 @@ mod tests {
         fn fetch_blob(
             &self,
             hash: RawHash,
-        ) -> futures::future::BoxFuture<'static, Option<crate::protocol::VerifiedBlob>> {
+        ) -> futures::future::BoxFuture<'static, Option<Blob<UnknownBlob>>> {
             let answer = self.answers.get(&hash).cloned();
             let blocked = self.blocked.contains(&hash);
             let delay = *self.delay.lock().unwrap();
@@ -2211,7 +2212,9 @@ mod tests {
                     }
                 }
                 guard.completed = true;
-                answer.and_then(|bytes| crate::protocol::VerifiedBlob::verify(bytes, hash))
+                answer
+                    .map(Blob::<UnknownBlob>::new)
+                    .filter(|blob| blob.get_handle().raw == hash)
             })
         }
     }

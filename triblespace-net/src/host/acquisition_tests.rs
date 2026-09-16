@@ -331,7 +331,11 @@ async fn verified_provider_fetch_does_not_wait_for_a_stalled_directory_reply() {
     let budget = Duration::from_secs(2);
     let started = tokio::time::Instant::now();
     assert_eq!(
-        fixture.sender.fetch_blob(fixture.hash, budget).await.map(anybytes::Bytes::from),
+        fixture
+            .sender
+            .fetch_blob(fixture.hash, budget)
+            .await
+            .map(|blob| blob.bytes),
         Some(fixture.bytes.clone()),
         "a verified provider is usable before unrelated directory replies complete",
     );
@@ -396,7 +400,8 @@ async fn later_directory_hint_case(stalled: bool) {
         fixture
             .sender
             .fetch_blob(fixture.hash, Duration::from_secs(2))
-            .await.map(anybytes::Bytes::from),
+            .await
+            .map(|blob| blob.bytes),
         Some(fixture.bytes.clone()),
     );
     assert_eq!(started.elapsed(), Duration::from_secs(1));
@@ -539,7 +544,8 @@ async fn stale_provider_lease_survives_loss_alternate_fetch_and_same_endpoint_re
         fixture
             .sender
             .fetch_blob(fixture.hash, INTERACTIVE_FETCH_DEADLINE)
-            .await.map(anybytes::Bytes::from),
+            .await
+            .map(|blob| blob.bytes),
         Some(fixture.bytes.clone()),
     );
     assert_eq!(
@@ -567,7 +573,8 @@ async fn stale_provider_lease_survives_loss_alternate_fetch_and_same_endpoint_re
         fixture
             .sender
             .fetch_blob(fixture.hash, INTERACTIVE_FETCH_DEADLINE)
-            .await.map(anybytes::Bytes::from),
+            .await
+            .map(|blob| blob.bytes),
         Some(fixture.bytes.clone()),
     );
     assert!(started.elapsed() < INTERACTIVE_FETCH_DEADLINE);
@@ -613,7 +620,8 @@ async fn stale_provider_lease_survives_loss_alternate_fetch_and_same_endpoint_re
         fixture
             .sender
             .fetch_blob(fixture.hash, INTERACTIVE_FETCH_DEADLINE)
-            .await.map(anybytes::Bytes::from),
+            .await
+            .map(|blob| blob.bytes),
         Some(fixture.bytes.clone()),
     );
     assert_eq!(
@@ -696,7 +704,8 @@ async fn cancelled_discovered_provider_dial_leaves_a_same_client_retry_usable() 
         fixture
             .sender
             .fetch_blob(fixture.hash, INTERACTIVE_FETCH_DEADLINE)
-            .await.map(anybytes::Bytes::from),
+            .await
+            .map(|blob| blob.bytes),
         Some(fixture.bytes.clone()),
     );
     assert_eq!(
@@ -738,7 +747,8 @@ async fn alternate_provider_success_cancels_a_stalled_discovered_dial() {
         fixture
             .sender
             .fetch_blob(fixture.hash, INTERACTIVE_FETCH_DEADLINE)
-            .await.map(anybytes::Bytes::from),
+            .await
+            .map(|blob| blob.bytes),
         Some(fixture.bytes.clone()),
     );
     assert_eq!(started.elapsed(), Duration::from_secs(4));
@@ -830,7 +840,8 @@ async fn mid_transfer_crash_rejects_old_bytes_after_restart_and_allows_fresh_ret
         fixture
             .sender
             .fetch_blob(fixture.hash, INTERACTIVE_FETCH_DEADLINE)
-            .await.map(anybytes::Bytes::from),
+            .await
+            .map(|blob| blob.bytes),
         Some(fixture.bytes.clone()),
     );
     assert_eq!(
@@ -855,7 +866,8 @@ async fn cold_exact_lookup_outlives_background_cap_within_caller_deadline() {
         fixture
             .sender
             .fetch_blob(fixture.hash, INTERACTIVE_FETCH_DEADLINE)
-            .await.map(anybytes::Bytes::from),
+            .await
+            .map(|blob| blob.bytes),
         Some(fixture.bytes.clone()),
     );
     assert!(started.elapsed() > BACKGROUND_LOOKUP_DEADLINE);
@@ -866,7 +878,8 @@ async fn cold_exact_lookup_outlives_background_cap_within_caller_deadline() {
         fixture
             .sender
             .fetch_blob(fixture.hash, INTERACTIVE_FETCH_DEADLINE)
-            .await.map(anybytes::Bytes::from),
+            .await
+            .map(|blob| blob.bytes),
         Some(fixture.bytes.clone()),
     );
     assert_eq!(warmed.elapsed(), Duration::ZERO);
@@ -899,7 +912,8 @@ async fn responsive_provider_is_not_held_behind_stalled_secondary_bootstrap() {
         fixture
             .sender
             .fetch_blob(fixture.hash, INTERACTIVE_FETCH_DEADLINE)
-            .await.map(anybytes::Bytes::from),
+            .await
+            .map(|blob| blob.bytes),
         Some(fixture.bytes.clone()),
     );
     assert_eq!(started.elapsed(), Duration::from_secs(4));
@@ -1134,7 +1148,12 @@ async fn resident_self_hint_needs_no_lease_or_payload_read() {
 
     // Only the ordinary, DHT-selected bearer GET reads the body.
     assert_eq!(
-        fixture.client.fetch_blob(fixture.hash, None).await.unwrap(),
+        fixture
+            .client
+            .fetch_blob(fixture.hash, None)
+            .await
+            .unwrap()
+            .map(|blob| blob.bytes),
         Some(fixture.bytes.clone())
     );
     assert_eq!(fixture.blob_reads.load(Ordering::Relaxed), 1);
@@ -1268,7 +1287,12 @@ async fn resident_self_hint_reserves_a_bounded_slot_and_deduplicates_self() {
             .contains(&(fixture.provider, [0; 32]))
     );
     assert_eq!(
-        fixture.client.fetch_blob(fixture.hash, None).await.unwrap(),
+        fixture
+            .client
+            .fetch_blob(fixture.hash, None)
+            .await
+            .unwrap()
+            .map(|blob| blob.bytes),
         Some(fixture.bytes.clone())
     );
     fixture.assert_no_control_effects();
@@ -1466,7 +1490,14 @@ async fn zero_announcement_budget_still_answers_resident_self_hints() {
                 candidates: Arc::new(Mutex::new(RoutingTable::new(client_id, [server_id]))),
                 my_id: client_id,
             };
-            assert_eq!(client.fetch_blob(hash, None).await.unwrap(), Some(bytes));
+            assert_eq!(
+                client
+                    .fetch_blob(hash, None)
+                    .await
+                    .unwrap()
+                    .map(|blob| blob.bytes),
+                Some(bytes)
+            );
             tokio::time::advance(Duration::from_secs(1)).await;
             tokio::task::yield_now().await;
             assert_eq!(
@@ -1561,7 +1592,8 @@ async fn idle_exact_receive_does_not_block_an_independent_healthy_fetch() {
         fixture
             .sender
             .fetch_blob(fixture.hash, INTERACTIVE_FETCH_DEADLINE)
-            .await.map(anybytes::Bytes::from),
+            .await
+            .map(|blob| blob.bytes),
         Some(fixture.bytes.clone()),
     );
     assert_eq!(started.elapsed(), Duration::from_secs(4));
@@ -1584,7 +1616,8 @@ async fn idle_exact_receive_does_not_block_an_independent_healthy_fetch() {
         fixture
             .sender
             .fetch_blob(fixture.hash, INTERACTIVE_FETCH_DEADLINE)
-            .await.map(anybytes::Bytes::from),
+            .await
+            .map(|blob| blob.bytes),
         Some(fixture.bytes.clone()),
     );
     assert_eq!(started.elapsed(), Duration::ZERO);
@@ -1640,7 +1673,8 @@ async fn local_receive_saturation_preserves_the_provider_connection() {
             .client
             .fetch_from_provider(fixture.hash, fixture.provider)
             .await
-            .unwrap(),
+            .unwrap()
+            .map(|blob| blob.bytes),
         Some(fixture.bytes.clone()),
     );
     assert_eq!(started.elapsed(), Duration::ZERO);

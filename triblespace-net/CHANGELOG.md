@@ -39,6 +39,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Preserve the existing `Blob<UnknownBlob>` and its cached handle through
+  interactive, descriptor and bulk landing, avoiding reconstruction and a
+  second content hash. Bind capability responses to the requested handle;
+  wire validation and Pile first-read validation remain unchanged.
+
 - Experiment with authenticated FIND_NODE progress feeding exact-H directory
   and body discovery in a shared ALPHA window. Reserve routing capacity and a
   final-replica directory sweep; bound and deduplicate speculative requests.

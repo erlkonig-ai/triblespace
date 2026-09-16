@@ -42,7 +42,7 @@ use crate::identity::iroh_secret;
 use crate::inventory::ReconcileQos;
 use crate::protocol::{
     OP_FIND_NODE, OP_GET_BLOB, OP_PROVIDER_GET, OP_PROVIDER_PUT, PILE_SYNC_ALPN, PROVIDER_PUT_FULL,
-    PROVIDER_PUT_OK, RawHash, VerifiedBlob, op_find_node, op_get_blob, op_provider_get, op_provider_put,
+    PROVIDER_PUT_OK, RawHash, op_find_node, op_get_blob, op_provider_get, op_provider_put,
     recv_hash, recv_u8, send_hash, send_u8, serve_get_blob,
 };
 use crate::provider::{
@@ -347,8 +347,14 @@ type SharedSnapshot = Arc<StoreSnapshot>;
 type SnapshotSlot = Arc<Mutex<Option<SharedSnapshot>>>;
 
 /// The async capability cloned into lazy readers.
+/// Implementations return Blobs constructed from the received bytes, with the
+/// cached handle preserved. The wire implementation also binds that handle to
+/// the request; NetSender repeats only the cheap handle comparison here.
 pub(crate) trait NetCapability: Send + Sync {
-    fn fetch_blob(&self, hash: RawHash) -> futures::future::BoxFuture<'static, Option<VerifiedBlob>>;
+    fn fetch_blob(
+        &self,
+        hash: RawHash,
+    ) -> futures::future::BoxFuture<'static, Option<Blob<UnknownBlob>>>;
 }
 
 type RoutingCandidates = Arc<Mutex<RoutingTable>>;
@@ -697,7 +703,10 @@ struct NetCap<T: Transport> {
 }
 
 impl<T: Transport> NetCapability for NetCap<T> {
-    fn fetch_blob(&self, hash: RawHash) -> futures::future::BoxFuture<'static, Option<VerifiedBlob>> {
+    fn fetch_blob(
+        &self,
+        hash: RawHash,
+    ) -> futures::future::BoxFuture<'static, Option<Blob<UnknownBlob>>> {
         let client = self.client.clone();
         Box::pin(async move {
             match client.fetch_blob(hash, None).await {
@@ -850,19 +859,22 @@ impl NetSender {
         }
     }
 
-    pub async fn fetch_blob(&self, hash: RawHash, budget: std::time::Duration) -> Option<VerifiedBlob> {
+    pub async fn fetch_blob(
+        &self,
+        hash: RawHash,
+        budget: std::time::Duration,
+    ) -> Option<Blob<UnknownBlob>> {
         let fetch = async {
             match self.ready_capability().await {
                 Ok(capability) => match capability.fetch_blob(hash).await {
-                    Some(verified) if verified.hash() == hash => Some(verified),
+                    Some(verified) if verified.get_handle().raw == hash => Some(verified),
                     Some(verified) => {
-                        // A verified payload proves its bytes are its own
-                        // handle, not that it answers this request. One cheap
-                        // equality here keeps a valid payload for B from
-                        // landing as the answer for A.
+                        // The cached content handle need not answer this
+                        // request. One cheap equality keeps a valid Blob for
+                        // B from landing as the answer for A.
                         warn!(
                             requested = %hex::encode(&hash[..4]),
-                            returned = %hex::encode(&verified.hash()[..4]),
+                            returned = %hex::encode(&verified.get_handle().raw[..4]),
                             "network capability answered with a payload for a different handle"
                         );
                         None
@@ -2099,7 +2111,7 @@ impl<T: Transport> ProviderClient<T> {
         &self,
         hash: RawHash,
         peer: PeerId,
-    ) -> anyhow::Result<Option<VerifiedBlob>> {
+    ) -> anyhow::Result<Option<Blob<UnknownBlob>>> {
         let connection = pool_get(&self.transport, &self.pool, peer).await?;
         let response = tokio::time::timeout(
             OP_DEADLINE,
@@ -2133,12 +2145,12 @@ impl<T: Transport> ProviderClient<T> {
         &self,
         hash: RawHash,
         lookup_limit: Option<std::time::Duration>,
-    ) -> anyhow::Result<Option<VerifiedBlob>> {
+    ) -> anyhow::Result<Option<Blob<UnknownBlob>>> {
         enum Progress {
             Routing(PeerId, anyhow::Result<Vec<PeerId>>),
             RoutingExpired,
             Directory(PeerId, anyhow::Result<Vec<(PeerId, ProviderToken)>>),
-            Blob(anyhow::Result<Option<VerifiedBlob>>),
+            Blob(anyhow::Result<Option<Blob<UnknownBlob>>>),
         }
 
         let key = blob_locator(hash);
@@ -2728,6 +2740,8 @@ mod tests {
     use crate::transport::PeerId;
     use ed25519_dalek::SigningKey;
     use iroh_base::EndpointId;
+    use triblespace_core::blob::Blob;
+    use triblespace_core::blob::encodings::UnknownBlob;
     use triblespace_core::collection::CollectionHandle;
 
     use super::{
@@ -2768,9 +2782,7 @@ mod tests {
                 attempts.fetch_add(1, Ordering::Relaxed);
                 let mut batch = super::NetEventBatch::default();
                 let bytes = anybytes::Bytes::from_source(b"descriptor".to_vec());
-                let verified =
-                    crate::protocol::VerifiedBlob::verify(bytes.clone(), *blake3::hash(&bytes[..]).as_bytes())
-                        .unwrap();
+                let verified = Blob::<UnknownBlob>::new(bytes);
                 batch.try_push(super::NetEvent::Blob(verified)).unwrap();
                 let _ = events.send(batch).await;
             });

@@ -668,7 +668,7 @@ async fn exact_h_repeated_fetches_count_rpcs_not_simulator_throughput() {
                 .unwrap()
                 .unwrap();
                 let returned = trace.mark();
-                assert_eq!(bytes, fixture.bytes);
+                assert_eq!(bytes.bytes, fixture.bytes);
                 trace.assert_stage_order(fixture.holder.peer, returned);
                 let counts = trace.counts();
                 assert_eq!(
@@ -749,7 +749,7 @@ async fn exact_h_responsive_body_precedes_stalled_routing_or_directory_drop() {
                 .unwrap()
                 .unwrap()
                 .unwrap();
-            assert_eq!(bytes, fixture.bytes);
+            assert_eq!(bytes.bytes, fixture.bytes);
         }
         let returned = fixture.client.transport.trace.mark();
         let counts = fixture.client.transport.trace.counts();
@@ -853,7 +853,10 @@ async fn exact_h_routing_expiry_keeps_a_pending_body_within_the_caller_deadline(
         released = trace.mark();
         assert!(routing_dropped.order < released.order);
         body_gate.release();
-        assert_eq!(fetch.await.unwrap().unwrap(), Some(fixture.bytes.clone()));
+        assert_eq!(
+            fetch.await.unwrap().unwrap().map(|blob| blob.bytes),
+            Some(fixture.bytes.clone())
+        );
     }
     let returned = trace.mark();
     trace.assert_stage_order(fixture.holder.peer, returned);
@@ -919,7 +922,8 @@ async fn exact_h_empty_early_directory_waits_for_referred_holder_authentication(
             tokio::time::timeout(Duration::from_secs(1), &mut fetch)
                 .await
                 .unwrap()
-                .unwrap(),
+                .unwrap()
+                .map(|blob| blob.bytes),
             Some(fixture.bytes.clone())
         );
     }
@@ -1072,7 +1076,10 @@ async fn exact_h_stale_early_hints_leave_room_for_fresh_routing_and_final_holder
         assert_eq!(later_directory.trace.counts(), Counts::default());
         trace.assert_request_bound();
         holder_gate.release();
-        assert_eq!(fetch.await.unwrap().unwrap(), Some(fixture.bytes.clone()));
+        assert_eq!(
+            fetch.await.unwrap().unwrap().map(|blob| blob.bytes),
+            Some(fixture.bytes.clone())
+        );
     }
     let returned = trace.mark();
     trace.assert_stage_order(fixture.holder.peer, returned);
@@ -1215,7 +1222,8 @@ async fn exact_h_direct_bearer_control_has_one_rpc_and_329_application_bytes() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(returned, fixture.bytes);
+    assert_eq!(returned.get_handle().raw, fixture.hash);
+    assert_eq!(returned.bytes, fixture.bytes);
     let counts = fixture.client.transport.trace.counts();
     assert_eq!(
         (counts.find, counts.directory, counts.put, counts.body),
