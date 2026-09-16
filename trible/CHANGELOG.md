@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+- Reuse a dashboard's final projection after unchanged scoped-input checks,
+  avoiding repeated historical-header queries without a report catalogue.
+  Age the original result independently; time reversal, future-sample arrival,
+  changed evidence and unavailable inputs force fresh queries. Generated
+  controls compare full query results across clock boundaries and count work.
+
 - Scope watched collection maintenance to each hop's actual stored dependencies.
   Unchanged independent chains skip upkeep and census work; descriptor misses,
   new receipt support, proof-component changes and in-flight arrivals still

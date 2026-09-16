@@ -897,6 +897,23 @@ Reader failures cross into the display as fixed categories, never backend error
 text or source chains: those may contain a full bearer blob handle. Control
 stripping and truncation alone do not redact a read capability.
 
+The sampler retains its final display projection while every contributing
+collection observation remains dependency-current in a newly refreshed pile
+snapshot. It then ages a copy instead of querying historical report headers
+again. This is not a report catalogue or an alternative index: changed inputs
+run the same queries again. Wall time remains a separate dependency. Moving
+before the original projection time or reaching a previously future worker
+sample triggers a query, because either may enable a rate omitted earlier.
+Rate expiry also clears its prior-sample metadata; the original result stays
+unchanged so an in-range clock correction can restore a valid interval.
+
+Partial or failed inputs never qualify for reuse and keep being retried.
+This first cut is deliberately all-source: an unreadable selected health
+collection also prevents telemetry reuse. A missing key disables the optional
+health source instead and does not have that effect. Scoped dependency checks,
+snapshot refresh, frame aging and rendering still cost work on unchanged ticks;
+no idle-CPU or whole-pile performance claim follows from skipping the queries.
+
 Aggregate telemetry is ordinary relational data, not an external metrics
 database. `triblespace_net::telemetry` describes a **subject** (endpoint,
 operator worker label, role, optional stage/target/peer) and timestamped samples

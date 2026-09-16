@@ -119,12 +119,14 @@ impl SelectedSource {
         }
     }
 
-    fn facts(&mut self, snapshot: &PileSnapshot) -> ReadResult<&TribleSet> {
-        if !self
-            .observed
+    fn is_current(&self, snapshot: &PileSnapshot) -> bool {
+        self.observed
             .as_ref()
             .is_some_and(|(observed, _)| observed.is_current(snapshot))
-        {
+    }
+
+    fn facts(&mut self, snapshot: &PileSnapshot) -> ReadResult<&TribleSet> {
+        if !self.is_current(snapshot) {
             let collection = Collection::<SimpleArchive>::open(snapshot, self.handle)
                 .map_err(|_| ReadFailure::OpenCollection)?;
             let observed = snapshot
@@ -143,6 +145,11 @@ struct Reader {
     health: Option<SelectedSource>,
     setup_warnings: Vec<String>,
     max_age: Duration,
+    // Only the final display projection, not a mutable report catalogue. Its
+    // application time is independent of the store's scoped dependencies.
+    retained: Option<(i128, Frame)>,
+    #[cfg(test)]
+    projection_runs: usize,
 }
 
 impl Reader {
@@ -186,15 +193,58 @@ impl Reader {
             health,
             setup_warnings,
             max_age: options.max_age,
+            retained: None,
+            #[cfg(test)]
+            projection_runs: 0,
         })
     }
 
     fn sample(&mut self) -> ReadResult<Frame> {
+        self.sample_with_clock(|| {
+            triblespace_core::clock::epoch_now()
+                .to_tai_duration()
+                .total_nanoseconds()
+        })
+    }
+
+    #[cfg(test)]
+    fn sample_at(&mut self, now_ns: i128) -> ReadResult<Frame> {
+        self.sample_with_clock(|| now_ns)
+    }
+
+    fn sample_with_clock(&mut self, clock: impl FnOnce() -> i128) -> ReadResult<Frame> {
         let started = Instant::now();
-        let snapshot = self.pile.snapshot().map_err(|_| ReadFailure::RefreshPile)?;
-        let now_ns = triblespace_core::clock::epoch_now()
-            .to_tai_duration()
-            .total_nanoseconds();
+        let snapshot = self.pile.snapshot().map_err(|_| {
+            self.retained = None;
+            ReadFailure::RefreshPile
+        })?;
+        // Retain the original application boundary: a blocking snapshot must
+        // finish before we decide whether the producer samples are fresh.
+        let now_ns = clock();
+        if let Some((origin_ns, retained)) = &self.retained {
+            if retained.can_age_from(*origin_ns, now_ns)
+                && self
+                    .sources
+                    .iter()
+                    .all(|source| source.is_current(&snapshot))
+                && self
+                    .health
+                    .as_ref()
+                    .is_none_or(|source| source.is_current(&snapshot))
+            {
+                let mut frame = retained.at(now_ns);
+                frame.sampled = Instant::now();
+                frame.observation_time = started.elapsed();
+                return Ok(frame);
+            }
+        }
+        // Partial/error observations must retry. Never let an older successful
+        // frame conceal unavailable evidence or recovery of a selected source.
+        self.retained = None;
+        #[cfg(test)]
+        {
+            self.projection_runs += 1;
+        }
         let mut facts = TribleSet::new();
         let mut warnings = self.setup_warnings.clone();
         let mut readable_sources = 0;
@@ -212,17 +262,19 @@ impl Reader {
             }
         }
         let workers = telemetry::observe(&facts, now_ns, self.max_age);
+        let mut health_readable = true;
         let health = match self.health.as_mut() {
             Some(source) => match source.facts(&snapshot) {
                 Ok(facts) => dashboard::observe_health(facts, now_ns, self.max_age),
                 Err(error) => {
+                    health_readable = false;
                     warnings.push(format!("Health reports unreadable: {error}"));
                     Vec::new()
                 }
             },
             None => Vec::new(),
         };
-        Ok(Frame {
+        let frame = Frame {
             workers,
             health,
             warnings,
@@ -231,7 +283,11 @@ impl Reader {
             readable_sources,
             selected_sources: self.sources.len(),
             max_age: self.max_age,
-        })
+        };
+        if readable_sources == self.sources.len() && health_readable {
+            self.retained = Some((now_ns, frame.clone()));
+        }
+        Ok(frame)
     }
 
     fn close(self) -> ReadResult<()> {
@@ -261,6 +317,17 @@ struct Frame {
 }
 
 impl Frame {
+    fn can_age_from(&self, origin_ns: i128, now_ns: i128) -> bool {
+        // observe() omits rates when evidence is stale/future. Aging can only
+        // suppress rates, so a clock before the original observation or a
+        // formerly future sample becoming current requires the real query.
+        now_ns >= origin_ns
+            && !self
+                .workers
+                .iter()
+                .any(|worker| worker.created_ns > origin_ns && worker.created_ns <= now_ns)
+    }
+
     // Sampling may be blocked in local storage. Repainting must keep aging the
     // producer evidence independently, without reopening the pile or inventing
     // a new rate. A fresh reader frame does not make an old producer fresh.
@@ -289,6 +356,7 @@ impl Frame {
                 .previous_created_ns
                 .is_some_and(|at| freshness(at) == Freshness::Fresh);
             if worker.freshness != Freshness::Fresh || !prior_fresh {
+                worker.previous_created_ns = None;
                 for metric in &mut worker.metrics {
                     metric.per_second = None;
                 }
@@ -884,6 +952,7 @@ mod tests {
         );
         let old_interval = frame.at(40_000_000_000);
         assert_eq!(old_interval.workers[0].freshness, Freshness::Fresh);
+        assert_eq!(old_interval.workers[0].previous_created_ns, None);
         assert_eq!(cpu(&old_interval.workers[0]), "unmeasured");
         let stale = frame.at(50_000_000_000);
         assert_eq!(stale.workers[0].freshness, Freshness::Stale);
@@ -1221,6 +1290,16 @@ mod tests {
             assert_eq!(count(&frame.workers[0], Metric::Queued), "8");
             assert_eq!(std::fs::read(&path).unwrap(), before);
         }
+        assert_eq!(reader.projection_runs, 1);
+        // A disjoint arrival must not make the dashboard walk telemetry
+        // history again. It still takes a new snapshot and checks dependencies.
+        let mut writer = Pile::open(&path).unwrap();
+        writer
+            .put::<SimpleArchive, _>(Blob::new(anybytes::Bytes::from(vec![42_u8; 63])))
+            .unwrap();
+        writer.close().unwrap();
+        reader.sample().unwrap();
+        assert_eq!(reader.projection_runs, 1);
         let second = genid();
         let at = hifitime::Epoch::from_tai_seconds(101.0);
         let mut writer = Pile::open(&path).unwrap();
@@ -1244,8 +1323,203 @@ mod tests {
         assert_eq!(frame.readable_sources, 1);
         assert_eq!(frame.workers[0].report, second.id);
         assert_eq!(count(&frame.workers[0], Metric::Queued), "3");
+        assert_eq!(reader.projection_runs, 2);
         reader.close().unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), after_writer);
+    }
+
+    #[test]
+    fn retained_projection_matches_real_queries_across_clock_boundaries() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("clocks.pile");
+        std::fs::File::create(&path).unwrap();
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
+        let authority = signer.verifying_key();
+        let mut writer = Pile::open(&path).unwrap();
+        let collection = writer
+            .collection(
+                "clocked-reports",
+                CollectionPolicy::new(
+                    AdmissionPolicy::direct(authority),
+                    AdmissionPolicy::direct(authority),
+                ),
+            )
+            .unwrap();
+        let subject = genid();
+        let session = genid();
+        let mut facts = entity! { &subject @
+            health_record::attrs::endpoint: authority,
+            telemetry::attrs::worker: "clocked",
+            telemetry::attrs::role: "maintenance",
+        };
+        for seconds in [90, 100] {
+            let report = genid();
+            let at = hifitime::Epoch::from_tai_seconds(f64::from(seconds));
+            facts += entity! { &report @
+                metadata::tag: &telemetry::KIND_SAMPLE,
+                telemetry::attrs::subject: &subject,
+                health_record::attrs::session: &session,
+                metadata::created_at: (at, at).try_to_inline().unwrap(),
+                telemetry::attrs::elapsed_ns: seconds as u128 * 1_000_000_000,
+                telemetry::attrs::completed: seconds as u128 * 2,
+            };
+        }
+        // Health has a different future boundary but no rate derivation. Its
+        // freshness can be recomputed from the retained result without a query.
+        let health_report = genid();
+        let at = hifitime::Epoch::from_tai_seconds(105.0);
+        facts += entity! { &health_report @
+            metadata::tag: &health_record::KIND_REPORT,
+            health_record::attrs::node: &subject,
+            health_record::attrs::session: &session,
+            metadata::created_at: (at, at).try_to_inline().unwrap(),
+        };
+        writer.commit(collection, &signer, facts.clone()).unwrap();
+        writer.close().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let options = Options {
+            pile: path.clone(),
+            key: Some(directory.path().join("absent.key")),
+            telemetry: vec![collection.handle()],
+            max_age: Duration::from_secs(30),
+            interval: Duration::from_secs(1),
+            once: true,
+            gui: false,
+        };
+        let mut reader = Reader::open(&options).unwrap();
+        reader.health = Some(SelectedSource::new(collection.handle()));
+        // Cross Future -> Fresh, prior expiry, current expiry, then return
+        // within the original valid interval and finally before its origin.
+        // A retained already-aged copy would lose rates on the return to 115.
+        for (seconds, expected_queries) in [
+            (99, 1),
+            (99, 1),
+            (100, 2),
+            (101, 2),
+            (105, 2),
+            (110, 2),
+            (120, 2),
+            (130, 2),
+            (115, 2),
+            (99, 3),
+            (100, 4),
+        ] {
+            let now_ns = i128::from(seconds) * 1_000_000_000;
+            let frame = reader.sample_at(now_ns).unwrap();
+            assert_eq!(reader.projection_runs, expected_queries, "at {seconds}");
+            assert_eq!(
+                frame.workers,
+                telemetry::observe(facts.facts(), now_ns, options.max_age)
+            );
+            assert_eq!(
+                frame.health,
+                dashboard::observe_health(facts.facts(), now_ns, options.max_age)
+            );
+        }
+        assert_eq!(
+            measured_rate(
+                &reader.sample_at(115_000_000_000).unwrap().workers[0],
+                Metric::Completed
+            ),
+            Some(2.0)
+        );
+        reader.close().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn unreadable_health_retries_until_payload_arrival_then_reuses() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("late-health.pile");
+        std::fs::File::create(&path).unwrap();
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
+        let authority = signer.verifying_key();
+        let policy = CollectionPolicy::new(
+            AdmissionPolicy::direct(authority),
+            AdmissionPolicy::direct(authority),
+        );
+        let mut writer = Pile::open(&path).unwrap();
+        let reports: Collection<SimpleArchive> =
+            writer.collection("reports", policy.clone()).unwrap();
+        let mut descriptors = MemoryRepo::default();
+        let health: Collection<SimpleArchive> = descriptors
+            .collection("pending-health", policy.clone())
+            .unwrap();
+        let node = genid();
+        let report = genid();
+        let at = hifitime::Epoch::from_tai_seconds(100.0);
+        let facts = entity! { &report @
+            metadata::tag: &health_record::KIND_REPORT,
+            health_record::attrs::node: &node,
+            metadata::created_at: (at, at).try_to_inline().unwrap(),
+        };
+        let payload: Blob<SimpleArchive> = facts.facts().clone().to_blob();
+        let handle = payload.get_handle();
+        writer.close().unwrap();
+        let options = Options {
+            pile: path.clone(),
+            key: Some(directory.path().join("absent.key")),
+            telemetry: vec![reports.handle()],
+            max_age: Duration::from_secs(30),
+            interval: Duration::from_secs(1),
+            once: true,
+            gui: false,
+        };
+        let mut reader = Reader::open(&options).unwrap();
+        // A missing key means health=None and does not block the fast path.
+        reader.sample_at(100_000_000_000).unwrap();
+        reader.sample_at(101_000_000_000).unwrap();
+        assert_eq!(reader.projection_runs, 1);
+        reader.health = Some(SelectedSource::new(health.handle()));
+        for expected in 2..=3 {
+            let frame = reader.sample_at(102_000_000_000).unwrap();
+            assert!(frame.warnings.iter().any(|warning| warning
+                == "Health reports unreadable: collection descriptor unavailable or invalid"));
+            assert_eq!(reader.projection_runs, expected);
+            assert!(reader.retained.is_none());
+        }
+        let mut writer = Pile::open(&path).unwrap();
+        let installed: Collection<SimpleArchive> =
+            writer.collection("pending-health", policy).unwrap();
+        assert_eq!(installed.handle(), health.handle());
+        CollectionStore::insert(
+            &mut writer,
+            CollectionRecord::Commit(CollectionCommit::sign(
+                &signer,
+                health.handle(),
+                Handle::<SimpleArchive>::to_hash(handle),
+                empty_metadata_handle(),
+            )),
+        )
+        .unwrap();
+        writer.close().unwrap();
+        // A known COMMIT with an absent payload is a successful empty resident
+        // cover, not a view error. Its missing-blob dependency must still wake
+        // the reader when those bytes arrive; do not invent an error here.
+        for _ in 0..2 {
+            let frame = reader.sample_at(103_000_000_000).unwrap();
+            assert!(frame.health.is_empty());
+            assert!(!frame
+                .warnings
+                .iter()
+                .any(|warning| warning.starts_with("Health reports unreadable")));
+            assert_eq!(reader.projection_runs, 4);
+        }
+        let mut writer = Pile::open(&path).unwrap();
+        assert_eq!(writer.put(payload).unwrap(), handle);
+        writer.close().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        for _ in 0..2 {
+            let frame = reader.sample_at(103_000_000_000).unwrap();
+            assert_eq!(frame.health.len(), 1);
+            assert!(!frame
+                .warnings
+                .iter()
+                .any(|warning| warning.starts_with("Health reports unreadable")));
+            assert_eq!(reader.projection_runs, 5);
+        }
+        reader.close().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     #[test]
