@@ -2546,7 +2546,9 @@ mod tests {
         fixture
             .peer
             .store()
-            .want(WantRequest::blob::<UnknownBlob>(Inline::new(fixture.roots[0])))
+            .want(WantRequest::blob::<UnknownBlob>(Inline::new(
+                fixture.roots[0],
+            )))
             .unwrap();
         let mut reconciler =
             Reconciler::new().with_replication(ReplicationMode::Shallow, [fixture.collection]);
