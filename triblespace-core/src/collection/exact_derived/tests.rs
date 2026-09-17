@@ -274,6 +274,7 @@ thread_local! {
     /// controls they move together, and both are asserted there for exactly
     /// that reason.
     static SECOND_BIND_CALLS: Cell<usize> = const { Cell::new(0) };
+    static FIRST_BIND_CALLS: Cell<usize> = const { Cell::new(0) };
     /// Forces `GuardSnapshot::changes_since` to answer `ALL`, standing in for a
     /// backend without scoped comparison. A carried resolution must then be
     /// refused, because ALL is the conservative answer and conservative means
@@ -288,6 +289,7 @@ fn reset_mapping_calls() {
     SECOND_MAP_CALLS.set(0);
     SECOND_JOIN_CALLS.set(0);
     SECOND_BIND_CALLS.set(0);
+    FIRST_BIND_CALLS.set(0);
     GUARD_CHANGES_ALL.set(false);
     FIRST_MAP_MISSING.set(false);
     FIRST_MAP_CAPACITY.replace(None);
@@ -309,6 +311,7 @@ impl CollectionDerivation for FirstEncoding {
         target: &Fragment,
     ) -> Result<Self::Argument, CollectionOperationError> {
         require_mapping(target, FIRST_MAPPING)?;
+        FIRST_BIND_CALLS.set(FIRST_BIND_CALLS.get() + 1);
         Ok(())
     }
 
@@ -614,6 +617,9 @@ struct GuardStore {
     inject_record_on_acquire: Option<CollectionRecord>,
     inject_proof_on_acquire: Option<CapabilityProof>,
     snapshot_calls: usize,
+    /// Fail the Nth snapshot, so the boundary coarsening already had can be
+    /// shown to survive the carry unchanged.
+    reject_snapshot_at: Option<usize>,
     /// Land a blob immediately before the Nth snapshot, SIMULATING an external
     /// arrival.
     ///
@@ -644,6 +650,7 @@ impl GuardStore {
             inject_record_on_acquire: None,
             inject_proof_on_acquire: None,
             snapshot_calls: 0,
+            reject_snapshot_at: None,
             land_blob_before_snapshot_at: None,
         }
     }
@@ -724,17 +731,23 @@ impl BlobStorePut for GuardStore {
 
 impl SnapshotSource for GuardStore {
     type Snapshot = GuardSnapshot;
-    type SnapshotError = <MemoryRepo as SnapshotSource>::SnapshotError;
+    type SnapshotError = GuardStoreError;
 
     fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
         self.snapshot_calls += 1;
+        if self.reject_snapshot_at == Some(self.snapshot_calls) {
+            return Err(GuardStoreError::Injected("snapshot"));
+        }
         if self.land_blob_before_snapshot_at == Some(self.snapshot_calls) {
             let late = archive(9, 9);
             self.inner
                 .put::<SimpleArchive, _>(late)
                 .expect("a second writer lands bytes between two observations");
         }
-        let inner = self.inner.snapshot()?;
+        let inner = self
+            .inner
+            .snapshot()
+            .map_err(|error| GuardStoreError::Backend(error.to_string()))?;
         self.live.fetch_add(1, Ordering::SeqCst);
         Ok(GuardSnapshot {
             inner,
@@ -3355,6 +3368,7 @@ fn coarsening_reuses_the_ensure_resolution_when_nothing_changed_between_them() {
     drive_to_fixed_point(&mut inner, second, &support);
 
     let mut store = GuardStore::new(inner);
+    let before_records = records(&mut store.inner);
     reset_mapping_calls();
     maintain_exact_resident::<_, SecondEncoding>(&mut store, second, &equation_signer(), &support)
         .unwrap();
@@ -3363,6 +3377,11 @@ fn coarsening_reuses_the_ensure_resolution_when_nothing_changed_between_them() {
         store.events.is_empty(),
         "this pass must publish nothing, or it is not the no-op case: {:?}",
         store.events
+    );
+    assert_eq!(
+        records(&mut store.inner),
+        before_records,
+        "a no-op leaves the canonical record set identical, events or not",
     );
     // Measured on this candidate against its own parent c0bd6042, same test,
     // same fixture: the unpatched round resolves TWICE here, once in ensure and
@@ -3538,6 +3557,23 @@ fn the_public_ensure_future_stays_send_for_a_non_send_mapping<S>(
     drop(future);
 }
 
+/// The same property on the PUBLIC entry points rather than the private helper
+/// the tip still calls. Never called; it exists to be compiled.
+#[allow(dead_code)]
+fn the_public_store_api_stays_send_for_a_non_send_mapping<S>(
+    store: &mut S,
+    target: Collection<SimpleArchive>,
+    signing_key: &SigningKey,
+    support: &Support,
+) where
+    S: crate::collection::CollectionStoreExt + Store + AsyncBlobStoreAcquire + Send,
+{
+    fn assert_send<T: Send>(_: &T) {}
+    let ensure = store.ensure_exact_with::<NonSendMapping>(target, signing_key, support);
+    assert_send(&ensure);
+    drop(ensure);
+}
+
 /// Late-arriving bytes between the ensure round's observation and coarsening's
 /// own must refuse the carried resolution.
 ///
@@ -3589,3 +3625,114 @@ fn late_residency_between_ensure_and_coarsening_refuses_the_carried_resolution()
     );
 }
 
+
+/// Coarsening opens its own fresh view and keeps its own error boundary. The
+/// carry is permitted to replace the PROBE only, never the observation, so a
+/// failing coarsen snapshot must still surface as coarsening's own error.
+#[test]
+fn a_failing_coarsen_snapshot_still_surfaces_its_own_error() {
+    let (mut inner, root, first, second) = collections();
+    let left = archive(1, 1);
+    let right = archive(2, 2);
+    for blob in [&left, &right] {
+        publish_root(&mut inner, root, blob, 31);
+    }
+    let support = support(root, &[left, right]);
+    ensure_exact_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer(), &support)
+        .unwrap();
+    ensure_exact_resident::<_, SecondEncoding>(&mut inner, second, &equation_signer(), &support)
+        .unwrap();
+    drive_to_fixed_point(&mut inner, second, &support);
+
+    let mut store = GuardStore::new(inner);
+    let before_records = records(&mut store.inner);
+    // The third snapshot is coarsening's, the one the carry is checked against.
+    store.reject_snapshot_at = Some(3);
+    reset_mapping_calls();
+    let error = maintain_exact_resident::<_, SecondEncoding>(
+        &mut store,
+        second,
+        &equation_signer(),
+        &support,
+    )
+    .expect_err("a failed coarsening snapshot must surface, carried probe or not");
+
+    let text = format!("{error}");
+    assert!(
+        text.contains("source-guided") && text.contains("injected snapshot"),
+        "the error must still be coarsening's own: {text}",
+    );
+    assert!(store.events.is_empty(), "a failed pass publishes nothing");
+    assert_eq!(records(&mut store.inner), before_records);
+}
+
+/// The carried pair is consumed AT MOST ONCE, on a pass where source guidance
+/// actually does work rather than on a quiet one.
+///
+/// This fixture supplies a coarse source MERGE and then maintains again, so
+/// coarsening publishes a DERIVE and runs on. Measured against the unpatched
+/// parent c0bd6042 on this same fixture: (4 binds, 5 select_records) becomes
+/// (3, 4). Exactly ONE resolution is saved on a working pass, which is the
+/// one-shot property; a mutant reusing the pair on every coarsening iteration
+/// would save more than one and fail this.
+///
+/// What this does NOT establish, stated rather than implied: an independent
+/// count of how many times coarsening's loop iterates here. The structural
+/// guarantee is that `carried.take()` runs unconditionally on the first
+/// iteration, so no later one can see a pair; this control pins the
+/// consequence of that, not the iteration count itself.
+#[test]
+fn source_guidance_consumes_the_carried_pair_at_most_once() {
+    let (mut inner, root, first, _second) = collections();
+    let members = [archive(1, 1), archive(2, 2), archive(3, 3)];
+    for member in &members {
+        publish_root(&mut inner, root, member, 31);
+    }
+    let support = support(root, &members);
+    ensure_exact_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer(), &support)
+        .unwrap();
+    let mut store = GuardStore::new(inner);
+    block_on(store.maintain_exact(first, &equation_signer(), &support)).unwrap();
+
+    let intermediate =
+        crate::collection::simplearchive_union::join(&members[0], &members[1]).unwrap();
+    let upper = crate::collection::simplearchive_union::join(&intermediate, &members[2]).unwrap();
+    for member in [&intermediate, &upper] {
+        store.inner.put::<SimpleArchive, _>(member.clone()).unwrap();
+    }
+    for (low, high, result) in [
+        (&members[0], &members[1], &intermediate),
+        (&intermediate, &members[2], &upper),
+    ] {
+        let before = store.inner.snapshot().unwrap();
+        let low_witness = witnessed_input(&before, root.handle(), data(low));
+        let high_witness = witnessed_input(&before, root.handle(), data(high));
+        drop(before);
+        store
+            .inner
+            .insert(CollectionRecord::Merge(CollectionMerge::sign(
+                &equation_signer(),
+                root.handle(),
+                low_witness,
+                high_witness,
+                data(result),
+            )))
+            .unwrap();
+    }
+
+    reset_mapping_calls();
+    let probes_before = store.semantic_probes.load(Ordering::SeqCst);
+    block_on(store.maintain_exact(first, &equation_signer(), &support)).unwrap();
+    assert!(
+        !store.events.is_empty() && FIRST_MAP_CALLS.get() > 0,
+        "source guidance must actually publish here, or the control is quiet and proves less",
+    );
+    assert_eq!(
+        (
+            FIRST_BIND_CALLS.get(),
+            store.semantic_probes.load(Ordering::SeqCst) - probes_before
+        ),
+        (3, 4),
+        "one resolution saved on a working pass; the unpatched parent is (4, 5)",
+    );
+}
