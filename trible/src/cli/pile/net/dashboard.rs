@@ -20,6 +20,9 @@ use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::pile::{Pile, PileSnapshot};
 use triblespace_core::repo::SnapshotSource;
 use triblespace_core::trible::TribleSet;
+use triblespace_core::blob::encodings::utf8string::UTF8String;
+use triblespace_core::blob::Blob;
+use triblespace_core::collection::descriptor;
 use triblespace_net::dashboard::{self, CountMetric, Freshness, ObserverReport};
 use triblespace_net::health_record;
 use triblespace_net::telemetry::{self, Metric, WorkerReport};
@@ -36,6 +39,7 @@ pub(super) struct Options {
     pub interval: Duration,
     pub once: bool,
     pub gui: bool,
+    pub lattice: bool,
 }
 
 pub(super) fn run(mut options: Options) -> Result<()> {
@@ -145,6 +149,7 @@ struct Reader {
     health: Option<SelectedSource>,
     setup_warnings: Vec<String>,
     max_age: Duration,
+    lattice: bool,
     // Only the final display projection, not a mutable report catalogue. Its
     // application time is independent of the store's scoped dependencies.
     retained: Option<(i128, Frame)>,
@@ -193,6 +198,7 @@ impl Reader {
             health,
             setup_warnings,
             max_age: options.max_age,
+            lattice: options.lattice,
             retained: None,
             #[cfg(test)]
             projection_runs: 0,
@@ -274,9 +280,38 @@ impl Reader {
             },
             None => Vec::new(),
         };
+        // Sampled from the same frozen snapshot as the telemetry above, so
+        // the lattice and the worker backlog describe the same instant.
+        let lattice = match self.lattice {
+            true => match observe_lattice(
+                &snapshot,
+                // Handles the dashboard knows without a record scan: what the
+                // operator selected, and what the observers are complaining
+                // about. On a live pile these are usually the only evidence
+                // that an unstarted derivation exists at all.
+                self.sources
+                    .iter()
+                    .map(|source| source.handle.raw)
+                    .chain(health.iter().flat_map(|observer| {
+                        observer
+                            .conditions
+                            .iter()
+                            .flat_map(|condition| condition.collections.iter().copied())
+                    }))
+                    .collect::<Vec<_>>(),
+            ) {
+                Ok(lattice) => Some(lattice),
+                Err(error) => {
+                    warnings.push(format!("Collection lattice unreadable: {error}"));
+                    None
+                }
+            },
+            false => None,
+        };
         let frame = Frame {
             workers,
             health,
+            lattice,
             warnings,
             sampled: Instant::now(),
             observation_time: started.elapsed(),
@@ -284,7 +319,12 @@ impl Reader {
             selected_sources: self.sources.len(),
             max_age: self.max_age,
         };
-        if readable_sources == self.sources.len() && health_readable {
+        // The retention test only proves the *selected* telemetry sources are
+        // unchanged. The lattice depends on every stored record and every
+        // resident blob, so a retained frame could show a stale lattice beside
+        // fresh backlog. Rather than widen the test, do not retain at all when
+        // the lattice was asked for: the caller already accepted the cost.
+        if readable_sources == self.sources.len() && health_readable && !self.lattice {
             self.retained = Some((now_ns, frame.clone()));
         }
         Ok(frame)
@@ -304,10 +344,158 @@ impl Reader {
     }
 }
 
+/// One collection as a single frozen observation sees it.
+///
+/// A flat display row, computed once per observation and dropped with the
+/// frame. It is deliberately not a catalogue anything later queries: the
+/// answers below are read back out of the store's own projections every time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LatticeCollection {
+    /// Descriptor handle. This, not the entity inside the archive, is the
+    /// collection's identity.
+    handle: [u8; 32],
+    /// The name a root descriptor carries, when its bytes are here.
+    name: Option<String>,
+    /// The collection this one derives from. `None` is what being a root
+    /// means; it is not a failure to read one.
+    source: Option<[u8; 32]>,
+    /// Whether this collection's descriptor archive is resident and decodable
+    /// in this observation.
+    descriptor_resident: bool,
+    /// Signed records naming this collection, by kind.
+    commits: u64,
+    merges: u64,
+    derives: u64,
+    /// Records naming it whose member, join result or mapping output blob is
+    /// actually here. The shortfall against the three counts above is the
+    /// concrete "what is missing": endorsed work whose bytes this store does
+    /// not hold.
+    result_resident: u64,
+}
+
+impl LatticeCollection {
+    fn stored(&self) -> u64 {
+        self.commits
+            .saturating_add(self.merges)
+            .saturating_add(self.derives)
+    }
+}
+
+/// Project the collection lattice from one frozen observation.
+///
+/// Two independent facts are needed, and they live in two different places,
+/// which is why this is not one query. `inspect_local` already counts the
+/// signed records naming each collection and how many of their result blobs
+/// are resident — that is *what is here and what is missing*. It never reads a
+/// descriptor, so it cannot say which collection derives from which; that
+/// ordering lives in the descriptor archive and is read with the library's own
+/// `descriptor::*` queries, the same ones resolution and retention use.
+/// Reusing both rather than re-deriving either is what keeps this a view and
+/// not a second inventory of the store.
+///
+/// The walk closes over handles that no record names. A derivation's source
+/// can have no records here at all, and a chain that stopped at the first
+/// non-resident link would answer "where did this come from" with silence
+/// instead of with the hole that is actually there.
+///
+/// `seeds` exist because records are not the only evidence a collection is
+/// real, and relying on them alone hides exactly the case worth seeing: a
+/// derived collection that was registered and never once maintained has no
+/// records at all, so a record-seeded walk would omit the empty derivation
+/// rather than draw it. The dashboard already holds handles that did not come
+/// from a record scan — the operator's selected telemetry collections, and the
+/// collections named inside health conditions — and seeding with those is what
+/// makes an unstarted derivation appear as the hole it is.
+///
+/// Every descriptor read that fails is a skip, never an error: the store is an
+/// open world, and a collection whose bytes are elsewhere is ordinary, not
+/// corrupt.
+///
+/// Cost, measured on self.pile (6.1 GB, 423562 stored records, 275
+/// collections) with a debug build on this aarch64 box: the record walk inside
+/// `inspect_local` is ~13 s and the descriptor pass ~1.2 s, **per observation**
+/// — against ~925 s for the first `snapshot()` the dashboard already takes, but
+/// repeated every sample thereafter, where the rest of a sample is milliseconds.
+/// That is why it is behind a flag rather than always on.
+fn observe_lattice<R: triblespace_core::repo::StoreRead>(
+    snapshot: &R,
+    seeds: impl IntoIterator<Item = [u8; 32]>,
+) -> ReadResult<Vec<LatticeCollection>> {
+    // No blob samples are retained: this view never shows individual blobs,
+    // and asking for none keeps the report to the counts actually rendered.
+    let local = dashboard::inspect_local(snapshot, 0).map_err(|_| ReadFailure::RefreshPile)?;
+    let evidence: std::collections::BTreeMap<[u8; 32], _> = local
+        .collections
+        .iter()
+        .map(|collection| (collection.collection, collection))
+        .collect();
+
+    let mut pending: Vec<[u8; 32]> = evidence.keys().copied().chain(seeds).collect();
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    while let Some(raw) = pending.pop() {
+        if !seen.insert(raw) {
+            continue;
+        }
+        let handle = CollectionHandle::new(raw);
+        let facts: Option<TribleSet> = snapshot.get(handle).ok();
+        let source = facts
+            .as_ref()
+            .and_then(|facts| descriptor::source(facts).ok().flatten())
+            .map(|source| source.raw);
+        let name = facts.as_ref().and_then(|facts| {
+            let named = descriptor::name(facts).ok().flatten()?;
+            let blob: Blob<UTF8String> = snapshot.get(named).ok()?;
+            std::str::from_utf8(&blob.bytes).ok().map(str::to_owned)
+        });
+        if let Some(source) = source {
+            pending.push(source);
+        }
+        let (commits, merges, derives, result_resident) = match evidence.get(&raw) {
+            Some(found) => (
+                found.commits.stored,
+                found.merges.stored,
+                found.derives.stored,
+                found
+                    .commits
+                    .result_resident
+                    .saturating_add(found.merges.result_resident)
+                    .saturating_add(found.derives.result_resident),
+            ),
+            None => (0, 0, 0, 0),
+        };
+        out.push(LatticeCollection {
+            handle: raw,
+            name,
+            source,
+            descriptor_resident: facts.is_some(),
+            commits,
+            merges,
+            derives,
+            result_resident,
+        });
+    }
+
+    // A stable order: named collections alphabetically, then the rest by
+    // handle. The drawing places nodes by rank and then by this order, so a
+    // fixed order is what stops the picture jumping between observations.
+    out.sort_by(|left, right| {
+        (left.name.is_none(), &left.name, left.handle)
+            .cmp(&(right.name.is_none(), &right.name, right.handle))
+    });
+    Ok(out)
+}
+
 #[derive(Clone)]
 struct Frame {
     workers: Vec<WorkerReport>,
     health: Vec<ObserverReport>,
+    /// The collection lattice, when this dashboard was asked for it.
+    ///
+    /// `None` is not "no collections": it is "not looked at". The renderers
+    /// say so, because an empty lattice and an unsampled one look identical
+    /// on screen and mean opposite things.
+    lattice: Option<Vec<LatticeCollection>>,
     warnings: Vec<String>,
     sampled: Instant,
     observation_time: Duration,
@@ -744,6 +932,50 @@ fn render_terminal(frame: &Frame) -> String {
         }
         out.push('\n');
     }
+    match &frame.lattice {
+        None => out.push_str(
+            "COLLECTION LATTICE · not sampled. Rerun with --lattice; an unsampled lattice is not an empty one.\n\n",
+        ),
+        Some(collections) if collections.is_empty() => out.push_str(
+            "COLLECTION LATTICE · sampled; this pile references no collections.\n\n",
+        ),
+        Some(collections) => {
+            let derived = collections.iter().filter(|c| c.source.is_some()).count();
+            let absent = collections.iter().filter(|c| !c.descriptor_resident).count();
+            let _ = writeln!(
+                out,
+                "COLLECTION LATTICE · {} collections, {derived} derived, {absent} with no resident descriptor",
+                collections.len()
+            );
+            out.push_str(
+                "  Resident is result blobs actually here over records naming the collection, per collection.\n",
+            );
+            for collection in collections.iter().take(24) {
+                let _ = writeln!(
+                    out,
+                    "  {} {} · {} commit / {} merge / {} derive · {} of {} results resident{}",
+                    if collection.descriptor_resident { "+" } else { "?" },
+                    collection
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| short(&collection.handle)),
+                    collection.commits,
+                    collection.merges,
+                    collection.derives,
+                    collection.result_resident,
+                    collection.stored(),
+                    match collection.source {
+                        Some(source) => format!(" · derives from {}", short(&source)),
+                        None => String::new(),
+                    }
+                );
+            }
+            if collections.len() > 24 {
+                let _ = writeln!(out, "  ... {} more not listed", collections.len() - 24);
+            }
+            out.push('\n');
+        }
+    }
     let links: Vec<_> = frame
         .workers
         .iter()
@@ -919,6 +1151,134 @@ mod tests {
     use triblespace_core::prelude::*;
     use triblespace_net::telemetry::MetricValue;
 
+    /// A root collection with one commit, plus a derivation registered over it
+    /// that has never been maintained.
+    fn lattice_fixture() -> (MemoryRepo, CollectionHandle, CollectionHandle) {
+        use triblespace_core::blob::encodings::succinctarchive::SuccinctArchiveBlob;
+        let mut store = MemoryRepo::default();
+        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+        let source: Collection<SimpleArchive> =
+            store.collection("facts", policy.clone()).unwrap();
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
+        store
+            .commit(source, &signer, entity! { metadata::name: "first" })
+            .unwrap();
+        let target = store
+            .derive::<SuccinctArchiveBlob>(source, (), policy)
+            .unwrap();
+        (store, source.handle(), target.handle())
+    }
+
+    #[test]
+    fn a_derivation_reports_the_collection_it_reads() {
+        // The order itself: without the source link there is no lattice, only
+        // a list, and no chain to walk back.
+        let (mut store, source, target) = lattice_fixture();
+        let snapshot = store.snapshot().unwrap();
+        let lattice = observe_lattice(&snapshot, [target.raw]).unwrap();
+        let derived = lattice
+            .iter()
+            .find(|collection| collection.handle == target.raw)
+            .expect("the derived collection is projected");
+        assert_eq!(derived.source, Some(source.raw));
+        let root = lattice
+            .iter()
+            .find(|collection| collection.handle == source.raw)
+            .expect("the source collection is projected");
+        assert_eq!(root.source, None, "a root has no source; that is not a failure");
+        assert_eq!(root.name.as_deref(), Some("facts"));
+        assert_eq!(root.commits, 1);
+    }
+
+    #[test]
+    fn a_registered_but_unmaintained_derivation_is_still_projected() {
+        // This is the case the view exists for. The target has no records at
+        // all, so a walk seeded only from stored records would omit it and
+        // draw a lattice that looks finished. Seeded, it appears with nothing
+        // endorsed, which is what "missing" looks like here.
+        let (mut store, _source, target) = lattice_fixture();
+        let snapshot = store.snapshot().unwrap();
+        let unseeded = observe_lattice(&snapshot, []).unwrap();
+        assert!(
+            !unseeded.iter().any(|c| c.handle == target.raw),
+            "records alone cannot evidence an unstarted derivation"
+        );
+        let seeded = observe_lattice(&snapshot, [target.raw]).unwrap();
+        let derived = seeded
+            .iter()
+            .find(|collection| collection.handle == target.raw)
+            .expect("a seeded handle is projected");
+        assert_eq!(derived.stored(), 0, "nothing has been derived yet");
+        assert_eq!(derived.derives, 0);
+        assert!(derived.descriptor_resident, "its descriptor is right here");
+    }
+
+    #[test]
+    fn a_source_reached_only_through_a_descriptor_closes_the_chain() {
+        // Seeding with the derived target alone must still reach the root, or
+        // "where did this come from" has no answer.
+        let (mut store, source, target) = lattice_fixture();
+        let snapshot = store.snapshot().unwrap();
+        let lattice = observe_lattice(&snapshot, [target.raw]).unwrap();
+        assert!(lattice.iter().any(|c| c.handle == source.raw));
+    }
+
+    #[test]
+    fn an_unknown_seed_becomes_a_hole_rather_than_being_dropped() {
+        // A collection named by an observer but absent here is exactly what
+        // must be drawn, not omitted: omitting it redraws an incomplete
+        // lattice as a complete one.
+        let (mut store, _source, _target) = lattice_fixture();
+        let snapshot = store.snapshot().unwrap();
+        let absent = [0x5A_u8; 32];
+        let lattice = observe_lattice(&snapshot, [absent]).unwrap();
+        let hole = lattice
+            .iter()
+            .find(|collection| collection.handle == absent)
+            .expect("an unreadable collection is still a row");
+        assert!(!hole.descriptor_resident);
+        assert_eq!(hole.source, None);
+        assert_eq!(hole.name, None);
+        assert_eq!(hole.stored(), 0);
+    }
+
+    #[test]
+    fn the_projection_is_ordered_and_free_of_duplicates() {
+        // The drawing places nodes by rank and then by this order, so a
+        // repeated observation of one snapshot must not move the picture.
+        let (mut store, source, target) = lattice_fixture();
+        let snapshot = store.snapshot().unwrap();
+        let once = observe_lattice(&snapshot, [target.raw, source.raw, target.raw]).unwrap();
+        let twice = observe_lattice(&snapshot, [target.raw, source.raw]).unwrap();
+        assert_eq!(once, twice, "one snapshot projects one lattice");
+        let mut handles: Vec<_> = once.iter().map(|c| c.handle).collect();
+        let count = handles.len();
+        handles.sort_unstable();
+        handles.dedup();
+        assert_eq!(handles.len(), count, "each collection appears once");
+    }
+
+    #[test]
+    fn an_unsampled_lattice_is_reported_as_unsampled_not_as_empty() {
+        let mut frame = Frame {
+            workers: vec![],
+            health: vec![],
+            lattice: None,
+            warnings: vec![],
+            sampled: Instant::now(),
+            observation_time: Duration::ZERO,
+            readable_sources: 0,
+            selected_sources: 0,
+            max_age: Duration::from_secs(30),
+        };
+        assert!(render_terminal(&frame).contains("not sampled"));
+        frame.lattice = Some(vec![]);
+        let rendered = render_terminal(&frame);
+        assert!(rendered.contains("references no collections"));
+        assert!(!rendered.contains("not sampled"));
+    }
+
+
     fn worker() -> WorkerReport {
         let id = Id::new([1; 16]).unwrap();
         WorkerReport {
@@ -972,6 +1332,7 @@ mod tests {
         let frame = Frame {
             workers: vec![worker],
             health: vec![],
+            lattice: None,
             warnings: vec![],
             sampled: Instant::now(),
             observation_time: Duration::ZERO,
@@ -1057,6 +1418,7 @@ mod tests {
                 freshness: Freshness::Fresh,
                 conditions: vec![],
             }],
+            lattice: None,
             warnings: vec![],
             sampled: Instant::now(),
             observation_time: Duration::ZERO,
@@ -1095,6 +1457,7 @@ mod tests {
         let mut frame = Frame {
             workers: vec![stage],
             health: vec![],
+            lattice: None,
             warnings: vec![],
             sampled: Instant::now(),
             observation_time: Duration::ZERO,
@@ -1172,6 +1535,7 @@ mod tests {
             interval: Duration::from_secs(1),
             once: true,
             gui: false,
+            lattice: false,
         };
         let mut reader = Reader::open(&options).unwrap();
         // Exercise the health warning arm over the same disposable bad member.
@@ -1255,6 +1619,7 @@ mod tests {
             interval: Duration::from_secs(1),
             once: true,
             gui: false,
+            lattice: false,
         };
         let failure = match Reader::open(&options) {
             Err(error) => error,
@@ -1314,6 +1679,7 @@ mod tests {
             interval: Duration::from_secs(1),
             once: true,
             gui: false,
+            lattice: false,
         };
         let mut reader = Reader::open(&options).unwrap();
         for _ in 0..2 {
@@ -1418,6 +1784,7 @@ mod tests {
             interval: Duration::from_secs(1),
             once: true,
             gui: false,
+            lattice: false,
         };
         let mut reader = Reader::open(&options).unwrap();
         reader.health = Some(SelectedSource::new(collection.handle()));
@@ -1497,6 +1864,7 @@ mod tests {
             interval: Duration::from_secs(1),
             once: true,
             gui: false,
+            lattice: false,
         };
         let mut reader = Reader::open(&options).unwrap();
         // A missing key means health=None and does not block the fast path.
@@ -1568,6 +1936,7 @@ mod tests {
             interval: Duration::from_secs(1),
             once: true,
             gui: false,
+            lattice: false,
         };
         let before = std::fs::read(&path).unwrap();
         let mut reader = Reader::open(&options).unwrap();

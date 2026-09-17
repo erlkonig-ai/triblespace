@@ -153,6 +153,15 @@ pub enum Command {
         /// Run the embedded GORBIE notebook on the native main thread.
         #[arg(long, conflicts_with = "tui")]
         gui: bool,
+        /// Also project the collection lattice: which collections exist, which
+        /// derives from which, and how much of each one's endorsed work is
+        /// actually resident here.
+        ///
+        /// Off by default because it walks every stored record and every
+        /// resident blob once per observation, which is seconds to minutes on
+        /// a large pile, while the rest of the dashboard is cheap.
+        #[arg(long)]
+        lattice: bool,
     },
     /// Repair explicitly named collections with peers.
     Sync {
@@ -210,6 +219,7 @@ pub fn run(command: Command) -> Result<()> {
             once,
             tui: _,
             gui,
+            lattice,
         } => dashboard::run(dashboard::Options {
             pile,
             key,
@@ -221,6 +231,7 @@ pub fn run(command: Command) -> Result<()> {
             interval: std::time::Duration::from_secs(interval),
             once,
             gui,
+            lattice,
         }),
         Command::Sync {
             pile,

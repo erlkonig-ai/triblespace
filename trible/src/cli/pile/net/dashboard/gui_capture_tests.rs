@@ -214,6 +214,7 @@ fn generated_frame(directory: &Path) -> Result<(Frame, i128)> {
         interval: Duration::from_secs(1),
         once: true,
         gui: false,
+        lattice: false,
     })?;
     let sampled = reader.sample();
     let closed = reader.close();

@@ -170,6 +170,181 @@ fn render_mesh(ui: &mut egui::Ui, frame: &Frame) {
     ui.separator();
 }
 
+/// The collection lattice, and the one panel in this dashboard you can walk.
+///
+/// Every other panel answers "how is it going". This one answers "what is
+/// there, what is not, and where did it come from" — the three questions the
+/// cluster view was wanted for. They are one picture because they come from
+/// one frozen observation: a node is a collection, a left-to-right edge is a
+/// derivation, a short arc is endorsed work whose bytes are not here, and a
+/// dashed mark is a collection this store knows only by name.
+///
+/// Clicking a node dims everything off its chain and prints that chain in full
+/// underneath, which is how a derived collection gets walked back to the root
+/// it was computed from.
+fn render_lattice(ui: &mut egui::Ui, frame: &Frame) {
+    use GORBIE::widgets::{LatticeEdge, LatticeGraph, LatticeMark, LatticeNode, LatticePresence};
+
+    ui.label(
+        egui::RichText::new("Collection lattice")
+            .strong()
+            .size(19.0),
+    );
+    let Some(collections) = &frame.lattice else {
+        ui.small("Not sampled. Rerun with --lattice; an unsampled lattice is not an empty one.");
+        ui.separator();
+        return;
+    };
+    if collections.is_empty() {
+        ui.small("Sampled: this pile references no collections.");
+        ui.separator();
+        return;
+    }
+
+    let label = |collection: &LatticeCollection| {
+        collection
+            .name
+            .clone()
+            .unwrap_or_else(|| short(&collection.handle))
+    };
+    let position = |handle: [u8; 32]| collections.iter().position(|c| c.handle == handle);
+
+    let nodes: Vec<LatticeNode> = collections
+        .iter()
+        .map(|collection| LatticeNode {
+            label: label(collection),
+            // A root is authored — someone named it. A derivation is
+            // computed, and could in principle be rebuilt from its source.
+            mark: match collection.source {
+                Some(_) => LatticeMark::Computed,
+                None => LatticeMark::Authored,
+            },
+            presence: match collection.descriptor_resident {
+                true => LatticePresence::Present,
+                false => LatticePresence::Absent,
+            },
+            // No records naming it means nothing to divide, which draws as an
+            // empty track. That is absence of evidence, not full residency.
+            coverage: (collection.stored() > 0)
+                .then(|| collection.result_resident as f32 / collection.stored() as f32),
+        })
+        .collect();
+
+    let edges: Vec<LatticeEdge> = collections
+        .iter()
+        .enumerate()
+        .filter_map(|(to, collection)| {
+            let from = position(collection.source?)?;
+            Some(LatticeEdge {
+                from,
+                to,
+                // The descriptor declares the derivation; a DERIVE record is
+                // what performs it. Declared but never performed is exactly
+                // the missing step this view exists to show, so it draws as a
+                // dashed edge rather than as an ordinary one.
+                endorsed: collection.derives > 0,
+            })
+        })
+        .collect();
+
+    let id = ui.make_persistent_id("colony-lattice-selection");
+    let selected: Option<usize> = ui.data(|data| data.get_temp::<usize>(id));
+    let drawn = LatticeGraph::new(&nodes, &edges)
+        .selected(selected)
+        .height(300.0)
+        .show(ui);
+    if let Some(clicked) = drawn.clicked {
+        ui.data_mut(|data| {
+            if selected == Some(clicked) {
+                data.remove::<usize>(id);
+            } else {
+                data.insert_temp(id, clicked);
+            }
+        });
+    }
+
+    let derived = collections.iter().filter(|c| c.source.is_some()).count();
+    let absent = collections
+        .iter()
+        .filter(|c| !c.descriptor_resident)
+        .count();
+    ui.horizontal_wrapped(|ui| {
+        ui.small(format!(
+            "{} collections · {derived} derived",
+            collections.len()
+        ));
+        if absent != 0 {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                format!("{absent} with no resident descriptor"),
+            );
+        }
+    });
+    ui.small(
+        "Left to right is derivation: a collection's sources are always to its left. \
+         Square is authored, circle is computed. Dashed is a hole — a collection this \
+         store knows only by name, or a derivation the descriptor declares and no \
+         record performs. The arc is result blobs resident over records naming that \
+         collection, per collection, in this pile alone.",
+    );
+
+    // Hover previews a chain; a click pins it. Previewing on hover is what
+    // makes a wide lattice explorable without committing to a selection.
+    match drawn.hovered.or(selected) {
+        None => ui.small("Click a collection to walk its source chain."),
+        Some(index) => {
+            let mut chain = Vec::new();
+            let mut visited = BTreeSet::new();
+            let mut at = Some(index);
+            let mut dangling = None;
+            while let Some(current) = at {
+                if !visited.insert(current) {
+                    break;
+                }
+                chain.push(current);
+                at = match collections[current].source {
+                    None => None,
+                    Some(source) => match position(source) {
+                        Some(found) => Some(found),
+                        None => {
+                            dangling = Some(source);
+                            None
+                        }
+                    },
+                };
+            }
+            chain.reverse();
+            let focus = &collections[index];
+            ui.small(format!(
+                "{} · {} commit / {} merge / {} derive · {} of {} result blobs resident{}",
+                label(focus),
+                focus.commits,
+                focus.merges,
+                focus.derives,
+                focus.result_resident,
+                focus.stored(),
+                match focus.descriptor_resident {
+                    true => "",
+                    false => " · descriptor not resident here",
+                }
+            ));
+            let walked = chain
+                .iter()
+                .map(|step| label(&collections[*step]))
+                .collect::<Vec<_>>()
+                .join(" -> ");
+            ui.small(match dangling {
+                Some(handle) => format!(
+                    "source chain: [{} not in this observation] -> {walked}",
+                    short(&handle)
+                ),
+                None => format!("source chain: {walked}"),
+            })
+        }
+    };
+    ui.separator();
+}
+
 fn render(ui: &mut egui::Ui, frame: &Frame) {
     // A dashboard has denser information than a prose notebook. Keep the
     // notebook's font families and theme, but scope spacing and sizes locally.
@@ -216,6 +391,7 @@ fn render(ui: &mut egui::Ui, frame: &Frame) {
         }
         ui.separator();
         render_mesh(ui, frame);
+        render_lattice(ui, frame);
 
         for node in frame.nodes() {
             ui.horizontal_wrapped(|ui| {
