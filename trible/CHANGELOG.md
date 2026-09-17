@@ -33,6 +33,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+- Gate maintenance watch passes on the preceding pass's raw store interests,
+  including descriptor/capability-definition misses, per-collection census,
+  source records and exact blob acquisitions. Exact target selections ignore
+  unrelated pile writes; name lookup remains a whole record-index interest.
+  Relevant before/after changes retain one bounded catch-up pass, so concurrent
+  input is not hidden by the post-work baseline. No WANTs or semantic result
+  cache are introduced; proof changes remain conservatively component-wide.
+
 - BM25 search queries the stored shard cover directly. It no longer serializes
   a temporary index union, rebuilds singleton indexes, or loads every document
   into a snippet catalog; snippet lookups run only for selected results.

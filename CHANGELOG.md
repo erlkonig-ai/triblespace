@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Scope CLI maintenance-watch eligibility to the preceding active pass's raw
+  record/blob/proof interests through opt-in `repo::ObservedStore` forwarding.
+  Misses and relevant concurrent arrivals remain retry interests; unrelated
+  writes and WANTs need not repeat collection algebra. Native collection APIs,
+  canonical plans, publication and protocol formats are unchanged.
+
 - Start exact-H blob GETs from verified provider hints while other directory
   replies remain pending. Directory and provider operations share the existing
   three request slots and at most 64 distinct provider attempts. Transient

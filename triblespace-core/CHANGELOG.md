@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Expose the opt-in `repo::ObservedStore` raw read-set observer for active
+  stores as well as immutable readers. Fresh snapshots share its private
+  tracker; explicit acquisitions retain their exact handle before forwarding,
+  including misses, errors and cancellation. Writes and existing collection
+  operation return contracts are unchanged. External provider availability is
+  not a stored dependency and still requires the caller's own retry policy.
+
 - Attach ordinary collection snapshots from admitted target endorsements and
   resident outputs without eagerly expanding historical COMMIT support.
   `CollectionSnapshot::support()` is now a fallible, lazy exact-provenance
