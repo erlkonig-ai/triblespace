@@ -39,6 +39,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Bound exact WANT/direct-root fetching to an experimental four-wide window
+  within the current service class and shared deadline. Land each completed
+  body through the unchanged serial hash/durability boundary; deadline expiry
+  cancels unfinished requests without consuming the unstarted tail. Peer fetch
+  futures own network handles and remain inert until polled. Recursive scans
+  retain their serial path and sixteen-attempt allowance; no throughput gain
+  is claimed before measurement.
+
 - Make `ReconcileDirection` govern collection repair only. Native `Blob(H)`
   discovery, provider publication, exact serving, and durable WANT service are
   orthogonal bearer operations available in every direction.

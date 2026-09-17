@@ -14,6 +14,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 use anybytes::Bytes;
+use futures::stream::{FuturesUnordered, StreamExt};
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::locator::blob_locator;
 use triblespace_core::collection::reference_summary::{ReferenceSummaryBlob, ReferenceSummaryView};
@@ -184,6 +185,10 @@ pub const RECONCILE_FETCH_DEADLINE: Duration = Duration::from_secs(30);
 pub const RECONCILE_SCAN_CANDIDATES_PER_TICK: usize = 16 * 1024;
 /// Speculation cannot turn one large binary into an unbounded burst of DHT work.
 pub const RECONCILE_SPECULATIVE_FETCHES_PER_TICK: usize = 16;
+
+/// Experimental exact-demand window, not a throughput guarantee. Speculative
+/// scanning keeps its separate, serial request path and existing allowance.
+const EXACT_FETCHES_IN_FLIGHT: usize = 4;
 
 /// Yield even when a source contains only local or summary-filtered words.
 const SCAN_WORDS_PER_QUANTUM: usize = 64;
@@ -517,25 +522,69 @@ impl Reconciler {
         }
 
         let started = crate::clock::mono_now();
+        let deadline = tokio::time::Instant::now() + self.fetch_budget;
         let work = self.next_work(&wanted_blob_handles, &roots, started);
         let scan_turn = matches!(work, Some((ServiceTurn::Scan, _)));
         if let Some((turn, handles)) = work {
-            for handle in handles {
-                let remaining = self.remaining(started);
-                if remaining.is_zero() {
+            // One class owns this finite observation and its original budget.
+            // Network futures own no Peer/store borrow; only this task lands
+            // results, one at a time. No task survives this tick's cancellation.
+            let mut handles = handles.into_iter();
+            let mut pending = FuturesUnordered::new();
+            let mut in_flight = BTreeSet::new();
+            loop {
+                while pending.len() < EXACT_FETCHES_IN_FLIGHT
+                    && !self.remaining(started).is_zero()
+                    && tokio::time::Instant::now() < deadline
+                {
+                    let Some(handle) = handles.next() else {
+                        break;
+                    };
+                    self.begin_attempt(turn, handle);
+                    if wanted_blob_handles.contains(&handle) {
+                        stats.attempted += 1;
+                    }
+                    // A failed durability barrier is retried locally, not
+                    // turned into a network fetch of already-visible bytes.
+                    let fetch = (!visible_blobs.contains(&handle)).then(|| {
+                        peer.fetch_blob_with_deadline(
+                            handle,
+                            deadline.saturating_duration_since(tokio::time::Instant::now()),
+                        )
+                    });
+                    in_flight.insert(handle);
+                    pending.push(async move {
+                        let bytes = match fetch {
+                            Some(fetch) if tokio::time::Instant::now() < deadline => {
+                                tokio::time::timeout_at(deadline, fetch)
+                                    .await
+                                    .ok()
+                                    .flatten()
+                            }
+                            _ => None,
+                        };
+                        (handle, bytes)
+                    });
+                }
+                if pending.is_empty()
+                    || self.remaining(started).is_zero()
+                    || tokio::time::Instant::now() >= deadline
+                {
                     break;
                 }
+                let Ok(Some((handle, bytes))) =
+                    tokio::time::timeout_at(deadline, pending.next()).await
+                else {
+                    break;
+                };
+                in_flight.remove(&handle);
                 let is_want = wanted_blob_handles.contains(&handle);
-                self.begin_attempt(turn, handle);
-                if is_want {
-                    stats.attempted += 1;
-                }
-                // A failed durability barrier is retried locally, not turned
-                // into a needless network fetch of already-visible bytes.
                 let landed = if visible_blobs.contains(&handle) {
                     peer.store().flush().is_ok()
                 } else {
-                    fetch_and_land(peer, handle, remaining).await.is_some()
+                    bytes
+                        .and_then(|bytes| land_exact(peer, handle, bytes))
+                        .is_some()
                 };
                 if !landed {
                     self.record_unavailable(handle);
@@ -550,6 +599,14 @@ impl Reconciler {
                     stats.replication.acquired += 1;
                 }
                 peer.refresh();
+            }
+            // Expiry cancels admitted unfinished requests, not untouched tail
+            // candidates. Charge each once; no answer is durable until its
+            // serial landing barrier succeeds. Dropping the entire tick also
+            // drops these futures, without inventing a completion or miss.
+            drop(pending);
+            for handle in in_flight {
+                self.record_unavailable(handle);
             }
         }
         stats.pending = missing_operations
@@ -1097,6 +1154,20 @@ where
     S::Snapshot: StoreRead + BlobChildren,
 {
     let bytes = peer.fetch_blob_with_deadline(handle, budget).await?;
+    land_exact(peer, handle, bytes)
+}
+
+fn land_exact<S>(peer: &Peer<S>, handle: RawHash, bytes: Bytes) -> Option<()>
+where
+    S: BlobStore
+        + CollectionStore
+        + CapabilityProofStore
+        + WantStore
+        + StorageFlush
+        + Send
+        + 'static,
+    S::Snapshot: StoreRead + BlobChildren,
+{
     let landing = {
         let mut store = peer.store();
         match store.put::<UnknownBlob, Bytes>(bytes) {
@@ -1163,9 +1234,16 @@ mod tests {
     }
 
     use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
     use ed25519_dalek::SigningKey;
+    use triblespace_core::blob::{BlobEncoding, IntoBlob};
+    use triblespace_core::capability::CapabilityProof;
     use triblespace_core::collection::{CollectionCommit, CollectionDerive, CollectionMerge};
-    use triblespace_core::inline::Inline;
+    use triblespace_core::inline::encodings::hash::Handle;
+    use triblespace_core::inline::{Inline, InlineEncoding};
     use triblespace_core::repo::BlobStorePut;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
 
@@ -1978,6 +2056,448 @@ mod tests {
                 Inline::new(metadata),
             )))
             .unwrap();
+    }
+
+    #[derive(Default)]
+    struct LandingTrace {
+        put: Vec<RawHash>,
+        unflushed: BTreeSet<RawHash>,
+        durable: BTreeSet<RawHash>,
+        fail_flush: bool,
+    }
+
+    struct LandingStore {
+        inner: MemoryRepo,
+        trace: Arc<Mutex<LandingTrace>>,
+    }
+
+    impl SnapshotSource for LandingStore {
+        type Snapshot = <MemoryRepo as SnapshotSource>::Snapshot;
+        type SnapshotError = <MemoryRepo as SnapshotSource>::SnapshotError;
+
+        fn snapshot_at(
+            &mut self,
+            instant: hifitime::Epoch,
+        ) -> Result<Self::Snapshot, Self::SnapshotError> {
+            self.inner.snapshot_at(instant)
+        }
+    }
+
+    impl BlobStorePut for LandingStore {
+        type PutError = <MemoryRepo as BlobStorePut>::PutError;
+
+        fn put<E, T>(&mut self, item: T) -> Result<Inline<Handle<E>>, Self::PutError>
+        where
+            E: BlobEncoding + 'static,
+            T: IntoBlob<E>,
+            Handle<E>: InlineEncoding,
+        {
+            let handle = self.inner.put(item)?;
+            let mut trace = self.trace.lock().unwrap();
+            trace.put.push(handle.raw);
+            trace.unflushed.insert(handle.raw);
+            Ok(handle)
+        }
+    }
+
+    impl CollectionStore for LandingStore {
+        type InsertError = <MemoryRepo as CollectionStore>::InsertError;
+
+        fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
+            self.inner.insert(record)
+        }
+    }
+
+    impl CapabilityProofStore for LandingStore {
+        type InsertError = <MemoryRepo as CapabilityProofStore>::InsertError;
+
+        fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
+            self.inner.insert_proof(proof)
+        }
+    }
+
+    impl WantStore for LandingStore {
+        type WantError = <MemoryRepo as WantStore>::WantError;
+
+        fn want(&mut self, request: WantRequest) -> Result<(), Self::WantError> {
+            self.inner.want(request)
+        }
+    }
+
+    impl StorageFlush for LandingStore {
+        type Error = std::io::Error;
+
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            let mut trace = self.trace.lock().unwrap();
+            if trace.fail_flush {
+                return Err(std::io::Error::other("test durability barrier failed"));
+            }
+            let landed = std::mem::take(&mut trace.unflushed);
+            trace.durable.extend(landed);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FetchTrace {
+        calls: Vec<RawHash>,
+        active: usize,
+        peak: usize,
+        cancelled: usize,
+    }
+
+    struct FetchGuard {
+        trace: Arc<Mutex<FetchTrace>>,
+        completed: bool,
+    }
+
+    impl Drop for FetchGuard {
+        fn drop(&mut self) {
+            let mut trace = self.trace.lock().unwrap();
+            trace.active -= 1;
+            trace.cancelled += usize::from(!self.completed);
+        }
+    }
+
+    struct ControlledFetches {
+        answers: BTreeMap<RawHash, Bytes>,
+        blocked: BTreeSet<RawHash>,
+        delay: Mutex<Duration>,
+        released: Arc<AtomicBool>,
+        wake: Arc<tokio::sync::Notify>,
+        trace: Arc<Mutex<FetchTrace>>,
+    }
+
+    impl ControlledFetches {
+        fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+            self.wake.notify_waiters();
+        }
+    }
+
+    impl crate::host::NetCapability for ControlledFetches {
+        fn fetch_blob(&self, hash: RawHash) -> futures::future::BoxFuture<'static, Option<Bytes>> {
+            let answer = self.answers.get(&hash).cloned();
+            let blocked = self.blocked.contains(&hash);
+            let delay = *self.delay.lock().unwrap();
+            let released = self.released.clone();
+            let wake = self.wake.clone();
+            let trace = self.trace.clone();
+            Box::pin(async move {
+                {
+                    let mut trace = trace.lock().unwrap();
+                    trace.calls.push(hash);
+                    trace.active += 1;
+                    trace.peak = trace.peak.max(trace.active);
+                }
+                let mut guard = FetchGuard {
+                    trace,
+                    completed: false,
+                };
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                if blocked {
+                    let notified = wake.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if !released.load(Ordering::SeqCst) {
+                        notified.await;
+                    }
+                }
+                guard.completed = true;
+                answer
+            })
+        }
+    }
+
+    fn controlled_peer(
+        store: MemoryRepo,
+        answers: BTreeMap<RawHash, Bytes>,
+        blocked: BTreeSet<RawHash>,
+    ) -> (
+        Peer<LandingStore>,
+        Arc<ControlledFetches>,
+        Arc<Mutex<LandingTrace>>,
+    ) {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let (sender, receiver, wiring) =
+            crate::host::wire(crate::identity::iroh_secret(&key).public().into());
+        let fetches = Arc::new(ControlledFetches {
+            answers,
+            blocked,
+            delay: Mutex::new(Duration::ZERO),
+            released: Arc::new(AtomicBool::new(false)),
+            wake: Arc::new(tokio::sync::Notify::new()),
+            trace: Arc::new(Mutex::new(FetchTrace::default())),
+        });
+        wiring.install_test_capability(fetches.clone());
+        let landings = Arc::new(Mutex::new(LandingTrace::default()));
+        let peer = Peer::with_wiring(
+            LandingStore {
+                inner: store,
+                trace: landings.clone(),
+            },
+            crate::inventory::ReconcileQos::default(),
+            sender,
+            receiver,
+        );
+        (peer, fetches, landings)
+    }
+
+    struct ExactFixture {
+        peer: Peer<LandingStore>,
+        fetches: Arc<ControlledFetches>,
+        landings: Arc<Mutex<LandingTrace>>,
+        roots: Vec<RawHash>,
+        collection: CollectionHandle,
+    }
+
+    fn exact_fixture(count: usize, blocked: usize) -> ExactFixture {
+        let mut source = MemoryRepo::default();
+        let answers: BTreeMap<_, _> = (0..count)
+            .map(|ordinal| {
+                let bytes = Bytes::from_source(format!("exact root {ordinal}").into_bytes());
+                (
+                    source.put::<UnknownBlob, _>(bytes.clone()).unwrap().raw,
+                    bytes,
+                )
+            })
+            .collect();
+        let roots: Vec<_> = answers.keys().copied().collect();
+        let mut store = MemoryRepo::default();
+        let collection = put(&mut store, b"exact-window descriptor".to_vec());
+        let metadata = put(&mut store, Vec::new());
+        for &root in &roots {
+            raw_commit(&mut store, collection, root, metadata);
+        }
+        let (peer, fetches, landings) = controlled_peer(
+            store,
+            answers,
+            roots.iter().take(blocked).copied().collect(),
+        );
+        ExactFixture {
+            peer,
+            fetches,
+            landings,
+            roots,
+            collection: Inline::new(collection),
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_window_lands_ready_roots_before_the_first_stalled_root() {
+        let mut fixture = exact_fixture(9, 1);
+        let mut reconciler =
+            Reconciler::new().with_replication(ReplicationMode::Shallow, [fixture.collection]);
+        let mut tick = Box::pin(reconciler.tick(&mut fixture.peer));
+        assert!(futures::poll!(tick.as_mut()).is_pending());
+        assert_eq!(
+            fixture.landings.lock().unwrap().durable,
+            fixture.roots[1..].iter().copied().collect(),
+            "the first pending network request must not hold later durable answers",
+        );
+        {
+            let trace = fixture.fetches.trace.lock().unwrap();
+            assert_eq!(trace.calls.len(), fixture.roots.len());
+            assert_eq!(trace.active, 1);
+            assert!(trace.peak <= EXACT_FETCHES_IN_FLIGHT);
+        }
+        fixture.fetches.release();
+        let stats = tick.await;
+        assert_eq!(stats.replication.acquired, fixture.roots.len());
+        assert_eq!(stats.replication.pending, 0);
+        assert_eq!(stats.replication.speculative_attempted, 0);
+        assert_eq!(fixture.fetches.trace.lock().unwrap().cancelled, 0);
+        assert!(reconciler.states.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropping_exact_tick_cancels_only_its_bounded_started_window() {
+        let mut fixture = exact_fixture(9, 9);
+        let mut reconciler =
+            Reconciler::new().with_replication(ReplicationMode::Shallow, [fixture.collection]);
+        let mut tick = Box::pin(reconciler.tick(&mut fixture.peer));
+        assert!(futures::poll!(tick.as_mut()).is_pending());
+        assert_eq!(
+            fixture.fetches.trace.lock().unwrap().active,
+            EXACT_FETCHES_IN_FLIGHT
+        );
+        drop(tick);
+        {
+            let trace = fixture.fetches.trace.lock().unwrap();
+            assert_eq!(trace.calls, fixture.roots[..EXACT_FETCHES_IN_FLIGHT]);
+            assert_eq!(trace.peak, EXACT_FETCHES_IN_FLIGHT);
+            assert_eq!(trace.active, 0);
+            assert_eq!(trace.cancelled, EXACT_FETCHES_IN_FLIGHT);
+        }
+        assert!(fixture.landings.lock().unwrap().put.is_empty());
+        for (index, handle) in fixture.roots.iter().enumerate() {
+            let state = &reconciler.states[handle];
+            assert_eq!(state.first_root_attempt, index >= EXACT_FETCHES_IN_FLIGHT);
+            assert!(
+                state.last_attempt.is_none(),
+                "external drop is not a reported miss"
+            );
+        }
+        assert_eq!(reconciler.next_service, ServiceTurn::Roots);
+        fixture.fetches.release();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            fixture.fetches.trace.lock().unwrap().calls.len(),
+            EXACT_FETCHES_IN_FLIGHT
+        );
+        assert!(fixture.landings.lock().unwrap().put.is_empty());
+    }
+
+    #[cfg(feature = "sim")]
+    #[tokio::test(start_paused = true)]
+    async fn exact_window_refills_share_one_deadline_instead_of_renewing_it() {
+        let mut fixture = exact_fixture(9, 0);
+        *fixture.fetches.delay.lock().unwrap() = Duration::from_secs(10);
+        let mut reconciler = Reconciler::new()
+            .with_replication(ReplicationMode::Shallow, [fixture.collection])
+            .with_fetch_budget(Duration::from_secs(25));
+        let started = tokio::time::Instant::now();
+        let stats = reconciler.tick(&mut fixture.peer).await;
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started),
+            Duration::from_secs(25)
+        );
+        assert_eq!(stats.replication.acquired, 8);
+        assert_eq!(stats.replication.pending, 1);
+        let trace = fixture.fetches.trace.lock().unwrap();
+        assert_eq!(trace.calls.len(), 9);
+        assert_eq!(trace.peak, EXACT_FETCHES_IN_FLIGHT);
+        assert_eq!(trace.active, 0);
+        assert_eq!(trace.cancelled, 1);
+        assert_eq!(fixture.landings.lock().unwrap().durable.len(), 8);
+    }
+
+    #[cfg(feature = "sim")]
+    #[tokio::test(start_paused = true)]
+    async fn exact_window_deadline_preserves_the_unstarted_tail_and_next_service() {
+        let mut fixture = exact_fixture(9, 9);
+        let mut reconciler =
+            Reconciler::with_backoff(Duration::from_secs(5), Duration::from_secs(20))
+                .with_replication(ReplicationMode::Full, [fixture.collection])
+                .with_fetch_budget(Duration::from_secs(30));
+        reconciler.next_service = ServiceTurn::Roots;
+        let started = tokio::time::Instant::now();
+        let stats = reconciler.tick(&mut fixture.peer).await;
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started),
+            Duration::from_secs(30)
+        );
+        assert_eq!(stats.replication.acquired, 0);
+        assert_eq!(stats.replication.pending, fixture.roots.len());
+        assert_eq!(stats.replication.speculative_attempted, 0);
+        assert_eq!(reconciler.next_service, ServiceTurn::Scan);
+        assert_eq!(
+            reconciler.root_round.after,
+            Some(fixture.roots[EXACT_FETCHES_IN_FLIGHT - 1])
+        );
+        assert_eq!(
+            fixture.fetches.trace.lock().unwrap().cancelled,
+            EXACT_FETCHES_IN_FLIGHT
+        );
+        assert_eq!(fixture.fetches.trace.lock().unwrap().active, 0);
+        for (index, handle) in fixture.roots.iter().enumerate() {
+            let state = &reconciler.states[handle];
+            assert_eq!(state.first_root_attempt, index >= EXACT_FETCHES_IN_FLIGHT);
+            assert_eq!(
+                state.last_attempt.is_some(),
+                index < EXACT_FETCHES_IN_FLIGHT
+            );
+            assert_eq!(
+                state.backoff,
+                if index < EXACT_FETCHES_IN_FLIGHT {
+                    Duration::from_secs(5)
+                } else {
+                    Duration::ZERO
+                }
+            );
+        }
+        assert_eq!(
+            fixture.fetches.trace.lock().unwrap().calls,
+            fixture.roots[..EXACT_FETCHES_IN_FLIGHT]
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_window_zero_budget_preserves_every_unstarted_priority() {
+        let mut fixture = exact_fixture(9, 0);
+        let mut reconciler = Reconciler::new()
+            .with_replication(ReplicationMode::Shallow, [fixture.collection])
+            .with_fetch_budget(Duration::ZERO);
+        let stats = reconciler.tick(&mut fixture.peer).await;
+        assert_eq!(stats.replication.pending, fixture.roots.len());
+        assert!(fixture.fetches.trace.lock().unwrap().calls.is_empty());
+        assert!(fixture.landings.lock().unwrap().put.is_empty());
+        for handle in fixture.roots {
+            assert!(reconciler.states[&handle].first_root_attempt);
+            assert!(reconciler.states[&handle].last_attempt.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_window_failed_flush_stays_pending_and_retries_without_fetching() {
+        let bytes = Bytes::from_source(b"one failed landing barrier".to_vec());
+        let mut source = MemoryRepo::default();
+        let handle = source.put::<UnknownBlob, _>(bytes.clone()).unwrap();
+        let mut store = MemoryRepo::default();
+        store.want(WantRequest::blob(handle)).unwrap();
+        let (mut peer, fetches, landings) = controlled_peer(
+            store,
+            BTreeMap::from([(handle.raw, bytes)]),
+            BTreeSet::new(),
+        );
+        landings.lock().unwrap().fail_flush = true;
+        let mut reconciler = Reconciler::new();
+        let first = reconciler.tick(&mut peer).await;
+        assert_eq!(first.attempted, 1);
+        assert_eq!(first.fulfilled, 0);
+        assert_eq!(first.pending, 1);
+        assert!(landings.lock().unwrap().durable.is_empty());
+        assert!(!reconciler.durable_blob_answers.contains(&handle.raw));
+        landings.lock().unwrap().fail_flush = false;
+        let second = reconciler.tick(&mut peer).await;
+        assert_eq!(second.pending, 0);
+        assert_eq!(second.attempted, 0);
+        assert_eq!(fetches.trace.lock().unwrap().calls, [handle.raw]);
+        assert_eq!(landings.lock().unwrap().put, [handle.raw]);
+        assert!(landings.lock().unwrap().durable.contains(&handle.raw));
+    }
+
+    #[tokio::test]
+    async fn exact_window_does_not_parallelize_or_expand_speculative_scans() {
+        let mut store = MemoryRepo::default();
+        let descriptor = put(&mut store, b"scan descriptor".to_vec());
+        let metadata = put(&mut store, Vec::new());
+        let words: Vec<_> = (0..40)
+            .flat_map(|word| {
+                *blake3::hash(format!("absent scan word {word}").as_bytes()).as_bytes()
+            })
+            .collect();
+        let data = put(&mut store, words);
+        raw_commit(&mut store, descriptor, data, metadata);
+        let (mut peer, fetches, _) = controlled_peer(store, BTreeMap::new(), BTreeSet::new());
+        let mut reconciler =
+            Reconciler::new().with_replication(ReplicationMode::Full, [Inline::new(descriptor)]);
+        let stats = reconciler.tick(&mut peer).await;
+        assert_eq!(
+            stats.replication.speculative_attempted,
+            RECONCILE_SPECULATIVE_FETCHES_PER_TICK
+        );
+        assert_eq!(
+            stats.replication.speculative_misses,
+            RECONCILE_SPECULATIVE_FETCHES_PER_TICK
+        );
+        let trace = fetches.trace.lock().unwrap();
+        assert_eq!(trace.calls.len(), RECONCILE_SPECULATIVE_FETCHES_PER_TICK);
+        assert_eq!(trace.peak, 1);
+        assert_eq!(trace.active, 0);
+        assert_eq!(peer.snapshot().unwrap().wants().unwrap().count(), 0);
     }
 
     #[tokio::test]

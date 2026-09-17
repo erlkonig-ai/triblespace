@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Experiment with four concurrent exact-handle hydration fetches within one
+  service class's existing deadline. Completed bodies land and flush serially;
+  a stalled first request no longer blocks ready later answers. Owned lazy Peer
+  fetch futures start only when polled. Cancellation, retry accounting and
+  frozen rounds remain bounded; recursive speculation stays serial and keeps
+  its existing allowance. This is not a measured live-throughput claim.
+
 - Keep an already-started recursive hydration startup window across later
   root arrivals, so its next word does not repeatedly lose priority. Enforce
   its 128-word allowance even for partial local-word quanta; completion or
