@@ -848,6 +848,9 @@ impl SelectionScans {
         let scan = &mut self.lanes[self.last_lane].1;
         scan.sources.remove(key);
         scan.cursor = None;
+        if scan.recent_active == Some(*key) {
+            scan.recent_active = None;
+        }
         self.active = None;
     }
 }
@@ -866,9 +869,11 @@ struct FullScan {
     pass: Option<PATCH<64, IdentitySchema, SourceProgress>>,
     cursor: Option<ScanCursor>,
     after: Option<[u8; 64]>,
-    /// A bounded startup window, newest arrivals first. Every entry also gets
-    /// ordinary rounds, so sustained arrivals cannot starve older sources.
+    /// Choose bounded startup windows newest-first. Once started, a window
+    /// keeps its remaining allowance across yields and subsequent arrivals.
+    /// Every entry also gets ordinary rounds, independently of this priority.
     recent: Vec<[u8; 64]>,
+    recent_active: Option<[u8; 64]>,
     /// Deliberately retained across ticks, including a fetch timeout.
     prefer_recent: bool,
 }
@@ -958,10 +963,18 @@ impl FullScan {
         if self.sources.is_empty() {
             return ScanStep::Idle;
         }
-        let recent = self.prefer_recent && !self.recent.is_empty();
+        let recent =
+            self.prefer_recent && (self.recent_active.is_some() || !self.recent.is_empty());
         self.prefer_recent = !self.prefer_recent;
         let key = if recent {
-            self.recent.pop().expect("nonempty recent lane")
+            match self.recent_active {
+                Some(key) => key,
+                None => {
+                    let key = self.recent.pop().expect("nonempty recent lane");
+                    self.recent_active = Some(key);
+                    key
+                }
+            }
         } else {
             let pass = self.pass.get_or_insert_with(|| self.sources.clone());
             let next = match self.after {
@@ -977,9 +990,13 @@ impl FullScan {
             key
         };
         let Some(progress) = self.sources.get(&key) else {
+            if recent {
+                self.recent_active = None;
+            }
             return ScanStep::Skip;
         };
         if recent && progress.startup_left == 0 {
+            self.recent_active = None;
             return ScanStep::Skip;
         }
         if progress
@@ -1002,7 +1019,17 @@ impl FullScan {
         let cursor = self.cursor.as_mut().expect("active scan");
         cursor.offset += 32;
         cursor.words += 1;
-        if cursor.words >= SCAN_WORDS_PER_QUANTUM {
+        // The per-source startup allowance also bounds a partial local-word
+        // quantum; this does not change collection or global request limits.
+        if cursor.words >= SCAN_WORDS_PER_QUANTUM
+            || (cursor.recent
+                && cursor.words
+                    >= self
+                        .sources
+                        .get(&cursor.key)
+                        .expect("positive source")
+                        .startup_left)
+        {
             self.yield_source();
         }
     }
@@ -1011,19 +1038,23 @@ impl FullScan {
         let Some(cursor) = self.cursor.filter(|cursor| cursor.words != 0) else {
             return;
         };
+        debug_assert!(!cursor.recent || self.recent_active == Some(cursor.key));
         self.cursor = None;
         let mut progress = *self.sources.get(&cursor.key).expect("positive source");
         progress.offset = cursor.offset;
         progress.startup_left = progress.startup_left.saturating_sub(cursor.words);
         self.sources
             .replace(&PatchEntry::with_value(&cursor.key, progress));
-        if cursor.recent && progress.startup_left != 0 {
-            self.recent.push(cursor.key);
+        if progress.startup_left == 0 && self.recent_active == Some(cursor.key) {
+            self.recent_active = None;
         }
     }
 
     fn finish_source(&mut self, initial: Duration, max: Duration) {
         let cursor = self.cursor.take().expect("active scan");
+        if self.recent_active == Some(cursor.key) {
+            self.recent_active = None;
+        }
         let mut progress = *self.sources.get(&cursor.key).expect("positive source");
         progress.offset = 0;
         progress.startup_left = 0;
@@ -1570,6 +1601,172 @@ mod tests {
             "a name in word eight must not wait behind the old root backlog",
         );
         assert_eq!(regular_turns, 8);
+    }
+
+    #[test]
+    fn full_scan_started_window_survives_arrivals_and_expires_without_taking_regular_turns() {
+        let mut scan = FullScan::default();
+        let old = scheduled_handle(1, 0);
+        for ordinal in 0..4_096 {
+            scan.observe(old, scheduled_handle(2, ordinal));
+        }
+        scan.recent.clear();
+        // Freeze an old round which does not contain the incoming message.
+        let first = next_ready(&mut scan);
+        assert_eq!(first.handles(), (old, scheduled_handle(2, 0)));
+        scan.advance();
+        scan.yield_source();
+
+        let message = scheduled_handle(250, 0);
+        scan.observe(message, message);
+        let first_word = next_ready(&mut scan);
+        assert!(first_word.recent);
+        assert_eq!(first_word.handles(), (message, message));
+        assert_eq!(first_word.offset, 0);
+        scan.advance();
+        scan.yield_source();
+
+        let mut regular_turns = 0;
+        for word in 1..SCAN_STARTUP_WORDS {
+            // A fresh positive source arrives between every startup grant.
+            // It must not push the already-started message's next word behind
+            // thousands of ordinary sources or a growing newest-first stack.
+            let arrival = scheduled_handle(251, word as u32);
+            scan.observe(arrival, arrival);
+            let regular = next_ready(&mut scan);
+            assert!(!regular.recent);
+            assert_eq!(regular.handles(), (old, scheduled_handle(2, word as u32)));
+            scan.advance();
+            scan.yield_source();
+            regular_turns += 1;
+
+            let resumed = next_ready(&mut scan);
+            assert!(resumed.recent);
+            assert_eq!(resumed.handles(), (message, message));
+            assert_eq!(resumed.offset, word * 32);
+            scan.advance();
+            scan.yield_source();
+        }
+        assert_eq!(regular_turns, SCAN_STARTUP_WORDS - 1);
+        assert_eq!(
+            scan.sources
+                .get(&scan_key(message, message))
+                .unwrap()
+                .startup_left,
+            0
+        );
+
+        // Exhausting the existing allowance releases the startup position;
+        // the next grant goes to the newest still-unstarted arrival.
+        let regular = next_ready(&mut scan);
+        assert!(!regular.recent);
+        assert_eq!(
+            regular.handles(),
+            (old, scheduled_handle(2, SCAN_STARTUP_WORDS as u32))
+        );
+        scan.advance();
+        scan.yield_source();
+        let next = next_ready(&mut scan);
+        let newest = scheduled_handle(251, (SCAN_STARTUP_WORDS - 1) as u32);
+        assert!(next.recent);
+        assert_eq!(next.handles(), (newest, newest));
+        assert_eq!(next.offset, 0);
+    }
+
+    #[test]
+    fn full_scan_started_window_caps_partial_resident_quanta_at_128_words() {
+        let mut scan = FullScan::default();
+        let old = scheduled_handle(1, 0);
+        for ordinal in 0..4 {
+            scan.observe(old, scheduled_handle(2, ordinal));
+        }
+        scan.recent.clear();
+        next_ready(&mut scan);
+        scan.advance();
+        scan.yield_source();
+        let source = scheduled_handle(3, 0);
+        scan.observe(source, source);
+        let mut offset = 0;
+        for words in [
+            1,
+            SCAN_WORDS_PER_QUANTUM,
+            SCAN_STARTUP_WORDS - SCAN_WORDS_PER_QUANTUM - 1,
+        ] {
+            let recent = next_ready(&mut scan);
+            assert!(recent.recent);
+            assert_eq!(recent.handles(), (source, source));
+            assert_eq!(recent.offset, offset);
+            for _ in 0..words {
+                scan.advance();
+                offset += 32;
+            }
+            if words == 1 {
+                // A speculative request interrupts the first quantum. Later
+                // resident/filtered words must use only the remaining budget.
+                scan.yield_source();
+            }
+            assert!(scan.cursor.is_none());
+            if offset < SCAN_STARTUP_WORDS * 32 {
+                let regular = next_ready(&mut scan);
+                assert!(!regular.recent);
+                assert_eq!(regular.handles().0, old);
+                scan.advance();
+                scan.yield_source();
+            }
+        }
+        assert_eq!(offset, SCAN_STARTUP_WORDS * 32);
+        assert_eq!(
+            scan.sources
+                .get(&scan_key(source, source))
+                .unwrap()
+                .startup_left,
+            0
+        );
+    }
+
+    #[test]
+    fn selection_scan_started_window_releases_on_eof_or_unavailable_source() {
+        for unavailable in [false, true] {
+            let selector = CollectionRecordSelector::Collection(Inline::new([1; 32]));
+            let mut scans = SelectionScans::new([selector]);
+            let old = scheduled_handle(1, 0);
+            let source = scheduled_handle(2, 0);
+            let arrival = scheduled_handle(3, 0);
+            scans.lanes[0].1.observe(old, old);
+            scans.lanes[0].1.observe(source, source);
+            // Ordinary work starts the round, then the second source starts
+            // a recent window. Both lanes share that source's exact offset.
+            assert_eq!(next_selection(&mut scans).handles(), (old, old));
+            scans.advance();
+            scans.yield_source();
+            let recent = next_selection(&mut scans);
+            assert!(recent.recent);
+            assert_eq!(recent.handles(), (source, source));
+            scans.advance();
+            scans.yield_source();
+            scans.lanes[0].1.observe(arrival, arrival);
+
+            let regular = next_selection(&mut scans);
+            assert!(!regular.recent);
+            assert_eq!(regular.handles(), (source, source));
+            assert_eq!(regular.offset, 32);
+            if unavailable {
+                scans.forget_source(&regular.key);
+                assert!(scans.lanes[0].1.sources.get(&regular.key).is_none());
+            } else {
+                // A 32-byte source reaches EOF during its ordinary turn.
+                // Completion there must also release its recent reservation.
+                scans.finish_source(Duration::from_secs(60), Duration::from_secs(60));
+                let progress = scans.lanes[0].1.sources.get(&regular.key).unwrap();
+                assert_eq!(progress.startup_left, 0);
+                assert_eq!(progress.offset, 0);
+                assert!(progress.last_scan.is_some());
+            }
+            let next = next_selection(&mut scans);
+            assert!(next.recent);
+            assert_eq!(next.handles(), (arrival, arrival));
+            assert_eq!(next.offset, 0);
+        }
     }
 
     #[test]

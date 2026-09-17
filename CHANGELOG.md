@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Keep an already-started recursive hydration startup window across later
+  root arrivals, so its next word does not repeatedly lose priority. Enforce
+  its 128-word allowance even for partial local-word quanta; completion or
+  local unavailability releases it. Ordinary turns, collection rotation and
+  global fetch limits are unchanged.
+
 - Rotate hydration service between eligible WANT, new direct-root, ordinary
   direct-root, and recursive-scan classes. First-attempt priority does not renew
   on re-observation; frozen ordinary rounds preserve old-demand service under
