@@ -134,6 +134,9 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(nightly)', 'cfg(kani)'] }
 # immutable external-buffer registration so mmap-backed storage can be exposed
 # to Metal without an upload when a caller has a suitable layout and lifetime.
 [patch.crates-io]
+# Section freezes are immutable views, not durability barriers. Keep the same
+# AnyBytes lineage at every build root; dependency patch tables are ignored.
+anybytes = { git = "https://github.com/triblespace/anybytes.git", rev = "066c32a7cfcc470a6750c849499c1e88a0e0c50a" }
 netwatch = { git = "https://github.com/erlkonig-ai/net-tools.git", rev = "10ab7b328809103be74f6ca24258249715fae52b" }
 cubecl-runtime = { git = "https://github.com/erlkonig-ai/cubecl.git", rev = "75635270eed8cfacd1cd0f171f2f6b45a5e65b9c" }
 cubecl-wgpu = { git = "https://github.com/erlkonig-ai/cubecl.git", rev = "75635270eed8cfacd1cd0f171f2f6b45a5e65b9c" }

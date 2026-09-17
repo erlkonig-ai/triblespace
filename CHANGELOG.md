@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Pin source builds to AnyBytes `066c32a7`, which freezes temporary sections
+  without synchronously flushing each one. Archive construction and resident
+  view attachment keep identical bytes; explicit `ByteArea::persist` owns the
+  durability barrier. Collection identities, encodings, and authority are
+  unchanged; downstream build roots must carry the same Cargo patch.
+
 - Interpret AUTH permissions from immutable capability-definition blobs. Proof
   edges carry only a definition handle, delegate key, and prefix signature;
   invocation and onward delegation are independent action sets, with attenuation
