@@ -146,6 +146,10 @@ The crate also ships with these blob encodings:
 
 - `UTF8String` for arbitrarily long UTF‑8 strings.
 - `RawBytes` for opaque file-backed byte payloads.
+- `EntityIdSetBlob` for a grow-only set of opaque entity IDs: strictly sorted,
+  unique, nonnil 16-byte IDs with no header or padding; empty is zero bytes.
+  `EntityIdSet` retains typed views of a cover's members and performs membership
+  and ordered set iteration without serializing a temporary union.
 - `SimpleArchive` which stores a raw sequence of tribles.
 - `SuccinctArchiveBlob` which stores the portable deterministic Ring/wavelet
   data and EOF metadata for a SuccinctArchive set. It has no native query
@@ -220,6 +224,34 @@ whose facts tag the encoding entity with `metadata::KIND_INLINE_ENCODING` or
 `metadata::KIND_BLOB_ENCODING` and may attach a `metadata::name` and
 `metadata::description` (UTF8String handles). Persist the description blobs
 alongside the metadata tribles if you want the text to remain readable.
+
+### Grow-only entity-ID sets
+
+`blob::encodings::entity_id_set::encode` sorts and deduplicates authored `Id`
+values into the portable `EntityIdSetBlob` format. `join` merges two sorted
+members into their canonical union. It checks fixed-width framing while doing
+new producer work, without running a second canonical audit of its inputs.
+`validate_element` is the explicit linear check for framing, nonnil IDs, strict
+ordering, and uniqueness.
+
+Ordinary `TryFromBlob` attachment retains an AnyBytes `View<[[u8; 16]]>` and
+checks only that the length contains complete rows. `TryFromCover` retains one
+such view per resident member. No read rebuilds, hashes, or copies a physical
+set. `contains` binary-searches each member; `iter` merges and deduplicates sorted
+member streams lazily. Exact `len` is constant-time for one member, but overlaps
+require enumerating the logical union. These operations rely on the canonical
+ordering contract; they are not replacement audits. Typed iteration never
+constructs an invalid nil Rust `Id` from unaudited bytes.
+
+The IDs are opaque set elements, not blob handles or edges that cause dependency
+acquisition. This encoding describes an authored grow-only set, not a derivation
+of the entities it names. It differs from a flat typed array, whose order and
+duplicates are meaningful, and from `LatestBlob`, whose join also tracks
+retired states. Generic root-publication support is separate from this encoding
+and its logical-cover view; no `SimpleArchive` reinterpretation is involved.
+
+The encoding ID is `0BF639287590CFC9CE0E2B83D9FBC1E3`, minted with the installed
+`trible genid` on 2026-09-15. There is no new pile record kind or mapping ID.
 
 ## Choosing the right encoding
 

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add a compact grow-only entity-ID set encoding with canonical authored union,
+  structural shared-byte attachment, and lazy logical cover iteration. Audits
+  stay explicit, and entity IDs do not become blob dependencies. The encoding
+  ID `0BF639287590CFC9CE0E2B83D9FBC1E3` was minted with `trible genid` on
+  2026-09-15; generic root publication remains a separate API change.
+
 - Separate maintained-index attachment from canonical audits and query
   preparation. Typed views retain persisted backing and check safe framing;
   they do not reconstruct canonical data or serialize temporary cover unions.

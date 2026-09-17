@@ -17,6 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add `EntityIdSetBlob`, a canonical grow-only set of opaque, nonnil 16-byte
+  entity IDs, and its shard-backed `EntityIdSet` cover view. Authored encoding
+  sorts/deduplicates; collection joins use sorted union. Ordinary attachment
+  checks framing without re-auditing, copying, or hashing content; membership
+  and lazy merged iteration use the persisted rows. Explicit canonical audits
+  remain separate. The encoding ID `0BF639287590CFC9CE0E2B83D9FBC1E3` was minted
+  with installed `trible genid` on 2026-09-15. No generic root-publication API,
+  record format, event derivation, or implicit blob dependency is added.
+
 - Add opt-in raw Succinct build/merge wavelet backends, sharing the canonical
   CPU domain/rotation preparation and portable writer. Backend output uses the
   existing prefix/tail checks and explicit little-endian serialization; there
