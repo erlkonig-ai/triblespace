@@ -57,6 +57,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Retain a started full-scan source's finite startup window across new positive
+  arrivals and request/deadline yields. Its second word no longer falls behind
+  a newer source on every turn. Ordinary rounds and collection rotation remain
+  independent; EOF, unavailability or the existing 128-word allowance releases
+  the startup position. Partial local-word quanta respect the remaining startup
+  allowance. No request quota, deadline or concurrency is increased.
+
 - Do not hold an already verified blob provider behind a stalled sibling
   `PROVIDER_GET`. Exact-H discovery progressively schedules bounded provider
   attempts as hints arrive, sharing three slots with directory queries and

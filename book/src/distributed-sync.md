@@ -627,10 +627,14 @@ burst cannot all receive immediate service, sustained arrivals can outgrow the
 recent lane, and a slow request may consume its class's whole fetch deadline.
 Recent work never takes away the reserved regular turns, including revisits;
 it only accelerates a finite prefix of newly observed positive sources. The
-recent lane is newest-first and retains a source for at most 128 aligned words;
-regular quanta inspect at most 64 words. For a finite burst of A newcomers, the
-last first-service bound is O(A times the startup window), not constant time or
-round-robin service within that burst.
+recent lane chooses an unstarted source newest-first, then retains its remaining
+startup allowance across yields: later arrivals cannot displace that source's
+second word. The existing allowance is at most 128 aligned words, including any
+progress made in ordinary turns. EOF or local unavailability releases the
+startup position too. This continuation does not hold a collection lane or take
+an ordinary turn; regular quanta still inspect at most 64 words. For a finite
+burst of A newcomers, the last first-service bound is O(A times the startup
+window), not constant time or round-robin service within that burst.
 
 Full scans grant sustained quanta round-robin between the explicitly selected
 collections, each retaining the regular/recent walk above. A large selection's
