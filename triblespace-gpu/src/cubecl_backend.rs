@@ -154,6 +154,15 @@ pub struct CubeClWaveletFreeze<R: Runtime> {
     client: ComputeClient<R>,
 }
 
+impl<R: Runtime> Default for CubeClWaveletFreeze<R>
+where
+    R::Device: Default,
+{
+    fn default() -> Self {
+        Self::new(&R::Device::default())
+    }
+}
+
 impl<R: Runtime> CubeClWaveletFreeze<R> {
     /// Use `device` for all subsequent freeze passes.
     pub fn new(device: &R::Device) -> Self {

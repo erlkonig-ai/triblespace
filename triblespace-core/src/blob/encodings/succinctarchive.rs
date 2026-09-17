@@ -227,6 +227,32 @@ impl SuccinctArchiveBlob {
     pub fn build_from_simple_archive(
         source: &Blob<SimpleArchive>,
     ) -> Result<Blob<Self>, SuccinctArchiveRawBuildError> {
+        Self::build_from_simple_archive_using(source, portable::encode_canonical_eav_u32)
+    }
+
+    /// Builds the same canonical raw artifact with accelerated wavelet packing.
+    ///
+    /// Domain construction, sorting and section layout remain on the CPU. The
+    /// backend contract and validation are those of [`WaveletMatrixFreezeBackend`].
+    /// A returned backend error is a construction failure; callers may retry the
+    /// canonical CPU builder. Allocation failure, panic and OOM are not caught.
+    pub fn build_from_simple_archive_with_backend<B>(
+        source: &Blob<SimpleArchive>,
+        backend: &B,
+    ) -> Result<Blob<Self>, SuccinctArchiveRawBuildError>
+    where
+        B: WaveletMatrixFreezeBackend,
+        B::Error: std::fmt::Display,
+    {
+        Self::build_from_simple_archive_using(source, |domain, rows| {
+            portable::encode_canonical_eav_u32_with_backend(domain, rows, backend)
+        })
+    }
+
+    fn build_from_simple_archive_using(
+        source: &Blob<SimpleArchive>,
+        encode: impl FnOnce(&[RawInline], Vec<[u32; 3]>) -> Result<Vec<u8>, portable::PortableError>,
+    ) -> Result<Blob<Self>, SuccinctArchiveRawBuildError> {
         let bytes = source.bytes.as_ref();
         if bytes.len() % 64 != 0 {
             return Err(UnarchiveError::BadArchive.into());
@@ -301,7 +327,7 @@ impl SuccinctArchiveBlob {
             ]);
         }
 
-        let portable = portable::encode_canonical_eav_u32(&domain, eav_rows)
+        let portable = encode(&domain, eav_rows)
             .map_err(|error| SuccinctArchiveRawBuildError::Construction(error.to_string()))?;
         Ok(Blob::new(Bytes::from(portable)))
     }
@@ -321,6 +347,31 @@ impl SuccinctArchiveBlob {
     /// `u32` codes and row offsets; an external-memory spool remains necessary
     /// for a single merged artifact exceeding those limits.
     pub fn merge(segments: &[Blob<Self>]) -> Result<Blob<Self>, SuccinctArchiveRawMergeError> {
+        Self::merge_using(segments, portable::encode_canonical_eav_u32)
+    }
+
+    /// Computes the canonical raw union with accelerated wavelet packing.
+    ///
+    /// Inputs receive exactly the same structural and canonical validation as
+    /// [`Self::merge`]. Only the final wavelet packing uses the supplied backend;
+    /// no native query arena or Rank9 accelerator is constructed.
+    pub fn merge_with_backend<B>(
+        segments: &[Blob<Self>],
+        backend: &B,
+    ) -> Result<Blob<Self>, SuccinctArchiveRawMergeError>
+    where
+        B: WaveletMatrixFreezeBackend,
+        B::Error: std::fmt::Display,
+    {
+        Self::merge_using(segments, |domain, rows| {
+            portable::encode_canonical_eav_u32_with_backend(domain, rows, backend)
+        })
+    }
+
+    fn merge_using(
+        segments: &[Blob<Self>],
+        encode: impl FnOnce(&[RawInline], Vec<[u32; 3]>) -> Result<Vec<u8>, portable::PortableError>,
+    ) -> Result<Blob<Self>, SuccinctArchiveRawMergeError> {
         let mut decoded = Vec::with_capacity(segments.len());
         for (index, segment) in segments.iter().enumerate() {
             let view = portable::parse(segment.bytes.as_ref()).map_err(|error| {
@@ -338,7 +389,7 @@ impl SuccinctArchiveBlob {
         }
 
         let (domain, rows) = merge_raw_eav_parts(decoded)?;
-        let bytes = portable::encode_canonical_eav_u32(&domain, rows).map_err(|error| {
+        let bytes = encode(&domain, rows).map_err(|error| {
             SuccinctArchiveRawMergeError::Construction(raw_merge_error(error.to_string()))
         })?;
         Ok(Blob::new(Bytes::from(bytes)))
@@ -1931,7 +1982,7 @@ fn remap_row(row: [usize; 3], remap: &[usize]) -> [usize; 3] {
 }
 
 /// Device-agnostic seam for accelerating the expensive wavelet-freeze phase
-/// of a structural [`SuccinctArchive`] merge.
+/// of raw [`SuccinctArchiveBlob`] construction or structural runtime merges.
 ///
 /// Core performs the domain remap and sorted k-way merge of EAV once, derives
 /// the other Ring rotations by stable counting sort, and passes each resulting
@@ -2141,6 +2192,43 @@ impl MergedWaveletOutputs for JerkyWaveletOutputs<'_> {
     }
 }
 
+fn wavelet_tail_is_zero<'a>(len: usize, mut planes: impl Iterator<Item = &'a [u64]>) -> bool {
+    let tail = len % 64;
+    if tail == 0 {
+        return true;
+    }
+    let mask = !((1u64 << tail) - 1);
+    planes.all(|plane| plane.last().is_none_or(|word| word & mask == 0))
+}
+
+fn validate_wavelet_plane_prefix(sequence: &[u32], planes: &[&[u64]]) -> Result<(), usize> {
+    let code_or = sequence.iter().copied().fold(0, |bits, code| bits | code);
+    if code_or == 0 {
+        return planes
+            .iter()
+            .position(|plane| plane.iter().any(|word| *word != 0))
+            .map_or(Ok(()), Err);
+    }
+    let highest_bit = (u32::BITS - 1 - code_or.leading_zeros()) as usize;
+    let informative_depth = planes.len() - 1 - highest_bit;
+    if let Some(depth) = planes[..informative_depth]
+        .iter()
+        .position(|plane| plane.iter().any(|word| *word != 0))
+    {
+        return Err(depth);
+    }
+    let plane = planes[informative_depth];
+    if sequence.iter().enumerate().all(|(position, code)| {
+        let expected = (code >> highest_bit) & 1;
+        let actual = (plane[position / 64] >> (position % 64)) & 1;
+        actual == u64::from(expected)
+    }) {
+        Ok(())
+    } else {
+        Err(informative_depth)
+    }
+}
+
 /// Preallocated packed wavelet output with the same section order as Jerky's
 /// `WaveletMatrixBuilder`, but without constructing a temporary CPU index.
 struct PackedWaveletBuilder<'area> {
@@ -2174,45 +2262,12 @@ impl<'area> PackedWaveletBuilder<'area> {
     }
 
     fn tail_is_zero(&self) -> bool {
-        let tail = self.len % 64;
-        if tail == 0 {
-            return true;
-        }
-        let mask = !((1u64 << tail) - 1);
-        self.planes
-            .iter()
-            .all(|plane| plane.last().is_none_or(|word| word & mask == 0))
+        wavelet_tail_is_zero(self.len, self.planes.iter().map(|plane| &**plane))
     }
 
     fn validate_plane_prefix(&self, sequence: &[u32]) -> Result<(), usize> {
-        let code_or = sequence.iter().copied().fold(0, |bits, code| bits | code);
-        if code_or == 0 {
-            return self
-                .planes
-                .iter()
-                .position(|plane| plane.iter().any(|word| *word != 0))
-                .map_or(Ok(()), Err);
-        }
-
-        let highest_bit = (u32::BITS - 1 - code_or.leading_zeros()) as usize;
-        let informative_depth = self.planes.len() - 1 - highest_bit;
-        if let Some(depth) = self.planes[..informative_depth]
-            .iter()
-            .position(|plane| plane.iter().any(|word| *word != 0))
-        {
-            return Err(depth);
-        }
-
-        let plane = &self.planes[informative_depth];
-        if sequence.iter().enumerate().all(|(position, code)| {
-            let expected = (code >> highest_bit) & 1;
-            let actual = (plane[position / 64] >> (position % 64)) & 1;
-            actual == u64::from(expected)
-        }) {
-            Ok(())
-        } else {
-            Err(informative_depth)
-        }
+        let planes: Vec<&[u64]> = self.planes.iter().map(|plane| &**plane).collect();
+        validate_wavelet_plane_prefix(sequence, &planes)
     }
 
     fn freeze_with_rank9_indexes(
@@ -3751,11 +3806,16 @@ mod tests {
                 .collect();
             let source: Blob<SimpleArchive> = (&set).to_blob();
             let raw = SuccinctArchiveBlob::build_from_simple_archive(&source).unwrap();
+            let backend_raw = SuccinctArchiveBlob::build_from_simple_archive_with_backend(
+                &source, &ReferencePackedFreeze,
+            ).unwrap();
             let ordered: SuccinctArchive<OrderedUniverse> = (&set).into();
             let compressed: SuccinctArchive<CompressedUniverse> = (&set).into();
 
             prop_assert_eq!(raw.bytes.as_ref(), ordered.bytes.as_ref());
             prop_assert_eq!(raw.bytes.as_ref(), compressed.bytes.as_ref());
+            prop_assert_eq!(backend_raw.bytes.as_ref(), raw.bytes.as_ref());
+            prop_assert_eq!(backend_raw.get_handle(), raw.get_handle());
             let attached: SuccinctArchive<OrderedUniverse> = raw.try_from_blob().unwrap();
             prop_assert_eq!(TribleSet::from(&attached), set);
         }
@@ -3796,8 +3856,10 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             let forward = SuccinctArchiveBlob::merge(&segments).unwrap();
+            let backend_forward = SuccinctArchiveBlob::merge_with_backend(&segments, &ReferencePackedFreeze).unwrap();
             segments.reverse();
             let reverse = SuccinctArchiveBlob::merge(&segments).unwrap();
+            let backend_reverse = SuccinctArchiveBlob::merge_with_backend(&segments, &ReferencePackedFreeze).unwrap();
             let union = sets.into_iter().fold(TribleSet::new(), |left, right| left + right);
             let union_source: Blob<SimpleArchive> = (&union).to_blob();
             let expected = SuccinctArchiveBlob::build_from_simple_archive(&union_source).unwrap();
@@ -3805,6 +3867,9 @@ mod tests {
             prop_assert_eq!(forward.bytes.as_ref(), expected.bytes.as_ref());
             prop_assert_eq!(reverse.bytes.as_ref(), expected.bytes.as_ref());
             prop_assert_eq!(forward.get_handle(), expected.get_handle());
+            prop_assert_eq!(backend_forward.bytes.as_ref(), expected.bytes.as_ref());
+            prop_assert_eq!(backend_reverse.bytes.as_ref(), expected.bytes.as_ref());
+            prop_assert_eq!(backend_forward.get_handle(), expected.get_handle());
             let attached: SuccinctArchive<OrderedUniverse> = forward.try_from_blob().unwrap();
             prop_assert_eq!(TribleSet::from(&attached), union);
         }
@@ -4355,6 +4420,103 @@ mod tests {
         assert_eq!(merged.entity_count, rebuilt.entity_count);
         assert_eq!(merged.attribute_count, rebuilt.attribute_count);
         assert_eq!(merged.value_count, rebuilt.value_count);
+    }
+
+    #[test]
+    fn raw_backend_handles_word_block_and_alphabet_boundaries() {
+        struct Counted(std::cell::Cell<usize>);
+        impl WaveletMatrixFreezeBackend for Counted {
+            type Error = std::convert::Infallible;
+            fn freeze_rotation(
+                &self,
+                rotation: SuccinctRotation,
+                alphabet: usize,
+                sequence: &[u32],
+                planes: &mut [&mut [u64]],
+            ) -> Result<(), Self::Error> {
+                self.0.set(self.0.get() + 1);
+                ReferencePackedFreeze.freeze_rotation(rotation, alphabet, sequence, planes)
+            }
+        }
+        for rows in [
+            0u32, 1, 2, 5, 6, 7, 14, 15, 16, 30, 31, 32, 33, 62, 63, 64, 65, 126, 127, 128, 129,
+            254, 255, 256, 257,
+        ] {
+            let mut set = TribleSet::new();
+            for row in 0..rows {
+                let mut data = [0u8; 64];
+                data[0] = 1;
+                data[16] = 2;
+                data[32] = 3;
+                data[60..].copy_from_slice(&row.to_be_bytes());
+                set.insert(&Trible { data });
+            }
+            // One entity, one attribute, N distinct values: D = N + 2.
+            let source: Blob<SimpleArchive> = (&set).to_blob();
+            let cpu = SuccinctArchiveBlob::build_from_simple_archive(&source).unwrap();
+            let backend = Counted(std::cell::Cell::new(0));
+            let raw =
+                SuccinctArchiveBlob::build_from_simple_archive_with_backend(&source, &backend)
+                    .unwrap();
+            assert_eq!(raw.bytes.as_ref(), cpu.bytes.as_ref(), "rows={rows}");
+            assert_eq!(raw.get_handle(), cpu.get_handle());
+            assert_eq!(backend.0.get(), if rows == 0 { 0 } else { 6 });
+            let joined =
+                SuccinctArchiveBlob::merge_with_backend(&[raw.clone(), raw.clone()], &backend)
+                    .unwrap();
+            assert_eq!(joined.get_handle(), cpu.get_handle());
+            assert_eq!(backend.0.get(), if rows == 0 { 0 } else { 12 });
+            let accelerated =
+                SuccinctArchive::<OrderedUniverse>::build_accelerated_root(raw.clone()).unwrap();
+            let attached =
+                SuccinctArchive::<OrderedUniverse>::from_accelerated_parts(raw, accelerated)
+                    .unwrap();
+            assert_eq!(TribleSet::from(&attached), set);
+        }
+    }
+
+    #[test]
+    fn raw_backend_failure_and_noncanonical_planes_are_rejected() {
+        struct Broken(u8);
+        impl WaveletMatrixFreezeBackend for Broken {
+            type Error = &'static str;
+            fn freeze_rotation(
+                &self,
+                rotation: SuccinctRotation,
+                alphabet: usize,
+                sequence: &[u32],
+                planes: &mut [&mut [u64]],
+            ) -> Result<(), Self::Error> {
+                ReferencePackedFreeze
+                    .freeze_rotation(rotation, alphabet, sequence, planes)
+                    .unwrap();
+                match self.0 {
+                    0 => return Err("device failure after writing planes"),
+                    1 => planes[0][0] ^= 1,
+                    _ => *planes[0].last_mut().unwrap() |= 1u64 << 63,
+                }
+                Ok(())
+            }
+        }
+        let set = entity! { knights::name: "A" }.into_facts();
+        let source: Blob<SimpleArchive> = (&set).to_blob();
+        let cpu = SuccinctArchiveBlob::build_from_simple_archive(&source).unwrap();
+        for broken in [Broken(0), Broken(1), Broken(2)] {
+            assert!(
+                SuccinctArchiveBlob::build_from_simple_archive_with_backend(&source, &broken)
+                    .is_err()
+            );
+            assert!(
+                SuccinctArchiveBlob::merge_with_backend(std::slice::from_ref(&cpu), &broken)
+                    .is_err()
+            );
+        }
+        let malformed = Blob::<SimpleArchive>::new(Bytes::from(vec![0; 1]));
+        assert!(SuccinctArchiveBlob::build_from_simple_archive_with_backend(
+            &malformed,
+            &ReferencePackedFreeze
+        )
+        .is_err());
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]

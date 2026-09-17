@@ -42,8 +42,10 @@
 use std::fmt;
 use std::ops::Range;
 
-use crate::id::{Id, id_from_value};
+use crate::id::{id_from_value, Id};
 use crate::inline::RawInline;
+
+use super::{SuccinctRotation, WaveletMatrixFreezeBackend};
 
 const COUNT_FOOTER_LEN: usize = 16;
 const RAW_INLINE_LEN: usize = 32;
@@ -583,14 +585,8 @@ fn canonical_bytes_from_eav(
         )
     });
 
-    let [
-        eav_changes,
-        vea_changes,
-        ave_changes,
-        vae_changes,
-        eva_changes,
-        aev_changes,
-    ] = rotation_changes;
+    let [eav_changes, vea_changes, ave_changes, vae_changes, eva_changes, aev_changes] =
+        rotation_changes;
     let changes = [
         eav_changes,
         eva_changes,
@@ -908,7 +904,11 @@ const fn words_for_bits(bits: usize) -> usize {
 pub(crate) const fn alphabet_width(domain_len: usize) -> usize {
     let max_code = domain_len.saturating_sub(1);
     let width = usize::BITS as usize - max_code.leading_zeros() as usize;
-    if width == 0 { 1 } else { width }
+    if width == 0 {
+        1
+    } else {
+        width
+    }
 }
 
 /// Writes one portable payload and validates its raw-layout invariants.
@@ -974,7 +974,98 @@ pub(crate) fn encode(parts: PortableParts<'_>) -> Result<Vec<u8>, PortableError>
 /// stay `u32`; the caller must reject wider domains before entering here.
 pub(super) fn encode_canonical_eav_u32(
     domain: &[RawInline],
+    rows: Vec<[u32; 3]>,
+) -> Result<Vec<u8>, PortableError> {
+    encode_canonical_eav_u32_using(
+        domain,
+        rows,
+        &mut |bytes, layout, rotation, sequence, scratch| {
+            write_wavelet(
+                bytes,
+                &layout.wavelets[rotation.index()],
+                layout.alphabet_width,
+                layout.row_words,
+                sequence,
+                scratch,
+            );
+            Ok(())
+        },
+    )
+}
+
+pub(super) fn encode_canonical_eav_u32_with_backend<B>(
+    domain: &[RawInline],
+    rows: Vec<[u32; 3]>,
+    backend: &B,
+) -> Result<Vec<u8>, PortableError>
+where
+    B: WaveletMatrixFreezeBackend,
+    B::Error: fmt::Display,
+{
+    // Vec<u8> promises no u64 alignment. Use one reusable rotation-sized
+    // allocation and serialize its words explicitly, without pointer casts or
+    // host-endian assumptions. The other five output rotations stay in place.
+    let mut packed = Vec::<u64>::new();
+    encode_canonical_eav_u32_using(
+        domain,
+        rows,
+        &mut |bytes, layout, rotation, sequence, scratch| {
+            if layout.row_words == 0 {
+                return Ok(());
+            }
+            let range = &layout.wavelets[rotation.index()];
+            packed.resize(range.len() / WORD_LEN, 0);
+            packed.fill(0);
+            let rotation = match rotation {
+                Rotation::Eav => SuccinctRotation::Eav,
+                Rotation::Vea => SuccinctRotation::Vea,
+                Rotation::Ave => SuccinctRotation::Ave,
+                Rotation::Vae => SuccinctRotation::Vae,
+                Rotation::Eva => SuccinctRotation::Eva,
+                Rotation::Aev => SuccinctRotation::Aev,
+            };
+            {
+                let mut planes: Vec<_> = packed.chunks_mut(layout.row_words).collect();
+                backend
+                    .freeze_rotation(rotation, layout.domain_len, sequence, &mut planes)
+                    .map_err(|error| {
+                        PortableError::new(format!("wavelet backend for {rotation:?}: {error}"))
+                    })?;
+            }
+            // Validate our owned output, not slice references a backend could
+            // have shortened or replaced while filling it.
+            let planes: Vec<&[u64]> = packed.chunks(layout.row_words).collect();
+            super::validate_wavelet_plane_prefix(sequence, &planes).map_err(|depth| {
+                PortableError::new(format!(
+                    "wavelet backend wrote invalid {rotation:?} prefix plane {depth}"
+                ))
+            })?;
+            if !super::wavelet_tail_is_zero(sequence.len(), planes.iter().copied()) {
+                return Err(PortableError::new(format!(
+                    "wavelet backend wrote nonzero {rotation:?} padding"
+                )));
+            }
+            for (destination, word) in bytes[range.clone()].chunks_exact_mut(WORD_LEN).zip(&packed)
+            {
+                destination.copy_from_slice(&word.to_le_bytes());
+            }
+            sequence.clear();
+            scratch.clear();
+            Ok(())
+        },
+    )
+}
+
+fn encode_canonical_eav_u32_using(
+    domain: &[RawInline],
     mut rows: Vec<[u32; 3]>,
+    freeze: &mut impl FnMut(
+        &mut [u8],
+        &Layout,
+        Rotation,
+        &mut Vec<u32>,
+        &mut Vec<u32>,
+    ) -> Result<(), PortableError>,
 ) -> Result<Vec<u8>, PortableError> {
     if domain.len() > u32::MAX as usize {
         return Err(PortableError::new(format!(
@@ -1055,7 +1146,8 @@ pub(super) fn encode_canonical_eav_u32(
         Rotation::Eav,
         &mut sequence,
         &mut sequence_scratch,
-    );
+        freeze,
+    )?;
     stable_sort_rows_by_component(&mut rows, &mut row_scratch, &mut radix_counts, 2)?;
     write_canonical_rotation(
         &mut bytes,
@@ -1067,7 +1159,8 @@ pub(super) fn encode_canonical_eav_u32(
         Rotation::Vea,
         &mut sequence,
         &mut sequence_scratch,
-    );
+        freeze,
+    )?;
     stable_sort_rows_by_component(&mut rows, &mut row_scratch, &mut radix_counts, 1)?;
     write_canonical_rotation(
         &mut bytes,
@@ -1079,7 +1172,8 @@ pub(super) fn encode_canonical_eav_u32(
         Rotation::Ave,
         &mut sequence,
         &mut sequence_scratch,
-    );
+        freeze,
+    )?;
     stable_sort_rows_by_component(&mut rows, &mut row_scratch, &mut radix_counts, 2)?;
     write_canonical_rotation(
         &mut bytes,
@@ -1091,7 +1185,8 @@ pub(super) fn encode_canonical_eav_u32(
         Rotation::Vae,
         &mut sequence,
         &mut sequence_scratch,
-    );
+        freeze,
+    )?;
     stable_sort_rows_by_component(&mut rows, &mut row_scratch, &mut radix_counts, 0)?;
     write_canonical_rotation(
         &mut bytes,
@@ -1103,7 +1198,8 @@ pub(super) fn encode_canonical_eav_u32(
         Rotation::Eva,
         &mut sequence,
         &mut sequence_scratch,
-    );
+        freeze,
+    )?;
     stable_sort_rows_by_component(&mut rows, &mut row_scratch, &mut radix_counts, 1)?;
     write_canonical_rotation(
         &mut bytes,
@@ -1115,7 +1211,8 @@ pub(super) fn encode_canonical_eav_u32(
         Rotation::Aev,
         &mut sequence,
         &mut sequence_scratch,
-    );
+        freeze,
+    )?;
 
     // The construction above owns every bit in the gapless layout. Keep a
     // debug-only structural oracle close to the writer without charging the
@@ -1173,7 +1270,14 @@ fn write_canonical_rotation(
     rotation: Rotation,
     sequence: &mut Vec<u32>,
     sequence_scratch: &mut Vec<u32>,
-) {
+    freeze: &mut impl FnMut(
+        &mut [u8],
+        &Layout,
+        Rotation,
+        &mut Vec<u32>,
+        &mut Vec<u32>,
+    ) -> Result<(), PortableError>,
+) -> Result<(), PortableError> {
     let [first_component, middle_component, last_component] = components;
     let mut previous_first = None;
     let mut previous_pair = None;
@@ -1210,14 +1314,7 @@ fn write_canonical_rotation(
         }
     }
 
-    write_wavelet(
-        bytes,
-        &layout.wavelets[rotation.index()],
-        layout.alphabet_width,
-        layout.row_words,
-        sequence,
-        sequence_scratch,
-    );
+    freeze(bytes, layout, rotation, sequence, sequence_scratch)
 }
 
 fn write_wavelet(

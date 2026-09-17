@@ -25,15 +25,21 @@ cubecl = { version = "=0.10.0", default-features = false, features = ["std"], op
 itertools = { version = "0.14.0", optional = true }
 jerky = { version = "0.9.0", git = "https://github.com/triblespace/jerky.git", rev = "fc0be54529f6bc0a6c5e7312cd649de21a7f3316", default-features = false, features = ["gpu"], optional = true }
 triblespace-core = { version = "0.47.0", path = "../triblespace-core", default-features = false }
+tracing = "0.1"
 
 [dev-dependencies]
 ed25519-dalek = "2.1.0"
+futures = "0.3"
 rayon = "1.7"
 triblespace-core = { version = "0.47.0", path = "../triblespace-core", default-features = false, features = ["parallel"] }
 
 [[example]]
 name = "archive_merge"
 required-features = ["wgpu"]
+
+[[example]]
+name = "raw_succinct_cuda"
+required-features = ["cuda"]
 
 [[test]]
 name = "batch_confirm_parity"

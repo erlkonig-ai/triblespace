@@ -124,9 +124,32 @@ from retaining that policy surface.
 
 The exact Succinct collection lattice is instead blob-native and does not call
 a branch-index merge. `SuccinctArchiveBlob` owns the canonical derivation from
-`SimpleArchive` and consumes and produces canonical collection blobs directly;
-the low-level freeze backend remains available for accelerating that mapping
-without adding another lifecycle facade.
+`SimpleArchive` and consumes and produces canonical collection blobs directly.
+Its `build_from_simple_archive_with_backend` and `merge_with_backend` entry
+points share the CPU writer's domain preparation and portable layout. Only the
+six wavelet matrices use the backend. One reusable `u64` plane allocation is
+serialized explicitly into the little-endian raw bytes; no native query arena
+or Rank9 accelerator is built as a bridge.
+
+`BackendSuccinctMapping<B>` selects this execution route through the existing
+`ensure_with`/`maintain_with` APIs. Its descriptor is the ordinary canonical
+mapping descriptor, not a GPU-specific collection. Both DERIVE and horizontal
+target MERGE use the backend; Rank9 remains CPU work. Returned backend errors
+or invalid prefix/tail output retry the canonical CPU operation, with a warning.
+Descriptor binding is device-free: a per-binding `OnceLock` initializes the
+backend only for an actual map or join. A no-op maintenance pass therefore does
+not initialize CUDA; `new(backend)` can reuse an explicitly supplied backend.
+Device initialization, allocation failures, runtime panics and OOM are not
+caught, and no partial failed output is published.
+
+The CLI's optional `succinct-cuda` build feature enables
+`--succinct-backend cuda` for `pile collection maintain` and `maintain-all`.
+The command default stays `cpu`, even in a CUDA-capable build. This flag is not
+a reservation: a Spark launcher must reserve its device/shared-memory workload
+before each bounded maintenance pass and release while idle. Do not compete
+with a model job or hold a device for a watcher's entire lifetime. There is no
+internal scheduler, memory-budget oracle, global backend registry or persistent
+rollup lifecycle here.
 
 Repository builds patch CubeCL 0.10's runtime and WGPU crates to the project's
 fork, which exposes immutable external-buffer registration for mmap-to-Metal
@@ -151,12 +174,35 @@ cargo test -p triblespace-gpu --features wgpu --test batch_confirm_parity
 cargo run --release -p triblespace-gpu --features wgpu --example archive_merge -- 100000
 ```
 
-WGPU has runtime parity coverage on Apple Metal. CUDA exposes the same CubeCL
-kernels and is compile-checked, but remains experimental until the parity gate
-has also run on CUDA hardware.
+WGPU has historical runtime parity coverage on Apple Metal. The new direct-raw
+CUDA path must pass its explicit hardware gate before a deployment selects it
+by default. CPU-only plumbing and hardware tests are separate; the hardware
+gate refuses to turn a CUDA error into a successful CPU fallback:
+
+```sh
+cargo test -p triblespace-gpu --no-default-features --test raw_mapping
+cargo test -p triblespace-gpu --no-default-features --features cuda --test raw_mapping -- --ignored --test-threads=1
+cargo run --release -p triblespace-gpu --no-default-features --features cuda --example raw_succinct_cuda -- 65536 3
+```
+
+The counted collection test proves that actual signed target MERGEs, not just
+DERIVEs, use the backend, that binding does not construct a backend, and that
+repeat maintenance neither initializes nor executes a backend. Raw
+parity covers padding/block/alphabet boundaries, overlap, duplicates, input
+order, varied entity/attribute codes, and exact canonical bytes and hashes.
+The benchmark includes raw domain
+and rotation preparation, canonical input checks and hashing; it alternates CPU
+and GPU order and deliberately caps rows and repetitions.
+
+For `N` rows and `W` wavelet levels, the backend's main device buffers require
+roughly `8N + W*N/8` bytes per rotation, plus block scratch and readback, on top
+of the CPU domain/rows/sort scratch and final output. Allocator-retained scratch
+can increase this. Rotations run sequentially; model and construction memory
+must be budgeted together on a unified-memory Spark. Synchronization errors are
+recoverable, but this estimate is not an OOM guarantee.
 
 `archive_merge` is deliberately a low-level backend benchmark. It compares the
 same canonical structural merge with CPU and device wavelet freezing; it is
-not an exact-collection benchmark or a production admission policy. Use it to
-measure a prospective backend on its deployment hardware before building the
-separate direct-raw collection adapter.
+not an exact-collection benchmark or a production admission policy. The
+`raw_succinct_cuda` example measures the direct-raw path used by the companion
+mapping instead.

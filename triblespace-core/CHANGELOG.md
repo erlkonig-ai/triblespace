@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add opt-in raw Succinct build/merge wavelet backends, sharing the canonical
+  CPU domain/rotation preparation and portable writer. Backend output uses the
+  existing prefix/tail checks and explicit little-endian serialization; there
+  is no native query arena, new encoding identity, or device dependency in Core.
+
 - Add witness-bound MERGE/DERIVE endorsements over actual native input-record
   fingerprints as well as payload handles. Their new dense tags are 6/7 with
   288/224-byte bodies; both native frames occupy 512 bytes. New semantic kinds,
