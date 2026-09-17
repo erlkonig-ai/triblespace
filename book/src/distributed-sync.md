@@ -719,6 +719,24 @@ descriptors, later arrivals, unavailable providers, and exhausted scan quanta
 can still delay a descriptor child; no special blob authorization or
 publisher priority is implied.
 
+Within a known SimpleArchive source, full hydration examines the value half of
+each 64-byte row before its entity/attribute half: byte offsets
+`32, 0, 96, 64, ...`. Both halves remain candidate bearer capabilities; the
+ordering is not a schema-based reference filter. Unlike scanning the complete
+value column first, this postpones each entity/attribute word by only one source
+word, regardless of archive size. Native descriptor/COMMIT-metadata roles and
+resident collection representation facts supply optional hints. A DERIVE input
+uses its source collection's representation, not its target's. No collection
+attachment, support/admission traversal or descriptor acquisition is needed;
+missing, ambiguous or misframed evidence leaves physical order intact.
+
+The source pins its order when its first cursor is selected, even if that word
+has not been attempted. A late hint changes only the next pass after EOF, never
+the current offset or startup allowance. Unknown descendants keep the generic
+aligned walk. Collection/class scheduling, deadlines and speculative limits are
+unchanged: this can improve which candidate gets the first source service, but
+cannot bound the preceding backlog or the exact-H request's latency.
+
 A producer can maintain an ordinary `ReferenceSummaryBlob` collection to make
 negative recursive probes cheap. Its mapping scans the complete source blob
 closure and projects referenced handles through the same opaque `KDF(H)` used

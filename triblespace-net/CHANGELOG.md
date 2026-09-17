@@ -39,6 +39,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Full hydration swaps adjacent aligned words in known SimpleArchive sources
+  (`32, 0, 96, 64, ...`) so each value gets the first look without withholding
+  entity/attribute bearer capabilities. Native role and resident descriptor
+  hints are optional and frozen for the current pass, including an unattempted
+  cursor; uncertain/misframed sources retain physical order. No authority,
+  request budget, concurrency or wall-clock completion guarantee changes.
+
 - Preserve the existing `Blob<UnknownBlob>` and its cached handle through
   interactive, descriptor and bulk landing, avoiding reconstruction and a
   second content hash. Bind capability responses to the requested handle;

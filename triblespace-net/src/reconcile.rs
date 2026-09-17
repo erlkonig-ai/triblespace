@@ -10,13 +10,14 @@
 //! Optional shallow/full hydration is local acquisition policy over selected
 //! structural records, not semantic admission or another Peer protocol.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 use anybytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::encodings::UnknownBlob;
+use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::locator::blob_locator;
 use triblespace_core::collection::reference_summary::{ReferenceSummaryBlob, ReferenceSummaryView};
 use triblespace_core::collection::{
@@ -24,11 +25,13 @@ use triblespace_core::collection::{
     CollectionSnapshotExt, CollectionStore,
 };
 use triblespace_core::inline::Inline;
+use triblespace_core::metadata::MetaDescribe;
 use triblespace_core::patch::{Entry as PatchEntry, IdentitySchema, PATCH};
 use triblespace_core::repo::{
     BlobChildren, BlobStore, BlobStoreGet, CapabilityProofStore, SnapshotSource, StorageFlush,
     StoreRead, WantRead, WantRequest, WantStore,
 };
+use triblespace_core::trible::TribleSet;
 
 use crate::peer::Peer;
 use crate::protocol::RawHash;
@@ -478,7 +481,10 @@ impl Reconciler {
                 }
             }
         };
-        let roots: BTreeSet<_> = selected_roots.iter().flatten().copied().collect();
+        let roots: BTreeSet<_> = selected_roots
+            .iter()
+            .flat_map(|roots| roots.keys().copied())
+            .collect();
         stats.replication.roots = roots.len();
         let exact_handles: BTreeSet<_> = wanted_blob_handles.union(&roots).copied().collect();
         let visible_blobs: HashSet<_> = exact_handles
@@ -701,7 +707,7 @@ impl Reconciler {
                 };
             let Some(chunk) = bytes
                 .as_ref()
-                .get(cursor.offset..)
+                .get(cursor.physical_offset(bytes.len())..)
                 .and_then(|tail| tail.get(..32))
             else {
                 self.scan
@@ -835,7 +841,11 @@ impl SelectionScans {
         }
     }
 
-    fn observe_roots(&mut self, selected_roots: &[BTreeSet<RawHash>], resident: &HashSet<RawHash>) {
+    fn observe_roots(
+        &mut self,
+        selected_roots: &[BTreeMap<RawHash, ScanOrder>],
+        resident: &HashSet<RawHash>,
+    ) {
         for ((selector, scan), roots) in self.lanes.iter_mut().zip(selected_roots) {
             // Reuse this tick's native discovery without rechecking signatures.
             // Shared roots get service in each selecting lane, while physical
@@ -938,10 +948,22 @@ struct FullScan {
 
 #[derive(Clone, Copy)]
 struct SourceProgress {
+    /// Logical bytes consumed, independent of this pass's physical word order.
     offset: usize,
+    hint: ScanOrder,
+    /// Frozen when the first cursor is selected, even before its word is read.
+    order: Option<ScanOrder>,
     startup_left: usize,
     last_scan: Option<crate::clock::Mono>,
     backoff: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ScanOrder {
+    #[default]
+    Physical,
+    /// Examine each SimpleArchive value before its adjacent E+A word.
+    SimpleArchivePairs,
 }
 
 enum ScanStep {
@@ -955,11 +977,22 @@ enum ScanStep {
 struct ScanCursor {
     key: [u8; 64],
     offset: usize,
+    order: ScanOrder,
     words: usize,
     recent: bool,
 }
 
 impl ScanCursor {
+    fn physical_offset(self, byte_len: usize) -> usize {
+        if self.order == ScanOrder::SimpleArchivePairs && byte_len.is_multiple_of(64) {
+            // A permutation of complete word pairs, not a type-based filter.
+            // Unknown/misframed data retains every original aligned word.
+            self.offset ^ 32
+        } else {
+            self.offset
+        }
+    }
+
     fn handles(self) -> (RawHash, RawHash) {
         (
             self.key[..32].try_into().expect("root half"),
@@ -971,26 +1004,28 @@ impl ScanCursor {
 impl FullScan {
     fn observe_roots(
         &mut self,
-        roots: &BTreeSet<RawHash>,
+        roots: &BTreeMap<RawHash, ScanOrder>,
         selected: &BTreeSet<CollectionRecordSelector>,
         resident: &HashSet<RawHash>,
     ) {
         // Seed ordinary roots first: the existing recent LIFO then gives the
         // few selected descriptors their finite startup window. This changes
         // only first-observation order, never closure membership or old offsets.
-        for &root in roots {
+        for (&root, &order) in roots {
             if !selected.contains(&CollectionRecordSelector::Collection(
                 CollectionHandle::new(root),
             )) && resident.contains(&root)
             {
-                self.observe(root, root);
+                self.observe_ordered(root, order);
             }
         }
         for selector in selected {
             if let CollectionRecordSelector::Collection(collection) = selector {
                 let root = collection.raw;
-                if roots.contains(&root) && resident.contains(&root) {
-                    self.observe(root, root);
+                if let Some(&order) = roots.get(&root)
+                    && resident.contains(&root)
+                {
+                    self.observe_ordered(root, order);
                 }
             }
         }
@@ -1005,12 +1040,29 @@ impl FullScan {
                 &key,
                 SourceProgress {
                     offset: 0,
+                    hint: ScanOrder::Physical,
+                    order: None,
                     startup_left: SCAN_STARTUP_WORDS,
                     last_scan: None,
                     backoff: Duration::ZERO,
                 },
             ));
             self.recent.push(key);
+        }
+    }
+
+    fn observe_ordered(&mut self, root: RawHash, hint: ScanOrder) {
+        self.observe(root, root);
+        let mut key = [0; 64];
+        key[..32].copy_from_slice(&root);
+        key[32..].copy_from_slice(&root);
+        let mut progress = *self.sources.get(&key).expect("observed root");
+        if progress.hint != hint {
+            progress.hint = hint;
+            // A newly available descriptor can improve the NEXT pass only.
+            // In particular, do not retarget an owed zero-word cursor.
+            self.sources
+                .replace(&PatchEntry::with_value(&key, progress));
         }
     }
 
@@ -1047,7 +1099,7 @@ impl FullScan {
             self.after = Some(key);
             key
         };
-        let Some(progress) = self.sources.get(&key) else {
+        let Some(mut progress) = self.sources.get(&key).copied() else {
             if recent {
                 self.recent_active = None;
             }
@@ -1063,9 +1115,19 @@ impl FullScan {
         {
             return ScanStep::Skip;
         }
+        let order = match progress.order {
+            Some(order) => order,
+            None => {
+                progress.order = Some(progress.hint);
+                self.sources
+                    .replace(&PatchEntry::with_value(&key, progress));
+                progress.hint
+            }
+        };
         let cursor = ScanCursor {
             key,
             offset: progress.offset,
+            order,
             words: 0,
             recent,
         };
@@ -1115,6 +1177,7 @@ impl FullScan {
         }
         let mut progress = *self.sources.get(&cursor.key).expect("positive source");
         progress.offset = 0;
+        progress.order = None;
         progress.startup_left = 0;
         progress.last_scan = Some(crate::clock::mono_now());
         progress.backoff = if progress.backoff.is_zero() {
@@ -1130,15 +1193,79 @@ impl FullScan {
 fn direct_roots<R>(
     snapshot: &R,
     selectors: &BTreeSet<CollectionRecordSelector>,
-) -> Result<BTreeSet<RawHash>, R::RecordsError>
+) -> Result<BTreeMap<RawHash, ScanOrder>, R::RecordsError>
 where
-    R: CollectionRead,
+    R: CollectionRead + BlobStoreGet,
 {
-    let mut roots = BTreeSet::new();
+    let mut roots = BTreeMap::new();
+    // Ordinary callers select one collection per lane. Keep only that
+    // descriptor's optional order hints while projecting its native records.
+    // Neither missing definitions nor WRITE admission can remove a root.
+    let mut orders = None;
     for record in snapshot.select_records(selectors)? {
         // Records are trusted local evidence; foreign signatures were checked
         // at ingress. WRITE admission does not govern structural ownership.
-        roots.extend(record.blob_references().map(|handle| handle.raw));
+        let collection = record.collection();
+        let (members, inputs) = match orders {
+            Some((current, members, inputs)) if current == collection => (members, inputs),
+            _ => {
+                let descriptor =
+                    BlobStoreGet::get::<TribleSet, SimpleArchive>(snapshot, collection).ok();
+                let source = descriptor
+                    .as_ref()
+                    .and_then(|facts| {
+                        triblespace_core::collection::descriptor::source(facts)
+                            .ok()
+                            .flatten()
+                    })
+                    .and_then(|source| {
+                        BlobStoreGet::get::<TribleSet, SimpleArchive>(snapshot, source).ok()
+                    });
+                let simple_archive = SimpleArchive::id();
+                let order = |facts: Option<&TribleSet>| {
+                    if facts.and_then(|facts| {
+                        triblespace_core::collection::descriptor::representation(facts).ok()
+                    }) == Some(simple_archive)
+                    {
+                        ScanOrder::SimpleArchivePairs
+                    } else {
+                        ScanOrder::Physical
+                    }
+                };
+                let members = order(descriptor.as_ref());
+                let inputs = order(source.as_ref());
+                orders = Some((collection, members, inputs));
+                (members, inputs)
+            }
+        };
+        let mut insert = |handle: RawHash, order: ScanOrder| {
+            roots
+                .entry(handle)
+                .and_modify(|previous| {
+                    // Conflicting or unknown roles choose conservative order.
+                    if *previous != order {
+                        *previous = ScanOrder::Physical;
+                    }
+                })
+                .or_insert(order);
+        };
+        insert(collection.raw, ScanOrder::SimpleArchivePairs);
+        match record {
+            CollectionRecord::Commit(commit) => {
+                insert(commit.data().raw, members);
+                insert(commit.metadata().raw, ScanOrder::SimpleArchivePairs);
+            }
+            CollectionRecord::Merge(merge) => {
+                let (low, high) = merge.inputs();
+                for handle in [low, high, merge.result()] {
+                    insert(handle.raw, members);
+                }
+            }
+            CollectionRecord::Derive(derive) => {
+                insert(derive.input().raw, inputs);
+                insert(derive.output().raw, members);
+            }
+        }
     }
     Ok(roots)
 }
@@ -1242,13 +1369,22 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use ed25519_dalek::SigningKey;
-    use triblespace_core::blob::{BlobEncoding, IntoBlob};
+    use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+    use triblespace_core::blob::encodings::succinctarchive::SuccinctArchiveBlob;
+    use triblespace_core::blob::encodings::utf8string::UTF8String;
+    use triblespace_core::blob::{BlobEncoding, IntoBlob, TryFromBlob};
     use triblespace_core::capability::CapabilityProof;
-    use triblespace_core::collection::{CollectionCommit, CollectionDerive, CollectionMerge};
+    use triblespace_core::collection::{
+        AdmissionPolicy, CollectionCommit, CollectionDerive, CollectionMerge, CollectionPolicy,
+        CollectionStoreExt,
+    };
+    use triblespace_core::id::ExclusiveId;
     use triblespace_core::inline::encodings::hash::Handle;
     use triblespace_core::inline::{Inline, InlineEncoding};
+    use triblespace_core::macros::entity;
     use triblespace_core::repo::BlobStorePut;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
+    use triblespace_core::trible::{Trible, TribleSet};
 
     // Scheduling tokens only; no record or blob is published by these tests.
     fn scheduled_handle(class: u8, ordinal: u32) -> RawHash {
@@ -1406,6 +1542,19 @@ mod tests {
         }
     }
 
+    impl BlobStoreGet for FailingCollectionRead {
+        type GetError<E: std::error::Error + Send + Sync + 'static> = std::io::Error;
+
+        fn get<T, E>(&self, _handle: Inline<Handle<E>>) -> Result<T, Self::GetError<T::Error>>
+        where
+            E: BlobEncoding + 'static,
+            T: TryFromBlob<E>,
+            Handle<E>: InlineEncoding,
+        {
+            panic!("failed record discovery must not attempt descriptor hints")
+        }
+    }
+
     #[test]
     fn operation_observation_failure_aborts_projection() {
         let collection = Inline::new([1; 32]);
@@ -1456,7 +1605,7 @@ mod tests {
     }
 
     #[test]
-    fn hydration_roots_use_selected_structural_records_without_loading_descriptors() {
+    fn hydration_roots_use_selected_structural_records_without_requiring_descriptors() {
         let key = SigningKey::from_bytes(&[7; 32]);
         let collection = Inline::new([1; 32]);
         let other = Inline::new([9; 32]);
@@ -1505,7 +1654,10 @@ mod tests {
         let snapshot = store.snapshot().unwrap();
         let selectors = BTreeSet::from([CollectionRecordSelector::Collection(collection)]);
         assert_eq!(
-            direct_roots(&snapshot, &selectors).unwrap(),
+            direct_roots(&snapshot, &selectors)
+                .unwrap()
+                .into_keys()
+                .collect::<BTreeSet<_>>(),
             (1..=7).map(|byte| [byte; 32]).collect(),
         );
         assert!(
@@ -1543,6 +1695,244 @@ mod tests {
             }
         }
         panic!("selection did not receive service");
+    }
+
+    #[test]
+    fn full_scan_late_order_hint_preserves_owed_word_and_complete_pass() {
+        let root = scheduled_handle(30, 0);
+        let mut scan = FullScan::default();
+        scan.observe(root, root);
+        let owed = next_ready(&mut scan);
+        assert_eq!(owed.words, 0);
+        assert_eq!(owed.physical_offset(192), 0);
+        scan.observe_ordered(root, ScanOrder::SimpleArchivePairs);
+        scan.yield_source();
+        assert_eq!(next_ready(&mut scan).physical_offset(192), 0);
+
+        let mut first = Vec::new();
+        for _ in 0..6 {
+            let cursor = next_ready(&mut scan);
+            first.push(cursor.physical_offset(192));
+            scan.observe_ordered(root, ScanOrder::SimpleArchivePairs);
+            scan.advance();
+            scan.yield_source();
+        }
+        assert_eq!(first, [0, 32, 64, 96, 128, 160]);
+        assert!(next_ready(&mut scan).physical_offset(192) >= 192);
+        scan.finish_source(Duration::ZERO, Duration::ZERO);
+
+        let owed = next_ready(&mut scan);
+        assert_eq!(owed.words, 0);
+        assert_eq!(owed.physical_offset(192), 32);
+        // Losing/contradicting a hint cannot change this pass either.
+        scan.observe_ordered(root, ScanOrder::Physical);
+        let mut second = Vec::new();
+        for _ in 0..6 {
+            second.push(next_ready(&mut scan).physical_offset(192));
+            scan.advance();
+            scan.yield_source();
+        }
+        assert_eq!(second, [32, 0, 96, 64, 160, 128]);
+        assert!(next_ready(&mut scan).physical_offset(192) >= 192);
+        scan.finish_source(Duration::ZERO, Duration::ZERO);
+        assert_eq!(next_ready(&mut scan).physical_offset(192), 0);
+        assert_eq!(
+            scan.sources
+                .get(&scan_key(root, root))
+                .unwrap()
+                .startup_left,
+            0
+        );
+    }
+
+    #[test]
+    fn scan_value_priority_control_counts_first_two_quanta_with_31k_roots() {
+        const LANES: usize = 64;
+        for order in [ScanOrder::Physical, ScanOrder::SimpleArchivePairs] {
+            let mut reconciler = Reconciler::with_backoff(Duration::ZERO, Duration::ZERO)
+                .with_replication(
+                    ReplicationMode::Full,
+                    (0..LANES as u32).map(|lane| Inline::new(scheduled_handle(30, lane))),
+                );
+            let mut roots: BTreeSet<_> = (0..31_000)
+                .map(|ordinal| scheduled_handle(10, ordinal))
+                .collect();
+            let wanted: BTreeSet<_> = (0..EXACT_FETCHES_IN_FLIGHT as u32)
+                .map(|ordinal| scheduled_handle(20, ordinal))
+                .collect();
+            reconciler.observe_missing(&wanted, &roots);
+            reconciler.root_round.generation = reconciler.observation_generation;
+            reconciler.want_round.generation = reconciler.observation_generation;
+            for (lane, (_, scan)) in reconciler.scan.lanes.iter_mut().enumerate() {
+                for ordinal in 0..3 {
+                    scan.observe(
+                        scheduled_handle(30, lane as u32),
+                        scheduled_handle(40, lane as u32 * 3 + ordinal),
+                    );
+                }
+            }
+            // The fresh source is not in any already-frozen ordinary round.
+            for lane in 0..LANES {
+                let cursor = next_selection(&mut reconciler.scan);
+                assert_eq!(reconciler.scan.last_lane, lane);
+                assert!(!cursor.recent);
+                reconciler.scan.advance();
+                reconciler.scan.yield_source();
+            }
+            let fresh = scheduled_handle(250, 0);
+            reconciler.scan.lanes[LANES - 1]
+                .1
+                .observe_ordered(fresh, order);
+
+            let mut scan_turns = 0;
+            let mut speculative_words = 0;
+            let mut trace = Vec::new();
+            let mut classes = [0; 4];
+            let mut ordinary_root_attempts = 0;
+            for turn_number in 1..=48 {
+                roots.insert(scheduled_handle(9, turn_number as u32));
+                reconciler.observe_missing(&wanted, &roots);
+                let (turn, candidates) = reconciler
+                    .next_work(&wanted, &roots, crate::clock::mono_now())
+                    .expect("all four service classes remain eligible");
+                let class = (turn_number - 1) % 4;
+                assert_eq!(
+                    turn,
+                    [
+                        ServiceTurn::Wants,
+                        ServiceTurn::FreshRoots,
+                        ServiceTurn::Roots,
+                        ServiceTurn::Scan,
+                    ][class],
+                );
+                classes[class] += 1;
+                if turn != ServiceTurn::Scan {
+                    assert!(candidates.len() >= EXACT_FETCHES_IN_FLIGHT);
+                    for handle in candidates.into_iter().take(EXACT_FETCHES_IN_FLIGHT) {
+                        reconciler.begin_attempt(turn, handle);
+                        reconciler.record_unavailable(handle);
+                        if turn == ServiceTurn::Roots {
+                            assert_eq!(handle[0], 10, "the frozen old round keeps advancing");
+                            ordinary_root_attempts += 1;
+                        }
+                    }
+                    continue;
+                }
+                scan_turns += 1;
+                assert!(candidates.is_empty());
+                for _ in 0..RECONCILE_SPECULATIVE_FETCHES_PER_TICK {
+                    let cursor = next_selection(&mut reconciler.scan);
+                    speculative_words += 1;
+                    if cursor.handles() == (fresh, fresh) {
+                        trace.push((
+                            turn_number,
+                            scan_turns,
+                            speculative_words,
+                            cursor.physical_offset(320),
+                        ));
+                    }
+                    // Count the existing one-miss advance/yield path, not latency.
+                    reconciler.scan.advance();
+                    reconciler.scan.yield_source();
+                }
+                // Quota exhaustion must keep the selected but unattempted word.
+                assert_eq!(next_selection(&mut reconciler.scan).words, 0);
+                reconciler.scan.yield_source();
+            }
+            assert_eq!(classes, [12; 4]);
+            assert_eq!(ordinary_root_attempts, 12 * EXACT_FETCHES_IN_FLIGHT);
+            let physical_offsets = match order {
+                ScanOrder::Physical => [0, 32],
+                ScanOrder::SimpleArchivePairs => [32, 0],
+            };
+            assert_eq!(
+                trace,
+                [
+                    (16, 4, 64, physical_offsets[0]),
+                    (48, 12, 192, physical_offsets[1])
+                ]
+            );
+            // Byte32 moves from the second to first service; the preceding
+            // collection/class backlog and every existing budget are unchanged.
+        }
+    }
+
+    #[test]
+    fn scan_value_priority_control_keeps_started_progress_under_fresh_arrivals() {
+        const LANES: usize = 64;
+        const OLD_SOURCES: usize = 512;
+        for order in [ScanOrder::Physical, ScanOrder::SimpleArchivePairs] {
+            let mut scans = SelectionScans::new((0..LANES as u32).map(|lane| {
+                CollectionRecordSelector::Collection(Inline::new(scheduled_handle(30, lane)))
+            }));
+            for (lane, (_, scan)) in scans.lanes.iter_mut().enumerate() {
+                for ordinal in 0..OLD_SOURCES {
+                    scan.observe(
+                        scheduled_handle(30, lane as u32),
+                        scheduled_handle(40, (lane * OLD_SOURCES + ordinal) as u32),
+                    );
+                }
+            }
+            // Same fixed warm-up as the rejected FIFO experiment: the current
+            // scheduler has one active recent source with ONE startup word left.
+            for _ in 0..127 {
+                for recent in [false, true] {
+                    for lane in 0..LANES {
+                        let cursor = next_selection(&mut scans);
+                        assert_eq!(scans.last_lane, lane);
+                        assert_eq!(cursor.recent, recent);
+                        scans.advance();
+                        scans.yield_source();
+                    }
+                }
+            }
+            let fresh = scheduled_handle(250, 0);
+            scans.lanes[LANES - 1].1.observe_ordered(fresh, order);
+            let mut trace = Vec::new();
+            let mut words = 0;
+            let mut ordinary_words = [0; LANES];
+            for round in 1..=3 {
+                if round > 2 {
+                    // Arriving after the first visit cannot displace its second.
+                    scans.lanes[LANES - 1]
+                        .1
+                        .observe_ordered(scheduled_handle(251, round), order);
+                }
+                for recent in [false, true] {
+                    for lane in 0..LANES {
+                        let cursor = next_selection(&mut scans);
+                        assert_eq!(scans.last_lane, lane);
+                        assert_eq!(cursor.recent, recent);
+                        words += 1;
+                        if !recent {
+                            ordinary_words[lane] += 1;
+                            assert_eq!(cursor.handles().1[0], 40);
+                        }
+                        if cursor.handles() == (fresh, fresh) {
+                            trace.push((words, cursor.physical_offset(320)));
+                        }
+                        scans.advance();
+                        scans.yield_source();
+                    }
+                }
+            }
+            let physical_offsets = match order {
+                ScanOrder::Physical => [0, 32],
+                ScanOrder::SimpleArchivePairs => [32, 0],
+            };
+            assert_eq!(
+                trace,
+                [(256, physical_offsets[0]), (384, physical_offsets[1])]
+            );
+            assert_eq!(ordinary_words, [3; LANES]);
+            let progress = scans.lanes[LANES - 1]
+                .1
+                .sources
+                .get(&scan_key(fresh, fresh))
+                .unwrap();
+            assert_eq!(progress.offset, 64);
+            assert_eq!(progress.startup_left, SCAN_STARTUP_WORDS - 2);
+        }
     }
 
     #[test]
@@ -1895,13 +2285,17 @@ mod tests {
             .map(|root| CollectionRecordSelector::Collection(CollectionHandle::new(root)))
             .into_iter()
             .collect();
-        let mut roots = BTreeSet::from([descriptor, missing_descriptor, [255; 32]]);
+        let mut roots = BTreeMap::from([
+            (descriptor, ScanOrder::SimpleArchivePairs),
+            (missing_descriptor, ScanOrder::SimpleArchivePairs),
+            ([255; 32], ScanOrder::Physical),
+        ]);
         for ordinal in 0_u32..4_096 {
             let mut root = [0; 32];
             root[..4].copy_from_slice(&ordinal.to_be_bytes());
-            roots.insert(root);
+            roots.insert(root, ScanOrder::Physical);
         }
-        let mut resident: HashSet<_> = roots.iter().copied().collect();
+        let mut resident: HashSet<_> = roots.keys().copied().collect();
         resident.remove(&missing_descriptor);
         resident.insert(unrelated_descriptor);
         let mut scan = FullScan::default();
@@ -1920,14 +2314,17 @@ mod tests {
             scan.observe_roots(&roots, &selected, &resident);
             let cursor = next_ready(&mut scan);
             if cursor.handles().0 == descriptor {
-                descriptor_words.push(cursor.offset / 32);
+                descriptor_words.push(cursor.physical_offset(128 * 64) / 32);
             } else {
                 regular_turns += 1;
             }
             scan.advance();
             scan.yield_source();
         }
-        assert_eq!(descriptor_words, (0..32).collect::<Vec<_>>());
+        assert_eq!(
+            descriptor_words,
+            (0..32).map(|word| word ^ 1).collect::<Vec<_>>()
+        );
         assert!(
             descriptor_words.contains(&27),
             "the model name sits in word 28"
@@ -2059,6 +2456,270 @@ mod tests {
                 Inline::new(metadata),
             )))
             .unwrap();
+    }
+
+    fn scan_archive_fixture() -> Blob<SimpleArchive> {
+        let mut facts = TribleSet::new();
+        for row in 0..3 {
+            let mut raw = [0; 64];
+            for (half, role) in ["entity and attribute", "value"].into_iter().enumerate() {
+                // BOTH halves are actual hashes of synthetic blob bytes. A
+                // valid handle in E+A must survive the conservative fallback.
+                let body = Blob::<UnknownBlob>::new(Bytes::from_source(
+                    format!("scan fixture {row} {role}").into_bytes(),
+                ));
+                raw[half * 32..(half + 1) * 32].copy_from_slice(&body.get_handle().raw);
+            }
+            facts.insert(&Trible::force_raw(raw).expect("fixture E and A are non-nil"));
+        }
+        facts.to_blob()
+    }
+
+    async fn trace_root_scan(
+        mut store: MemoryRepo,
+        descriptor: RawHash,
+        data: RawHash,
+    ) -> Vec<RawHash> {
+        let metadata = put(&mut store, Vec::new());
+        raw_commit(&mut store, descriptor, data, metadata);
+        let mut peer = local_peer(store);
+        let mut reconciler =
+            Reconciler::with_backoff(Duration::from_secs(60), Duration::from_secs(60))
+                .with_replication(ReplicationMode::Full, [Inline::new(descriptor)]);
+        let mut seen = Vec::new();
+        let stats = reconciler
+            .tick_with_reference_filter(&mut peer, |root, word| {
+                if root == data {
+                    seen.push(word);
+                }
+                // Exercise real byte selection without a network request or
+                // synthetic missing-handle frontier; record order only here.
+                Some(false)
+            })
+            .await;
+        assert_eq!(stats.replication.pending, 0);
+        assert_eq!(stats.replication.speculative_attempted, 0);
+        assert_eq!(peer.snapshot().unwrap().wants().unwrap().count(), 0);
+        seen
+    }
+
+    #[tokio::test]
+    async fn full_scan_known_simple_archive_prioritizes_first_value_without_omitting_words() {
+        let mut store = MemoryRepo::default();
+        let owner = SigningKey::from_bytes(&[9; 32]).verifying_key();
+        let collection = store
+            .collection(
+                "value-priority fixture",
+                // The fixture COMMIT/reader use key7, with no collection
+                // authority. A representation hint does not decide admission.
+                CollectionPolicy::new(
+                    AdmissionPolicy::direct(owner),
+                    AdmissionPolicy::direct(owner),
+                ),
+            )
+            .unwrap();
+        let archive = scan_archive_fixture();
+        let physical: Vec<RawHash> = archive
+            .bytes
+            .chunks_exact(32)
+            .map(|word| word.try_into().unwrap())
+            .collect();
+        let data = store.put::<SimpleArchive, _>(archive).unwrap().raw;
+        let seen = trace_root_scan(store, collection.handle().raw, data).await;
+        assert_eq!(seen.len(), physical.len());
+        assert_eq!(
+            seen.iter().copied().collect::<BTreeSet<_>>(),
+            physical.iter().copied().collect::<BTreeSet<_>>(),
+            "ordering never omits the E+A words, even when they are handles",
+        );
+        let expected: Vec<_> = physical
+            .chunks_exact(2)
+            .flat_map(|pair| [pair[1], pair[0]])
+            .collect();
+        // Byte32 is first, but byte0 is only one source word later. A large
+        // archive must not defer E+A capabilities until all values are read.
+        assert_eq!(seen, expected);
+    }
+
+    #[tokio::test]
+    async fn full_scan_absent_or_ambiguous_descriptor_keeps_physical_data_order() {
+        let mut store = MemoryRepo::default();
+        let collection = store
+            .collection(
+                "optional descriptor fixture",
+                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+            )
+            .unwrap();
+        let mut descriptor: TribleSet = store.snapshot().unwrap().get(collection.handle()).unwrap();
+        let archive = scan_archive_fixture();
+        let physical: Vec<RawHash> = archive
+            .bytes
+            .chunks_exact(32)
+            .map(|word| word.try_into().unwrap())
+            .collect();
+        let data = store.put::<SimpleArchive, _>(archive).unwrap();
+        let metadata = put(&mut store, Vec::new());
+        raw_commit(&mut store, collection.handle().raw, data.raw, metadata);
+        store.blobs.keep([data.transmute(), Inline::new(metadata)]);
+        let snapshot = store.snapshot().unwrap();
+        assert!(snapshot.get::<TribleSet, _>(collection.handle()).is_err());
+        let selectors = BTreeSet::from([CollectionRecordSelector::Collection(collection.handle())]);
+        let roots = direct_roots(&snapshot, &selectors).unwrap();
+        assert_eq!(
+            roots.len(),
+            3,
+            "a missing descriptor removes no physical root"
+        );
+        assert_eq!(roots[&data.raw], ScanOrder::Physical);
+        assert_eq!(
+            roots[&collection.handle().raw],
+            ScanOrder::SimpleArchivePairs
+        );
+        let mut scan = FullScan::default();
+        scan.observe_ordered(data.raw, roots[&data.raw]);
+        for offset in (0..192).step_by(32) {
+            assert_eq!(next_ready(&mut scan).physical_offset(192), offset);
+            scan.advance();
+            scan.yield_source();
+        }
+        assert_eq!(
+            store.put::<SimpleArchive, _>(descriptor.clone()).unwrap(),
+            collection.handle()
+        );
+        let arrived = direct_roots(&store.snapshot().unwrap(), &selectors).unwrap();
+        assert_eq!(arrived[&data.raw], ScanOrder::SimpleArchivePairs);
+        scan.observe_ordered(data.raw, arrived[&data.raw]);
+        assert_eq!(next_ready(&mut scan).physical_offset(192), 192);
+        scan.finish_source(Duration::ZERO, Duration::ZERO);
+        assert_eq!(next_ready(&mut scan).physical_offset(192), 32);
+
+        // Adding another representation on the actual decoded entity creates
+        // ambiguous evidence; it does not invalidate the retained native roots.
+        let subject = triblespace_core::collection::descriptor::entity(&descriptor).unwrap();
+        descriptor += entity! { ExclusiveId::force_ref(&subject) @
+            triblespace_core::collection::collection_representation: UTF8String::id(),
+        }
+        .into_facts();
+        assert!(triblespace_core::collection::descriptor::representation(&descriptor).is_err());
+        let ambiguous = store.put::<SimpleArchive, _>(descriptor).unwrap();
+        assert_eq!(
+            trace_root_scan(store, ambiguous.raw, data.raw).await,
+            physical
+        );
+    }
+
+    #[test]
+    fn hydration_derive_input_order_comes_from_source_not_target_representation() {
+        let mut store = MemoryRepo::default();
+        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+        let source = store
+            .collection("derive scan source", policy.clone())
+            .unwrap();
+        let target = store
+            .derive::<SuccinctArchiveBlob>(source, (), policy)
+            .unwrap();
+        let input = scan_archive_fixture();
+        let output =
+            triblespace_core::collection::succinctarchive_union::derive_element(&input).unwrap();
+        let input = store.put::<SimpleArchive, _>(input).unwrap();
+        let output = store.put::<SuccinctArchiveBlob, _>(output).unwrap();
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let metadata = put(&mut store, Vec::new());
+        let commit = CollectionCommit::sign(
+            &key,
+            source.handle(),
+            input.transmute(),
+            Inline::new(metadata),
+        );
+        let derive = CollectionDerive::sign(
+            &key,
+            target.handle(),
+            (input.transmute(), commit.fingerprint()),
+            output.transmute(),
+        );
+        store.insert(CollectionRecord::Commit(commit)).unwrap();
+        store.insert(CollectionRecord::Derive(derive)).unwrap();
+        let selectors = BTreeSet::from([CollectionRecordSelector::Collection(target.handle())]);
+        let roots = direct_roots(&store.snapshot().unwrap(), &selectors).unwrap();
+        assert_eq!(roots.len(), 3);
+        assert_eq!(roots[&target.handle().raw], ScanOrder::SimpleArchivePairs);
+        assert_eq!(roots[&input.raw], ScanOrder::SimpleArchivePairs);
+        assert_eq!(roots[&output.raw], ScanOrder::Physical);
+        let mut target_descriptor: TribleSet =
+            store.snapshot().unwrap().get(target.handle()).unwrap();
+
+        // No source-descriptor acquisition or implicit new root is permitted.
+        // Without that optional evidence the DERIVE input stays a raw walk.
+        store.blobs.keep([
+            target.handle().transmute(),
+            input.transmute(),
+            output.transmute(),
+        ]);
+        let without_source = direct_roots(&store.snapshot().unwrap(), &selectors).unwrap();
+        assert_eq!(
+            without_source.keys().collect::<Vec<_>>(),
+            roots.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(without_source[&input.raw], ScanOrder::Physical);
+        assert_eq!(without_source[&output.raw], ScanOrder::Physical);
+
+        let subject = triblespace_core::collection::descriptor::entity(&target_descriptor).unwrap();
+        target_descriptor += entity! { ExclusiveId::force_ref(&subject) @
+            triblespace_core::collection::collection_source: target.handle(),
+        }
+        .into_facts();
+        assert!(triblespace_core::collection::descriptor::source(&target_descriptor).is_err());
+        let ambiguous = store.put::<SimpleArchive, _>(target_descriptor).unwrap();
+        store
+            .insert(CollectionRecord::Derive(CollectionDerive::sign(
+                &key,
+                ambiguous,
+                (input.transmute(), commit.fingerprint()),
+                output.transmute(),
+            )))
+            .unwrap();
+        let ambiguous_roots = direct_roots(
+            &store.snapshot().unwrap(),
+            &BTreeSet::from([CollectionRecordSelector::Collection(ambiguous)]),
+        )
+        .unwrap();
+        assert_eq!(ambiguous_roots.len(), 3);
+        assert_eq!(ambiguous_roots[&input.raw], ScanOrder::Physical);
+        assert_eq!(ambiguous_roots[&output.raw], ScanOrder::Physical);
+    }
+
+    #[tokio::test]
+    async fn full_scan_unknown_or_misframed_layout_keeps_every_aligned_word() {
+        for typed_descriptor in [false, true] {
+            let mut store = MemoryRepo::default();
+            let descriptor = if typed_descriptor {
+                store
+                    .collection(
+                        "misframed value-priority fixture",
+                        CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+                    )
+                    .unwrap()
+                    .handle()
+                    .raw
+            } else {
+                put(&mut store, b"unknown representation".to_vec())
+            };
+            let archive = scan_archive_fixture();
+            // Three complete words plus a partial tail: not SimpleArchive
+            // framing. Unknown data keeps physical order even if it happens
+            // to have 64-byte framing; typed misframing must do so too.
+            let bytes = if typed_descriptor {
+                archive.bytes[..99].to_vec()
+            } else {
+                archive.bytes.to_vec()
+            };
+            let expected: Vec<RawHash> = bytes
+                .chunks_exact(32)
+                .map(|word| word.try_into().unwrap())
+                .collect();
+            let data = put(&mut store, bytes);
+            assert_eq!(trace_root_scan(store, descriptor, data).await, expected);
+        }
     }
 
     #[derive(Default)]
