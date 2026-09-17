@@ -142,7 +142,7 @@ pub enum Command {
         #[arg(long)]
         long: bool,
     },
-    /// Report same-named collections and the records they strand.
+    /// Prove a collection holds everything its earlier generations do.
     ///
     /// A collection is the handle of its descriptor, so changing what a
     /// descriptor says re-mints it under the same name and leaves the previous
@@ -150,10 +150,14 @@ pub enum Command {
     /// the call site notices: the caller asks for the name, gets the new
     /// generation, and finds it empty.
     ///
-    /// This is the completeness check a migration needs and that adopting does
-    /// not provide. Adopting reports how many commits it processed, not how
-    /// many the target was missing, so a partial migration looks exactly like a
-    /// finished one. Exits non-zero when any records are unreachable.
+    /// This is the completeness check a migration needs and that carrying the
+    /// records does not provide on its own: a carry reports how many records it
+    /// wrote, not how many the target was missing, so a partial migration looks
+    /// exactly like a finished one. Name a collection and this compares source
+    /// against target by content and exits non-zero while anything a source
+    /// admits is absent; name none and it sweeps the whole pile for names
+    /// claimed by more than one collection. It takes no key and writes nothing,
+    /// so a migration somebody else ran months ago can be checked today.
     Reconcile {
         /// Path to the pile file to inspect.
         pile: PathBuf,
