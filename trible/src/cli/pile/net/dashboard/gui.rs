@@ -107,6 +107,24 @@ fn render_mesh(ui: &mut egui::Ui, frame: &Frame) {
                     .iter()
                     .filter(|observer| observer.endpoints.iter().any(|endpoint| endpoint == node))
             };
+            // KNOWN CONFLATION, and it is the one JP could not read off the
+            // picture: he asked whether slashed nodes meant the daemons were
+            // down or just that we had no recent updates, and the view cannot
+            // say, because `Unknown` below is an `else` that swallows two
+            // different facts. A node with NO reports at all (named only by a
+            // peer, never heard from here) and a node whose reports are all
+            // `Freshness::Future` (heard from, but its clock disagrees) render
+            // identically.
+            //
+            // `Freshness` is not the bug and should not grow a variant:
+            // freshness describes a REPORT, so there is no freshness value for
+            // "no report exists". The missing distinction belongs one level up,
+            // as a fourth `MeshNodeState` for never-reported, leaving `Unknown`
+            // to mean only "reported, and we cannot place it in time". That
+            // enum lives in GORBIE and is mid-rewrite onto the shared
+            // force-directed solver; make the change there and then split this
+            // `else` on whether `reports()` and `health()` are empty at all
+            // rather than on what they contain.
             let fresh = reports().any(|worker| worker.freshness == Freshness::Fresh)
                 || health().any(|observer| observer.freshness == Freshness::Fresh);
             let stale = reports().any(|worker| worker.freshness == Freshness::Stale)
