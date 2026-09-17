@@ -3268,58 +3268,6 @@ where
         self.root.as_ref().map(|root| root.hash())
     }
 
-    /// Whether two snapshots still share the same persistent root allocation.
-    ///
-    /// This is a lineage-local invalidation primitive, not semantic equality
-    /// and not a portable version. Clones share the root; every key or attached
-    /// value mutation copy-on-writes it, even when the key-only fingerprint is
-    /// unchanged by replacing a value.
-    pub(crate) fn shares_root(&self, other: &Self) -> bool {
-        match (&self.root, &other.root) {
-            (None, None) => true,
-            (Some(left), Some(right)) => left.tptr == right.tptr,
-            _ => false,
-        }
-    }
-
-    /// Whether the complete subtree under `prefix` is structurally shared.
-    ///
-    /// The prefix is in tree order and may end inside a compressed path or a
-    /// segment. Two absent prefixes are shared; present prefixes require the
-    /// same node body and kind, not equal counts or key-set fingerprints. An
-    /// unrelated insertion may re-key that body's incoming edge without
-    /// changing its contents, so the edge byte is not part of this comparison.
-    ///
-    /// Like [`Self::shares_root`], this is conservative, lineage-local
-    /// invalidation evidence, not semantic equality or a portable version.
-    /// Key changes and attached-value replacements through PATCH are observed;
-    /// interior mutations of an attached value are outside this contract.
-    pub(crate) fn shares_prefix<const PREFIX_LEN: usize>(
-        &self,
-        other: &Self,
-        prefix: &[u8; PREFIX_LEN],
-    ) -> bool {
-        const {
-            assert!(PREFIX_LEN <= KEY_LEN);
-        }
-        let left = self
-            .root
-            .as_ref()
-            .and_then(|root| root.locate_prefix(0, prefix));
-        let right = other
-            .root
-            .as_ref()
-            .and_then(|root| root.locate_prefix(0, prefix));
-        match (left, right) {
-            (None, None) => true,
-            (Some(left), Some(right)) => {
-                let mask = !(Head::<KEY_LEN, O, V, H>::KEY_MASK as usize);
-                (left.tptr.as_ptr().addr() & mask) == (right.tptr.as_ptr().addr() & mask)
-            }
-            _ => false,
-        }
-    }
-
     /// Clone the opaque archive-owner receipt without exposing the root Head.
     pub(crate) fn owner_guard(&self) -> PATCHOwnerGuard {
         PATCHOwnerGuard(self.owners.clone())
@@ -5762,143 +5710,17 @@ mod tests {
     crate::key_schema!(PermutedInfixSchema, PermutedInfixSegments, 12, [1, 2, 0]);
     crate::key_segmentation!(PrefixProjectionSegments, 6, [4, 2]);
     crate::key_schema!(PrefixProjectionSchema, PrefixProjectionSegments, 6, [0, 1]);
-    crate::key_segmentation!(PrefixSharingBlobSegments, 40, [32, 8]);
-    crate::key_schema!(
-        PrefixSharingBlobSchema,
-        PrefixSharingBlobSegments,
-        40,
-        [0, 1]
-    );
-
     #[test]
-    fn shares_prefix_handles_empty_and_full_prefixes() {
-        let empty = PATCH::<4, IdentitySchema>::new();
+    fn key_equality_ignores_replaced_values_but_snapshots_retain_them() {
         let key = [1, 2, 3, 4];
-        assert!(empty.shares_prefix(&empty.clone(), &[]));
-        assert!(empty.shares_prefix(&empty.clone(), &key));
-
-        let mut populated = empty.clone();
-        populated.insert(&Entry::new(&key));
-        assert!(!empty.shares_prefix(&populated, &[]));
-        assert!(!empty.shares_prefix(&populated, &key));
-        assert!(!populated.shares_prefix(&empty, &[1, 2]));
-        assert!(populated.shares_prefix(&empty, &[1, 9]));
-        assert!(populated.shares_prefix(&populated.clone(), &[]));
-        assert!(populated.shares_prefix(&populated.clone(), &key));
-
-        let mut rebuilt = PATCH::<4, IdentitySchema>::new();
-        rebuilt.insert(&Entry::new(&key));
-        assert_eq!(populated, rebuilt);
-        assert!(!populated.shares_prefix(&rebuilt, &[]));
-        assert!(!populated.shares_prefix(&rebuilt, &key));
-    }
-
-    #[test]
-    fn shares_prefix_retains_compressed_subtrees_after_unrelated_insertions() {
-        let mut original = PATCH::<4, IdentitySchema>::new();
-        original.insert(&Entry::new(&[1, 2, 3, 0]));
-        original.insert(&Entry::new(&[1, 2, 3, 255]));
-        assert_eq!(original.root.as_ref().unwrap().end_depth(), 3);
-
-        let mut outside = original.clone();
-        outside.insert(&Entry::new(&[9, 8, 7, 6]));
-        // The old compressed root becomes a child with a different edge byte.
-        assert!(!original.shares_prefix(&outside, &[]));
-        assert!(original.shares_prefix(&outside, &[1]));
-        assert!(original.shares_prefix(&outside, &[1, 2]));
-        assert!(original.shares_prefix(&outside, &[1, 2, 3]));
-        assert!(original.shares_prefix(&outside, &[1, 2, 3, 0]));
-        assert!(original.shares_prefix(&outside, &[1, 2, 4]));
-
-        let mut split = outside.clone();
-        split.insert(&Entry::new(&[1, 2, 4, 0]));
-        assert!(!outside.shares_prefix(&split, &[1]));
-        assert!(!outside.shares_prefix(&split, &[1, 2]));
-        assert!(!outside.shares_prefix(&split, &[1, 2, 4]));
-        assert!(outside.shares_prefix(&split, &[1, 2, 3]));
-        assert!(outside.shares_prefix(&split, &[9]));
-
-        let mut inside = split.clone();
-        inside.insert(&Entry::new(&[1, 2, 3, 127]));
-        assert!(!split.shares_prefix(&inside, &[1, 2, 3]));
-        assert!(split.shares_prefix(&inside, &[1, 2, 3, 0]));
-        assert!(split.shares_prefix(&inside, &[1, 2, 4]));
-    }
-
-    #[test]
-    fn shares_prefix_detects_an_additional_physical_blob_occurrence() {
-        let physical_key = |hash: [u8; 32], offset: u64| {
-            let mut key = [0; 40];
-            key[..32].copy_from_slice(&hash);
-            key[32..].copy_from_slice(&offset.to_be_bytes());
-            key
-        };
-        let hash = [7; 32];
-        let other_hash = [9; 32];
-        let first = physical_key(hash, 512);
-        let mut before = PATCH::<40, PrefixSharingBlobSchema>::new();
-        before.insert(&Entry::new(&first));
-        before.insert(&Entry::new(&physical_key(other_hash, 1024)));
-        let mut after = before.clone();
-        after.insert(&Entry::new(&physical_key(hash, 2048)));
-
-        assert_eq!(
-            before.prefix_set::<32>().iter().collect::<Vec<_>>(),
-            after.prefix_set::<32>().iter().collect::<Vec<_>>()
-        );
-        assert!(!before.shares_prefix(&after, &hash));
-        assert!(before.shares_prefix(&after, &first));
-        assert!(before.shares_prefix(&after, &other_hash));
-    }
-
-    #[test]
-    fn shares_prefix_observes_replaced_values_with_unchanged_keys() {
-        let key = [1, 2, 3, 4];
-        let sibling = [1, 2, 3, 9];
-        let unrelated = [9, 8, 7, 6];
         let mut before = PATCH::<4, IdentitySchema, u64>::new();
-        for key in [key, sibling, unrelated] {
-            before.insert(&Entry::with_value(&key, 10));
-        }
+        before.insert(&Entry::with_value(&key, 10));
         let mut after = before.clone();
         after.replace(&Entry::with_value(&key, 11));
 
         assert_eq!(before, after);
         assert_eq!(before.get(&key), Some(&10));
         assert_eq!(after.get(&key), Some(&11));
-        assert!(!before.shares_prefix(&after, &key));
-        assert!(!before.shares_prefix(&after, &[1, 2, 3]));
-        assert!(before.shares_prefix(&after, &sibling));
-        assert!(before.shares_prefix(&after, &[9]));
-    }
-
-    #[test]
-    fn shares_prefix_uses_tree_order_inside_permuted_segments() {
-        let first = [30, 31, 32, 33, 1, 2, 3, 4, 5, 6, 7, 8];
-        let mut sibling = first;
-        sibling[0] = 40;
-        let mut before = PATCH::<12, PermutedInfixSchema>::new();
-        before.insert(&Entry::new(&first));
-        before.insert(&Entry::new(&sibling));
-
-        let mut unrelated = first;
-        unrelated[4..8].copy_from_slice(&[9, 8, 7, 6]);
-        let mut after = before.clone();
-        after.insert(&Entry::new(&unrelated));
-        assert!(before.shares_prefix(&after, &[1, 2]));
-        assert!(before.shares_prefix(&after, &[1, 2, 3, 4]));
-        assert!(before.shares_prefix(
-            &after,
-            &<PermutedInfixSchema as KeySchema<12>>::tree_ordered(&first)
-        ));
-        assert!(!before.shares_prefix(&after, &[9, 8]));
-
-        let mut added = first;
-        added[6] = 8;
-        let mut split = after.clone();
-        split.insert(&Entry::new(&added));
-        assert!(!after.shares_prefix(&split, &[1, 2]));
-        assert!(after.shares_prefix(&split, &[1, 2, 3, 4]));
     }
 
     #[test]

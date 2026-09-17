@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Make Pile's blob index content-keyed with a single first-valid representative.
+  Ignore redundant readable occurrences within one mapping while preserving
+  corruption recovery and conservative rewrite invalidation. Replace scoped
+  pointer-prefix comparisons with semantic record deltas; duplicate replay may
+  now perform payload validation. No wire or persisted record format changes.
+
 - Remove the generic storage-snapshot timestamp and `snapshot_at` APIs. A
   snapshot is an immutable content observation; application deadlines use an
   explicit evaluation time instead. Content change and dependency comparison

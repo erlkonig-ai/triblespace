@@ -103,10 +103,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 When `None` is returned, callers can treat it the same way they would handle a
 missing blob from `get`: the data is considered absent from the snapshot they
-are reading. Validation is cached in the physical occurrence's persistent PATCH
-leaf, which immutable snapshots share. Later calls therefore reuse the verdict;
-a future snapshot can recover when the pile acquires another occurrence of the
-same handle whose payload validates.
+are reading. Validation is cached in the content-keyed representative's
+persistent PATCH leaf, which immutable snapshots share. A unique representative
+is validated on demand; duplicate replay may already have validated it. A future
+snapshot can recover when replay replaces an invalid representative with a
+valid occurrence of the same handle. Metadata then comes from that first valid
+occurrence. Older snapshots retain the original representative and verdict.
 
 For additional background on the binary layout and how the header interacts
 with padding, see the [Pile Format](./pile-format.md) chapter.

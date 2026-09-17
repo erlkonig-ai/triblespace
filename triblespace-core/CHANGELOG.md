@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Key the Pile blob index by content hash, retaining one first-valid (or still
+  lazy/invalid) representative instead of every occurrence. Redundant readable
+  copies no longer invalidate observations within one mapping; same-hash repairs
+  and mapping/rewrite boundaries remain visible. Duplicate replay may now hash
+  candidates before a read. Use semantic PATCH differences for scoped record
+  invalidation and remove the internal pointer-sharing comparison APIs.
+
 - Remove `uncovered_source_members` and `PatternUnion`, introduced only for
   hybrid editor reads. Indexed readers do not manufacture a source-freshness
   guarantee; maintenance and exact support queries retain their existing APIs.

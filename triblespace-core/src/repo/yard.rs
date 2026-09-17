@@ -2503,6 +2503,58 @@ mod tests {
     }
 
     #[test]
+    fn reclaim_with_identical_handles_still_invalidates_changed_metadata() {
+        let (_dir, paths, mut yard) = yard_with_paths(1, YardConfig::default());
+        let handle = yard
+            .put::<RawBytes, _>(raw_blob(b"same content after rewrite"))
+            .unwrap();
+        yard.close().unwrap();
+
+        // Change only the timestamp of this closed disposable fixture, before
+        // retaining any mapping. Its sole current-format BLOB starts at zero.
+        let records = PileRecords::open(&paths[0])
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].offset, 0);
+        assert!(matches!(records[0].content,
+            PileRecordContent::Blob { hash, data_offset: 256, .. }
+                if hash.raw == handle.raw));
+        let mut bytes = fs::read(&paths[0]).unwrap();
+        assert_eq!(bytes.len(), records[0].len);
+        bytes[64..72].copy_from_slice(&1u64.to_le_bytes());
+        fs::write(&paths[0], &bytes).unwrap();
+
+        let mut yard = Yard::open(&paths, YardConfig::default()).unwrap();
+        let before = yard.snapshot().unwrap();
+        let old_metadata = before.metadata(handle).unwrap().unwrap();
+        assert_eq!(old_metadata.timestamp, 1);
+        assert_eq!(before.changes_since(&before.clone()), StoreChanges::NONE);
+
+        yard.reclaim().unwrap();
+        let after = yard.snapshot().unwrap();
+        assert_eq!(before.generations.len(), after.generations.len());
+        assert_eq!(before.generations[0].live, after.generations[0].live);
+        assert_eq!(fs::metadata(&paths[0]).unwrap().len(), bytes.len() as u64);
+        assert!(after.blobs_diff(&before).next().is_none());
+        assert!(before.blobs_diff(&after).next().is_none());
+        let new_metadata = after.metadata(handle).unwrap().unwrap();
+        assert_ne!(new_metadata.timestamp, old_metadata.timestamp);
+        assert_eq!(new_metadata.length, old_metadata.length);
+        assert_eq!(after.changes_since(&before), StoreChanges::BLOBS);
+        assert_eq!(before.changes_since(&after), StoreChanges::BLOBS);
+        let retained_metadata = before.metadata(handle).unwrap().unwrap();
+        assert_eq!(retained_metadata.timestamp, old_metadata.timestamp);
+        assert_eq!(retained_metadata.length, old_metadata.length);
+        assert_eq!(
+            before.get::<Bytes, RawBytes>(handle).unwrap(),
+            after.get::<Bytes, RawBytes>(handle).unwrap(),
+        );
+        yard.close().unwrap();
+    }
+
+    #[test]
     fn reclaim_rewrites_generation_to_live_blobs_only() {
         let (_dir, paths, mut yard) = yard_with_paths(1, YardConfig::default());
 

@@ -281,8 +281,11 @@ after a crash, so validation and repair only operate on that region. Each
 record's validation state is cached for the lifetime of the process under this
 assumption, avoiding repeated hash verification for frequently accessed blobs.
 
-Hash verification only happens when blobs are read. Opening even a very large
-pile is therefore fast while still catching corruption before data is used.
+Unique blob arrivals remain lazily validated on their first read. When replay
+encounters another occurrence of an indexed hash, it validates the retained
+representative; only if that is corrupt does it validate the new candidate.
+Duplicate-rich replay can therefore hash payloads while refreshing or appending,
+not just while reading. Validation results are cached in the representative leaf.
 
 Every newly written record begins with the generic marker, kind ID, and span
 described above. The sections below illustrate each kind-specific body.
@@ -362,21 +365,31 @@ Appends beyond a successful bounded observation remain for the next refresh.
 
 `PileSnapshot` receives persistent PATCH roots when it is created. Later
 refreshes can extend the pile without changing existing snapshots.
-Blob replay maintains one segmented PATCH relation keyed by
-`hash || offset_be`. It retains every physical occurrence in file order, while
-its zero-copy view at the 32-byte segment boundary is the semantic resident-blob
-set used for listing, membership, differences, and cover intersection. Reads
-walk the offsets for one hash lazily when an earlier payload fails content
-validation. The validation byte lives in the persistent occurrence leaf, so
-snapshots share cached verdicts without a separate map or per-handle Arc-linked
-duplicate chain.
-`StoreSnapshot::changes_since` compares the Blob, collection-record, and
-capability-proof PATCH roots directly. For Blobs the physical
-occurrence root means adding a duplicate fallback or replacing a corrupt
-same-handle candidate is visible while unrelated appended records are
-not. Classification is therefore constant in the number of semantic
-components rather than a scan of either snapshot; component-specific consumers
-can reuse unchanged derived state.
+Blob replay maintains one PATCH keyed by the 32-byte content hash. Its attached
+value holds one representative offset and the lazy validation verdict. The
+first occurrence stays lazy; a duplicate retains an already valid representative
+or replaces an invalid one only if the incoming payload validates. If every
+candidate is invalid, the first invalid representative remains. Replacement
+copy-on-writes the leaf: an old snapshot cannot gain access to a later repair.
+There is no second occurrence index or duplicate chain. The raw log still keeps
+every frame, independently of this content-keyed index.
+
+`StoreSnapshot::changes_since` compares semantic key sets for blobs, native
+records, proofs and WANTs. A local repair count also distinguishes a corrupt
+representative replaced by valid bytes under the same hash. Its comparison is
+bounded by the existing retained memory-map Arc; separately opened or remapped
+observations conservatively report blob changes rather than infer unchanged
+metadata or retrievability from equal hashes. This is not a new portable revision
+or catalogue. Normal mapping growth can consequently invalidate blob interests
+even if only unrelated records crossed the mapping capacity. Within one mapping,
+redundant copies of an already readable blob do not signal change.
+
+Scoped comparison tests only changed native records against the retained raw
+selectors, using semantic differences in both directions. Exact blob interests
+compare their representatives within the same mapping domain; proof interests
+remain component-wide. These comparisons preserve disjoint-append filtering;
+they do not interpret or cache collection answers. Constructing a large record
+delta still costs work, even when none of it matches the retained interests.
 
 Tools that need the raw log rather than the collapsed state—reflogs,
 consolidation, forensics—should use
@@ -1034,8 +1047,10 @@ V1 had no want records.
 
 ## Recovery
 
-`refresh` scans an existing file to ensure every record fits. It does not verify
-blob hashes. A malformed or truncated known or enveloped record reports the
+`refresh` scans an existing file to ensure every record fits. Unique blob
+arrivals remain lazy, while duplicate replay may validate the retained and
+incoming representatives as described above. A malformed or truncated known or
+enveloped record reports the
 number of bytes that were valid so far using `ReadError::CorruptPile`. A
 complete unknown envelope kind is structurally accepted and semantically
 skipped; an unknown unenveloped marker reports its bytes and offset using
@@ -1061,8 +1076,9 @@ markers without truncating. Run it deliberately (e.g. via
 `trible pile amputate <path> --truncate-to <byte-offset>`)—never as a routine
 part of opening. The CLI refuses a boundary that differs from the current
 reader's result. Hash
-verification happens lazily only when individual blobs are loaded so that
-opening a large pile remains fast.
+verification happens when a representative is read or duplicate replay needs
+to decide whether a corrupt representative can be replaced. Merely listing a
+claimed hash does not establish payload validity.
 
 For more details on interacting with a pile see the [`Pile` struct
 documentation](https://docs.rs/triblespace/latest/triblespace/repo/pile/struct.Pile.html).

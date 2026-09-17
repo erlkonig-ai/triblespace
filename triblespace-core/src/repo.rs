@@ -128,8 +128,8 @@ impl StoreChanges {
 ///
 /// These are lookup interests, including absent records and blobs, rather
 /// than copies of their contents or a second catalog. A later matching record
-/// or physical blob occurrence can invalidate an earlier miss. Whole-component
-/// flags cover readers that enumerate rather than perform exact lookups.
+/// or readable replacement of a corrupt blob can invalidate an earlier miss.
+/// Whole-component flags cover readers that enumerate rather than perform exact lookups.
 /// Query time and external provider availability are not stored dependencies;
 /// callers retain their existing deadline and exact-acquisition behavior.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -187,8 +187,9 @@ pub trait StoreSnapshot: Clone + Send + Sync + 'static {
     /// Backends may narrow comparison using shared indexes; this default only
     /// masks [`changes_since`](Self::changes_since) by the components that
     /// were consulted, so wrappers without scoped comparison remain safe.
-    /// Blob changes include additional physical occurrences of an existing
-    /// hash, which may recover a previously unreadable payload. WANT changes
+    /// Blob changes include recovery of a previously unreadable payload under
+    /// an existing hash, not just newly observed hashes. A redundant readable
+    /// copy need not invalidate an observation. WANT changes
     /// and application clocks are deliberately outside this read-set.
     fn changes_for(&self, previous: &Self, dependencies: &StoreDependencies) -> StoreChanges {
         if dependencies.is_empty() {

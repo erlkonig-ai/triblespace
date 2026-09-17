@@ -384,11 +384,11 @@ fn compute_validation_state(
     classify_validation(Hash::<Blake3>::digest(bytes), expected)
 }
 
-/// Lazy payload validation stored inline in one physical-occurrence leaf.
+/// Lazy payload validation stored inline beside one representative offset.
 ///
 /// PATCH leaves are refcount-shared by immutable snapshots, so this atomic is
 /// one byte inside the existing leaf allocation rather than one heap object or
-/// hash-table entry per occurrence. Hashing happens before the compare/exchange:
+/// hash-table entry per blob. Hashing happens before the compare/exchange:
 /// concurrent first misses may duplicate deterministic work, then converge on
 /// the first published result without holding a lock while Rayon executes.
 #[derive(Debug, Default)]
@@ -453,27 +453,19 @@ impl IndexEntry {
     }
 }
 
-fn blob_occurrence_key(hash: &RawInline, entry: IndexEntry) -> [u8; 40] {
-    let mut key = [0; 40];
-    key[..32].copy_from_slice(hash);
-    key[32..].copy_from_slice(
-        &u64::try_from(entry.record_offset)
-            .expect("a pile offset must fit in the portable u64 key")
-            .to_be_bytes(),
-    );
-    key
+#[derive(Debug)]
+struct BlobEntry {
+    index: IndexEntry,
+    validation: CachedValidation,
 }
 
-fn blob_occurrence_entry(offset: [u8; 8]) -> IndexEntry {
-    IndexEntry::new(
-        usize::try_from(u64::from_be_bytes(offset))
-            .expect("an indexed pile offset must fit this platform's usize"),
-    )
-}
-
-mod blob_occurrence_key {
-    crate::key_segmentation!(Segments, 40, [32, 8]);
-    crate::key_schema!(Schema, Segments, 40, [0, 1]);
+impl BlobEntry {
+    fn new(record_offset: usize) -> Self {
+        Self {
+            index: IndexEntry::new(record_offset),
+            validation: CachedValidation::default(),
+        }
+    }
 }
 
 mod collection_record_collection_key {
@@ -491,7 +483,7 @@ mod collection_record_reference_key {
     crate::key_schema!(Schema, Segments, 64, [0, 1]);
 }
 
-type PileBlobIndex = PATCH<40, blob_occurrence_key::Schema, CachedValidation, XorSip128>;
+type PileBlobIndex = PATCH<32, IdentitySchema, BlobEntry, XorSip128>;
 type CollectionRecordIndex = PATCH<32, IdentitySchema, CollectionRecord, XorSip128>;
 type CollectionRecordCollectionIndex =
     PATCH<64, collection_record_collection_key::Schema, (), XorSip128>;
@@ -541,35 +533,6 @@ fn collection_record_reference_key(
     key[..32].copy_from_slice(&input.raw());
     key[32..].copy_from_slice(&consumer.raw());
     key
-}
-
-fn first_blob_occurrence(occurrences: &PileBlobIndex, hash: &RawInline) -> Option<IndexEntry> {
-    occurrences
-        .first_infix_range(hash, &[u8::MIN; 8], &[u8::MAX; 8])
-        .map(blob_occurrence_entry)
-}
-
-fn next_blob_occurrence(
-    occurrences: &PileBlobIndex,
-    hash: &RawInline,
-    after: IndexEntry,
-) -> Option<IndexEntry> {
-    let after = u64::try_from(after.record_offset)
-        .expect("a pile offset must fit in the portable u64 key")
-        .to_be_bytes();
-    occurrences
-        .next_infix_after(hash, &after, &[u8::MAX; 8])
-        .map(blob_occurrence_entry)
-}
-
-fn blob_occurrence_validation<'a>(
-    occurrences: &'a PileBlobIndex,
-    hash: &RawInline,
-    entry: IndexEntry,
-) -> &'a CachedValidation {
-    occurrences
-        .get(&blob_occurrence_key(hash, entry))
-        .expect("an enumerated blob occurrence must retain its leaf value")
 }
 
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
@@ -2726,12 +2689,13 @@ pub struct Pile {
     /// successful durability barrier. Refreshing bytes written by another
     /// handle does not make this handle responsible for flushing them.
     dirty: bool,
-    /// Every physical blob occurrence keyed by `hash || offset_be`.
-    ///
-    /// Prefix projection at the 32-byte segment boundary is the semantic blob
-    /// set, so duplicate offsets never need a second index. Each existing leaf
-    /// carries its own lazy validation byte inline.
+    /// One representative per content hash, with its offset and validation
+    /// state in the value. Duplicate replay retains the first valid candidate,
+    /// or the first candidate when every occurrence is invalid.
     blobs: PileBlobIndex,
+    /// Invalid representatives replaced by valid bytes in this applied prefix.
+    /// This cannot exceed the number of physical records in the pile.
+    blob_repairs: usize,
     branches: PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>,
     /// Immutable collection records keyed by full-width canonical-byte fingerprint.
     collection_records: CollectionRecordIndex,
@@ -2792,12 +2756,12 @@ pub struct PileSnapshot {
     mmap: Arc<MmapRaw>,
     covered_len: usize,
     opaque_records: usize,
-    /// Physical occurrences keyed by `hash || offset_be`.
-    ///
-    /// Projecting this relation at its 32-byte segment boundary is the
-    /// semantic resident-blob set. Each leaf also carries its own lazy
-    /// validation state inline and is shared across immutable snapshots.
+    /// Content hashes with representatives frozen at this accepted prefix.
+    /// Replacing a corrupt representative copy-on-writes its leaf, so older
+    /// snapshots retain their original bytes and shared validation verdict.
     blobs: PileBlobIndex,
+    /// Comparable only within the same backing mapping as another snapshot.
+    blob_repairs: usize,
     collection_records: CollectionRecordIndex,
     collection_records_by_collection: CollectionRecordCollectionIndex,
     collection_records_by_produced_member: CollectionRecordProducedMemberIndex,
@@ -2831,6 +2795,7 @@ impl PileSnapshot {
         covered_len: usize,
         opaque_records: usize,
         blobs: PileBlobIndex,
+        blob_repairs: usize,
         collection_records: CollectionRecordIndex,
         collection_records_by_collection: CollectionRecordCollectionIndex,
         collection_records_by_produced_member: CollectionRecordProducedMemberIndex,
@@ -2844,6 +2809,7 @@ impl PileSnapshot {
             covered_len,
             opaque_records,
             blobs,
+            blob_repairs,
             collection_records,
             collection_records_by_collection,
             collection_records_by_produced_member,
@@ -2856,13 +2822,12 @@ impl PileSnapshot {
 
     /// Returns an iterator over all blobs currently stored in the pile.
     ///
-    /// The persistent occurrence trie is cloned in constant time. Its
-    /// consuming prefix iterator then stops at the hash segment, so listing
-    /// neither visits duplicate suffixes nor allocates a handle inventory.
+    /// The persistent content index is cloned in constant time; the iterator
+    /// owns that snapshot without allocating a handle inventory.
     pub fn iter(&self) -> PileBlobStoreIter {
         PileBlobStoreIter {
             snapshot: self.clone(),
-            inner: self.blobs.clone().into_prefixes(),
+            inner: self.blobs.clone().into_iter(),
         }
     }
 
@@ -2920,55 +2885,33 @@ impl PileSnapshot {
         handle: Inline<Handle<UnknownBlob>>,
     ) -> Option<super::BlobInfo> {
         let hash: &Inline<Hash<Blake3>> = handle.as_transmute();
-        let entry = first_blob_occurrence(&self.blobs, &hash.raw)?;
-        let header = indexed_blob_header(&self.mmap, self.covered_len, entry, hash);
+        let entry = self.blobs.get(&hash.raw)?;
+        let header = indexed_blob_header(&self.mmap, self.covered_len, entry.index, hash);
         Some(super::BlobInfo {
             handle,
             length: header.data_len as u64,
         })
     }
 
-    /// Resolve one handle to any physical occurrence whose payload validates.
-    ///
-    /// Physical occurrences are tried in ascending file-offset order.
-    /// Validation results live in the shared occurrence leaf, so a corrupt
-    /// candidate is hashed at most once after the first result is published.
+    /// Validate the representative retained for this handle and prefix.
+    /// Duplicate replay already selected the first valid occurrence, if any;
+    /// a unique first arrival remains lazy until a reader asks for its bytes.
     fn validated_blob_record<E: Error>(
         &self,
         hash: &Inline<Hash<Blake3>>,
         strategy: ValidationStrategy,
     ) -> Result<IndexedBlobRecord, GetBlobError<E>> {
-        let Some(mut candidate) = first_blob_occurrence(&self.blobs, &hash.raw) else {
+        let Some(entry) = self.blobs.get(&hash.raw) else {
             return Err(GetBlobError::BlobNotFound(super::MissingBlob {
                 handle: Inline::new(hash.raw),
             }));
         };
 
-        let mut first_invalid = None;
-        let mut validate = |entry: IndexEntry| {
-            let record = indexed_blob_record(&self.mmap, self.covered_len, entry, hash);
-            let validation = blob_occurrence_validation(&self.blobs, &hash.raw, entry);
-            match validation.state(&record.bytes, hash, strategy) {
-                ValidationState::Validated => Some(record),
-                ValidationState::Invalid => {
-                    first_invalid.get_or_insert_with(|| record.bytes.clone());
-                    None
-                }
-            }
-        };
-
-        loop {
-            if let Some(record) = validate(candidate) {
-                return Ok(record);
-            }
-            let Some(next) = next_blob_occurrence(&self.blobs, &hash.raw, candidate) else {
-                break;
-            };
-            candidate = next;
+        let record = indexed_blob_record(&self.mmap, self.covered_len, entry.index, hash);
+        match entry.validation.state(&record.bytes, hash, strategy) {
+            ValidationState::Validated => Ok(record),
+            ValidationState::Invalid => Err(GetBlobError::ValidationError(record.bytes)),
         }
-        Err(GetBlobError::ValidationError(first_invalid.expect(
-            "a present primary candidate was validated and rejected",
-        )))
     }
 
     // metadata moved into BlobStoreMeta impl below
@@ -3003,10 +2946,13 @@ impl super::BlobChildren for PileSnapshot {}
 impl super::StoreSnapshot for PileSnapshot {
     fn changes_since(&self, previous: &Self) -> super::StoreChanges {
         let mut changes = super::StoreChanges::NONE;
-        // A semantic addition and another physical fallback occurrence are
-        // both observable blob-store changes, even though only the former
-        // appears in `blobs_diff`.
-        if !previous.blobs.shares_root(&self.blobs) {
+        // PATCH equality observes content membership. A same-hash repair also
+        // changes retrievability. A replacement mapping may name a rewritten
+        // pile with different metadata, so its repair count is not comparable.
+        if !Arc::ptr_eq(&self.mmap, &previous.mmap)
+            || self.blobs != previous.blobs
+            || self.blob_repairs != previous.blob_repairs
+        {
             changes = changes.union(super::StoreChanges::BLOBS);
         }
         if previous.collection_records != self.collection_records {
@@ -3027,75 +2973,46 @@ impl super::StoreSnapshot for PileSnapshot {
         dependencies: &super::StoreDependencies,
     ) -> super::StoreChanges {
         let mut changes = super::StoreChanges::NONE;
-        let records_changed = if dependencies.all_records {
-            !self
-                .collection_records
-                .shares_root(&previous.collection_records)
-        } else {
-            dependencies.records.iter().any(|selector| {
-                let collection = match selector {
-                    CollectionRecordSelector::Fingerprint(fingerprint) => {
-                        return !self
-                            .collection_records
-                            .shares_prefix(&previous.collection_records, &fingerprint.raw());
-                    }
-                    CollectionRecordSelector::ProducedMember(collection, output)
-                    | CollectionRecordSelector::CommitMember(collection, output) => {
-                        let mut prefix = [0; 64];
-                        prefix[..32].copy_from_slice(&collection.raw);
-                        prefix[32..].copy_from_slice(&output.raw);
-                        return !self.collection_records_by_produced_member.shares_prefix(
-                            &previous.collection_records_by_produced_member,
-                            &prefix,
-                        );
-                    }
-                    CollectionRecordSelector::ReferencingRecord(input) => {
-                        return !self.collection_records_by_reference.shares_prefix(
-                            &previous.collection_records_by_reference,
-                            &input.raw(),
-                        );
-                    }
-                    CollectionRecordSelector::Collection(collection)
-                    | CollectionRecordSelector::MergeCollection(collection)
-                    | CollectionRecordSelector::DeriveTarget(collection) => collection,
-                    CollectionRecordSelector::Operation(WantRequest::Merge {
-                        collection, ..
-                    })
-                    | CollectionRecordSelector::Operation(WantRequest::Derive {
-                        target: collection,
-                        ..
-                    }) => collection,
-                    CollectionRecordSelector::Operation(WantRequest::Blob { .. }) => {
-                        return false;
-                    }
-                };
-                // Kind/operation selectors conservatively share the whole
-                // collection prefix; exact producer routes above are narrower.
-                !self
-                    .collection_records_by_collection
-                    .shares_prefix(&previous.collection_records_by_collection, &collection.raw)
-            })
-        };
+        let records_changed = self.collection_records != previous.collection_records
+            && (dependencies.all_records
+                || (!dependencies.records.is_empty()
+                    && [
+                        (&self.collection_records, &previous.collection_records),
+                        (&previous.collection_records, &self.collection_records),
+                    ]
+                    .into_iter()
+                    .any(|(left, right)| {
+                        let changed = left.difference(right);
+                        let matches = changed.iter().any(|key| {
+                            let record =
+                                *changed.get(key).expect("difference key retains its record");
+                            selectors_match_record(&dependencies.records, record)
+                        });
+                        matches
+                    })));
         if records_changed {
             changes = changes.union(super::StoreChanges::COLLECTION_RECORDS);
         }
 
-        let blobs_changed = if dependencies.all_blobs {
-            !self.blobs.shares_root(&previous.blobs)
-        } else {
-            dependencies
-                .blobs
-                .iter()
-                .any(|hash| !self.blobs.shares_prefix(&previous.blobs, &hash.raw))
-        };
+        let blobs_changed = (dependencies.all_blobs || !dependencies.blobs.is_empty())
+            && (!Arc::ptr_eq(&self.mmap, &previous.mmap)
+                || if dependencies.all_blobs {
+                    self.blobs != previous.blobs || self.blob_repairs != previous.blob_repairs
+                } else {
+                    dependencies.blobs.iter().any(|hash| {
+                        self.blobs
+                            .get(&hash.raw)
+                            .map(|entry| entry.index.record_offset)
+                            != previous
+                                .blobs
+                                .get(&hash.raw)
+                                .map(|entry| entry.index.record_offset)
+                    })
+                });
         if blobs_changed {
             changes = changes.union(super::StoreChanges::BLOBS);
         }
-        if dependencies.capability_proofs
-            && !self
-                .capability_proofs
-                .shares_root(&previous.capability_proofs)
-        {
+        if dependencies.capability_proofs && self.capability_proofs != previous.capability_proofs {
             changes = changes.union(super::StoreChanges::CAPABILITY_PROOFS);
         }
         changes
@@ -3113,6 +3030,7 @@ impl super::SnapshotSource for Pile {
             self.applied_length,
             self.opaque_records,
             self.blobs.clone(),
+            self.blob_repairs,
             self.collection_records.clone(),
             self.collection_records_by_collection.clone(),
             self.collection_records_by_produced_member.clone(),
@@ -3502,6 +3420,7 @@ impl Pile {
             mmap,
             dirty: false,
             blobs: PileBlobIndex::new(),
+            blob_repairs: 0,
             branches: PATCH::<16, IdentitySchema, Inline<Handle<SimpleArchive>>>::new(),
             collection_records: CollectionRecordIndex::new(),
             collection_records_by_collection: CollectionRecordCollectionIndex::new(),
@@ -3608,15 +3527,49 @@ impl Pile {
         });
         let applied = match record.content {
             PileRecordContent::Blob { hash, .. } => {
-                let candidate = IndexEntry::new(start_offset);
-                // Replay is an index construction path, not a payload
-                // validation pass. One segmented relation retains every
-                // physical fallback; its 32-byte prefix projection is the
-                // semantic resident set, and big-endian offsets preserve file
-                // order under PATCH's lexicographic infix traversal.
-                let key = blob_occurrence_key(&hash.raw, candidate);
-                self.blobs
-                    .insert(&Entry::with_value(&key, CachedValidation::default()));
+                let candidate = BlobEntry::new(start_offset);
+                if let Some(existing) = self.blobs.get(&hash.raw) {
+                    // A first arrival is lazy. A duplicate needs a verdict
+                    // before either representative can be discarded: keep
+                    // the earliest valid bytes, or the first invalid bytes
+                    // when no valid candidate has arrived.
+                    let state = existing.validation.cached().unwrap_or_else(|| {
+                        let record = indexed_blob_record(
+                            &self.mmap,
+                            self.applied_length,
+                            existing.index,
+                            &hash,
+                        );
+                        existing
+                            .validation
+                            .state(&record.bytes, &hash, ValidationStrategy::Serial)
+                    });
+                    if state == ValidationState::Invalid {
+                        let record = indexed_blob_record(
+                            &self.mmap,
+                            next_applied_length,
+                            candidate.index,
+                            &hash,
+                        );
+                        if candidate.validation.state(
+                            &record.bytes,
+                            &hash,
+                            ValidationStrategy::Serial,
+                        ) == ValidationState::Validated
+                        {
+                            // Each repair consumes a complete physical record,
+                            // so this count is bounded by the usize file length.
+                            let repairs = self
+                                .blob_repairs
+                                .checked_add(1)
+                                .expect("blob repairs cannot exceed physical record count");
+                            self.blobs.replace(&Entry::with_value(&hash.raw, candidate));
+                            self.blob_repairs = repairs;
+                        }
+                    }
+                } else {
+                    self.blobs.insert(&Entry::with_value(&hash.raw, candidate));
+                }
                 Applied::Blob { hash }
             }
             PileRecordContent::Branch { branch_id, head } => {
@@ -3911,13 +3864,7 @@ use super::WantStore;
 /// it can live independently of the [`Pile`] without an O(blob-count) setup.
 pub struct PileBlobStoreIter {
     snapshot: PileSnapshot,
-    inner: crate::patch::PATCHIntoPrefixSetIterator<
-        40,
-        32,
-        blob_occurrence_key::Schema,
-        CachedValidation,
-        XorSip128,
-    >,
+    inner: crate::patch::PATCHIntoIterator<32, IdentitySchema, BlobEntry, XorSip128>,
 }
 
 impl Iterator for PileBlobStoreIter {
@@ -3940,37 +3887,22 @@ impl Iterator for PileBlobStoreIter {
     }
 }
 
-/// Adapter that yields semantic blob information from an occurrence snapshot.
+/// Adapter that yields blob information from a content-index snapshot.
 pub struct PileBlobStoreListIter {
     snapshot: PileSnapshot,
-    inner: crate::patch::PATCHIntoPrefixSetIterator<
-        40,
-        32,
-        blob_occurrence_key::Schema,
-        CachedValidation,
-        XorSip128,
-    >,
-    /// When present, skip projected hashes already present in this old
-    /// snapshot. Physical duplicate changes therefore remain semantically
-    /// invisible to [`BlobStoreList::blobs_diff`].
-    old: Option<PileBlobIndex>,
+    inner: crate::patch::PATCHIntoIterator<32, IdentitySchema, BlobEntry, XorSip128>,
 }
 
 impl Iterator for PileBlobStoreListIter {
     type Item = Result<BlobInfo, GetBlobError<Infallible>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let key = self.inner.next()?;
-            if self.old.as_ref().is_some_and(|old| old.has_prefix(&key)) {
-                continue;
-            }
-            let hash = Inline::<Hash<Blake3>>::new(key);
-            let handle = hash.into();
-            return Some(Ok(self.snapshot.unvalidated_blob_info(handle).expect(
-                "key from PATCH iterator must resolve in the same snapshot",
-            )));
-        }
+        let key = self.inner.next()?;
+        let hash = Inline::<Hash<Blake3>>::new(key);
+        let handle = hash.into();
+        Some(Ok(self.snapshot.unvalidated_blob_info(handle).expect(
+            "key from PATCH iterator must resolve in the same snapshot",
+        )))
     }
 }
 
@@ -3981,8 +3913,7 @@ impl BlobStoreList for PileSnapshot {
     fn blobs(&self) -> Self::Iter<'_> {
         PileBlobStoreListIter {
             snapshot: self.clone(),
-            inner: self.blobs.clone().into_prefixes(),
-            old: None,
+            inner: self.blobs.clone().into_iter(),
         }
     }
 
@@ -3991,7 +3922,7 @@ impl BlobStoreList for PileSnapshot {
         S: BlobEncoding + 'static,
         Handle<S>: InlineEncoding,
     {
-        Ok(self.blobs.has_prefix(&handle.raw))
+        Ok(self.blobs.get(&handle.raw).is_some())
     }
 
     fn blob_info<S>(&self, handle: Inline<Handle<S>>) -> Result<Option<super::BlobInfo>, Self::Err>
@@ -4006,8 +3937,7 @@ impl BlobStoreList for PileSnapshot {
     fn blobs_diff(&self, old: &Self) -> Self::Iter<'_> {
         PileBlobStoreListIter {
             snapshot: self.clone(),
-            inner: self.blobs.difference(&old.blobs).into_prefixes(),
-            old: Some(old.blobs.clone()),
+            inner: self.blobs.difference(&old.blobs).into_iter(),
         }
     }
 }
@@ -4483,20 +4413,15 @@ impl Pile {
             let handle: Inline<Handle<S>> = blob.get_handle();
             let hash: Inline<Hash<Blake3>> = handle.into();
 
-            if let Some(mut entry) = first_blob_occurrence(&self.blobs, &hash.raw) {
-                loop {
-                    let record = indexed_blob_record(&self.mmap, self.applied_length, entry, &hash);
-                    let validation = blob_occurrence_validation(&self.blobs, &hash.raw, entry);
-                    if matches!(
-                        validation.state(&record.bytes, &hash, ValidationStrategy::Serial),
-                        ValidationState::Validated
-                    ) {
-                        return Ok(handle.transmute());
-                    }
-                    let Some(next) = next_blob_occurrence(&self.blobs, &hash.raw, entry) else {
-                        break;
-                    };
-                    entry = next;
+            if let Some(entry) = self.blobs.get(&hash.raw) {
+                let record =
+                    indexed_blob_record(&self.mmap, self.applied_length, entry.index, &hash);
+                if entry
+                    .validation
+                    .state(&record.bytes, &hash, ValidationStrategy::Serial)
+                    == ValidationState::Validated
+                {
+                    return Ok(handle.transmute());
                 }
             }
             let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
@@ -8208,12 +8133,14 @@ mod tests {
         }
         let middle = reader.snapshot().unwrap();
         let cloned = middle.clone();
-        assert!(cloned
-            .collection_records_by_produced_member
-            .shares_root(&middle.collection_records_by_produced_member));
-        assert!(cloned
-            .collection_records_by_reference
-            .shares_root(&middle.collection_records_by_reference));
+        assert_eq!(
+            cloned.collection_records_by_produced_member,
+            middle.collection_records_by_produced_member,
+        );
+        assert_eq!(
+            cloned.collection_records_by_reference,
+            middle.collection_records_by_reference,
+        );
         assert!(empty.select_records(&produced).unwrap().is_empty());
         assert!(empty.select_records(&referencing).unwrap().is_empty());
         assert_eq!(middle.blobs().count(), 0);
@@ -8265,9 +8192,10 @@ mod tests {
             after.select_records(&referencing).unwrap(),
             expected_referencing
         );
-        assert!(after
-            .collection_records_by_reference
-            .shares_root(&middle.collection_records_by_reference));
+        assert_eq!(
+            after.collection_records_by_reference,
+            middle.collection_records_by_reference,
+        );
         assert_eq!(
             after
                 .select_records(&BTreeSet::from([CollectionRecordSelector::ProducedMember(
@@ -9003,40 +8931,6 @@ mod tests {
     }
 
     #[test]
-    fn blob_occurrence_relation_groups_and_orders_offsets() {
-        let hash = [0xA5; 32];
-        let other_hash = [0x5A; 32];
-        let mut occurrences = PileBlobIndex::new();
-        for (key_hash, offset) in [
-            (hash, 65_536usize),
-            (other_hash, 17),
-            (hash, 1),
-            (hash, 256),
-        ] {
-            let key = blob_occurrence_key(&key_hash, IndexEntry::new(offset));
-            occurrences.insert(&Entry::with_value(&key, CachedValidation::default()));
-        }
-
-        assert_eq!(occurrences.len(), 4);
-        assert_eq!(occurrences.segmented_len(&hash), 3);
-        assert_eq!(occurrences.segmented_len(&other_hash), 1);
-        assert_eq!(
-            occurrences
-                .iter_prefix_count::<32>()
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from([(hash, 3), (other_hash, 1)])
-        );
-
-        let first = first_blob_occurrence(&occurrences, &hash).unwrap();
-        let second = next_blob_occurrence(&occurrences, &hash, first).unwrap();
-        let third = next_blob_occurrence(&occurrences, &hash, second).unwrap();
-        assert_eq!(first.record_offset, 1);
-        assert_eq!(second.record_offset, 256);
-        assert_eq!(third.record_offset, 65_536);
-        assert!(next_blob_occurrence(&occurrences, &hash, third).is_none());
-    }
-
-    #[test]
     fn semantic_blob_frontier_is_independent_of_occurrence_order_and_multiplicity() {
         let dir = tempfile::tempdir().unwrap();
         let path_a = fresh_empty_pile_path(&dir, "semantic-a.pile");
@@ -9063,18 +8957,13 @@ mod tests {
         let snapshot_a = pile_a.snapshot().unwrap();
         let snapshot_b = pile_b.snapshot().unwrap();
 
-        assert_eq!(snapshot_a.blobs.len(), 3);
+        assert_eq!(snapshot_a.blobs.len(), 2);
         assert_eq!(snapshot_b.blobs.len(), 2);
-        let semantic_a = snapshot_a.blobs.prefix_set::<32>();
-        let semantic_b = snapshot_b.blobs.prefix_set::<32>();
         assert_eq!(
-            semantic_a.iter().collect::<BTreeSet<_>>(),
+            snapshot_a.blobs.iter().copied().collect::<BTreeSet<_>>(),
             BTreeSet::from([hash_a.raw, hash_b.raw])
         );
-        assert_eq!(
-            semantic_a.iter().collect::<BTreeSet<_>>(),
-            semantic_b.iter().collect::<BTreeSet<_>>()
-        );
+        assert_eq!(snapshot_a.blobs, snapshot_b.blobs);
         assert!(snapshot_a.blobs_diff(&snapshot_b).next().is_none());
         assert!(snapshot_b.blobs_diff(&snapshot_a).next().is_none());
 
@@ -9155,35 +9044,33 @@ mod tests {
 
         let mut replay = Pile::open(&path).unwrap();
         replay.refresh().unwrap();
-        let first_entry = first_blob_occurrence(&replay.blobs, &first.raw).unwrap();
-        let second_entry = first_blob_occurrence(&replay.blobs, &second.raw).unwrap();
         assert_eq!(
-            blob_occurrence_validation(&replay.blobs, &first.raw, first_entry).cached(),
+            replay.blobs.get(&first.raw).unwrap().validation.cached(),
             None
         );
         assert_eq!(
-            blob_occurrence_validation(&replay.blobs, &second.raw, second_entry).cached(),
+            replay.blobs.get(&second.raw).unwrap().validation.cached(),
             None
         );
 
         let reader = replay.snapshot().unwrap();
         let cloned = reader.clone();
         assert!(std::ptr::eq(
-            blob_occurrence_validation(&reader.blobs, &first.raw, first_entry),
-            blob_occurrence_validation(&cloned.blobs, &first.raw, first_entry),
+            &reader.blobs.get(&first.raw).unwrap().validation,
+            &cloned.blobs.get(&first.raw).unwrap().validation,
         ));
         let _: Blob<UnknownBlob> = reader.get(first).unwrap();
         assert_eq!(
-            blob_occurrence_validation(&replay.blobs, &first.raw, first_entry).cached(),
+            replay.blobs.get(&first.raw).unwrap().validation.cached(),
             Some(ValidationState::Validated)
         );
         let _: Blob<UnknownBlob> = cloned.get(first).unwrap();
         assert_eq!(
-            blob_occurrence_validation(&replay.blobs, &first.raw, first_entry).cached(),
+            replay.blobs.get(&first.raw).unwrap().validation.cached(),
             Some(ValidationState::Validated)
         );
         assert_eq!(
-            blob_occurrence_validation(&replay.blobs, &second.raw, second_entry).cached(),
+            replay.blobs.get(&second.raw).unwrap().validation.cached(),
             None
         );
 
@@ -9199,9 +9086,8 @@ mod tests {
         let mut pile = Pile::open(&path).unwrap();
         let blob = Blob::<SimpleArchive>::new(Bytes::from_source(Vec::<u8>::new()));
         let handle = pile.put::<SimpleArchive, _>(blob).unwrap();
-        let occurrence = first_blob_occurrence(&pile.blobs, &handle.raw).unwrap();
         assert_eq!(
-            blob_occurrence_validation(&pile.blobs, &handle.raw, occurrence).cached(),
+            pile.blobs.get(&handle.raw).unwrap().validation.cached(),
             None,
         );
 
@@ -9210,14 +9096,14 @@ mod tests {
         let snapshot = pile.snapshot().unwrap();
         assert_eq!(cover.available(&snapshot).unwrap(), cover);
         assert_eq!(
-            blob_occurrence_validation(&pile.blobs, &handle.raw, occurrence).cached(),
+            pile.blobs.get(&handle.raw).unwrap().validation.cached(),
             None,
         );
 
         let materialized = cover.materialize::<TribleSet, _>(&snapshot).unwrap();
         assert!(materialized.is_empty());
         assert_eq!(
-            blob_occurrence_validation(&pile.blobs, &handle.raw, occurrence).cached(),
+            pile.blobs.get(&handle.raw).unwrap().validation.cached(),
             Some(ValidationState::Validated),
         );
 
@@ -9237,15 +9123,14 @@ mod tests {
         let collection = register_simplearchive_collection(&mut pile, "corrupt-cover-availability");
         let cover = Cover::from_members(collection, [handle]);
         let snapshot = pile.snapshot().unwrap();
-        let occurrence = first_blob_occurrence(&snapshot.blobs, &handle.raw).unwrap();
         assert_eq!(cover.available(&snapshot).unwrap(), cover);
         assert_eq!(
-            blob_occurrence_validation(&snapshot.blobs, &handle.raw, occurrence).cached(),
+            snapshot.blobs.get(&handle.raw).unwrap().validation.cached(),
             None,
         );
         assert!(cover.materialize::<TribleSet, _>(&snapshot).is_err());
         assert_eq!(
-            blob_occurrence_validation(&snapshot.blobs, &handle.raw, occurrence).cached(),
+            snapshot.blobs.get(&handle.raw).unwrap().validation.cached(),
             Some(ValidationState::Invalid),
         );
 
@@ -9310,51 +9195,113 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_replay_keeps_payload_validation_lazy() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = fresh_empty_pile_path(&dir, "offset-validation.pile");
-        let payload = b"target";
-        let handle = Blob::<UnknownBlob>::new(Bytes::from_source(payload.to_vec())).get_handle();
-        let hash: Inline<Hash<Blake3>> = handle.into();
-
-        let first = append_v3_blob_candidate(&path, hash, payload, 1);
-        let second = append_v3_blob_candidate(&path, hash, b"bad-02", 2);
-        let third = append_v3_blob_candidate(&path, hash, b"bad-03", 3);
-
-        let mut pile = Pile::open(&path).unwrap();
-        pile.refresh().unwrap();
-        assert_eq!(
-            first_blob_occurrence(&pile.blobs, &hash.raw)
-                .unwrap()
-                .record_offset,
-            first
-        );
-        assert_eq!(pile.blobs.segmented_len(&hash.raw), 3);
-        for offset in [first, second, third] {
+    fn duplicate_replay_preserves_representatives_and_frozen_snapshots() {
+        for (first_valid, second_valid) in
+            [(true, true), (true, false), (false, false), (false, true)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let path = fresh_empty_pile_path(&dir, "duplicate-representative.pile");
+            let payload = b"target";
+            let handle =
+                Blob::<UnknownBlob>::new(Bytes::from_source(payload.to_vec())).get_handle();
+            let hash: Inline<Hash<Blake3>> = handle.into();
+            let first_bytes: &[u8] = if first_valid {
+                payload
+            } else {
+                b"first invalid claim"
+            };
+            let second_bytes: &[u8] = if second_valid {
+                payload
+            } else {
+                b"second invalid claim"
+            };
+            let first = append_v3_blob_candidate(&path, hash, first_bytes, 1);
+            let mut pile = Pile::open(&path).unwrap();
+            let before = pile.snapshot().unwrap();
             assert_eq!(
-                blob_occurrence_validation(&pile.blobs, &hash.raw, IndexEntry::new(offset))
-                    .cached(),
+                before.blobs.get(&hash.raw).unwrap().validation.cached(),
                 None
             );
-        }
 
-        let reader = pile.snapshot().unwrap();
-        let blob: Blob<UnknownBlob> = reader.get(handle).unwrap();
-        assert_eq!(blob.bytes.as_ref(), payload);
-        assert_eq!(
-            blob_occurrence_validation(&pile.blobs, &hash.raw, IndexEntry::new(first)).cached(),
-            Some(ValidationState::Validated)
-        );
-        assert_eq!(
-            blob_occurrence_validation(&pile.blobs, &hash.raw, IndexEntry::new(second)).cached(),
-            None
-        );
-        assert_eq!(
-            blob_occurrence_validation(&pile.blobs, &hash.raw, IndexEntry::new(third)).cached(),
-            None
-        );
-        drop(reader);
-        pile.close().unwrap();
+            let second = append_v3_blob_candidate(&path, hash, second_bytes, 2);
+            let after = pile.snapshot().unwrap();
+            let repaired = !first_valid && second_valid;
+            let expected_changes = if repaired {
+                StoreChanges::BLOBS
+            } else {
+                StoreChanges::NONE
+            };
+            assert!(Arc::ptr_eq(&before.mmap, &after.mmap));
+            assert_eq!(before.blobs, after.blobs);
+            assert_eq!(after.blobs.len(), 1);
+            assert_eq!(after.blob_repairs, usize::from(repaired));
+            assert_eq!(before.blob_repairs, 0);
+            assert_eq!(
+                before.blobs.get(&hash.raw).unwrap().index.record_offset,
+                first
+            );
+            assert_eq!(
+                after.blobs.get(&hash.raw).unwrap().index.record_offset,
+                if repaired { second } else { first },
+            );
+            assert_eq!(after.changes_since(&before), expected_changes);
+            assert_eq!(before.changes_since(&after), expected_changes);
+            for dependencies in [
+                StoreDependencies {
+                    all_blobs: true,
+                    ..StoreDependencies::default()
+                },
+                StoreDependencies {
+                    blobs: BTreeSet::from([hash]),
+                    ..StoreDependencies::default()
+                },
+            ] {
+                assert_eq!(after.changes_for(&before, &dependencies), expected_changes);
+            }
+            assert_eq!(
+                after.changes_for(
+                    &before,
+                    &StoreDependencies {
+                        blobs: BTreeSet::from([Inline::new([0xA5; 32])]),
+                        ..StoreDependencies::default()
+                    },
+                ),
+                StoreChanges::NONE,
+            );
+            assert!(after.blobs_diff(&before).next().is_none());
+            assert_eq!(after.blobs().count(), 1);
+            assert_eq!(after.iter().count(), 1);
+            let expected_bytes = if repaired { second_bytes } else { first_bytes };
+            assert_eq!(
+                after.blob_info(handle).unwrap().unwrap().length,
+                expected_bytes.len() as u64
+            );
+            for (snapshot, valid, stamp) in [
+                (&before, first_valid, 1),
+                (
+                    &after,
+                    first_valid || second_valid,
+                    if repaired { 2 } else { 1 },
+                ),
+            ] {
+                if valid {
+                    let blob: Blob<UnknownBlob> = snapshot.get(handle).unwrap();
+                    assert_eq!(blob.bytes.as_ref(), payload);
+                    let metadata = snapshot.metadata(handle).unwrap().unwrap();
+                    assert_eq!(metadata.timestamp, stamp);
+                    assert_eq!(metadata.length, payload.len() as u64);
+                } else {
+                    match snapshot.get::<Blob<UnknownBlob>, UnknownBlob>(handle) {
+                        Err(GetBlobError::ValidationError(bytes)) => {
+                            assert_eq!(bytes.as_ref(), first_bytes)
+                        }
+                        other => panic!("expected first invalid candidate: {other:?}"),
+                    }
+                    assert!(snapshot.metadata(handle).unwrap().is_none());
+                }
+            }
+            pile.close().unwrap();
+        }
     }
 
     #[test]
@@ -9365,18 +9312,21 @@ mod tests {
         let handle = Blob::<UnknownBlob>::new(Bytes::from_source(payload.to_vec())).get_handle();
         let hash: Inline<Hash<Blake3>> = handle.into();
 
-        let first = append_v3_blob_candidate(&path, hash, b"bad-01", 1);
+        append_v3_blob_candidate(&path, hash, b"bad-01", 1);
         let second = append_v3_blob_candidate(&path, hash, payload, 2);
-        let third = append_v3_blob_candidate(&path, hash, b"bad-03", 3);
+        append_v3_blob_candidate(&path, hash, b"bad-03", 3);
         let mut pile = Pile::open(&path).unwrap();
         pile.refresh().unwrap();
-        for offset in [first, second, third] {
-            assert_eq!(
-                blob_occurrence_validation(&pile.blobs, &hash.raw, IndexEntry::new(offset))
-                    .cached(),
-                None
-            );
-        }
+        assert_eq!(pile.blobs.len(), 1);
+        assert_eq!(pile.blob_repairs, 1);
+        assert_eq!(
+            pile.blobs.get(&hash.raw).unwrap().index.record_offset,
+            second
+        );
+        assert_eq!(
+            pile.blobs.get(&hash.raw).unwrap().validation.cached(),
+            Some(ValidationState::Validated),
+        );
         let reader = pile.snapshot().unwrap();
         let blob: Blob<UnknownBlob> = reader.get(handle).unwrap();
         assert_eq!(blob.bytes.as_ref(), payload);
@@ -9386,24 +9336,12 @@ mod tests {
             .expect("valid fallback metadata");
         assert_eq!(metadata.timestamp, 2);
         assert_eq!(metadata.length, payload.len() as u64);
-        assert_eq!(
-            blob_occurrence_validation(&pile.blobs, &hash.raw, IndexEntry::new(first)).cached(),
-            Some(ValidationState::Invalid)
-        );
-        assert_eq!(
-            blob_occurrence_validation(&pile.blobs, &hash.raw, IndexEntry::new(second)).cached(),
-            Some(ValidationState::Validated)
-        );
-        assert_eq!(
-            blob_occurrence_validation(&pile.blobs, &hash.raw, IndexEntry::new(third)).cached(),
-            None
-        );
         drop(reader);
         pile.close().unwrap();
     }
 
     #[test]
-    fn all_invalid_duplicates_fail_after_lazy_exhaustion() {
+    fn all_invalid_duplicates_retain_the_first_error() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "all-invalid.pile");
         let expected = b"target";
@@ -9411,31 +9349,27 @@ mod tests {
         let hash: Inline<Hash<Blake3>> = handle.into();
 
         let first = append_v3_blob_candidate(&path, hash, b"bad-01", 1);
-        let second = append_v3_blob_candidate(&path, hash, b"bad-02", 2);
-        let third = append_v3_blob_candidate(&path, hash, b"bad-03", 3);
+        append_v3_blob_candidate(&path, hash, b"bad-02", 2);
+        append_v3_blob_candidate(&path, hash, b"bad-03", 3);
         let mut pile = Pile::open(&path).unwrap();
         pile.refresh().unwrap();
-        for offset in [first, second, third] {
-            assert_eq!(
-                blob_occurrence_validation(&pile.blobs, &hash.raw, IndexEntry::new(offset))
-                    .cached(),
-                None
-            );
-        }
+        assert_eq!(pile.blobs.len(), 1);
+        assert_eq!(pile.blob_repairs, 0);
+        assert_eq!(
+            pile.blobs.get(&hash.raw).unwrap().index.record_offset,
+            first
+        );
+        assert_eq!(
+            pile.blobs.get(&hash.raw).unwrap().validation.cached(),
+            Some(ValidationState::Invalid),
+        );
 
         let reader = pile.snapshot().unwrap();
-        assert!(matches!(
-            reader.get::<Blob<UnknownBlob>, UnknownBlob>(handle),
-            Err(GetBlobError::ValidationError(_))
-        ));
-        assert!(reader.metadata(handle).unwrap().is_none());
-        for offset in [first, second, third] {
-            assert_eq!(
-                blob_occurrence_validation(&pile.blobs, &hash.raw, IndexEntry::new(offset))
-                    .cached(),
-                Some(ValidationState::Invalid)
-            );
+        match reader.get::<Blob<UnknownBlob>, UnknownBlob>(handle) {
+            Err(GetBlobError::ValidationError(bytes)) => assert_eq!(bytes.as_ref(), b"bad-01"),
+            other => panic!("expected first invalid candidate: {other:?}"),
         }
+        assert!(reader.metadata(handle).unwrap().is_none());
         drop(reader);
         pile.close().unwrap();
     }
@@ -9559,9 +9493,11 @@ mod tests {
         let mut pile: Pile = Pile::open(&path).unwrap();
         pile.amputate().unwrap();
         for (hash, expected) in hashes.iter().zip(&datas) {
-            let entry = first_blob_occurrence(&pile.blobs, &hash.raw)
+            let entry = pile
+                .blobs
+                .get(&hash.raw)
                 .expect("enveloped blob missing after reopen");
-            let record = indexed_blob_record(&pile.mmap, pile.applied_length, entry, hash);
+            let record = indexed_blob_record(&pile.mmap, pile.applied_length, entry.index, hash);
             assert_eq!(
                 record.payload_offset % GPU_DATA_ALIGNMENT,
                 0,
@@ -9644,9 +9580,12 @@ mod tests {
             "cat-merged pile was truncated — cat is not a valid framed merge"
         );
         for (hash, expected) in &handles {
-            let entry =
-                first_blob_occurrence(&merged.blobs, &hash.raw).expect("blob lost after cat-merge");
-            let record = indexed_blob_record(&merged.mmap, merged.applied_length, entry, hash);
+            let entry = merged
+                .blobs
+                .get(&hash.raw)
+                .expect("blob lost after cat-merge");
+            let record =
+                indexed_blob_record(&merged.mmap, merged.applied_length, entry.index, hash);
             assert_eq!(
                 record.payload_offset % ENVELOPE_BLOCK_LEN,
                 0,
@@ -10042,7 +9981,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_occurrence_changes_physical_snapshot_but_not_semantic_diff() {
+    fn valid_duplicate_preserves_content_snapshot_and_semantic_diff() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "duplicate-diff.pile");
         let payload = b"same semantic blob";
@@ -10053,7 +9992,6 @@ mod tests {
         let mut pile = Pile::open(&path).unwrap();
         let baseline = pile.snapshot().unwrap();
         assert_eq!(baseline.blobs.len(), 1);
-        assert_eq!(baseline.blobs.segmented_len(&hash.raw), 1);
         assert_eq!(baseline.blobs().count(), 1);
         assert_eq!(baseline.iter().count(), 1);
 
@@ -10061,21 +9999,61 @@ mod tests {
         let current = pile.snapshot().unwrap();
         assert!(second > first);
         assert_eq!(baseline.blobs.len(), 1);
-        assert_eq!(current.blobs.len(), 2);
-        assert!(!baseline.blobs.shares_root(&current.blobs));
-        assert_eq!(baseline.blobs.segmented_len(&hash.raw), 1);
-        assert_eq!(current.blobs.segmented_len(&hash.raw), 2);
-        assert_eq!(
-            baseline.blobs.prefix_set::<32>().iter().collect::<Vec<_>>(),
-            current.blobs.prefix_set::<32>().iter().collect::<Vec<_>>()
-        );
-        assert_eq!(current.changes_since(&baseline), StoreChanges::BLOBS);
+        assert_eq!(current.blobs.len(), 1);
+        assert_eq!(baseline.blobs, current.blobs);
+        assert_eq!(current.changes_since(&baseline), StoreChanges::NONE);
         assert_eq!(current.blobs().count(), 1);
         assert_eq!(current.iter().count(), 1);
 
         assert!(current.blobs_diff(&baseline).next().is_none());
         assert!(baseline.blobs_diff(&current).next().is_none());
 
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn duplicate_that_remaps_conservatively_changes_the_blob_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "duplicate-remap.pile");
+        let mut pile = Pile::open(&path).unwrap();
+        // One record fits the initial mapping; its duplicate crosses the bound.
+        let payload = vec![0xA7; pile.mmap.len() / 2];
+        let handle = Blob::<UnknownBlob>::new(Bytes::from_source(payload.clone())).get_handle();
+        let hash: Inline<Hash<Blake3>> = handle.into();
+        append_v3_blob_candidate(&path, hash, &payload, 1);
+        let before = pile.snapshot().unwrap();
+        append_v3_blob_candidate(&path, hash, &payload, 2);
+        let after = pile.snapshot().unwrap();
+
+        assert!(!Arc::ptr_eq(&before.mmap, &after.mmap));
+        assert_eq!(before.blobs, after.blobs);
+        assert_eq!((before.blob_repairs, after.blob_repairs), (0, 0));
+        assert_eq!(after.changes_since(&before), StoreChanges::BLOBS);
+        for dependencies in [
+            StoreDependencies {
+                all_blobs: true,
+                ..StoreDependencies::default()
+            },
+            StoreDependencies {
+                blobs: BTreeSet::from([hash]),
+                ..StoreDependencies::default()
+            },
+        ] {
+            assert_eq!(
+                after.changes_for(&before, &dependencies),
+                StoreChanges::BLOBS
+            );
+        }
+        assert_eq!(
+            after.changes_for(&before, &StoreDependencies::default()),
+            StoreChanges::NONE,
+        );
+        assert!(after.blobs_diff(&before).next().is_none());
+        for snapshot in [&before, &after] {
+            let blob: Blob<UnknownBlob> = snapshot.get(handle).unwrap();
+            assert_eq!(blob.bytes.as_ref(), payload.as_slice());
+            assert_eq!(snapshot.metadata(handle).unwrap().unwrap().timestamp, 1);
+        }
         pile.close().unwrap();
     }
 
@@ -10386,29 +10364,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "pile.pile");
 
-        let mut pile1: Pile = Pile::open(&path).unwrap();
-        let mut pile2: Pile = Pile::open(&path).unwrap();
-
         let data = vec![1u8; 4];
         let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(data.clone()));
-        let handle = pile1.put(blob).unwrap();
-        pile1.flush().unwrap();
-        pile1.refresh().unwrap();
+        let handle = blob.get_handle();
+        append_v3_blob_candidate(&path, handle.into(), &[9u8; 4], 1);
+        let mut pile1: Pile = Pile::open(&path).unwrap();
+        let mut pile2: Pile = Pile::open(&path).unwrap();
         let before_replacement = pile1.snapshot().unwrap();
 
-        // Corrupt the first enveloped blob's payload (the fixed header is 256 bytes).
-        use std::io::Seek;
-        use std::io::SeekFrom;
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        file.seek(SeekFrom::Start(ENVELOPE_HEADER_LEN as u64))
-            .unwrap();
-        file.write_all(&[9u8; 4]).unwrap();
-        file.sync_all().unwrap();
-
-        // Append a valid copy using the second pile which hasn't seen the first one.
-        let blob_dup: Blob<UnknownBlob> = Blob::new(Bytes::from_source(data.clone()));
-        pile2.put::<UnknownBlob, _>(blob_dup).unwrap();
+        // Repair by append; no byte visible to the old snapshot is mutated.
+        pile2.put::<UnknownBlob, _>(blob).unwrap();
         pile2.flush().unwrap();
 
         // Refresh the first pile; it should replace the corrupted blob with the new one.
@@ -10421,6 +10386,10 @@ mod tests {
         let reader = pile1.snapshot().unwrap();
         let fetched: Blob<UnknownBlob> = reader.get(handle).unwrap();
         assert_eq!(fetched.bytes.as_ref(), data.as_slice());
+        assert!(matches!(
+            before_replacement.get::<Blob<UnknownBlob>, UnknownBlob>(handle),
+            Err(GetBlobError::ValidationError(_)),
+        ));
         pile1.close().unwrap();
         pile2.close().unwrap();
     }
@@ -10631,7 +10600,125 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_dependencies_notice_missing_and_recovered_blob_occurrences() {
+    fn scoped_record_changes_detect_removal_and_replacement_but_ignore_rebuilding() {
+        let dir = tempfile::tempdir().unwrap();
+        let path_a = fresh_empty_pile_path(&dir, "record-a.pile");
+        let path_b = fresh_empty_pile_path(&dir, "record-b.pile");
+        let path_c = fresh_empty_pile_path(&dir, "record-c.pile");
+        let mut a = Pile::open(&path_a).unwrap();
+        let mut b = Pile::open(&path_b).unwrap();
+        let mut c = Pile::open(&path_c).unwrap();
+        let author = SigningKey::from_bytes(&[71; 32]);
+        let other_author = SigningKey::from_bytes(&[72; 32]);
+        let source = collection_test_collection(73);
+        let target = collection_test_collection(74);
+        let input = CollectionCommit::sign(
+            &author,
+            source,
+            collection_test_hash(75),
+            empty_metadata_handle(),
+        );
+        let output = collection_test_hash(76);
+        let selected = CollectionRecord::Derive(CollectionDerive::sign(
+            &author,
+            target,
+            (input.data(), input.fingerprint()),
+            output,
+        ));
+        let replacement = CollectionRecord::Derive(CollectionDerive::sign(
+            &other_author,
+            target,
+            (input.data(), input.fingerprint()),
+            output,
+        ));
+        let unrelated = CollectionRecord::Commit(input);
+        a.insert(unrelated).unwrap();
+        let without_selected = a.snapshot().unwrap();
+        a.insert(selected).unwrap();
+        let original = a.snapshot().unwrap();
+        // Rebuild in a different order and mapping, with identical content.
+        b.insert(selected).unwrap();
+        b.insert(unrelated).unwrap();
+        let rebuilt = b.snapshot().unwrap();
+        // Equal cardinality, but a different producer for the same member and input.
+        c.insert(replacement).unwrap();
+        c.insert(unrelated).unwrap();
+        let replaced = c.snapshot().unwrap();
+        assert_eq!(
+            original.collection_records.len(),
+            replaced.collection_records.len()
+        );
+
+        for selector in [
+            CollectionRecordSelector::Fingerprint(selected.fingerprint()),
+            CollectionRecordSelector::Collection(target),
+            CollectionRecordSelector::ProducedMember(target, output),
+            CollectionRecordSelector::ReferencingRecord(input.fingerprint()),
+            CollectionRecordSelector::DeriveTarget(target),
+            CollectionRecordSelector::Operation(WantRequest::derive(target, input.data())),
+        ] {
+            let dependencies = StoreDependencies {
+                records: BTreeSet::from([selector]),
+                ..StoreDependencies::default()
+            };
+            assert_eq!(
+                rebuilt.changes_for(&original, &dependencies),
+                StoreChanges::NONE
+            );
+            for changed in [&without_selected, &replaced] {
+                assert_eq!(
+                    changed.changes_for(&original, &dependencies),
+                    StoreChanges::COLLECTION_RECORDS,
+                    "{selector:?}",
+                );
+                assert_eq!(
+                    original.changes_for(changed, &dependencies),
+                    StoreChanges::COLLECTION_RECORDS,
+                    "{selector:?}",
+                );
+            }
+        }
+        let all = StoreDependencies {
+            all_records: true,
+            ..StoreDependencies::default()
+        };
+        assert_eq!(rebuilt.changes_for(&original, &all), StoreChanges::NONE);
+        assert_eq!(
+            without_selected.changes_for(&original, &all),
+            StoreChanges::COLLECTION_RECORDS
+        );
+        for selector in [
+            CollectionRecordSelector::Collection(source),
+            CollectionRecordSelector::CommitMember(target, output),
+            CollectionRecordSelector::MergeCollection(target),
+            CollectionRecordSelector::Operation(WantRequest::derive(
+                target,
+                collection_test_hash(77),
+            )),
+            CollectionRecordSelector::Operation(WantRequest::blob(
+                Inline::<Handle<UnknownBlob>>::new(output.raw),
+            )),
+        ] {
+            let dependencies = StoreDependencies {
+                records: BTreeSet::from([selector]),
+                ..StoreDependencies::default()
+            };
+            assert_eq!(
+                replaced.changes_for(&original, &dependencies),
+                StoreChanges::NONE
+            );
+            assert_eq!(
+                without_selected.changes_for(&original, &dependencies),
+                StoreChanges::NONE
+            );
+        }
+        a.close().unwrap();
+        b.close().unwrap();
+        c.close().unwrap();
+    }
+
+    #[test]
+    fn snapshot_dependencies_notice_missing_and_recovered_blob_representatives() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "scoped-blobs.pile");
         let payload = b"desired content";
@@ -10790,7 +10877,7 @@ mod tests {
     }
 
     #[test]
-    fn iterator_reflects_snapshot_occurrence_relation() {
+    fn iterator_reflects_snapshot_content_index() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "pile.pile");
 
@@ -10803,8 +10890,7 @@ mod tests {
 
         let mut reader = pile.snapshot().unwrap();
         let hash1: Inline<Hash<Blake3>> = handle1.into();
-        let entry = first_blob_occurrence(&reader.blobs, &hash1.raw).unwrap();
-        reader.blobs.remove(&blob_occurrence_key(&hash1.raw, entry));
+        reader.blobs.remove(&hash1.raw);
 
         let mut iter = reader.iter();
         assert_eq!(iter.next().unwrap().unwrap().0, handle2);
