@@ -111,6 +111,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Construct aggregate endorsed collection support once from the selected
+  witness DAG's distinct COMMIT payloads, avoiding repeated unions of
+  overlapping certificates while preserving exact support alternatives,
+  requested-support filtering, and complete conflict checks.
+
 - Preflight each invocation and delegation action of a compound collection
   grant against that action's roots before publishing it. An open action may
   accompany useful restricted actions, but one action's authority cannot make

@@ -576,7 +576,6 @@ where
     })?;
     let mut closure = super::witness::WitnessClosure::default();
     let mut roots = BTreeSet::new();
-    let mut support = Support::from_data(lineage.foundation, []);
     let mut witnesses = InputWitnesses::new();
     let mut images = BTreeMap::<_, BTreeSet<_>>::new();
     for record in candidates {
@@ -621,7 +620,6 @@ where
             continue;
         }
         roots.insert(record.fingerprint());
-        support = support.union(&record_support).expect("one foundation");
     }
     let records = closure.records_for(roots);
     for record in &records {
@@ -649,6 +647,13 @@ where
         alternatives.push((record.fingerprint(), record_support));
     }
     let discovered = super::DiscoveredCollectionRecords::from_records(records);
+    // The selected closed DAG's distinct COMMIT payloads are exactly the
+    // union of its accepted roots' supports. Build that PATCH once rather
+    // than repeatedly unioning overlapping intermediate certificates.
+    let support = Support::from_data(
+        lineage.foundation,
+        discovered.commits().iter().map(|commit| commit.data()),
+    );
     let commits = discovered.commits().iter().copied().collect();
     let resolution =
         resolve_collection_semantics(&discovered, &lineage.source_by_target, &commits, |_| {

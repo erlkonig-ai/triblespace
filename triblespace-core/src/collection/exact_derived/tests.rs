@@ -750,6 +750,210 @@ fn foundation_walks_the_complete_descriptor_ancestry() {
 }
 
 #[test]
+fn aggregate_support_uses_selected_dag_leaves_without_clipping_certificates() {
+    let (mut store, root, first, _second) = collections();
+    let signer = equation_signer();
+    let a = archive(1, 1);
+    let b = crate::collection::simplearchive_union::join(&a, &archive(2, 2)).unwrap();
+    let ca = publish_root(&mut store, root, &a, 31);
+    let cb = publish_root(&mut store, root, &b, 31);
+    let a_support = support(root, std::slice::from_ref(&a));
+    let b_support = support(root, std::slice::from_ref(&b));
+    let ab_support = support(root, &[a.clone(), b.clone()]);
+    let a_output = FirstEncoding::map(&(), &a, &store.snapshot().unwrap()).unwrap();
+    let da = CollectionDerive::sign(
+        &signer,
+        first.handle(),
+        (data(&a), ca.fingerprint()),
+        data(&a_output),
+    );
+    store.insert(CollectionRecord::Derive(da)).unwrap();
+    let selected = BTreeSet::from([first.handle()]);
+    let before = store.snapshot().unwrap();
+    let lineage = load_lineage(&before, first).unwrap();
+    let partial =
+        resolve_endorsed_lineage(&before, &lineage, &selected, Some(&ab_support)).unwrap();
+    assert_eq!(
+        partial.support, a_support,
+        "requested AB is not yet certified",
+    );
+
+    // b contains a, but its COMMIT is a distinct foundational member. The
+    // source merge certifies both members despite producing b's same bytes.
+    let ab = CollectionMerge::sign(
+        &signer,
+        root.handle(),
+        (data(&a), ca.fingerprint()),
+        (data(&b), cb.fingerprint()),
+        data(&b),
+    );
+    store.insert(CollectionRecord::Merge(ab)).unwrap();
+    let b_output = FirstEncoding::map(&(), &b, &store.snapshot().unwrap()).unwrap();
+    let dab = CollectionDerive::sign(
+        &signer,
+        first.handle(),
+        (data(&b), ab.fingerprint()),
+        data(&b_output),
+    );
+    store.insert(CollectionRecord::Derive(dab)).unwrap();
+    let after = store.snapshot().unwrap();
+    reset_mapping_calls();
+    for requested in [None, Some(&ab_support), Some(&a_support), Some(&b_support)] {
+        let resolved = resolve_endorsed_lineage(&after, &lineage, &selected, requested).unwrap();
+        let expected = match requested {
+            None => ab_support.clone(),
+            Some(requested) if requested == &ab_support => ab_support.clone(),
+            Some(requested) if requested == &a_support => a_support.clone(),
+            Some(_) => Support::from_data(root, []),
+        };
+        assert_eq!(resolved.support, expected);
+        // Image reuse remains independent of the requested-support filter.
+        assert_eq!(
+            resolved.images[&(first.handle(), data(&b))],
+            BTreeSet::from([data(&b_output)]),
+        );
+    }
+    assert_eq!(
+        FIRST_MAP_CALLS.get(),
+        0,
+        "resolution never recomputes a map"
+    );
+}
+
+#[test]
+fn aggregate_support_deduplicates_leaves_but_keeps_alternative_certifications() {
+    let (mut store, root, first, _second) = collections();
+    let signer = equation_signer();
+    let other_signer = SigningKey::from_bytes(&[32; 32]);
+    let a = archive(1, 1);
+    let b = crate::collection::simplearchive_union::join(&a, &archive(2, 2)).unwrap();
+    let ca = publish_root(&mut store, root, &a, 31);
+    let cb = publish_root(&mut store, root, &b, 31);
+    let cb_other = publish_root(&mut store, root, &b, 32);
+    let ab = CollectionMerge::sign(
+        &signer,
+        root.handle(),
+        (data(&a), ca.fingerprint()),
+        (data(&b), cb.fingerprint()),
+        data(&b),
+    );
+    store.insert(CollectionRecord::Merge(ab)).unwrap();
+    let output = FirstEncoding::map(&(), &b, &store.snapshot().unwrap()).unwrap();
+    let mut target_records = Vec::new();
+    for (key, witness) in [
+        (&signer, ab.fingerprint()),
+        (&signer, cb.fingerprint()),
+        (&signer, cb_other.fingerprint()),
+        (&other_signer, cb.fingerprint()),
+    ] {
+        let derive =
+            CollectionDerive::sign(key, first.handle(), (data(&b), witness), data(&output));
+        store.insert(CollectionRecord::Derive(derive)).unwrap();
+        target_records.push(derive);
+    }
+    let snapshot = store.snapshot().unwrap();
+    let lineage = load_lineage(&snapshot, first).unwrap();
+    let selected = BTreeSet::from([first.handle()]);
+    let ab_support = support(root, &[a.clone(), b.clone()]);
+    let b_support = support(root, &[b]);
+    let whole = resolve_endorsed_lineage(&snapshot, &lineage, &selected, None).unwrap();
+    assert_eq!(whole.support, ab_support);
+    let alternatives = &whole.witnesses[&(first.handle(), data(&output))];
+    assert_eq!(alternatives.len(), 4);
+    for record in &target_records {
+        let expected = if record.input_witness() == ab.fingerprint() {
+            &ab_support
+        } else {
+            &b_support
+        };
+        assert!(alternatives.iter().any(|(fingerprint, support)| {
+            *fingerprint == record.fingerprint() && support == expected
+        }));
+    }
+    let exact = resolve_endorsed_lineage(&snapshot, &lineage, &selected, Some(&b_support)).unwrap();
+    assert_eq!(exact.support, b_support);
+    assert_eq!(exact.witnesses[&(first.handle(), data(&output))].len(), 3);
+    assert!(!exact.witnesses.contains_key(&(root.handle(), data(&a))));
+}
+
+#[test]
+fn aggregate_support_excludes_missing_witnesses_and_unadmitted_producers() {
+    let mut store = MemoryRepo::default();
+    let signer = equation_signer();
+    let other_signer = SigningKey::from_bytes(&[32; 32]);
+    let root = store.collection("root", policy()).unwrap();
+    let first = store
+        .derive::<FirstEncoding>(
+            root,
+            (),
+            CollectionPolicy::new(
+                AdmissionPolicy::Open,
+                AdmissionPolicy::direct(signer.verifying_key()),
+            ),
+        )
+        .unwrap();
+    let a = archive(1, 1);
+    let b = archive(2, 2);
+    let c = archive(3, 3);
+    let ca = publish_root(&mut store, root, &a, 31);
+    let cc = publish_root(&mut store, root, &c, 31);
+    let metadata = store.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
+    // This is the actual predecessor, deliberately not persisted yet.
+    let cb = CollectionCommit::sign(&signer, root.handle(), data(&b), metadata);
+    let mut a_output = None;
+    for (key, source, witness) in [
+        (&signer, &a, ca.fingerprint()),
+        (&signer, &b, cb.fingerprint()),
+        (&other_signer, &c, cc.fingerprint()),
+    ] {
+        let output = FirstEncoding::map(&(), source, &store.snapshot().unwrap()).unwrap();
+        if source.get_handle() == a.get_handle() {
+            a_output = Some(data(&output));
+        }
+        store
+            .insert(CollectionRecord::Derive(CollectionDerive::sign(
+                key,
+                first.handle(),
+                (data(source), witness),
+                data(&output),
+            )))
+            .unwrap();
+    }
+    let before = store.snapshot().unwrap();
+    let lineage = load_lineage(&before, first).unwrap();
+    let selected = BTreeSet::from([first.handle()]);
+    let resolved = resolve_endorsed_lineage(&before, &lineage, &selected, None).unwrap();
+    assert_eq!(resolved.support, support(root, std::slice::from_ref(&a)));
+    assert_eq!(resolved.images.len(), 1);
+    assert_eq!(
+        resolved.images[&(first.handle(), data(&a))],
+        BTreeSet::from([a_output.unwrap()]),
+    );
+
+    store.insert(CollectionRecord::Commit(cb)).unwrap();
+    let after = store.snapshot().unwrap();
+    let resolved = resolve_endorsed_lineage(&after, &lineage, &selected, None).unwrap();
+    assert_eq!(resolved.support, support(root, &[a.clone(), b.clone()]));
+    assert_eq!(resolved.images.len(), 2);
+
+    // Complete coverage is not an excuse to stop scanning: this admitted,
+    // closed claim conflicts with the already certified image of a.
+    let wrong = FirstEncoding::map(&(), &b, &after).unwrap();
+    store
+        .insert(CollectionRecord::Derive(CollectionDerive::sign(
+            &signer,
+            first.handle(),
+            (data(&a), ca.fingerprint()),
+            data(&wrong),
+        )))
+        .unwrap();
+    assert!(matches!(
+        resolve_endorsed_lineage(&store.snapshot().unwrap(), &lineage, &selected, None),
+        Err(CollectionRealizationError::Resolution(reason)) if reason.contains("conflicting outputs")
+    ));
+}
+
+#[test]
 fn downstream_ensure_requires_an_existing_immediate_source_realization() {
     let (mut store, root, first, second) = collections();
     let source = archive(1, 1);
