@@ -2,8 +2,8 @@
 //!
 //! The host runtime repairs immutable per-collection semantic overlays. This
 //! side owns the only mutable store boundary: authenticated leaves are deduplicated,
-//! inserted monotonically, flushed once per drain, and only then exposed in a
-//! replacement serving snapshot. Snapshot-backed blob acquisition is separate
+//! inserted monotonically and exposed in a replacement serving snapshot.
+//! Explicit close owns the final persistence boundary. Snapshot-backed acquisition is separate
 //! from frozen record reads and durable WANT delegation.
 
 use std::error::Error;
@@ -195,10 +195,6 @@ where
     qos: ReconcileQos,
     active: ActiveCollections,
     active_dirty: bool,
-    /// Network admissions stay outside the advertised snapshot until their
-    /// shared durability barrier succeeds. A failed flush is retried on every
-    /// refresh without requiring the remote to redeliver the event first.
-    pending_network_flush: bool,
     /// Last local observation used to build the installed immutable inventory.
     /// Equality is a cheap invalidation check supplied by the store; it is not
     /// a portable generation or a semantic version.
@@ -295,7 +291,6 @@ where
             qos,
             active: PATCH::new(),
             active_dirty: true,
-            pending_network_flush: false,
             last_store_snapshot: None,
             last_provider_observation: ProviderObservation::default(),
             last_event_at: crate::clock::mono_now(),
@@ -422,8 +417,8 @@ where
         }
     }
 
-    /// Drain authenticated collection progress, cross one durability barrier,
-    /// then replace the immutable active-collection snapshot. Calling this
+    /// Drain authenticated collection progress and replace the immutable
+    /// active-collection snapshot without flushing the backend. Calling this
     /// with no events is still meaningful: file-backed stores reobserve
     /// external appends before periodic repair uses them.
     pub fn refresh(&mut self) {
@@ -453,10 +448,12 @@ where
         self.sender.observe_store(|health| {
             let now = crate::clock::mono_now();
             health.last_refresh_completed_at = Some(now);
-            health.pending_flush = self.pending_network_flush;
             if result.is_err() {
                 health.last_failure_at = Some(now);
-                health.last_failure = Some(crate::health::StoreFailure::Refresh);
+                health.last_failure = Some(match &result {
+                    Err(PeerSnapshotError::Store(_)) => crate::health::StoreFailure::Snapshot,
+                    _ => crate::health::StoreFailure::Refresh,
+                });
             }
         });
         if result.is_err() {
@@ -491,9 +488,7 @@ where
                         // Verified on the wire against the handle it was fetched
                         // by; it lands under that handle without a second hash.
                         match store.put::<UnknownBlob, _>(verified) {
-                            Ok(_) => {
-                                self.pending_network_flush = true;
-                            }
+                            Ok(_) => {}
                             Err(error) => {
                                 return Err(PeerSnapshotError::Overlay(anyhow::anyhow!(
                                     "landing network blob failed: {error:?}"
@@ -502,7 +497,7 @@ where
                         }
                     }
                     NetEvent::CollectionRecord(record) => match store.insert(record) {
-                        Ok(()) => self.pending_network_flush = true,
+                        Ok(()) => {}
                         Err(error) => {
                             tracing::warn!(?error, "admitting collection repair record failed")
                         }
@@ -510,7 +505,7 @@ where
                     // Proof repair carries complete inline evidence, not blob
                     // demand. No content closure is implied by admission.
                     NetEvent::CapabilityProof(proof) => match store.insert_proof(proof) {
-                        Ok(()) => self.pending_network_flush = true,
+                        Ok(()) => {}
                         Err(error) => {
                             tracing::warn!(
                                 ?error,
@@ -524,109 +519,70 @@ where
                 }
             }
         }
-        self.sender
-            .observe_store(|health| health.pending_flush = self.pending_network_flush);
-        if self.pending_network_flush {
-            match store.flush() {
-                Ok(()) => {
-                    self.pending_network_flush = false;
-                    self.sender.observe_store(|health| {
-                        health.last_flush_at = Some(crate::clock::mono_now());
-                        health.pending_flush = false;
-                    });
-                    tracing::debug!(
-                        received,
-                        received_batches,
-                        "collection repair admission durable"
-                    );
-                }
-                Err(error) => {
-                    self.sender.observe_store(|health| {
-                        health.last_failure_at = Some(crate::clock::mono_now());
-                        health.last_failure = Some(crate::health::StoreFailure::Flush);
-                    });
-                    tracing::warn!(
-                        ?error,
-                        received,
-                        received_batches,
-                        "collection repair flush failed; snapshot withheld"
-                    );
-                }
-            }
+        if received != 0 {
+            tracing::debug!(
+                received,
+                received_batches,
+                "collection repair admission applied"
+            );
         }
-        if !self.pending_network_flush {
-            let snapshot = match store.snapshot_at(instant) {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    self.sender.observe_store(|health| {
-                        health.last_failure_at = Some(crate::clock::mono_now());
-                        health.last_failure = Some(crate::health::StoreFailure::Snapshot);
-                    });
-                    tracing::warn!(
-                        ?error,
-                        "store snapshot unavailable; keeping prior collection view"
-                    );
-                    return Ok(());
-                }
-            };
-            self.sender.observe_store(|health| {
-                health.last_snapshot_observed_at = Some(crate::clock::mono_now());
-            });
-            let previous_snapshot = self.sender.current_snapshot();
-            let changes = if previous_snapshot.is_none() {
-                StoreChanges::ALL
-            } else {
-                self.last_store_snapshot
-                    .as_ref()
-                    .map_or(StoreChanges::ALL, |previous| {
-                        snapshot.changes_since(previous)
-                    })
-            };
-            if received == 0
-                && changes == StoreChanges::NONE
-                && !self.active_dirty
-                && previous_snapshot.is_some()
-            {
-                self.last_store_snapshot = Some(snapshot);
-                return Ok(());
-            }
-            // Even a semantic no-op installs the fresh read observation. Unchanged
-            // semantic repair PATCHes retain their Arc while exact-GET advances to
-            // the new immutable store observation.
-            let serving = StoreSnapshot::from_store_changes(
-                snapshot.clone(),
-                &self.active,
-                VerifyingKey::from_bytes(self.sender.id().as_bytes())
-                    .expect("endpoint id is an Ed25519 key"),
-                self.last_store_snapshot.as_ref(),
-                previous_snapshot.as_deref(),
-                changes,
-            )
-            .map_err(PeerSnapshotError::Overlay)?;
-            let serves_collections = self.qos.direction.serves();
-            let provider_observation = ProviderObservation::from_locators(
-                serving
-                    .collections()
-                    .map(|collection| collection.collection()),
-                serves_collections,
-                serving.bearer_locators(),
-            );
-            self.sender.update_snapshot(serving, &self.active);
-            #[cfg(test)]
-            {
-                self.serving_snapshot_rebuilds += 1;
-            }
-            self.active_dirty = false;
-            self.last_store_snapshot = Some(snapshot);
-            Self::observe_provider_observation(
-                &self.sender,
-                &mut self.last_provider_observation,
-                provider_observation,
-            );
+        let snapshot = store
+            .snapshot_at(instant)
+            .map_err(PeerSnapshotError::Store)?;
+        self.sender.observe_store(|health| {
+            health.last_snapshot_observed_at = Some(crate::clock::mono_now());
+        });
+        let previous_snapshot = self.sender.current_snapshot();
+        let changes = if previous_snapshot.is_none() {
+            StoreChanges::ALL
         } else {
-            // Keep the last immutable serving/provider observation until the
-            // failed admission batch is retried successfully.
+            self.last_store_snapshot
+                .as_ref()
+                .map_or(StoreChanges::ALL, |previous| {
+                    snapshot.changes_since(previous)
+                })
+        };
+        if received == 0
+            && changes == StoreChanges::NONE
+            && !self.active_dirty
+            && previous_snapshot.is_some()
+        {
+            self.last_store_snapshot = Some(snapshot);
+            return Ok(());
         }
+        // Unchanged semantic repair PATCHes retain their Arc while exact-GET
+        // advances to the new immutable store observation. No flush is needed
+        // to make a successful local append part of that observation.
+        let serving = StoreSnapshot::from_store_changes(
+            snapshot.clone(),
+            &self.active,
+            VerifyingKey::from_bytes(self.sender.id().as_bytes())
+                .expect("endpoint id is an Ed25519 key"),
+            self.last_store_snapshot.as_ref(),
+            previous_snapshot.as_deref(),
+            changes,
+        )
+        .map_err(PeerSnapshotError::Overlay)?;
+        let serves_collections = self.qos.direction.serves();
+        let provider_observation = ProviderObservation::from_locators(
+            serving
+                .collections()
+                .map(|collection| collection.collection()),
+            serves_collections,
+            serving.bearer_locators(),
+        );
+        self.sender.update_snapshot(serving, &self.active);
+        #[cfg(test)]
+        {
+            self.serving_snapshot_rebuilds += 1;
+        }
+        self.active_dirty = false;
+        self.last_store_snapshot = Some(snapshot);
+        Self::observe_provider_observation(
+            &self.sender,
+            &mut self.last_provider_observation,
+            provider_observation,
+        );
         Ok(())
     }
 
@@ -1441,6 +1397,46 @@ mod tests {
             bytes
         );
         reopened.close().unwrap();
+    }
+
+    #[test]
+    fn failed_refresh_returns_store_error_and_withdraws_previous_serving_snapshot() {
+        use std::io::Write;
+
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let key = SigningKey::from_bytes(&[85; 32]);
+        let (sender, receiver, _wiring) =
+            host::wire(crate::identity::iroh_secret(&key).public().into());
+        let observer = sender.clone();
+        let mut peer = Peer::with_wiring(
+            Pile::open(path.path()).unwrap(),
+            ReconcileQos::default(),
+            sender,
+            receiver,
+        );
+        let previous = peer.snapshot().unwrap();
+        assert!(observer.current_snapshot().is_some());
+        // A new incomplete external tail cannot change the already frozen
+        // prefix, but it must make the requested refresh fail honestly.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path.path())
+            .unwrap()
+            .write_all(&[0])
+            .unwrap();
+        assert!(matches!(
+            peer.try_refresh(),
+            Err(PeerSnapshotError::Store(_))
+        ));
+        assert!(observer.current_snapshot().is_none());
+        assert!(peer.last_store_snapshot.is_none());
+        assert_eq!(
+            observer.health().store.last_failure,
+            Some(crate::health::StoreFailure::Snapshot)
+        );
+        assert!(!observer.health().store.serving_snapshot);
+        assert_eq!(previous.blobs().count(), 0);
+        peer.close().unwrap();
     }
 
     #[test]

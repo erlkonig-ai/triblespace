@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Make Net admission and hydration visible after local put without automatic
+  disk flushes or a retained durable-answer cache. Explicit close remains the
+  persistence boundary; manual flush, put and refresh errors remain observable.
+  Keep physical corruption/valid-duplicate read semantics, frozen observations,
+  and existing request concurrency. Remove obsolete pending-flush health state.
+
 - Carry the existing `Blob<UnknownBlob>` through interactive, descriptor and
   bulk-replication landing. The wire constructs it once and checks its cached
   handle against the request; destination insertion no longer reconstructs and
@@ -35,7 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or change transport, scheduling, wire bytes, or live state.
 
 - Experiment with four concurrent exact-handle hydration fetches within one
-  service class's existing deadline. Completed bodies land and flush serially;
+  service class's existing deadline. Completed bodies land serially;
   a stalled first request no longer blocks ready later answers. Owned lazy Peer
   fetch futures start only when polled. Cancellation, retry accounting and
   frozen rounds remain bounded; recursive speculation stays serial and keeps

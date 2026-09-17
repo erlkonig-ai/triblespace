@@ -134,7 +134,6 @@ pub struct CollectionHealth {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StoreFailure {
-    Flush,
     Snapshot,
     Refresh,
 }
@@ -147,10 +146,8 @@ pub struct StoreHealth {
     /// immutable frontier did not change. It is not a rebuild counter.
     pub last_snapshot_observed_at: Option<Mono>,
     pub last_snapshot_published_at: Option<Mono>,
-    pub last_flush_at: Option<Mono>,
     pub last_failure_at: Option<Mono>,
     pub last_failure: Option<StoreFailure>,
-    pub pending_flush: bool,
     pub serving_snapshot: bool,
     /// Exact number of blobs in the most recently published immutable store
     /// observation. This is local residency, not network availability.
@@ -254,7 +251,6 @@ impl HealthSnapshot {
         }
         if !self.is_fresh(now, max_age)
             || !self.store.serving_snapshot
-            || self.store.pending_flush
             || !fresh(self.store.last_snapshot_observed_at, now, max_age)
             || self.store.last_failure_at > self.store.last_snapshot_observed_at
         {
@@ -540,18 +536,12 @@ mod tests {
     }
 
     #[test]
-    fn pending_flush_and_failed_store_observation_are_not_fresh_matches() {
+    fn failed_store_observation_is_not_a_fresh_match() {
         let (health, collection, peer, now) = fixture();
         compare(&health, collection, peer, now);
         let later = now + Duration::from_secs(1);
         let age = Duration::from_secs(180);
-        health.update(|health| health.store.pending_flush = true);
-        assert_eq!(
-            health.snapshot().comparison(collection, peer, later, age),
-            ComparisonState::Unknown
-        );
         health.update(|health| {
-            health.store.pending_flush = false;
             health.store.last_failure_at = Some(later);
             health.store.last_failure = Some(StoreFailure::Snapshot);
         });

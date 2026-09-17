@@ -191,7 +191,6 @@ pub fn conditions(
             && !within(health.started_at, HOST_MAX_AGE),
     }];
     let store_current = health.store.serving_snapshot
-        && !health.store.pending_flush
         && within(health.store.last_snapshot_observed_at, HOST_MAX_AGE)
         && health.store.last_failure_at <= health.store.last_snapshot_observed_at;
     conditions.push(Condition {

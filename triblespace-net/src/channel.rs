@@ -2,7 +2,8 @@
 //!
 //! Collection repair admission is monotone. The host streams authenticated leaves to
 //! the store side in bounded batches, where one refresh drain inserts all
-//! available batches and crosses a single durability barrier.
+//! available batches into the next immutable observation without a disk flush.
+//! Explicit close (or an application-chosen flush) owns persistence.
 
 use crate::provider::ProviderObservation;
 use triblespace_core::blob::Blob;
