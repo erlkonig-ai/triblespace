@@ -419,8 +419,12 @@ mod tests {
         assert!(before.proof(proof.id()).unwrap().is_none());
         assert_eq!(after.proof(proof.id()).unwrap(), Some(proof));
         let expected = StoreDependencies {
-            blobs: BTreeSet::from([Handle::<UnknownBlob>::to_hash(handle)]),
-            records: BTreeSet::from([CollectionRecordSelector::Fingerprint(record.fingerprint())]),
+            blobs: crate::collection::CollectionDataSet::from([Handle::<UnknownBlob>::to_hash(
+                handle,
+            )]),
+            records: crate::collection::CollectionRecordSelectors::from([
+                CollectionRecordSelector::Fingerprint(record.fingerprint()),
+            ]),
             capability_proofs: true,
             ..StoreDependencies::default()
         };
@@ -538,7 +542,7 @@ mod tests {
         assert_eq!(
             observed.dependencies(),
             StoreDependencies {
-                records: BTreeSet::from([
+                records: crate::collection::CollectionRecordSelectors::from([
                     CollectionRecordSelector::Collection(collection.handle()),
                     CollectionRecordSelector::Fingerprint(record.fingerprint()),
                 ]),

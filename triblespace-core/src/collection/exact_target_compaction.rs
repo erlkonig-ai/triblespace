@@ -5,12 +5,15 @@
 //! or a missing optional join dependency keeps the finer cover, as does a
 //! producer without target WRITE authority. None triggers upstream construction.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use ed25519_dalek::SigningKey;
 
+use super::resolution::{bytes, infixes};
 use crate::blob::Blob;
 use crate::inline::encodings::hash::Handle;
+use crate::inline::Inline;
+use crate::patch::{Entry, PATCH};
 use crate::repo::{BlobStoreGet, Store};
 
 use super::exact_derived::{
@@ -22,6 +25,9 @@ use super::{
     Collection, CollectionData, CollectionEncoding, CollectionMerge, CollectionOperationError,
     CollectionRecord, CollectionSemantics, Cover, Support,
 };
+
+crate::key_segmentation!(TierSegments, 36, [4, 32]);
+crate::key_schema!(TierOrder, TierSegments, 36, [0, 1]);
 
 /// Carry one exact target realization to its deterministic dyadic LSM fixed
 /// point feasible under the producer's target WRITE authority.
@@ -74,7 +80,9 @@ where
         &OperationSnapshot<S::Snapshot, S::Snapshot>,
     ) -> Result<Option<Blob<E>>, CollectionOperationError>,
 {
-    let mut blocked = BTreeSet::new();
+    let mut blocked = PATCH::<64>::new();
+    // Operation-local cycle detection for this one planning run. Variable-length
+    // cover vectors stay exact; this is not an observation cache or catalogue.
     let mut seen = BTreeSet::new();
 
     loop {
@@ -124,13 +132,7 @@ fn prepare_carry_round<R, E>(
     snapshot: &R,
     target: Collection<E>,
     cover: &Cover<E>,
-) -> Result<
-    Option<(
-        crate::trible::Fragment,
-        BTreeMap<u32, BTreeSet<CollectionData>>,
-    )>,
-    CollectionRealizationError,
->
+) -> Result<Option<(crate::trible::Fragment, PATCH<36, TierOrder>)>, CollectionRealizationError>
 where
     R: BlobStoreGet + crate::repo::BlobStoreMeta,
     E: CollectionEncoding,
@@ -155,7 +157,7 @@ where
     // be arbitrarily large, while size-tier selection needs only indexed
     // length metadata.  The publisher loads at most one disjoint pair at a
     // time from a cheap fresh snapshot.
-    let mut tiers = BTreeMap::<u32, BTreeSet<CollectionData>>::new();
+    let mut tiers = PATCH::<36, TierOrder>::new();
     for handle in cover.members() {
         let data = Handle::<E>::to_hash(handle);
         let metadata = snapshot
@@ -164,7 +166,10 @@ where
                 CollectionRealizationError::storage("inspect target-maintenance member", error)
             })?
             .ok_or(CollectionRealizationError::MissingDependency { member: data })?;
-        tiers.entry(tier(metadata.length)).or_default().insert(data);
+        let mut row = [0; 36];
+        row[..4].copy_from_slice(&tier(metadata.length).to_be_bytes());
+        row[4..].copy_from_slice(&data.raw);
+        tiers.insert(&Entry::new(&row));
     }
 
     Ok(Some((descriptor, tiers)))
@@ -175,10 +180,10 @@ fn publish_carry_round<S, E, J>(
     target: Collection<E>,
     signing_key: &SigningKey,
     descriptor: &crate::trible::Fragment,
-    tiers: BTreeMap<u32, BTreeSet<CollectionData>>,
+    tiers: PATCH<36, TierOrder>,
     witnesses: &InputWitnesses,
     semantics: &CollectionSemantics,
-    blocked: &mut BTreeSet<(CollectionData, CollectionData)>,
+    blocked: &mut PATCH<64>,
     frontier: &mut OperationFrontier<S::Snapshot>,
     join: &mut J,
 ) -> Result<bool, CollectionRealizationError>
@@ -192,7 +197,10 @@ where
         &OperationSnapshot<S::Snapshot, S::Snapshot>,
     ) -> Result<Option<Blob<E>>, CollectionOperationError>,
 {
-    for (_, mut members) in tiers {
+    for (tier, _) in tiers.iter_prefix_count::<4>() {
+        // Scratch pairing queue for just this tier of one carry round.
+        let mut members: BTreeSet<CollectionData> =
+            infixes(&tiers, tier).map(Inline::new).collect();
         let mut published = false;
         while members.len() >= 2 {
             let low_data = members
@@ -201,7 +209,10 @@ where
             let high_data = members
                 .pop_first()
                 .expect("colliding target tier contains a higher member");
-            if blocked.contains(&(low_data, high_data)) {
+            if blocked
+                .get(&bytes(&[low_data.raw, high_data.raw]))
+                .is_some()
+            {
                 members.insert(high_data);
                 continue;
             }
@@ -261,7 +272,7 @@ where
                     // Retire the lower input for this planning pass and leave
                     // the higher one eligible for the next deterministic pair.
                     // The exact finer cover remains the valid result.
-                    blocked.insert((low_data, high_data));
+                    blocked.insert(&Entry::new(&bytes(&[low_data.raw, high_data.raw])));
                     members.insert(high_data);
                 }
             }

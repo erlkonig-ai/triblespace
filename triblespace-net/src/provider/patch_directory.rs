@@ -1,198 +1,206 @@
-//! A representation experiment, not another provider protocol.
+//! Differential and scale checks for the live two-PATCH provider directory.
 //!
-//! One segmented PATCH owns memberships, exact-key counts, and responsibility
-//! order. A second PATCH orders deadlines. Differential tests keep the current
-//! receiver-local TTL, bounded pruning, provider ordering, and eviction policy.
-//! Nothing here persists leases, changes trust, or changes live host behavior.
+//! The four-index BTree reference preserves the previous receiver-local policy.
+//! Historical measurements remain in the book: lower retained index memory
+//! came with slower renewal and some slower multi-provider insertions.
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::*;
 
-triblespace_core::key_segmentation!(MembershipSegments, 64, [32, 32]);
-triblespace_core::key_schema!(MembershipOrder, MembershipSegments, 64, [0, 1]);
-
-struct PatchDirectory {
+// Independent four-index reference retained only for differential tests.
+struct BTreeDirectory {
     local_id: PeerId,
-    // !(locator XOR local) | !provider: first key is farthest responsibility.
-    // XOR is bijective, so the first segment also identifies an exact locator.
-    members: PATCH<64, MembershipOrder, (Mono, ProviderToken)>,
-    // deadline | locator | provider preserves the old prune tie-breaking too.
-    deadlines: PATCH<72>,
+    memberships: BTreeMap<(ProviderKey, PeerId), (Mono, ProviderToken)>,
+    providers_by_key: BTreeMap<ProviderKey, BTreeSet<PeerId>>,
+    deadlines: BTreeSet<(Mono, ProviderKey, PeerId)>,
+    responsibility: BTreeSet<([u8; 32], ProviderKey, PeerId)>,
     limits: DirectoryLimits,
 }
 
-impl PatchDirectory {
-    fn new(local_id: PeerId, limits: DirectoryLimits) -> Self {
-        Self {
-            local_id,
-            members: PATCH::new(),
-            deadlines: PATCH::new(),
-            limits,
-        }
-    }
-
-    fn prefix(&self, locator: ProviderKey) -> [u8; 32] {
-        std::array::from_fn(|i| !(locator[i] ^ self.local_id[i]))
-    }
-
-    fn key(&self, locator: ProviderKey, provider: PeerId) -> [u8; 64] {
-        let mut key = [0; 64];
-        key[..32].copy_from_slice(&self.prefix(locator));
-        key[32..].copy_from_slice(&provider.map(|byte| !byte));
-        key
-    }
-
-    fn decode(&self, key: [u8; 64]) -> (ProviderKey, PeerId) {
-        (
-            std::array::from_fn(|i| !key[i] ^ self.local_id[i]),
-            std::array::from_fn(|i| !key[32 + i]),
-        )
-    }
-
-    fn deadline_key(deadline: Mono, locator: ProviderKey, provider: PeerId) -> [u8; 72] {
-        let mut key = [0; 72];
-        key[..8].copy_from_slice(&deadline.as_nanos().to_be_bytes());
-        key[8..40].copy_from_slice(&locator);
-        key[40..].copy_from_slice(&provider);
-        key
-    }
-
-    fn retained_counts(&self) -> (usize, usize) {
-        (
-            self.members.len() as usize,
-            self.members.segmented_len(&[]) as usize,
-        )
-    }
-
-    fn farthest(&self) -> Option<[u8; 64]> {
-        // Ordered descent, not an allocated ordered iterator for just one key.
-        let prefix = self.members.first_infix_range(&[], &[0; 32], &[255; 32])?;
-        let suffix = self
-            .members
-            .first_infix_range(&prefix, &[0; 32], &[255; 32])?;
-        let mut key = [0; 64];
-        key[..32].copy_from_slice(&prefix);
-        key[32..].copy_from_slice(&suffix);
-        Some(key)
-    }
-
-    fn remove(&mut self, key: [u8; 64]) {
-        let Some((deadline, _)) = self.members.get(&key).copied() else {
-            return;
-        };
-        let (locator, provider) = self.decode(key);
-        self.deadlines
-            .remove(&Self::deadline_key(deadline, locator, provider));
-        self.members.remove(&key);
-    }
-
-    fn prune(&mut self, now: Mono) {
-        for _ in 0..MAX_EXPIRED_PROVIDER_MEMBERSHIPS_PER_CALL {
-            let Some(key) = self.deadlines.first_infix_range(&[], &[0; 72], &[255; 72]) else {
-                break;
-            };
-            if key[..8] > now.as_nanos().to_be_bytes()[..] {
-                break;
-            }
-            let locator = key[8..40].try_into().unwrap();
-            let provider = key[40..].try_into().unwrap();
-            self.remove(self.key(locator, provider));
-        }
-    }
-
-    fn prune_key(&mut self, locator: ProviderKey, now: Mono) {
-        let prefix = self.prefix(locator);
-        let mut expired = Vec::new();
-        self.members.infixes(&prefix, |suffix: &[u8; 32]| {
-            let mut key = [0; 64];
-            key[..32].copy_from_slice(&prefix);
-            key[32..].copy_from_slice(suffix);
-            if self.members.get(&key).unwrap().0 <= now {
-                expired.push(key);
-            }
-        });
-        for key in expired {
-            self.remove(key);
-        }
-    }
-
-    fn put(
-        &mut self,
-        locator: ProviderKey,
-        provider: PeerId,
-        token: ProviderToken,
-        now: Mono,
-    ) -> bool {
-        self.prune(now);
-        let key = self.key(locator, provider);
-        if let Some((old, _)) = self.members.get(&key).copied() {
-            self.deadlines
-                .remove(&Self::deadline_key(old, locator, provider));
-        } else {
-            self.prune_key(locator, now);
-            if self.members.segmented_len(&self.prefix(locator)) >= MAX_PROVIDERS_PER_KEY as u64 {
-                return false;
-            }
-            if self.members.len() >= self.limits.memberships as u64 {
-                let Some(farthest) = self.farthest() else {
-                    return false;
-                };
-                if key <= farthest {
-                    return false;
-                }
-                self.remove(farthest);
-            }
-        }
-        let deadline = now + self.limits.lease;
-        self.members
-            .replace(&PatchEntry::with_value(&key, (deadline, token)));
-        self.deadlines.insert(&PatchEntry::new(&Self::deadline_key(
-            deadline, locator, provider,
-        )));
-        true
-    }
-
-    fn get(&mut self, locator: ProviderKey, now: Mono) -> Vec<(PeerId, ProviderToken)> {
-        self.prune(now);
-        let prefix = self.prefix(locator);
-        let mut result = Vec::with_capacity(self.members.segmented_len(&prefix) as usize);
-        self.members.infixes(&prefix, |suffix: &[u8; 32]| {
-            let mut key = [0; 64];
-            key[..32].copy_from_slice(&prefix);
-            key[32..].copy_from_slice(suffix);
-            let (deadline, token) = self.members.get(&key).unwrap();
-            if *deadline > now {
-                result.push((suffix.map(|byte| !byte), *token));
-            }
-        });
-        result.sort_unstable_by_key(|entry| entry.0);
-        result
+impl Default for BTreeDirectory {
+    fn default() -> Self {
+        Self::new([0; 32])
     }
 }
 
-fn same_state(reference: &ProviderDirectory, candidate: &PatchDirectory) {
+impl BTreeDirectory {
+    fn new(local_id: PeerId) -> Self {
+        Self {
+            local_id,
+            memberships: BTreeMap::new(),
+            providers_by_key: BTreeMap::new(),
+            deadlines: BTreeSet::new(),
+            responsibility: BTreeSet::new(),
+            limits: DirectoryLimits {
+                lease: PROVIDER_LEASE_LIFETIME,
+                memberships: MAX_PROVIDER_MEMBERSHIPS,
+            },
+        }
+    }
+
+    /// O(1) retained soft-state counts; expired entries may await bounded prune.
+    fn retained_counts(&self) -> (usize, usize) {
+        (self.memberships.len(), self.providers_by_key.len())
+    }
+
+    /// Install or renew one exact membership. Capacity pressure never prevents
+    /// an already-admitted live membership from renewing.
+    fn put(&mut self, key: ProviderKey, provider: PeerId, token: ProviderToken, now: Mono) -> bool {
+        self.prune_expired(now);
+        let membership = (key, provider);
+        if let Some((previous, _)) = self.memberships.get(&membership).copied() {
+            self.deadlines.remove(&(previous, key, provider));
+        } else {
+            self.prune_expired_key(key, now);
+            if self
+                .providers_by_key
+                .get(&key)
+                .is_some_and(|providers| providers.len() >= MAX_PROVIDERS_PER_KEY)
+            {
+                return false;
+            }
+            if self.memberships.len() >= self.limits.memberships {
+                let candidate = (self.distance(key), key, provider);
+                let Some(farthest) = self.responsibility.last().copied() else {
+                    return false;
+                };
+                if candidate >= farthest {
+                    return false;
+                }
+                self.remove_membership(farthest.1, farthest.2);
+            }
+            self.providers_by_key
+                .entry(key)
+                .or_default()
+                .insert(provider);
+            self.responsibility
+                .insert((self.distance(key), key, provider));
+        }
+
+        let expires_at = now + self.limits.lease;
+        self.memberships.insert(membership, (expires_at, token));
+        self.deadlines.insert((expires_at, key, provider));
+        true
+    }
+
+    /// Reclaim the at-most-64 stale memberships that can block this exact key.
+    /// Global expiry cleanup remains bounded too, but unrelated older entries
+    /// must never make a live insertion spuriously observe a saturated key.
+    fn prune_expired_key(&mut self, key: ProviderKey, now: Mono) {
+        let expired = self
+            .providers_by_key
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|provider| {
+                self.memberships
+                    .get(&(key, *provider))
+                    .is_some_and(|(expires_at, _)| *expires_at <= now)
+            })
+            .collect::<Vec<_>>();
+        for provider in expired {
+            self.remove_membership(key, provider);
+        }
+    }
+
+    /// Return every live provider retained for one exact rendezvous key.
+    fn get(&mut self, key: ProviderKey, now: Mono) -> Vec<(PeerId, ProviderToken)> {
+        self.prune_expired(now);
+        let Some(providers) = self.providers_by_key.get(&key) else {
+            return Vec::new();
+        };
+        let mut result = Vec::with_capacity(MAX_PROVIDERS_PER_KEY.min(providers.len()));
+        for provider in providers.iter().copied() {
+            if self
+                .memberships
+                .get(&(key, provider))
+                .is_some_and(|(expires_at, _)| *expires_at > now)
+            {
+                result.push((provider, self.memberships[&(key, provider)].1));
+            }
+        }
+        result
+    }
+
+    fn prune_expired(&mut self, now: Mono) {
+        for _ in 0..MAX_EXPIRED_PROVIDER_MEMBERSHIPS_PER_CALL {
+            let Some((expires_at, key, provider)) = self.deadlines.first().copied() else {
+                break;
+            };
+            if expires_at > now {
+                break;
+            }
+            self.deadlines.remove(&(expires_at, key, provider));
+            let membership = (key, provider);
+            if self
+                .memberships
+                .get(&membership)
+                .is_none_or(|(deadline, _)| *deadline != expires_at)
+            {
+                continue;
+            }
+            self.remove_membership(key, provider);
+        }
+    }
+
+    fn distance(&self, key: ProviderKey) -> [u8; 32] {
+        std::array::from_fn(|index| key[index] ^ self.local_id[index])
+    }
+
+    fn remove_membership(&mut self, key: ProviderKey, provider: PeerId) {
+        let Some((deadline, _)) = self.memberships.remove(&(key, provider)) else {
+            return;
+        };
+        self.deadlines.remove(&(deadline, key, provider));
+        self.responsibility
+            .remove(&(self.distance(key), key, provider));
+        let remove_key = {
+            let providers = self
+                .providers_by_key
+                .get_mut(&key)
+                .expect("stored membership contributes to its exact-key index");
+            providers.remove(&provider);
+            providers.is_empty()
+        };
+        if remove_key {
+            self.providers_by_key.remove(&key);
+        }
+    }
+}
+
+fn same_state(reference: &BTreeDirectory, candidate: &ProviderDirectory) {
     assert_eq!(reference.retained_counts(), candidate.retained_counts());
     let members = candidate
-        .members
+        .memberships
         .iter()
-        .map(|key| (candidate.decode(*key), *candidate.members.get(key).unwrap()))
+        .map(|key| {
+            (
+                candidate.decode_membership(*key),
+                *candidate.memberships.get(key).unwrap(),
+            )
+        })
         .collect::<BTreeMap<_, _>>();
     assert_eq!(reference.memberships, members);
     let deadlines = reference
         .deadlines
         .iter()
         .map(|(deadline, locator, provider)| {
-            PatchDirectory::deadline_key(*deadline, *locator, *provider)
+            ProviderDirectory::deadline_key(*deadline, *locator, *provider)
         })
         .collect::<BTreeSet<_>>();
     assert_eq!(deadlines, candidate.deadlines.iter().copied().collect());
-    assert_eq!(candidate.members.len(), candidate.deadlines.len());
+    assert_eq!(candidate.memberships.len(), candidate.deadlines.len());
     let farthest = reference
         .responsibility
         .last()
         .map(|(_, locator, provider)| (*locator, *provider));
     assert_eq!(
         farthest,
-        candidate.farthest().map(|key| candidate.decode(key))
+        candidate
+            .farthest()
+            .map(|key| candidate.decode_membership(key))
     );
 }
 
@@ -211,11 +219,14 @@ fn patch_directory_matches_capacity_renewal_expiry_and_removal() {
             lease: Duration::from_secs(20),
             memberships: capacity,
         };
-        let mut reference = ProviderDirectory {
+        let mut reference = BTreeDirectory {
+            limits,
+            ..BTreeDirectory::new(local)
+        };
+        let mut candidate = ProviderDirectory {
             limits,
             ..ProviderDirectory::new(local)
         };
-        let mut candidate = PatchDirectory::new(local, limits);
         let mut now = crate::clock::mono_now();
         for step in 0..4000 {
             let locator = locators[if step % 3 == 0 {
@@ -227,7 +238,7 @@ fn patch_directory_matches_capacity_renewal_expiry_and_removal() {
             match rng.gen_range(0..10) {
                 0 => {
                     reference.remove_membership(locator, provider);
-                    candidate.remove(candidate.key(locator, provider));
+                    candidate.remove_membership(locator, provider);
                 }
                 1 | 2 => assert_eq!(reference.get(locator, now), candidate.get(locator, now)),
                 _ => {
@@ -253,11 +264,14 @@ fn patch_directory_keeps_exact_prune_ties_and_full_key_renewal() {
         lease: Duration::from_secs(10),
         memberships: 256,
     };
-    let mut reference = ProviderDirectory {
+    let mut reference = BTreeDirectory {
+        limits,
+        ..BTreeDirectory::new(local)
+    };
+    let mut candidate = ProviderDirectory {
         limits,
         ..ProviderDirectory::new(local)
     };
-    let mut candidate = PatchDirectory::new(local, limits);
     let now = crate::clock::mono_now();
     for locator in [[0; 32], [1; 32], [2; 32]] {
         for byte in 0..64 {
@@ -368,10 +382,13 @@ fn patch_directory_scale_probe() {
         }};
     }
     match mode.as_str() {
-        "patch" => measure!(PatchDirectory::new(local, limits)),
-        "btree" => measure!(ProviderDirectory {
+        "patch" => measure!(ProviderDirectory {
             limits,
             ..ProviderDirectory::new(local)
+        }),
+        "btree" => measure!(BTreeDirectory {
+            limits,
+            ..BTreeDirectory::new(local)
         }),
         _ => panic!("choose patch or btree"),
     }

@@ -15,6 +15,29 @@ ideas:
 Together these properties let PATCH evaluate unions, intersections, and
 differences quickly while staying cache friendly and safe to clone.
 
+## Retained state and typed relations
+
+PATCH is the default for retained TribleSpace state. A collection's membership,
+for example, is one relation keyed by `(collection, member)`, not a map from
+collections to separately owned sets. A prefix view answers one collection's
+membership without materializing another catalog. Retained read dependencies
+combine by structural union; prior observations remain unchanged.
+
+Key design determines what equality means. PATCH compares key sets, **not
+attached values**. Put all semantic operands into a relation key. When a key
+names mutable observed metadata instead, replace the leaf through copy-on-write
+and compare that metadata explicitly where it affects change detection. A
+key-only equality test must not hide a changed timestamp, rejection reason, or
+worker state. Inserting an already-present key is not a value replacement.
+
+Use ordered traversal where ordering is observable, with key encodings that
+preserve that order (for example big-endian state numbers). Keep domain types
+at public boundaries rather than exposing malformed raw identifiers merely to
+reuse a trie. Operation-local planning scratch, query projections, and
+independent test oracles can still use ordinary ordered maps or sets; they are
+not an additional retained database. These representation choices establish
+sharing and identity semantics, not a measured speedup for every workload.
+
 ## Node layout
 
 Traditional Adaptive Radix Trees (ART) use specialised node types (`Node4`,

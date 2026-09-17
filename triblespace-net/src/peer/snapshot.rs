@@ -379,8 +379,12 @@ mod tests {
         let missing = Blob::<UnknownBlob>::new(Bytes::from_source(b"arrives later".to_vec()));
         let missing_handle = missing.get_handle();
         let dependencies = StoreDependencies {
-            records: BTreeSet::from([CollectionRecordSelector::Collection(target.handle())]),
-            blobs: BTreeSet::from([Handle::<UnknownBlob>::to_hash(missing_handle)]),
+            records: triblespace_core::collection::CollectionRecordSelectors::from([
+                CollectionRecordSelector::Collection(target.handle()),
+            ]),
+            blobs: triblespace_core::collection::CollectionDataSet::from([
+                Handle::<UnknownBlob>::to_hash(missing_handle),
+            ]),
             ..StoreDependencies::default()
         };
         // No peer host or live store is installed: these snapshots can only
@@ -394,7 +398,7 @@ mod tests {
         assert!(!before.contains_blob(missing_handle).unwrap());
         assert!(
             before
-                .select_records(&dependencies.records)
+                .select_records(&dependencies.records.iter().collect())
                 .unwrap()
                 .is_empty()
         );
@@ -432,7 +436,7 @@ mod tests {
         let published = freeze(&mut pile);
         assert_eq!(
             published
-                .select_records(&dependencies.records)
+                .select_records(&dependencies.records.iter().collect())
                 .unwrap()
                 .len(),
             1
@@ -449,7 +453,7 @@ mod tests {
         assert!(!before.contains_blob(missing_handle).unwrap());
         assert!(
             before
-                .select_records(&dependencies.records)
+                .select_records(&dependencies.records.iter().collect())
                 .unwrap()
                 .is_empty()
         );

@@ -1,8 +1,6 @@
 //! Raw Covers select payloads; signed equations can realize them without
 //! inventing collection membership or requiring complete COMMIT provenance.
 
-use std::collections::BTreeSet;
-
 use ed25519_dalek::SigningKey;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{Blob, IntoBlob};
@@ -175,7 +173,10 @@ fn raw_cover_does_not_accept_one_input_as_a_complete_reverse_realization() {
     assert!(cover.available(&snapshot).unwrap().is_empty());
     match cover.materialize::<TribleSet, _>(&snapshot) {
         Err(CollectionMaterializationError::Missing { obligations, .. }) => {
-            assert_eq!(obligations, BTreeSet::from([data(&c)]));
+            assert_eq!(
+                obligations,
+                triblespace_core::collection::CollectionDataSet::from([data(&c)])
+            );
         }
         other => panic!("one child cannot realize the whole result: {other:?}"),
     }
@@ -205,7 +206,10 @@ fn raw_cover_never_infers_an_unknown_sibling_from_a_single_input() {
     assert!(cover.available(&snapshot).unwrap().is_empty());
     match cover.materialize::<TribleSet, _>(&snapshot) {
         Err(CollectionMaterializationError::Missing { obligations, .. }) => {
-            assert_eq!(obligations, BTreeSet::from([data(&a)]));
+            assert_eq!(
+                obligations,
+                triblespace_core::collection::CollectionDataSet::from([data(&a)])
+            );
         }
         other => panic!("the upper contains an unrequested sibling: {other:?}"),
     }

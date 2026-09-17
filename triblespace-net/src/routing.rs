@@ -8,6 +8,8 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
+use triblespace_core::patch::{Entry as PatchEntry, IdentitySchema, PATCH};
+
 use crate::clock::Mono;
 use crate::transport::PeerId;
 
@@ -33,10 +35,10 @@ pub(crate) enum RouteState {
 
 #[derive(Default)]
 struct Bucket {
-    entries: BTreeMap<PeerId, RouteState>,
+    entries: PATCH<32, IdentitySchema, RouteState>,
     /// At most K recent local failures, independently of positive-route
     /// retention. Third-party referrals cannot erase or extend these deadlines.
-    failed_until: BTreeMap<PeerId, Mono>,
+    failed_until: PATCH<32, IdentitySchema, Mono>,
 }
 
 /// A deterministic, hard-bounded Kademlia-style routing table.
@@ -54,7 +56,7 @@ pub(crate) struct RoutingTable {
     /// Explicit local configuration is trusted provenance, not hostile learned
     /// state. It remains available even if the corresponding learned route is
     /// evicted or a connection attempt fails.
-    configured: BTreeSet<PeerId>,
+    configured: PATCH<32>,
     buckets: [Bucket; BUCKET_COUNT],
 }
 
@@ -65,13 +67,13 @@ impl RoutingTable {
     where
         I: IntoIterator<Item = PeerId>,
     {
-        let configured = configured
-            .into_iter()
-            .filter(|peer| *peer != local)
-            .collect();
+        let mut configured_peers = PATCH::new();
+        for peer in configured.into_iter().filter(|peer| *peer != local) {
+            configured_peers.insert(&PatchEntry::new(&peer));
+        }
         Self {
             local,
-            configured,
+            configured: configured_peers,
             buckets: std::array::from_fn(|_| Bucket::default()),
         }
     }
@@ -83,7 +85,7 @@ impl RoutingTable {
         if !self.query_eligible(peer, crate::clock::mono_now()) {
             return false;
         }
-        if self.configured.contains(&peer) {
+        if self.configured.has_prefix(&peer) {
             return true;
         }
         self.insert(peer, RouteState::Candidate)
@@ -102,7 +104,7 @@ impl RoutingTable {
     /// Explicit configuration remains eligible, including cold bootstraps.
     /// This predicate is independent of positive-route bucket admission.
     fn query_eligible(&self, peer: PeerId, now: Mono) -> bool {
-        self.configured.contains(&peer)
+        self.configured.has_prefix(&peer)
             || bucket_index(self.local, peer)
                 .and_then(|bucket| self.buckets[bucket].failed_until.get(&peer))
                 .is_none_or(|until| now >= *until)
@@ -110,7 +112,7 @@ impl RoutingTable {
 
     fn note_failure(&mut self, peer: PeerId, now: Mono) {
         self.remove(peer);
-        if self.configured.contains(&peer) {
+        if self.configured.has_prefix(&peer) {
             return;
         }
         let Some(bucket) = bucket_index(self.local, peer) else {
@@ -120,14 +122,28 @@ impl RoutingTable {
         // Expiry work and eviction inspect at most K entries in this bucket,
         // never a process-wide peer inventory. Positive-route eviction does
         // not erase recent failure evidence, nor does referral insertion.
-        failures.retain(|_, until| now < *until);
-        failures.insert(peer, now + LEARNED_ROUTE_FAILURE_COOLDOWN);
-        if failures.len() > K {
+        let expired: Vec<_> = failures
+            .iter()
+            .copied()
+            .filter(|peer| failures.get(peer).is_some_and(|until| now >= *until))
+            .collect();
+        for peer in expired {
+            failures.remove(&peer);
+        }
+        failures.replace(&PatchEntry::with_value(
+            &peer,
+            now + LEARNED_ROUTE_FAILURE_COOLDOWN,
+        ));
+        if failures.len() > K as u64 {
             let oldest = *failures
                 .iter()
-                .min_by_key(|(peer, until)| (**until, **peer))
-                .expect("an overfull failure bucket is nonempty")
-                .0;
+                .min_by_key(|peer| {
+                    (
+                        *failures.get(peer).expect("stored failure deadline"),
+                        **peer,
+                    )
+                })
+                .expect("an overfull failure bucket is nonempty");
             failures.remove(&oldest);
         }
     }
@@ -138,7 +154,10 @@ impl RoutingTable {
         let Some(bucket) = bucket_index(self.local, peer) else {
             return false;
         };
-        self.buckets[bucket].entries.remove(&peer).is_some()
+        let entries = &mut self.buckets[bucket].entries;
+        let present = entries.has_prefix(&peer);
+        entries.remove(&peer);
+        present
     }
 
     #[cfg(test)]
@@ -147,7 +166,7 @@ impl RoutingTable {
             .and_then(|bucket| self.buckets[bucket].entries.get(&peer).copied());
         learned.or_else(|| {
             self.configured
-                .contains(&peer)
+                .has_prefix(&peer)
                 .then_some(RouteState::Candidate)
         })
     }
@@ -160,12 +179,15 @@ impl RoutingTable {
 
     #[cfg(test)]
     pub(crate) fn learned_len(&self) -> usize {
-        self.buckets.iter().map(|bucket| bucket.entries.len()).sum()
+        self.buckets
+            .iter()
+            .map(|bucket| bucket.entries.len() as usize)
+            .sum()
     }
 
     #[cfg(test)]
     pub(crate) fn configured_len(&self) -> usize {
-        self.configured.len()
+        self.configured.len() as usize
     }
 
     /// Return at most `limit` known identities ordered by XOR distance from
@@ -180,15 +202,15 @@ impl RoutingTable {
     /// Like [`Self::closest`], but excludes identities that have never
     /// answered this process directly.
     pub(crate) fn closest_verified(&self, target: RoutingKey, limit: usize) -> Vec<PeerId> {
-        let mut peers: Vec<_> =
-            self.buckets
-                .iter()
-                .flat_map(|bucket| {
-                    bucket.entries.iter().filter_map(|(peer, state)| {
-                        (*state == RouteState::Verified).then_some(*peer)
-                    })
+        let mut peers: Vec<_> = self
+            .buckets
+            .iter()
+            .flat_map(|bucket| {
+                bucket.entries.iter().filter_map(move |peer| {
+                    (bucket.entries.get(peer) == Some(&RouteState::Verified)).then_some(*peer)
                 })
-                .collect();
+            })
+            .collect();
         peers.sort_unstable_by(|a, b| distance_cmp(target, *a, *b));
         peers.truncate(limit);
         peers
@@ -199,13 +221,14 @@ impl RoutingTable {
         for peer in self
             .buckets
             .iter()
-            .flat_map(|bucket| bucket.entries.keys().copied())
+            .flat_map(|bucket| bucket.entries.iter().copied())
         {
-            peers.insert(peer);
+            peers.insert(&PatchEntry::new(&peer));
         }
         let now = crate::clock::mono_now();
         peers
-            .into_iter()
+            .iter_ordered()
+            .copied()
             .filter(|peer| self.query_eligible(*peer, now))
             .collect()
     }
@@ -215,36 +238,33 @@ impl RoutingTable {
             return false;
         };
         let bucket = &mut self.buckets[index];
-        bucket
-            .entries
-            .entry(peer)
-            .and_modify(|old| {
-                if state == RouteState::Verified {
-                    *old = RouteState::Verified;
-                }
-            })
-            .or_insert(state);
+        if state == RouteState::Verified || bucket.entries.get(&peer).is_none() {
+            bucket
+                .entries
+                .replace(&PatchEntry::with_value(&peer, state));
+        }
 
-        if bucket.entries.len() > K {
+        if bucket.entries.len() > K as u64 {
             let mut ranked: Vec<_> = bucket
                 .entries
                 .iter()
-                .map(|(peer, state)| (*peer, *state))
+                .map(|peer| (*peer, *bucket.entries.get(peer).expect("stored route")))
                 .collect();
             ranked.sort_unstable_by(|(a, a_state), (b, b_state)| {
                 route_rank(*a_state)
                     .cmp(&route_rank(*b_state))
                     .then_with(|| distance_cmp(self.local, *a, *b))
             });
-            let retained: BTreeSet<_> = ranked.into_iter().take(K).map(|(peer, _)| peer).collect();
-            bucket.entries.retain(|peer, _| retained.contains(peer));
+            for (peer, _) in ranked.into_iter().skip(K) {
+                bucket.entries.remove(&peer);
+            }
         }
-        bucket.entries.contains_key(&peer)
+        bucket.entries.has_prefix(&peer)
     }
 
     #[cfg(test)]
     fn bucket_len(&self, index: usize) -> usize {
-        self.buckets[index].entries.len()
+        self.buckets[index].entries.len() as usize
     }
 }
 
@@ -291,6 +311,8 @@ enum LookupState {
 pub(crate) struct IterativeLookup {
     local: PeerId,
     target: RoutingKey,
+    // Operation-local scratch, discarded with this one lookup. It is never
+    // retained by the routing table or reused by another request.
     shortlist: BTreeMap<PeerId, LookupState>,
     queried: BTreeSet<PeerId>,
     authenticated_responders: Vec<PeerId>,
@@ -758,7 +780,7 @@ mod tests {
         for _ in 0..3 {
             assert!(!routes.note_candidate(peer));
             assert!(!routes.closest(peer, K).contains(&peer));
-            assert_eq!(routes.buckets[bucket].failed_until[&peer], until);
+            assert_eq!(routes.buckets[bucket].failed_until.get(&peer), Some(&until));
         }
         assert!(!routes.query_eligible(peer, now));
         assert!(!routes.query_eligible(
@@ -849,9 +871,9 @@ mod tests {
                 id(0x8000 + n),
                 now + std::time::Duration::from_nanos(u64::from(n)),
             );
-            assert!(routes.buckets[bucket].failed_until.len() <= K);
+            assert!(routes.buckets[bucket].failed_until.len() <= K as u64);
         }
-        assert_eq!(routes.buckets[bucket].failed_until.len(), K);
+        assert_eq!(routes.buckets[bucket].failed_until.len(), K as u64);
         assert_eq!(routes.learned_len(), 0);
         assert!(!routes.query_eligible(id(0x8000 + (K * 3 - 1) as u16), now));
 
@@ -865,9 +887,50 @@ mod tests {
                 .buckets
                 .iter()
                 .map(|bucket| bucket.failed_until.len())
-                .sum::<usize>(),
+                .sum::<u64>(),
             1
         );
+    }
+
+    #[test]
+    fn route_promotion_replaces_values_without_demoting_or_mutating_snapshots() {
+        let local = id(0);
+        let peer = id(0x8000);
+        let mut routes = RoutingTable::new(local, []);
+        assert!(routes.note_candidate(peer));
+        let bucket = bucket_index(local, peer).unwrap();
+        let before = routes.buckets[bucket].entries.clone();
+        assert!(routes.promote_authenticated(peer));
+        assert!(routes.note_candidate(peer));
+        assert_eq!(before.get(&peer), Some(&RouteState::Candidate));
+        assert_eq!(routes.state(peer), Some(RouteState::Verified));
+        for n in 1..=K as u16 {
+            routes.note_candidate(id(0x8000 + n));
+        }
+        assert_eq!(routes.bucket_len(bucket), K);
+        assert_eq!(routes.state(peer), Some(RouteState::Verified));
+        assert_eq!(routes.state(id(0x8000 + K as u16)), None);
+    }
+
+    #[test]
+    fn renewed_failure_deadline_survives_oldest_peer_tie_eviction() {
+        let now = crate::clock::mono_now();
+        let mut routes = RoutingTable::new(id(0), []);
+        for n in 0..K as u16 {
+            routes.note_failure(id(0x8000 + n), now);
+        }
+        let later = now + std::time::Duration::from_secs(1);
+        routes.note_failure(id(0x8000), later);
+        routes.note_failure(id(0x8000 + K as u16), now);
+        let bucket = bucket_index(id(0), id(0x8000)).unwrap();
+        let failures = &routes.buckets[bucket].failed_until;
+        assert_eq!(failures.len(), K as u64);
+        assert_eq!(
+            failures.get(&id(0x8000)),
+            Some(&(later + LEARNED_ROUTE_FAILURE_COOLDOWN))
+        );
+        assert!(failures.get(&id(0x8001)).is_none());
+        assert!(failures.get(&id(0x8000 + K as u16)).is_some());
     }
 
     #[test]

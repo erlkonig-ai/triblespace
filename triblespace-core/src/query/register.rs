@@ -136,6 +136,7 @@ use std::marker::PhantomData;
 use crate::id::Id;
 use crate::inline::encodings::genid::GenId;
 use crate::inline::{Inline, InlineEncoding, IntoInline, TryFromInline};
+use crate::patch::{Entry, PATCH};
 use crate::query::intersectionconstraint::and;
 use crate::query::rangeconstraint::value_range;
 use crate::query::{
@@ -203,6 +204,34 @@ where
         .collect()
 }
 
+/// The typed state identifiers handed back in a register fork.
+///
+/// Construction accepts only non-nil [`Id`]s. The private PATCH keeps raw
+/// byte keys out of that public boundary and shares storage across clones.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkStates {
+    ids: PATCH<16>,
+}
+
+impl ForkStates {
+    /// The fork's states, in canonical identifier order.
+    pub fn iter(&self) -> impl Iterator<Item = Id> + '_ {
+        self.ids
+            .iter_ordered()
+            .map(|id| Id::new(*id).expect("typed non-nil state"))
+    }
+}
+
+impl FromIterator<Id> for ForkStates {
+    fn from_iter<T: IntoIterator<Item = Id>>(states: T) -> Self {
+        let mut ids = PATCH::new();
+        for state in states {
+            ids.insert(&Entry::new(&state.raw()));
+        }
+        Self { ids }
+    }
+}
+
 /// What an order left standing: nothing, exactly one state, or a fork.
 ///
 /// The three cases are kept apart deliberately. An earlier shape returned
@@ -224,7 +253,7 @@ pub enum Resolution {
     /// reader believed. Picking one would invent an order the data does not
     /// have and hide exactly the divergence a register exists to expose, so
     /// the fork is handed back instead of resolved.
-    Fork(BTreeSet<Id>),
+    Fork(ForkStates),
 }
 
 impl Resolution {
@@ -236,12 +265,14 @@ impl Resolution {
         }
     }
 
-    /// Every maximal state, whatever the shape.
+    /// Every maximal state, whatever the shape, as an ordered projection.
+    ///
+    /// This operation-local result does not retain the fork's PATCH storage.
     pub fn states(&self) -> BTreeSet<Id> {
         match self {
             Resolution::Empty => BTreeSet::new(),
             Resolution::Sole(id) => BTreeSet::from([*id]),
-            Resolution::Fork(set) => set.clone(),
+            Resolution::Fork(set) => set.iter().collect(),
         }
     }
 }
@@ -251,10 +282,13 @@ pub fn sole<O>(order: &O, candidates: impl IntoIterator<Item = Id>) -> Resolutio
 where
     O: RegisterOrder + ?Sized,
 {
-    let resolved = resolve(order, candidates);
-    match resolved.len() {
+    let resolved: ForkStates = candidates
+        .into_iter()
+        .filter(|state| !order.dominated(*state))
+        .collect();
+    match resolved.ids.len() {
         0 => Resolution::Empty,
-        1 => Resolution::Sole(*resolved.iter().next().expect("length checked")),
+        1 => Resolution::Sole(resolved.iter().next().expect("length checked")),
         _ => Resolution::Fork(resolved),
     }
 }
@@ -884,16 +918,43 @@ mod tests {
 
         // A fork, and it hands back the states that forked.
         let forked = sole(&stated(&facts), [*one, *two]);
-        assert_eq!(
-            forked,
-            Resolution::Fork([*one, *two].into_iter().collect::<BTreeSet<_>>())
-        );
+        assert!(matches!(&forked, Resolution::Fork(_)));
+        assert_eq!(forked.states(), [*one, *two].into_iter().collect());
         assert_eq!(forked.states().len(), 2, "the fork must not be empty");
 
         // Both report "no single answer", but they are not the same answer.
         assert_eq!(forked.sole(), None);
         assert_eq!(Resolution::Empty.sole(), None);
         assert_ne!(forked, Resolution::Empty);
+    }
+
+    #[test]
+    fn fork_membership_is_canonical_and_cloned_storage_is_independent() {
+        let first = Id::new([1; 16]).unwrap();
+        let second = Id::new([2; 16]).unwrap();
+        let forked = sole(&Unordered, [second, first, second]);
+        assert_eq!(forked, sole(&Unordered, [first, second]));
+        assert_eq!(
+            forked,
+            Resolution::Fork([second, first, second].into_iter().collect())
+        );
+        assert_eq!(
+            forked.states().into_iter().collect::<Vec<_>>(),
+            [first, second]
+        );
+        let Resolution::Fork(original) = &forked else {
+            panic!("two unordered states must fork");
+        };
+        assert_eq!(original.iter().collect::<Vec<_>>(), [first, second]);
+
+        let mut changed = forked.clone();
+        let Resolution::Fork(states) = &mut changed else {
+            panic!("two unordered states must fork");
+        };
+        states.ids.remove(&second.raw());
+        assert_ne!(changed, forked);
+        assert_eq!(changed.states(), BTreeSet::from([first]));
+        assert_eq!(forked.states(), BTreeSet::from([first, second]));
     }
 
     /// The failure that produced the removed scoping axis, and its actual

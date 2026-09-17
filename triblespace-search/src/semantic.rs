@@ -71,6 +71,7 @@ use triblespace_core::inline::encodings::shortstring::ShortString;
 use triblespace_core::inline::{Inline, IntoInline};
 use triblespace_core::macros::{attributes, entity, find};
 use triblespace_core::metadata::{self, MetaDescribe};
+use triblespace_core::patch::{Entry, PATCH};
 use triblespace_core::query::TriblePattern;
 use triblespace_core::repo::StoreRead;
 use triblespace_core::trible::{Fragment, TribleSet, TRIBLE_LEN};
@@ -159,8 +160,9 @@ pub struct SemanticIndex<E: BlobEncoding> {
     /// Attribute whose values are handles to raw content bytes (image, PDF or
     /// UTF-8 text), if content is indexed.
     pub content_attribute: Option<Id>,
-    /// Attributes whose values are handles to UTF-8 text.
-    pub text_attributes: BTreeSet<Id>,
+    // Raw non-nil attribute IDs; typed inputs and accessors preserve that
+    // invariant without exposing arbitrary PATCH key insertion.
+    text_attributes: PATCH<16>,
     /// The collection containing the selected roots and text tokenizer.
     /// Its physical support does not participate in this index's identity.
     pub model_collection: CollectionHandle,
@@ -214,7 +216,10 @@ impl<E: BlobEncoding> std::fmt::Debug for SemanticIndex<E> {
         formatter
             .debug_struct("SemanticIndex")
             .field("content_attribute", &self.content_attribute)
-            .field("text_attributes", &self.text_attributes)
+            .field(
+                "text_attributes",
+                &self.text_attributes().collect::<Vec<_>>(),
+            )
             .field("model_collection", &self.model_collection)
             .field("vision_root", &self.vision_root)
             .field("text_root", &self.text_root)
@@ -238,9 +243,9 @@ impl<E: BlobEncoding> SemanticIndex<E> {
         compute: impl Into<String>,
         dimension: usize,
     ) -> Result<Self, CollectionOperationError> {
-        let index = Self {
+        let mut index = Self {
             content_attribute,
-            text_attributes: text_attributes.into_iter().collect(),
+            text_attributes: PATCH::new(),
             model_collection,
             vision_root,
             text_root,
@@ -249,8 +254,25 @@ impl<E: BlobEncoding> SemanticIndex<E> {
             dimension,
             encoding: PhantomData,
         };
+        index.set_text_attributes(text_attributes);
         index.check()?;
         Ok(index)
+    }
+
+    /// Attributes whose values are handles to UTF-8 text, in identifier order.
+    pub fn text_attributes(&self) -> impl Iterator<Item = Id> + '_ {
+        self.text_attributes
+            .iter_ordered()
+            .map(|attribute| Id::new(*attribute).expect("typed non-nil attribute"))
+    }
+
+    /// Replaces the text attributes, deduplicating them by identifier.
+    pub fn set_text_attributes(&mut self, attributes: impl IntoIterator<Item = Id>) {
+        let mut text_attributes = PATCH::new();
+        for attribute in attributes {
+            text_attributes.insert(&Entry::new(&attribute.raw()));
+        }
+        self.text_attributes = text_attributes;
     }
 
     fn check(&self) -> Result<(), CollectionOperationError> {
@@ -584,7 +606,7 @@ where
             nvfp4_dimension: self.dimension as u64,
             semantic_compute: self.compute.as_str(),
             semantic_content_attribute?: image,
-            semantic_text_attribute*: self.text_attributes.iter(),
+            semantic_text_attribute*: self.text_attributes(),
             semantic_model_collection: self.model_collection,
             semantic_vision_root?: vision,
             semantic_text_root?: text,
@@ -661,9 +683,9 @@ where
                 images.entry(entity).or_default().insert(value);
                 continue;
             }
-            for attribute in &self.text_attributes {
+            for attribute in self.text_attributes() {
                 if raw[16..32] == attribute[..] {
-                    texts.entry((*attribute, entity)).or_default().insert(value);
+                    texts.entry((attribute, entity)).or_default().insert(value);
                 }
             }
         }
@@ -879,8 +901,15 @@ mod tests {
         changed.tokenizer_root = Some(Id::new([9; 16]).unwrap());
         assert_ne!(changed.fragment(), index.fragment());
         changed = index.clone();
-        changed.text_attributes.remove(&body);
+        changed.set_text_attributes([title]);
         assert_ne!(changed.fragment(), index.fragment());
+        assert_ne!(changed, index);
+        assert_eq!(index.text_attributes().collect::<Vec<_>>(), [title, body]);
+
+        changed.set_text_attributes([body, title, body]);
+        assert_eq!(changed.text_attributes().collect::<Vec<_>>(), [title, body]);
+        assert_eq!(changed, index);
+        assert_eq!(changed.fragment(), index.fragment());
     }
 
     #[test]

@@ -16,6 +16,119 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
+use crate::inline::Inline;
+use crate::patch::{Entry, KeySchema, PATCH};
+
+mod sets;
+pub use sets::{CollectionCommitSet, CollectionDataSet, CollectionRecordSet, CollectionRejections};
+
+crate::key_segmentation!(MemberSegments, 64, [32, 32]);
+crate::key_schema!(MemberOrder, MemberSegments, 64, [0, 1]);
+crate::key_segmentation!(ProducerSegments, 128, [64, 64]);
+crate::key_schema!(ProducerOrder, ProducerSegments, 128, [0, 1]);
+crate::key_segmentation!(OrderSegments, 96, [64, 32]);
+crate::key_schema!(OrderOrder, OrderSegments, 96, [0, 1]);
+crate::key_segmentation!(MappingSegments, 128, [64, 32, 32]);
+crate::key_schema!(MappingOrder, MappingSegments, 128, [0, 1, 2]);
+crate::key_segmentation!(CommitSegments, 192, [64, 128]);
+crate::key_schema!(CommitOrder, CommitSegments, 192, [0, 1]);
+
+pub(super) fn bytes<const N: usize>(fields: &[[u8; 32]]) -> [u8; N] {
+    let mut key = [0; N];
+    assert_eq!(fields.len() * 32, N);
+    for (slot, field) in key.chunks_exact_mut(32).zip(fields) {
+        slot.copy_from_slice(field);
+    }
+    key
+}
+
+pub(super) fn infixes<'a, const N: usize, const P: usize, const I: usize, O: KeySchema<N>, V>(
+    patch: &'a PATCH<N, O, V>,
+    prefix: [u8; P],
+) -> impl Iterator<Item = [u8; I]> + 'a {
+    let mut next = patch.first_infix_range(&prefix, &[0; I], &[u8::MAX; I]);
+    std::iter::from_fn(move || {
+        let current = next?;
+        next = patch.next_infix_after(&prefix, &current, &[u8::MAX; I]);
+        Some(current)
+    })
+}
+
+/// A borrowed collection prefix in the retained membership relation.
+#[derive(Clone, Copy)]
+pub struct CollectionMemberView<'a> {
+    relation: &'a PATCH<64, MemberOrder>,
+    collection: CollectionHandle,
+}
+
+impl<'a> CollectionMemberView<'a> {
+    /// Enumerate payloads in canonical byte order without materializing a map.
+    pub fn iter(&self) -> CollectionMemberIter<'a> {
+        CollectionMemberIter {
+            relation: self.relation,
+            collection: self.collection.raw,
+            next: self
+                .relation
+                .first_infix_range(&self.collection.raw, &[0; 32], &[u8::MAX; 32]),
+            remaining: self.len(),
+        }
+    }
+    /// Whether this collection prefix is empty.
+    pub fn is_empty(&self) -> bool {
+        !self.relation.has_prefix(&self.collection.raw)
+    }
+    /// Number of members in this collection prefix.
+    pub fn len(&self) -> usize {
+        self.relation.segmented_len(&self.collection.raw) as usize
+    }
+    /// Whether a payload is in this collection prefix.
+    pub fn contains(&self, member: &CollectionData) -> bool {
+        self.relation
+            .get(&bytes(&[self.collection.raw, member.raw]))
+            .is_some()
+    }
+}
+
+impl<'a> IntoIterator for CollectionMemberView<'a> {
+    type Item = CollectionData;
+    type IntoIter = CollectionMemberIter<'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// Ordered payload traversal over one borrowed collection prefix.
+pub struct CollectionMemberIter<'a> {
+    relation: &'a PATCH<64, MemberOrder>,
+    collection: [u8; 32],
+    next: Option<[u8; 32]>,
+    remaining: usize,
+}
+
+impl Iterator for CollectionMemberIter<'_> {
+    type Item = CollectionData;
+    fn next(&mut self) -> Option<Self::Item> {
+        let current = self.next?;
+        self.next = self
+            .relation
+            .next_infix_after(&self.collection, &current, &[u8::MAX; 32]);
+        self.remaining -= 1;
+        Some(Inline::new(current))
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for CollectionMemberIter<'_> {}
+impl std::iter::FusedIterator for CollectionMemberIter<'_> {}
+
+impl fmt::Debug for CollectionMemberView<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_set().entries(self.iter()).finish()
+    }
+}
+
 #[cfg(test)]
 use crate::id::Id;
 use crate::repo::{BlobStoreGet, BlobStoreMeta};
@@ -247,10 +360,10 @@ impl<E: Error + 'static> Error for CollectionResolutionError<E> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CollectionResolution<D> {
     semantics: CollectionSemantics,
-    admitted_claims: BTreeSet<CollectionRecord>,
-    validation_pending: BTreeSet<CollectionRecord>,
-    activation_pending: BTreeSet<CollectionRecord>,
-    rejected: BTreeMap<CollectionRecord, D>,
+    admitted_claims: CollectionRecordSet,
+    validation_pending: CollectionRecordSet,
+    activation_pending: CollectionRecordSet,
+    rejected: CollectionRejections<D>,
 }
 
 impl<D> CollectionResolution<D> {
@@ -271,23 +384,23 @@ impl<D> CollectionResolution<D> {
     /// rejected claims. This set is a semantic result only: physical retention
     /// follows structural references from every retained native record and
     /// does not consume admission results.
-    pub fn admitted_claims(&self) -> &BTreeSet<CollectionRecord> {
+    pub fn admitted_claims(&self) -> &CollectionRecordSet {
         &self.admitted_claims
     }
 
     /// Claims awaiting a positive callback verdict, commonly because a
     /// descriptor or element blob is absent.
-    pub fn validation_pending(&self) -> &BTreeSet<CollectionRecord> {
+    pub fn validation_pending(&self) -> &CollectionRecordSet {
         &self.validation_pending
     }
 
     /// Accepted equations whose membership prerequisites are not yet known.
-    pub fn activation_pending(&self) -> &BTreeSet<CollectionRecord> {
+    pub fn activation_pending(&self) -> &CollectionRecordSet {
         &self.activation_pending
     }
 
     /// Semantically invalid claims and their caller-defined diagnostics.
-    pub fn rejected(&self) -> &BTreeMap<CollectionRecord, D> {
+    pub fn rejected(&self) -> &CollectionRejections<D> {
         &self.rejected
     }
 }
@@ -300,33 +413,98 @@ impl<D> CollectionResolution<D> {
 /// inputs to the data lattice.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CollectionSemantics {
-    members: BTreeMap<CollectionHandle, BTreeSet<CollectionData>>,
-    frontier: BTreeMap<CollectionHandle, BTreeSet<CollectionData>>,
-    root_members: BTreeSet<MemberKey>,
-    commit_records_by_member: BTreeMap<MemberKey, BTreeSet<CollectionCommit>>,
-    merge_inputs_by_result: BTreeMap<MemberKey, BTreeSet<MergeProducer>>,
-    order_results_by_input: BTreeMap<MemberKey, BTreeSet<CollectionData>>,
-    derive_inputs_by_output: BTreeMap<MemberKey, BTreeSet<DeriveProducer>>,
-    derive_outputs_by_input: BTreeMap<
-        (CollectionHandle, CollectionHandle),
-        BTreeMap<CollectionData, BTreeSet<CollectionData>>,
-    >,
+    members: PATCH<64, MemberOrder>,
+    frontier: PATCH<64, MemberOrder>,
+    root_members: PATCH<64, MemberOrder>,
+    commit_records_by_member: PATCH<192, CommitOrder, CollectionCommit>,
+    merge_inputs_by_result: PATCH<128, ProducerOrder>,
+    order_results_by_input: PATCH<96, OrderOrder>,
+    derive_inputs_by_output: PATCH<128, ProducerOrder>,
+    derive_outputs_by_input: PATCH<128, MappingOrder>,
 }
 
 impl CollectionSemantics {
     /// Whether `data` belongs to the collection's least known closure.
     pub fn contains(&self, collection: CollectionHandle, data: CollectionData) -> bool {
-        contains_member(&self.members, collection, data)
+        self.members
+            .get(&bytes(&[collection.raw, data.raw]))
+            .is_some()
     }
 
     /// All known semantic members of `collection`.
-    pub fn members(&self, collection: CollectionHandle) -> Option<&BTreeSet<CollectionData>> {
-        self.members.get(&collection)
+    pub fn members(&self, collection: CollectionHandle) -> Option<CollectionMemberView<'_>> {
+        self.members
+            .has_prefix(&collection.raw)
+            .then_some(CollectionMemberView {
+                relation: &self.members,
+                collection,
+            })
     }
 
     /// Maximal members under active merge and mapping lineage.
-    pub fn frontier(&self, collection: CollectionHandle) -> Option<&BTreeSet<CollectionData>> {
-        self.frontier.get(&collection)
+    pub fn frontier(&self, collection: CollectionHandle) -> Option<CollectionMemberView<'_>> {
+        self.members
+            .has_prefix(&collection.raw)
+            .then_some(CollectionMemberView {
+                relation: &self.frontier,
+                collection,
+            })
+    }
+
+    fn merge_producers(
+        &self,
+        (collection, result): MemberKey,
+    ) -> impl Iterator<Item = MergeProducer> + '_ {
+        infixes::<128, 64, 64, _, _>(
+            &self.merge_inputs_by_result,
+            bytes(&[collection.raw, result.raw]),
+        )
+        .map(|pair| {
+            (
+                Inline::new(pair[..32].try_into().unwrap()),
+                Inline::new(pair[32..].try_into().unwrap()),
+            )
+        })
+    }
+
+    fn derive_producers(
+        &self,
+        (collection, output): MemberKey,
+    ) -> impl Iterator<Item = DeriveProducer> + '_ {
+        infixes::<128, 64, 64, _, _>(
+            &self.derive_inputs_by_output,
+            bytes(&[collection.raw, output.raw]),
+        )
+        .map(|pair| {
+            (
+                Inline::new(pair[..32].try_into().unwrap()),
+                Inline::new(pair[32..].try_into().unwrap()),
+            )
+        })
+    }
+
+    fn successors(
+        &self,
+        (collection, input): MemberKey,
+    ) -> impl Iterator<Item = CollectionData> + '_ {
+        infixes(
+            &self.order_results_by_input,
+            bytes::<64>(&[collection.raw, input.raw]),
+        )
+        .map(Inline::new)
+    }
+
+    fn images(
+        &self,
+        source: CollectionHandle,
+        target: CollectionHandle,
+        input: CollectionData,
+    ) -> impl Iterator<Item = CollectionData> + '_ {
+        infixes(
+            &self.derive_outputs_by_input,
+            bytes::<96>(&[source.raw, target.raw, input.raw]),
+        )
+        .map(Inline::new)
     }
 
     /// Resident source-cover members which can replace at least two currently
@@ -337,70 +515,59 @@ impl CollectionSemantics {
         &self,
         source: CollectionHandle,
         target: CollectionHandle,
-        source_cover: &BTreeSet<CollectionData>,
-        target_cover: &BTreeSet<CollectionData>,
+        source_cover: &CollectionDataSet,
+        target_cover: &CollectionDataSet,
     ) -> Vec<(CollectionData, BTreeSet<(CollectionData, CollectionData)>)> {
-        let Some(mappings) = self.derive_outputs_by_input.get(&(source, target)) else {
+        if !self
+            .derive_outputs_by_input
+            .has_prefix(&bytes::<64>(&[source.raw, target.raw]))
+        {
             return Vec::new();
-        };
-        // Reverse only the two sparse generating orders, not their transitive
-        // closures. Each candidate walks its predecessors at most once.
+        }
+        // Scratch reverse edges for this one reachability query only.
         let mut predecessors = BTreeMap::<MemberKey, BTreeSet<CollectionData>>::new();
-        for ((collection, lower), uppers) in &self.order_results_by_input {
-            if *collection == source || *collection == target {
-                for upper in uppers {
-                    predecessors
-                        .entry((*collection, *upper))
-                        .or_default()
-                        .insert(*lower);
-                }
+        for row in self.order_results_by_input.iter_ordered() {
+            let collection = Inline::new(row[..32].try_into().unwrap());
+            if collection == source || collection == target {
+                let lower = Inline::new(row[32..64].try_into().unwrap());
+                let upper = Inline::new(row[64..].try_into().unwrap());
+                predecessors
+                    .entry((collection, upper))
+                    .or_default()
+                    .insert(lower);
             }
         }
-
         let mut candidates = Vec::new();
         for upper in source_cover {
-            // An equal or greater image already represented by ONE selected
-            // target member is not useful work. A finer decomposition of that
-            // image does not satisfy this coarsening test.
             let mut seen = BTreeSet::new();
-            let mut pending = vec![*upper];
+            let mut pending = vec![upper];
             let mut covered = false;
             while let Some(member) = pending.pop() {
                 if !seen.insert(member) {
                     continue;
                 }
-                for image in mappings.get(&member).into_iter().flatten() {
-                    if target_cover.contains(image)
+                if self.images(source, target, member).any(|image| {
+                    target_cover.contains(&image)
                         || self
-                            .first_strict_subsumer_in(target, *image, target_cover)
+                            .first_strict_subsumer_in(target, image, target_cover)
                             .is_some()
-                    {
-                        covered = true;
-                        break;
-                    }
-                }
-                if covered {
+                }) {
+                    covered = true;
                     break;
                 }
-                pending.extend(
-                    self.order_results_by_input
-                        .get(&(source, member))
-                        .into_iter()
-                        .flatten(),
-                );
+                pending.extend(self.successors((source, member)));
             }
             if covered {
                 continue;
             }
-
             let mut seen_source = BTreeSet::new();
-            let mut pending_source = vec![*upper];
+            let mut pending_source = vec![upper];
             let mut pending_target = Vec::new();
             while let Some(member) = pending_source.pop() {
                 if !seen_source.insert(member) {
                     continue;
                 }
-                pending_target.extend(mappings.get(&member).into_iter().flatten().copied());
+                pending_target.extend(self.images(source, target, member));
                 pending_source.extend(predecessors.get(&(source, member)).into_iter().flatten());
             }
             let mut seen_target = BTreeSet::new();
@@ -417,131 +584,94 @@ impl CollectionSemantics {
             if dominated.len() < 2 {
                 continue;
             }
-
             let mut image_pairs = BTreeSet::new();
-            for (low, high) in self
-                .merge_inputs_by_result
-                .get(&(source, *upper))
-                .into_iter()
-                .flatten()
-            {
-                for left in mappings.get(low).into_iter().flatten() {
-                    for right in mappings.get(high).into_iter().flatten() {
-                        image_pairs.insert(ordered(*left, *right));
+            for (low, high) in self.merge_producers((source, upper)) {
+                for left in self.images(source, target, low) {
+                    for right in self.images(source, target, high) {
+                        image_pairs.insert(ordered(left, right));
                     }
                 }
             }
-            candidates.push((*upper, image_pairs));
+            candidates.push((upper, image_pairs));
         }
         candidates
     }
 
-    /// Exact authorized commit records supporting one
-    /// member through every known active construction path.
-    ///
-    /// The traversal is computed on demand and follows derives for provenance.
-    /// Multiple commits of the same data remain distinct leaves.
+    /// Exact authorized commits through every active construction path.
+    /// Equal payloads with distinct signatures or metadata remain distinct.
     pub fn supporting_commits(
         &self,
         collection: CollectionHandle,
         data: CollectionData,
-    ) -> BTreeSet<CollectionCommit> {
+    ) -> CollectionCommitSet {
+        let mut supporting = CollectionCommitSet::new();
         if !self.contains(collection, data) {
-            return BTreeSet::new();
+            return supporting;
         }
-
-        let mut supporting = BTreeSet::new();
         let mut visited = BTreeSet::new();
         let mut pending = vec![(collection, data)];
         while let Some(member) = pending.pop() {
             if !visited.insert(member) {
                 continue;
             }
-            supporting.extend(
-                self.commit_records_by_member
-                    .get(&member)
-                    .into_iter()
-                    .flatten()
-                    .copied(),
-            );
-
-            if let Some(producers) = self.merge_inputs_by_result.get(&member) {
-                for (low, high) in producers {
-                    pending.push((member.0, *low));
-                    pending.push((member.0, *high));
-                }
+            let prefix = bytes::<64>(&[member.0.raw, member.1.raw]);
+            for suffix in infixes::<192, 64, 128, _, _>(&self.commit_records_by_member, prefix) {
+                let mut key = [0; 192];
+                key[..64].copy_from_slice(&prefix);
+                key[64..].copy_from_slice(&suffix);
+                supporting.extend([*self
+                    .commit_records_by_member
+                    .get(&key)
+                    .expect("indexed commit")]);
             }
-            if let Some(producers) = self.derive_inputs_by_output.get(&member) {
-                for (source, input) in producers {
-                    pending.push((*source, *input));
-                }
+            for (low, high) in self.merge_producers(member) {
+                pending.extend([(member.0, low), (member.0, high)]);
             }
+            pending.extend(self.derive_producers(member));
         }
         supporting
     }
 
-    /// Canonical root payloads supporting one member through every known
-    /// active construction path.
-    ///
-    /// Unlike [`Self::supporting_commits`], multiple authorized commits of
-    /// the same payload collapse to one leaf. A member is a root whenever it
-    /// was supplied directly, either by an accepted commit or as an explicit
-    /// payload root; traversal still follows active merge and derive producers
-    /// so that every known support path contributes its roots.
+    /// Canonical root payloads through every active construction path.
     pub fn supporting_data(
         &self,
         collection: CollectionHandle,
         data: CollectionData,
-    ) -> BTreeSet<CollectionData> {
+    ) -> CollectionDataSet {
         self.supporting_data_for([(collection, data)])
     }
 
-    /// Canonical root payloads supporting several members through every
-    /// known active construction path.
-    ///
-    /// The shared traversal visits an overlapping lineage only once. Roots
-    /// from every encountered collection are returned; callers interested in
-    /// one lattice can intersect the result with that lattice's explicit
-    /// roots.
+    /// Root payloads for several members, visiting shared lineage only once.
     pub(crate) fn supporting_data_for(
         &self,
-        members: impl IntoIterator<Item = (CollectionHandle, CollectionData)>,
-    ) -> BTreeSet<CollectionData> {
-        let members: Vec<_> = members
-            .into_iter()
-            .filter(|(collection, data)| self.contains(*collection, *data))
-            .collect();
-        if members.is_empty() {
-            return BTreeSet::new();
-        }
-
-        let mut supporting = BTreeSet::new();
+        members: impl IntoIterator<Item = MemberKey>,
+    ) -> CollectionDataSet {
+        let mut supporting = CollectionDataSet::new();
         let mut visited = BTreeSet::new();
-        let mut pending = members;
+        let mut pending: Vec<_> = members
+            .into_iter()
+            .filter(|(c, d)| self.contains(*c, *d))
+            .collect();
         while let Some(member) = pending.pop() {
             if !visited.insert(member) {
                 continue;
             }
-            if self.root_members.contains(&member) {
+            if self
+                .root_members
+                .get(&bytes(&[member.0.raw, member.1.raw]))
+                .is_some()
+            {
                 supporting.insert(member.1);
             }
-
-            if let Some(producers) = self.merge_inputs_by_result.get(&member) {
-                for (low, high) in producers {
-                    pending.push((member.0, *low));
-                    pending.push((member.0, *high));
-                }
+            for (low, high) in self.merge_producers(member) {
+                pending.extend([(member.0, low), (member.0, high)]);
             }
-            if let Some(producers) = self.derive_inputs_by_output.get(&member) {
-                for (source, input) in producers {
-                    pending.push((*source, *input));
-                }
-            }
+            pending.extend(self.derive_producers(member));
         }
         supporting
     }
 
-    /// Whether the sparse accepted order already proves `lower <= upper`.
+    /// Whether the sparse accepted order proves `lower <= upper`.
     pub(crate) fn subsumes(
         &self,
         collection: CollectionHandle,
@@ -551,82 +681,57 @@ impl CollectionSemantics {
         if lower == upper {
             return true;
         }
-
         let mut visited = BTreeSet::from([lower]);
         let mut pending = vec![lower];
         while let Some(input) = pending.pop() {
-            for result in self
-                .order_results_by_input
-                .get(&(collection, input))
-                .into_iter()
-                .flatten()
-            {
-                if *result == upper {
+            for result in self.successors((collection, input)) {
+                if result == upper {
                     return true;
                 }
-                if visited.insert(*result) {
-                    pending.push(*result);
+                if visited.insert(result) {
+                    pending.push(result);
                 }
             }
         }
         false
     }
 
-    /// Whether any candidate is strictly above `lower` in the sparse order.
-    /// Frontier membership needs only existence, not a canonical witness.
     fn has_strict_subsumer_in(
         &self,
         collection: CollectionHandle,
         lower: CollectionData,
-        candidates: &BTreeSet<CollectionData>,
+        candidates: &CollectionDataSet,
     ) -> bool {
         let mut visited = BTreeSet::from([lower]);
         let mut pending = vec![lower];
         while let Some(input) = pending.pop() {
-            for result in self
-                .order_results_by_input
-                .get(&(collection, input))
-                .into_iter()
-                .flatten()
-            {
+            for result in self.successors((collection, input)) {
                 #[cfg(test)]
                 EXISTENTIAL_SUBSUMER_EDGE_VISITS.set(EXISTENTIAL_SUBSUMER_EDGE_VISITS.get() + 1);
-                if !visited.insert(*result) {
+                if !visited.insert(result) {
                     continue;
                 }
-                if candidates.contains(result) {
+                if candidates.contains(&result) {
                     return true;
                 }
-                pending.push(*result);
+                pending.push(result);
             }
         }
         false
     }
 
-    /// Return the first canonical candidate strictly above `lower` in the
-    /// sparse generating order.
-    ///
-    /// One reachability walk tests membership as it goes, instead of walking
-    /// the same order graph once for every candidate. The explicit exclusion
-    /// of `lower` preserves the resident-frontier meaning even if malformed
-    /// accepted evidence introduced a cycle.
     fn first_strict_subsumer_in(
         &self,
         collection: CollectionHandle,
         lower: CollectionData,
-        candidates: &BTreeSet<CollectionData>,
+        candidates: &CollectionDataSet,
     ) -> Option<CollectionData> {
         let mut visited = BTreeSet::from([lower]);
         let mut pending = vec![lower];
         while let Some(input) = pending.pop() {
-            for result in self
-                .order_results_by_input
-                .get(&(collection, input))
-                .into_iter()
-                .flatten()
-            {
-                if visited.insert(*result) {
-                    pending.push(*result);
+            for result in self.successors((collection, input)) {
+                if visited.insert(result) {
+                    pending.push(result);
                 }
             }
         }
@@ -639,32 +744,25 @@ impl CollectionSemantics {
         &self,
         collection: CollectionHandle,
         element: CollectionData,
-        resident_frontier: &BTreeSet<CollectionData>,
+        resident_frontier: &CollectionDataSet,
         mut path: BTreeSet<CollectionData>,
-    ) -> Option<BTreeSet<CollectionData>> {
+    ) -> Option<CollectionDataSet> {
         if resident_frontier.contains(&element) {
-            return Some(BTreeSet::from([element]));
+            return Some(CollectionDataSet::from([element]));
         }
         if let Some(upper) = self.first_strict_subsumer_in(collection, element, resident_frontier) {
-            return Some(BTreeSet::from([upper]));
+            return Some(CollectionDataSet::from([upper]));
         }
         if !path.insert(element) {
             return None;
         }
-
-        for (low, high) in self
-            .merge_inputs_by_result
-            .get(&(collection, element))
-            .into_iter()
-            .flatten()
-        {
+        for (low, high) in self.merge_producers((collection, element)) {
             let Some(mut proof) =
-                self.cover_element(collection, *low, resident_frontier, path.clone())
+                self.cover_element(collection, low, resident_frontier, path.clone())
             else {
                 continue;
             };
-            let Some(right) =
-                self.cover_element(collection, *high, resident_frontier, path.clone())
+            let Some(right) = self.cover_element(collection, high, resident_frontier, path.clone())
             else {
                 continue;
             };
@@ -679,9 +777,9 @@ impl CollectionSemantics {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct CollectionPhysicalCover {
     /// Resident semantic members selected by the first known proof.
-    pub cover: BTreeSet<CollectionData>,
+    pub cover: CollectionDataSet,
     /// Semantic-frontier obligations with no proof from `cover`.
-    pub missing: BTreeSet<CollectionData>,
+    pub missing: CollectionDataSet,
 }
 
 /// Closure-aware result of selecting a physical collection cover.
@@ -690,7 +788,7 @@ pub(crate) struct CollectionCompletePhysicalCover {
     pub physical: CollectionPhysicalCover,
     /// Missing representation blobs selected by the best otherwise-complete
     /// hypothetical cover.
-    pub dependencies: BTreeSet<CollectionData>,
+    pub dependencies: CollectionDataSet,
     /// Unusable selected member required only when no complete or merely
     /// incomplete alternative can cover the frontier.
     pub unusable: Option<(CollectionData, CollectionOperationError)>,
@@ -710,9 +808,12 @@ pub(crate) struct CollectionCompletePhysicalCover {
 pub(crate) fn collection_physical_cover(
     semantics: &CollectionSemantics,
     collection: CollectionHandle,
-    resident: &BTreeSet<CollectionData>,
+    resident: &CollectionDataSet,
 ) -> CollectionPhysicalCover {
-    let obligations = semantics.frontier(collection).cloned().unwrap_or_default();
+    let obligations = semantics
+        .frontier(collection)
+        .map(|members| members.iter().collect())
+        .unwrap_or_default();
     collection_physical_cover_for(semantics, collection, &obligations, resident)
 }
 
@@ -728,7 +829,7 @@ pub(crate) fn collection_physical_cover(
 pub(crate) fn collection_complete_physical_cover<E, R>(
     semantics: &CollectionSemantics,
     collection: CollectionHandle,
-    root_resident: &BTreeSet<CollectionData>,
+    root_resident: &CollectionDataSet,
     reader: &R,
 ) -> CollectionCompletePhysicalCover
 where
@@ -736,6 +837,8 @@ where
     R: BlobStoreGet + BlobStoreMeta,
 {
     let mut candidates = root_resident.clone();
+    // Per-call candidate diagnostics against this fixed reader, never a cache
+    // carried into a later store observation.
     let mut incomplete = BTreeMap::<CollectionData, Vec<CollectionData>>::new();
     let mut unusable = BTreeMap::<CollectionData, CollectionOperationError>::new();
 
@@ -743,16 +846,16 @@ where
         let physical = collection_physical_cover(semantics, collection, &candidates);
         let mut removed = false;
         for member in &physical.cover {
-            match E::missing_representation_dependencies(*member, reader) {
+            match E::missing_representation_dependencies(member, reader) {
                 Ok(missing) if missing.is_empty() => {}
                 Ok(missing) => {
-                    candidates.remove(member);
-                    incomplete.insert(*member, missing);
+                    candidates.remove(&member);
+                    incomplete.insert(member, missing);
                     removed = true;
                 }
                 Err(source) => {
-                    candidates.remove(member);
-                    unusable.insert(*member, source);
+                    candidates.remove(&member);
+                    unusable.insert(member, source);
                     removed = true;
                 }
             }
@@ -763,7 +866,7 @@ where
         if physical.missing.is_empty() {
             return CollectionCompletePhysicalCover {
                 physical,
-                dependencies: BTreeSet::new(),
+                dependencies: CollectionDataSet::new(),
                 unusable: None,
             };
         }
@@ -777,7 +880,7 @@ where
         let dependencies = tentative
             .cover
             .iter()
-            .filter_map(|member| incomplete.get(member))
+            .filter_map(|member| incomplete.get(&member))
             .flatten()
             .copied()
             .collect();
@@ -796,8 +899,7 @@ where
             if let Some(member) = last_resort
                 .cover
                 .iter()
-                .find(|member| unusable.contains_key(*member))
-                .copied()
+                .find(|member| unusable.contains_key(member))
             {
                 return CollectionCompletePhysicalCover {
                     physical,
@@ -831,25 +933,28 @@ where
 pub(crate) fn collection_physical_cover_for(
     semantics: &CollectionSemantics,
     collection: CollectionHandle,
-    obligations: &BTreeSet<CollectionData>,
-    resident: &BTreeSet<CollectionData>,
+    obligations: &CollectionDataSet,
+    resident: &CollectionDataSet,
 ) -> CollectionPhysicalCover {
     let Some(members) = semantics.members(collection) else {
         return CollectionPhysicalCover {
-            cover: BTreeSet::new(),
+            cover: CollectionDataSet::new(),
             missing: obligations.clone(),
         };
     };
-    let resident_members: BTreeSet<_> = resident.intersection(members).copied().collect();
-    let mut resident_frontier = BTreeSet::new();
+    let resident_members: CollectionDataSet = resident
+        .iter()
+        .filter(|member| members.contains(member))
+        .collect();
+    let mut resident_frontier = CollectionDataSet::new();
     for candidate in &resident_members {
-        if !semantics.has_strict_subsumer_in(collection, *candidate, &resident_members) {
-            resident_frontier.insert(*candidate);
+        if !semantics.has_strict_subsumer_in(collection, candidate, &resident_members) {
+            resident_frontier.insert(candidate);
         }
     }
 
     let mut result = CollectionPhysicalCover::default();
-    for obligation in obligations.iter().copied() {
+    for obligation in obligations.iter() {
         if !members.contains(&obligation) {
             result.missing.insert(obligation);
             continue;
@@ -935,8 +1040,8 @@ where
     let mut accepted_commits = Vec::new();
     let mut accepted_merges = Vec::new();
     let mut accepted_derives = Vec::new();
-    let mut validation_pending = BTreeSet::new();
-    let mut rejected = BTreeMap::new();
+    let mut validation_pending = CollectionRecordSet::new();
+    let mut rejected = CollectionRejections::default();
 
     for claim in records.commits() {
         if !authorized_commits.contains(claim) {
@@ -1009,23 +1114,19 @@ where
         )
         .collect();
 
-    let mut members: BTreeMap<CollectionHandle, BTreeSet<CollectionData>> = BTreeMap::new();
-    let mut root_members = explicit_roots.clone();
+    let mut members = PATCH::<64, MemberOrder>::new();
+    let mut root_members = PATCH::<64, MemberOrder>::new();
     for (collection, data) in explicit_roots {
-        members.entry(*collection).or_default().insert(*data);
+        let entry = Entry::new(&bytes(&[collection.raw, data.raw]));
+        members.insert(&entry);
+        root_members.insert(&entry);
     }
-    let mut commit_records_by_member: BTreeMap<MemberKey, BTreeSet<CollectionCommit>> =
-        BTreeMap::new();
+    let mut commit_records_by_member = PATCH::<192, CommitOrder, CollectionCommit>::new();
     for commit in accepted_commits {
-        members
-            .entry(commit.collection())
-            .or_default()
-            .insert(commit.data());
-        root_members.insert((commit.collection(), commit.data()));
-        commit_records_by_member
-            .entry((commit.collection(), commit.data()))
-            .or_default()
-            .insert(*commit);
+        let entry = Entry::new(&bytes(&[commit.collection().raw, commit.data().raw]));
+        members.insert(&entry);
+        root_members.insert(&entry);
+        commit_records_by_member.insert(&Entry::with_value(&commit.to_bytes(), *commit));
     }
 
     loop {
@@ -1035,10 +1136,12 @@ where
             if contains_member(&members, claim.collection(), low)
                 && contains_member(&members, claim.collection(), high)
             {
-                changed |= members
-                    .entry(claim.collection())
-                    .or_default()
-                    .insert(claim.result());
+                let before = members.len();
+                members.insert(&Entry::new(&bytes(&[
+                    claim.collection().raw,
+                    claim.result().raw,
+                ])));
+                changed |= members.len() != before;
             }
         }
         for claim in &accepted_derives {
@@ -1047,10 +1150,9 @@ where
                 continue;
             };
             if contains_member(&members, source, input) {
-                changed |= members
-                    .entry(claim.collection())
-                    .or_default()
-                    .insert(output);
+                let before = members.len();
+                members.insert(&Entry::new(&bytes(&[claim.collection().raw, output.raw])));
+                changed |= members.len() != before;
             }
         }
         if !changed {
@@ -1070,7 +1172,9 @@ where
         .map(|(target, source)| (*source, *target))
         .collect();
 
-    let mut activation_pending = BTreeSet::new();
+    let mut activation_pending = CollectionRecordSet::new();
+    // Equation closure scratch for this resolution invocation. Only the flat
+    // generating relations below survive in the returned semantic value.
     let mut active_merges = BTreeMap::<MergeEquation, Option<CollectionMerge>>::new();
     let mut active_derives = BTreeMap::<DeriveEquation, Option<CollectionDerive>>::new();
 
@@ -1122,54 +1226,43 @@ where
     for &(collection, low, high, result) in active_merges.keys() {
         semantics
             .merge_inputs_by_result
-            .entry((collection, result))
-            .or_default()
-            .insert((low, high));
+            .insert(&Entry::new(&bytes(&[
+                collection.raw,
+                result.raw,
+                low.raw,
+                high.raw,
+            ])));
         for input in [low, high] {
             if input != result {
                 semantics
                     .order_results_by_input
-                    .entry((collection, input))
-                    .or_default()
-                    .insert(result);
+                    .insert(&Entry::new(&bytes(&[
+                        collection.raw,
+                        input.raw,
+                        result.raw,
+                    ])));
             }
         }
     }
-
     for &(target, input, output) in active_derives.keys() {
         let Some(source) = lineage.get(&target).copied() else {
             continue;
         };
         semantics
             .derive_inputs_by_output
-            .entry((target, output))
-            .or_default()
-            .insert((source, input));
+            .insert(&Entry::new(&bytes(&[
+                target.raw, output.raw, source.raw, input.raw,
+            ])));
         semantics
             .derive_outputs_by_input
-            .entry((source, target))
-            .or_default()
-            .entry(input)
-            .or_default()
-            .insert(output);
+            .insert(&Entry::new(&bytes(&[
+                source.raw, target.raw, input.raw, output.raw,
+            ])));
     }
-
-    close_homomorphic_order(
-        &semantics.derive_outputs_by_input,
-        &mut semantics.order_results_by_input,
-    );
-
-    // Every stored edge is strict. Its input therefore cannot be maximal;
-    // ordinary graph reachability supplies the transitive order on demand.
-    for ((collection, element), results) in &semantics.order_results_by_input {
-        if results.is_empty() {
-            continue;
-        }
-        semantics
-            .frontier
-            .get_mut(collection)
-            .expect("known order collection has members")
-            .remove(element);
+    close_homomorphic_order(&mut semantics);
+    // Every generated edge is strict; remove exactly its input from the frontier.
+    for (member, _) in semantics.order_results_by_input.iter_prefix_count::<64>() {
+        semantics.frontier.remove(&member);
     }
 
     Ok(CollectionResolution {
@@ -1193,77 +1286,69 @@ where
 /// Target edges can themselves be sources for another mapping, so all
 /// maps are revisited until no sparse edge is added. The graph remains a
 /// generating relation; its transitive closure is never materialized.
-fn close_homomorphic_order(
-    mappings_by_homomorphism: &BTreeMap<
-        (CollectionHandle, CollectionHandle),
-        BTreeMap<CollectionData, BTreeSet<CollectionData>>,
-    >,
-    order_results_by_input: &mut BTreeMap<MemberKey, BTreeSet<CollectionData>>,
-) {
+fn close_homomorphic_order(semantics: &mut CollectionSemantics) {
     loop {
-        let mut changed = false;
-        for ((source, target), mappings) in mappings_by_homomorphism {
-            let additions =
-                nearest_mapped_order_edges(*source, *target, mappings, order_results_by_input);
+        let before = semantics.order_results_by_input.len();
+        for (pair, _) in semantics.derive_outputs_by_input.iter_prefix_count::<64>() {
+            let source = Inline::new(pair[..32].try_into().unwrap());
+            let target = Inline::new(pair[32..].try_into().unwrap());
+            let additions = nearest_mapped_order_edges(semantics, source, target);
             for (lower, upper) in additions {
-                changed |= order_results_by_input
-                    .entry((*target, lower))
-                    .or_default()
-                    .insert(upper);
+                semantics
+                    .order_results_by_input
+                    .insert(&Entry::new(&bytes(&[target.raw, lower.raw, upper.raw])));
             }
         }
-        if !changed {
+        if semantics.order_results_by_input.len() == before {
             return;
         }
     }
 }
 
 fn nearest_mapped_order_edges(
+    semantics: &CollectionSemantics,
     source: CollectionHandle,
     target: CollectionHandle,
-    mappings: &BTreeMap<CollectionData, BTreeSet<CollectionData>>,
-    order_results_by_input: &BTreeMap<MemberKey, BTreeSet<CollectionData>>,
 ) -> BTreeSet<(CollectionData, CollectionData)> {
+    // This worklist and its visited set are scratch for one frozen order closure.
     let mut pending = Vec::new();
-    for (input, outputs) in mappings {
-        for output in outputs {
-            for successor in order_results_by_input
-                .get(&(source, *input))
-                .into_iter()
-                .flatten()
-            {
-                pending.push((*successor, *output));
+    for input in infixes::<128, 64, 32, _, _>(
+        &semantics.derive_outputs_by_input,
+        bytes(&[source.raw, target.raw]),
+    )
+    .map(Inline::new)
+    {
+        for output in semantics.images(source, target, input) {
+            for successor in semantics.successors((source, input)) {
+                pending.push((successor, output));
             }
         }
     }
-
     let mut visited = BTreeSet::new();
     let mut additions = BTreeSet::new();
     while let Some((source_member, lower_output)) = pending.pop() {
         if !visited.insert((source_member, lower_output)) {
             continue;
         }
-
-        if let Some(upper_outputs) = mappings.get(&source_member) {
-            for upper_output in upper_outputs {
-                if lower_output != *upper_output
-                    && !order_results_by_input
-                        .get(&(target, lower_output))
-                        .is_some_and(|results| results.contains(upper_output))
+        let prefix = bytes::<96>(&[source.raw, target.raw, source_member.raw]);
+        if semantics.derive_outputs_by_input.has_prefix(&prefix) {
+            for upper_output in semantics.images(source, target, source_member) {
+                if lower_output != upper_output
+                    && semantics
+                        .order_results_by_input
+                        .get(&bytes(&[target.raw, lower_output.raw, upper_output.raw]))
+                        .is_none()
                 {
-                    additions.insert((lower_output, *upper_output));
+                    additions.insert((lower_output, upper_output));
                 }
             }
             continue;
         }
-
-        for successor in order_results_by_input
-            .get(&(source, source_member))
-            .into_iter()
-            .flatten()
-        {
-            pending.push((*successor, lower_output));
-        }
+        pending.extend(
+            semantics
+                .successors((source, source_member))
+                .map(|successor| (successor, lower_output)),
+        );
     }
     additions
 }
@@ -1442,13 +1527,11 @@ where
 }
 
 fn contains_member(
-    members: &BTreeMap<CollectionHandle, BTreeSet<CollectionData>>,
+    members: &PATCH<64, MemberOrder>,
     collection: CollectionHandle,
     data: CollectionData,
 ) -> bool {
-    members
-        .get(&collection)
-        .is_some_and(|elements| elements.contains(&data))
+    members.get(&bytes(&[collection.raw, data.raw])).is_some()
 }
 
 pub(super) fn check_functional(
@@ -1500,6 +1583,52 @@ pub(super) fn check_functional(
 
 #[cfg(test)]
 mod tests {
+    fn member_relation<const N: usize>(
+        rows: [(CollectionHandle, BTreeSet<CollectionData>); N],
+    ) -> PATCH<64, MemberOrder> {
+        let mut relation = PATCH::new();
+        for (collection, members) in rows {
+            for member in members {
+                relation.insert(&Entry::new(&bytes(&[collection.raw, member.raw])));
+            }
+        }
+        relation
+    }
+
+    fn order_relation<const N: usize>(
+        rows: [(MemberKey, BTreeSet<CollectionData>); N],
+    ) -> PATCH<96, OrderOrder> {
+        let mut relation = PATCH::new();
+        for ((collection, lower), uppers) in rows {
+            for upper in uppers {
+                relation.insert(&Entry::new(&bytes(&[collection.raw, lower.raw, upper.raw])));
+            }
+        }
+        relation
+    }
+
+    fn collection_physical_cover(
+        semantics: &CollectionSemantics,
+        collection: CollectionHandle,
+        resident: &BTreeSet<CollectionData>,
+    ) -> CollectionPhysicalCover {
+        super::collection_physical_cover(semantics, collection, &resident.iter().copied().collect())
+    }
+
+    fn collection_physical_cover_for(
+        semantics: &CollectionSemantics,
+        collection: CollectionHandle,
+        obligations: &BTreeSet<CollectionData>,
+        resident: &BTreeSet<CollectionData>,
+    ) -> CollectionPhysicalCover {
+        super::collection_physical_cover_for(
+            semantics,
+            collection,
+            &obligations.iter().copied().collect(),
+            &resident.iter().copied().collect(),
+        )
+    }
+
     /// Resolve with a stated lineage.
     ///
     /// A derive record no longer names its source -- the target's descriptor
@@ -1683,16 +1812,11 @@ mod tests {
         if !path.insert(element) {
             return None;
         }
-        for (low, high) in semantics
-            .merge_inputs_by_result
-            .get(&(collection, element))
-            .into_iter()
-            .flatten()
-        {
+        for (low, high) in semantics.merge_producers((collection, element)) {
             let Some(mut proof) = reference_cover_element(
                 semantics,
                 collection,
-                *low,
+                low,
                 resident_frontier,
                 path.clone(),
             ) else {
@@ -1701,7 +1825,7 @@ mod tests {
             let Some(right) = reference_cover_element(
                 semantics,
                 collection,
-                *high,
+                high,
                 resident_frontier,
                 path.clone(),
             ) else {
@@ -1721,7 +1845,11 @@ mod tests {
         let Some(members) = semantics.members(collection) else {
             return CollectionPhysicalCover::default();
         };
-        let resident_members: BTreeSet<_> = resident.intersection(members).copied().collect();
+        let resident_members: BTreeSet<_> = resident
+            .iter()
+            .copied()
+            .filter(|member| members.contains(member))
+            .collect();
         let mut resident_frontier = BTreeSet::new();
         for candidate in &resident_members {
             let dominated = resident_members.iter().any(|other| {
@@ -1733,12 +1861,7 @@ mod tests {
         }
 
         let mut result = CollectionPhysicalCover::default();
-        for obligation in semantics
-            .frontier(collection)
-            .into_iter()
-            .flatten()
-            .copied()
-        {
+        for obligation in semantics.frontier(collection).into_iter().flatten() {
             match reference_cover_element(
                 semantics,
                 collection,
@@ -1759,6 +1882,58 @@ mod tests {
         let mut raw = [0u8; 32];
         raw[28..].copy_from_slice(&number.to_be_bytes());
         Inline::new(raw)
+    }
+
+    #[test]
+    fn retained_records_keep_canonical_order_and_diagnostic_value_equality() {
+        let definition = named_for_tests("retained-records", id(2));
+        let collection = identity_for_tests(&definition);
+        let records = [
+            derive_record(signed_derive(collection, data(1), data(3))),
+            commit_record(commit(&definition, data(1), 9)),
+            merge_record(signed_merge(collection, data(1), data(2), data(3))),
+            commit_record(commit(&definition, data(1), 1)),
+        ];
+        let actual: CollectionRecordSet = records.into_iter().collect();
+        let expected: BTreeSet<_> = records.into_iter().collect();
+        assert_eq!(
+            actual.iter().copied().collect::<Vec<_>>(),
+            expected.into_iter().collect::<Vec<_>>()
+        );
+
+        let mut rejected = CollectionRejections::default();
+        rejected.insert(records[0], "old diagnosis");
+        let frozen = rejected.clone();
+        rejected.insert(records[0], "new diagnosis");
+        assert_ne!(frozen, rejected);
+        assert_eq!(frozen.get(&records[0]), Some(&"old diagnosis"));
+        assert_eq!(rejected.get(&records[0]), Some(&"new diagnosis"));
+    }
+
+    #[test]
+    fn retained_relations_observe_suffix_changes_and_keep_known_empty_frontiers() {
+        let collection = identity_for_tests(&named_for_tests("retained-relations", id(2)));
+        let absent = identity_for_tests(&named_for_tests("absent", id(2)));
+        let mut semantics = CollectionSemantics {
+            members: member_relation([(collection, BTreeSet::from([data(1)]))]),
+            ..CollectionSemantics::default()
+        };
+        assert!(semantics.frontier(collection).unwrap().is_empty());
+        assert!(semantics.frontier(absent).is_none());
+        let frozen = semantics.clone();
+        semantics
+            .members
+            .insert(&Entry::new(&bytes(&[collection.raw, data(2).raw])));
+        assert_ne!(frozen, semantics);
+        assert!(!frozen.contains(collection, data(2)));
+        assert_eq!(
+            semantics
+                .members(collection)
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![data(1), data(2)]
+        );
     }
 
     #[test]
@@ -1885,16 +2060,22 @@ mod tests {
         let semantics = resolution.semantics();
 
         assert_eq!(
-            semantics.members(source_handle),
-            Some(&BTreeSet::from([data(1), data(2), data(3)]))
+            semantics
+                .members(source_handle)
+                .map(|members| members.iter().collect::<BTreeSet<_>>()),
+            Some(BTreeSet::from([data(1), data(2), data(3)]))
         );
         assert_eq!(
-            semantics.members(target_handle),
-            Some(&BTreeSet::from([data(4)]))
+            semantics
+                .members(target_handle)
+                .map(|members| members.iter().collect::<BTreeSet<_>>()),
+            Some(BTreeSet::from([data(4)]))
         );
         assert_eq!(
-            semantics.frontier(source_handle),
-            Some(&BTreeSet::from([data(3)]))
+            semantics
+                .frontier(source_handle)
+                .map(|members| members.iter().collect::<BTreeSet<_>>()),
+            Some(BTreeSet::from([data(3)]))
         );
         assert_eq!(
             semantics.supporting_data(target_handle, data(4)),
@@ -2057,20 +2238,28 @@ mod tests {
 
         let semantics = forward.semantics();
         assert_eq!(
-            semantics.members(identity_for_tests(&raw)),
-            Some(&BTreeSet::from([data(1), data(2), data(3)]))
+            semantics
+                .members(identity_for_tests(&raw))
+                .map(|members| members.iter().collect::<BTreeSet<_>>()),
+            Some(BTreeSet::from([data(1), data(2), data(3)]))
         );
         assert_eq!(
-            semantics.members(identity_for_tests(&rollup)),
-            Some(&BTreeSet::from([data(4), data(5), data(6)]))
+            semantics
+                .members(identity_for_tests(&rollup))
+                .map(|members| members.iter().collect::<BTreeSet<_>>()),
+            Some(BTreeSet::from([data(4), data(5), data(6)]))
         );
         assert_eq!(
-            semantics.frontier(identity_for_tests(&raw)),
-            Some(&BTreeSet::from([data(3)]))
+            semantics
+                .frontier(identity_for_tests(&raw))
+                .map(|members| members.iter().collect::<BTreeSet<_>>()),
+            Some(BTreeSet::from([data(3)]))
         );
         assert_eq!(
-            semantics.frontier(identity_for_tests(&rollup)),
-            Some(&BTreeSet::from([data(6)]))
+            semantics
+                .frontier(identity_for_tests(&rollup))
+                .map(|members| members.iter().collect::<BTreeSet<_>>()),
+            Some(BTreeSet::from([data(6)]))
         );
         assert_eq!(
             semantics.supporting_commits(identity_for_tests(&rollup), data(6)),
@@ -2105,8 +2294,10 @@ mod tests {
 
         assert!(semantics.subsumes(identity_for_tests(&target), data(11), data(13)));
         assert_eq!(
-            semantics.frontier(identity_for_tests(&target)),
-            Some(&BTreeSet::from([data(13)]))
+            semantics
+                .frontier(identity_for_tests(&target))
+                .map(|members| members.iter().collect::<BTreeSet<_>>()),
+            Some(BTreeSet::from([data(13)]))
         );
         assert_eq!(
             collection_physical_cover(
@@ -2115,8 +2306,8 @@ mod tests {
                 &BTreeSet::from([data(13)])
             ),
             CollectionPhysicalCover {
-                cover: BTreeSet::from([data(13)]),
-                missing: BTreeSet::new(),
+                cover: CollectionDataSet::from([data(13)]),
+                missing: CollectionDataSet::new(),
             }
         );
     }
@@ -2157,8 +2348,10 @@ mod tests {
 
         assert!(semantics.subsumes(identity_for_tests(&target), data(11), data(17)));
         assert_eq!(
-            semantics.frontier(identity_for_tests(&target)),
-            Some(&BTreeSet::from([data(17)]))
+            semantics
+                .frontier(identity_for_tests(&target))
+                .map(|members| members.iter().collect::<BTreeSet<_>>()),
+            Some(BTreeSet::from([data(17)]))
         );
     }
 
@@ -2191,12 +2384,12 @@ mod tests {
         )
         .unwrap();
         let semantics = resolution.semantics();
-        let target_cover = BTreeSet::from([data(11), data(12), data(14)]);
+        let target_cover = CollectionDataSet::from([data(11), data(12), data(14)]);
         assert_eq!(
             semantics.source_coarsenings(
                 source_id,
                 target_id,
-                &BTreeSet::from([data(7)]),
+                &CollectionDataSet::from([data(7)]),
                 &target_cover
             ),
             vec![(data(7), BTreeSet::new())],
@@ -2206,7 +2399,7 @@ mod tests {
             semantics.source_coarsenings(
                 source_id,
                 target_id,
-                &BTreeSet::from([data(3), data(4)]),
+                &CollectionDataSet::from([data(3), data(4)]),
                 &target_cover
             ),
             vec![(data(3), BTreeSet::from([(data(11), data(12))]))],
@@ -2243,21 +2436,21 @@ mod tests {
         )
         .unwrap();
         let semantics = resolution.semantics();
-        let source_cover = BTreeSet::from([data(3), data(4)]);
+        let source_cover = CollectionDataSet::from([data(3), data(4)]);
         assert!(
             !semantics
                 .source_coarsenings(
                     source_id,
                     target_id,
                     &source_cover,
-                    &BTreeSet::from([data(11), data(12), data(14)]),
+                    &CollectionDataSet::from([data(11), data(12), data(14)]),
                 )
                 .is_empty(),
             "a missing upper image may still improve its complete finer cover"
         );
         for resident in [
-            BTreeSet::from([data(13), data(14)]),
-            BTreeSet::from([data(19)]),
+            CollectionDataSet::from([data(13), data(14)]),
+            CollectionDataSet::from([data(19)]),
         ] {
             assert!(
                 semantics
@@ -2311,8 +2504,10 @@ mod tests {
             assert!(semantics.subsumes(identity_for_tests(&target), lower, data(35)));
         }
         assert_eq!(
-            semantics.frontier(identity_for_tests(&target)),
-            Some(&BTreeSet::from([data(35)]))
+            semantics
+                .frontier(identity_for_tests(&target))
+                .map(|members| members.iter().collect::<BTreeSet<_>>()),
+            Some(BTreeSet::from([data(35)]))
         );
     }
 
@@ -2357,8 +2552,10 @@ mod tests {
         assert!(semantics.subsumes(identity_for_tests(&middle), data(11), data(13)));
         assert!(semantics.subsumes(identity_for_tests(&target), data(21), data(23)));
         assert_eq!(
-            semantics.frontier(identity_for_tests(&target)),
-            Some(&BTreeSet::from([data(23)]))
+            semantics
+                .frontier(identity_for_tests(&target))
+                .map(|members| members.iter().collect::<BTreeSet<_>>()),
+            Some(BTreeSet::from([data(23)]))
         );
     }
 
@@ -2391,8 +2588,10 @@ mod tests {
         let semantics = resolution.semantics();
 
         assert_eq!(
-            semantics.frontier(identity_for_tests(&target)),
-            Some(&BTreeSet::from([data(13)]))
+            semantics
+                .frontier(identity_for_tests(&target))
+                .map(|members| members.iter().collect::<BTreeSet<_>>()),
+            Some(BTreeSet::from([data(13)]))
         );
         assert_eq!(
             collection_physical_cover(
@@ -2401,8 +2600,8 @@ mod tests {
                 &BTreeSet::from([data(11), data(12)])
             ),
             CollectionPhysicalCover {
-                cover: BTreeSet::from([data(11), data(12)]),
-                missing: BTreeSet::new(),
+                cover: CollectionDataSet::from([data(11), data(12)]),
+                missing: CollectionDataSet::new(),
             }
         );
     }
@@ -2434,11 +2633,8 @@ mod tests {
 
         assert!(resolution
             .semantics()
-            .derive_inputs_by_output
-            .get(&(identity_for_tests(&target), data(13)))
-            .is_some_and(|producers| {
-                producers.contains(&(identity_for_tests(&source), data(3)))
-            }));
+            .derive_producers((identity_for_tests(&target), data(13)))
+            .any(|producer| producer == (identity_for_tests(&source), data(3))));
         assert!(
             !resolution.admitted_claims().iter().any(|record| {
                 matches!(record, CollectionRecord::Derive(claim)
@@ -2552,11 +2748,17 @@ mod tests {
             once.admitted_claims().len() + 2
         );
         assert_eq!(
-            twice.semantics().merge_inputs_by_result[&(target_handle, data(13))],
+            twice
+                .semantics()
+                .merge_producers((target_handle, data(13)))
+                .collect::<BTreeSet<_>>(),
             BTreeSet::from([(data(11), data(12))]),
         );
         assert_eq!(
-            twice.semantics().derive_inputs_by_output[&(target_handle, data(11))],
+            twice
+                .semantics()
+                .derive_producers((target_handle, data(11)))
+                .collect::<BTreeSet<_>>(),
             BTreeSet::from([(source_handle, data(1))]),
         );
     }
@@ -2712,12 +2914,12 @@ mod tests {
             .semantics()
             .members(identity_for_tests(&definition))
             .unwrap()
-            .is_subset(
-                final_pass
-                    .semantics()
-                    .members(identity_for_tests(&definition))
-                    .unwrap()
-            ));
+            .iter()
+            .all(|member| final_pass
+                .semantics()
+                .members(identity_for_tests(&definition))
+                .unwrap()
+                .contains(&member)));
     }
 
     #[test]
@@ -2748,8 +2950,10 @@ mod tests {
         .unwrap();
         let semantics = resolution.semantics();
         assert_eq!(
-            semantics.frontier(identity_for_tests(&definition)),
-            Some(&BTreeSet::from([data(2)]))
+            semantics
+                .frontier(identity_for_tests(&definition))
+                .map(|members| members.iter().collect::<BTreeSet<_>>()),
+            Some(BTreeSet::from([data(2)]))
         );
         assert_eq!(
             semantics.supporting_commits(identity_for_tests(&definition), data(2)),
@@ -2765,8 +2969,8 @@ mod tests {
                 &BTreeSet::from([data(1)])
             ),
             CollectionPhysicalCover {
-                cover: BTreeSet::new(),
-                missing: BTreeSet::from([data(2)]),
+                cover: CollectionDataSet::new(),
+                missing: CollectionDataSet::from([data(2)]),
             }
         );
     }
@@ -2853,8 +3057,10 @@ mod tests {
         let resolution = resolve_with_derive_lineage(&records, &[], &authorized, accepted).unwrap();
         let semantics = resolution.semantics();
         assert_eq!(
-            semantics.frontier(identity_for_tests(&definition)),
-            Some(&BTreeSet::from([data(3), data(14)]))
+            semantics
+                .frontier(identity_for_tests(&definition))
+                .map(|members| members.iter().collect::<BTreeSet<_>>()),
+            Some(BTreeSet::from([data(3), data(14)]))
         );
 
         // 14 covers the shared input 2 through nonresident 6; it is then
@@ -2866,8 +3072,8 @@ mod tests {
                 &BTreeSet::from([data(1), data(9), data(14)])
             ),
             CollectionPhysicalCover {
-                cover: BTreeSet::from([data(1), data(14)]),
-                missing: BTreeSet::new(),
+                cover: CollectionDataSet::from([data(1), data(14)]),
+                missing: CollectionDataSet::new(),
             }
         );
         assert_eq!(
@@ -2896,17 +3102,15 @@ mod tests {
 
         for graph in 0u16..(1u16 << directed_edges.len()) {
             let mut semantics = CollectionSemantics {
-                members: BTreeMap::from([(collection, members.clone())]),
-                frontier: BTreeMap::from([(collection, members.clone())]),
+                members: member_relation([(collection, members.clone())]),
+                frontier: member_relation([(collection, members.clone())]),
                 ..CollectionSemantics::default()
             };
             for (index, (lower, upper)) in directed_edges.iter().copied().enumerate() {
                 if graph & (1 << index) != 0 {
                     semantics
                         .order_results_by_input
-                        .entry((collection, lower))
-                        .or_default()
-                        .insert(upper);
+                        .insert(&Entry::new(&bytes(&[collection.raw, lower.raw, upper.raw])));
                 }
             }
 
@@ -2933,16 +3137,16 @@ mod tests {
         let collection = identity_for_tests(&named_for_tests("c1", id(2)));
         let members: BTreeSet<_> = (1..=4_096).map(numbered_data).collect();
         let semantics = CollectionSemantics {
-            members: BTreeMap::from([(collection, members.clone())]),
-            frontier: BTreeMap::from([(collection, members.clone())]),
+            members: member_relation([(collection, members.clone())]),
+            frontier: member_relation([(collection, members.clone())]),
             ..CollectionSemantics::default()
         };
 
         assert_eq!(
             collection_physical_cover(&semantics, collection, &members),
             CollectionPhysicalCover {
-                cover: members,
-                missing: BTreeSet::new(),
+                cover: members.into_iter().collect(),
+                missing: CollectionDataSet::new(),
             }
         );
     }
@@ -2961,23 +3165,28 @@ mod tests {
             let input = numbered_data(leaf);
             let result = numbered_data(LEAVES + leaf - 1);
             members.insert(result);
-            semantics.merge_inputs_by_result.insert(
-                (collection, result),
-                BTreeSet::from([ordered(previous, input)]),
-            );
+            let (low, high) = ordered(previous, input);
+            semantics
+                .merge_inputs_by_result
+                .insert(&Entry::new(&bytes(&[
+                    collection.raw,
+                    result.raw,
+                    low.raw,
+                    high.raw,
+                ])));
             for lower in [previous, input] {
                 semantics
                     .order_results_by_input
-                    .entry((collection, lower))
-                    .or_default()
-                    .insert(result);
+                    .insert(&Entry::new(&bytes(&[
+                        collection.raw,
+                        lower.raw,
+                        result.raw,
+                    ])));
             }
             previous = result;
         }
-        semantics.members.insert(collection, members.clone());
-        semantics
-            .frontier
-            .insert(collection, BTreeSet::from([previous]));
+        semantics.members = member_relation([(collection, members.clone())]);
+        semantics.frontier = member_relation([(collection, BTreeSet::from([previous]))]);
 
         EXISTENTIAL_SUBSUMER_EDGE_VISITS.set(0);
         let physical = collection_physical_cover(&semantics, collection, &members);
@@ -2985,8 +3194,8 @@ mod tests {
         assert_eq!(
             physical,
             CollectionPhysicalCover {
-                cover: BTreeSet::from([previous]),
-                missing: BTreeSet::new(),
+                cover: CollectionDataSet::from([previous]),
+                missing: CollectionDataSet::new(),
             }
         );
         assert_eq!(
@@ -3000,9 +3209,9 @@ mod tests {
         let collection = identity_for_tests(&named_for_tests("c1", id(2)));
         let [lower, middle, upper] = [data(1), data(2), data(3)];
         let semantics = CollectionSemantics {
-            members: BTreeMap::from([(collection, BTreeSet::from([lower, middle, upper]))]),
-            frontier: BTreeMap::from([(collection, BTreeSet::from([upper]))]),
-            order_results_by_input: BTreeMap::from([
+            members: member_relation([(collection, BTreeSet::from([lower, middle, upper]))]),
+            frontier: member_relation([(collection, BTreeSet::from([upper]))]),
+            order_results_by_input: order_relation([
                 ((collection, lower), BTreeSet::from([middle])),
                 ((collection, middle), BTreeSet::from([upper])),
             ]),
@@ -3024,15 +3233,23 @@ mod tests {
         let collection = identity_for_tests(&named_for_tests("c1", id(2)));
         let [lower, other] = [data(1), data(2)];
         let semantics = CollectionSemantics {
-            order_results_by_input: BTreeMap::from([
+            order_results_by_input: order_relation([
                 ((collection, lower), BTreeSet::from([lower, other])),
                 ((collection, other), BTreeSet::from([lower])),
             ]),
             ..CollectionSemantics::default()
         };
-        assert!(!semantics.has_strict_subsumer_in(collection, lower, &BTreeSet::from([lower])));
-        assert!(semantics.has_strict_subsumer_in(collection, lower, &BTreeSet::from([other])));
-        assert!(!semantics.has_strict_subsumer_in(collection, lower, &BTreeSet::new()));
+        assert!(!semantics.has_strict_subsumer_in(
+            collection,
+            lower,
+            &CollectionDataSet::from([lower])
+        ));
+        assert!(semantics.has_strict_subsumer_in(
+            collection,
+            lower,
+            &CollectionDataSet::from([other])
+        ));
+        assert!(!semantics.has_strict_subsumer_in(collection, lower, &CollectionDataSet::new()));
     }
 
     #[test]
@@ -3040,8 +3257,8 @@ mod tests {
         let collection = identity_for_tests(&named_for_tests("c1", id(2)));
         let [lower, canonical, other] = [data(1), data(2), data(3)];
         let semantics = CollectionSemantics {
-            members: BTreeMap::from([(collection, BTreeSet::from([lower, canonical, other]))]),
-            order_results_by_input: BTreeMap::from([(
+            members: member_relation([(collection, BTreeSet::from([lower, canonical, other]))]),
+            order_results_by_input: order_relation([(
                 (collection, lower),
                 BTreeSet::from([canonical, other]),
             )]),
@@ -3056,8 +3273,8 @@ mod tests {
         assert_eq!(
             physical,
             CollectionPhysicalCover {
-                cover: BTreeSet::from([canonical]),
-                missing: BTreeSet::new(),
+                cover: CollectionDataSet::from([canonical]),
+                missing: CollectionDataSet::new(),
             }
         );
     }
@@ -3094,8 +3311,8 @@ mod tests {
                 &BTreeSet::from([data(1)])
             ),
             CollectionPhysicalCover {
-                cover: BTreeSet::new(),
-                missing: BTreeSet::from([data(2)]),
+                cover: CollectionDataSet::new(),
+                missing: CollectionDataSet::from([data(2)]),
             }
         );
         assert_eq!(
@@ -3105,8 +3322,8 @@ mod tests {
                 &BTreeSet::from([data(2)])
             ),
             CollectionPhysicalCover {
-                cover: BTreeSet::from([data(2)]),
-                missing: BTreeSet::new(),
+                cover: CollectionDataSet::from([data(2)]),
+                missing: CollectionDataSet::new(),
             }
         );
     }
@@ -3286,8 +3503,9 @@ mod tests {
         assert_eq!(
             resolved
                 .semantics()
-                .frontier(identity_for_tests(&definition)),
-            Some(&BTreeSet::from([merge.result()]))
+                .frontier(identity_for_tests(&definition))
+                .map(|members| members.iter().collect::<BTreeSet<_>>()),
+            Some(BTreeSet::from([merge.result()]))
         );
         assert_eq!(
             resolved

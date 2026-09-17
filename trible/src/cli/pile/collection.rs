@@ -53,6 +53,7 @@ use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::{Blake3, Handle, Hash};
 use triblespace_core::inline::Inline;
 use triblespace_core::metadata::{self, MetaDescribe};
+use triblespace_core::patch::{Entry, IdentitySchema, PATCH};
 use triblespace_core::repo::async_store::AsyncBlobStoreAcquire;
 use triblespace_core::repo::pile::{Pile, PileSnapshot};
 use triblespace_core::repo::{
@@ -2666,7 +2667,8 @@ fn maintenance_order<R: BlobStoreGet>(
     Ok(order)
 }
 
-/// Ephemeral recomputation boundaries, never interpreted collection answers.
+/// Retained recomputation boundaries, never interpreted collection answers.
+#[derive(Clone)]
 struct MaintenanceHop<R> {
     before: R,
     interests: StoreDependencies,
@@ -2681,24 +2683,16 @@ struct MaintenanceHop<R> {
 
 struct MaintenanceState<R> {
     planning: StoreDependencies,
-    hops: BTreeMap<CollectionHandle, MaintenanceHop<R>>,
+    hops: PATCH<32, IdentitySchema, MaintenanceHop<R>>,
 }
 
 impl<R> Default for MaintenanceState<R> {
     fn default() -> Self {
         Self {
             planning: StoreDependencies::default(),
-            hops: BTreeMap::new(),
+            hops: PATCH::new(),
         }
     }
-}
-
-fn extend_maintenance_interests(into: &mut StoreDependencies, from: &StoreDependencies) {
-    into.records.extend(from.records.iter().copied());
-    into.blobs.extend(from.blobs.iter().copied());
-    into.capability_proofs |= from.capability_proofs;
-    into.all_records |= from.all_records;
-    into.all_blobs |= from.all_blobs;
 }
 
 impl<R: StoreSnapshot> MaintenanceState<R> {
@@ -2706,22 +2700,27 @@ impl<R: StoreSnapshot> MaintenanceState<R> {
         let mut interests = self.planning.clone();
         // A pass triggered by one chain must not forget skipped chains' misses
         // or record interests. Name lookup stays broad only at planning scope.
-        for hop in self.hops.values() {
-            extend_maintenance_interests(&mut interests, &hop.interests);
+        for key in self.hops.iter_ordered() {
+            let hop = self.hops.get(key).expect("hop key retains its observation");
+            interests.union(&hop.interests);
         }
         interests
     }
 
     fn rebase_unchanged(&mut self, current: &R) {
-        for hop in self.hops.values_mut() {
+        let previous = self.hops.clone();
+        for key in previous.iter_ordered() {
+            let hop = previous.get(key).expect("hop key retains its observation");
             if !maintenance_changed(&hop.before, current, &hop.interests) {
+                let mut hop = hop.clone();
                 hop.before = current.clone();
+                self.hops.replace(&Entry::with_value(key, hop));
             }
         }
     }
 
     fn needs_work(&mut self, handle: CollectionHandle, dependency_only: bool, current: &R) -> bool {
-        let Some(hop) = self.hops.get_mut(&handle) else {
+        let Some(hop) = self.hops.get(&handle.raw) else {
             return true;
         };
         if hop.retry_on_pass
@@ -2732,7 +2731,9 @@ impl<R: StoreSnapshot> MaintenanceState<R> {
         }
         // Rebase only after proving this hop unchanged, releasing older shared
         // index versions without swallowing an unconsumed relevant arrival.
+        let mut hop = hop.clone();
         hop.before = current.clone();
+        self.hops.replace(&Entry::with_value(&handle.raw, hop));
         false
     }
 }
@@ -2787,7 +2788,7 @@ async fn maintenance_pass<S: Store + AsyncBlobStoreAcquire + Send>(
                 .map_err(|error| anyhow!("pile snapshot: {error:?}"))?,
         );
         let order = maintenance_order(&snapshot, target, dependencies, &attempted);
-        extend_maintenance_interests(&mut state.planning, &snapshot.dependencies());
+        state.planning.union(&snapshot.dependencies());
         let order = match order {
             Ok(order) => order,
             Err(error) => {
@@ -2808,8 +2809,10 @@ async fn maintenance_pass<S: Store + AsyncBlobStoreAcquire + Send>(
             let before = match pile.snapshot() {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
-                    if let Some(hop) = state.hops.get_mut(&handle) {
+                    if let Some(hop) = state.hops.get(&handle.raw) {
+                        let mut hop = hop.clone();
                         hop.retry_on_pass = true;
+                        state.hops.replace(&Entry::with_value(&handle.raw, hop));
                     }
                     eprintln!(
                         "maintenance blake3:{}: pile snapshot: {error:?}",
@@ -2878,15 +2881,15 @@ async fn maintenance_pass<S: Store + AsyncBlobStoreAcquire + Send>(
             // A later snapshot can contain records/proofs that the operation's
             // frozen frontier did not consume. Its own writes also request one
             // local catch-up; an unchanged sibling need not run again.
-            state.hops.insert(
-                handle,
+            state.hops.replace(&Entry::with_value(
+                &handle.raw,
                 MaintenanceHop {
                     before,
                     interests,
                     dependency_only,
                     retry_on_pass: result.is_err(),
                 },
-            );
+            ));
             if let Err(error) = result {
                 eprintln!("maintenance blake3:{}: {error:#}", handle_hex(handle));
                 failures += 1;
@@ -2898,7 +2901,11 @@ async fn maintenance_pass<S: Store + AsyncBlobStoreAcquire + Send>(
     // Entries no longer reachable from this selection hold no useful work.
     // Failed planning retains its exact misses above; when that route becomes
     // available, absent entries run afresh rather than reusing an old answer.
-    state.hops.retain(|handle, _| attempted.contains(handle));
+    for key in state.hops.clone().iter() {
+        if !attempted.contains(&CollectionHandle::new(*key)) {
+            state.hops.remove(key);
+        }
+    }
     Ok(failures)
 }
 

@@ -171,7 +171,7 @@ pub struct Reconciler {
     max_backoff: Duration,
     fetch_budget: Duration,
     mode: ReplicationMode,
-    collections: BTreeSet<CollectionRecordSelector>,
+    collections: PATCH<32>,
     observation_generation: u64,
     want_round: ExactRound,
     root_round: ExactRound,
@@ -213,7 +213,7 @@ impl Reconciler {
             max_backoff: max,
             fetch_budget: RECONCILE_FETCH_DEADLINE,
             mode: ReplicationMode::Demand,
-            collections: BTreeSet::new(),
+            collections: PATCH::new(),
             observation_generation: 0,
             want_round: ExactRound::default(),
             root_round: ExactRound::default(),
@@ -240,11 +240,14 @@ impl Reconciler {
         collections: impl IntoIterator<Item = CollectionHandle>,
     ) -> Self {
         self.mode = mode;
-        self.collections = collections
-            .into_iter()
-            .map(CollectionRecordSelector::Collection)
-            .collect();
-        self.scan = SelectionScans::new(self.collections.iter().copied());
+        self.collections = PATCH::new();
+        for collection in collections {
+            self.collections.insert(&PatchEntry::new(&collection.raw));
+        }
+        self.scan =
+            SelectionScans::new(self.collections.iter_ordered().map(|handle| {
+                CollectionRecordSelector::Collection(CollectionHandle::new(*handle))
+            }));
         self.root_round = ExactRound::default();
         self.next_service = ServiceTurn::default();
         for state in self.states.values_mut() {
@@ -459,8 +462,17 @@ impl Reconciler {
             // tick. COMMIT signatures are checked once, before physical union.
             let observed = self
                 .collections
-                .iter()
-                .map(|selector| direct_roots(&snapshot, &BTreeSet::from([*selector])))
+                // Match the order used to construct SelectionScans: its lanes
+                // are zipped with this tick's corresponding root sets.
+                .iter_ordered()
+                .map(|handle| {
+                    direct_roots(
+                        &snapshot,
+                        &BTreeSet::from([CollectionRecordSelector::Collection(
+                            CollectionHandle::new(*handle),
+                        )]),
+                    )
+                })
                 .collect::<Result<Vec<_>, _>>();
             match observed {
                 Ok(roots) => roots,
@@ -612,19 +624,16 @@ impl Reconciler {
         // Structural endpoints landed during an earlier exact-service turn
         // can now make a previously absent summary usable.
         let mut summaries = Vec::new();
-        for selector in &self.collections {
-            let CollectionRecordSelector::Collection(handle) = selector else {
-                continue;
-            };
-            let Ok(collection) = Collection::<ReferenceSummaryBlob>::open(&snapshot, *handle)
-            else {
+        for handle in self.collections.iter_ordered() {
+            let handle = CollectionHandle::new(*handle);
+            let Ok(collection) = Collection::<ReferenceSummaryBlob>::open(&snapshot, handle) else {
                 continue;
             };
             let Ok(observed) = snapshot.collection(collection) else {
                 continue;
             };
             let Ok(descriptor) =
-                BlobStoreGet::get::<triblespace_core::trible::TribleSet, _>(&snapshot, *handle)
+                BlobStoreGet::get::<triblespace_core::trible::TribleSet, _>(&snapshot, handle)
             else {
                 continue;
             };
@@ -2013,6 +2022,46 @@ mod tests {
                 Inline::new(metadata),
             )))
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn collection_selection_keeps_observed_roots_in_their_sorted_scan_lanes() {
+        let mut store = MemoryRepo::default();
+        let metadata = put(&mut store, Vec::new());
+        let mut expected = BTreeMap::new();
+        for byte in 0..40_u8 {
+            let descriptor = put(&mut store, vec![0, byte]);
+            let data = put(&mut store, vec![1, byte]);
+            raw_commit(&mut store, descriptor, data, metadata);
+            expected.insert(
+                CollectionHandle::new(descriptor),
+                BTreeSet::from([descriptor, data, metadata]),
+            );
+        }
+        let mut peer = local_peer(store);
+        let duplicate = *expected.keys().next().unwrap();
+        let mut reconciler = Reconciler::new()
+            .with_replication(
+                ReplicationMode::Full,
+                expected.keys().rev().copied().chain([duplicate]),
+            )
+            .with_fetch_budget(Duration::ZERO);
+        let stats = reconciler.tick(&mut peer).await;
+        assert_eq!(stats.replication.pending, 0);
+        assert_eq!(reconciler.scan.lanes.len(), expected.len());
+        for ((selector, scan), (collection, roots)) in reconciler.scan.lanes.iter().zip(&expected) {
+            assert_eq!(*selector, CollectionRecordSelector::Collection(*collection));
+            let observed = scan
+                .sources
+                .iter()
+                .map(|key| {
+                    let root: RawHash = key[..32].try_into().unwrap();
+                    assert_eq!(&key[32..], &root);
+                    root
+                })
+                .collect::<BTreeSet<_>>();
+            assert_eq!(&observed, roots);
+        }
     }
 
     #[derive(Default)]

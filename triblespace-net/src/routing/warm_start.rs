@@ -124,7 +124,7 @@ fn lookup(
                 routes.configured.len() <= 1,
                 "fixture policy supports one bootstrap"
             );
-            if let Some(bootstrap) = routes.configured.first().copied() {
+            if let Some(bootstrap) = routes.configured.iter_ordered().next().copied() {
                 let mut initial = vec![bootstrap];
                 initial.extend(
                     deferred

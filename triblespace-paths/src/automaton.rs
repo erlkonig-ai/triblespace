@@ -1,8 +1,8 @@
-use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 
 use triblespace_core::id::RawId;
+use triblespace_core::patch::{Entry, PATCH};
 
 /// Dense state number in a fixed automaton.
 pub type StateId = u32;
@@ -82,8 +82,9 @@ impl Transition {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Automaton {
     state_count: StateId,
-    initial: BTreeSet<StateId>,
-    accepting: BTreeSet<StateId>,
+    // Big-endian state numbers preserve canonical numeric order in PATCH.
+    initial: PATCH<4>,
+    accepting: PATCH<4>,
     transitions: Vec<Transition>,
 }
 
@@ -129,18 +130,29 @@ impl Automaton {
             return Err(AutomatonError::NoStates);
         }
 
-        let initial = initial.into_iter().collect::<BTreeSet<_>>();
-        if initial.is_empty() {
+        let mut initial_set = PATCH::new();
+        for state in initial {
+            initial_set.insert(&Entry::new(&state.to_be_bytes()));
+        }
+        if initial_set.is_empty() {
             return Err(AutomatonError::NoInitialState);
         }
-        let accepting = accepting.into_iter().collect::<BTreeSet<_>>();
+        let mut accepting_set = PATCH::new();
+        for state in accepting {
+            accepting_set.insert(&Entry::new(&state.to_be_bytes()));
+        }
         let mut transitions = transitions.into_iter().collect::<Vec<_>>();
 
-        for state in initial.iter().chain(&accepting).copied().chain(
-            transitions
-                .iter()
-                .flat_map(|transition| [transition.from, transition.to]),
-        ) {
+        for state in initial_set
+            .iter_ordered()
+            .chain(accepting_set.iter_ordered())
+            .map(|state| StateId::from_be_bytes(*state))
+            .chain(
+                transitions
+                    .iter()
+                    .flat_map(|transition| [transition.from, transition.to]),
+            )
+        {
             if state >= state_count {
                 return Err(AutomatonError::StateOutOfRange { state, state_count });
             }
@@ -154,8 +166,8 @@ impl Automaton {
 
         Ok(Self {
             state_count,
-            initial,
-            accepting,
+            initial: initial_set,
+            accepting: accepting_set,
             transitions,
         })
     }
@@ -167,12 +179,16 @@ impl Automaton {
 
     /// Canonically ordered initial states.
     pub fn initial_states(&self) -> impl Iterator<Item = StateId> + '_ {
-        self.initial.iter().copied()
+        self.initial
+            .iter_ordered()
+            .map(|state| StateId::from_be_bytes(*state))
     }
 
     /// Canonically ordered accepting states.
     pub fn accepting_states(&self) -> impl Iterator<Item = StateId> + '_ {
-        self.accepting.iter().copied()
+        self.accepting
+            .iter_ordered()
+            .map(|state| StateId::from_be_bytes(*state))
     }
 
     /// Whether the automaton accepts the empty path.
@@ -182,16 +198,68 @@ impl Automaton {
     pub fn accepts_empty(&self) -> bool {
         self.initial
             .iter()
-            .any(|state| self.accepting.contains(state))
+            .any(|state| self.accepting.has_prefix(state))
     }
 
     /// Whether `state` accepts a completed path.
     pub fn is_accepting(&self, state: StateId) -> bool {
-        self.accepting.contains(&state)
+        self.accepting.has_prefix(&state.to_be_bytes())
     }
 
     /// Canonically ordered, duplicate-free transitions.
     pub fn transitions(&self) -> &[Transition] {
         &self.transitions
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_sets_keep_numeric_order_and_snapshot_independence() {
+        let automaton =
+            Automaton::new(65_537, [65_536, 256, 1, 256], [256, 65_536, 256], []).unwrap();
+        assert_eq!(
+            automaton.initial_states().collect::<Vec<_>>(),
+            [1, 256, 65_536]
+        );
+        assert_eq!(
+            automaton.accepting_states().collect::<Vec<_>>(),
+            [256, 65_536]
+        );
+        assert!(automaton.accepts_empty());
+        assert!(!automaton.is_accepting(1));
+        assert_eq!(
+            automaton,
+            Automaton::new(65_537, [1, 256, 65_536], [65_536, 256], []).unwrap()
+        );
+
+        let mut changed = automaton.clone();
+        changed.initial.remove(&256_u32.to_be_bytes());
+        changed.accepting.remove(&256_u32.to_be_bytes());
+        assert!(automaton.is_accepting(256));
+        assert!(!changed.is_accepting(256));
+        assert_eq!(automaton.initial_states().count(), 3);
+        assert_eq!(changed.initial_states().count(), 2);
+        assert_ne!(changed, automaton);
+    }
+
+    #[test]
+    fn invalid_state_selection_remains_canonical() {
+        assert_eq!(
+            Automaton::new(2, [65_536, 256, 1], [2], []),
+            Err(AutomatonError::StateOutOfRange {
+                state: 256,
+                state_count: 2,
+            })
+        );
+        assert_eq!(
+            Automaton::new(2, [1], [65_536, 256], []),
+            Err(AutomatonError::StateOutOfRange {
+                state: 256,
+                state_count: 2,
+            })
+        );
     }
 }

@@ -2728,7 +2728,7 @@ pub struct Pile {
     /// BLAKE3 digests of the exact bytes of those frames, so a rewrite into a
     /// pile that already carries one appends nothing, at a set lookup per
     /// frame rather than a scan of every earlier one.
-    opaque_digests: BTreeSet<[u8; 32]>,
+    opaque_digests: PATCH<32>,
     /// Current grow-only typed request set. Retired weak-pin and typed LWW-log
     /// records are deliberately absent: they are raw input to the explicit
     /// WANT cutover migration, not live state that stale pile concatenation can
@@ -2986,7 +2986,7 @@ impl super::StoreSnapshot for PileSnapshot {
                         let matches = changed.iter().any(|key| {
                             let record =
                                 *changed.get(key).expect("difference key retains its record");
-                            selectors_match_record(&dependencies.records, record)
+                            dependencies.records.matches(record)
                         });
                         matches
                     })));
@@ -3430,7 +3430,7 @@ impl Pile {
             legacy_collection_headers: LegacyCollectionHeaderIndex::new(),
             opaque_records: 0,
             opaque_frames: Vec::new(),
-            opaque_digests: BTreeSet::new(),
+            opaque_digests: PATCH::new(),
             wants: PATCH::<WANT_REQUEST_BYTES_LEN, IdentitySchema>::new(),
             applied_length: 0,
         })
@@ -3665,7 +3665,7 @@ impl Pile {
                 let frame_len = next_applied_length - start_offset;
                 self.opaque_frames.push((start_offset, frame_len));
                 self.opaque_digests
-                    .insert(*blake3::hash(&slice[..frame_len]).as_bytes());
+                    .insert(&Entry::new(blake3::hash(&slice[..frame_len]).as_bytes()));
                 Applied::Opaque
             }
         };
@@ -4096,7 +4096,11 @@ impl Pile {
         let result = (|| {
             self.refresh_locked()?;
 
-            if self.opaque_digests.contains(blake3::hash(frame).as_bytes()) {
+            if self
+                .opaque_digests
+                .get(blake3::hash(frame).as_bytes())
+                .is_some()
+            {
                 return Ok(());
             }
 
@@ -9252,7 +9256,7 @@ mod tests {
                     ..StoreDependencies::default()
                 },
                 StoreDependencies {
-                    blobs: BTreeSet::from([hash]),
+                    blobs: crate::collection::CollectionDataSet::from([hash]),
                     ..StoreDependencies::default()
                 },
             ] {
@@ -9262,7 +9266,9 @@ mod tests {
                 after.changes_for(
                     &before,
                     &StoreDependencies {
-                        blobs: BTreeSet::from([Inline::new([0xA5; 32])]),
+                        blobs: crate::collection::CollectionDataSet::from([Inline::new(
+                            [0xA5; 32]
+                        )]),
                         ..StoreDependencies::default()
                     },
                 ),
@@ -10035,7 +10041,7 @@ mod tests {
                 ..StoreDependencies::default()
             },
             StoreDependencies {
-                blobs: BTreeSet::from([hash]),
+                blobs: crate::collection::CollectionDataSet::from([hash]),
                 ..StoreDependencies::default()
             },
         ] {
@@ -10519,7 +10525,7 @@ mod tests {
         let realized = observer.snapshot().unwrap();
         for route in routes {
             let exact = StoreDependencies {
-                records: BTreeSet::from([route]),
+                records: crate::collection::CollectionRecordSelectors::from([route]),
                 ..StoreDependencies::default()
             };
             assert_eq!(
@@ -10527,11 +10533,9 @@ mod tests {
                 StoreChanges::COLLECTION_RECORDS,
                 "{route:?}",
             );
-            assert!(unrelated.select_records(&exact.records).unwrap().is_empty());
-            assert_eq!(
-                realized.select_records(&exact.records).unwrap(),
-                vec![produced]
-            );
+            let selectors = exact.records.iter().collect();
+            assert!(unrelated.select_records(&selectors).unwrap().is_empty());
+            assert_eq!(realized.select_records(&selectors).unwrap(), vec![produced]);
             assert_eq!(
                 realized.changes_for(&realized.clone(), &exact),
                 StoreChanges::NONE
@@ -10550,9 +10554,9 @@ mod tests {
             alternate_witness.changes_for(
                 &realized,
                 &StoreDependencies {
-                    records: BTreeSet::from([CollectionRecordSelector::ProducedMember(
-                        target, output
-                    )]),
+                    records: crate::collection::CollectionRecordSelectors::from([
+                        CollectionRecordSelector::ProducedMember(target, output)
+                    ]),
                     ..StoreDependencies::default()
                 }
             ),
@@ -10563,7 +10567,7 @@ mod tests {
                 alternate_witness.changes_for(
                     &realized,
                     &StoreDependencies {
-                        records: BTreeSet::from([unchanged]),
+                        records: crate::collection::CollectionRecordSelectors::from([unchanged]),
                         ..StoreDependencies::default()
                     }
                 ),
@@ -10581,9 +10585,9 @@ mod tests {
             input_arrived.changes_for(
                 &alternate_witness,
                 &StoreDependencies {
-                    records: BTreeSet::from([CollectionRecordSelector::Fingerprint(
-                        input.fingerprint()
-                    )]),
+                    records: crate::collection::CollectionRecordSelectors::from([
+                        CollectionRecordSelector::Fingerprint(input.fingerprint())
+                    ]),
                     ..StoreDependencies::default()
                 }
             ),
@@ -10591,7 +10595,9 @@ mod tests {
         );
         assert_eq!(realized.record(input.fingerprint()).unwrap(), None);
         assert_eq!(
-            realized.select_records(&dependencies.records).unwrap(),
+            realized
+                .select_records(&dependencies.records.iter().collect())
+                .unwrap(),
             vec![produced]
         );
         assert_eq!(realized.blobs().count(), 0);
@@ -10658,7 +10664,7 @@ mod tests {
             CollectionRecordSelector::Operation(WantRequest::derive(target, input.data())),
         ] {
             let dependencies = StoreDependencies {
-                records: BTreeSet::from([selector]),
+                records: crate::collection::CollectionRecordSelectors::from([selector]),
                 ..StoreDependencies::default()
             };
             assert_eq!(
@@ -10700,7 +10706,7 @@ mod tests {
             )),
         ] {
             let dependencies = StoreDependencies {
-                records: BTreeSet::from([selector]),
+                records: crate::collection::CollectionRecordSelectors::from([selector]),
                 ..StoreDependencies::default()
             };
             assert_eq!(
@@ -10725,7 +10731,7 @@ mod tests {
         let handle = Blob::<UnknownBlob>::new(Bytes::from_source(payload.to_vec())).get_handle();
         let hash: CollectionData = handle.into();
         let dependencies = StoreDependencies {
-            blobs: BTreeSet::from([hash]),
+            blobs: crate::collection::CollectionDataSet::from([hash]),
             ..StoreDependencies::default()
         };
         let mut observer = Pile::open(&path).unwrap();
@@ -10789,7 +10795,7 @@ mod tests {
             recovered.changes_for(
                 &invalid,
                 &StoreDependencies {
-                    blobs: BTreeSet::from([other_hash]),
+                    blobs: crate::collection::CollectionDataSet::from([other_hash]),
                     ..StoreDependencies::default()
                 }
             ),

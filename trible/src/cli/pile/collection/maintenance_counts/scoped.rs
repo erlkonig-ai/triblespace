@@ -7,6 +7,20 @@ use triblespace_core::repo::memoryrepo::MemoryRepo;
 
 type State = MaintenanceState<Counted<PileSnapshot>>;
 
+fn hop(state: &State, handle: CollectionHandle) -> &MaintenanceHop<Counted<PileSnapshot>> {
+    state
+        .hops
+        .get(&handle.raw)
+        .expect("the exercised maintenance hop is retained")
+}
+
+fn hops(state: &State) -> impl Iterator<Item = &MaintenanceHop<Counted<PileSnapshot>>> {
+    state
+        .hops
+        .iter_ordered()
+        .map(|key| state.hops.get(key).expect("retained hop key has a value"))
+}
+
 fn pass(
     fixture: &mut Fixture,
     references: &[String],
@@ -92,7 +106,7 @@ fn changed_chain_skips_other_chain_without_losing_its_wake_interest() {
     assert!(idle.selected_calls.is_empty());
     assert_eq!(idle.proof_enumerations, 0);
     assert_eq!(idle.blob_puts, 0);
-    for hop in state.hops.values() {
+    for hop in hops(&state) {
         assert!(
             hop.before.inner.changes_since(&current).is_empty(),
             "proven-unchanged entries release their older observation"
@@ -196,7 +210,7 @@ fn failed_hop_keeps_its_retry_opportunity_when_another_chain_wakes() {
     references.push(handle_hex(inaccessible.handle()));
     let (failures, _) = pass(&mut fixture, &references, true, &mut state, None);
     assert_eq!(failures, 1);
-    assert!(state.hops[&inaccessible.handle()].retry_on_pass);
+    assert!(hop(&state, inaccessible.handle()).retry_on_pass);
     let failed = fixture.pile.snapshot().unwrap();
     fixture
         .writer
@@ -211,7 +225,7 @@ fn failed_hop_keeps_its_retry_opportunity_when_another_chain_wakes() {
         !maintenance_changed(
             &failed,
             &arrived,
-            &state.hops[&inaccessible.handle()].interests
+            &hop(&state, inaccessible.handle()).interests
         ),
         "the failed hop's own stored inputs did not change"
     );
@@ -252,7 +266,7 @@ fn pre_hop_snapshot_failure_retries_old_success_on_another_chain_wake() {
         .unwrap();
     let a = 1 - b;
     let failed_target = fixture.targets[b].handle();
-    assert!(!state.hops[&failed_target].retry_on_pass);
+    assert!(!hop(&state, failed_target).retry_on_pass);
     let counts = Arc::new(Mutex::new(Counts::default()));
     let mut counted = Counted {
         inner: &mut fixture.pile,
@@ -279,7 +293,7 @@ fn pre_hop_snapshot_failure_retries_old_success_on_another_chain_wake() {
     assert_eq!(counts.lock().unwrap().snapshots, 5);
     assert!(counts.lock().unwrap().selected_calls.is_empty());
     assert!(
-        state.hops[&failed_target].retry_on_pass,
+        hop(&state, failed_target).retry_on_pass,
         "the pre-hop Err must invalidate its old successful attempt"
     );
     let failed = fixture.pile.snapshot().unwrap();
@@ -298,7 +312,7 @@ fn pre_hop_snapshot_failure_retries_old_success_on_another_chain_wake() {
     assert!(!maintenance_changed(
         &failed,
         &arrived,
-        &state.hops[&failed_target].interests
+        &hop(&state, failed_target).interests
     ));
     assert!(maintenance_changed(&failed, &arrived, &state.interests()));
     let (failures, retry) = pass(&mut fixture, &references, false, &mut state, None);
@@ -307,7 +321,7 @@ fn pre_hop_snapshot_failure_retries_old_success_on_another_chain_wake() {
         retry.selected_calls[&failed_target] >= 2,
         "the one-shot failed B is really retried even though only A changed"
     );
-    assert!(!state.hops[&failed_target].retry_on_pass);
+    assert!(!hop(&state, failed_target).retry_on_pass);
     fixture.close();
 }
 
@@ -353,11 +367,11 @@ fn implicit_root_retries_when_explicitly_selected() {
     let mut state = State::default();
     let mut references = warm(&mut fixture, &mut state);
     let root = fixture.sources[0].handle();
-    assert!(state.hops[&root].dependency_only);
+    assert!(hop(&state, root).dependency_only);
     references.push(handle_hex(root));
     let (failures, counts) = pass(&mut fixture, &references, true, &mut state, None);
     assert_eq!(failures, 0);
-    assert!(!state.hops[&root].dependency_only);
+    assert!(!hop(&state, root).dependency_only);
     assert!(counts.selected_calls[&root] >= 2);
     assert_eq!(
         counts.selected_calls.get(&fixture.targets[0].handle()),
@@ -387,9 +401,9 @@ fn upstream_publication_rechecks_downstream_in_the_same_pass() {
         .iter()
         .all(|record| matches!(record, CollectionRecord::Commit(_))));
     assert!(!maintenance_changed(
-        &state.hops[&target].before.inner,
+        &hop(&state, target).before.inner,
         &before,
-        &state.hops[&target].interests
+        &hop(&state, target).interests
     ));
     // Explicitly maintaining the previously ensure-only root publishes a
     // coarsening. Target eligibility must be checked after that publication,
@@ -426,7 +440,7 @@ fn broad_name_planning_does_not_make_each_hop_broad() {
     references.push("name:hot receipt source".to_owned());
     assert_eq!(pass(&mut fixture, &references, true, &mut state, None).0, 0);
     assert!(state.planning.all_records);
-    assert!(state.hops.values().all(|hop| !hop.interests.all_records));
+    assert!(hops(&state).all(|hop| !hop.interests.all_records));
     let before = fixture.pile.snapshot().unwrap();
     fixture
         .writer
@@ -568,7 +582,7 @@ fn append_during_frozen_hop_is_not_absorbed_by_end_baseline() {
         1
     );
     assert!(maintenance_changed(
-        &state.hops[&fixture.targets[0].handle()].before.inner,
+        &hop(&state, fixture.targets[0].handle()).before.inner,
         &after,
         &state.interests()
     ));

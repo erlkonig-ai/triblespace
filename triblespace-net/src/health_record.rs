@@ -8,7 +8,6 @@
 //! residency of every blob. All IDs below were minted with `trible genid` on
 //! 2026-09-09; attributes use encoding-derived, not literal-pinned identities.
 
-use std::collections::BTreeMap;
 use std::time::Duration;
 
 use ed25519_dalek::VerifyingKey;
@@ -16,6 +15,7 @@ use hifitime::Epoch;
 use triblespace_core::collection::CollectionHandle;
 use triblespace_core::macros::{attributes, entity, id_hex};
 use triblespace_core::metadata;
+use triblespace_core::patch::{Entry as PatchEntry, IdentitySchema, PATCH};
 use triblespace_core::prelude::*;
 
 pub const COLLECTION_NAME: &str = "swarm-health";
@@ -364,8 +364,6 @@ pub fn measurements(
         .collect()
 }
 
-type Subject = (Component, Option<[u8; 32]>, Option<[u8; 32]>);
-
 #[derive(Clone)]
 struct Episode {
     state: State,
@@ -380,7 +378,9 @@ struct Episode {
 pub struct Recorder {
     node: Fragment,
     session: Id,
-    episodes: BTreeMap<Subject, Episode>,
+    // component rank | collection presence/bytes | peer presence/bytes.
+    // Presence bytes distinguish absent subjects from all-zero handles.
+    episodes: PATCH<67, IdentitySchema, Episode>,
 }
 
 impl Recorder {
@@ -388,7 +388,7 @@ impl Recorder {
         Self {
             node: entity! { attrs::endpoint: endpoint },
             session: genid().forget(),
-            episodes: BTreeMap::new(),
+            episodes: PATCH::new(),
         }
     }
 
@@ -422,15 +422,25 @@ impl Recorder {
         measurements: impl IntoIterator<Item = Measurement>,
     ) -> anyhow::Result<Fragment> {
         let created = point(at)?;
-        let mut next = BTreeMap::new();
+        let mut next = PATCH::new();
         for measurement in measurements {
             let condition = measurement.condition;
             let evidence = measurement.evidence;
-            let subject = (
-                condition.component,
-                condition.collection.map(|handle| handle.raw),
-                condition.peer.map(|key| key.to_bytes()),
-            );
+            let mut subject = [0; 67];
+            subject[0] = match condition.component {
+                Component::Host => 0,
+                Component::Store => 1,
+                Component::Collection => 2,
+                Component::Dht => 3,
+            };
+            if let Some(collection) = condition.collection {
+                subject[1] = 1;
+                subject[2..34].copy_from_slice(&collection.raw);
+            }
+            if let Some(peer) = condition.peer {
+                subject[34] = 1;
+                subject[35..].copy_from_slice(&peer.to_bytes());
+            }
             let previous = self.episodes.get(&subject);
             let episode = match previous {
                 Some(previous)
@@ -483,11 +493,17 @@ impl Recorder {
                     }
                 }
             };
-            next.insert(subject, episode);
+            // Repeated subjects keep the last measurement, each compared
+            // against the preceding heartbeat rather than this partial batch.
+            next.replace(&PatchEntry::with_value(&subject, episode));
         }
         self.episodes = next;
         let mut current = Fragment::empty();
-        for episode in self.episodes.values() {
+        for subject in self.episodes.iter_ordered() {
+            let episode = self
+                .episodes
+                .get(subject)
+                .expect("stored condition episode");
             current += episode.facts.clone();
         }
         Ok(entity! {
@@ -924,6 +940,81 @@ mod tests {
             .collect::<Vec<_>>(),
             vec![18]
         );
+    }
+
+    #[test]
+    fn repeated_subject_uses_last_measurement_against_the_previous_heartbeat() {
+        let endpoint = ed25519_dalek::SigningKey::from_bytes(&[4; 32]).verifying_key();
+        let mut recorder = Recorder::new(endpoint);
+        let at = Epoch::from_unix_seconds(1_700_000_000.0);
+        let measurement = |state, alert, count| Measurement {
+            condition: condition(state, alert),
+            evidence: Evidence {
+                resident_blobs: Some(count),
+                ..Evidence::default()
+            },
+        };
+        let first = recorder
+            .record_measurements(at, [measurement(State::Stalled, true, 17)])
+            .unwrap();
+        let unchanged = recorder
+            .record_measurements(
+                at + 60.0,
+                [
+                    measurement(State::Current, false, 18),
+                    measurement(State::Stalled, true, 17),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            conditions(&first, KIND_CONDITION),
+            conditions(&unchanged, KIND_CONDITION)
+        );
+        assert!(conditions(&unchanged, KIND_RECOVERED).is_empty());
+
+        let recovered = recorder
+            .record_measurements(
+                at + 120.0,
+                [
+                    measurement(State::Stalled, true, 17),
+                    measurement(State::Current, false, 20),
+                ],
+            )
+            .unwrap();
+        let episodes = conditions(&recovered, KIND_CONDITION);
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(conditions(&recovered, KIND_RECOVERED), episodes);
+        let episode = episodes[0];
+        assert_eq!(
+            find!(count: u128, pattern!(recovered.facts(), [{
+                episode @ attrs::resident_blobs: ?count,
+            }]))
+            .collect::<Vec<_>>(),
+            vec![20]
+        );
+        let heartbeat = recorder
+            .record_measurements(at + 180.0, [measurement(State::Current, false, 20)])
+            .unwrap();
+        assert_eq!(conditions(&heartbeat, KIND_CONDITION), episodes);
+    }
+
+    #[test]
+    fn absent_collection_subject_differs_from_an_all_zero_handle() {
+        let endpoint = ed25519_dalek::SigningKey::from_bytes(&[4; 32]).verifying_key();
+        let mut recorder = Recorder::new(endpoint);
+        let at = Epoch::from_unix_seconds(1_700_000_000.0);
+        let report = recorder
+            .record(
+                at,
+                [None, Some(CollectionHandle::new([0; 32]))].map(|collection| Condition {
+                    component: Component::Collection,
+                    collection,
+                    ..condition(State::Current, false)
+                }),
+            )
+            .unwrap();
+        assert_eq!(conditions(&report, KIND_CONDITION).len(), 2);
+        assert_eq!(recorder.episodes.len(), 2);
     }
 
     #[test]

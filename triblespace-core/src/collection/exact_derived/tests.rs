@@ -802,7 +802,7 @@ fn aggregate_support_uses_selected_dag_leaves_without_clipping_certificates() {
         assert_eq!(resolved.support, expected);
         // Image reuse remains independent of the requested-support filter.
         assert_eq!(
-            resolved.images[&(first.handle(), data(&b))],
+            images_for(&resolved.images, first.handle(), data(&b)).collect::<BTreeSet<_>>(),
             BTreeSet::from([data(&b_output)]),
         );
     }
@@ -851,7 +851,7 @@ fn aggregate_support_deduplicates_leaves_but_keeps_alternative_certifications() 
     let b_support = support(root, &[b]);
     let whole = resolve_endorsed_lineage(&snapshot, &lineage, &selected, None).unwrap();
     assert_eq!(whole.support, ab_support);
-    let alternatives = &whole.witnesses[&(first.handle(), data(&output))];
+    let alternatives = whole.witnesses.alternatives(first.handle(), data(&output));
     assert_eq!(alternatives.len(), 4);
     for record in &target_records {
         let expected = if record.input_witness() == ab.fingerprint() {
@@ -865,8 +865,17 @@ fn aggregate_support_deduplicates_leaves_but_keeps_alternative_certifications() 
     }
     let exact = resolve_endorsed_lineage(&snapshot, &lineage, &selected, Some(&b_support)).unwrap();
     assert_eq!(exact.support, b_support);
-    assert_eq!(exact.witnesses[&(first.handle(), data(&output))].len(), 3);
-    assert!(!exact.witnesses.contains_key(&(root.handle(), data(&a))));
+    assert_eq!(
+        exact
+            .witnesses
+            .alternatives(first.handle(), data(&output))
+            .len(),
+        3
+    );
+    assert!(exact
+        .witnesses
+        .alternatives(root.handle(), data(&a))
+        .is_empty());
 }
 
 #[test]
@@ -919,7 +928,7 @@ fn aggregate_support_excludes_missing_witnesses_and_unadmitted_producers() {
     assert_eq!(resolved.support, support(root, std::slice::from_ref(&a)));
     assert_eq!(resolved.images.len(), 1);
     assert_eq!(
-        resolved.images[&(first.handle(), data(&a))],
+        images_for(&resolved.images, first.handle(), data(&a)).collect::<BTreeSet<_>>(),
         BTreeSet::from([a_output.unwrap()]),
     );
 

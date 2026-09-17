@@ -57,7 +57,7 @@
 //! [`RegisterOrder`] utility remains available separately; it does not promise
 //! positive membership for candidates it has never observed.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
@@ -72,6 +72,7 @@ use crate::inline::Inline;
 use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
+use crate::patch::{Entry, PATCH};
 use crate::query::register::{register_identity, register_orders, RegisterOrder};
 use crate::query::{
     Binding, Candidates, Constraint, ContainsConstraint, Frontier, ProposalBuffer, Variable,
@@ -102,6 +103,16 @@ const ORDER_ROW_LEN: usize = ID_LEN + KEY_LEN;
 
 type RawId = [u8; ID_LEN];
 type RawKey = [u8; KEY_LEN];
+
+crate::key_segmentation!(WinnerSegments, 64, [16, 48]);
+crate::key_schema!(WinnerOrder, WinnerSegments, 64, [0, 1]);
+
+fn winner_row(register: RawId, coordinate: [u8; 48]) -> [u8; 64] {
+    let mut row = [0; 64];
+    row[..16].copy_from_slice(&register);
+    row[16..].copy_from_slice(&coordinate);
+    row
+}
 
 /// Canonical projection of the two fact halves needed by a stated LWW register.
 ///
@@ -192,6 +203,8 @@ impl fmt::Display for LwwRegisterError {
 
 impl Error for LwwRegisterError {}
 
+// Canonicalization scratch for one derive, validation, or join invocation.
+// Attached observations retain ProjectionRows instead.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct Projection {
     identities: BTreeSet<(RawId, RawId)>,
@@ -607,7 +620,7 @@ impl LwwIndex {
     pub fn query(&self) -> Result<LwwQuery, LwwRegisterError> {
         let mut identities = self.identity_rows().peekable();
         let mut orders = self.order_rows().peekable();
-        let mut winners = BTreeMap::<RawId, (RawKey, RawId)>::new();
+        let mut winners = PATCH::<64, WinnerOrder>::new();
         let mut complete = 0;
         let mut unresolved = 0;
         loop {
@@ -654,11 +667,16 @@ impl LwwIndex {
                 return Err(LwwRegisterError::ConflictingOrder(state));
             }
             complete += 1;
-            let candidate = (key, state);
-            winners
-                .entry(register)
-                .and_modify(|winner| *winner = (*winner).max(candidate))
-                .or_insert(candidate);
+            let mut candidate = [0; 48];
+            candidate[..32].copy_from_slice(&key);
+            candidate[32..].copy_from_slice(&state);
+            let previous = winners.first_infix_range(&register, &[0; 48], &[u8::MAX; 48]);
+            if previous.is_none_or(|previous| previous < candidate) {
+                if let Some(previous) = previous {
+                    winners.remove(&winner_row(register, previous));
+                }
+                winners.insert(&Entry::new(&winner_row(register, candidate)));
+            }
         }
         Ok(LwwQuery {
             index: self.clone(),
@@ -681,7 +699,7 @@ impl Eq for LwwIndex {}
 #[derive(Clone, Debug, Default)]
 pub struct LwwQuery {
     index: LwwIndex,
-    winners: BTreeMap<RawId, (RawKey, RawId)>,
+    winners: PATCH<64, WinnerOrder>,
     complete: usize,
     unresolved: usize,
 }
@@ -699,7 +717,7 @@ impl LwwQuery {
 
     /// Number of registers with at least one complete state.
     pub fn register_count(&self) -> usize {
-        self.winners.len()
+        self.winners.len() as usize
     }
 
     /// Number of projected states missing either identity or order.
@@ -710,9 +728,8 @@ impl LwwQuery {
     /// The total-order winner for `register`, if it has a complete state.
     pub fn winner(&self, register: Id) -> Option<Id> {
         let raw: RawId = register[..].try_into().expect("id is 16 bytes");
-        self.winners
-            .get(&raw)
-            .map(|(_, state)| Id::new(*state).expect("indexed states are non-nil"))
+        self.winning_coordinate(&raw)
+            .map(|(_, state)| Id::new(state).expect("indexed states are non-nil"))
     }
 
     /// Whether this state is a known complete winner in this observation.
@@ -720,10 +737,20 @@ impl LwwQuery {
     pub fn contains(&self, state: Id) -> bool {
         let raw: RawId = state[..].try_into().expect("id is 16 bytes");
         self.index.coordinate(&raw).is_some_and(|(register, _)| {
-            self.winners
-                .get(&register)
-                .is_some_and(|(_, winner)| *winner == raw)
+            self.winning_coordinate(&register)
+                .is_some_and(|(_, winner)| winner == raw)
         })
+    }
+
+    fn winning_coordinate(&self, register: &RawId) -> Option<(RawKey, RawId)> {
+        self.winners
+            .first_infix_range(register, &[0; 48], &[u8::MAX; 48])
+            .map(|coordinate| {
+                (
+                    coordinate[..32].try_into().unwrap(),
+                    coordinate[32..].try_into().unwrap(),
+                )
+            })
     }
 
     fn coordinates(&self) -> impl Iterator<Item = (RawId, RawId, RawKey)> + '_ {
@@ -786,7 +813,8 @@ impl<'a> Constraint<'a> for LwwConstraint<'a> {
         if self.variable.index == variable {
             for row in 0..frontier.len() {
                 proposals.open(row as u32);
-                proposals.extend(self.index.winners.values().map(|(_, state)| {
+                proposals.extend(self.index.winners.iter_ordered().map(|row| {
+                    let state: RawId = row[48..].try_into().expect("16-byte winner id");
                     let value: Inline<GenId> = state.to_inline();
                     value.raw
                 }));
@@ -830,9 +858,8 @@ impl RegisterOrder for LwwQuery {
         let Some((register, _)) = self.index.coordinate(&raw) else {
             return false;
         };
-        self.winners
-            .get(&register)
-            .is_some_and(|(_, winner)| *winner != raw)
+        self.winning_coordinate(&register)
+            .is_some_and(|(_, winner)| winner != raw)
     }
 }
 
@@ -957,6 +984,32 @@ mod tests {
         drop(index);
         assert_eq!(query.winner(*register), Some(*state));
         assert!(query.contains(*state));
+    }
+
+    #[test]
+    fn winner_changes_change_relation_identity_and_preserve_frozen_queries() {
+        let register = ufoid();
+        let left = ufoid();
+        let right = ufoid();
+        let old = attach(&[
+            project(&coordinate(&left, &register, 2)),
+            project(&coordinate(&right, &register, 1)),
+        ])
+        .query()
+        .unwrap();
+        let frozen = old.clone();
+        let new = attach(&[
+            project(&coordinate(&left, &register, 1)),
+            project(&coordinate(&right, &register, 2)),
+        ])
+        .query()
+        .unwrap();
+        assert_eq!(old.register_count(), new.register_count());
+        assert_eq!(old.len(), new.len());
+        assert_ne!(old.winners, new.winners);
+        assert_ne!(old, new);
+        assert_eq!(frozen.winner(*register), Some(*left));
+        assert_eq!(new.winner(*register), Some(*right));
     }
 
     #[test]

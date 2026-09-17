@@ -5,12 +5,13 @@
 //! pkarr + mDNS address lookup) and protocol-handler registration — happens in [`bind`], which returns the
 //! transport-agnostic [`Harness`] the host loop runs against.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 use futures::StreamExt;
 use iroh_base::{EndpointAddr, EndpointId};
 use tokio::sync::mpsc;
 use tracing::{Instrument as _, debug, warn};
+use triblespace_core::patch::{Entry as PatchEntry, IdentitySchema, PATCH};
 
 use super::{Alpn, Conn, Harness, Incoming, PeerId, Transport};
 use crate::host::PeerConfig;
@@ -36,7 +37,7 @@ pub struct IrohTransport {
     /// 200 Gbit fabric).  Retaining the full address here makes an explicit
     /// route authoritative for outbound protocol connections while preserving
     /// discovery as the fallback for address-less peers.
-    peers: Arc<BTreeMap<EndpointId, EndpointAddr>>,
+    peers: Arc<PATCH<32, IdentitySchema, EndpointAddr>>,
     /// Keeps the router (and through it the registered protocol handlers)
     /// alive for the transport's lifetime. The host loop never touches these;
     /// they exist below the seam.
@@ -98,7 +99,7 @@ impl Transport for IrohTransport {
         let id = EndpointId::from_bytes(&peer).map_err(|e| anyhow::anyhow!("peer id: {e}"))?;
         let addr = self
             .peers
-            .get(&id)
+            .get(id.as_bytes())
             .cloned()
             .unwrap_or_else(|| EndpointAddr::from(id));
         let ep = self.ep.clone();
@@ -325,14 +326,7 @@ pub async fn bind_with_endpoint(ep: iroh::Endpoint, config: &PeerConfig) -> Harn
     use iroh::address_lookup::{EndpointInfo, MemoryLookup};
     use iroh::protocol::Router;
 
-    let peers = Arc::new(
-        config
-            .peers
-            .iter()
-            .cloned()
-            .map(|addr| (addr.id, addr))
-            .collect(),
-    );
+    let peers = Arc::new(configured_routes(&config.peers));
 
     // Make configured routes available to iroh's discovery services as well
     // as `IrohTransport::dial`. A memory lookup bridges endpoint ids back to
@@ -380,5 +374,32 @@ pub async fn bind_with_endpoint(ep: iroh::Endpoint, config: &PeerConfig) -> Harn
     Harness {
         transport,
         incoming: inc_rx,
+    }
+}
+
+fn configured_routes(peers: &[EndpointAddr]) -> PATCH<32, IdentitySchema, EndpointAddr> {
+    let mut routes = PATCH::new();
+    for addr in peers {
+        // Configuration order remains authoritative for repeated identities.
+        routes.replace(&PatchEntry::with_value(addr.id.as_bytes(), addr.clone()));
+    }
+    routes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_configured_identity_keeps_the_last_complete_address() {
+        let first_id = iroh_base::SecretKey::from_bytes(&[7; 32]).public();
+        let other_id = iroh_base::SecretKey::from_bytes(&[8; 32]).public();
+        let first = EndpointAddr::new(first_id).with_ip_addr("127.0.0.1:1001".parse().unwrap());
+        let last = EndpointAddr::new(first_id).with_ip_addr("127.0.0.1:1002".parse().unwrap());
+        let other = EndpointAddr::new(other_id);
+        let routes = configured_routes(&[first, other.clone(), last.clone()]);
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes.get(first_id.as_bytes()), Some(&last));
+        assert_eq!(routes.get(other_id.as_bytes()), Some(&other));
     }
 }

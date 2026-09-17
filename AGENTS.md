@@ -24,6 +24,14 @@ The project balances a few key goals:
 * Add an entry to `CHANGELOG.md` summarizing your task.
 * Avoid writing asynchronous code. Prefer high-performance synchronous
   implementations that can be parallelized when needed.
+* Retained TribleSpace state must use PATCH rather than `BTreeMap` or
+  `BTreeSet`. Model relations as fixed, typed key tuples and expose prefix
+  views instead of nested map catalogs. Temporary per-operation scratch,
+  query inputs/results, and independent test oracles may use BTree types.
+  Check their lifetime rather than merely whether they occur in a struct.
+  PATCH equality identifies keys, not attached values: put semantic identity
+  into the key, or compare the value explicitly when it is observable.
+  Preserve ordering, replacement behavior, and old-snapshot independence.
 
 ## Inventory
 

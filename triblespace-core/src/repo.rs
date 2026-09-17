@@ -135,9 +135,9 @@ impl StoreChanges {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StoreDependencies {
     /// Raw record selection routes consulted by the observation.
-    pub records: BTreeSet<CollectionRecordSelector>,
+    pub records: CollectionRecordSelectors,
     /// Exact blob hashes consulted, whether resident, missing, or unreadable.
-    pub blobs: BTreeSet<CollectionData>,
+    pub blobs: CollectionDataSet,
     /// Whether complete capability proof evidence was consulted.
     pub capability_proofs: bool,
     /// Whether an unrestricted record enumeration was consulted.
@@ -147,6 +147,15 @@ pub struct StoreDependencies {
 }
 
 impl StoreDependencies {
+    /// Combine raw read sets without enumerating their already-shared members.
+    pub fn union(&mut self, other: &Self) {
+        self.records.union(other.records.clone());
+        self.blobs = self.blobs.union(&other.blobs);
+        self.capability_proofs |= other.capability_proofs;
+        self.all_records |= other.all_records;
+        self.all_blobs |= other.all_blobs;
+    }
+
     /// Whether no store component was consulted.
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
@@ -217,6 +226,7 @@ pub trait StoreSnapshot: Clone + Send + Sync + 'static {
 #[cfg(test)]
 mod store_dependency_tests {
     use super::*;
+    use crate::collection::CollectionRecordSelector;
 
     #[derive(Clone)]
     struct UnclassifiedSnapshot;
@@ -230,6 +240,50 @@ mod store_dependency_tests {
         fn changes_since(&self, _previous: &Self) -> StoreChanges {
             self.0
         }
+    }
+
+    #[test]
+    fn retained_dependency_union_preserves_independent_observations() {
+        let selector = CollectionRecordSelector::Collection(CollectionHandle::new([1; INLINE_LEN]));
+        let missing = CollectionData::new([2; INLINE_LEN]);
+        let mut left = StoreDependencies::default();
+        left.records.insert(selector);
+        let before = left.clone();
+        let mut right = StoreDependencies::default();
+        right.blobs.insert(missing);
+        right.capability_proofs = true;
+        right.all_blobs = true;
+        left.union(&right);
+        assert!(left.records.contains(&selector));
+        assert!(left.blobs.contains(&missing));
+        assert!(left.capability_proofs && left.all_blobs);
+        assert!(!left.all_records);
+        assert!(before.blobs.is_empty());
+        assert!(!before.capability_proofs && !before.all_blobs);
+        assert!(right.records.is_empty());
+        left.records.clear();
+        left.blobs.clear();
+        assert!(before.records.contains(&selector));
+        assert!(right.blobs.contains(&missing));
+    }
+
+    #[test]
+    fn retained_roots_union_keeps_modes_and_canonical_order() {
+        let low = Inline::<Handle<UnknownBlob>>::new([1; INLINE_LEN]);
+        let high = Inline::<Handle<UnknownBlob>>::new([9; INLINE_LEN]);
+        let mut roots = RetentionRoots::new();
+        roots.retain_direct(high);
+        let before = roots.clone();
+        let mut other = RetentionRoots::new();
+        other.retain_direct(low);
+        other.retain_recursive(high);
+        roots.union(other.clone());
+        roots.retain_direct(low);
+        assert_eq!(roots.direct().collect::<Vec<_>>(), vec![low, high]);
+        assert_eq!(roots.recursive().collect::<Vec<_>>(), vec![high]);
+        assert_eq!(before.direct().collect::<Vec<_>>(), vec![high]);
+        assert!(before.recursive().next().is_none());
+        assert_eq!(other.direct().collect::<Vec<_>>(), vec![low]);
     }
 
     #[test]
@@ -357,7 +411,8 @@ use crate::blob::Blob;
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
 use crate::collection::{
-    CollectionData, CollectionHandle, CollectionRead, CollectionRecordSelector, CollectionStore,
+    CollectionData, CollectionDataSet, CollectionHandle, CollectionRead, CollectionRecordSelectors,
+    CollectionStore,
 };
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
@@ -647,8 +702,8 @@ pub trait BlobStoreKeep {
 /// self-contained and therefore own no blobs.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RetentionRoots {
-    direct: BTreeSet<[u8; INLINE_LEN]>,
-    recursive: BTreeSet<[u8; INLINE_LEN]>,
+    direct: PATCH<INLINE_LEN>,
+    recursive: PATCH<INLINE_LEN>,
 }
 
 impl RetentionRoots {
@@ -664,7 +719,7 @@ impl RetentionRoots {
         S: BlobEncoding + 'static,
         Handle<S>: InlineEncoding,
     {
-        self.direct.insert(handle.raw);
+        self.direct.insert(&crate::patch::Entry::new(&handle.raw));
     }
 
     /// Retain `handle` and every resident descendant reached through the
@@ -674,19 +729,20 @@ impl RetentionRoots {
         S: BlobEncoding + 'static,
         Handle<S>: InlineEncoding,
     {
-        self.recursive.insert(handle.raw);
+        self.recursive
+            .insert(&crate::patch::Entry::new(&handle.raw));
     }
 
     /// Merge another policy result into this one.
     pub fn union(&mut self, other: Self) {
-        self.direct.extend(other.direct);
-        self.recursive.extend(other.recursive);
+        self.direct.union(other.direct);
+        self.recursive.union(other.recursive);
     }
 
     /// Direct roots in deterministic handle order.
     pub fn direct(&self) -> impl ExactSizeIterator<Item = Inline<Handle<UnknownBlob>>> + '_ {
         self.direct
-            .iter()
+            .iter_ordered()
             .copied()
             .map(Inline::<Handle<UnknownBlob>>::new)
     }
@@ -694,7 +750,7 @@ impl RetentionRoots {
     /// Recursive roots in deterministic handle order.
     pub fn recursive(&self) -> impl ExactSizeIterator<Item = Inline<Handle<UnknownBlob>>> + '_ {
         self.recursive
-            .iter()
+            .iter_ordered()
             .copied()
             .map(Inline::<Handle<UnknownBlob>>::new)
     }

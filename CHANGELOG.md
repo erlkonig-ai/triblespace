@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Replace retained BTree state with PATCH across collection resolution and
+  covers, store dependencies and retention roots, maintenance observations,
+  network routing/providers/health, automata, registers, and semantic-index
+  configuration. Collection relations use flat typed keys and borrowed prefix
+  views; actual per-operation scratch and independent ordered-map test oracles
+  remain. Preserve value-sensitive observations and deterministic ordering;
+  public set/view types change, but wire and persisted formats do not.
+
 - Make Pile's blob index content-keyed with a single first-valid representative.
   Ignore redundant readable occurrences within one mapping while preserving
   corruption recovery and conservative rewrite invalidation. Replace scoped

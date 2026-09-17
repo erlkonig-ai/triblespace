@@ -36,6 +36,7 @@ use crate::inline::encodings::hash::{Blake3, Handle, Hash};
 use crate::inline::Inline;
 use crate::inline::InlineEncoding;
 use crate::inline::RawInline;
+use crate::patch::{Entry, IdentitySchema, PATCH};
 
 const BLOB_INFIX: &str = "blobs";
 const COLLECTION_RECORD_INFIX: &str = "collection-records";
@@ -104,7 +105,7 @@ impl fmt::Debug for ObjectStoreSnapshot {
 pub struct ObjectStoreSnapshot {
     store: Arc<dyn ObjectStore>,
     prefix: Path,
-    blobs: Arc<BTreeMap<RawInline, ObservedBlob>>,
+    blobs: PATCH<32, IdentitySchema, ObservedBlob>,
     collection_records: Arc<Vec<CollectionRecord>>,
 }
 
@@ -117,7 +118,14 @@ struct ObservedBlob {
 impl StoreSnapshot for ObjectStoreSnapshot {
     fn changes_since(&self, previous: &Self) -> StoreChanges {
         let mut changes = StoreChanges::NONE;
-        if self.blobs != previous.blobs {
+        // PATCH equality covers keys, not attached metadata. A retained
+        // observation must also notice a changed timestamp or length at H.
+        if self.blobs != previous.blobs
+            || self
+                .blobs
+                .iter()
+                .any(|key| self.blobs.get(key) != previous.blobs.get(key))
+        {
             changes = changes.union(StoreChanges::BLOBS);
         }
         if self.collection_records != previous.collection_records {
@@ -219,25 +227,25 @@ impl AsyncSnapshotSource for ObjectStoreRemote {
             let collection_records = collection_records.into_values().collect();
 
             let blob_prefix = self.prefix.child(BLOB_INFIX);
-            let mut blobs = BTreeMap::new();
+            let mut blobs = PATCH::new();
             let mut listed_blobs = self.store.list(Some(&blob_prefix));
             while let Some(item) = listed_blobs.next().await {
                 let meta = item.map_err(ListBlobsErr::List)?;
                 let raw = blob_handle_from_path(&blob_prefix, &meta.location)?;
                 let timestamp = u64::try_from(meta.last_modified.timestamp_millis()).unwrap_or(0);
-                blobs.insert(
-                    raw,
+                blobs.replace(&Entry::with_value(
+                    &raw,
                     ObservedBlob {
                         length: meta.size,
                         timestamp,
                     },
-                );
+                ));
             }
 
             Ok(ObjectStoreSnapshot {
                 store: self.store.clone(),
                 prefix: self.prefix.clone(),
-                blobs: Arc::new(blobs),
+                blobs,
                 collection_records: Arc::new(collection_records),
             })
         }
@@ -363,8 +371,9 @@ impl AsyncBlobStoreList for ObjectStoreSnapshot {
     fn blobs(&self) -> impl Future<Output = Vec<Result<BlobInfo, Self::Err>>> + Send {
         let blobs = self
             .blobs
-            .iter()
-            .map(|(raw, observed)| {
+            .iter_ordered()
+            .map(|raw| {
+                let observed = self.blobs.get(raw).expect("blob key retains its metadata");
                 Ok(BlobInfo {
                     handle: Inline::new(*raw),
                     length: observed.length,
@@ -777,6 +786,45 @@ mod tests {
             ),
             Inline::new([tag.wrapping_add(5); 32]),
         ))
+    }
+
+    #[test]
+    fn snapshot_notices_changed_metadata_at_the_same_blob_key() {
+        let remote = remote();
+        let key = [7; 32];
+        let original = ObservedBlob {
+            length: 11,
+            timestamp: 20,
+        };
+        let mut blobs = PATCH::new();
+        blobs.insert(&Entry::with_value(&key, original));
+        let before = ObjectStoreSnapshot {
+            store: remote.store,
+            prefix: remote.prefix,
+            blobs,
+            collection_records: Arc::new(Vec::new()),
+        };
+        assert_eq!(before.clone().changes_since(&before), StoreChanges::NONE);
+        for changed in [
+            ObservedBlob {
+                length: 12,
+                ..original
+            },
+            ObservedBlob {
+                timestamp: 21,
+                ..original
+            },
+        ] {
+            let mut after = before.clone();
+            after.blobs.replace(&Entry::with_value(&key, changed));
+            assert_eq!(
+                after.blobs, before.blobs,
+                "PATCH Eq is key identity, not metadata identity"
+            );
+            assert_eq!(after.changes_since(&before), StoreChanges::BLOBS);
+            assert_eq!(before.blobs.get(&key), Some(&original));
+            assert_eq!(after.blobs.get(&key), Some(&changed));
+        }
     }
 
     #[test]

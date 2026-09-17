@@ -6,6 +6,8 @@
 //! LSM carries are the separate `maintain` operation. Neither operation ever
 //! manufactures an upstream dependency as a side effect of downstream work.
 
+use super::resolution::{bytes, infixes, CollectionDataSet};
+use crate::patch::{Entry, IdentitySchema, PATCH};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
@@ -16,6 +18,7 @@ use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::Blob;
 use crate::inline::encodings::hash::Handle;
+use crate::inline::Inline;
 use crate::repo::async_store::AsyncBlobStoreAcquire;
 use crate::repo::{BlobStoreGet, BlobStoreList, BlobStoreMeta, Store, StoreRead};
 use crate::trible::Fragment;
@@ -200,6 +203,8 @@ where
 
 /// Runtime descriptor ancestry from one `SimpleArchive` foundation to a
 /// typed target.
+/// Scratch for one frozen probe only; each new observation loads its own
+/// ancestry. It is never retained by a collection observation or retry state.
 struct Lineage {
     foundation: Collection<SimpleArchive>,
     descriptors: BTreeMap<CollectionHandle, Fragment>,
@@ -351,8 +356,84 @@ fn require_support(lineage: &Lineage, support: &Support) -> Result<(), Collectio
     )))
 }
 
-pub(super) type InputWitnesses =
-    BTreeMap<(CollectionHandle, CollectionData), Vec<(CollectionRecordFingerprint, Support)>>;
+crate::key_segmentation!(WitnessSegments, 96, [64, 32]);
+crate::key_schema!(WitnessOrder, WitnessSegments, 96, [0, 1]);
+
+/// Exact output-record alternatives retained for one frozen control observation.
+/// The support value remains the complete immutable certificate, never clipped
+/// to a caller's requested slice. No key-only equality is exposed for this map.
+#[derive(Default)]
+pub(super) struct InputWitnesses(PATCH<96, WitnessOrder, Support>);
+
+impl InputWitnesses {
+    fn new() -> Self {
+        Self::default()
+    }
+    fn insert(
+        &mut self,
+        collection: CollectionHandle,
+        member: CollectionData,
+        record: CollectionRecordFingerprint,
+        support: Support,
+    ) {
+        self.0.insert(&Entry::with_value(
+            &bytes(&[collection.raw, member.raw, record.raw()]),
+            support,
+        ));
+    }
+    fn alternatives(
+        &self,
+        collection: CollectionHandle,
+        member: CollectionData,
+    ) -> Vec<(CollectionRecordFingerprint, Support)> {
+        infixes::<96, 64, 32, _, _>(&self.0, bytes(&[collection.raw, member.raw]))
+            .map(|id| {
+                let support = self
+                    .0
+                    .get(&bytes(&[collection.raw, member.raw, id]))
+                    .expect("indexed witness support");
+                (CollectionRecordFingerprint::from_raw(id), support.clone())
+            })
+            .collect()
+    }
+    fn members(&self) -> impl Iterator<Item = (CollectionHandle, CollectionData)> + '_ {
+        self.0.iter_prefix_count::<64>().map(|(key, _)| {
+            (
+                Inline::new(key[..32].try_into().unwrap()),
+                Inline::new(key[32..].try_into().unwrap()),
+            )
+        })
+    }
+    fn iter(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            CollectionHandle,
+            CollectionData,
+            CollectionRecordFingerprint,
+            &Support,
+        ),
+    > {
+        self.0.iter_ordered().map(|key| {
+            (
+                Inline::new(key[..32].try_into().unwrap()),
+                Inline::new(key[32..64].try_into().unwrap()),
+                CollectionRecordFingerprint::from_raw(key[64..].try_into().unwrap()),
+                self.0.get(key).expect("indexed witness support"),
+            )
+        })
+    }
+}
+
+type Images = PATCH<96, WitnessOrder>;
+
+fn images_for(
+    images: &Images,
+    target: CollectionHandle,
+    input: CollectionData,
+) -> impl Iterator<Item = CollectionData> + '_ {
+    infixes(images, bytes::<64>(&[target.raw, input.raw])).map(Inline::new)
+}
 
 fn witness_cover(
     alternatives: &[(CollectionRecordFingerprint, Support)],
@@ -385,20 +466,20 @@ pub(super) fn merge_witness_pairs(
     CollectionRealizationError,
 > {
     let alternatives = |member| {
-        witnesses
-            .get(&(collection, member))
-            .filter(|witnesses| !witnesses.is_empty())
-            .ok_or_else(|| {
-                CollectionRealizationError::InvalidCover(
-                    "a published MERGE needs an endorsed record for each input".into(),
-                )
-            })
+        let alternatives = witnesses.alternatives(collection, member);
+        if alternatives.is_empty() {
+            Err(CollectionRealizationError::InvalidCover(
+                "a published MERGE needs an endorsed record for each input".into(),
+            ))
+        } else {
+            Ok(alternatives)
+        }
     };
     let low_witnesses = alternatives(low)?;
     let high_witnesses = alternatives(high)?;
     let foundation = low_witnesses[0].1.collection();
-    let low_witnesses = witness_cover(low_witnesses, foundation.cover([]));
-    let high_witnesses = witness_cover(high_witnesses, foundation.cover([]));
+    let low_witnesses = witness_cover(&low_witnesses, foundation.cover([]));
+    let high_witnesses = witness_cover(&high_witnesses, foundation.cover([]));
     // One joined blob, enough paired certificates to preserve every distinct
     // input support. A Cartesian product adds no denotational information.
     Ok((0..low_witnesses.len().max(high_witnesses.len()))
@@ -419,8 +500,8 @@ fn witnessed_support(
 ) -> Support {
     let mut support = Support::from_data(foundation, []);
     for member in members {
-        for (_, input_support) in witnesses.get(&(collection, member)).into_iter().flatten() {
-            support = support.union(input_support).expect("one foundation");
+        for (_, input_support) in witnesses.alternatives(collection, member) {
+            support = support.union(&input_support).expect("one foundation");
         }
     }
     support
@@ -434,7 +515,7 @@ fn witnessed_physical_cover<E, R>(
     semantics: &CollectionSemantics,
     witnesses: &InputWitnesses,
     collection: CollectionHandle,
-    resident: &BTreeSet<CollectionData>,
+    resident: &CollectionDataSet,
     requested: &Support,
 ) -> Result<(super::resolution::CollectionCompletePhysicalCover, Support), CollectionRealizationError>
 where
@@ -446,7 +527,7 @@ where
     let mut represented = witnessed_support(
         witnesses,
         collection,
-        selected.physical.cover.iter().copied(),
+        selected.physical.cover.iter(),
         requested.collection(),
     );
     let coarse_support = represented.clone();
@@ -456,20 +537,20 @@ where
             break;
         }
         let member_support =
-            witnessed_support(witnesses, collection, [*member], requested.collection());
+            witnessed_support(witnesses, collection, [member], requested.collection());
         if member_support
             .is_subset(&represented)
             .expect("one foundation")
         {
             continue;
         }
-        match collection_member_availability::<E, _>(*member, snapshot).map_err(|error| {
+        match collection_member_availability::<E, _>(member, snapshot).map_err(|error| {
             CollectionRealizationError::storage("inspect residual witness realization", error)
         })? {
             CollectionMemberAvailability::Complete => {
-                selected.physical.cover.insert(*member);
+                selected.physical.cover.insert(member);
                 represented = represented.union(&member_support).expect("one foundation");
-                residuals.push((*member, member_support));
+                residuals.push((member, member_support));
             }
             _ => {}
         }
@@ -524,7 +605,7 @@ struct CertifiedResolution {
     resolution: super::CollectionResolution<()>,
     support: Support,
     witnesses: InputWitnesses,
-    images: BTreeMap<(CollectionHandle, CollectionData), BTreeSet<CollectionData>>,
+    images: Images,
 }
 
 /// Enumerate exact admitted input witnesses for explicit equation imports.
@@ -544,16 +625,14 @@ where
     let certified =
         resolve_endorsed_lineage(snapshot, &lineage, &BTreeSet::from([collection]), None)?;
     let mut records = Vec::new();
-    for ((owner, _), alternatives) in certified.witnesses {
+    for (owner, _, id, support) in certified.witnesses.iter() {
         if owner != collection {
             continue;
         }
-        for (id, support) in alternatives {
-            if let Some(record) = snapshot.record(id).map_err(|error| {
-                CollectionRealizationError::storage("read admitted input witness", error)
-            })? {
-                records.push((record, support));
-            }
+        if let Some(record) = snapshot.record(id).map_err(|error| {
+            CollectionRealizationError::storage("read admitted input witness", error)
+        })? {
+            records.push((record, support.clone()));
         }
     }
     Ok(records)
@@ -629,7 +708,7 @@ where
     let mut closure = super::witness::WitnessClosure::default();
     let mut roots = BTreeSet::new();
     let mut witnesses = InputWitnesses::new();
-    let mut images = BTreeMap::<_, BTreeSet<_>>::new();
+    let mut images = Images::new();
     for record in candidates {
         let accepted = *admitted
             .entry((record.collection(), record.public_key().raw))
@@ -661,10 +740,11 @@ where
         // Reusing a computed image is independent of which exact support the
         // caller wants to endorse today. Keep this index before that filter.
         if let CollectionRecord::Derive(derive) = record {
-            images
-                .entry((derive.collection(), derive.input()))
-                .or_default()
-                .insert(derive.output());
+            images.insert(&Entry::new(&bytes(&[
+                derive.collection().raw,
+                derive.input().raw,
+                derive.output().raw,
+            ])));
         }
         if requested
             .is_some_and(|requested| !record_support.is_subset(requested).expect("one foundation"))
@@ -676,10 +756,11 @@ where
     let records = closure.records_for(roots);
     for record in &records {
         if let CollectionRecord::Derive(derive) = record {
-            images
-                .entry((derive.collection(), derive.input()))
-                .or_default()
-                .insert(derive.output());
+            images.insert(&Entry::new(&bytes(&[
+                derive.collection().raw,
+                derive.input().raw,
+                derive.output().raw,
+            ])));
         }
         let record_support = closure
             .support(
@@ -690,13 +771,16 @@ where
             )
             .map_err(|error| CollectionRealizationError::storage("read endorsed support", error))?
             .expect("accepted roots have closed witness DAGs");
-        let alternatives = witnesses
-            .entry((record.collection(), super::witness::output(*record)))
-            .or_default();
+        // Index all exact record alternatives, retaining their complete support.
         // Retain actual records, including equal-support signatures/routes.
         // Publication selects a small covering witness set when needed;
         // diagnostics and migrations must still see every persisted identity.
-        alternatives.push((record.fingerprint(), record_support));
+        witnesses.insert(
+            record.collection(),
+            super::witness::output(*record),
+            record.fingerprint(),
+            record_support,
+        );
     }
     let discovered = super::DiscoveredCollectionRecords::from_records(records);
     // The selected closed DAG's distinct COMMIT payloads are exactly the
@@ -736,19 +820,20 @@ fn relevant_missing_dependency<R, M>(
     target: Collection<M::Target>,
     source: CollectionHandle,
     resolved: &TargetResolution<M::Target>,
-    unavailable: &BTreeSet<CollectionData>,
+    unavailable: &CollectionDataSet,
 ) -> Result<Option<CollectionData>, CollectionRealizationError>
 where
     R: StoreRead,
     M: CollectionMapping,
 {
     for member in &resolved.dependencies {
-        if !unavailable.contains(member) {
-            return Ok(Some(*member));
+        if !unavailable.contains(&member) {
+            return Ok(Some(member));
         }
     }
-    for ((collection, member), witnesses) in &resolved.witnesses {
-        if *collection != target.handle() || unavailable.contains(member) {
+    for (collection, member) in resolved.witnesses.members() {
+        let witnesses = resolved.witnesses.alternatives(collection, member);
+        if collection != target.handle() || unavailable.contains(&member) {
             continue;
         }
         if witnesses.iter().all(|(_, support)| {
@@ -759,24 +844,24 @@ where
             continue;
         }
         if !snapshot
-            .contains_blob(Handle::<M::Target>::from_hash(*member))
+            .contains_blob(Handle::<M::Target>::from_hash(member))
             .map_err(|error| {
                 CollectionRealizationError::storage("inspect existing target output", error)
             })?
         {
-            return Ok(Some(*member));
+            return Ok(Some(member));
         }
     }
-    let mut resident = BTreeSet::new();
+    let mut resident = CollectionDataSet::new();
     for member in resolved.semantics.members(source).into_iter().flatten() {
         if snapshot
-            .metadata(Handle::<M::Source>::from_hash(*member))
+            .metadata(Handle::<M::Source>::from_hash(member))
             .map_err(|error| {
                 CollectionRealizationError::storage("inspect immediate-source output", error)
             })?
             .is_some()
         {
-            resident.insert(*member);
+            resident.insert(member);
         }
     }
     let selected = collection_complete_physical_cover::<M::Source, _>(
@@ -795,11 +880,11 @@ where
 pub(super) struct TargetResolution<E: CollectionEncoding> {
     pub(super) semantics: CollectionSemantics,
     pub(super) witnesses: InputWitnesses,
-    images: BTreeMap<(CollectionHandle, CollectionData), BTreeSet<CollectionData>>,
-    dependencies: BTreeSet<CollectionData>,
+    images: Images,
+    dependencies: CollectionDataSet,
     support: Support,
     pub(super) cover: Cover<E>,
-    missing: BTreeSet<CollectionData>,
+    missing: CollectionDataSet,
 }
 
 impl<E: CollectionEncoding> TargetResolution<E> {
@@ -810,7 +895,7 @@ impl<E: CollectionEncoding> TargetResolution<E> {
     fn incomplete_error(&self, requested: &Support) -> CollectionRealizationError {
         let represented: BTreeSet<_> = self.support.data_members().collect();
         CollectionRealizationError::IncompleteCover {
-            missing: self.missing.iter().copied().collect(),
+            missing: self.missing.iter().collect(),
             unsupported_members: requested
                 .data_members()
                 .filter(|member| !represented.contains(member))
@@ -851,13 +936,8 @@ where
 {
     let semantics = certified.resolution.into_semantics();
     let target_handle = target.handle();
-    let mut resident = BTreeSet::new();
-    for member in semantics
-        .members(target_handle)
-        .into_iter()
-        .flatten()
-        .copied()
-    {
+    let mut resident = CollectionDataSet::new();
+    for member in semantics.members(target_handle).into_iter().flatten() {
         if snapshot
             .metadata(Handle::<E>::from_hash(member))
             .map_err(|error| {
@@ -885,7 +965,7 @@ where
                 .data_members()
                 .filter(|member| represented.contains_data(*member)),
         ),
-        cover: Cover::from_data(target, selected.physical.cover.iter().copied()),
+        cover: Cover::from_data(target, selected.physical.cover.iter()),
         missing: selected.physical.missing,
         dependencies: selected.dependencies,
         witnesses: certified.witnesses,
@@ -1078,11 +1158,7 @@ where
         .into_iter()
         .flatten()
     {
-        let mut outputs = certified
-            .images
-            .get(&(target.handle(), *input))
-            .into_iter()
-            .flatten();
+        let mut outputs = images_for(&certified.images, target.handle(), input);
         if let (Some(first), Some(second)) = (outputs.next(), outputs.next()) {
             return Err(CollectionRealizationError::Resolution(format!(
                 "derivation into {} has conflicting outputs {} and {} for {}",
@@ -1117,7 +1193,7 @@ fn demand_missing_dependency<R, M>(
     target: Collection<M::Target>,
     probe: &MappingProbe<M>,
     support: &Support,
-    unavailable: &BTreeSet<CollectionData>,
+    unavailable: &CollectionDataSet,
 ) -> Result<(), CollectionRealizationError>
 where
     R: StoreRead,
@@ -1142,7 +1218,7 @@ fn source_residual<R, M>(
     snapshot: &R,
     probe: &MappingProbe<M>,
     requested: &Support,
-    blocked: &BTreeMap<CollectionData, String>,
+    blocked: &PATCH<32, IdentitySchema, String>,
 ) -> Result<
     Vec<(
         CollectionData,
@@ -1157,9 +1233,9 @@ where
 {
     let semantics = &probe.target_resolution.semantics;
     let source = probe.source.handle();
-    let mut resident = BTreeSet::new();
-    for member in semantics.members(source).into_iter().flatten().copied() {
-        if blocked.contains_key(&member) {
+    let mut resident = CollectionDataSet::new();
+    for member in semantics.members(source).into_iter().flatten() {
+        if blocked.get(&member.raw).is_some() {
             continue;
         }
         if snapshot
@@ -1191,28 +1267,31 @@ where
     if !missing.is_empty() {
         if blocked.is_empty() {
             return Err(CollectionRealizationError::IncompleteCover {
-                missing: selected.physical.missing.iter().copied().collect(),
+                missing: selected.physical.missing.iter().collect(),
                 unsupported_members: missing,
             });
         }
         return Err(CollectionRealizationError::UnrepresentableCover {
             blocked: blocked
-                .iter()
-                .map(|(member, reason)| (*member, reason.clone()))
+                .iter_ordered()
+                .map(|key| {
+                    (
+                        Inline::new(*key),
+                        blocked.get(key).expect("blocked reason").clone(),
+                    )
+                })
                 .collect(),
             missing,
         });
     }
 
     let mut residual = Vec::new();
-    for member in selected.physical.cover.iter().copied() {
+    for member in selected.physical.cover.iter() {
         let alternatives = probe
             .target_resolution
             .witnesses
-            .get(&(source, member))
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        let witnesses = witness_cover(alternatives, probe.target_resolution.support.clone());
+            .alternatives(source, member);
+        let witnesses = witness_cover(&alternatives, probe.target_resolution.support.clone());
         if witnesses.is_empty() {
             continue;
         }
@@ -1252,7 +1331,7 @@ where
         target,
         signing_key,
         support,
-        &BTreeSet::new(),
+        &CollectionDataSet::new(),
         &mut frontier,
     )
 }
@@ -1276,15 +1355,15 @@ fn ensure_exact_resident_in_frontier_with<S, M>(
     target: Collection<M::Target>,
     signing_key: &SigningKey,
     support: &Support,
-    unavailable: &BTreeSet<CollectionData>,
+    unavailable: &CollectionDataSet,
     frontier: &mut OperationFrontier<S::Snapshot>,
 ) -> Result<(), CollectionRealizationError>
 where
     S: Store,
     M: CollectionMapping,
 {
-    let mut blocked = BTreeMap::<CollectionData, String>::new();
-    let mut published = BTreeSet::<CollectionRecordFingerprint>::new();
+    let mut blocked = PATCH::<32, IdentitySchema, String>::new();
+    let mut published = PATCH::<32>::new();
 
     loop {
         let snapshot = frontier.view(store.snapshot().map_err(|error| {
@@ -1312,7 +1391,10 @@ where
 
         let mut replan = false;
         for (input_data, input, witnesses) in residual {
-            if witnesses.iter().any(|witness| published.contains(witness)) {
+            if witnesses
+                .iter()
+                .any(|witness| published.get(&witness.raw()).is_some())
+            {
                 return Err(CollectionRealizationError::Stalled {
                     cover: repeated_cover,
                 });
@@ -1321,14 +1403,7 @@ where
                 CollectionRealizationError::storage("open mapping dependency snapshot", error)
             })?);
             let mut reusable = None;
-            for member in probe
-                .target_resolution
-                .images
-                .get(&(target.handle(), input_data))
-                .into_iter()
-                .flatten()
-                .copied()
-            {
+            for member in images_for(&probe.target_resolution.images, target.handle(), input_data) {
                 if matches!(
                     collection_member_availability::<M::Target, _>(member, &snapshot).map_err(
                         |error| CollectionRealizationError::storage(
@@ -1365,7 +1440,7 @@ where
                     });
                 }
                 Err(CollectionOperationError::Capacity(reason)) => {
-                    blocked.insert(input_data, reason);
+                    blocked.replace(&Entry::with_value(&input_data.raw, reason));
                     replan = true;
                     break;
                 }
@@ -1388,7 +1463,7 @@ where
                     CollectionRealizationError::storage("publish target DERIVE", error)
                 })?;
                 frontier.include_record(record);
-                published.insert(witness);
+                published.insert(&Entry::new(&witness.raw()));
             }
         }
         if replan {
@@ -1419,7 +1494,7 @@ where
         target,
         signing_key,
         support,
-        &BTreeSet::new(),
+        &CollectionDataSet::new(),
         &mut frontier,
     )
 }
@@ -1443,7 +1518,7 @@ fn maintain_exact_resident_in_frontier_with<S, M>(
     target: Collection<M::Target>,
     signing_key: &SigningKey,
     support: &Support,
-    unavailable: &BTreeSet<CollectionData>,
+    unavailable: &CollectionDataSet,
     frontier: &mut OperationFrontier<S::Snapshot>,
 ) -> Result<(), CollectionRealizationError>
 where
@@ -1486,14 +1561,14 @@ fn coarsen_from_resident_source<S, M>(
     target: Collection<M::Target>,
     signing_key: &SigningKey,
     support: &Support,
-    unavailable: &BTreeSet<CollectionData>,
+    unavailable: &CollectionDataSet,
     frontier: &mut OperationFrontier<S::Snapshot>,
 ) -> Result<M, CollectionRealizationError>
 where
     S: Store,
     M: CollectionMapping,
 {
-    let mut attempted = BTreeSet::new();
+    let mut attempted = CollectionDataSet::new();
     loop {
         let snapshot = frontier.view(store.snapshot().map_err(|error| {
             CollectionRealizationError::storage("open source-guided maintenance snapshot", error)
@@ -1502,8 +1577,8 @@ where
         demand_missing_dependency::<_, M>(&snapshot, target, &probe, support, unavailable)?;
         let semantics = &probe.target_resolution.semantics;
         let source = probe.source.handle();
-        let mut resident = BTreeSet::new();
-        for member in semantics.members(source).into_iter().flatten().copied() {
+        let mut resident = CollectionDataSet::new();
+        for member in semantics.members(source).into_iter().flatten() {
             if snapshot
                 .metadata(Handle::<M::Source>::from_hash(member))
                 .map_err(|error| {
@@ -1541,10 +1616,8 @@ where
         let input_alternatives = probe
             .target_resolution
             .witnesses
-            .get(&(source, input_data))
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        let input_witnesses = witness_cover(input_alternatives, support.collection().cover([]));
+            .alternatives(source, input_data);
+        let input_witnesses = witness_cover(&input_alternatives, support.collection().cover([]));
         if input_witnesses.is_empty() {
             attempted.insert(input_data);
             continue;
@@ -1675,7 +1748,7 @@ where
 
 pub(crate) async fn acquire_missing<S>(
     store: &mut S,
-    attempted: &mut BTreeSet<CollectionData>,
+    attempted: &mut CollectionDataSet,
     member: CollectionData,
 ) -> Result<bool, CollectionRealizationError>
 where
@@ -1705,7 +1778,7 @@ where
     S: Store + AsyncBlobStoreAcquire,
     E: CollectionEncoding,
 {
-    let mut attempted = BTreeSet::new();
+    let mut attempted = CollectionDataSet::new();
     loop {
         let snapshot = frontier.view(store.snapshot().map_err(|error| {
             CollectionRealizationError::storage("observe authority definitions", error)
@@ -1776,7 +1849,7 @@ pub(crate) async fn ensure_root_in_frontier<S>(
 where
     S: Store + AsyncBlobStoreAcquire,
 {
-    let mut attempted = BTreeSet::new();
+    let mut attempted = CollectionDataSet::new();
     loop {
         let snapshot = frontier.view(store.snapshot().map_err(|error| {
             CollectionRealizationError::storage("observe root realization", error)
@@ -1805,8 +1878,7 @@ where
                 .dependencies
                 .iter()
                 .chain(&resolved.missing)
-                .find(|member| !attempted.contains(*member))
-                .copied()
+                .find(|member| !attempted.contains(member))
             {
                 return Err(CollectionRealizationError::MissingDependency { member });
             }
@@ -1880,8 +1952,8 @@ where
     if prepare_exact_mapping::<S, M>(store, target, support, frontier).await? {
         return Ok(());
     }
-    let mut attempted = BTreeSet::new();
-    let mut unavailable = BTreeSet::new();
+    let mut attempted = CollectionDataSet::new();
+    let mut unavailable = CollectionDataSet::new();
     loop {
         match ensure_exact_resident_in_frontier_with::<S, M>(
             store,
@@ -1918,8 +1990,8 @@ where
     // Warm maintenance may still coarsen the target, but source-guided
     // opportunities are optional and must use only already resident evidence.
     prepare_exact_mapping::<S, M>(store, target, support, frontier).await?;
-    let mut attempted = BTreeSet::new();
-    let mut unavailable = BTreeSet::new();
+    let mut attempted = CollectionDataSet::new();
+    let mut unavailable = CollectionDataSet::new();
     loop {
         match maintain_exact_resident_in_frontier_with::<S, M>(
             store,

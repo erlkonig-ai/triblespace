@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::Debug;
 
+use crate::patch::{Entry, IdentitySchema, PATCH};
 use crate::repo::WantRequest;
 
 use super::{CollectionData, CollectionHandle, CollectionRecord, CollectionRecordFingerprint};
@@ -60,6 +61,105 @@ pub enum CollectionRecordSelector {
     Operation(WantRequest),
 }
 
+/// Retained raw record lookup interests, including routes that currently miss.
+///
+/// This is the selection itself, not a cache of records or query answers.
+/// Its fixed internal keys name every selector operand; they are not a wire
+/// encoding. Clones share their PATCH until an observation adds an interest.
+#[derive(Clone, Default, Eq, PartialEq)]
+pub struct CollectionRecordSelectors(PATCH<98, IdentitySchema, CollectionRecordSelector>);
+
+fn selector_key(selector: CollectionRecordSelector) -> [u8; 98] {
+    let mut key = [0; 98];
+    let (tag, first, second) = match selector {
+        CollectionRecordSelector::Fingerprint(fingerprint) => (0, fingerprint.raw(), None),
+        CollectionRecordSelector::Collection(collection) => (1, collection.raw, None),
+        CollectionRecordSelector::CommitMember(collection, data) => {
+            (2, collection.raw, Some(data.raw))
+        }
+        CollectionRecordSelector::ProducedMember(collection, data) => {
+            (3, collection.raw, Some(data.raw))
+        }
+        CollectionRecordSelector::ReferencingRecord(fingerprint) => (4, fingerprint.raw(), None),
+        CollectionRecordSelector::MergeCollection(collection) => (5, collection.raw, None),
+        CollectionRecordSelector::DeriveTarget(collection) => (6, collection.raw, None),
+        CollectionRecordSelector::Operation(operation) => {
+            key[0] = 7;
+            key[1..].copy_from_slice(&operation.to_bytes());
+            return key;
+        }
+    };
+    key[0] = tag;
+    key[1..33].copy_from_slice(&first);
+    if let Some(second) = second {
+        key[33..65].copy_from_slice(&second);
+    }
+    key
+}
+
+impl CollectionRecordSelectors {
+    /// Whether no lookup route was observed.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    /// Number of distinct lookup routes.
+    pub fn len(&self) -> usize {
+        self.0.len() as usize
+    }
+    /// Add one exact lookup interest.
+    pub fn insert(&mut self, selector: CollectionRecordSelector) {
+        self.0
+            .insert(&Entry::with_value(&selector_key(selector), selector));
+    }
+    /// Whether the exact lookup route was observed.
+    pub fn contains(&self, selector: &CollectionRecordSelector) -> bool {
+        self.0.get(&selector_key(*selector)).is_some()
+    }
+    /// Lookup routes in deterministic selector order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = CollectionRecordSelector> + '_ {
+        self.0
+            .iter_ordered()
+            .map(|key| *self.0.get(key).expect("selector key retains its value"))
+    }
+    /// Combine independently observed read sets through structural union.
+    pub fn union(&mut self, other: Self) {
+        self.0.union(other.0);
+    }
+    /// Discard all lookup interests in this value, not in its earlier clones.
+    pub fn clear(&mut self) {
+        self.0 = PATCH::new();
+    }
+    pub(crate) fn matches(&self, record: CollectionRecord) -> bool {
+        let fingerprints = self.0.iter_ordered().next().is_some_and(|key| key[0] == 0);
+        matches_record(|selector| self.contains(selector), fingerprints, record)
+    }
+}
+
+impl Extend<CollectionRecordSelector> for CollectionRecordSelectors {
+    fn extend<I: IntoIterator<Item = CollectionRecordSelector>>(&mut self, selectors: I) {
+        for selector in selectors {
+            self.insert(selector);
+        }
+    }
+}
+impl FromIterator<CollectionRecordSelector> for CollectionRecordSelectors {
+    fn from_iter<I: IntoIterator<Item = CollectionRecordSelector>>(selectors: I) -> Self {
+        let mut result = Self::default();
+        result.extend(selectors);
+        result
+    }
+}
+impl<const N: usize> From<[CollectionRecordSelector; N]> for CollectionRecordSelectors {
+    fn from(selectors: [CollectionRecordSelector; N]) -> Self {
+        selectors.into_iter().collect()
+    }
+}
+impl std::fmt::Debug for CollectionRecordSelectors {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set().entries(self.iter()).finish()
+    }
+}
+
 fn collection_record_operation(record: CollectionRecord) -> Option<WantRequest> {
     match record {
         CollectionRecord::Commit(_) => None,
@@ -78,12 +178,27 @@ pub(crate) fn selectors_match_record(
     selectors: &BTreeSet<CollectionRecordSelector>,
     record: CollectionRecord,
 ) -> bool {
+    matches_record(
+        |selector| selectors.contains(selector),
+        matches!(
+            selectors.first(),
+            Some(CollectionRecordSelector::Fingerprint(_))
+        ),
+        record,
+    )
+}
+
+fn matches_record(
+    contains: impl Fn(&CollectionRecordSelector) -> bool,
+    fingerprints: bool,
+    record: CollectionRecord,
+) -> bool {
     let collection = match record {
         CollectionRecord::Commit(commit) => commit.collection(),
         CollectionRecord::Merge(merge) => merge.collection(),
         CollectionRecord::Derive(derive) => derive.collection(),
     };
-    if selectors.contains(&CollectionRecordSelector::Collection(collection)) {
+    if contains(&CollectionRecordSelector::Collection(collection)) {
         return true;
     }
     let output = match record {
@@ -91,27 +206,29 @@ pub(crate) fn selectors_match_record(
         CollectionRecord::Merge(merge) => merge.result(),
         CollectionRecord::Derive(derive) => derive.output(),
     };
-    if selectors.contains(&CollectionRecordSelector::ProducedMember(
+    if contains(&CollectionRecordSelector::ProducedMember(
         collection, output,
-    )) || record.record_references().any(|fingerprint| {
-        selectors.contains(&CollectionRecordSelector::ReferencingRecord(fingerprint))
-    }) {
+    )) || record
+        .record_references()
+        .any(|fingerprint| contains(&CollectionRecordSelector::ReferencingRecord(fingerprint)))
+    {
         return true;
     }
     let matches_fields = match record {
-        CollectionRecord::Commit(commit) => selectors.contains(
-            &CollectionRecordSelector::CommitMember(commit.collection(), commit.data()),
-        ),
+        CollectionRecord::Commit(commit) => contains(&CollectionRecordSelector::CommitMember(
+            commit.collection(),
+            commit.data(),
+        )),
         CollectionRecord::Merge(merge) => {
-            selectors.contains(&CollectionRecordSelector::MergeCollection(
+            contains(&CollectionRecordSelector::MergeCollection(
                 merge.collection(),
-            )) || selectors.contains(&CollectionRecordSelector::Operation(
+            )) || contains(&CollectionRecordSelector::Operation(
                 collection_record_operation(record).expect("MERGE has an operation key"),
             ))
         }
         CollectionRecord::Derive(derive) => {
-            selectors.contains(&CollectionRecordSelector::DeriveTarget(derive.collection()))
-                || selectors.contains(&CollectionRecordSelector::Operation(
+            contains(&CollectionRecordSelector::DeriveTarget(derive.collection()))
+                || contains(&CollectionRecordSelector::Operation(
                     collection_record_operation(record).expect("DERIVE has an operation key"),
                 ))
         }
@@ -123,10 +240,7 @@ pub(crate) fn selectors_match_record(
     // ask only for fields already in the record, so do not hash its bytes just
     // to test a route which is absent. A matching field also satisfies a mixed
     // union without needing its physical fingerprint.
-    matches!(
-        selectors.first(),
-        Some(CollectionRecordSelector::Fingerprint(_))
-    ) && selectors.contains(&CollectionRecordSelector::Fingerprint(record.fingerprint()))
+    fingerprints && contains(&CollectionRecordSelector::Fingerprint(record.fingerprint()))
 }
 
 /// Immutable read surface for canonical collection-calculus records.
@@ -388,6 +502,80 @@ mod tests {
         records
     }
 
+    #[test]
+    fn retained_selectors_preserve_order_operands_and_clone_union() {
+        use crate::blob::encodings::UnknownBlob;
+        use crate::inline::encodings::hash::Handle;
+
+        let records = fixture();
+        let mut expected = BTreeSet::new();
+        for &record in &records {
+            expected.insert(CollectionRecordSelector::Fingerprint(record.fingerprint()));
+            expected.insert(CollectionRecordSelector::Collection(record.collection()));
+            expected.extend(
+                record
+                    .record_references()
+                    .map(CollectionRecordSelector::ReferencingRecord),
+            );
+        }
+        for byte in [0, 1, 2, 127, 255] {
+            expected.extend([
+                CollectionRecordSelector::CommitMember(collection(byte), data(4)),
+                CollectionRecordSelector::CommitMember(collection(1), data(byte)),
+                CollectionRecordSelector::ProducedMember(collection(byte), data(11)),
+                CollectionRecordSelector::ProducedMember(collection(2), data(byte)),
+                CollectionRecordSelector::MergeCollection(collection(byte)),
+                CollectionRecordSelector::DeriveTarget(collection(byte)),
+                CollectionRecordSelector::Operation(WantRequest::blob(
+                    Handle::<UnknownBlob>::from_hash(data(byte)),
+                )),
+                CollectionRecordSelector::Operation(WantRequest::merge(
+                    collection(byte),
+                    data(4),
+                    data(5),
+                )),
+                CollectionRecordSelector::Operation(WantRequest::merge(
+                    collection(1),
+                    data(byte),
+                    data(5),
+                )),
+                CollectionRecordSelector::Operation(WantRequest::derive(
+                    collection(byte),
+                    data(10),
+                )),
+                CollectionRecordSelector::Operation(WantRequest::derive(collection(2), data(byte))),
+            ]);
+        }
+        let retained: CollectionRecordSelectors = expected.iter().rev().copied().collect();
+        assert_eq!(
+            retained.iter().collect::<Vec<_>>(),
+            expected.iter().copied().collect::<Vec<_>>()
+        );
+        assert_eq!(retained.len(), expected.len());
+        for selector in &expected {
+            assert!(retained.contains(selector));
+            let one = CollectionRecordSelectors::from([*selector]);
+            for &record in &records {
+                assert_eq!(
+                    one.matches(record),
+                    selectors_match_record(&BTreeSet::from([*selector]), record)
+                );
+            }
+        }
+        let mut left: CollectionRecordSelectors = expected.iter().step_by(2).copied().collect();
+        let before = left.clone();
+        let right = expected.iter().skip(1).step_by(2).copied().collect();
+        left.union(right);
+        assert_eq!(left, retained);
+        left.clear();
+        assert!(left.is_empty());
+        assert_eq!(
+            before.iter().collect::<Vec<_>>(),
+            expected.iter().step_by(2).copied().collect::<Vec<_>>()
+        );
+        assert!(!retained.is_empty());
+    }
+
     #[derive(Default)]
     struct FallbackStore {
         records: Vec<CollectionRecord>,
@@ -450,6 +638,7 @@ mod tests {
         for selector in selectors {
             for &record in &records {
                 selectors_match_record(&BTreeSet::from([selector]), record);
+                CollectionRecordSelectors::from([selector]).matches(record);
             }
         }
         for &record in &records {

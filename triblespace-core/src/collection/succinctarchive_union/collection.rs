@@ -443,8 +443,8 @@ mod tests {
             crate::collection::CollectionMaterializationError::Missing {
                 obligations,
                 dependencies,
-            } if obligations == [accelerated_data].into_iter().collect()
-                && dependencies == [raw_data].into_iter().collect()
+            } if obligations == crate::collection::CollectionDataSet::from([accelerated_data])
+                && dependencies == crate::collection::CollectionDataSet::from([raw_data])
         ));
     }
 
@@ -551,7 +551,7 @@ mod tests {
             Err(crate::collection::CollectionMaterializationError::Missing {
                 obligations,
                 ..
-            }) if obligations == [fb_data].into_iter().collect()
+            }) if obligations == crate::collection::CollectionDataSet::from([fb_data])
         ));
     }
 

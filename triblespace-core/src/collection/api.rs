@@ -45,6 +45,7 @@ use super::encoding::{
 };
 use super::exact_derived::CollectionRealizationError;
 use super::operation_snapshot::OperationFrontier;
+use super::resolution::CollectionDataSet;
 use super::simplearchive_union::{FactViewError, PreparedCollectionCommit};
 use super::{
     collection_complete_physical_cover, descriptor, discover_collection_records_authorized,
@@ -822,10 +823,10 @@ pub enum CollectionMaterializationError<
     /// No resident physical cover spans every semantic obligation.
     Missing {
         /// Requested semantic members lacking a complete resident realization.
-        obligations: BTreeSet<CollectionData>,
+        obligations: CollectionDataSet,
         /// Named immutable representation dependencies which would make an
         /// otherwise useful resident member complete.
-        dependencies: BTreeSet<CollectionData>,
+        dependencies: CollectionDataSet,
     },
     /// The selected physical cover could not form the requested logical view.
     View(ViewError),
@@ -2364,8 +2365,8 @@ where
     L: CollectionEncoding,
 {
     let collection = cover.collection().handle();
-    let mut complete = BTreeSet::new();
-    for member in semantics.members(collection).into_iter().flatten().copied() {
+    let mut complete = CollectionDataSet::new();
+    for member in semantics.members(collection).into_iter().flatten() {
         match collection_member_structural_availability::<L, _>(member, snapshot) {
             Ok(CollectionMemberAvailability::Complete) => {
                 complete.insert(member);
@@ -2431,8 +2432,8 @@ where
     // Merkle closures remain uncovered obligations, allowing the physical
     // cover algorithm to fall back to finer support-equivalent members. Exact
     // semantic validation still belongs to the eventual view.
-    let mut resident_roots = BTreeSet::new();
-    for data in semantics.members(collection).into_iter().flatten().copied() {
+    let mut resident_roots = CollectionDataSet::new();
+    for data in semantics.members(collection).into_iter().flatten() {
         if matches!(reader.metadata(Handle::<L>::from_hash(data)), Ok(Some(_))) {
             resident_roots.insert(data);
         }
@@ -2458,7 +2459,6 @@ where
         .members(collection)
         .into_iter()
         .flatten()
-        .copied()
         .filter(|member| {
             matches!(
                 collection_member_availability::<L, _>(*member, reader),
@@ -2833,8 +2833,10 @@ mod cover_resolution_tests {
             2 * LENGTH as usize + 1,
         );
         assert_eq!(
-            semantics.frontier(collection.handle()),
-            Some(&BTreeSet::from([previous])),
+            semantics
+                .frontier(collection.handle())
+                .map(|members| members.iter().collect::<BTreeSet<_>>()),
+            Some(BTreeSet::from([previous])),
         );
         assert_eq!(
             EQUATION_VISITS.with(Cell::get),
