@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Remove support-redundant physical-cover repair members before LSM planning.
+  A later resident member may already carry every exact witness of an earlier
+  addition; retaining both could repeat a useless subsuming carry and report a
+  stalled collection. Selection preserves full witnessed support, and genuine
+  publication-progress failures remain errors.
+
 ### Added
 
 - Add witness-bound MERGE/DERIVE endorsements over actual native input-record

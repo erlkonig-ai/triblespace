@@ -2897,3 +2897,169 @@ fn target_maintenance_is_deterministic_and_repeatedly_idempotent() {
     let second_result = store.snapshot().unwrap();
     assert!(second_result.changes_since(&first_result).is_empty());
 }
+
+/// Four genuine root values with two different certificates for B:
+/// A | D = B [a,d], and B | Z = Z [b,z]. B's COMMIT and its MERGE are
+/// different support routes to exactly the same bytes. Only D is evicted.
+fn redundant_support_fixture() -> (
+    MemoryRepo,
+    Collection<SimpleArchive>,
+    [Blob<SimpleArchive>; 4],
+) {
+    // Fix the deterministic carry order without inventing content hashes.
+    // Four/five/six facts all occupy the same serialized-size tier. The
+    // bounded search changes only test values, not the mathematical fixture.
+    let blobs = (1..=u8::MAX)
+        .find_map(|value| {
+            let a = (1..=4)
+                .map(|entity| row(entity, value))
+                .collect::<TribleSet>()
+                .to_blob();
+            let d = archive(5, value);
+            let b = crate::collection::simplearchive_union::join(&a, &d).unwrap();
+            let z = crate::collection::simplearchive_union::join(&b, &archive(6, value)).unwrap();
+            (data(&a) < data(&b) && data(&b) < data(&z)).then_some([a, b, z, d])
+        })
+        .expect("a deterministic fixture with H(A) < H(B) < H(Z)");
+    let [a, b, z, d] = &blobs;
+    assert_eq!(a.bytes.len().ilog2(), b.bytes.len().ilog2());
+    assert_eq!(b.bytes.len().ilog2(), z.bytes.len().ilog2());
+    let mut store = MemoryRepo::default();
+    let collection = store.collection("compaction-progress", policy()).unwrap();
+    let commits = blobs
+        .each_ref()
+        .map(|blob| publish_root(&mut store, collection, blob, 31));
+    for (low, high, output) in [(0, 3, b), (1, 2, z)] {
+        store
+            .insert(CollectionRecord::Merge(CollectionMerge::sign(
+                &equation_signer(),
+                collection.handle(),
+                (commits[low].data(), commits[low].fingerprint()),
+                (commits[high].data(), commits[high].fingerprint()),
+                data(output),
+            )))
+            .unwrap();
+    }
+    let retained = store
+        .blobs
+        .snapshot()
+        .unwrap()
+        .iter()
+        .map(|(handle, _)| handle)
+        .filter(|handle| handle.raw != d.get_handle().raw)
+        .collect::<Vec<_>>();
+    store.blobs.keep(retained);
+    (store, collection, blobs)
+}
+
+#[test]
+fn support_repair_removes_an_earlier_member_made_redundant_by_a_later_one() {
+    let (mut store, collection, blobs) = redundant_support_fixture();
+    let [a, b, z, _] = &blobs;
+    let requested = support(collection, &blobs);
+    let snapshot = store.snapshot().unwrap();
+    let selected = snapshot.collection_exact(collection, &requested).unwrap();
+    assert_eq!(selected.support(), &requested);
+    // Starting with Z [b,z], a forward support-repair walk adds A [a], then
+    // B [a,b,d] for d. B makes A redundant without enlarging the support.
+    assert_eq!(
+        selected.cover().data_members().collect::<BTreeSet<_>>(),
+        BTreeSet::from([data(b), data(z)]),
+    );
+    assert_eq!(
+        selected.view::<TribleSet>().unwrap(),
+        TribleSet::try_from_blob(z.clone()).unwrap(),
+    );
+    assert!(snapshot.contains_blob(a.get_handle()).unwrap());
+}
+
+#[test]
+fn target_maintenance_does_not_repeat_a_support_redundant_carry() {
+    let (inner, collection, blobs) = redundant_support_fixture();
+    let [_, _, z, d] = &blobs;
+    let requested = support(collection, &blobs);
+    let mut store = GuardStore::new(inner);
+    // On the unfixed selector this tries A | B = B even though B's existing
+    // witnesses already cover A, then errors on the same three-member cover.
+    let after = block_on(store.maintain_exact(collection, &equation_signer(), &requested)).unwrap();
+    let selected = after.collection_exact(collection, &requested).unwrap();
+    assert_eq!(selected.support(), &requested);
+    assert_eq!(
+        selected.cover().data_members().collect::<Vec<_>>(),
+        vec![data(z)]
+    );
+    assert!(!after.contains_blob(d.get_handle()).unwrap());
+    assert!(store.acquired.is_empty());
+    assert!(store
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            WriteEvent::Insert(CollectionRecord::Merge(merge)) => Some(merge),
+            _ => None,
+        })
+        .all(|merge| merge.result() == data(z)));
+    drop(selected);
+    drop(after);
+
+    let before = records(&mut store.inner);
+    store.events.clear();
+    let after = block_on(store.maintain_exact(collection, &equation_signer(), &requested)).unwrap();
+    assert_eq!(
+        after
+            .collection_exact(collection, &requested)
+            .unwrap()
+            .support(),
+        &requested
+    );
+    assert!(
+        store.events.is_empty(),
+        "the maintained cover is a true fixed point"
+    );
+    assert!(store.acquired.is_empty());
+    drop(after);
+    assert_eq!(records(&mut store.inner), before);
+}
+
+#[test]
+fn support_repair_does_not_clip_a_wider_certificate_to_the_requested_support() {
+    let (mut store, collection, blobs) = redundant_support_fixture();
+    let [a, b, z, _] = &blobs;
+    let requested = support(collection, &[a.clone(), b.clone(), z.clone()]);
+    let snapshot = store.snapshot().unwrap();
+    let selected = snapshot.collection_exact(collection, &requested).unwrap();
+    assert_eq!(selected.support(), &requested);
+    // B's [a,d] certificate is not a [a] certificate when d is unselected.
+    // Reusing B [b] and Z [b,z] therefore cannot justify removing A [a].
+    assert_eq!(
+        selected.cover().data_members().collect::<BTreeSet<_>>(),
+        BTreeSet::from([data(a), data(z)]),
+    );
+    assert_eq!(
+        selected.view::<TribleSet>().unwrap(),
+        TribleSet::try_from_blob(z.clone()).unwrap(),
+    );
+}
+
+#[test]
+fn equal_payload_commit_does_not_restart_completed_target_maintenance() {
+    let (mut store, collection, blobs) = redundant_support_fixture();
+    let requested = support(collection, &blobs);
+    drop(block_on(store.maintain_exact(collection, &equation_signer(), &requested)).unwrap());
+    // A different signer attests B, not a new foundational payload. This must
+    // not make the old fine member or its redundant carries reappear.
+    publish_root(&mut store, collection, &blobs[1], 32);
+    let before = records(&mut store);
+    let mut store = GuardStore::new(store);
+    let after = block_on(store.maintain_exact(collection, &equation_signer(), &requested)).unwrap();
+    assert_eq!(
+        after
+            .collection_exact(collection, &requested)
+            .unwrap()
+            .support(),
+        &requested
+    );
+    assert!(store.events.is_empty());
+    assert!(store.acquired.is_empty());
+    drop(after);
+    assert_eq!(records(&mut store.inner), before);
+}

@@ -438,6 +438,8 @@ where
         selected.physical.cover.iter().copied(),
         requested.collection(),
     );
+    let coarse_support = represented.clone();
+    let mut residuals = Vec::new();
     for member in resident {
         if requested.is_subset(&represented).expect("one foundation") {
             break;
@@ -456,9 +458,48 @@ where
             CollectionMemberAvailability::Complete => {
                 selected.physical.cover.insert(*member);
                 represented = represented.union(&member_support).expect("one foundation");
+                residuals.push((*member, member_support));
             }
             _ => {}
         }
+    }
+    // A later support-repair member can make an earlier one redundant even
+    // though both were needed when first visited. Keep the semantic physical
+    // cover, and prune only these additions before an LSM carry is planned.
+    // Cached suffix unions let each candidate see every other retained support
+    // without rebuilding the whole union per candidate. Compare FULL witnessed
+    // support, never its intersection with the requested slice.
+    if residuals.len() > 1 {
+        let mut remaining = Vec::with_capacity(residuals.len() + 1);
+        remaining.push(requested.collection().cover([]));
+        for (_, member_support) in residuals.iter().rev() {
+            remaining.push(
+                remaining
+                    .last()
+                    .expect("suffix union starts with the empty support")
+                    .union(member_support)
+                    .expect("one foundation"),
+            );
+        }
+        let mut retained_support = coarse_support;
+        for (member, member_support) in residuals {
+            remaining.pop();
+            let others = retained_support
+                .union(
+                    remaining
+                        .last()
+                        .expect("suffix retains its empty terminator"),
+                )
+                .expect("one foundation");
+            if member_support.is_subset(&others).expect("one foundation") {
+                selected.physical.cover.remove(&member);
+            } else {
+                retained_support = retained_support
+                    .union(&member_support)
+                    .expect("one foundation");
+            }
+        }
+        debug_assert_eq!(retained_support, represented);
     }
     if requested.is_subset(&represented).expect("one foundation") {
         selected.physical.missing.clear();
