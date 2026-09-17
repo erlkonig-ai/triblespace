@@ -530,6 +530,16 @@ struct Member {
     committed: bool,
     /// The member's bytes are here.
     resident: bool,
+    /// A record *in this collection* produced it: a `MERGE` result or a
+    /// `DERIVE` output.
+    ///
+    /// `false` with `committed` also false is a member reached only as
+    /// somebody else's join input — real, resident, and made by a record this
+    /// observation cannot see. It was already counted here and printed as a
+    /// number beside the picture, which is the one absence in the whole view a
+    /// reader could not point at. It is now carried per member so the mark can
+    /// carry it too.
+    produced: bool,
 }
 
 /// The join lattice *inside* one collection.
@@ -633,6 +643,7 @@ fn observe_members<R: triblespace_core::repo::StoreRead>(
             resident: snapshot
                 .contains_blob(Inline::<Handle<UnknownBlob>>::new(*handle))
                 .unwrap_or(false),
+            produced: produced.contains(handle),
         })
         .collect();
     let index = |handle: &[u8; 32]| order.binary_search(handle).ok();

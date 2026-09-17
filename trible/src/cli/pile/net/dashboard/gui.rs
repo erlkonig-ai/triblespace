@@ -107,34 +107,29 @@ fn render_mesh(ui: &mut egui::Ui, frame: &Frame) {
                     .iter()
                     .filter(|observer| observer.endpoints.iter().any(|endpoint| endpoint == node))
             };
-            // KNOWN CONFLATION, and it is the one JP could not read off the
-            // picture: he asked whether slashed nodes meant the daemons were
-            // down or just that we had no recent updates, and the view cannot
-            // say, because `Unknown` below is an `else` that swallows two
-            // different facts. A node with NO reports at all (named only by a
-            // peer, never heard from here) and a node whose reports are all
-            // `Freshness::Future` (heard from, but its clock disagrees) render
-            // identically.
+            // The conflation that used to live here is gone. `MeshNodeState`
+            // grew the fourth variant it needed, so the split is on whether a
+            // report EXISTS at all rather than on what one contains: a node
+            // nobody here has heard from is an absence, and a node that
+            // reported something we cannot place in time is a clock fault. They
+            // are different questions with different answers and they now draw
+            // differently — dashed for the hole, slashed for the fault.
             //
-            // `Freshness` is not the bug and should not grow a variant:
-            // freshness describes a REPORT, so there is no freshness value for
-            // "no report exists". The missing distinction belongs one level up,
-            // as a fourth `MeshNodeState` for never-reported, leaving `Unknown`
-            // to mean only "reported, and we cannot place it in time". That
-            // enum lives in GORBIE and is mid-rewrite onto the shared
-            // force-directed solver; make the change there and then split this
-            // `else` on whether `reports()` and `health()` are empty at all
-            // rather than on what they contain.
+            // `Freshness` is deliberately untouched: it describes a report, so
+            // there is no freshness value for "no report exists".
             let fresh = reports().any(|worker| worker.freshness == Freshness::Fresh)
                 || health().any(|observer| observer.freshness == Freshness::Fresh);
             let stale = reports().any(|worker| worker.freshness == Freshness::Stale)
                 || health().any(|observer| observer.freshness == Freshness::Stale);
+            let reported = reports().next().is_some() || health().next().is_some();
             let state = if fresh {
                 MeshNodeState::Fresh
             } else if stale {
                 MeshNodeState::Stale
-            } else {
+            } else if reported {
                 MeshNodeState::Unknown
+            } else {
+                MeshNodeState::Unreported
             };
             let mut done = 0u128;
             let mut pending = 0u128;
@@ -197,22 +192,22 @@ fn render_mesh(ui: &mut egui::Ui, frame: &Frame) {
     ui.small(
         "Filled square: this node reported, inside the freshness window. Open \
          square: it reported, but older than the window — stale describes a \
-         report, so only a node that sent one can be stale. Slashed square: no \
-         usable report. Arc: merge and derive work completed over work seen. \
-         Barb points at the observed peer.",
+         report, so only a node that sent one can be stale. Dashed square: \
+         never heard from here; it is in this picture because a peer named it. \
+         Slashed square: it reported, and the report cannot be placed in time — \
+         a clock fault, not a silence. Arc: merge and derive work completed \
+         over work seen. Barb points at the observed peer.",
     );
-    // A legend that reads cleanly over a glyph which conflates states is worse
-    // than no legend: it certifies the wrong reading. JP asked whether the
-    // slashed daemons were down or just quiet and could not tell from the
-    // picture — he was right, the picture does not say, and until the mark
-    // vocabulary separates them the words have to.
+    // One conflation remains, and the marks do not separate it. Saying so is
+    // not a style note: a legend that reads cleanly over a mark that cannot
+    // support the reading certifies the wrong answer, which is worse than
+    // saying nothing.
     ui.small(
-        "Two conflations remain, and the marks do not yet separate them. The \
-         slashed square is both never-heard-from — known only because a peer \
-         named it — and heard-but-future-dated, which is a clock fault, not a \
-         silence. The empty track is both no measurement and a measured zero: \
+        "The empty track is still both no measurement and a measured zero: \
          convergence is None when nothing was reported AND when nothing was \
-         pending, so an empty ring cannot be read as agreement OR as a zero.",
+         pending, so an empty ring cannot be read as agreement OR as a zero. \
+         Separating them needs the sampler to say whether the node reported \
+         these metrics at all, which it does not currently carry.",
     );
     if links.is_empty() {
         ui.small("No link telemetry observed, so no edges are drawn.");
@@ -277,6 +272,17 @@ fn render_lattice(ui: &mut egui::Ui, frame: &Frame) {
             // empty track. That is absence of evidence, not full residency.
             coverage: (collection.stored() > 0)
                 .then(|| collection.result_resident as f32 / collection.stored() as f32),
+            // A collection is named or derived, so something produced it by
+            // construction; "reached only as an input" is a fact about members,
+            // not about collections.
+            produced: true,
+            // Not claimed. The widget can draw "this label is a stand-in for a
+            // name whose bytes are missing", but this observation cannot tell
+            // that apart from "this collection has no name at all" —
+            // `LatticeCollection::name` is `None` for both. Asserting either
+            // would be inventing a fact, so it asserts neither until the
+            // sampler carries whether a name attribute was present.
+            label_known: true,
         })
         .collect();
 
@@ -455,6 +461,13 @@ fn render_members(ui: &mut egui::Ui, frame: &Frame, chosen: Option<[u8; 32]>) {
             // Residency is already carried by the mark's stroke; a second
             // channel saying the same thing would be decoration.
             coverage: None,
+            // A commit is produced by definition — an author asserted it. For
+            // the rest, this is whether a record HERE made it. False is the
+            // member reached only as somebody else's join input, which until
+            // now was a count printed beside a mark that looked exactly like a
+            // fully-produced one.
+            produced: member.committed || member.produced,
+            label_known: true,
         })
         .collect();
     let edges: Vec<LatticeEdge> = members
@@ -480,19 +493,19 @@ fn render_members(ui: &mut egui::Ui, frame: &Frame, chosen: Option<[u8; 32]>) {
             edges.len()
         ));
         if members.unproduced != 0 {
-            ui.colored_label(
-                ui.visuals().warn_fg_color,
-                format!(
-                    "{} reached only as a join input; what produced them is elsewhere",
-                    members.unproduced
-                ),
-            );
+            ui.small(format!(
+                "{} reached only as a join input — each one drawn with a gap at \
+                 the bottom of its mark, so you can point at them",
+                members.unproduced
+            ));
         }
     });
     ui.small(
         "Inside the selection: square is a commit, circle a join result or mapping \
-         output, dashed a member whose bytes are not here. Each join's two edges are \
-         its MERGE inputs.",
+         output, a circle with a gap at the bottom a member nothing here produced — \
+         it was reached as somebody else's join input and the record that made it is \
+         elsewhere. Dashed is a member whose bytes are not here. Each join's two \
+         edges are its MERGE inputs.",
     );
 }
 
