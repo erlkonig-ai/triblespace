@@ -22,7 +22,10 @@ use triblespace_core::repo::SnapshotSource;
 use triblespace_core::trible::TribleSet;
 use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::Blob;
+use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::collection::descriptor;
+use triblespace_core::inline::encodings::hash::Handle;
+use triblespace_core::inline::Inline;
 use triblespace_net::dashboard::{self, CountMetric, Freshness, ObserverReport};
 use triblespace_net::health_record;
 use triblespace_net::telemetry::{self, Metric, WorkerReport};
@@ -150,6 +153,8 @@ struct Reader {
     setup_warnings: Vec<String>,
     max_age: Duration,
     lattice: bool,
+    /// Collection whose members the next sample should project, if any.
+    focus: Option<[u8; 32]>,
     // Only the final display projection, not a mutable report catalogue. Its
     // application time is independent of the store's scoped dependencies.
     retained: Option<(i128, Frame)>,
@@ -199,6 +204,7 @@ impl Reader {
             setup_warnings,
             max_age: options.max_age,
             lattice: options.lattice,
+            focus: None,
             retained: None,
             #[cfg(test)]
             projection_runs: 0,
@@ -228,7 +234,8 @@ impl Reader {
         // finish before we decide whether the producer samples are fresh.
         let now_ns = clock();
         if let Some((origin_ns, retained)) = &self.retained {
-            if retained.can_age_from(*origin_ns, now_ns)
+            if self.focus.is_none()
+                && retained.can_age_from(*origin_ns, now_ns)
                 && self
                     .sources
                     .iter()
@@ -308,10 +315,23 @@ impl Reader {
             },
             false => None,
         };
+        // An indexed per-collection lookup, so this costs the selected
+        // collection's own records rather than the store's.
+        let members = match (self.lattice, self.focus) {
+            (true, Some(collection)) => match observe_members(&snapshot, collection, MEMBER_LIMIT) {
+                Ok(members) => Some(members),
+                Err(error) => {
+                    warnings.push(format!("Collection members unreadable: {error}"));
+                    None
+                }
+            },
+            _ => None,
+        };
         let frame = Frame {
             workers,
             health,
             lattice,
+            members,
             warnings,
             sampled: Instant::now(),
             observation_time: started.elapsed(),
@@ -324,7 +344,11 @@ impl Reader {
         // resident blob, so a retained frame could show a stale lattice beside
         // fresh backlog. Rather than widen the test, do not retain at all when
         // the lattice was asked for: the caller already accepted the cost.
-        if readable_sources == self.sources.len() && health_readable && !self.lattice {
+        if readable_sources == self.sources.len()
+            && health_readable
+            && !self.lattice
+            && self.focus.is_none()
+        {
             self.retained = Some((now_ns, frame.clone()));
         }
         Ok(frame)
@@ -486,10 +510,155 @@ fn observe_lattice<R: triblespace_core::repo::StoreRead>(
     Ok(out)
 }
 
+/// Members above which the join lattice is reported but not drawn.
+///
+/// A truncated graph is a false picture rather than a partial one: dropping
+/// nodes silently deletes the joins that ran through them, so what is left
+/// reads as a collection with fewer merges than it has. Past this size the
+/// view states the count and draws nothing.
+const MEMBER_LIMIT: usize = 240;
+
+/// One member of a collection, as this observation sees it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Member {
+    /// The payload handle. Members are named by content, not by an entity.
+    handle: [u8; 32],
+    /// A `COMMIT` here names this handle as data. That is a positive fact; its
+    /// absence is not the opposite fact, only the lack of one.
+    committed: bool,
+    /// The member's bytes are here.
+    resident: bool,
+}
+
+/// The join lattice *inside* one collection.
+///
+/// The panel above draws the order *between* collections. This is the order
+/// *within* one, and it is the merge chain: `MERGE(C, low, high, result)`
+/// states `low ⊔ high = result` under C's join law, so its two inputs are
+/// literally the two edges below a join. Nothing is summarised — the edges are
+/// the equations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MemberLattice {
+    /// The collection these members belong to.
+    collection: [u8; 32],
+    members: Vec<Member>,
+    /// `(from, to)` indices into `members`: an input of a join, and its result.
+    joins: Vec<(usize, usize)>,
+    /// Members this collection's records reach that no record here produces —
+    /// a join input whose own commit or merge lives somewhere else.
+    unproduced: usize,
+    /// The lattice was too large to draw honestly, so it was not built.
+    /// A truncated graph is a false picture, not a partial one.
+    too_large: Option<usize>,
+}
+
+/// Project one collection's member lattice from a frozen observation.
+///
+/// This is an indexed lookup, not another walk: a pile keys its records by
+/// collection, so asking for one collection's records costs its own records
+/// rather than the store's. That is why this is safe to do per selection while
+/// the collection-level pass is not safe to do per frame.
+///
+/// A `DERIVE` naming this collection contributes only its output. Its input is
+/// a member of the *source* collection and has no place in this order; drawing
+/// it here would put two different collections' members in one lattice.
+fn observe_members<R: triblespace_core::repo::StoreRead>(
+    snapshot: &R,
+    collection: [u8; 32],
+    limit: usize,
+) -> ReadResult<MemberLattice> {
+    use triblespace_core::collection::records::CollectionRecord;
+    use triblespace_core::collection::CollectionRecordSelector;
+
+    let selectors = BTreeSet::from([CollectionRecordSelector::Collection(
+        CollectionHandle::new(collection),
+    )]);
+    let records = snapshot
+        .select_records(&selectors)
+        .map_err(|_| ReadFailure::RefreshPile)?;
+
+    let mut committed = BTreeSet::new();
+    let mut produced = BTreeSet::new();
+    let mut raw_joins = Vec::new();
+    let mut handles = BTreeSet::new();
+    for record in records {
+        match record {
+            CollectionRecord::Commit(commit) => {
+                let data = commit.data().raw;
+                committed.insert(data);
+                handles.insert(data);
+            }
+            CollectionRecord::Merge(merge) => {
+                let (low, high) = merge.inputs();
+                let result = merge.result().raw;
+                produced.insert(result);
+                handles.insert(result);
+                for input in [low.raw, high.raw] {
+                    handles.insert(input);
+                    raw_joins.push((input, result));
+                }
+            }
+            CollectionRecord::Derive(derive) => {
+                let output = derive.output().raw;
+                produced.insert(output);
+                handles.insert(output);
+            }
+        }
+    }
+
+    let unproduced = handles
+        .iter()
+        .filter(|handle| !committed.contains(*handle) && !produced.contains(*handle))
+        .count();
+    if handles.len() > limit {
+        return Ok(MemberLattice {
+            collection,
+            members: Vec::new(),
+            joins: Vec::new(),
+            unproduced,
+            too_large: Some(handles.len()),
+        });
+    }
+
+    let order: Vec<[u8; 32]> = handles.into_iter().collect();
+    let members = order
+        .iter()
+        .map(|handle| Member {
+            handle: *handle,
+            committed: committed.contains(handle),
+            // A storage error and a missing blob are both "not here" for
+            // drawing purposes; neither is a reason to refuse the whole view.
+            resident: snapshot
+                .contains_blob(Inline::<Handle<UnknownBlob>>::new(*handle))
+                .unwrap_or(false),
+        })
+        .collect();
+    let index = |handle: &[u8; 32]| order.binary_search(handle).ok();
+    let mut joins: Vec<(usize, usize)> = raw_joins
+        .iter()
+        .filter_map(|(from, to)| Some((index(from)?, index(to)?)))
+        .filter(|(from, to)| from != to)
+        .collect();
+    joins.sort_unstable();
+    joins.dedup();
+
+    Ok(MemberLattice {
+        collection,
+        members,
+        joins,
+        unproduced,
+        too_large: None,
+    })
+}
+
 #[derive(Clone)]
 struct Frame {
     workers: Vec<WorkerReport>,
     health: Vec<ObserverReport>,
+    /// The member lattice of the collection the viewer selected, when one is
+    /// selected. Requested by the renderer and answered on the next sample,
+    /// because the sampler owns the store and the renderer owns the pointer.
+    members: Option<MemberLattice>,
     /// The collection lattice, when this dashboard was asked for it.
     ///
     /// `None` is not "no collections": it is "not looked at". The renderers
@@ -590,6 +759,13 @@ struct Shared {
     finished: bool,
     revision: u64,
     latest: Option<ReadResult<Arc<Frame>>>,
+    /// The collection whose member lattice the renderer wants next, and a
+    /// counter that changes whenever that choice does. The renderer holds the
+    /// pointer and the sampler holds the store, so the selection has to cross
+    /// between them; the counter is what lets the sampler tell "asked again"
+    /// from "asked for something else" without comparing frames.
+    focus: Option<[u8; 32]>,
+    focus_revision: u64,
 }
 
 type SharedState = Arc<(Mutex<Shared>, Condvar)>;
@@ -669,6 +845,11 @@ fn sample_until_stopped(options: &Options, shared: &SharedState) -> ReadResult<(
         {
             break;
         }
+        let (focus, focus_revision) = {
+            let state = shared.0.lock().unwrap_or_else(|error| error.into_inner());
+            (state.focus, state.focus_revision)
+        };
+        reader.focus = focus;
         let observation = reader.sample().map(Arc::new);
         if options.once {
             once_error = observation.as_ref().err().cloned();
@@ -680,9 +861,14 @@ fn sample_until_stopped(options: &Options, shared: &SharedState) -> ReadResult<(
         if options.once || state.stop {
             break;
         }
+        // Also stop waiting when the viewer selects a different collection:
+        // a member lattice that arrives a whole interval after the click reads
+        // as the view being broken rather than merely periodic.
         let waited = shared
             .1
-            .wait_timeout_while(state, options.interval, |state| !state.stop)
+            .wait_timeout_while(state, options.interval, |state| {
+                !state.stop && state.focus_revision == focus_revision
+            })
             .unwrap_or_else(|error| error.into_inner());
         if waited.0.stop {
             break;
@@ -1145,6 +1331,7 @@ fn rtt(worker: &WorkerReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use triblespace_core::collection::records::{CollectionDerive, CollectionMerge};
     use triblespace_core::collection::{empty_metadata_handle, CollectionCommit, CollectionRecord};
     use triblespace_core::inline::encodings::hash::Handle;
     use triblespace_core::metadata;
@@ -1258,12 +1445,167 @@ mod tests {
         assert_eq!(handles.len(), count, "each collection appears once");
     }
 
+    /// Two commits joined by one merge whose result bytes are not here.
+    fn member_fixture() -> (MemoryRepo, [u8; 32], [u8; 32], [u8; 32], [u8; 32]) {
+        use triblespace_core::collection::CollectionStore;
+        let mut store = MemoryRepo::default();
+        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+        let collection: Collection<SimpleArchive> =
+            store.collection("members", policy).unwrap();
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[13; 32]);
+        let first = store
+            .commit(collection, &signer, entity! { metadata::name: "a" })
+            .unwrap();
+        let second = store
+            .commit(collection, &signer, entity! { metadata::name: "b" })
+            .unwrap();
+        // A real join equation. Its result blob is deliberately not stored:
+        // an endorsed merge whose bytes were collected is ordinary, and it is
+        // exactly the case the drawing must not show as complete.
+        let result = Inline::new([0x77; 32]);
+        let merge = CollectionMerge::sign(
+            &signer,
+            collection.handle(),
+            (first.data(), first.fingerprint()),
+            (second.data(), second.fingerprint()),
+            result,
+        );
+        store.insert(CollectionRecord::Merge(merge)).unwrap();
+        (
+            store,
+            collection.handle().raw,
+            first.data().raw,
+            second.data().raw,
+            result.raw,
+        )
+    }
+
+    #[test]
+    fn a_merge_puts_both_of_its_inputs_under_its_result() {
+        // The join equation is the lattice. If the two inputs do not both land
+        // below the result, the picture is not of `low join high = result`.
+        let (mut store, collection, first, second, result) = member_fixture();
+        let snapshot = store.snapshot().unwrap();
+        let members = observe_members(&snapshot, collection, MEMBER_LIMIT).unwrap();
+        let at = |handle: [u8; 32]| {
+            members
+                .members
+                .iter()
+                .position(|member| member.handle == handle)
+                .expect("member projected")
+        };
+        assert_eq!(members.members.len(), 3);
+        assert_eq!(
+            members.joins,
+            {
+                let mut expected = vec![(at(first), at(result)), (at(second), at(result))];
+                expected.sort_unstable();
+                expected
+            },
+            "both inputs feed the one result"
+        );
+        assert!(members.members[at(first)].committed);
+        assert!(members.members[at(first)].resident);
+        assert!(
+            !members.members[at(result)].committed,
+            "a join result is computed, never authored"
+        );
+        assert!(
+            !members.members[at(result)].resident,
+            "its bytes were never stored, and must draw as the hole they are"
+        );
+        assert_eq!(members.unproduced, 0, "both inputs are commits here");
+    }
+
+    #[test]
+    fn a_derive_contributes_its_output_and_not_its_input() {
+        // A derive's input is a member of the *source* collection. Drawing it
+        // in the target's lattice would mix two collections' members into one
+        // order, which is not a lattice at all.
+        use triblespace_core::collection::CollectionStore;
+        let (mut store, _source, target) = lattice_fixture();
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[17; 32]);
+        let input = Inline::new([0x31; 32]);
+        let output = Inline::new([0x32; 32]);
+        let commit = CollectionCommit::sign(
+            &signer,
+            CollectionHandle::new([0x99; 32]),
+            input,
+            empty_metadata_handle(),
+        );
+        let derive = CollectionDerive::sign(
+            &signer,
+            CollectionHandle::new(target.raw),
+            (input, commit.fingerprint()),
+            output,
+        );
+        store
+            .insert(CollectionRecord::Derive(derive))
+            .unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let members = observe_members(&snapshot, target.raw, MEMBER_LIMIT).unwrap();
+        let handles: Vec<[u8; 32]> = members.members.iter().map(|m| m.handle).collect();
+        assert!(handles.contains(&output.raw), "the output is a member here");
+        assert!(
+            !handles.contains(&input.raw),
+            "the input belongs to the source collection"
+        );
+        assert!(members.joins.is_empty(), "a derive is not a join");
+    }
+
+    #[test]
+    fn an_oversized_member_lattice_is_declined_rather_than_truncated() {
+        // Dropping nodes would silently delete the joins that ran through
+        // them, so the remainder would read as fewer merges than exist.
+        let (mut store, collection, ..) = member_fixture();
+        let snapshot = store.snapshot().unwrap();
+        let members = observe_members(&snapshot, collection, 2).unwrap();
+        assert_eq!(members.too_large, Some(3));
+        assert!(members.members.is_empty());
+        assert!(members.joins.is_empty());
+    }
+
+    #[test]
+    fn a_member_known_only_as_a_join_input_is_counted_not_hidden() {
+        use triblespace_core::collection::CollectionStore;
+        let (mut store, collection, first, _second, result) = member_fixture();
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[19; 32]);
+        // Join the earlier result with a member nothing here produces.
+        let orphan = Inline::new([0x44; 32]);
+        let commit = CollectionCommit::sign(
+            &signer,
+            CollectionHandle::new(collection),
+            orphan,
+            empty_metadata_handle(),
+        );
+        let merge = CollectionMerge::sign(
+            &signer,
+            CollectionHandle::new(collection),
+            (Inline::new(result), commit.fingerprint()),
+            (orphan, commit.fingerprint()),
+            Inline::new([0x55; 32]),
+        );
+        store.insert(CollectionRecord::Merge(merge)).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let members = observe_members(&snapshot, collection, MEMBER_LIMIT).unwrap();
+        assert_eq!(
+            members.unproduced, 1,
+            "the orphan input is reported, not silently dropped"
+        );
+        assert!(
+            members.members.iter().any(|m| m.handle == orphan.raw),
+            "and it is still drawn"
+        );
+        assert!(members.members.iter().any(|m| m.handle == first));
+    }
+
     #[test]
     fn an_unsampled_lattice_is_reported_as_unsampled_not_as_empty() {
         let mut frame = Frame {
             workers: vec![],
             health: vec![],
             lattice: None,
+            members: None,
             warnings: vec![],
             sampled: Instant::now(),
             observation_time: Duration::ZERO,
@@ -1333,6 +1675,7 @@ mod tests {
             workers: vec![worker],
             health: vec![],
             lattice: None,
+            members: None,
             warnings: vec![],
             sampled: Instant::now(),
             observation_time: Duration::ZERO,
@@ -1419,6 +1762,7 @@ mod tests {
                 conditions: vec![],
             }],
             lattice: None,
+            members: None,
             warnings: vec![],
             sampled: Instant::now(),
             observation_time: Duration::ZERO,
@@ -1458,6 +1802,7 @@ mod tests {
             workers: vec![stage],
             health: vec![],
             lattice: None,
+            members: None,
             warnings: vec![],
             sampled: Instant::now(),
             observation_time: Duration::ZERO,

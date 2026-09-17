@@ -23,6 +23,23 @@ pub(super) fn run(options: Options) -> Result<()> {
                 .unwrap_or_else(|error| error.into_inner())
                 .latest
                 .clone();
+            // Forward the viewer's selection to the sampler, which owns the
+            // store. Only a change is published, and it bumps the revision the
+            // sampler waits on so a click is answered on the next pass rather
+            // than at the end of the current interval.
+            let chosen: Option<[u8; 32]> =
+                ctx.ctx().data(|data| data.get_temp(selection_id()));
+            {
+                let mut state = shared
+                    .0
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if state.focus != chosen {
+                    state.focus = chosen;
+                    state.focus_revision = state.focus_revision.wrapping_add(1);
+                    shared.1.notify_all();
+                }
+            }
             ctx.with_padding(DEFAULT_CARD_PADDING, |ctx| match latest {
                 Some(Ok(frame)) => render(
                     ctx,
@@ -247,18 +264,24 @@ fn render_lattice(ui: &mut egui::Ui, frame: &Frame) {
         })
         .collect();
 
-    let id = ui.make_persistent_id("colony-lattice-selection");
-    let selected: Option<usize> = ui.data(|data| data.get_temp::<usize>(id));
+    // The selection is stored as a handle, not as an index: the projection is
+    // re-sorted every observation, and an index would quietly come to mean a
+    // different collection. The id is fixed rather than salted by the Ui stack
+    // so the sampler thread can read the same value back.
+    let id = selection_id();
+    let chosen: Option<[u8; 32]> = ui.data(|data| data.get_temp::<[u8; 32]>(id));
+    let selected = chosen.and_then(position);
     let drawn = LatticeGraph::new(&nodes, &edges)
         .selected(selected)
         .height(300.0)
         .show(ui);
     if let Some(clicked) = drawn.clicked {
+        let handle = collections[clicked].handle;
         ui.data_mut(|data| {
-            if selected == Some(clicked) {
-                data.remove::<usize>(id);
+            if chosen == Some(handle) {
+                data.remove::<[u8; 32]>(id);
             } else {
-                data.insert_temp(id, clicked);
+                data.insert_temp(id, handle);
             }
         });
     }
@@ -342,7 +365,104 @@ fn render_lattice(ui: &mut egui::Ui, frame: &Frame) {
             })
         }
     };
+    render_members(ui, frame, chosen);
     ui.separator();
+}
+
+/// The fixed key the selected collection is stored under.
+///
+/// Fixed, not salted by the Ui stack, because two different holders read it:
+/// the panel that draws the lattice and the loop that forwards the selection
+/// to the sampler.
+fn selection_id() -> egui::Id {
+    egui::Id::new("colony-lattice-selection")
+}
+
+/// The join lattice inside the selected collection.
+///
+/// `MERGE(C, low, high, result)` states `low ⊔ high = result`, so the two
+/// edges under each join mark are the equation itself. A member with no edge
+/// below it was committed or derived rather than joined; a member with none
+/// above it is a maximal element — nothing has joined it into anything yet,
+/// which is the merge work this collection still owes.
+fn render_members(ui: &mut egui::Ui, frame: &Frame, chosen: Option<[u8; 32]>) {
+    use GORBIE::widgets::{LatticeEdge, LatticeGraph, LatticeMark, LatticeNode, LatticePresence};
+
+    let Some(chosen) = chosen else { return };
+    let Some(members) = &frame.members else {
+        ui.small("Reading the selected collection's members...");
+        return;
+    };
+    if members.collection != chosen {
+        // The sampler answers the previous selection until its next pass.
+        ui.small("Reading the selected collection's members...");
+        return;
+    }
+    if let Some(count) = members.too_large {
+        ui.small(format!(
+            "{count} members: more than can be drawn legibly. A truncated lattice              would hide the joins that ran through the dropped members, so none is drawn."
+        ));
+        return;
+    }
+    if members.members.is_empty() {
+        ui.small("No members: nothing has been committed to or derived into this collection.");
+        return;
+    }
+
+    let nodes: Vec<LatticeNode> = members
+        .members
+        .iter()
+        .map(|member| LatticeNode {
+            label: short(&member.handle),
+            // A COMMIT is the one thing here no machine can recompute.
+            mark: match member.committed {
+                true => LatticeMark::Authored,
+                false => LatticeMark::Computed,
+            },
+            presence: match member.resident {
+                true => LatticePresence::Present,
+                false => LatticePresence::Absent,
+            },
+            // Residency is already carried by the mark's stroke; a second
+            // channel saying the same thing would be decoration.
+            coverage: None,
+        })
+        .collect();
+    let edges: Vec<LatticeEdge> = members
+        .joins
+        .iter()
+        .map(|(from, to)| LatticeEdge {
+            from: *from,
+            to: *to,
+            // Every edge here comes from a stored MERGE. Absence of a join is
+            // a member with nothing above it, not a dashed edge.
+            endorsed: true,
+        })
+        .collect();
+
+    let maximal = (0..nodes.len())
+        .filter(|node| !edges.iter().any(|edge| edge.from == *node))
+        .count();
+    ui.add(LatticeGraph::new(&nodes, &edges).height(220.0));
+    ui.horizontal_wrapped(|ui| {
+        ui.small(format!(
+            "{} members · {} joins · {maximal} not yet joined into anything",
+            nodes.len(),
+            edges.len()
+        ));
+        if members.unproduced != 0 {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                format!(
+                    "{} reached only as a join input; what produced them is elsewhere",
+                    members.unproduced
+                ),
+            );
+        }
+    });
+    ui.small(
+        "Within the selected collection: square is a commit, circle is a join result or          mapping output, dashed is a member whose bytes are not here. Each join's two          edges are its MERGE inputs.",
+    );
 }
 
 fn render(ui: &mut egui::Ui, frame: &Frame) {
