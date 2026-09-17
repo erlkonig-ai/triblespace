@@ -411,7 +411,7 @@ fn run_health(pile_path: PathBuf, key_path: Option<PathBuf>, max_age: u64) -> Re
         let facts = snapshot
             .collection(facts)?
             .view::<UnionArchive<OrderedUniverse>>()?;
-        let latest = snapshot.collection(latest)?.view::<LwwIndex>()?;
+        let latest = snapshot.collection(latest)?.view::<LwwIndex>()?.query()?;
         let now = snapshot.instant().to_tai_duration().total_nanoseconds();
         let mut count = 0;
         for (report, node, session, endpoint, created) in find!(
