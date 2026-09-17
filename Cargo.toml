@@ -141,6 +141,10 @@ netwatch = { git = "https://github.com/erlkonig-ai/net-tools.git", rev = "10ab7b
 cubecl-runtime = { git = "https://github.com/erlkonig-ai/cubecl.git", rev = "75635270eed8cfacd1cd0f171f2f6b45a5e65b9c" }
 cubecl-wgpu = { git = "https://github.com/erlkonig-ai/cubecl.git", rev = "75635270eed8cfacd1cd0f171f2f6b45a5e65b9c" }
 
+# Isolated reader candidate: replace with the reviewed Jerky commit pin before publication.
+[patch."https://github.com/triblespace/jerky.git"]
+jerky = { path = "../jerky" }
+
 [package.metadata.kani.flags]
 default-unwind = "1"
 

@@ -147,7 +147,7 @@ fn retain_at(cands: &mut Candidates<'_>, order: &[u32], mut keep: impl FnMut(&Ra
 /// candidate indices.
 fn retain_occurring_at<U>(
     domain: &U,
-    column: &WaveletMatrix<Rank9SelIndex>,
+    column: &WaveletMatrix<SuccinctIndex>,
     r: &Range<usize>,
     cands: &mut Candidates<'_>,
     order: &[u32],
@@ -304,7 +304,7 @@ where
 
 pub(super) fn base_range<U>(
     universe: &U,
-    a: &BitVector<Rank9SelIndex>,
+    a: &BitVector<SuccinctIndex>,
     value: &RawInline,
 ) -> Range<usize>
 where
@@ -321,8 +321,8 @@ where
 
 fn restrict_range<U>(
     universe: &U,
-    a: &BitVector<Rank9SelIndex>,
-    c: &WaveletMatrix<Rank9SelIndex>,
+    a: &BitVector<SuccinctIndex>,
+    c: &WaveletMatrix<SuccinctIndex>,
     value: &RawInline,
     r: &Range<usize>,
 ) -> Range<usize>
@@ -730,9 +730,9 @@ where
         let v_bound = self.term_v.position_value(binding);
 
         Some(match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
-            (None, None, None, true, false, false) => self.archive.entity_count,
-            (None, None, None, false, true, false) => self.archive.attribute_count,
-            (None, None, None, false, false, true) => self.archive.value_count,
+            (None, None, None, true, false, false) => self.archive.entity_count(),
+            (None, None, None, false, true, false) => self.archive.attribute_count(),
+            (None, None, None, false, false, true) => self.archive.value_count(),
             (Some(e), None, None, false, true, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.e_a, e);
                 self.archive.distinct_in(&self.archive.changed_e_a, &r)
