@@ -765,7 +765,14 @@ fn aggregate_support_uses_selected_dag_leaves_without_clipping_certificates() {
     let before = store.snapshot().unwrap();
     let lineage = load_lineage(&before, first).unwrap();
     let partial =
-        resolve_endorsed_lineage(&before, &lineage, &selected, Some(&ab_support)).unwrap();
+        resolve_endorsed_lineage(
+            &before,
+            &lineage,
+            &selected,
+            Some(&ab_support),
+            &mut WitnessMemo::default(),
+        )
+        .unwrap();
     assert_eq!(
         partial.support, a_support,
         "requested AB is not yet certified",
@@ -792,7 +799,14 @@ fn aggregate_support_uses_selected_dag_leaves_without_clipping_certificates() {
     let after = store.snapshot().unwrap();
     reset_mapping_calls();
     for requested in [None, Some(&ab_support), Some(&a_support), Some(&b_support)] {
-        let resolved = resolve_endorsed_lineage(&after, &lineage, &selected, requested).unwrap();
+        let resolved = resolve_endorsed_lineage(
+            &after,
+            &lineage,
+            &selected,
+            requested,
+            &mut WitnessMemo::default(),
+        )
+        .unwrap();
         let expected = match requested {
             None => ab_support.clone(),
             Some(requested) if requested == &ab_support => ab_support.clone(),
@@ -849,7 +863,14 @@ fn aggregate_support_deduplicates_leaves_but_keeps_alternative_certifications() 
     let selected = BTreeSet::from([first.handle()]);
     let ab_support = support(root, &[a.clone(), b.clone()]);
     let b_support = support(root, &[b]);
-    let whole = resolve_endorsed_lineage(&snapshot, &lineage, &selected, None).unwrap();
+    let whole = resolve_endorsed_lineage(
+        &snapshot,
+        &lineage,
+        &selected,
+        None,
+        &mut WitnessMemo::default(),
+    )
+    .unwrap();
     assert_eq!(whole.support, ab_support);
     let alternatives = &whole.witnesses[&(first.handle(), data(&output))];
     assert_eq!(alternatives.len(), 4);
@@ -863,7 +884,14 @@ fn aggregate_support_deduplicates_leaves_but_keeps_alternative_certifications() 
             *fingerprint == record.fingerprint() && support == expected
         }));
     }
-    let exact = resolve_endorsed_lineage(&snapshot, &lineage, &selected, Some(&b_support)).unwrap();
+    let exact = resolve_endorsed_lineage(
+        &snapshot,
+        &lineage,
+        &selected,
+        Some(&b_support),
+        &mut WitnessMemo::default(),
+    )
+    .unwrap();
     assert_eq!(exact.support, b_support);
     assert_eq!(exact.witnesses[&(first.handle(), data(&output))].len(), 3);
     assert!(!exact.witnesses.contains_key(&(root.handle(), data(&a))));
@@ -915,7 +943,14 @@ fn aggregate_support_excludes_missing_witnesses_and_unadmitted_producers() {
     let before = store.snapshot().unwrap();
     let lineage = load_lineage(&before, first).unwrap();
     let selected = BTreeSet::from([first.handle()]);
-    let resolved = resolve_endorsed_lineage(&before, &lineage, &selected, None).unwrap();
+    let resolved = resolve_endorsed_lineage(
+        &before,
+        &lineage,
+        &selected,
+        None,
+        &mut WitnessMemo::default(),
+    )
+    .unwrap();
     assert_eq!(resolved.support, support(root, std::slice::from_ref(&a)));
     assert_eq!(resolved.images.len(), 1);
     assert_eq!(
@@ -925,7 +960,14 @@ fn aggregate_support_excludes_missing_witnesses_and_unadmitted_producers() {
 
     store.insert(CollectionRecord::Commit(cb)).unwrap();
     let after = store.snapshot().unwrap();
-    let resolved = resolve_endorsed_lineage(&after, &lineage, &selected, None).unwrap();
+    let resolved = resolve_endorsed_lineage(
+        &after,
+        &lineage,
+        &selected,
+        None,
+        &mut WitnessMemo::default(),
+    )
+    .unwrap();
     assert_eq!(resolved.support, support(root, &[a.clone(), b.clone()]));
     assert_eq!(resolved.images.len(), 2);
 
@@ -941,7 +983,13 @@ fn aggregate_support_excludes_missing_witnesses_and_unadmitted_producers() {
         )))
         .unwrap();
     assert!(matches!(
-        resolve_endorsed_lineage(&store.snapshot().unwrap(), &lineage, &selected, None),
+        resolve_endorsed_lineage(
+            &store.snapshot().unwrap(),
+            &lineage,
+            &selected,
+            None,
+            &mut WitnessMemo::default(),
+        ),
         Err(CollectionRealizationError::Resolution(reason)) if reason.contains("conflicting outputs")
     ));
 }
@@ -3268,4 +3316,95 @@ fn equal_payload_commit_does_not_restart_completed_target_maintenance() {
     assert!(store.acquired.is_empty());
     drop(after);
     assert_eq!(records(&mut store.inner), before);
+}
+
+/// Fixture for the witness memo: one foundational COMMIT and one DERIVE that
+/// names it, with the DERIVE inserted first so the memo can observe it open.
+fn witness_memo_fixture() -> (
+    MemoryRepo,
+    Collection<SimpleArchive>,
+    BTreeMap<crate::collection::CollectionHandle, crate::collection::CollectionHandle>,
+    Blob<SimpleArchive>,
+    CollectionCommit,
+    CollectionDerive,
+) {
+    let key = equation_signer();
+    let mut store = MemoryRepo::default();
+    let foundation = store.collection("witness-memo-root", policy()).unwrap();
+    let target = store.collection("witness-memo-target", policy()).unwrap();
+    let source_by_target = BTreeMap::from([(target.handle(), foundation.handle())]);
+
+    let blob = archive(1, 1);
+    store.put::<SimpleArchive, _>(blob.clone()).unwrap();
+    let metadata = store
+        .put::<SimpleArchive, _>(TribleSet::new().to_blob())
+        .unwrap();
+    let commit = CollectionCommit::sign(&key, foundation.handle(), data(&blob), metadata);
+    let derive = CollectionDerive::sign(
+        &key,
+        target.handle(),
+        (data(&blob), commit.fingerprint()),
+        data(&archive(2, 2)),
+    );
+    store.insert(CollectionRecord::Derive(derive)).unwrap();
+    (store, foundation, source_by_target, blob, commit, derive)
+}
+
+/// The same operation may publish the witness that closes a record it has
+/// already seen open, so an open record must never be memoized. Only closure
+/// is a property of the record rather than of one snapshot.
+#[test]
+fn a_witness_arriving_later_closes_a_record_the_memo_already_saw_open() {
+    let (mut store, foundation, source_by_target, blob, commit, derive) = witness_memo_fixture();
+    let mut memo = WitnessMemo::default();
+
+    let open = store.snapshot().unwrap();
+    assert_eq!(
+        memo.closure(foundation, &source_by_target)
+            .support(&open, CollectionRecord::Derive(derive))
+            .unwrap(),
+        None,
+    );
+
+    store.insert(CollectionRecord::Commit(commit)).unwrap();
+    let closed = store.snapshot().unwrap();
+    assert_eq!(
+        memo.closure(foundation, &source_by_target)
+            .support(&closed, CollectionRecord::Derive(derive))
+            .unwrap(),
+        Some(support(foundation, &[blob])),
+    );
+}
+
+/// The lineage names each DERIVE's source collection, so it is part of what
+/// the memoized answer is an answer to. Presenting another lineage starts a
+/// new memo instead of reusing the old one.
+#[test]
+fn a_different_lineage_does_not_answer_from_the_previous_lineages_memo() {
+    let (mut store, foundation, source_by_target, blob, commit, derive) = witness_memo_fixture();
+    store.insert(CollectionRecord::Commit(commit)).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let record = CollectionRecord::Derive(derive);
+    let expected = support(foundation, &[blob]);
+    let mut memo = WitnessMemo::default();
+
+    assert_eq!(
+        memo.closure(foundation, &source_by_target)
+            .support(&snapshot, record)
+            .unwrap(),
+        Some(expected.clone()),
+    );
+    // No source for the DERIVE's collection: this lineage cannot close it.
+    assert_eq!(
+        memo.closure(foundation, &BTreeMap::new())
+            .support(&snapshot, record)
+            .unwrap(),
+        None,
+    );
+    assert_eq!(
+        memo.closure(foundation, &source_by_target)
+            .support(&snapshot, record)
+            .unwrap(),
+        Some(expected),
+    );
 }

@@ -22,6 +22,7 @@ use crate::trible::Fragment;
 
 use super::encoding::{collection_member_availability, CollectionMemberAvailability};
 use super::operation_snapshot::OperationFrontier;
+use super::witness::WitnessMemo;
 use super::{
     collection_complete_physical_cover, descriptor, resolve_collection_semantics, Collection,
     CollectionClaimValidation, CollectionData, CollectionDerive, CollectionEncoding,
@@ -575,8 +576,13 @@ where
     R: StoreRead,
 {
     let lineage = load_record_lineage(snapshot, collection)?;
-    let certified =
-        resolve_endorsed_lineage(snapshot, &lineage, &BTreeSet::from([collection]), None)?;
+    let certified = resolve_endorsed_lineage(
+        snapshot,
+        &lineage,
+        &BTreeSet::from([collection]),
+        None,
+        &mut WitnessMemo::default(),
+    )?;
     let mut records = Vec::new();
     for ((owner, _), alternatives) in certified.witnesses {
         if owner != collection {
@@ -630,6 +636,7 @@ fn resolve_endorsed_lineage<R>(
     lineage: &Lineage,
     collections: &BTreeSet<CollectionHandle>,
     requested: Option<&Support>,
+    memo: &mut WitnessMemo,
 ) -> Result<CertifiedResolution, CollectionRealizationError>
 where
     R: StoreRead,
@@ -660,7 +667,7 @@ where
     let candidates = snapshot.select_records(&selectors).map_err(|error| {
         CollectionRealizationError::storage("select endorsed collection records", error)
     })?;
-    let mut closure = super::witness::WitnessClosure::default();
+    let mut closure = memo.closure(lineage.foundation, &lineage.source_by_target);
     let mut roots = BTreeSet::new();
     let mut witnesses = InputWitnesses::new();
     let mut images = BTreeMap::<_, BTreeSet<_>>::new();
@@ -680,12 +687,7 @@ where
             continue;
         }
         let Some(record_support) = closure
-            .support(
-                snapshot,
-                lineage.foundation,
-                &lineage.source_by_target,
-                record,
-            )
+            .support(snapshot, record)
             .map_err(|error| {
                 CollectionRealizationError::storage("read endorsed input records", error)
             })?
@@ -716,12 +718,7 @@ where
                 .insert(derive.output());
         }
         let record_support = closure
-            .support(
-                snapshot,
-                lineage.foundation,
-                &lineage.source_by_target,
-                *record,
-            )
+            .support(snapshot, *record)
             .map_err(|error| CollectionRealizationError::storage("read endorsed support", error))?
             .expect("accepted roots have closed witness DAGs");
         let alternatives = witnesses
@@ -858,6 +855,7 @@ fn resolve_target<R, E>(
     target: Collection<E>,
     lineage: &Lineage,
     requested: &Support,
+    memo: &mut WitnessMemo,
 ) -> Result<TargetResolution<E>, CollectionRealizationError>
 where
     R: StoreRead,
@@ -868,6 +866,7 @@ where
         lineage,
         &BTreeSet::from([target.handle()]),
         Some(requested),
+        memo,
     )?;
     resolve_certified_target(snapshot, target, lineage, requested, certified)
 }
@@ -941,7 +940,8 @@ where
     R: StoreRead,
     E: CollectionEncoding,
 {
-    let resolved = attach_exact_resolution(snapshot, target, requested)?;
+    let resolved =
+        attach_exact_resolution(snapshot, target, requested, &mut WitnessMemo::default())?;
     Ok((resolved.support, resolved.cover))
 }
 
@@ -949,13 +949,14 @@ pub(super) fn attach_exact_resolution<R, E>(
     snapshot: &R,
     target: Collection<E>,
     requested: &Support,
+    memo: &mut WitnessMemo,
 ) -> Result<TargetResolution<E>, CollectionRealizationError>
 where
     R: StoreRead,
     E: CollectionEncoding,
 {
     let lineage = load_lineage(snapshot, target)?;
-    let mut resolved = resolve_target(snapshot, target, &lineage, requested)?;
+    let mut resolved = resolve_target(snapshot, target, &lineage, requested, memo)?;
     // An explicit root cover is also a low-level content selection: its
     // directly resident members need no COMMIT to be read. This does not
     // manufacture admission or an input witness. Ordinary collection
@@ -1005,8 +1006,13 @@ where
     E: CollectionEncoding,
 {
     let lineage = load_lineage(snapshot, target)?;
-    let certified =
-        resolve_endorsed_lineage(snapshot, &lineage, &BTreeSet::from([target.handle()]), None)?;
+    let certified = resolve_endorsed_lineage(
+        snapshot,
+        &lineage,
+        &BTreeSet::from([target.handle()]),
+        None,
+        &mut WitnessMemo::default(),
+    )?;
     let represented = certified.support.clone();
     let resolved = resolve_certified_target(snapshot, target, &lineage, &represented, certified)?;
     Ok((resolved.support, resolved.cover))
@@ -1024,17 +1030,13 @@ where
     E: CollectionEncoding,
 {
     let lineage = load_lineage(snapshot, target)?;
-    let mut closure = super::witness::WitnessClosure::default();
+    let mut memo = WitnessMemo::default();
+    let mut closure = memo.closure(lineage.foundation, &lineage.source_by_target);
     let mut support = Support::from_data(lineage.foundation, []);
     let mut incomplete = Vec::new();
     for record in records {
         match closure
-            .support(
-                snapshot,
-                lineage.foundation,
-                &lineage.source_by_target,
-                *record,
-            )
+            .support(snapshot, *record)
             .map_err(|error| CollectionRealizationError::storage("read support witnesses", error))?
         {
             Some(represented) => {
@@ -1068,6 +1070,7 @@ fn probe_mapping<R, M>(
     target: Collection<M::Target>,
     support: &Support,
     admit_source: bool,
+    memo: &mut WitnessMemo,
 ) -> Result<MappingProbe<M>, CollectionRealizationError>
 where
     R: StoreRead,
@@ -1100,7 +1103,7 @@ where
     if admit_source {
         selected.insert(source_handle);
     }
-    let certified = resolve_endorsed_lineage(snapshot, &lineage, &selected, Some(support))?;
+    let certified = resolve_endorsed_lineage(snapshot, &lineage, &selected, Some(support), memo)?;
     // Image reuse crosses support witnesses, so its functional check must do
     // the same. A cold or support-pruned claim is still a certified equation;
     // residency must never decide which conflicting image we endorse next.
@@ -1288,6 +1291,7 @@ where
         support,
         &BTreeSet::new(),
         &mut frontier,
+        &mut WitnessMemo::default(),
     )
 }
 
@@ -1312,6 +1316,7 @@ fn ensure_exact_resident_in_frontier_with<S, M>(
     support: &Support,
     unavailable: &BTreeSet<CollectionData>,
     frontier: &mut OperationFrontier<S::Snapshot>,
+    memo: &mut WitnessMemo,
 ) -> Result<(), CollectionRealizationError>
 where
     S: Store,
@@ -1324,7 +1329,7 @@ where
         let snapshot = frontier.view(store.snapshot().map_err(|error| {
             CollectionRealizationError::storage("open exact mapping snapshot", error)
         })?);
-        let probe = probe_mapping::<_, M>(&snapshot, target, support, true)?;
+        let probe = probe_mapping::<_, M>(&snapshot, target, support, true, memo)?;
         demand_missing_dependency::<_, M>(&snapshot, target, &probe, support, unavailable)?;
         if probe.target_resolution.is_exact_for(support) {
             return Ok(());
@@ -1455,6 +1460,7 @@ where
         support,
         &BTreeSet::new(),
         &mut frontier,
+        &mut WitnessMemo::default(),
     )
 }
 
@@ -1479,6 +1485,7 @@ fn maintain_exact_resident_in_frontier_with<S, M>(
     support: &Support,
     unavailable: &BTreeSet<CollectionData>,
     frontier: &mut OperationFrontier<S::Snapshot>,
+    memo: &mut WitnessMemo,
 ) -> Result<(), CollectionRealizationError>
 where
     S: Store,
@@ -1491,6 +1498,7 @@ where
         support,
         unavailable,
         frontier,
+        memo,
     )?;
     let mapping = coarsen_from_resident_source::<S, M>(
         store,
@@ -1499,6 +1507,7 @@ where
         support,
         unavailable,
         frontier,
+        memo,
     )?;
     super::exact_target_compaction::maintain_target_with(
         store,
@@ -1506,6 +1515,7 @@ where
         signing_key,
         support,
         frontier,
+        memo,
         |descriptor, low, high, reader| mapping.join_images(descriptor, None, low, high, reader),
     )
 }
@@ -1522,6 +1532,7 @@ fn coarsen_from_resident_source<S, M>(
     support: &Support,
     unavailable: &BTreeSet<CollectionData>,
     frontier: &mut OperationFrontier<S::Snapshot>,
+    memo: &mut WitnessMemo,
 ) -> Result<M, CollectionRealizationError>
 where
     S: Store,
@@ -1532,7 +1543,7 @@ where
         let snapshot = frontier.view(store.snapshot().map_err(|error| {
             CollectionRealizationError::storage("open source-guided maintenance snapshot", error)
         })?);
-        let probe = probe_mapping::<_, M>(&snapshot, target, support, true)?;
+        let probe = probe_mapping::<_, M>(&snapshot, target, support, true, memo)?;
         demand_missing_dependency::<_, M>(&snapshot, target, &probe, support, unavailable)?;
         let semantics = &probe.target_resolution.semantics;
         let source = probe.source.handle();
@@ -1811,6 +1822,7 @@ where
     S: Store + AsyncBlobStoreAcquire,
 {
     let mut attempted = BTreeSet::new();
+    let mut memo = WitnessMemo::default();
     loop {
         let snapshot = frontier.view(store.snapshot().map_err(|error| {
             CollectionRealizationError::storage("observe root realization", error)
@@ -1823,7 +1835,7 @@ where
                 ));
             }
             require_support(&lineage, support)?;
-            let resolved = resolve_target(&snapshot, target, &lineage, support)?;
+            let resolved = resolve_target(&snapshot, target, &lineage, support, &mut memo)?;
             if resolved.is_exact_for(support) {
                 return Ok(());
             }
@@ -1877,6 +1889,7 @@ async fn prepare_exact_mapping<S, M>(
     target: Collection<M::Target>,
     support: &Support,
     frontier: &OperationFrontier<S::Snapshot>,
+    memo: &mut WitnessMemo,
 ) -> Result<bool, CollectionRealizationError>
 where
     S: Store + AsyncBlobStoreAcquire,
@@ -1886,7 +1899,7 @@ where
         let snapshot = frontier.view(store.snapshot().map_err(|error| {
             CollectionRealizationError::storage("observe exact target before acquisition", error)
         })?);
-        match probe_mapping::<_, M>(&snapshot, target, support, false) {
+        match probe_mapping::<_, M>(&snapshot, target, support, false, memo) {
             Ok(probe) => probe.target_resolution.is_exact_for(support),
             // A missing descriptor can still be acquired through the ordinary
             // active path. Semantic/type/mapping errors must not become misses.
@@ -1911,7 +1924,8 @@ where
     S: Store + AsyncBlobStoreAcquire,
     M: CollectionMapping,
 {
-    if prepare_exact_mapping::<S, M>(store, target, support, frontier).await? {
+    let mut memo = WitnessMemo::default();
+    if prepare_exact_mapping::<S, M>(store, target, support, frontier, &mut memo).await? {
         return Ok(());
     }
     let mut attempted = BTreeSet::new();
@@ -1924,6 +1938,7 @@ where
             support,
             &unavailable,
             frontier,
+            &mut memo,
         ) {
             Err(CollectionRealizationError::MissingDependency { member }) => {
                 if attempted.contains(&member) {
@@ -1951,7 +1966,8 @@ where
 {
     // Warm maintenance may still coarsen the target, but source-guided
     // opportunities are optional and must use only already resident evidence.
-    prepare_exact_mapping::<S, M>(store, target, support, frontier).await?;
+    let mut memo = WitnessMemo::default();
+    prepare_exact_mapping::<S, M>(store, target, support, frontier, &mut memo).await?;
     let mut attempted = BTreeSet::new();
     let mut unavailable = BTreeSet::new();
     loop {
@@ -1962,6 +1978,7 @@ where
             support,
             &unavailable,
             frontier,
+            &mut memo,
         ) {
             Err(CollectionRealizationError::MissingDependency { member }) => {
                 if attempted.contains(&member) {

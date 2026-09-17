@@ -17,6 +17,7 @@ use super::exact_derived::{
     attach_exact_resolution, data_identity, merge_witness_pairs, producer_is_admitted,
     CollectionRealizationError, InputWitnesses,
 };
+use super::witness::WitnessMemo;
 use super::operation_snapshot::{OperationFrontier, OperationSnapshot};
 use super::{
     Collection, CollectionData, CollectionEncoding, CollectionMerge, CollectionOperationError,
@@ -39,6 +40,7 @@ pub(super) fn maintain_target<S, E>(
     signing_key: &SigningKey,
     support: &Support,
     frontier: &mut OperationFrontier<S::Snapshot>,
+    memo: &mut WitnessMemo,
 ) -> Result<(), CollectionRealizationError>
 where
     S: Store,
@@ -50,6 +52,7 @@ where
         signing_key,
         support,
         frontier,
+        memo,
         |descriptor, low, high, reader| E::join_members(descriptor, low, high, reader).map(Some),
     )
 }
@@ -62,6 +65,7 @@ pub(super) fn maintain_target_with<S, E, J>(
     signing_key: &SigningKey,
     support: &Support,
     frontier: &mut OperationFrontier<S::Snapshot>,
+    memo: &mut WitnessMemo,
     mut join: J,
 ) -> Result<(), CollectionRealizationError>
 where
@@ -81,7 +85,7 @@ where
         let snapshot = frontier.view(store.snapshot().map_err(|error| {
             CollectionRealizationError::storage("open target-maintenance snapshot", error)
         })?);
-        let resolved = attach_exact_resolution(&snapshot, target, support)?;
+        let resolved = attach_exact_resolution(&snapshot, target, support, memo)?;
         let identity = cover_identity(&resolved.cover);
         if !seen.insert(identity.clone()) {
             return Err(CollectionRealizationError::Stalled { cover: identity });
