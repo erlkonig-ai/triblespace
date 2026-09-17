@@ -3433,3 +3433,69 @@ fn a_conservative_all_change_set_refuses_the_carried_resolution() {
         "ALL refuses the carry, so coarsening resolves for itself as it did before"
     );
 }
+
+/// A mapping that is deliberately NOT `Send`.
+///
+/// `ensure_exact_resident_in_frontier_with` returns `()` and delegates to a
+/// private carrying form, and that split is load-bearing rather than
+/// cosmetic: `CarriedProbe` contains `M`, the asynchronous ensure entry point
+/// holds its callee's result across an `.await`, and letting the pair out of
+/// the original function puts `M` inside a public `impl Future + Send` and
+/// demands `M: Send` on an existing public signature. This type plus the
+/// assertion below make that a compile-time control instead of a comment: if
+/// the carry ever leaks into that future's state machine, this stops building.
+#[allow(dead_code)]
+struct NonSendMapping {
+    not_send: std::rc::Rc<()>,
+}
+
+impl CollectionMapping for NonSendMapping {
+    type Source = SimpleArchive;
+    type Target = SimpleArchive;
+
+    fn fragment(&self) -> Fragment {
+        Fragment::empty()
+    }
+
+    fn bind(_source: &Fragment, _target: &Fragment) -> Result<Self, CollectionOperationError> {
+        Ok(Self {
+            not_send: std::rc::Rc::new(()),
+        })
+    }
+
+    fn map<R>(
+        &self,
+        source: &Blob<Self::Source>,
+        _reader: &R,
+    ) -> Result<Blob<Self::Target>, CollectionOperationError>
+    where
+        R: StoreRead,
+    {
+        let _ = &self.not_send;
+        Ok(source.clone())
+    }
+}
+
+/// Never called. It exists to be compiled.
+#[allow(dead_code)]
+fn the_public_ensure_future_stays_send_for_a_non_send_mapping<S>(
+    store: &mut S,
+    target: Collection<SimpleArchive>,
+    signing_key: &SigningKey,
+    support: &Support,
+    frontier: &mut OperationFrontier<S::Snapshot>,
+) where
+    S: Store + AsyncBlobStoreAcquire + Send,
+    S::Snapshot: Send,
+{
+    fn assert_send<T: Send>(_: &T) {}
+    let future = ensure_exact_in_frontier_with::<S, NonSendMapping>(
+        store,
+        target,
+        signing_key,
+        support,
+        frontier,
+    );
+    assert_send(&future);
+    drop(future);
+}
