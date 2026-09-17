@@ -271,10 +271,7 @@ fn render_lattice(ui: &mut egui::Ui, frame: &Frame) {
     let id = selection_id();
     let chosen: Option<[u8; 32]> = ui.data(|data| data.get_temp::<[u8; 32]>(id));
     let selected = chosen.and_then(position);
-    let drawn = LatticeGraph::new(&nodes, &edges)
-        .selected(selected)
-        .height(300.0)
-        .show(ui);
+    let drawn = LatticeGraph::new(&nodes, &edges).selected(selected).show(ui);
     if let Some(clicked) = drawn.clicked {
         let handle = collections[clicked].handle;
         ui.data_mut(|data| {
@@ -304,11 +301,10 @@ fn render_lattice(ui: &mut egui::Ui, frame: &Frame) {
         }
     });
     ui.small(
-        "Left to right is derivation: a collection's sources are always to its left. \
-         Square is authored, circle is computed. Dashed is a hole — a collection this \
-         store knows only by name, or a derivation the descriptor declares and no \
-         record performs. The arc is result blobs resident over records naming that \
-         collection, per collection, in this pile alone.",
+        "Left to right is derivation; sources are always to the left. Square authored, \
+         circle computed. Dashed is a hole: a collection known only by name, or a \
+         derivation declared and never performed. Arc: result blobs resident over \
+         records naming that collection, per collection, in this pile alone.",
     );
 
     // Hover previews a chain; a click pins it. Previewing on hover is what
@@ -443,7 +439,7 @@ fn render_members(ui: &mut egui::Ui, frame: &Frame, chosen: Option<[u8; 32]>) {
     let maximal = (0..nodes.len())
         .filter(|node| !edges.iter().any(|edge| edge.from == *node))
         .count();
-    ui.add(LatticeGraph::new(&nodes, &edges).height(220.0));
+    ui.add(LatticeGraph::new(&nodes, &edges));
     ui.horizontal_wrapped(|ui| {
         ui.small(format!(
             "{} members · {} joins · {maximal} not yet joined into anything",
@@ -461,7 +457,9 @@ fn render_members(ui: &mut egui::Ui, frame: &Frame, chosen: Option<[u8; 32]>) {
         }
     });
     ui.small(
-        "Within the selected collection: square is a commit, circle is a join result or          mapping output, dashed is a member whose bytes are not here. Each join's two          edges are its MERGE inputs.",
+        "Inside the selection: square is a commit, circle a join result or mapping \
+         output, dashed a member whose bytes are not here. Each join's two edges are \
+         its MERGE inputs.",
     );
 }
 

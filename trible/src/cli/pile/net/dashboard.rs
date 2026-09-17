@@ -435,12 +435,14 @@ impl LatticeCollection {
 /// open world, and a collection whose bytes are elsewhere is ordinary, not
 /// corrupt.
 ///
-/// Cost, measured on self.pile (6.1 GB, 423562 stored records, 275
-/// collections) with a debug build on this aarch64 box: the record walk inside
-/// `inspect_local` is ~13 s and the descriptor pass ~1.2 s, **per observation**
-/// — against ~925 s for the first `snapshot()` the dashboard already takes, but
-/// repeated every sample thereafter, where the rest of a sample is milliseconds.
-/// That is why it is behind a flag rather than always on.
+/// Cost, measured end to end on self.pile — 6.1 GB, 423562 stored records over
+/// 275 collections — with a debug build on this aarch64 box: **37 s for one
+/// whole observation**, snapshot and all. That is the figure that matters,
+/// because it is what the sampler actually spends per sample. A first cold
+/// open of the same pile took ~925 s in `snapshot()` alone, so the 37 s is a
+/// warm-cache steady state and a first sample after boot will be far worse.
+/// Either way it is seconds to minutes where the rest of a sample is
+/// milliseconds, which is why it is behind a flag rather than always on.
 fn observe_lattice<R: triblespace_core::repo::StoreRead>(
     snapshot: &R,
     seeds: impl IntoIterator<Item = [u8; 32]>,
@@ -1136,28 +1138,35 @@ fn render_terminal(frame: &Frame) -> String {
             out.push_str(
                 "  Resident is result blobs actually here over records naming the collection, per collection.\n",
             );
-            for collection in collections.iter().take(24) {
-                let _ = writeln!(
-                    out,
-                    "  {} {} · {} commit / {} merge / {} derive · {} of {} results resident{}",
-                    if collection.descriptor_resident { "+" } else { "?" },
-                    collection
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| short(&collection.handle)),
-                    collection.commits,
-                    collection.merges,
-                    collection.derives,
-                    collection.result_resident,
-                    collection.stored(),
-                    match collection.source {
-                        Some(source) => format!(" · derives from {}", short(&source)),
-                        None => String::new(),
-                    }
-                );
-            }
-            if collections.len() > 24 {
-                let _ = writeln!(out, "  ... {} more not listed", collections.len() - 24);
+            // Derived descriptors carry no name of their own, so they sort
+            // last; a flat cut then hides every derivation behind the roots,
+            // which are the least interesting rows here. Sample both.
+            let (derived_rows, root_rows): (Vec<_>, Vec<_>) =
+                collections.iter().partition(|c| c.source.is_some());
+            for (rows, kind) in [(&root_rows, "root"), (&derived_rows, "derived")] {
+                for collection in rows.iter().take(12) {
+                    let _ = writeln!(
+                        out,
+                        "  {} {} · {} commit / {} merge / {} derive · {} of {} results resident{}",
+                        if collection.descriptor_resident { "+" } else { "?" },
+                        collection
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| short(&collection.handle)),
+                        collection.commits,
+                        collection.merges,
+                        collection.derives,
+                        collection.result_resident,
+                        collection.stored(),
+                        match collection.source {
+                            Some(source) => format!(" · derives from {}", short(&source)),
+                            None => String::new(),
+                        }
+                    );
+                }
+                if rows.len() > 12 {
+                    let _ = writeln!(out, "  ... {} more {kind} not listed", rows.len() - 12);
+                }
             }
             out.push('\n');
         }

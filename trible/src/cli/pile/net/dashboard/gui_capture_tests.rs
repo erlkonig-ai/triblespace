@@ -17,6 +17,7 @@ use super::*;
 use std::fs::{self, OpenOptions};
 use std::path::Path;
 
+use triblespace_core::blob::encodings::succinctarchive::SuccinctArchiveBlob;
 use triblespace_core::prelude::*;
 use triblespace_core::{metadata, signing_key_file};
 use GORBIE::{CaptureOptions, HeadlessTheme};
@@ -43,7 +44,11 @@ fn generated_frame(directory: &Path) -> Result<(Frame, i128)> {
     let collection: Collection<SimpleArchive> =
         writer.collection("generated-dashboard-telemetry", policy.clone())?;
     let health: Collection<SimpleArchive> =
-        writer.collection(health_record::COLLECTION_NAME, policy)?;
+        writer.collection(health_record::COLLECTION_NAME, policy.clone())?;
+    // A registered derivation that is never maintained. It has no records at
+    // all, so it is exactly the case a record-seeded walk would omit: the
+    // lattice must show the declared-but-unperformed derivation as a hole.
+    let derived = writer.derive::<SuccinctArchiveBlob>(collection, (), policy)?;
     // These are disposable, public fixture endpoint labels, not any node's key.
     let nodes = [11, 12, 13, 14, 15]
         .map(|seed| ed25519_dalek::SigningKey::from_bytes(&[seed; 32]).verifying_key());
@@ -200,6 +205,17 @@ fn generated_frame(directory: &Path) -> Result<(Frame, i128)> {
                 state: health_record::State::Stalled,
                 alert: true,
             },
+            // An observer naming the derivation. This is the realistic way a
+            // never-maintained collection becomes visible: it has no records
+            // of its own, so only a handle from outside the record set reaches
+            // it, and a health condition is exactly such a handle.
+            health_record::Condition {
+                component: health_record::Component::Collection,
+                collection: Some(derived.handle()),
+                peer: Some(nodes[1]),
+                state: health_record::State::Stalled,
+                alert: true,
+            },
         ],
     )?;
     writer.commit(health, &signer, health_facts)?;
@@ -214,8 +230,11 @@ fn generated_frame(directory: &Path) -> Result<(Frame, i128)> {
         interval: Duration::from_secs(1),
         once: true,
         gui: false,
-        lattice: false,
+        lattice: true,
     })?;
+    // Stand in for a viewer's click, so the capture also exercises the member
+    // lattice the renderer requests through the sampler.
+    reader.focus = Some(collection.handle().raw);
     let sampled = reader.sample();
     let closed = reader.close();
     closed?;
@@ -225,6 +244,26 @@ fn generated_frame(directory: &Path) -> Result<(Frame, i128)> {
 
 fn assert_mixed_states(frame: &Frame) {
     assert_eq!((frame.readable_sources, frame.selected_sources), (1, 1));
+    let lattice = frame.lattice.as_ref().expect("the lattice was requested");
+    let derived: Vec<_> = lattice.iter().filter(|c| c.source.is_some()).collect();
+    assert_eq!(derived.len(), 1, "one derivation is registered");
+    assert_eq!(
+        derived[0].stored(),
+        0,
+        "and never maintained, which must draw as an unperformed derivation"
+    );
+    assert!(
+        lattice.iter().any(|c| c.name.as_deref()
+            == Some("generated-dashboard-telemetry")
+            && c.commits > 0),
+        "the source root is present with its commits"
+    );
+    let members = frame.members.as_ref().expect("the selection was answered");
+    assert!(members.too_large.is_none());
+    assert!(
+        !members.members.is_empty(),
+        "the selected collection has members to draw"
+    );
     assert_eq!(frame.nodes().len(), 5);
     assert_eq!(frame.workers.len(), 9);
     assert_eq!(frame.health.len(), 1);
