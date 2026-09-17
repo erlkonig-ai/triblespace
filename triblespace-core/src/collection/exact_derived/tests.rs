@@ -268,9 +268,11 @@ thread_local! {
     static FIRST_MAP_CALLS: Cell<usize> = const { Cell::new(0) };
     static SECOND_MAP_CALLS: Cell<usize> = const { Cell::new(0) };
     static SECOND_JOIN_CALLS: Cell<usize> = const { Cell::new(0) };
-    /// One bind per resolution: `probe_mapping` binds the concrete mapping
-    /// named by the target descriptor, so a resolution that is carried forward
-    /// instead of recomputed is exactly a bind that does not happen.
+    /// Mapping binds. NOT "one per resolution": the eight-member tier cascade
+    /// binds once while selecting records five times, so the two quantities
+    /// come apart as soon as a pass has several tier rounds. In the carry
+    /// controls they move together, and both are asserted there for exactly
+    /// that reason.
     static SECOND_BIND_CALLS: Cell<usize> = const { Cell::new(0) };
     /// Forces `GuardSnapshot::changes_since` to answer `ALL`, standing in for a
     /// backend without scoped comparison. A carried resolution must then be
@@ -2123,6 +2125,7 @@ fn target_maintenance_reprobes_once_per_tier_not_per_carry() {
         .unwrap();
 
     let mut store = GuardStore::new(inner);
+    reset_mapping_calls();
     maintain_exact_resident::<_, SecondEncoding>(&mut store, second, &equation_signer(), &support)
         .unwrap();
 
@@ -3361,10 +3364,19 @@ fn coarsening_reuses_the_ensure_resolution_when_nothing_changed_between_them() {
     // Measured on this candidate against its own parent c0bd6042, same test,
     // same fixture: the unpatched round resolves TWICE here, once in ensure and
     // once again in coarsening. Carrying the first forward makes it one.
+    // Measured on this candidate against its own parent c0bd6042, same test,
+    // same fixture: the unpatched round is (2, 3). Carrying the ensure round's
+    // resolution into coarsening removes one mapping bind and one
+    // record-selection query. Both are asserted, because they are different
+    // quantities and only their agreement makes "one resolution fewer" a fair
+    // description of what happened.
     assert_eq!(
-        SECOND_BIND_CALLS.get(),
-        1,
-        "a no-op maintain resolves once; it resolved twice before the carry"
+        (
+            SECOND_BIND_CALLS.get(),
+            store.semantic_probes.load(Ordering::SeqCst)
+        ),
+        (1, 2),
+        "a no-op maintain binds once and selects twice; it was (2, 3) before the carry"
     );
 }
 
@@ -3444,10 +3456,16 @@ fn a_conservative_all_change_set_refuses_the_carried_resolution() {
         "refusing the carry must not create work: {:?}",
         store.events
     );
+    // Exactly the unpatched no-op figures, which is the strongest thing this
+    // control can say: refusing the carry reproduces the behaviour the carry
+    // replaced, rather than merely costing something more.
     assert_eq!(
-        SECOND_BIND_CALLS.get(),
-        2,
-        "ALL refuses the carry, so coarsening resolves for itself as it did before"
+        (
+            SECOND_BIND_CALLS.get(),
+            store.semantic_probes.load(Ordering::SeqCst)
+        ),
+        (2, 3),
+        "ALL refuses the carry, restoring the unpatched (2, 3)"
     );
 }
 
