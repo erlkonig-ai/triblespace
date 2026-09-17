@@ -117,6 +117,31 @@ impl CollectionRealizationError {
     }
 }
 
+/// How many identities an error names before it starts counting instead.
+///
+/// A cover can hold tens of thousands of members, so an error is not a place to
+/// dump all of them. But printing NONE of them, as these variants used to, keeps
+/// the only part that tells you where to look: every one of them already holds
+/// the identities and threw them away at the display boundary. A count says
+/// something is wrong; an identity says what to go and read.
+const NAMED_IN_ERROR: usize = 4;
+
+/// Render up to [`NAMED_IN_ERROR`] entries, then say how many were elided.
+fn name_some(entries: impl IntoIterator<Item = String>) -> String {
+    let entries: Vec<_> = entries.into_iter().collect();
+    let total = entries.len();
+    let shown = entries
+        .iter()
+        .take(NAMED_IN_ERROR)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    match total.saturating_sub(NAMED_IN_ERROR) {
+        0 => shown,
+        rest => format!("{shown}, and {rest} more"),
+    }
+}
+
 impl fmt::Display for CollectionRealizationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -128,9 +153,11 @@ impl fmt::Display for CollectionRealizationError {
                 unsupported_members,
             } => write!(
                 formatter,
-                "collection realization is incomplete ({} missing target element(s), {} unsupported foundational member(s))",
+                "collection realization is incomplete ({} missing target element(s): {}; {} unsupported foundational member(s): {})",
                 missing.len(),
+                name_some(missing.iter().map(|m| hex::encode_upper(m.raw))),
                 unsupported_members.len(),
+                name_some(unsupported_members.iter().map(|m| hex::encode_upper(m.raw))),
             ),
             Self::UnauthorizedProducer { collection } => write!(
                 formatter,
@@ -155,14 +182,21 @@ impl fmt::Display for CollectionRealizationError {
             ),
             Self::IncompleteSupport { records } => write!(
                 formatter,
-                "collection support is unavailable ({} incomplete endorsed record route(s))",
+                "collection support is unavailable ({} incomplete endorsed record route(s): {})",
                 records.len(),
+                name_some(records.iter().map(|r| hex::encode_upper(r.raw()))),
             ),
             Self::UnrepresentableCover { blocked, missing } => write!(
                 formatter,
-                "source support is unrepresentable ({} capacity-terminal member(s), {} uncovered foundational member(s))",
+                "source support is unrepresentable ({} capacity-terminal member(s): {}; {} uncovered foundational member(s): {})",
                 blocked.len(),
+                name_some(
+                    blocked
+                        .iter()
+                        .map(|(member, reason)| format!("{} ({reason})", hex::encode_upper(member.raw))),
+                ),
                 missing.len(),
+                name_some(missing.iter().map(|m| hex::encode_upper(m.raw))),
             ),
             Self::Stalled { cover } => write!(
                 formatter,
