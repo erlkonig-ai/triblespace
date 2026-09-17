@@ -614,12 +614,15 @@ struct GuardStore {
     inject_record_on_acquire: Option<CollectionRecord>,
     inject_proof_on_acquire: Option<CapabilityProof>,
     snapshot_calls: usize,
-    /// Land a blob from a second writer immediately before the Nth snapshot.
+    /// Land a blob immediately before the Nth snapshot, SIMULATING an external
+    /// arrival.
     ///
-    /// This is a REAL residency change rather than a forced change set: the
-    /// bytes actually arrive between two observations, exactly as another
-    /// owner or an acquisition would land them, and the fresh view reports it
-    /// through its ordinary comparison.
+    /// The distinction matters and is Sol's: this writes the same inner
+    /// MemoryRepo from inside `snapshot()`, it is not a separately opened
+    /// concurrent writer. What it faithfully reproduces is the effect -- real
+    /// bytes present at the later observation and absent at the earlier one,
+    /// detected through the ordinary `changes_since` comparison rather than a
+    /// forced change set. What it does not reproduce is concurrency.
     land_blob_before_snapshot_at: Option<usize>,
 }
 
@@ -3535,12 +3538,13 @@ fn the_public_ensure_future_stays_send_for_a_non_send_mapping<S>(
     drop(future);
 }
 
-/// A real residency change between the ensure round's observation and
-/// coarsening's own must refuse the carried resolution.
+/// Late-arriving bytes between the ensure round's observation and coarsening's
+/// own must refuse the carried resolution.
 ///
 /// This is the same refusal the forced `StoreChanges::ALL` control exercises,
-/// reached through a genuine cause instead: a second writer lands bytes in
-/// between, and the fresh view reports it through its ordinary comparison. The
+/// reached through real bytes instead of a forced change set. The arrival is
+/// SIMULATED rather than concurrent -- see `land_blob_before_snapshot_at` --
+/// so this establishes the detection, not the race. The
 /// snapshot index is asserted first, so the control cannot silently drift onto
 /// some other observation if the call order changes.
 #[test]
@@ -3559,13 +3563,16 @@ fn late_residency_between_ensure_and_coarsening_refuses_the_carried_resolution()
     drive_to_fixed_point(&mut inner, second, &support);
 
     let mut store = GuardStore::new(inner);
-    // This pass takes exactly four snapshots: two in the ensure round's loop,
-    // then coarsening's own fresh view, then the target-maintenance view. The
-    // third is the one the carry is checked against, established by sweeping
-    // every index 1..=8 and observing which refuses: only 3 does, because
-    // bytes landing before 1 or 2 are already inside the carried probe and
-    // bytes landing at 4 arrive after the decision. An assertion below pins
-    // the count so this cannot silently drift onto another observation.
+    // This pass takes exactly four snapshots, and their order is (Sol's
+    // reading of the fixture, correcting mine):
+    //   1  the initial OperationFrontier snapshot
+    //   2  the ensure round's observation
+    //   3  coarsening's observation      <- the window the carry is checked in
+    //   4  target compaction's observation
+    // Sweeping every index 1..=8 shows only 3 refuses the carry: bytes landing
+    // before 1 or 2 are already inside the carried probe, and bytes landing at
+    // 4 arrive after the decision. An assertion below pins the count so this
+    // cannot silently drift onto another observation.
     store.land_blob_before_snapshot_at = Some(3);
     reset_mapping_calls();
     maintain_exact_resident::<_, SecondEncoding>(&mut store, second, &equation_signer(), &support)
