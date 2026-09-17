@@ -1545,6 +1545,147 @@ mod tests {
         panic!("selection did not receive service");
     }
 
+    // Count scheduler opportunities, not elapsed time or actual network work.
+    // Each source is assumed readable and long enough, and every examined word
+    // is a distinct, unfiltered, nonresident candidate whose miss yields after
+    // one word. All four service classes remain eligible and every Scan turn
+    // reaches its existing 16-request quota before the shared deadline.
+    fn count_parent_words_after_started_windows(
+        arrival_class: Option<u8>,
+    ) -> [(usize, usize, usize, bool); 2] {
+        const LANES: usize = 64;
+        const OLD_PER_LANE: usize = 512;
+        let mut scans = SelectionScans::new((0..LANES).map(|lane| {
+            CollectionRecordSelector::Collection(Inline::new(scheduled_handle(30, lane as u32)))
+        }));
+        for (lane, (_, scan)) in scans.lanes.iter_mut().enumerate() {
+            for ordinal in 0..OLD_PER_LANE {
+                scan.observe(
+                    scheduled_handle(30, lane as u32),
+                    scheduled_handle(40, ordinal as u32),
+                );
+            }
+        }
+        // Freeze every ordinary round, then spend just one word from each
+        // newest source's 128-word startup window. This is the opposite edge
+        // from arriving when the predecessor has only one startup word left.
+        for _ in 0..2 * LANES {
+            next_selection(&mut scans);
+            scans.advance();
+            scans.yield_source();
+        }
+        for (_, scan) in &scans.lanes {
+            let active = scan.recent_active.expect("started predecessor");
+            assert_eq!(scan.sources.get(&active).unwrap().startup_left, 127);
+        }
+        // The real scan loop selects the seventeenth absent word before
+        // noticing quota exhaustion. Retain that wholly unattempted cursor
+        // across observations, both here and after each counted Scan turn.
+        let owed = next_selection(&mut scans);
+        scans.yield_source();
+        assert_eq!(next_selection(&mut scans).key, owed.key);
+        let parent = scheduled_handle(250, 0);
+        scans.lanes[LANES - 1].1.observe(parent, parent);
+
+        let mut words = 0;
+        let mut scan_turns = 0;
+        let mut service_turns = 0;
+        let mut turn = ServiceTurn::Wants;
+        let mut arrival_epoch = 0;
+        let mut observed = Vec::new();
+        while words < 1_000_000 && observed.len() < 2 {
+            service_turns += 1;
+            let selected = turn;
+            turn = turn.next();
+            if selected != ServiceTurn::Scan {
+                continue;
+            }
+            scan_turns += 1;
+            if let Some(class) = arrival_class {
+                // One new positive source in EVERY lane per 128 examined
+                // words (eight full Scan turns). Its scheduling-key class
+                // fixes whether ordinary ordering puts it before or after
+                // the parent; either way it is newer in the recent LIFO.
+                if words % (2 * LANES) == 0 {
+                    arrival_epoch += 1;
+                    for (lane, (_, scan)) in scans.lanes.iter_mut().enumerate() {
+                        let arrival =
+                            scheduled_handle(class, (arrival_epoch * LANES + lane) as u32);
+                        scan.observe(arrival, arrival);
+                    }
+                }
+            }
+            for _ in 0..RECONCILE_SPECULATIVE_FETCHES_PER_TICK {
+                let cursor = next_selection(&mut scans);
+                words += 1;
+                if scans.last_lane == LANES - 1 && cursor.handles() == (parent, parent) {
+                    assert_eq!(cursor.offset, observed.len() * 32);
+                    observed.push((words, scan_turns, service_turns, cursor.recent));
+                }
+                scans.advance();
+                scans.yield_source();
+                if observed.len() == 2 {
+                    break;
+                }
+            }
+            next_selection(&mut scans);
+            scans.yield_source();
+        }
+        // A recent-work delay is not loss of the frozen ordinary round: every
+        // lane has advanced this older source, well past the two warm words.
+        for (lane, (_, scan)) in scans.lanes.iter().enumerate() {
+            let older = scan_key(scheduled_handle(30, lane as u32), scheduled_handle(40, 127));
+            assert!(scan.sources.get(&older).unwrap().offset >= 32);
+        }
+        if arrival_class.is_some() {
+            assert!(
+                scans.lanes[LANES - 1]
+                    .1
+                    .recent
+                    .contains(&scan_key(parent, parent)),
+                "ordinary service does not claim the unstarted recent window",
+            );
+        }
+        observed
+            .try_into()
+            .expect("both parent words received service")
+    }
+
+    #[test]
+    fn scan_window_count_new_parent_waits_behind_127_owed_words_in_64_lanes() {
+        assert_eq!(
+            count_parent_words_after_started_windows(None),
+            [(16_384, 1_024, 4_096, true), (16_512, 1_032, 4_128, true)],
+            "(global speculative words, Scan turns, all-class turns, recent)",
+        );
+    }
+
+    #[test]
+    fn scan_window_count_lifo_overtaking_keeps_only_ordinary_parent_opportunities() {
+        for (class, expected) in [
+            (
+                200,
+                [
+                    (196_545, 12_285, 49_140, false),
+                    (459_137, 28_697, 114_788, false),
+                ],
+            ),
+            (
+                251,
+                [
+                    (131_072, 8_192, 32_768, false),
+                    (262_336, 16_396, 65_584, false),
+                ],
+            ),
+        ] {
+            assert_eq!(
+                count_parent_words_after_started_windows(Some(class)),
+                expected,
+                "new arrival class {class}; counts, not a wall-clock promise",
+            );
+        }
+    }
+
     #[test]
     fn selection_scans_sustain_all_28_lanes_beyond_the_startup_window() {
         let mut scans = SelectionScans::new(
