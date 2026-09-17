@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Use the existing per-collection record selector for foundational admission,
+  avoiding a whole-store record enumeration for each collection attachment.
+  Preserve author admission, direct-reference residency, trusted local signature
+  handling, and canonical results; cover the indexed route with counters rather
+  than elapsed-time assertions.
+
 - Add descriptor-driven `trible pile collection maintain-all` and foreground
   `--watch` maintenance for explicitly selected collections. Schedule source
   dependencies with ordinary one-edge operations, deduplicate shared work, and
