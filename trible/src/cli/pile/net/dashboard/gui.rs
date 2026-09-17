@@ -177,9 +177,24 @@ fn render_mesh(ui: &mut egui::Ui, frame: &Frame) {
 
     ui.add(MeshGraph::new(&mesh_nodes, &links).height(260.0));
     ui.small(
-        "Ring: observed peers. Filled square fresh, open stale, slashed unknown. \
-         Arc: merge and derive work completed over work seen; an empty track is \
-         no evidence, not agreement. Barb points at the observed peer.",
+        "Filled square: this node reported, inside the freshness window. Open \
+         square: it reported, but older than the window — stale describes a \
+         report, so only a node that sent one can be stale. Slashed square: no \
+         usable report. Arc: merge and derive work completed over work seen. \
+         Barb points at the observed peer.",
+    );
+    // A legend that reads cleanly over a glyph which conflates states is worse
+    // than no legend: it certifies the wrong reading. JP asked whether the
+    // slashed daemons were down or just quiet and could not tell from the
+    // picture — he was right, the picture does not say, and until the mark
+    // vocabulary separates them the words have to.
+    ui.small(
+        "Two conflations remain, and the marks do not yet separate them. The \
+         slashed square is both never-heard-from — known only because a peer \
+         named it — and heard-but-future-dated, which is a clock fault, not a \
+         silence. The empty track is both no measurement and a measured zero: \
+         convergence is None when nothing was reported AND when nothing was \
+         pending, so an empty ring cannot be read as agreement OR as a zero.",
     );
     if links.is_empty() {
         ui.small("No link telemetry observed, so no edges are drawn.");
