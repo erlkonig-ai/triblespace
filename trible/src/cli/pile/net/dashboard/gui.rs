@@ -46,6 +46,130 @@ pub(super) fn run(options: Options) -> Result<()> {
     closed
 }
 
+/// The observed mesh, drawn once above the per-node detail.
+///
+/// The link rows already exist in the sampler and the terminal view prints
+/// them, but this frontend filtered them out entirely, so who-observes-whom
+/// was the one thing the colony view could not show. Nodes are placed by the
+/// widget; this function only decides what is true.
+///
+/// Convergence is `completed / (completed + pending)` over merges and derives.
+/// That is backlog, which is what "behind" actually means here — it is not a
+/// record count, and it is deliberately `None` rather than 1.0 when a node
+/// reported no work at all, because no evidence is not agreement.
+fn render_mesh(ui: &mut egui::Ui, frame: &Frame) {
+    use GORBIE::widgets::{MeshGraph, MeshLink, MeshNode, MeshNodeState};
+
+    // `frame.nodes()` counts reporters: worker nodes and health endpoints. A peer
+    // named inside a health condition is also part of the mesh even though it
+    // never reported here, and on a live pile that is usually the ONLY edge
+    // evidence available — worker link telemetry is opt-in and often absent.
+    // Including them is what makes this draw anything outside the fixture.
+    let mut nodes: BTreeSet<[u8; 32]> = frame.nodes();
+    for observer in &frame.health {
+        for condition in &observer.conditions {
+            nodes.extend(condition.peers.iter().copied());
+        }
+    }
+    for worker in &frame.workers {
+        nodes.extend(worker.peers.iter().copied());
+    }
+    let nodes: Vec<[u8; 32]> = nodes.into_iter().collect();
+    if nodes.len() < 2 {
+        return;
+    }
+    let index = |handle: &[u8; 32]| nodes.iter().position(|node| node == handle);
+
+    let mesh_nodes: Vec<MeshNode> = nodes
+        .iter()
+        .map(|node| {
+            let reports = || frame.workers.iter().filter(|worker| worker.node == *node);
+            let health = || {
+                frame
+                    .health
+                    .iter()
+                    .filter(|observer| observer.endpoints.iter().any(|endpoint| endpoint == node))
+            };
+            let fresh = reports().any(|worker| worker.freshness == Freshness::Fresh)
+                || health().any(|observer| observer.freshness == Freshness::Fresh);
+            let stale = reports().any(|worker| worker.freshness == Freshness::Stale)
+                || health().any(|observer| observer.freshness == Freshness::Stale);
+            let state = if fresh {
+                MeshNodeState::Fresh
+            } else if stale {
+                MeshNodeState::Stale
+            } else {
+                MeshNodeState::Unknown
+            };
+            let mut done = 0u128;
+            let mut pending = 0u128;
+            for worker in reports() {
+                for measured in &worker.metrics {
+                    let Some(value) = measured.value.value() else {
+                        continue;
+                    };
+                    match measured.metric {
+                        Metric::CompletedMerges | Metric::CompletedDerives => done += value,
+                        Metric::PendingMerges | Metric::PendingDerives => pending += value,
+                        _ => {}
+                    }
+                }
+            }
+            let total = done + pending;
+            MeshNode {
+                label: short(node),
+                state,
+                convergence: (total > 0).then(|| done as f32 / total as f32),
+            }
+        })
+        .collect();
+
+    let mut links: Vec<MeshLink> = Vec::new();
+    // Health conditions name who observed whom, and are the live pile's edges.
+    for observer in &frame.health {
+        for endpoint in &observer.endpoints {
+            let Some(from) = index(endpoint) else {
+                continue;
+            };
+            for condition in &observer.conditions {
+                for peer in &condition.peers {
+                    if let Some(to) = index(peer) {
+                        if from != to && !links.contains(&MeshLink { from, to }) {
+                            links.push(MeshLink { from, to });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for worker in &frame.workers {
+        if worker.role != "link" && worker.peers.is_empty() {
+            continue;
+        }
+        let Some(from) = index(&worker.node) else {
+            continue;
+        };
+        for peer in &worker.peers {
+            if let Some(to) = index(peer) {
+                if from != to && !links.contains(&MeshLink { from, to }) {
+                    links.push(MeshLink { from, to });
+                }
+            }
+        }
+    }
+
+    ui.add(MeshGraph::new(&mesh_nodes, &links).height(260.0));
+    ui.small(
+        "Ring: observed peers. Filled square fresh, open stale, slashed unknown. \
+         Arc: merge and derive work completed over work seen; an empty track is \
+         no evidence, not agreement. Barb points at the observed peer.",
+    );
+    if links.is_empty() {
+        ui.small("No link telemetry observed, so no edges are drawn.");
+    }
+    ui.separator();
+}
+
 fn render(ui: &mut egui::Ui, frame: &Frame) {
     // A dashboard has denser information than a prose notebook. Keep the
     // notebook's font families and theme, but scope spacing and sizes locally.
@@ -91,6 +215,7 @@ fn render(ui: &mut egui::Ui, frame: &Frame) {
             ui.colored_label(ui.visuals().warn_fg_color, warning);
         }
         ui.separator();
+        render_mesh(ui, frame);
 
         for node in frame.nodes() {
             ui.horizontal_wrapped(|ui| {
