@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add deterministic scan-freshness counter fixtures for 64 selected lanes
+  beside a 31,000-root backlog, and for already-started recent windows under
+  continued arrivals. They count scheduler turns and speculative word service;
+  imposed timeout projections are not measurements of DHT or delivery latency.
+
 - Add opt-in demand, shallow, and full acquisition policy to the external
   `Reconciler`. Shallow hydrates selected structural collection-record roots;
   full streams their aligned recursive references with bounded speculative

@@ -1543,6 +1543,248 @@ mod tests {
     }
 
     #[test]
+    fn scan_freshness_64_lanes_counts_first_two_words_with_31k_roots() {
+        const LANES: usize = 64;
+        let mut reconciler = Reconciler::with_backoff(Duration::ZERO, Duration::ZERO)
+            .with_replication(
+                ReplicationMode::Full,
+                (0..LANES as u32).map(|lane| Inline::new(scheduled_handle(30, lane))),
+            );
+        let mut roots: BTreeSet<_> = (0..31_000)
+            .map(|ordinal| scheduled_handle(10, ordinal))
+            .collect();
+        let wanted: BTreeSet<_> = (0..EXACT_FETCHES_IN_FLIGHT as u32)
+            .map(|ordinal| scheduled_handle(20, ordinal))
+            .collect();
+        reconciler.observe_missing(&wanted, &roots);
+        reconciler.root_round.generation = reconciler.observation_generation;
+        reconciler.want_round.generation = reconciler.observation_generation;
+
+        for (lane, (_, scan)) in reconciler.scan.lanes.iter_mut().enumerate() {
+            for ordinal in 0..3 {
+                scan.observe(
+                    scheduled_handle(30, lane as u32),
+                    scheduled_handle(40, lane as u32 * 3 + ordinal),
+                );
+            }
+        }
+        // Start the ordinary rounds BEFORE the fresh source becomes readable.
+        // It is consequently absent from their frozen positive-source passes.
+        for lane in 0..LANES {
+            let cursor = next_selection(&mut reconciler.scan);
+            assert_eq!(reconciler.scan.last_lane, lane);
+            assert!(!cursor.recent);
+            reconciler.scan.advance();
+            reconciler.scan.yield_source();
+        }
+        let root = scheduled_handle(30, LANES as u32 - 1);
+        let fresh = scheduled_handle(250, 0);
+        reconciler.scan.lanes[LANES - 1].1.observe(root, fresh);
+
+        let mut scan_turns = 0;
+        let mut speculative_words = 0;
+        let mut word_trace = Vec::new();
+        let mut class_counts = [0; 4];
+        let mut regular_roots = Vec::new();
+        for service_turn in 1..=48 {
+            // Continued exact-root arrivals keep fresh-root service eligible;
+            // the startup backlog and explicit WANTs also remain due.
+            roots.insert(scheduled_handle(9, service_turn as u32));
+            reconciler.observe_missing(&wanted, &roots);
+            let (turn, candidates) = reconciler
+                .next_work(&wanted, &roots, crate::clock::mono_now())
+                .expect("all four service classes stay eligible");
+            let class = (service_turn - 1) % 4;
+            assert_eq!(
+                turn,
+                [
+                    ServiceTurn::Wants,
+                    ServiceTurn::FreshRoots,
+                    ServiceTurn::Roots,
+                    ServiceTurn::Scan,
+                ][class],
+            );
+            class_counts[class] += 1;
+            if turn != ServiceTurn::Scan {
+                // Model the four-wide exact window spending its quantum on
+                // four unavailable requests. No clock or transport is run.
+                assert!(candidates.len() >= EXACT_FETCHES_IN_FLIGHT);
+                for handle in candidates.into_iter().take(EXACT_FETCHES_IN_FLIGHT) {
+                    reconciler.begin_attempt(turn, handle);
+                    reconciler.record_unavailable(handle);
+                    if turn == ServiceTurn::Roots {
+                        regular_roots.push(handle);
+                    }
+                }
+                continue;
+            }
+
+            scan_turns += 1;
+            assert!(candidates.is_empty());
+            for _ in 0..RECONCILE_SPECULATIVE_FETCHES_PER_TICK {
+                let cursor = next_selection(&mut reconciler.scan);
+                speculative_words += 1;
+                if cursor.handles() == (root, fresh) {
+                    word_trace.push((service_turn, scan_turns, speculative_words, cursor.offset));
+                }
+                // Every examined word is a distinct, nonresident, unfiltered
+                // candidate whose speculative request misses. This is the
+                // production advance + yield-before-await path, not a model
+                // of the duration of that await or of local/filter hits.
+                reconciler.scan.advance();
+                reconciler.scan.yield_source();
+            }
+            // The real loop peeks the next candidate before noticing that the
+            // sixteen-attempt allowance is spent. Preserve its owed cursor.
+            let owed = next_selection(&mut reconciler.scan);
+            assert_eq!(owed.words, 0);
+            reconciler.scan.yield_source();
+        }
+
+        assert_eq!(class_counts, [12; 4]);
+        assert_eq!(regular_roots.len(), 12 * EXACT_FETCHES_IN_FLIGHT);
+        assert!(regular_roots.iter().all(|handle| handle[0] == 10));
+        assert_eq!(word_trace, [(16, 4, 64, 0), (48, 12, 192, 32)]);
+        assert_eq!(
+            reconciler.scan.lanes[LANES - 1]
+                .1
+                .sources
+                .get(&scan_key(root, fresh))
+                .unwrap()
+                .offset,
+            64,
+        );
+        // Counts begin at source residency, excluding any earlier exact-root
+        // fetch delay. For example, imposing 30 seconds on EVERY class would
+        // end quanta 16/48 at 480/1440 seconds, with the attempts inside those
+        // final Scan quanta. These are hypothetical costs, not measured DHT
+        // latency or a live bound.
+        println!(
+            "fresh source (service turn, scan turn, speculative word, offset): {word_trace:?}"
+        );
+    }
+
+    #[test]
+    fn scan_freshness_64_started_windows_delay_unstarted_source_during_arrivals() {
+        const LANES: usize = 64;
+        const OLD_SOURCES: usize = 256;
+        let mut scans = SelectionScans::new((0..LANES as u32).map(|lane| {
+            CollectionRecordSelector::Collection(Inline::new(scheduled_handle(30, lane)))
+        }));
+        for (lane, (_, scan)) in scans.lanes.iter_mut().enumerate() {
+            for ordinal in 0..OLD_SOURCES {
+                scan.observe(
+                    scheduled_handle(30, lane as u32),
+                    scheduled_handle(40, (lane * OLD_SOURCES + ordinal) as u32),
+                );
+            }
+        }
+        // Real scheduler calls first freeze each ordinary pass, then consume
+        // one word from the newest source's 128-word startup window.
+        for recent in [false, true] {
+            for lane in 0..LANES {
+                let cursor = next_selection(&mut scans);
+                assert_eq!(scans.last_lane, lane);
+                assert_eq!(cursor.recent, recent);
+                assert_eq!(cursor.offset, 0);
+                scans.advance();
+                scans.yield_source();
+            }
+        }
+        let root = scheduled_handle(30, LANES as u32 - 1);
+        let fresh = scheduled_handle(250, 0);
+        scans.lanes[LANES - 1].1.observe(root, fresh);
+        let remaining = SCAN_STARTUP_WORDS - 1;
+        let mut speculative_words = 0;
+        let mut ordinary_words = 0;
+        for word in 1..=remaining {
+            // Re-observing the waiting source does not renew its position.
+            // New readable descendants arrive while the old window is active.
+            scans.lanes[LANES - 1].1.observe(root, fresh);
+            scans.lanes[LANES - 1]
+                .1
+                .observe(root, scheduled_handle(251, word as u32));
+            for recent in [false, true] {
+                for lane in 0..LANES {
+                    let cursor = next_selection(&mut scans);
+                    assert_eq!(scans.last_lane, lane);
+                    assert_eq!(cursor.recent, recent);
+                    assert_ne!(cursor.handles(), (root, fresh));
+                    if recent {
+                        assert_eq!(
+                            cursor.handles().1,
+                            scheduled_handle(40, (lane * OLD_SOURCES + OLD_SOURCES - 1) as u32),
+                        );
+                        assert_eq!(cursor.offset, word * 32);
+                    } else {
+                        ordinary_words += 1;
+                    }
+                    speculative_words += 1;
+                    // A controlled speculative miss spends one word, not the
+                    // 64 local/resident words a quantum could otherwise read.
+                    scans.advance();
+                    scans.yield_source();
+                }
+            }
+        }
+        assert_eq!(remaining, 127);
+        assert_eq!(speculative_words, 16_256);
+        assert_eq!(
+            ordinary_words, 8_128,
+            "ordinary work still gets equal service"
+        );
+        assert!(
+            scans
+                .lanes
+                .iter()
+                .all(|(_, scan)| scan.recent_active.is_none())
+        );
+
+        // Clearing those windows does not itself give the waiting source its
+        // first word: the newest arrival, rather than that older unstarted
+        // source, receives the next recent opportunity in its lane.
+        for recent in [false, true] {
+            for lane in 0..LANES {
+                let cursor = next_selection(&mut scans);
+                assert_eq!(scans.last_lane, lane);
+                assert_eq!(cursor.recent, recent);
+                if lane == LANES - 1 && recent {
+                    assert_eq!(
+                        cursor.handles(),
+                        (root, scheduled_handle(251, remaining as u32)),
+                    );
+                    assert_eq!(cursor.offset, 0);
+                }
+                scans.advance();
+                scans.yield_source();
+            }
+        }
+        let scan = &scans.lanes[LANES - 1].1;
+        let fresh_key = scan_key(root, fresh);
+        let progress = scan.sources.get(&fresh_key).unwrap();
+        assert_eq!(progress.offset, 0);
+        assert_eq!(progress.startup_left, SCAN_STARTUP_WORDS);
+        assert_eq!(
+            scan.recent.iter().filter(|key| **key == fresh_key).count(),
+            1
+        );
+        // This is a lower bound for this controlled-miss schedule, not proof
+        // of permanent starvation: the frozen ordinary passes still progress.
+        // At sixteen misses per scan turn it requires 1016 Scan turns just to
+        // clear the older windows. No transport, elapsed-time assertion, or
+        // real-source content distribution is represented by this fixture.
+        assert_eq!(
+            speculative_words / RECONCILE_SPECULATIVE_FETCHES_PER_TICK,
+            1_016,
+        );
+        println!(
+            "started-window lower bound: {speculative_words} speculative words, \
+             {ordinary_words} ordinary words; waiting source offset {}",
+            progress.offset,
+        );
+    }
+
+    #[test]
     fn selection_scans_sustain_all_28_lanes_beyond_the_startup_window() {
         let mut scans = SelectionScans::new(
             (1_u8..=28).map(|byte| CollectionRecordSelector::Collection(Inline::new([byte; 32]))),
