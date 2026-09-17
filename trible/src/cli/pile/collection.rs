@@ -2817,8 +2817,8 @@ fn run_search(
     use triblespace_core::blob::encodings::utf8string::UTF8String;
     use triblespace_core::collection::{CollectionDerivation, CollectionSnapshotExt};
     use triblespace_core::inline::encodings::genid::GenId;
-    use triblespace_core::trible::TRIBLE_LEN;
-    use triblespace_search::portable_bm25::{PortableBM25Blob, PortableBM25Index};
+    use triblespace_core::prelude::{find, TriblePattern};
+    use triblespace_search::portable_bm25::{PortableBM25Blob, PortableBM25View};
     use triblespace_search::text_bm25::Bm25Tokenizer;
     use triblespace_search::tokens::{
         bigram_tokens, code_tokens, hash_tokens, BigramHash, WordHash,
@@ -2857,68 +2857,51 @@ fn run_search(
             println!("the collection has no members yet; run 'collection maintain' first");
             return Ok(());
         }
-        let mut carriers = Vec::with_capacity(members.len());
-        for member in &members {
-            let blob: Blob<PortableBM25Blob> = snapshot
-                .get(*member)
-                .map_err(|error| anyhow!("read member: {error}"))?;
-            carriers.push(blob.bytes);
-        }
-
         // Score under the tokenizer the descriptor names; the carrier bytes are
-        // the same grammar whichever term space they hold.
+        // the same grammar whichever term space they hold. Interpreting a cover
+        // does not rebuild a physical carrier, even when it has several shards.
         let hits: Vec<(Inline<GenId>, f32)> = match argument.tokenizer {
             Bm25Tokenizer::Bigram => {
-                let indexes = carriers
-                    .iter()
-                    .map(|bytes| PortableBM25Index::<GenId, BigramHash>::from_bytes(bytes.clone()))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| anyhow!("decode carrier: {error}"))?;
-                let index = PortableBM25Index::<GenId, BigramHash>::merge(indexes.iter())
-                    .map_err(|error| anyhow!("merge carriers: {error}"))?;
-                index.query_multi(&bigram_tokens(&query))
+                let index: PortableBM25View<GenId, BigramHash> = view
+                    .view()
+                    .map_err(|error| anyhow!("read carriers: {error}"))?;
+                index
+                    .query()
+                    .map_err(|error| anyhow!("prepare BM25 scoring: {error}"))?
+                    .query_multi(&bigram_tokens(&query))
             }
             Bm25Tokenizer::Word | Bm25Tokenizer::Code => {
-                let indexes = carriers
-                    .iter()
-                    .map(|bytes| PortableBM25Index::<GenId, WordHash>::from_bytes(bytes.clone()))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| anyhow!("decode carrier: {error}"))?;
-                let index = PortableBM25Index::<GenId, WordHash>::merge(indexes.iter())
-                    .map_err(|error| anyhow!("merge carriers: {error}"))?;
+                let index: PortableBM25View<GenId, WordHash> = view
+                    .view()
+                    .map_err(|error| anyhow!("read carriers: {error}"))?;
                 let terms = if argument.tokenizer == Bm25Tokenizer::Code {
                     code_tokens(&query)
                 } else {
                     hash_tokens(&query)
                 };
-                index.query_multi(&terms)
+                index
+                    .query()
+                    .map_err(|error| anyhow!("prepare BM25 scoring: {error}"))?
+                    .query_multi(&terms)
             }
         };
         let mut hits = hits;
-        hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         hits.truncate(top);
 
-        // Snippets come from the source facts through the descriptor's attribute.
-        let texts: std::collections::HashMap<[u8; 16], [u8; 32]> = if snippet {
+        // The normal source view is needed only for selected snippets. Query it
+        // at the point of use; do not serialize it again or build a shadow map.
+        let source_facts: Option<TribleSet> = if snippet && !hits.is_empty() {
             let source_collection: Collection<SimpleArchive> = Collection::open(&snapshot, source)
                 .map_err(|error| anyhow!("open source descriptor: {error}"))?;
-            let facts: TribleSet = snapshot
-                .collection_exact(source_collection, view.support())
-                .map_err(|error| anyhow!("attach source: {error:?}"))?
-                .view::<TribleSet>()
-                .map_err(|error| anyhow!("view source: {error:?}"))?;
-            let blob: Blob<SimpleArchive> = facts.to_blob();
-            let mut map = std::collections::HashMap::new();
-            for trible in blob.bytes.as_ref().chunks_exact(TRIBLE_LEN) {
-                if trible[16..32] == argument.attribute[..] {
-                    let entity: [u8; 16] = trible[..16].try_into().unwrap();
-                    let value: [u8; 32] = trible[32..].try_into().unwrap();
-                    map.entry(entity).or_insert(value);
-                }
-            }
-            map
+            Some(
+                snapshot
+                    .collection_exact(source_collection, view.support())
+                    .map_err(|error| anyhow!("attach source: {error:?}"))?
+                    .view::<TribleSet>()
+                    .map_err(|error| anyhow!("view source: {error:?}"))?,
+            )
         } else {
-            Default::default()
+            None
         };
 
         println!(
@@ -2933,16 +2916,28 @@ fn run_search(
                 .try_from_inline()
                 .map_err(|error| anyhow!("document key is not an entity id: {error:?}"))?;
             let line = format!("{score:>8.3}  {entity:X}");
-            if let Some(handle) = texts.get(&entity.raw()) {
-                let text = snapshot
-                    .get(Inline::<Handle<UTF8String>>::new(*handle))
-                    .ok()
-                    .and_then(|blob: Blob<UTF8String>| View::<str>::try_from_blob(blob).ok())
-                    .map(|view| {
-                        let flat: String = view.split_whitespace().collect::<Vec<_>>().join(" ");
-                        clip_chars(&flat, 110)
-                    })
-                    .unwrap_or_default();
+            if let Some(facts) = &source_facts {
+                let text = find!(
+                    handle: Inline<Handle<UTF8String>>,
+                    facts.pattern(entity, &argument.attribute, handle)
+                )
+                .find_map(|handle| {
+                    let blob: Blob<UTF8String> = snapshot.get(handle).ok()?;
+                    let text = View::<str>::try_from_blob(blob).ok()?;
+                    // Only consume enough characters to display this snippet.
+                    let mut chars =
+                        text.split_whitespace()
+                            .enumerate()
+                            .flat_map(|(index, word)| {
+                                (index != 0).then_some(' ').into_iter().chain(word.chars())
+                            });
+                    let mut snippet: String = chars.by_ref().take(110).collect();
+                    if chars.next().is_some() {
+                        snippet.push('…');
+                    }
+                    Some(snippet)
+                })
+                .unwrap_or_default();
                 println!("{line}  {text}");
             } else {
                 println!("{line}");
@@ -2954,15 +2949,6 @@ fn run_search(
         .close()
         .map_err(|error| anyhow!("pile close: {error:?}"));
     res.and(close_res)
-}
-
-#[cfg(feature = "search")]
-fn clip_chars(text: &str, limit: usize) -> String {
-    let mut out: String = text.chars().take(limit).collect();
-    if text.chars().count() > limit {
-        out.push('…');
-    }
-    out
 }
 
 #[cfg(not(feature = "search"))]

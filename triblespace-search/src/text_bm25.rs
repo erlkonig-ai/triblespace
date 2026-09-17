@@ -386,10 +386,10 @@ mod tests {
         assert_eq!(index.doc_count(), 3);
         let two: Inline<GenId> = GenId::encode([2u8; 16]);
         let apple_terms = hash_tokens("apples");
-        assert_eq!(index.term_frequency(&two, &apple_terms[0]), 2);
+        assert_eq!(index.term_frequency(&two, &apple_terms[0]).unwrap(), 2);
         // "pears" occurs once in each of entity 2's texts: the maximum, not the sum.
         let pear_terms = hash_tokens("pears");
-        assert_eq!(index.term_frequency(&two, &pear_terms[0]), 1);
+        assert_eq!(index.term_frequency(&two, &pear_terms[0]).unwrap(), 1);
     }
 
     #[test]
