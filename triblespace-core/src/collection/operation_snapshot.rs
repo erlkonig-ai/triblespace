@@ -253,6 +253,7 @@ where
         selectors: &BTreeSet<CollectionRecordSelector>,
     ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
         let mut selected = self.control.select_records(selectors)?;
+        let control_len = selected.len();
         selected.extend(self.authored.iter_ordered().filter_map(|key| {
             let record = *self
                 .authored
@@ -260,9 +261,22 @@ where
                 .expect("authored PATCH key must retain its record");
             selectors_match_record(selectors, record).then_some(record)
         }));
-        selected.sort_unstable_by_key(|record| record.fingerprint());
-        selected.dedup_by_key(|record| record.fingerprint());
-        Ok(selected)
+        if selected.len() == control_len {
+            // The control view already answers in the canonical deduplicated
+            // fingerprint order this trait promises.
+            return Ok(selected);
+        }
+        // Appending authored records breaks that order, so restore it. A
+        // fingerprint is a BLAKE3 digest of the whole canonical payload, and
+        // sorting *by* it recomputes one per comparison; carry each record's
+        // own fingerprint instead so it is computed exactly once.
+        let mut ordered: Vec<_> = selected
+            .into_iter()
+            .map(|record| (record.fingerprint(), record))
+            .collect();
+        ordered.sort_unstable_by_key(|(fingerprint, _)| *fingerprint);
+        ordered.dedup_by_key(|(fingerprint, _)| *fingerprint);
+        Ok(ordered.into_iter().map(|(_, record)| record).collect())
     }
 }
 
@@ -400,5 +414,40 @@ mod tests {
             .unwrap();
         assert_eq!(wants, vec![initial_want]);
         assert_eq!(observed.get::<Bytes, UnknownBlob>(arrived).unwrap(), bytes,);
+    }
+
+    /// A fingerprint is a BLAKE3 digest of the record's whole canonical
+    /// payload, so the canonical order must never be recovered by hashing the
+    /// same record once per comparison. A selection that adds nothing to the
+    /// control view is already in that order and hashes nothing at all.
+    #[test]
+    fn selection_hashes_each_record_at_most_once() {
+        use crate::collection::records::FINGERPRINT_CALLS;
+
+        let mut store = MemoryRepo::default();
+        let control_records: Vec<_> = (0u8..64).map(record).collect();
+        for record in &control_records {
+            store.insert(*record).unwrap();
+        }
+        let control = store.snapshot().unwrap();
+        let selectors = BTreeSet::from([CollectionRecordSelector::Collection(
+            Inline::<Handle<SimpleArchive>>::new([1; 32]),
+        )]);
+
+        let warm = OperationFrontier::new(control.clone()).view(control.clone());
+        assert_eq!(warm.select_records(&selectors).unwrap().len(), 64);
+        let before = FINGERPRINT_CALLS.get();
+        assert_eq!(warm.select_records(&selectors).unwrap().len(), 64);
+        assert_eq!(FINGERPRINT_CALLS.get() - before, 0);
+
+        let mut frontier = OperationFrontier::new(control.clone());
+        frontier.include_record(record(200));
+        let authored = frontier.view(control);
+        let warm = authored.select_records(&selectors).unwrap();
+        assert_eq!(warm.len(), 65);
+        let before = FINGERPRINT_CALLS.get();
+        let selected = authored.select_records(&selectors).unwrap();
+        assert_eq!(selected, warm);
+        assert_eq!(FINGERPRINT_CALLS.get() - before, 65);
     }
 }
