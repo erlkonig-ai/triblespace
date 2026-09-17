@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add `collection::migration`: carrying committed content between collections,
+  and the survey that prices the carry before it happens. A carry re-signs each
+  source commit's `(data, metadata)` pair as a COMMIT of the target instead of
+  decoding and re-encoding the payload, so a member this build cannot parse —
+  or whose blob is not resident here at all — moves as the claim it is, and no
+  re-encoding can silently relocate content by producing a different handle.
+  Net-new is counted against `(target, data, metadata, signer)` tuples, which
+  is exactly what deterministic Ed25519 re-signing reproduces: a repeated
+  migration reports zero and appends zero, while a different author re-authors
+  everything. Source content is split by whether the source's own WRITE policy
+  admits an author who asserted it, because local storage is a claim ledger and
+  promoting what a source excluded is a different act from moving what it
+  admitted. Record kinds other than COMMIT, unverifiable signatures, and source
+  descriptors this build cannot read are counted and passed over rather than
+  ending the walk.
+
 - Add native aggregate colony telemetry facts and point-of-use worker/rate
   projections. Keep explicit collection authority/selection, process-session
   counter lifetimes and stale/unknown evidence distinct. Embed GORBIE in the

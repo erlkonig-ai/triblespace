@@ -46,16 +46,18 @@ pub mod descriptor;
 pub mod discovery;
 /// Canonical collection encodings and join-preserving mappings.
 pub mod encoding;
-/// Same-named collection generations, and the records they strand.
-pub mod generation;
 /// Exact realization over invariant foundational support.
 mod exact_derived;
 /// Deterministic size-tiered maintenance behind exact derived collections.
 mod exact_target_compaction;
+/// Same-named collection generations, and the records they strand.
+pub mod generation;
 /// Maintained positive latest states and historical supersession evidence.
 pub mod latest;
 /// Maintained stated last-write-wins registers over exact source covers.
 pub mod lww_register;
+/// Carrying content between collections, and proving it arrived.
+pub mod migration;
 mod observation;
 pub(crate) mod observed_store;
 mod operation_snapshot;
@@ -86,10 +88,10 @@ pub use ed25519_dalek::VerifyingKey;
 pub use api::*;
 pub use discovery::*;
 pub use encoding::*;
-pub use generation::*;
 pub use exact_derived::{
     admitted_record_witnesses, preview_record_witnesses, CollectionRealizationError,
 };
+pub use generation::*;
 pub use policy::*;
 pub use records::*;
 pub use resolution::*;

@@ -8,6 +8,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+- Replace `pile collection adopt` with `pile collection migrate`, which carries
+  many sources into one target — `--from` repeated, `--siblings` for every
+  same-named generation, or a `--plan` file of `source -> target` edges — and
+  whose dry run is the default. The dry run reports NET NEW, the records the
+  signing key would actually append, where adopt printed its source count: a
+  figure identical on a first run, a second run, and under the wrong key. It
+  also reports how many of those writes would add no content the target lacks,
+  which is what the wrong key looks like before it is used. Nothing is chosen
+  silently: a signer the target does not admit as a writer, a source that does
+  not share the target's name, and source content the source's own policy never
+  admitted each stop the run until the operator says which they mean. After
+  `--apply` the pile is re-read and every carried pair asserted present, and
+  the merge-then-compact discipline is stated rather than assumed.
+
+- Prove containment in `pile collection reconcile <pile> <collection>` source by
+  source against the generation the caller resolved, rather than grouping by
+  name and comparing against whichever member holds the most records — a basis
+  that reads a half-finished migration as finished, because mid-drain the
+  retired generation is still the largest and the new one's content is a subset
+  of it. `--from` names the sources explicitly and `--list` prints the content
+  handles that are absent. The pile-wide sweep additionally reports how many
+  collections hold commits under no name it can read; those are in no name
+  group, so nothing else in its output accounts for them.
+
 - Reuse a dashboard's final projection after unchanged scoped-input checks,
   avoiding repeated historical-header queries without a report catalogue.
   Age the original result independently; time reversal, future-sample arrival,

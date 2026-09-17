@@ -67,6 +67,7 @@ use super::open_refreshed;
 #[cfg(test)]
 mod maintenance_counts;
 mod maintenance_telemetry;
+mod migrate;
 
 /// Hex characters shown for a handle or key when the full value is not asked
 /// for. Sixteen is far past the point where two collections in one pile
@@ -156,12 +157,23 @@ pub enum Command {
     Reconcile {
         /// Path to the pile file to inspect.
         pile: PathBuf,
-        /// Ask about one collection only: name, or `blake3:` descriptor handle.
+        /// The collection that must hold everything: name, or `blake3:`
+        /// descriptor handle.
         ///
-        /// Without this, every name claimed by more than one collection is
-        /// reported, comparing against whichever generation holds the most
-        /// records.
+        /// Naming it asks the exact question, source by source, against the
+        /// generation *you* resolve. Without it, every name claimed by more
+        /// than one collection is swept, comparing against whichever
+        /// generation holds the most records — a heuristic that reads a
+        /// half-finished migration as finished, because mid-drain the retired
+        /// generation is still the largest.
         collection: Option<String>,
+        /// Compare against these collections instead of the target's
+        /// same-named siblings. Repeat for several.
+        #[arg(long)]
+        from: Vec<String>,
+        /// Print the content handles that are missing, not just how many.
+        #[arg(long)]
+        list: bool,
     },
     /// Fully decode one collection descriptor.
     ///
@@ -194,33 +206,19 @@ pub enum Command {
         #[arg(long)]
         long: bool,
     },
-    /// Re-sign every commit of one collection into another, under this key.
+    /// Carry committed content from one or more collections into another.
     ///
     /// Concatenation is the merge: after `cat other.pile >> pile`, the other
     /// pile's collections are here physically, but under their own authority,
-    /// so nothing reading this pile's collections sees them. Adopt reads each
-    /// COMMIT of the source collection from one frozen snapshot, verifies its
-    /// signature, and commits the exact same data and metadata archives into
-    /// the target collection signed by this key. A claim-level act: no data is
-    /// rewritten, no id is minted, and repeating it appends nothing new.
-    Adopt {
-        /// Path to the pile file to update.
-        pile: PathBuf,
-        /// Source collection: name, or descriptor handle (`name:` / `blake3:`).
-        #[arg(long)]
-        from: String,
-        /// Target collection: name, or descriptor handle (`name:` / `blake3:`).
-        #[arg(long)]
-        into: String,
-        /// Signing key for the target commits: one of the target's WRITE roots,
-        /// or an author with a resident WRITE proof. Defaults to TRIBLESPACE_KEY
-        /// or self.key beside the pile.
-        #[arg(long)]
-        key: Option<PathBuf>,
-        /// Report what would be adopted without appending anything.
-        #[arg(long, default_value_t = false)]
-        dry_run: bool,
-    },
+    /// so nothing reading this pile's collections sees them. The same silence
+    /// follows every descriptor change, which re-mints a collection under its
+    /// own name. This carries the content forward, re-signing each `(data,
+    /// metadata)` assertion as a COMMIT of the target. No data is rewritten,
+    /// no id is minted, and a second run appends nothing.
+    ///
+    /// Nothing is written without `--apply`; the dry run is the default, and
+    /// its net-new figure is exactly what `--apply` appends.
+    Migrate(migrate::MigrateArgs),
     /// Register one derived collection over a source and print its exact handle.
     ///
     /// The kind picks the encoding and its mapping. The descriptor then carries
@@ -433,7 +431,12 @@ pub fn run(cmd: Command) -> Result<()> {
             metadata,
             long,
         } => run_list(path, named, metadata, long),
-        Command::Reconcile { pile, collection } => run_reconcile(pile, collection),
+        Command::Reconcile {
+            pile,
+            collection,
+            from,
+            list,
+        } => run_reconcile(pile, collection, from, list),
         Command::Show { pile, collection } => run_show(pile, collection),
         Command::Log {
             pile,
@@ -441,13 +444,7 @@ pub fn run(cmd: Command) -> Result<()> {
             limit,
             long,
         } => run_log(pile, collection, limit, long),
-        Command::Adopt {
-            pile,
-            from,
-            into,
-            key,
-            dry_run,
-        } => run_adopt(pile, from, into, key, dry_run),
+        Command::Migrate(args) => migrate::run_migrate(args),
         Command::Derive {
             pile,
             source,
@@ -1419,158 +1416,46 @@ fn run_grant(
     res.and(close_res)
 }
 
-fn run_adopt(
+/// Prove a collection holds everything its same-named generations do.
+///
+/// Two shapes, and the difference matters. With a collection named, this is the
+/// exact question: source by source, by content, against the generation the
+/// caller resolved — which is the one their build actually uses. Without one it
+/// is the pile-wide sweep, which groups by name and compares against whichever
+/// member holds the most records. That heuristic is honest about being one, and
+/// it is blind in the state a migration passes through: mid-drain the retired
+/// generation is still the largest, its content is a superset, and the sweep
+/// reports nothing outstanding while half the records are unreachable.
+fn run_reconcile(
     path: PathBuf,
-    from: String,
-    into: String,
-    key: Option<PathBuf>,
-    dry_run: bool,
+    reference: Option<String>,
+    from: Vec<String>,
+    list: bool,
 ) -> Result<()> {
-    let key_path = triblespace_core::signing_key_file::resolve_path(key.as_deref(), &path);
-    let signer = triblespace_core::signing_key_file::load_existing(&key_path)
-        .map_err(|error| anyhow!("load adopting signing key {}: {error}", key_path.display()))?;
-
     let mut pile = open_refreshed(&path)?;
     let res = (|| -> Result<()> {
-        // One frozen view chooses both collections and every commit adopted;
-        // a concurrent append cannot change what this run means.
-        let snapshot = pile
-            .snapshot()
-            .map_err(|error| anyhow!("pile snapshot: {error:?}"))?;
-        let rows = enumerate(&snapshot)?;
-        let source = resolve(&rows, &from)?;
-        let target = resolve(&rows, &into)?;
-        if source == target {
-            return Err(anyhow!("source and target are the same collection"));
+        if let Some(reference) = reference {
+            return migrate::run_reconcile_exact(&mut pile, &reference, &from, list);
         }
-        let target_collection: Collection<SimpleArchive> = Collection::open(&snapshot, target)
-            .map_err(|error| anyhow!("open target collection descriptor: {error}"))?;
-
-        // Prepare everything before appending anything: every source commit
-        // verified, its exact data and metadata decoded. Re-wrapping canonical
-        // fact sets mints nothing; `commit` serializes them back to the same
-        // data and metadata handles while signing the native record.
-        let empty_metadata: Blob<SimpleArchive> = TribleSet::new().to_blob();
-        let mut prepared: Vec<(CollectionRecord, Fragment)> = Vec::new();
-        let mut invalid = 0usize;
-        let records = snapshot
-            .records()
-            .map_err(|error| anyhow!("enumerate collection records: {error:?}"))?;
-        for record in records {
-            let record = record.map_err(|error| anyhow!("decode collection record: {error:?}"))?;
-            let CollectionRecord::Commit(commit) = &record else {
-                continue;
-            };
-            if commit.collection() != source {
-                continue;
-            }
-            if let Err(error) = commit.verify_strict() {
-                eprintln!(
-                    "skipping commit {:X}: invalid signature ({error})",
-                    record.fingerprint()
-                );
-                invalid += 1;
-                continue;
-            }
-            // A commit names its member by bare content hash; the member of a
-            // SimpleArchive collection is a SimpleArchive.
-            let data_handle: Inline<Handle<SimpleArchive>> = Inline::new(commit.data().raw);
-            let data: Blob<SimpleArchive> = snapshot.get(data_handle).map_err(|error| {
-                anyhow!(
-                    "read commit data {}: {error}",
-                    hex::encode(commit.data().raw)
-                )
-            })?;
-            let metadata: Blob<SimpleArchive> = match snapshot.get(commit.metadata()) {
-                Ok(blob) => blob,
-                Err(error) => {
-                    if commit.metadata() == empty_metadata.get_handle() {
-                        empty_metadata.clone()
-                    } else {
-                        return Err(anyhow!(
-                            "read commit metadata {}: {error}",
-                            hex::encode(commit.metadata().raw)
-                        ));
-                    }
-                }
-            };
-            let facts = TribleSet::try_from_blob(data)
-                .map_err(|error| anyhow!("decode commit data: {error:?}"))?;
-            let metafacts = TribleSet::try_from_blob(metadata)
-                .map_err(|error| anyhow!("decode commit metadata: {error:?}"))?;
-            prepared.push((
-                record,
-                Fragment::from_parts(facts, metafacts, Default::default()),
-            ));
+        if !from.is_empty() {
+            bail!("--from needs a collection to compare against; name the target as well");
         }
-        drop(snapshot);
-
-        println!("source: blake3:{}", handle_hex(source));
-        println!("target: blake3:{}", handle_hex(target));
-        println!(
-            "signer: {}",
-            hex::encode_upper(signer.verifying_key().to_bytes())
-        );
-        println!(
-            "commits: {} to adopt, {} skipped as invalid",
-            prepared.len(),
-            invalid
-        );
-        if dry_run {
-            println!("dry run: nothing appended");
-            return Ok(());
-        }
-        let mut adopted = std::collections::BTreeSet::new();
-        for (record, fragment) in prepared {
-            let commit = pile
-                .commit(target_collection, &signer, fragment)
-                .map_err(|error| anyhow!("adopt commit {:X}: {error}", record.fingerprint()))?;
-            adopted.insert(commit.data().raw);
-        }
-        println!(
-            "adopted: {} distinct data archive(s) now asserted in the target",
-            adopted.len()
-        );
-        Ok(())
-    })();
-    let close_res = pile
-        .close()
-        .map_err(|error| anyhow!("pile close: {error:?}"));
-    res.and(close_res)
-}
-
-/// Report same-named generations, and fail when any records are unreachable.
-fn run_reconcile(path: PathBuf, reference: Option<String>) -> Result<()> {
-    let mut pile = open_refreshed(&path)?;
-    let res = (|| -> Result<()> {
         let snapshot = pile
             .snapshot()
             .map_err(|e| anyhow!("pile snapshot: {e:?}"))?;
 
-        let reports = match reference {
-            Some(reference) => {
-                // An exact handle needs no enumeration, and enumerating means
-                // decoding every descriptor in the pile. It also lets a caller
-                // ask about a collection it just registered, which holds no
-                // records yet and so is referenced by nothing to enumerate.
-                let handle = if reference.trim().starts_with("blake3:") {
-                    parse_collection_handle(reference.trim())?
-                } else {
-                    let rows = enumerate(&snapshot)?;
-                    resolve(&rows, &reference)?
-                };
-                triblespace_core::collection::generation::named_generations(&snapshot, handle)
-                    .map_err(|e| anyhow!("compare same-named generations: {e:?}"))?
-                    .into_iter()
-                    .collect::<Vec<_>>()
-            }
-            None => triblespace_core::collection::generation::all_named_generations(&snapshot)
-                .map_err(|e| anyhow!("compare same-named generations: {e:?}"))?,
-        };
+        let reports = triblespace_core::collection::generation::all_named_generations(&snapshot)
+            .map_err(|e| anyhow!("compare same-named generations: {e:?}"))?;
+
+        // What the sweep cannot see, said out loud. It groups by name, so a
+        // collection whose descriptor carries no name this build can read is
+        // not in any group and is never mentioned — and that is exactly where
+        // the largest arrears have been found.
+        let rows = enumerate(&snapshot)?;
+        let unnamed = migrate::unnamed_with_commits(&rows);
 
         if reports.is_empty() {
             println!("no name in this pile is claimed by more than one collection");
-            return Ok(());
         }
 
         let mut stranded = 0usize;
@@ -1578,17 +1463,27 @@ fn run_reconcile(path: PathBuf, reference: Option<String>) -> Result<()> {
             println!("{report}\n");
             stranded += report.stranded_records();
         }
+        if unnamed > 0 {
+            println!(
+                "{unnamed} collection(s) in this pile hold commits under no name this build can \
+                 read. They are in no name group, so nothing above accounts for them; ask about \
+                 one directly with `trible pile collection reconcile <pile> blake3:<handle>`."
+            );
+        }
         if stranded > 0 {
             bail!(
                 "{stranded} record(s) across {} name(s) are held only by a retired generation and \
-                 cannot be reached under their name; migrate them forward with `trible pile \
-                 collection adopt --from <retired> --into <current>`, then re-run this check",
+                 cannot be reached under their name; carry them forward with `trible pile \
+                 collection migrate --into <current> --siblings`, then re-run this check",
                 reports.iter().filter(|r| r.strands_records()).count(),
             );
         }
         Ok(())
     })();
-    res
+    let close_res = pile
+        .close()
+        .map_err(|error| anyhow!("pile close: {error:?}"));
+    res.and(close_res)
 }
 
 fn run_show(path: PathBuf, reference: String) -> Result<()> {
