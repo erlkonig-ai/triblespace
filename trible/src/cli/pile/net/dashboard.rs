@@ -562,6 +562,32 @@ fn run_terminal(options: Options, live: bool) -> Result<()> {
     })
 }
 
+/// Convergence for one node: completed over completed plus pending merges and
+/// derives. Backlog is what "behind" means here.
+///
+/// Reported as a plain percentage with the two counts beside it, deliberately
+/// without a drawn bar. This view is read by agents as often as by people, and
+/// an ASCII bar costs a reader tokens to decode into the number it already
+/// encodes. `None` means the node reported no comparable work at all, which is
+/// absence of evidence and must never print as full convergence.
+fn node_convergence(frame: &Frame, node: &[u8; 32]) -> Option<(u128, u128)> {
+    let mut done = 0u128;
+    let mut pending = 0u128;
+    for worker in frame.workers.iter().filter(|worker| worker.node == *node) {
+        for measured in &worker.metrics {
+            let Some(value) = measured.value.value() else {
+                continue;
+            };
+            match measured.metric {
+                Metric::CompletedMerges | Metric::CompletedDerives => done += value,
+                Metric::PendingMerges | Metric::PendingDerives => pending += value,
+                _ => {}
+            }
+        }
+    }
+    (done + pending > 0).then_some((done, pending))
+}
+
 fn render_terminal(frame: &Frame) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "COLONY · live work observations\n{}", frame.coverage());
@@ -581,9 +607,16 @@ fn render_terminal(frame: &Frame) -> String {
             .iter()
             .filter(|worker| worker.node == node && worker.role != "link")
             .collect();
+        let converged = match node_convergence(frame, &node) {
+            Some((done, pending)) => format!(
+                " · converged {:.0}% ({done} done / {pending} pending)",
+                (done as f64 / (done + pending) as f64) * 100.0
+            ),
+            None => String::new(),
+        };
         let _ = writeln!(
             out,
-            "NODE {} · {} observed worker scopes",
+            "NODE {} · {} observed worker scopes{converged}",
             short(&node),
             workers
                 .iter()
