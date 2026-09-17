@@ -20,20 +20,19 @@ use iroh_base::{EndpointAddr, EndpointId};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tracing::{Instrument as _, debug, debug_span, info_span, warn};
 use triblespace_core::blob::Blob;
-use triblespace_core::blob::encodings::{UnknownBlob, simplearchive::SimpleArchive};
+use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::capability::CapabilityProof;
-use triblespace_core::collection::CollectionHandle;
+use triblespace_core::collection::{CollectionHandle, CollectionRecordSelector};
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::patch::{Entry as PatchEntry, IdentitySchema, PATCH};
-use triblespace_core::repo::{BlobStoreGet, StoreChanges, StoreRead};
+use triblespace_core::repo::{
+    BlobStoreGet, ObservedStore, StoreChanges, StoreDependencies, StoreRead,
+};
 
 use crate::bearer::{BearerLocatorIndex, blob_locator, locator_index, update_locator_index};
 use crate::channel::{NetCommand, NetEvent, NetEventBatch, SnapshotNotice};
-use crate::collection_activation::{
-    CollectionReadBootstrapError, CollectionRepairOverlay, CollectionRepairOverlayError,
-    collection_read_bootstrap_proofs, collection_repair_overlay,
-};
+use crate::collection_activation::{CollectionRepairOverlay, CollectionRepairOverlayError};
 use crate::collection_session::{manifest, pull_collection, serve_collection_repair};
 use crate::collection_wire::{MAX_COLLECTION_READ_BOOTSTRAP_PROOFS, OP_COLLECTION_REPAIR};
 use crate::health::{
@@ -163,7 +162,14 @@ impl CollectionSnapshot {
     }
 }
 
-type CollectionSnapshotIndex = PATCH<32, IdentitySchema, Arc<CollectionSnapshot>>;
+/// Fixed results and their raw lookup interests, including a missing descriptor.
+/// Pending entries remain local observations, never serving advertisements.
+struct CollectionObservation {
+    value: Option<Arc<CollectionSnapshot>>,
+    dependencies: StoreDependencies,
+}
+
+type CollectionSnapshotIndex = PATCH<32, IdentitySchema, Arc<CollectionObservation>>;
 
 /// Immutable host observation indexed exactly by active collection handle.
 ///
@@ -172,6 +178,7 @@ type CollectionSnapshotIndex = PATCH<32, IdentitySchema, Arc<CollectionSnapshot>
 /// blob manifest is retained.
 pub(crate) struct StoreSnapshot {
     collections: CollectionSnapshotIndex,
+    local: VerifyingKey,
     blobs: Arc<dyn BlobSnapshotReader>,
     bearer_locators: Arc<BearerLocatorIndex>,
 }
@@ -200,99 +207,121 @@ impl StoreSnapshot {
             (_, Some(previous)) => previous.bearer_locators.clone(),
             _ => Arc::new(locator_index(&snapshot)?),
         };
-        let blob_reader = ResidentBlobReader::new(&snapshot).0;
-        let repair_inputs_changed = changes.contains(StoreChanges::BLOBS)
-            || changes.contains(StoreChanges::COLLECTION_RECORDS)
-            || changes.contains(StoreChanges::CAPABILITY_PROOFS);
+        // This unobserved reader advances even when fixed per-C products do
+        // not change. A later peer request may name a previously unseen R or
+        // capability definition, outside any construction-time read set.
+        let reader = ResidentBlobReader::new(&snapshot);
         for raw in active.iter_ordered() {
             let collection = CollectionHandle::new(*raw);
-            if snapshot
-                .get::<Blob<SimpleArchive>, SimpleArchive>(Inline::new(collection.raw))
-                .is_err()
-            {
-                warn!(collection = %hex::encode(&collection.raw[..4]), "active collection descriptor unavailable; isolating pending collection");
+            let prior = previous.and_then(|prior| prior.collections.get(&collection.raw));
+            let relevant = match (previous_store, previous, prior) {
+                (Some(before), Some(previous), Some(prior)) if previous.local == local => {
+                    snapshot.changes_for(before, &prior.dependencies)
+                }
+                _ => StoreChanges::ALL,
+            };
+            if let Some(prior) = prior.filter(|_| relevant.is_empty()) {
+                let value = prior.value.as_ref().map(|prior| {
+                    Arc::new(CollectionSnapshot {
+                        repair: Arc::new(prior.repair.as_ref().clone().with_reader(reader.clone())),
+                        read_bootstrap: prior.read_bootstrap.clone(),
+                    })
+                });
+                collections.insert(&PatchEntry::with_value(
+                    raw,
+                    Arc::new(CollectionObservation {
+                        value,
+                        dependencies: prior.dependencies.clone(),
+                    }),
+                ));
                 continue;
             }
-            // Only record, proof, or resident-definition changes affect the
-            // pinned collection observation; generic proofs have no clock gate.
-            let prior = previous.and_then(|prior| prior.collections.get(&collection.raw).cloned());
-            let repair_result = if !repair_inputs_changed {
-                prior
-                    .as_ref()
-                    .map(|prior| prior.repair.clone())
-                    .map_or_else(
-                        || collection_repair_overlay(&snapshot, collection).map(Arc::new),
-                        Ok,
-                    )
-            } else {
-                // Blob arrival may enable a capability definition, but cannot
-                // change the record set. Keep its already-built Merkle PATCH
-                // while updating the authorization reader to this snapshot.
-                let records = prior
-                    .as_ref()
-                    .filter(|_| !changes.contains(StoreChanges::COLLECTION_RECORDS))
-                    .map(|prior| prior.repair.records());
-                CollectionRepairOverlay::observe(&snapshot, collection, records).map(|fresh| {
-                    prior
-                        .as_ref()
-                        .filter(|prior| {
-                            !changes.contains(StoreChanges::BLOBS)
-                                && prior.wake_root() == fresh.wake_root()
-                        })
-                        .map_or_else(|| Arc::new(fresh), |prior| prior.repair.clone())
+            let observed = ObservedStore::new(snapshot.clone());
+            let prior_value = prior.and_then(|prior| prior.value.as_ref());
+            let records = prior_value
+                .filter(|_| !relevant.contains(StoreChanges::COLLECTION_RECORDS))
+                .map(|prior| prior.repair.records());
+            let authorization = prior_value
+                .filter(|_| {
+                    !relevant.contains(StoreChanges::BLOBS)
+                        && !relevant.contains(StoreChanges::CAPABILITY_PROOFS)
                 })
-            };
-            let repair = match repair_result {
+                .map(|prior| prior.repair.authorization_evidence());
+            let repair = match CollectionRepairOverlay::observe(
+                &observed,
+                collection,
+                records,
+                authorization,
+            ) {
                 Ok(repair) => repair,
                 Err(CollectionRepairOverlayError::Descriptor(error)) => {
                     warn!(collection = %hex::encode(&collection.raw[..4]), %error, "active collection descriptor is unavailable or invalid; isolating collection");
+                    collections.insert(&PatchEntry::with_value(
+                        raw,
+                        Arc::new(CollectionObservation {
+                            value: None,
+                            dependencies: observed.dependencies(),
+                        }),
+                    ));
                     continue;
                 }
                 Err(error) => return Err(anyhow::Error::new(error)),
             };
-            let read_bootstrap = if !repair_inputs_changed && prior.is_some() {
-                prior.as_ref().unwrap().read_bootstrap.clone()
+            let read_bootstrap = if authorization.is_some() {
+                prior_value.unwrap().read_bootstrap.clone()
             } else {
-                match collection_read_bootstrap_proofs(
-                    &snapshot,
-                    collection,
-                    local,
-                    MAX_COLLECTION_READ_BOOTSTRAP_PROOFS,
-                ) {
-                    Ok(evidence) => evidence.into(),
-                    Err(CollectionReadBootstrapError::TooMany { count, limit }) => {
-                        warn!(
-                            collection = %hex::encode(&collection.raw[..4]),
-                            count,
-                            limit,
-                            "collection READ bootstrap exceeds network bound; collection remains locally active but cannot bootstrap a cold remote"
-                        );
-                        Arc::from([])
-                    }
-                    Err(error) => return Err(anyhow::Error::new(error)),
+                let evidence = repair.authorization_evidence().read_bootstrap_proofs(local);
+                if evidence.len() > MAX_COLLECTION_READ_BOOTSTRAP_PROOFS {
+                    warn!(
+                        collection = %hex::encode(&collection.raw[..4]),
+                        count = evidence.len(),
+                        limit = MAX_COLLECTION_READ_BOOTSTRAP_PROOFS,
+                        "collection READ bootstrap exceeds network bound; collection remains locally active but cannot bootstrap a cold remote"
+                    );
+                    Arc::from([])
+                } else {
+                    evidence.into()
                 }
             };
+            // Reused components keep their interests. In particular, reusing
+            // the record PATCH must not lose its whole-C selector merely
+            // because this pass read only authority inputs.
+            let mut dependencies = if authorization.is_some() {
+                prior.unwrap().dependencies.clone()
+            } else {
+                observed.dependencies()
+            };
+            dependencies
+                .records
+                .insert(CollectionRecordSelector::Collection(collection));
             let value = Arc::new(CollectionSnapshot {
-                repair,
+                repair: Arc::new(repair.with_reader(reader.clone())),
                 read_bootstrap,
             });
-            collections.insert(&PatchEntry::with_value(raw, value));
+            collections.insert(&PatchEntry::with_value(
+                raw,
+                Arc::new(CollectionObservation {
+                    value: Some(value),
+                    dependencies,
+                }),
+            ));
         }
         Ok(Self {
             collections,
-            blobs: blob_reader,
+            local,
+            blobs: reader.0,
             bearer_locators,
         })
     }
 
     fn collection(&self, collection: CollectionHandle) -> Option<Arc<CollectionSnapshot>> {
-        self.collections.get(&collection.raw).cloned()
+        self.collections.get(&collection.raw)?.value.clone()
     }
 
     pub(crate) fn collections(&self) -> impl Iterator<Item = Arc<CollectionSnapshot>> + '_ {
         self.collections
             .iter_ordered()
-            .filter_map(move |key| self.collections.get(key).cloned())
+            .filter_map(move |key| self.collections.get(key)?.value.clone())
     }
 
     fn notices(&self) -> Vec<(CollectionHandle, [u8; 32])> {
@@ -2667,8 +2696,8 @@ mod tests {
             .unwrap();
             let after_collection = serving_after.collection(collection.handle()).unwrap();
             assert!(Arc::ptr_eq(
-                &before_collection.repair,
-                &after_collection.repair
+                &before_collection.read_bootstrap,
+                &after_collection.read_bootstrap
             ));
             assert_eq!(after_collection.read_bootstrap.as_ref(), &[proof.clone()]);
         }
