@@ -10,7 +10,7 @@
 //! Optional shallow/full hydration is local acquisition policy over selected
 //! structural records, not semantic admission or another Peer protocol.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use anybytes::Bytes;
@@ -905,9 +905,10 @@ impl SelectionScans {
         let scan = &mut self.lanes[self.last_lane].1;
         scan.sources.remove(key);
         scan.cursor = None;
-        if scan.recent_active == Some(*key) {
-            scan.recent_active = None;
-        }
+        // A later resident observation is a new first look, not a second copy
+        // of this forgotten source's old scheduling interest.
+        scan.recent.retain(|pending| pending != key);
+        scan.continuations.retain(|pending| pending != key);
         self.active = None;
     }
 }
@@ -926,11 +927,13 @@ struct FullScan {
     pass: Option<PATCH<64, IdentitySchema, SourceProgress>>,
     cursor: Option<ScanCursor>,
     after: Option<[u8; 64]>,
-    /// Choose bounded startup windows newest-first. Once started, a window
-    /// keeps its remaining allowance across yields and subsequent arrivals.
-    /// Every entry also gets ordinary rounds, independently of this priority.
+    /// Newest-unstarted first looks share recent turns with started work.
+    /// These are scheduling keys only; offsets and allowances live in sources.
     recent: Vec<[u8; 64]>,
-    recent_active: Option<[u8; 64]>,
+    /// One quantum per started source, then requeue its remaining allowance.
+    /// Later arrivals cannot overtake the finite prefix already queued.
+    continuations: VecDeque<[u8; 64]>,
+    prefer_continuation: bool,
     /// Deliberately retained across ticks, including a fetch timeout.
     prefer_recent: bool,
 }
@@ -974,8 +977,8 @@ impl FullScan {
         selected: &BTreeSet<CollectionRecordSelector>,
         resident: &HashSet<RawHash>,
     ) {
-        // Seed ordinary roots first: the existing recent LIFO then gives the
-        // few selected descriptors their finite startup window. This changes
+        // Seed ordinary roots first: the recent LIFO then gives the few
+        // selected descriptors an early first look. This changes
         // only first-observation order, never closure membership or old offsets.
         for &root in roots {
             if !selected.contains(&CollectionRecordSelector::Collection(
@@ -1021,16 +1024,18 @@ impl FullScan {
             return ScanStep::Idle;
         }
         let recent =
-            self.prefer_recent && (self.recent_active.is_some() || !self.recent.is_empty());
+            self.prefer_recent && (!self.recent.is_empty() || !self.continuations.is_empty());
         self.prefer_recent = !self.prefer_recent;
         let key = if recent {
-            match self.recent_active {
-                Some(key) => key,
-                None => {
-                    let key = self.recent.pop().expect("nonempty recent lane");
-                    self.recent_active = Some(key);
-                    key
-                }
+            let continuing = !self.continuations.is_empty()
+                && (self.prefer_continuation || self.recent.is_empty());
+            self.prefer_continuation = !continuing;
+            if continuing {
+                self.continuations
+                    .pop_front()
+                    .expect("nonempty continuation lane")
+            } else {
+                self.recent.pop().expect("nonempty first-look lane")
             }
         } else {
             let pass = self.pass.get_or_insert_with(|| self.sources.clone());
@@ -1047,13 +1052,9 @@ impl FullScan {
             key
         };
         let Some(progress) = self.sources.get(&key) else {
-            if recent {
-                self.recent_active = None;
-            }
             return ScanStep::Skip;
         };
         if recent && progress.startup_left == 0 {
-            self.recent_active = None;
             return ScanStep::Skip;
         }
         if progress
@@ -1095,23 +1096,19 @@ impl FullScan {
         let Some(cursor) = self.cursor.filter(|cursor| cursor.words != 0) else {
             return;
         };
-        debug_assert!(!cursor.recent || self.recent_active == Some(cursor.key));
         self.cursor = None;
         let mut progress = *self.sources.get(&cursor.key).expect("positive source");
         progress.offset = cursor.offset;
         progress.startup_left = progress.startup_left.saturating_sub(cursor.words);
         self.sources
             .replace(&PatchEntry::with_value(&cursor.key, progress));
-        if progress.startup_left == 0 && self.recent_active == Some(cursor.key) {
-            self.recent_active = None;
+        if cursor.recent && progress.startup_left != 0 {
+            self.continuations.push_back(cursor.key);
         }
     }
 
     fn finish_source(&mut self, initial: Duration, max: Duration) {
         let cursor = self.cursor.take().expect("active scan");
-        if self.recent_active == Some(cursor.key) {
-            self.recent_active = None;
-        }
         let mut progress = *self.sources.get(&cursor.key).expect("positive source");
         progress.offset = 0;
         progress.startup_left = 0;
@@ -1543,6 +1540,364 @@ mod tests {
     }
 
     #[test]
+    fn scan_freshness_64_lanes_counts_first_two_words_with_31k_roots() {
+        const LANES: usize = 64;
+        let mut reconciler = Reconciler::with_backoff(Duration::ZERO, Duration::ZERO)
+            .with_replication(
+                ReplicationMode::Full,
+                (0..LANES as u32).map(|lane| Inline::new(scheduled_handle(30, lane))),
+            );
+        let mut roots: BTreeSet<_> = (0..31_000)
+            .map(|ordinal| scheduled_handle(10, ordinal))
+            .collect();
+        let wanted: BTreeSet<_> = (0..EXACT_FETCHES_IN_FLIGHT as u32)
+            .map(|ordinal| scheduled_handle(20, ordinal))
+            .collect();
+        reconciler.observe_missing(&wanted, &roots);
+        reconciler.root_round.generation = reconciler.observation_generation;
+        reconciler.want_round.generation = reconciler.observation_generation;
+
+        for (lane, (_, scan)) in reconciler.scan.lanes.iter_mut().enumerate() {
+            for ordinal in 0..3 {
+                scan.observe(
+                    scheduled_handle(30, lane as u32),
+                    scheduled_handle(40, lane as u32 * 3 + ordinal),
+                );
+            }
+        }
+        // Start the ordinary rounds BEFORE the fresh source becomes readable.
+        // It is consequently absent from their frozen positive-source passes.
+        for lane in 0..LANES {
+            let cursor = next_selection(&mut reconciler.scan);
+            assert_eq!(reconciler.scan.last_lane, lane);
+            assert!(!cursor.recent);
+            reconciler.scan.advance();
+            reconciler.scan.yield_source();
+        }
+        let root = scheduled_handle(30, LANES as u32 - 1);
+        let fresh = scheduled_handle(250, 0);
+        reconciler.scan.lanes[LANES - 1].1.observe(root, fresh);
+
+        let mut scan_turns = 0;
+        let mut speculative_words = 0;
+        let mut word_trace = Vec::new();
+        let mut class_counts = [0; 4];
+        let mut regular_roots = Vec::new();
+        for service_turn in 1..=48 {
+            // Continued exact-root arrivals keep fresh-root service eligible;
+            // the startup backlog and explicit WANTs also remain due.
+            roots.insert(scheduled_handle(9, service_turn as u32));
+            reconciler.observe_missing(&wanted, &roots);
+            let (turn, candidates) = reconciler
+                .next_work(&wanted, &roots, crate::clock::mono_now())
+                .expect("all four service classes stay eligible");
+            let class = (service_turn - 1) % 4;
+            assert_eq!(
+                turn,
+                [
+                    ServiceTurn::Wants,
+                    ServiceTurn::FreshRoots,
+                    ServiceTurn::Roots,
+                    ServiceTurn::Scan,
+                ][class],
+            );
+            class_counts[class] += 1;
+            if turn != ServiceTurn::Scan {
+                // Model the four-wide exact window spending its quantum on
+                // four unavailable requests. No clock or transport is run.
+                assert!(candidates.len() >= EXACT_FETCHES_IN_FLIGHT);
+                for handle in candidates.into_iter().take(EXACT_FETCHES_IN_FLIGHT) {
+                    reconciler.begin_attempt(turn, handle);
+                    reconciler.record_unavailable(handle);
+                    if turn == ServiceTurn::Roots {
+                        regular_roots.push(handle);
+                    }
+                }
+                continue;
+            }
+
+            scan_turns += 1;
+            assert!(candidates.is_empty());
+            for _ in 0..RECONCILE_SPECULATIVE_FETCHES_PER_TICK {
+                let cursor = next_selection(&mut reconciler.scan);
+                speculative_words += 1;
+                if cursor.handles() == (root, fresh) {
+                    word_trace.push((service_turn, scan_turns, speculative_words, cursor.offset));
+                }
+                // Every examined word is a distinct, nonresident, unfiltered
+                // candidate whose speculative request misses. This is the
+                // production advance + yield-before-await path, not a model
+                // of the duration of that await or of local/filter hits.
+                reconciler.scan.advance();
+                reconciler.scan.yield_source();
+            }
+            // The real loop peeks the next candidate before noticing that the
+            // sixteen-attempt allowance is spent. Preserve its owed cursor.
+            let owed = next_selection(&mut reconciler.scan);
+            assert_eq!(owed.words, 0);
+            reconciler.scan.yield_source();
+        }
+
+        assert_eq!(class_counts, [12; 4]);
+        assert_eq!(regular_roots.len(), 12 * EXACT_FETCHES_IN_FLIGHT);
+        assert!(regular_roots.iter().all(|handle| handle[0] == 10));
+        assert_eq!(word_trace, [(16, 4, 64, 0), (48, 12, 192, 32)]);
+        assert_eq!(
+            reconciler.scan.lanes[LANES - 1]
+                .1
+                .sources
+                .get(&scan_key(root, fresh))
+                .unwrap()
+                .offset,
+            64,
+        );
+        // Counts begin at source residency, excluding any earlier exact-root
+        // fetch delay. For example, imposing 30 seconds on EVERY class would
+        // end quanta 16/48 at 480/1440 seconds, with the attempts inside those
+        // final Scan quanta. These are hypothetical costs, not measured DHT
+        // latency or a live bound.
+        println!(
+            "fresh source (service turn, scan turn, speculative word, offset): {word_trace:?}"
+        );
+    }
+
+    #[test]
+    fn scan_first_look_64_started_lanes_do_not_drain_windows_before_a_new_source() {
+        const LANES: usize = 64;
+        const OLD_SOURCES: usize = 256;
+        let mut scans = SelectionScans::new((0..LANES as u32).map(|lane| {
+            CollectionRecordSelector::Collection(Inline::new(scheduled_handle(30, lane)))
+        }));
+        for (lane, (_, scan)) in scans.lanes.iter_mut().enumerate() {
+            for ordinal in 0..OLD_SOURCES {
+                scan.observe(
+                    scheduled_handle(30, lane as u32),
+                    scheduled_handle(40, (lane * OLD_SOURCES + ordinal) as u32),
+                );
+            }
+        }
+        for recent in [false, true] {
+            for lane in 0..LANES {
+                let cursor = next_selection(&mut scans);
+                assert_eq!(scans.last_lane, lane);
+                assert_eq!(cursor.recent, recent);
+                assert_eq!(cursor.offset, 0);
+                scans.advance();
+                scans.yield_source();
+            }
+        }
+        let root = scheduled_handle(30, LANES as u32 - 1);
+        let fresh = scheduled_handle(250, 0);
+        scans.lanes[LANES - 1].1.observe(root, fresh);
+        let mut words = [0; LANES];
+        let mut ordinary_words = 0;
+        let mut speculative_words = 0;
+        let mut trace = Vec::new();
+        for round in 1..=5 {
+            scans.lanes[LANES - 1].1.observe(root, fresh);
+            if round > 2 {
+                // The new source has received its first look. Subsequent
+                // arrivals get their own turns but join behind its already
+                // queued continuation, even under continuous fresh work.
+                scans.lanes[LANES - 1]
+                    .1
+                    .observe(root, scheduled_handle(251, round));
+            }
+            for recent in [false, true] {
+                for lane in 0..LANES {
+                    let cursor = next_selection(&mut scans);
+                    assert_eq!(scans.last_lane, lane);
+                    assert_eq!(cursor.recent, recent);
+                    words[lane] += 1;
+                    speculative_words += 1;
+                    if !recent {
+                        ordinary_words += 1;
+                        assert_eq!(
+                            cursor.handles().1,
+                            scheduled_handle(40, (lane * OLD_SOURCES) as u32 + round),
+                            "first looks never take the frozen ordinary turn",
+                        );
+                    }
+                    if cursor.handles() == (root, fresh) {
+                        trace.push((speculative_words, cursor.offset));
+                    }
+                    // One speculative miss consumes one word and yields.
+                    scans.advance();
+                    scans.yield_source();
+                }
+            }
+        }
+        assert_eq!(trace, [(256, 0), (640, 32)]);
+        assert_eq!(words, [10; LANES]);
+        assert_eq!(ordinary_words, 320);
+        assert_eq!(speculative_words, 640);
+        for (lane, (_, scan)) in scans.lanes.iter().enumerate() {
+            let old = scan_key(
+                scheduled_handle(30, lane as u32),
+                scheduled_handle(40, (lane * OLD_SOURCES + OLD_SOURCES - 1) as u32),
+            );
+            let progress = scan.sources.get(&old).unwrap();
+            assert_eq!(progress.offset, 3 * 32);
+            assert_eq!(progress.startup_left, SCAN_STARTUP_WORDS - 3);
+        }
+        let scan = &scans.lanes[LANES - 1].1;
+        let key = scan_key(root, fresh);
+        assert_eq!(scan.sources.get(&key).unwrap().offset, 64);
+        assert_eq!(
+            scan.sources.get(&key).unwrap().startup_left,
+            SCAN_STARTUP_WORDS - 2
+        );
+        // The predecessor fixture on unchanged f20/f09 gives this source no
+        // first word while 16,256 speculative words drain the old windows.
+        // This is a count, not a time bound: exact classes, network stalls and
+        // newer arrivals before first-look admission remain independent delays.
+        println!("first-look source (speculative word, offset): {trace:?}");
+    }
+
+    #[test]
+    fn scan_first_look_arrival_order_cannot_starve_frozen_ordinary_rounds() {
+        let mut scan = FullScan::default();
+        let old = scheduled_handle(1, 0);
+        for ordinal in 0..4 {
+            scan.observe(old, scheduled_handle(2, ordinal));
+        }
+        scan.recent.clear();
+        assert_eq!(
+            next_ready(&mut scan).handles(),
+            (old, scheduled_handle(2, 0))
+        );
+        scan.advance();
+        scan.yield_source();
+        let waiting = scheduled_handle(250, 0);
+        scan.observe(waiting, waiting);
+
+        let mut reached = false;
+        for turn in 1..=64 {
+            // A newer source wins every first-look selection. The waiting
+            // source therefore depends on a subsequent frozen ordinary pass,
+            // not on any promise of FIFO admission to newest-first priority.
+            let arrival = scheduled_handle(251, turn);
+            scan.observe(arrival, arrival);
+            let cursor = next_ready(&mut scan);
+            if cursor.handles() == (waiting, waiting) {
+                assert!(!cursor.recent);
+                assert_eq!(cursor.offset, 0);
+                reached = true;
+                break;
+            }
+            scan.advance();
+            scan.yield_source();
+        }
+        assert!(
+            reached,
+            "new arrivals cannot lengthen a frozen ordinary round"
+        );
+    }
+
+    #[test]
+    fn scan_first_look_second_word_remains_proportional_to_started_queue() {
+        const LANES: usize = 64;
+        const OLD_SOURCES: usize = 512;
+        const STARTED: usize = 64;
+        let mut scans = SelectionScans::new((0..LANES as u32).map(|lane| {
+            CollectionRecordSelector::Collection(Inline::new(scheduled_handle(30, lane)))
+        }));
+        for (lane, (_, scan)) in scans.lanes.iter_mut().enumerate() {
+            for ordinal in 0..OLD_SOURCES {
+                scan.observe(
+                    scheduled_handle(30, lane as u32),
+                    scheduled_handle(40, (lane * OLD_SOURCES + ordinal) as u32),
+                );
+            }
+        }
+        let mut started = BTreeSet::new();
+        for _ in 0..STARTED * 2 - 1 {
+            for recent in [false, true] {
+                for lane in 0..LANES {
+                    let cursor = next_selection(&mut scans);
+                    assert_eq!(scans.last_lane, lane);
+                    assert_eq!(cursor.recent, recent);
+                    if recent && lane == LANES - 1 {
+                        started.insert(cursor.key);
+                    }
+                    scans.advance();
+                    scans.yield_source();
+                }
+            }
+        }
+        let prior_offsets: Vec<_> = started
+            .iter()
+            .map(|key| (*key, scans.lanes[LANES - 1].1.sources.get(key).unwrap().offset))
+            .collect();
+        let root = scheduled_handle(30, LANES as u32 - 1);
+        let fresh = scheduled_handle(250, 0);
+        scans.lanes[LANES - 1].1.observe(root, fresh);
+
+        let mut trace = Vec::new();
+        let mut words = [0; LANES];
+        let mut ordinary_words = 0;
+        let mut speculative_words = 0;
+        for round in 1..=STARTED * 2 + 3 {
+            scans.lanes[LANES - 1].1.observe(root, fresh);
+            if round > 2 {
+                // The arrival sequence is fixed, not conditional on the
+                // implementation's progress. Both old and new schedulers
+                // give the fresh source its first look on recent turn two.
+                scans.lanes[LANES - 1]
+                    .1
+                    .observe(root, scheduled_handle(251, round as u32));
+            }
+            for recent in [false, true] {
+                for lane in 0..LANES {
+                    let cursor = next_selection(&mut scans);
+                    assert_eq!(scans.last_lane, lane);
+                    assert_eq!(cursor.recent, recent);
+                    words[lane] += 1;
+                    speculative_words += 1;
+                    if !recent {
+                        ordinary_words += 1;
+                        assert_eq!(cursor.handles().1[0], 40);
+                    }
+                    if cursor.handles() == (root, fresh) {
+                        trace.push((speculative_words, cursor.offset));
+                    }
+                    scans.advance();
+                    scans.yield_source();
+                }
+            }
+            if trace.len() == 2 {
+                break;
+            }
+        }
+        println!(
+            "started sources={}, fresh (speculative word, offset)={trace:?}",
+            started.len(),
+        );
+        assert_eq!(trace, [(256, 0), (16_768, 32)]);
+        assert_eq!(started.len(), STARTED);
+        assert_eq!(words, [262; LANES]);
+        assert_eq!(ordinary_words, 8_384);
+        assert_eq!(speculative_words, 16_768);
+        let scan = &scans.lanes[LANES - 1].1;
+        for (key, prior_offset) in prior_offsets {
+            assert!(
+                scan.sources.get(&key).unwrap().offset > prior_offset,
+                "every already-started predecessor gets continuing progress",
+            );
+        }
+        let progress = scan.sources.get(&scan_key(root, fresh)).unwrap();
+        assert_eq!(progress.offset, 64);
+        assert_eq!(progress.startup_left, SCAN_STARTUP_WORDS - 2);
+        // Offset zero may contain only an entity/attribute pair; the useful
+        // descendant handle can be the second word. This deliberately records
+        // that first-look latency is not useful-reference latency. Under the
+        // same warm-up the predecessor scheduler has one window with one word
+        // left, rather than 64 started continuations: its expected trace is
+        // [(256, 0), (384, 32)]. The FIFO cost is real, not a constant-time
+        // second-word guarantee or a measured live latency improvement.
+    }
+
+    #[test]
     fn selection_scans_sustain_all_28_lanes_beyond_the_startup_window() {
         let mut scans = SelectionScans::new(
             (1_u8..=28).map(|byte| CollectionRecordSelector::Collection(Inline::new([byte; 32]))),
@@ -1646,7 +2001,7 @@ mod tests {
     }
 
     #[test]
-    fn full_scan_recent_descriptor_gets_a_window_beyond_its_first_word() {
+    fn full_scan_recent_descriptor_keeps_a_continuation_without_owning_every_recent_turn() {
         let mut scan = FullScan::default();
         let old = [1; 32];
         for ordinal in 0_u32..4_096 {
@@ -1666,7 +2021,8 @@ mod tests {
             let cursor = next_ready(&mut scan);
             if cursor.handles() == (descriptor, descriptor) {
                 descriptor_offsets.push(cursor.offset);
-            } else {
+            }
+            if !cursor.recent {
                 regular_turns += 1;
             }
             // One speculative request per turn, including deadline exits.
@@ -1675,14 +2031,14 @@ mod tests {
         }
         assert_eq!(
             descriptor_offsets,
-            (0..8).map(|word| word * 32).collect::<Vec<_>>(),
-            "a name in word eight must not wait behind the old root backlog",
+            [0, 32, 64, 96],
+            "first look and continuing service coexist with other first looks",
         );
         assert_eq!(regular_turns, 8);
     }
 
     #[test]
-    fn full_scan_started_window_survives_arrivals_and_expires_without_taking_regular_turns() {
+    fn full_scan_started_allowance_survives_arrivals_and_expires_without_taking_regular_turns() {
         let mut scan = FullScan::default();
         let old = scheduled_handle(1, 0);
         for ordinal in 0..4_096 {
@@ -1704,28 +2060,43 @@ mod tests {
         scan.advance();
         scan.yield_source();
 
-        let mut regular_turns = 0;
-        for word in 1..SCAN_STARTUP_WORDS {
-            // A fresh positive source arrives between every startup grant.
-            // It must not push the already-started message's next word behind
-            // thousands of ordinary sources or a growing newest-first stack.
-            let arrival = scheduled_handle(251, word as u32);
+        let mut message_words = 1;
+        let mut ordinary_words = 0;
+        let mut first_looks = 0;
+        for turn in 1..=3 {
+            // Every opportunity has a newer first look available. Existing
+            // continuations still get their FIFO turns, without consuming an
+            // ordinary turn or restarting the source's 128-word allowance.
+            let arrival = scheduled_handle(251, turn);
             scan.observe(arrival, arrival);
             let regular = next_ready(&mut scan);
             assert!(!regular.recent);
-            assert_eq!(regular.handles(), (old, scheduled_handle(2, word as u32)));
+            assert_eq!(regular.handles(), (old, scheduled_handle(2, turn)));
             scan.advance();
             scan.yield_source();
-            regular_turns += 1;
+            ordinary_words += 1;
 
             let resumed = next_ready(&mut scan);
             assert!(resumed.recent);
-            assert_eq!(resumed.handles(), (message, message));
-            assert_eq!(resumed.offset, word * 32);
-            scan.advance();
-            scan.yield_source();
+            if turn == 2 {
+                assert_eq!(resumed.handles(), (arrival, arrival));
+                assert_eq!(resumed.offset, 0);
+                scan.advance();
+                scan.yield_source();
+                first_looks += 1;
+            } else {
+                assert_eq!(resumed.handles(), (message, message));
+                assert_eq!(resumed.offset, message_words * 32);
+                let words = (SCAN_STARTUP_WORDS - message_words).min(SCAN_WORDS_PER_QUANTUM);
+                for _ in 0..words {
+                    scan.advance();
+                }
+                message_words += words;
+                assert!(scan.cursor.is_none());
+            }
         }
-        assert_eq!(regular_turns, SCAN_STARTUP_WORDS - 1);
+        assert_eq!((ordinary_words, first_looks), (3, 1));
+        assert_eq!(message_words, SCAN_STARTUP_WORDS);
         assert_eq!(
             scan.sources
                 .get(&scan_key(message, message))
@@ -1733,22 +2104,11 @@ mod tests {
                 .startup_left,
             0
         );
-
-        // Exhausting the existing allowance releases the startup position;
-        // the next grant goes to the newest still-unstarted arrival.
-        let regular = next_ready(&mut scan);
-        assert!(!regular.recent);
-        assert_eq!(
-            regular.handles(),
-            (old, scheduled_handle(2, SCAN_STARTUP_WORDS as u32))
-        );
-        scan.advance();
-        scan.yield_source();
-        let next = next_ready(&mut scan);
-        let newest = scheduled_handle(251, (SCAN_STARTUP_WORDS - 1) as u32);
-        assert!(next.recent);
-        assert_eq!(next.handles(), (newest, newest));
-        assert_eq!(next.offset, 0);
+        assert!(!scan.continuations.contains(&scan_key(message, message)));
+        assert!(scan.continuations.contains(&scan_key(
+            scheduled_handle(251, 2),
+            scheduled_handle(251, 2),
+        )));
     }
 
     #[test]
@@ -1831,9 +2191,11 @@ mod tests {
             if unavailable {
                 scans.forget_source(&regular.key);
                 assert!(scans.lanes[0].1.sources.get(&regular.key).is_none());
+                assert!(!scans.lanes[0].1.recent.contains(&regular.key));
+                assert!(!scans.lanes[0].1.continuations.contains(&regular.key));
             } else {
                 // A 32-byte source reaches EOF during its ordinary turn.
-                // Completion there must also release its recent reservation.
+                // Completion there must also clear its startup allowance.
                 scans.finish_source(Duration::from_secs(60), Duration::from_secs(60));
                 let progress = scans.lanes[0].1.sources.get(&regular.key).unwrap();
                 assert_eq!(progress.startup_left, 0);
@@ -1844,6 +2206,17 @@ mod tests {
             assert!(next.recent);
             assert_eq!(next.handles(), (arrival, arrival));
             assert_eq!(next.offset, 0);
+            scans.advance();
+            scans.yield_source();
+            if unavailable {
+                let scan = &mut scans.lanes[0].1;
+                scan.observe(source, source);
+                scan.observe(source, source);
+                let key = scan_key(source, source);
+                assert_eq!(scan.recent.iter().filter(|entry| **entry == key).count(), 1);
+                assert!(!scan.continuations.contains(&key));
+                assert_eq!(scan.sources.get(&key).unwrap().offset, 0);
+            }
         }
     }
 
@@ -1875,16 +2248,20 @@ mod tests {
             scan.yield_source();
         }
         assert_eq!(regular_turns, SCAN_STARTUP_WORDS * 2);
-        assert_eq!(
-            recent_roots,
-            [vec![3; SCAN_STARTUP_WORDS], vec![2; SCAN_STARTUP_WORDS]].concat(),
-            "newest-first is a finite window per arrival, not cohort round-robin",
-        );
+        assert_eq!(&recent_roots[..4], &[3, 3, 2, 3]);
+        for root in [2, 3] {
+            assert_eq!(
+                recent_roots.iter().filter(|seen| **seen == root).count(),
+                SCAN_STARTUP_WORDS,
+                "every started source retains its finite allowance",
+            );
+        }
         assert!(scan.recent.is_empty());
+        assert!(scan.continuations.is_empty());
     }
 
     #[test]
-    fn full_scan_startup_descriptors_reach_word_28_without_requeueing_or_widening_roots() {
+    fn full_scan_startup_descriptors_get_first_look_without_requeueing_or_widening_roots() {
         let descriptor = [128; 32];
         let missing_descriptor = [129; 32];
         let unrelated_descriptor = [130; 32];
@@ -1918,27 +2295,38 @@ mod tests {
             let cursor = next_ready(&mut scan);
             if cursor.handles().0 == descriptor {
                 descriptor_words.push(cursor.offset / 32);
-            } else {
+            }
+            if !cursor.recent {
                 regular_turns += 1;
             }
             scan.advance();
             scan.yield_source();
         }
-        assert_eq!(descriptor_words, (0..32).collect::<Vec<_>>());
-        assert!(
-            descriptor_words.contains(&27),
-            "the model name sits in word 28"
-        );
+        assert_eq!(descriptor_words, (0..6).collect::<Vec<_>>());
         assert_eq!(regular_turns, 32);
-        // A completed descriptor is not promoted again by a steady snapshot.
-        let cursor = next_ready(&mut scan);
-        scan.advance();
-        scan.yield_source();
-        assert_ne!(cursor.handles().0, descriptor);
-        assert_eq!(next_ready(&mut scan).handles().0, descriptor);
-        scan.finish_source(Duration::from_secs(60), Duration::from_secs(60));
+        // Later words share continuation service; there is no promise that
+        // word 28 precedes every other source's first look. A completed source
+        // still must not be promoted again by an identical snapshot.
+        let mut finished = false;
+        for _ in 0..128 {
+            let cursor = next_ready(&mut scan);
+            if cursor.handles().0 == descriptor {
+                assert_eq!(cursor.offset, 6 * 32);
+                scan.finish_source(Duration::from_secs(60), Duration::from_secs(60));
+                finished = true;
+                break;
+            }
+            scan.advance();
+            scan.yield_source();
+        }
+        assert!(finished, "the queued prefix is finite");
         scan.observe_roots(&roots, &selected, &resident);
         assert!(!scan.recent.contains(&scan_key(descriptor, descriptor)));
+        assert!(
+            !scan
+                .continuations
+                .contains(&scan_key(descriptor, descriptor))
+        );
         assert_eq!(
             scan.sources
                 .get(&scan_key(descriptor, descriptor))

@@ -39,6 +39,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Experiment with alternating newest-unstarted first looks and FIFO
+  round-robin startup continuations inside recursive scanning's recent turns.
+  Retain the 128-word per-source allowance, frozen ordinary rounds, all-lane
+  rotation and existing local/speculative limits. Later arrivals cannot
+  overtake an already queued continuation; first-look admission remains
+  arrival-sensitive and no wall-time hydration bound is claimed.
+
 - Bound exact WANT/direct-root fetching to an experimental four-wide window
   within the current service class and shared deadline. Land each completed
   body through the unchanged serial hash/durability boundary; deadline expiry

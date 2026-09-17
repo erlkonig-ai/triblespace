@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Experiment with separate recursive-hydration first looks and FIFO startup
+  continuations. Newest unstarted sources receive one bounded quantum while
+  started sources retain their shared offsets and 128-word allowance without
+  holding every recent turn. Ordinary rounds, selection rotation, serial
+  speculation, deadlines and limits are unchanged; no live latency claim.
+
 - Avoid recomputing collection-record fingerprints for field-only selectors.
   Mixed selector unions hash only when their field routes do not match;
   physical identities, result ordering and authentication are unchanged.

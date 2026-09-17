@@ -656,15 +656,31 @@ This is service fairness, not a wall-clock hydration guarantee. A large initial
 burst cannot all receive immediate service, sustained arrivals can outgrow the
 recent lane, and a slow request may consume its class's whole fetch deadline.
 Recent work never takes away the reserved regular turns, including revisits;
-it only accelerates a finite prefix of newly observed positive sources. The
-recent lane chooses an unstarted source newest-first, then retains its remaining
-startup allowance across yields: later arrivals cannot displace that source's
-second word. The existing allowance is at most 128 aligned words, including any
-progress made in ordinary turns. EOF or local unavailability releases the
-startup position too. This continuation does not hold a collection lane or take
-an ordinary turn; regular quanta still inspect at most 64 words. For a finite
-burst of A newcomers, the last first-service bound is O(A times the startup
-window), not constant time or round-robin service within that burst.
+it only accelerates a finite prefix of newly observed positive sources. An
+experimental recent scheduler alternates one newest-unstarted first look with
+one FIFO continuation quantum, using whichever is available when the other is
+empty. A first look uses the existing quantum: at most 64 local words, or one
+speculative request before yielding. Its remaining startup allowance joins the
+continuation queue; each continuation quantum moves its remaining work to the
+tail. Both queues hold only scheduling keys into the existing positive-source
+PATCH, which remains the sole owner of offsets and allowances.
+
+The allowance is still at most 128 aligned words, including progress made in
+ordinary turns. It is not a nonpreemptible reservation of every recent turn.
+Once a continuation is queued, new first looks join behind it: the finite
+prefix already ahead determines its next continuation opportunity. EOF clears
+the allowance; local unavailability removes that source's queued interests.
+An untouched selected word remains owed across quota or deadline exits.
+
+This exchanges uninterrupted startup-prefix service for earlier first looks.
+Later words of a descriptor now share service with other started sources; a
+growing continuation queue can increase the cost of subsequent opportunities.
+An older unstarted source can still lose newest-first priority to later
+arrivals, independently of its guaranteed place in a frozen ordinary round.
+Neither the size of a source's queued predecessor prefix nor the number of
+selected lanes is globally constant, and none of these counts is a network
+or wall-time bound. No startup quantum holds a collection lane beyond the
+existing 64-word or one-request limit.
 
 Full scans grant sustained quanta round-robin between the explicitly selected
 collections, each retaining the regular/recent walk above. A large selection's
@@ -682,8 +698,8 @@ class quanta still prevent a general finite hydration deadline.
 
 When seeding a full scan, ordinary resident record roots are observed before
 explicitly selected collection descriptors. A descriptor already present in
-both that root set and the durable resident set therefore receives its finite
-recent startup window ahead of the bulk inventory. This is ordering only:
+both that root set and the durable resident set therefore receives its recent
+first look ahead of the bulk inventory. This is ordering only:
 selection alone never invents a closure root, repeated snapshots do not reset
 offsets or requeue descriptors, and regular turns still progress. Many selected
 descriptors, later arrivals, unavailable providers, and exhausted scan quanta
