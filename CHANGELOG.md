@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Start exact-H blob GETs from verified provider hints while other directory
+  replies remain pending. Directory and provider operations share the existing
+  three request slots and at most 64 distinct provider attempts. Transient
+  attempt selection is arrival-sensitive; canonical collection discovery,
+  bearer authorization, byte validation and caller deadlines are unchanged.
+
 - Separate target-first collection reading from lazy exact support queries.
   Accepted target endorsements remain readable before their historical source
   records arrive. Collection observations track their consulted dependencies

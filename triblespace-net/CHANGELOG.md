@@ -56,6 +56,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Do not hold an already verified blob provider behind a stalled sibling
+  `PROVIDER_GET`. Exact-H discovery progressively schedules bounded provider
+  attempts as hints arrive, sharing three slots with directory queries and
+  retaining a 64-provider total attempt cap. Pending hints are XOR-ranked, but
+  the transient attempted subset can depend on reply order; canonical
+  collection discovery is unchanged. Three stalled in-flight operations may
+  still exhaust the caller deadline. No token, hash, memory or wire rule changes.
+
 - Keep missing subordinate-resource descriptors from hot-looping AUTH repair
   or starving independent collection records. AUTH retains an explicit
   incomplete result and a bounded share of each stream; immediate continuation
