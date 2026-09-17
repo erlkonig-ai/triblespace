@@ -240,6 +240,105 @@ impl Drop for RecoveryNode {
     }
 }
 
+/// A directory which remains responsive to routing but delays its provider
+/// reply. This isolates the post-FIND_NODE barrier from cold-dial behavior.
+struct DelayedDirectory {
+    peer: PeerId,
+    queries: Arc<AtomicUsize>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl DelayedDirectory {
+    fn new(
+        net: &SimNet,
+        key: &SigningKey,
+        replies: Vec<(PeerId, ProviderToken)>,
+        delay: Option<Duration>,
+    ) -> Self {
+        let peer = key.verifying_key().to_bytes();
+        let mut harness = net.join(key);
+        let queries = Arc::new(AtomicUsize::new(0));
+        let counted = queries.clone();
+        let server = tokio::spawn(async move {
+            while let Some(incoming) = harness.incoming.recv().await {
+                let replies = replies.clone();
+                let queries = counted.clone();
+                tokio::spawn(async move {
+                    while let Some((mut send, mut recv)) = incoming.conn.accept_bi().await {
+                        let replies = replies.clone();
+                        let queries = queries.clone();
+                        tokio::spawn(async move {
+                            let op = recv_u8(&mut recv).await.unwrap();
+                            let _key = recv_exact_key(&mut recv).await.unwrap();
+                            match op {
+                                OP_FIND_NODE => send_u8(&mut send, 0).await.unwrap(),
+                                OP_PROVIDER_GET => {
+                                    queries.fetch_add(1, Ordering::Relaxed);
+                                    match delay {
+                                        Some(delay) => tokio::time::sleep(delay).await,
+                                        None => std::future::pending::<()>().await,
+                                    }
+                                    send_u8(&mut send, replies.len() as u8).await.unwrap();
+                                    for (provider, token) in replies {
+                                        send_hash(&mut send, &provider).await.unwrap();
+                                        send_hash(&mut send, &token).await.unwrap();
+                                    }
+                                }
+                                other => panic!("unexpected directory opcode {other:#x}"),
+                            }
+                            send.shutdown().await.unwrap();
+                        });
+                    }
+                });
+            }
+        });
+        Self {
+            peer,
+            queries,
+            server,
+        }
+    }
+}
+
+impl Drop for DelayedDirectory {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn verified_provider_fetch_does_not_wait_for_a_stalled_directory_reply() {
+    let _guard = crate::protocol::exact_blob_receive_test_guard();
+    let mut fixture = Fixture::new(false);
+    let slow = DelayedDirectory::new(
+        &fixture.net,
+        &SigningKey::from_bytes(&[133; 32]),
+        Vec::new(),
+        None,
+    );
+    *fixture.client.candidates.lock().unwrap() =
+        RoutingTable::new(fixture.client.my_id, [slow.peer, fixture.provider]);
+    for peer in [slow.peer, fixture.provider] {
+        fixture
+            .client
+            .find_node(peer, blob_locator(fixture.hash))
+            .await
+            .unwrap();
+    }
+
+    let budget = Duration::from_secs(2);
+    let started = tokio::time::Instant::now();
+    assert_eq!(
+        fixture.sender.fetch_blob(fixture.hash, budget).await,
+        Some(fixture.bytes.clone()),
+        "a verified provider is usable before unrelated directory replies complete",
+    );
+    assert!(started.elapsed() < budget);
+    assert_eq!(slow.queries.load(Ordering::Relaxed), 1);
+    assert_eq!(fixture.blob_reads.load(Ordering::Relaxed), 1);
+    fixture.assert_no_control_effects();
+}
+
 #[tokio::test(start_paused = true)]
 async fn stale_provider_lease_survives_loss_alternate_fetch_and_same_endpoint_restart() {
     let _guard = crate::protocol::exact_blob_receive_test_guard();
