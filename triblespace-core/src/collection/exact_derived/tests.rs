@@ -611,6 +611,14 @@ struct GuardStore {
     acquired: Vec<CollectionData>,
     inject_record_on_acquire: Option<CollectionRecord>,
     inject_proof_on_acquire: Option<CapabilityProof>,
+    snapshot_calls: usize,
+    /// Land a blob from a second writer immediately before the Nth snapshot.
+    ///
+    /// This is a REAL residency change rather than a forced change set: the
+    /// bytes actually arrive between two observations, exactly as another
+    /// owner or an acquisition would land them, and the fresh view reports it
+    /// through its ordinary comparison.
+    land_blob_before_snapshot_at: Option<usize>,
 }
 
 impl GuardStore {
@@ -630,6 +638,8 @@ impl GuardStore {
             acquired: Vec::new(),
             inject_record_on_acquire: None,
             inject_proof_on_acquire: None,
+            snapshot_calls: 0,
+            land_blob_before_snapshot_at: None,
         }
     }
 
@@ -712,6 +722,13 @@ impl SnapshotSource for GuardStore {
     type SnapshotError = <MemoryRepo as SnapshotSource>::SnapshotError;
 
     fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+        self.snapshot_calls += 1;
+        if self.land_blob_before_snapshot_at == Some(self.snapshot_calls) {
+            let late = archive(9, 9);
+            self.inner
+                .put::<SimpleArchive, _>(late)
+                .expect("a second writer lands bytes between two observations");
+        }
         let inner = self.inner.snapshot()?;
         self.live.fetch_add(1, Ordering::SeqCst);
         Ok(GuardSnapshot {
@@ -3499,3 +3516,51 @@ fn the_public_ensure_future_stays_send_for_a_non_send_mapping<S>(
     assert_send(&future);
     drop(future);
 }
+
+/// A real residency change between the ensure round's observation and
+/// coarsening's own must refuse the carried resolution.
+///
+/// This is the same refusal the forced `StoreChanges::ALL` control exercises,
+/// reached through a genuine cause instead: a second writer lands bytes in
+/// between, and the fresh view reports it through its ordinary comparison. The
+/// snapshot index is asserted first, so the control cannot silently drift onto
+/// some other observation if the call order changes.
+#[test]
+fn late_residency_between_ensure_and_coarsening_refuses_the_carried_resolution() {
+    let (mut inner, root, first, second) = collections();
+    let left = archive(1, 1);
+    let right = archive(2, 2);
+    for blob in [&left, &right] {
+        publish_root(&mut inner, root, blob, 31);
+    }
+    let support = support(root, &[left, right]);
+    ensure_exact_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer(), &support)
+        .unwrap();
+    ensure_exact_resident::<_, SecondEncoding>(&mut inner, second, &equation_signer(), &support)
+        .unwrap();
+    drive_to_fixed_point(&mut inner, second, &support);
+
+    let mut store = GuardStore::new(inner);
+    // This pass takes exactly four snapshots: two in the ensure round's loop,
+    // then coarsening's own fresh view, then the target-maintenance view. The
+    // third is the one the carry is checked against, established by sweeping
+    // every index 1..=8 and observing which refuses: only 3 does, because
+    // bytes landing before 1 or 2 are already inside the carried probe and
+    // bytes landing at 4 arrive after the decision. An assertion below pins
+    // the count so this cannot silently drift onto another observation.
+    store.land_blob_before_snapshot_at = Some(3);
+    reset_mapping_calls();
+    maintain_exact_resident::<_, SecondEncoding>(&mut store, second, &equation_signer(), &support)
+        .unwrap();
+
+    assert_eq!(
+        store.snapshot_calls, 4,
+        "the snapshot order this control depends on has changed; re-derive the index",
+    );
+    assert_eq!(
+        SECOND_BIND_CALLS.get(),
+        2,
+        "bytes arriving in between refuse the carry, so coarsening resolves for itself",
+    );
+}
+
