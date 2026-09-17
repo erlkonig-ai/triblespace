@@ -78,9 +78,6 @@ pub(crate) fn selectors_match_record(
     selectors: &BTreeSet<CollectionRecordSelector>,
     record: CollectionRecord,
 ) -> bool {
-    if selectors.contains(&CollectionRecordSelector::Fingerprint(record.fingerprint())) {
-        return true;
-    }
     let collection = match record {
         CollectionRecord::Commit(commit) => commit.collection(),
         CollectionRecord::Merge(merge) => merge.collection(),
@@ -101,7 +98,7 @@ pub(crate) fn selectors_match_record(
     }) {
         return true;
     }
-    match record {
+    let matches_fields = match record {
         CollectionRecord::Commit(commit) => selectors.contains(
             &CollectionRecordSelector::CommitMember(commit.collection(), commit.data()),
         ),
@@ -118,7 +115,18 @@ pub(crate) fn selectors_match_record(
                     collection_record_operation(record).expect("DERIVE has an operation key"),
                 ))
         }
+    };
+    if matches_fields {
+        return true;
     }
+    // Fingerprint sorts first in this enum's derived Ord. Most indexed reads
+    // ask only for fields already in the record, so do not hash its bytes just
+    // to test a route which is absent. A matching field also satisfies a mixed
+    // union without needing its physical fingerprint.
+    matches!(
+        selectors.first(),
+        Some(CollectionRecordSelector::Fingerprint(_))
+    ) && selectors.contains(&CollectionRecordSelector::Fingerprint(record.fingerprint()))
 }
 
 /// Immutable read surface for canonical collection-calculus records.
@@ -411,6 +419,69 @@ mod tests {
                 .sort_unstable_by_key(CollectionRecord::fingerprint);
             self.records.dedup_by_key(|record| record.fingerprint());
             Ok(())
+        }
+    }
+
+    #[test]
+    fn field_selectors_do_not_recompute_record_fingerprints() {
+        use crate::collection::records::FINGERPRINT_CALLS;
+
+        let records = fixture();
+        let witness = records
+            .iter()
+            .find_map(|record| record.record_references().next())
+            .unwrap();
+        let selectors = [
+            CollectionRecordSelector::Collection(collection(1)),
+            CollectionRecordSelector::Collection(collection(99)),
+            CollectionRecordSelector::CommitMember(collection(1), data(4)),
+            CollectionRecordSelector::ProducedMember(collection(2), data(11)),
+            CollectionRecordSelector::ReferencingRecord(witness),
+            CollectionRecordSelector::MergeCollection(collection(1)),
+            CollectionRecordSelector::DeriveTarget(collection(2)),
+            CollectionRecordSelector::Operation(WantRequest::derive(collection(2), data(10))),
+            CollectionRecordSelector::Operation(WantRequest::blob(data(10))),
+        ];
+        let before = FINGERPRINT_CALLS.get();
+        for selector in selectors {
+            for &record in &records {
+                selectors_match_record(&BTreeSet::from([selector]), record);
+            }
+        }
+        for &record in &records {
+            assert!(!selectors_match_record(&BTreeSet::new(), record));
+        }
+        assert_eq!(FINGERPRINT_CALLS.get() - before, 0);
+    }
+
+    #[test]
+    fn fingerprint_routes_hash_only_when_field_routes_do_not_match() {
+        use crate::collection::records::FINGERPRINT_CALLS;
+
+        let records = fixture();
+        for (index, &record) in records.iter().enumerate() {
+            let fingerprint = record.fingerprint();
+            let other = records[(index + 1) % records.len()].fingerprint();
+            let exact = BTreeSet::from([CollectionRecordSelector::Fingerprint(fingerprint)]);
+            let before = FINGERPRINT_CALLS.get();
+            assert!(selectors_match_record(&exact, record));
+            assert_eq!(FINGERPRINT_CALLS.get() - before, 1);
+
+            let mixed = BTreeSet::from([
+                CollectionRecordSelector::Fingerprint(other),
+                CollectionRecordSelector::Collection(record.collection()),
+            ]);
+            let before = FINGERPRINT_CALLS.get();
+            assert!(selectors_match_record(&mixed, record));
+            assert_eq!(FINGERPRINT_CALLS.get() - before, 0);
+
+            let absent = BTreeSet::from([
+                CollectionRecordSelector::Fingerprint(other),
+                CollectionRecordSelector::Collection(collection(99)),
+            ]);
+            let before = FINGERPRINT_CALLS.get();
+            assert!(!selectors_match_record(&absent, record));
+            assert_eq!(FINGERPRINT_CALLS.get() - before, 1);
         }
     }
 

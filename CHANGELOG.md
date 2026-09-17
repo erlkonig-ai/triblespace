@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Avoid recomputing collection-record fingerprints for field-only selectors.
+  Mixed selector unions hash only when their field routes do not match;
+  physical identities, result ordering and authentication are unchanged.
+
 - Scope CLI maintenance-watch eligibility to the preceding active pass's raw
   record/blob/proof interests through opt-in `repo::ObservedStore` forwarding.
   Misses and relevant concurrent arrivals remain retry interests; unrelated

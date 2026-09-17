@@ -17,6 +17,11 @@
 use std::error::Error;
 use std::fmt;
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FINGERPRINT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 use ed25519::signature::Signer;
 use ed25519::Signature;
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -1238,6 +1243,8 @@ impl CollectionRecord {
 
     /// Recompute the exact content fingerprint of this canonical record.
     pub fn fingerprint(&self) -> CollectionRecordFingerprint {
+        #[cfg(test)]
+        FINGERPRINT_CALLS.set(FINGERPRINT_CALLS.get() + 1);
         match self {
             Self::Commit(record) => {
                 collection_record_fingerprint(KIND_COLLECTION_COMMIT, &record.to_bytes())
