@@ -3736,3 +3736,124 @@ fn source_guidance_consumes_the_carried_pair_at_most_once() {
         "one resolution saved on a working pass; the unpatched parent is (4, 5)",
     );
 }
+
+/// Build the working source-guidance fixture deterministically, so two arms can
+/// be constructed identically and compared.
+fn guidance_fixture() -> (
+    GuardStore,
+    Collection<SimpleArchive>,
+    Collection<FirstEncoding>,
+    Support,
+) {
+    let (mut inner, root, first, _second) = collections();
+    let members = [archive(1, 1), archive(2, 2), archive(3, 3)];
+    for member in &members {
+        publish_root(&mut inner, root, member, 31);
+    }
+    let support = support(root, &members);
+    ensure_exact_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer(), &support)
+        .unwrap();
+    let mut store = GuardStore::new(inner);
+    block_on(store.maintain_exact(first, &equation_signer(), &support)).unwrap();
+
+    let intermediate =
+        crate::collection::simplearchive_union::join(&members[0], &members[1]).unwrap();
+    let upper = crate::collection::simplearchive_union::join(&intermediate, &members[2]).unwrap();
+    for member in [&intermediate, &upper] {
+        store.inner.put::<SimpleArchive, _>(member.clone()).unwrap();
+    }
+    for (low, high, result) in [
+        (&members[0], &members[1], &intermediate),
+        (&intermediate, &members[2], &upper),
+    ] {
+        let before = store.inner.snapshot().unwrap();
+        let low_witness = witnessed_input(&before, root.handle(), data(low));
+        let high_witness = witnessed_input(&before, root.handle(), data(high));
+        drop(before);
+        store
+            .inner
+            .insert(CollectionRecord::Merge(CollectionMerge::sign(
+                &equation_signer(),
+                root.handle(),
+                low_witness,
+                high_witness,
+                data(result),
+            )))
+            .unwrap();
+    }
+    (store, root, first, support)
+}
+
+/// CARRY VERSUS RE-PROBE, differentially.
+///
+/// Every other control asserts that one arm publishes nothing or that a count
+/// changes. None of them compares what the two routes actually PRODUCE on a
+/// pass that does work. This does: two identically constructed fixtures, one
+/// taking the ordinary carry and one forced onto the re-probe route by
+/// `StoreChanges::ALL`, compared afterwards on the complete record set, the
+/// resolved cover, its data members, and the write events.
+///
+/// The counter difference is asserted too, so the two arms cannot accidentally
+/// take the same route and agree trivially.
+#[test]
+fn carry_and_reprobe_produce_identical_records_support_and_outputs() {
+    let (mut carry_store, _root, carry_first, carry_support) = guidance_fixture();
+    reset_mapping_calls();
+    let carry_probes_before = carry_store.semantic_probes.load(Ordering::SeqCst);
+    let carry_after =
+        block_on(carry_store.maintain_exact(carry_first, &equation_signer(), &carry_support))
+            .unwrap();
+    let carry_counts = (
+        FIRST_BIND_CALLS.get(),
+        carry_store.semantic_probes.load(Ordering::SeqCst) - carry_probes_before,
+    );
+    let carry_cover: Vec<_> = carry_after
+        .collection_exact(carry_first, &carry_support)
+        .unwrap()
+        .cover()
+        .data_members()
+        .collect();
+    drop(carry_after);
+    let carry_records = records(&mut carry_store.inner);
+    let carry_events = carry_store.events.clone();
+
+    let (mut probe_store, _root2, probe_first, probe_support) = guidance_fixture();
+    reset_mapping_calls();
+    let probe_probes_before = probe_store.semantic_probes.load(Ordering::SeqCst);
+    GUARD_CHANGES_ALL.set(true);
+    let probe_after =
+        block_on(probe_store.maintain_exact(probe_first, &equation_signer(), &probe_support))
+            .unwrap();
+    GUARD_CHANGES_ALL.set(false);
+    let probe_counts = (
+        FIRST_BIND_CALLS.get(),
+        probe_store.semantic_probes.load(Ordering::SeqCst) - probe_probes_before,
+    );
+    let probe_cover: Vec<_> = probe_after
+        .collection_exact(probe_first, &probe_support)
+        .unwrap()
+        .cover()
+        .data_members()
+        .collect();
+    drop(probe_after);
+    let probe_records = records(&mut probe_store.inner);
+    let probe_events = probe_store.events.clone();
+
+    assert_ne!(
+        carry_counts, probe_counts,
+        "both arms took the same route, so agreeing below would prove nothing",
+    );
+    assert_eq!(
+        carry_counts.0 + 1,
+        probe_counts.0,
+        "the re-probe arm must bind exactly one more time",
+    );
+
+    assert!(
+        !carry_events.is_empty(),
+        "this comparison must be over a pass that publishes",
+    );
+    assert_eq!(carry_events, probe_events, "write events differ");
+    assert_eq!(carry_records, probe_records, "canonical record sets differ");
+    assert_eq!(carry_cover, probe_cover, "resolved covers differ");
+}
