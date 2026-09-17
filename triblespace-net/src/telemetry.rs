@@ -49,7 +49,8 @@ pub mod attrs {
         /// Sum of completed operation wall durations for this scope/session,
         /// not process CPU time. Parallel operation durations may overlap.
         "8F269C3A72BA2A2BD3AF72C9033CED7A" as work_ns: inlineencodings::U256BE;
-        /// Observed connection path (e.g. direct/relay); not routing candidates.
+        /// Observed connection path (e.g. direct/relay); not routing
+        /// candidates or endpoint addresses.  Link samples only.
         "3610AA8DE6C85D0816DB04E08B82E823" as path: inlineencodings::ShortString;
         /// Known queued work in this subject's scope; never an inventory guess.
         "6414ACDA4FF1CF3605A98A96E06E7207" as queued: inlineencodings::U256BE;
@@ -74,6 +75,12 @@ pub mod attrs {
         "C23227AD4E963B210884B38B298514E1" as compiled_backend: inlineencodings::ShortString;
         /// Measured transport RTT, not an estimate from application completion.
         "CF8B3D8834B521AF09A16ABAD48305DD" as rtt_ns: inlineencodings::U256BE;
+        /// Cumulative transport bytes received on a link, including protocol
+        /// overhead; distinct from verified payload counters.
+        "874669888A0AFFD5CD65FAA72EB73C78" as transport_received_bytes: inlineencodings::U256BE;
+        /// Cumulative transport bytes sent on a link, including protocol
+        /// overhead; distinct from verified payload counters.
+        "FA5075DE328F226016F5AF77720B3943" as transport_sent_bytes: inlineencodings::U256BE;
         "DF90FF3ACACCA2A75BEF4CF95E54A58A" as pending_merges: inlineencodings::U256BE;
         "A5C1E6D84624930A582EFCD992502351" as pending_derives: inlineencodings::U256BE;
         "30E10F0077BF9463BC25887C04D37925" as completed_merges: inlineencodings::U256BE;
@@ -93,6 +100,8 @@ pub enum Metric {
     WorkNs,
     Parallelism,
     RttNs,
+    TransportReceivedBytes,
+    TransportSentBytes,
     PendingMerges,
     PendingDerives,
     CompletedMerges,
@@ -100,7 +109,7 @@ pub enum Metric {
 }
 
 impl Metric {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 16] = [
         Self::Queued,
         Self::Active,
         Self::Completed,
@@ -111,6 +120,8 @@ impl Metric {
         Self::WorkNs,
         Self::Parallelism,
         Self::RttNs,
+        Self::TransportReceivedBytes,
+        Self::TransportSentBytes,
         Self::PendingMerges,
         Self::PendingDerives,
         Self::CompletedMerges,
@@ -129,6 +140,8 @@ impl Metric {
             Self::WorkNs => &attrs::work_ns,
             Self::Parallelism => &attrs::parallelism,
             Self::RttNs => &attrs::rtt_ns,
+            Self::TransportReceivedBytes => &attrs::transport_received_bytes,
+            Self::TransportSentBytes => &attrs::transport_sent_bytes,
             Self::PendingMerges => &attrs::pending_merges,
             Self::PendingDerives => &attrs::pending_derives,
             Self::CompletedMerges => &attrs::completed_merges,
@@ -148,6 +161,8 @@ impl Metric {
             Self::WorkNs => "completed operation wall time",
             Self::Parallelism => "configured parallelism",
             Self::RttNs => "link RTT",
+            Self::TransportReceivedBytes => "transport bytes received",
+            Self::TransportSentBytes => "transport bytes sent",
             Self::PendingMerges => "pending merges",
             Self::PendingDerives => "pending derives",
             Self::CompletedMerges => "completed merges",
@@ -166,6 +181,8 @@ impl Metric {
                 | Self::WorkNs
                 | Self::CompletedMerges
                 | Self::CompletedDerives
+                | Self::TransportReceivedBytes
+                | Self::TransportSentBytes
         )
     }
 }

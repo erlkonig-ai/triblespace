@@ -18,10 +18,13 @@ use crate::clock::Mono;
 use crate::collection_wire::CollectionRepairManifest;
 use crate::inventory::ReconcileDirection;
 use crate::patch_repair::PatchSummary;
-use crate::transport::PeerId;
+use crate::transport::{LinkObservation, LinkPath, PeerId};
 
 /// Hard per-active-collection bound on retained pairwise runtime evidence.
 pub const MAX_HEALTH_PEERS_PER_COLLECTION: usize = 128;
+/// Hard bound on the current transport-link observations retained for a
+/// process.  This is a participant observation, not a topology inventory.
+pub const MAX_HEALTH_LINKS: usize = 128;
 
 /// The existing immutable manifest received after READ(C) admission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -197,6 +200,20 @@ pub struct BlobServeHealth {
     pub work_ns: u128,
 }
 
+/// The latest sanitized transport observation for one peer.  A new path or
+/// connection replaces the prior observation for that peer; old telemetry
+/// subjects naturally age out in readers instead of being retained as a
+/// second mutable catalogue here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LinkHealth {
+    pub peer: PeerId,
+    pub path: LinkPath,
+    pub observed_at: Mono,
+    pub rtt_ns: Option<u64>,
+    pub sent_bytes: Option<u64>,
+    pub received_bytes: Option<u64>,
+}
+
 impl PublicationHealth {
     pub(crate) fn completed(&mut self, at: Mono, result: crate::provider::PublicationResult) {
         use crate::provider::PublicationResult;
@@ -241,6 +258,9 @@ pub struct HealthSnapshot {
     pub collections: Vec<CollectionHealth>,
     pub publication: PublicationHealth,
     pub blob_serving: BlobServeHealth,
+    /// Current links observed by the transport adapter, never an inferred
+    /// roster.  Absence means this adapter/connection has no link sample.
+    pub links: Vec<LinkHealth>,
 }
 
 fn fresh(at: Option<Mono>, now: Mono, max_age: Duration) -> bool {
@@ -315,6 +335,7 @@ impl Health {
             collections: Vec::new(),
             publication: PublicationHealth::default(),
             blob_serving: BlobServeHealth::default(),
+            links: Vec::new(),
         })))
     }
 
@@ -333,6 +354,49 @@ impl Health {
             started: crate::clock::mono_now(),
             finished: false,
         }
+    }
+
+    /// Replace the current observation for a peer, retaining at most the
+    /// bounded set of most recently observed peers.  This records no locator,
+    /// routing candidate, bearer, or application payload.
+    pub(crate) fn observe_link(&self, observation: LinkObservation) {
+        let observed_at = crate::clock::mono_now();
+        self.update(|health| {
+            if let Some(link) = health
+                .links
+                .iter_mut()
+                .find(|link| link.peer == observation.peer)
+            {
+                *link = LinkHealth {
+                    peer: observation.peer,
+                    path: observation.path,
+                    observed_at,
+                    rtt_ns: observation.rtt_ns,
+                    sent_bytes: observation.sent_bytes,
+                    received_bytes: observation.received_bytes,
+                };
+                return;
+            }
+            if health.links.len() == MAX_HEALTH_LINKS {
+                let Some((oldest, _)) = health
+                    .links
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, link)| (link.observed_at, link.peer))
+                else {
+                    return;
+                };
+                health.links.swap_remove(oldest);
+            }
+            health.links.push(LinkHealth {
+                peer: observation.peer,
+                path: observation.path,
+                observed_at,
+                rtt_ns: observation.rtt_ns,
+                sent_bytes: observation.sent_bytes,
+                received_bytes: observation.received_bytes,
+            });
+        });
     }
 
     pub(crate) fn with_peer(
@@ -438,6 +502,32 @@ mod tests {
             pinned.blob_serving.in_flight, 1,
             "snapshots remain immutable"
         );
+    }
+
+    #[test]
+    fn link_observation_is_bounded_to_one_current_entry_per_peer() {
+        let (health, _, peer, _) = fixture();
+        health.observe_link(LinkObservation {
+            peer,
+            path: LinkPath::Direct,
+            rtt_ns: Some(12),
+            sent_bytes: Some(100),
+            received_bytes: Some(80),
+        });
+        health.observe_link(LinkObservation {
+            peer,
+            path: LinkPath::Relay,
+            rtt_ns: Some(34),
+            sent_bytes: Some(200),
+            received_bytes: Some(180),
+        });
+        let links = &health.snapshot().links;
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].peer, peer);
+        assert_eq!(links[0].path, LinkPath::Relay);
+        assert_eq!(links[0].rtt_ns, Some(34));
+        assert_eq!(links[0].sent_bytes, Some(200));
+        assert_eq!(links[0].received_bytes, Some(180));
     }
 
     fn frontier(byte: u8, count: u64) -> RepairFrontier {

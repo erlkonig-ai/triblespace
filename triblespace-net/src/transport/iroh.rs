@@ -12,7 +12,7 @@ use iroh_base::{EndpointAddr, EndpointId};
 use tokio::sync::mpsc;
 use tracing::{Instrument as _, debug, warn};
 
-use super::{Alpn, Conn, Harness, Incoming, PeerId, Transport};
+use super::{Alpn, Conn, Harness, Incoming, LinkObservation, LinkPath, PeerId, Transport};
 use crate::host::PeerConfig;
 use crate::wake::CollectionWakePlane;
 
@@ -68,6 +68,35 @@ impl Conn for IrohConn {
 
     fn remote_id(&self) -> PeerId {
         *self.0.remote_id().as_bytes()
+    }
+
+    fn link_observation(&self) -> Option<LinkObservation> {
+        let path = self.0.paths().iter().find(|path| path.is_selected());
+        let (path_kind, rtt_ns, sent_bytes, received_bytes) = path
+            .map(|path| {
+                let kind = if path.is_ip() {
+                    LinkPath::Direct
+                } else if path.is_relay() {
+                    LinkPath::Relay
+                } else {
+                    LinkPath::Unknown
+                };
+                let stats = path.stats();
+                (
+                    kind,
+                    Some(u64::try_from(path.rtt().as_nanos()).unwrap_or(u64::MAX)),
+                    Some(stats.udp_tx.bytes),
+                    Some(stats.udp_rx.bytes),
+                )
+            })
+            .unwrap_or((LinkPath::Unknown, None, None, None));
+        Some(LinkObservation {
+            peer: self.remote_id(),
+            path: path_kind,
+            rtt_ns,
+            sent_bytes,
+            received_bytes,
+        })
     }
 
     async fn open_bi(&self) -> anyhow::Result<(Self::SendHalf, Self::RecvHalf)> {

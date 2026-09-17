@@ -10,7 +10,8 @@ use triblespace_core::collection::{descriptor, Collection, CollectionStoreExt};
 use triblespace_core::metadata;
 use triblespace_core::prelude::*;
 use triblespace_core::repo::pile::Pile;
-use triblespace_net::health::HealthSnapshot;
+use triblespace_net::health::{HealthSnapshot, LinkHealth};
+use triblespace_net::transport::LinkPath;
 use triblespace_net::health_record as h;
 use triblespace_net::reconcile::ReconcileStats;
 use triblespace_net::telemetry as t;
@@ -79,6 +80,7 @@ mod tests {
             collections: Vec::new(),
             publication: Default::default(),
             blob_serving: Default::default(),
+            links: Vec::new(),
         }
     }
 
@@ -113,6 +115,72 @@ mod tests {
             ]))
             .is_ok()
         );
+    }
+
+    #[test]
+    fn fresh_link_observations_are_published_as_transport_metrics() {
+        let (_directory, mut pile, collection, key_path, signer) = fixture();
+        let mut publisher = Publisher::open(
+            &mut pile,
+            signer.verifying_key(),
+            options(collection, key_path),
+        )
+        .unwrap()
+        .unwrap();
+        let peer = ed25519_dalek::SigningKey::from_bytes(&[11; 32])
+            .verifying_key()
+            .to_bytes();
+        let mut health = health(signer.verifying_key());
+        health.links.push(LinkHealth {
+            peer,
+            path: LinkPath::Direct,
+            observed_at: triblespace_core::clock::mono_now(),
+            rtt_ns: Some(1_000),
+            sent_bytes: Some(2_000),
+            received_bytes: Some(3_000),
+        });
+        let at = triblespace_core::clock::epoch_now();
+        let facts = publisher
+            .sample(&health, at, Duration::from_secs(1), None)
+            .unwrap();
+        let report = t::observe(
+            facts.facts(),
+            at.to_tai_duration().total_nanoseconds(),
+            Duration::from_secs(180),
+        )
+        .into_iter()
+        .find(|report| report.role == "link")
+        .expect("fresh link report");
+        assert_eq!(report.peers, vec![peer]);
+        assert_eq!(report.paths, vec!["direct"]);
+        assert_eq!(
+            report
+                .metrics
+                .iter()
+                .find(|metric| metric.metric == t::Metric::RttNs)
+                .unwrap()
+                .value,
+            triblespace_net::dashboard::CountMetric::Value(1_000)
+        );
+        assert_eq!(
+            report
+                .metrics
+                .iter()
+                .find(|metric| metric.metric == t::Metric::TransportSentBytes)
+                .unwrap()
+                .value,
+            triblespace_net::dashboard::CountMetric::Value(2_000)
+        );
+        assert_eq!(
+            report
+                .metrics
+                .iter()
+                .find(|metric| metric.metric == t::Metric::TransportReceivedBytes)
+                .unwrap()
+                .value,
+            triblespace_net::dashboard::CountMetric::Value(3_000)
+        );
+        pile.close().unwrap();
     }
 
     #[test]
@@ -513,6 +581,8 @@ pub(super) struct Publisher {
     collection: Collection<blobencodings::SimpleArchive>,
     signer: SigningKey,
     session: ExclusiveId,
+    node: VerifyingKey,
+    worker: Inline<inlineencodings::ShortString>,
     started: Instant,
     subjects: [Fragment; 5],
     landed: u128,
@@ -577,11 +647,13 @@ impl Publisher {
             collection,
             signer,
             session: ufoid(),
+            node: node.clone(),
+            worker: worker.clone(),
             started: Instant::now(),
             subjects: ["hydration", "serve", "repair", "publication", "process"].map(|role| {
                 entity! {
-                    h::attrs::endpoint: node,
-                    t::attrs::worker: worker,
+                    h::attrs::endpoint: node.clone(),
+                    t::attrs::worker: worker.clone(),
                     t::attrs::role: role,
                 }
             }),
@@ -672,6 +744,38 @@ impl Publisher {
             t::attrs::cpu_ns?: cpu_ns,
             t::attrs::parallel_compiled: triblespace_core::PARALLEL_COMPILED,
         };
+        // Link subjects are emitted only from fresh adapter observations.
+        // A missing/aged observation remains absent; it is never converted
+        // into a zero-byte or zero-RTT claim.  Transport counters include
+        // protocol overhead and therefore use their own attributes.
+        let observed_at = triblespace_core::clock::mono_now();
+        for link in &health.links {
+            if observed_at < link.observed_at
+                || observed_at.duration_since(link.observed_at) > h::HOST_MAX_AGE
+            {
+                continue;
+            }
+            let Ok(peer) = VerifyingKey::from_bytes(&link.peer) else {
+                continue;
+            };
+            let subject = entity! {
+                h::attrs::endpoint: self.node.clone(),
+                t::attrs::worker: self.worker.clone(),
+                t::attrs::role: "link",
+                h::attrs::peer: peer,
+            };
+            facts += entity! {
+                metadata::tag: &t::KIND_SAMPLE,
+                t::attrs::subject*: subject,
+                h::attrs::session: &self.session,
+                metadata::created_at: created,
+                t::attrs::elapsed_ns: elapsed_ns,
+                t::attrs::path: link.path.label(),
+                t::attrs::rtt_ns?: link.rtt_ns,
+                t::attrs::transport_sent_bytes?: link.sent_bytes,
+                t::attrs::transport_received_bytes?: link.received_bytes,
+            };
+        }
         Ok(facts)
     }
 

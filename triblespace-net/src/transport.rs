@@ -34,6 +34,43 @@ use tokio::sync::mpsc;
 /// simulator.
 pub type PeerId = [u8; 32];
 
+/// Coarse path class safe to publish as operational telemetry.
+///
+/// The transport must not export endpoint addresses, relay URLs, routing
+/// candidates, or bearer material.  `Unknown` covers adapters that can report
+/// byte/RTT counters without exposing a path classification.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum LinkPath {
+    Direct,
+    Relay,
+    Unknown,
+}
+
+impl LinkPath {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Relay => "relay",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// One instantaneous, adapter-provided link observation.
+///
+/// Byte counters are transport bytes (including protocol overhead), not
+/// verified payload bytes.  They are cumulative for the underlying
+/// connection; a pool replacement may reset them and therefore suppress a
+/// derived rate rather than manufacture one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LinkObservation {
+    pub peer: PeerId,
+    pub path: LinkPath,
+    pub rtt_ns: Option<u64>,
+    pub sent_bytes: Option<u64>,
+    pub received_bytes: Option<u64>,
+}
+
 /// Application-layer protocol identifier for a connection. The protocol's
 /// ALPN is a `'static` const ([`crate::protocol::PILE_SYNC_ALPN`]), so a
 /// borrowed static slice suffices and keeps dispatch alloc-free.
@@ -57,6 +94,14 @@ pub trait Conn: Clone + Send + Sync + 'static {
     /// node that dialed, so identity-dependent protocol logic is
     /// exercised honestly.
     fn remote_id(&self) -> PeerId;
+
+    /// Return a sanitized instantaneous transport observation when the
+    /// adapter can provide one.  This is deliberately optional so the
+    /// simulator and future transports can remain honest about unavailable
+    /// link statistics instead of estimating them from application timing.
+    fn link_observation(&self) -> Option<LinkObservation> {
+        None
+    }
 
     /// Open an outgoing bidirectional stream.
     fn open_bi(

@@ -696,6 +696,7 @@ struct ProviderClient<T: Transport> {
     providers: Arc<Mutex<ProviderDirectory>>,
     candidates: RoutingCandidates,
     my_id: PeerId,
+    health: Health,
 }
 
 struct NetCap<T: Transport> {
@@ -1271,6 +1272,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
         providers: providers.clone(),
         candidates: candidates.clone(),
         my_id,
+        health: wiring.health.clone(),
     };
     let cap = Arc::new(NetCap {
         client: provider_client.clone(),
@@ -1886,10 +1888,16 @@ async fn reconcile_collection_peer<T: Transport>(
     {
         Ok(delta) => delta,
         Err(error) => {
+            if let Some(observation) = connection.conn().link_observation() {
+                health.observe_link(observation);
+            }
             pool_invalidate(pool, target.peer, &connection.entry);
             return Err(error);
         }
     };
+    if let Some(observation) = connection.conn().link_observation() {
+        health.observe_link(observation);
+    }
     health.with_peer(target.collection, target.peer, |health| {
         let now = crate::clock::mono_now();
         let records_received = delta.records.len() as u64;
@@ -1922,11 +1930,21 @@ async fn reconcile_collection_peer<T: Transport>(
 }
 
 impl<T: Transport> ProviderClient<T> {
+    fn observe_link<C>(&self, connection: &PooledConnection<C>)
+    where
+        C: Conn,
+    {
+        if let Some(observation) = connection.conn().link_observation() {
+            self.health.observe_link(observation);
+        }
+    }
+
     async fn find_node(&self, peer: PeerId, target: RoutingKey) -> anyhow::Result<Vec<PeerId>> {
         let connection = pool_get(&self.transport, &self.pool, peer).await?;
         let response = tokio::time::timeout(OP_DEADLINE, op_find_node(connection.conn(), &target))
             .await
             .map_err(|_| anyhow::anyhow!("FIND_NODE deadline exceeded"))?;
+        self.observe_link(&connection);
         match response {
             Ok(peers) => {
                 self.candidates.lock().unwrap().promote_authenticated(peer);
@@ -2005,6 +2023,7 @@ impl<T: Transport> ProviderClient<T> {
         .await
         {
             Ok(Ok(stored)) => {
+                self.observe_link(&connection);
                 self.candidates.lock().unwrap().promote_authenticated(peer);
                 if stored {
                     ProviderPutResult::Accepted
@@ -2013,6 +2032,7 @@ impl<T: Transport> ProviderClient<T> {
                 }
             }
             Ok(Err(_)) | Err(_) => {
+                self.observe_link(&connection);
                 pool_invalidate(&self.pool, peer, &connection.entry);
                 ProviderPutResult::Unavailable
             }
@@ -2054,6 +2074,7 @@ impl<T: Transport> ProviderClient<T> {
             .await
             .map_err(|_| anyhow::anyhow!("DHT provider query deadline exceeded"))
             .and_then(|response| response);
+        self.observe_link(&connection);
         match response {
             Ok(providers) => {
                 self.candidates.lock().unwrap().promote_authenticated(peer);
@@ -2121,6 +2142,7 @@ impl<T: Transport> ProviderClient<T> {
         .await
         .map_err(|_| anyhow::anyhow!("exact blob provider request deadline exceeded"))
         .and_then(|response| response);
+        self.observe_link(&connection);
         match response {
             Ok(Some(bytes)) => {
                 self.candidates.lock().unwrap().promote_authenticated(peer);
@@ -2516,6 +2538,9 @@ impl SnapshotHandler {
         _permit: tokio::sync::OwnedSemaphorePermit,
     ) {
         let peer_id = connection.remote_id();
+        if let Some(observation) = connection.link_observation() {
+            self.health.observe_link(observation);
+        }
         let span = info_span!("connection", peer = %hex::encode(&peer_id[..4]));
         async move {
             debug!(target: "triblespace_net::handoff", "host connection handler started");
