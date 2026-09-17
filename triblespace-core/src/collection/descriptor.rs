@@ -81,6 +81,29 @@ where
     store.put::<SimpleArchive, _>(descriptor.facts().clone())
 }
 
+/// Content identity of one fixed root descriptor, pinned so that re-minting
+/// every collection cannot happen quietly.
+///
+/// A collection *is* the handle of its descriptor blob. So every fact
+/// [`naming`] emits — the name, the representation, and the whole encoded
+/// admission policy — is part of that identity, and changing any of their
+/// shapes gives the same logical collection a different handle. Callers do not
+/// see this. A faculty asks for the name it always used, receives the new
+/// generation, finds it empty, and carries on while the old generation's
+/// records sit unreferenced in the pile.
+///
+/// That has already happened four times in nine days. The records survived
+/// each time; what was lost was the fact that anything had moved.
+///
+/// `root_descriptor_identity_is_pinned` recomputes this from a fixed name, a
+/// fixed representation and a fixed key, so a policy-schema edit fails the test
+/// with the new value instead of silently re-minting every collection in every
+/// pile. **Never repin this to make the test pass.** A new value means existing
+/// collections have new identities and their records need a migration forward;
+/// the constant is the last thing to change, after that migration exists.
+pub const PINNED_ROOT_DESCRIPTOR_IDENTITY: RawInline =
+    hex_literal::hex!("8A63C584C7A645DAA1DA959631E55299181869B7FFC5A567A535D71924367D68");
+
 /// Build a root descriptor that names its encoding without describing it.
 ///
 /// A collection encoding normally writes its own descriptor as a visible
@@ -518,6 +541,33 @@ mod policy_tests {
 
     fn root(name: &str, expected: CollectionPolicy) -> Fragment {
         naming::<SimpleArchive>(name, expected)
+    }
+
+    /// The canonical root descriptor still hashes to its pinned identity.
+    ///
+    /// This is the guard the four 2026-08/09 re-mints did not have. It fails
+    /// loudly with the computed value so that changing the descriptor's shape
+    /// is a deliberate act carrying a migration, rather than an invisible one.
+    /// Restore the previous descriptor shape, or land the migration and repin
+    /// in the same change; never repin alone.
+    #[test]
+    fn root_descriptor_identity_is_pinned() {
+        let authority = key(0x2A);
+        let policy = CollectionPolicy::new(
+            AdmissionPolicy::direct(authority),
+            AdmissionPolicy::direct(authority),
+        );
+        let computed = identity_for_tests(&naming::<SimpleArchive>("pinned-root", policy)).raw;
+        assert_eq!(
+            computed,
+            PINNED_ROOT_DESCRIPTOR_IDENTITY,
+            "the canonical root descriptor now hashes to {} instead of {}; every collection this \
+             build registers has a new identity and the records of the previous generation are \
+             unreachable by name. Restore the descriptor shape, or land a migration that carries \
+             those records forward and repin in the same change.",
+            hex::encode(computed),
+            hex::encode(PINNED_ROOT_DESCRIPTOR_IDENTITY),
+        );
     }
 
     #[test]

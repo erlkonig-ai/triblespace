@@ -22,7 +22,7 @@
 //! accepts either spelling. `blake3:` and `name:` prefixes disambiguate the
 //! unusual case where an arbitrary UTF-8 name itself looks like a bare handle.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use clap::Parser;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::collections::{BTreeMap, BTreeSet};
@@ -140,6 +140,28 @@ pub enum Command {
         /// Print handles and policy roots in full.
         #[arg(long)]
         long: bool,
+    },
+    /// Report same-named collections and the records they strand.
+    ///
+    /// A collection is the handle of its descriptor, so changing what a
+    /// descriptor says re-mints it under the same name and leaves the previous
+    /// generation's records resident but unreachable by that name. Nothing at
+    /// the call site notices: the caller asks for the name, gets the new
+    /// generation, and finds it empty.
+    ///
+    /// This is the completeness check a migration needs and that adopting does
+    /// not provide. Adopting reports how many commits it processed, not how
+    /// many the target was missing, so a partial migration looks exactly like a
+    /// finished one. Exits non-zero when any records are unreachable.
+    Reconcile {
+        /// Path to the pile file to inspect.
+        pile: PathBuf,
+        /// Ask about one collection only: name, or `blake3:` descriptor handle.
+        ///
+        /// Without this, every name claimed by more than one collection is
+        /// reported, comparing against whichever generation holds the most
+        /// records.
+        collection: Option<String>,
     },
     /// Fully decode one collection descriptor.
     ///
@@ -411,6 +433,7 @@ pub fn run(cmd: Command) -> Result<()> {
             metadata,
             long,
         } => run_list(path, named, metadata, long),
+        Command::Reconcile { pile, collection } => run_reconcile(pile, collection),
         Command::Show { pile, collection } => run_show(pile, collection),
         Command::Log {
             pile,
@@ -1514,6 +1537,58 @@ fn run_adopt(
         .close()
         .map_err(|error| anyhow!("pile close: {error:?}"));
     res.and(close_res)
+}
+
+/// Report same-named generations, and fail when any records are unreachable.
+fn run_reconcile(path: PathBuf, reference: Option<String>) -> Result<()> {
+    let mut pile = open_refreshed(&path)?;
+    let res = (|| -> Result<()> {
+        let snapshot = pile
+            .snapshot()
+            .map_err(|e| anyhow!("pile snapshot: {e:?}"))?;
+
+        let reports = match reference {
+            Some(reference) => {
+                // An exact handle needs no enumeration, and enumerating means
+                // decoding every descriptor in the pile. It also lets a caller
+                // ask about a collection it just registered, which holds no
+                // records yet and so is referenced by nothing to enumerate.
+                let handle = if reference.trim().starts_with("blake3:") {
+                    parse_collection_handle(reference.trim())?
+                } else {
+                    let rows = enumerate(&snapshot)?;
+                    resolve(&rows, &reference)?
+                };
+                triblespace_core::collection::generation::named_generations(&snapshot, handle)
+                    .map_err(|e| anyhow!("compare same-named generations: {e:?}"))?
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            }
+            None => triblespace_core::collection::generation::all_named_generations(&snapshot)
+                .map_err(|e| anyhow!("compare same-named generations: {e:?}"))?,
+        };
+
+        if reports.is_empty() {
+            println!("no name in this pile is claimed by more than one collection");
+            return Ok(());
+        }
+
+        let mut stranded = 0usize;
+        for report in &reports {
+            println!("{report}\n");
+            stranded += report.stranded_records();
+        }
+        if stranded > 0 {
+            bail!(
+                "{stranded} record(s) across {} name(s) are held only by a retired generation and \
+                 cannot be reached under their name; migrate them forward with `trible pile \
+                 collection adopt --from <retired> --into <current>`, then re-run this check",
+                reports.iter().filter(|r| r.strands_records()).count(),
+            );
+        }
+        Ok(())
+    })();
+    res
 }
 
 fn run_show(path: PathBuf, reference: String) -> Result<()> {
