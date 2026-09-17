@@ -481,10 +481,24 @@ mod collection_record_collection_key {
     crate::key_schema!(Schema, Segments, 64, [0, 1]);
 }
 
+mod collection_record_produced_member_key {
+    crate::key_segmentation!(Segments, 96, [32, 32, 32]);
+    crate::key_schema!(Schema, Segments, 96, [0, 1, 2]);
+}
+
+mod collection_record_reference_key {
+    crate::key_segmentation!(Segments, 64, [32, 32]);
+    crate::key_schema!(Schema, Segments, 64, [0, 1]);
+}
+
 type PileBlobIndex = PATCH<40, blob_occurrence_key::Schema, CachedValidation, XorSip128>;
 type CollectionRecordIndex = PATCH<32, IdentitySchema, CollectionRecord, XorSip128>;
 type CollectionRecordCollectionIndex =
     PATCH<64, collection_record_collection_key::Schema, (), XorSip128>;
+type CollectionRecordProducedMemberIndex =
+    PATCH<96, collection_record_produced_member_key::Schema, (), XorSip128>;
+type CollectionRecordReferenceIndex =
+    PATCH<64, collection_record_reference_key::Schema, (), XorSip128>;
 type CapabilityProofIndex = PATCH<32, IdentitySchema, CapabilityProof, XorSip128>;
 type LegacyCollectionHeaderIndex = PATCH<V3_HEADER_LEN, IdentitySchema>;
 
@@ -500,6 +514,32 @@ fn collection_record_collection_key(record: CollectionRecord) -> [u8; 64] {
     let mut key = [0; 64];
     key[..32].copy_from_slice(&collection_record_collection(record).raw);
     key[32..].copy_from_slice(&record.fingerprint().raw());
+    key
+}
+
+fn collection_record_produced_member_key(
+    record: CollectionRecord,
+    fingerprint: CollectionRecordFingerprint,
+) -> [u8; 96] {
+    let output = match record {
+        CollectionRecord::Commit(commit) => commit.data(),
+        CollectionRecord::Merge(merge) => merge.result(),
+        CollectionRecord::Derive(derive) => derive.output(),
+    };
+    let mut key = [0; 96];
+    key[..32].copy_from_slice(&record.collection().raw);
+    key[32..64].copy_from_slice(&output.raw);
+    key[64..].copy_from_slice(&fingerprint.raw());
+    key
+}
+
+fn collection_record_reference_key(
+    input: CollectionRecordFingerprint,
+    consumer: CollectionRecordFingerprint,
+) -> [u8; 64] {
+    let mut key = [0; 64];
+    key[..32].copy_from_slice(&input.raw());
+    key[32..].copy_from_slice(&consumer.raw());
     key
 }
 
@@ -2697,6 +2737,10 @@ pub struct Pile {
     collection_records: CollectionRecordIndex,
     /// Derived selector index keyed by `collection_handle || record_fingerprint`.
     collection_records_by_collection: CollectionRecordCollectionIndex,
+    /// Raw producer relationship: `collection || output || record_fingerprint`.
+    collection_records_by_produced_member: CollectionRecordProducedMemberIndex,
+    /// Raw immediate witness relationship: `input_fingerprint || consumer_fingerprint`.
+    collection_records_by_reference: CollectionRecordReferenceIndex,
     /// Complete canonical proofs keyed by the BLAKE3 identity of exact bytes.
     /// Each value owns its validated mmap-backed view, shared by snapshots and readers.
     capability_proofs: CapabilityProofIndex,
@@ -2757,6 +2801,8 @@ pub struct PileSnapshot {
     blobs: PileBlobIndex,
     collection_records: CollectionRecordIndex,
     collection_records_by_collection: CollectionRecordCollectionIndex,
+    collection_records_by_produced_member: CollectionRecordProducedMemberIndex,
+    collection_records_by_reference: CollectionRecordReferenceIndex,
     legacy_collection_headers: LegacyCollectionHeaderIndex,
     capability_proofs: CapabilityProofIndex,
     wants: PATCH<WANT_REQUEST_BYTES_LEN, IdentitySchema>,
@@ -2789,6 +2835,8 @@ impl PileSnapshot {
         blobs: PileBlobIndex,
         collection_records: CollectionRecordIndex,
         collection_records_by_collection: CollectionRecordCollectionIndex,
+        collection_records_by_produced_member: CollectionRecordProducedMemberIndex,
+        collection_records_by_reference: CollectionRecordReferenceIndex,
         legacy_collection_headers: LegacyCollectionHeaderIndex,
         capability_proofs: CapabilityProofIndex,
         wants: PATCH<WANT_REQUEST_BYTES_LEN, IdentitySchema>,
@@ -2801,6 +2849,8 @@ impl PileSnapshot {
             blobs,
             collection_records,
             collection_records_by_collection,
+            collection_records_by_produced_member,
+            collection_records_by_reference,
             legacy_collection_headers,
             capability_proofs,
             wants,
@@ -2996,6 +3046,8 @@ impl super::SnapshotSource for Pile {
             self.blobs.clone(),
             self.collection_records.clone(),
             self.collection_records_by_collection.clone(),
+            self.collection_records_by_produced_member.clone(),
+            self.collection_records_by_reference.clone(),
             self.legacy_collection_headers.clone(),
             self.capability_proofs.clone(),
             self.wants.clone(),
@@ -3384,6 +3436,8 @@ impl Pile {
             branches: PATCH::<16, IdentitySchema, Inline<Handle<SimpleArchive>>>::new(),
             collection_records: CollectionRecordIndex::new(),
             collection_records_by_collection: CollectionRecordCollectionIndex::new(),
+            collection_records_by_produced_member: CollectionRecordProducedMemberIndex::new(),
+            collection_records_by_reference: CollectionRecordReferenceIndex::new(),
             capability_proofs: CapabilityProofIndex::new(),
             legacy_collection_headers: LegacyCollectionHeaderIndex::new(),
             opaque_records: 0,
@@ -3528,6 +3582,16 @@ impl Pile {
                         .insert(&Entry::with_value(&fingerprint.raw(), record));
                     self.collection_records_by_collection
                         .insert(&Entry::new(&collection_record_collection_key(record)));
+                    self.collection_records_by_produced_member
+                        .insert(&Entry::new(&collection_record_produced_member_key(
+                            record,
+                            fingerprint,
+                        )));
+                    for input in record.record_references() {
+                        self.collection_records_by_reference.insert(&Entry::new(
+                            &collection_record_reference_key(input, fingerprint),
+                        ));
+                    }
                 }
                 Applied::Collection { fingerprint }
             }
@@ -3725,6 +3789,8 @@ impl Pile {
             std::ptr::drop_in_place(&mut this.branches);
             std::ptr::drop_in_place(&mut this.collection_records);
             std::ptr::drop_in_place(&mut this.collection_records_by_collection);
+            std::ptr::drop_in_place(&mut this.collection_records_by_produced_member);
+            std::ptr::drop_in_place(&mut this.collection_records_by_reference);
             std::ptr::drop_in_place(&mut this.capability_proofs);
             std::ptr::drop_in_place(&mut this.legacy_collection_headers);
             std::ptr::drop_in_place(&mut this.opaque_frames);
@@ -4076,41 +4142,57 @@ impl CollectionRead for PileSnapshot {
         if selectors.is_empty() {
             return Ok(Vec::new());
         }
-        if selectors
-            .iter()
-            .all(|selector| matches!(selector, CollectionRecordSelector::Collection(_)))
-        {
-            let mut ids = Vec::new();
-            for selector in selectors {
-                let CollectionRecordSelector::Collection(collection) = selector else {
-                    unreachable!("selector kinds were checked above");
-                };
-                self.collection_records_by_collection
-                    .infixes(&collection.raw, |fingerprint: &[u8; 32]| {
-                        ids.push(*fingerprint)
-                    });
-            }
-            // Infix traversal follows PATCH's structural tree order, while
-            // CollectionRead promises deterministic fingerprint order.
-            ids.sort_unstable();
-            return Ok(ids
-                .into_iter()
-                .map(|id| {
-                    *self
-                        .collection_records
-                        .get(&id)
-                        .expect("collection selector index must reference the primary index")
-                })
-                .collect());
+        let mut ids = Vec::new();
+        for selector in selectors {
+            let collection = match selector {
+                CollectionRecordSelector::Fingerprint(fingerprint) => {
+                    if self.collection_records.get(&fingerprint.raw()).is_some() {
+                        ids.push(fingerprint.raw());
+                    }
+                    continue;
+                }
+                CollectionRecordSelector::ProducedMember(collection, output)
+                | CollectionRecordSelector::CommitMember(collection, output) => {
+                    let mut prefix = [0; 64];
+                    prefix[..32].copy_from_slice(&collection.raw);
+                    prefix[32..].copy_from_slice(&output.raw);
+                    self.collection_records_by_produced_member
+                        .infixes(&prefix, |fingerprint: &[u8; 32]| ids.push(*fingerprint));
+                    continue;
+                }
+                CollectionRecordSelector::ReferencingRecord(input) => {
+                    self.collection_records_by_reference
+                        .infixes(&input.raw(), |fingerprint: &[u8; 32]| {
+                            ids.push(*fingerprint)
+                        });
+                    continue;
+                }
+                CollectionRecordSelector::Collection(collection)
+                | CollectionRecordSelector::MergeCollection(collection)
+                | CollectionRecordSelector::DeriveTarget(collection) => collection,
+                CollectionRecordSelector::Operation(WantRequest::Merge { collection, .. })
+                | CollectionRecordSelector::Operation(WantRequest::Derive {
+                    target: collection,
+                    ..
+                }) => collection,
+                CollectionRecordSelector::Operation(WantRequest::Blob { .. }) => continue,
+            };
+            self.collection_records_by_collection
+                .infixes(&collection.raw, |fingerprint: &[u8; 32]| {
+                    ids.push(*fingerprint)
+                });
         }
-        Ok(self
-            .collection_records
-            .iter_ordered()
-            .map(|key| {
+        // Index traversal follows PATCH's structural order. Overlapping and
+        // mixed routes still produce one union in canonical fingerprint order.
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids
+            .into_iter()
+            .map(|id| {
                 *self
                     .collection_records
-                    .get(key)
-                    .expect("collection key from PATCH must retain its value")
+                    .get(&id)
+                    .expect("record selector index must reference the primary index")
             })
             .filter(|record| selectors_match_record(selectors, *record))
             .collect())
@@ -7961,6 +8043,246 @@ mod tests {
                 .len(),
             3
         );
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn record_relationship_indexes_keep_raw_aliases_and_frozen_missing_witnesses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "record-relationships.pile");
+        let collection = collection_test_collection(40);
+        let other = collection_test_collection(41);
+        let key = SigningKey::from_bytes(&[42; 32]);
+        let second_key = SigningKey::from_bytes(&[43; 32]);
+        let input = collection_test_hash(44);
+        let second_input = collection_test_hash(45);
+        let output = collection_test_hash(46);
+        let a = CollectionCommit::sign(&key, collection, input, empty_metadata_handle());
+        let b = CollectionCommit::sign(&second_key, collection, input, empty_metadata_handle());
+        let c = CollectionCommit::sign(&key, collection, second_input, empty_metadata_handle());
+        let direct = CollectionRecord::Commit(CollectionCommit::sign(
+            &key,
+            collection,
+            output,
+            empty_metadata_handle(),
+        ));
+        let merge_a = CollectionRecord::Merge(CollectionMerge::sign(
+            &key,
+            collection,
+            (a.data(), a.fingerprint()),
+            (c.data(), c.fingerprint()),
+            output,
+        ));
+        let merge_b = CollectionRecord::Merge(CollectionMerge::sign(
+            &key,
+            collection,
+            (b.data(), b.fingerprint()),
+            (c.data(), c.fingerprint()),
+            output,
+        ));
+        // Repeating one immediate witness creates only one reverse relation.
+        let repeated = CollectionRecord::Merge(CollectionMerge::sign(
+            &key,
+            collection,
+            (a.data(), a.fingerprint()),
+            (a.data(), a.fingerprint()),
+            output,
+        ));
+        let derive_a = CollectionRecord::Derive(CollectionDerive::sign(
+            &key,
+            collection,
+            (a.data(), a.fingerprint()),
+            output,
+        ));
+        let derive_b = CollectionRecord::Derive(CollectionDerive::sign(
+            &key,
+            collection,
+            (b.data(), b.fingerprint()),
+            output,
+        ));
+        let other_producer = CollectionRecord::Derive(CollectionDerive::sign(
+            &key,
+            other,
+            (a.data(), a.fingerprint()),
+            output,
+        ));
+        let descendant = CollectionRecord::Derive(CollectionDerive::sign(
+            &key,
+            other,
+            (output, merge_a.fingerprint()),
+            collection_test_hash(47),
+        ));
+        let records = vec![
+            direct,
+            merge_a,
+            merge_b,
+            repeated,
+            derive_a,
+            derive_b,
+            other_producer,
+            descendant,
+        ];
+        let produced =
+            BTreeSet::from([CollectionRecordSelector::ProducedMember(collection, output)]);
+        let referencing =
+            BTreeSet::from([CollectionRecordSelector::ReferencingRecord(a.fingerprint())]);
+        let expected_produced =
+            sorted_collection_records(vec![direct, merge_a, merge_b, repeated, derive_a, derive_b]);
+        let expected_referencing =
+            sorted_collection_records(vec![merge_a, repeated, derive_a, other_producer]);
+
+        let mut reader = Pile::open(&path).unwrap();
+        let empty = reader.snapshot().unwrap();
+        let mut writer = Pile::open(&path).unwrap();
+        for record in records.iter().rev().copied() {
+            writer.insert(record).unwrap();
+        }
+        let middle = reader.snapshot().unwrap();
+        let cloned = middle.clone();
+        assert!(cloned
+            .collection_records_by_produced_member
+            .shares_root(&middle.collection_records_by_produced_member));
+        assert!(cloned
+            .collection_records_by_reference
+            .shares_root(&middle.collection_records_by_reference));
+        assert!(empty.select_records(&produced).unwrap().is_empty());
+        assert!(empty.select_records(&referencing).unwrap().is_empty());
+        assert_eq!(middle.blobs().count(), 0);
+        assert_eq!(middle.proofs().unwrap().count(), 0);
+        assert_eq!(middle.record(a.fingerprint()).unwrap(), None);
+        assert_eq!(middle.select_records(&produced).unwrap(), expected_produced);
+        assert_eq!(
+            middle.select_records(&referencing).unwrap(),
+            expected_referencing
+        );
+        assert_eq!(
+            middle
+                .select_records(&BTreeSet::from([
+                    CollectionRecordSelector::ReferencingRecord(merge_a.fingerprint()),
+                ]))
+                .unwrap(),
+            vec![descendant],
+        );
+        assert_eq!(
+            middle.collection_records_by_produced_member.len(),
+            records.len() as u64
+        );
+        let expected_edges: BTreeSet<_> = records
+            .iter()
+            .flat_map(|record| {
+                record
+                    .record_references()
+                    .map(move |input| (input, record.fingerprint()))
+            })
+            .collect();
+        assert_eq!(
+            middle.collection_records_by_reference.len(),
+            expected_edges.len() as u64
+        );
+
+        let once = std::fs::metadata(&path).unwrap().len();
+        writer.insert(merge_a).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), once);
+        for record in [a, b, c] {
+            writer.insert(CollectionRecord::Commit(record)).unwrap();
+        }
+        let after = reader.snapshot().unwrap();
+        assert_eq!(
+            after.record(a.fingerprint()).unwrap(),
+            Some(CollectionRecord::Commit(a))
+        );
+        assert_eq!(middle.record(a.fingerprint()).unwrap(), None);
+        assert_eq!(
+            after.select_records(&referencing).unwrap(),
+            expected_referencing
+        );
+        assert!(after
+            .collection_records_by_reference
+            .shares_root(&middle.collection_records_by_reference));
+        assert_eq!(
+            after
+                .select_records(&BTreeSet::from([CollectionRecordSelector::ProducedMember(
+                    collection, input
+                ),]))
+                .unwrap(),
+            sorted_collection_records(vec![
+                CollectionRecord::Commit(a),
+                CollectionRecord::Commit(b)
+            ]),
+        );
+
+        struct ScanOnly(Vec<CollectionRecord>);
+        impl CollectionRead for ScanOnly {
+            type RecordsError = Infallible;
+            type RecordIter<'a> = std::vec::IntoIter<Result<CollectionRecord, Infallible>>;
+            fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+                Ok(self
+                    .0
+                    .iter()
+                    .copied()
+                    .map(Ok)
+                    .collect::<Vec<_>>()
+                    .into_iter())
+            }
+        }
+        let selectors = [
+            CollectionRecordSelector::ProducedMember(collection, output),
+            CollectionRecordSelector::ProducedMember(other, input),
+            CollectionRecordSelector::ReferencingRecord(a.fingerprint()),
+            CollectionRecordSelector::ReferencingRecord(merge_a.fingerprint()),
+            CollectionRecordSelector::Fingerprint(a.fingerprint()),
+            CollectionRecordSelector::Fingerprint(descendant.fingerprint()),
+            CollectionRecordSelector::CommitMember(collection, output),
+            CollectionRecordSelector::MergeCollection(collection),
+            CollectionRecordSelector::DeriveTarget(other),
+            CollectionRecordSelector::Collection(other),
+            CollectionRecordSelector::Operation(WantRequest::merge(
+                collection,
+                input,
+                second_input,
+            )),
+            CollectionRecordSelector::Operation(WantRequest::derive(collection, input)),
+            CollectionRecordSelector::Operation(WantRequest::blob(collection)),
+        ];
+        let mut queries = vec![BTreeSet::new(), selectors.into_iter().collect()];
+        for left in selectors {
+            for right in selectors {
+                queries.push(BTreeSet::from([left, right]));
+            }
+        }
+        // Both the incomplete observation and the later one agree with the
+        // trait's ordinary sorted scan for every pair of selector routes.
+        for snapshot in [&middle, &after] {
+            let fallback = ScanOnly(
+                snapshot
+                    .records()
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap(),
+            );
+            for query in &queries {
+                let selected = snapshot.select_records(query).unwrap();
+                assert_eq!(
+                    selected,
+                    fallback.select_records(query).unwrap(),
+                    "{query:?}"
+                );
+                assert!(selected
+                    .windows(2)
+                    .all(|pair| pair[0].fingerprint() < pair[1].fingerprint()));
+            }
+        }
+        writer.close().unwrap();
+        reader.close().unwrap();
+        let mut reopened = Pile::open(&path).unwrap();
+        let replayed = reopened.snapshot().unwrap();
+        for query in &queries {
+            assert_eq!(
+                replayed.select_records(query).unwrap(),
+                after.select_records(query).unwrap()
+            );
+        }
+        assert_eq!(middle.select_records(&produced).unwrap(), expected_produced);
         reopened.close().unwrap();
     }
 

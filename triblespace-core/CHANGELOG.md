@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add raw `ProducedMember(C, H)` and `ReferencingRecord(FP)` collection-record
+  selectors. Pile maintains snapshot-shared producer and immediate-witness
+  PATCH indexes during replay, including consumers whose inputs have not
+  arrived. Mixed selections use primary/relationship/collection indexes and
+  preserve the scan fallback's fingerprint-sorted, deduplicated union without
+  authorization, support resolution, or payload reads during refresh.
+
 - Add opt-in raw Succinct build/merge wavelet backends, sharing the canonical
   CPU domain/rotation preparation and portable writer. Backend output uses the
   existing prefix/tail checks and explicit little-endian serialization; there
