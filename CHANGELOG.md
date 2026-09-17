@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Remove the editor-only residual-member API and its now-unused heterogeneous
+  pattern wrapper. Ordinary consumers use the available indexed cover;
+  explicit maintenance and exact support queries remain separate operations.
+
 - Carry the existing `Blob<UnknownBlob>` through interactive, descriptor and
   bulk-replication landing. The wire constructs it once and checks its cached
   handle against the request; destination insertion no longer reconstructs and

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Remove `uncovered_source_members` and `PatternUnion`, introduced only for
+  hybrid editor reads. Indexed readers do not manufacture a source-freshness
+  guarantee; maintenance and exact support queries retain their existing APIs.
+
 - Stop resident-frontier membership searches at the first strict resident
   subsumer. Canonical cover-witness selection is unchanged; counted regressions
   cover merge chains, nonresident intermediates, and self/cycle exclusion.

@@ -1746,44 +1746,6 @@ pub trait CollectionSnapshotExt: StoreRead + Sized {
         super::observation::attach(self, target)
     }
 
-    /// Resident immediate-source members of a derived target whose support
-    /// the target's resident realization does not yet represent, with their
-    /// payloads and input witnesses.
-    ///
-    /// Read-only: nothing is mapped or published. An editor that needs facts
-    /// the derived index has not carried yet queries these payloads beside
-    /// the resident view (see [`crate::query::patternunion::PatternUnion`])
-    /// instead of running maintenance. The selection is the same residual
-    /// `ensure` would map next: the coarsest complete resident source cover
-    /// of the support the target lacks. It is small when the target is close
-    /// behind, the whole resident source when the target is empty or far
-    /// behind, and a selected member may overlap support the target already
-    /// represents. The support compared is the source's resident admitted
-    /// support: an admitted COMMIT whose payload has not landed is not part
-    /// of it, so an empty result is exactness for what is resident. A signed
-    /// target equation whose output has not landed does not block the
-    /// selection. An incomplete cover is an error naming the absent support,
-    /// never a silent partial delta.
-    fn uncovered_source_members<T>(
-        &self,
-        target: Collection<T>,
-    ) -> Result<
-        Vec<(
-            super::CollectionData,
-            Blob<T::Source>,
-            Vec<super::CollectionRecordFingerprint>,
-        )>,
-        CollectionRealizationError,
-    >
-    where
-        T: CollectionDerivation,
-        Handle<T>: InlineEncoding,
-    {
-        super::exact_derived::uncovered_resident_source_members::<Self, CanonicalDerivation<T>>(
-            self, target,
-        )
-    }
-
     /// Observe the complete target realization for one explicit support.
     ///
     /// Unlike [`Self::collection`], this is an assertion boundary: it fails
