@@ -3318,93 +3318,16 @@ fn equal_payload_commit_does_not_restart_completed_target_maintenance() {
     assert_eq!(records(&mut store.inner), before);
 }
 
-/// Fixture for the witness memo: one foundational COMMIT and one DERIVE that
-/// names it, with the DERIVE inserted first so the memo can observe it open.
-fn witness_memo_fixture() -> (
-    MemoryRepo,
-    Collection<SimpleArchive>,
-    BTreeMap<crate::collection::CollectionHandle, crate::collection::CollectionHandle>,
-    Blob<SimpleArchive>,
-    CollectionCommit,
-    CollectionDerive,
-) {
-    let key = equation_signer();
-    let mut store = MemoryRepo::default();
-    let foundation = store.collection("witness-memo-root", policy()).unwrap();
-    let target = store.collection("witness-memo-target", policy()).unwrap();
-    let source_by_target = BTreeMap::from([(target.handle(), foundation.handle())]);
-
-    let blob = archive(1, 1);
-    store.put::<SimpleArchive, _>(blob.clone()).unwrap();
-    let metadata = store
-        .put::<SimpleArchive, _>(TribleSet::new().to_blob())
-        .unwrap();
-    let commit = CollectionCommit::sign(&key, foundation.handle(), data(&blob), metadata);
-    let derive = CollectionDerive::sign(
-        &key,
-        target.handle(),
-        (data(&blob), commit.fingerprint()),
-        data(&archive(2, 2)),
-    );
-    store.insert(CollectionRecord::Derive(derive)).unwrap();
-    (store, foundation, source_by_target, blob, commit, derive)
-}
-
-/// The same operation may publish the witness that closes a record it has
-/// already seen open, so an open record must never be memoized. Only closure
-/// is a property of the record rather than of one snapshot.
-#[test]
-fn a_witness_arriving_later_closes_a_record_the_memo_already_saw_open() {
-    let (mut store, foundation, source_by_target, blob, commit, derive) = witness_memo_fixture();
-    let mut memo = WitnessMemo::default();
-
-    let open = store.snapshot().unwrap();
-    assert_eq!(
-        memo.closure(foundation, &source_by_target)
-            .support(&open, CollectionRecord::Derive(derive))
-            .unwrap(),
-        None,
-    );
-
-    store.insert(CollectionRecord::Commit(commit)).unwrap();
-    let closed = store.snapshot().unwrap();
-    assert_eq!(
-        memo.closure(foundation, &source_by_target)
-            .support(&closed, CollectionRecord::Derive(derive))
-            .unwrap(),
-        Some(support(foundation, &[blob])),
-    );
-}
-
-/// The lineage names each DERIVE's source collection, so it is part of what
-/// the memoized answer is an answer to. Presenting another lineage starts a
-/// new memo instead of reusing the old one.
-#[test]
-fn a_different_lineage_does_not_answer_from_the_previous_lineages_memo() {
-    let (mut store, foundation, source_by_target, blob, commit, derive) = witness_memo_fixture();
-    store.insert(CollectionRecord::Commit(commit)).unwrap();
-    let snapshot = store.snapshot().unwrap();
-    let record = CollectionRecord::Derive(derive);
-    let expected = support(foundation, &[blob]);
-    let mut memo = WitnessMemo::default();
-
-    assert_eq!(
-        memo.closure(foundation, &source_by_target)
-            .support(&snapshot, record)
-            .unwrap(),
-        Some(expected.clone()),
-    );
-    // No source for the DERIVE's collection: this lineage cannot close it.
-    assert_eq!(
-        memo.closure(foundation, &BTreeMap::new())
-            .support(&snapshot, record)
-            .unwrap(),
-        None,
-    );
-    assert_eq!(
-        memo.closure(foundation, &source_by_target)
-            .support(&snapshot, record)
-            .unwrap(),
-        Some(expected),
-    );
-}
+// The two tests that lived here exercised `WitnessMemo`'s memoized support
+// walk, which no longer exists: support is read from the coverage index, and
+// the memo keeps only records and what produces them. The properties they
+// protected did not go with them --
+//
+//   "an open record must never be memoized, because the same operation may
+//    publish the witness that closes it"
+//       -> collection::coverage::tests::records_arriving_before_their_inputs_still_land
+//          and ::settling_without_the_awaited_arrival_does_nothing
+//
+//   "another lineage must not answer from the previous lineage's memo"
+//       -> cannot arise: nothing memoizes support to become stale, and
+//          coverage rows are keyed by collection rather than by a walk.

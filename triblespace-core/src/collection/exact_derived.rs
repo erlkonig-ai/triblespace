@@ -628,6 +628,44 @@ where
     admitted_record_witnesses(&frontier.view(snapshot.clone()), collection)
 }
 
+/// What ONE cited record certifies, read straight out of the coverage index.
+///
+/// A coverage row is the denotational answer for a value: every route to it
+/// unions in, because either way of building it is a way it could have been
+/// built. Citing a record is narrower -- it chooses a route -- so a
+/// certificate is the union over the inputs *that record* names, and the rows
+/// supply those inputs' answers without a walk.
+///
+/// All-or-nothing, like a row: one input with no row makes the certificate
+/// unknown, never a smaller set that would pass a subset test it should fail.
+fn record_certificate(
+    coverage: &super::coverage::Coverage,
+    lineage: &Lineage,
+    record: CollectionRecord,
+) -> Option<super::coverage::CoverageSet> {
+    use super::coverage::{Attestation, CoverageSet};
+    let collection = record.collection();
+    match Attestation::of(&record) {
+        // A commit stands for its own payload. The row is consulted only to
+        // ask whether it was admitted; the row itself may be wider, and that
+        // width belongs to the value rather than to this citation.
+        Attestation::Foundation { data } => coverage
+            .of(collection, data)
+            .map(|_| CoverageSet::from_keys(std::iter::once(data.raw))),
+        Attestation::Join { low, high, .. } => {
+            let mut set = coverage.of(collection, low)?.clone();
+            set.union(coverage.of(collection, high)?.clone());
+            Some(set)
+        }
+        Attestation::Image { input, .. } => {
+            // The input is a node in this collection's source, which the
+            // lineage already names -- no descriptor read needed here.
+            let source = lineage.source_by_target.get(&collection)?;
+            coverage.of(*source, input).cloned()
+        }
+    }
+}
+
 /// Admit selected producers, then follow only their immutable witness DAGs.
 /// Read attachment selects only the target; maintenance additionally admits
 /// immediate-source candidates it may use to publish new equations.
@@ -667,12 +705,13 @@ where
     let candidates = snapshot.select_records(&selectors).map_err(|error| {
         CollectionRealizationError::storage("select endorsed collection records", error)
     })?;
-    // The caller's `evidence` covers the collections it asked to resolve. A
-    // walk descends past those into the foundation, so it needs writers for
-    // everything in the lineage -- otherwise every commit below the selection
-    // has no entry, is disbelieved, and nothing grounds.
-    let traversable = lineage_writers(snapshot, lineage)?;
-    let mut closure = memo.closure(lineage.foundation, &lineage.source_by_target, &traversable);
+    let mut closure = memo.closure(lineage.foundation, &lineage.source_by_target);
+    // Support is a lookup, not a walk: every edge under a row was admitted
+    // when the fold believed it, so nothing here re-derives or re-decides it.
+    let coverage = snapshot
+        .coverage()
+        .map_err(|error| CollectionRealizationError::storage("read downward coverage", error))?;
+    let mut certified = super::coverage::CoverageSet::new();
     let mut roots = BTreeSet::new();
     let mut witnesses = InputWitnesses::new();
     let mut images = BTreeMap::<_, BTreeSet<_>>::new();
@@ -691,14 +730,10 @@ where
         if !accepted {
             continue;
         }
-        let Some(record_support) = closure
-            .support(snapshot, record)
-            .map_err(|error| {
-                CollectionRealizationError::storage("read endorsed input records", error)
-            })?
-        else {
+        let Some(certificate) = record_certificate(&coverage, lineage, record) else {
             continue;
         };
+        let record_support = Support::from_patch(lineage.foundation, certificate.clone());
         // Reusing a computed image is independent of which exact support the
         // caller wants to endorse today. Keep this index before that filter.
         if let CollectionRecord::Derive(derive) = record {
@@ -712,8 +747,17 @@ where
         {
             continue;
         }
+        certified.union(certificate);
         roots.insert(record.fingerprint());
     }
+    // Support comes from the index now, but the RECORD set still has to be
+    // expanded: `resolve_collection_semantics` needs the COMMIT records
+    // underneath the selected endorsements, and record retention is exactly
+    // what the coverage index forgets. Two different questions, and only one
+    // of them is denotational.
+    closure
+        .index_edges(snapshot)
+        .map_err(|error| CollectionRealizationError::storage("index collection records", error))?;
     let records = closure.records_for(roots);
     for record in &records {
         if let CollectionRecord::Derive(derive) = record {
@@ -722,10 +766,10 @@ where
                 .or_default()
                 .insert(derive.output());
         }
-        let record_support = closure
-            .support(snapshot, *record)
-            .map_err(|error| CollectionRealizationError::storage("read endorsed support", error))?
-            .expect("accepted roots have closed witness DAGs");
+        let record_support = Support::from_patch(
+            lineage.foundation,
+            record_certificate(&coverage, lineage, *record).unwrap_or_default(),
+        );
         let alternatives = witnesses
             .entry((record.collection(), super::witness::output(*record)))
             .or_default();
@@ -735,13 +779,11 @@ where
         alternatives.push((record.fingerprint(), record_support));
     }
     let discovered = super::DiscoveredCollectionRecords::from_records(records);
-    // The selected closed DAG's distinct COMMIT payloads are exactly the
-    // union of its accepted roots' supports. Build that PATCH once rather
-    // than repeatedly unioning overlapping intermediate certificates.
-    let support = Support::from_data(
-        lineage.foundation,
-        discovered.commits().iter().map(|commit| commit.data()),
-    );
+    // Exactly what the selected roots certify -- accumulated as they were
+    // selected, so the filter and the answer are the same quantity. Reading
+    // the expanded record set's COMMITs instead let those two diverge: a root
+    // admitted on a narrow certificate could still drag a wider one in.
+    let support = Support::from_patch(lineage.foundation, certified);
     let commits = discovered.commits().iter().copied().collect();
     let resolution =
         resolve_collection_semantics(&discovered, &lineage.source_by_target, &commits, |_| {
