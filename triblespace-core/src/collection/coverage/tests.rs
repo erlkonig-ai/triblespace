@@ -254,3 +254,88 @@ fn set_algebra_between_two_nodes_is_patch_algebra() {
     let only_left: Vec<_> = left.difference(&right).iter_ordered().copied().collect();
     assert_eq!(only_left, vec![[1u8; 32]]);
 }
+
+/// What building the index on store open actually costs.
+///
+/// Framing rule: the printed figure is **microseconds per record folded**, in
+/// a `--release` build, for one synthetic lattice of `commits` foundation
+/// commits LSM-merged pairwise to a single root and then projected through
+/// `derive_hops` derived collections. It is the whole cost of
+/// [`CoverageIndex`] construction — admission is stubbed open, because the
+/// question here is what the fold costs, not what descriptor resolution costs.
+/// The alternative it is measured against is the existing per-record work in a
+/// maintenance pass, ~9 ms per record in a faculty write chain.
+///
+/// Measured 2026-09-18 on the GB10 `sky` (aarch64, release): 5.95 µs/record at
+/// 821 records, then 2.65 / 2.85 / 2.94 µs/record at 3 445 / 29 961 / 200 001
+/// records. Flat across two orders of magnitude, so the fold is linear in
+/// records and the doubly nested PATCH is sharing rather than copying. In
+/// absolute terms the largest probe — 100 000 commits compacted to one root —
+/// builds in 587 ms once, at open; a 30 000-record collection builds in 85 ms.
+/// That is about three thousand times cheaper per record than the maintenance
+/// pass it serves, which answers whether an index rebuilt on every open is
+/// affordable: it is.
+#[test]
+#[ignore = "timing probe; run with --ignored --nocapture"]
+fn folding_a_realistic_lattice_is_cheap_enough_to_do_on_open() {
+    fn probe(commits: usize, derive_hops: usize) {
+        let source = collection(0);
+        let mut records = Vec::new();
+        let mut tier: Vec<CollectionData> = Vec::with_capacity(commits);
+        for index in 0..commits {
+            let mut raw = [0u8; 32];
+            raw[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            let payload = Inline::new(raw);
+            records.push(commit(1, source, payload));
+            tier.push(payload);
+        }
+        // Pairwise compaction upward, exactly the LSM geometry maintenance
+        // produces: `commits - 1` joins for `commits` leaves.
+        let mut next_result = commits as u64;
+        while tier.len() > 1 {
+            let mut above = Vec::with_capacity(tier.len().div_ceil(2));
+            for pair in tier.chunks(2) {
+                if let [low, high] = pair {
+                    let mut raw = [0u8; 32];
+                    raw[..8].copy_from_slice(&next_result.to_be_bytes());
+                    next_result += 1;
+                    let result = Inline::new(raw);
+                    records.push(merge(1, source, *low, *high, result));
+                    above.push(result);
+                } else {
+                    above.push(pair[0]);
+                }
+            }
+            tier = above;
+        }
+        let mut carried = tier[0];
+        for hop in 0..derive_hops {
+            let mut raw = [0u8; 32];
+            raw[..8].copy_from_slice(&next_result.to_be_bytes());
+            next_result += 1;
+            let output = Inline::new(raw);
+            records.push(derive(1, collection(8 + hop as u8), carried, output));
+            carried = output;
+        }
+
+        let started = std::time::Instant::now();
+        let mut index = CoverageIndex::new();
+        for record in &records {
+            index.apply(record, &AdmitEveryRecord);
+        }
+        let elapsed = started.elapsed();
+        assert_eq!(index.coverage(carried).map(|row| row.len()), Some(commits as u64));
+        println!(
+            "{:>7} records ({commits} commits, {derive_hops} derive hops): \
+             {:>8.2?} total, {:>6.2} us/record",
+            records.len(),
+            elapsed,
+            elapsed.as_secs_f64() * 1e6 / records.len() as f64,
+        );
+    }
+
+    probe(410, 2);
+    probe(1_722, 2);
+    probe(14_980, 2);
+    probe(100_000, 2);
+}
