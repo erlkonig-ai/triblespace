@@ -716,21 +716,14 @@ impl Error for ListBlobsErr {}
 mod tests {
     // Canonical but deliberately uninserted COMMIT witnesses keep these
     // physical-storage fixtures independent of ancestor arrival order.
+    /// An equation names its input PAYLOAD; this used to pair it with a
+    /// fingerprint citing a record that produced it.
     fn witnessed(
-        signer: &ed25519_dalek::SigningKey,
-        collection: crate::collection::CollectionHandle,
+        _signer: &ed25519_dalek::SigningKey,
+        _collection: crate::collection::CollectionHandle,
         data: crate::collection::CollectionData,
-    ) -> (
-        crate::collection::CollectionData,
-        crate::collection::CollectionRecordFingerprint,
-    ) {
-        let record = crate::collection::CollectionCommit::sign(
-            signer,
-            collection,
-            data,
-            crate::collection::empty_metadata_handle(),
-        );
-        (data, record.fingerprint())
+    ) -> crate::collection::CollectionData {
+        data
     }
 
     use super::*;

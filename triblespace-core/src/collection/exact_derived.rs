@@ -389,63 +389,6 @@ fn require_support(lineage: &Lineage, support: &Support) -> Result<(), Collectio
 pub(super) type InputWitnesses =
     BTreeMap<(CollectionHandle, CollectionData), Vec<(CollectionRecordFingerprint, Support)>>;
 
-fn witness_cover(
-    alternatives: &[(CollectionRecordFingerprint, Support)],
-    mut represented: Support,
-) -> Vec<CollectionRecordFingerprint> {
-    let mut ordered: Vec<_> = alternatives.iter().collect();
-    ordered.sort_by(|(left_id, left), (right_id, right)| {
-        right.len().cmp(&left.len()).then(left_id.cmp(right_id))
-    });
-    let mut selected = Vec::new();
-    for (id, support) in ordered {
-        if !support.is_subset(&represented).expect("one foundation") {
-            represented = represented.union(support).expect("one foundation");
-            selected.push(*id);
-        }
-    }
-    selected
-}
-
-pub(super) fn merge_witness_pairs(
-    witnesses: &InputWitnesses,
-    collection: CollectionHandle,
-    low: CollectionData,
-    high: CollectionData,
-) -> Result<
-    Vec<(
-        (CollectionData, CollectionRecordFingerprint),
-        (CollectionData, CollectionRecordFingerprint),
-    )>,
-    CollectionRealizationError,
-> {
-    let alternatives = |member| {
-        witnesses
-            .get(&(collection, member))
-            .filter(|witnesses| !witnesses.is_empty())
-            .ok_or_else(|| {
-                CollectionRealizationError::InvalidCover(
-                    "a published MERGE needs an endorsed record for each input".into(),
-                )
-            })
-    };
-    let low_witnesses = alternatives(low)?;
-    let high_witnesses = alternatives(high)?;
-    let foundation = low_witnesses[0].1.collection();
-    let low_witnesses = witness_cover(low_witnesses, foundation.cover([]));
-    let high_witnesses = witness_cover(high_witnesses, foundation.cover([]));
-    // One joined blob, enough paired certificates to preserve every distinct
-    // input support. A Cartesian product adds no denotational information.
-    Ok((0..low_witnesses.len().max(high_witnesses.len()))
-        .map(|index| {
-            (
-                (low, low_witnesses[index % low_witnesses.len()]),
-                (high, high_witnesses[index % high_witnesses.len()]),
-            )
-        })
-        .collect())
-}
-
 fn witnessed_support(
     witnesses: &InputWitnesses,
     collection: CollectionHandle,
@@ -1070,32 +1013,6 @@ where
 /// Support is reachability over believed attestations, so every collection a
 /// walk may cross needs its writers known before the walk starts -- not just
 /// the one the caller happens to begin in.
-fn lineage_writers<R: StoreRead>(
-    snapshot: &R,
-    lineage: &Lineage,
-) -> Result<BTreeMap<CollectionHandle, super::api::AdmissionEvidence>, CollectionRealizationError> {
-    let mut collections: BTreeSet<CollectionHandle> = BTreeSet::new();
-    collections.insert(lineage.foundation.handle());
-    for (target, source) in &lineage.source_by_target {
-        collections.insert(*target);
-        collections.insert(*source);
-    }
-    let mut writers = BTreeMap::new();
-    for collection in collections {
-        let descriptor = lineage.descriptor(collection);
-        let admitted = super::api::discover_admission_evidence(
-            snapshot,
-            descriptor::admission_policies(snapshot, descriptor.facts(), super::ACTION_WRITE, None),
-            super::ACTION_WRITE,
-            collection,
-        )
-        .map_err(|error| {
-            CollectionRealizationError::storage("discover equation WRITE admission", error)
-        })?;
-        writers.insert(collection, admitted);
-    }
-    Ok(writers)
-}
 
 /// Read what an immutable target's retained endorsements stand for.
 ///
@@ -1263,14 +1180,7 @@ fn source_residual<R, M>(
     probe: &MappingProbe<M>,
     requested: &Support,
     blocked: &BTreeMap<CollectionData, String>,
-) -> Result<
-    Vec<(
-        CollectionData,
-        Blob<M::Source>,
-        Vec<CollectionRecordFingerprint>,
-    )>,
-    CollectionRealizationError,
->
+) -> Result<Vec<(CollectionData, Blob<M::Source>)>, CollectionRealizationError>
 where
     R: BlobStoreGet + BlobStoreMeta,
     M: CollectionMapping,
@@ -1332,8 +1242,10 @@ where
             .get(&(source, member))
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let witnesses = witness_cover(alternatives, probe.target_resolution.support.clone());
-        if witnesses.is_empty() {
+        // Only that the member has endorsed support at all. Choosing a minimal
+        // set of records to cite was the greedy cover's job, and nothing cites
+        // anything any more.
+        if alternatives.is_empty() {
             continue;
         }
         let blob = snapshot
@@ -1341,7 +1253,7 @@ where
             .map_err(|error| {
                 CollectionRealizationError::storage("load source member for mapping", error)
             })?;
-        residual.push((member, blob, witnesses));
+        residual.push((member, blob));
     }
     Ok(residual)
 }
@@ -1406,7 +1318,9 @@ where
     M: CollectionMapping,
 {
     let mut blocked = BTreeMap::<CollectionData, String>::new();
-    let mut published = BTreeSet::<CollectionRecordFingerprint>::new();
+    // Stall detection: the work is identified by the input being mapped, not
+    // by a citation naming a record that produced it.
+    let mut published = BTreeSet::<CollectionData>::new();
 
     loop {
         let snapshot = frontier.view(store.snapshot().map_err(|error| {
@@ -1433,8 +1347,8 @@ where
         drop(snapshot);
 
         let mut replan = false;
-        for (input_data, input, witnesses) in residual {
-            if witnesses.iter().any(|witness| published.contains(witness)) {
+        for (input_data, input) in residual {
+            if published.contains(&input_data) {
                 return Err(CollectionRealizationError::Stalled {
                     cover: repeated_cover,
                 });
@@ -1499,18 +1413,18 @@ where
             store.put::<M::Target, _>(output).map_err(|error| {
                 CollectionRealizationError::storage("store derived target member", error)
             })?;
-            for witness in witnesses {
+            {
                 let record = CollectionRecord::Derive(CollectionDerive::sign(
                     signing_key,
                     target.handle(),
-                    (input_data, witness),
+                    input_data,
                     output_data,
                 ));
                 store.insert(record).map_err(|error| {
                     CollectionRealizationError::storage("publish target DERIVE", error)
                 })?;
                 frontier.include_record(record);
-                published.insert(witness);
+                published.insert(input_data);
             }
         }
         if replan {
@@ -1672,8 +1586,7 @@ where
             .get(&(source, input_data))
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let input_witnesses = witness_cover(input_alternatives, support.collection().cover([]));
-        if input_witnesses.is_empty() {
+        if input_alternatives.is_empty() {
             attempted.insert(input_data);
             continue;
         }
@@ -1758,22 +1671,12 @@ where
                 }
             },
         };
-        let merge_witnesses = pair
-            .map(|(low, high)| {
-                merge_witness_pairs(
-                    &probe.target_resolution.witnesses,
-                    target.handle(),
-                    low,
-                    high,
-                )
-            })
-            .transpose()?;
         drop(snapshot);
         let output_data = data_identity::<M::Target>(&output);
         store.put::<M::Target, _>(output).map_err(|error| {
             CollectionRealizationError::storage("store source-guided target member", error)
         })?;
-        for (low, high) in merge_witnesses.into_iter().flatten() {
+        if let Some((low, high)) = pair {
             let record = CollectionRecord::Merge(CollectionMerge::sign(
                 signing_key,
                 target.handle(),
@@ -1786,11 +1689,11 @@ where
             })?;
             frontier.include_record(record);
         }
-        for witness in input_witnesses {
+        {
             let record = CollectionRecord::Derive(CollectionDerive::sign(
                 signing_key,
                 target.handle(),
-                (input_data, witness),
+                input_data,
                 output_data,
             ));
             store.insert(record).map_err(|error| {

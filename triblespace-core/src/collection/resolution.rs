@@ -1600,20 +1600,14 @@ mod tests {
     // These tests exercise payload-lattice closure directly, not collection
     // attachment. Still use addresses of concrete records, never synthetic
     // entity identities, for their otherwise uninterpreted witness fields.
+    /// A merge or derive names its input PAYLOAD. This used to wrap it
+    /// beside a fingerprint citing a record that produced it; nothing
+    /// cites anything now, so it is just the payload.
     fn witnessed_input(
         collection: CollectionHandle,
         data: CollectionData,
-    ) -> (
-        CollectionData,
-        crate::collection::CollectionRecordFingerprint,
-    ) {
-        let record = CollectionRecord::Commit(CollectionCommit::sign(
-            &SigningKey::from_bytes(&[31; 32]),
-            collection,
-            data,
-            super::super::empty_metadata_handle(),
-        ));
-        (data, record.fingerprint())
+    ) -> CollectionData {
+        data
     }
 
     fn commit(definition: &Fragment, element: CollectionData, key: u8) -> CollectionCommit {

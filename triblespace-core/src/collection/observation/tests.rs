@@ -89,7 +89,7 @@ fn one_hop() -> OneHop {
     let equation = CollectionRecord::Derive(CollectionDerive::sign(
         &producer,
         target.handle(),
-        (commit.data(), commit.fingerprint()),
+        commit.data(),
         data(&output),
     ));
     OneHop {
@@ -387,7 +387,7 @@ fn unauthorized_target_producers_neither_admit_outputs_nor_hide_authorized_input
         .insert(CollectionRecord::Derive(CollectionDerive::sign(
             &outsider,
             fixture.target.handle(),
-            (other_commit.data(), other_commit.fingerprint()),
+            other_commit.data(),
             data(&wrong),
         )))
         .unwrap();
@@ -396,8 +396,8 @@ fn unauthorized_target_producers_neither_admit_outputs_nor_hide_authorized_input
         .insert(CollectionRecord::Merge(CollectionMerge::sign(
             &outsider,
             fixture.target.handle(),
-            (data(&fixture.output), fixture.equation.fingerprint()),
-            (data(&fixture.output), fixture.equation.fingerprint()),
+            data(&fixture.output),
+            data(&fixture.output),
             data(&wrong),
         )))
         .unwrap();
@@ -437,7 +437,7 @@ fn unavailable_target_parent_falls_back_to_its_resident_exact_inputs() {
     let other_equation = CollectionRecord::Derive(CollectionDerive::sign(
         &fixture.producer,
         fixture.target.handle(),
-        (other_commit.data(), other_commit.fingerprint()),
+        other_commit.data(),
         data(&other_output),
     ));
     fixture.store.insert(other_equation).unwrap();
@@ -447,8 +447,8 @@ fn unavailable_target_parent_falls_back_to_its_resident_exact_inputs() {
     let parent = CollectionRecord::Merge(CollectionMerge::sign(
         &fixture.producer,
         fixture.target.handle(),
-        (data(&fixture.output), fixture.equation.fingerprint()),
-        (data(&other_output), other_equation.fingerprint()),
+        data(&fixture.output),
+        data(&other_output),
         data(&union_blob),
     ));
     fixture.store.insert(parent).unwrap();
@@ -559,7 +559,7 @@ fn multihop_support_uses_exact_endorsed_records_without_ancestor_authority_or_pa
     let raw_record = CollectionRecord::Derive(CollectionDerive::sign(
         &historical,
         fixture.target.handle(),
-        (commit.data(), commit.fingerprint()),
+        commit.data(),
         data(&fixture.output),
     ));
     fixture
@@ -587,7 +587,7 @@ fn multihop_support_uses_exact_endorsed_records_without_ancestor_authority_or_pa
         .insert(CollectionRecord::Derive(CollectionDerive::sign(
             &final_owner,
             final_target.handle(),
-            (data(&fixture.output), raw_record.fingerprint()),
+            data(&fixture.output),
             data(&accelerated),
         )))
         .unwrap();
@@ -735,8 +735,8 @@ fn pile_observation_tracks_only_consulted_ancestry_and_target_changes() {
     pile.insert(CollectionRecord::Merge(CollectionMerge::sign(
         &fixture.producer,
         fixture.target.handle(),
-        (data(&fixture.output), fixture.equation.fingerprint()),
-        (data(&fixture.output), fixture.equation.fingerprint()),
+        data(&fixture.output),
+        data(&fixture.output),
         data(&fixture.output),
     )))
     .unwrap();

@@ -14,7 +14,7 @@ use crate::inline::encodings::hash::Handle;
 use crate::repo::{BlobStoreGet, Store};
 
 use super::exact_derived::{
-    attach_exact_resolution, data_identity, merge_witness_pairs, producer_is_admitted,
+    attach_exact_resolution, data_identity, producer_is_admitted,
     CollectionRealizationError, InputWitnesses,
 };
 use super::witness::WitnessMemo;
@@ -209,7 +209,6 @@ where
                 members.insert(high_data);
                 continue;
             }
-            let pairs = merge_witness_pairs(witnesses, target.handle(), low_data, high_data)?;
             let snapshot = frontier.view(store.snapshot().map_err(|error| {
                 CollectionRealizationError::storage("open target-carry snapshot", error)
             })?);
@@ -237,12 +236,12 @@ where
                     store.put::<E, _>(output).map_err(|error| {
                         CollectionRealizationError::storage("store merged target member", error)
                     })?;
-                    for (low, high) in pairs {
+                    {
                         let record = CollectionRecord::Merge(CollectionMerge::sign(
                             signing_key,
                             target.handle(),
-                            low,
-                            high,
+                            low_data,
+                            high_data,
                             result,
                         ));
                         store.insert(record).map_err(|error| {

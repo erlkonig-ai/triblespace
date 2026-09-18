@@ -843,21 +843,14 @@ mod tests {
         simplearchive_union::descriptor(name, direct_policy())
     }
 
+    /// A merge or derive names its input PAYLOAD. This used to wrap it
+    /// beside a fingerprint citing a record that produced it; nothing
+    /// cites anything now, so it is just the payload.
     fn witnessed_input(
         descriptor: &Fragment,
         data: CollectionData,
-    ) -> (
-        CollectionData,
-        crate::collection::CollectionRecordFingerprint,
-    ) {
-        let record =
-            crate::collection::CollectionRecord::Commit(crate::collection::CollectionCommit::sign(
-                &SigningKey::from_bytes(&[7; 32]),
-                identity_for_tests(descriptor),
-                data,
-                crate::collection::empty_metadata_handle(),
-            ));
-        (data, record.fingerprint())
+    ) -> CollectionData {
+        data
     }
 
     fn row(entity: u8, attribute: u8, value: u8) -> [u8; TRIBLE_LEN] {

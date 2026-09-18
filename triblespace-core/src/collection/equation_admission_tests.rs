@@ -79,8 +79,8 @@ fn read_rights_do_not_admit_merges_or_inject_conflicts() {
         .insert(CollectionRecord::Merge(CollectionMerge::sign(
             &root,
             collection.handle(),
-            (low, CollectionRecord::Commit(ca).fingerprint()),
-            (high, CollectionRecord::Commit(cb).fingerprint()),
+            low,
+            high,
             Handle::<SimpleArchive>::to_hash(c_handle),
         )))
         .unwrap();
@@ -88,8 +88,8 @@ fn read_rights_do_not_admit_merges_or_inject_conflicts() {
         .insert(CollectionRecord::Merge(CollectionMerge::sign(
             &reader,
             collection.handle(),
-            (low, CollectionRecord::Commit(ca).fingerprint()),
-            (high, CollectionRecord::Commit(cb).fingerprint()),
+            low,
+            high,
             Handle::<SimpleArchive>::to_hash(wrong),
         )))
         .unwrap();
@@ -149,7 +149,7 @@ fn derive_before_write_proof_is_inert_then_admitted_without_reinsertion() {
     let equation = CollectionRecord::Derive(CollectionDerive::sign(
         &producer,
         target.handle(),
-        (ca.data(), CollectionRecord::Commit(ca).fingerprint()),
+        ca.data(),
         Handle::<SuccinctArchiveBlob>::to_hash(output),
     ));
     store.insert(equation).unwrap();
@@ -162,7 +162,7 @@ fn derive_before_write_proof_is_inert_then_admitted_without_reinsertion() {
         .insert(CollectionRecord::Derive(CollectionDerive::sign(
             &source_owner,
             target.handle(),
-            (ca.data(), CollectionRecord::Commit(ca).fingerprint()),
+            ca.data(),
             Handle::<SuccinctArchiveBlob>::to_hash(output),
         )))
         .unwrap();
@@ -237,8 +237,8 @@ fn equation_admission_uses_frozen_proof_evidence() {
         .insert(CollectionRecord::Merge(CollectionMerge::sign(
             &producer,
             collection.handle(),
-            (ca.data(), CollectionRecord::Commit(ca).fingerprint()),
-            (cb.data(), CollectionRecord::Commit(cb).fingerprint()),
+            ca.data(),
+            cb.data(),
             Handle::<SimpleArchive>::to_hash(joined),
         )))
         .unwrap();
@@ -312,7 +312,7 @@ fn selected_endorsement_reads_without_ancestry_but_support_needs_exact_records()
     let selected = CollectionRecord::Derive(CollectionDerive::sign(
         &target_owner,
         target.handle(),
-        (input_data, ancestor.fingerprint()),
+        input_data,
         Handle::<SuccinctArchiveBlob>::to_hash(output),
     ));
     store.insert(selected).unwrap();
@@ -335,7 +335,7 @@ fn selected_endorsement_reads_without_ancestry_but_support_needs_exact_records()
         .insert(CollectionRecord::Derive(CollectionDerive::sign(
             &target_owner,
             target.handle(),
-            (input_data, wrong_collection.fingerprint()),
+            input_data,
             Handle::<SuccinctArchiveBlob>::to_hash(output),
         )))
         .unwrap();
@@ -362,7 +362,7 @@ fn selected_endorsement_reads_without_ancestry_but_support_needs_exact_records()
         .insert(CollectionRecord::Derive(CollectionDerive::sign(
             &target_owner,
             target.handle(),
-            (input_data, wrong_payload.fingerprint()),
+            input_data,
             Handle::<SuccinctArchiveBlob>::to_hash(output),
         )))
         .unwrap();
@@ -436,7 +436,7 @@ fn indexed_reads_do_not_replace_absent_target_outputs_with_source_members() {
     let b_record = CollectionRecord::Derive(CollectionDerive::sign(
         &owner,
         succinct.handle(),
-        (ca.data(), CollectionRecord::Commit(ca).fingerprint()),
+        ca.data(),
         b_data,
     ));
     store.insert(b_record).unwrap();
@@ -449,7 +449,7 @@ fn indexed_reads_do_not_replace_absent_target_outputs_with_source_members() {
         .insert(CollectionRecord::Derive(CollectionDerive::sign(
             &owner,
             rank9.handle(),
-            (b_data, b_record.fingerprint()),
+            b_data,
             r_data,
         )))
         .unwrap();

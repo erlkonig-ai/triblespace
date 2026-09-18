@@ -1552,21 +1552,15 @@ impl Error for YardReclaimError {}
 mod tests {
     // Canonical but deliberately uninserted COMMIT witnesses keep these
     // physical-storage fixtures independent of ancestor arrival order.
+    /// A merge or derive names its input PAYLOAD. This used to wrap it
+    /// beside a fingerprint citing a record that produced it; nothing
+    /// cites anything now, so it is just the payload.
     fn witnessed(
         signer: &ed25519_dalek::SigningKey,
         collection: crate::collection::CollectionHandle,
         data: crate::collection::CollectionData,
-    ) -> (
-        crate::collection::CollectionData,
-        crate::collection::CollectionRecordFingerprint,
-    ) {
-        let record = crate::collection::CollectionCommit::sign(
-            signer,
-            collection,
-            data,
-            crate::collection::empty_metadata_handle(),
-        );
-        (data, record.fingerprint())
+    ) -> crate::collection::CollectionData {
+        data
     }
 
     use super::*;
@@ -2102,7 +2096,7 @@ mod tests {
         let derive = CollectionDerive::sign(
             &signer,
             Inline::new([88; 32]),
-            (commit.data(), commit.fingerprint()),
+            commit.data(),
             Inline::new(output.raw),
         );
         // Young evidence can arrive first; the later witness belongs to an

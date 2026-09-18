@@ -72,15 +72,15 @@ fn raw_cover_reuses_an_endorsed_merge_without_ancestor_write_authority() {
     let predecessor = CollectionMerge::sign(
         &other,
         target.handle(),
-        (data(&a), leaf(target, &owner, &a).fingerprint()),
-        (data(&b), leaf(target, &owner, &b).fingerprint()),
+        data(&a),
+        data(&b),
         data(&x),
     );
     let upper = CollectionMerge::sign(
         &owner,
         target.handle(),
-        (data(&x), predecessor.fingerprint()),
-        (data(&c), leaf(target, &owner, &c).fingerprint()),
+        data(&x),
+        data(&c),
         data(&z),
     );
     store.insert(CollectionRecord::Merge(predecessor)).unwrap();
@@ -122,8 +122,8 @@ fn raw_cover_decomposes_a_nonresident_result_into_both_resident_inputs() {
     let merge = CollectionMerge::sign(
         &owner,
         target.handle(),
-        (data(&a), leaf(target, &owner, &a).fingerprint()),
-        (data(&b), leaf(target, &owner, &b).fingerprint()),
+        data(&a),
+        data(&b),
         data(&c),
     );
     store.insert(CollectionRecord::Merge(merge)).unwrap();
@@ -163,8 +163,8 @@ fn raw_cover_does_not_accept_one_input_as_a_complete_reverse_realization() {
         .insert(CollectionRecord::Merge(CollectionMerge::sign(
             &owner,
             target.handle(),
-            (data(&a), leaf(target, &owner, &a).fingerprint()),
-            (data(&b), leaf(target, &owner, &b).fingerprint()),
+            data(&a),
+            data(&b),
             data(&c),
         )))
         .unwrap();
@@ -193,8 +193,8 @@ fn raw_cover_never_infers_an_unknown_sibling_from_a_single_input() {
         .insert(CollectionRecord::Merge(CollectionMerge::sign(
             &owner,
             target.handle(),
-            (data(&a), leaf(target, &owner, &a).fingerprint()),
-            (data(&b), leaf(target, &owner, &b).fingerprint()),
+            data(&a),
+            data(&b),
             data(&c),
         )))
         .unwrap();
@@ -226,8 +226,8 @@ fn raw_cover_ignores_unauthorized_equations_without_an_exact_endorsement() {
             .insert(CollectionRecord::Merge(CollectionMerge::sign(
                 signer,
                 target.handle(),
-                (data(&a), leaf(target, &owner, &a).fingerprint()),
-                (data(&b), leaf(target, &owner, &b).fingerprint()),
+                data(&a),
+                data(&b),
                 data(output),
             )))
             .unwrap();
@@ -267,15 +267,15 @@ fn raw_cover_does_not_import_wrong_collection_or_output_witnesses() {
         let predecessor = CollectionMerge::sign(
             &other,
             predecessor_owner.handle(),
-            (data(&a), leaf(predecessor_owner, &owner, &a).fingerprint()),
-            (data(&b), leaf(predecessor_owner, &owner, &b).fingerprint()),
+            data(&a),
+            data(&b),
             data(&x),
         );
         let upper = CollectionMerge::sign(
             &owner,
             target.handle(),
-            (data(&expected_input), predecessor.fingerprint()),
-            (data(&c), leaf(target, &owner, &c).fingerprint()),
+            data(&expected_input),
+            data(&c),
             data(&z),
         );
         store.insert(CollectionRecord::Merge(predecessor)).unwrap();

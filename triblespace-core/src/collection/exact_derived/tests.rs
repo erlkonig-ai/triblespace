@@ -99,25 +99,15 @@ fn publish_root(
     commit
 }
 
+/// A merge or derive names its input PAYLOAD. This used to wrap it
+/// beside a fingerprint citing a record that produced it; nothing
+/// cites anything now, so it is just the payload.
 fn witnessed_input(
     snapshot: &MemoryRepoSnapshot,
     collection: crate::collection::CollectionHandle,
     data: CollectionData,
-) -> (CollectionData, CollectionRecordFingerprint) {
-    let record = snapshot
-        .records()
-        .unwrap()
-        .map(Result::unwrap)
-        .find(|record| {
-            record.collection() == collection
-                && match record {
-                    CollectionRecord::Commit(commit) => commit.data() == data,
-                    CollectionRecord::Merge(merge) => merge.result() == data,
-                    CollectionRecord::Derive(derive) => derive.output() == data,
-                }
-        })
-        .expect("fixture input has an actual persisted predecessor");
-    (data, record.fingerprint())
+) -> CollectionData {
+    data
 }
 
 /// Test encoding `SimpleArchive || 0xA5`; id originally minted for the old
@@ -757,7 +747,7 @@ fn aggregate_support_uses_selected_dag_leaves_without_clipping_certificates() {
     let da = CollectionDerive::sign(
         &signer,
         first.handle(),
-        (data(&a), ca.fingerprint()),
+        data(&a),
         data(&a_output),
     );
     store.insert(CollectionRecord::Derive(da)).unwrap();
@@ -783,8 +773,8 @@ fn aggregate_support_uses_selected_dag_leaves_without_clipping_certificates() {
     let ab = CollectionMerge::sign(
         &signer,
         root.handle(),
-        (data(&a), ca.fingerprint()),
-        (data(&b), cb.fingerprint()),
+        data(&a),
+        data(&b),
         data(&b),
     );
     store.insert(CollectionRecord::Merge(ab)).unwrap();
@@ -792,7 +782,7 @@ fn aggregate_support_uses_selected_dag_leaves_without_clipping_certificates() {
     let dab = CollectionDerive::sign(
         &signer,
         first.handle(),
-        (data(&b), ab.fingerprint()),
+        data(&b),
         data(&b_output),
     );
     store.insert(CollectionRecord::Derive(dab)).unwrap();
@@ -827,75 +817,12 @@ fn aggregate_support_uses_selected_dag_leaves_without_clipping_certificates() {
     );
 }
 
-#[test]
-fn aggregate_support_deduplicates_leaves_but_keeps_alternative_certifications() {
-    let (mut store, root, first, _second) = collections();
-    let signer = equation_signer();
-    let other_signer = SigningKey::from_bytes(&[32; 32]);
-    let a = archive(1, 1);
-    let b = crate::collection::simplearchive_union::join(&a, &archive(2, 2)).unwrap();
-    let ca = publish_root(&mut store, root, &a, 31);
-    let cb = publish_root(&mut store, root, &b, 31);
-    let cb_other = publish_root(&mut store, root, &b, 32);
-    let ab = CollectionMerge::sign(
-        &signer,
-        root.handle(),
-        (data(&a), ca.fingerprint()),
-        (data(&b), cb.fingerprint()),
-        data(&b),
-    );
-    store.insert(CollectionRecord::Merge(ab)).unwrap();
-    let output = FirstEncoding::map(&(), &b, &store.snapshot().unwrap()).unwrap();
-    let mut target_records = Vec::new();
-    for (key, witness) in [
-        (&signer, ab.fingerprint()),
-        (&signer, cb.fingerprint()),
-        (&signer, cb_other.fingerprint()),
-        (&other_signer, cb.fingerprint()),
-    ] {
-        let derive =
-            CollectionDerive::sign(key, first.handle(), (data(&b), witness), data(&output));
-        store.insert(CollectionRecord::Derive(derive)).unwrap();
-        target_records.push(derive);
-    }
-    let snapshot = store.snapshot().unwrap();
-    let lineage = load_lineage(&snapshot, first).unwrap();
-    let selected = BTreeSet::from([first.handle()]);
-    let ab_support = support(root, &[a.clone(), b.clone()]);
-    let b_support = support(root, &[b]);
-    let whole = resolve_endorsed_lineage(
-        &snapshot,
-        &lineage,
-        &selected,
-        None,
-        &mut WitnessMemo::default(),
-    )
-    .unwrap();
-    assert_eq!(whole.support, ab_support);
-    let alternatives = &whole.witnesses[&(first.handle(), data(&output))];
-    assert_eq!(alternatives.len(), 4);
-    for record in &target_records {
-        let expected = if record.input_witness() == ab.fingerprint() {
-            &ab_support
-        } else {
-            &b_support
-        };
-        assert!(alternatives.iter().any(|(fingerprint, support)| {
-            *fingerprint == record.fingerprint() && support == expected
-        }));
-    }
-    let exact = resolve_endorsed_lineage(
-        &snapshot,
-        &lineage,
-        &selected,
-        Some(&b_support),
-        &mut WitnessMemo::default(),
-    )
-    .unwrap();
-    assert_eq!(exact.support, b_support);
-    assert_eq!(exact.witnesses[&(first.handle(), data(&output))].len(), 3);
-    assert!(!exact.witnesses.contains_key(&(root.handle(), data(&a))));
-}
+// `aggregate_support_deduplicates_leaves_but_keeps_alternative_certifications`
+// lived here. It published four DERIVEs over one (collection, input, output)
+// that differed only in which record each cited, and asserted four distinct
+// certificates. Records are content-addressed, so without citations those four
+// are one record per signer -- the test states the property we removed rather
+// than one we lost.
 
 #[test]
 fn aggregate_support_excludes_missing_witnesses_and_unadmitted_producers() {
@@ -935,7 +862,7 @@ fn aggregate_support_excludes_missing_witnesses_and_unadmitted_producers() {
             .insert(CollectionRecord::Derive(CollectionDerive::sign(
                 key,
                 first.handle(),
-                (data(source), witness),
+                data(source),
                 data(&output),
             )))
             .unwrap();
@@ -978,7 +905,7 @@ fn aggregate_support_excludes_missing_witnesses_and_unadmitted_producers() {
         .insert(CollectionRecord::Derive(CollectionDerive::sign(
             &signer,
             first.handle(),
-            (data(&a), ca.fingerprint()),
+            data(&a),
             data(&wrong),
         )))
         .unwrap();
@@ -1151,10 +1078,7 @@ fn exact_ensure_fetches_a_known_derive_output_without_recomputing() {
     let pending = CollectionRecord::Derive(CollectionDerive::sign(
         &equation_signer(),
         first.handle(),
-        (
-            data(&source),
-            CollectionRecord::Commit(source_commit).fingerprint(),
-        ),
+        data(&source),
         output_data,
     ));
     inner.insert(pending).unwrap();
@@ -1197,8 +1121,8 @@ fn exact_ensure_reendorses_a_resident_image_from_a_different_support_without_map
     let ab = CollectionMerge::sign(
         &signer,
         root.handle(),
-        (data(&a), a_commit.fingerprint()),
-        (data(&b), b_commit.fingerprint()),
+        data(&a),
+        data(&b),
         data(&b),
     );
     inner.insert(CollectionRecord::Merge(ab)).unwrap();
@@ -1207,7 +1131,7 @@ fn exact_ensure_reendorses_a_resident_image_from_a_different_support_without_map
     let previous = CollectionDerive::sign(
         &signer,
         first.handle(),
-        (data(&b), ab.fingerprint()),
+        data(&b),
         data(&output),
     );
     inner.insert(CollectionRecord::Derive(previous)).unwrap();
@@ -1248,7 +1172,7 @@ fn exact_ensure_reendorses_a_resident_image_from_a_different_support_without_map
     let expected = CollectionDerive::sign(
         &signer,
         first.handle(),
-        (data(&b), b_commit.fingerprint()),
+        data(&b),
         data(&output),
     );
     assert_eq!(published, vec![CollectionRecord::Derive(expected)]);
@@ -1269,8 +1193,8 @@ fn exact_ensure_rejects_conflicting_images_before_reusing_a_pruned_support() {
     let ab = CollectionMerge::sign(
         &signer,
         root.handle(),
-        (data(&a), a_commit.fingerprint()),
-        (data(&b), b_commit.fingerprint()),
+        data(&a),
+        data(&b),
         data(&b),
     );
     inner.insert(CollectionRecord::Merge(ab)).unwrap();
@@ -1283,7 +1207,7 @@ fn exact_ensure_rejects_conflicting_images_before_reusing_a_pruned_support() {
             .insert(CollectionRecord::Derive(CollectionDerive::sign(
                 &signer,
                 first.handle(),
-                (data(&b), ab.fingerprint()),
+                data(&b),
                 data(output),
             )))
             .unwrap();
@@ -1329,8 +1253,8 @@ fn exact_ensure_rejects_a_cold_conflicting_image_before_fetch_or_publication() {
     let ab = CollectionMerge::sign(
         &signer,
         root.handle(),
-        (data(&a), a_commit.fingerprint()),
-        (data(&b), b_commit.fingerprint()),
+        data(&a),
+        data(&b),
         data(&b),
     );
     inner.insert(CollectionRecord::Merge(ab)).unwrap();
@@ -1345,7 +1269,7 @@ fn exact_ensure_rejects_a_cold_conflicting_image_before_fetch_or_publication() {
             .insert(CollectionRecord::Derive(CollectionDerive::sign(
                 &signer,
                 first.handle(),
-                (data(&b), witness),
+                data(&b),
                 data(output),
             )))
             .unwrap();
@@ -1388,10 +1312,7 @@ fn passive_derived_snapshot_keeps_dangling_output_as_raw_evidence_only() {
     let pending = CollectionRecord::Derive(CollectionDerive::sign(
         &equation_signer(),
         first.handle(),
-        (
-            data(&source),
-            CollectionRecord::Commit(source_commit).fingerprint(),
-        ),
+        data(&source),
         data(&output),
     ));
     inner.insert(pending).unwrap();
@@ -1430,10 +1351,7 @@ fn exact_maintenance_recovers_a_pending_derive_with_a_missing_output() {
     let pending = CollectionDerive::sign(
         &equation_signer(),
         first.handle(),
-        (
-            data(&source),
-            CollectionRecord::Commit(source_commit).fingerprint(),
-        ),
+        data(&source),
         output_data,
     );
     inner.insert(CollectionRecord::Derive(pending)).unwrap();
@@ -1712,8 +1630,8 @@ fn root_ensure_reuses_a_signed_union_without_fetching_ancestor_bytes() {
         .insert(CollectionRecord::Merge(CollectionMerge::sign(
             &equation_signer(),
             root.handle(),
-            (data(&left), a.fingerprint()),
-            (data(&right), b.fingerprint()),
+            data(&left),
+            data(&right),
             data(&joined),
         )))
         .unwrap();
@@ -3006,8 +2924,8 @@ fn target_maintenance_reendorses_a_resident_upper_without_joining_again() {
     let ab = CollectionMerge::sign(
         &signer,
         root.handle(),
-        (data(&a), a_commit.fingerprint()),
-        (data(&b), b_commit.fingerprint()),
+        data(&a),
+        data(&b),
         data(&b),
     );
     inner.insert(CollectionRecord::Merge(ab)).unwrap();
@@ -3020,19 +2938,19 @@ fn target_maintenance_reendorses_a_resident_upper_without_joining_again() {
     let first_b_record = CollectionDerive::sign(
         &signer,
         first.handle(),
-        (data(&b), b_commit.fingerprint()),
+        data(&b),
         data(&first_b),
     );
     let first_ab_record = CollectionDerive::sign(
         &signer,
         first.handle(),
-        (data(&b), ab.fingerprint()),
+        data(&b),
         data(&first_b),
     );
     let first_c_record = CollectionDerive::sign(
         &signer,
         first.handle(),
-        (data(&c), c_commit.fingerprint()),
+        data(&c),
         data(&first_c),
     );
     for record in [first_b_record, first_ab_record, first_c_record] {
@@ -3049,19 +2967,19 @@ fn target_maintenance_reendorses_a_resident_upper_without_joining_again() {
     let x_b = CollectionDerive::sign(
         &signer,
         second.handle(),
-        (data(&first_b), first_b_record.fingerprint()),
+        data(&first_b),
         data(&x),
     );
     let x_ab = CollectionDerive::sign(
         &signer,
         second.handle(),
-        (data(&first_b), first_ab_record.fingerprint()),
+        data(&first_b),
         data(&x),
     );
     let y_c = CollectionDerive::sign(
         &signer,
         second.handle(),
-        (data(&first_c), first_c_record.fingerprint()),
+        data(&first_c),
         data(&y),
     );
     for record in [x_b, x_ab, y_c] {
@@ -3070,8 +2988,8 @@ fn target_maintenance_reendorses_a_resident_upper_without_joining_again() {
     let z_bc = CollectionMerge::sign(
         &signer,
         second.handle(),
-        (data(&x), x_b.fingerprint()),
-        (data(&y), y_c.fingerprint()),
+        data(&x),
+        data(&y),
         data(&z),
     );
     inner.insert(CollectionRecord::Merge(z_bc)).unwrap();
@@ -3118,10 +3036,12 @@ fn target_maintenance_reendorses_a_resident_upper_without_joining_again() {
     };
     assert_eq!(endorsement.collection(), second.handle());
     assert_eq!(endorsement.result(), data(&z));
-    let (low_witness, high_witness) = endorsement.input_witnesses();
+    // It names the payloads those two merges produce. Naming the records
+    // themselves said the same thing one indirection further out.
+    let (low, high) = endorsement.inputs();
     assert_eq!(
-        BTreeSet::from([low_witness, high_witness]),
-        BTreeSet::from([x_ab.fingerprint(), z_bc.fingerprint()]),
+        BTreeSet::from([low, high]),
+        BTreeSet::from([x_ab.output(), z_bc.result()]),
     );
     assert_eq!(
         after.record(z_bc.fingerprint()).unwrap(),
@@ -3186,8 +3106,8 @@ fn redundant_support_fixture() -> (
             .insert(CollectionRecord::Merge(CollectionMerge::sign(
                 &equation_signer(),
                 collection.handle(),
-                (commits[low].data(), commits[low].fingerprint()),
-                (commits[high].data(), commits[high].fingerprint()),
+                commits[low].data(),
+                commits[high].data(),
                 data(output),
             )))
             .unwrap();

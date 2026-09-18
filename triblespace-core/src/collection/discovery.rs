@@ -499,20 +499,14 @@ mod tests {
     }
 
     // Discovery indexes stored records; it does not interpret witness closure.
+    /// A merge or derive names its input PAYLOAD. This used to wrap it
+    /// beside a fingerprint citing a record that produced it; nothing
+    /// cites anything now, so it is just the payload.
     fn witnessed_input(
         collection: CollectionHandle,
         data: CollectionData,
-    ) -> (
-        CollectionData,
-        crate::collection::CollectionRecordFingerprint,
-    ) {
-        let record = CollectionRecord::Commit(CollectionCommit::sign(
-            &SigningKey::from_bytes(&[7; 32]),
-            collection,
-            data,
-            empty_metadata_handle(),
-        ));
-        (data, record.fingerprint())
+    ) -> CollectionData {
+        data
     }
 
     fn member(byte: u8) -> Inline<Handle<SimpleArchive>> {
@@ -643,17 +637,14 @@ mod tests {
         let merge = CollectionRecord::Merge(CollectionMerge::sign(
             &key,
             source.handle(),
-            (ca.data(), CollectionRecord::Commit(ca).fingerprint()),
-            (cb.data(), CollectionRecord::Commit(cb).fingerprint()),
+            ca.data(),
+            cb.data(),
             Handle::<SimpleArchive>::to_hash(joined.get_handle()),
         ));
         let derive = CollectionRecord::Derive(CollectionDerive::sign(
             &key,
             target.handle(),
-            (
-                Handle::<SimpleArchive>::to_hash(joined.get_handle()),
-                merge.fingerprint(),
-            ),
+            Handle::<SimpleArchive>::to_hash(joined.get_handle()),
             Handle::<SuccinctArchiveBlob>::to_hash(output.get_handle()),
         ));
         store.insert(merge).unwrap();
@@ -729,14 +720,14 @@ mod tests {
         let merge = CollectionRecord::Merge(CollectionMerge::sign(
             &key,
             source.handle(),
-            (ca.data(), CollectionRecord::Commit(ca).fingerprint()),
-            (cb.data(), CollectionRecord::Commit(cb).fingerprint()),
+            ca.data(),
+            cb.data(),
             merged,
         ));
         let derive = CollectionRecord::Derive(CollectionDerive::sign(
             &key,
             target.handle(),
-            (merged, merge.fingerprint()),
+            merged,
             derived,
         ));
         store.insert(merge).unwrap();
@@ -783,14 +774,14 @@ mod tests {
         let merge = CollectionMerge::sign(
             &SigningKey::from_bytes(&[7; 32]),
             collection(1).handle(),
-            (data(4), CollectionRecord::Commit(commit).fingerprint()),
+            data(4),
             witnessed_input(collection(1).handle(), data(5)),
             data(6),
         );
         let derive = CollectionDerive::sign(
             &SigningKey::from_bytes(&[7; 32]),
             collection(7).handle(),
-            (data(4), CollectionRecord::Commit(commit).fingerprint()),
+            data(4),
             data(8),
         );
 
@@ -850,14 +841,14 @@ mod tests {
         let merge = CollectionMerge::sign(
             &authorized_key,
             target.handle(),
-            (low, CollectionRecord::Commit(commit).fingerprint()),
+            low,
             witnessed_input(target.handle(), high),
             output,
         );
         let derive = CollectionDerive::sign(
             &authorized_key,
             target.handle(),
-            (low, CollectionRecord::Commit(commit).fingerprint()),
+            low,
             output,
         );
         let unauthorized = CollectionCommit::sign(&foreign_key, target.handle(), high, metadata);
@@ -966,11 +957,8 @@ mod tests {
         let target_merge = CollectionMerge::sign(
             &SigningKey::from_bytes(&[7; 32]),
             target.handle(),
-            (data(1), CollectionRecord::Commit(valid).fingerprint()),
-            (
-                data(2),
-                CollectionRecord::Commit(relevant_invalid).fingerprint(),
-            ),
+            data(1),
+            data(2),
             data(5),
         );
         let other_merge = CollectionMerge::sign(
@@ -983,7 +971,7 @@ mod tests {
         let crossing_derive = CollectionDerive::sign(
             &SigningKey::from_bytes(&[7; 32]),
             other.handle(),
-            (data(5), CollectionRecord::Merge(target_merge).fingerprint()),
+            data(5),
             data(6),
         );
 
@@ -1101,8 +1089,8 @@ mod tests {
             CollectionRecord::Merge(CollectionMerge::sign(
                 &SigningKey::from_bytes(&[7; 32]),
                 target.handle(),
-                (data(1), CollectionRecord::Commit(matching[0]).fingerprint()),
-                (data(2), CollectionRecord::Commit(matching[1]).fingerprint()),
+                data(1),
+                data(2),
                 data(6),
             )),
         ];

@@ -30,13 +30,14 @@ fn commit(key: u8, into: CollectionHandle, payload: CollectionData) -> Collectio
     ))
 }
 
-/// Witness fields are still part of the signed shape; the fold never consults
-/// them, which is exactly the property under test.
+/// A merge or derive names its input PAYLOAD. This used to wrap it
+/// beside a fingerprint citing a record that produced it; nothing
+/// cites anything now, so it is just the payload.
 fn witnessed(
     into: CollectionHandle,
     payload: CollectionData,
-) -> (CollectionData, CollectionRecordFingerprint) {
-    (payload, commit(31, into, payload).fingerprint())
+) -> CollectionData {
+    payload
 }
 
 fn merge(

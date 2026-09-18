@@ -111,9 +111,19 @@ pub const KIND_COLLECTION_GOSSIP_V1: Id = id_hex!("9BB5B1F4D6FD8FB850B494C2CF51B
 /// Byte length of a dense signed commit.
 pub const COLLECTION_COMMIT_BYTES_LEN: usize = 6 * 32;
 /// Byte length of a dense merge equation.
-pub const COLLECTION_MERGE_BYTES_LEN: usize = 9 * 32;
+pub const COLLECTION_MERGE_BYTES_LEN: usize = 7 * 32;
 /// Byte length of a dense derive equation.
-pub const COLLECTION_DERIVE_BYTES_LEN: usize = 7 * 32;
+pub const COLLECTION_DERIVE_BYTES_LEN: usize = 6 * 32;
+
+/// Dense byte length of a witness-free `MERGE`: collection, two inputs, the
+/// result, the author key and its signature. One 32-byte field shorter per
+/// input than the witness-bearing form it replaces.
+pub const COLLECTION_MERGE_V4_BYTES_LEN: usize = 7 * 32;
+
+/// Dense byte length of a witness-free `DERIVE`. Structurally identical to a
+/// COMMIT -- a collection, the payloads, the key and the signature -- which is
+/// the tell that all three records are now one kind of statement.
+pub const COLLECTION_DERIVE_V4_BYTES_LEN: usize = 6 * 32;
 /// Byte length of a retired signed merge without input-record witnesses.
 pub const COLLECTION_MERGE_SIGNED_V2_BYTES_LEN: usize = 7 * 32;
 /// Byte length of a retired signed derive without an input-record witness.
@@ -246,6 +256,18 @@ pub const DERIVE_TRANSCRIPT_DOMAIN: &[u8] = b"triblespace.collection.derive.endo
 pub const MERGE_SIGNED_V2_TRANSCRIPT_DOMAIN: &[u8] = b"triblespace.collection.merge.transcript";
 /// Retired signature domain for DERIVE equations without an input witness.
 pub const DERIVE_SIGNED_V2_TRANSCRIPT_DOMAIN: &[u8] = b"triblespace.collection.derive.transcript";
+
+/// Witness-free equation transcripts.
+///
+/// An equation is a statement about PAYLOADS: these inputs combine to this
+/// output in this collection. Which record happened to assert an input is not
+/// part of that statement. Binding one made support narrower than the facts
+/// warranted -- a reader holding a different but equally admitted assertion of
+/// the same payload had the support and was told it did not, because the cited
+/// record was missing. An annotation may only widen; a witness narrowed.
+pub const MERGE_V4_TRANSCRIPT_DOMAIN: &[u8] = b"triblespace.collection.merge.equation";
+/// See [`MERGE_V4_TRANSCRIPT_DOMAIN`].
+pub const DERIVE_V4_TRANSCRIPT_DOMAIN: &[u8] = b"triblespace.collection.derive.equation";
 
 /// Return the canonical handle of an empty metadata archive.
 ///
@@ -495,52 +517,45 @@ pub struct CollectionMerge {
     low: CollectionData,
     high: CollectionData,
     result: CollectionData,
-    low_witness: CollectionRecordFingerprint,
-    high_witness: CollectionRecordFingerprint,
     public_key: Inline<ED25519PublicKey>,
     signature_r: Inline<ED25519RComponent>,
     signature_s: Inline<ED25519SComponent>,
 }
 
 impl CollectionMerge {
-    /// Canonical persisted record identity, including its input witnesses.
+    /// Canonical persisted record identity.
     pub fn fingerprint(&self) -> CollectionRecordFingerprint {
         CollectionRecord::Merge(*self).fingerprint()
     }
 
-    /// Sign an endorsement after sorting (payload digest, record witness) pairs.
+    /// Sign a join of two payloads, in canonical order.
     ///
-    /// A witness names an actual persisted input record. The producer checks
-    /// that evidence before publishing; signing alone does not acquire it.
+    /// The statement is about PAYLOADS: these two join to this result. Which
+    /// records happen to produce the inputs is not part of it -- a reader
+    /// finds those by content, and naming one here only chose a route nobody
+    /// needed and made the same join publishable several times over.
     pub fn sign(
         signing_key: &SigningKey,
         collection: CollectionHandle,
-        mut left: (CollectionData, CollectionRecordFingerprint),
-        mut right: (CollectionData, CollectionRecordFingerprint),
+        mut low: CollectionData,
+        mut high: CollectionData,
         result: CollectionData,
     ) -> Self {
-        if right < left {
-            std::mem::swap(&mut left, &mut right);
+        if high < low {
+            std::mem::swap(&mut low, &mut high);
         }
         let public_key = Inline::new(signing_key.verifying_key().to_bytes());
         let transcript = equation_transcript(
-            MERGE_TRANSCRIPT_DOMAIN,
-            KIND_COLLECTION_MERGE,
+            MERGE_SIGNED_V2_TRANSCRIPT_DOMAIN,
+            KIND_COLLECTION_MERGE_SIGNED_V2,
             public_key,
-            [
-                collection.raw,
-                left.0.raw,
-                right.0.raw,
-                result.raw,
-                left.1.raw(),
-                right.1.raw(),
-            ],
+            [collection.raw, low.raw, high.raw, result.raw],
         );
         let signature: Signature = signing_key.sign(&transcript);
         Self::from_parts(
             collection,
-            left,
-            right,
+            low,
+            high,
             result,
             public_key,
             Inline::new(*signature.r_bytes()),
@@ -550,8 +565,8 @@ impl CollectionMerge {
 
     pub(crate) fn from_parts(
         collection: CollectionHandle,
-        (low, low_witness): (CollectionData, CollectionRecordFingerprint),
-        (high, high_witness): (CollectionData, CollectionRecordFingerprint),
+        low: CollectionData,
+        high: CollectionData,
         result: CollectionData,
         public_key: Inline<ED25519PublicKey>,
         signature_r: Inline<ED25519RComponent>,
@@ -562,8 +577,6 @@ impl CollectionMerge {
             low,
             high,
             result,
-            low_witness,
-            high_witness,
             public_key,
             signature_r,
             signature_s,
@@ -581,22 +594,19 @@ impl CollectionMerge {
     pub(crate) fn from_bytes_trusted(
         bytes: [u8; COLLECTION_MERGE_BYTES_LEN],
     ) -> Result<Self, RecordDecodeError> {
-        let collection = Inline::new(field(&bytes, 0));
         let low = Inline::new(field(&bytes, 1));
         let high = Inline::new(field(&bytes, 2));
-        let low_witness = CollectionRecordFingerprint::from_raw(field(&bytes, 4));
-        let high_witness = CollectionRecordFingerprint::from_raw(field(&bytes, 5));
-        if (high, high_witness) < (low, low_witness) {
+        if high < low {
             return Err(RecordDecodeError::NonCanonicalMergeInputs);
         }
         Ok(Self::from_parts(
-            collection,
-            (low, low_witness),
-            (high, high_witness),
+            Inline::new(field(&bytes, 0)),
+            low,
+            high,
             Inline::new(field(&bytes, 3)),
+            Inline::new(field(&bytes, 4)),
+            Inline::new(field(&bytes, 5)),
             Inline::new(field(&bytes, 6)),
-            Inline::new(field(&bytes, 7)),
-            Inline::new(field(&bytes, 8)),
         ))
     }
 
@@ -612,16 +622,14 @@ impl CollectionMerge {
     /// Exact domain-separated bytes signed by the author.
     pub fn signing_transcript(&self) -> Vec<u8> {
         equation_transcript(
-            MERGE_TRANSCRIPT_DOMAIN,
-            KIND_COLLECTION_MERGE,
+            MERGE_SIGNED_V2_TRANSCRIPT_DOMAIN,
+            KIND_COLLECTION_MERGE_SIGNED_V2,
             self.public_key,
             [
                 self.collection.raw,
                 self.low.raw,
                 self.high.raw,
                 self.result.raw,
-                self.low_witness.raw(),
-                self.high_witness.raw(),
             ],
         )
     }
@@ -644,11 +652,6 @@ impl CollectionMerge {
     /// Canonically ordered merge inputs.
     pub fn inputs(&self) -> (CollectionData, CollectionData) {
         (self.low, self.high)
-    }
-
-    /// Exact input-record witnesses in the same order as [`Self::inputs`].
-    pub fn input_witnesses(&self) -> (CollectionRecordFingerprint, CollectionRecordFingerprint) {
-        (self.low_witness, self.high_witness)
     }
 
     /// Asserted exact join result.
@@ -676,8 +679,6 @@ impl CollectionMerge {
             self.low.raw,
             self.high.raw,
             self.result.raw,
-            self.low_witness.raw(),
-            self.high_witness.raw(),
             self.public_key.raw,
             self.signature_r.raw,
             self.signature_s.raw,
@@ -691,14 +692,13 @@ pub struct CollectionDerive {
     collection: CollectionHandle,
     input: CollectionData,
     output: CollectionData,
-    input_witness: CollectionRecordFingerprint,
     public_key: Inline<ED25519PublicKey>,
     signature_r: Inline<ED25519RComponent>,
     signature_s: Inline<ED25519SComponent>,
 }
 
 impl CollectionDerive {
-    /// Canonical persisted record identity, including its input witness.
+    /// Canonical persisted record identity.
     pub fn fingerprint(&self) -> CollectionRecordFingerprint {
         CollectionRecord::Derive(*self).fingerprint()
     }
@@ -715,15 +715,15 @@ impl CollectionDerive {
     pub fn sign(
         signing_key: &SigningKey,
         collection: CollectionHandle,
-        input: (CollectionData, CollectionRecordFingerprint),
+        input: CollectionData,
         output: CollectionData,
     ) -> Self {
         let public_key = Inline::new(signing_key.verifying_key().to_bytes());
         let transcript = equation_transcript(
-            DERIVE_TRANSCRIPT_DOMAIN,
-            KIND_COLLECTION_DERIVE,
+            DERIVE_SIGNED_V2_TRANSCRIPT_DOMAIN,
+            KIND_COLLECTION_DERIVE_SIGNED_V2,
             public_key,
-            [collection.raw, input.0.raw, output.raw, input.1.raw()],
+            [collection.raw, input.raw, output.raw],
         );
         let signature: Signature = signing_key.sign(&transcript);
         Self::from_parts(
@@ -738,7 +738,7 @@ impl CollectionDerive {
 
     pub(crate) fn from_parts(
         collection: CollectionHandle,
-        (input, input_witness): (CollectionData, CollectionRecordFingerprint),
+        input: CollectionData,
         output: CollectionData,
         public_key: Inline<ED25519PublicKey>,
         signature_r: Inline<ED25519RComponent>,
@@ -748,7 +748,6 @@ impl CollectionDerive {
             collection,
             input,
             output,
-            input_witness,
             public_key,
             signature_r,
             signature_s,
@@ -766,14 +765,11 @@ impl CollectionDerive {
     pub(crate) fn from_bytes_trusted(bytes: [u8; COLLECTION_DERIVE_BYTES_LEN]) -> Self {
         Self::from_parts(
             Inline::new(field(&bytes, 0)),
-            (
-                Inline::new(field(&bytes, 1)),
-                CollectionRecordFingerprint::from_raw(field(&bytes, 3)),
-            ),
+            Inline::new(field(&bytes, 1)),
             Inline::new(field(&bytes, 2)),
+            Inline::new(field(&bytes, 3)),
             Inline::new(field(&bytes, 4)),
             Inline::new(field(&bytes, 5)),
-            Inline::new(field(&bytes, 6)),
         )
     }
 
@@ -796,7 +792,6 @@ impl CollectionDerive {
                 self.collection.raw,
                 self.input.raw,
                 self.output.raw,
-                self.input_witness.raw(),
             ],
         )
     }
@@ -819,11 +814,6 @@ impl CollectionDerive {
     /// Source member mapped by this equation.
     pub fn input(&self) -> CollectionData {
         self.input
-    }
-
-    /// Exact source record validated and endorsed by this equation's producer.
-    pub fn input_witness(&self) -> CollectionRecordFingerprint {
-        self.input_witness
     }
 
     /// Target member produced by this equation.
@@ -849,7 +839,6 @@ impl CollectionDerive {
             self.collection.raw,
             self.input.raw,
             self.output.raw,
-            self.input_witness.raw(),
             self.public_key.raw,
             self.signature_r.raw,
             self.signature_s.raw,
@@ -1191,18 +1180,7 @@ impl CollectionRecord {
     /// These are record fingerprints, not blob handles or support members.
     /// Retention follows them even when the referenced payload is absent;
     /// authority and network disclosure remain separate decisions.
-    pub fn record_references(&self) -> impl ExactSizeIterator<Item = CollectionRecordFingerprint> {
-        let mut references = arrayvec::ArrayVec::<_, 2>::new();
-        match self {
-            Self::Commit(_) => {}
-            Self::Merge(record) => {
-                let (low, high) = record.input_witnesses();
-                references.extend([low, high]);
-            }
-            Self::Derive(record) => references.push(record.input_witness()),
-        }
-        references.into_iter()
-    }
+
 
     /// Decode the self-tagged dense form and strictly verify its signature.
     ///
@@ -1229,11 +1207,11 @@ impl CollectionRecord {
                 let bytes = exact_array::<COLLECTION_COMMIT_BYTES_LEN>(payload)?;
                 Ok(Self::Commit(CollectionCommit::from_bytes_trusted(bytes)))
             }
-            COLLECTION_RECORD_KIND_MERGE_V3 => {
+            COLLECTION_RECORD_KIND_MERGE_V2 => {
                 let bytes = exact_array::<COLLECTION_MERGE_BYTES_LEN>(payload)?;
                 Ok(Self::Merge(CollectionMerge::from_bytes_trusted(bytes)?))
             }
-            COLLECTION_RECORD_KIND_DERIVE_V3 => {
+            COLLECTION_RECORD_KIND_DERIVE_V2 => {
                 let bytes = exact_array::<COLLECTION_DERIVE_BYTES_LEN>(payload)?;
                 Ok(Self::Derive(CollectionDerive::from_bytes_trusted(bytes)))
             }
@@ -1250,10 +1228,10 @@ impl CollectionRecord {
                 collection_record_fingerprint(KIND_COLLECTION_COMMIT, &record.to_bytes())
             }
             Self::Merge(record) => {
-                collection_record_fingerprint(KIND_COLLECTION_MERGE, &record.to_bytes())
+                collection_record_fingerprint(KIND_COLLECTION_MERGE_SIGNED_V2, &record.to_bytes())
             }
             Self::Derive(record) => {
-                collection_record_fingerprint(KIND_COLLECTION_DERIVE, &record.to_bytes())
+                collection_record_fingerprint(KIND_COLLECTION_DERIVE_SIGNED_V2, &record.to_bytes())
             }
         }
     }
@@ -1265,10 +1243,10 @@ impl CollectionRecord {
                 tagged_bytes(COLLECTION_RECORD_KIND_COMMIT_V1, &record.to_bytes())
             }
             Self::Merge(record) => {
-                tagged_bytes(COLLECTION_RECORD_KIND_MERGE_V3, &record.to_bytes())
+                tagged_bytes(COLLECTION_RECORD_KIND_MERGE_V2, &record.to_bytes())
             }
             Self::Derive(record) => {
-                tagged_bytes(COLLECTION_RECORD_KIND_DERIVE_V3, &record.to_bytes())
+                tagged_bytes(COLLECTION_RECORD_KIND_DERIVE_V2, &record.to_bytes())
             }
         }
     }
@@ -1291,6 +1269,11 @@ pub const COLLECTION_RECORD_KIND_DERIVE_V2: u8 = 5;
 pub const COLLECTION_RECORD_KIND_MERGE_V3: u8 = 6;
 /// Dense generic-store tag for witness-bound signed DERIVE endorsements.
 pub const COLLECTION_RECORD_KIND_DERIVE_V3: u8 = 7;
+/// Witness-free `MERGE`. An equation cites the payloads it relates, never the
+/// particular records that happened to assert them.
+pub const COLLECTION_RECORD_KIND_MERGE_V4: u8 = 8;
+/// Witness-free `DERIVE`.
+pub const COLLECTION_RECORD_KIND_DERIVE_V4: u8 = 9;
 
 fn commit_bytes(
     collection: CollectionHandle,
@@ -1454,11 +1437,10 @@ mod tests {
         Inline::new([byte; 32])
     }
 
-    fn input(byte: u8) -> (CollectionData, CollectionRecordFingerprint) {
-        (
-            hash(byte),
-            CollectionRecordFingerprint::from_raw([byte; 32]),
-        )
+    /// An equation names its input PAYLOAD; this used to pair it with a
+    /// fingerprint citing a record that produced it.
+    fn input(byte: u8) -> CollectionData {
+        hash(byte)
     }
 
     fn collection(byte: u8) -> CollectionHandle {
@@ -1620,83 +1602,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn equal_payloads_sort_by_witness_and_keep_pairs_together() {
-        let first = (hash(2), CollectionRecordFingerprint::from_raw([9; 32]));
-        let second = (hash(2), CollectionRecordFingerprint::from_raw([3; 32]));
-        let forward = CollectionMerge::sign(&fixture_key(), collection(1), first, second, hash(4));
-        let reverse = CollectionMerge::sign(&fixture_key(), collection(1), second, first, hash(4));
-        assert_eq!(forward, reverse);
-        assert_eq!(forward.inputs(), (hash(2), hash(2)));
-        assert_eq!(forward.input_witnesses(), (second.1, first.1));
-        assert_eq!(&forward.to_bytes()[128..160], second.1.as_bytes());
-        assert_eq!(&forward.to_bytes()[160..192], first.1.as_bytes());
-        assert_eq!(
-            CollectionMerge::from_bytes(forward.to_bytes()).unwrap(),
-            forward
-        );
-
-        let mut reversed = forward.to_bytes();
-        reversed[128..160].copy_from_slice(first.1.as_bytes());
-        reversed[160..192].copy_from_slice(second.1.as_bytes());
-        assert_eq!(
-            CollectionMerge::from_bytes_trusted(reversed),
-            Err(RecordDecodeError::NonCanonicalMergeInputs)
-        );
-    }
-
-    #[test]
-    fn input_witnesses_are_signed_and_change_record_identity() {
-        let first =
-            CollectionMerge::sign(&fixture_key(), collection(1), input(2), input(3), hash(4));
-        let changed = CollectionMerge::sign(
-            &fixture_key(),
-            collection(1),
-            (hash(2), CollectionRecordFingerprint::from_raw([8; 32])),
-            input(3),
-            hash(4),
-        );
-        assert_eq!(first.inputs(), changed.inputs());
-        assert_eq!(first.result(), changed.result());
-        assert_ne!(first.signing_transcript(), changed.signing_transcript());
-        assert_ne!(
-            CollectionRecord::Merge(first).fingerprint(),
-            CollectionRecord::Merge(changed).fingerprint()
-        );
-
-        // Payload ordering remains canonical: only the witness changes.
-        let mut tampered = first.to_bytes();
-        tampered[128..160].copy_from_slice(changed.input_witnesses().0.as_bytes());
-        assert!(CollectionMerge::from_bytes_trusted(tampered).is_ok());
-        assert_eq!(
-            CollectionMerge::from_bytes(tampered),
-            Err(RecordDecodeError::Verification(
-                RecordVerificationError::InvalidSignature
-            ))
-        );
-
-        let first = CollectionDerive::sign(&fixture_key(), collection(2), input(3), hash(4));
-        let changed = CollectionDerive::sign(
-            &fixture_key(),
-            collection(2),
-            (hash(3), CollectionRecordFingerprint::from_raw([8; 32])),
-            hash(4),
-        );
-        assert_eq!(first.input(), changed.input());
-        assert_eq!(first.output(), changed.output());
-        assert_ne!(
-            CollectionRecord::Derive(first).fingerprint(),
-            CollectionRecord::Derive(changed).fingerprint()
-        );
-        let mut tampered = first.to_bytes();
-        tampered[96..128].copy_from_slice(changed.input_witness().as_bytes());
-        assert_eq!(
-            CollectionDerive::from_bytes(tampered),
-            Err(RecordDecodeError::Verification(
-                RecordVerificationError::InvalidSignature
-            ))
-        );
-    }
+    // Two tests lived here that existed only to pin witness behaviour --
+    // that equal payloads sorted by their citation, and that changing a
+    // citation changed record identity. A merge names no record now, so
+    // neither statement is expressible, let alone true.
 
     #[test]
     fn derive_roundtrips() {
@@ -1782,25 +1691,18 @@ mod tests {
         let merged = CollectionRecord::Merge(CollectionMerge::sign(
             &fixture_key(),
             collection(1),
-            (hash(2), first.fingerprint()),
-            (hash(3), second.fingerprint()),
+            hash(2),
+            hash(3),
             hash(4),
         ));
         let derived = CollectionRecord::Derive(CollectionDerive::sign(
             &fixture_key(),
             collection(5),
-            (hash(4), merged.fingerprint()),
+            hash(4),
             hash(6),
         ));
-        assert_eq!(first.record_references().len(), 0);
-        assert_eq!(
-            merged.record_references().collect::<Vec<_>>(),
-            vec![first.fingerprint(), second.fingerprint()]
-        );
-        assert_eq!(
-            derived.record_references().collect::<Vec<_>>(),
-            vec![merged.fingerprint()]
-        );
+        // Record references were the citation graph. A record names payloads
+        // now, and a reader relates it to its inputs by content.
         assert_eq!(merged.blob_references().len(), 4);
         assert_eq!(derived.blob_references().len(), 3);
     }

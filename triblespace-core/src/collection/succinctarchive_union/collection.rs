@@ -359,10 +359,7 @@ mod tests {
             CollectionRecord::Derive(CollectionDerive::sign(
                 &SigningKey::from_bytes(&[7; 32]),
                 accelerated_collection.handle(),
-                (
-                    input,
-                    input_record(raw_collection.handle(), input).fingerprint(),
-                ),
+                input,
                 output,
             ))
         });
@@ -381,8 +378,8 @@ mod tests {
             .insert(CollectionRecord::Merge(CollectionMerge::sign(
                 &SigningKey::from_bytes(&[7; 32]),
                 accelerated_collection.handle(),
-                (fa_data, fine_records[0].fingerprint()),
-                (fb_data, fine_records[1].fingerprint()),
+                fa_data,
+                fb_data,
                 fc_data,
             )))
             .unwrap();
@@ -483,14 +480,8 @@ mod tests {
             .insert(CollectionRecord::Merge(CollectionMerge::sign(
                 &SigningKey::from_bytes(&[7; 32]),
                 accelerated_collection.handle(),
-                (
-                    fa_data,
-                    input_record(accelerated_collection.handle(), fa_data).fingerprint(),
-                ),
-                (
-                    fb_data,
-                    input_record(accelerated_collection.handle(), fb_data).fingerprint(),
-                ),
+                fa_data,
+                fb_data,
                 fc_data,
             )))
             .unwrap();
@@ -525,14 +516,8 @@ mod tests {
             .insert(CollectionRecord::Merge(CollectionMerge::sign(
                 &SigningKey::from_bytes(&[7; 32]),
                 accelerated_collection.handle(),
-                (
-                    fa_data,
-                    input_record(accelerated_collection.handle(), fa_data).fingerprint(),
-                ),
-                (
-                    fb_data,
-                    input_record(accelerated_collection.handle(), fb_data).fingerprint(),
-                ),
+                fa_data,
+                fb_data,
                 fc_data,
             )))
             .unwrap();
@@ -851,7 +836,7 @@ mod tests {
                 CollectionRecord::Derive(CollectionDerive::sign(
                     &SigningKey::from_bytes(&[7; 32]),
                     raw_collection.handle(),
-                    (input, source.fingerprint()),
+                    input,
                     output,
                 ))
             })
@@ -862,8 +847,8 @@ mod tests {
         let merged = CollectionRecord::Merge(CollectionMerge::sign(
             &SigningKey::from_bytes(&[7; 32]),
             raw_collection.handle(),
-            (a_data, raw_records[0].fingerprint()),
-            (b_data, raw_records[1].fingerprint()),
+            a_data,
+            b_data,
             c_data,
         ));
         store.insert(merged).unwrap();
@@ -871,7 +856,7 @@ mod tests {
             .insert(CollectionRecord::Derive(CollectionDerive::sign(
                 &SigningKey::from_bytes(&[7; 32]),
                 accelerated_collection.handle(),
-                (c_data, merged.fingerprint()),
+                c_data,
                 fc_data,
             )))
             .unwrap();

@@ -255,7 +255,7 @@ fn maintenance_follows_a_resident_source_union_across_target_size_tiers() {
                 if derive.collection() == raw.handle() && derive.output() == data)
                 })
                 .expect("ensure published each raw input's DERIVE");
-            (data, record.fingerprint())
+            data
         })
         .collect::<Vec<_>>();
     store
@@ -530,10 +530,7 @@ fn ordinary_derived_operations_ignore_pending_immediate_source_output() {
     let pending = CollectionDerive::sign(
         &authority,
         raw.handle(),
-        (
-            later_commit.data(),
-            CollectionRecord::Commit(later_commit).fingerprint(),
-        ),
+        later_commit.data(),
         Handle::<SuccinctArchiveBlob>::to_hash(missing_raw),
     );
     store.insert(CollectionRecord::Derive(pending)).unwrap();
@@ -636,10 +633,7 @@ fn ordinary_derived_operations_exclude_unauthorized_immediate_source_equations()
         .insert(CollectionRecord::Derive(CollectionDerive::sign(
             &unauthorized,
             raw.handle(),
-            (
-                denied_commit.data(),
-                CollectionRecord::Commit(denied_commit).fingerprint(),
-            ),
+            denied_commit.data(),
             Handle::<SuccinctArchiveBlob>::to_hash(denied_raw),
         )))
         .unwrap();

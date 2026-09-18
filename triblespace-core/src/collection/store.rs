@@ -277,21 +277,15 @@ where
 mod tests {
     // Canonical but deliberately uninserted COMMIT witnesses keep these
     // physical-storage fixtures independent of ancestor arrival order.
+    /// A merge or derive names its input PAYLOAD. This used to wrap it
+    /// beside a fingerprint citing a record that produced it; nothing
+    /// cites anything now, so it is just the payload.
     fn witnessed(
         signer: &ed25519_dalek::SigningKey,
         collection: crate::collection::CollectionHandle,
         data: crate::collection::CollectionData,
-    ) -> (
-        crate::collection::CollectionData,
-        crate::collection::CollectionRecordFingerprint,
-    ) {
-        let record = crate::collection::CollectionCommit::sign(
-            signer,
-            collection,
-            data,
-            crate::collection::empty_metadata_handle(),
-        );
-        (data, record.fingerprint())
+    ) -> CollectionData {
+        data
     }
 
     use std::cell::Cell;

@@ -1191,7 +1191,9 @@ struct CollectionMergeRecordHeader {
 impl CollectionMergeRecordHeader {
     fn new(record: &CollectionMerge) -> Self {
         let (low, high) = record.inputs();
-        let (low_witness, high_witness) = record.input_witnesses();
+        // Retired frame slots: a merge states a payload relation and names no
+        // record. Kept zeroed so the frame keeps its size and alignment.
+        let (low_witness, high_witness) = ([0u8; 32], [0u8; 32]);
         let (signature_r, signature_s) = record.signature();
         Self {
             magic: FRAME_MAGIC,
@@ -1201,8 +1203,8 @@ impl CollectionMergeRecordHeader {
             low: low.raw,
             high: high.raw,
             result: record.result().raw,
-            low_witness: low_witness.raw(),
-            high_witness: high_witness.raw(),
+            low_witness,
+            high_witness,
             public_key: record.public_key().raw,
             signature_r: signature_r.raw,
             signature_s: signature_s.raw,
@@ -1252,7 +1254,8 @@ impl CollectionDeriveRecordHeader {
             target: record.collection().raw,
             input: input.raw,
             output: output.raw,
-            input_witness: record.input_witness().raw(),
+            // Retired frame slot; see the merge header.
+            input_witness: [0u8; 32],
             public_key: record.public_key().raw,
             signature_r: signature_r.raw,
             signature_s: signature_s.raw,
@@ -1858,14 +1861,8 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
                 content: PileRecordContent::Collection {
                     record: CollectionRecord::Merge(CollectionMerge::from_parts(
                         Inline::new(header.collection),
-                        (
-                            Inline::new(header.low),
-                            CollectionRecordFingerprint::from_raw(header.low_witness),
-                        ),
-                        (
-                            Inline::new(header.high),
-                            CollectionRecordFingerprint::from_raw(header.high_witness),
-                        ),
+                        Inline::new(header.low),
+                        Inline::new(header.high),
                         Inline::new(header.result),
                         Inline::new(header.public_key),
                         Inline::new(header.signature_r),
@@ -1889,10 +1886,7 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
                 content: PileRecordContent::Collection {
                     record: CollectionRecord::Derive(CollectionDerive::from_parts(
                         Inline::new(header.target),
-                        (
-                            Inline::new(header.input),
-                            CollectionRecordFingerprint::from_raw(header.input_witness),
-                        ),
+                        Inline::new(header.input),
                         Inline::new(header.output),
                         Inline::new(header.public_key),
                         Inline::new(header.signature_r),
@@ -5578,21 +5572,15 @@ impl Pile {
 mod tests {
     // Canonical but deliberately uninserted COMMIT witnesses keep these
     // physical-storage fixtures independent of ancestor arrival order.
+    /// A merge or derive names its input PAYLOAD. This used to wrap it
+    /// beside a fingerprint citing a record that produced it; nothing
+    /// cites anything now, so it is just the payload.
     fn witnessed(
         signer: &ed25519_dalek::SigningKey,
         collection: crate::collection::CollectionHandle,
         data: crate::collection::CollectionData,
-    ) -> (
-        crate::collection::CollectionData,
-        crate::collection::CollectionRecordFingerprint,
-    ) {
-        let record = crate::collection::CollectionCommit::sign(
-            signer,
-            collection,
-            data,
-            crate::collection::empty_metadata_handle(),
-        );
-        (data, record.fingerprint())
+    ) -> CollectionData {
+        data
     }
 
     use super::*;
@@ -6759,8 +6747,8 @@ mod tests {
         let merge = CollectionRecord::Merge(CollectionMerge::sign(
             &signer,
             collection,
-            (data, first.fingerprint()),
-            (data, second.fingerprint()),
+            data,
+            data,
             data,
         ));
         let mut frame = collection_record_header(&merge);
@@ -8428,47 +8416,47 @@ mod tests {
         let merge_a = CollectionRecord::Merge(CollectionMerge::sign(
             &key,
             collection,
-            (a.data(), a.fingerprint()),
-            (c.data(), c.fingerprint()),
+            a.data(),
+            c.data(),
             output,
         ));
         let merge_b = CollectionRecord::Merge(CollectionMerge::sign(
             &key,
             collection,
-            (b.data(), b.fingerprint()),
-            (c.data(), c.fingerprint()),
+            b.data(),
+            c.data(),
             output,
         ));
         // Repeating one immediate witness creates only one reverse relation.
         let repeated = CollectionRecord::Merge(CollectionMerge::sign(
             &key,
             collection,
-            (a.data(), a.fingerprint()),
-            (a.data(), a.fingerprint()),
+            a.data(),
+            a.data(),
             output,
         ));
         let derive_a = CollectionRecord::Derive(CollectionDerive::sign(
             &key,
             collection,
-            (a.data(), a.fingerprint()),
+            a.data(),
             output,
         ));
         let derive_b = CollectionRecord::Derive(CollectionDerive::sign(
             &key,
             collection,
-            (b.data(), b.fingerprint()),
+            b.data(),
             output,
         ));
         let other_producer = CollectionRecord::Derive(CollectionDerive::sign(
             &key,
             other,
-            (a.data(), a.fingerprint()),
+            a.data(),
             output,
         ));
         let descendant = CollectionRecord::Derive(CollectionDerive::sign(
             &key,
             other,
-            (output, merge_a.fingerprint()),
+            output,
             collection_test_hash(47),
         ));
         let records = vec![
@@ -9084,7 +9072,7 @@ mod tests {
         let derive = CollectionDerive::sign(
             &signer,
             target,
-            (commit.data(), commit.fingerprint()),
+            commit.data(),
             Inline::new(output.raw),
         );
         // The second fingerprint is deliberately dangling and happens to name
@@ -9093,11 +9081,8 @@ mod tests {
         let merge = CollectionMerge::sign(
             &signer,
             target,
-            (derive.output(), derive.fingerprint()),
-            (
-                derive.output(),
-                CollectionRecordFingerprint::from_raw(orphan.raw),
-            ),
+            derive.output(),
+            derive.output(),
             derive.output(),
         );
         source.insert(CollectionRecord::Merge(merge)).unwrap();
@@ -10756,7 +10741,7 @@ mod tests {
         let produced = CollectionRecord::Derive(CollectionDerive::sign(
             &key,
             target,
-            (input.data(), input.fingerprint()),
+            input.data(),
             output,
         ));
         let routes = [
@@ -10820,7 +10805,7 @@ mod tests {
         let alternative = CollectionRecord::Derive(CollectionDerive::sign(
             &key,
             target,
-            (second_input.data(), second_input.fingerprint()),
+            second_input.data(),
             output,
         ));
         writer.insert(alternative).unwrap();

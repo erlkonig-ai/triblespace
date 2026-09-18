@@ -45,12 +45,12 @@ fn later_alternative_equations_cannot_change_an_endorsed_results_support() {
     let merged = CollectionRecord::Merge(CollectionMerge::sign(
         &owner,
         source.handle(),
-        (ca.data(), CollectionRecord::Commit(ca).fingerprint()),
-        (cb.data(), CollectionRecord::Commit(cb).fingerprint()),
+        ca.data(),
+        cb.data(),
         c,
     ));
     store.insert(merged).unwrap();
-    let selected = CollectionDerive::sign(&owner, target.handle(), (c, merged.fingerprint()), t);
+    let selected = CollectionDerive::sign(&owner, target.handle(), c, t);
     store.insert(CollectionRecord::Derive(selected)).unwrap();
 
     let observe = |store: &mut MemoryRepo| {
@@ -85,8 +85,8 @@ fn later_alternative_equations_cannot_change_an_endorsed_results_support() {
             .insert(CollectionRecord::Merge(CollectionMerge::sign(
                 signer,
                 source.handle(),
-                (c, merged.fingerprint()),
-                (cz.data(), CollectionRecord::Commit(cz).fingerprint()),
+                c,
+                cz.data(),
                 c,
             )))
             .unwrap();

@@ -741,20 +741,14 @@ mod tests {
         Inline::<Hash<Blake3>>::new(Blake3::digest(&blob.bytes))
     }
 
+    /// A merge or derive names its input PAYLOAD. This used to wrap it
+    /// beside a fingerprint citing a record that produced it; nothing
+    /// cites anything now, so it is just the payload.
     fn witnessed_input(
         descriptor: &Fragment,
         data: CollectionData,
-    ) -> (
-        CollectionData,
-        crate::collection::CollectionRecordFingerprint,
-    ) {
-        let record = CollectionRecord::Commit(CollectionCommit::sign(
-            &SigningKey::from_bytes(&[7; 32]),
-            identity_for_tests(descriptor),
-            data,
-            empty_metadata_handle(),
-        ));
-        (data, record.fingerprint())
+    ) -> CollectionData {
+        data
     }
 
     fn ordered_inputs<'a>(
@@ -841,10 +835,7 @@ mod tests {
         let derive = CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&target),
-            (
-                expected.data(),
-                CollectionRecord::Commit(expected).fingerprint(),
-            ),
+            expected.data(),
             Inline::new([0x42; 32]),
         );
         let derive_record = CollectionRecord::Derive(derive);

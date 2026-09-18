@@ -2811,8 +2811,8 @@ mod cover_resolution_tests {
             let merge = CollectionMerge::sign(
                 &signer,
                 collection.handle(),
-                (atom, atom_record.fingerprint()),
-                (previous, previous_record.fingerprint()),
+                atom,
+                previous,
                 result,
             );
             previous = result;

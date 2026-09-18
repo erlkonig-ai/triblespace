@@ -973,8 +973,8 @@ mod tests {
         let merge = CollectionMerge::sign(
             &old_key,
             old.handle(),
-            (commits[0].data(), commits[0].fingerprint()),
-            (commits[1].data(), commits[1].fingerprint()),
+            commits[0].data(),
+            commits[1].data(),
             crate::inline::Inline::new([0xEE; 32]),
         );
         store.insert(CollectionRecord::Merge(merge)).unwrap();

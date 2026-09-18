@@ -342,7 +342,7 @@ mod tests {
         CollectionRecord::Derive(CollectionDerive::sign(
             &key,
             Inline::<Handle<SimpleArchive>>::new([1; 32]),
-            (Inline::new([byte; 32]), input.fingerprint()),
+            Inline::new([byte; 32]),
             Inline::new([byte.wrapping_add(1); 32]),
         ))
     }
