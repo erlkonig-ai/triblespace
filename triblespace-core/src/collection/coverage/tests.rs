@@ -339,3 +339,90 @@ fn folding_a_realistic_lattice_is_cheap_enough_to_do_on_open() {
     probe(14_980, 2);
     probe(100_000, 2);
 }
+
+/// The outer key is the bare result handle, so two collections attesting the
+/// same payload share one row.
+///
+/// This pins present behaviour rather than endorsing it. Content addressing
+/// means a shared key is genuinely the same bytes, and when both collections
+/// reach it the same way the union is a no-op. It stops being a no-op when a
+/// payload is a foundation commit in one lattice and a merge result in
+/// another: the row then names commits from a lineage the first collection
+/// has nothing to do with.
+#[test]
+fn one_payload_in_two_lattices_shares_a_row() {
+    let mut index = CoverageIndex::new();
+    let ledger = collection(0);
+    let tally = collection(1);
+    let shared = data(3);
+
+    // `shared` is committed on its own authority into `ledger`.
+    index.apply(&commit(1, ledger, shared), &AdmitEveryRecord);
+    assert_eq!(members(&index, shared), vec![[3u8; 32]]);
+
+    // The very same bytes are the join of two commits in `tally`.
+    index.apply(&commit(1, tally, data(1)), &AdmitEveryRecord);
+    index.apply(&commit(1, tally, data(2)), &AdmitEveryRecord);
+    index.apply(&merge(1, tally, data(1), data(2), shared), &AdmitEveryRecord);
+
+    assert_eq!(
+        members(&index, shared),
+        vec![[1u8; 32], [2u8; 32], [3u8; 32]]
+    );
+}
+
+/// What the shared row costs, stated as the question that actually breaks.
+///
+/// Asking "does this node cover everything I need" is safe under aliasing:
+/// the needed set is a known universe, and a foreign member can never satisfy
+/// a real requirement. Asking "does this node subsume that one", which is how
+/// a cover is minimised, has no universe to intersect against — so a foreign
+/// member can flip the verdict and drop a node the collection still needs.
+///
+/// `alias` covers only commit 1 inside `tally`. A foreign lattice attests
+/// that the same payload also stands for commit 2, and with that member in
+/// the row, `pair` — which genuinely covers both of tally's commits — reads
+/// as redundant beside it. Minimising the cover on that verdict would lose
+/// commit 2.
+#[test]
+fn a_foreign_member_can_flip_a_subsumption_verdict() {
+    let tally = collection(0);
+    let ledger = collection(1);
+    let alias = data(3);
+
+    let tally_only = {
+        let mut index = CoverageIndex::new();
+        index.apply(&commit(1, tally, data(1)), &AdmitEveryRecord);
+        index.apply(&commit(1, tally, data(2)), &AdmitEveryRecord);
+        index.apply(&merge(1, tally, data(1), data(1), alias), &AdmitEveryRecord);
+        index.apply(&merge(1, tally, data(1), data(2), data(5)), &AdmitEveryRecord);
+        index
+    };
+    let honest_alias = tally_only.coverage(alias).expect("row").clone();
+    let pair = tally_only.coverage(data(5)).expect("row").clone();
+    assert_eq!(
+        honest_alias.iter_ordered().copied().collect::<Vec<_>>(),
+        vec![[1u8; 32]]
+    );
+    // Restricted to tally, `pair` is not redundant: it names a commit the
+    // alias does not.
+    assert!(!pair.difference(&honest_alias).is_empty());
+
+    let mut aliased = CoverageIndex::new();
+    aliased.apply(&commit(1, tally, data(1)), &AdmitEveryRecord);
+    aliased.apply(&commit(1, tally, data(2)), &AdmitEveryRecord);
+    aliased.apply(&merge(1, tally, data(1), data(1), alias), &AdmitEveryRecord);
+    aliased.apply(&merge(1, tally, data(1), data(2), data(5)), &AdmitEveryRecord);
+    // The foreign lattice reaches the same payload by its own route.
+    aliased.apply(&merge(1, ledger, data(2), data(2), alias), &AdmitEveryRecord);
+
+    let polluted = aliased.coverage(alias).expect("row").clone();
+    assert_eq!(
+        polluted.iter_ordered().copied().collect::<Vec<_>>(),
+        vec![[1u8; 32], [2u8; 32]]
+    );
+    assert!(
+        pair.difference(&polluted).is_empty(),
+        "the foreign member makes a needed node read as redundant"
+    );
+}
