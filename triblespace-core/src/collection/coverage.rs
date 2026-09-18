@@ -69,6 +69,72 @@ use super::records::{CollectionData, CollectionHandle, CollectionRecord};
 /// share subtries instead of copying members.
 pub type CoverageSet = PATCH<32, IdentitySchema, (), Blake3Merkle>;
 
+/// One immutable observation of downward coverage.
+///
+/// This is the half of [`CoverageIndex`] a reader needs, and it is a single
+/// persistent PATCH root, so publishing it into a snapshot is a constant-time
+/// clone rather than a copy of the fold's bookkeeping. The builder's consumer
+/// map and backlog exist to keep the index growing incrementally; nothing that
+/// only asks questions has any use for them.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Coverage {
+    rows: PATCH<32, IdentitySchema, CoverageSet>,
+}
+
+impl Coverage {
+    /// The foundation commits this node covers, if any admitted record has
+    /// attested it.
+    ///
+    /// An absent row and an empty row are different answers: absent means no
+    /// admitted attestation names this payload as a result at all.
+    pub fn of(&self, node: CollectionData) -> Option<&CoverageSet> {
+        self.rows.get(&node.raw)
+    }
+
+    /// Whether this node is known to cover that foundation commit.
+    pub fn covers(&self, node: CollectionData, commit: CollectionData) -> bool {
+        self.of(node)
+            .is_some_and(|coverage| coverage.get(&commit.raw).is_some())
+    }
+
+    /// The union of what every one of these nodes covers.
+    ///
+    /// Nodes with no row are reported rather than silently skipped: a caller
+    /// asking for support needs to know its answer is partial. The union is
+    /// PATCH union over shared subtries, so overlapping nodes cost nothing
+    /// extra.
+    pub fn union_over(
+        &self,
+        nodes: impl IntoIterator<Item = CollectionData>,
+    ) -> (CoverageSet, Vec<CollectionData>) {
+        let mut union = CoverageSet::new();
+        let mut unattested = Vec::new();
+        for node in nodes {
+            match self.of(node) {
+                Some(row) => union.union(row.clone()),
+                None => unattested.push(node),
+            }
+        }
+        (union, unattested)
+    }
+
+    /// Number of lattice nodes with a coverage row.
+    pub fn len(&self) -> usize {
+        self.rows.len().min(usize::MAX as u64) as usize
+    }
+
+    /// Whether any node has a coverage row.
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Whether two observations share one persistent root, and so are known
+    /// equal without comparing members.
+    pub fn shares_root(&self, other: &Self) -> bool {
+        self.rows.shares_root(&other.rows)
+    }
+}
+
 /// What one record says about the relationship between payloads.
 ///
 /// This is the whole of a record that coverage needs. Everything else a record
@@ -175,8 +241,8 @@ struct Parked {
 /// Downward coverage for every lattice node a store has admitted.
 #[derive(Debug, Default)]
 pub struct CoverageIndex {
-    /// Result payload handle to the foundation commits it covers.
-    rows: PATCH<32, IdentitySchema, CoverageSet>,
+    /// The half a reader sees: result payload handle to the commits it covers.
+    published: Coverage,
     /// Input payload handle to the attestations that read it, so a row that
     /// grows can re-drive its consumers instead of forcing a full replay.
     consumers: BTreeMap<[u8; 32], Vec<Attestation>>,
@@ -196,23 +262,30 @@ impl CoverageIndex {
     /// An absent row and an empty row are different answers: absent means no
     /// admitted attestation names this payload as a result at all.
     pub fn coverage(&self, node: CollectionData) -> Option<&CoverageSet> {
-        self.rows.get(&node.raw)
+        self.published.of(node)
     }
 
     /// Whether this node is known to cover that foundation commit.
     pub fn covers(&self, node: CollectionData, commit: CollectionData) -> bool {
-        self.coverage(node)
-            .is_some_and(|coverage| coverage.get(&commit.raw).is_some())
+        self.published.covers(node, commit)
+    }
+
+    /// The immutable observation to hand a reader.
+    ///
+    /// A constant-time clone: one persistent PATCH root, none of the fold's
+    /// bookkeeping.
+    pub fn published(&self) -> &Coverage {
+        &self.published
     }
 
     /// Number of lattice nodes with a coverage row.
     pub fn len(&self) -> usize {
-        self.rows.len().min(usize::MAX as u64) as usize
+        self.published.len()
     }
 
     /// Whether any node has a coverage row.
     pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
+        self.published.is_empty()
     }
 
     /// Whether any attestation is waiting on an admission decision.
@@ -363,8 +436,10 @@ impl CoverageIndex {
         let mut contribution = match attestation {
             Attestation::Foundation { data } => CoverageSet::from_keys(std::iter::once(data.raw)),
             Attestation::Join { low, high, .. } => {
-                let (Some(low), Some(high)) = (self.rows.get(&low.raw), self.rows.get(&high.raw))
-                else {
+                let (Some(low), Some(high)) = (
+                    self.published.rows.get(&low.raw),
+                    self.published.rows.get(&high.raw),
+                ) else {
                     // All or nothing: a join that only saw one side would
                     // otherwise publish a support it never attested.
                     return false;
@@ -374,20 +449,21 @@ impl CoverageIndex {
                 union
             }
             Attestation::Image { input, .. } => {
-                let Some(input) = self.rows.get(&input.raw) else {
+                let Some(input) = self.published.rows.get(&input.raw) else {
                     return false;
                 };
                 input.clone()
             }
         };
         let result = attestation.result();
-        if let Some(existing) = self.rows.get(&result.raw) {
+        if let Some(existing) = self.published.rows.get(&result.raw) {
             if contribution.difference(existing).is_empty() {
                 return false;
             }
             contribution.union(existing.clone());
         }
-        self.rows
+        self.published
+            .rows
             .replace(&Entry::with_value(&result.raw, contribution));
         true
     }

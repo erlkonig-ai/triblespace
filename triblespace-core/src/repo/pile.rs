@@ -51,7 +51,7 @@ use crate::capability::{
     CapabilityProof, CapabilityProofId, CAPABILITY_PROOF_EDGE_LEN, CAPABILITY_PROOF_HEADER_LEN,
     CAPABILITY_PROOF_MAGIC, MAX_CAPABILITY_PROOF_STEPS,
 };
-use crate::collection::coverage::{CoverageIndex, StoreWriters};
+use crate::collection::coverage::{Coverage, CoverageIndex, StoreWriters};
 use crate::collection::store::{selectors_match_record, CollectionRead};
 pub use crate::collection::LegacyUnsignedCollectionEquation;
 use crate::collection::{
@@ -2811,6 +2811,12 @@ pub struct PileSnapshot {
     collection_records_by_collection: CollectionRecordCollectionIndex,
     collection_records_by_produced_member: CollectionRecordProducedMemberIndex,
     collection_records_by_reference: CollectionRecordReferenceIndex,
+    /// Downward coverage as of this exact prefix, folded during replay.
+    ///
+    /// One persistent PATCH root, so carrying it costs the same as carrying
+    /// any other index here. The fold's consumer map and admission backlog
+    /// stay behind on the pile: a reader only ever asks what a node covers.
+    coverage: Coverage,
     legacy_collection_headers: LegacyCollectionHeaderIndex,
     capability_proofs: CapabilityProofIndex,
     wants: PATCH<WANT_REQUEST_BYTES_LEN, IdentitySchema>,
@@ -2844,6 +2850,7 @@ impl PileSnapshot {
         collection_records_by_collection: CollectionRecordCollectionIndex,
         collection_records_by_produced_member: CollectionRecordProducedMemberIndex,
         collection_records_by_reference: CollectionRecordReferenceIndex,
+        coverage: Coverage,
         legacy_collection_headers: LegacyCollectionHeaderIndex,
         capability_proofs: CapabilityProofIndex,
         wants: PATCH<WANT_REQUEST_BYTES_LEN, IdentitySchema>,
@@ -2857,10 +2864,19 @@ impl PileSnapshot {
             collection_records_by_collection,
             collection_records_by_produced_member,
             collection_records_by_reference,
+            coverage,
             legacy_collection_headers,
             capability_proofs,
             wants,
         }
+    }
+
+    /// Downward coverage as of this exact observation.
+    ///
+    /// Every edge folded into it was admitted when it was folded, so reading
+    /// a row here is reading a decision already made, not re-deciding it.
+    pub fn coverage(&self) -> &Coverage {
+        &self.coverage
     }
 
     /// Returns an iterator over all blobs currently stored in the pile.
@@ -3126,6 +3142,7 @@ impl super::SnapshotSource for Pile {
             self.collection_records_by_collection.clone(),
             self.collection_records_by_produced_member.clone(),
             self.collection_records_by_reference.clone(),
+            self.coverage.published().clone(),
             self.legacy_collection_headers.clone(),
             self.capability_proofs.clone(),
             self.wants.clone(),
@@ -3806,6 +3823,7 @@ impl Pile {
             self.collection_records_by_collection.clone(),
             self.collection_records_by_produced_member.clone(),
             self.collection_records_by_reference.clone(),
+            self.coverage.published().clone(),
             self.legacy_collection_headers.clone(),
             self.capability_proofs.clone(),
             self.wants.clone(),
