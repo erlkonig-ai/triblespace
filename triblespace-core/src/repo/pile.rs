@@ -51,6 +51,7 @@ use crate::capability::{
     CapabilityProof, CapabilityProofId, CAPABILITY_PROOF_EDGE_LEN, CAPABILITY_PROOF_HEADER_LEN,
     CAPABILITY_PROOF_MAGIC, MAX_CAPABILITY_PROOF_STEPS,
 };
+use crate::collection::coverage::{CoverageIndex, StoreWriters};
 use crate::collection::store::{selectors_match_record, CollectionRead};
 pub use crate::collection::LegacyUnsignedCollectionEquation;
 use crate::collection::{
@@ -2744,6 +2745,14 @@ pub struct Pile {
     /// Complete canonical proofs keyed by the BLAKE3 identity of exact bytes.
     /// Each value owns its validated mmap-backed view, shared by snapshots and readers.
     capability_proofs: CapabilityProofIndex,
+    /// Downward coverage folded from every replayed record: which foundation
+    /// commits each lattice node stands for.
+    ///
+    /// Never persisted and never written to the file. Replay parks each
+    /// record's attestation; [`Pile::resolve_coverage`] decides admission once
+    /// per refresh, when every descriptor and proof in the applied prefix is
+    /// resident.
+    coverage: CoverageIndex,
     /// Exact byte-distinct legacy V3 and unsigned collection headers accepted during replay.
     /// They remain inert but are conservatively carried through retained
     /// rewrites so an explicit future migration still has its source evidence.
@@ -3508,6 +3517,7 @@ impl Pile {
             collection_records_by_produced_member: CollectionRecordProducedMemberIndex::new(),
             collection_records_by_reference: CollectionRecordReferenceIndex::new(),
             capability_proofs: CapabilityProofIndex::new(),
+            coverage: CoverageIndex::new(),
             legacy_collection_headers: LegacyCollectionHeaderIndex::new(),
             opaque_records: 0,
             opaque_frames: Vec::new(),
@@ -3661,6 +3671,7 @@ impl Pile {
                             &collection_record_reference_key(input, fingerprint),
                         ));
                     }
+                    self.coverage.park_record(&record);
                 }
                 Applied::Collection { fingerprint }
             }
@@ -3753,10 +3764,52 @@ impl Pile {
         loop {
             match self.apply_next_bounded(file_len) {
                 Ok(Some(_)) => {}
-                Ok(None) => return Ok(()),
+                Ok(None) => {
+                    self.resolve_coverage();
+                    return Ok(());
+                }
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    /// Decide admission for every attestation parked during replay.
+    ///
+    /// Deliberately after the apply loop, not inside it: the descriptor that
+    /// says who may write a collection, and the capability proofs that answer
+    /// it, are themselves records in the same file and may sit after the
+    /// records they authorize. Asking once, when the applied prefix is
+    /// complete, is both correct and cheaper than asking per record.
+    ///
+    /// Attestations this pass cannot admit stay parked rather than being
+    /// dropped — a proof may still arrive in a later append.
+    fn resolve_coverage(&mut self) {
+        if !self.coverage.has_parked() {
+            return;
+        }
+        let mut coverage = std::mem::take(&mut self.coverage);
+        let reader = self.reader_snapshot();
+        coverage.resolve(&StoreWriters::new(&reader));
+        self.coverage = coverage;
+    }
+
+    /// One immutable observation of the applied prefix, for questions this
+    /// pile needs to ask itself. Every component is a persistent PATCH root or
+    /// an `Arc`, so this is a constant-time clone rather than a copy.
+    fn reader_snapshot(&self) -> PileSnapshot {
+        PileSnapshot::new(
+            self.mmap.clone(),
+            self.applied_length,
+            self.opaque_records,
+            self.blobs.clone(),
+            self.collection_records.clone(),
+            self.collection_records_by_collection.clone(),
+            self.collection_records_by_produced_member.clone(),
+            self.collection_records_by_reference.clone(),
+            self.legacy_collection_headers.clone(),
+            self.capability_proofs.clone(),
+            self.wants.clone(),
+        )
     }
 
     /// Amputates the pile's tail: **TRUNCATES the file at the first malformed
@@ -5844,6 +5897,137 @@ mod tests {
             ),
         )
         .unwrap()
+    }
+
+
+    /// The index that replaces the record walk agrees with the record walk.
+    ///
+    /// Two commits and a merge over them, folded during replay. The merge's
+    /// result must stand for exactly the two commit payloads underneath it,
+    /// with no walk of the record DAG and no witness consulted.
+    #[test]
+    fn replay_folds_admitted_records_into_downward_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "coverage-fold.pile");
+        let mut pile = Pile::open(&path).unwrap();
+        let collection = register_simplearchive_collection(&mut pile, "coverage-fold");
+        let authority = SigningKey::from_bytes(&[0xAA; 32]);
+
+        let low = collection_test_hash(6);
+        let high = collection_test_hash(7);
+        let result = collection_test_hash(8);
+        for payload in [low, high] {
+            pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
+                &authority,
+                collection.handle(),
+                payload,
+                empty_metadata_handle(),
+            )))
+            .unwrap();
+        }
+        pile.insert(CollectionRecord::Merge(CollectionMerge::sign(
+            &authority,
+            collection.handle(),
+            witnessed(&authority, collection.handle(), low),
+            witnessed(&authority, collection.handle(), high),
+            result,
+        )))
+        .unwrap();
+        pile.refresh().unwrap();
+
+        assert!(pile.coverage.covers(result, low));
+        assert!(pile.coverage.covers(result, high));
+        assert_eq!(pile.coverage.coverage(result).map(|row| row.len()), Some(2));
+        // A commit stands for itself and nothing else.
+        assert_eq!(pile.coverage.coverage(low).map(|row| row.len()), Some(1));
+        assert!(!pile.coverage.has_parked());
+        pile.close().unwrap();
+    }
+
+    /// Reopening rebuilds the whole index from the file, because it is never
+    /// written to it.
+    #[test]
+    fn coverage_is_rebuilt_from_the_file_on_every_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "coverage-rebuild.pile");
+        let authority = SigningKey::from_bytes(&[0xAA; 32]);
+        let low = collection_test_hash(6);
+        let high = collection_test_hash(7);
+        let result = collection_test_hash(8);
+        let handle = {
+            let mut pile = Pile::open(&path).unwrap();
+            let collection = register_simplearchive_collection(&mut pile, "coverage-rebuild");
+            for payload in [low, high] {
+                pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
+                    &authority,
+                    collection.handle(),
+                    payload,
+                    empty_metadata_handle(),
+                )))
+                .unwrap();
+            }
+            pile.insert(CollectionRecord::Merge(CollectionMerge::sign(
+                &authority,
+                collection.handle(),
+                witnessed(&authority, collection.handle(), low),
+                witnessed(&authority, collection.handle(), high),
+                result,
+            )))
+            .unwrap();
+            pile.close().unwrap();
+            collection.handle()
+        };
+
+        let mut reopened = Pile::open(&path).unwrap();
+        reopened.refresh().unwrap();
+        assert_eq!(
+            reopened.coverage.coverage(result).map(|row| row.len()),
+            Some(2)
+        );
+        assert!(reopened.coverage.covers(result, low));
+        let _ = handle;
+        reopened.close().unwrap();
+    }
+
+    /// A signer the collection's policy does not admit contributes nothing,
+    /// and is parked rather than dropped — a proof can still arrive.
+    #[test]
+    fn an_unadmitted_signer_contributes_no_coverage_and_stays_parked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "coverage-unadmitted.pile");
+        let mut pile = Pile::open(&path).unwrap();
+        let collection = register_simplearchive_collection(&mut pile, "coverage-unadmitted");
+        let stranger = SigningKey::from_bytes(&[7; 32]);
+
+        let payload = collection_test_hash(6);
+        pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
+            &stranger,
+            collection.handle(),
+            payload,
+            empty_metadata_handle(),
+        )))
+        .unwrap();
+        pile.refresh().unwrap();
+
+        assert!(pile.coverage.coverage(payload).is_none());
+        assert_eq!(pile.coverage.parked_on_signers(), 1);
+        pile.close().unwrap();
+    }
+
+    /// A record about a collection whose descriptor is not resident parks
+    /// instead of being believed: absence of evidence is not evidence.
+    #[test]
+    fn a_record_naming_an_unresolvable_collection_parks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "coverage-no-descriptor.pile");
+        let mut pile = Pile::open(&path).unwrap();
+        for record in collection_test_records() {
+            pile.insert(record).unwrap();
+        }
+        pile.refresh().unwrap();
+        assert!(pile.coverage.is_empty());
+        assert_eq!(pile.coverage.parked_on_signers(), 3);
+        pile.close().unwrap();
     }
 
     fn collection_test_records() -> Vec<CollectionRecord> {

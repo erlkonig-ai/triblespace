@@ -50,12 +50,17 @@
 //! coverage rows without re-deciding whether the edges that built them were
 //! authorized: that decision is already baked into which unions happened.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+
+use ed25519_dalek::VerifyingKey;
 
 use crate::inline::encodings::ed25519::ED25519PublicKey;
 use crate::inline::Inline;
 use crate::patch::{Blake3Merkle, Entry, IdentitySchema, PATCH};
+use crate::repo::{BlobStoreGet, CapabilityProofRead};
 
+use super::api::AdmissionEvidence;
 use super::records::{CollectionData, CollectionHandle, CollectionRecord};
 
 /// The foundation commits one lattice node covers.
@@ -210,6 +215,14 @@ impl CoverageIndex {
         self.rows.is_empty()
     }
 
+    /// Whether any attestation is waiting on an admission decision.
+    ///
+    /// A store can skip building a reader entirely when this is false, which is
+    /// the steady state once a pile has been replayed once.
+    pub fn has_parked(&self) -> bool {
+        !self.pending_on_signer.is_empty()
+    }
+
     /// Number of attestations parked on a signer no proof admits yet.
     pub fn parked_on_signers(&self) -> usize {
         self.pending_on_signer
@@ -251,6 +264,55 @@ impl CoverageIndex {
             return;
         }
         self.believe(attestation);
+    }
+
+    /// Record an attestation without deciding its admission yet.
+    ///
+    /// Replay is an index construction path, not an authorization pass: the
+    /// descriptor that says who may write a collection is itself a blob that
+    /// may not be resident until the pass finishes. Parking everything and
+    /// deciding once at the end costs one map insert per record and removes
+    /// the ordering question entirely.
+    pub fn park(
+        &mut self,
+        collection: CollectionHandle,
+        attestation: Attestation,
+        signer: Inline<ED25519PublicKey>,
+    ) {
+        self.pending_on_signer
+            .entry(signer.raw)
+            .or_default()
+            .push(Parked {
+                collection,
+                attestation,
+            });
+    }
+
+    /// Reduce one record to what it attests and park it.
+    pub fn park_record(&mut self, record: &CollectionRecord) {
+        self.park(
+            record.collection(),
+            Attestation::of(record),
+            record.public_key(),
+        );
+    }
+
+    /// Re-offer every parked attestation to this admission oracle.
+    ///
+    /// Call once whenever the evidence may have changed — after a replay pass,
+    /// or when new capability proofs land. Attestations this oracle still
+    /// cannot admit stay parked, because a proof can always arrive later.
+    pub fn resolve<A: RecordAdmission>(&mut self, admission: &A) {
+        if self.pending_on_signer.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending_on_signer);
+        for (signer, entries) in pending {
+            let signer = Inline::new(signer);
+            for entry in entries {
+                self.attest(entry.collection, entry.attestation, signer, admission);
+            }
+        }
     }
 
     /// Retry every attestation parked on this signer.
@@ -328,6 +390,75 @@ impl CoverageIndex {
         self.rows
             .replace(&Entry::with_value(&result.raw, contribution));
         true
+    }
+}
+
+
+/// Admission decided from one immutable store observation.
+///
+/// Evidence is discovered once per collection and cached, because a fold
+/// touches the same handful of collections thousands of times and descriptor
+/// resolution is the expensive half of the question. A collection whose
+/// descriptor or proofs are not resident yet simply admits nobody — its
+/// attestations park, and the next resolution pass retries them.
+pub(crate) struct StoreWriters<'a, R> {
+    reader: &'a R,
+    evidence: RefCell<BTreeMap<CollectionHandle, Option<AdmissionEvidence>>>,
+}
+
+impl<'a, R: BlobStoreGet + CapabilityProofRead> StoreWriters<'a, R> {
+    /// Ask this reader who may write which collection.
+    pub(crate) fn new(reader: &'a R) -> Self {
+        Self {
+            reader,
+            evidence: RefCell::new(BTreeMap::new()),
+        }
+    }
+
+    fn write_evidence(&self, collection: CollectionHandle) -> bool {
+        let mut cache = self.evidence.borrow_mut();
+        let entry = cache.entry(collection).or_insert_with(|| {
+            let descriptor = super::api::load_collection_descriptor(self.reader, collection).ok()?;
+            super::api::discover_admission_evidence(
+                self.reader,
+                super::descriptor::admission_policies(
+                    self.reader,
+                    descriptor.fragment.facts(),
+                    super::ACTION_WRITE,
+                    None,
+                ),
+                super::ACTION_WRITE,
+                collection,
+            )
+            .ok()
+        });
+        entry.is_some()
+    }
+}
+
+impl<R: BlobStoreGet + CapabilityProofRead> RecordAdmission for StoreWriters<'_, R> {
+    fn admits(&self, collection: CollectionHandle, signer: Inline<ED25519PublicKey>) -> Admittance {
+        if !self.write_evidence(collection) {
+            // The descriptor is not resident, so nothing is known about who may
+            // write here. Absence is pending, never refusal.
+            return Admittance::Pending;
+        }
+        let cache = self.evidence.borrow();
+        let evidence = cache
+            .get(&collection)
+            .and_then(Option::as_ref)
+            .expect("write evidence was just resolved");
+        let Ok(subject) = VerifyingKey::from_bytes(&signer.raw) else {
+            // A malformed key cannot be the subject of any proof, so no future
+            // proof can admit it either — but the fold has no refusal state and
+            // does not need one: this attestation simply never applies.
+            return Admittance::Pending;
+        };
+        if evidence.authorizes(self.reader, subject) {
+            Admittance::Admitted
+        } else {
+            Admittance::Pending
+        }
     }
 }
 
