@@ -26,14 +26,14 @@ fn signed_records() -> [CollectionRecord; 3] {
         CollectionRecord::Merge(CollectionMerge::sign(
             &key,
             Inline::new([1; 32]),
-            witnessed(&key, Inline::new([1; 32]), Inline::new([2; 32])),
-            witnessed(&key, Inline::new([1; 32]), Inline::new([3; 32])),
+            Inline::new([2; 32]),
+            Inline::new([3; 32]),
             Inline::new([4; 32]),
         )),
         CollectionRecord::Derive(CollectionDerive::sign(
             &key,
             Inline::new([1; 32]),
-            witnessed(&key, Inline::new([1; 32]), Inline::new([2; 32])),
+            Inline::new([2; 32]),
             Inline::new([3; 32]),
         )),
     ]
@@ -220,19 +220,3 @@ fn verify_reports_unsigned_and_opaque_records_without_hashing_blob_payloads() {
 
 // Canonical but deliberately uninserted COMMIT witnesses keep these
 // physical-storage fixtures independent of ancestor arrival order.
-fn witnessed(
-    signer: &ed25519_dalek::SigningKey,
-    collection: triblespace_core::collection::CollectionHandle,
-    data: triblespace_core::collection::CollectionData,
-) -> (
-    triblespace_core::collection::CollectionData,
-    triblespace_core::collection::CollectionRecordFingerprint,
-) {
-    let record = triblespace_core::collection::CollectionCommit::sign(
-        signer,
-        collection,
-        data,
-        triblespace_core::collection::empty_metadata_handle(),
-    );
-    (data, record.fingerprint())
-}

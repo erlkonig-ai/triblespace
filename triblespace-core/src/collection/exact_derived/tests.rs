@@ -102,14 +102,6 @@ fn publish_root(
 /// A merge or derive names its input PAYLOAD. This used to wrap it
 /// beside a fingerprint citing a record that produced it; nothing
 /// cites anything now, so it is just the payload.
-fn witnessed_input(
-    snapshot: &MemoryRepoSnapshot,
-    collection: crate::collection::CollectionHandle,
-    data: CollectionData,
-) -> CollectionData {
-    data
-}
-
 /// Test encoding `SimpleArchive || 0xA5`; id originally minted for the old
 /// exact-derived tests with `trible genid` on 2026-08-29.
 const FIRST_ENCODING: Id = id_hex!("39B18B6D13B2B1872F2394EF6588F1B5");
@@ -2190,8 +2182,8 @@ fn capacity_blocked_source_upper_falls_back_to_its_resident_children() {
     let joined = crate::collection::simplearchive_union::join(&left, &right).unwrap();
     store.put::<SimpleArchive, _>(joined.clone()).unwrap();
     let before = store.snapshot().unwrap();
-    let left_witness = witnessed_input(&before, root.handle(), data(&left));
-    let right_witness = witnessed_input(&before, root.handle(), data(&right));
+    let left_witness = data(&left);
+    let right_witness = data(&right);
     drop(before);
     store
         .insert(CollectionRecord::Merge(CollectionMerge::sign(
@@ -2645,8 +2637,8 @@ fn optional_maintenance_without_write_keeps_the_fine_cover_without_algebra() {
     let upper = crate::collection::simplearchive_union::join(&left, &right).unwrap();
     inner.put::<SimpleArchive, _>(upper.clone()).unwrap();
     let before = inner.snapshot().unwrap();
-    let left_witness = witnessed_input(&before, root.handle(), data(&left));
-    let right_witness = witnessed_input(&before, root.handle(), data(&right));
+    let left_witness = data(&left);
+    let right_witness = data(&right);
     drop(before);
     inner
         .insert(CollectionRecord::Merge(CollectionMerge::sign(
@@ -2733,8 +2725,8 @@ fn resident_source_upper_is_mapped_instead_of_its_finer_children() {
     });
     let low = children.next().unwrap();
     let high = children.next().unwrap();
-    let low_witness = witnessed_input(&snapshot, first.handle(), data(&low));
-    let high_witness = witnessed_input(&snapshot, first.handle(), data(&high));
+    let low_witness = data(&low);
+    let high_witness = data(&high);
     drop(snapshot);
     let upper = join_first(&low, &high).unwrap();
     store.put::<FirstEncoding, _>(upper.clone()).unwrap();
@@ -2830,8 +2822,8 @@ fn source_guidance_maps_only_the_resident_coarsest_upper_and_repeats_without_wor
         (&upper, &outside, &overreach),
     ] {
         let before = store.inner.snapshot().unwrap();
-        let low_witness = witnessed_input(&before, root.handle(), data(low));
-        let high_witness = witnessed_input(&before, root.handle(), data(high));
+        let low_witness = data(low);
+        let high_witness = data(high);
         drop(before);
         store
             .inner

@@ -799,22 +799,6 @@ fn validate_evidence_for_policies(
 mod tests {
     // Canonical but deliberately uninserted COMMIT witnesses keep these
     // physical-storage fixtures independent of ancestor arrival order.
-    fn witnessed(
-        signer: &ed25519_dalek::SigningKey,
-        collection: triblespace_core::collection::CollectionHandle,
-        data: triblespace_core::collection::CollectionData,
-    ) -> (
-        triblespace_core::collection::CollectionData,
-        triblespace_core::collection::CollectionRecordFingerprint,
-    ) {
-        let record = triblespace_core::collection::CollectionCommit::sign(
-            signer,
-            collection,
-            data,
-            triblespace_core::collection::empty_metadata_handle(),
-        );
-        (data, record.fingerprint())
-    }
 
     use std::num::NonZeroUsize;
 
@@ -1357,8 +1341,8 @@ mod tests {
             .insert(CollectionRecord::Merge(CollectionMerge::sign(
                 &writer,
                 collection.handle(),
-                witnessed(&writer, collection.handle(), data(31)),
-                witnessed(&writer, collection.handle(), data(32)),
+                data(31),
+                data(32),
                 data(33),
             )))
             .unwrap();
@@ -1366,7 +1350,7 @@ mod tests {
             .insert(CollectionRecord::Derive(CollectionDerive::sign(
                 &writer,
                 collection.handle(),
-                witnessed(&writer, collection.handle(), data(33)),
+                data(33),
                 data(34),
             )))
             .unwrap();

@@ -280,14 +280,6 @@ mod tests {
     /// A merge or derive names its input PAYLOAD. This used to wrap it
     /// beside a fingerprint citing a record that produced it; nothing
     /// cites anything now, so it is just the payload.
-    fn witnessed(
-        signer: &ed25519_dalek::SigningKey,
-        collection: crate::collection::CollectionHandle,
-        data: crate::collection::CollectionData,
-    ) -> CollectionData {
-        data
-    }
-
     use std::cell::Cell;
     use std::convert::Infallible;
 
@@ -322,71 +314,39 @@ mod tests {
             CollectionRecord::Merge(CollectionMerge::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 source,
-                witnessed(
-                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                    source,
-                    data(4),
-                ),
-                witnessed(
-                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                    source,
-                    data(5),
-                ),
+                data(4),
+                data(5),
                 data(6),
             )),
             CollectionRecord::Merge(CollectionMerge::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 other,
-                witnessed(
-                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                    other,
-                    data(4),
-                ),
-                witnessed(
-                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                    other,
-                    data(5),
-                ),
+                data(4),
+                data(5),
                 data(7),
             )),
             CollectionRecord::Derive(CollectionDerive::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 target,
-                witnessed(
-                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                    target,
-                    input,
-                ),
+                input,
                 data(11),
             )),
             CollectionRecord::Derive(CollectionDerive::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 target,
-                witnessed(
-                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                    target,
-                    input,
-                ),
+                input,
                 data(12),
             )),
             CollectionRecord::Derive(CollectionDerive::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 target,
-                witnessed(
-                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                    target,
-                    data(13),
-                ),
+                data(13),
                 data(14),
             )),
             CollectionRecord::Derive(CollectionDerive::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 other,
-                witnessed(
-                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                    other,
-                    input,
-                ),
+                input,
                 data(15),
             )),
         ];
@@ -657,26 +617,14 @@ mod tests {
             CollectionRecord::Merge(CollectionMerge::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 expected,
-                witnessed(
-                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                    expected,
-                    data(1),
-                ),
-                witnessed(
-                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                    expected,
-                    data(2),
-                ),
+                data(1),
+                data(2),
                 data(3),
             )),
             CollectionRecord::Derive(CollectionDerive::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 expected,
-                witnessed(
-                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                    expected,
-                    data(3),
-                ),
+                data(3),
                 data(4),
             )),
             CollectionRecord::Commit(CollectionCommit::sign(
@@ -688,26 +636,14 @@ mod tests {
             CollectionRecord::Merge(CollectionMerge::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 other,
-                witnessed(
-                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                    other,
-                    data(1),
-                ),
-                witnessed(
-                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                    other,
-                    data(2),
-                ),
+                data(1),
+                data(2),
                 data(3),
             )),
             CollectionRecord::Derive(CollectionDerive::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 other,
-                witnessed(
-                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                    other,
-                    data(3),
-                ),
+                data(3),
                 data(4),
             )),
         ];

@@ -744,13 +744,6 @@ mod tests {
     /// A merge or derive names its input PAYLOAD. This used to wrap it
     /// beside a fingerprint citing a record that produced it; nothing
     /// cites anything now, so it is just the payload.
-    fn witnessed_input(
-        descriptor: &Fragment,
-        data: CollectionData,
-    ) -> CollectionData {
-        data
-    }
-
     fn ordered_inputs<'a>(
         left: &'a Blob<SimpleArchive>,
         right: &'a Blob<SimpleArchive>,
@@ -1215,8 +1208,8 @@ mod tests {
         let claim = CollectionMerge::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&descriptor),
-            witnessed_input(&descriptor, data(&left)),
-            witnessed_input(&descriptor, data(&right)),
+            data(&left),
+            data(&right),
             data(&result),
         );
         let (low, high) = ordered_inputs(&left, &right);
@@ -1225,8 +1218,8 @@ mod tests {
         let wrong_collection = CollectionMerge::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&root("ninth")),
-            witnessed_input(&descriptor, data(low)),
-            witnessed_input(&descriptor, data(high)),
+            data(low),
+            data(high),
             data(&result),
         );
         assert!(matches!(
@@ -1255,8 +1248,8 @@ mod tests {
         let wrong_claim = CollectionMerge::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&descriptor),
-            witnessed_input(&descriptor, data(low)),
-            witnessed_input(&descriptor, data(high)),
+            data(low),
+            data(high),
             data(&wrong_result),
         );
         assert_eq!(
@@ -1268,8 +1261,8 @@ mod tests {
         let invalid_claim = CollectionMerge::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&descriptor),
-            witnessed_input(&descriptor, data(low)),
-            witnessed_input(&descriptor, data(high)),
+            data(low),
+            data(high),
             data(&invalid_result),
         );
         assert_eq!(
@@ -1328,8 +1321,8 @@ mod tests {
                 let collection = root("first");
                 let claim = CollectionMerge::sign(&ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                     identity_for_tests(&collection),
-                    witnessed_input(&collection, data(&left)),
-                    witnessed_input(&collection, data(&right)),
+                    data(&left),
+                    data(&right),
                     data(&actual),
                 );
                 let (low, high) = ordered_inputs(&left, &right);

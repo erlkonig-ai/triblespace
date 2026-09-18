@@ -42,7 +42,7 @@ use crate::blob::{Blob, TryFromBlob};
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
 use crate::repo::BlobStoreGet;
-use crate::trible::{Fragment, TribleSet};
+use crate::trible::TribleSet;
 
 use super::discovery::CollectionDiscoveryError;
 use super::{descriptor, CollectionData, CollectionHandle, CollectionRead, CollectionRecord};
@@ -368,6 +368,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trible::Fragment;
 
     use ed25519_dalek::SigningKey;
 

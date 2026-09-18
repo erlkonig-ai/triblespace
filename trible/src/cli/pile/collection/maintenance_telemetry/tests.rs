@@ -111,18 +111,18 @@ fn equations() -> [CollectionRecord; 3] {
     [
         CollectionRecord::Commit(a),
         CollectionRecord::Merge(CollectionMerge::sign(
-            &signer,
-            collection.handle(),
-            (low, CollectionRecord::Commit(a).fingerprint()),
-            (high, CollectionRecord::Commit(b).fingerprint()),
-            high,
-        )),
+    &signer,
+    collection.handle(),
+    low,
+    high,
+    high,
+)),
         CollectionRecord::Derive(CollectionDerive::sign(
-            &signer,
-            collection.handle(),
-            (low, CollectionRecord::Commit(a).fingerprint()),
-            high,
-        )),
+    &signer,
+    collection.handle(),
+    low,
+    high,
+)),
     ]
 }
 

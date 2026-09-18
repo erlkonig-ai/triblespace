@@ -1555,14 +1555,6 @@ mod tests {
     /// A merge or derive names its input PAYLOAD. This used to wrap it
     /// beside a fingerprint citing a record that produced it; nothing
     /// cites anything now, so it is just the payload.
-    fn witnessed(
-        signer: &ed25519_dalek::SigningKey,
-        collection: crate::collection::CollectionHandle,
-        data: crate::collection::CollectionData,
-    ) -> crate::collection::CollectionData {
-        data
-    }
-
     use super::*;
     use crate::blob::encodings::rawbytes::RawBytes;
     use crate::blob::encodings::simplearchive::SimpleArchive;
@@ -1738,16 +1730,8 @@ mod tests {
         CollectionRecord::Merge(CollectionMerge::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&descriptor),
-            witnessed(
-                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                identity_for_tests(&descriptor),
-                Inline::new([tag.wrapping_add(3); 32]),
-            ),
-            witnessed(
-                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                identity_for_tests(&descriptor),
-                Inline::new([tag.wrapping_add(4); 32]),
-            ),
+            Inline::new([tag.wrapping_add(3); 32]),
+            Inline::new([tag.wrapping_add(4); 32]),
             Inline::new([tag.wrapping_add(5); 32]),
         ))
     }
@@ -1954,31 +1938,19 @@ mod tests {
         let first = CollectionRecord::Derive(CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             target,
-            witnessed(
-                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                target,
-                input,
-            ),
+            input,
             Inline::new([44; 32]),
         ));
         let conflicting = CollectionRecord::Derive(CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             target,
-            witnessed(
-                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                target,
-                input,
-            ),
+            input,
             Inline::new([45; 32]),
         ));
         let unrelated = CollectionRecord::Derive(CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             Inline::new([46; 32]),
-            witnessed(
-                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                Inline::new([46; 32]),
-                input,
-            ),
+            input,
             Inline::new([47; 32]),
         ));
         yard.generations[1]
@@ -2156,26 +2128,14 @@ mod tests {
             CollectionRecord::Merge(CollectionMerge::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 collection,
-                witnessed(
-                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                    collection,
-                    Inline::new(equation_owned.raw),
-                ),
-                witnessed(
-                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                    collection,
-                    Inline::new([35; 32]),
-                ),
+                Inline::new(equation_owned.raw),
+                Inline::new([35; 32]),
                 Inline::new([36; 32]),
             )),
             CollectionRecord::Derive(CollectionDerive::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 identity_for_tests(&named_for_tests("derived", pin_id(38))),
-                witnessed(
-                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                    identity_for_tests(&named_for_tests("derived", pin_id(38))),
-                    Inline::new([36; 32]),
-                ),
+                Inline::new([36; 32]),
                 Inline::new(equation_owned.raw),
             )),
         ];

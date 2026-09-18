@@ -1484,12 +1484,12 @@ mod tests {
         // exactly the case the drawing must not show as complete.
         let result = Inline::new([0x77; 32]);
         let merge = CollectionMerge::sign(
-            &signer,
-            collection.handle(),
-            (first.data(), first.fingerprint()),
-            (second.data(), second.fingerprint()),
-            result,
-        );
+    &signer,
+    collection.handle(),
+    first.data(),
+    second.data(),
+    result,
+);
         store.insert(CollectionRecord::Merge(merge)).unwrap();
         (
             store,
@@ -1554,11 +1554,11 @@ mod tests {
             empty_metadata_handle(),
         );
         let derive = CollectionDerive::sign(
-            &signer,
-            CollectionHandle::new(target.raw),
-            (input, commit.fingerprint()),
-            output,
-        );
+    &signer,
+    CollectionHandle::new(target.raw),
+    input,
+    output,
+);
         store
             .insert(CollectionRecord::Derive(derive))
             .unwrap();
@@ -1599,12 +1599,12 @@ mod tests {
             empty_metadata_handle(),
         );
         let merge = CollectionMerge::sign(
-            &signer,
-            CollectionHandle::new(collection),
-            (Inline::new(result), commit.fingerprint()),
-            (orphan, commit.fingerprint()),
-            Inline::new([0x55; 32]),
-        );
+    &signer,
+    CollectionHandle::new(collection),
+    Inline::new(result),
+    orphan,
+    Inline::new([0x55; 32]),
+);
         store.insert(CollectionRecord::Merge(merge)).unwrap();
         let snapshot = store.snapshot().unwrap();
         let members = observe_members(&snapshot, collection, MEMBER_LIMIT).unwrap();

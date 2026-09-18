@@ -404,14 +404,6 @@ mod tests {
     // physical-storage fixtures independent of ancestor arrival order.
     /// An equation names its input PAYLOAD; this used to pair it with a
     /// fingerprint citing a record that produced it.
-    fn witnessed(
-        _signer: &ed25519_dalek::SigningKey,
-        _collection: crate::collection::CollectionHandle,
-        data: crate::collection::CollectionData,
-    ) -> crate::collection::CollectionData {
-        data
-    }
-
     use super::*;
     use crate::id::Id;
 
@@ -468,16 +460,8 @@ mod tests {
         let record = CollectionRecord::Merge(CollectionMerge::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             collection,
-            witnessed(
-                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                collection,
-                Inline::new([4; 32]),
-            ),
-            witnessed(
-                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                collection,
-                Inline::new([5; 32]),
-            ),
+            Inline::new([4; 32]),
+            Inline::new([5; 32]),
             Inline::new([6; 32]),
         ));
         let mut hybrid = HybridStore::new(MemoryRepo::default(), MemoryRepo::default());

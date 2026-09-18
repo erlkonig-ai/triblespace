@@ -635,7 +635,6 @@ fn print_record(bytes: &[u8], file_len: usize, record: triblespace_core::repo::p
             }
             CollectionRecord::Merge(merge) => {
                 let (low, high) = merge.inputs();
-                let (low_witness, high_witness) = merge.input_witnesses();
                 println!("  classification: collection-merge");
                 println!(
                     "  collection: {}",
@@ -643,8 +642,6 @@ fn print_record(bytes: &[u8], file_len: usize, record: triblespace_core::repo::p
                 );
                 println!("  low: {}", hex::encode_upper(low.raw));
                 println!("  high: {}", hex::encode_upper(high.raw));
-                println!("  low_witness: {low_witness:X}");
-                println!("  high_witness: {high_witness:X}");
                 println!("  result: {}", hex::encode_upper(merge.result().raw));
                 println!("  author: {}", hex::encode_upper(merge.public_key().raw));
             }
@@ -653,7 +650,6 @@ fn print_record(bytes: &[u8], file_len: usize, record: triblespace_core::repo::p
                 println!("  classification: collection-derive");
                 println!("  target: {}", hex::encode_upper(derive.collection().raw));
                 println!("  input: {}", hex::encode_upper(input.raw));
-                println!("  input_witness: {:X}", derive.input_witness());
                 println!("  output: {}", hex::encode_upper(output.raw));
                 println!("  author: {}", hex::encode_upper(derive.public_key().raw));
             }

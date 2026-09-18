@@ -1578,8 +1578,8 @@ mod tests {
         CollectionMerge::sign(
             &SigningKey::from_bytes(&[31; 32]),
             collection,
-            witnessed_input(collection, left),
-            witnessed_input(collection, right),
+            left,
+            right,
             result,
         )
     }
@@ -1592,7 +1592,7 @@ mod tests {
         CollectionDerive::sign(
             &SigningKey::from_bytes(&[31; 32]),
             target,
-            witnessed_input(target, input),
+            input,
             output,
         )
     }
@@ -1603,13 +1603,6 @@ mod tests {
     /// A merge or derive names its input PAYLOAD. This used to wrap it
     /// beside a fingerprint citing a record that produced it; nothing
     /// cites anything now, so it is just the payload.
-    fn witnessed_input(
-        collection: CollectionHandle,
-        data: CollectionData,
-    ) -> CollectionData {
-        data
-    }
-
     fn commit(definition: &Fragment, element: CollectionData, key: u8) -> CollectionCommit {
         CollectionCommit::sign(
             &SigningKey::from_bytes(&[key; 32]),
@@ -2504,14 +2497,14 @@ mod tests {
         let second_merge = CollectionMerge::sign(
             &other_key,
             source_handle,
-            witnessed_input(source_handle, data(1)),
-            witnessed_input(source_handle, data(2)),
+            data(1),
+            data(2),
             data(3),
         );
         let second_derive = CollectionDerive::sign(
             &other_key,
             target_handle,
-            witnessed_input(target_handle, data(1)),
+            data(1),
             data(11),
         );
         assert_ne!(source_merge, second_merge);

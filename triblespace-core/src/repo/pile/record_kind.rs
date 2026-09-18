@@ -89,6 +89,21 @@ pub const KIND_AUTH_PROOF_V1: RawInline =
 pub const KIND_AUTH_PROOF_V2: RawInline =
     hex_literal::hex!("334D7A044E5F9ED4F3E51618A3FB1752120F37BB5CDBC6B9F6497FB9E338E8D5");
 
+/// Retired witness-bound MERGE, carrying a second copy of a relation that
+/// content addressing already holds. Ordinary replay crosses it as an inert
+/// frame. Its dense fields were collection, low, high, result, low_witness,
+/// high_witness, author, R, S (288 bytes), padded to two 256-byte blocks.
+#[cfg(test)]
+pub const KIND_COLLECTION_MERGE_WITNESSED_V6: RawInline =
+    hex_literal::hex!("4D2087B6C4944A404E1D0BCF4898819267E00FCAE49B146F5955522CBE935909");
+
+/// Retired witness-bound DERIVE; see [`KIND_COLLECTION_MERGE_WITNESSED_V6`].
+/// Its dense fields were target, input, output, input_witness, author, R, S
+/// (224 bytes), padded to two 256-byte blocks.
+#[cfg(test)]
+pub const KIND_COLLECTION_DERIVE_WITNESSED_V7: RawInline =
+    hex_literal::hex!("DBF641F31E772F6CE715087D954375AA44860BF411C0DE849C207B542ABDC583");
+
 /// Retired unsigned equations. Their exact frames and resident references are
 /// preserved for explicit writer endorsement, but ordinary replay is inert.
 pub const KIND_COLLECTION_MERGE_UNSIGNED: RawInline =
@@ -198,17 +213,17 @@ record_kinds! {
         "pile-collection-commit-v4",
         "A signed COMMIT(collection, data, metadata) assertion. Envelope bytes 64..96 hold the collection descriptor handle, 96..128 the data digest, 128..160 the metadata archive handle, 160..192 the author Ed25519 public key, 192..224 the signature R component, and 224..256 the signature S component. This is the tightest record the pile writes: it fills the block exactly and reserves nothing. The signature covers a domain-separated transcript, not these bytes, so a commit survives reframing unchanged.";
 
-    /// A witness-bound MERGE endorsement. Anchor minted with `trible genid` on 2026-09-14.
-    CollectionMergeRecordV6 = KIND_ID_COLLECTION_MERGE "3AB7D3C2BAB53C85CCA6108A30BB8930",
-        KIND_COLLECTION_MERGE hex_literal::hex!("4D2087B6C4944A404E1D0BCF4898819267E00FCAE49B146F5955522CBE935909"),
-        "pile-collection-merge-v6",
-        "A signed MERGE(collection, low, high, result, low_witness, high_witness) endorsement. Envelope bytes 64..96 hold the collection descriptor handle, 96..128 the low input digest, 128..160 the high input digest, 160..192 the result digest, 192..224 the low input record fingerprint, 224..256 the high input record fingerprint, 256..288 the author Ed25519 public key, 288..320 the signature R component, 320..352 the signature S component, and 352..512 zeros. The record spans exactly two 256-byte blocks. Input pairs are sorted lexicographically by payload digest then record fingerprint; witnesses move with their payloads, including when the payload digests are equal. A record fingerprint is the full BLAKE3 digest of its semantic kind followed by its canonical dense payload, not a blob handle. The signature covers a domain-separated transcript containing the semantic kind, author, collection, ordered payload inputs, result, and ordered witnesses, not the pile framing. An authorized producer endorses the exact witnessed inputs and the join result; storing an endorsement does not itself establish WRITE admission or witness availability.";
+    /// A witness-free MERGE endorsement. Anchor minted with `trible genid` on 2026-09-18.
+    CollectionMergeRecordV8 = KIND_ID_COLLECTION_MERGE "8EE2A3F5C3469990F32DC9A91D2ABB28",
+        KIND_COLLECTION_MERGE hex_literal::hex!("424E7CF62C69A76E6829DF9F71CDFCB42B2B4795143AC6CC5CFF57F410E287CA"),
+        "pile-collection-merge-v8",
+        "A signed MERGE(collection, low, high, result) endorsement. Envelope bytes 64..96 hold the collection descriptor handle, 96..128 the low input digest, 128..160 the high input digest, 160..192 the result digest, 192..224 the author Ed25519 public key, 224..256 the signature R component, 256..288 the signature S component, and 288..512 zeros. The record spans exactly two 256-byte blocks. Input payloads are sorted lexicographically by digest. The record names no input RECORD: which records produce those payloads is a relation content addressing already holds, so storing it again on the endorsement was redundant. A record fingerprint is the full BLAKE3 digest of its semantic kind followed by its canonical dense payload, not a blob handle. The signature covers a domain-separated transcript containing the semantic kind, author, collection, ordered payload inputs, and result, not the pile framing. An authorized producer endorses that those two payloads join to that result; storing an endorsement does not itself establish WRITE admission or input availability.";
 
-    /// A witness-bound DERIVE endorsement. Anchor minted with `trible genid` on 2026-09-14.
-    CollectionDeriveRecordV7 = KIND_ID_COLLECTION_DERIVE "D933002B5656620792BFD250AB5061AD",
-        KIND_COLLECTION_DERIVE hex_literal::hex!("DBF641F31E772F6CE715087D954375AA44860BF411C0DE849C207B542ABDC583"),
-        "pile-collection-derive-v7",
-        "A signed DERIVE(target, input, output, input_witness) endorsement. Envelope bytes 64..96 hold the target collection descriptor handle, 96..128 the input digest, 128..160 the output digest, 160..192 the input record fingerprint, 192..224 the author Ed25519 public key, 224..256 the signature R component, 256..288 the signature S component, and 288..512 zeros. The record spans exactly two 256-byte blocks. A record fingerprint is the full BLAKE3 digest of its semantic kind followed by its canonical dense payload, not a blob handle. The signature covers a domain-separated transcript containing the semantic kind, author, target, input, output, and input witness, not the pile framing. The target descriptor names the source and mapping. An authorized producer endorses the exact witnessed source record and the mapping result; storing an endorsement does not itself establish WRITE admission or witness availability.";
+    /// A witness-free DERIVE endorsement. Anchor minted with `trible genid` on 2026-09-18.
+    CollectionDeriveRecordV9 = KIND_ID_COLLECTION_DERIVE "22919B84195046DF981C19D5B43F6DF3",
+        KIND_COLLECTION_DERIVE hex_literal::hex!("5839C091F53DFDDCC32BB1909471989E3C40F934A64E4A2F7729E610ACF0494F"),
+        "pile-collection-derive-v9",
+        "A signed DERIVE(target, input, output) endorsement. Envelope bytes 64..96 hold the target collection descriptor handle, 96..128 the input digest, 128..160 the output digest, 160..192 the author Ed25519 public key, 192..224 the signature R component, and 224..256 the signature S component. Like a commit, it fills one 256-byte block exactly and reserves nothing. The record names no input RECORD: which records produce that input payload is a relation content addressing already holds. A record fingerprint is the full BLAKE3 digest of its semantic kind followed by its canonical dense payload, not a blob handle. The signature covers a domain-separated transcript containing the semantic kind, author, target, input, and output, not the pile framing. The target descriptor names the source and mapping. An authorized producer endorses that the mapping takes that input to that output; storing an endorsement does not itself establish WRITE admission or input availability.";
 
     /// A self-contained prefix-signed capability proof.
     ///
@@ -285,5 +300,9 @@ mod tests {
         assert!(!writable.contains(&KIND_WANT_RETRACT));
         assert!(!writable.contains(&KIND_COLLECTION_MERGE_UNSIGNED));
         assert!(!writable.contains(&KIND_COLLECTION_DERIVE_UNSIGNED));
+        assert!(!writable.contains(&KIND_COLLECTION_MERGE_SIGNED_V2));
+        assert!(!writable.contains(&KIND_COLLECTION_DERIVE_SIGNED_V2));
+        assert!(!writable.contains(&KIND_COLLECTION_MERGE_WITNESSED_V6));
+        assert!(!writable.contains(&KIND_COLLECTION_DERIVE_WITNESSED_V7));
     }
 }

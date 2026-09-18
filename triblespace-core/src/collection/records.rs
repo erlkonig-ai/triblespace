@@ -785,8 +785,8 @@ impl CollectionDerive {
     /// Exact domain-separated bytes signed by the author.
     pub fn signing_transcript(&self) -> Vec<u8> {
         equation_transcript(
-            DERIVE_TRANSCRIPT_DOMAIN,
-            KIND_COLLECTION_DERIVE,
+            DERIVE_SIGNED_V2_TRANSCRIPT_DOMAIN,
+            KIND_COLLECTION_DERIVE_SIGNED_V2,
             self.public_key,
             [
                 self.collection.raw,
@@ -949,178 +949,6 @@ impl LegacyUnsignedCollectionEquation {
     }
 }
 
-/// Retired signed equation without input-record witnesses.
-///
-/// This is migration and audit evidence only, never a [`CollectionRecord`].
-/// Its old signature proves authorship of payload-only mathematics, not an
-/// endorsement of any particular support route. A writer must select and
-/// validate actual input records before issuing a current endorsement.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct LegacySignedCollectionEquation {
-    equation: LegacyUnsignedCollectionEquation,
-    public_key: Inline<ED25519PublicKey>,
-    signature_r: Inline<ED25519RComponent>,
-    signature_s: Inline<ED25519SComponent>,
-}
-
-impl LegacySignedCollectionEquation {
-    /// Structurally decode exact retired tagged bytes for explicit migration.
-    ///
-    /// No current record is manufactured, and no signature check is implied.
-    /// Audits can therefore retain and report malformed signatures faithfully.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, RecordDecodeError> {
-        let Some((&kind, payload)) = bytes.split_first() else {
-            return Err(RecordDecodeError::InvalidLength {
-                expected: 1,
-                actual: 0,
-            });
-        };
-        match kind {
-            COLLECTION_RECORD_KIND_MERGE_V2 => {
-                let bytes = exact_array::<COLLECTION_MERGE_SIGNED_V2_BYTES_LEN>(payload)?;
-                let low = Inline::new(field(&bytes, 1));
-                let high = Inline::new(field(&bytes, 2));
-                if high < low {
-                    return Err(RecordDecodeError::NonCanonicalMergeInputs);
-                }
-                Ok(Self {
-                    equation: LegacyUnsignedCollectionEquation::Merge {
-                        collection: Inline::new(field(&bytes, 0)),
-                        low,
-                        high,
-                        result: Inline::new(field(&bytes, 3)),
-                    },
-                    public_key: Inline::new(field(&bytes, 4)),
-                    signature_r: Inline::new(field(&bytes, 5)),
-                    signature_s: Inline::new(field(&bytes, 6)),
-                })
-            }
-            COLLECTION_RECORD_KIND_DERIVE_V2 => {
-                let bytes = exact_array::<COLLECTION_DERIVE_SIGNED_V2_BYTES_LEN>(payload)?;
-                Ok(Self {
-                    equation: LegacyUnsignedCollectionEquation::Derive {
-                        collection: Inline::new(field(&bytes, 0)),
-                        input: Inline::new(field(&bytes, 1)),
-                        output: Inline::new(field(&bytes, 2)),
-                    },
-                    public_key: Inline::new(field(&bytes, 3)),
-                    signature_r: Inline::new(field(&bytes, 4)),
-                    signature_s: Inline::new(field(&bytes, 5)),
-                })
-            }
-            unknown => Err(RecordDecodeError::UnknownKind(unknown)),
-        }
-    }
-
-    /// Historical payload-only statement, without manufacturing new evidence.
-    pub fn equation(&self) -> LegacyUnsignedCollectionEquation {
-        self.equation
-    }
-
-    /// Exact output collection requiring a fresh writer endorsement.
-    pub fn collection(&self) -> CollectionHandle {
-        self.equation.collection()
-    }
-
-    /// Historical signing principal.
-    pub fn public_key(&self) -> Inline<ED25519PublicKey> {
-        self.public_key
-    }
-
-    /// Exact historical signature components.
-    pub fn signature(&self) -> (Inline<ED25519RComponent>, Inline<ED25519SComponent>) {
-        (self.signature_r, self.signature_s)
-    }
-
-    /// Exact old transcript, retaining its kind, domain and field order.
-    pub fn signing_transcript(&self) -> Vec<u8> {
-        match self.equation {
-            LegacyUnsignedCollectionEquation::Merge {
-                collection,
-                low,
-                high,
-                result,
-            } => equation_transcript(
-                MERGE_SIGNED_V2_TRANSCRIPT_DOMAIN,
-                KIND_COLLECTION_MERGE_SIGNED_V2,
-                self.public_key,
-                [collection.raw, low.raw, high.raw, result.raw],
-            ),
-            LegacyUnsignedCollectionEquation::Derive {
-                collection,
-                input,
-                output,
-            } => equation_transcript(
-                DERIVE_SIGNED_V2_TRANSCRIPT_DOMAIN,
-                KIND_COLLECTION_DERIVE_SIGNED_V2,
-                self.public_key,
-                [collection.raw, input.raw, output.raw],
-            ),
-        }
-    }
-
-    /// Verify historical authorship, not current admission or input validation.
-    pub fn verify_strict(&self) -> Result<(), RecordVerificationError> {
-        verify_record_signature(
-            self.public_key,
-            self.signature(),
-            &self.signing_transcript(),
-        )
-    }
-
-    /// Historical record address, unchanged across the witness-bound cutover.
-    pub fn fingerprint(&self) -> CollectionRecordFingerprint {
-        let kind = match self.equation {
-            LegacyUnsignedCollectionEquation::Merge { .. } => KIND_COLLECTION_MERGE_SIGNED_V2,
-            LegacyUnsignedCollectionEquation::Derive { .. } => KIND_COLLECTION_DERIVE_SIGNED_V2,
-        };
-        collection_record_fingerprint(kind, &self.to_bytes()[1..])
-    }
-
-    /// Exact retired self-tagged form; never emits the current record tags.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        match self.equation {
-            LegacyUnsignedCollectionEquation::Merge {
-                collection,
-                low,
-                high,
-                result,
-            } => tagged_bytes(
-                COLLECTION_RECORD_KIND_MERGE_V2,
-                &concat_fields::<7, COLLECTION_MERGE_SIGNED_V2_BYTES_LEN>([
-                    collection.raw,
-                    low.raw,
-                    high.raw,
-                    result.raw,
-                    self.public_key.raw,
-                    self.signature_r.raw,
-                    self.signature_s.raw,
-                ]),
-            ),
-            LegacyUnsignedCollectionEquation::Derive {
-                collection,
-                input,
-                output,
-            } => tagged_bytes(
-                COLLECTION_RECORD_KIND_DERIVE_V2,
-                &concat_fields::<6, COLLECTION_DERIVE_SIGNED_V2_BYTES_LEN>([
-                    collection.raw,
-                    input.raw,
-                    output.raw,
-                    self.public_key.raw,
-                    self.signature_r.raw,
-                    self.signature_s.raw,
-                ]),
-            ),
-        }
-    }
-
-    /// Retired evidence still names the same physical blob dependencies.
-    pub fn blob_references(&self) -> impl ExactSizeIterator<Item = Inline<Handle<UnknownBlob>>> {
-        self.equation.blob_references()
-    }
-}
-
 /// A canonical signed native collection record.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum CollectionRecord {
@@ -1261,19 +1089,16 @@ pub const COLLECTION_RECORD_KIND_COMMIT_V1: u8 = 1;
 pub const COLLECTION_RECORD_KIND_MERGE_V1: u8 = 2;
 /// Retired dense tag for the unsigned DERIVE layout. Never reused.
 pub const COLLECTION_RECORD_KIND_DERIVE_V1: u8 = 3;
-/// Retired dense generic-store tag for signed MERGE without input witnesses.
+/// Dense generic-store tag for signed MERGE. An equation names the payloads it
+/// relates, never the particular records that happened to assert them.
 pub const COLLECTION_RECORD_KIND_MERGE_V2: u8 = 4;
-/// Retired dense generic-store tag for signed DERIVE without an input witness.
+/// Dense generic-store tag for signed DERIVE. See the MERGE tag above.
 pub const COLLECTION_RECORD_KIND_DERIVE_V2: u8 = 5;
-/// Dense generic-store tag for witness-bound signed MERGE endorsements.
+/// Retired dense tag for the witness-bound MERGE layout. Never reused: those
+/// bytes carried a second copy of a relation content addressing already holds.
 pub const COLLECTION_RECORD_KIND_MERGE_V3: u8 = 6;
-/// Dense generic-store tag for witness-bound signed DERIVE endorsements.
+/// Retired dense tag for the witness-bound DERIVE layout. Never reused.
 pub const COLLECTION_RECORD_KIND_DERIVE_V3: u8 = 7;
-/// Witness-free `MERGE`. An equation cites the payloads it relates, never the
-/// particular records that happened to assert them.
-pub const COLLECTION_RECORD_KIND_MERGE_V4: u8 = 8;
-/// Witness-free `DERIVE`.
-pub const COLLECTION_RECORD_KIND_DERIVE_V4: u8 = 9;
 
 fn commit_bytes(
     collection: CollectionHandle,
@@ -1759,8 +1584,8 @@ mod tests {
                 assert!(retained.verify_strict().is_err());
             }
             let key_start = match record {
-                CollectionRecord::Merge(_) => 1 + 6 * 32,
-                CollectionRecord::Derive(_) => 1 + 4 * 32,
+                CollectionRecord::Merge(_) => 1 + 4 * 32,
+                CollectionRecord::Derive(_) => 1 + 3 * 32,
                 CollectionRecord::Commit(_) => unreachable!(),
             };
             let mut weak = encoded;
@@ -1848,82 +1673,6 @@ mod tests {
     }
 
     #[test]
-    fn retired_signed_equations_keep_their_exact_signatures_and_fingerprints() {
-        // These are the published pre-witness format's golden records. Their
-        // signatures must still verify under that format, never the new one.
-        let public_key = fixture_key().verifying_key().to_bytes();
-        let merge = tagged_bytes(
-            COLLECTION_RECORD_KIND_MERGE_V2,
-            &concat_fields::<7, COLLECTION_MERGE_SIGNED_V2_BYTES_LEN>([
-                collection(1).raw,
-                hash(2).raw,
-                hash(3).raw,
-                hash(4).raw,
-                public_key,
-                hex!("39D1BE8DC91EE25298CD4B03D4CDD9D1D021994A0B5999EFCD86F1BB4D87EE08"),
-                hex!("A64EE5C40BBBAA21F01C6963BCF2F259CD76D93CBBB4D4351879CB7167ADB00B"),
-            ]),
-        );
-        let derive = tagged_bytes(
-            COLLECTION_RECORD_KIND_DERIVE_V2,
-            &concat_fields::<6, COLLECTION_DERIVE_SIGNED_V2_BYTES_LEN>([
-                collection(2).raw,
-                hash(3).raw,
-                hash(4).raw,
-                public_key,
-                hex!("10325E15C286E263AFE7D7219F4F637F852F1EB61ECA68916DA4793C6BE9BAB5"),
-                hex!("287380B741FF9D1AE6AD5FA36329785AAA36C6FAABFEB759A7E5387F1F2D140B"),
-            ]),
-        );
-        for (bytes, fingerprint, reference_count) in [
-            (
-                merge,
-                hex!("BF31C64514D9721278866D2AD87819D0C4282D5AC59A7AEBC37729D078038BDC"),
-                4,
-            ),
-            (
-                derive,
-                hex!("2CEC0E4B0A78362E7EC93F5951B4FE6B1BB8233A1A6377C51ECF455A5B945672"),
-                3,
-            ),
-        ] {
-            let legacy = LegacySignedCollectionEquation::from_bytes(&bytes).unwrap();
-            legacy.verify_strict().unwrap();
-            assert_eq!(legacy.to_bytes(), bytes);
-            assert_eq!(legacy.fingerprint().raw(), fingerprint);
-            assert_eq!(legacy.blob_references().len(), reference_count);
-            assert_eq!(legacy.collection(), legacy.equation().collection());
-            assert_eq!(legacy.public_key().raw, public_key);
-            assert_eq!(
-                CollectionRecord::from_bytes(&bytes),
-                Err(RecordDecodeError::UnknownKind(bytes[0]))
-            );
-            assert_eq!(
-                CollectionRecord::from_bytes_trusted(&bytes),
-                Err(RecordDecodeError::UnknownKind(bytes[0]))
-            );
-            assert!(LegacyUnsignedCollectionEquation::from_bytes(&bytes).is_err());
-            let mut altered = bytes.clone();
-            *altered.last_mut().unwrap() ^= 1;
-            let altered = LegacySignedCollectionEquation::from_bytes(&altered).unwrap();
-            assert_eq!(
-                altered.verify_strict(),
-                Err(RecordVerificationError::InvalidSignature)
-            );
-            let mut trailing = bytes;
-            trailing.push(0);
-            assert!(LegacySignedCollectionEquation::from_bytes(&trailing).is_err());
-        }
-        let current = CollectionRecord::Derive(CollectionDerive::sign(
-            &fixture_key(),
-            collection(2),
-            input(3),
-            hash(4),
-        ));
-        assert!(LegacySignedCollectionEquation::from_bytes(&current.to_bytes()).is_err());
-    }
-
-    #[test]
     fn transcript_and_record_fingerprints_are_golden() {
         let collection_name_anchor = id_hex!("A2EEF06D4E1AA4B17B745AA2E8C37867");
         assert_eq!(
@@ -1945,15 +1694,15 @@ mod tests {
         assert_eq!(commit.to_bytes().len(), COLLECTION_COMMIT_BYTES_LEN);
         assert_eq!(merge.to_bytes().len(), COLLECTION_MERGE_BYTES_LEN);
         assert_eq!(derive.to_bytes().len(), COLLECTION_DERIVE_BYTES_LEN);
-        assert_eq!(merge.signing_transcript().len(), 280);
-        assert_eq!(derive.signing_transcript().len(), 217);
+        assert_eq!(merge.signing_transcript().len(), 215);
+        assert_eq!(derive.signing_transcript().len(), 184);
         assert_eq!(
             concat_fields::<2, 64>([merge.signature().0.raw, merge.signature().1.raw]),
-            hex!("7C0F9640365009531D00D24E2087787E69AFE915D07468730DAD13485C646B7D70F768A1D876D28EA442C66E3C4DECDBD517FA4F7E5670ED3FABC6B9E7AA6E0B")
+            hex!("39D1BE8DC91EE25298CD4B03D4CDD9D1D021994A0B5999EFCD86F1BB4D87EE08A64EE5C40BBBAA21F01C6963BCF2F259CD76D93CBBB4D4351879CB7167ADB00B")
         );
         assert_eq!(
             concat_fields::<2, 64>([derive.signature().0.raw, derive.signature().1.raw]),
-            hex!("19F3BB4CB02901E4BE1535998D53B3EE8AB27BB0CE7B4AE899835F2C73EFD9A8212F7FDD727340E3E4072379F0E2BDB8354026CC037F42061BE1912FB250900E")
+            hex!("10325E15C286E263AFE7D7219F4F637F852F1EB61ECA68916DA4793C6BE9BAB5287380B741FF9D1AE6AD5FA36329785AAA36C6FAABFEB759A7E5387F1F2D140B")
         );
 
         assert_eq!(commit.signing_transcript().len(), COMMIT_TRANSCRIPT_LEN);
@@ -1971,11 +1720,11 @@ mod tests {
         );
         assert_eq!(
             CollectionRecord::Merge(merge).fingerprint().raw(),
-            hex!("8E67D751DDC13E67624C0B657ACDF57FCAEE7E15BAC7AD9522658A2B080EBF30")
+            hex!("BF31C64514D9721278866D2AD87819D0C4282D5AC59A7AEBC37729D078038BDC")
         );
         assert_eq!(
             CollectionRecord::Derive(derive).fingerprint().raw(),
-            hex!("EAF3D8007F8D355502562B45099C569DDF64A8051387551D8B3C468CB9A15471")
+            hex!("2CEC0E4B0A78362E7EC93F5951B4FE6B1BB8233A1A6377C51ECF455A5B945672")
         );
         assert_eq!(
             commit.signing_transcript(),

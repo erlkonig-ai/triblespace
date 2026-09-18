@@ -1966,7 +1966,7 @@ fn full_replication_does_not_apply_a_projected_summary_to_foundational_payloads(
             .insert(CollectionRecord::Derive(CollectionDerive::sign(
                 &server_key,
                 projection.handle(),
-                (commit.data(), commit.fingerprint()),
+                commit.data(),
                 Handle::<SimpleArchive>::to_hash(projected),
             )))
             .unwrap();

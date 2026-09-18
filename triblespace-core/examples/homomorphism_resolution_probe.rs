@@ -122,13 +122,6 @@ fn build(
             )
         })
         .collect();
-    // Payloads are synthetic mathematical oracles; input witnesses are not.
-    // Every witness names the actual signed record inserted below.
-    let mut witnesses: BTreeMap<_, _> = commits
-        .iter()
-        .map(|record| (record.data(), record.fingerprint()))
-        .collect();
-
     let mut all_elements = leaf_data.clone();
     let mut merges = Vec::with_capacity(leaves - 1);
     let root = match shape {
@@ -143,11 +136,10 @@ fn build(
                 let merge = CollectionMerge::sign(
                     &signing_key,
                     source_collection,
-                    (current, witnesses[&current]),
-                    (next, witnesses[&next]),
+                    current,
+                    next,
                     result,
                 );
-                witnesses.insert(result, merge.fingerprint());
                 merges.push(merge);
                 all_elements.push(result);
                 current = result;
@@ -169,11 +161,10 @@ fn build(
                     let merge = CollectionMerge::sign(
                         &signing_key,
                         source_collection,
-                        (pair[0], witnesses[&pair[0]]),
-                        (pair[1], witnesses[&pair[1]]),
+                        pair[0],
+                        pair[1],
                         result,
                     );
-                    witnesses.insert(result, merge.fingerprint());
                     merges.push(merge);
                     all_elements.push(result);
                     next_level.push(result);
@@ -196,7 +187,7 @@ fn build(
             CollectionDerive::sign(
                 &signing_key,
                 target_collection,
-                (*input, witnesses[input]),
+                *input,
                 mapped(*input),
             )
         })
@@ -292,7 +283,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_probe_equation_names_its_actual_source_records() {
+    fn every_probe_equation_names_a_payload_the_probe_produces() {
         for shape in [Shape::Chain, Shape::Balanced] {
             for mapping in [
                 Mapping::None,
@@ -302,22 +293,28 @@ mod tests {
             ] {
                 let (records, _, _, _, _) = build(8, shape, mapping);
                 let source = records.commits()[0].collection();
-                let witnesses: BTreeMap<_, _> = records
+                // The witness-era check looked a CITED fingerprint up in a
+                // map. Nothing is cited now, so this asserts the relation that
+                // always mattered and that a reader actually recovers: every
+                // input payload is one the probe genuinely produces.
+                let produced: std::collections::BTreeSet<_> = records
                     .commits()
                     .iter()
-                    .map(|record| (record.fingerprint(), (record.collection(), record.data())))
-                    .chain(records.merges().iter().map(|record| {
-                        (record.fingerprint(), (record.collection(), record.result()))
-                    }))
+                    .map(|record| (record.collection(), record.data()))
+                    .chain(
+                        records
+                            .merges()
+                            .iter()
+                            .map(|record| (record.collection(), record.result())),
+                    )
                     .collect();
                 for record in records.merges() {
                     let (low, high) = record.inputs();
-                    let (low_witness, high_witness) = record.input_witnesses();
-                    assert_eq!(witnesses[&low_witness], (record.collection(), low));
-                    assert_eq!(witnesses[&high_witness], (record.collection(), high));
+                    assert!(produced.contains(&(record.collection(), low)));
+                    assert!(produced.contains(&(record.collection(), high)));
                 }
                 for record in records.derives() {
-                    assert_eq!(witnesses[&record.input_witness()], (source, record.input()));
+                    assert!(produced.contains(&(source, record.input())));
                 }
             }
         }

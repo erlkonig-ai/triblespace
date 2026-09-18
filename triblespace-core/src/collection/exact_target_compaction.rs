@@ -15,7 +15,7 @@ use crate::repo::{BlobStoreGet, Store};
 
 use super::exact_derived::{
     attach_exact_resolution, data_identity, producer_is_admitted,
-    CollectionRealizationError, InputWitnesses,
+    CollectionRealizationError,
 };
 use super::witness::WitnessMemo;
 use super::operation_snapshot::{OperationFrontier, OperationSnapshot};
@@ -105,7 +105,6 @@ where
             signing_key,
             &descriptor,
             tiers,
-            &resolved.witnesses,
             &resolved.semantics,
             &mut blocked,
             frontier,
@@ -180,7 +179,6 @@ fn publish_carry_round<S, E, J>(
     signing_key: &SigningKey,
     descriptor: &crate::trible::Fragment,
     tiers: BTreeMap<u32, BTreeSet<CollectionData>>,
-    witnesses: &InputWitnesses,
     semantics: &CollectionSemantics,
     blocked: &mut BTreeSet<(CollectionData, CollectionData)>,
     frontier: &mut OperationFrontier<S::Snapshot>,

@@ -6,7 +6,6 @@ use super::*;
 use crate::collection::empty_metadata_handle;
 use crate::collection::records::{
     CollectionCommit, CollectionDerive, CollectionHandle, CollectionMerge,
-    CollectionRecordFingerprint,
 };
 
 fn signer(byte: u8) -> SigningKey {
@@ -33,13 +32,6 @@ fn commit(key: u8, into: CollectionHandle, payload: CollectionData) -> Collectio
 /// A merge or derive names its input PAYLOAD. This used to wrap it
 /// beside a fingerprint citing a record that produced it; nothing
 /// cites anything now, so it is just the payload.
-fn witnessed(
-    into: CollectionHandle,
-    payload: CollectionData,
-) -> CollectionData {
-    payload
-}
-
 fn merge(
     key: u8,
     into: CollectionHandle,
@@ -50,8 +42,8 @@ fn merge(
     CollectionRecord::Merge(CollectionMerge::sign(
         &signer(key),
         into,
-        witnessed(into, low),
-        witnessed(into, high),
+        low,
+        high,
         result,
     ))
 }
@@ -65,7 +57,7 @@ fn derive(
     CollectionRecord::Derive(CollectionDerive::sign(
         &signer(key),
         target,
-        witnessed(target, input),
+        input,
         output,
     ))
 }

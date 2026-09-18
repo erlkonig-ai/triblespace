@@ -769,7 +769,7 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use triblespace_core::blob::encodings::UnknownBlob;
     use triblespace_core::collection::{
-        AdmissionPolicy, CollectionMerge, CollectionPolicy, CollectionRecordFingerprint,
+        AdmissionPolicy, CollectionMerge, CollectionPolicy,
         CollectionStore, CollectionStoreExt,
     };
     use triblespace_core::inline::Inline;
@@ -791,13 +791,12 @@ mod tests {
             .put::<UnknownBlob, _>(anybytes::Bytes::from_source(vec![1, 2, 3]))
             .unwrap();
         let missing_result = Inline::new([9; 32]);
-        let input_witness = CollectionRecordFingerprint::from_raw([6; 32]);
         store
             .insert(CollectionRecord::Merge(CollectionMerge::sign(
                 &key,
                 collection.handle(),
-                (Inline::new(input.raw), input_witness),
-                (Inline::new(input.raw), input_witness),
+                Inline::new(input.raw),
+                Inline::new(input.raw),
                 missing_result,
             )))
             .unwrap();

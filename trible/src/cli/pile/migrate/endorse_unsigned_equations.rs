@@ -1,4 +1,9 @@
-//! Explicit writer migration from payload-only equations to exact witnesses.
+//! Explicit writer endorsement of historical payload-only equations.
+//!
+//! A historical equation states a payload relation that nobody signed. This
+//! reissues it as a current signed record under the caller's key. It never
+//! reads an ancestor payload and never authors a COMMIT: the statement is
+//! exactly the old one, now with an author.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -12,7 +17,7 @@ use triblespace_core::collection::{
     CollectionData, CollectionDerive, CollectionFunctionalConflict, CollectionHandle,
     CollectionMerge, CollectionRead, CollectionReadAudience, CollectionRecord,
     CollectionRecordFingerprint, CollectionStore, ConflictingCollectionOutput,
-    LegacySignedCollectionEquation, LegacyUnsignedCollectionEquation, Support, ACTION_WRITE,
+    LegacyUnsignedCollectionEquation, RecordDecodeError, Support, ACTION_WRITE,
     COLLECTION_DERIVE_SIGNED_V2_BYTES_LEN, COLLECTION_MERGE_SIGNED_V2_BYTES_LEN,
     COLLECTION_RECORD_KIND_DERIVE_V2, COLLECTION_RECORD_KIND_MERGE_V2,
 };
@@ -36,7 +41,7 @@ struct Report {
     endorsed: usize,
     already_present: usize,
     missing_outputs: usize,
-    missing_witnesses: usize,
+    unmapped_targets: usize,
     unauthorized: usize,
     invalid_signatures: usize,
     malformed_signed_frames: usize,
@@ -45,7 +50,7 @@ struct Report {
 impl Report {
     fn skipped(&self) -> usize {
         self.missing_outputs
-            + self.missing_witnesses
+            + self.unmapped_targets
             + self.unauthorized
             + self.invalid_signatures
             + self.malformed_signed_frames
@@ -112,25 +117,31 @@ fn inventory(path: &Path, collection: CollectionHandle) -> Result<Inventory> {
         let mut bytes = Vec::with_capacity(payload_len + 1);
         bytes.push(tag);
         bytes.extend_from_slice(&frame[64..64 + payload_len]);
-        let legacy = match LegacySignedCollectionEquation::from_bytes(&bytes) {
-            Ok(legacy) => legacy,
+        // These bytes are exactly what the live decoder reads: restoring the
+        // witness-free record brought the live dense form back to the retired
+        // one, so the retired frame is the only thing still historical here.
+        let decoded = match CollectionRecord::from_bytes(&bytes) {
+            Ok(decoded) => decoded,
+            Err(RecordDecodeError::Verification(_)) => {
+                eprintln!(
+                    "skipped retired signed equation at byte {}: invalid old signature",
+                    record.offset
+                );
+                result.report.invalid_signatures += 1;
+                continue;
+            }
             Err(_) => {
                 malformed();
                 result.report.malformed_signed_frames += 1;
                 continue;
             }
         };
-        if legacy.verify_strict().is_err() {
-            eprintln!(
-                "skipped retired signed equation at byte {}: invalid old signature",
-                record.offset
-            );
-            result.report.invalid_signatures += 1;
+        let Some(equation) = payload_equation(decoded) else {
+            malformed();
+            result.report.malformed_signed_frames += 1;
             continue;
-        }
-        // Authorship of the old payload statement is not witness provenance.
-        // It enters exactly the same planner as unsigned historical equations.
-        result.equations.insert(legacy.equation());
+        };
+        result.equations.insert(equation);
     }
     Ok(result)
 }
@@ -163,19 +174,19 @@ pub(super) fn run(
         hex::encode_upper(signer.verifying_key().to_bytes())
     );
     println!(
-        "{}: {}; already-covered equations: {}; skipped missing outputs: {}; \
-         missing/cyclic witnesses: {}; unauthorized: {}; \
+        "{}: {}; already-endorsed equations: {}; skipped missing outputs: {}; \
+         unmapped targets: {}; unauthorized: {}; \
          invalid old signatures: {}; malformed old signed frames: {}",
         if dry_run { "would endorse" } else { "endorsed" },
         report.endorsed,
         report.already_present,
         report.missing_outputs,
-        report.missing_witnesses,
+        report.unmapped_targets,
         report.unauthorized,
         report.invalid_signatures,
         report.malformed_signed_frames,
     );
-    println!("Payloads and historical frames are unchanged; results were not recomputed. These are fresh owner endorsements of actual witnesses, not recovered historical provenance. Small witness covers preserve total admitted support, not every exact-subset realization.");
+    println!("Payloads and historical frames are unchanged; results were not recomputed. These are fresh owner endorsements of the exact historical statements, not recovered historical provenance: the old author is not preserved and is not claimed.");
     if report.skipped() != 0 {
         bail!(
             "{} historical equation(s)/frame(s) remain unresolved",
@@ -194,78 +205,16 @@ fn endorse(
 ) -> Result<Report> {
     let snapshot = pile.snapshot().context("freeze endorsement snapshot")?;
     let (records, report) = plan(&snapshot, historical, collection, signer)?;
-    // Plan the whole support closure and reject functional conflicts before
-    // publishing anything. Every planned witness precedes its consumers.
+    // Reject functional conflicts before publishing anything. Records may be
+    // appended in any order: an endorsement names payloads, so it does not
+    // depend on another record having arrived first.
     if !dry_run {
         for record in records {
-            pile.insert(record)
-                .context("append witness-bound endorsement")?;
+            pile.insert(record).context("append endorsement")?;
         }
         pile.flush().context("flush writer endorsements")?;
     }
     Ok(report)
-}
-
-type Node = (CollectionHandle, CollectionData);
-type Witness = (CollectionRecordFingerprint, Support);
-
-struct Witnesses {
-    support: Support,
-    records: BTreeMap<CollectionRecordFingerprint, Support>,
-}
-
-/// Remember actual certificates, but wake dependents only for new support.
-/// An equivalent descendant is useful for a later small cover, not a reason
-/// to revisit an equation whose entire denotation is already certified.
-fn add_witness(
-    known: &mut BTreeMap<Node, Witnesses>,
-    node: Node,
-    record: CollectionRecordFingerprint,
-    incoming: Support,
-) -> Result<bool> {
-    match known.entry(node) {
-        std::collections::btree_map::Entry::Vacant(entry) => {
-            entry.insert(Witnesses {
-                support: incoming.clone(),
-                records: BTreeMap::from([(record, incoming)]),
-            });
-            Ok(true)
-        }
-        std::collections::btree_map::Entry::Occupied(mut entry) => {
-            let known = entry.get_mut();
-            let grew = !incoming.is_subset(&known.support)?;
-            if grew {
-                known.support = known.support.union(&incoming)?;
-            }
-            known.records.entry(record).or_insert(incoming);
-            Ok(grew)
-        }
-    }
-}
-
-/// A deterministic greedy cover of the union, not all support alternatives.
-fn witness_cover(witnesses: &Witnesses) -> Result<Vec<Witness>> {
-    let mut alternatives: Vec<_> = witnesses.records.iter().collect();
-    alternatives.sort_by(|(left_id, left), (right_id, right)| {
-        right.len().cmp(&left.len()).then(left_id.cmp(right_id))
-    });
-    let mut represented = witnesses.support.collection().cover([]);
-    let mut selected = Vec::new();
-    for (record, support) in alternatives {
-        if !support.is_subset(&represented)? {
-            represented = represented.union(support)?;
-            selected.push((*record, support.clone()));
-        }
-    }
-    Ok(selected)
-}
-
-struct Equation {
-    old: LegacyUnsignedCollectionEquation,
-    inputs: Vec<Node>,
-    output: Node,
-    certified: Option<Support>,
-    appended: usize,
 }
 
 fn output(record: CollectionRecord) -> CollectionData {
@@ -347,22 +296,6 @@ fn check_functionality(records: impl IntoIterator<Item = CollectionRecord>) -> R
     Ok(())
 }
 
-fn notify_dependents(
-    node: Node,
-    consumers: &BTreeMap<Node, Vec<usize>>,
-    queue: &mut VecDeque<usize>,
-    queued: &mut [bool],
-) {
-    if let Some(dependents) = consumers.get(&node) {
-        for index in dependents {
-            if !queued[*index] {
-                queue.push_back(*index);
-                queued[*index] = true;
-            }
-        }
-    }
-}
-
 fn plan(
     snapshot: &PileSnapshot,
     historical: Inventory,
@@ -393,42 +326,33 @@ fn plan(
         .get::<TribleSet, SimpleArchive>(collection)
         .context("read target descriptor")?;
     let source = descriptor::source(&facts).context("read immediate source")?;
+
+    // Records the pile already admits are the conflict baseline: a plan may
+    // not contradict what this collection (or its immediate source) already
+    // says. They are not inputs to the endorsement itself.
     let mut seeds = admitted_record_witnesses(snapshot, collection)
-        .context("resolve admitted target witnesses")?;
+        .context("resolve admitted target records")?;
     if let Some(source) = source {
         seeds.extend(
             admitted_record_witnesses(snapshot, source)
-                .context("resolve admitted immediate-source witnesses")?,
+                .context("resolve admitted immediate-source records")?,
         );
     }
     seeds.sort_unstable_by_key(|(record, _)| record.fingerprint());
-    let mut witnesses = BTreeMap::new();
-    let mut existing = BTreeMap::<LegacyUnsignedCollectionEquation, Support>::new();
-    for (record, support) in &seeds {
-        add_witness(
-            &mut witnesses,
-            (record.collection(), output(*record)),
-            record.fingerprint(),
-            support.clone(),
-        )?;
-        if let Some(equation) = payload_equation(*record) {
-            let represented = existing
-                .entry(equation)
-                .or_insert_with(|| support.collection().cover([]));
-            *represented = represented.union(support)?;
-        }
-    }
 
-    let mut equations = Vec::new();
-    let mut consumers: BTreeMap<Node, Vec<usize>> = BTreeMap::new();
+    let mut records = Vec::new();
+    let mut proposed = Vec::new();
     for old in old_equations {
         let result = match old {
             LegacyUnsignedCollectionEquation::Merge { result, .. } => result,
             LegacyUnsignedCollectionEquation::Derive { output, .. } => output,
         };
-        // Only the result must be resident. Historical input payloads may
-        // have been evicted; their exact closed record witnesses, not their
-        // bytes, establish which support this new endorsement asserts.
+        // Only the result must be resident. Historical input payloads may have
+        // been evicted, and that is fine: the equation states a relation
+        // between digests, so endorsing it needs no ancestor bytes and no
+        // ancestor record. This is the whole reason the plan is a single pass
+        // now -- there is no support to accumulate and no fixed point to
+        // reach, because a record no longer cites the records before it.
         if !snapshot
             .contains_blob(Handle::<UnknownBlob>::from_hash(result))
             .context("inspect historical output residency")?
@@ -440,190 +364,48 @@ fn plan(
             );
             continue;
         }
-        let (inputs, output) = match old {
+        let record = match old {
             LegacyUnsignedCollectionEquation::Merge {
                 low, high, result, ..
-            } => (
-                vec![(collection, low), (collection, high)],
-                (collection, result),
-            ),
+            } => CollectionRecord::Merge(CollectionMerge::sign(
+                signer, collection, low, high, result,
+            )),
             LegacyUnsignedCollectionEquation::Derive { input, output, .. } => {
-                let Some(source) = source else {
-                    report.missing_witnesses += 1;
+                // A DERIVE asserts the mapping this descriptor names. Without
+                // a source there is no mapping and the statement means nothing.
+                if source.is_none() {
+                    report.unmapped_targets += 1;
                     eprintln!(
                         "skipped equation {:X}: target descriptor has no source",
                         old.fingerprint()
                     );
                     continue;
-                };
-                (vec![(source, input)], (collection, output))
+                }
+                CollectionRecord::Derive(CollectionDerive::sign(
+                    signer, collection, input, output,
+                ))
             }
         };
-        let index = equations.len();
-        for input in &inputs {
-            consumers.entry(*input).or_default().push(index);
+        proposed.push(record);
+        if snapshot
+            .record(record.fingerprint())
+            .context("inspect exact existing endorsement")?
+            .is_some()
+        {
+            report.already_present += 1;
+        } else {
+            records.push(record);
+            report.endorsed += 1;
         }
-        equations.push(Equation {
-            old,
-            inputs,
-            output,
-            certified: existing.get(&old).cloned(),
-            appended: 0,
-        });
     }
 
-    // Every certificate strictly increases the support already certified for
-    // its exact payload equation. All support comes from the finite frozen
-    // record graph (no COMMITs are authored here): even grounded payload
-    // cycles terminate without inventing record cycles.
-    // The dependency index wakes only equations whose input support grew.
-    let mut queue: VecDeque<_> = (0..equations.len()).collect();
-    let mut queued = vec![true; equations.len()];
-    let equation_by_key: BTreeMap<_, _> = equations
-        .iter()
-        .enumerate()
-        .map(|(index, equation)| (equation.old, index))
-        .collect();
-    let mut known_records: BTreeSet<_> = seeds
-        .iter()
-        .map(|(record, _)| record.fingerprint())
-        .collect();
-    let mut records = Vec::new();
-    let mut proposed = Vec::new();
-    let mut previewed = 0;
-    loop {
-        while let Some(index) = queue.pop_front() {
-            queued[index] = false;
-            let equation = &mut equations[index];
-            let Some(inputs) = equation
-                .inputs
-                .iter()
-                .map(|node| witnesses.get(node))
-                .collect::<Option<Vec<_>>>()
-            else {
-                continue;
-            };
-            let mut required = inputs[0].support.clone();
-            for input in &inputs[1..] {
-                required = required.union(&input.support)?;
-            }
-            if let Some(certified) = &equation.certified {
-                if required.is_subset(certified)? {
-                    continue;
-                }
-            }
-            // Freeze the actual input choices before adding any output witness.
-            // In particular, a self-output merge cannot select itself mid-pass.
-            let covers: Vec<_> = inputs
-                .into_iter()
-                .map(witness_cover)
-                .collect::<Result<_>>()?;
-            if covers.iter().any(Vec::is_empty) {
-                continue;
-            }
-            // Cycling the shorter side covers both input unions in max(k, l)
-            // pairs. A Cartesian product would add only exact-subset alternatives.
-            let count = covers.iter().map(Vec::len).max().unwrap();
-            for position in 0..count {
-                let first = &covers[0][position % covers[0].len()];
-                let second = covers.get(1).map(|cover| &cover[position % cover.len()]);
-                let support = match second {
-                    Some(second) => first.1.union(&second.1)?,
-                    None => first.1.clone(),
-                };
-                if let Some(certified) = &equation.certified {
-                    if support.is_subset(certified)? {
-                        continue;
-                    }
-                }
-                let record = match equation.old {
-                    LegacyUnsignedCollectionEquation::Merge {
-                        low, high, result, ..
-                    } => CollectionRecord::Merge(CollectionMerge::sign(
-                        signer,
-                        collection,
-                        (low, first.0),
-                        (high, second.expect("MERGE has two inputs").0),
-                        result,
-                    )),
-                    LegacyUnsignedCollectionEquation::Derive { input, output, .. } => {
-                        CollectionRecord::Derive(CollectionDerive::sign(
-                            signer,
-                            collection,
-                            (input, first.0),
-                            output,
-                        ))
-                    }
-                };
-                equation.certified = Some(match &equation.certified {
-                    Some(certified) => certified.union(&support)?,
-                    None => support.clone(),
-                });
-                proposed.push(record);
-                known_records.insert(record.fingerprint());
-                if add_witness(
-                    &mut witnesses,
-                    equation.output,
-                    record.fingerprint(),
-                    support,
-                )? {
-                    notify_dependents(equation.output, &consumers, &mut queue, &mut queued);
-                }
-                if snapshot
-                    .record(record.fingerprint())
-                    .context("inspect exact existing endorsement")?
-                    .is_none()
-                {
-                    records.push(record);
-                    equation.appended += 1;
-                    report.endorsed += 1;
-                }
-            }
-        }
-        if proposed.len() == previewed {
-            break;
-        }
-        check_functionality(
-            seeds
-                .iter()
-                .map(|(record, _)| *record)
-                .chain(proposed.iter().copied()),
-        )
-        .context("conflicting historical endorsement plan; nothing was appended")?;
-        // A stored native record may precede its witnesses. Let the ordinary
-        // admission/closure machinery inspect the complete planned overlay:
-        // it detects newly closed conflicts (including commuting squares) and
-        // supplies any additional support to the same indexed worklist.
-        let activated = preview_record_witnesses(snapshot, collection, proposed.iter().copied())
-            .context("preflight complete endorsement overlay; nothing was appended")?;
-        previewed = proposed.len();
-        for (record, support) in activated {
-            if !known_records.insert(record.fingerprint()) {
-                continue;
-            }
-            if let Some(index) = payload_equation(record)
-                .and_then(|equation| equation_by_key.get(&equation).copied())
-            {
-                let certified = &mut equations[index].certified;
-                *certified = Some(match certified.as_ref() {
-                    Some(known) => known.union(&support)?,
-                    None => support.clone(),
-                });
-            }
-            let node = (record.collection(), output(record));
-            if add_witness(&mut witnesses, node, record.fingerprint(), support)? {
-                notify_dependents(node, &consumers, &mut queue, &mut queued);
-            }
-        }
-    }
-    for equation in &equations {
-        if equation.certified.is_none() {
-            report.missing_witnesses += 1;
-            eprintln!("skipped equation {:X}: no acyclic admitted input witness (migrate its source first if needed)", equation.old.fingerprint());
-        } else if equation.appended == 0 {
-            report.already_present += 1;
-        }
-    }
+    check_functionality(
+        seeds
+            .iter()
+            .map(|(record, _)| *record)
+            .chain(proposed.iter().copied()),
+    )
+    .context("conflicting historical endorsement plan; nothing was appended")?;
     Ok((records, report))
 }
 
@@ -705,13 +487,28 @@ mod tests {
         frame.resize(physical_len, 0);
         frame[28..32].copy_from_slice(&((physical_len / 256) as u32).to_le_bytes());
         frame[32..64].copy_from_slice(&hex::decode(kind).unwrap());
-        let key_offset = 64 + payload_len - 96;
-        frame[key_offset..key_offset + 32].copy_from_slice(&signer.verifying_key().to_bytes());
-        let mut tagged = vec![tag];
-        tagged.extend_from_slice(&frame[64..64 + payload_len]);
-        let unsigned = LegacySignedCollectionEquation::from_bytes(&tagged).unwrap();
-        let signature = signer.sign(&unsigned.signing_transcript());
-        frame[64 + payload_len - 64..64 + payload_len].copy_from_slice(&signature.to_bytes());
+        // The live record IS the retired dense body now, so sign it with the
+        // ordinary constructor instead of splicing a key and signature in.
+        let record = match equation {
+            LegacyUnsignedCollectionEquation::Merge {
+                collection,
+                low,
+                high,
+                result,
+            } => CollectionRecord::Merge(CollectionMerge::sign(
+                signer, collection, low, high, result,
+            )),
+            LegacyUnsignedCollectionEquation::Derive {
+                collection,
+                input,
+                output,
+            } => CollectionRecord::Derive(CollectionDerive::sign(
+                signer, collection, input, output,
+            )),
+        };
+        let dense = record.to_bytes();
+        debug_assert_eq!(dense[0], tag);
+        frame[64..64 + payload_len].copy_from_slice(&dense[1..]);
         frame
     }
 
@@ -771,23 +568,6 @@ mod tests {
         }
         result.flush()?;
         Ok(result)
-    }
-
-    fn assert_witnesses_precede_consumers(path: &Path) -> Result<()> {
-        let mut seen = BTreeSet::new();
-        let mut frames = PileRecords::open(path)?;
-        while let Some(frame) = frames.next() {
-            if let PileRecordContent::Collection { record } = frame?.content {
-                for witness in record.record_references() {
-                    assert!(
-                        seen.contains(&witness),
-                        "witness must already be in the pile"
-                    );
-                }
-                seen.insert(record.fingerprint());
-            }
-        }
-        Ok(())
     }
 
     struct Fixture {
@@ -919,26 +699,24 @@ mod tests {
             assert!(fixture
                 .equations
                 .contains(&payload_equation(record).unwrap()));
-            for witness in record.record_references() {
-                assert!(by_fingerprint.contains_key(&witness));
-            }
+            // Each endorsement's input payloads are ones the pile actually
+            // produces. The witness-era version of this looked up a cited
+            // fingerprint; production is the same relation without the field.
+            let produces = |payload| {
+                by_fingerprint.values().any(|producer: &CollectionRecord| {
+                    producer.collection() == fixture.target && output(*producer) == payload
+                })
+            };
             match record {
                 CollectionRecord::Derive(derive) => {
-                    let commit = fixture
+                    assert!(fixture
                         .commits
                         .iter()
-                        .find(|commit| commit.data() == derive.input())
-                        .unwrap();
-                    assert_eq!(derive.input_witness(), commit.fingerprint());
+                        .any(|commit| commit.data() == derive.input()));
                 }
                 CollectionRecord::Merge(merge) => {
-                    for (payload, witness) in [merge.inputs().0, merge.inputs().1]
-                        .into_iter()
-                        .zip([merge.input_witnesses().0, merge.input_witnesses().1])
-                    {
-                        assert_eq!(output(by_fingerprint[&witness]), payload);
-                        assert_eq!(by_fingerprint[&witness].collection(), fixture.target);
-                    }
+                    assert!(produces(merge.inputs().0));
+                    assert!(produces(merge.inputs().1));
                 }
                 CollectionRecord::Commit(_) => panic!("migration must not create COMMITs"),
             }
@@ -984,7 +762,7 @@ mod tests {
         assert_eq!(
             fixture.endorse(false)?,
             Report {
-                missing_witnesses: 1,
+                unmapped_targets: 1,
                 ..Report::default()
             }
         );
@@ -999,27 +777,21 @@ mod tests {
                 let fixture = Fixture::new()?;
                 let mut excluded: BTreeSet<_> =
                     fixture.commits.iter().map(|commit| commit.data()).collect();
-                let (old, expected_witnesses) = if is_merge {
+                let old = if is_merge {
                     let mut pile = super::super::super::open_refreshed(fixture.file.path())?;
-                    let mut witnesses = BTreeSet::new();
                     for (commit, image) in fixture.commits.into_iter().zip(fixture.images) {
-                        let record = CollectionRecord::Derive(CollectionDerive::sign(
+                        pile.insert(CollectionRecord::Derive(CollectionDerive::sign(
                             &fixture.signer,
                             fixture.target,
-                            (commit.data(), commit.fingerprint()),
+                            commit.data(),
                             image,
-                        ));
-                        pile.insert(record)?;
-                        witnesses.insert(record.fingerprint());
+                        )))?;
                         excluded.insert(image);
                     }
                     pile.close()?;
-                    (fixture.equations[2], witnesses)
+                    fixture.equations[2]
                 } else {
-                    (
-                        fixture.equations[0],
-                        BTreeSet::from([fixture.commits[0].fingerprint()]),
-                    )
+                    fixture.equations[0]
                 };
                 let file = without_blobs(fixture.file.path(), &excluded)?;
                 append(
@@ -1056,16 +828,14 @@ mod tests {
                         "migration fetched an input payload"
                     );
                 }
-                let record = snapshot
+                // The endorsement exists and says exactly the old equation.
+                // What it does NOT do is name the records that produced its
+                // inputs, which is why none of their payloads had to be here.
+                assert!(snapshot
                     .records()?
                     .collect::<std::result::Result<Vec<_>, _>>()?
                     .into_iter()
-                    .find(|record| payload_equation(*record) == Some(old))
-                    .unwrap();
-                assert_eq!(
-                    record.record_references().collect::<BTreeSet<_>>(),
-                    expected_witnesses
-                );
+                    .any(|record| payload_equation(record) == Some(old)));
                 pile.close()?;
             }
         }
@@ -1101,7 +871,7 @@ mod tests {
         assert_eq!(
             run_downstream()?,
             Report {
-                missing_witnesses: 1,
+                unmapped_targets: 1,
                 ..Report::default()
             }
         );
@@ -1134,7 +904,10 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        assert_eq!(derived.input_witness(), witness.fingerprint());
+        // The downstream DERIVE names the upstream MERGE's result payload.
+        // It does not name the merge record, and does not need to: the
+        // upstream migration having run is what makes that payload exist.
+        assert_eq!(derived.input(), output(*witness));
         Ok(())
     }
 
@@ -1145,11 +918,11 @@ mod tests {
         let outsider = SigningKey::from_bytes(&[43; 32]);
         for (commit, output) in fixture.commits.into_iter().zip(fixture.images) {
             pile.insert(CollectionRecord::Derive(CollectionDerive::sign(
-                &outsider,
-                fixture.target,
-                (commit.data(), commit.fingerprint()),
-                output,
-            )))?;
+    &outsider,
+    fixture.target,
+    commit.data(),
+    output,
+)))?;
         }
         pile.close()?;
         append(fixture.file.path(), [frame(fixture.equations[2])])?;
@@ -1157,7 +930,7 @@ mod tests {
         assert_eq!(
             fixture.endorse(false)?,
             Report {
-                missing_witnesses: 1,
+                unmapped_targets: 1,
                 ..Report::default()
             }
         );
@@ -1215,7 +988,6 @@ mod tests {
             .source
             .cover(commits.iter().map(|commit| Inline::new(commit.data().raw)));
         assert_eq!(fixture.support_for(fixture.target, z)?, expected);
-        assert_witnesses_precede_consumers(fixture.file.path())?;
         assert_eq!(
             fixture.endorse(false)?,
             Report {
@@ -1310,7 +1082,6 @@ mod tests {
                 .count(),
             2
         );
-        assert_witnesses_precede_consumers(fixture.file.path())?;
         assert_eq!(run_downstream(false)?.already_present, 1);
         assert_eq!(fs::read(fixture.file.path())?, after);
 
@@ -1326,11 +1097,11 @@ mod tests {
             CollectionCommit::sign(&fixture.signer, fixture.source.handle(), a.data(), metadata);
         pile.insert(CollectionRecord::Commit(duplicate))?;
         pile.insert(CollectionRecord::Derive(CollectionDerive::sign(
-            &fixture.signer,
-            fixture.target,
-            (a.data(), duplicate.fingerprint()),
-            x,
-        )))?;
+    &fixture.signer,
+    fixture.target,
+    a.data(),
+    x,
+)))?;
         pile.close()?;
         let before = fs::read(fixture.file.path())?;
         assert_eq!(
@@ -1370,7 +1141,6 @@ mod tests {
                 .map(|commit| Inline::new(commit.data().raw)),
         );
         assert_eq!(fixture.support_for(fixture.target, x)?, expected);
-        assert_witnesses_precede_consumers(fixture.file.path())?;
         let after = fs::read(fixture.file.path())?;
         for _ in 0..3 {
             assert_eq!(
@@ -1419,7 +1189,6 @@ mod tests {
         );
         assert_eq!(fs::read(fixture.file.path())?, before);
         assert_eq!(fixture.endorse(false)?, planned);
-        assert_witnesses_precede_consumers(fixture.file.path())?;
         let expected = fixture.source.cover(
             fixture
                 .commits
@@ -1477,12 +1246,12 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        assert_eq!(
-            derived.input_witness(),
-            duplicate
-                .fingerprint()
-                .min(fixture.commits[0].fingerprint())
-        );
+        // Two COMMITs assert the same payload. The endorsement names that
+        // payload once, so which of them a reader relates it to is not a
+        // choice the migration has to make any more -- there is exactly one
+        // record, not one per producer.
+        assert_eq!(derived.input(), duplicate.data());
+        assert_eq!(derived.input(), fixture.commits[0].data());
         Ok(())
     }
 
@@ -1632,11 +1401,11 @@ mod tests {
         let a = fixture.commits[0];
         let mut pile = super::super::super::open_refreshed(fixture.file.path())?;
         pile.insert(CollectionRecord::Derive(CollectionDerive::sign(
-            &fixture.signer,
-            fixture.target,
-            (a.data(), a.fingerprint()),
-            fixture.images[0],
-        )))?;
+    &fixture.signer,
+    fixture.target,
+    a.data(),
+    fixture.images[0],
+)))?;
         pile.close()?;
         append(
             fixture.file.path(),
@@ -1662,31 +1431,31 @@ mod tests {
             // P is a real signed record, but not yet in the pile. Its exact
             // bytes are what the historical a -> x plan will later produce.
             let p = CollectionDerive::sign(
-                &fixture.signer,
-                fixture.target,
-                (a.data(), a.fingerprint()),
-                x,
-            );
+    &fixture.signer,
+    fixture.target,
+    a.data(),
+    x,
+);
             let q = CollectionDerive::sign(
-                &fixture.signer,
-                fixture.target,
-                (b.data(), b.fingerprint()),
-                y,
-            );
+    &fixture.signer,
+    fixture.target,
+    b.data(),
+    y,
+);
             pile.insert(CollectionRecord::Derive(q))?;
             let bad = blob(&mut pile, "dormant-conflicting-result")?;
             let outsider = SigningKey::from_bytes(&[43; 32]);
             pile.insert(CollectionRecord::Merge(CollectionMerge::sign(
-                if authorized {
+    if authorized {
                     &fixture.signer
                 } else {
                     &outsider
                 },
-                fixture.target,
-                (x, p.fingerprint()),
-                (y, q.fingerprint()),
-                bad,
-            )))?;
+    fixture.target,
+    x,
+    y,
+    bad,
+)))?;
             pile.close()?;
             append(
                 fixture.file.path(),
@@ -1734,32 +1503,32 @@ mod tests {
             entity! { metadata::tag: Id::new([3; 16]).unwrap() },
         )?;
         let p = CollectionDerive::sign(
-            &fixture.signer,
-            fixture.target,
-            (a.data(), a.fingerprint()),
-            x,
-        );
+    &fixture.signer,
+    fixture.target,
+    a.data(),
+    x,
+);
         let dz = CollectionDerive::sign(
-            &fixture.signer,
-            fixture.target,
-            (b.data(), b.fingerprint()),
-            z,
-        );
+    &fixture.signer,
+    fixture.target,
+    b.data(),
+    z,
+);
         let dy = CollectionDerive::sign(
-            &fixture.signer,
-            fixture.target,
-            (c.data(), c.fingerprint()),
-            y,
-        );
+    &fixture.signer,
+    fixture.target,
+    c.data(),
+    y,
+);
         pile.insert(CollectionRecord::Derive(dz))?;
         pile.insert(CollectionRecord::Derive(dy))?;
         pile.insert(CollectionRecord::Merge(CollectionMerge::sign(
-            &fixture.signer,
-            fixture.target,
-            (x, p.fingerprint()),
-            (z, dz.fingerprint()),
-            z,
-        )))?;
+    &fixture.signer,
+    fixture.target,
+    x,
+    z,
+    z,
+)))?;
         let result = blob(&mut pile, "activated-support-result")?;
         pile.close()?;
         append(
@@ -1810,12 +1579,12 @@ mod tests {
             let mut pile = super::super::super::open_refreshed(fixture.file.path())?;
             let c = blob(&mut pile, "merged-source-member")?;
             pile.insert(CollectionRecord::Merge(CollectionMerge::sign(
-                &fixture.signer,
-                fixture.source.handle(),
-                (a.data(), a.fingerprint()),
-                (b.data(), b.fingerprint()),
-                c,
-            )))?;
+    &fixture.signer,
+    fixture.source.handle(),
+    a.data(),
+    b.data(),
+    c,
+)))?;
             let joined = if agrees {
                 z
             } else {
@@ -1890,7 +1659,7 @@ mod tests {
         assert_eq!(
             fixture.endorse(false)?,
             Report {
-                missing_witnesses: 2,
+                unmapped_targets: 2,
                 missing_outputs: 1,
                 ..Report::default()
             }

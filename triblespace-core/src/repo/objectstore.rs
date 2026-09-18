@@ -718,14 +718,6 @@ mod tests {
     // physical-storage fixtures independent of ancestor arrival order.
     /// An equation names its input PAYLOAD; this used to pair it with a
     /// fingerprint citing a record that produced it.
-    fn witnessed(
-        _signer: &ed25519_dalek::SigningKey,
-        _collection: crate::collection::CollectionHandle,
-        data: crate::collection::CollectionData,
-    ) -> crate::collection::CollectionData {
-        data
-    }
-
     use super::*;
 
     use futures::executor::block_on;
@@ -735,7 +727,7 @@ mod tests {
     use crate::collection::descriptor::{identity_for_tests, named_for_tests};
     use crate::collection::{
         CollectionMerge, CollectionRead, CollectionStore, COLLECTION_MERGE_BYTES_LEN,
-        COLLECTION_RECORD_KIND_MERGE_V3,
+        COLLECTION_RECORD_KIND_MERGE_V2,
     };
     use crate::repo::async_store::{
         AsyncBlobStoreGet, AsyncBlobStoreList, AsyncBlobStorePut, AsyncCollectionRead,
@@ -758,16 +750,8 @@ mod tests {
         CollectionRecord::Merge(CollectionMerge::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&descriptor),
-            witnessed(
-                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                identity_for_tests(&descriptor),
-                Inline::new([tag.wrapping_add(3); 32]),
-            ),
-            witnessed(
-                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                identity_for_tests(&descriptor),
-                Inline::new([tag.wrapping_add(4); 32]),
-            ),
+            Inline::new([tag.wrapping_add(3); 32]),
+            Inline::new([tag.wrapping_add(4); 32]),
             Inline::new([tag.wrapping_add(5); 32]),
         ))
     }
@@ -803,7 +787,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(stored.len(), 1 + COLLECTION_MERGE_BYTES_LEN);
-            assert_eq!(stored[0], COLLECTION_RECORD_KIND_MERGE_V3);
+            assert_eq!(stored[0], COLLECTION_RECORD_KIND_MERGE_V2);
 
             let snapshot = AsyncSnapshotSource::snapshot(&mut store).await.unwrap();
             assert!(AsyncCollectionRead::records(&before)

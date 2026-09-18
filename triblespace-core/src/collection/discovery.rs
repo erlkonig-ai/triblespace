@@ -502,13 +502,6 @@ mod tests {
     /// A merge or derive names its input PAYLOAD. This used to wrap it
     /// beside a fingerprint citing a record that produced it; nothing
     /// cites anything now, so it is just the payload.
-    fn witnessed_input(
-        collection: CollectionHandle,
-        data: CollectionData,
-    ) -> CollectionData {
-        data
-    }
-
     fn member(byte: u8) -> Inline<Handle<SimpleArchive>> {
         Inline::new([byte; 32])
     }
@@ -775,7 +768,7 @@ mod tests {
             &SigningKey::from_bytes(&[7; 32]),
             collection(1).handle(),
             data(4),
-            witnessed_input(collection(1).handle(), data(5)),
+            data(5),
             data(6),
         );
         let derive = CollectionDerive::sign(
@@ -842,7 +835,7 @@ mod tests {
             &authorized_key,
             target.handle(),
             low,
-            witnessed_input(target.handle(), high),
+            high,
             output,
         );
         let derive = CollectionDerive::sign(
@@ -964,8 +957,8 @@ mod tests {
         let other_merge = CollectionMerge::sign(
             &SigningKey::from_bytes(&[7; 32]),
             other.handle(),
-            witnessed_input(other.handle(), data(3)),
-            witnessed_input(other.handle(), data(4)),
+            data(3),
+            data(4),
             data(6),
         );
         let crossing_derive = CollectionDerive::sign(
@@ -1068,15 +1061,15 @@ mod tests {
             CollectionRecord::Merge(CollectionMerge::sign(
                 &SigningKey::from_bytes(&[7; 32]),
                 other.handle(),
-                witnessed_input(other.handle(), data(3)),
-                witnessed_input(other.handle(), data(4)),
+                data(3),
+                data(4),
                 data(5),
             )),
             CollectionRecord::Commit(matching[1]),
             CollectionRecord::Derive(CollectionDerive::sign(
                 &SigningKey::from_bytes(&[7; 32]),
                 target.handle(),
-                witnessed_input(other.handle(), data(5)),
+                data(5),
                 data(2),
             )),
             CollectionRecord::Commit(CollectionCommit::sign(

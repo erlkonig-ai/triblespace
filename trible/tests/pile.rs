@@ -145,16 +145,8 @@ fn compact_uses_valid_blob_occurrence_without_collecting_blobs_or_equations() {
     let equation = CollectionRecord::Merge(CollectionMerge::sign(
         &SigningKey::from_bytes(&[1; 32]),
         Inline::new([1; 32]),
-        witnessed(
-            &SigningKey::from_bytes(&[1; 32]),
-            Inline::new([1; 32]),
-            Inline::new([2; 32]),
-        ),
-        witnessed(
-            &SigningKey::from_bytes(&[1; 32]),
-            Inline::new([1; 32]),
-            Inline::new([3; 32]),
-        ),
+        Inline::new([2; 32]),
+        Inline::new([3; 32]),
         Inline::new([4; 32]),
     ));
     source.insert(equation).unwrap();
@@ -1536,19 +1528,3 @@ fn amputate_requires_and_matches_the_current_reader_boundary() {
 
 // Canonical but deliberately uninserted COMMIT witnesses keep these
 // physical-storage fixtures independent of ancestor arrival order.
-fn witnessed(
-    signer: &ed25519_dalek::SigningKey,
-    collection: triblespace_core::collection::CollectionHandle,
-    data: triblespace_core::collection::CollectionData,
-) -> (
-    triblespace_core::collection::CollectionData,
-    triblespace_core::collection::CollectionRecordFingerprint,
-) {
-    let record = triblespace_core::collection::CollectionCommit::sign(
-        signer,
-        collection,
-        data,
-        triblespace_core::collection::empty_metadata_handle(),
-    );
-    (data, record.fingerprint())
-}
