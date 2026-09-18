@@ -43,11 +43,6 @@ pub enum CollectionRecordSelector {
     /// exactly `(C, H)`. Distinct producers and input witnesses remain distinct
     /// records; neither authority nor witness closure is evaluated here.
     ProducedMember(CollectionHandle, CollectionData),
-    /// Select every `MERGE` or `DERIVE` naming one exact input record.
-    ///
-    /// The referenced fingerprint need not be present in this snapshot. This
-    /// is an immediate raw relationship, not transitive ancestry or admission.
-    ReferencingRecord(CollectionRecordFingerprint),
     /// Select every `MERGE` asserted for one collection descriptor.
     MergeCollection(CollectionHandle),
     /// Select every `DERIVE` into one exact target descriptor.
@@ -94,9 +89,7 @@ pub(crate) fn selectors_match_record(
     };
     if selectors.contains(&CollectionRecordSelector::ProducedMember(
         collection, output,
-    )) || record.record_references().any(|fingerprint| {
-        selectors.contains(&CollectionRecordSelector::ReferencingRecord(fingerprint))
-    }) {
+    )) {
         return true;
     }
     let matches_fields = match record {
@@ -448,16 +441,11 @@ mod tests {
         use crate::inline::encodings::hash::Handle;
 
         let records = fixture();
-        let witness = records
-            .iter()
-            .find_map(|record| record.record_references().next())
-            .unwrap();
         let selectors = [
             CollectionRecordSelector::Collection(collection(1)),
             CollectionRecordSelector::Collection(collection(99)),
             CollectionRecordSelector::CommitMember(collection(1), data(4)),
             CollectionRecordSelector::ProducedMember(collection(2), data(11)),
-            CollectionRecordSelector::ReferencingRecord(witness),
             CollectionRecordSelector::MergeCollection(collection(1)),
             CollectionRecordSelector::DeriveTarget(collection(2)),
             CollectionRecordSelector::Operation(WantRequest::derive(collection(2), data(10))),
@@ -522,8 +510,6 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        let witness = derive.input_witness();
-        assert!(records.iter().all(|record| record.fingerprint() != witness));
         let store = FallbackStore {
             records: records.clone(),
             ..FallbackStore::default()
@@ -532,7 +518,6 @@ mod tests {
             CollectionRecordSelector::ProducedMember(collection(1), data(4)),
             CollectionRecordSelector::ProducedMember(collection(1), data(6)),
             CollectionRecordSelector::ProducedMember(collection(2), data(11)),
-            CollectionRecordSelector::ReferencingRecord(witness),
             CollectionRecordSelector::Fingerprint(derive.fingerprint()),
         ]);
         let selected = store.select_records(&selectors).unwrap();
@@ -546,7 +531,12 @@ mod tests {
                 CollectionRecord::Merge(merge) => {
                     merge.collection() == collection(1) && merge.result() == data(6)
                 }
-                CollectionRecord::Derive(derive) => derive.input_witness() == witness,
+                // Selected as the producer of (collection(2), data(11)),
+                // which is what the removed citation selector was standing in
+                // for here.
+                CollectionRecord::Derive(derive) => {
+                    derive.collection() == collection(2) && derive.output() == data(11)
+                }
             })
             .collect();
         assert_eq!(selected, expected);

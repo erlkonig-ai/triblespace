@@ -487,19 +487,12 @@ mod collection_record_produced_member_key {
     crate::key_schema!(Schema, Segments, 96, [0, 1, 2]);
 }
 
-mod collection_record_reference_key {
-    crate::key_segmentation!(Segments, 64, [32, 32]);
-    crate::key_schema!(Schema, Segments, 64, [0, 1]);
-}
-
 type PileBlobIndex = PATCH<40, blob_occurrence_key::Schema, CachedValidation, XorSip128>;
 type CollectionRecordIndex = PATCH<32, IdentitySchema, CollectionRecord, XorSip128>;
 type CollectionRecordCollectionIndex =
     PATCH<64, collection_record_collection_key::Schema, (), XorSip128>;
 type CollectionRecordProducedMemberIndex =
     PATCH<96, collection_record_produced_member_key::Schema, (), XorSip128>;
-type CollectionRecordReferenceIndex =
-    PATCH<64, collection_record_reference_key::Schema, (), XorSip128>;
 type CapabilityProofIndex = PATCH<32, IdentitySchema, CapabilityProof, XorSip128>;
 type LegacyCollectionHeaderIndex = PATCH<V3_HEADER_LEN, IdentitySchema>;
 
@@ -531,16 +524,6 @@ fn collection_record_produced_member_key(
     key[..32].copy_from_slice(&record.collection().raw);
     key[32..64].copy_from_slice(&output.raw);
     key[64..].copy_from_slice(&fingerprint.raw());
-    key
-}
-
-fn collection_record_reference_key(
-    input: CollectionRecordFingerprint,
-    consumer: CollectionRecordFingerprint,
-) -> [u8; 64] {
-    let mut key = [0; 64];
-    key[..32].copy_from_slice(&input.raw());
-    key[32..].copy_from_slice(&consumer.raw());
     key
 }
 
@@ -2740,8 +2723,6 @@ pub struct Pile {
     collection_records_by_collection: CollectionRecordCollectionIndex,
     /// Raw producer relationship: `collection || output || record_fingerprint`.
     collection_records_by_produced_member: CollectionRecordProducedMemberIndex,
-    /// Raw immediate witness relationship: `input_fingerprint || consumer_fingerprint`.
-    collection_records_by_reference: CollectionRecordReferenceIndex,
     /// Complete canonical proofs keyed by the BLAKE3 identity of exact bytes.
     /// Each value owns its validated mmap-backed view, shared by snapshots and readers.
     capability_proofs: CapabilityProofIndex,
@@ -2836,7 +2817,6 @@ pub struct PileSnapshot {
     collection_records: CollectionRecordIndex,
     collection_records_by_collection: CollectionRecordCollectionIndex,
     collection_records_by_produced_member: CollectionRecordProducedMemberIndex,
-    collection_records_by_reference: CollectionRecordReferenceIndex,
     /// Downward coverage as of this exact prefix, folded during replay.
     ///
     /// One persistent PATCH root, so carrying it costs the same as carrying
@@ -2875,7 +2855,6 @@ impl PileSnapshot {
         collection_records: CollectionRecordIndex,
         collection_records_by_collection: CollectionRecordCollectionIndex,
         collection_records_by_produced_member: CollectionRecordProducedMemberIndex,
-        collection_records_by_reference: CollectionRecordReferenceIndex,
         coverage: Coverage,
         legacy_collection_headers: LegacyCollectionHeaderIndex,
         capability_proofs: CapabilityProofIndex,
@@ -2889,7 +2868,6 @@ impl PileSnapshot {
             collection_records,
             collection_records_by_collection,
             collection_records_by_produced_member,
-            collection_records_by_reference,
             coverage,
             legacy_collection_headers,
             capability_proofs,
@@ -3100,12 +3078,6 @@ impl super::StoreSnapshot for PileSnapshot {
                             &prefix,
                         );
                     }
-                    CollectionRecordSelector::ReferencingRecord(input) => {
-                        return !self.collection_records_by_reference.shares_prefix(
-                            &previous.collection_records_by_reference,
-                            &input.raw(),
-                        );
-                    }
                     CollectionRecordSelector::Collection(collection)
                     | CollectionRecordSelector::MergeCollection(collection)
                     | CollectionRecordSelector::DeriveTarget(collection) => collection,
@@ -3167,7 +3139,6 @@ impl super::SnapshotSource for Pile {
             self.collection_records.clone(),
             self.collection_records_by_collection.clone(),
             self.collection_records_by_produced_member.clone(),
-            self.collection_records_by_reference.clone(),
             self.coverage.published().clone(),
             self.legacy_collection_headers.clone(),
             self.capability_proofs.clone(),
@@ -3558,7 +3529,6 @@ impl Pile {
             collection_records: CollectionRecordIndex::new(),
             collection_records_by_collection: CollectionRecordCollectionIndex::new(),
             collection_records_by_produced_member: CollectionRecordProducedMemberIndex::new(),
-            collection_records_by_reference: CollectionRecordReferenceIndex::new(),
             capability_proofs: CapabilityProofIndex::new(),
             coverage: CoverageIndex::new(),
             coverage_arrivals: CoverageArrivals::default(),
@@ -3716,11 +3686,6 @@ impl Pile {
                             record,
                             fingerprint,
                         )));
-                    for input in record.record_references() {
-                        self.collection_records_by_reference.insert(&Entry::new(
-                            &collection_record_reference_key(input, fingerprint),
-                        ));
-                    }
                     self.coverage.park_record(&record);
                 }
                 Applied::Collection { fingerprint }
@@ -3867,7 +3832,6 @@ impl Pile {
             self.collection_records.clone(),
             self.collection_records_by_collection.clone(),
             self.collection_records_by_produced_member.clone(),
-            self.collection_records_by_reference.clone(),
             self.coverage.published().clone(),
             self.legacy_collection_headers.clone(),
             self.capability_proofs.clone(),
@@ -3975,7 +3939,6 @@ impl Pile {
             std::ptr::drop_in_place(&mut this.collection_records);
             std::ptr::drop_in_place(&mut this.collection_records_by_collection);
             std::ptr::drop_in_place(&mut this.collection_records_by_produced_member);
-            std::ptr::drop_in_place(&mut this.collection_records_by_reference);
             std::ptr::drop_in_place(&mut this.capability_proofs);
             std::ptr::drop_in_place(&mut this.legacy_collection_headers);
             std::ptr::drop_in_place(&mut this.opaque_frames);
@@ -4352,13 +4315,6 @@ impl CollectionRead for PileSnapshot {
                     prefix[32..].copy_from_slice(&output.raw);
                     self.collection_records_by_produced_member
                         .infixes(&prefix, |fingerprint: &[u8; 32]| ids.push(*fingerprint));
-                    continue;
-                }
-                CollectionRecordSelector::ReferencingRecord(input) => {
-                    self.collection_records_by_reference
-                        .infixes(&input.raw(), |fingerprint: &[u8; 32]| {
-                            ids.push(*fingerprint)
-                        });
                     continue;
                 }
                 CollectionRecordSelector::Collection(collection)
@@ -8527,12 +8483,8 @@ mod tests {
         ];
         let produced =
             BTreeSet::from([CollectionRecordSelector::ProducedMember(collection, output)]);
-        let referencing =
-            BTreeSet::from([CollectionRecordSelector::ReferencingRecord(a.fingerprint())]);
         let expected_produced =
             sorted_collection_records(vec![direct, merge_a, merge_b, repeated, derive_a, derive_b]);
-        let expected_referencing =
-            sorted_collection_records(vec![merge_a, repeated, derive_a, other_producer]);
 
         let mut reader = Pile::open(&path).unwrap();
         let empty = reader.snapshot().unwrap();
@@ -8545,42 +8497,14 @@ mod tests {
         assert!(cloned
             .collection_records_by_produced_member
             .shares_root(&middle.collection_records_by_produced_member));
-        assert!(cloned
-            .collection_records_by_reference
-            .shares_root(&middle.collection_records_by_reference));
         assert!(empty.select_records(&produced).unwrap().is_empty());
-        assert!(empty.select_records(&referencing).unwrap().is_empty());
         assert_eq!(middle.blobs().count(), 0);
         assert_eq!(middle.proofs().unwrap().count(), 0);
         assert_eq!(middle.record(a.fingerprint()).unwrap(), None);
         assert_eq!(middle.select_records(&produced).unwrap(), expected_produced);
         assert_eq!(
-            middle.select_records(&referencing).unwrap(),
-            expected_referencing
-        );
-        assert_eq!(
-            middle
-                .select_records(&BTreeSet::from([
-                    CollectionRecordSelector::ReferencingRecord(merge_a.fingerprint()),
-                ]))
-                .unwrap(),
-            vec![descendant],
-        );
-        assert_eq!(
             middle.collection_records_by_produced_member.len(),
             records.len() as u64
-        );
-        let expected_edges: BTreeSet<_> = records
-            .iter()
-            .flat_map(|record| {
-                record
-                    .record_references()
-                    .map(move |input| (input, record.fingerprint()))
-            })
-            .collect();
-        assert_eq!(
-            middle.collection_records_by_reference.len(),
-            expected_edges.len() as u64
         );
 
         let once = std::fs::metadata(&path).unwrap().len();
@@ -8595,13 +8519,6 @@ mod tests {
             Some(CollectionRecord::Commit(a))
         );
         assert_eq!(middle.record(a.fingerprint()).unwrap(), None);
-        assert_eq!(
-            after.select_records(&referencing).unwrap(),
-            expected_referencing
-        );
-        assert!(after
-            .collection_records_by_reference
-            .shares_root(&middle.collection_records_by_reference));
         assert_eq!(
             after
                 .select_records(&BTreeSet::from([CollectionRecordSelector::ProducedMember(
@@ -8631,8 +8548,6 @@ mod tests {
         let selectors = [
             CollectionRecordSelector::ProducedMember(collection, output),
             CollectionRecordSelector::ProducedMember(other, input),
-            CollectionRecordSelector::ReferencingRecord(a.fingerprint()),
-            CollectionRecordSelector::ReferencingRecord(merge_a.fingerprint()),
             CollectionRecordSelector::Fingerprint(a.fingerprint()),
             CollectionRecordSelector::Fingerprint(descendant.fingerprint()),
             CollectionRecordSelector::CommitMember(collection, output),
@@ -10848,7 +10763,6 @@ mod tests {
             CollectionRecordSelector::Collection(target),
             CollectionRecordSelector::Fingerprint(produced.fingerprint()),
             CollectionRecordSelector::ProducedMember(target, output),
-            CollectionRecordSelector::ReferencingRecord(input.fingerprint()),
         ];
         let dependencies = StoreDependencies {
             records: routes.into_iter().collect(),
@@ -10923,7 +10837,7 @@ mod tests {
             ),
             StoreChanges::COLLECTION_RECORDS,
         );
-        for unchanged in [routes[1], routes[3]] {
+        for unchanged in [routes[1]] {
             assert_eq!(
                 alternate_witness.changes_for(
                     &realized,
