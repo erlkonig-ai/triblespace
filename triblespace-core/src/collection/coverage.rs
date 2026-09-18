@@ -61,6 +61,7 @@ use crate::patch::{Blake3Merkle, Entry, IdentitySchema, PATCH};
 use crate::repo::{BlobStoreGet, CapabilityProofRead};
 
 use super::api::AdmissionEvidence;
+use super::store::CollectionRead;
 use super::records::{CollectionData, CollectionHandle, CollectionRecord};
 
 /// The foundation commits one lattice node covers.
@@ -536,6 +537,25 @@ impl<R: BlobStoreGet + CapabilityProofRead> RecordAdmission for StoreWriters<'_,
             Admittance::Pending
         }
     }
+}
+
+/// Fold one store's whole record set into a coverage index.
+///
+/// The general path, for any store that enumerates records and can answer who
+/// may write a collection. A backend that maintains the index across appends
+/// — a pile does, during replay — should hand out its own instead of folding
+/// again; this is what everything else uses, and what an equivalence check
+/// compares that maintained index against.
+pub(crate) fn coverage_of<R>(reader: &R) -> Result<CoverageIndex, R::RecordsError>
+where
+    R: CollectionRead + BlobStoreGet + CapabilityProofRead,
+{
+    let mut index = CoverageIndex::new();
+    for record in reader.records()? {
+        index.park_record(&record?);
+    }
+    index.resolve(&StoreWriters::new(reader));
+    Ok(index)
 }
 
 #[cfg(test)]

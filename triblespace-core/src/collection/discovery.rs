@@ -678,6 +678,83 @@ mod tests {
         assert!(before.collection(target).unwrap().cover().is_empty());
     }
 
+
+    /// The fold answers what the witness walk answers.
+    ///
+    /// This is the thesis under test: support is downward coverage, so the set
+    /// a node stands for can be read from an index built once instead of
+    /// recovered by walking each record's witnesses on every query. Two
+    /// commits joined and then projected into a derived collection — the
+    /// shape every derived lattice is made of — and both routes must name the
+    /// same two foundation commits.
+    #[test]
+    fn folded_coverage_equals_the_witness_walk_it_replaces() {
+        use crate::blob::encodings::succinctarchive::SuccinctArchiveBlob;
+        use crate::collection::coverage::coverage_of;
+
+        let mut store = MemoryRepo::default();
+        let source = store
+            .collection(
+                "coverage-equivalence",
+                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+            )
+            .unwrap();
+        let target = store
+            .derive::<SuccinctArchiveBlob>(
+                source,
+                (),
+                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+            )
+            .unwrap();
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let a = crate::prelude::entity! { crate::metadata::name: "a" };
+        let b = crate::prelude::entity! { crate::metadata::name: "b" };
+        let joined = crate::collection::simplearchive_union::join(
+            &a.facts().clone().to_blob(),
+            &b.facts().clone().to_blob(),
+        )
+        .unwrap();
+        let output = crate::collection::succinctarchive_union::derive_element(&joined).unwrap();
+        let ca = store.commit(source, &key, a).unwrap();
+        let cb = store.commit(source, &key, b).unwrap();
+        let merged = Handle::<SimpleArchive>::to_hash(joined.get_handle());
+        let derived = Handle::<SuccinctArchiveBlob>::to_hash(output.get_handle());
+        let merge = CollectionRecord::Merge(CollectionMerge::sign(
+            &key,
+            source.handle(),
+            (ca.data(), CollectionRecord::Commit(ca).fingerprint()),
+            (cb.data(), CollectionRecord::Commit(cb).fingerprint()),
+            merged,
+        ));
+        let derive = CollectionRecord::Derive(CollectionDerive::sign(
+            &key,
+            target.handle(),
+            (merged, merge.fingerprint()),
+            derived,
+        ));
+        store.insert(merge).unwrap();
+        store.insert(derive).unwrap();
+        store.put::<SuccinctArchiveBlob, _>(output).unwrap();
+
+        let snapshot = store.snapshot().unwrap();
+        let attached = snapshot.collection(target).unwrap();
+        let walked = attached.support().unwrap().clone();
+
+        let index = coverage_of(&snapshot).unwrap();
+        let (folded, unattested) = index
+            .published()
+            .union_over(attached.cover().data_members());
+
+        assert!(unattested.is_empty(), "every cover member has a row");
+        let walked_members: Vec<_> = walked.data_members().map(|member| member.raw).collect();
+        let folded_members: Vec<_> = folded.iter_ordered().copied().collect();
+        assert_eq!(folded_members, walked_members);
+        assert_eq!(folded_members.len(), 2);
+        // The merge result is a node in the source lattice, and it covers the
+        // same two commits without anyone walking to them.
+        assert_eq!(index.coverage(merged).map(|row| row.len()), Some(2));
+    }
+
     fn fixture_records() -> (Vec<CollectionRecord>, CollectionCommit) {
         let commit = CollectionCommit::sign(
             &SigningKey::from_bytes(&[7; 32]),
