@@ -69,9 +69,38 @@ fn derive(
     ))
 }
 
-fn members(index: &CoverageIndex, node: CollectionData) -> Vec<[u8; 32]> {
+/// Every collection maps to the root of its lineage; anything unnamed is its
+/// own root. Real derived collections reach their foundation through their
+/// descriptors, which is what `StoreWriters` walks.
+struct Lineages(std::collections::BTreeMap<CollectionHandle, CollectionHandle>);
+
+impl RecordAdmission for Lineages {
+    fn foundation(&self, collection: CollectionHandle) -> Option<CollectionHandle> {
+        Some(*self.0.get(&collection).unwrap_or(&collection))
+    }
+
+    fn admits(
+        &self,
+        _collection: CollectionHandle,
+        _signer: Inline<crate::inline::encodings::ed25519::ED25519PublicKey>,
+    ) -> Admittance {
+        Admittance::Admitted
+    }
+}
+
+fn projection(hop: usize) -> CollectionHandle {
+    let mut raw = [0xEEu8; 32];
+    raw[0] = hop as u8;
+    Inline::new(raw)
+}
+
+fn members(
+    index: &CoverageIndex,
+    lineage: CollectionHandle,
+    node: CollectionData,
+) -> Vec<[u8; 32]> {
     index
-        .coverage(node)
+        .coverage(lineage, node)
         .map(|coverage| coverage.iter_ordered().copied().collect())
         .unwrap_or_default()
 }
@@ -79,15 +108,17 @@ fn members(index: &CoverageIndex, node: CollectionData) -> Vec<[u8; 32]> {
 #[test]
 fn a_commit_is_its_own_foundation() {
     let mut index = CoverageIndex::new();
-    index.apply(&commit(1, collection(0), data(1)), &AdmitEveryRecord);
-    assert_eq!(members(&index, data(1)), vec![[1u8; 32]]);
+    let c = collection(0);
+    index.apply(&commit(1, c, data(1)), &AdmitEveryRecord);
+    assert_eq!(members(&index, c, data(1)), vec![[1u8; 32]]);
 }
 
 #[test]
 fn a_node_nobody_attested_has_no_row_at_all() {
     let index = CoverageIndex::new();
-    assert!(index.coverage(data(9)).is_none());
-    assert!(!index.covers(data(9), data(9)));
+    let c = collection(0);
+    assert!(index.coverage(c, data(9)).is_none());
+    assert!(!index.covers(c, data(9), data(9)));
 }
 
 #[test]
@@ -97,61 +128,64 @@ fn a_merge_covers_both_sides() {
     index.apply(&commit(1, c, data(1)), &AdmitEveryRecord);
     index.apply(&commit(1, c, data(2)), &AdmitEveryRecord);
     index.apply(&merge(1, c, data(1), data(2), data(3)), &AdmitEveryRecord);
-    assert_eq!(members(&index, data(3)), vec![[1u8; 32], [2u8; 32]]);
+    assert_eq!(members(&index, c, data(3)), vec![[1u8; 32], [2u8; 32]]);
 }
 
 #[test]
 fn a_derive_carries_the_support_across_the_lattice_boundary() {
-    let mut index = CoverageIndex::new();
     let source = collection(0);
     let target = collection(7);
-    index.apply(&commit(1, source, data(1)), &AdmitEveryRecord);
-    index.apply(&commit(1, source, data(2)), &AdmitEveryRecord);
-    index.apply(
-        &merge(1, source, data(1), data(2), data(3)),
-        &AdmitEveryRecord,
-    );
-    index.apply(&derive(1, target, data(3), data(4)), &AdmitEveryRecord);
+    let lineages = Lineages([(target, source)].into_iter().collect());
+    let mut index = CoverageIndex::new();
+    index.apply(&commit(1, source, data(1)), &lineages);
+    index.apply(&commit(1, source, data(2)), &lineages);
+    index.apply(&merge(1, source, data(1), data(2), data(3)), &lineages);
+    index.apply(&derive(1, target, data(3), data(4)), &lineages);
     // The derived image denotes the same logical value, so it stands for the
-    // same foundation commits — not for its own payload.
-    assert_eq!(members(&index, data(4)), vec![[1u8; 32], [2u8; 32]]);
+    // same foundation commits — not for its own payload. Target and source
+    // share a foundation, so the projection needs no boundary crossing.
+    assert_eq!(members(&index, source, data(4)), vec![[1u8; 32], [2u8; 32]]);
 }
 
 #[test]
 fn records_arriving_before_their_inputs_still_land() {
+    let source = collection(0);
+    let target = collection(7);
+    let lineages = Lineages([(target, source)].into_iter().collect());
     let mut index = CoverageIndex::new();
-    let c = collection(0);
     // Reverse causal order: the derive first, then the merge it consumes, then
     // finally the commits underneath.
-    index.apply(&derive(1, collection(7), data(3), data(4)), &AdmitEveryRecord);
-    index.apply(&merge(1, c, data(1), data(2), data(3)), &AdmitEveryRecord);
-    assert!(index.coverage(data(3)).is_none());
-    index.apply(&commit(1, c, data(1)), &AdmitEveryRecord);
+    index.apply(&derive(1, target, data(3), data(4)), &lineages);
+    index.apply(&merge(1, source, data(1), data(2), data(3)), &lineages);
+    assert!(index.coverage(source, data(3)).is_none());
+    index.apply(&commit(1, source, data(1)), &lineages);
     // One side is not enough: a merge attests a join, not either half.
-    assert!(index.coverage(data(3)).is_none());
-    index.apply(&commit(1, c, data(2)), &AdmitEveryRecord);
-    assert_eq!(members(&index, data(3)), vec![[1u8; 32], [2u8; 32]]);
+    assert!(index.coverage(source, data(3)).is_none());
+    index.apply(&commit(1, source, data(2)), &lineages);
+    assert_eq!(members(&index, source, data(3)), vec![[1u8; 32], [2u8; 32]]);
     // And the growth propagated through the derive that was already parked.
-    assert_eq!(members(&index, data(4)), vec![[1u8; 32], [2u8; 32]]);
+    assert_eq!(members(&index, source, data(4)), vec![[1u8; 32], [2u8; 32]]);
 }
 
 #[test]
 fn a_row_that_grows_later_widens_everything_downstream_of_it() {
+    let source = collection(0);
+    let target = collection(7);
+    let lineages = Lineages([(target, source)].into_iter().collect());
     let mut index = CoverageIndex::new();
-    let c = collection(0);
-    index.apply(&commit(1, c, data(1)), &AdmitEveryRecord);
-    index.apply(&commit(1, c, data(2)), &AdmitEveryRecord);
-    index.apply(&merge(1, c, data(1), data(2), data(3)), &AdmitEveryRecord);
-    index.apply(&derive(1, collection(7), data(3), data(4)), &AdmitEveryRecord);
-    assert_eq!(members(&index, data(4)), vec![[1u8; 32], [2u8; 32]]);
+    index.apply(&commit(1, source, data(1)), &lineages);
+    index.apply(&commit(1, source, data(2)), &lineages);
+    index.apply(&merge(1, source, data(1), data(2), data(3)), &lineages);
+    index.apply(&derive(1, target, data(3), data(4)), &lineages);
+    assert_eq!(members(&index, source, data(4)), vec![[1u8; 32], [2u8; 32]]);
 
     // An alternative route attests that the same result also stands for a
     // third commit. Coverage is a union over routes, so the derived image
     // widens with it without replaying anything.
-    index.apply(&commit(1, c, data(5)), &AdmitEveryRecord);
-    index.apply(&merge(1, c, data(1), data(5), data(3)), &AdmitEveryRecord);
+    index.apply(&commit(1, source, data(5)), &lineages);
+    index.apply(&merge(1, source, data(1), data(5), data(3)), &lineages);
     assert_eq!(
-        members(&index, data(4)),
+        members(&index, source, data(4)),
         vec![[1u8; 32], [2u8; 32], [5u8; 32]]
     );
 }
@@ -168,11 +202,11 @@ fn folding_the_same_record_twice_changes_nothing() {
     for record in &records {
         index.apply(record, &AdmitEveryRecord);
     }
-    let once = members(&index, data(3));
+    let once = members(&index, c, data(3));
     for record in &records {
         index.apply(record, &AdmitEveryRecord);
     }
-    assert_eq!(members(&index, data(3)), once);
+    assert_eq!(members(&index, c, data(3)), once);
     assert_eq!(index.len(), 3);
 }
 
@@ -184,13 +218,17 @@ fn a_cycle_between_a_node_and_its_own_merge_terminates() {
     index.apply(&commit(1, c, data(2)), &AdmitEveryRecord);
     // MERGE(1, 2) -> 1: the result is also one of its own inputs.
     index.apply(&merge(1, c, data(1), data(2), data(1)), &AdmitEveryRecord);
-    assert_eq!(members(&index, data(1)), vec![[1u8; 32], [2u8; 32]]);
+    assert_eq!(members(&index, c, data(1)), vec![[1u8; 32], [2u8; 32]]);
 }
 
 /// Admission decided once, at fold time.
 struct OnlySigner(u8);
 
 impl RecordAdmission for OnlySigner {
+    fn foundation(&self, collection: CollectionHandle) -> Option<CollectionHandle> {
+        Some(collection)
+    }
+
     fn admits(
         &self,
         _collection: CollectionHandle,
@@ -212,16 +250,17 @@ fn a_record_whose_signer_is_not_admitted_yet_is_parked_not_dropped() {
     index.apply(&commit(2, c, data(2)), &OnlySigner(1));
     index.apply(&merge(2, c, data(1), data(2), data(3)), &OnlySigner(1));
 
-    assert_eq!(members(&index, data(1)), vec![[1u8; 32]]);
-    assert!(index.coverage(data(2)).is_none());
+    assert_eq!(members(&index, c, data(1)), vec![[1u8; 32]]);
+    assert!(index.coverage(c, data(2)).is_none());
     assert_eq!(index.parked_on_signers(), 2);
 
-    // The proof arrives. Draining one signer cascades through every record it
-    // was blocking, including the merge that needed its output.
-    index.admit_signer(Inline::new(signer(2).verifying_key().to_bytes()));
+    // The proofs arrive, so the oracle's answer changes and the index is
+    // re-offered everything it parked. Draining cascades through the merge
+    // that needed the newly admitted commit.
+    index.resolve(&AdmitEveryRecord);
     assert_eq!(index.parked_on_signers(), 0);
-    assert_eq!(members(&index, data(2)), vec![[2u8; 32]]);
-    assert_eq!(members(&index, data(3)), vec![[1u8; 32], [2u8; 32]]);
+    assert_eq!(members(&index, c, data(2)), vec![[2u8; 32]]);
+    assert_eq!(members(&index, c, data(3)), vec![[1u8; 32], [2u8; 32]]);
 }
 
 #[test]
@@ -234,7 +273,35 @@ fn an_unadmitted_route_contributes_nothing_to_a_node_an_admitted_route_reached()
     index.apply(&merge(1, c, data(1), data(2), data(3)), &OnlySigner(1));
     // A second, unadmitted attestation about the same result.
     index.apply(&merge(2, c, data(1), data(5), data(3)), &OnlySigner(1));
-    assert_eq!(members(&index, data(3)), vec![[1u8; 32], [2u8; 32]]);
+    assert_eq!(members(&index, c, data(3)), vec![[1u8; 32], [2u8; 32]]);
+}
+
+#[test]
+fn a_record_whose_lineage_cannot_be_resolved_parks() {
+    /// Knows no lineage at all, which is what a store looks like before a
+    /// descriptor is resident.
+    struct NoLineage;
+    impl RecordAdmission for NoLineage {
+        fn foundation(&self, _collection: CollectionHandle) -> Option<CollectionHandle> {
+            None
+        }
+        fn admits(
+            &self,
+            _collection: CollectionHandle,
+            _signer: Inline<crate::inline::encodings::ed25519::ED25519PublicKey>,
+        ) -> Admittance {
+            Admittance::Admitted
+        }
+    }
+
+    let mut index = CoverageIndex::new();
+    let c = collection(0);
+    index.apply(&commit(1, c, data(1)), &NoLineage);
+    assert!(index.is_empty());
+    assert_eq!(index.parked_on_signers(), 1);
+    // An admitted signer is not enough; a row needs a lineage to live in.
+    index.resolve(&AdmitEveryRecord);
+    assert_eq!(members(&index, c, data(1)), vec![[1u8; 32]]);
 }
 
 #[test]
@@ -247,14 +314,80 @@ fn set_algebra_between_two_nodes_is_patch_algebra() {
     index.apply(&merge(1, c, data(1), data(2), data(4)), &AdmitEveryRecord);
     index.apply(&merge(1, c, data(2), data(3), data(5)), &AdmitEveryRecord);
 
-    let left = index.coverage(data(4)).expect("left row").clone();
-    let right = index.coverage(data(5)).expect("right row").clone();
+    let left = index.coverage(c, data(4)).expect("left row").clone();
+    let right = index.coverage(c, data(5)).expect("right row").clone();
     let shared: Vec<_> = left.intersect(&right).iter_ordered().copied().collect();
     assert_eq!(shared, vec![[2u8; 32]]);
     let only_left: Vec<_> = left.difference(&right).iter_ordered().copied().collect();
     assert_eq!(only_left, vec![[1u8; 32]]);
 }
 
+/// Two lattices holding the same payload bytes do not share a row.
+///
+/// Content addressing makes a shared handle genuinely the same bytes, but the
+/// commits underneath it belong to a lineage, and commits from two lineages
+/// are not comparable. Scoping each row by its foundation is what keeps them
+/// apart — and it is free, because the inner set is a separate nested trie
+/// either way.
+#[test]
+fn one_payload_in_two_lattices_keeps_two_rows() {
+    let mut index = CoverageIndex::new();
+    let ledger = collection(0);
+    let tally = collection(1);
+    let shared = data(3);
+
+    // `shared` is committed on its own authority into `ledger`.
+    index.apply(&commit(1, ledger, shared), &AdmitEveryRecord);
+    // The very same bytes are the join of two commits in `tally`.
+    index.apply(&commit(1, tally, data(1)), &AdmitEveryRecord);
+    index.apply(&commit(1, tally, data(2)), &AdmitEveryRecord);
+    index.apply(&merge(1, tally, data(1), data(2), shared), &AdmitEveryRecord);
+
+    assert_eq!(members(&index, ledger, shared), vec![[3u8; 32]]);
+    assert_eq!(
+        members(&index, tally, shared),
+        vec![[1u8; 32], [2u8; 32]]
+    );
+}
+
+/// The subsumption verdict a bare result key used to flip.
+///
+/// Asking "does this node cover everything I need" was always safe, because
+/// the needed set is a known universe and a foreign member can never satisfy
+/// a real requirement. Asking "does this node subsume that one" — how a cover
+/// is minimised — has no universe to intersect against, so a foreign member
+/// could make a needed node read as redundant. `alias` covers only commit 1
+/// inside `tally`; a foreign lattice attesting that the same payload stands
+/// for commit 2 must not reach that row.
+#[test]
+fn a_foreign_member_cannot_flip_a_subsumption_verdict() {
+    let tally = collection(0);
+    let ledger = collection(1);
+    let alias = data(3);
+
+    let mut index = CoverageIndex::new();
+    index.apply(&commit(1, tally, data(1)), &AdmitEveryRecord);
+    index.apply(&commit(1, tally, data(2)), &AdmitEveryRecord);
+    index.apply(&merge(1, tally, data(1), data(1), alias), &AdmitEveryRecord);
+    index.apply(&merge(1, tally, data(1), data(2), data(5)), &AdmitEveryRecord);
+    // The foreign lattice commits its own copy of the same payload bytes and
+    // reaches `alias` by its own route.
+    index.apply(&commit(1, ledger, data(2)), &AdmitEveryRecord);
+    index.apply(&merge(1, ledger, data(2), data(2), alias), &AdmitEveryRecord);
+
+    let alias_row = index.coverage(tally, alias).expect("row").clone();
+    let pair = index.coverage(tally, data(5)).expect("row").clone();
+    assert_eq!(
+        alias_row.iter_ordered().copied().collect::<Vec<_>>(),
+        vec![[1u8; 32]]
+    );
+    assert!(
+        !pair.difference(&alias_row).is_empty(),
+        "a node tally still needs must not read as redundant"
+    );
+    // The foreign route kept its own row, and it says what it actually knows.
+    assert_eq!(members(&index, ledger, alias), vec![[2u8; 32]]);
+}
 /// What building the index on store open actually costs.
 ///
 /// Framing rule: the printed figure is **microseconds per record folded**, in
@@ -314,17 +447,27 @@ fn folding_a_realistic_lattice_is_cheap_enough_to_do_on_open() {
             raw[..8].copy_from_slice(&next_result.to_be_bytes());
             next_result += 1;
             let output = Inline::new(raw);
-            records.push(derive(1, collection(8 + hop as u8), carried, output));
+            records.push(derive(1, projection(hop), carried, output));
             carried = output;
         }
 
+        // Every derived hop shares the source lineage, exactly as a real
+        // derived collection does.
+        let lineages = Lineages(
+            (0..derive_hops)
+                .map(|hop| (projection(hop), source))
+                .collect(),
+        );
         let started = std::time::Instant::now();
         let mut index = CoverageIndex::new();
         for record in &records {
-            index.apply(record, &AdmitEveryRecord);
+            index.apply(record, &lineages);
         }
         let elapsed = started.elapsed();
-        assert_eq!(index.coverage(carried).map(|row| row.len()), Some(commits as u64));
+        assert_eq!(
+            index.coverage(source, carried).map(|row| row.len()),
+            Some(commits as u64)
+        );
         println!(
             "{:>7} records ({commits} commits, {derive_hops} derive hops): \
              {:>8.2?} total, {:>6.2} us/record",
@@ -340,89 +483,3 @@ fn folding_a_realistic_lattice_is_cheap_enough_to_do_on_open() {
     probe(100_000, 2);
 }
 
-/// The outer key is the bare result handle, so two collections attesting the
-/// same payload share one row.
-///
-/// This pins present behaviour rather than endorsing it. Content addressing
-/// means a shared key is genuinely the same bytes, and when both collections
-/// reach it the same way the union is a no-op. It stops being a no-op when a
-/// payload is a foundation commit in one lattice and a merge result in
-/// another: the row then names commits from a lineage the first collection
-/// has nothing to do with.
-#[test]
-fn one_payload_in_two_lattices_shares_a_row() {
-    let mut index = CoverageIndex::new();
-    let ledger = collection(0);
-    let tally = collection(1);
-    let shared = data(3);
-
-    // `shared` is committed on its own authority into `ledger`.
-    index.apply(&commit(1, ledger, shared), &AdmitEveryRecord);
-    assert_eq!(members(&index, shared), vec![[3u8; 32]]);
-
-    // The very same bytes are the join of two commits in `tally`.
-    index.apply(&commit(1, tally, data(1)), &AdmitEveryRecord);
-    index.apply(&commit(1, tally, data(2)), &AdmitEveryRecord);
-    index.apply(&merge(1, tally, data(1), data(2), shared), &AdmitEveryRecord);
-
-    assert_eq!(
-        members(&index, shared),
-        vec![[1u8; 32], [2u8; 32], [3u8; 32]]
-    );
-}
-
-/// What the shared row costs, stated as the question that actually breaks.
-///
-/// Asking "does this node cover everything I need" is safe under aliasing:
-/// the needed set is a known universe, and a foreign member can never satisfy
-/// a real requirement. Asking "does this node subsume that one", which is how
-/// a cover is minimised, has no universe to intersect against — so a foreign
-/// member can flip the verdict and drop a node the collection still needs.
-///
-/// `alias` covers only commit 1 inside `tally`. A foreign lattice attests
-/// that the same payload also stands for commit 2, and with that member in
-/// the row, `pair` — which genuinely covers both of tally's commits — reads
-/// as redundant beside it. Minimising the cover on that verdict would lose
-/// commit 2.
-#[test]
-fn a_foreign_member_can_flip_a_subsumption_verdict() {
-    let tally = collection(0);
-    let ledger = collection(1);
-    let alias = data(3);
-
-    let tally_only = {
-        let mut index = CoverageIndex::new();
-        index.apply(&commit(1, tally, data(1)), &AdmitEveryRecord);
-        index.apply(&commit(1, tally, data(2)), &AdmitEveryRecord);
-        index.apply(&merge(1, tally, data(1), data(1), alias), &AdmitEveryRecord);
-        index.apply(&merge(1, tally, data(1), data(2), data(5)), &AdmitEveryRecord);
-        index
-    };
-    let honest_alias = tally_only.coverage(alias).expect("row").clone();
-    let pair = tally_only.coverage(data(5)).expect("row").clone();
-    assert_eq!(
-        honest_alias.iter_ordered().copied().collect::<Vec<_>>(),
-        vec![[1u8; 32]]
-    );
-    // Restricted to tally, `pair` is not redundant: it names a commit the
-    // alias does not.
-    assert!(!pair.difference(&honest_alias).is_empty());
-
-    let mut aliased = CoverageIndex::new();
-    aliased.apply(&commit(1, tally, data(1)), &AdmitEveryRecord);
-    aliased.apply(&commit(1, tally, data(2)), &AdmitEveryRecord);
-    aliased.apply(&merge(1, tally, data(1), data(1), alias), &AdmitEveryRecord);
-    aliased.apply(&merge(1, tally, data(1), data(2), data(5)), &AdmitEveryRecord);
-    // The foreign lattice reaches the same payload by its own route.
-    aliased.apply(&merge(1, ledger, data(2), data(2), alias), &AdmitEveryRecord);
-
-    let polluted = aliased.coverage(alias).expect("row").clone();
-    assert_eq!(
-        polluted.iter_ordered().copied().collect::<Vec<_>>(),
-        vec![[1u8; 32], [2u8; 32]]
-    );
-    assert!(
-        pair.difference(&polluted).is_empty(),
-        "the foreign member makes a needed node read as redundant"
-    );
-}

@@ -5953,11 +5953,20 @@ mod tests {
         .unwrap();
         pile.refresh().unwrap();
 
-        assert!(pile.coverage.covers(result, low));
-        assert!(pile.coverage.covers(result, high));
-        assert_eq!(pile.coverage.coverage(result).map(|row| row.len()), Some(2));
+        // A registered SimpleArchive collection is the root of its own
+        // lineage, so it is also the scope its coverage rows live in.
+        let lineage = collection.handle();
+        assert!(pile.coverage.covers(lineage, result, low));
+        assert!(pile.coverage.covers(lineage, result, high));
+        assert_eq!(
+            pile.coverage.coverage(lineage, result).map(|row| row.len()),
+            Some(2)
+        );
         // A commit stands for itself and nothing else.
-        assert_eq!(pile.coverage.coverage(low).map(|row| row.len()), Some(1));
+        assert_eq!(
+            pile.coverage.coverage(lineage, low).map(|row| row.len()),
+            Some(1)
+        );
         assert!(!pile.coverage.has_parked());
         pile.close().unwrap();
     }
@@ -5999,11 +6008,10 @@ mod tests {
         let mut reopened = Pile::open(&path).unwrap();
         reopened.refresh().unwrap();
         assert_eq!(
-            reopened.coverage.coverage(result).map(|row| row.len()),
+            reopened.coverage.coverage(handle, result).map(|row| row.len()),
             Some(2)
         );
-        assert!(reopened.coverage.covers(result, low));
-        let _ = handle;
+        assert!(reopened.coverage.covers(handle, result, low));
         reopened.close().unwrap();
     }
 
@@ -6027,7 +6035,10 @@ mod tests {
         .unwrap();
         pile.refresh().unwrap();
 
-        assert!(pile.coverage.coverage(payload).is_none());
+        assert!(pile
+            .coverage
+            .coverage(collection.handle(), payload)
+            .is_none());
         assert_eq!(pile.coverage.parked_on_signers(), 1);
         pile.close().unwrap();
     }

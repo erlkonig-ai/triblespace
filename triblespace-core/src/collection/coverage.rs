@@ -51,7 +51,7 @@
 //! authorized: that decision is already baked into which unions happened.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ed25519_dalek::VerifyingKey;
 
@@ -79,26 +79,46 @@ pub type CoverageSet = PATCH<32, IdentitySchema, (), Blake3Merkle>;
 /// only asks questions has any use for them.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Coverage {
-    rows: PATCH<32, IdentitySchema, CoverageSet>,
+    rows: PATCH<64, IdentitySchema, CoverageSet>,
+}
+
+/// One row's key: the lineage a node belongs to, then the node itself.
+///
+/// Scoping by foundation rather than by the bare node handle is what keeps
+/// two unrelated lattices that happen to contain the same payload bytes from
+/// sharing a row. It costs nothing in sharing, because the inner set is a
+/// separate nested trie either way, and it preserves the sharing that
+/// matters: a derived collection and its source have the same foundation, so
+/// a `DERIVE` carries support across with no special case at all.
+fn row_key(foundation: CollectionHandle, node: CollectionData) -> [u8; 64] {
+    let mut key = [0u8; 64];
+    key[..32].copy_from_slice(&foundation.raw);
+    key[32..].copy_from_slice(&node.raw);
+    key
 }
 
 impl Coverage {
-    /// The foundation commits this node covers, if any admitted record has
-    /// attested it.
+    /// The foundation commits this node covers within that lineage, if any
+    /// admitted record has attested it.
     ///
     /// An absent row and an empty row are different answers: absent means no
-    /// admitted attestation names this payload as a result at all.
-    pub fn of(&self, node: CollectionData) -> Option<&CoverageSet> {
-        self.rows.get(&node.raw)
+    /// admitted attestation names this payload as a result in this lineage.
+    pub fn of(&self, foundation: CollectionHandle, node: CollectionData) -> Option<&CoverageSet> {
+        self.rows.get(&row_key(foundation, node))
     }
 
     /// Whether this node is known to cover that foundation commit.
-    pub fn covers(&self, node: CollectionData, commit: CollectionData) -> bool {
-        self.of(node)
+    pub fn covers(
+        &self,
+        foundation: CollectionHandle,
+        node: CollectionData,
+        commit: CollectionData,
+    ) -> bool {
+        self.of(foundation, node)
             .is_some_and(|coverage| coverage.get(&commit.raw).is_some())
     }
 
-    /// The union of what every one of these nodes covers.
+    /// The union of what every one of these nodes covers, within one lineage.
     ///
     /// Nodes with no row are reported rather than silently skipped: a caller
     /// asking for support needs to know its answer is partial. The union is
@@ -106,12 +126,13 @@ impl Coverage {
     /// extra.
     pub fn union_over(
         &self,
+        foundation: CollectionHandle,
         nodes: impl IntoIterator<Item = CollectionData>,
     ) -> (CoverageSet, Vec<CollectionData>) {
         let mut union = CoverageSet::new();
         let mut unattested = Vec::new();
         for node in nodes {
-            match self.of(node) {
+            match self.of(foundation, node) {
                 Some(row) => union.union(row.clone()),
                 None => unattested.push(node),
             }
@@ -212,22 +233,42 @@ pub enum Admittance {
     Pending,
 }
 
-/// Decides whether one signer may write the collection an attestation names.
+/// What the fold must know about a collection before it can believe an
+/// attestation naming it: which lineage the attestation belongs to, and
+/// whether this signer may make it.
 ///
 /// Implementors do the descriptor and capability work; this module only asks,
 /// and only once per attestation.
 pub trait RecordAdmission {
+    /// The root of this collection's lineage.
+    ///
+    /// Coverage rows name that foundation's commits, so this is the scope a
+    /// row belongs to. `None` when the descriptor chain is not resident yet —
+    /// an absence, not a refusal.
+    fn foundation(&self, collection: CollectionHandle) -> Option<CollectionHandle>;
+
     /// Whether attestations this signer makes about this collection count.
     fn admits(&self, collection: CollectionHandle, signer: Inline<ED25519PublicKey>) -> Admittance;
 }
 
-/// Admits every signer. For stores that carry no admission evidence, and for
-/// exercising the fold on its own.
+/// Admits every signer and treats every collection as its own foundation.
+///
+/// For stores that carry no admission evidence, and for exercising the fold
+/// on its own — where each test collection is the root of its own lineage,
+/// which is exactly what makes cross-lineage aliasing visible.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AdmitEveryRecord;
 
 impl RecordAdmission for AdmitEveryRecord {
-    fn admits(&self, _collection: CollectionHandle, _signer: Inline<ED25519PublicKey>) -> Admittance {
+    fn foundation(&self, collection: CollectionHandle) -> Option<CollectionHandle> {
+        Some(collection)
+    }
+
+    fn admits(
+        &self,
+        _collection: CollectionHandle,
+        _signer: Inline<ED25519PublicKey>,
+    ) -> Admittance {
         Admittance::Admitted
     }
 }
@@ -244,9 +285,9 @@ struct Parked {
 pub struct CoverageIndex {
     /// The half a reader sees: result payload handle to the commits it covers.
     published: Coverage,
-    /// Input payload handle to the attestations that read it, so a row that
-    /// grows can re-drive its consumers instead of forcing a full replay.
-    consumers: BTreeMap<[u8; 32], Vec<Attestation>>,
+    /// Lineage-scoped input handle to the attestations that read it, so a row
+    /// that grows can re-drive its consumers instead of forcing a full replay.
+    consumers: BTreeMap<[u8; 64], Vec<Attestation>>,
     /// Attestations parked on a signer no proof admits yet.
     pending_on_signer: BTreeMap<[u8; 32], Vec<Parked>>,
 }
@@ -262,13 +303,22 @@ impl CoverageIndex {
     ///
     /// An absent row and an empty row are different answers: absent means no
     /// admitted attestation names this payload as a result at all.
-    pub fn coverage(&self, node: CollectionData) -> Option<&CoverageSet> {
-        self.published.of(node)
+    pub fn coverage(
+        &self,
+        foundation: CollectionHandle,
+        node: CollectionData,
+    ) -> Option<&CoverageSet> {
+        self.published.of(foundation, node)
     }
 
     /// Whether this node is known to cover that foundation commit.
-    pub fn covers(&self, node: CollectionData, commit: CollectionData) -> bool {
-        self.published.covers(node, commit)
+    pub fn covers(
+        &self,
+        foundation: CollectionHandle,
+        node: CollectionData,
+        commit: CollectionData,
+    ) -> bool {
+        self.published.covers(foundation, node, commit)
     }
 
     /// The immutable observation to hand a reader.
@@ -327,7 +377,8 @@ impl CoverageIndex {
         signer: Inline<ED25519PublicKey>,
         admission: &A,
     ) {
-        if admission.admits(collection, signer) == Admittance::Pending {
+        let foundation = admission.foundation(collection);
+        if foundation.is_none() || admission.admits(collection, signer) == Admittance::Pending {
             self.pending_on_signer
                 .entry(signer.raw)
                 .or_default()
@@ -337,7 +388,7 @@ impl CoverageIndex {
                 });
             return;
         }
-        self.believe(attestation);
+        self.believe(foundation.expect("checked above"), attestation);
     }
 
     /// Record an attestation without deciding its admission yet.
@@ -389,40 +440,31 @@ impl CoverageIndex {
         }
     }
 
-    /// Retry every attestation parked on this signer.
-    ///
-    /// Call when a capability proof arrives. Draining is monotone: an
-    /// attestation that becomes believable stays believable.
-    pub fn admit_signer(&mut self, signer: Inline<ED25519PublicKey>) {
-        let Some(parked) = self.pending_on_signer.remove(&signer.raw) else {
-            return;
-        };
-        for entry in parked {
-            self.believe(entry.attestation);
-        }
-    }
-
-    /// Fold an attestation whose signer is already admitted.
-    fn believe(&mut self, attestation: Attestation) {
+    /// Fold an attestation whose collection resolves and whose signer is
+    /// admitted.
+    fn believe(&mut self, foundation: CollectionHandle, attestation: Attestation) {
         for input in attestation.inputs() {
-            let consumers = self.consumers.entry(input.raw).or_default();
+            let consumers = self
+                .consumers
+                .entry(row_key(foundation, input))
+                .or_default();
             if !consumers.contains(&attestation) {
                 consumers.push(attestation);
             }
         }
         let mut grown = Vec::new();
-        if self.drive(attestation) {
+        if self.drive(foundation, attestation) {
             grown.push(attestation.result());
         }
         // A row that grew may unblock or widen the attestations that read it,
         // and those may widen their own consumers in turn. Growth is bounded by
         // the finite set of foundation commits, so the worklist drains.
         while let Some(node) = grown.pop() {
-            let Some(consumers) = self.consumers.get(&node.raw) else {
+            let Some(consumers) = self.consumers.get(&row_key(foundation, node)) else {
                 continue;
             };
             for consumer in consumers.clone() {
-                if self.drive(consumer) {
+                if self.drive(foundation, consumer) {
                     grown.push(consumer.result());
                 }
             }
@@ -433,13 +475,13 @@ impl CoverageIndex {
     ///
     /// Returns whether the row actually grew — the termination condition for
     /// the propagation worklist.
-    fn drive(&mut self, attestation: Attestation) -> bool {
+    fn drive(&mut self, foundation: CollectionHandle, attestation: Attestation) -> bool {
         let mut contribution = match attestation {
             Attestation::Foundation { data } => CoverageSet::from_keys(std::iter::once(data.raw)),
             Attestation::Join { low, high, .. } => {
                 let (Some(low), Some(high)) = (
-                    self.published.rows.get(&low.raw),
-                    self.published.rows.get(&high.raw),
+                    self.published.rows.get(&row_key(foundation, low)),
+                    self.published.rows.get(&row_key(foundation, high)),
                 ) else {
                     // All or nothing: a join that only saw one side would
                     // otherwise publish a support it never attested.
@@ -450,14 +492,18 @@ impl CoverageIndex {
                 union
             }
             Attestation::Image { input, .. } => {
-                let Some(input) = self.published.rows.get(&input.raw) else {
+                // A derived collection shares its source's foundation, so the
+                // input row is already in scope: a projection needs no
+                // boundary crossing here, which is the point of scoping rows
+                // by lineage rather than by collection.
+                let Some(input) = self.published.rows.get(&row_key(foundation, input)) else {
                     return false;
                 };
                 input.clone()
             }
         };
-        let result = attestation.result();
-        if let Some(existing) = self.published.rows.get(&result.raw) {
+        let key = row_key(foundation, attestation.result());
+        if let Some(existing) = self.published.rows.get(&key) {
             if contribution.difference(existing).is_empty() {
                 return false;
             }
@@ -465,7 +511,7 @@ impl CoverageIndex {
         }
         self.published
             .rows
-            .replace(&Entry::with_value(&result.raw, contribution));
+            .replace(&Entry::with_value(&key, contribution));
         true
     }
 }
@@ -481,6 +527,7 @@ impl CoverageIndex {
 pub(crate) struct StoreWriters<'a, R> {
     reader: &'a R,
     evidence: RefCell<BTreeMap<CollectionHandle, Option<AdmissionEvidence>>>,
+    foundations: RefCell<BTreeMap<CollectionHandle, Option<CollectionHandle>>>,
 }
 
 impl<'a, R: BlobStoreGet + CapabilityProofRead> StoreWriters<'a, R> {
@@ -489,6 +536,30 @@ impl<'a, R: BlobStoreGet + CapabilityProofRead> StoreWriters<'a, R> {
         Self {
             reader,
             evidence: RefCell::new(BTreeMap::new()),
+            foundations: RefCell::new(BTreeMap::new()),
+        }
+    }
+
+    /// Walk a collection's descriptor chain to the root of its lineage.
+    ///
+    /// A descriptor names its source, so the root is the first one that names
+    /// none. Any link being absent makes the whole answer absent — a partial
+    /// walk would put rows under the wrong lineage, which is worse than
+    /// waiting. The guard is against a descriptor cycle, which content
+    /// addressing should make impossible and which would otherwise hang the
+    /// fold rather than fail it.
+    fn walk_to_foundation(&self, collection: CollectionHandle) -> Option<CollectionHandle> {
+        let mut seen = BTreeSet::new();
+        let mut cursor = collection;
+        loop {
+            if !seen.insert(cursor) {
+                return None;
+            }
+            let descriptor = super::api::load_collection_descriptor(self.reader, cursor).ok()?;
+            match super::descriptor::source(descriptor.fragment.facts()).ok()? {
+                Some(source) => cursor = source,
+                None => return Some(cursor),
+            }
         }
     }
 
@@ -514,6 +585,15 @@ impl<'a, R: BlobStoreGet + CapabilityProofRead> StoreWriters<'a, R> {
 }
 
 impl<R: BlobStoreGet + CapabilityProofRead> RecordAdmission for StoreWriters<'_, R> {
+    fn foundation(&self, collection: CollectionHandle) -> Option<CollectionHandle> {
+        if let Some(cached) = self.foundations.borrow().get(&collection) {
+            return *cached;
+        }
+        let resolved = self.walk_to_foundation(collection);
+        self.foundations.borrow_mut().insert(collection, resolved);
+        resolved
+    }
+
     fn admits(&self, collection: CollectionHandle, signer: Inline<ED25519PublicKey>) -> Admittance {
         if !self.write_evidence(collection) {
             // The descriptor is not resident, so nothing is known about who may
