@@ -4305,6 +4305,15 @@ impl CollectionRead for PileSnapshot {
     type RecordsError = ReadError;
     type RecordIter<'a> = PileCollectionRecordIter;
 
+    /// Hand out the index replay already folded, rather than folding again.
+    ///
+    /// One persistent-root clone. The answer is the same one the default fold
+    /// would reach from these records and this reader — `coverage_matches_a_fold_over_the_same_records`
+    /// pins that — because both decide admission from the same applied prefix.
+    fn coverage(&self) -> Result<Coverage, Self::RecordsError> {
+        Ok(self.coverage.clone())
+    }
+
     fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
         let keys = self.collection_records.clone().into_iter_ordered();
         Ok(PileCollectionRecordIter {
@@ -6107,6 +6116,67 @@ mod tests {
         assert_eq!(pile.coverage.parked(), 3);
         assert_eq!(pile.coverage.parked_on_signers(), 2);
         assert_eq!(pile.coverage.parked_on_lineages(), 1);
+        pile.close().unwrap();
+    }
+
+
+    /// The maintained index and a fold over the same records agree.
+    ///
+    /// `PileSnapshot::coverage` overrides the trait default to hand out what
+    /// replay already built, and that override is a claim: that folding these
+    /// records against this reader reaches the same answer. An override whose
+    /// equivalence is assumed rather than checked is how a fast path quietly
+    /// becomes a different path.
+    #[test]
+    fn coverage_matches_a_fold_over_the_same_records() {
+        use crate::collection::coverage::coverage_of;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "coverage-agreement.pile");
+        let mut pile = Pile::open(&path).unwrap();
+        let collection = register_simplearchive_collection(&mut pile, "coverage-agreement");
+        let authority = SigningKey::from_bytes(&[0xAA; 32]);
+        let stranger = SigningKey::from_bytes(&[7; 32]);
+
+        let low = collection_test_hash(6);
+        let high = collection_test_hash(7);
+        let result = collection_test_hash(8);
+        for payload in [low, high] {
+            pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
+                &authority,
+                collection.handle(),
+                payload,
+                empty_metadata_handle(),
+            )))
+            .unwrap();
+        }
+        pile.insert(CollectionRecord::Merge(CollectionMerge::sign(
+            &authority,
+            collection.handle(),
+            witnessed(&authority, collection.handle(), low),
+            witnessed(&authority, collection.handle(), high),
+            result,
+        )))
+        .unwrap();
+        // A record nobody can admit, and one naming a collection with no
+        // descriptor: both routes through the backlog, both must agree.
+        pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
+            &stranger,
+            collection.handle(),
+            collection_test_hash(9),
+            empty_metadata_handle(),
+        )))
+        .unwrap();
+        for record in collection_test_records() {
+            pile.insert(record).unwrap();
+        }
+
+        let snapshot = pile.snapshot().unwrap();
+        let maintained = CollectionRead::coverage(&snapshot).unwrap();
+        let folded = coverage_of(&snapshot).unwrap().published().clone();
+        assert_eq!(maintained, folded);
+        assert!(!maintained.is_empty());
+        drop(snapshot);
         pile.close().unwrap();
     }
 

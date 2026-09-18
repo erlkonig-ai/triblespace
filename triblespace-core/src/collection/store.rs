@@ -10,8 +10,9 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::Debug;
 
-use crate::repo::WantRequest;
+use crate::repo::{BlobStoreGet, CapabilityProofRead, WantRequest};
 
+use super::coverage::{coverage_of, Coverage};
 use super::{CollectionData, CollectionHandle, CollectionRecord, CollectionRecordFingerprint};
 
 /// One raw selection route into the grow-only collection-record set.
@@ -170,6 +171,24 @@ pub trait CollectionRead {
             }
         }
         Ok(None)
+    }
+
+    /// Downward coverage for every lattice node this store has admitted.
+    ///
+    /// The default implementation folds one enumeration of [`Self::records`],
+    /// deciding admission from this same reader. A backend that maintains the
+    /// index across appends — a pile does, during replay — should override
+    /// this and hand out what it already has; the answer is the same, it just
+    /// costs a persistent-root clone instead of a fold.
+    ///
+    /// Bounded on `Self: Sized` and the two readers the fold needs, so the
+    /// trait keeps every implementor that cannot answer the admission
+    /// question, and stays object-safe.
+    fn coverage(&self) -> Result<Coverage, Self::RecordsError>
+    where
+        Self: Sized + BlobStoreGet + CapabilityProofRead,
+    {
+        Ok(coverage_of(self)?.published().clone())
     }
 
     /// Select one deterministic union of raw record routes.
