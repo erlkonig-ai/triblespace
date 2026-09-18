@@ -741,12 +741,11 @@ mod tests {
         let walked = attached.support().unwrap().clone();
 
         let index = coverage_of(&snapshot).unwrap();
-        // The target is derived from `source`, so both live in the source's
-        // lineage and a projection needs no boundary crossing.
-        let lineage = source.handle();
+        // Cover members are nodes in the target; the merge they come from is
+        // a node in the source. Each is asked in its own collection.
         let (folded, unattested) = index
             .published()
-            .union_over(lineage, attached.cover().data_members());
+            .union_over(target.handle(), attached.cover().data_members());
 
         assert!(unattested.is_empty(), "every cover member has a row");
         let walked_members: Vec<_> = walked.data_members().map(|member| member.raw).collect();
@@ -755,7 +754,10 @@ mod tests {
         assert_eq!(folded_members.len(), 2);
         // The merge result is a node in the source lattice, and it covers the
         // same two commits without anyone walking to them.
-        assert_eq!(index.coverage(lineage, merged).map(|row| row.len()), Some(2));
+        assert_eq!(
+            index.coverage(source.handle(), merged).map(|row| row.len()),
+            Some(2)
+        );
     }
 
     fn fixture_records() -> (Vec<CollectionRecord>, CollectionCommit) {

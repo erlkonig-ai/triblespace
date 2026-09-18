@@ -2753,6 +2753,15 @@ pub struct Pile {
     /// per refresh, when every descriptor and proof in the applied prefix is
     /// resident.
     coverage: CoverageIndex,
+    /// Descriptor blobs and capability proofs observed in the batch currently
+    /// being applied, so the coverage backlog is drained by what actually
+    /// arrived rather than re-walked on every refresh.
+    ///
+    /// A pile grows by append and by sync, so there is no end of the run to
+    /// defer a decision to. What makes deferral correct is that it is keyed on
+    /// the arrival that would change the answer, and both arrivals are records
+    /// this loop already decodes.
+    coverage_arrivals: CoverageArrivals,
     /// Exact byte-distinct legacy V3 and unsigned collection headers accepted during replay.
     /// They remain inert but are conservatively carried through retained
     /// rewrites so an explicit future migration still has its source evidence.
@@ -2784,6 +2793,23 @@ pub struct Pile {
     /// Offsets below this value are guaranteed valid; corruption detection
     /// only operates on the un-applied tail beyond this boundary.
     applied_length: usize,
+}
+
+/// Arrivals in one applied batch that can change a parked coverage decision.
+///
+/// Only arrivals something is actually waiting on are recorded: the blob arm
+/// probes the backlog before pushing, so an ordinary payload blob costs one
+/// map lookup and nothing else.
+#[derive(Debug, Default)]
+struct CoverageArrivals {
+    descriptors: Vec<CollectionHandle>,
+    proofs: bool,
+}
+
+impl CoverageArrivals {
+    fn woke_anything(&self) -> bool {
+        !self.descriptors.is_empty() || self.proofs
+    }
 }
 
 fn padding_for_blob(blob_size: usize) -> usize {
@@ -3535,6 +3561,7 @@ impl Pile {
             collection_records_by_reference: CollectionRecordReferenceIndex::new(),
             capability_proofs: CapabilityProofIndex::new(),
             coverage: CoverageIndex::new(),
+            coverage_arrivals: CoverageArrivals::default(),
             legacy_collection_headers: LegacyCollectionHeaderIndex::new(),
             opaque_records: 0,
             opaque_frames: Vec::new(),
@@ -3644,6 +3671,12 @@ impl Pile {
                 let key = blob_occurrence_key(&hash.raw, candidate);
                 self.blobs
                     .insert(&Entry::with_value(&key, CachedValidation::default()));
+                // A descriptor is an ordinary blob, so this is the arrival that
+                // can unblock an attestation parked on an unresolved lineage.
+                let descriptor = Inline::new(hash.raw);
+                if self.coverage.blob_arrived(descriptor) {
+                    self.coverage_arrivals.descriptors.push(descriptor);
+                }
                 Applied::Blob { hash }
             }
             PileRecordContent::Branch { branch_id, head } => {
@@ -3717,6 +3750,10 @@ impl Pile {
                     self.capability_proofs
                         .insert(&Entry::with_value(&id.raw, candidate));
                 }
+                // A proof is the other arrival that can change an admission
+                // answer, so a batch carrying one wakes every signer-parked
+                // attestation. Proofs are rare; refreshes are not.
+                self.coverage_arrivals.proofs = true;
                 Applied::CapabilityProof { id }
             }
             PileRecordContent::RetiredCapabilityProof => Applied::RetiredCapabilityProof,
@@ -3801,12 +3838,20 @@ impl Pile {
     /// Attestations this pass cannot admit stay parked rather than being
     /// dropped — a proof may still arrive in a later append.
     fn resolve_coverage(&mut self) {
-        if !self.coverage.has_parked() {
+        let arrivals = std::mem::take(&mut self.coverage_arrivals);
+        if !self.coverage.has_fresh() && !arrivals.woke_anything() {
+            // Nothing new to decide and nothing arrived that could change an
+            // earlier decision, so a backlog nobody can admit costs this
+            // refresh nothing at all.
             return;
         }
         let mut coverage = std::mem::take(&mut self.coverage);
         let reader = self.reader_snapshot();
-        coverage.resolve(&StoreWriters::new(&reader));
+        coverage.settle(
+            &StoreWriters::new(&reader),
+            arrivals.descriptors,
+            arrivals.proofs,
+        );
         self.coverage = coverage;
     }
 
@@ -6055,7 +6100,13 @@ mod tests {
         }
         pile.refresh().unwrap();
         assert!(pile.coverage.is_empty());
-        assert_eq!(pile.coverage.parked_on_signers(), 3);
+        // The commit and the merge name a collection whose descriptor is
+        // absent, so nothing can say who may write it: both wait on a proof.
+        // The derive additionally cannot tell which collection its input
+        // lives in, so it waits on that descriptor instead.
+        assert_eq!(pile.coverage.parked(), 3);
+        assert_eq!(pile.coverage.parked_on_signers(), 2);
+        assert_eq!(pile.coverage.parked_on_lineages(), 1);
         pile.close().unwrap();
     }
 

@@ -69,14 +69,17 @@ fn derive(
     ))
 }
 
-/// Every collection maps to the root of its lineage; anything unnamed is its
-/// own root. Real derived collections reach their foundation through their
-/// descriptors, which is what `StoreWriters` walks.
+/// Maps a derived collection to the one it derives from; anything unnamed is
+/// a lineage root. Real collections answer this from their descriptor, which
+/// is the single hop `StoreWriters` reads.
 struct Lineages(std::collections::BTreeMap<CollectionHandle, CollectionHandle>);
 
 impl RecordAdmission for Lineages {
-    fn foundation(&self, collection: CollectionHandle) -> Option<CollectionHandle> {
-        Some(*self.0.get(&collection).unwrap_or(&collection))
+    fn source(&self, collection: CollectionHandle) -> SourceResolution {
+        match self.0.get(&collection) {
+            Some(source) => SourceResolution::Derived(*source),
+            None => SourceResolution::Root,
+        }
     }
 
     fn admits(
@@ -142,9 +145,9 @@ fn a_derive_carries_the_support_across_the_lattice_boundary() {
     index.apply(&merge(1, source, data(1), data(2), data(3)), &lineages);
     index.apply(&derive(1, target, data(3), data(4)), &lineages);
     // The derived image denotes the same logical value, so it stands for the
-    // same foundation commits — not for its own payload. Target and source
-    // share a foundation, so the projection needs no boundary crossing.
-    assert_eq!(members(&index, source, data(4)), vec![[1u8; 32], [2u8; 32]]);
+    // same foundation commits — not for its own payload. It is a node in the
+    // target, reading a node in the source.
+    assert_eq!(members(&index, target, data(4)), vec![[1u8; 32], [2u8; 32]]);
 }
 
 #[test]
@@ -164,7 +167,7 @@ fn records_arriving_before_their_inputs_still_land() {
     index.apply(&commit(1, source, data(2)), &lineages);
     assert_eq!(members(&index, source, data(3)), vec![[1u8; 32], [2u8; 32]]);
     // And the growth propagated through the derive that was already parked.
-    assert_eq!(members(&index, source, data(4)), vec![[1u8; 32], [2u8; 32]]);
+    assert_eq!(members(&index, target, data(4)), vec![[1u8; 32], [2u8; 32]]);
 }
 
 #[test]
@@ -177,7 +180,7 @@ fn a_row_that_grows_later_widens_everything_downstream_of_it() {
     index.apply(&commit(1, source, data(2)), &lineages);
     index.apply(&merge(1, source, data(1), data(2), data(3)), &lineages);
     index.apply(&derive(1, target, data(3), data(4)), &lineages);
-    assert_eq!(members(&index, source, data(4)), vec![[1u8; 32], [2u8; 32]]);
+    assert_eq!(members(&index, target, data(4)), vec![[1u8; 32], [2u8; 32]]);
 
     // An alternative route attests that the same result also stands for a
     // third commit. Coverage is a union over routes, so the derived image
@@ -185,7 +188,7 @@ fn a_row_that_grows_later_widens_everything_downstream_of_it() {
     index.apply(&commit(1, source, data(5)), &lineages);
     index.apply(&merge(1, source, data(1), data(5), data(3)), &lineages);
     assert_eq!(
-        members(&index, source, data(4)),
+        members(&index, target, data(4)),
         vec![[1u8; 32], [2u8; 32], [5u8; 32]]
     );
 }
@@ -225,8 +228,8 @@ fn a_cycle_between_a_node_and_its_own_merge_terminates() {
 struct OnlySigner(u8);
 
 impl RecordAdmission for OnlySigner {
-    fn foundation(&self, collection: CollectionHandle) -> Option<CollectionHandle> {
-        Some(collection)
+    fn source(&self, _collection: CollectionHandle) -> SourceResolution {
+        SourceResolution::Root
     }
 
     fn admits(
@@ -276,14 +279,21 @@ fn an_unadmitted_route_contributes_nothing_to_a_node_an_admitted_route_reached()
     assert_eq!(members(&index, c, data(3)), vec![[1u8; 32], [2u8; 32]]);
 }
 
+/// Only a projection needs a descriptor to know where to read.
+///
+/// A commit and a merge name their own collection and stay inside it, so an
+/// unresolvable descriptor never stops them — admission still does, but that
+/// is a different question with a different key. A derive is the one
+/// attestation whose input lives somewhere the record does not name, and it
+/// parks on the exact descriptor whose arrival would tell it where.
 #[test]
-fn a_record_whose_lineage_cannot_be_resolved_parks() {
-    /// Knows no lineage at all, which is what a store looks like before a
-    /// descriptor is resident.
-    struct NoLineage;
-    impl RecordAdmission for NoLineage {
-        fn foundation(&self, _collection: CollectionHandle) -> Option<CollectionHandle> {
-            None
+fn only_a_projection_parks_on_an_unresolvable_descriptor() {
+    /// Knows no descriptor at all, which is what a store looks like before
+    /// one is resident.
+    struct NoDescriptor;
+    impl RecordAdmission for NoDescriptor {
+        fn source(&self, collection: CollectionHandle) -> SourceResolution {
+            SourceResolution::Missing(collection)
         }
         fn admits(
             &self,
@@ -294,14 +304,55 @@ fn a_record_whose_lineage_cannot_be_resolved_parks() {
         }
     }
 
+    let source = collection(0);
+    let target = collection(7);
     let mut index = CoverageIndex::new();
-    let c = collection(0);
-    index.apply(&commit(1, c, data(1)), &NoLineage);
-    assert!(index.is_empty());
+    index.apply(&commit(1, source, data(1)), &NoDescriptor);
+    index.apply(&commit(1, source, data(2)), &NoDescriptor);
+    index.apply(&merge(1, source, data(1), data(2), data(3)), &NoDescriptor);
+    index.apply(&derive(1, target, data(3), data(4)), &NoDescriptor);
+
+    // The source lattice folded without any descriptor at all.
+    assert_eq!(members(&index, source, data(3)), vec![[1u8; 32], [2u8; 32]]);
+    // The projection could not know which collection to read, so it waits.
+    assert!(index.coverage(target, data(4)).is_none());
+    assert_eq!(index.parked_on_lineages(), 1);
+    assert_eq!(index.parked_on_signers(), 0);
+
+    // The descriptor lands and the projection completes.
+    index.settle(
+        &Lineages([(target, source)].into_iter().collect()),
+        [target],
+        false,
+    );
+    assert_eq!(members(&index, target, data(4)), vec![[1u8; 32], [2u8; 32]]);
+    assert_eq!(index.parked(), 0);
+}
+
+/// A drain costs the arrivals that happened, not the size of the backlog.
+///
+/// This is what makes the design work under continuous sync rather than only
+/// at the end of a replay: a refresh carrying no descriptor and no proof
+/// leaves an un-admittable backlog completely untouched.
+#[test]
+fn settling_without_the_awaited_arrival_does_nothing() {
+    let source = collection(0);
+    let target = collection(7);
+    let lineages = Lineages([(target, source)].into_iter().collect());
+    let mut index = CoverageIndex::new();
+    index.apply(&commit(1, source, data(1)), &OnlySigner(1));
+    index.apply(&commit(2, source, data(2)), &OnlySigner(1));
     assert_eq!(index.parked_on_signers(), 1);
-    // An admitted signer is not enough; a row needs a lineage to live in.
-    index.resolve(&AdmitEveryRecord);
-    assert_eq!(members(&index, c, data(1)), vec![[1u8; 32]]);
+
+    // A batch with neither a descriptor nor a proof in it.
+    index.settle(&OnlySigner(1), [], false);
+    assert_eq!(index.parked_on_signers(), 1);
+    assert!(index.coverage(source, data(2)).is_none());
+
+    // A batch carrying a proof wakes it.
+    index.settle(&AdmitEveryRecord, [], true);
+    assert_eq!(index.parked(), 0);
+    assert_eq!(members(&index, source, data(2)), vec![[2u8; 32]]);
 }
 
 #[test]
@@ -322,13 +373,13 @@ fn set_algebra_between_two_nodes_is_patch_algebra() {
     assert_eq!(only_left, vec![[1u8; 32]]);
 }
 
-/// Two lattices holding the same payload bytes do not share a row.
+/// Two collections holding the same payload bytes do not share a row.
 ///
 /// Content addressing makes a shared handle genuinely the same bytes, but the
-/// commits underneath it belong to a lineage, and commits from two lineages
-/// are not comparable. Scoping each row by its foundation is what keeps them
-/// apart — and it is free, because the inner set is a separate nested trie
-/// either way.
+/// commits underneath it belong to a collection, and commits from two
+/// collections are not comparable. Scoping each row by its collection is what
+/// keeps them apart — and it is free, because the commit set is a separate
+/// nested trie either way.
 #[test]
 fn one_payload_in_two_lattices_keeps_two_rows() {
     let mut index = CoverageIndex::new();
@@ -451,11 +502,14 @@ fn folding_a_realistic_lattice_is_cheap_enough_to_do_on_open() {
             carried = output;
         }
 
-        // Every derived hop shares the source lineage, exactly as a real
-        // derived collection does.
+        // Each hop derives from the one before it, exactly as a real chain of
+        // derived collections does.
         let lineages = Lineages(
             (0..derive_hops)
-                .map(|hop| (projection(hop), source))
+                .map(|hop| {
+                    let from = if hop == 0 { source } else { projection(hop - 1) };
+                    (projection(hop), from)
+                })
                 .collect(),
         );
         let started = std::time::Instant::now();
@@ -464,8 +518,13 @@ fn folding_a_realistic_lattice_is_cheap_enough_to_do_on_open() {
             index.apply(record, &lineages);
         }
         let elapsed = started.elapsed();
+        let last = if derive_hops == 0 {
+            source
+        } else {
+            projection(derive_hops - 1)
+        };
         assert_eq!(
-            index.coverage(source, carried).map(|row| row.len()),
+            index.coverage(last, carried).map(|row| row.len()),
             Some(commits as u64)
         );
         println!(
