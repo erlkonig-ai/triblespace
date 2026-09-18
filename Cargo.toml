@@ -120,6 +120,27 @@ harness = false
 name = "number_format"
 harness = false
 
+# Dependencies are built once and cached, so optimizing them costs almost
+# nothing per build and buys back most of the debug penalty: blake3 and the
+# siphash behind XorSip128 are unrolled SIMD code that is pathological at
+# opt-level 0, and PATCH hashes on essentially every node operation. Our own
+# crates stay at 1 so debuginfo and all 53 debug_asserts in patch.rs remain.
+#
+# Framing rule: measured 2026-09-18 on sky (GB10, aarch64) with the coverage
+# fold probe, microseconds per record folded. Release: 5.95 / 2.65 / 2.85 /
+# 2.94 at 821 / 3 445 / 29 961 / 200 001 records. Debug before this profile:
+# 101.6 / 99.3 / 129.0 / 169.3 -- 37x at 3.4k records worsening to 58x at
+# 200k, where release stays flat and debug degrades with size. Debug after:
+# 9.33 / 5.61 / 6.76 / 8.02, an 11-21x win that also restores release's flat
+# shape, so the superlinear part was the unoptimized dependencies rather than
+# anything of ours. That probe's own wall time went 371.6 s to 34.7 s; the
+# one-time dependency rebuild cost 7m14s and is cached thereafter.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
 [profile.bench]
 debug = true
 opt-level = 3
