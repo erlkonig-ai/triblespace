@@ -10,7 +10,7 @@ use crate::repo::StoreRead;
 
 use super::encoding::{collection_member_availability, CollectionMemberAvailability};
 use super::{
-    descriptor, Collection, CollectionEncoding, CollectionHandle, CollectionRead,
+    descriptor, Collection, CollectionData, CollectionEncoding, CollectionHandle, CollectionRead,
     CollectionRealizationError, CollectionRecord, CollectionRecordFingerprint,
     CollectionRecordSelector, CollectionSnapshot, Cover,
 };
@@ -175,6 +175,14 @@ where
 #[cfg(test)]
 mod tests;
 
+/// Which records in this set produce a merge's inputs.
+///
+/// A merge names its input PAYLOADS, so its inputs are whatever produces them
+/// in the same collection. That is what the old cited-witness form checked for
+/// anyway -- it looked a fingerprint up and then verified the record was in
+/// this collection and produced this payload, which is exactly the
+/// `(collection, payload)` key. Content addressing already holds the relation;
+/// the citation was a second copy of it.
 fn merge_inputs(
     record: CollectionRecord,
     records: &BTreeMap<CollectionRecordFingerprint, CollectionRecord>,
@@ -183,24 +191,35 @@ fn merge_inputs(
         return Vec::new();
     };
     let (low, high) = merge.inputs();
-    let (low_record, high_record) = merge.input_witnesses();
-    [(low_record, low), (high_record, high)]
-        .into_iter()
-        .filter_map(|(id, data)| {
-            records
-                .get(&id)
-                .filter(|input| {
-                    input.collection() == merge.collection()
-                        && super::witness::output(**input) == data
-                })
-                .map(|_| id)
+    let self_id = record.fingerprint();
+    records
+        .iter()
+        .filter(|(id, input)| {
+            // A merge may name its own result as an input -- `MERGE(x, x) -> x`
+            // is legal and appears in practice. Under content addressing it
+            // would then be its own input, be marked consumed, and never be
+            // reachable as a root. A citation could not express that because a
+            // witness named some other record; the payload form has to say so.
+            **id != self_id
+                && input.collection() == merge.collection()
+                && {
+                    let produced = super::witness::output(**input);
+                    produced == low || produced == high
+                }
         })
+        .map(|(id, _)| *id)
         .collect()
 }
 
-/// Reuse a coarser image when exact source-record order proves it covers a
-/// selected finer image. Walk indexed consumers upward, never foundational
-/// leaves downward. Missing relationships merely leave a finer cover.
+/// Reuse a coarser image when source order proves it covers a selected finer
+/// image. Walk consumers upward, never foundational leaves downward. Missing
+/// relationships merely leave a finer cover.
+///
+/// The walk is over PAYLOADS rather than over cited records: from the payload
+/// a candidate image reads, upward through whatever consumes it. A merge in
+/// the source consumes its two inputs; a derive into the target consumes the
+/// source payload it maps. Neither needs a witness to say so, because both
+/// already name the payload.
 fn coarsen_images<R: StoreRead>(
     snapshot: &R,
     target: CollectionHandle,
@@ -218,40 +237,48 @@ fn coarsen_images<R: StoreRead>(
     if images.len() < 2 {
         return Ok(());
     }
+    // Every record that could sit above a source payload, in one read.
+    let upward = snapshot
+        .select_records(&BTreeSet::from([
+            CollectionRecordSelector::Collection(source),
+            CollectionRecordSelector::DeriveTarget(target),
+        ]))
+        .map_err(|error| CollectionRealizationError::storage("read source order", error))?;
+    let mut consumers: BTreeMap<CollectionData, Vec<CollectionRecord>> = BTreeMap::new();
+    for record in upward {
+        match record {
+            CollectionRecord::Merge(merge) if merge.collection() == source => {
+                let (low, high) = merge.inputs();
+                consumers.entry(low).or_default().push(record);
+                if high != low {
+                    consumers.entry(high).or_default().push(record);
+                }
+            }
+            CollectionRecord::Derive(derive) if derive.collection() == target => {
+                consumers.entry(derive.input()).or_default().push(record);
+            }
+            _ => {}
+        }
+    }
     for (candidate, derive) in images {
         if !selected.contains(&candidate) {
             continue;
         }
-        let mut pending = vec![(derive.input_witness(), derive.input())];
+        let mut pending = vec![derive.input()];
         let mut visited = BTreeSet::new();
         let mut subsumed = false;
-        while let Some((input, data)) = pending.pop() {
-            if !visited.insert(input) {
+        while let Some(data) = pending.pop() {
+            if !visited.insert(data) {
                 continue;
             }
-            let consumers = snapshot
-                .select_records(&BTreeSet::from([
-                    CollectionRecordSelector::ReferencingRecord(input),
-                ]))
-                .map_err(|error| CollectionRealizationError::storage("read source order", error))?;
-            for record in consumers {
+            for record in consumers.get(&data).into_iter().flatten() {
                 match record {
-                    CollectionRecord::Merge(merge) if merge.collection() == source => {
-                        let (low, high) = merge.inputs();
-                        let (low_witness, high_witness) = merge.input_witnesses();
-                        if (low_witness == input && low == data)
-                            || (high_witness == input && high == data)
-                        {
-                            pending.push((record.fingerprint(), merge.result()));
-                        }
-                    }
+                    CollectionRecord::Merge(merge) => pending.push(merge.result()),
                     CollectionRecord::Derive(parent)
-                        if parent.collection() == target
-                            && parent.input_witness() == input
-                            && parent.input() == data
-                            && record.fingerprint() != candidate
+                        if record.fingerprint() != candidate
                             && selected.contains(&record.fingerprint()) =>
                     {
+                        let _ = parent;
                         subsumed = true;
                         break;
                     }
