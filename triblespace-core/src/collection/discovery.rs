@@ -217,22 +217,28 @@ where
 
     let mut pending = discovered.merges.clone();
     let mut seen: BTreeSet<_> = pending.iter().map(CollectionMerge::fingerprint).collect();
+    // A merge names its input PAYLOADS, so its predecessors are whatever
+    // produces them here. The cited form looked a fingerprint up and then
+    // checked the record was in this collection and produced this input --
+    // which is what `ProducedMember` is keyed on, so ask it directly. Every
+    // producer enters rather than only the one cited; admission was never
+    // re-checked on predecessors either way.
     while let Some(merge) = pending.pop() {
         let (low, high) = merge.inputs();
-        let (low_witness, high_witness) = merge.input_witnesses();
-        for (input, witness) in [(low, low_witness), (high, high_witness)] {
-            let Some(CollectionRecord::Merge(predecessor)) = snapshot
-                .record(witness)
-                .map_err(CollectionDiscoveryError::Records)?
-            else {
-                continue;
-            };
-            if predecessor.collection() != collection || predecessor.result() != input {
-                continue;
-            }
-            if seen.insert(predecessor.fingerprint()) {
-                discovered.merges.push(predecessor);
-                pending.push(predecessor);
+        for input in [low, high] {
+            let producers = snapshot
+                .select_records(&BTreeSet::from([CollectionRecordSelector::ProducedMember(
+                    collection, input,
+                )]))
+                .map_err(CollectionDiscoveryError::Records)?;
+            for record in producers {
+                let CollectionRecord::Merge(predecessor) = record else {
+                    continue;
+                };
+                if seen.insert(predecessor.fingerprint()) {
+                    discovered.merges.push(predecessor);
+                    pending.push(predecessor);
+                }
             }
         }
     }
