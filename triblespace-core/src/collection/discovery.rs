@@ -679,16 +679,17 @@ mod tests {
     }
 
 
-    /// The fold answers what the witness walk answers.
+    /// Support names the foundation commits underneath a derived image.
     ///
-    /// This is the thesis under test: support is downward coverage, so the set
-    /// a node stands for can be read from an index built once instead of
-    /// recovered by walking each record's witnesses on every query. Two
-    /// commits joined and then projected into a derived collection — the
-    /// shape every derived lattice is made of — and both routes must name the
-    /// same two foundation commits.
+    /// Two commits joined and then projected into a derived collection — the
+    /// shape every derived lattice is made of. This once compared `support()`
+    /// against a fold to show the index could replace the witness walk; that
+    /// comparison went circular the moment `support()` started reading the
+    /// index, so it asserts the expected members directly instead. The
+    /// evidence that the swap preserved behaviour is the unchanged suite
+    /// across it, not this test.
     #[test]
-    fn folded_coverage_equals_the_witness_walk_it_replaces() {
+    fn support_names_the_commits_under_a_derived_image() {
         use crate::blob::encodings::succinctarchive::SuccinctArchiveBlob;
         use crate::collection::coverage::coverage_of;
 
@@ -738,22 +739,28 @@ mod tests {
 
         let snapshot = store.snapshot().unwrap();
         let attached = snapshot.collection(target).unwrap();
-        let walked = attached.support().unwrap().clone();
+        let support: Vec<_> = attached
+            .support()
+            .unwrap()
+            .data_members()
+            .map(|member| member.raw)
+            .collect();
+        let expected = {
+            let mut both = vec![ca.data().raw, cb.data().raw];
+            both.sort();
+            both
+        };
+        assert_eq!(support, expected);
 
-        let index = coverage_of(&snapshot).unwrap();
         // Cover members are nodes in the target; the merge they come from is
-        // a node in the source. Each is asked in its own collection.
+        // a node in the source. Each is asked in its own collection, and the
+        // merge result covers the same two commits without a walk.
+        let index = coverage_of(&snapshot).unwrap();
         let (folded, unattested) = index
             .published()
             .union_over(target.handle(), attached.cover().data_members());
-
         assert!(unattested.is_empty(), "every cover member has a row");
-        let walked_members: Vec<_> = walked.data_members().map(|member| member.raw).collect();
-        let folded_members: Vec<_> = folded.iter_ordered().copied().collect();
-        assert_eq!(folded_members, walked_members);
-        assert_eq!(folded_members.len(), 2);
-        // The merge result is a node in the source lattice, and it covers the
-        // same two commits without anyone walking to them.
+        assert_eq!(folded.iter_ordered().copied().collect::<Vec<_>>(), expected);
         assert_eq!(
             index.coverage(source.handle(), merged).map(|row| row.len()),
             Some(2)

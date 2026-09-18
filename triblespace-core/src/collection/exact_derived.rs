@@ -667,7 +667,12 @@ where
     let candidates = snapshot.select_records(&selectors).map_err(|error| {
         CollectionRealizationError::storage("select endorsed collection records", error)
     })?;
-    let mut closure = memo.closure(lineage.foundation, &lineage.source_by_target);
+    // The caller's `evidence` covers the collections it asked to resolve. A
+    // walk descends past those into the foundation, so it needs writers for
+    // everything in the lineage -- otherwise every commit below the selection
+    // has no entry, is disbelieved, and nothing grounds.
+    let traversable = lineage_writers(snapshot, lineage)?;
+    let mut closure = memo.closure(lineage.foundation, &lineage.source_by_target, &traversable);
     let mut roots = BTreeSet::new();
     let mut witnesses = InputWitnesses::new();
     let mut images = BTreeMap::<_, BTreeSet<_>>::new();
@@ -1018,8 +1023,45 @@ where
     Ok((resolved.support, resolved.cover))
 }
 
-/// Expand only the exact endorsements retained by an immutable target read.
-/// Ancestor authority and payloads remain the admitted producer's responsibility.
+/// Who may WRITE each collection in one lineage.
+///
+/// Support is reachability over believed attestations, so every collection a
+/// walk may cross needs its writers known before the walk starts -- not just
+/// the one the caller happens to begin in.
+fn lineage_writers<R: StoreRead>(
+    snapshot: &R,
+    lineage: &Lineage,
+) -> Result<BTreeMap<CollectionHandle, super::api::AdmissionEvidence>, CollectionRealizationError> {
+    let mut collections: BTreeSet<CollectionHandle> = BTreeSet::new();
+    collections.insert(lineage.foundation.handle());
+    for (target, source) in &lineage.source_by_target {
+        collections.insert(*target);
+        collections.insert(*source);
+    }
+    let mut writers = BTreeMap::new();
+    for collection in collections {
+        let descriptor = lineage.descriptor(collection);
+        let admitted = super::api::discover_admission_evidence(
+            snapshot,
+            descriptor::admission_policies(snapshot, descriptor.facts(), super::ACTION_WRITE, None),
+            super::ACTION_WRITE,
+            collection,
+        )
+        .map_err(|error| {
+            CollectionRealizationError::storage("discover equation WRITE admission", error)
+        })?;
+        writers.insert(collection, admitted);
+    }
+    Ok(writers)
+}
+
+/// Read what an immutable target's retained endorsements stand for.
+///
+/// Every edge these records rest on was admitted when the coverage index
+/// folded it, so nothing is re-decided here and no witness is consulted: a
+/// record's support is the row its result already has. A record whose result
+/// has no row is reported rather than skipped, because a caller asking for
+/// support needs to know when its answer is partial.
 pub(crate) fn support_of_records<R, E>(
     snapshot: &R,
     target: Collection<E>,
@@ -1030,24 +1072,23 @@ where
     E: CollectionEncoding,
 {
     let lineage = load_lineage(snapshot, target)?;
-    let mut memo = WitnessMemo::default();
-    let mut closure = memo.closure(lineage.foundation, &lineage.source_by_target);
-    let mut support = Support::from_data(lineage.foundation, []);
-    let mut incomplete = Vec::new();
-    for record in records {
-        match closure
-            .support(snapshot, *record)
-            .map_err(|error| CollectionRealizationError::storage("read support witnesses", error))?
-        {
-            Some(represented) => {
-                support = support.union(&represented).expect("one foundation");
-            }
-            None => incomplete.push(record.fingerprint()),
-        }
-    }
-    if incomplete.is_empty() {
-        Ok(support)
+    let coverage = snapshot
+        .coverage()
+        .map_err(|error| CollectionRealizationError::storage("read downward coverage", error))?;
+    let (members, unattested) = coverage.union_over(
+        target.handle(),
+        records.iter().copied().map(super::witness::output),
+    );
+    if unattested.is_empty() {
+        Ok(Support::from_patch(lineage.foundation, members))
     } else {
+        // Name the records, not the payloads: a caller repairing this needs
+        // to know which endorsements it is missing evidence for.
+        let incomplete = records
+            .iter()
+            .filter(|record| unattested.contains(&super::witness::output(**record)))
+            .map(|record| record.fingerprint())
+            .collect();
         Err(CollectionRealizationError::IncompleteSupport {
             records: incomplete,
         })
