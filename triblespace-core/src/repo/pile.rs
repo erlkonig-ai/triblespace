@@ -1,4 +1,4 @@
-//! A Pile is an append-only collection of blobs, collection records, complete
+//! A PileFile is an append-only collection of blobs, collection records, complete
 //! capability proofs, wants, and legacy branches stored in a single file. It
 //! is designed as a durable local
 //! repository storage that can be safely shared between threads.
@@ -16,7 +16,7 @@
 //! beyond `applied_length`. Each record's [`ValidationState`](crate::repo::pile::ValidationState) is cached for the
 //! lifetime of the process under this immutability assumption.
 //!
-//! For layout and recovery details see the [Pile
+//! For layout and recovery details see the [PileFile
 //! Format](../../book/src/pile-format.md) chapter of the Tribles Book.
 
 use anybytes::Bytes;
@@ -51,7 +51,6 @@ use crate::capability::{
     CapabilityProof, CapabilityProofId, CAPABILITY_PROOF_EDGE_LEN, CAPABILITY_PROOF_HEADER_LEN,
     CAPABILITY_PROOF_MAGIC, MAX_CAPABILITY_PROOF_STEPS,
 };
-use crate::collection::coverage::{Coverage, CoverageArrivals, CoverageIndex, StoreWriters};
 use crate::collection::store::{selectors_match_record, CollectionRead};
 pub use crate::collection::LegacyUnsignedCollectionEquation;
 use crate::collection::{
@@ -156,12 +155,12 @@ fn pin_head_record_kind() -> RecordKind {
 
 fn retain_record_kind_if_resident(
     roots: &mut super::RetentionRoots,
-    reader: &PileSnapshot,
+    reader: &PileFileSnapshot,
     kind: RecordKind,
 ) {
     if reader
         .contains_blob(kind)
-        .expect("PileSnapshot residency lookup is infallible")
+        .expect("PileFileSnapshot residency lookup is infallible")
     {
         roots.retain_recursive(kind);
     }
@@ -319,7 +318,7 @@ fn block_post_pad(data_len: usize) -> usize {
 /// recheck parse failures behind an exclusive-lock completion barrier. Above
 /// it we switch to an exclusive-lock fallback that
 /// issues plain `write_all` calls — still append-only, still recoverable
-/// via [`Pile::amputate`], just serialized with other writers for the
+/// via [`PileFile::amputate`], just serialized with other writers for the
 /// duration of the large append. The margin keeps us comfortably below
 /// any platform's single-call ceiling.
 const ATOMIC_WRITE_LIMIT: usize = 1 << 30;
@@ -1370,7 +1369,7 @@ const _: () = {
 /// Yielded by [`PileRecords`], the raw record-level view of a pile. The
 /// record's header starts at `offset` and the whole record (header + payload +
 /// padding) spans `len` bytes, so `offset + len` is the offset of the next
-/// record. This is the same decoder the [`Pile`] itself replays on open, so it
+/// record. This is the same decoder the [`PileFile`] itself replays on open, so it
 /// understands every record format ever written (V1, unenveloped V3/V4, and
 /// the generic envelope alike).
 #[derive(Debug, Clone, Copy)]
@@ -2184,7 +2183,7 @@ fn decode_enveloped_record_v1(bytes: &[u8], offset: usize) -> Result<PileRecord,
 
 /// Decodes the record starting at the beginning of `bytes`, which is the pile
 /// file's content from `offset` onward. This is the single source of truth for
-/// record parsing: [`Pile::refresh`]/[`Pile::amputate`] replay records through
+/// record parsing: [`PileFile::refresh`]/[`PileFile::amputate`] replay records through
 /// it, and [`PileRecords`] exposes it for raw inspection.
 ///
 /// An unknown **kind** and an unknown **frame** are different questions with
@@ -2200,7 +2199,7 @@ fn decode_enveloped_record_v1(bytes: &[u8], offset: usize) -> Result<PileRecord,
 ///   magic buys, and it must stay sharp: never soften it into a skip or a
 ///   warning. A torn or truncated tail yields
 ///   [`ReadError::CorruptPile { valid_length: offset }`](ReadError::CorruptPile),
-///   which is what [`Pile::amputate`] repairs; bytes that name a legacy marker
+///   which is what [`PileFile::amputate`] repairs; bytes that name a legacy marker
 ///   this reader no longer decodes yield
 ///   [`ReadError::UnsupportedRecord`], which it deliberately refuses to
 ///   truncate.
@@ -2543,7 +2542,7 @@ struct IndexedBlobRecord {
 /// Entries are created only after `decode_record` accepted the complete record,
 /// and `covered_len` is the exact accepted prefix captured with this mapping.
 /// A failure here therefore means bytes below an applied boundary changed,
-/// which violates Pile's append-only safety contract.
+/// which violates PileFile's append-only safety contract.
 fn indexed_blob_record(
     mmap: &Arc<MmapRaw>,
     covered_len: usize,
@@ -2570,7 +2569,7 @@ fn indexed_blob_record(
 /// This is the record-level view of the append-only log: every blob, complete
 /// proof, branch update, branch tombstone, and WANT marker ever
 /// appended, including records that later ones supersede (superseded branch
-/// heads, tombstoned branches, and retired WANT log entries). It shares its decoder with the [`Pile`]
+/// heads, tombstoned branches, and retired WANT log entries). It shares its decoder with the [`PileFile`]
 /// replay path, so V1, unenveloped V3/V4, and generic-envelope records are
 /// understood; tools that need
 /// history or forensics (reflogs, consolidation, corruption reports) should
@@ -2668,6 +2667,21 @@ enum Applied {
     Opaque,
 }
 
+/// The store every consumer opens: a [`PileFile`] with its coverage index
+/// maintained by snapshot difference.
+pub type Pile = crate::collection::covered::Covered<PileFile>;
+/// One immutable observation of a [`Pile`]: the file snapshot and the index
+/// settled for exactly that prefix.
+pub type PileSnapshot = crate::collection::covered::CoveredSnapshot<PileFileSnapshot>;
+
+impl Pile {
+    /// Open the pile at `path` and replay it, with the coverage index fed at
+    /// the first snapshot.
+    pub fn open(path: &Path) -> Result<Self, ReadError> {
+        PileFile::open(path).map(Self::new)
+    }
+}
+
 #[derive(Debug)]
 /// A grow-only collection of blobs, collection records, complete proofs,
 /// wants, and pin heads backed by a single file on disk.
@@ -2675,10 +2689,10 @@ enum Applied {
 /// Branch updates do not verify that referenced blobs exist in the pile, allowing the
 /// pile to operate as a head-only store when blob data lives elsewhere.
 ///
-/// [`Pile::refresh`] aborts immediately if the underlying file shrinks below
+/// [`PileFile::refresh`] aborts immediately if the underlying file shrinks below
 /// data that has already been applied, preventing undefined behavior from
 /// dangling [`Bytes`] handles.
-pub struct Pile {
+pub struct PileFile {
     file: File,
     mmap: Arc<MmapRaw>,
     /// Whether this handle has appended or truncated bytes since its last
@@ -2701,23 +2715,6 @@ pub struct Pile {
     /// Complete canonical proofs keyed by the BLAKE3 identity of exact bytes.
     /// Each value owns its validated mmap-backed view, shared by snapshots and readers.
     capability_proofs: CapabilityProofIndex,
-    /// Downward coverage folded from every replayed record: which foundation
-    /// commits each lattice node stands for.
-    ///
-    /// Never persisted and never written to the file. Replay parks each
-    /// record's attestation; [`Pile::resolve_coverage`] decides admission once
-    /// per refresh, when every descriptor and proof in the applied prefix is
-    /// resident.
-    coverage: CoverageIndex,
-    /// Descriptor blobs and capability proofs observed in the batch currently
-    /// being applied, so the coverage backlog is drained by what actually
-    /// arrived rather than re-walked on every refresh.
-    ///
-    /// A pile grows by append and by sync, so there is no end of the run to
-    /// defer a decision to. What makes deferral correct is that it is keyed on
-    /// the arrival that would change the answer, and both arrivals are records
-    /// this loop already decodes.
-    coverage_arrivals: CoverageArrivals,
     /// Exact byte-distinct legacy V3 and unsigned collection headers accepted during replay.
     /// They remain inert but are conservatively carried through retained
     /// rewrites so an explicit future migration still has its source evidence.
@@ -2761,13 +2758,13 @@ fn padding_for_blob(blob_size: usize) -> usize {
 }
 
 #[derive(Debug, Clone)]
-/// One immutable, coherent observation of a [`Pile`].
+/// One immutable, coherent observation of a [`PileFile`].
 ///
 /// Blob bytes, collection records, and capability proofs all come from the
 /// same validated pile prefix. Persistent PATCH roots make both
 /// cloning and [`StoreSnapshot::changes_since`](super::StoreSnapshot::changes_since)
 /// constant-time in the number of semantic components.
-pub struct PileSnapshot {
+pub struct PileFileSnapshot {
     mmap: Arc<MmapRaw>,
     covered_len: usize,
     opaque_records: usize,
@@ -2780,12 +2777,6 @@ pub struct PileSnapshot {
     collection_records: CollectionRecordIndex,
     collection_records_by_collection: CollectionRecordCollectionIndex,
     collection_records_by_produced_member: CollectionRecordProducedMemberIndex,
-    /// Downward coverage as of this exact prefix, folded during replay.
-    ///
-    /// One persistent PATCH root, so carrying it costs the same as carrying
-    /// any other index here. The fold's consumer map and admission backlog
-    /// stay behind on the pile: a reader only ever asks what a node covers.
-    coverage: CoverageIndex,
     legacy_collection_headers: LegacyCollectionHeaderIndex,
     capability_proofs: CapabilityProofIndex,
     wants: PATCH<WANT_REQUEST_BYTES_LEN, IdentitySchema>,
@@ -2809,7 +2800,7 @@ pub struct WantCutoverStatus {
     pub missing_current: usize,
 }
 
-impl PileSnapshot {
+impl PileFileSnapshot {
     fn new(
         mmap: Arc<MmapRaw>,
         covered_len: usize,
@@ -2818,7 +2809,6 @@ impl PileSnapshot {
         collection_records: CollectionRecordIndex,
         collection_records_by_collection: CollectionRecordCollectionIndex,
         collection_records_by_produced_member: CollectionRecordProducedMemberIndex,
-        coverage: CoverageIndex,
         legacy_collection_headers: LegacyCollectionHeaderIndex,
         capability_proofs: CapabilityProofIndex,
         wants: PATCH<WANT_REQUEST_BYTES_LEN, IdentitySchema>,
@@ -2831,20 +2821,12 @@ impl PileSnapshot {
             collection_records,
             collection_records_by_collection,
             collection_records_by_produced_member,
-            coverage,
             legacy_collection_headers,
             capability_proofs,
             wants,
         }
     }
 
-    /// Downward coverage as of this exact observation.
-    ///
-    /// Every edge folded into it was admitted when it was folded, so reading
-    /// a row here is reading a decision already made, not re-deciding it.
-    pub fn coverage(&self) -> &Coverage {
-        self.coverage.published()
-    }
 
     /// Returns an iterator over all blobs currently stored in the pile.
     ///
@@ -2966,7 +2948,7 @@ impl PileSnapshot {
     // metadata moved into BlobStoreMeta impl below
 }
 
-impl BlobStoreGet for PileSnapshot {
+impl BlobStoreGet for PileFileSnapshot {
     type GetError<E: Error + Send + Sync + 'static> = GetBlobError<E>;
 
     fn get<T, S>(
@@ -2990,9 +2972,9 @@ impl BlobStoreGet for PileSnapshot {
     }
 }
 
-impl super::BlobChildren for PileSnapshot {}
+impl super::BlobChildren for PileFileSnapshot {}
 
-impl super::StoreSnapshot for PileSnapshot {
+impl super::StoreSnapshot for PileFileSnapshot {
     fn changes_since(&self, previous: &Self) -> super::StoreChanges {
         let mut changes = super::StoreChanges::NONE;
         // A semantic addition and another physical fallback occurrence are
@@ -3088,13 +3070,13 @@ impl super::StoreSnapshot for PileSnapshot {
     }
 }
 
-impl super::SnapshotSource for Pile {
-    type Snapshot = PileSnapshot;
+impl super::SnapshotSource for PileFile {
+    type Snapshot = PileFileSnapshot;
     type SnapshotError = ReadError;
 
     fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
         self.refresh()?;
-        Ok(PileSnapshot::new(
+        Ok(PileFileSnapshot::new(
             self.mmap.clone(),
             self.applied_length,
             self.opaque_records,
@@ -3102,7 +3084,6 @@ impl super::SnapshotSource for Pile {
             self.collection_records.clone(),
             self.collection_records_by_collection.clone(),
             self.collection_records_by_produced_member.clone(),
-            self.coverage.clone(),
             self.legacy_collection_headers.clone(),
             self.capability_proofs.clone(),
             self.wants.clone(),
@@ -3110,7 +3091,7 @@ impl super::SnapshotSource for Pile {
     }
 }
 
-/// Error returned when opening or refreshing a [`Pile`].
+/// Error returned when opening or refreshing a [`PileFile`].
 #[derive(Debug)]
 pub enum ReadError {
     /// Underlying I/O failure.
@@ -3152,7 +3133,7 @@ impl std::fmt::Display for ReadError {
                 hex::encode_upper(marker)
             ),
             ReadError::FileTooLarge { length } => {
-                write!(f, "Pile of length {length} exceeds supported size")
+                write!(f, "PileFile of length {length} exceeds supported size")
             }
         }
     }
@@ -3192,7 +3173,7 @@ impl From<ReadError> for std::io::Error {
     }
 }
 
-/// Error returned when appending a blob to a [`Pile`].
+/// Error returned when appending a blob to a [`PileFile`].
 #[derive(Debug)]
 pub enum InsertError {
     /// Underlying I/O failure.
@@ -3237,7 +3218,7 @@ impl From<ReadError> for InsertError {
 }
 
 /// Error returned when appending a pin-head update or want marker to a
-/// [`Pile`].
+/// [`PileFile`].
 pub enum PileWriteError {
     /// Underlying I/O failure.
     IoError(std::io::Error),
@@ -3390,7 +3371,7 @@ impl From<std::io::Error> for CapabilityProofInsertError {
     }
 }
 
-/// Error returned when retrieving a blob from a [`Pile`].
+/// Error returned when retrieving a blob from a [`PileFile`].
 #[derive(Debug)]
 pub enum GetBlobError<E: Error> {
     /// No blob with the given handle exists in the pile.
@@ -3421,7 +3402,7 @@ impl<E: Error + 'static> std::error::Error for GetBlobError<E> {
     }
 }
 
-/// Error returned by [`Pile::flush`] and [`Pile::close`].
+/// Error returned by [`PileFile::flush`] and [`PileFile::close`].
 #[derive(Debug)]
 pub enum FlushError {
     /// Underlying I/O failure.
@@ -3444,7 +3425,7 @@ impl std::fmt::Display for FlushError {
 
 impl std::error::Error for FlushError {}
 
-impl Pile {
+impl PileFile {
     /// Metadata for the exact backing file opened by this handle.
     ///
     /// This is deliberately derived from the held file descriptor rather than
@@ -3493,8 +3474,6 @@ impl Pile {
             collection_records_by_collection: CollectionRecordCollectionIndex::new(),
             collection_records_by_produced_member: CollectionRecordProducedMemberIndex::new(),
             capability_proofs: CapabilityProofIndex::new(),
-            coverage: CoverageIndex::new(),
-            coverage_arrivals: CoverageArrivals::default(),
             legacy_collection_headers: LegacyCollectionHeaderIndex::new(),
             opaque_records: 0,
             opaque_frames: Vec::new(),
@@ -3604,12 +3583,6 @@ impl Pile {
                 let key = blob_occurrence_key(&hash.raw, candidate);
                 self.blobs
                     .insert(&Entry::with_value(&key, CachedValidation::default()));
-                // A descriptor is an ordinary blob, so this is the arrival that
-                // can unblock an attestation parked on an unresolved lineage.
-                let descriptor = Inline::new(hash.raw);
-                if self.coverage.blob_arrived(descriptor) {
-                    self.coverage_arrivals.descriptors.push(descriptor);
-                }
                 Applied::Blob { hash }
             }
             PileRecordContent::Branch { branch_id, head } => {
@@ -3649,7 +3622,6 @@ impl Pile {
                             record,
                             fingerprint,
                         )));
-                    self.coverage.park_record(&record);
                 }
                 Applied::Collection { fingerprint }
             }
@@ -3660,7 +3632,7 @@ impl Pile {
             } => {
                 // The decoder just validated this exact immutable body and its
                 // bounds. Retaining the mapping makes the proof independent of
-                // this Pile's lifetime and subsequent mapping replacements.
+                // this PileFile's lifetime and subsequent mapping replacements.
                 let bytes = unsafe {
                     let body = slice_from_raw_parts(self.mmap.as_ptr().add(data_offset), data_len)
                         .as_ref()
@@ -3678,10 +3650,6 @@ impl Pile {
                     self.capability_proofs
                         .insert(&Entry::with_value(&id.raw, candidate));
                 }
-                // A proof is the other arrival that can change an admission
-                // answer, so a batch carrying one wakes every signer-parked
-                // attestation. Proofs are rare; refreshes are not.
-                self.coverage_arrivals.proofs = true;
                 Applied::CapabilityProof { id }
             }
             PileRecordContent::RetiredCapabilityProof => Applied::RetiredCapabilityProof,
@@ -3746,48 +3714,18 @@ impl Pile {
         loop {
             match self.apply_next_bounded(file_len) {
                 Ok(Some(_)) => {}
-                Ok(None) => {
-                    self.resolve_coverage();
-                    return Ok(());
-                }
+                Ok(None) => return Ok(()),
                 Err(error) => return Err(error),
             }
         }
     }
 
-    /// Decide admission for every attestation parked during replay.
-    ///
-    /// Deliberately after the apply loop, not inside it: the descriptor that
-    /// says who may write a collection, and the capability proofs that answer
-    /// it, are themselves records in the same file and may sit after the
-    /// records they authorize. Asking once, when the applied prefix is
-    /// complete, is both correct and cheaper than asking per record.
-    ///
-    /// Attestations this pass cannot admit stay parked rather than being
-    /// dropped — a proof may still arrive in a later append.
-    fn resolve_coverage(&mut self) {
-        let arrivals = std::mem::take(&mut self.coverage_arrivals);
-        if !self.coverage.has_fresh() && !arrivals.woke_anything() {
-            // Nothing new to decide and nothing arrived that could change an
-            // earlier decision, so a backlog nobody can admit costs this
-            // refresh nothing at all.
-            return;
-        }
-        let mut coverage = std::mem::take(&mut self.coverage);
-        let reader = self.reader_snapshot();
-        coverage.settle(
-            &StoreWriters::new(&reader),
-            arrivals.descriptors,
-            arrivals.proofs,
-        );
-        self.coverage = coverage;
-    }
 
     /// One immutable observation of the applied prefix, for questions this
     /// pile needs to ask itself. Every component is a persistent PATCH root or
     /// an `Arc`, so this is a constant-time clone rather than a copy.
-    fn reader_snapshot(&self) -> PileSnapshot {
-        PileSnapshot::new(
+    fn reader_snapshot(&self) -> PileFileSnapshot {
+        PileFileSnapshot::new(
             self.mmap.clone(),
             self.applied_length,
             self.opaque_records,
@@ -3795,7 +3733,6 @@ impl Pile {
             self.collection_records.clone(),
             self.collection_records_by_collection.clone(),
             self.collection_records_by_produced_member.clone(),
-            self.coverage.clone(),
             self.legacy_collection_headers.clone(),
             self.capability_proofs.clone(),
             self.wants.clone(),
@@ -3913,30 +3850,30 @@ impl Pile {
     }
 }
 
-impl Drop for Pile {
+impl Drop for PileFile {
     fn drop(&mut self) {
-        eprintln!("warning: Pile dropped without calling close(); data may not be persisted");
+        eprintln!("warning: PileFile dropped without calling close(); data may not be persisted");
     }
 }
 
 // Implement the repository storage close trait so callers can call
-// `repo.close()` when the repository was created with a `Pile` storage.
-impl crate::repo::StorageClose for Pile {
+// `repo.close()` when the repository was created with a `PileFile` storage.
+impl crate::repo::StorageClose for PileFile {
     type Error = FlushError;
 
     fn close(self) -> Result<(), Self::Error> {
-        Pile::close(self)
+        PileFile::close(self)
     }
 }
 
 // Generic durability hook: appended records (blobs, branch updates,
 // collection records, want markers) are not crash-durable until flushed — see the
-// inherent [`Pile::flush`].
-impl crate::repo::StorageFlush for Pile {
+// inherent [`PileFile::flush`].
+impl crate::repo::StorageFlush for PileFile {
     type Error = FlushError;
 
     fn flush(&mut self) -> Result<(), Self::Error> {
-        Pile::flush(self)
+        PileFile::flush(self)
     }
 }
 
@@ -3946,13 +3883,13 @@ use super::BlobStoreList;
 use super::BlobStorePut;
 use super::WantStore;
 
-/// Iterator returned by [`PileSnapshot::iter`].
+/// Iterator returned by [`PileFileSnapshot::iter`].
 ///
 /// Iterates over all `(Handle, Blob)` pairs currently stored in the pile.
 /// The iterator owns persistent roots rather than a collected handle list, so
-/// it can live independently of the [`Pile`] without an O(blob-count) setup.
+/// it can live independently of the [`PileFile`] without an O(blob-count) setup.
 pub struct PileBlobStoreIter {
-    snapshot: PileSnapshot,
+    snapshot: PileFileSnapshot,
     inner: crate::patch::PATCHIntoPrefixSetIterator<
         40,
         32,
@@ -3984,7 +3921,7 @@ impl Iterator for PileBlobStoreIter {
 
 /// Adapter that yields semantic blob information from an occurrence snapshot.
 pub struct PileBlobStoreListIter {
-    snapshot: PileSnapshot,
+    snapshot: PileFileSnapshot,
     inner: crate::patch::PATCHIntoPrefixSetIterator<
         40,
         32,
@@ -4016,7 +3953,7 @@ impl Iterator for PileBlobStoreListIter {
     }
 }
 
-impl BlobStoreList for PileSnapshot {
+impl BlobStoreList for PileFileSnapshot {
     type Err = GetBlobError<Infallible>;
     type Iter<'a> = PileBlobStoreListIter;
 
@@ -4093,7 +4030,7 @@ impl Iterator for PileCollectionRecordIter {
     }
 }
 
-impl Pile {
+impl PileFile {
     /// Store every blob needed to resolve every record kind this writer emits.
     ///
     /// A record kind is the handle of a description archive, which makes it
@@ -4136,7 +4073,7 @@ impl Pile {
     /// idempotent by exact header bytes.
     pub(crate) fn preserve_legacy_collection_headers_into(
         &mut self,
-        destination: &mut Pile,
+        destination: &mut PileFile,
     ) -> Result<(), CollectionInsertError> {
         self.refresh()?;
         let headers = self.legacy_collection_headers.clone();
@@ -4227,7 +4164,7 @@ impl Pile {
     }
 }
 
-impl crate::collection::covered::RecordDelta for PileSnapshot {
+impl crate::collection::covered::RecordDelta for PileFileSnapshot {
     fn for_each_record_since(
         &self,
         since: Option<&Self>,
@@ -4243,17 +4180,7 @@ impl crate::collection::covered::RecordDelta for PileSnapshot {
     }
 }
 
-impl crate::collection::CoverageRead for PileSnapshot {
-    /// The index replay maintained; a persistent-root clone.
-    fn index(
-        &self,
-        _lineage: &BTreeSet<CollectionHandle>,
-    ) -> Result<CoverageIndex, Self::RecordsError> {
-        Ok(self.coverage.clone())
-    }
-}
-
-impl CollectionRead for PileSnapshot {
+impl CollectionRead for PileFileSnapshot {
     type RecordsError = ReadError;
     type RecordIter<'a> = PileCollectionRecordIter;
 
@@ -4334,7 +4261,7 @@ impl CollectionRead for PileSnapshot {
     }
 }
 
-impl CollectionStore for Pile {
+impl CollectionStore for PileFile {
     type InsertError = CollectionInsertError;
 
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
@@ -4376,7 +4303,7 @@ impl CollectionStore for Pile {
     }
 }
 
-impl CapabilityProofRead for PileSnapshot {
+impl CapabilityProofRead for PileFileSnapshot {
     type ProofsError = ReadError;
     type ProofIter<'a> = PileCapabilityProofIter;
 
@@ -4393,7 +4320,7 @@ impl CapabilityProofRead for PileSnapshot {
     }
 }
 
-impl CapabilityProofStore for Pile {
+impl CapabilityProofStore for PileFile {
     type InsertError = CapabilityProofInsertError;
 
     fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
@@ -4457,7 +4384,7 @@ impl CapabilityProofStore for Pile {
     }
 }
 
-impl Pile {
+impl PileFile {
     /// Refresh once and return the remaining fail-closed condition for a
     /// semantic physical rewrite from that exact applied prefix.
     pub(crate) fn physical_rewrite_guard(&mut self) -> Result<usize, ReadError> {
@@ -4465,7 +4392,7 @@ impl Pile {
     }
 }
 
-impl BlobStorePut for Pile {
+impl BlobStorePut for PileFile {
     type PutError = InsertError;
 
     /// Inserts a blob into the pile and returns its handle.
@@ -4475,7 +4402,7 @@ impl BlobStorePut for Pile {
     /// hold a shared file lock and proceed concurrently. Larger records
     /// take an exclusive lock and append via plain `write_all`, trading
     /// concurrency for reach — the recovery path
-    /// ([`Pile::amputate`]) truncates any partial tail left by a crash,
+    /// ([`PileFile::amputate`]) truncates any partial tail left by a crash,
     /// so a multi-`write` record is still crash-safe. Multiple writers
     /// are safe only on filesystems guaranteeing atomic `write`/`vwrite`
     /// appends; other filesystems may corrupt the pile.
@@ -4489,7 +4416,7 @@ impl BlobStorePut for Pile {
     }
 }
 
-impl Pile {
+impl PileFile {
     /// Shared blob-append. Writes an enveloped record: a fixed 256-byte header, the blob
     /// data at `record_start + ENVELOPE_HEADER_LEN`, and post-padding to a 256-byte
     /// multiple. Because the envelope has no offset-derived pad, the append uses the atomic
@@ -4641,7 +4568,7 @@ impl Pile {
     }
 }
 
-impl Pile {
+impl PileFile {
     /// Append one legacy pin occurrence while rewriting an existing pile.
     ///
     /// This is deliberately private and unconditional: reframe must replay
@@ -4733,19 +4660,19 @@ impl Iterator for PileWantIter {
     fn next(&mut self) -> Option<Self::Item> {
         let bytes = self.inner.next()?;
         Some(Ok(WantRequest::from_bytes(bytes).expect(
-            "Pile only indexes structurally decoded canonical want requests",
+            "PileFile only indexes structurally decoded canonical want requests",
         )))
     }
 }
 
-impl Pile {
+impl PileFile {
     fn retired_want_projection(
         &self,
     ) -> Result<(usize, PATCH<WANT_REQUEST_BYTES_LEN, IdentitySchema>), ReadError> {
         let bytes = unsafe {
             slice_from_raw_parts(self.mmap.as_ptr(), self.applied_length)
                 .as_ref()
-                .expect("Pile mapping pointer is valid for its applied prefix")
+                .expect("PileFile mapping pointer is valid for its applied prefix")
         };
         let mut offset = 0usize;
         let mut retired_records = 0usize;
@@ -4871,7 +4798,7 @@ impl Pile {
     /// The exact request is the set key, so an already-present request is a
     /// no-op. Otherwise one fixed 256-byte frame is appended and read back
     /// while the exclusive lock is still held. Like other header appends, the
-    /// record is not crash-durable until [`Pile::flush`] is called.
+    /// record is not crash-durable until [`PileFile::flush`] is called.
     fn write_want_marker(&mut self, request: WantRequest) -> Result<(), PileWriteError> {
         self.file.lock()?;
         let res = (|| {
@@ -4885,7 +4812,7 @@ impl Pile {
     }
 }
 
-impl super::PinSnapshotSource for Pile {
+impl super::PinSnapshotSource for PileFile {
     type PinSnapshotError = ReadError;
 
     fn snapshot_pin_heads(&mut self) -> Result<super::PinSnapshot, Self::PinSnapshotError> {
@@ -4897,16 +4824,16 @@ impl super::PinSnapshotSource for Pile {
     }
 }
 
-impl WantStore for Pile {
+impl WantStore for PileFile {
     type WantError = PileWriteError;
-    /// Add `request` idempotently; call [`Pile::flush`] to make it
+    /// Add `request` idempotently; call [`PileFile::flush`] to make it
     /// crash-durable.
     fn want(&mut self, request: WantRequest) -> Result<(), Self::WantError> {
         self.write_want_marker(request)
     }
 }
 
-impl super::WantRead for PileSnapshot {
+impl super::WantRead for PileFileSnapshot {
     type WantsError = PileWriteError;
     type WantIter<'a> = PileWantIter;
 
@@ -4918,7 +4845,7 @@ impl super::WantRead for PileSnapshot {
     }
 }
 
-impl crate::repo::BlobStoreMeta for PileSnapshot {
+impl crate::repo::BlobStoreMeta for PileFileSnapshot {
     type MetaError = Infallible;
 
     fn metadata<S>(
@@ -5109,7 +5036,7 @@ impl Error for PileReframeError {
 /// framings, which is exactly what this exists to eliminate.
 pub fn reframe_into(
     source: &Path,
-    destination: &mut Pile,
+    destination: &mut PileFile,
 ) -> Result<PileReframeStats, PileReframeError> {
     let existing = destination
         .refresh()
@@ -5321,7 +5248,7 @@ impl Error for PileRewriteError {
     }
 }
 
-impl Pile {
+impl PileFile {
     /// Copy a policy-selected state into another append-only pile.
     ///
     /// `explicit` is normally produced by a higher-level policy such as
@@ -5359,7 +5286,7 @@ impl Pile {
     /// in append order.
     pub fn rewrite_retained_into(
         &mut self,
-        destination: &mut Pile,
+        destination: &mut PileFile,
         explicit: &super::RetentionRoots,
         wants: WantRewritePolicy,
     ) -> Result<PileRewriteStats, PileRewriteError> {
@@ -5392,7 +5319,7 @@ impl Pile {
                 .into_iter_ordered()
                 .map(|bytes| {
                     WantRequest::from_bytes(bytes)
-                        .expect("Pile only indexes structurally decoded canonical want requests")
+                        .expect("PileFile only indexes structurally decoded canonical want requests")
                 })
                 .collect()
         } else {
@@ -5406,7 +5333,7 @@ impl Pile {
         // its bytes.
         if !opaque_frames.is_empty() {
             for info in reader.blobs() {
-                let info = info.expect("PileSnapshot blob listing is infallible");
+                let info = info.expect("PileFileSnapshot blob listing is infallible");
                 roots.retain_direct(info.handle);
             }
         }
@@ -5420,7 +5347,7 @@ impl Pile {
             for handle in proof.blob_references() {
                 if reader
                     .contains_blob(handle)
-                    .expect("PileSnapshot residency lookup is infallible")
+                    .expect("PileFileSnapshot residency lookup is infallible")
                 {
                     roots.retain_recursive(handle);
                 }
@@ -5435,7 +5362,7 @@ impl Pile {
                 .expect("pin key from snapshot must retain its value");
             if reader
                 .contains_blob(head)
-                .expect("PileSnapshot residency lookup is infallible")
+                .expect("PileFileSnapshot residency lookup is infallible")
             {
                 roots.retain_recursive(head);
             }
@@ -5448,7 +5375,7 @@ impl Pile {
             for handle in record.blob_references() {
                 if reader
                     .contains_blob(handle)
-                    .expect("PileSnapshot residency lookup is infallible")
+                    .expect("PileFileSnapshot residency lookup is infallible")
                 {
                     roots.retain_recursive(handle);
                 }
@@ -5457,7 +5384,7 @@ impl Pile {
         for handle in reader.legacy_unsigned_collection_references() {
             if reader
                 .contains_blob(handle)
-                .expect("PileSnapshot residency lookup is infallible")
+                .expect("PileFileSnapshot residency lookup is infallible")
             {
                 roots.retain_recursive(handle);
             }
@@ -5466,7 +5393,7 @@ impl Pile {
             for handle in request.blob_references() {
                 if reader
                     .contains_blob(handle)
-                    .expect("PileSnapshot residency lookup is infallible")
+                    .expect("PileFileSnapshot residency lookup is infallible")
                 {
                     roots.retain_recursive(handle);
                 }
@@ -5476,7 +5403,7 @@ impl Pile {
         let emits_blob = keep.iter().any(|handle| {
             reader
                 .contains_blob(*handle)
-                .expect("PileSnapshot residency lookup is infallible")
+                .expect("PileFileSnapshot residency lookup is infallible")
         });
         if emits_blob {
             retain_record_kind_if_resident(&mut roots, &reader, blob_record_kind());
@@ -5493,7 +5420,7 @@ impl Pile {
             .map_err(PileWriteError::from)
             .map_err(PileRewriteError::StrongPin)?;
         for raw in &strong_pins {
-            let id = Id::new(*raw).expect("Pile never stores a nil strong-pin id");
+            let id = Id::new(*raw).expect("PileFile never stores a nil strong-pin id");
             let head = *strong_pins
                 .get(raw)
                 .expect("pin key from snapshot must retain its value");
@@ -5932,18 +5859,18 @@ mod tests {
         // A registered SimpleArchive collection is the root of its own
         // lineage, so it is also the scope its coverage rows live in.
         let lineage = collection.handle();
-        assert!(pile.coverage.covers(lineage, result, low));
-        assert!(pile.coverage.covers(lineage, result, high));
+        assert!(pile.snapshot().unwrap().coverage_index().covers(lineage, result, low));
+        assert!(pile.snapshot().unwrap().coverage_index().covers(lineage, result, high));
         assert_eq!(
-            pile.coverage.coverage(lineage, result).map(|row| row.len()),
+            pile.snapshot().unwrap().coverage_index().coverage(lineage, result).map(|row| row.len()),
             Some(2)
         );
         // A commit stands for itself and nothing else.
         assert_eq!(
-            pile.coverage.coverage(lineage, low).map(|row| row.len()),
+            pile.snapshot().unwrap().coverage_index().coverage(lineage, low).map(|row| row.len()),
             Some(1)
         );
-        assert!(!pile.coverage.has_parked());
+        assert!(!pile.snapshot().unwrap().coverage_index().has_parked());
         pile.close().unwrap();
     }
 
@@ -5984,10 +5911,10 @@ mod tests {
         let mut reopened = Pile::open(&path).unwrap();
         reopened.refresh().unwrap();
         assert_eq!(
-            reopened.coverage.coverage(handle, result).map(|row| row.len()),
+            reopened.snapshot().unwrap().coverage_index().coverage(handle, result).map(|row| row.len()),
             Some(2)
         );
-        assert!(reopened.coverage.covers(handle, result, low));
+        assert!(reopened.snapshot().unwrap().coverage_index().covers(handle, result, low));
         reopened.close().unwrap();
     }
 
@@ -6011,11 +5938,10 @@ mod tests {
         .unwrap();
         pile.refresh().unwrap();
 
-        assert!(pile
-            .coverage
+        assert!(pile.snapshot().unwrap().coverage_index()
             .coverage(collection.handle(), payload)
             .is_none());
-        assert_eq!(pile.coverage.parked_on_signers(), 1);
+        assert_eq!(pile.snapshot().unwrap().coverage_index().parked_on_signers(), 1);
         pile.close().unwrap();
     }
 
@@ -6030,14 +5956,14 @@ mod tests {
             pile.insert(record).unwrap();
         }
         pile.refresh().unwrap();
-        assert!(pile.coverage.is_empty());
+        assert!(pile.snapshot().unwrap().coverage_index().is_empty());
         // The commit and the merge name a collection whose descriptor is
         // absent, so nothing can say who may write it: both wait on a proof.
         // The derive additionally cannot tell which collection its input
         // lives in, so it waits on that descriptor instead.
-        assert_eq!(pile.coverage.parked(), 3);
-        assert_eq!(pile.coverage.parked_on_signers(), 2);
-        assert_eq!(pile.coverage.parked_on_lineages(), 1);
+        assert_eq!(pile.snapshot().unwrap().coverage_index().parked(), 3);
+        assert_eq!(pile.snapshot().unwrap().coverage_index().parked_on_signers(), 2);
+        assert_eq!(pile.snapshot().unwrap().coverage_index().parked_on_lineages(), 1);
         pile.close().unwrap();
     }
 

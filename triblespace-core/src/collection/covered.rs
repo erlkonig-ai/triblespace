@@ -27,8 +27,8 @@ use crate::inline::{Inline, InlineEncoding};
 use crate::repo::async_store::AsyncBlobStoreAcquire;
 use crate::repo::{
     BlobChildren, BlobInfo, BlobMetadata, BlobStoreGet, BlobStoreKeep, BlobStoreList,
-    BlobStoreMeta, BlobStorePut, CapabilityProofRead, CapabilityProofStore, SnapshotSource,
-    StorageClose, StorageFlush, StoreChanges, StoreDependencies, StoreSnapshot, WantRead,
+    BlobStoreMeta, BlobStorePut, CapabilityProofRead, CapabilityProofStore, PinSnapshot,
+    PinSnapshotSource, SnapshotSource, StorageClose, StorageFlush, StoreChanges, StoreDependencies, StoreSnapshot, WantRead,
     WantRequest, WantStore,
 };
 
@@ -248,10 +248,28 @@ impl<S: SnapshotSource + AsyncBlobStoreAcquire> AsyncBlobStoreAcquire for Covere
     }
 }
 
+impl<S: SnapshotSource + PinSnapshotSource> PinSnapshotSource for Covered<S> {
+    type PinSnapshotError = S::PinSnapshotError;
+
+    fn snapshot_pin_heads(&mut self) -> Result<PinSnapshot, Self::PinSnapshotError> {
+        self.inner.snapshot_pin_heads()
+    }
+}
+
 impl<S: SnapshotSource + StorageClose> StorageClose for Covered<S> {
     type Error = S::Error;
 
     fn close(self) -> Result<(), Self::Error> {
+        self.inner.close()
+    }
+}
+
+impl<S: SnapshotSource + StorageClose> Covered<S> {
+    /// Close the inner store. Inherent as well as via [`StorageClose`]: a
+    /// by-value `close` reached through `Deref` would try to move the inner
+    /// store out of the wrapper, and the trait method is only found when the
+    /// trait is in scope.
+    pub fn close(self) -> Result<(), S::Error> {
         self.inner.close()
     }
 }
@@ -290,6 +308,12 @@ impl<T> Deref for CoveredSnapshot<T> {
 
     fn deref(&self) -> &T {
         &self.inner
+    }
+}
+
+impl<T> std::ops::DerefMut for CoveredSnapshot<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.inner
     }
 }
 
