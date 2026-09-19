@@ -277,6 +277,22 @@ impl CapabilityProofStore for MemoryRepo {
     }
 }
 
+impl crate::collection::covered::RecordDelta for MemoryRepoSnapshot {
+    fn for_each_record_since(
+        &self,
+        since: Option<&Self>,
+        each: &mut dyn FnMut(&CollectionRecord),
+    ) {
+        let fresh = match since {
+            Some(since) => self.collection_records.difference(&since.collection_records),
+            None => self.collection_records.clone(),
+        };
+        for key in fresh.iter_ordered() {
+            each(fresh.get(key).expect("record index key retains its record"));
+        }
+    }
+}
+
 impl crate::collection::CoverageRead for MemoryRepoSnapshot {
     /// The index settled when this snapshot was taken; a persistent-root clone.
     fn index(

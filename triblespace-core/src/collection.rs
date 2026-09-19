@@ -43,6 +43,7 @@ pub fn write_capability() -> CapabilityHandle {
 pub mod api;
 /// Downward coverage: which foundation commits a lattice node covers.
 pub mod coverage;
+pub mod covered;
 /// Reading one collection descriptor's facts.
 pub mod descriptor;
 pub mod discovery;
