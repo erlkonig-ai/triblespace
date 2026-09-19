@@ -61,7 +61,7 @@ pub mod lww_register;
 /// Carrying content between collections, and proving it arrived.
 pub mod migration;
 mod observation;
-pub(crate) mod observed_store;
+pub mod observed_store;
 mod operation_snapshot;
 /// Immutable collection-local READ and WRITE authorization ceilings.
 pub mod policy;

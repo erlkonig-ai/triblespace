@@ -27,7 +27,9 @@ use super::{
     CollectionRecordSelector, CollectionStore, CoverageRead,
 };
 
-pub(crate) type DependencyTracker = Arc<Mutex<StoreDependencies>>;
+/// One read-set, shareable between every reader that should charge its
+/// consultations to the same observation.
+pub type DependencyTracker = Arc<Mutex<StoreDependencies>>;
 
 /// Opt-in raw read-set observation without retaining interpreted results.
 ///
@@ -51,7 +53,10 @@ impl<R> ObservedStore<R> {
         Self::with_tracker(inner, Arc::new(Mutex::new(StoreDependencies::default())))
     }
 
-    pub(crate) fn with_tracker(inner: R, tracker: DependencyTracker) -> Self {
+    /// Read through `inner`, recording into a read-set another reader may
+    /// share -- so that payloads an observation renders from a later snapshot
+    /// still count as that observation's dependencies.
+    pub fn with_tracker(inner: R, tracker: DependencyTracker) -> Self {
         Self { inner, tracker }
     }
 
@@ -72,7 +77,7 @@ impl<R> ObservedStore<R> {
         self.inner
     }
 
-    pub(crate) fn tracker(&self) -> DependencyTracker {
+    pub fn tracker(&self) -> DependencyTracker {
         Arc::clone(&self.tracker)
     }
 
