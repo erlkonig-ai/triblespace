@@ -388,14 +388,15 @@ fn selected_endorsement_reads_without_ancestry_but_support_needs_exact_records()
     assert!(source.admitted(&snapshot).unwrap().is_empty());
     let attached = snapshot.collection(target).unwrap();
     assert_eq!(attached.cover().members().collect::<Vec<_>>(), vec![output]);
-    // Ordinary attachment retained every independent target endorsement.
-    // A good route does not fill in the other malformed routes' provenance.
-    assert!(matches!(
-        attached.support(),
-        Err(CollectionRealizationError::IncompleteSupport { .. })
-    ));
-    // An explicit support request can choose the now-complete exact route.
+    // The one target endorsement names input, whose COMMIT now exists in
+    // source. That the COMMIT's writer is not admitted here is the source's
+    // own question, asserted above; it does not stop the target's admitted
+    // producer from being certified for what it named. Before witnesses were
+    // removed this fixture held three endorsements differing only in the
+    // record each cited, two of them malformed routes that kept the
+    // unrequested support incomplete -- they are one record now.
     let requested = source.cover([input.get_handle()]);
+    assert_eq!(attached.support().unwrap(), &requested);
     let exact = snapshot.collection_exact(target, &requested).unwrap();
     assert_eq!(exact.support().unwrap(), &requested);
     assert_eq!(

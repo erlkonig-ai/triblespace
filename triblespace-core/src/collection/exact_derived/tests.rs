@@ -741,8 +741,8 @@ fn aggregate_support_uses_selected_dag_leaves_without_clipping_certificates() {
     let signer = equation_signer();
     let a = archive(1, 1);
     let b = crate::collection::simplearchive_union::join(&a, &archive(2, 2)).unwrap();
-    let ca = publish_root(&mut store, root, &a, 31);
-    let cb = publish_root(&mut store, root, &b, 31);
+    publish_root(&mut store, root, &a, 31);
+    publish_root(&mut store, root, &b, 31);
     let a_support = support(root, std::slice::from_ref(&a));
     let b_support = support(root, std::slice::from_ref(&b));
     let ab_support = support(root, &[a.clone(), b.clone()]);
@@ -802,7 +802,11 @@ fn aggregate_support_uses_selected_dag_leaves_without_clipping_certificates() {
             None => ab_support.clone(),
             Some(requested) if requested == &ab_support => ab_support.clone(),
             Some(requested) if requested == &a_support => a_support.clone(),
-            Some(_) => Support::from_data(root, []),
+            // dab's certificate is {a, b}. A request for {b} is the same
+            // lattice point -- a sits beneath b -- so the record is selected
+            // and its certificate is reported unclipped, as this test's name
+            // says. Member-identity comparison used to select nothing here.
+            Some(_) => ab_support.clone(),
         };
         assert_eq!(resolved.support, expected);
         // Image reuse remains independent of the requested-support filter.
@@ -844,17 +848,13 @@ fn aggregate_support_excludes_missing_witnesses_and_unadmitted_producers() {
     let a = archive(1, 1);
     let b = archive(2, 2);
     let c = archive(3, 3);
-    let ca = publish_root(&mut store, root, &a, 31);
-    let cc = publish_root(&mut store, root, &c, 31);
+    publish_root(&mut store, root, &a, 31);
+    publish_root(&mut store, root, &c, 31);
     let metadata = store.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
     // This is the actual predecessor, deliberately not persisted yet.
     let cb = CollectionCommit::sign(&signer, root.handle(), data(&b), metadata);
     let mut a_output = None;
-    for (key, source, witness) in [
-        (&signer, &a, ca.fingerprint()),
-        (&signer, &b, cb.fingerprint()),
-        (&other_signer, &c, cc.fingerprint()),
-    ] {
+    for (key, source) in [(&signer, &a), (&signer, &b), (&other_signer, &c)] {
         let output = FirstEncoding::map(&(), source, &store.snapshot().unwrap()).unwrap();
         if source.get_handle() == a.get_handle() {
             a_output = Some(data(&output));
@@ -1139,10 +1139,11 @@ fn exact_ensure_reendorses_a_resident_image_from_a_different_support_without_map
         before.collection(first).unwrap().support().unwrap(),
         &support(root, &[a, b.clone()]),
     );
-    assert!(matches!(
-        before.collection_exact(first, &requested),
-        Err(CollectionRealizationError::IncompleteCover { .. })
-    ));
+    // The resident image was endorsed with certificate {a, b}. A request for
+    // {b} is the same lattice point, so it is already exact: there is no
+    // "different support" to re-endorse under. That concept only existed
+    // while endorsements named routes.
+    before.collection_exact(first, &requested).unwrap();
     drop(before);
 
     let mut store = GuardStore::new(inner);
@@ -1167,13 +1168,7 @@ fn exact_ensure_reendorses_a_resident_image_from_a_different_support_without_map
             WriteEvent::Put(_) => None,
         })
         .collect();
-    let expected = CollectionDerive::sign(
-        &signer,
-        first.handle(),
-        data(&b),
-        data(&output),
-    );
-    assert_eq!(published, vec![CollectionRecord::Derive(expected)]);
+    assert!(published.is_empty(), "nothing to re-endorse: {published:?}");
     assert_eq!(
         after.record(previous.fingerprint()).unwrap(),
         Some(CollectionRecord::Derive(previous)),
@@ -1211,15 +1206,16 @@ fn exact_ensure_rejects_conflicting_images_before_reusing_a_pruned_support() {
             .unwrap();
     }
     let requested = support(root, std::slice::from_ref(&b));
-    // Neither conflicting target claim has support [B]; both are [A, B].
-    // The exact snapshot excludes them, but maintenance may otherwise reuse
-    // their resident images under b's COMMIT witness.
+    // Both claims certify {a, b}, which is the requested point {b} at lattice
+    // granularity, so both are candidates -- and two candidates mapping one
+    // input to different outputs is the conflict itself. Member-identity
+    // comparison used to exclude both and report the vaguer IncompleteCover.
     assert!(matches!(
         inner
             .snapshot()
             .unwrap()
             .collection_exact(first, &requested),
-        Err(CollectionRealizationError::IncompleteCover { .. })
+        Err(CollectionRealizationError::Resolution(reason)) if reason.contains("conflicting outputs")
     ));
     let mut store = GuardStore::new(inner);
     reset_mapping_calls();
@@ -1278,7 +1274,7 @@ fn exact_ensure_rejects_a_cold_conflicting_image_before_fetch_or_publication() {
     assert!(before.contains_blob(wrong.get_handle()).unwrap());
     assert!(matches!(
         before.collection_exact(first, &requested),
-        Err(CollectionRealizationError::IncompleteCover { .. })
+        Err(CollectionRealizationError::Resolution(reason)) if reason.contains("conflicting outputs")
     ));
     drop(before);
     let mut store = GuardStore::new(inner);
@@ -2394,11 +2390,25 @@ fn exact_warm_target_reuse_does_not_acquire_or_admit_its_source() {
             }
             .unwrap();
             if !maintain {
+                // The only collection ENUMERATED is the target's own. Walking
+                // the producers of a named payload is an indexed lookup -- not
+                // an enumeration, and not an admission decision -- so it may
+                // touch ancestors freely; that is how the target's endorsement
+                // is certified without admitting anything beneath it.
+                let enumerated: BTreeSet<_> = store
+                    .selected_collections
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .flatten()
+                    .filter_map(|selector| match selector {
+                        CollectionRecordSelector::Collection(collection) => Some(*collection),
+                        _ => None,
+                    })
+                    .collect();
                 assert_eq!(
-                    *store.selected_collections.lock().unwrap(),
-                    vec![BTreeSet::from([CollectionRecordSelector::Collection(
-                        target.handle(),
-                    )])],
+                    enumerated,
+                    BTreeSet::from([target.handle()]),
                     "reuse authenticates the target, not its ancestral producers",
                 );
             }
@@ -2991,18 +3001,20 @@ fn target_maintenance_reendorses_a_resident_upper_without_joining_again() {
         data(&z),
     );
     inner.insert(CollectionRecord::Merge(z_bc)).unwrap();
-    // x carries [A, B] as well as [B], while this particular z certificate
-    // carries only [B, C]. Both resident blobs must remain selected until the
-    // producer endorses join(x[A, B], z[B, C]) = z [A, B, C]. Their payload
-    // order already proves that equality, so no new join is needed.
+    // x's row is {a, b}, y's is {c}, and z = join(x, y) carries {a, b, c}
+    // outright. Under cited routes z certified only {b, c} and x had to stay
+    // selected beside it until a second MERGE widened z; a row is the union
+    // over every producer, so z alone is the requested point.
     let requested = support(root, &[a, b, c]);
     assert_eq!(x.bytes.len().ilog2(), z.bytes.len().ilog2());
     let before = inner.snapshot().unwrap();
     let selected = before.collection_exact(second, &requested).unwrap();
     assert_eq!(selected.support().unwrap(), &requested);
+    // z = join(x, y) covers {a, b, c} outright, so x is already beneath it
+    // and nothing needs a second endorsement to say so.
     assert_eq!(
         selected.cover().data_members().collect::<BTreeSet<_>>(),
-        BTreeSet::from([data(&x), data(&z)]),
+        BTreeSet::from([data(&z)]),
     );
     drop(selected);
     drop(before);
@@ -3029,18 +3041,10 @@ fn target_maintenance_reendorses_a_resident_upper_without_joining_again() {
             WriteEvent::Put(_) => None,
         })
         .collect();
-    let [CollectionRecord::Merge(endorsement)] = published.as_slice() else {
-        panic!("maintenance must publish exactly one target MERGE: {published:?}");
-    };
-    assert_eq!(endorsement.collection(), second.handle());
-    assert_eq!(endorsement.result(), data(&z));
-    // It names the payloads those two merges produce. Naming the records
-    // themselves said the same thing one indirection further out.
-    let (low, high) = endorsement.inputs();
-    assert_eq!(
-        BTreeSet::from([low, high]),
-        BTreeSet::from([x_ab.output(), z_bc.result()]),
-    );
+    // Nothing to endorse: z is already exact for the request. The witness-era
+    // maintenance published join(x, z) = z here to certify z at the wider
+    // support, because its cited route carried only {b, c}.
+    assert!(published.is_empty(), "nothing to endorse: {published:?}");
     assert_eq!(
         after.record(z_bc.fingerprint()).unwrap(),
         Some(CollectionRecord::Merge(z_bc)),
@@ -3130,11 +3134,11 @@ fn support_repair_removes_an_earlier_member_made_redundant_by_a_later_one() {
     let snapshot = store.snapshot().unwrap();
     let selected = snapshot.collection_exact(collection, &requested).unwrap();
     assert_eq!(selected.support().unwrap(), &requested);
-    // Starting with Z [b,z], a forward support-repair walk adds A [a], then
-    // B [a,b,d] for d. B makes A redundant without enlarging the support.
+    // Z's row is the whole requested support, so it subsumes every other
+    // member. The old expectation {b, z} was the route-selected cover.
     assert_eq!(
         selected.cover().data_members().collect::<BTreeSet<_>>(),
-        BTreeSet::from([data(b), data(z)]),
+        BTreeSet::from([data(z)]),
     );
     assert_eq!(
         selected.view::<TribleSet>().unwrap(),
@@ -3199,11 +3203,15 @@ fn support_repair_does_not_clip_a_wider_certificate_to_the_requested_support() {
     let snapshot = store.snapshot().unwrap();
     let selected = snapshot.collection_exact(collection, &requested).unwrap();
     assert_eq!(selected.support().unwrap(), &requested);
-    // B's [a,d] certificate is not a [a] certificate when d is unselected.
-    // Reusing B [b] and Z [b,z] therefore cannot justify removing A [a].
+    // Requested {a, b, z} without d. B's row is {a, b, d} and Z's is
+    // {a, b, d, z}: neither is a member-identity subset of the request, but
+    // every member is AT OR BELOW a requested one, so both certificates sit
+    // inside the request at lattice granularity and Z alone represents it.
+    // The old expectation {a, z} kept a beside z because certificates were
+    // compared by member identity.
     assert_eq!(
         selected.cover().data_members().collect::<BTreeSet<_>>(),
-        BTreeSet::from([data(a), data(z)]),
+        BTreeSet::from([data(z)]),
     );
     assert_eq!(
         selected.view::<TribleSet>().unwrap(),

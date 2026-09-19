@@ -607,6 +607,81 @@ fn record_certificate(
     }
 }
 
+/// The foundation payloads a record's stated inputs reduce to, walking
+/// producers structurally through the produced-member index.
+///
+/// This is what an admitted producer vouches for when it names its inputs,
+/// and it is the certificate to use when the coverage fold has no row for the
+/// record -- which happens exactly when something beneath it is not admitted
+/// HERE. Records below the certified one must EXIST: every payload on the way
+/// down needs a producing record, and a foundation payload needs a COMMIT. A
+/// missing record anywhere makes the certificate unknown (`None`), not
+/// narrower. But none of them is re-admitted, and no payload is loaded: the
+/// reader trusts the producer it admitted for what that producer named.
+///
+/// Two named tests hold the two halves apart.
+/// `aggregate_support_excludes_missing_witnesses_and_unadmitted_producers`
+/// keeps a derive out of the support until its input's COMMIT lands;
+/// `multihop_support_uses_exact_endorsed_records_without_ancestor_authority_
+/// or_payload_rechecks` follows a chain whose every ancestor is signed by a
+/// key this store does not admit. The witness field satisfied both by citing
+/// one exact record; naming the payload and walking every producer of it
+/// satisfies both without the field, wider where routes diverge -- which the
+/// lattice comparison absorbs.
+///
+/// [`super::witness::records_for`] walks the same graph for retention.
+fn structural_certificate<R>(
+    snapshot: &R,
+    lineage: &Lineage,
+    record: CollectionRecord,
+) -> Result<Option<super::coverage::CoverageSet>, CollectionRealizationError>
+where
+    R: StoreRead,
+{
+    let foundation = lineage.foundation.handle();
+    let mut certificate = super::coverage::CoverageSet::new();
+    let mut visited = BTreeSet::new();
+    let mut pending = vec![record];
+    while let Some(record) = pending.pop() {
+        if !visited.insert(record.fingerprint()) {
+            continue;
+        }
+        let collection = record.collection();
+        let inputs: Vec<(CollectionHandle, CollectionData)> = match record {
+            CollectionRecord::Commit(commit) if collection == foundation => {
+                certificate.union(super::coverage::CoverageSet::from_keys([commit.data().raw]));
+                Vec::new()
+            }
+            // A COMMIT anywhere but the foundation is a raw membership claim
+            // with no derivation behind it: its foundation provenance is not
+            // empty, it is unknown.
+            CollectionRecord::Commit(_) => return Ok(None),
+            CollectionRecord::Merge(merge) => {
+                let (low, high) = merge.inputs();
+                vec![(collection, low), (collection, high)]
+            }
+            CollectionRecord::Derive(derive) => match lineage.source_by_target.get(&collection) {
+                Some(source) => vec![(*source, derive.input())],
+                None => return Ok(None),
+            },
+        };
+        for (owner, payload) in inputs {
+            let producers = snapshot
+                .select_records(&BTreeSet::from([CollectionRecordSelector::ProducedMember(
+                    owner, payload,
+                )]))
+                .map_err(|error| {
+                    CollectionRealizationError::storage("expand producing records", error)
+                })?;
+            if producers.is_empty() {
+                return Ok(None);
+            }
+            pending.extend(producers);
+        }
+    }
+    Ok(Some(certificate))
+}
+
 /// Admit selected producers, then follow only their immutable witness DAGs.
 /// Read attachment selects only the target; maintenance additionally admits
 /// immediate-source candidates it may use to publish new equations.
@@ -650,6 +725,23 @@ where
     let coverage = snapshot
         .coverage(&lineage.descriptors.keys().copied().collect())
         .map_err(|error| CollectionRealizationError::storage("read downward coverage", error))?;
+    // A request is compared at lattice granularity, not member identity. A
+    // certificate wider than the request still sits inside it when every
+    // extra member is BELOW a requested one, and `row(r)` is r's downward
+    // closure, so the union of the requested rows is the downward closure of
+    // the request. A requested member with no row stays in as itself, so this
+    // is never looser than the identity test was. Without this, a record
+    // certified for {a, b} where a <= b could not satisfy a request for {b},
+    // and the only way to make it could was a second record naming a
+    // narrower route -- the fan-out the witness field forced.
+    let requested_closure = requested.map(|requested| {
+        let (mut closure, unattested) =
+            coverage.union_over(lineage.foundation.handle(), requested.data_members());
+        closure.union(super::coverage::CoverageSet::from_keys(
+            unattested.into_iter().map(|member| member.raw),
+        ));
+        Support::from_patch(lineage.foundation, closure)
+    });
     let mut certified = super::coverage::CoverageSet::new();
     let mut roots = BTreeSet::new();
     let mut witnesses = InputWitnesses::new();
@@ -669,8 +761,15 @@ where
         if !accepted {
             continue;
         }
-        let Some(certificate) = record_certificate(&coverage, lineage, record) else {
-            continue;
+        // The fold's row when it has one; that is the O(1) path and, where
+        // the whole ancestry is admitted, the same set. Otherwise certify
+        // from what the producer named.
+        let certificate = match record_certificate(&coverage, lineage, record) {
+            Some(certificate) => certificate,
+            None => match structural_certificate(snapshot, lineage, record)? {
+                Some(certificate) => certificate,
+                None => continue,
+            },
         };
         let record_support = Support::from_patch(lineage.foundation, certificate.clone());
         // Reusing a computed image is independent of which exact support the
@@ -681,8 +780,9 @@ where
                 .or_default()
                 .insert(derive.output());
         }
-        if requested
-            .is_some_and(|requested| !record_support.is_subset(requested).expect("one foundation"))
+        if requested_closure
+            .as_ref()
+            .is_some_and(|closure| !record_support.is_subset(closure).expect("one foundation"))
         {
             continue;
         }
@@ -705,7 +805,10 @@ where
         }
         let record_support = Support::from_patch(
             lineage.foundation,
-            record_certificate(&coverage, lineage, *record).unwrap_or_default(),
+            match record_certificate(&coverage, lineage, *record) {
+                Some(certificate) => certificate,
+                None => structural_certificate(snapshot, lineage, *record)?.unwrap_or_default(),
+            },
         );
         let alternatives = witnesses
             .entry((record.collection(), super::coverage::produced(*record)))
@@ -1024,20 +1127,28 @@ where
     let coverage = snapshot
         .coverage(&lineage.descriptors.keys().copied().collect())
         .map_err(|error| CollectionRealizationError::storage("read downward coverage", error))?;
-    let (members, unattested) = coverage.union_over(
+    let (mut members, unattested) = coverage.union_over(
         target.handle(),
         records.iter().copied().map(super::coverage::produced),
     );
-    if unattested.is_empty() {
+    // A record the fold has no row for is certified from what it named,
+    // minus the admission of everything beneath it -- see
+    // `structural_certificate`. Unknown stays unknown, and is reported.
+    let mut incomplete = Vec::new();
+    for record in records
+        .iter()
+        .filter(|record| unattested.contains(&super::coverage::produced(**record)))
+    {
+        match structural_certificate(snapshot, &lineage, *record)? {
+            Some(certificate) => members.union(certificate),
+            None => incomplete.push(record.fingerprint()),
+        }
+    }
+    if incomplete.is_empty() {
         Ok(Support::from_patch(lineage.foundation, members))
     } else {
         // Name the records, not the payloads: a caller repairing this needs
         // to know which endorsements it is missing evidence for.
-        let incomplete = records
-            .iter()
-            .filter(|record| unattested.contains(&super::coverage::produced(**record)))
-            .map(|record| record.fingerprint())
-            .collect();
         Err(CollectionRealizationError::IncompleteSupport {
             records: incomplete,
         })

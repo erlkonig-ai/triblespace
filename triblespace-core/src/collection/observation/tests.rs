@@ -611,18 +611,10 @@ fn multihop_support_uses_exact_endorsed_records_without_ancestor_authority_or_pa
     assert_eq!(support.collection(), fixture.source);
     assert!(support.contains(fixture.source_blob.get_handle()));
     assert_eq!(support.len(), 1);
-    assert!(snapshot
-        .counts
-        .point_records
-        .lock()
-        .unwrap()
-        .contains(&raw_record.fingerprint()));
-    assert!(snapshot
-        .counts
-        .point_records
-        .lock()
-        .unwrap()
-        .contains(&commit.fingerprint()));
+    // The chain is followed by the payloads its records name, through the
+    // produced-member index, so no cited fingerprint is point-read; what the
+    // walk must not do -- enumerate a collection, load a payload, or ask
+    // for a proof -- is asserted around this.
     assert_eq!(
         snapshot.counts.proof_queries.load(Ordering::SeqCst),
         proof_queries
