@@ -406,6 +406,15 @@ fn plan(
             .chain(proposed.iter().copied()),
     )
     .context("conflicting historical endorsement plan; nothing was appended")?;
+    // `check_functionality` compares the plan against itself and the records
+    // already admitted. That misses a conflict that only exists once the plan
+    // CLOSES -- a commuting square, where two routes agree on every record in
+    // isolation and disagree about an output only when both are present. Let
+    // the ordinary admission machinery resolve the complete overlay and report
+    // it. The plan no longer needs what this returns, but it still needs this
+    // to fail.
+    preview_record_witnesses(snapshot, collection, proposed.iter().copied())
+        .context("preflight complete endorsement overlay; nothing was appended")?;
     Ok((records, report))
 }
 
@@ -750,23 +759,40 @@ mod tests {
     }
 
     #[test]
-    fn a_valid_old_signature_does_not_manufacture_missing_provenance() -> Result<()> {
+    fn a_valid_old_signature_is_not_carried_into_the_new_endorsement() -> Result<()> {
         let fixture = Fixture::new()?;
-        // The result and both inputs are resident, but none names a current
-        // admitted target record. A valid historical signature cannot fill it.
+        // Under witnesses this equation was unendorsable: its inputs named no
+        // admitted target record, and a valid historical signature could not
+        // fill that in. There is no such gap now -- the equation states a
+        // payload relation and can be restated -- so the property that
+        // survives is the one the name was always about: the old authorship is
+        // neither preserved nor claimed. The new record is the migrator's
+        // statement, signed by the migrator.
+        let historical = SigningKey::from_bytes(&[43; 32]);
         append(
             fixture.file.path(),
-            [signed_frame(fixture.equations[2], &fixture.signer)],
+            [signed_frame(fixture.equations[2], &historical)],
         )?;
-        let before = fs::read(fixture.file.path())?;
         assert_eq!(
             fixture.endorse(false)?,
             Report {
-                unmapped_targets: 1,
+                endorsed: 1,
                 ..Report::default()
             }
         );
-        assert_eq!(fs::read(fixture.file.path())?, before);
+        let endorsement = fixture
+            .records()?
+            .into_iter()
+            .find(|record| payload_equation(*record) == Some(fixture.equations[2]))
+            .expect("the historical equation is endorsed");
+        assert_eq!(
+            endorsement.public_key().raw,
+            fixture.signer.verifying_key().to_bytes()
+        );
+        assert_ne!(
+            endorsement.public_key().raw,
+            historical.verifying_key().to_bytes()
+        );
         Ok(())
     }
 
@@ -843,7 +869,8 @@ mod tests {
     }
 
     #[test]
-    fn upstream_migration_is_explicit_and_downstream_uses_its_exact_record() -> Result<()> {
+    fn migration_order_no_longer_matters_and_downstream_names_the_upstream_payload(
+    ) -> Result<()> {
         let fixture = Fixture::new()?;
         let mut pile = super::super::super::open_refreshed(fixture.file.path())?;
         let policy = CollectionPolicy::new(
@@ -868,14 +895,18 @@ mod tests {
             pile.close()?;
             Ok(report)
         };
+        // Downstream first. Under witnesses this was refused: the downstream
+        // DERIVE had to cite the upstream MERGE record, so upstream had to be
+        // migrated first and the ordering was load-bearing. A DERIVE names an
+        // input PAYLOAD now, so it can be stated before anything produces that
+        // payload -- migration order stopped mattering when citation did.
         assert_eq!(
             run_downstream()?,
             Report {
-                unmapped_targets: 1,
+                endorsed: 1,
                 ..Report::default()
             }
         );
-        assert_eq!(fixture.records()?.len(), 2);
         assert_eq!(
             fixture.endorse(false)?,
             Report {
@@ -883,10 +914,12 @@ mod tests {
                 ..Report::default()
             }
         );
+        // Running it again after upstream lands adds nothing: the record was
+        // already exactly this statement.
         assert_eq!(
             run_downstream()?,
             Report {
-                endorsed: 1,
+                already_present: 1,
                 ..Report::default()
             }
         );
@@ -912,34 +945,36 @@ mod tests {
     }
 
     #[test]
-    fn unauthorized_current_equations_are_not_migration_witnesses() -> Result<()> {
+    fn an_unauthorized_record_is_not_part_of_the_functional_baseline() -> Result<()> {
         let fixture = Fixture::new()?;
         let mut pile = super::super::super::open_refreshed(fixture.file.path())?;
         let outsider = SigningKey::from_bytes(&[43; 32]);
-        for (commit, output) in fixture.commits.into_iter().zip(fixture.images) {
-            pile.insert(CollectionRecord::Derive(CollectionDerive::sign(
-    &outsider,
-    fixture.target,
-    commit.data(),
-    output,
-)))?;
-        }
+        // The same input mapped to a DIFFERENT output, by a key this
+        // collection does not admit. Under witnesses this test said such a
+        // record cannot witness an input; the plan does not take inputs from
+        // records at all now, so what remains to check is the other half:
+        // an unadmitted record is not a statement the plan has to agree with,
+        // and must not read as a functional conflict.
+        pile.insert(CollectionRecord::Derive(CollectionDerive::sign(
+            &outsider,
+            fixture.target,
+            fixture.commits[0].data(),
+            fixture.images[2],
+        )))?;
         pile.close()?;
-        append(fixture.file.path(), [frame(fixture.equations[2])])?;
-        let before = fs::read(fixture.file.path())?;
+        append(fixture.file.path(), [frame(fixture.equations[0])])?;
         assert_eq!(
             fixture.endorse(false)?,
             Report {
-                unmapped_targets: 1,
+                endorsed: 1,
                 ..Report::default()
             }
         );
-        assert_eq!(fs::read(fixture.file.path())?, before);
         Ok(())
     }
 
     #[test]
-    fn merge_support_aliases_use_linear_witness_pairs() -> Result<()> {
+    fn merge_support_aliases_need_no_fan_out_at_all() -> Result<()> {
         let fixture = Fixture::new()?;
         let [x, y, z] = fixture.images;
         let mut pile = super::super::super::open_refreshed(fixture.file.path())?;
@@ -952,8 +987,12 @@ mod tests {
             )?);
         }
         pile.close()?;
-        // x has two disjoint support routes, y has three. The merge needs
-        // only three witness pairs, not the six-pair Cartesian product.
+        // x has two disjoint support routes, y has three. This used to cost
+        // three MERGE records -- one per witness pair, chosen by a greedy
+        // cover, and already an improvement on the six-pair Cartesian
+        // product. A merge names PAYLOADS, and x is one payload however many
+        // records produce it, so one record now carries what three did and
+        // the fan-out disappears rather than shrinking.
         let equations = [
             merge(fixture.target, x, y, z),
             derive(fixture.target, commits[0].data(), x),
@@ -968,7 +1007,7 @@ mod tests {
         assert_eq!(
             dry_run,
             Report {
-                endorsed: 8,
+                endorsed: 6,
                 ..Report::default()
             }
         );
@@ -982,8 +1021,11 @@ mod tests {
                 .iter()
                 .filter(|record| matches!(record, CollectionRecord::Merge(_)))
                 .count(),
-            3
+            1
         );
+        // One record, and the support is still the whole union: what the
+        // three-record cover was reconstructing is what content addressing
+        // already relates.
         let expected = fixture
             .source
             .cover(commits.iter().map(|commit| Inline::new(commit.data().raw)));
@@ -1000,7 +1042,7 @@ mod tests {
     }
 
     #[test]
-    fn later_source_alias_adds_only_the_missing_derive_certificate() -> Result<()> {
+    fn a_later_source_alias_grows_support_without_a_new_downstream_record() -> Result<()> {
         let fixture = Fixture::new()?;
         let [a, b] = fixture.commits;
         let x = fixture.images[0];
@@ -1035,8 +1077,12 @@ mod tests {
         assert_eq!(run_downstream(false)?.already_present, 1);
         assert_eq!(fs::read(fixture.file.path())?, first);
 
-        // New support for the same source bytes is migrated source-first.
-        // The old downstream payload is reused, with one additional witness.
+        // New support arrives for the same source payload. Under witnesses
+        // the downstream DERIVE had to be reissued citing the new record, so
+        // this added a second downstream certificate. The downstream record
+        // says `x -> result`, which is unchanged by another record also
+        // producing x -- so nothing downstream needs writing, and the support
+        // underneath it widens on its own.
         append(
             fixture.file.path(),
             [signed_frame(
@@ -1052,24 +1098,17 @@ mod tests {
                 ..Report::default()
             }
         );
-        let before = fs::read(fixture.file.path())?;
-        assert_eq!(
-            run_downstream(true)?,
-            Report {
-                endorsed: 1,
-                ..Report::default()
-            }
-        );
-        assert_eq!(fs::read(fixture.file.path())?, before);
+        let after = fs::read(fixture.file.path())?;
         assert_eq!(
             run_downstream(false)?,
             Report {
-                endorsed: 1,
+                already_present: 1,
                 ..Report::default()
             }
         );
-        let after = fs::read(fixture.file.path())?;
-        assert_eq!(&after[..before.len()], before);
+        assert_eq!(fs::read(fixture.file.path())?, after);
+        // Support now covers both source commits, under the one record that
+        // was already there.
         let expected = fixture
             .source
             .cover([Inline::new(a.data().raw), Inline::new(b.data().raw)]);
@@ -1080,10 +1119,8 @@ mod tests {
                 .iter()
                 .filter(|record| record.collection() == downstream)
                 .count(),
-            2
+            1
         );
-        assert_eq!(run_downstream(false)?.already_present, 1);
-        assert_eq!(fs::read(fixture.file.path())?, after);
 
         // A later, different real record with the same support is not new
         // work, even if its fingerprint wins the canonical witness ordering.
@@ -1097,11 +1134,11 @@ mod tests {
             CollectionCommit::sign(&fixture.signer, fixture.source.handle(), a.data(), metadata);
         pile.insert(CollectionRecord::Commit(duplicate))?;
         pile.insert(CollectionRecord::Derive(CollectionDerive::sign(
-    &fixture.signer,
-    fixture.target,
-    a.data(),
-    x,
-)))?;
+            &fixture.signer,
+            fixture.target,
+            a.data(),
+            x,
+        )))?;
         pile.close()?;
         let before = fs::read(fixture.file.path())?;
         assert_eq!(
@@ -1156,7 +1193,7 @@ mod tests {
     }
 
     #[test]
-    fn grounded_payload_cycle_has_a_finite_acyclic_record_plan() -> Result<()> {
+    fn a_payload_cycle_needs_no_acyclic_record_plan() -> Result<()> {
         let fixture = Fixture::new()?;
         let [x, y, z] = fixture.images;
         let mut pile = super::super::super::open_refreshed(fixture.file.path())?;
@@ -1167,9 +1204,12 @@ mod tests {
         )?;
         let w = blob(&mut pile, "cycle-third-input")?;
         pile.close()?;
-        // This historical payload graph cycles x -> z -> x. Migration does
-        // not re-prove its mathematics, but must construct only grounded,
-        // finite record ancestry and stop once each equation covers {a,b,c}.
+        // This historical payload graph cycles x -> z -> x. Migration does not
+        // re-prove its mathematics. It used to have to build grounded, finite
+        // record ancestry through that cycle, which cost an extra record where
+        // the plan re-entered it; a record that names no other record cannot
+        // form a cycle, so the plan is one record per equation and finite by
+        // construction. The support each payload ends up with is unchanged.
         let equations = [
             fixture.equations[0],
             fixture.equations[1],
@@ -1183,7 +1223,7 @@ mod tests {
         assert_eq!(
             planned,
             Report {
-                endorsed: 6,
+                endorsed: 5,
                 ..Report::default()
             }
         );
@@ -1492,7 +1532,7 @@ mod tests {
     }
 
     #[test]
-    fn newly_closed_native_support_is_in_the_first_plan_fixed_point() -> Result<()> {
+    fn newly_closed_native_support_needs_no_second_round() -> Result<()> {
         let fixture = Fixture::new()?;
         let [a, b] = fixture.commits;
         let [x, z, y] = fixture.images;
@@ -1502,33 +1542,17 @@ mod tests {
             &fixture.signer,
             entity! { metadata::tag: Id::new([3; 16]).unwrap() },
         )?;
-        let p = CollectionDerive::sign(
-    &fixture.signer,
-    fixture.target,
-    a.data(),
-    x,
-);
-        let dz = CollectionDerive::sign(
-    &fixture.signer,
-    fixture.target,
-    b.data(),
-    z,
-);
-        let dy = CollectionDerive::sign(
-    &fixture.signer,
-    fixture.target,
-    c.data(),
-    y,
-);
+        let dz = CollectionDerive::sign(&fixture.signer, fixture.target, b.data(), z);
+        let dy = CollectionDerive::sign(&fixture.signer, fixture.target, c.data(), y);
         pile.insert(CollectionRecord::Derive(dz))?;
         pile.insert(CollectionRecord::Derive(dy))?;
         pile.insert(CollectionRecord::Merge(CollectionMerge::sign(
-    &fixture.signer,
-    fixture.target,
-    x,
-    z,
-    z,
-)))?;
+            &fixture.signer,
+            fixture.target,
+            x,
+            z,
+            z,
+        )))?;
         let result = blob(&mut pile, "activated-support-result")?;
         pile.close()?;
         append(
@@ -1540,9 +1564,13 @@ mod tests {
         )?;
         let before = fs::read(fixture.file.path())?;
         // K first certifies {b,c}; P then closes the already stored M, whose
-        // {a,b} support must extend K to {a,b,c} before the first publication.
+        // {a,b} support has to reach K. That used to need a second planning
+        // round and a third record -- K reissued once its support had widened.
+        // A record states a payload relation and never states its support, so
+        // K is written once and the widening happens underneath it, in the
+        // coverage fold, with no second round to reach a fixed point in.
         let expected_report = Report {
-            endorsed: 3,
+            endorsed: 2,
             ..Report::default()
         };
         assert_eq!(fixture.endorse(true)?, expected_report);
@@ -1638,7 +1666,7 @@ mod tests {
     }
 
     #[test]
-    fn ungrounded_cycles_and_missing_outputs_are_reported_without_writes() -> Result<()> {
+    fn a_missing_output_is_refused_and_an_ungrounded_cycle_is_merely_unbelieved() -> Result<()> {
         let fixture = Fixture::new()?;
         let a = fixture.images[0];
         let b = fixture.images[1];
@@ -1655,16 +1683,27 @@ mod tests {
                 )),
             ],
         )?;
-        let before = fs::read(fixture.file.path())?;
+        // The derive's output blob is absent, and that is still refused: you
+        // cannot endorse a result you do not have.
+        //
+        // The two merges cycle a -> b -> a with nothing grounding either, and
+        // they ARE endorsed now. Under witnesses the migration refused them,
+        // because no witness record existed to cite. That gate moved rather
+        // than vanished: an equation is a statement its author is entitled to
+        // make, and whether anything reaches it from the foundation is settled
+        // by the reader, in the coverage fold, at read time. So the records
+        // exist and mean nothing -- their support is empty.
         assert_eq!(
             fixture.endorse(false)?,
             Report {
-                unmapped_targets: 2,
+                endorsed: 2,
                 missing_outputs: 1,
                 ..Report::default()
             }
         );
-        assert_eq!(fs::read(fixture.file.path())?, before);
+        let empty = fixture.source.cover([]);
+        assert_eq!(fixture.support_for(fixture.target, a)?, empty);
+        assert_eq!(fixture.support_for(fixture.target, b)?, empty);
         Ok(())
     }
 
