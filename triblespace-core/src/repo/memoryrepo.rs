@@ -9,7 +9,6 @@ use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
 use crate::blob::{MemoryBlobStore, MemoryBlobStoreSnapshot, TryFromBlob};
 use crate::capability::{CapabilityProof, CapabilityProofId};
-use crate::collection::coverage::{Coverage, CoverageArrivals, CoverageIndex, StoreWriters};
 use crate::collection::store::selectors_match_record;
 use crate::collection::{
     CollectionRead, CollectionRecord, CollectionRecordFingerprint, CollectionRecordSelector,
@@ -34,8 +33,15 @@ type CapabilityProofIndex = PATCH<INLINE_LEN, IdentitySchema, CapabilityProof, X
 ///
 /// Useful for unit tests or ephemeral repositories where persistence is not
 /// required.
+/// The store every consumer uses: a [`MemoryStore`] with its coverage index
+/// maintained by snapshot difference.
+pub type MemoryRepo = crate::collection::covered::Covered<MemoryStore>;
+/// One immutable observation of a [`MemoryRepo`]: the store snapshot and the
+/// index settled for exactly that prefix.
+pub type MemoryRepoSnapshot = crate::collection::covered::CoveredSnapshot<MemoryStoreSnapshot>;
+
 #[derive(Clone, Debug, Default)]
-pub struct MemoryRepo {
+pub struct MemoryStore {
     /// In-memory blob store for all repository blobs.
     pub blobs: MemoryBlobStore,
     /// Grow-only typed requests (see [`WantStore`]). Wants here are exactly as
@@ -46,31 +52,22 @@ pub struct MemoryRepo {
     collection_records: CollectionRecordIndex,
     /// Canonical complete capability proofs keyed by exact-body content id.
     capability_proofs: CapabilityProofIndex,
-    /// Downward coverage, folded incrementally as records arrive and settled
-    /// when a snapshot is taken -- the same arrangement a pile keeps across
-    /// appends. Without it every `coverage()` read is the trait default: a
-    /// full refold with an admission query per unadmitted record, which is
-    /// both the cost and, for a reader that must not repeat ancestors'
-    /// admission decisions, the wrong answer.
-    coverage: CoverageIndex,
-    coverage_arrivals: CoverageArrivals,
 }
 
-/// One O(1)-clone immutable observation of a [`MemoryRepo`].
+/// One O(1)-clone immutable observation of a [`MemoryStore`].
 ///
 /// The blob snapshot and all semantic indexes are frozen together, so
 /// collection admission, capability verification, and payload decoding cannot
 /// observe different prefixes.
 #[derive(Clone, PartialEq, Eq)]
-pub struct MemoryRepoSnapshot {
+pub struct MemoryStoreSnapshot {
     blobs: MemoryBlobStoreSnapshot,
     collection_records: CollectionRecordIndex,
     capability_proofs: CapabilityProofIndex,
     wants: HashSet<WantRequest>,
-    coverage: CoverageIndex,
 }
 
-impl StoreSnapshot for MemoryRepoSnapshot {
+impl StoreSnapshot for MemoryStoreSnapshot {
     fn changes_since(&self, previous: &Self) -> StoreChanges {
         let mut changes = StoreChanges::NONE;
         if self
@@ -93,45 +90,17 @@ impl StoreSnapshot for MemoryRepoSnapshot {
     }
 }
 
-impl SnapshotSource for MemoryRepo {
-    type Snapshot = MemoryRepoSnapshot;
+impl SnapshotSource for MemoryStore {
+    type Snapshot = MemoryStoreSnapshot;
     type SnapshotError = Infallible;
 
     fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
-        self.resolve_coverage();
-        Ok(MemoryRepoSnapshot {
+        Ok(MemoryStoreSnapshot {
             blobs: self.blobs.snapshot()?,
             collection_records: self.collection_records.clone(),
             capability_proofs: self.capability_proofs.clone(),
             wants: self.wants.clone(),
-            coverage: self.coverage.clone(),
         })
-    }
-}
-
-impl MemoryRepo {
-    /// Decide every attestation parked since the last snapshot, and re-drive
-    /// any earlier decision that an arrival since then could change.
-    fn resolve_coverage(&mut self) {
-        let arrivals = std::mem::take(&mut self.coverage_arrivals);
-        if !self.coverage.has_fresh() && !arrivals.woke_anything() {
-            return;
-        }
-        let mut coverage = std::mem::take(&mut self.coverage);
-        let Ok(blobs) = self.blobs.snapshot();
-        let reader = MemoryRepoSnapshot {
-            blobs,
-            collection_records: self.collection_records.clone(),
-            capability_proofs: self.capability_proofs.clone(),
-            wants: self.wants.clone(),
-            coverage: CoverageIndex::default(),
-        };
-        coverage.settle(
-            &StoreWriters::new(&reader),
-            arrivals.descriptors,
-            arrivals.proofs,
-        );
-        self.coverage = coverage;
     }
 }
 
@@ -185,7 +154,7 @@ impl Iterator for MemoryCapabilityProofIter {
     }
 }
 
-/// Failure while admitting a proof to [`MemoryRepo`].
+/// Failure while admitting a proof to [`MemoryStore`].
 #[derive(Debug)]
 pub enum MemoryProofInsertError {
     /// The proof's byte-only signature chain is invalid.
@@ -214,7 +183,7 @@ impl Error for MemoryProofInsertError {
     }
 }
 
-/// Failure while inserting a collection record into [`MemoryRepo`].
+/// Failure while inserting a collection record into [`MemoryStore`].
 #[derive(Debug)]
 pub enum MemoryCollectionInsertError {
     /// An infeasible full-width fingerprint collision named different records.
@@ -238,7 +207,7 @@ impl fmt::Display for MemoryCollectionInsertError {
 
 impl Error for MemoryCollectionInsertError {}
 
-impl CapabilityProofRead for MemoryRepoSnapshot {
+impl CapabilityProofRead for MemoryStoreSnapshot {
     type ProofsError = Infallible;
     type ProofIter<'a> = MemoryCapabilityProofIter;
 
@@ -255,7 +224,7 @@ impl CapabilityProofRead for MemoryRepoSnapshot {
     }
 }
 
-impl CapabilityProofStore for MemoryRepo {
+impl CapabilityProofStore for MemoryStore {
     type InsertError = MemoryProofInsertError;
 
     fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
@@ -272,12 +241,11 @@ impl CapabilityProofStore for MemoryRepo {
         }
         self.capability_proofs
             .insert(&Entry::with_value(&id.raw, proof));
-        self.coverage_arrivals.proofs = true;
         Ok(())
     }
 }
 
-impl crate::collection::covered::RecordDelta for MemoryRepoSnapshot {
+impl crate::collection::covered::RecordDelta for MemoryStoreSnapshot {
     fn for_each_record_since(
         &self,
         since: Option<&Self>,
@@ -293,17 +261,7 @@ impl crate::collection::covered::RecordDelta for MemoryRepoSnapshot {
     }
 }
 
-impl crate::collection::CoverageRead for MemoryRepoSnapshot {
-    /// The index settled when this snapshot was taken; a persistent-root clone.
-    fn index(
-        &self,
-        _lineage: &BTreeSet<crate::collection::CollectionHandle>,
-    ) -> Result<CoverageIndex, Self::RecordsError> {
-        Ok(self.coverage.clone())
-    }
-}
-
-impl CollectionRead for MemoryRepoSnapshot {
+impl CollectionRead for MemoryStoreSnapshot {
     type RecordsError = Infallible;
     type RecordIter<'a> = MemoryCollectionRecordIter;
 
@@ -343,7 +301,7 @@ impl CollectionRead for MemoryRepoSnapshot {
     }
 }
 
-impl CollectionStore for MemoryRepo {
+impl CollectionStore for MemoryStore {
     type InsertError = MemoryCollectionInsertError;
 
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
@@ -357,12 +315,11 @@ impl CollectionStore for MemoryRepo {
         }
         self.collection_records
             .insert(&Entry::with_value(&fingerprint.raw(), record));
-        self.coverage.park_record(&record);
         Ok(())
     }
 }
 
-impl crate::repo::BlobStorePut for MemoryRepo {
+impl crate::repo::BlobStorePut for MemoryStore {
     type PutError = <MemoryBlobStore as crate::repo::BlobStorePut>::PutError;
     fn put<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
     where
@@ -370,18 +327,11 @@ impl crate::repo::BlobStorePut for MemoryRepo {
         T: IntoBlob<S>,
         Handle<S>: InlineEncoding,
     {
-        let handle = self.blobs.put(item)?;
-        // A descriptor is an ordinary blob, so this is the arrival that can
-        // unblock an attestation parked on an unresolved lineage.
-        let descriptor = Inline::new(handle.raw);
-        if self.coverage.blob_arrived(descriptor) {
-            self.coverage_arrivals.descriptors.push(descriptor);
-        }
-        Ok(handle)
+        self.blobs.put(item)
     }
 }
 
-impl BlobStoreList for MemoryRepoSnapshot {
+impl BlobStoreList for MemoryStoreSnapshot {
     type Iter<'a>
         = <MemoryBlobStoreSnapshot as BlobStoreList>::Iter<'a>
     where
@@ -413,7 +363,7 @@ impl BlobStoreList for MemoryRepoSnapshot {
     }
 }
 
-impl BlobStoreMeta for MemoryRepoSnapshot {
+impl BlobStoreMeta for MemoryStoreSnapshot {
     type MetaError = <MemoryBlobStoreSnapshot as BlobStoreMeta>::MetaError;
 
     fn metadata<S>(
@@ -428,7 +378,7 @@ impl BlobStoreMeta for MemoryRepoSnapshot {
     }
 }
 
-impl BlobStoreGet for MemoryRepoSnapshot {
+impl BlobStoreGet for MemoryStoreSnapshot {
     type GetError<E: Error + Send + Sync + 'static> =
         <MemoryBlobStoreSnapshot as BlobStoreGet>::GetError<E>;
 
@@ -445,9 +395,9 @@ impl BlobStoreGet for MemoryRepoSnapshot {
     }
 }
 
-impl crate::repo::BlobChildren for MemoryRepoSnapshot {}
+impl crate::repo::BlobChildren for MemoryStoreSnapshot {}
 
-impl crate::repo::BlobStoreKeep for MemoryRepo {
+impl crate::repo::BlobStoreKeep for MemoryStore {
     fn keep<I>(&mut self, handles: I)
     where
         I: IntoIterator<Item = Inline<Handle<UnknownBlob>>>,
@@ -480,7 +430,7 @@ impl crate::repo::BlobStoreKeep for MemoryRepo {
     }
 }
 
-impl WantStore for MemoryRepo {
+impl WantStore for MemoryStore {
     type WantError = Infallible;
 
     fn want(&mut self, request: WantRequest) -> Result<(), Self::WantError> {
@@ -489,7 +439,7 @@ impl WantStore for MemoryRepo {
     }
 }
 
-impl WantRead for MemoryRepoSnapshot {
+impl WantRead for MemoryStoreSnapshot {
     type WantsError = Infallible;
     type WantIter<'a> = std::vec::IntoIter<Result<WantRequest, Self::WantsError>>;
 
@@ -502,7 +452,7 @@ impl WantRead for MemoryRepoSnapshot {
     }
 }
 
-impl crate::repo::StorageFlush for MemoryRepo {
+impl crate::repo::StorageFlush for MemoryStore {
     type Error = Infallible;
 
     fn flush(&mut self) -> Result<(), Self::Error> {
@@ -512,7 +462,7 @@ impl crate::repo::StorageFlush for MemoryRepo {
     }
 }
 
-impl crate::repo::StorageClose for MemoryRepo {
+impl crate::repo::StorageClose for MemoryStore {
     type Error = Infallible;
 
     fn close(self) -> Result<(), Self::Error> {

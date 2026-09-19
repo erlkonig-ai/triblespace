@@ -24,6 +24,7 @@ use crate::blob::{BlobEncoding, IntoBlob, TryFromBlob};
 use crate::capability::{CapabilityProof, CapabilityProofId};
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
+use crate::repo::async_store::AsyncBlobStoreAcquire;
 use crate::repo::{
     BlobChildren, BlobInfo, BlobMetadata, BlobStoreGet, BlobStoreKeep, BlobStoreList,
     BlobStoreMeta, BlobStorePut, CapabilityProofRead, CapabilityProofStore, SnapshotSource,
@@ -31,7 +32,7 @@ use crate::repo::{
     WantRequest, WantStore,
 };
 
-use super::coverage::{CoverageIndex, StoreWriters};
+use super::coverage::{Coverage, CoverageIndex, StoreWriters};
 use super::{
     CollectionHandle, CollectionRead, CollectionRecord, CollectionRecordFingerprint,
     CollectionRecordSelector, CollectionStore, CoverageRead,
@@ -71,6 +72,42 @@ impl<S: SnapshotSource> Covered<S> {
 
     pub fn into_inner(self) -> S {
         self.inner
+    }
+
+    /// The index as of the last snapshot taken. Writes since then are not in
+    /// it until the next snapshot; take one first to inspect their effect.
+    pub fn coverage_index(&self) -> &CoverageIndex {
+        &self.index
+    }
+}
+
+impl<S: SnapshotSource + Default> Default for Covered<S> {
+    fn default() -> Self {
+        Self::new(S::default())
+    }
+}
+
+impl<S> Clone for Covered<S>
+where
+    S: SnapshotSource + Clone,
+    S::Snapshot: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            index: self.index.clone(),
+            fed: self.fed.clone(),
+        }
+    }
+}
+
+impl<S: SnapshotSource + std::fmt::Debug> std::fmt::Debug for Covered<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Covered")
+            .field("inner", &self.inner)
+            .field("index", &self.index)
+            .field("fed", &self.fed.is_some())
+            .finish()
     }
 }
 
@@ -199,6 +236,18 @@ impl<S: SnapshotSource + StorageFlush> StorageFlush for Covered<S> {
     }
 }
 
+impl<S: SnapshotSource + AsyncBlobStoreAcquire> AsyncBlobStoreAcquire for Covered<S> {
+    type AcquireError = S::AcquireError;
+
+    fn acquire(
+        &mut self,
+        handle: Inline<Handle<UnknownBlob>>,
+    ) -> impl std::future::Future<Output = Result<Option<anybytes::Bytes>, Self::AcquireError>> + Send
+    {
+        self.inner.acquire(handle)
+    }
+}
+
 impl<S: SnapshotSource + StorageClose> StorageClose for Covered<S> {
     type Error = S::Error;
 
@@ -210,7 +259,7 @@ impl<S: SnapshotSource + StorageClose> StorageClose for Covered<S> {
 /// One immutable observation of a [`Covered`] store: the inner snapshot and
 /// the index settled for exactly that prefix. Every part is a persistent
 /// root, so cloning is constant time.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoveredSnapshot<T> {
     inner: T,
     index: CoverageIndex,
@@ -219,6 +268,20 @@ pub struct CoveredSnapshot<T> {
 impl<T> CoveredSnapshot<T> {
     pub fn inner(&self) -> &T {
         &self.inner
+    }
+
+    /// The index settled for exactly this prefix, parked attestations
+    /// included; [`CoverageRead::index`] hands out a clone of the same. (Named
+    /// apart from it: an inherent `index()` would shadow the trait method at
+    /// every concrete call site.)
+    pub fn coverage_index(&self) -> &CoverageIndex {
+        &self.index
+    }
+
+    /// The published half of the index: which foundation commits each
+    /// lattice node stands for, as decided for exactly this prefix.
+    pub fn coverage(&self) -> &Coverage {
+        self.index.published()
     }
 }
 
