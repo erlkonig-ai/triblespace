@@ -172,18 +172,18 @@ proptest! {
                                     metadata,
                                 )
                             });
-                            // Persist the exact input witnesses before the endorsement;
-                            // their physical union is part of the state-machine oracle.
-                            for witness in [left, right] {
-                                let record = CollectionRecord::Commit(witness);
+                            // The input commits are records too; their physical
+                            // union is part of the state-machine oracle.
+                            for input in [left, right] {
+                                let record = CollectionRecord::Commit(input);
                                 piles[actor].insert(record).unwrap();
                                 expected_records.insert(record.fingerprint(), record);
                             }
                             let record = CollectionRecord::Merge(CollectionMerge::sign(
                                 &signing_key,
                                 collection,
-                                (left.data(), left.fingerprint()),
-                                (right.data(), right.fingerprint()),
+                                left.data(),
+                                right.data(),
                                 at(result).into(),
                             ));
                             piles[actor].insert(record).unwrap();
