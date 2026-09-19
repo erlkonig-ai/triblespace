@@ -150,11 +150,11 @@ impl<R: CapabilityProofRead> CapabilityProofRead for CountedSnapshot<R> {
 impl<R: triblespace_core::collection::CoverageRead> triblespace_core::collection::CoverageRead
     for CountedSnapshot<R>
 {
-    fn coverage(
+    fn index(
         &self,
         lineage: &std::collections::BTreeSet<triblespace_core::collection::CollectionHandle>,
-    ) -> Result<triblespace_core::collection::coverage::Coverage, Self::RecordsError> {
-        self.inner.coverage(lineage)
+    ) -> Result<triblespace_core::collection::coverage::CoverageIndex, Self::RecordsError> {
+        self.inner.index(lineage)
     }
 }
 

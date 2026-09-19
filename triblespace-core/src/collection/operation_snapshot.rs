@@ -218,28 +218,35 @@ where
     }
 }
 
-/// A frontier folds its coverage from scratch: the control's records plus the
-/// ones authored on top, one admission query per record it does not admit.
-///
-/// This is the cost that used to hide in `CollectionRead`'s default. It is
-/// written here so that it is visible, and it is the wrong shape: the control
-/// already holds a settled index, and with `CoverageIndex: Clone` a frontier's
-/// coverage is that index cloned, the authored records parked, and one
-/// settle. What stands in the way is that a snapshot hands out only the
-/// published root, not the index -- and the index's consumer map is a
-/// `BTreeMap`, not a PATCH, so carrying it in every snapshot is not yet a
-/// constant-time clone. Tracked as compass goal ffd9ca8a; the thirteen
-/// maintenance read-set tests it fails are the measurement.
+/// A frontier's coverage is its control's index, continued: clone it (every
+/// part is a persistent root), park the records this operation authored, and
+/// settle them against the frontier's own view. The fold the control ran is
+/// not restarted, so nothing beneath the authored records is re-decided and
+/// no record is enumerated -- which is also why a reader tracking what was
+/// consulted sees the lineage it named rather than every record in the store.
 impl<C, R> super::store::CoverageRead for OperationSnapshot<C, R>
 where
-    C: CollectionRead,
+    C: super::store::CoverageRead,
     Self: crate::repo::BlobStoreGet + crate::repo::CapabilityProofRead,
 {
-    fn coverage(
+    fn index(
         &self,
-        _lineage: &BTreeSet<super::CollectionHandle>,
-    ) -> Result<super::coverage::Coverage, Self::RecordsError> {
-        super::store::fold_coverage(self)
+        lineage: &BTreeSet<super::CollectionHandle>,
+    ) -> Result<super::coverage::CoverageIndex, Self::RecordsError> {
+        let mut index = self.control.index(lineage)?;
+        for key in self.authored.iter_ordered() {
+            let record = self
+                .authored
+                .get(key)
+                .expect("authored PATCH key must retain its record");
+            index.park_record(record);
+        }
+        index.settle(
+            &super::coverage::StoreWriters::new(self),
+            std::iter::empty(),
+            false,
+        );
+        Ok(index)
     }
 }
 

@@ -186,11 +186,11 @@ impl<R: BlobChildren> BlobChildren for Counted<R> {}
 impl<R: triblespace_core::collection::CoverageRead> triblespace_core::collection::CoverageRead
     for Counted<R>
 {
-    fn coverage(
+    fn index(
         &self,
         lineage: &std::collections::BTreeSet<triblespace_core::collection::CollectionHandle>,
-    ) -> Result<triblespace_core::collection::coverage::Coverage, Self::RecordsError> {
-        self.inner.coverage(lineage)
+    ) -> Result<triblespace_core::collection::coverage::CoverageIndex, Self::RecordsError> {
+        self.inner.index(lineage)
     }
 }
 

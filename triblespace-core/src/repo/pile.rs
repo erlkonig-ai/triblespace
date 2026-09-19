@@ -2785,7 +2785,7 @@ pub struct PileSnapshot {
     /// One persistent PATCH root, so carrying it costs the same as carrying
     /// any other index here. The fold's consumer map and admission backlog
     /// stay behind on the pile: a reader only ever asks what a node covers.
-    coverage: Coverage,
+    coverage: CoverageIndex,
     legacy_collection_headers: LegacyCollectionHeaderIndex,
     capability_proofs: CapabilityProofIndex,
     wants: PATCH<WANT_REQUEST_BYTES_LEN, IdentitySchema>,
@@ -2818,7 +2818,7 @@ impl PileSnapshot {
         collection_records: CollectionRecordIndex,
         collection_records_by_collection: CollectionRecordCollectionIndex,
         collection_records_by_produced_member: CollectionRecordProducedMemberIndex,
-        coverage: Coverage,
+        coverage: CoverageIndex,
         legacy_collection_headers: LegacyCollectionHeaderIndex,
         capability_proofs: CapabilityProofIndex,
         wants: PATCH<WANT_REQUEST_BYTES_LEN, IdentitySchema>,
@@ -2843,7 +2843,7 @@ impl PileSnapshot {
     /// Every edge folded into it was admitted when it was folded, so reading
     /// a row here is reading a decision already made, not re-deciding it.
     pub fn coverage(&self) -> &Coverage {
-        &self.coverage
+        self.coverage.published()
     }
 
     /// Returns an iterator over all blobs currently stored in the pile.
@@ -3102,7 +3102,7 @@ impl super::SnapshotSource for Pile {
             self.collection_records.clone(),
             self.collection_records_by_collection.clone(),
             self.collection_records_by_produced_member.clone(),
-            self.coverage.published().clone(),
+            self.coverage.clone(),
             self.legacy_collection_headers.clone(),
             self.capability_proofs.clone(),
             self.wants.clone(),
@@ -3795,7 +3795,7 @@ impl Pile {
             self.collection_records.clone(),
             self.collection_records_by_collection.clone(),
             self.collection_records_by_produced_member.clone(),
-            self.coverage.published().clone(),
+            self.coverage.clone(),
             self.legacy_collection_headers.clone(),
             self.capability_proofs.clone(),
             self.wants.clone(),
@@ -4229,10 +4229,10 @@ impl Pile {
 
 impl crate::collection::CoverageRead for PileSnapshot {
     /// The index replay maintained; a persistent-root clone.
-    fn coverage(
+    fn index(
         &self,
         _lineage: &BTreeSet<CollectionHandle>,
-    ) -> Result<Coverage, Self::RecordsError> {
+    ) -> Result<CoverageIndex, Self::RecordsError> {
         Ok(self.coverage.clone())
     }
 }

@@ -343,17 +343,33 @@ impl CoverageArrivals {
     }
 }
 
+/// One consumer edge: the collection it writes to, the one it reads from,
+/// and the attestation itself.
+type ConsumerEdge = (CollectionHandle, CollectionHandle, Attestation);
+/// Collection-scoped input handle to the edges that read it.
+type Consumers = PATCH<64, IdentitySchema, Vec<ConsumerEdge>>;
+/// Attestations held until one named thing arrives, keyed by that thing.
+type Waiters = PATCH<32, IdentitySchema, Vec<Parked>>;
+
 /// Downward coverage for every lattice node a store has admitted.
-#[derive(Clone, Debug, Default)]
+///
+/// Every part of this is a persistent PATCH root, so the whole index -- not
+/// only its published half -- is a constant-time clone. That is what lets a
+/// snapshot carry the index rather than a copy of the rows, and what lets a
+/// reader compose on top of one: clone it, park a few more records, settle.
+/// Only `fresh` is a plain vector, and it is empty whenever the index is
+/// settled, which is the only time one is handed out.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CoverageIndex {
     /// The half a reader sees: result payload handle to the commits it covers.
     published: Coverage,
-    /// Collection-scoped input handle to the attestations that read it, each
-    /// with the collections it writes to and reads from, so a row that grows
-    /// can re-drive its consumers instead of forcing a full replay.
-    consumers: BTreeMap<[u8; 64], Vec<(CollectionHandle, CollectionHandle, Attestation)>>,
-    /// Attestations held until the evidence each one waits on arrives.
-    pending: BTreeMap<Awaiting, Vec<Parked>>,
+    /// Which attestations read each input, so a row that grows can re-drive
+    /// its consumers instead of forcing a full replay.
+    consumers: Consumers,
+    /// Waiting on a descriptor blob, keyed by that blob's handle.
+    awaiting_lineage: Waiters,
+    /// Waiting on a proof admitting their signer, keyed by the signer.
+    awaiting_proof: Waiters,
     /// Attestations parked this batch that no oracle has seen yet.
     ///
     /// Replay cannot ask the oracle per record — the descriptor that answers
@@ -362,6 +378,23 @@ pub struct CoverageIndex {
     /// distinct from `pending`, whose entries have already been decided
     /// against and are waiting on a *named* arrival.
     fresh: Vec<Parked>,
+}
+
+/// How many attestations a waiter map holds.
+fn waiting(waiters: &Waiters) -> usize {
+    waiters
+        .iter_ordered()
+        .map(|key| waiters.get(key).map_or(0, Vec::len))
+        .sum()
+}
+
+/// Move every attestation out of a waiter map.
+fn drain(waiters: Waiters, into: &mut Vec<Parked>) {
+    for key in waiters.iter_ordered() {
+        if let Some(entries) = waiters.get(key) {
+            into.extend(entries.iter().copied());
+        }
+    }
 }
 
 impl CoverageIndex {
@@ -416,7 +449,7 @@ impl CoverageIndex {
     /// A store can skip building a reader entirely when this is false, which is
     /// the steady state once a pile has been replayed once.
     pub fn has_parked(&self) -> bool {
-        !self.pending.is_empty() || !self.fresh.is_empty()
+        !self.awaiting_lineage.is_empty() || !self.awaiting_proof.is_empty() || !self.fresh.is_empty()
     }
 
     /// Whether any attestation has never been offered a decision.
@@ -426,25 +459,17 @@ impl CoverageIndex {
 
     /// Number of attestations waiting on evidence that has not arrived.
     pub fn parked(&self) -> usize {
-        self.pending.values().map(|parked| parked.len()).sum::<usize>() + self.fresh.len()
+        waiting(&self.awaiting_lineage) + waiting(&self.awaiting_proof) + self.fresh.len()
     }
 
     /// Number waiting specifically on a proof admitting their signer.
     pub fn parked_on_signers(&self) -> usize {
-        self.pending
-            .iter()
-            .filter(|(awaiting, _)| matches!(awaiting, Awaiting::Proof(_)))
-            .map(|(_, parked)| parked.len())
-            .sum()
+        waiting(&self.awaiting_proof)
     }
 
     /// Number waiting specifically on a descriptor chain becoming resident.
     pub fn parked_on_lineages(&self) -> usize {
-        self.pending
-            .iter()
-            .filter(|(awaiting, _)| matches!(awaiting, Awaiting::Lineage(_)))
-            .map(|(_, parked)| parked.len())
-            .sum()
+        waiting(&self.awaiting_lineage)
     }
 
     /// Fold one record into the index, keeping only what it attests.
@@ -508,7 +533,14 @@ impl CoverageIndex {
     }
 
     fn hold(&mut self, awaiting: Awaiting, entry: Parked) {
-        self.pending.entry(awaiting).or_default().push(entry);
+        let (waiters, key) = match awaiting {
+            Awaiting::Lineage(descriptor) => (&mut self.awaiting_lineage, descriptor.raw),
+            Awaiting::Proof(signer) => (&mut self.awaiting_proof, signer.raw),
+        };
+        let mut entries = waiters.get(&key).cloned().unwrap_or_default();
+        entries.push(entry);
+        // `insert` keeps an existing key's value; a waiter list grows in place.
+        waiters.replace(&Entry::with_value(&key, entries));
     }
 
     /// Record an attestation without deciding it yet.
@@ -548,7 +580,7 @@ impl CoverageIndex {
     /// Cheap and unconditional: one map probe per blob. Almost every blob is
     /// not a descriptor anyone is waiting on, and the probe says so at once.
     pub fn blob_arrived(&mut self, handle: CollectionHandle) -> bool {
-        self.pending.contains_key(&Awaiting::Lineage(handle))
+        self.awaiting_lineage.get(&handle.raw).is_some()
     }
 
     /// Note that a capability proof arrived, unblocking signers it may admit.
@@ -559,9 +591,7 @@ impl CoverageIndex {
     /// which are not — which is the whole point. Keying on the delegate set
     /// would narrow it further if proofs ever become hot.
     pub fn proof_arrived(&self) -> bool {
-        self.pending
-            .keys()
-            .any(|awaiting| matches!(awaiting, Awaiting::Proof(_)))
+        !self.awaiting_proof.is_empty()
     }
 
     /// Give every attestation whose evidence may have changed a decision.
@@ -581,22 +611,13 @@ impl CoverageIndex {
     ) {
         let mut woken: Vec<Parked> = std::mem::take(&mut self.fresh);
         for handle in arrivals {
-            if let Some(entries) = self.pending.remove(&Awaiting::Lineage(handle)) {
+            if let Some(entries) = self.awaiting_lineage.get(&handle.raw).cloned() {
+                self.awaiting_lineage.remove(&handle.raw);
                 woken.extend(entries);
             }
         }
         if proofs_arrived {
-            let keys: Vec<_> = self
-                .pending
-                .keys()
-                .filter(|awaiting| matches!(awaiting, Awaiting::Proof(_)))
-                .copied()
-                .collect();
-            for key in keys {
-                if let Some(entries) = self.pending.remove(&key) {
-                    woken.extend(entries);
-                }
-            }
+            drain(std::mem::take(&mut self.awaiting_proof), &mut woken);
         }
         for entry in woken {
             self.decide(entry, admission);
@@ -610,9 +631,8 @@ impl CoverageIndex {
     /// are observable.
     pub fn resolve<A: RecordAdmission>(&mut self, admission: &A) {
         let mut woken: Vec<Parked> = std::mem::take(&mut self.fresh);
-        for (_, entries) in std::mem::take(&mut self.pending) {
-            woken.extend(entries);
-        }
+        drain(std::mem::take(&mut self.awaiting_lineage), &mut woken);
+        drain(std::mem::take(&mut self.awaiting_proof), &mut woken);
         for entry in woken {
             self.decide(entry, admission);
         }
@@ -627,13 +647,12 @@ impl CoverageIndex {
         attestation: Attestation,
     ) {
         for input in attestation.inputs() {
-            let consumers = self
-                .consumers
-                .entry(row_key(reads_from, input))
-                .or_default();
+            let key = row_key(reads_from, input);
             let edge = (writes_to, reads_from, attestation);
+            let mut consumers = self.consumers.get(&key).cloned().unwrap_or_default();
             if !consumers.contains(&edge) {
                 consumers.push(edge);
+                self.consumers.replace(&Entry::with_value(&key, consumers));
             }
         }
         let mut grown = Vec::new();
@@ -644,10 +663,10 @@ impl CoverageIndex {
         // and those may widen their own consumers in turn. Growth is bounded by
         // the finite set of foundation commits, so the worklist drains.
         while let Some((collection, node)) = grown.pop() {
-            let Some(consumers) = self.consumers.get(&row_key(collection, node)) else {
+            let Some(consumers) = self.consumers.get(&row_key(collection, node)).cloned() else {
                 continue;
             };
-            for (writes_to, reads_from, consumer) in consumers.clone() {
+            for (writes_to, reads_from, consumer) in consumers {
                 if self.drive(writes_to, reads_from, consumer) {
                     grown.push((writes_to, consumer.result()));
                 }

@@ -293,11 +293,11 @@ impl<S: SnapshotSource> triblespace_core::collection::CoverageRead for PeerSnaps
 where
     S::Snapshot: triblespace_core::collection::CoverageRead,
 {
-    fn coverage(
+    fn index(
         &self,
         lineage: &std::collections::BTreeSet<triblespace_core::collection::CollectionHandle>,
-    ) -> Result<triblespace_core::collection::coverage::Coverage, Self::RecordsError> {
-        self.frozen.coverage(lineage)
+    ) -> Result<triblespace_core::collection::coverage::CoverageIndex, Self::RecordsError> {
+        self.frozen.index(lineage)
     }
 }
 

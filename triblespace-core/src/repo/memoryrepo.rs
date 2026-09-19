@@ -67,7 +67,7 @@ pub struct MemoryRepoSnapshot {
     collection_records: CollectionRecordIndex,
     capability_proofs: CapabilityProofIndex,
     wants: HashSet<WantRequest>,
-    coverage: Coverage,
+    coverage: CoverageIndex,
 }
 
 impl StoreSnapshot for MemoryRepoSnapshot {
@@ -104,7 +104,7 @@ impl SnapshotSource for MemoryRepo {
             collection_records: self.collection_records.clone(),
             capability_proofs: self.capability_proofs.clone(),
             wants: self.wants.clone(),
-            coverage: self.coverage.published().clone(),
+            coverage: self.coverage.clone(),
         })
     }
 }
@@ -124,7 +124,7 @@ impl MemoryRepo {
             collection_records: self.collection_records.clone(),
             capability_proofs: self.capability_proofs.clone(),
             wants: self.wants.clone(),
-            coverage: Coverage::default(),
+            coverage: CoverageIndex::default(),
         };
         coverage.settle(
             &StoreWriters::new(&reader),
@@ -279,10 +279,10 @@ impl CapabilityProofStore for MemoryRepo {
 
 impl crate::collection::CoverageRead for MemoryRepoSnapshot {
     /// The index settled when this snapshot was taken; a persistent-root clone.
-    fn coverage(
+    fn index(
         &self,
         _lineage: &BTreeSet<crate::collection::CollectionHandle>,
-    ) -> Result<Coverage, Self::RecordsError> {
+    ) -> Result<CoverageIndex, Self::RecordsError> {
         Ok(self.coverage.clone())
     }
 }

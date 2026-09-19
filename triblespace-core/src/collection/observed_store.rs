@@ -21,7 +21,7 @@ use crate::repo::{
     StoreSnapshot, WantRead,
 };
 
-use super::coverage::Coverage;
+use super::coverage::CoverageIndex;
 use super::{
     CollectionHandle, CollectionRead, CollectionRecord, CollectionRecordFingerprint,
     CollectionRecordSelector, CollectionStore, CoverageRead,
@@ -237,16 +237,16 @@ impl<R: CoverageRead> CoverageRead for ObservedStore<R> {
     /// an observation miss the arrival that completes its own support,
     /// because a resolution selects its target and source but not the
     /// foundation the completing COMMIT lands in.
-    fn coverage(
+    fn index(
         &self,
         lineage: &BTreeSet<CollectionHandle>,
-    ) -> Result<Coverage, Self::RecordsError> {
+    ) -> Result<CoverageIndex, Self::RecordsError> {
         self.tracker
             .lock()
             .expect("store dependency tracker is not poisoned")
             .records
             .extend(lineage.iter().copied().map(CollectionRecordSelector::Collection));
-        self.inner.coverage(lineage)
+        self.inner.index(lineage)
     }
 }
 

@@ -224,11 +224,11 @@ impl<R: triblespace_core::collection::CoverageRead> triblespace_core::collection
 {
     /// A coverage read is a handout of the inner index, not an enumeration,
     /// so it counts as neither; the fold it replaced enumerated.
-    fn coverage(
+    fn index(
         &self,
         lineage: &std::collections::BTreeSet<triblespace_core::collection::CollectionHandle>,
-    ) -> Result<triblespace_core::collection::coverage::Coverage, Self::RecordsError> {
-        self.inner.coverage(lineage)
+    ) -> Result<triblespace_core::collection::coverage::CoverageIndex, Self::RecordsError> {
+        self.inner.index(lineage)
     }
 }
 

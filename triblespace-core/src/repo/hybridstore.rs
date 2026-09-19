@@ -309,11 +309,11 @@ where
         + crate::repo::BlobStoreGet
         + crate::repo::CapabilityProofRead,
 {
-    fn coverage(
+    fn index(
         &self,
         _lineage: &std::collections::BTreeSet<crate::collection::CollectionHandle>,
-    ) -> Result<crate::collection::coverage::Coverage, Self::RecordsError> {
-        crate::collection::fold_coverage(self)
+    ) -> Result<crate::collection::coverage::CoverageIndex, Self::RecordsError> {
+        crate::collection::fold_index(self)
     }
 }
 

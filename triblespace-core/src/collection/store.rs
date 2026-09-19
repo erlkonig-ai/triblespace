@@ -12,7 +12,7 @@ use std::fmt::Debug;
 
 use crate::repo::{BlobStoreGet, CapabilityProofRead, WantRequest};
 
-use super::coverage::{coverage_of, Coverage};
+use super::coverage::{coverage_of, Coverage, CoverageIndex};
 use super::{CollectionData, CollectionHandle, CollectionRecord, CollectionRecordFingerprint};
 
 /// One raw selection route into the grow-only collection-record set.
@@ -213,13 +213,36 @@ pub trait CollectionRead {
 /// honest read set of a coverage read is every record in the store, which
 /// makes every observation wake on every arrival.
 pub trait CoverageRead: CollectionRead {
+    /// The settled index itself, a constant-time clone.
+    ///
+    /// This is what a reader that composes on top of another needs: an
+    /// operation frontier clones its control's index, parks the records it
+    /// authored, and settles -- the same fold the control ran, continued for
+    /// a few records, instead of restarted for all of them.
+    fn index(
+        &self,
+        lineage: &BTreeSet<CollectionHandle>,
+    ) -> Result<CoverageIndex, Self::RecordsError>;
+
+    /// The published half of [`Self::index`]: what a reader that only asks
+    /// questions needs. Exact and constant-time by construction, so it may be
+    /// provided; the trait's refusal is of defaults that would refold.
     fn coverage(
         &self,
         lineage: &BTreeSet<CollectionHandle>,
-    ) -> Result<Coverage, Self::RecordsError>;
+    ) -> Result<Coverage, Self::RecordsError> {
+        Ok(self.index(lineage)?.published().clone())
+    }
 }
 
 impl<R: CoverageRead> CoverageRead for &R {
+    fn index(
+        &self,
+        lineage: &BTreeSet<CollectionHandle>,
+    ) -> Result<CoverageIndex, Self::RecordsError> {
+        (**self).index(lineage)
+    }
+
     fn coverage(
         &self,
         lineage: &BTreeSet<CollectionHandle>,
@@ -235,11 +258,19 @@ impl<R: CoverageRead> CoverageRead for &R {
 /// admit. It is the right answer for a reader that has no index of its own
 /// and no inner store to delegate to, and it is written at the call site so
 /// that it is visible there.
+pub fn fold_index<R>(reader: &R) -> Result<CoverageIndex, R::RecordsError>
+where
+    R: CollectionRead + BlobStoreGet + CapabilityProofRead,
+{
+    coverage_of(reader)
+}
+
+/// [`fold_index`]'s published half.
 pub fn fold_coverage<R>(reader: &R) -> Result<Coverage, R::RecordsError>
 where
     R: CollectionRead + BlobStoreGet + CapabilityProofRead,
 {
-    Ok(coverage_of(reader)?.published().clone())
+    Ok(fold_index(reader)?.published().clone())
 }
 
 impl<R> CollectionRead for &R

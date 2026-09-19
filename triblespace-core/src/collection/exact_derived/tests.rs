@@ -517,11 +517,11 @@ impl BlobStoreList for GuardSnapshot {
 }
 
 impl crate::collection::CoverageRead for GuardSnapshot {
-    fn coverage(
+    fn index(
         &self,
         lineage: &BTreeSet<crate::collection::CollectionHandle>,
-    ) -> Result<crate::collection::coverage::Coverage, Self::RecordsError> {
-        self.inner.coverage(lineage)
+    ) -> Result<crate::collection::coverage::CoverageIndex, Self::RecordsError> {
+        self.inner.index(lineage)
     }
 }
 
