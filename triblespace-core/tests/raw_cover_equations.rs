@@ -7,7 +7,7 @@ use ed25519_dalek::SigningKey;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::collection::{
-    empty_metadata_handle, simplearchive_union, AdmissionPolicy, Collection, CollectionCommit,
+    simplearchive_union, AdmissionPolicy, Collection,
     CollectionData, CollectionMaterializationError, CollectionMerge, CollectionPolicy,
     CollectionRealizationError, CollectionRecord, CollectionSnapshotExt, CollectionStore,
     CollectionStoreExt,

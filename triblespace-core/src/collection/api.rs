@@ -2776,7 +2776,7 @@ mod cover_resolution_tests {
     use std::cell::Cell;
 
     use super::*;
-    use crate::collection::{empty_metadata_handle, CollectionMerge, CollectionRecord};
+    use crate::collection::{CollectionMerge, CollectionRecord};
 
     thread_local! {
         pub(super) static EQUATION_VISITS: Cell<usize> = const { Cell::new(0) };
