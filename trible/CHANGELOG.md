@@ -16,6 +16,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+- `pile compact --drop-drained RETIRED=CURRENT` (repeatable) leaves a drained
+  generation behind, with every collection derived from it, after checking
+  that every commit of RETIRED is present in CURRENT; it refuses otherwise
+  and names the gap. The report says how many frames stayed behind.
 - `pile compact` leaves behind a retired equation frame whose current signed
   twin is present, in every retired framing, and says how many it left; the
   endorsement migration writes the twins, compaction sheds the originals.

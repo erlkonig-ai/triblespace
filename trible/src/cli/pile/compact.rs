@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use triblespace_core::repo::pile::{
-    Pile, PileRecordContent, PileRecords, PileRewriteStats, WantRewritePolicy,
+    DrainedGeneration, Pile, PileRecordContent, PileRecords, PileRewriteStats, WantRewritePolicy,
 };
 use triblespace_core::repo::{BlobStoreList, RetentionRoots, SnapshotSource};
 
@@ -94,6 +94,7 @@ fn compact_into(
     source: &mut Pile,
     destination: &mut Pile,
     stable_source_len: u64,
+    drained: &[DrainedGeneration],
 ) -> Result<PileRewriteStats> {
     let snapshot = source.snapshot().context("freeze source pile")?;
     let mut roots = RetentionRoots::new();
@@ -119,7 +120,7 @@ fn compact_into(
     }
 
     let stats = source
-        .rewrite_retained_into(destination, &roots, WantRewritePolicy::Preserve)
+        .rewrite_retained_into_leaving(destination, &roots, WantRewritePolicy::Preserve, drained)
         .map_err(|error| anyhow!("compact pile: {error}"))?;
 
     let final_source_len = source
@@ -136,7 +137,23 @@ fn compact_into(
     Ok(stats)
 }
 
-pub(super) fn run(source_path: PathBuf, destination_path: PathBuf) -> Result<()> {
+pub(super) fn run(
+    source_path: PathBuf,
+    destination_path: PathBuf,
+    drop_drained: Vec<String>,
+) -> Result<()> {
+    let drained = drop_drained
+        .iter()
+        .map(|pair| {
+            let (retired, current) = pair.split_once('=').ok_or_else(|| {
+                anyhow!("--drop-drained takes RETIRED=CURRENT, two collection handles: {pair:?}")
+            })?;
+            Ok(DrainedGeneration {
+                retired: super::collection::parse_collection_handle(retired)?,
+                current: super::collection::parse_collection_handle(current)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     if destination_path.exists() {
         bail!(
             "destination {} already exists; compact writes a fresh pile",
@@ -180,7 +197,7 @@ pub(super) fn run(source_path: PathBuf, destination_path: PathBuf) -> Result<()>
         }
     };
 
-    let operation = compact_into(&mut source, &mut destination, stable_source_len)
+    let operation = compact_into(&mut source, &mut destination, stable_source_len, &drained)
         .and_then(|stats| Ok((stats, census(&destination_path)?)));
     let destination_close = destination
         .close()
@@ -235,6 +252,10 @@ pub(super) fn run(source_path: PathBuf, destination_path: PathBuf) -> Result<()>
     println!(
         "  retired equations left behind, signed twin present: {}",
         stats.superseded_equations
+    );
+    println!(
+        "  frames left behind with drained generations: {}",
+        stats.drained_frames
     );
     Ok(())
 }

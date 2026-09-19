@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- A retained rewrite can leave a drained generation behind:
+  `PileFile::rewrite_retained_into_leaving` takes `DrainedGeneration` pairs
+  (retired, current), refuses with `PileRewriteError::Undrained` unless every
+  distinct commit of the retired generation is present in the current one,
+  and then carries no frame that names the retired generation or any
+  collection derived from it, whether a current record, a retired unsigned
+  equation, or a retired signed frame. Counted in
+  `PileRewriteStats::drained_frames`.
+
 - A retained rewrite no longer carries a retired equation frame, unsigned or
   signed under a retired kind (payload-only V2, witness-bound V6/V7), once a
   current signed equation with the same collection, inputs and result is

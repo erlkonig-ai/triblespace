@@ -54,8 +54,8 @@ use crate::capability::{
 use crate::collection::store::{selectors_match_record, CollectionRead};
 pub use crate::collection::LegacyUnsignedCollectionEquation;
 use crate::collection::{
-    CollectionCommit, CollectionData, CollectionDerive, CollectionMerge, CollectionRecord,
-    CollectionRecordSelector, CollectionStore,
+    CollectionCommit, CollectionData, CollectionDerive, CollectionHandle, CollectionMerge,
+    CollectionRecord, CollectionRecordSelector, CollectionStore,
 };
 use crate::id::Id;
 use crate::id::RawId;
@@ -5215,6 +5215,82 @@ pub struct PileRewriteStats {
     /// kind, not carried because a current signed equation with the same
     /// collection, inputs and result is present.
     pub superseded_equations: usize,
+    /// Number of frames of every kind not carried because they belong to a
+    /// generation named as drained, or to a collection derived from one.
+    pub drained_frames: usize,
+}
+
+/// One retired generation and the generation its content was drained into.
+///
+/// Naming a pair is an explicit statement: every distinct commit of
+/// `retired` is present in `current` (the rewrite checks and refuses
+/// otherwise), so `retired`, and every collection derived from it, is
+/// baggage the rewrite may leave behind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DrainedGeneration {
+    /// The generation to leave behind, with everything derived from it.
+    pub retired: CollectionHandle,
+    /// The generation that now holds every one of its commits.
+    pub current: CollectionHandle,
+}
+
+/// The collection a retired signed frame names, when its kind is one of the
+/// four retired signed kinds. Every one of them laid the collection out
+/// first.
+fn retired_signed_frame_collection(frame: &[u8]) -> Option<[u8; 32]> {
+    let kind = frame.get(FRAME_BODY_OFFSET - 32..FRAME_BODY_OFFSET)?;
+    let retired = [
+        record_kind::KIND_COLLECTION_MERGE_SIGNED_V2,
+        record_kind::KIND_COLLECTION_DERIVE_SIGNED_V2,
+        record_kind::KIND_COLLECTION_MERGE_WITNESSED_V6,
+        record_kind::KIND_COLLECTION_DERIVE_WITNESSED_V7,
+    ];
+    if !retired.iter().any(|known| kind == known.as_slice()) {
+        return None;
+    }
+    frame
+        .get(FRAME_BODY_OFFSET..FRAME_BODY_OFFSET + 32)?
+        .try_into()
+        .ok()
+}
+
+/// Close `drained` under derivation: every candidate collection whose
+/// resident descriptor names a drained collection as its source is drained
+/// too, to a fixpoint. A candidate without a resident descriptor is left
+/// alone, which is the conservative direction.
+fn close_drained_over_derivations(
+    reader: &PileFileSnapshot,
+    drained: &mut BTreeSet<[u8; 32]>,
+    candidates: &BTreeSet<[u8; 32]>,
+) {
+    use crate::blob::TryFromBlob;
+    use crate::trible::TribleSet;
+
+    let mut sources: std::collections::BTreeMap<[u8; 32], Option<[u8; 32]>> =
+        std::collections::BTreeMap::new();
+    for candidate in candidates {
+        let descriptor: Result<Blob<SimpleArchive>, _> =
+            reader.get(CollectionHandle::new(*candidate));
+        let source = descriptor
+            .ok()
+            .and_then(|blob| <TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(blob).ok())
+            .and_then(|facts| crate::collection::descriptor::source(&facts).ok().flatten())
+            .map(|source| source.raw);
+        sources.insert(*candidate, source);
+    }
+    loop {
+        let before = drained.len();
+        for (candidate, source) in &sources {
+            if let Some(source) = source {
+                if drained.contains(source) {
+                    drained.insert(*candidate);
+                }
+            }
+        }
+        if drained.len() == before {
+            break;
+        }
+    }
 }
 
 /// Failure while copying one policy-selected pile state into another pile.
@@ -5242,6 +5318,17 @@ pub enum PileRewriteError {
     CapabilityProof(CapabilityProofInsertError),
     /// The completed destination state could not be made durable.
     Flush(FlushError),
+    /// A generation named as drained still holds content its successor lacks.
+    Undrained {
+        /// The generation that was to be left behind.
+        retired: CollectionHandle,
+        /// The generation that was to hold all of its content.
+        current: CollectionHandle,
+        /// Distinct commits of `retired` with no counterpart in `current`.
+        unreached: usize,
+    },
+    /// The drain check itself could not read the source.
+    Drain(String),
 }
 
 impl std::fmt::Display for PileRewriteError {
@@ -5262,6 +5349,17 @@ impl std::fmt::Display for PileRewriteError {
                 write!(f, "failed to preserve a capability proof: {error}")
             }
             Self::Flush(error) => write!(f, "failed to flush rewritten pile: {error}"),
+            Self::Undrained {
+                retired,
+                current,
+                unreached,
+            } => write!(
+                f,
+                "generation {} is not drained into {}: {unreached} commit(s) have no counterpart",
+                hex::encode(retired.raw),
+                hex::encode(current.raw)
+            ),
+            Self::Drain(error) => write!(f, "failed to check a drained generation: {error}"),
         }
     }
 }
@@ -5275,7 +5373,7 @@ impl Error for PileRewriteError {
             Self::Collection(error) => Some(error),
             Self::CapabilityProof(error) => Some(error),
             Self::Flush(error) => Some(error),
-            Self::StrongPinConflict { .. } => None,
+            Self::StrongPinConflict { .. } | Self::Undrained { .. } | Self::Drain(_) => None,
         }
     }
 }
@@ -5322,7 +5420,36 @@ impl PileFile {
         explicit: &super::RetentionRoots,
         wants: WantRewritePolicy,
     ) -> Result<PileRewriteStats, PileRewriteError> {
+        self.rewrite_retained_into_leaving(destination, explicit, wants, &[])
+    }
+
+    /// [`Self::rewrite_retained_into`], leaving the named drained generations
+    /// behind: every frame naming one of them, or a collection derived from
+    /// one, is not carried. Each pair is checked first; a generation with a
+    /// commit its successor lacks refuses the whole rewrite.
+    pub fn rewrite_retained_into_leaving(
+        &mut self,
+        destination: &mut PileFile,
+        explicit: &super::RetentionRoots,
+        wants: WantRewritePolicy,
+        drained_generations: &[DrainedGeneration],
+    ) -> Result<PileRewriteStats, PileRewriteError> {
         let reader = self.snapshot().map_err(PileRewriteError::Source)?;
+        for pair in drained_generations {
+            let unreached = crate::collection::generation::unreached_records(
+                &reader,
+                pair.retired,
+                pair.current,
+            )
+            .map_err(|error| PileRewriteError::Drain(error.to_string()))?;
+            if unreached > 0 {
+                return Err(PileRewriteError::Undrained {
+                    retired: pair.retired,
+                    current: pair.current,
+                    unreached,
+                });
+            }
+        }
         let strong_pins = self.branches.clone();
         // Frames whose kind this binary does not model are carried exactly,
         // by their own length, from the observed prefix: this rewrite keeps
@@ -5347,6 +5474,44 @@ impl PileFile {
             }
         }
         let mut superseded_equations = 0usize;
+        let mut drained_frames = 0usize;
+        let legacy_collection_headers = self.legacy_collection_headers.clone();
+        // Which collections are being left behind: the named generations and,
+        // to a fixpoint, everything derived from them. Candidates are every
+        // collection any frame in the file names.
+        let mut drained: BTreeSet<[u8; 32]> = drained_generations
+            .iter()
+            .map(|pair| pair.retired.raw)
+            .collect();
+        if !drained.is_empty() {
+            let mut candidates: BTreeSet<[u8; 32]> = BTreeSet::new();
+            for key in collection_records.iter_ordered() {
+                candidates.insert(key[..32].try_into().expect("key head is the collection"));
+            }
+            for header in legacy_collection_headers.iter_ordered() {
+                if let Ok(PileRecord {
+                    content: PileRecordContent::LegacyUnsignedCollectionEquation { equation },
+                    ..
+                }) = decode_record(header, 0)
+                {
+                    candidates.insert(equation.collection().raw);
+                }
+            }
+            for (offset, len) in self.opaque_frames.iter().copied() {
+                if offset + len > covered {
+                    continue;
+                }
+                let frame = unsafe {
+                    slice_from_raw_parts(reader.mmap.as_ptr().add(offset), len)
+                        .as_ref()
+                        .expect("mapped opaque frame")
+                };
+                if let Some(collection) = retired_signed_frame_collection(frame) {
+                    candidates.insert(collection);
+                }
+            }
+            close_drained_over_derivations(&reader, &mut drained, &candidates);
+        }
         let opaque_frames: Vec<(usize, usize)> = self
             .opaque_frames
             .iter()
@@ -5358,6 +5523,12 @@ impl PileFile {
                         .as_ref()
                         .expect("mapped opaque frame")
                 };
+                if retired_signed_frame_collection(frame)
+                    .is_some_and(|collection| drained.contains(&collection))
+                {
+                    drained_frames += 1;
+                    return false;
+                }
                 let superseded = retired_signed_frame_equation_key(frame)
                     .is_some_and(|equation| signed_equations.contains(&equation));
                 if superseded {
@@ -5371,7 +5542,6 @@ impl PileFile {
             .map_err(PileRewriteError::Source)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(PileRewriteError::Source)?;
-        let legacy_collection_headers = self.legacy_collection_headers.clone();
         let source_wants = self.wants.clone();
         let preserved_wants: Vec<_> = if wants == WantRewritePolicy::Preserve {
             source_wants
@@ -5501,6 +5671,10 @@ impl PileFile {
                 ..
             }) = decode_record(&header, 0)
             {
+                if drained.contains(&equation.collection().raw) {
+                    drained_frames += 1;
+                    continue;
+                }
                 if signed_equations.contains(&legacy_equation_key(&equation)) {
                     superseded_equations += 1;
                     continue;
@@ -5523,6 +5697,10 @@ impl PileFile {
         }
 
         for key in collection_records.iter_ordered() {
+            if drained.contains(&key[..32]) {
+                drained_frames += 1;
+                continue;
+            }
             let record = reader.record_at(key[64..].try_into().expect("key tail is the offset"));
             destination
                 .insert(record)
@@ -5548,6 +5726,7 @@ impl PileFile {
             capability_proofs: capability_proof_count,
             opaque_frames: opaque_frames.len(),
             superseded_equations,
+            drained_frames,
         })
     }
 }
@@ -8749,6 +8928,7 @@ mod tests {
                 capability_proofs: 0,
                 opaque_frames: 0,
                 superseded_equations: 0,
+                drained_frames: 0,
             }
         );
 
@@ -11330,6 +11510,141 @@ mod tests {
         assert!(records.contains(&derive_twin));
         drop(reader);
         assert_eq!(destination.opaque_record_count().unwrap(), 1);
+        destination.close().unwrap();
+        source.close().unwrap();
+    }
+
+    /// A generation named as drained is left behind whole: its commits, the
+    /// equations of every collection derived from it, and the retired frames
+    /// that name either, in every framing. A generation with a commit its
+    /// successor lacks refuses the rewrite instead.
+    #[test]
+    fn a_drained_generation_and_its_derivations_are_left_behind_by_rewrite() {
+        use crate::blob::encodings::succinctarchive::SuccinctArchiveBlob;
+        use crate::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "drained-source.pile");
+        let mut source = Pile::open(&source_path).unwrap();
+        let key = SigningKey::from_bytes(&[9; 32]);
+        let other = SigningKey::from_bytes(&[10; 32]);
+        let policy = |signer: &SigningKey| {
+            CollectionPolicy::new(
+                AdmissionPolicy::direct(signer.verifying_key()),
+                AdmissionPolicy::direct(signer.verifying_key()),
+            )
+        };
+        let old = source.collection("gen", policy(&key)).unwrap();
+        let new = source.collection("gen", policy(&other)).unwrap();
+        assert_ne!(old.handle(), new.handle());
+        let derived = source
+            .derive::<SuccinctArchiveBlob>(old, (), policy(&key))
+            .unwrap();
+        let data = [collection_test_hash(1), collection_test_hash(2)];
+        for member in data {
+            source
+                .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                    &key,
+                    old.handle(),
+                    member,
+                    empty_metadata_handle(),
+                )))
+                .unwrap();
+        }
+        source
+            .insert(CollectionRecord::Derive(CollectionDerive::sign(
+                &key,
+                derived.handle(),
+                data[0],
+                collection_test_hash(3),
+            )))
+            .unwrap();
+        source.close().unwrap();
+        // A retired unsigned merge and a retired signed derive, both naming
+        // the old generation, opaque or inert to replay.
+        let unsigned = LegacyCollectionMergeRecordHeader {
+            magic: FRAME_MAGIC,
+            span_blocks: ENVELOPE_HEADER_BLOCKS.to_le_bytes(),
+            record_kind: record_kind::KIND_COLLECTION_MERGE_UNSIGNED,
+            collection: old.handle().raw,
+            low: data[0].raw,
+            high: data[1].raw,
+            result: collection_test_hash(4).raw,
+            reserved: [0; 64],
+        };
+        let mut retired = test_envelope_bytes(record_kind::KIND_COLLECTION_DERIVE_SIGNED_V2, 1, 256);
+        retired[FRAME_BODY_OFFSET..FRAME_BODY_OFFSET + 32].copy_from_slice(&old.handle().raw);
+        append_test_bytes(&source_path, unsigned.as_bytes());
+        append_test_bytes(&source_path, &retired);
+
+        let mut source = Pile::open(&source_path).unwrap();
+        let pair = DrainedGeneration {
+            retired: old.handle(),
+            current: new.handle(),
+        };
+        // Only one commit carried: the rewrite refuses and names the gap.
+        source
+            .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                &other,
+                new.handle(),
+                data[0],
+                empty_metadata_handle(),
+            )))
+            .unwrap();
+        let refused_path = fresh_empty_pile_path(&dir, "refused.pile");
+        let mut refused = Pile::open(&refused_path).unwrap();
+        assert!(matches!(
+            source.rewrite_retained_into_leaving(
+                &mut refused,
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+                &[pair],
+            ),
+            Err(PileRewriteError::Undrained { unreached: 1, .. })
+        ));
+        refused.close().unwrap();
+
+        // Both carried: the old generation, its derivation and the retired
+        // frames naming it stay behind; the new generation travels.
+        source
+            .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                &other,
+                new.handle(),
+                data[1],
+                empty_metadata_handle(),
+            )))
+            .unwrap();
+        let destination_path = fresh_empty_pile_path(&dir, "drained-destination.pile");
+        let mut destination = Pile::open(&destination_path).unwrap();
+        let stats = source
+            .rewrite_retained_into_leaving(
+                &mut destination,
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+                &[pair],
+            )
+            .unwrap();
+        assert_eq!(stats.drained_frames, 5);
+        assert_eq!(stats.opaque_frames, 0);
+        let reader = destination.snapshot().unwrap();
+        for handle in [old.handle(), derived.handle()] {
+            assert!(reader
+                .select_records(&BTreeSet::from([CollectionRecordSelector::Collection(handle)]))
+                .unwrap()
+                .is_empty());
+        }
+        assert_eq!(
+            reader
+                .select_records(&BTreeSet::from([CollectionRecordSelector::Collection(
+                    new.handle()
+                )]))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(reader.legacy_unsigned_collection_equations().count(), 0);
+        drop(reader);
+        assert_eq!(destination.opaque_record_count().unwrap(), 0);
         destination.close().unwrap();
         source.close().unwrap();
     }

@@ -606,7 +606,7 @@ fn run_init(
 /// `pile blob inspect` rejects the bare form with `BadProtocol`. Collection
 /// handles get copied out of record dumps and log lines in both shapes, so
 /// this entry point normalizes rather than nitpicks.
-fn parse_collection_handle(handle: &str) -> Result<CollectionHandle> {
+pub(super) fn parse_collection_handle(handle: &str) -> Result<CollectionHandle> {
     use triblespace::prelude::TryToInline;
 
     let trimmed = handle.trim();

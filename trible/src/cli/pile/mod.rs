@@ -68,6 +68,12 @@ pub enum PileCommand {
         /// Fresh destination pile to create.
         #[arg(long = "into")]
         into: PathBuf,
+        /// Leave a drained generation behind: `RETIRED=CURRENT`, two
+        /// collection handles. Every frame naming RETIRED or a collection
+        /// derived from it is not carried, after checking that every commit
+        /// of RETIRED is present in CURRENT. Repeat for several generations.
+        #[arg(long = "drop-drained", value_name = "RETIRED=CURRENT")]
+        drop_drained: Vec<String>,
     },
     /// Diagnostic helpers for inspecting and repairing piles.
     Diagnose {
@@ -184,7 +190,11 @@ pub fn run(cmd: PileCommand) -> Result<()> {
             pile.close().map_err(|e| anyhow::anyhow!("{e:?}"))?;
             Ok(())
         }
-        PileCommand::Compact { source, into } => compact::run(source, into),
+        PileCommand::Compact {
+            source,
+            into,
+            drop_drained,
+        } => compact::run(source, into, drop_drained),
         PileCommand::Net { cmd } => net::run(cmd),
         PileCommand::Diagnose { cmd } => diagnose::run(cmd),
         PileCommand::Verify { pile } => verify::run(&pile),
