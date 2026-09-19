@@ -20,8 +20,8 @@ use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::locator::blob_locator;
 use triblespace_core::collection::reference_summary::{ReferenceSummaryBlob, ReferenceSummaryView};
 use triblespace_core::collection::{
-    Collection, CollectionHandle, CollectionRead, CollectionRecord, CollectionRecordSelector,
-    CollectionSnapshotExt, CollectionStore,
+    Collection, CollectionHandle, CollectionRead, CollectionRecordSelector, CollectionSnapshotExt,
+    CollectionStore,
 };
 use triblespace_core::inline::Inline;
 use triblespace_core::patch::{Entry as PatchEntry, IdentitySchema, PATCH};
@@ -421,45 +421,7 @@ impl Reconciler {
         };
         stats.wants = requests.len();
 
-        let blob_wants: BTreeSet<_> = requests
-            .iter()
-            .copied()
-            .filter(|request| request.blob_handle().is_some())
-            .collect();
-        let operation_wants: BTreeSet<_> = requests
-            .iter()
-            .copied()
-            .filter(|request| {
-                matches!(
-                    request,
-                    WantRequest::Merge { .. } | WantRequest::Derive { .. }
-                )
-            })
-            .collect();
-
-        // One native indexed union retains every conflicting answer. Empty is
-        // only "not obtained yet", never proof that no answer exists.
-        let selectors: BTreeSet<_> = operation_wants
-            .iter()
-            .copied()
-            .map(CollectionRecordSelector::Operation)
-            .collect();
-        let answered_operations = match answered_operations(&snapshot, &selectors) {
-            Ok(answered) => answered,
-            Err(error) => {
-                tracing::warn!(
-                    ?error,
-                    "operation receipt observation failed; skipping reconcile pass"
-                );
-                return ReconcileStats::default();
-            }
-        };
-        let missing_operations = operation_wants
-            .iter()
-            .filter(|request| !answered_operations.contains(request))
-            .count();
-
-        let wanted_blob_handles: BTreeSet<_> = blob_wants
+        let wanted_blob_handles: BTreeSet<_> = requests
             .iter()
             .filter_map(|request| request.blob_handle().map(|handle| handle.raw))
             .collect();
@@ -511,7 +473,7 @@ impl Reconciler {
             .filter(|handle| !visible_blobs.contains(*handle))
             .copied()
             .collect();
-        stats.missing = missing_operations + missing_wanted.len();
+        stats.missing = missing_wanted.len();
         self.states
             .retain(|handle, _| exact_handles.contains(handle) && !visible_blobs.contains(handle));
         self.observe_missing(&missing_wanted, &missing_roots);
@@ -599,11 +561,10 @@ impl Reconciler {
                 self.record_unavailable(handle);
             }
         }
-        stats.pending = missing_operations
-            + wanted_blob_handles
-                .iter()
-                .filter(|handle| !visible_blobs.contains(*handle))
-                .count();
+        stats.pending = wanted_blob_handles
+            .iter()
+            .filter(|handle| !visible_blobs.contains(*handle))
+            .count();
         stats.replication.pending = roots
             .iter()
             .filter(|handle| !visible_blobs.contains(*handle))
@@ -1160,33 +1121,6 @@ where
     Some(bytes)
 }
 
-fn answered_operations<R>(
-    snapshot: &R,
-    selectors: &BTreeSet<CollectionRecordSelector>,
-) -> Result<HashSet<WantRequest>, R::RecordsError>
-where
-    R: CollectionRead,
-{
-    Ok(snapshot
-        .select_records(selectors)?
-        .into_iter()
-        .filter_map(want_request_for_record)
-        .collect())
-}
-
-fn want_request_for_record(record: CollectionRecord) -> Option<WantRequest> {
-    match record {
-        CollectionRecord::Commit(_) => None,
-        CollectionRecord::Merge(merge) => {
-            let (low, high) = merge.inputs();
-            Some(WantRequest::merge(merge.collection(), low, high))
-        }
-        CollectionRecord::Derive(derive) => {
-            Some(WantRequest::derive(derive.collection(), derive.input()))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     // Canonical but deliberately uninserted COMMIT witnesses keep these
@@ -1200,7 +1134,9 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use triblespace_core::blob::{BlobEncoding, IntoBlob};
     use triblespace_core::capability::CapabilityProof;
-    use triblespace_core::collection::{CollectionCommit, CollectionDerive, CollectionMerge};
+    use triblespace_core::collection::{
+        CollectionCommit, CollectionDerive, CollectionMerge, CollectionRecord,
+    };
     use triblespace_core::inline::encodings::hash::Handle;
     use triblespace_core::inline::{Inline, InlineEncoding};
     use triblespace_core::repo::memoryrepo::MemoryRepo;
@@ -1361,47 +1297,6 @@ mod tests {
         fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
             Err(std::io::Error::other("collection observation failed"))
         }
-    }
-
-    #[test]
-    fn operation_observation_failure_aborts_projection() {
-        let collection = Inline::new([1; 32]);
-        let a = Inline::new([2; 32]);
-        let b = Inline::new([3; 32]);
-        let selectors = BTreeSet::from([CollectionRecordSelector::Operation(WantRequest::merge(
-            collection, a, b,
-        ))]);
-
-        let error = answered_operations(&FailingCollectionRead, &selectors).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::Other);
-    }
-
-    #[test]
-    fn receipts_project_to_exact_input_only_wants() {
-        let collection = Inline::new([1; 32]);
-        let target = Inline::new([2; 32]);
-        let a = Inline::new([3; 32]);
-        let b = Inline::new([4; 32]);
-        let result = Inline::new([5; 32]);
-        assert_eq!(
-            want_request_for_record(CollectionRecord::Merge(CollectionMerge::sign(
-                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                collection,
-                b,
-                a,
-                result,
-            ))),
-            Some(WantRequest::merge(collection, a, b))
-        );
-        assert_eq!(
-            want_request_for_record(CollectionRecord::Derive(CollectionDerive::sign(
-                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                target,
-                a,
-                result,
-            ))),
-            Some(WantRequest::derive(target, a))
-        );
     }
 
     #[test]

@@ -22,8 +22,6 @@ names directly:
 | `DERIVE` | target descriptor, input, output |
 | authorization proof | each capability-definition handle in its signed path |
 | `WANT Blob(H)` | `H` |
-| `WANT Merge(C, A, B)` | `C`, `A`, `B` |
-| `WANT Derive(C, A)` | `C`, `A` |
 
 Each direct reference is an independent recursive ownership edge. If the
 referenced blob is resident, collection retains it and every resident child

@@ -216,6 +216,7 @@ pub trait StoreSnapshot: Clone + Send + Sync + 'static {
 #[cfg(test)]
 mod store_dependency_tests {
     use super::*;
+    use crate::collection::CollectionHandle;
 
     #[derive(Clone)]
     struct UnclassifiedSnapshot;
@@ -356,7 +357,7 @@ use crate::blob::Blob;
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
 use crate::collection::{
-    CollectionData, CollectionHandle, CollectionRead, CollectionRecordSelector, CollectionStore,
+    CollectionData, CollectionRead, CollectionRecordSelector, CollectionStore,
     CoverageRead,
 };
 use crate::inline::encodings::hash::Handle;
@@ -802,51 +803,27 @@ pub const WANT_REQUEST_BYTES_LEN: usize = 1 + 3 * INLINE_LEN;
 
 /// Versioned tag of a blob request in the canonical [`WantRequest`] codec.
 pub const WANT_REQUEST_KIND_BLOB_V1: u8 = 1;
-/// Versioned tag of a merge request in the canonical [`WantRequest`] codec.
-pub const WANT_REQUEST_KIND_MERGE_V1: u8 = 2;
-/// Retired derive tag used only while projecting historical pile WANT logs.
-///
-/// It encoded `(source, target, input)`; current canonical requests use tag 4
-/// and omit the source already named by the target descriptor.
+/// Retired derive tag, seen only in historical pile WANT logs. It encoded
+/// `(source, target, input)`; a later tag 4 dropped the source, and then
+/// computation wants were removed altogether. Kept so a decoder can name
+/// what it refuses to interpret.
+#[cfg(test)]
 pub(crate) const WANT_REQUEST_KIND_DERIVE_V1: u8 = 3;
-/// Derive request naming only its target and input.
-///
-/// The source is what the target's descriptor says it is, so a want that
-/// restated it only offered a way to disagree with the descriptor.
-pub const WANT_REQUEST_KIND_DERIVE_V2: u8 = 4;
 
-/// A durable request for absent content or reproducible collection work.
+/// A durable request for absent content.
 ///
-/// Requests deliberately name only inputs. A fulfiller may satisfy a blob
-/// request by fetching its content, a merge request by publishing an exact
-/// [`crate::collection::CollectionMerge`], or a derive request by publishing
-/// an exact [`crate::collection::CollectionDerive`].
+/// A request names only what it wants, and a fulfiller satisfies it by
+/// fetching the content. Requests for *work* -- "someone compute this merge
+/// or derivation" -- were once a second shape here and are gone: a blob want
+/// costs the wanter the bytes, so a flood floods itself, while a computation
+/// want costs the wanter nothing and asks others to pay; whoever wants a
+/// computation runs it.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum WantRequest {
     /// Obtain and retain one content-addressed blob according to local policy.
     Blob {
         /// Type-erased bearer handle used for local lookup or global discovery.
         handle: Inline<Handle<UnknownBlob>>,
-    },
-    /// Discover or compute the exact merge of two collection elements.
-    Merge {
-        /// Collection whose merge operation is requested.
-        collection: CollectionHandle,
-        /// Canonically lower input digest.
-        low: CollectionData,
-        /// Canonically higher input digest.
-        high: CollectionData,
-    },
-    /// Discover or compute one collection derivation.
-    ///
-    /// The source is not named: the target's descriptor says which collection
-    /// it derives from, so a want asks for one instance of a mapping the
-    /// responder can already identify.
-    Derive {
-        /// Target collection requested for the derived output.
-        target: CollectionHandle,
-        /// Source element to derive.
-        input: CollectionData,
     },
 }
 
@@ -866,31 +843,7 @@ impl WantRequest {
     pub const fn blob_handle(self) -> Option<Inline<Handle<UnknownBlob>>> {
         match self {
             Self::Blob { handle } => Some(handle),
-            Self::Merge { .. } | Self::Derive { .. } => None,
         }
-    }
-
-    /// Construct a merge request with its two inputs in canonical order.
-    pub fn merge(
-        collection: CollectionHandle,
-        first: CollectionData,
-        second: CollectionData,
-    ) -> Self {
-        let (low, high) = if first <= second {
-            (first, second)
-        } else {
-            (second, first)
-        };
-        Self::Merge {
-            collection,
-            low,
-            high,
-        }
-    }
-
-    /// Construct a derivation request from one exact source element.
-    pub const fn derive(target: CollectionHandle, input: CollectionData) -> Self {
-        Self::Derive { target, input }
     }
 
     /// Blob handles named directly by this durable request.
@@ -902,18 +855,6 @@ impl WantRequest {
         let mut references = arrayvec::ArrayVec::<_, 3>::new();
         match self {
             Self::Blob { handle } => references.push(handle),
-            Self::Merge {
-                collection,
-                low,
-                high,
-            } => references.extend([
-                collection.transmute(),
-                Handle::<UnknownBlob>::from_hash(low),
-                Handle::<UnknownBlob>::from_hash(high),
-            ]),
-            Self::Derive { target, input } => {
-                references.extend([target.transmute(), Handle::<UnknownBlob>::from_hash(input)])
-            }
         }
         references.into_iter()
     }
@@ -925,21 +866,6 @@ impl WantRequest {
             Self::Blob { handle } => {
                 bytes[0] = WANT_REQUEST_KIND_BLOB_V1;
                 write_want_field(&mut bytes, 0, handle.raw);
-            }
-            Self::Merge {
-                collection,
-                low,
-                high,
-            } => {
-                bytes[0] = WANT_REQUEST_KIND_MERGE_V1;
-                write_want_field(&mut bytes, 0, collection.raw);
-                write_want_field(&mut bytes, 1, low.raw);
-                write_want_field(&mut bytes, 2, high.raw);
-            }
-            Self::Derive { target, input } => {
-                bytes[0] = WANT_REQUEST_KIND_DERIVE_V2;
-                write_want_field(&mut bytes, 0, target.raw);
-                write_want_field(&mut bytes, 1, input.raw);
             }
         }
         bytes
@@ -958,30 +884,6 @@ impl WantRequest {
                     handle: Inline::new(read_want_field(&bytes, 0)),
                 })
             }
-            WANT_REQUEST_KIND_MERGE_V1 => {
-                let collection = Inline::new(read_want_field(&bytes, 0));
-                let low = Inline::new(read_want_field(&bytes, 1));
-                let high = Inline::new(read_want_field(&bytes, 2));
-                if high < low {
-                    return Err(WantRequestDecodeError::NonCanonicalMergeInputs);
-                }
-                Ok(Self::Merge {
-                    collection,
-                    low,
-                    high,
-                })
-            }
-            WANT_REQUEST_KIND_DERIVE_V2 => {
-                if read_want_field(&bytes, 2).iter().any(|byte| *byte != 0) {
-                    return Err(WantRequestDecodeError::NonZeroUnusedFields {
-                        kind: WANT_REQUEST_KIND_DERIVE_V2,
-                    });
-                }
-                Ok(Self::Derive {
-                    target: Inline::new(read_want_field(&bytes, 0)),
-                    input: Inline::new(read_want_field(&bytes, 1)),
-                })
-            }
             unknown => Err(WantRequestDecodeError::UnknownKind(unknown)),
         }
     }
@@ -994,8 +896,6 @@ pub enum WantRequestDecodeError {
     UnknownKind(u8),
     /// A short variant used non-zero bytes in a reserved field.
     NonZeroUnusedFields { kind: u8 },
-    /// A merge encoded its inputs in descending order.
-    NonCanonicalMergeInputs,
 }
 
 impl fmt::Display for WantRequestDecodeError {
@@ -1008,9 +908,6 @@ impl fmt::Display for WantRequestDecodeError {
                 formatter,
                 "want request kind {kind} has non-zero unused fields"
             ),
-            Self::NonCanonicalMergeInputs => {
-                formatter.write_str("want request merge inputs are not canonically ordered")
-            }
         }
     }
 }
@@ -1047,7 +944,7 @@ pub trait WantRead {
     fn wants<'a>(&'a self) -> Result<Self::WantIter<'a>, Self::WantsError>;
 }
 
-/// Insertion capability for durable typed wants.
+/// Insertion capability for durable blob wants.
 ///
 /// Wants are an idempotent grow-only set, independent of legacy named-pin
 /// evidence and native collection records. A backend may support either
@@ -1073,14 +970,6 @@ pub trait WantStore {
 mod want_request_tests {
     use super::*;
 
-    fn collection(byte: u8) -> CollectionHandle {
-        Inline::new([byte; INLINE_LEN])
-    }
-
-    fn data(byte: u8) -> CollectionData {
-        Inline::new([byte; INLINE_LEN])
-    }
-
     #[test]
     fn typed_blob_request_roundtrips_with_zero_unused_fields() {
         let typed = Inline::<Handle<SimpleArchive>>::new([0x41; INLINE_LEN]);
@@ -1100,60 +989,14 @@ mod want_request_tests {
     }
 
     #[test]
-    fn merge_constructor_sorts_and_dense_decoder_rejects_reverse_order() {
-        let request = WantRequest::merge(collection(1), data(9), data(2));
-        assert_eq!(
-            request,
-            WantRequest::Merge {
-                collection: collection(1),
-                low: data(2),
-                high: data(9),
-            }
-        );
-        assert_eq!(WantRequest::from_bytes(request.to_bytes()), Ok(request));
-
-        let mut reversed = request.to_bytes();
-        reversed[1 + INLINE_LEN..1 + 2 * INLINE_LEN].fill(9);
-        reversed[1 + 2 * INLINE_LEN..].fill(2);
-        assert_eq!(
-            WantRequest::from_bytes(reversed),
-            Err(WantRequestDecodeError::NonCanonicalMergeInputs)
-        );
-    }
-
-    #[test]
-    fn derive_request_roundtrips() {
-        let request = WantRequest::derive(collection(2), data(3));
-        let bytes = request.to_bytes();
-        assert_eq!(bytes[0], WANT_REQUEST_KIND_DERIVE_V2);
-        assert_eq!(WantRequest::from_bytes(bytes), Ok(request));
-    }
-
-    #[test]
     fn wants_enumerate_every_direct_blob_reference() {
         let blob = WantRequest::blob(Inline::<Handle<UnknownBlob>>::new([1; INLINE_LEN]));
-        let merge = WantRequest::merge(collection(2), data(3), data(4));
-        let derive = WantRequest::derive(collection(5), data(6));
 
         assert_eq!(
             blob.blob_references()
                 .map(|handle| handle.raw)
                 .collect::<Vec<_>>(),
             vec![[1; INLINE_LEN]],
-        );
-        assert_eq!(
-            merge
-                .blob_references()
-                .map(|handle| handle.raw)
-                .collect::<Vec<_>>(),
-            vec![[2; INLINE_LEN], [3; INLINE_LEN], [4; INLINE_LEN]],
-        );
-        assert_eq!(
-            derive
-                .blob_references()
-                .map(|handle| handle.raw)
-                .collect::<Vec<_>>(),
-            vec![[5; INLINE_LEN], [6; INLINE_LEN]],
         );
     }
 

@@ -1683,36 +1683,15 @@ mod tests {
 
     #[test]
     fn want_state_enumerates_canonical_request_order_without_sorting() {
-        let blob_low = WantRequest::blob(Inline::<Handle<UnknownBlob>>::new([1; INLINE_LEN]));
-        let blob_high = WantRequest::blob(Inline::<Handle<UnknownBlob>>::new([2; INLINE_LEN]));
-        let merge_low = WantRequest::merge(
-            Inline::new([3; INLINE_LEN]),
-            Inline::new([5; INLINE_LEN]),
-            Inline::new([4; INLINE_LEN]),
-        );
-        let merge_high = WantRequest::merge(
-            Inline::new([4; INLINE_LEN]),
-            Inline::new([6; INLINE_LEN]),
-            Inline::new([5; INLINE_LEN]),
-        );
-        let derive_low =
-            WantRequest::derive(Inline::new([5; INLINE_LEN]), Inline::new([7; INLINE_LEN]));
-        let derive_high =
-            WantRequest::derive(Inline::new([6; INLINE_LEN]), Inline::new([8; INLINE_LEN]));
-        let expected = vec![
-            blob_low,
-            blob_high,
-            merge_low,
-            merge_high,
-            derive_low,
-            derive_high,
-        ];
+        let expected: Vec<WantRequest> = (1u8..=4)
+            .map(|byte| WantRequest::blob(Inline::<Handle<UnknownBlob>>::new([byte; INLINE_LEN])))
+            .collect();
 
         let mut state = WantState::default();
         for request in expected.iter().rev().copied() {
             state.want(request);
         }
-        state.want(merge_low);
+        state.want(expected[1]);
 
         let actual = state.requests();
         assert_eq!(actual, expected);
@@ -1973,11 +1952,9 @@ mod tests {
             .pile_mut()
             .insert(unrelated)
             .unwrap();
-        let selectors = [CollectionRecordSelector::Operation(WantRequest::derive(
-            target, input,
-        ))]
-        .into_iter()
-        .collect();
+        let selectors = [CollectionRecordSelector::DeriveTarget(target)]
+            .into_iter()
+            .collect();
         let mut expected = vec![first, conflicting];
         expected.sort_unstable_by_key(CollectionRecord::fingerprint);
 
@@ -2415,8 +2392,7 @@ mod tests {
             fanout: 1,
         };
         let (_dir, paths, mut yard) = yard_with_paths(3, config);
-        let operation =
-            WantRequest::derive(Inline::new([81; INLINE_LEN]), Inline::new([82; INLINE_LEN]));
+        let operation = WantRequest::blob(Inline::<Handle<UnknownBlob>>::new([81; INLINE_LEN]));
         yard.generations[1]
             .active_mut()
             .pile_mut()
@@ -2571,8 +2547,7 @@ mod tests {
         File::create(&path).unwrap();
         let temp_path = reclaim_temp_path(&path, 0);
         let pile = Pile::open(&path).unwrap();
-        let request =
-            WantRequest::derive(Inline::new([91; INLINE_LEN]), Inline::new([92; INLINE_LEN]));
+        let request = WantRequest::blob(Inline::<Handle<UnknownBlob>>::new([91; INLINE_LEN]));
 
         // Panic exactly after the replacement became visible but before Yard
         // can reopen it. This models process death at the old post-rename
@@ -2626,9 +2601,9 @@ mod tests {
             .unwrap()
             .wants()
             .unwrap()
-            .map(|result| match result.unwrap() {
-                WantRequest::Blob { handle } => handle.raw,
-                _ => panic!("test only inserted blob requests"),
+            .map(|result| {
+                let WantRequest::Blob { handle } = result.unwrap();
+                handle.raw
             })
             .collect();
         assert!(
@@ -2676,9 +2651,9 @@ mod tests {
             .unwrap()
             .wants()
             .unwrap()
-            .map(|result| match result.unwrap() {
-                WantRequest::Blob { handle } => handle.raw,
-                _ => panic!("test only inserted blob requests"),
+            .map(|result| {
+                let WantRequest::Blob { handle } = result.unwrap();
+                handle.raw
             })
             .collect();
         assert!(
@@ -2696,40 +2671,6 @@ mod tests {
     }
 
     #[test]
-    fn operation_wants_survive_reclaim_and_retain_resident_references() {
-        let config = YardConfig::default();
-        let (_dir, paths, mut yard) = yard_with_paths(1, config);
-        let input_blob = yard
-            .put::<RawBytes, _>(raw_blob(b"an operation input digest is not a blob root"))
-            .unwrap();
-        let source = Inline::new([51; INLINE_LEN]);
-        let target = Inline::new([52; INLINE_LEN]);
-        let input = Inline::new(input_blob.raw);
-        let merge = WantRequest::merge(source, input, Inline::new([53; INLINE_LEN]));
-        let derive = WantRequest::derive(target, input);
-        yard.want(merge).unwrap();
-        yard.want(derive).unwrap();
-
-        yard.collect(&RetentionRoots::new()).unwrap();
-        assert!(yard.contains_in_generation(0, input_blob));
-        yard.reclaim().unwrap();
-        drop(yard);
-
-        let mut reopened = Yard::open(paths, config).unwrap();
-        assert_eq!(
-            reopened
-                .snapshot()
-                .unwrap()
-                .wants()
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
-            vec![merge, derive]
-        );
-        assert!(reopened.contains_in_generation(0, input_blob));
-    }
-
-    #[test]
     fn collect_then_reclaim_preserves_grow_only_wants_and_their_resident_closure() {
         let config = YardConfig::default();
         let (_dir, paths, mut yard) = yard_with_paths(1, config);
@@ -2737,8 +2678,10 @@ mod tests {
         yard.want(WantRequest::blob(cached)).unwrap();
         yard.put::<RawBytes, _>(raw_blob(b"evict this cached value"))
             .unwrap();
-        let operation = WantRequest::derive(Inline::new([59; INLINE_LEN]), Inline::new([60; 32]));
-        yard.want(operation).unwrap();
+        let absent = WantRequest::blob(Inline::<Handle<UnknownBlob>>::new([59; INLINE_LEN]));
+        yard.want(absent).unwrap();
+        let mut expected = vec![WantRequest::blob(cached), absent];
+        expected.sort_unstable_by_key(|request| request.to_bytes());
 
         yard.collect(&RetentionRoots::new()).unwrap();
         assert_eq!(
@@ -2748,7 +2691,7 @@ mod tests {
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap(),
-            vec![WantRequest::blob(cached), operation]
+            expected
         );
 
         yard.reclaim().unwrap();
@@ -2762,7 +2705,7 @@ mod tests {
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap(),
-            vec![WantRequest::blob(cached), operation]
+            expected
         );
         assert!(reopened.contains_in_generation(0, cached));
         drop(reopened);
@@ -2791,12 +2734,8 @@ mod tests {
         drop(yard);
 
         let young_request =
-            WantRequest::derive(Inline::new([62; INLINE_LEN]), Inline::new([63; INLINE_LEN]));
-        let old_request = WantRequest::merge(
-            Inline::new([64; INLINE_LEN]),
-            Inline::new([65; INLINE_LEN]),
-            Inline::new([66; INLINE_LEN]),
-        );
+            WantRequest::blob(Inline::<Handle<UnknownBlob>>::new([63; INLINE_LEN]));
+        let old_request = WantRequest::blob(Inline::<Handle<UnknownBlob>>::new([62; INLINE_LEN]));
         let mut young = Pile::open(&paths[0]).unwrap();
         young.want(young_request).unwrap();
         young.close().unwrap();

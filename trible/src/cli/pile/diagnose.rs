@@ -3,29 +3,6 @@ use clap::Parser;
 use std::path::{Path, PathBuf};
 use triblespace_core::repo::{WantRequest, WANT_REQUEST_BYTES_LEN};
 
-// Raw-diagnostic knowledge of the short-lived retired typed-WANT format. This
-// is intentionally not part of WantRequest's current public encoding surface.
-const RETIRED_WANT_DERIVE_V1_TAG: u8 = 3;
-
-fn retired_derive_v1_source(
-    request: WantRequest,
-    identity: &[u8; WANT_REQUEST_BYTES_LEN],
-) -> Option<[u8; 32]> {
-    if identity[0] != RETIRED_WANT_DERIVE_V1_TAG {
-        return None;
-    }
-    let WantRequest::Derive { target, input } = request else {
-        return None;
-    };
-    let historical_target: [u8; 32] = identity[33..65].try_into().ok()?;
-    let historical_input: [u8; 32] = identity[65..97].try_into().ok()?;
-    (historical_target == target.raw && historical_input == input.raw).then(|| {
-        identity[1..33]
-            .try_into()
-            .expect("fixed historical WANT field")
-    })
-}
-
 #[derive(Parser)]
 pub enum Command {
     /// Verify pile integrity (blob hashes + legacy branch commit chains).
@@ -551,21 +528,15 @@ fn print_record(bytes: &[u8], file_len: usize, record: triblespace_core::repo::p
                 println!("  request_kind: blob");
                 println!("  handle: {}", hex::encode_upper(handle.raw));
             }
-            WantRequest::Merge {
-                collection,
-                low,
-                high,
-            } => {
-                println!("  request_kind: merge");
-                println!("  collection: {}", hex::encode_upper(collection.raw));
-                println!("  low: {}", hex::encode_upper(low.raw));
-                println!("  high: {}", hex::encode_upper(high.raw));
-            }
-            WantRequest::Derive { target, input } => {
-                println!("  request_kind: derive");
-                println!("  target: {}", hex::encode_upper(target.raw));
-                println!("  input: {}", hex::encode_upper(input.raw));
-            }
+        }
+    }
+    // A retired identity is raw migration input: only the blob shape still
+    // decodes, and the computation shapes project to no current want.
+    fn print_retired_want_identity(identity: &[u8; WANT_REQUEST_BYTES_LEN]) {
+        println!("  identity: {}", hex::encode_upper(identity));
+        match WantRequest::from_bytes(*identity) {
+            Ok(request) => print_want_request(request),
+            Err(error) => println!("  request_kind: retired, projects to no want ({error})"),
         }
     }
 
@@ -608,19 +579,13 @@ fn print_record(bytes: &[u8], file_len: usize, record: triblespace_core::repo::p
             println!("  classification: want (current grow-only set)");
             print_want_request(request);
         }
-        PileRecordContent::RetiredWantAssert { request, identity } => {
+        PileRecordContent::RetiredWantAssert { identity } => {
             println!("  classification: retired want assertion (migration input)");
-            print_want_request(request);
-            if let Some(source) = retired_derive_v1_source(request, &identity) {
-                println!("  historical_source: {}", hex::encode_upper(source));
-            }
+            print_retired_want_identity(&identity);
         }
-        PileRecordContent::RetiredWantRetract { request, identity } => {
+        PileRecordContent::RetiredWantRetract { identity } => {
             println!("  classification: retired want retraction (migration input)");
-            print_want_request(request);
-            if let Some(source) = retired_derive_v1_source(request, &identity) {
-                println!("  historical_source: {}", hex::encode_upper(source));
-            }
+            print_retired_want_identity(&identity);
         }
         PileRecordContent::Collection { record } => match record {
             CollectionRecord::Commit(commit) => {
@@ -702,24 +667,6 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
                 .then_some("handle")
                 .into_iter()
                 .collect(),
-            WantRequest::Merge {
-                collection,
-                low,
-                high,
-            } => [
-                ("collection", collection.raw),
-                ("low", low.raw),
-                ("high", high.raw),
-            ]
-            .into_iter()
-            .filter_map(|(field, value)| (value == *needle).then_some(field))
-            .collect(),
-            WantRequest::Derive { target, input } => {
-                { [("target", target.raw), ("input", input.raw)] }
-                    .into_iter()
-                    .filter_map(|(field, value)| (value == *needle).then_some(field))
-                    .collect()
-            }
         }
     }
 
@@ -796,21 +743,18 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
                     );
                 }
             }
-            PileRecordContent::RetiredWantAssert { request, identity }
-            | PileRecordContent::RetiredWantRetract { request, identity } => {
-                for field in matching_want_fields(request, &needle) {
-                    want_marker_matches += 1;
-                    println!(
-                        "typed want reference at byte {} (request field {field})",
-                        record.offset
-                    );
-                }
-                if retired_derive_v1_source(request, &identity) == Some(needle) {
-                    want_marker_matches += 1;
-                    println!(
-                        "typed want reference at byte {} (request field historical_source)",
-                        record.offset
-                    );
+            PileRecordContent::RetiredWantAssert { identity }
+            | PileRecordContent::RetiredWantRetract { identity } => {
+                // A retired identity may carry a shape no current decoder
+                // names, so match its fixed historical fields directly.
+                for (index, field) in identity[1..].chunks_exact(32).enumerate() {
+                    if field == needle {
+                        want_marker_matches += 1;
+                        println!(
+                            "typed want reference at byte {} (retired identity field {index})",
+                            record.offset
+                        );
+                    }
                 }
             }
             PileRecordContent::Collection { .. }

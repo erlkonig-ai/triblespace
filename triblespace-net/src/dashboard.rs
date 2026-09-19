@@ -1,11 +1,11 @@
 //! Read-only cluster-dashboard projections over one immutable store snapshot.
 //!
 //! The report deliberately keeps four kinds of evidence separate:
-//! local blob residency, stored native collection equations, durable requested
-//! work, and replicated observer reports. A stored equation is not proof that
-//! its output blob is resident, and an absent request is never invented from a
-//! missing blob. Renderers may share this value without maintaining another
-//! database beside the pile.
+//! local blob residency, stored native collection equations, durable blob
+//! requests, and replicated observer reports. A stored equation is not proof
+//! that its output blob is resident, and an absent request is never invented
+//! from a missing blob. Renderers may share this value without maintaining
+//! another database beside the pile.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use ed25519_dalek::VerifyingKey;
 use triblespace_core::attribute::Attribute;
 use triblespace_core::blob::encodings::UnknownBlob;
-use triblespace_core::collection::{CollectionHandle, CollectionRecord, CollectionRecordSelector};
+use triblespace_core::collection::{CollectionHandle, CollectionRecord};
 use triblespace_core::exists;
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
@@ -85,37 +85,12 @@ pub struct CollectionEvidence {
     pub derives: NativeSummary,
 }
 
-/// Kind of durable request.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum WantKind {
-    Blob,
-    Merge,
-    Derive,
-}
-
-impl WantKind {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Blob => "blob",
-            Self::Merge => "merge",
-            Self::Derive => "derive",
-        }
-    }
-}
-
 /// Durable request counts, with answered requests separated from pending work.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WantSummary {
     pub total: u64,
     pub answered: u64,
     pub pending: u64,
-}
-
-/// One bounded exact request that has no answer in this snapshot.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct PendingWant {
-    pub kind: WantKind,
-    pub request: WantRequest,
 }
 
 /// Complete read-only local projection used by every dashboard renderer.
@@ -133,10 +108,9 @@ pub struct LocalReport {
     pub missing_reference_sample: Vec<MissingReference>,
     pub missing_reference_sample_truncated: bool,
     pub wants: WantSummary,
-    pub blob_wants: WantSummary,
-    pub merge_wants: WantSummary,
-    pub derive_wants: WantSummary,
-    pub pending_want_sample: Vec<PendingWant>,
+    /// Bounded sample of the exact requests that have no answer in this
+    /// snapshot.
+    pub pending_want_sample: Vec<WantRequest>,
     pub pending_want_sample_truncated: bool,
 }
 
@@ -254,32 +228,6 @@ where
     let blob_sample_truncated =
         resident_blobs > u64::try_from(blob_sample.len()).unwrap_or(u64::MAX);
 
-    // Construct only the semantic query named by the durable operation
-    // requests. This avoids retaining a second inventory of every equation.
-    let mut operation_selectors = BTreeSet::new();
-    for request in snapshot
-        .wants()
-        .map_err(anyhow::Error::new)
-        .context("enumerate durable wants for operation lookup")?
-    {
-        let request = request
-            .map_err(anyhow::Error::new)
-            .context("read durable want for operation lookup")?;
-        if matches!(
-            request,
-            WantRequest::Merge { .. } | WantRequest::Derive { .. }
-        ) {
-            operation_selectors.insert(CollectionRecordSelector::Operation(request));
-        }
-    }
-    let answered_operations: BTreeSet<WantRequest> = snapshot
-        .select_records(&operation_selectors)
-        .map_err(anyhow::Error::new)
-        .context("select records answering durable operation wants")?
-        .into_iter()
-        .filter_map(record_answer)
-        .collect();
-
     let mut commits = NativeSummary::default();
     let mut merges = NativeSummary::default();
     let mut derives = NativeSummary::default();
@@ -352,9 +300,6 @@ where
         missing_reference_count > u64::try_from(missing_references.len()).unwrap_or(u64::MAX);
 
     let mut wants = WantSummary::default();
-    let mut blob_wants = WantSummary::default();
-    let mut merge_wants = WantSummary::default();
-    let mut derive_wants = WantSummary::default();
     let mut pending_wants = BTreeSet::new();
     for request in snapshot
         .wants()
@@ -364,31 +309,11 @@ where
         let request = request
             .map_err(anyhow::Error::new)
             .context("read durable want")?;
-        let (kind, answered) = match request {
-            WantRequest::Blob { handle } => (
-                WantKind::Blob,
-                contains_blob(snapshot, handle, "inspect durable blob WANT residency")?,
-            ),
-            WantRequest::Merge { .. } => (WantKind::Merge, answered_operations.contains(&request)),
-            WantRequest::Derive { .. } => {
-                (WantKind::Derive, answered_operations.contains(&request))
-            }
-        };
+        let WantRequest::Blob { handle } = request;
+        let answered = contains_blob(snapshot, handle, "inspect durable blob WANT residency")?;
         update_want_summary(&mut wants, answered);
-        update_want_summary(
-            match kind {
-                WantKind::Blob => &mut blob_wants,
-                WantKind::Merge => &mut merge_wants,
-                WantKind::Derive => &mut derive_wants,
-            },
-            answered,
-        );
         if !answered {
-            retain_smallest(
-                &mut pending_wants,
-                PendingWant { kind, request },
-                sample_limit,
-            );
+            retain_smallest(&mut pending_wants, request, sample_limit);
         }
     }
     let pending_want_sample_truncated =
@@ -415,9 +340,6 @@ where
         missing_reference_sample: missing_references.into_iter().collect(),
         missing_reference_sample_truncated,
         wants,
-        blob_wants,
-        merge_wants,
-        derive_wants,
         pending_want_sample: pending_wants.into_iter().collect(),
         pending_want_sample_truncated,
     })
@@ -675,19 +597,6 @@ fn count_metric(facts: &TribleSet, entity: Id, attribute: &Attribute<U256BE>) ->
     }
 }
 
-fn record_answer(record: CollectionRecord) -> Option<WantRequest> {
-    match record {
-        CollectionRecord::Commit(_) => None,
-        CollectionRecord::Merge(merge) => {
-            let (low, high) = merge.inputs();
-            Some(WantRequest::merge(merge.collection(), low, high))
-        }
-        CollectionRecord::Derive(derive) => {
-            Some(WantRequest::derive(derive.collection(), derive.input()))
-        }
-    }
-}
-
 fn contains_blob<R>(
     snapshot: &R,
     handle: Inline<Handle<UnknownBlob>>,
@@ -755,15 +664,6 @@ pub fn short_handle(raw: &[u8; 32]) -> String {
     hex::encode(&raw[..6])
 }
 
-/// Return the collection handle named by an operation request, if any.
-pub const fn requested_collection(request: WantRequest) -> Option<CollectionHandle> {
-    match request {
-        WantRequest::Blob { .. } => None,
-        WantRequest::Merge { collection, .. } => Some(collection),
-        WantRequest::Derive { target, .. } => Some(target),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use ed25519_dalek::SigningKey;
@@ -779,7 +679,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn report_keeps_equation_residency_and_requested_work_distinct() {
+    fn report_keeps_equation_residency_and_blob_wants_distinct() {
         let key = SigningKey::from_bytes(&[7; 32]);
         let policy = CollectionPolicy::new(
             AdmissionPolicy::direct(key.verifying_key()),
@@ -800,13 +700,6 @@ mod tests {
                 missing_result,
             )))
             .unwrap();
-        store
-            .want(WantRequest::merge(
-                collection.handle(),
-                Inline::new(input.raw),
-                Inline::new(input.raw),
-            ))
-            .unwrap();
         store.want(WantRequest::blob(input)).unwrap();
         let absent_blob =
             Inline::<triblespace_core::inline::encodings::hash::Handle<UnknownBlob>>::new([8; 32]);
@@ -821,13 +714,13 @@ mod tests {
         assert_eq!(
             report.wants,
             WantSummary {
-                total: 3,
-                answered: 2,
+                total: 2,
+                answered: 1,
                 pending: 1
             }
         );
         assert_eq!(
-            report.pending_want_sample[0].request,
+            report.pending_want_sample[0],
             WantRequest::blob(absent_blob)
         );
         assert!(report.blob_sample_truncated);

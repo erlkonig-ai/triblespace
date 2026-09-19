@@ -71,7 +71,8 @@ use crate::prelude::blobencodings::SimpleArchive;
 use crate::prelude::inlineencodings::Handle;
 use crate::repo::proof::{CapabilityProofRead, CapabilityProofStore};
 use crate::repo::{
-    SnapshotSource, WantRequest, WANT_REQUEST_BYTES_LEN, WANT_REQUEST_KIND_DERIVE_V1,
+    SnapshotSource, WantRequest, WantRequestDecodeError, WANT_REQUEST_BYTES_LEN,
+    WANT_REQUEST_KIND_BLOB_V1,
 };
 
 #[cfg(test)]
@@ -830,11 +831,8 @@ struct TypedWantHeaderEnvelopeV1 {
 }
 
 impl TypedWantHeaderEnvelopeV1 {
-    fn request(
-        &self,
-    ) -> Result<(WantRequest, [u8; WANT_REQUEST_BYTES_LEN]), crate::repo::WantRequestDecodeError>
-    {
-        decode_retired_want_request(
+    fn retired_identity(&self) -> [u8; WANT_REQUEST_BYTES_LEN] {
+        retired_want_identity(
             self.request_kind,
             &self.field_a,
             &self.field_b,
@@ -1099,20 +1097,8 @@ impl WantRecordHeader {
         }
     }
 
-    fn request(&self) -> Result<WantRequest, crate::repo::WantRequestDecodeError> {
-        decode_want_request(
-            self.request_kind,
-            &self.field_a,
-            &self.field_b,
-            &self.field_c,
-        )
-    }
-
-    fn retired_request(
-        &self,
-    ) -> Result<(WantRequest, [u8; WANT_REQUEST_BYTES_LEN]), crate::repo::WantRequestDecodeError>
-    {
-        decode_retired_want_request(
+    fn retired_identity(&self) -> [u8; WANT_REQUEST_BYTES_LEN] {
+        retired_want_identity(
             self.request_kind,
             &self.field_a,
             &self.field_b,
@@ -1253,43 +1239,22 @@ impl CollectionDeriveRecordHeader {
 
 /// Reassemble a canonical [`WantRequest`] from a header's tag and three
 /// fields. Shared by both envelope generations: only the field offsets moved.
-fn decode_want_request(
+/// The exact historical key of a retired typed-WANT log entry: its kind byte
+/// and three fields, as written. Nothing is decoded; the retired typed
+/// shapes (merge, derive in two versions) are gone from [`WantRequest`] and
+/// these keys only ever cancel each other during the cutover projection.
+fn retired_want_identity(
     request_kind: u8,
     field_a: &RawInline,
     field_b: &RawInline,
     field_c: &RawInline,
-) -> Result<WantRequest, crate::repo::WantRequestDecodeError> {
-    let mut bytes = [0u8; WANT_REQUEST_BYTES_LEN];
-    bytes[0] = request_kind;
-    bytes[1..33].copy_from_slice(field_a);
-    bytes[33..65].copy_from_slice(field_b);
-    bytes[65..97].copy_from_slice(field_c);
-    WantRequest::from_bytes(bytes)
-}
-
-/// Decode the retired typed-WANT log, including its short-lived V1 derive
-/// shape `(source, target, input)`. The current request no longer repeats the
-/// source because the target descriptor names it. Migration retains all three
-/// fields in the historical LWW identity, then drops field A only when an
-/// active historical key is projected to current `Derive(target, input)`.
-fn decode_retired_want_request(
-    request_kind: u8,
-    field_a: &RawInline,
-    field_b: &RawInline,
-    field_c: &RawInline,
-) -> Result<(WantRequest, [u8; WANT_REQUEST_BYTES_LEN]), crate::repo::WantRequestDecodeError> {
+) -> [u8; WANT_REQUEST_BYTES_LEN] {
     let mut identity = [0u8; WANT_REQUEST_BYTES_LEN];
     identity[0] = request_kind;
     identity[1..33].copy_from_slice(field_a);
     identity[33..65].copy_from_slice(field_b);
     identity[65..97].copy_from_slice(field_c);
-    if request_kind == WANT_REQUEST_KIND_DERIVE_V1 {
-        return Ok((
-            WantRequest::derive(Inline::new(*field_b), Inline::new(*field_c)),
-            identity,
-        ));
-    }
-    decode_want_request(request_kind, field_a, field_b, field_c).map(|request| (request, identity))
+    identity
 }
 
 fn envelope_blocks_for_payload(data_len: usize) -> Option<u32> {
@@ -1477,16 +1442,14 @@ pub enum PileRecordContent {
     },
     /// A retired LWW-log assertion, retained only as raw migration input.
     RetiredWantAssert {
-        /// Current projection of the historical request.
-        request: WantRequest,
-        /// Exact historical key used for LWW resolution before projection.
+        /// Exact historical key used for LWW resolution. Only a blob request
+        /// still projects to a current want; the retired typed shapes are
+        /// carried as bytes and project to nothing.
         identity: [u8; WANT_REQUEST_BYTES_LEN],
     },
     /// A retired LWW-log retraction, retained only as raw migration input.
     RetiredWantRetract {
-        /// Current projection of the historical request.
-        request: WantRequest,
-        /// Exact historical key used for LWW resolution before projection.
+        /// Exact historical key used for LWW resolution.
         identity: [u8; WANT_REQUEST_BYTES_LEN],
     },
     /// One immutable current collection-algebra record. Three distinct V4
@@ -1653,11 +1616,21 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
             if nonzero(&[&header.kind_pad[..], &header.reserved[..]]) {
                 return Err(corrupt());
             }
-            let request = header.request().map_err(|_| corrupt())?;
+            let identity = header.retired_identity();
+            let content = match WantRequest::from_bytes(identity) {
+                Ok(request) => PileRecordContent::Want { request },
+                // A computation request written while those existed. Nothing
+                // produces or answers one any more, so it stays an inert
+                // identity rather than a reason to refuse the file.
+                Err(WantRequestDecodeError::UnknownKind(_)) => {
+                    PileRecordContent::RetiredWantAssert { identity }
+                }
+                Err(WantRequestDecodeError::NonZeroUnusedFields { .. }) => return Err(corrupt()),
+            };
             Ok(PileRecord {
                 offset,
                 len,
-                content: PileRecordContent::Want { request },
+                content,
             })
         }
         record_kind::KIND_BLOB_WANT_ASSERT | record_kind::KIND_BLOB_WANT_RETRACT => {
@@ -1667,12 +1640,12 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
             if nonzero(&[&header.reserved[..]]) {
                 return Err(corrupt());
             }
-            let request = WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(header.handle));
-            let identity = request.to_bytes();
+            let identity =
+                WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(header.handle)).to_bytes();
             let content = if prefix.record_kind == record_kind::KIND_BLOB_WANT_ASSERT {
-                PileRecordContent::RetiredWantAssert { request, identity }
+                PileRecordContent::RetiredWantAssert { identity }
             } else {
-                PileRecordContent::RetiredWantRetract { request, identity }
+                PileRecordContent::RetiredWantRetract { identity }
             };
             Ok(PileRecord {
                 offset,
@@ -1687,17 +1660,17 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
             if nonzero(&[&header.kind_pad[..], &header.reserved[..]]) {
                 return Err(corrupt());
             }
-            let (request, identity) = header.retired_request().map_err(|_| corrupt())?;
+            let identity = header.retired_identity();
             // Historical typed records never admitted blob requests. Keep that
             // decoder boundary exact even though the current grow-only kind
-            // represents all request variants uniformly.
-            if matches!(request, WantRequest::Blob { .. }) {
+            // represents every request uniformly.
+            if identity[0] == WANT_REQUEST_KIND_BLOB_V1 {
                 return Err(corrupt());
             }
             let content = if prefix.record_kind == record_kind::KIND_WANT_ASSERT {
-                PileRecordContent::RetiredWantAssert { request, identity }
+                PileRecordContent::RetiredWantAssert { identity }
             } else {
-                PileRecordContent::RetiredWantRetract { request, identity }
+                PileRecordContent::RetiredWantRetract { identity }
             };
             Ok(PileRecord {
                 offset,
@@ -2051,12 +2024,12 @@ fn decode_enveloped_record_v1(bytes: &[u8], offset: usize) -> Result<PileRecord,
             if header.reserved.iter().any(|byte| *byte != 0) {
                 return Err(corrupt());
             }
-            let request = WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(header.handle));
-            let identity = request.to_bytes();
+            let identity =
+                WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(header.handle)).to_bytes();
             let content = if prefix.record_kind == MAGIC_MARKER_WEAK_PIN_V3 {
-                PileRecordContent::RetiredWantAssert { request, identity }
+                PileRecordContent::RetiredWantAssert { identity }
             } else {
-                PileRecordContent::RetiredWantRetract { request, identity }
+                PileRecordContent::RetiredWantRetract { identity }
             };
             Ok(PileRecord {
                 offset,
@@ -2071,15 +2044,15 @@ fn decode_enveloped_record_v1(bytes: &[u8], offset: usize) -> Result<PileRecord,
             if header.reserved.iter().any(|byte| *byte != 0) {
                 return Err(corrupt());
             }
-            let (request, identity) = header.request().map_err(|_| corrupt())?;
+            let identity = header.retired_identity();
             // Historical typed records never admitted blob requests.
-            if matches!(request, WantRequest::Blob { .. }) {
+            if identity[0] == WANT_REQUEST_KIND_BLOB_V1 {
                 return Err(corrupt());
             }
             let content = if prefix.record_kind == MAGIC_MARKER_WANT_ASSERT_V2 {
-                PileRecordContent::RetiredWantAssert { request, identity }
+                PileRecordContent::RetiredWantAssert { identity }
             } else {
-                PileRecordContent::RetiredWantRetract { request, identity }
+                PileRecordContent::RetiredWantRetract { identity }
             };
             Ok(PileRecord {
                 offset,
@@ -2334,7 +2307,6 @@ fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
                 offset,
                 len: V3_HEADER_LEN,
                 content: PileRecordContent::RetiredWantAssert {
-                    request,
                     identity: request.to_bytes(),
                 },
             })
@@ -2347,7 +2319,6 @@ fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
                 offset,
                 len: V3_HEADER_LEN,
                 content: PileRecordContent::RetiredWantRetract {
-                    request,
                     identity: request.to_bytes(),
                 },
             })
@@ -2736,7 +2707,7 @@ pub struct PileFile {
     /// pile that already carries one appends nothing, at a set lookup per
     /// frame rather than a scan of every earlier one.
     opaque_digests: BTreeSet<[u8; 32]>,
-    /// Current grow-only typed request set. Retired weak-pin and typed LWW-log
+    /// Current grow-only blob request set. Retired weak-pin and typed LWW-log
     /// records are deliberately absent: they are raw input to the explicit
     /// WANT cutover migration, not live state that stale pile concatenation can
     /// resurrect or retract.
@@ -3026,16 +2997,6 @@ impl super::StoreSnapshot for PileFileSnapshot {
                     CollectionRecordSelector::Collection(collection)
                     | CollectionRecordSelector::MergeCollection(collection)
                     | CollectionRecordSelector::DeriveTarget(collection) => collection,
-                    CollectionRecordSelector::Operation(WantRequest::Merge {
-                        collection, ..
-                    })
-                    | CollectionRecordSelector::Operation(WantRequest::Derive {
-                        target: collection,
-                        ..
-                    }) => collection,
-                    CollectionRecordSelector::Operation(WantRequest::Blob { .. }) => {
-                        return false;
-                    }
                 };
                 // Kind/operation selectors conservatively share the whole
                 // collection prefix; exact producer routes above are narrower.
@@ -4215,12 +4176,6 @@ impl CollectionRead for PileFileSnapshot {
                 CollectionRecordSelector::Collection(collection)
                 | CollectionRecordSelector::MergeCollection(collection)
                 | CollectionRecordSelector::DeriveTarget(collection) => collection,
-                CollectionRecordSelector::Operation(WantRequest::Merge { collection, .. })
-                | CollectionRecordSelector::Operation(WantRequest::Derive {
-                    target: collection,
-                    ..
-                }) => collection,
-                CollectionRecordSelector::Operation(WantRequest::Blob { .. }) => continue,
             };
             self.collection_records_by_collection
                 .infixes(&collection.raw, |fingerprint: &[u8; 32]| {
@@ -4631,7 +4586,7 @@ impl PileFile {
     }
 }
 
-/// Iterator over the grow-only typed requests stored in the pile,
+/// Iterator over the grow-only blob requests stored in the pile,
 /// using the PATCH's ordered key iterator (byte order, deterministic).
 pub struct PileWantIter {
     inner: crate::patch::PATCHIntoOrderedIterator<WANT_REQUEST_BYTES_LEN, IdentitySchema, ()>,
@@ -4659,33 +4614,32 @@ impl PileFile {
         };
         let mut offset = 0usize;
         let mut retired_records = 0usize;
-        let mut historical = PATCH::<WANT_REQUEST_BYTES_LEN, IdentitySchema, WantRequest>::new();
+        let mut historical = PATCH::<WANT_REQUEST_BYTES_LEN, IdentitySchema>::new();
         while offset < bytes.len() {
             let record = decode_record(&bytes[offset..], offset)?;
             offset = offset
                 .checked_add(record.len)
                 .expect("validated pile record boundary fits usize");
             match record.content {
-                PileRecordContent::RetiredWantAssert { request, identity } => {
+                PileRecordContent::RetiredWantAssert { identity } => {
                     retired_records += 1;
-                    historical.replace(&Entry::with_value(&identity, request));
+                    historical.insert(&Entry::new(&identity));
                 }
-                PileRecordContent::RetiredWantRetract { identity, .. } => {
+                PileRecordContent::RetiredWantRetract { identity } => {
                     retired_records += 1;
                     historical.remove(&identity);
                 }
                 _ => {}
             }
         }
-        // Resolve LWW in the historical key space before forgetting the V1
-        // derive source field. Distinct `(source,target,input)` keys may map
-        // to one current `Derive(target,input)` set element.
+        // Resolve LWW in the historical key space, then keep only what still
+        // has a current shape: a blob request's key is its current bytes; the
+        // retired typed shapes project to nothing.
         let mut active = PATCH::<WANT_REQUEST_BYTES_LEN, IdentitySchema>::new();
         for identity in &historical {
-            let request = *historical
-                .get(identity)
-                .expect("historical WANT key from PATCH retains its projection");
-            active.insert(&Entry::new(&request.to_bytes()));
+            if WantRequest::from_bytes(*identity).is_ok() {
+                active.insert(&Entry::new(identity));
+            }
         }
         Ok((retired_records, active))
     }
@@ -5043,7 +4997,7 @@ pub fn reframe_into(
     }
     records.offset = 0;
     let mut stats = PileReframeStats::default();
-    let mut retired_wants = PATCH::<WANT_REQUEST_BYTES_LEN, IdentitySchema, WantRequest>::new();
+    let mut retired_wants = PATCH::<WANT_REQUEST_BYTES_LEN, IdentitySchema>::new();
     let mut output_wants = PATCH::<WANT_REQUEST_BYTES_LEN, IdentitySchema>::new();
     loop {
         let record = match records.next() {
@@ -5088,11 +5042,11 @@ pub fn reframe_into(
                 destination.want(request).map_err(PileReframeError::Want)?;
                 output_wants.insert(&Entry::new(&request.to_bytes()));
             }
-            PileRecordContent::RetiredWantAssert { request, identity } => {
+            PileRecordContent::RetiredWantAssert { identity } => {
                 stats.retired_want_records += 1;
-                retired_wants.replace(&Entry::with_value(&identity, request));
+                retired_wants.insert(&Entry::new(&identity));
             }
-            PileRecordContent::RetiredWantRetract { identity, .. } => {
+            PileRecordContent::RetiredWantRetract { identity } => {
                 stats.retired_want_records += 1;
                 retired_wants.remove(&identity);
             }
@@ -5141,9 +5095,9 @@ pub fn reframe_into(
     }
 
     for identity in retired_wants.iter_ordered() {
-        let request = *retired_wants
-            .get(identity)
-            .expect("historical WANT key from PATCH retains its projection");
+        let Ok(request) = WantRequest::from_bytes(*identity) else {
+            continue;
+        };
         destination.want(request).map_err(PileReframeError::Want)?;
         output_wants.insert(&Entry::new(&request.to_bytes()));
     }
@@ -5471,6 +5425,7 @@ impl PileFile {
 
 #[cfg(test)]
 mod tests {
+    use crate::repo::WANT_REQUEST_KIND_DERIVE_V1;
     use super::*;
 
     use ed25519_dalek::SigningKey;
@@ -5720,9 +5675,7 @@ mod tests {
         request: WantRequest,
         asserted: bool,
     ) -> RetiredBlobWantRecordHeader {
-        let WantRequest::Blob { handle } = request else {
-            panic!("retired blob-WANT fixture requires a blob request")
-        };
+        let WantRequest::Blob { handle } = request;
         RetiredBlobWantRecordHeader {
             magic: FRAME_MAGIC,
             span_blocks: ENVELOPE_HEADER_BLOCKS.to_le_bytes(),
@@ -5733,26 +5686,6 @@ mod tests {
             },
             handle: handle.raw,
             reserved: [0; 160],
-        }
-    }
-
-    fn retired_typed_want_record(request: WantRequest, asserted: bool) -> WantRecordHeader {
-        assert!(!matches!(request, WantRequest::Blob { .. }));
-        let bytes = request.to_bytes();
-        WantRecordHeader {
-            magic: FRAME_MAGIC,
-            span_blocks: ENVELOPE_HEADER_BLOCKS.to_le_bytes(),
-            record_kind: if asserted {
-                record_kind::KIND_WANT_ASSERT
-            } else {
-                record_kind::KIND_WANT_RETRACT
-            },
-            request_kind: bytes[0],
-            kind_pad: [0; 31],
-            field_a: bytes[1..33].try_into().unwrap(),
-            field_b: bytes[33..65].try_into().unwrap(),
-            field_c: bytes[65..97].try_into().unwrap(),
-            reserved: [0; 64],
         }
     }
 
@@ -6838,8 +6771,6 @@ mod tests {
         let current_want = WantRequest::blob(Inline::<Handle<UnknownBlob>>::new([41; 32]));
         let retired_kept = WantRequest::blob(Inline::<Handle<UnknownBlob>>::new([42; 32]));
         let retired_dropped = WantRequest::blob(Inline::<Handle<UnknownBlob>>::new([43; 32]));
-        let retired_derive_want =
-            WantRequest::derive(collection_test_collection(45), collection_test_hash(46));
         source.want(current_want).unwrap();
 
         let records = collection_test_records();
@@ -6892,7 +6823,7 @@ mod tests {
         let stats = reframe_into(&source_path, &mut destination).unwrap();
         assert_eq!(stats.blobs, payloads.len());
         assert_eq!(stats.pin_updates, 4);
-        assert_eq!(stats.wants, 3);
+        assert_eq!(stats.wants, 2);
         assert_eq!(stats.retired_want_records, 5);
         assert_eq!(stats.collection_records, records.len());
         assert_eq!(stats.dropped_inert, 1);
@@ -6923,7 +6854,7 @@ mod tests {
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap(),
-            vec![current_want, retired_kept, retired_derive_want]
+            vec![current_want, retired_kept]
         );
         assert_eq!(
             result
@@ -8414,13 +8345,6 @@ mod tests {
             CollectionRecordSelector::MergeCollection(collection),
             CollectionRecordSelector::DeriveTarget(other),
             CollectionRecordSelector::Collection(other),
-            CollectionRecordSelector::Operation(WantRequest::merge(
-                collection,
-                input,
-                second_input,
-            )),
-            CollectionRecordSelector::Operation(WantRequest::derive(collection, input)),
-            CollectionRecordSelector::Operation(WantRequest::blob(collection)),
         ];
         let mut queries = vec![BTreeSet::new(), selectors.into_iter().collect()];
         for left in selectors {
@@ -8544,11 +8468,9 @@ mod tests {
             input,
             collection_test_hash(11),
         ));
-        let exact = [CollectionRecordSelector::Operation(WantRequest::derive(
-            target, input,
-        ))]
-        .into_iter()
-        .collect();
+        let exact = [CollectionRecordSelector::DeriveTarget(target)]
+            .into_iter()
+            .collect();
 
         let mut a = Pile::open(&path_a).unwrap();
         for record in [records[0], records[1], first, unrelated] {
@@ -10947,102 +10869,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_operation_wants_roundtrip_as_exact_enveloped_records() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = fresh_empty_pile_path(&dir, "typed-wants.pile");
-        let source = collection_test_collection(31);
-        let target = collection_test_collection(32);
-        let merge = WantRequest::merge(source, collection_test_hash(34), collection_test_hash(33));
-        let derive = WantRequest::derive(target, collection_test_hash(35));
-
-        let mut pile = Pile::open(&path).unwrap();
-        pile.want(merge).unwrap();
-        pile.want(derive).unwrap();
-        pile.flush().unwrap();
-        assert_eq!(
-            pile.snapshot()
-                .unwrap()
-                .wants()
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
-            vec![merge, derive]
-        );
-        pile.close().unwrap();
-
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().len(),
-            (2 * ENVELOPE_HEADER_LEN) as u64
-        );
-        let records = PileRecords::open(&path)
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert!(matches!(
-            records[0].content,
-            PileRecordContent::Want { request } if request == merge
-        ));
-        assert!(matches!(
-            records[1].content,
-            PileRecordContent::Want { request } if request == derive
-        ));
-
-        let mut reopened = Pile::open(&path).unwrap();
-        reopened.refresh().unwrap();
-        assert_eq!(
-            reopened
-                .snapshot()
-                .unwrap()
-                .wants()
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
-            vec![merge, derive]
-        );
-        reopened.close().unwrap();
-    }
-
-    #[test]
-    fn typed_wants_union_without_retraction() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = fresh_empty_pile_path(&dir, "typed-want-set.pile");
-        let source = collection_test_collection(41);
-        let target = collection_test_collection(42);
-        let input = collection_test_hash(43);
-        let merge = WantRequest::merge(source, input, collection_test_hash(44));
-        let derive = WantRequest::derive(target, input);
-
-        let mut pile = Pile::open(&path).unwrap();
-        pile.want(merge).unwrap();
-        pile.want(derive).unwrap();
-        assert_eq!(
-            pile.snapshot()
-                .unwrap()
-                .wants()
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
-            vec![merge, derive]
-        );
-        pile.close().unwrap();
-
-        let mut reopened = Pile::open(&path).unwrap();
-        reopened.refresh().unwrap();
-        assert_eq!(
-            reopened
-                .snapshot()
-                .unwrap()
-                .wants()
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
-            vec![merge, derive]
-        );
-        reopened.close().unwrap();
-    }
-
-    #[test]
-    fn blob_wants_use_the_same_current_marker_as_operation_wants() {
+    fn blob_wants_use_the_current_marker() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "blob-want-projection.pile");
         let handle = Inline::<Handle<UnknownBlob>>::new([47; 32]);
@@ -11064,7 +10891,7 @@ mod tests {
     }
 
     #[test]
-    fn current_want_marker_accepts_blob_but_rejects_retired_derive_tag() {
+    fn current_want_marker_accepts_blob_and_keeps_retired_kinds_inert() {
         let request = WantRequest::blob(Inline::<Handle<UnknownBlob>>::new([48; 32]));
         let header = WantRecordHeader::new(request);
         assert!(matches!(
@@ -11072,6 +10899,8 @@ mod tests {
             PileRecordContent::Want { request: actual } if actual == request
         ));
 
+        // A computation request under the live marker, written while those
+        // existed, is not corruption: it decodes as an inert identity.
         let mut header = retired_typed_derive_v1_record(
             collection_test_collection(49),
             collection_test_collection(50),
@@ -11080,8 +10909,10 @@ mod tests {
         );
         header.record_kind = record_kind::KIND_WANT;
         assert!(matches!(
-            decode_record(header.as_bytes(), 0),
-            Err(ReadError::CorruptPile { valid_length: 0 })
+            decode_record(header.as_bytes(), 0).unwrap().content,
+            PileRecordContent::RetiredWantAssert { identity }
+                if identity[0] == WANT_REQUEST_KIND_DERIVE_V1
+                    && identity[1..33] == collection_test_collection(49).raw
         ));
 
         let target = collection_test_collection(52);
@@ -11098,8 +10929,10 @@ mod tests {
         };
         assert!(matches!(
             decode_record(legacy.as_bytes(), 0).unwrap().content,
-            PileRecordContent::RetiredWantAssert { request, .. }
-                if request == WantRequest::derive(target, input)
+            PileRecordContent::RetiredWantAssert { identity }
+                if identity[0] == WANT_REQUEST_KIND_DERIVE_V1
+                    && identity[33..65] == target.raw
+                    && identity[65..97] == input.raw
         ));
     }
 
@@ -11110,23 +10943,18 @@ mod tests {
 
         let a = WantRequest::blob(Inline::<Handle<UnknownBlob>>::new([61; 32]));
         let b = WantRequest::blob(Inline::<Handle<UnknownBlob>>::new([62; 32]));
-        let merge = WantRequest::merge(
-            collection_test_collection(63),
-            collection_test_hash(64),
-            collection_test_hash(65),
-        );
-        let derive = WantRequest::derive(collection_test_collection(67), collection_test_hash(68));
+        let c = WantRequest::blob(Inline::<Handle<UnknownBlob>>::new([63; 32]));
 
-        // Resolve the retired log as: a active, b inactive, merge active, and
-        // one short-lived DERIVE_V1 request active. The latter carried
-        // `(source, target, input)` and must migrate to `(target, input)`.
+        // Resolve the retired log as: a active, b inactive, c active, and one
+        // short-lived DERIVE_V1 request active. Computation wants no longer
+        // exist, so that last one projects to nothing.
         for record in [
             retired_blob_want_record(a, true).as_bytes().to_vec(),
             retired_blob_want_record(a, false).as_bytes().to_vec(),
             retired_blob_want_record(a, true).as_bytes().to_vec(),
             retired_blob_want_record(b, true).as_bytes().to_vec(),
             retired_blob_want_record(b, false).as_bytes().to_vec(),
-            retired_typed_want_record(merge, true).as_bytes().to_vec(),
+            retired_blob_want_record(c, true).as_bytes().to_vec(),
             retired_typed_derive_v1_record(
                 collection_test_collection(66),
                 collection_test_collection(67),
@@ -11135,9 +10963,9 @@ mod tests {
             )
             .as_bytes()
             .to_vec(),
-            // A retraction with another historical source has the same
-            // current projection but is a distinct old LWW key. It must not
-            // cancel the active source-66 assertion above.
+            // A retraction with another historical source is a distinct old
+            // LWW key. It must not cancel the active source-66 assertion
+            // above, and neither of them becomes current demand.
             retired_typed_derive_v1_record(
                 collection_test_collection(69),
                 collection_test_collection(67),
@@ -11152,26 +10980,26 @@ mod tests {
 
         let mut pile = Pile::open(&path).unwrap();
         assert!(pile.snapshot().unwrap().wants().unwrap().next().is_none());
-        // One request already has a fresh marker; cutover appends only the two
-        // missing positives rather than rewriting the pile.
-        pile.want(merge).unwrap();
+        // One request already has a fresh marker; cutover appends only the
+        // missing positive rather than rewriting the pile.
+        pile.want(c).unwrap();
         let before = std::fs::metadata(&path).unwrap().len();
         assert_eq!(
             pile.want_cutover_status().unwrap(),
             WantCutoverStatus {
                 retired_records: 8,
-                resolved_active: 3,
+                resolved_active: 2,
                 already_current: 1,
-                missing_current: 2,
+                missing_current: 1,
             }
         );
         let migrated = pile.migrate_retired_wants().unwrap();
-        assert_eq!(migrated.missing_current, 2);
+        assert_eq!(migrated.missing_current, 1);
         assert_eq!(
             std::fs::metadata(&path).unwrap().len(),
-            before + 2 * ENVELOPE_HEADER_LEN as u64
+            before + ENVELOPE_HEADER_LEN as u64
         );
-        let expected = vec![a, merge, derive];
+        let expected = vec![a, c];
         assert_eq!(
             pile.snapshot()
                 .unwrap()

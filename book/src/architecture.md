@@ -282,12 +282,11 @@ raw child is absent is not a usable query value.
 
 ## WANT is operational, not semantic
 
-A `WantStore` records operational interest in obtaining a blob or discovering
-a particular merge/derive result. `Blob(H)` is the sole exact-content request
-and names no collection. WANTs do not add collection members, authorize
-authors, retain all referenced data, or force another node to perform work.
-They are durable coordination-free questions which a reconciler may satisfy by
-fetching content or unioning a matching native equation into the local store.
+A `WantStore` records operational interest in obtaining a blob. `Blob(H)` is
+the only request shape and names no collection. WANTs do not add collection
+members, authorize authors, retain all referenced data, or force another node
+to perform work. They are durable coordination-free questions which a
+reconciler may satisfy by fetching content into the local store.
 
 The network reconciler discovers exact providers under the opaque,
 domain-separated locator KDF(H). An H-bound endpoint token rejects false

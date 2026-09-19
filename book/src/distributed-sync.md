@@ -1011,7 +1011,7 @@ existing sync-loop boundary. Five subjects distinguish the measurements:
   Local hits, failed puts and speculative misses add no received bytes.
   `queued` is the distinct unreadable exact WANT plus selected direct-root
   set at the end of that tick's exact acquisition window, not recursive
-  descendants, operation WANTs or a global blob inventory. A failed exact-set
+  descendants or a global blob inventory. A failed exact-set
   observation leaves it absent; a later scan-only snapshot failure does not
   erase the earlier valid count.
 - `serve`: actual accepted inbound GET exchanges in flight, successfully

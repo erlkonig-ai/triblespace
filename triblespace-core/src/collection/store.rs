@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::Debug;
 
-use crate::repo::{BlobStoreGet, CapabilityProofRead, WantRequest};
+use crate::repo::{BlobStoreGet, CapabilityProofRead};
 
 use super::coverage::{coverage_of, Coverage, CoverageIndex};
 use super::{CollectionData, CollectionHandle, CollectionRecord, CollectionRecordFingerprint};
@@ -50,24 +50,6 @@ pub enum CollectionRecordSelector {
     /// The source is not part of the selector: a target has one source, named
     /// by its descriptor, so selecting the target selects the mapping.
     DeriveTarget(CollectionHandle),
-    /// Select every receipt answering one exact merge or derive request.
-    ///
-    /// Blob requests have no collection-record answer and select nothing.
-    Operation(WantRequest),
-}
-
-fn collection_record_operation(record: CollectionRecord) -> Option<WantRequest> {
-    match record {
-        CollectionRecord::Commit(_) => None,
-        CollectionRecord::Merge(record) => {
-            let (low, high) = record.inputs();
-            Some(WantRequest::merge(record.collection(), low, high))
-        }
-        CollectionRecord::Derive(record) => {
-            let (input, _) = (record.input(), record.output());
-            Some(WantRequest::derive(record.collection(), input))
-        }
-    }
 }
 
 pub(crate) fn selectors_match_record(
@@ -99,15 +81,10 @@ pub(crate) fn selectors_match_record(
         CollectionRecord::Merge(merge) => {
             selectors.contains(&CollectionRecordSelector::MergeCollection(
                 merge.collection(),
-            )) || selectors.contains(&CollectionRecordSelector::Operation(
-                collection_record_operation(record).expect("MERGE has an operation key"),
             ))
         }
         CollectionRecord::Derive(derive) => {
             selectors.contains(&CollectionRecordSelector::DeriveTarget(derive.collection()))
-                || selectors.contains(&CollectionRecordSelector::Operation(
-                    collection_record_operation(record).expect("DERIVE has an operation key"),
-                ))
         }
     };
     if matches_fields {
@@ -453,9 +430,7 @@ mod tests {
 
     #[test]
     fn field_selectors_do_not_recompute_record_fingerprints() {
-        use crate::blob::encodings::UnknownBlob;
         use crate::collection::records::FINGERPRINT_CALLS;
-        use crate::inline::encodings::hash::Handle;
 
         let records = fixture();
         let selectors = [
@@ -465,10 +440,6 @@ mod tests {
             CollectionRecordSelector::ProducedMember(collection(2), data(11)),
             CollectionRecordSelector::MergeCollection(collection(1)),
             CollectionRecordSelector::DeriveTarget(collection(2)),
-            CollectionRecordSelector::Operation(WantRequest::derive(collection(2), data(10))),
-            CollectionRecordSelector::Operation(WantRequest::blob(
-                Handle::<UnknownBlob>::from_hash(data(10)),
-            )),
         ];
         let before = FINGERPRINT_CALLS.get();
         for selector in selectors {
@@ -560,65 +531,6 @@ mod tests {
         assert!(selected
             .windows(2)
             .all(|pair| pair[0].fingerprint() < pair[1].fingerprint()));
-    }
-
-    #[test]
-    fn default_selection_scans_once_unions_routes_and_retains_operation_conflicts() {
-        let records = fixture();
-        let commit = records
-            .iter()
-            .find(|record| matches!(record, CollectionRecord::Commit(_)))
-            .copied()
-            .unwrap();
-        let source = collection(1);
-        let target = collection(2);
-        let exact_derive = WantRequest::derive(target, data(10));
-        let overlapping_fingerprint = records
-            .iter()
-            .find(|record| match record {
-                CollectionRecord::Derive(derive) => {
-                    derive.collection() == target && derive.input() == data(10)
-                }
-                _ => false,
-            })
-            .unwrap()
-            .fingerprint();
-        let selectors = [
-            CollectionRecordSelector::Fingerprint(commit.fingerprint()),
-            CollectionRecordSelector::Fingerprint(overlapping_fingerprint),
-            CollectionRecordSelector::MergeCollection(source),
-            CollectionRecordSelector::Operation(exact_derive),
-        ]
-        .into_iter()
-        .collect();
-        let store = FallbackStore {
-            records: records.clone(),
-            ..FallbackStore::default()
-        };
-
-        let selected = store.select_records(&selectors).unwrap();
-
-        let mut expected: Vec<_> = records
-            .into_iter()
-            .filter(|record| match record {
-                CollectionRecord::Commit(_) => record.fingerprint() == commit.fingerprint(),
-                CollectionRecord::Merge(merge) => merge.collection() == source,
-                CollectionRecord::Derive(derive) => {
-                    derive.collection() == target && derive.input() == data(10)
-                }
-            })
-            .collect();
-        expected.sort_unstable_by_key(CollectionRecord::fingerprint);
-        assert_eq!(selected, expected);
-        assert_eq!(store.enumerations.get(), 1);
-        assert_eq!(
-            selected
-                .iter()
-                .filter(|record| matches!(record, CollectionRecord::Derive(_)))
-                .count(),
-            2,
-            "different outputs for one exact DERIVE remain visible"
-        );
     }
 
     #[test]

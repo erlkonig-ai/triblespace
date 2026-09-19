@@ -642,7 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn collection_primary_selection_answers_group_and_exact_conflicting_operations() {
+    fn collection_primary_selection_answers_group_selectors() {
         let source = identity_for_tests(&named_for_tests("source", Id::new([22; 16]).unwrap()));
         let target = identity_for_tests(&named_for_tests("target", Id::new([25; 16]).unwrap()));
         let other = identity_for_tests(&named_for_tests("other", Id::new([28; 16]).unwrap()));
@@ -683,16 +683,7 @@ mod tests {
             repo.insert(record).unwrap();
         }
 
-        let exact = [CollectionRecordSelector::Operation(WantRequest::derive(
-            target, input,
-        ))]
-        .into_iter()
-        .collect();
-        let mut expected = vec![first, conflicting];
-        expected.sort_unstable_by_key(CollectionRecord::fingerprint);
         let snapshot = repo.snapshot().unwrap();
-        assert_eq!(snapshot.select_records(&exact).unwrap(), expected);
-
         let grouped = [
             CollectionRecordSelector::MergeCollection(source),
             CollectionRecordSelector::DeriveTarget(target),
@@ -781,11 +772,7 @@ mod tests {
             Inline::new(merge_output.raw),
         )))
         .unwrap();
-        repo.want(WantRequest::derive(
-            descriptor.transmute(),
-            Inline::new(wanted_input.raw),
-        ))
-        .unwrap();
+        repo.want(WantRequest::blob(wanted_input)).unwrap();
 
         repo.keep(std::iter::empty::<Inline<Handle<UnknownBlob>>>());
 

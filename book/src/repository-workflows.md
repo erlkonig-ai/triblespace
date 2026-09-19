@@ -648,28 +648,25 @@ member whose named raw child is unavailable and retries a finer
 support-equivalent route; the typed view repeats the raw/index check at its
 decoding boundary.
 
-## WANT missing content or computation
+## WANT missing content
 
 Sparse evidence discovery deliberately does not fetch commit dependencies.
-`WantStore` adds operational interest to one idempotent grow-only set with
-three request shapes:
+`WantStore` adds operational interest to one idempotent grow-only set with a
+single request shape, `Blob(handle)`: obtain those exact bytes.
 
-- `Blob(handle)` — obtain those exact bytes;
-- `Merge(collection, low, high)` — discover an existing matching merge result;
-  and
-- `Derive(target, input)` — discover an existing matching derivation; the
-  target descriptor already names the source collection and concrete mapping.
-
-`Blob(H)` is the only exact-content identity. A reconciler may satisfy it from
-local workers or discover providers under opaque KDF(H), without activating or
-even naming a collection. The provider proves H first and the requester second,
-with both proofs bound to the authenticated endpoints; H itself is never sent,
-and landed bytes must hash to H. The answer to an operation WANT is the
-ordinary native equation; obtaining its result bytes is a separate blob WANT.
-A WANT grants no collection authority and does not change the value of any
+A reconciler may satisfy it from local workers or discover providers under
+opaque KDF(H), without activating or even naming a collection. The provider
+proves H first and the requester second, with both proofs bound to the
+authenticated endpoints; H itself is never sent, and landed bytes must hash to
+H. A WANT grants no collection authority and does not change the value of any
 collection. There is no `unwant` operation: cache eviction belongs to Yard's
-physical rewrite policy, which re-records only surviving blob demand, while
-merge and derive requests remain durable.
+physical rewrite policy, which re-records only surviving blob demand.
+
+There is deliberately no request for computation. Asking another node to
+produce a merge or derivation result is asking it to spend work on the asker's
+behalf, and a flood of such requests costs the asker nothing; a blob request
+costs the asker the bytes it receives, so a flood floods itself. A node that
+wants a computation done runs it and then shares the equation.
 
 ## Migrate a legacy branch explicitly
 
