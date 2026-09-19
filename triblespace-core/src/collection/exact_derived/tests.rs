@@ -538,7 +538,18 @@ impl CollectionRead for GuardSnapshot {
         &self,
         selectors: &std::collections::BTreeSet<CollectionRecordSelector>,
     ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
-        self.semantic_probes.fetch_add(1, Ordering::SeqCst);
+        // A semantic PROBE is a lineage resolution, which selects by
+        // collection. Retention expansion also selects, by produced member,
+        // but that is one indexed lookup inside a probe rather than another
+        // probe -- it used to be a full enumeration and counted as neither.
+        // Counting both together would call an implementation detail a
+        // re-resolution.
+        if selectors
+            .iter()
+            .any(|selector| matches!(selector, CollectionRecordSelector::Collection(_)))
+        {
+            self.semantic_probes.fetch_add(1, Ordering::SeqCst);
+        }
         self.selected_collections
             .lock()
             .unwrap()
@@ -751,8 +762,7 @@ fn aggregate_support_uses_selected_dag_leaves_without_clipping_certificates() {
             &before,
             &lineage,
             &selected,
-            Some(&ab_support),
-            &mut WitnessMemo::default(),
+            Some(&ab_support)
         )
         .unwrap();
     assert_eq!(
@@ -785,8 +795,7 @@ fn aggregate_support_uses_selected_dag_leaves_without_clipping_certificates() {
             &after,
             &lineage,
             &selected,
-            requested,
-            &mut WitnessMemo::default(),
+            requested
         )
         .unwrap();
         let expected = match requested {
@@ -866,8 +875,7 @@ fn aggregate_support_excludes_missing_witnesses_and_unadmitted_producers() {
         &before,
         &lineage,
         &selected,
-        None,
-        &mut WitnessMemo::default(),
+        None
     )
     .unwrap();
     assert_eq!(resolved.support, support(root, std::slice::from_ref(&a)));
@@ -883,8 +891,7 @@ fn aggregate_support_excludes_missing_witnesses_and_unadmitted_producers() {
         &after,
         &lineage,
         &selected,
-        None,
-        &mut WitnessMemo::default(),
+        None
     )
     .unwrap();
     assert_eq!(resolved.support, support(root, &[a.clone(), b.clone()]));
@@ -906,8 +913,7 @@ fn aggregate_support_excludes_missing_witnesses_and_unadmitted_producers() {
             &store.snapshot().unwrap(),
             &lineage,
             &selected,
-            None,
-            &mut WitnessMemo::default(),
+            None
         ),
         Err(CollectionRealizationError::Resolution(reason)) if reason.contains("conflicting outputs")
     ));
@@ -3230,10 +3236,11 @@ fn equal_payload_commit_does_not_restart_completed_target_maintenance() {
     assert_eq!(records(&mut store.inner), before);
 }
 
-// The two tests that lived here exercised `WitnessMemo`'s memoized support
-// walk, which no longer exists: support is read from the coverage index, and
-// the memo keeps only records and what produces them. The properties they
-// protected did not go with them --
+// The two tests that lived here exercised a memoized support walk. Support
+// is read from the coverage index now, and the memo that replaced the walk is
+// itself gone: expansion selects producers from the store's own index, so
+// there is nothing left to cache or invalidate. The properties they protected
+// did not go with them --
 //
 //   "an open record must never be memoized, because the same operation may
 //    publish the witness that closes it"

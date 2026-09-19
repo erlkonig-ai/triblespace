@@ -21,6 +21,7 @@ use crate::repo::{
     StoreSnapshot, WantRead,
 };
 
+use super::coverage::Coverage;
 use super::{
     CollectionRead, CollectionRecord, CollectionRecordFingerprint, CollectionRecordSelector,
     CollectionStore,
@@ -225,7 +226,9 @@ impl<R: BlobStoreMeta> BlobStoreMeta for ObservedStore<R> {
     }
 }
 
-impl<R: CollectionRead> CollectionRead for ObservedStore<R> {
+impl<R: CollectionRead + BlobStoreGet + CapabilityProofRead> CollectionRead
+    for ObservedStore<R>
+{
     type RecordsError = R::RecordsError;
     type RecordIter<'a>
         = R::RecordIter<'a>
@@ -250,6 +253,32 @@ impl<R: CollectionRead> CollectionRead for ObservedStore<R> {
             .records
             .insert(CollectionRecordSelector::Fingerprint(fingerprint));
         self.inner.record(fingerprint)
+    }
+
+    /// Hand out the inner store's coverage instead of refolding it.
+    ///
+    /// Without this override the trait default applies, and that default folds
+    /// one full enumeration of [`Self::records`] -- ignoring the index a pile
+    /// already maintains across appends and paying for it again per read.
+    ///
+    /// The dependency is still every record, and deliberately so. This hands
+    /// the caller the whole index, so it may look up any row; the honest read
+    /// set of "I took the coverage" is therefore everything that could change
+    /// a row. Narrowing it to the rows actually consulted needs a row-wise
+    /// coverage read, not a snapshot-wide one, and dropping it without that
+    /// makes an observation miss the arrival that completes its own support
+    /// (`observation::tests::pile_observation_tracks_only_consulted_ancestry_and_target_changes`
+    /// catches exactly this). Not refolding and not depending are separable
+    /// wins; only the first is taken here.
+    fn coverage(&self) -> Result<Coverage, Self::RecordsError>
+    where
+        Self: Sized + BlobStoreGet + CapabilityProofRead,
+    {
+        self.tracker
+            .lock()
+            .expect("store dependency tracker is not poisoned")
+            .all_records = true;
+        self.inner.coverage()
     }
 
     fn select_records(

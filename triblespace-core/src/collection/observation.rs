@@ -113,7 +113,7 @@ where
                 continue;
             }
             let record = records[&id];
-            let member = super::witness::output(record);
+            let member = super::coverage::produced(record);
             let complete = match available.get(&member) {
                 Some(complete) => *complete,
                 None => {
@@ -161,7 +161,7 @@ where
     let witnesses: Vec<_> = selected.into_iter().map(|id| records[&id]).collect();
     let cover = Cover::from_data(
         target,
-        witnesses.iter().copied().map(super::witness::output),
+        witnesses.iter().copied().map(super::coverage::produced),
     );
     Ok(CollectionSnapshot::from_endorsements(
         observed.inner().clone(),
@@ -203,7 +203,7 @@ fn merge_inputs(
             **id != self_id
                 && input.collection() == merge.collection()
                 && {
-                    let produced = super::witness::output(**input);
+                    let produced = super::coverage::produced(**input);
                     produced == low || produced == high
                 }
         })

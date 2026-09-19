@@ -180,6 +180,14 @@ pub enum Attestation {
     },
 }
 
+/// The `(collection, payload)` a record produces: its attestation's result.
+///
+/// Consumers name input PAYLOADS, so this is the half of the production
+/// relation a record states about itself; the store indexes the other half.
+pub(super) fn produced(record: CollectionRecord) -> CollectionData {
+    Attestation::of(&record).result()
+}
+
 impl Attestation {
     /// The relationship a record states, with its proof stripped away.
     pub fn of(record: &CollectionRecord) -> Self {

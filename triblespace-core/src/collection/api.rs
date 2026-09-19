@@ -1917,7 +1917,6 @@ where
             signing_key,
             &support,
             &mut frontier,
-            &mut super::witness::WitnessMemo::default(),
         )?;
     }
     store.snapshot().map_err(|error| {
