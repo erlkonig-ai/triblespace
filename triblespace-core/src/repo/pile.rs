@@ -5957,13 +5957,12 @@ mod tests {
         }
         pile.refresh().unwrap();
         assert!(pile.snapshot().unwrap().coverage_index().is_empty());
-        // The commit and the merge name a collection whose descriptor is
-        // absent, so nothing can say who may write it: both wait on a proof.
-        // The derive additionally cannot tell which collection its input
-        // lives in, so it waits on that descriptor instead.
+        // Every record names a collection whose descriptor is absent, so
+        // nothing can say who may write it; all three wait on that descriptor,
+        // the one arrival that would change the answer.
         assert_eq!(pile.snapshot().unwrap().coverage_index().parked(), 3);
-        assert_eq!(pile.snapshot().unwrap().coverage_index().parked_on_signers(), 2);
-        assert_eq!(pile.snapshot().unwrap().coverage_index().parked_on_lineages(), 1);
+        assert_eq!(pile.snapshot().unwrap().coverage_index().parked_on_signers(), 0);
+        assert_eq!(pile.snapshot().unwrap().coverage_index().parked_on_lineages(), 3);
         pile.close().unwrap();
     }
 

@@ -241,6 +241,11 @@ pub enum Admittance {
     Admitted,
     /// No proof admits this signer yet; park the attestation under its key.
     Pending,
+    /// Nothing is known about who may write here, because the collection's
+    /// descriptor is not resident. Park the attestation under that descriptor:
+    /// it is an ordinary blob, and its arrival is what re-offers the record --
+    /// a proof would not.
+    Undescribed,
 }
 
 /// What the fold must know about a collection before it can believe an
@@ -576,9 +581,16 @@ impl CoverageIndex {
             },
             _ => entry.collection,
         };
-        if admission.admits(entry.collection, entry.signer) == Admittance::Pending {
-            self.hold(Awaiting::Proof(entry.signer), entry);
-            return;
+        match admission.admits(entry.collection, entry.signer) {
+            Admittance::Admitted => {}
+            Admittance::Pending => {
+                self.hold(Awaiting::Proof(entry.signer), entry);
+                return;
+            }
+            Admittance::Undescribed => {
+                self.hold(Awaiting::Lineage(entry.collection), entry);
+                return;
+            }
         }
         self.believe(entry.collection, reads_from, entry.attestation);
     }
@@ -789,9 +801,20 @@ impl CoverageIndex {
 /// resolution is the expensive half of the question. A collection whose
 /// descriptor or proofs are not resident yet simply admits nobody — its
 /// attestations park, and the next resolution pass retries them.
+/// Why a collection yields no write evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Absent {
+    /// The descriptor blob is not resident: nothing is known yet, and its
+    /// arrival is what would change that.
+    Descriptor,
+    /// The descriptor is resident but yields no admission evidence this
+    /// reader can use.
+    Evidence,
+}
+
 pub(crate) struct StoreWriters<'a, R> {
     reader: &'a R,
-    evidence: RefCell<BTreeMap<CollectionHandle, Option<AdmissionEvidence>>>,
+    evidence: RefCell<BTreeMap<CollectionHandle, Result<AdmissionEvidence, Absent>>>,
     sources: RefCell<BTreeMap<CollectionHandle, SourceResolution>>,
     /// One answer per (collection, signer) for the life of this reader. A
     /// fold asks once per record and a lattice holds thousands of records per
@@ -830,10 +853,17 @@ impl<'a, R: BlobStoreGet + CapabilityProofRead> StoreWriters<'a, R> {
     ///
     /// Returns whether the question could be answered at all; a descriptor
     /// that is not resident answers nothing, and the caller parks.
-    fn write_evidence(&self, collection: CollectionHandle) -> bool {
+    fn write_evidence(&self, collection: CollectionHandle) -> Result<(), Absent> {
         let mut cache = self.evidence.borrow_mut();
         let entry = cache.entry(collection).or_insert_with(|| {
-            let descriptor = super::api::load_collection_descriptor(self.reader, collection).ok()?;
+            let descriptor = match super::api::load_collection_descriptor(self.reader, collection)
+            {
+                Ok(descriptor) => descriptor,
+                Err(super::api::CollectionDescriptorError::Get { .. }) => {
+                    return Err(Absent::Descriptor)
+                }
+                Err(_) => return Err(Absent::Evidence),
+            };
             super::api::discover_admission_evidence(
                 self.reader,
                 super::descriptor::admission_policies(
@@ -845,9 +875,9 @@ impl<'a, R: BlobStoreGet + CapabilityProofRead> StoreWriters<'a, R> {
                 super::ACTION_WRITE,
                 collection,
             )
-            .ok()
+            .map_err(|_| Absent::Evidence)
         });
-        entry.is_some()
+        entry.as_ref().map(|_| ()).map_err(|absent| *absent)
     }
 
     fn decide_admits(
@@ -855,15 +885,19 @@ impl<'a, R: BlobStoreGet + CapabilityProofRead> StoreWriters<'a, R> {
         collection: CollectionHandle,
         signer: Inline<ED25519PublicKey>,
     ) -> Admittance {
-        if !self.write_evidence(collection) {
-            // The descriptor is not resident, so nothing is known about who may
-            // write here. Absence is pending, never refusal.
-            return Admittance::Pending;
+        match self.write_evidence(collection) {
+            // Nothing is known about who may write here until the descriptor
+            // lands; absence is a wait on that blob, never a refusal.
+            Err(Absent::Descriptor) => return Admittance::Undescribed,
+            // Resident but unusable to this reader: nothing this reader can
+            // wait on would change that, so it is held like a missing proof.
+            Err(Absent::Evidence) => return Admittance::Pending,
+            Ok(()) => {}
         }
         let cache = self.evidence.borrow();
         let evidence = cache
             .get(&collection)
-            .and_then(Option::as_ref)
+            .and_then(|state| state.as_ref().ok())
             .expect("write evidence was just resolved");
         let Ok(subject) = VerifyingKey::from_bytes(&signer.raw) else {
             // A malformed key cannot be the subject of any proof, so no future

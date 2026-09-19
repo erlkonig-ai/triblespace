@@ -549,33 +549,19 @@ mod tests {
             .unwrap();
         store.insert(CollectionRecord::Commit(ahead)).unwrap();
         // Nothing is known about who may write a collection whose descriptor
-        // is absent, so the commit is filed under its signer, not its lineage.
+        // is absent, so the commit waits on that descriptor -- an ordinary
+        // blob, whose arrival is what re-offers it.
         let waiting = agree(&store.snapshot().unwrap(), "a record ahead of its descriptor");
-        assert_eq!(waiting.parked_on_signers(), 1);
-        assert_eq!(waiting.parked_on_lineages(), 0);
+        assert_eq!(waiting.parked_on_lineages(), 1);
+        assert_eq!(waiting.parked_on_signers(), 0);
         assert_eq!(waiting.published().len(), 2);
 
-        // The descriptor landing wakes what waited on a lineage; this commit
-        // waits on a proof, so both indexes leave it parked. (A gap in the
-        // rule, shared by every store; see the proof below.)
         store.put::<UnknownBlob, _>(descriptor).unwrap();
-        let landed = agree(&store.snapshot().unwrap(), "the descriptor it did not wait on");
-        assert_eq!(landed.parked_on_signers(), 1);
-        assert_eq!(landed.published().len(), 2);
-
-        store
-            .insert_proof(CapabilityProof::new(
-                CapabilityResource::from(later.handle()),
-                &root,
-                write_capability(),
-                writer.verifying_key(),
-            ))
-            .unwrap();
-        let woken = agree(&store.snapshot().unwrap(), "a proof, which re-offers every signer wait");
-        assert_eq!(woken.parked(), 0);
-        assert_eq!(woken.published().len(), 3);
+        let landed = agree(&store.snapshot().unwrap(), "the descriptor it was waiting on");
+        assert_eq!(landed.parked(), 0);
+        assert_eq!(landed.published().len(), 3);
 
         let quiet = agree(&store.snapshot().unwrap(), "no change at all");
-        assert_eq!(quiet, woken);
+        assert_eq!(quiet, landed);
     }
 }
