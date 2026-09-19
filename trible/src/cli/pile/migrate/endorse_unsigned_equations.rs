@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::collection::{
@@ -19,9 +19,12 @@ use triblespace_core::collection::{
     CollectionRecordSelector, CollectionStore, ConflictingCollectionOutput,
     LegacyUnsignedCollectionEquation, RecordDecodeError, Support, ACTION_WRITE,
     COLLECTION_DERIVE_SIGNED_V2_BYTES_LEN, COLLECTION_MERGE_SIGNED_V2_BYTES_LEN,
+    DERIVE_TRANSCRIPT_DOMAIN, KIND_COLLECTION_DERIVE, KIND_COLLECTION_MERGE,
+    MERGE_TRANSCRIPT_DOMAIN,
     COLLECTION_RECORD_KIND_DERIVE_V2, COLLECTION_RECORD_KIND_MERGE_V2,
 };
 use triblespace_core::inline::encodings::hash::Handle;
+use triblespace_core::inline::Inline;
 use triblespace_core::repo::pile::{
     OpaqueKind, Pile, PileRecordContent, PileRecords, PileSnapshot,
 };
@@ -35,6 +38,17 @@ const MERGE_SIGNED_V2_FRAME: &str =
     "9D9B962D46FA42168AB3A11FB367AC14692D4F51B5190196F2BDB08D5BC2BA07";
 const DERIVE_SIGNED_V2_FRAME: &str =
     "B2EE8382C70161379E387D692B822946A60B602A909EED66B7D6DA2A62F36232";
+
+// Retired witness-bound framing handles, likewise preserved verbatim. Their
+// bodies carried input-record witnesses the current record does not; the old
+// signature is checked over the old transcript and then, like every other
+// retired frame, not carried into the fresh endorsement.
+const MERGE_WITNESSED_V6_FRAME: &str =
+    "4D2087B6C4944A404E1D0BCF4898819267E00FCAE49B146F5955522CBE935909";
+const DERIVE_WITNESSED_V7_FRAME: &str =
+    "DBF641F31E772F6CE715087D954375AA44860BF411C0DE849C207B542ABDC583";
+/// Every witnessed frame filled two blocks.
+const WITNESSED_FRAME_LEN: usize = 512;
 
 #[derive(Debug, Default, Eq, PartialEq)]
 struct Report {
@@ -69,6 +83,8 @@ fn inventory(path: &Path, collection: CollectionHandle) -> Result<Inventory> {
     let mut result = Inventory::default();
     let merge_kind = hex::decode(MERGE_SIGNED_V2_FRAME)?;
     let derive_kind = hex::decode(DERIVE_SIGNED_V2_FRAME)?;
+    let merge_witnessed = hex::decode(MERGE_WITNESSED_V6_FRAME)?;
+    let derive_witnessed = hex::decode(DERIVE_WITNESSED_V7_FRAME)?;
     let mut records = PileRecords::open(path).context("open historical record framing")?;
     while let Some(record) = records.next() {
         let record = record.context("read historical record framing")?;
@@ -77,6 +93,34 @@ fn inventory(path: &Path, collection: CollectionHandle) -> Result<Inventory> {
                 if equation.collection() == collection =>
             {
                 result.equations.insert(equation);
+                continue;
+            }
+            PileRecordContent::Opaque {
+                kind: OpaqueKind::Described(kind),
+            } if kind.as_slice() == merge_witnessed || kind.as_slice() == derive_witnessed => {
+                let frame = &records.bytes()[record.offset..record.offset + record.len];
+                if frame.get(64..96) != Some(collection.raw.as_slice()) {
+                    continue;
+                }
+                match witnessed_equation(frame, kind.as_slice() == merge_witnessed) {
+                    Ok(equation) => {
+                        result.equations.insert(equation);
+                    }
+                    Err(WitnessedFrame::Malformed) => {
+                        eprintln!(
+                            "skipped retired witnessed equation at byte {}: malformed body",
+                            record.offset
+                        );
+                        result.report.malformed_signed_frames += 1;
+                    }
+                    Err(WitnessedFrame::InvalidSignature) => {
+                        eprintln!(
+                            "skipped retired witnessed equation at byte {}: invalid old signature",
+                            record.offset
+                        );
+                        result.report.invalid_signatures += 1;
+                    }
+                }
                 continue;
             }
             PileRecordContent::Opaque {
@@ -144,6 +188,86 @@ fn inventory(path: &Path, collection: CollectionHandle) -> Result<Inventory> {
         result.equations.insert(equation);
     }
     Ok(result)
+}
+
+enum WitnessedFrame {
+    Malformed,
+    InvalidSignature,
+}
+
+/// The dense fields of a retired witness-bound body, in frame order: the
+/// payload fields, then the author's key, then the signature's R and S.
+fn witnessed_field(frame: &[u8], index: usize) -> [u8; 32] {
+    frame[64 + index * 32..96 + index * 32]
+        .try_into()
+        .expect("a witnessed frame holds whole 32-byte fields")
+}
+
+/// The exact bytes a witness-bound author signed: domain, semantic kind, key,
+/// then every payload and witness field. Kept here, not in core, because only
+/// this migration still reads those frames.
+fn witnessed_transcript(is_merge: bool, author: &[u8; 32], fields: &[[u8; 32]]) -> Vec<u8> {
+    let (domain, kind) = if is_merge {
+        (MERGE_TRANSCRIPT_DOMAIN, KIND_COLLECTION_MERGE)
+    } else {
+        (DERIVE_TRANSCRIPT_DOMAIN, KIND_COLLECTION_DERIVE)
+    };
+    let mut transcript = Vec::with_capacity(domain.len() + 16 + 32 + fields.len() * 32);
+    transcript.extend_from_slice(domain);
+    transcript.extend_from_slice(&kind.raw());
+    transcript.extend_from_slice(author);
+    for field in fields {
+        transcript.extend_from_slice(field);
+    }
+    transcript
+}
+
+/// Read one retired witness-bound frame through the old codec. A merge
+/// carried collection, low, high, result, low witness, high witness; a derive
+/// carried target, input, output, input witness; both then author, R, S and
+/// zero padding to two blocks. The witnesses are read to verify the old
+/// signature and dropped: the equation is a statement about payloads.
+fn witnessed_equation(
+    frame: &[u8],
+    is_merge: bool,
+) -> Result<LegacyUnsignedCollectionEquation, WitnessedFrame> {
+    let field_count = if is_merge { 6 } else { 4 };
+    let payload_len = (field_count + 3) * 32;
+    if frame.len() != WITNESSED_FRAME_LEN
+        || frame[64 + payload_len..].iter().any(|byte| *byte != 0)
+    {
+        return Err(WitnessedFrame::Malformed);
+    }
+    let fields: Vec<[u8; 32]> = (0..field_count)
+        .map(|index| witnessed_field(frame, index))
+        .collect();
+    let author = witnessed_field(frame, field_count);
+    let r = witnessed_field(frame, field_count + 1);
+    let s = witnessed_field(frame, field_count + 2);
+    let key = VerifyingKey::from_bytes(&author).map_err(|_| WitnessedFrame::Malformed)?;
+    key.verify_strict(
+        &witnessed_transcript(is_merge, &author, &fields),
+        &Signature::from_components(r, s),
+    )
+    .map_err(|_| WitnessedFrame::InvalidSignature)?;
+    Ok(if is_merge {
+        let (mut low, mut high) = (fields[1], fields[2]);
+        if high < low {
+            std::mem::swap(&mut low, &mut high);
+        }
+        LegacyUnsignedCollectionEquation::Merge {
+            collection: CollectionHandle::new(fields[0]),
+            low: Inline::new(low),
+            high: Inline::new(high),
+            result: Inline::new(fields[3]),
+        }
+    } else {
+        LegacyUnsignedCollectionEquation::Derive {
+            collection: CollectionHandle::new(fields[0]),
+            input: Inline::new(fields[1]),
+            output: Inline::new(fields[2]),
+        }
+    })
 }
 
 pub(super) fn run(
@@ -1713,6 +1837,115 @@ mod tests {
         let empty = fixture.source.cover([]);
         assert_eq!(fixture.support_for(fixture.target, a)?, empty);
         assert_eq!(fixture.support_for(fixture.target, b)?, empty);
+        Ok(())
+    }
+
+    /// A retired witness-bound frame as the witness-era writer produced it:
+    /// two blocks, the old kind, payload fields then two (or one) witness
+    /// fingerprints, the author's key and a signature over the old transcript.
+    fn witnessed_frame(equation: LegacyUnsignedCollectionEquation, signer: &SigningKey) -> Vec<u8> {
+        let mut frame = vec![0; WITNESSED_FRAME_LEN];
+        frame[..28].copy_from_slice(
+            &hex::decode("0371B249F0626B2ABDDB80E23EA969059D9656A5EA5A497320351F3B").unwrap(),
+        );
+        frame[28..32].copy_from_slice(&2u32.to_le_bytes());
+        let (is_merge, kind, fields): (bool, &str, Vec<[u8; 32]>) = match equation {
+            LegacyUnsignedCollectionEquation::Merge {
+                collection,
+                low,
+                high,
+                result,
+            } => (
+                true,
+                MERGE_WITNESSED_V6_FRAME,
+                vec![collection.raw, low.raw, high.raw, result.raw, [7; 32], [8; 32]],
+            ),
+            LegacyUnsignedCollectionEquation::Derive {
+                collection,
+                input,
+                output,
+            } => (
+                false,
+                DERIVE_WITNESSED_V7_FRAME,
+                vec![collection.raw, input.raw, output.raw, [9; 32]],
+            ),
+        };
+        frame[32..64].copy_from_slice(&hex::decode(kind).unwrap());
+        let author = signer.verifying_key().to_bytes();
+        let signature = signer.sign(&witnessed_transcript(is_merge, &author, &fields));
+        for (index, field) in fields
+            .iter()
+            .chain([&author, &signature.r_bytes().to_owned(), &signature.s_bytes().to_owned()])
+            .enumerate()
+        {
+            frame[64 + index * 32..96 + index * 32].copy_from_slice(field);
+        }
+        frame
+    }
+
+    #[test]
+    fn retired_witnessed_frames_are_endorsed_afresh() -> Result<()> {
+        let fixture = Fixture::new()?;
+        // The witness-era cohort wrote these; this reader crosses them as
+        // opaque. The migration reads them through the old codec, checks the
+        // old signature, and restates each equation under the migrator's key.
+        let historical = SigningKey::from_bytes(&[44; 32]);
+        append(
+            fixture.file.path(),
+            [
+                witnessed_frame(fixture.equations[0], &historical),
+                witnessed_frame(fixture.equations[2], &historical),
+            ],
+        )?;
+        assert_eq!(
+            fixture.endorse(false)?,
+            Report {
+                endorsed: 2,
+                ..Report::default()
+            }
+        );
+        for equation in [fixture.equations[0], fixture.equations[2]] {
+            let endorsement = fixture
+                .records()?
+                .into_iter()
+                .find(|record| payload_equation(*record) == Some(equation))
+                .expect("the witnessed equation is endorsed");
+            assert_eq!(
+                endorsement.public_key().raw,
+                fixture.signer.verifying_key().to_bytes()
+            );
+        }
+        // Idempotent: the endorsements are present now, nothing is appended.
+        let before = fs::read(fixture.file.path())?;
+        assert_eq!(
+            fixture.endorse(false)?,
+            Report {
+                already_present: 2,
+                ..Report::default()
+            }
+        );
+        assert_eq!(fs::read(fixture.file.path())?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn witnessed_frames_with_bad_signatures_or_padding_stay_opaque() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let mut invalid = witnessed_frame(fixture.equations[0], &fixture.signer);
+        invalid[64 + 32] ^= 1;
+        let mut malformed = witnessed_frame(fixture.equations[2], &fixture.signer);
+        malformed[511] = 1;
+        append(fixture.file.path(), [invalid, malformed])?;
+        let before = fs::read(fixture.file.path())?;
+        assert_eq!(
+            fixture.endorse(false)?,
+            Report {
+                invalid_signatures: 1,
+                malformed_signed_frames: 1,
+                ..Report::default()
+            }
+        );
+        assert_eq!(fs::read(fixture.file.path())?, before);
         Ok(())
     }
 
