@@ -346,10 +346,61 @@ impl CoverageArrivals {
 /// One consumer edge: the collection it writes to, the one it reads from,
 /// and the attestation itself.
 type ConsumerEdge = (CollectionHandle, CollectionHandle, Attestation);
+/// The edges that read one input, one entry per edge, keyed by
+/// [`edge_key`]. Recording the k-th edge of a node costs one path, not a
+/// copy of the other k-1; a node read by many records is the common case in
+/// a lattice and used to make the fold quadratic in it.
+type Edges = PATCH<96, IdentitySchema, ConsumerEdge>;
 /// Collection-scoped input handle to the edges that read it.
-type Consumers = PATCH<64, IdentitySchema, Vec<ConsumerEdge>>;
+type Consumers = PATCH<64, IdentitySchema, Edges>;
+/// The attestations held under one awaited thing, one entry each, keyed by
+/// [`parked_key`]; the same shape as [`Edges`], for the same reason.
+type Held = PATCH<160, IdentitySchema, Parked>;
 /// Attestations held until one named thing arrives, keyed by that thing.
-type Waiters = PATCH<32, IdentitySchema, Vec<Parked>>;
+type Waiters = PATCH<32, IdentitySchema, Held>;
+
+/// What identifies a consumer edge under one of its inputs: where it writes,
+/// what it produces, and the other input it reads -- zero for an image, which
+/// reads one.
+fn edge_key(
+    writes_to: CollectionHandle,
+    attestation: Attestation,
+    input: CollectionData,
+) -> [u8; 96] {
+    let mut key = [0u8; 96];
+    key[..32].copy_from_slice(&writes_to.raw);
+    key[32..64].copy_from_slice(&attestation.result().raw);
+    if let Attestation::Join { low, high, .. } = attestation {
+        let other = if input == low { high } else { low };
+        key[64..].copy_from_slice(&other.raw);
+    }
+    key
+}
+
+/// What identifies a parked attestation: the collection and signer that
+/// would believe it, and the attestation itself.
+fn parked_key(entry: &Parked) -> [u8; 160] {
+    let mut key = [0u8; 160];
+    key[..32].copy_from_slice(&entry.collection.raw);
+    key[32..64].copy_from_slice(&entry.signer.raw);
+    key[64..96].copy_from_slice(&entry.attestation.result().raw);
+    match entry.attestation {
+        Attestation::Foundation { .. } => {}
+        Attestation::Join { low, high, .. } => {
+            key[96..128].copy_from_slice(&low.raw);
+            key[128..].copy_from_slice(&high.raw);
+        }
+        Attestation::Image { input, .. } => {
+            key[96..128].copy_from_slice(&input.raw);
+        }
+    }
+    key
+}
+
+/// Every attestation held in one waiter map.
+fn held(held: &Held) -> impl Iterator<Item = Parked> + '_ {
+    held.iter_ordered().filter_map(|key| held.get(key).copied())
+}
 
 /// Downward coverage for every lattice node a store has admitted.
 ///
@@ -384,7 +435,7 @@ pub struct CoverageIndex {
 fn waiting(waiters: &Waiters) -> usize {
     waiters
         .iter_ordered()
-        .map(|key| waiters.get(key).map_or(0, Vec::len))
+        .map(|key| waiters.get(key).map_or(0, |held| held.len() as usize))
         .sum()
 }
 
@@ -392,7 +443,7 @@ fn waiting(waiters: &Waiters) -> usize {
 fn drain(waiters: Waiters, into: &mut Vec<Parked>) {
     for key in waiters.iter_ordered() {
         if let Some(entries) = waiters.get(key) {
-            into.extend(entries.iter().copied());
+            into.extend(held(entries));
         }
     }
 }
@@ -537,9 +588,12 @@ impl CoverageIndex {
             Awaiting::Lineage(descriptor) => (&mut self.awaiting_lineage, descriptor.raw),
             Awaiting::Proof(signer) => (&mut self.awaiting_proof, signer.raw),
         };
+        // The inner map is a persistent root: cloning it is constant time,
+        // and `insert` keeps an existing entry, so the same attestation parked
+        // twice is held once. `replace` on the outer map, because `insert`
+        // would keep the old inner map.
         let mut entries = waiters.get(&key).cloned().unwrap_or_default();
-        entries.push(entry);
-        // `insert` keeps an existing key's value; a waiter list grows in place.
+        entries.insert(&Entry::with_value(&parked_key(&entry), entry));
         waiters.replace(&Entry::with_value(&key, entries));
     }
 
@@ -613,7 +667,7 @@ impl CoverageIndex {
         for handle in arrivals {
             if let Some(entries) = self.awaiting_lineage.get(&handle.raw).cloned() {
                 self.awaiting_lineage.remove(&handle.raw);
-                woken.extend(entries);
+                woken.extend(held(&entries));
             }
         }
         if proofs_arrived {
@@ -648,12 +702,12 @@ impl CoverageIndex {
     ) {
         for input in attestation.inputs() {
             let key = row_key(reads_from, input);
-            let edge = (writes_to, reads_from, attestation);
-            let mut consumers = self.consumers.get(&key).cloned().unwrap_or_default();
-            if !consumers.contains(&edge) {
-                consumers.push(edge);
-                self.consumers.replace(&Entry::with_value(&key, consumers));
-            }
+            let mut edges = self.consumers.get(&key).cloned().unwrap_or_default();
+            edges.insert(&Entry::with_value(
+                &edge_key(writes_to, attestation, input),
+                (writes_to, reads_from, attestation),
+            ));
+            self.consumers.replace(&Entry::with_value(&key, edges));
         }
         let mut grown = Vec::new();
         if self.drive(writes_to, reads_from, attestation) {
@@ -663,10 +717,13 @@ impl CoverageIndex {
         // and those may widen their own consumers in turn. Growth is bounded by
         // the finite set of foundation commits, so the worklist drains.
         while let Some((collection, node)) = grown.pop() {
-            let Some(consumers) = self.consumers.get(&row_key(collection, node)).cloned() else {
+            let Some(edges) = self.consumers.get(&row_key(collection, node)).cloned() else {
                 continue;
             };
-            for (writes_to, reads_from, consumer) in consumers {
+            for key in edges.iter_ordered() {
+                let Some(&(writes_to, reads_from, consumer)) = edges.get(key) else {
+                    continue;
+                };
                 if self.drive(writes_to, reads_from, consumer) {
                     grown.push((writes_to, consumer.result()));
                 }
