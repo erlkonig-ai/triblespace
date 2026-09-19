@@ -365,7 +365,7 @@ mod tests {
 
     fn record(byte: u8) -> CollectionRecord {
         let key = SigningKey::from_bytes(&[7; 32]);
-        let input = CollectionRecord::Commit(CollectionCommit::sign(
+        let _input = CollectionRecord::Commit(CollectionCommit::sign(
             &key,
             Inline::<Handle<SimpleArchive>>::new([2; 32]),
             Inline::new([byte; 32]),

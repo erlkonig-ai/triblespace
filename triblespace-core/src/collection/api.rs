@@ -2795,18 +2795,10 @@ mod cover_resolution_tests {
         let signer = SigningKey::from_bytes(&[17; 32]);
         let collection = Collection::<SimpleArchive>::from_handle(Inline::new([7; 32]));
         let mut previous = data(1, 0);
-        let mut previous_record = CollectionRecord::Commit(CollectionCommit::sign(
-            &signer,
-            collection.handle(),
-            previous,
-            empty_metadata_handle(),
-        ));
         let mut records = Vec::new();
         for index in 1..=LENGTH {
             let atom = data(1, index);
             let result = data(2, index);
-            let atom_record =
-                CollectionCommit::sign(&signer, collection.handle(), atom, empty_metadata_handle());
             let merge = CollectionMerge::sign(
                 &signer,
                 collection.handle(),
@@ -2815,8 +2807,7 @@ mod cover_resolution_tests {
                 result,
             );
             previous = result;
-            previous_record = CollectionRecord::Merge(merge);
-            records.push(previous_record);
+            records.push(CollectionRecord::Merge(merge));
         }
         let discovered = DiscoveredCollectionRecords::from_records(records);
         // Canonical order runs opposite the requested reverse decomposition:

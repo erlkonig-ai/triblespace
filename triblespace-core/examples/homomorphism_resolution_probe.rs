@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::hint::black_box;
 use std::time::{Duration, Instant};

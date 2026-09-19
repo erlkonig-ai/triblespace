@@ -3721,23 +3721,6 @@ impl PileFile {
     }
 
 
-    /// One immutable observation of the applied prefix, for questions this
-    /// pile needs to ask itself. Every component is a persistent PATCH root or
-    /// an `Arc`, so this is a constant-time clone rather than a copy.
-    fn reader_snapshot(&self) -> PileFileSnapshot {
-        PileFileSnapshot::new(
-            self.mmap.clone(),
-            self.applied_length,
-            self.opaque_records,
-            self.blobs.clone(),
-            self.collection_records.clone(),
-            self.collection_records_by_collection.clone(),
-            self.collection_records_by_produced_member.clone(),
-            self.legacy_collection_headers.clone(),
-            self.capability_proofs.clone(),
-            self.wants.clone(),
-        )
-    }
 
     /// Amputates the pile's tail: **TRUNCATES the file at the first malformed
     /// or truncated record, destroying everything after it.**

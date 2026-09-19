@@ -246,7 +246,7 @@ fn maintenance_follows_a_resident_source_union_across_target_size_tiers() {
         .iter()
         .map(|input| {
             let data = Handle::<SuccinctArchiveBlob>::to_hash(input.get_handle());
-            let record = children
+            let _record = children
                 .records()
                 .unwrap()
                 .map(Result::unwrap)

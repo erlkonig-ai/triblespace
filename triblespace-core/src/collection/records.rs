@@ -1501,13 +1501,13 @@ mod tests {
 
     #[test]
     fn endorsements_reference_actual_records_separately_from_blobs() {
-        let first = CollectionRecord::Commit(CollectionCommit::sign(
+        let _first = CollectionRecord::Commit(CollectionCommit::sign(
             &fixture_key(),
             collection(1),
             hash(2),
             empty_metadata_handle(),
         ));
-        let second = CollectionRecord::Commit(CollectionCommit::sign(
+        let _second = CollectionRecord::Commit(CollectionCommit::sign(
             &fixture_key(),
             collection(1),
             hash(3),

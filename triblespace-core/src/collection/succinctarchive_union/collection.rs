@@ -343,7 +343,7 @@ mod tests {
     #[test]
     fn incomplete_compacted_rank9_member_does_not_hide_a_complete_finer_cover() {
         let mut store = MemoryRepo::default();
-        let (_, raw_collection, accelerated_collection) = collections(&mut store);
+        let (_, _raw_collection, accelerated_collection) = collections(&mut store);
         let a = raw([row(1, 2, 3)]);
         let b = raw([row(4, 5, 6)]);
         let c = super::super::join(&a, &b).unwrap();
@@ -832,7 +832,7 @@ mod tests {
         let raw_records = [(source_a_data, a_data), (source_b_data, b_data)]
             .into_iter()
             .zip(source_records)
-            .map(|((input, output), source)| {
+            .map(|((input, output), _source)| {
                 CollectionRecord::Derive(CollectionDerive::sign(
                     &SigningKey::from_bytes(&[7; 32]),
                     raw_collection.handle(),

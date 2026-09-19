@@ -331,7 +331,7 @@ fn only_a_projection_parks_on_an_unresolvable_descriptor() {
 fn settling_without_the_awaited_arrival_does_nothing() {
     let source = collection(0);
     let target = collection(7);
-    let lineages = Lineages([(target, source)].into_iter().collect());
+    let _lineages = Lineages([(target, source)].into_iter().collect());
     let mut index = CoverageIndex::new();
     index.apply(&commit(1, source, data(1)), &OnlySigner(1));
     index.apply(&commit(2, source, data(2)), &OnlySigner(1));

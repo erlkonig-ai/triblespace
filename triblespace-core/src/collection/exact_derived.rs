@@ -590,9 +590,16 @@ fn record_certificate(
         // A commit stands for its own payload. The row is consulted only to
         // ask whether it was admitted; the row itself may be wider, and that
         // width belongs to the value rather than to this citation.
-        Attestation::Foundation { data } => coverage
-            .of(collection, data)
-            .map(|_| CoverageSet::from_keys(std::iter::once(data.raw))),
+        Attestation::Foundation { data } => {
+            // A commit anywhere but the foundation is a malformed route --
+            // the structural walk says the same -- and certifies nothing.
+            if collection != lineage.foundation.handle() {
+                return None;
+            }
+            coverage
+                .of(collection, data)
+                .map(|_| CoverageSet::from_keys(std::iter::once(data.raw)))
+        }
         Attestation::Join { low, high, .. } => {
             let mut set = coverage.of(collection, low)?.clone();
             set.union(coverage.of(collection, high)?.clone());

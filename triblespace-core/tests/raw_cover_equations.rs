@@ -43,20 +43,6 @@ fn collection(store: &mut MemoryRepo, name: &str, owner: &SigningKey) -> Collect
         .unwrap()
 }
 
-fn leaf(
-    collection: Collection<SimpleArchive>,
-    signer: &SigningKey,
-    blob: &Blob<SimpleArchive>,
-) -> CollectionCommit {
-    // These actual records are deliberately not inserted. Raw cover reads
-    // need mathematical equations, not a claim that these are admitted leaves.
-    CollectionCommit::sign(
-        signer,
-        collection.handle(),
-        data(blob),
-        empty_metadata_handle(),
-    )
-}
 
 #[test]
 fn raw_cover_reuses_an_endorsed_merge_without_ancestor_write_authority() {

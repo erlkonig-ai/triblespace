@@ -1078,7 +1078,7 @@ fn exact_ensure_acquires_explicit_foundational_support_without_want() {
 fn exact_ensure_fetches_a_known_derive_output_without_recomputing() {
     let (mut inner, root, first, _second) = collections();
     let source = archive(1, 1);
-    let source_commit = publish_root(&mut inner, root, &source, 31);
+    let _source_commit = publish_root(&mut inner, root, &source, 31);
     let support = support(root, std::slice::from_ref(&source));
     let output = FirstEncoding::map(&(), &source, &inner.snapshot().unwrap()).unwrap();
     let output_data = data(&output);
@@ -1117,8 +1117,8 @@ fn exact_ensure_reendorses_a_resident_image_from_a_different_support_without_map
     let signer = equation_signer();
     let a = archive(1, 1);
     let b = crate::collection::simplearchive_union::join(&a, &archive(2, 2)).unwrap();
-    let a_commit = publish_root(&mut inner, root, &a, 31);
-    let b_commit = publish_root(&mut inner, root, &b, 31);
+    let _a_commit = publish_root(&mut inner, root, &a, 31);
+    let _b_commit = publish_root(&mut inner, root, &b, 31);
     // The same payload b has two genuine witnesses: its own COMMIT [B], and
     // join(a, b) = b [A, B]. No mapping result is invented for this fixture.
     assert_eq!(
@@ -1190,8 +1190,8 @@ fn exact_ensure_rejects_conflicting_images_before_reusing_a_pruned_support() {
     let signer = equation_signer();
     let a = archive(1, 1);
     let b = crate::collection::simplearchive_union::join(&a, &archive(2, 2)).unwrap();
-    let a_commit = publish_root(&mut inner, root, &a, 31);
-    let b_commit = publish_root(&mut inner, root, &b, 31);
+    let _a_commit = publish_root(&mut inner, root, &a, 31);
+    let _b_commit = publish_root(&mut inner, root, &b, 31);
     let ab = CollectionMerge::sign(
         &signer,
         root.handle(),
@@ -1251,7 +1251,7 @@ fn exact_ensure_rejects_a_cold_conflicting_image_before_fetch_or_publication() {
     let signer = equation_signer();
     let a = archive(1, 1);
     let b = crate::collection::simplearchive_union::join(&a, &archive(2, 2)).unwrap();
-    let a_commit = publish_root(&mut inner, root, &a, 31);
+    let _a_commit = publish_root(&mut inner, root, &a, 31);
     let b_commit = publish_root(&mut inner, root, &b, 31);
     let ab = CollectionMerge::sign(
         &signer,
@@ -1267,7 +1267,7 @@ fn exact_ensure_rejects_a_cold_conflicting_image_before_fetch_or_publication() {
     // The existing [B] claim's image is cold; only the incompatible [A, B]
     // image is resident. Residency cannot make that image safe to re-endorse.
     inner.put::<FirstEncoding, _>(wrong.clone()).unwrap();
-    for (witness, output) in [(b_commit.fingerprint(), &right), (ab.fingerprint(), &wrong)] {
+    for (_witness, output) in [(b_commit.fingerprint(), &right), (ab.fingerprint(), &wrong)] {
         inner
             .insert(CollectionRecord::Derive(CollectionDerive::sign(
                 &signer,
@@ -1309,7 +1309,7 @@ fn exact_ensure_rejects_a_cold_conflicting_image_before_fetch_or_publication() {
 fn passive_derived_snapshot_keeps_dangling_output_as_raw_evidence_only() {
     let (mut inner, root, first, _second) = collections();
     let source = archive(1, 1);
-    let source_commit = publish_root(&mut inner, root, &source, 42);
+    let _source_commit = publish_root(&mut inner, root, &source, 42);
     let support = support(root, std::slice::from_ref(&source));
     let output = FirstEncoding::map(&(), &source, &inner.snapshot().unwrap()).unwrap();
     let pending = CollectionRecord::Derive(CollectionDerive::sign(
@@ -1345,7 +1345,7 @@ fn passive_derived_snapshot_keeps_dangling_output_as_raw_evidence_only() {
 fn exact_maintenance_recovers_a_pending_derive_with_a_missing_output() {
     let (mut inner, root, first, _second) = collections();
     let source = archive(1, 1);
-    let source_commit = publish_root(&mut inner, root, &source, 31);
+    let _source_commit = publish_root(&mut inner, root, &source, 31);
     let support = support(root, std::slice::from_ref(&source));
     let snapshot = inner.snapshot().unwrap();
     let output = FirstEncoding::map(&(), &source, &snapshot).unwrap();
@@ -2935,9 +2935,9 @@ fn target_maintenance_reendorses_a_resident_upper_without_joining_again() {
     let a = archive(1, 1);
     let b = crate::collection::simplearchive_union::join(&a, &archive(2, 2)).unwrap();
     let c = archive(3, 3);
-    let a_commit = publish_root(&mut inner, root, &a, 31);
-    let b_commit = publish_root(&mut inner, root, &b, 31);
-    let c_commit = publish_root(&mut inner, root, &c, 31);
+    let _a_commit = publish_root(&mut inner, root, &a, 31);
+    let _b_commit = publish_root(&mut inner, root, &b, 31);
+    let _c_commit = publish_root(&mut inner, root, &c, 31);
     let ab = CollectionMerge::sign(
         &signer,
         root.handle(),
@@ -3138,7 +3138,7 @@ fn redundant_support_fixture() -> (
 #[test]
 fn support_repair_removes_an_earlier_member_made_redundant_by_a_later_one() {
     let (mut store, collection, blobs) = redundant_support_fixture();
-    let [a, b, z, _] = &blobs;
+    let [a, _b, z, _] = &blobs;
     let requested = support(collection, &blobs);
     let snapshot = store.snapshot().unwrap();
     let selected = snapshot.collection_exact(collection, &requested).unwrap();

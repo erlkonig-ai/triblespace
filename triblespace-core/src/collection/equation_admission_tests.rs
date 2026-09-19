@@ -59,8 +59,8 @@ fn read_rights_do_not_admit_merges_or_inject_conflicts() {
     let a = archive(2);
     let b = archive(3);
     let c = simplearchive_union::join(&a, &b).unwrap();
-    let ca = publish(&mut store, collection, &root, a.clone());
-    let cb = publish(&mut store, collection, &root, b.clone());
+    let _ca = publish(&mut store, collection, &root, a.clone());
+    let _cb = publish(&mut store, collection, &root, b.clone());
     let c_handle = store.put::<SimpleArchive, _>(c).unwrap();
     let wrong = store
         .put::<SimpleArchive, _>(TribleSet::new().to_blob())
