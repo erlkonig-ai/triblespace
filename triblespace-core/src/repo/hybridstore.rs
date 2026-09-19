@@ -299,6 +299,24 @@ where
     }
 }
 
+/// A hybrid has no index of its own: its blobs -- and so the descriptors the
+/// fold resolves lineages from -- come from one side, its records and proofs
+/// from the other. Neither side's index would be built over the pair, so the
+/// fold over the pair is the correct answer, at the fold's full cost.
+impl<B, R> crate::collection::CoverageRead for HybridSnapshot<B, R>
+where
+    Self: crate::collection::CollectionRead
+        + crate::repo::BlobStoreGet
+        + crate::repo::CapabilityProofRead,
+{
+    fn coverage(
+        &self,
+        _lineage: &std::collections::BTreeSet<crate::collection::CollectionHandle>,
+    ) -> Result<crate::collection::coverage::Coverage, Self::RecordsError> {
+        crate::collection::fold_coverage(self)
+    }
+}
+
 impl<B, R> CollectionRead for HybridSnapshot<B, R>
 where
     R: CollectionRead,

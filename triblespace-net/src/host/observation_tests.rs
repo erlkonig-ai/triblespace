@@ -147,6 +147,17 @@ impl<R: CapabilityProofRead> CapabilityProofRead for CountedSnapshot<R> {
     }
 }
 
+impl<R: triblespace_core::collection::CoverageRead> triblespace_core::collection::CoverageRead
+    for CountedSnapshot<R>
+{
+    fn coverage(
+        &self,
+        lineage: &std::collections::BTreeSet<triblespace_core::collection::CollectionHandle>,
+    ) -> Result<triblespace_core::collection::coverage::Coverage, Self::RecordsError> {
+        self.inner.coverage(lineage)
+    }
+}
+
 impl<R: CollectionRead> CollectionRead for CountedSnapshot<R> {
     type RecordsError = R::RecordsError;
     type RecordIter<'a>

@@ -277,6 +277,16 @@ impl CapabilityProofStore for MemoryRepo {
     }
 }
 
+impl crate::collection::CoverageRead for MemoryRepoSnapshot {
+    /// The index settled when this snapshot was taken; a persistent-root clone.
+    fn coverage(
+        &self,
+        _lineage: &BTreeSet<crate::collection::CollectionHandle>,
+    ) -> Result<Coverage, Self::RecordsError> {
+        Ok(self.coverage.clone())
+    }
+}
+
 impl CollectionRead for MemoryRepoSnapshot {
     type RecordsError = Infallible;
     type RecordIter<'a> = MemoryCollectionRecordIter;
@@ -314,16 +324,6 @@ impl CollectionRead for MemoryRepoSnapshot {
             })
             .filter(|record| selectors_match_record(selectors, *record))
             .collect())
-    }
-
-    fn coverage(
-        &self,
-        _lineage: &BTreeSet<crate::collection::CollectionHandle>,
-    ) -> Result<Coverage, Self::RecordsError>
-    where
-        Self: Sized + BlobStoreGet + CapabilityProofRead,
-    {
-        Ok(self.coverage.clone())
     }
 }
 

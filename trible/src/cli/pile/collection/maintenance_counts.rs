@@ -219,6 +219,19 @@ impl<R: BlobStoreMeta> BlobStoreMeta for Counted<R> {
     }
 }
 
+impl<R: triblespace_core::collection::CoverageRead> triblespace_core::collection::CoverageRead
+    for Counted<R>
+{
+    /// A coverage read is a handout of the inner index, not an enumeration,
+    /// so it counts as neither; the fold it replaced enumerated.
+    fn coverage(
+        &self,
+        lineage: &std::collections::BTreeSet<triblespace_core::collection::CollectionHandle>,
+    ) -> Result<triblespace_core::collection::coverage::Coverage, Self::RecordsError> {
+        self.inner.coverage(lineage)
+    }
+}
+
 impl<R: CollectionRead> CollectionRead for Counted<R> {
     type RecordsError = R::RecordsError;
     type RecordIter<'a>

@@ -357,6 +357,7 @@ use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
 use crate::collection::{
     CollectionData, CollectionHandle, CollectionRead, CollectionRecordSelector, CollectionStore,
+    CoverageRead,
 };
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
@@ -593,6 +594,7 @@ pub trait StoreRead:
     + BlobStoreList
     + BlobStoreMeta
     + CollectionRead
+    + CoverageRead
     + CapabilityProofRead
     + WantRead
 {
@@ -604,6 +606,7 @@ impl<R> StoreRead for R where
         + BlobStoreList
         + BlobStoreMeta
         + CollectionRead
+        + CoverageRead
         + CapabilityProofRead
         + WantRead
 {

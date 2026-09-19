@@ -24,7 +24,7 @@ use crate::repo::{
 use super::coverage::Coverage;
 use super::{
     CollectionHandle, CollectionRead, CollectionRecord, CollectionRecordFingerprint,
-    CollectionRecordSelector, CollectionStore,
+    CollectionRecordSelector, CollectionStore, CoverageRead,
 };
 
 pub(crate) type DependencyTracker = Arc<Mutex<StoreDependencies>>;
@@ -226,9 +226,31 @@ impl<R: BlobStoreMeta> BlobStoreMeta for ObservedStore<R> {
     }
 }
 
-impl<R: CollectionRead + BlobStoreGet + CapabilityProofRead> CollectionRead
-    for ObservedStore<R>
-{
+impl<R: CoverageRead> CoverageRead for ObservedStore<R> {
+    /// Hand out the inner store's coverage and depend on the lineage rather
+    /// than on everything.
+    ///
+    /// The dependency is a handful of `Collection` selectors, not
+    /// `all_records`: the fold propagates only along a lineage, so a row the
+    /// caller may consult changes only when a record arrives in one of the
+    /// collections it named. Dropping the dependency entirely instead makes
+    /// an observation miss the arrival that completes its own support,
+    /// because a resolution selects its target and source but not the
+    /// foundation the completing COMMIT lands in.
+    fn coverage(
+        &self,
+        lineage: &BTreeSet<CollectionHandle>,
+    ) -> Result<Coverage, Self::RecordsError> {
+        self.tracker
+            .lock()
+            .expect("store dependency tracker is not poisoned")
+            .records
+            .extend(lineage.iter().copied().map(CollectionRecordSelector::Collection));
+        self.inner.coverage(lineage)
+    }
+}
+
+impl<R: CollectionRead> CollectionRead for ObservedStore<R> {
     type RecordsError = R::RecordsError;
     type RecordIter<'a>
         = R::RecordIter<'a>
@@ -255,35 +277,6 @@ impl<R: CollectionRead + BlobStoreGet + CapabilityProofRead> CollectionRead
         self.inner.record(fingerprint)
     }
 
-    /// Hand out the inner store's coverage instead of refolding it, and
-    /// depend on the lineage rather than on everything.
-    ///
-    /// Without this override the trait default applies, and that default folds
-    /// one full enumeration of [`Self::records`] -- ignoring the index a pile
-    /// already maintains across appends, and marking the read as depending on
-    /// every record in the store.
-    ///
-    /// Neither is necessary. The fold propagates only along a lineage, so a
-    /// row the caller may consult changes only when a record arrives in one of
-    /// the collections it named. That is a handful of `Collection` selectors
-    /// instead of `all_records`, and it is why the parameter exists: dropping
-    /// the dependency entirely instead makes an observation miss the arrival
-    /// that completes its own support, because a resolution selects its target
-    /// and source but not the foundation the completing COMMIT lands in.
-    fn coverage(
-        &self,
-        lineage: &BTreeSet<CollectionHandle>,
-    ) -> Result<Coverage, Self::RecordsError>
-    where
-        Self: Sized + BlobStoreGet + CapabilityProofRead,
-    {
-        self.tracker
-            .lock()
-            .expect("store dependency tracker is not poisoned")
-            .records
-            .extend(lineage.iter().copied().map(CollectionRecordSelector::Collection));
-        self.inner.coverage(lineage)
-    }
 
     fn select_records(
         &self,

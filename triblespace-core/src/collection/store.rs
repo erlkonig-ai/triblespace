@@ -166,37 +166,6 @@ pub trait CollectionRead {
         Ok(None)
     }
 
-    /// Downward coverage for every lattice node this store has admitted.
-    ///
-    /// The default implementation folds one enumeration of [`Self::records`],
-    /// deciding admission from this same reader. A backend that maintains the
-    /// index across appends — a pile does, during replay — should override
-    /// this and hand out what it already has; the answer is the same, it just
-    /// costs a persistent-root clone instead of a fold.
-    ///
-    /// Bounded on `Self: Sized` and the two readers the fold needs, so the
-    /// trait keeps every implementor that cannot answer the admission
-    /// question, and stays object-safe.
-    ///
-    /// `lineage` names every collection whose rows the caller may consult --
-    /// the target and each of its sources down to the foundation. The index
-    /// itself is snapshot-wide and no implementor needs to narrow what it
-    /// hands back, but a reader that TRACKS what was read does need it: the
-    /// fold only propagates along a lineage, so a row under one can change
-    /// only when a record arrives in one of these collections. Without the
-    /// parameter the honest read set of a coverage read is every record in
-    /// the store, which makes every observation wake on every arrival.
-    fn coverage(
-        &self,
-        lineage: &BTreeSet<CollectionHandle>,
-    ) -> Result<Coverage, Self::RecordsError>
-    where
-        Self: Sized + BlobStoreGet + CapabilityProofRead,
-    {
-        let _ = lineage;
-        Ok(coverage_of(self)?.published().clone())
-    }
-
     /// Select one deterministic union of raw record routes.
     ///
     /// The default implementation performs exactly one ordinary enumeration
@@ -221,6 +190,56 @@ pub trait CollectionRead {
         }
         Ok(selected)
     }
+}
+
+/// Downward coverage for every lattice node this store has admitted.
+///
+/// Deliberately not a method of [`CollectionRead`], and deliberately without
+/// a default. A store that maintains the index -- a pile during replay, a
+/// [`crate::repo::memoryrepo::MemoryRepo`] across inserts -- hands out its
+/// published root, a constant-time clone. A wrapper delegates. A reader that
+/// can do neither says so by not implementing this, and then cannot be passed
+/// where coverage is needed: a compile error, where the alternative was a
+/// default that refolded every record with an admission query for each one
+/// the store did not admit -- found doing exactly that, silently, in four
+/// wrappers that had simply never overridden it.
+///
+/// `lineage` names every collection whose rows the caller may consult -- the
+/// target and each of its sources down to the foundation. The index itself
+/// is snapshot-wide and no implementor needs to narrow what it hands back,
+/// but a reader that TRACKS what was read does need it: the fold only
+/// propagates along a lineage, so a row under one can change only when a
+/// record arrives in one of these collections. Without the parameter the
+/// honest read set of a coverage read is every record in the store, which
+/// makes every observation wake on every arrival.
+pub trait CoverageRead: CollectionRead {
+    fn coverage(
+        &self,
+        lineage: &BTreeSet<CollectionHandle>,
+    ) -> Result<Coverage, Self::RecordsError>;
+}
+
+impl<R: CoverageRead> CoverageRead for &R {
+    fn coverage(
+        &self,
+        lineage: &BTreeSet<CollectionHandle>,
+    ) -> Result<Coverage, Self::RecordsError> {
+        (**self).coverage(lineage)
+    }
+}
+
+/// Fold coverage from scratch over one reader.
+///
+/// This is the cost [`CoverageRead`] refuses to hide: one enumeration of
+/// every record, and an admission query for each one this reader does not
+/// admit. It is the right answer for a reader that has no index of its own
+/// and no inner store to delegate to, and it is written at the call site so
+/// that it is visible there.
+pub fn fold_coverage<R>(reader: &R) -> Result<Coverage, R::RecordsError>
+where
+    R: CollectionRead + BlobStoreGet + CapabilityProofRead,
+{
+    Ok(coverage_of(reader)?.published().clone())
 }
 
 impl<R> CollectionRead for &R

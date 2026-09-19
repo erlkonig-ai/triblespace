@@ -285,6 +285,22 @@ where
     }
 }
 
+/// The frozen inner snapshot's index. Until this delegate existed the trait
+/// default applied here, and every `maintain` a faculty ran through a peer
+/// snapshot refolded the whole record set with an admission query per record
+/// the store did not admit -- in production, on every pass, unmeasured.
+impl<S: SnapshotSource> triblespace_core::collection::CoverageRead for PeerSnapshot<S>
+where
+    S::Snapshot: triblespace_core::collection::CoverageRead,
+{
+    fn coverage(
+        &self,
+        lineage: &std::collections::BTreeSet<triblespace_core::collection::CollectionHandle>,
+    ) -> Result<triblespace_core::collection::coverage::Coverage, Self::RecordsError> {
+        self.frozen.coverage(lineage)
+    }
+}
+
 impl<S: SnapshotSource> CollectionRead for PeerSnapshot<S>
 where
     S::Snapshot: CollectionRead,

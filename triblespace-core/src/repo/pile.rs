@@ -4227,6 +4227,16 @@ impl Pile {
     }
 }
 
+impl crate::collection::CoverageRead for PileSnapshot {
+    /// The index replay maintained; a persistent-root clone.
+    fn coverage(
+        &self,
+        _lineage: &BTreeSet<CollectionHandle>,
+    ) -> Result<Coverage, Self::RecordsError> {
+        Ok(self.coverage.clone())
+    }
+}
+
 impl CollectionRead for PileSnapshot {
     type RecordsError = ReadError;
     type RecordIter<'a> = PileCollectionRecordIter;
@@ -4236,13 +4246,6 @@ impl CollectionRead for PileSnapshot {
     /// One persistent-root clone. The answer is the same one the default fold
     /// would reach from these records and this reader — `coverage_matches_a_fold_over_the_same_records`
     /// pins that — because both decide admission from the same applied prefix.
-    fn coverage(
-        &self,
-        _lineage: &BTreeSet<CollectionHandle>,
-    ) -> Result<Coverage, Self::RecordsError> {
-        Ok(self.coverage.clone())
-    }
-
     fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
         let keys = self.collection_records.clone().into_iter_ordered();
         Ok(PileCollectionRecordIter {
@@ -6075,7 +6078,7 @@ mod tests {
         }
 
         let snapshot = pile.snapshot().unwrap();
-        let maintained = CollectionRead::coverage(&snapshot, &BTreeSet::new()).unwrap();
+        let maintained = crate::collection::CoverageRead::coverage(&snapshot, &BTreeSet::new()).unwrap();
         let folded = coverage_of(&snapshot).unwrap().published().clone();
         assert_eq!(maintained, folded);
         assert!(!maintained.is_empty());
