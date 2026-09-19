@@ -1,5 +1,6 @@
-//! An endorsed result's support follows its exact input records, not every
-//! alternative equation that happens to produce an equal payload.
+//! An endorsed result's support is what the believed equations beneath it
+//! say, and only those: an unauthorized alternative cannot change it, while an
+//! authorized one is one more attestation and is believed like any other.
 
 use std::collections::BTreeSet;
 
@@ -18,7 +19,7 @@ use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{BlobStorePut, SnapshotSource};
 
 #[test]
-fn later_alternative_equations_cannot_change_an_endorsed_results_support() {
+fn only_believed_alternative_equations_change_an_endorsed_results_support() {
     let owner = SigningKey::from_bytes(&[73; 32]);
     let unrelated = SigningKey::from_bytes(&[74; 32]);
     let policy = CollectionPolicy::new(
@@ -76,20 +77,27 @@ fn later_alternative_equations_cannot_change_an_endorsed_results_support() {
     assert_eq!(observe(&mut store), original);
 
     // Different operation inputs mean no functional-output conflict. This
-    // false absorption is signed, but its producer has no source WRITE.
-    // Even an authorized alternative cannot retroactively replace the
-    // selected DERIVE's exact witness. The signer of a false equation owns
-    // that lie; it does not taint a different, already-endorsed route.
-    for signer in [&unrelated, &owner] {
-        store
-            .insert(CollectionRecord::Merge(CollectionMerge::sign(
-                signer,
-                source.handle(),
-                c,
-                cz.data(),
-                c,
-            )))
-            .unwrap();
-        assert_eq!(observe(&mut store), original);
-    }
+    // absorption claims `c` already contains `z`. Signed by a key with no
+    // source WRITE it is not believed, so nothing downstream moves.
+    let absorb = |signer: &SigningKey| {
+        CollectionRecord::Merge(CollectionMerge::sign(
+            signer,
+            source.handle(),
+            c,
+            cz.data(),
+            c,
+        ))
+    };
+    store.insert(absorb(&unrelated)).unwrap();
+    assert_eq!(observe(&mut store), original);
+
+    // Signed by the owner it is one more believed attestation about `c`, and
+    // coverage is the monotone union of everything believed: `c` now stands
+    // for `z` as well, and the derived image inherits that through its
+    // unchanged DERIVE. A writer who lies about their own collection owns
+    // that lie; the index does not second-guess an admitted equation.
+    store.insert(absorb(&owner)).unwrap();
+    let mut extended = original.clone();
+    extended.insert(cz.data());
+    assert_eq!(observe(&mut store), extended);
 }
