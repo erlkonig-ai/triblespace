@@ -5952,11 +5952,11 @@ mod tests {
 
     /// The maintained index and a fold over the same records agree.
     ///
-    /// `PileSnapshot::coverage` overrides the trait default to hand out what
-    /// replay already built, and that override is a claim: that folding these
-    /// records against this reader reaches the same answer. An override whose
-    /// equivalence is assumed rather than checked is how a fast path quietly
-    /// becomes a different path.
+    /// The covered snapshot hands out an index fed by snapshot difference and
+    /// decided lineage by lineage, and that is a claim: that folding these
+    /// records against this reader reaches the same answer. A fast path whose
+    /// equivalence is assumed rather than checked is how it quietly becomes a
+    /// different path.
     #[test]
     fn coverage_matches_a_fold_over_the_same_records() {
         use crate::collection::coverage::coverage_of;
@@ -6002,7 +6002,8 @@ mod tests {
         }
 
         let snapshot = pile.snapshot().unwrap();
-        let maintained = crate::collection::CoverageRead::coverage(&snapshot, &BTreeSet::new()).unwrap();
+        // The eager form: every lineage decided, which is what a fold does.
+        let maintained = snapshot.coverage_index().published().clone();
         let folded = coverage_of(&snapshot).unwrap().published().clone();
         assert_eq!(maintained, folded);
         assert!(!maintained.is_empty());

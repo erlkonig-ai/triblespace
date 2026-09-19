@@ -51,6 +51,7 @@
 //! authorized: that decision is already baked into which unions happened.
 
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::collections::BTreeMap;
 
 use ed25519_dalek::VerifyingKey;
@@ -418,7 +419,7 @@ pub struct CoverageIndex {
     /// [`CoverageIndex::settle`] gives each one its first decision. This is
     /// distinct from `pending`, whose entries have already been decided
     /// against and are waiting on a *named* arrival.
-    fresh: Vec<Parked>,
+    fresh: Waiters,
 }
 
 /// How many attestations a waiter map holds.
@@ -500,7 +501,7 @@ impl CoverageIndex {
 
     /// Number of attestations waiting on evidence that has not arrived.
     pub fn parked(&self) -> usize {
-        waiting(&self.awaiting_lineage) + waiting(&self.awaiting_proof) + self.fresh.len()
+        waiting(&self.awaiting_lineage) + waiting(&self.awaiting_proof) + waiting(&self.fresh)
     }
 
     /// Number waiting specifically on a proof admitting their signer.
@@ -609,11 +610,16 @@ impl CoverageIndex {
         attestation: Attestation,
         signer: Inline<ED25519PublicKey>,
     ) {
-        self.fresh.push(Parked {
+        let entry = Parked {
             collection,
             attestation,
             signer,
-        });
+        };
+        // Keyed by the collection it names, so a reader can decide one
+        // lineage's records and leave every other lineage's parked.
+        let mut held = self.fresh.get(&collection.raw).cloned().unwrap_or_default();
+        held.insert(&Entry::with_value(&parked_key(&entry), entry));
+        self.fresh.replace(&Entry::with_value(&collection.raw, held));
     }
 
     /// Reduce one record to what it attests and park it.
@@ -660,7 +666,8 @@ impl CoverageIndex {
         arrivals: impl IntoIterator<Item = CollectionHandle>,
         proofs_arrived: bool,
     ) {
-        let mut woken: Vec<Parked> = std::mem::take(&mut self.fresh);
+        let mut woken: Vec<Parked> = Vec::new();
+        drain(std::mem::take(&mut self.fresh), &mut woken);
         for handle in arrivals {
             if let Some(entries) = self.awaiting_lineage.get(&handle.raw).cloned() {
                 self.awaiting_lineage.remove(&handle.raw);
@@ -675,13 +682,60 @@ impl CoverageIndex {
         }
     }
 
+    /// A descriptor landed: everything that waited on it is fresh again, to be
+    /// decided the next time its collection is settled. No decision is made
+    /// here, so this is one map move, not an admission query.
+    pub fn wake_descriptor(&mut self, descriptor: CollectionHandle) {
+        let Some(entries) = self.awaiting_lineage.get(&descriptor.raw).cloned() else {
+            return;
+        };
+        self.awaiting_lineage.remove(&descriptor.raw);
+        for entry in held(&entries) {
+            self.park(entry.collection, entry.attestation, entry.signer);
+        }
+    }
+
+    /// A proof landed: every attestation waiting on a signer is fresh again,
+    /// to be decided when its collection is next settled. Proofs are rare and
+    /// the move is one insert per entry, without an admission query.
+    pub fn wake_proofs(&mut self) {
+        let mut woken = Vec::new();
+        drain(std::mem::take(&mut self.awaiting_proof), &mut woken);
+        for entry in woken {
+            self.park(entry.collection, entry.attestation, entry.signer);
+        }
+    }
+
+    /// Decide every fresh attestation naming one of `collections`, and only
+    /// those. A reader asks for exactly the lineage it reads -- foundation,
+    /// sources, target -- which is closed under "reads from", so settling it
+    /// alone publishes the same rows a full settle would for those
+    /// collections; every other lineage's records stay parked, unpaid for.
+    pub fn settle_collections<A: RecordAdmission>(
+        &mut self,
+        admission: &A,
+        collections: &BTreeSet<CollectionHandle>,
+    ) {
+        let mut woken = Vec::new();
+        for collection in collections {
+            if let Some(entries) = self.fresh.get(&collection.raw).cloned() {
+                self.fresh.remove(&collection.raw);
+                woken.extend(held(&entries));
+            }
+        }
+        for entry in woken {
+            self.decide(entry, admission);
+        }
+    }
+
     /// Re-offer every parked attestation, whatever it is waiting for.
     ///
     /// The unconditional form, for a store that cannot say which evidence
     /// arrived. Correct but coarse: prefer [`Self::settle`] where the arrivals
     /// are observable.
     pub fn resolve<A: RecordAdmission>(&mut self, admission: &A) {
-        let mut woken: Vec<Parked> = std::mem::take(&mut self.fresh);
+        let mut woken: Vec<Parked> = Vec::new();
+        drain(std::mem::take(&mut self.fresh), &mut woken);
         drain(std::mem::take(&mut self.awaiting_lineage), &mut woken);
         drain(std::mem::take(&mut self.awaiting_proof), &mut woken);
         for entry in woken {

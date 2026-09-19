@@ -55,29 +55,29 @@ pub trait RecordDelta {
 /// taken.
 pub struct Covered<S: SnapshotSource> {
     inner: S,
+    /// The last snapshot handed out and the memo it settles into, so the
+    /// next snapshot starts from what readers have already decided and pays
+    /// only for what arrived since, and only for lineages someone reads.
+    last: Option<(S::Snapshot, std::sync::Arc<std::sync::Mutex<Memo>>)>,
+}
+
+/// What a snapshot has decided so far: the index, and the collections whose
+/// records have all been offered to it -- for those, a later snapshot needs
+/// only the records that arrived since; for the rest, the first reader that
+/// asks selects them wholesale from the store's own by-collection index.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct Memo {
     index: CoverageIndex,
-    /// The prefix the index has been fed up to; `None` before the first
-    /// snapshot, when everything the store holds is new.
-    fed: Option<S::Snapshot>,
+    settled: BTreeSet<CollectionHandle>,
 }
 
 impl<S: SnapshotSource> Covered<S> {
     pub fn new(inner: S) -> Self {
-        Self {
-            inner,
-            index: CoverageIndex::default(),
-            fed: None,
-        }
+        Self { inner, last: None }
     }
 
     pub fn into_inner(self) -> S {
         self.inner
-    }
-
-    /// The index as of the last snapshot taken. Writes since then are not in
-    /// it until the next snapshot; take one first to inspect their effect.
-    pub fn coverage_index(&self) -> &CoverageIndex {
-        &self.index
     }
 }
 
@@ -95,8 +95,7 @@ where
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
-            index: self.index.clone(),
-            fed: self.fed.clone(),
+            last: self.last.clone(),
         }
     }
 }
@@ -105,8 +104,7 @@ impl<S: SnapshotSource + std::fmt::Debug> std::fmt::Debug for Covered<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Covered")
             .field("inner", &self.inner)
-            .field("index", &self.index)
-            .field("fed", &self.fed.is_some())
+            .field("last", &self.last.is_some())
             .finish()
     }
 }
@@ -132,35 +130,41 @@ where
 {
     /// Feed the index everything `now` holds that the last fed snapshot did
     /// not, then decide what that could have changed.
-    fn catch_up(&mut self, now: &S::Snapshot) {
+    /// Start the next snapshot's memo from the last one and feed it only what
+    /// arrived since -- and only for collections some reader already had
+    /// decided. Nothing is decided here, and nothing is parked for a
+    /// collection nobody has asked about: the first reader to ask selects its
+    /// records from the store's own index. A first snapshot therefore costs
+    /// exactly replay.
+    fn carry_forward(&mut self, now: &S::Snapshot) -> std::sync::Arc<std::sync::Mutex<Memo>> {
+        let Some((fed, last)) = &self.last else {
+            return std::sync::Arc::default();
+        };
+        let mut memo = last.lock().expect("coverage memo is not poisoned").clone();
         // A blob matters only as the descriptor some parked record is waiting
-        // on; when nothing waits, the blob walk is skipped entirely, so the
-        // steady state of a store with no backlog costs no enumeration.
-        let mut descriptors = Vec::new();
-        if self.index.parked_on_lineages() > 0 {
-            let arrived = match &self.fed {
-                Some(fed) => now.blobs_diff(fed),
-                None => now.blobs(),
-            };
-            for handle in arrived.flatten() {
+        // on; when nothing waits, the blob walk is skipped entirely.
+        if memo.index.parked_on_lineages() > 0 {
+            for handle in now.blobs_diff(fed).flatten() {
                 let descriptor: CollectionHandle = Inline::new(handle.handle.raw);
-                if self.index.blob_arrived(descriptor) {
-                    descriptors.push(descriptor);
+                if memo.index.blob_arrived(descriptor) {
+                    memo.index.wake_descriptor(descriptor);
                 }
             }
         }
-        now.for_each_record_since(self.fed.as_ref(), &mut |record| {
-            self.index.park_record(record);
-        });
-        let proofs = self
-            .fed
-            .as_ref()
-            .is_none_or(|fed| now.changes_since(fed).contains(StoreChanges::CAPABILITY_PROOFS));
-        if self.index.has_fresh() || !descriptors.is_empty() || proofs {
-            self.index
-                .settle(&StoreWriters::new(now), descriptors, proofs);
+        if !memo.settled.is_empty() {
+            now.for_each_record_since(Some(fed), &mut |record| {
+                if memo.settled.contains(&record.collection()) {
+                    memo.index.park_record(record);
+                }
+            });
         }
-        self.fed = Some(now.clone());
+        if now
+            .changes_since(fed)
+            .contains(StoreChanges::CAPABILITY_PROOFS)
+        {
+            memo.index.wake_proofs();
+        }
+        std::sync::Arc::new(std::sync::Mutex::new(memo))
     }
 }
 
@@ -174,11 +178,9 @@ where
 
     fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
         let now = self.inner.snapshot()?;
-        self.catch_up(&now);
-        Ok(CoveredSnapshot {
-            inner: now,
-            index: self.index.clone(),
-        })
+        let memo = self.carry_forward(&now);
+        self.last = Some((now.clone(), std::sync::Arc::clone(&memo)));
+        Ok(CoveredSnapshot { inner: now, memo })
     }
 }
 
@@ -275,31 +277,99 @@ impl<S: SnapshotSource + StorageClose> Covered<S> {
 }
 
 /// One immutable observation of a [`Covered`] store: the inner snapshot and
-/// the index settled for exactly that prefix. Every part is a persistent
-/// root, so cloning is constant time.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// the coverage index for exactly that prefix, decided one lineage at a time
+/// as readers ask. The index is a persistent root behind a lock shared by
+/// every clone of this snapshot, so a lineage settled through one clone is
+/// settled for all of them, and handing it out is a constant-time clone.
+#[derive(Clone)]
 pub struct CoveredSnapshot<T> {
     inner: T,
-    index: CoverageIndex,
+    memo: std::sync::Arc<std::sync::Mutex<Memo>>,
 }
+
+impl<T: std::fmt::Debug> std::fmt::Debug for CoveredSnapshot<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CoveredSnapshot")
+            .field("inner", &self.inner)
+            .field("memo", &*self.memo.lock().expect("coverage memo is not poisoned"))
+            .finish()
+    }
+}
+
+impl<T: PartialEq> PartialEq for CoveredSnapshot<T> {
+    fn eq(&self, other: &Self) -> bool {
+        if self.inner != other.inner {
+            return false;
+        }
+        // Clones share the memo; locking it twice would wait on ourselves.
+        if std::sync::Arc::ptr_eq(&self.memo, &other.memo) {
+            return true;
+        }
+        *self.memo.lock().expect("coverage memo is not poisoned")
+            == *other.memo.lock().expect("coverage memo is not poisoned")
+    }
+}
+
+impl<T: Eq> Eq for CoveredSnapshot<T> {}
 
 impl<T> CoveredSnapshot<T> {
     pub fn inner(&self) -> &T {
         &self.inner
     }
+}
 
-    /// The index settled for exactly this prefix, parked attestations
-    /// included; [`CoverageRead::index`] hands out a clone of the same. (Named
-    /// apart from it: an inherent `index()` would shadow the trait method at
-    /// every concrete call site.)
-    pub fn coverage_index(&self) -> &CoverageIndex {
-        &self.index
+impl<T: CollectionRead + BlobStoreGet + CapabilityProofRead> CoveredSnapshot<T> {
+    /// Offer every record of `collections` this memo has not seen to the
+    /// index, selected from the store's own by-collection index, then decide
+    /// everything fresh for them. Records of a collection already settled
+    /// were parked by [`Covered`] as they arrived, so only those are new.
+    fn settle_lineage(
+        &self,
+        memo: &mut Memo,
+        collections: &BTreeSet<CollectionHandle>,
+    ) -> Result<(), T::RecordsError> {
+        let unseen: BTreeSet<_> = collections
+            .iter()
+            .filter(|collection| !memo.settled.contains(*collection))
+            .map(|collection| CollectionRecordSelector::Collection(*collection))
+            .collect();
+        if !unseen.is_empty() {
+            for record in self.inner.select_records(&unseen)? {
+                memo.index.park_record(&record);
+            }
+            memo.settled.extend(collections.iter().copied());
+        }
+        memo.index
+            .settle_collections(&StoreWriters::new(&self.inner), collections);
+        Ok(())
     }
 
-    /// The published half of the index: which foundation commits each
-    /// lattice node stands for, as decided for exactly this prefix.
-    pub fn coverage(&self) -> &Coverage {
-        self.index.published()
+    /// The whole index for this prefix, every collection decided -- the eager
+    /// form, for inspection and for readers that really do want everything.
+    /// [`CoverageRead::index`] is the lazy one. (Named apart from it: an
+    /// inherent `index()` would shadow the trait method at every concrete
+    /// call site.)
+    pub fn coverage_index(&self) -> CoverageIndex {
+        let mut memo = self.memo.lock().expect("coverage memo is not poisoned");
+        let mut all = BTreeSet::new();
+        if let Ok(records) = self.inner.records() {
+            for record in records.flatten() {
+                if !memo.settled.contains(&record.collection()) {
+                    memo.index.park_record(&record);
+                }
+                all.insert(record.collection());
+            }
+        }
+        memo.settled.extend(all.iter().copied());
+        memo.index
+            .settle(&StoreWriters::new(&self.inner), std::iter::empty(), false);
+        memo.index.clone()
+    }
+
+    /// The published half of the whole index: which foundation commits each
+    /// lattice node stands for, every lineage decided for exactly this prefix.
+    pub fn coverage(&self) -> Coverage {
+        self.coverage_index().published().clone()
     }
 }
 
@@ -317,10 +387,15 @@ impl<T> std::ops::DerefMut for CoveredSnapshot<T> {
     }
 }
 
-impl<T: CollectionRead> CoverageRead for CoveredSnapshot<T> {
-    /// The index settled when this snapshot was taken; a persistent-root clone.
-    fn index(&self, _lineage: &BTreeSet<CollectionHandle>) -> Result<CoverageIndex, Self::RecordsError> {
-        Ok(self.index.clone())
+impl<T: CollectionRead + BlobStoreGet + CapabilityProofRead> CoverageRead for CoveredSnapshot<T> {
+    /// Decide this lineage's records if nobody has yet, against this prefix,
+    /// and hand out the index as it stands: a persistent-root clone whose
+    /// rows for the lineage are complete and whose other lineages may still
+    /// be parked, which a reader asking for its own lineage never sees.
+    fn index(&self, lineage: &BTreeSet<CollectionHandle>) -> Result<CoverageIndex, Self::RecordsError> {
+        let mut memo = self.memo.lock().expect("coverage memo is not poisoned");
+        self.settle_lineage(&mut memo, lineage)?;
+        Ok(memo.index.clone())
     }
 }
 
@@ -483,13 +558,50 @@ mod tests {
         )
     }
 
-    /// The wrapper's index and the store's own, over the same snapshot.
+    /// The wrapper's index and the level below's, over the same snapshot,
+    /// both in the eager form so every lineage is decided.
     fn agree(snapshot: &CoveredSnapshot<MemoryRepoSnapshot>, step: &str) -> CoverageIndex {
-        let lineage = BTreeSet::new();
-        let ours = snapshot.index(&lineage).unwrap();
-        let theirs = snapshot.inner().index(&lineage).unwrap();
+        let ours = snapshot.coverage_index();
+        let theirs = snapshot.inner().coverage_index();
         assert_eq!(ours, theirs, "after {step}");
         ours
+    }
+
+    /// Asking for one lineage decides that lineage and leaves the other
+    /// parked; asking for the other afterwards decides it too, on the same
+    /// snapshot, without touching the first again.
+    #[test]
+    fn a_reader_pays_for_the_lineage_it_asks_for_and_no_other() {
+        let root = SigningKey::from_bytes(&[73; 32]);
+        let mut store = Covered::new(MemoryRepo::default());
+        let first: Collection<SimpleArchive> = store.collection("first", policy(&root)).unwrap();
+        let second: Collection<SimpleArchive> = store.collection("second", policy(&root)).unwrap();
+        for (collection, text) in [(first, "one"), (second, "two")] {
+            let child = store.put::<UTF8String, _>(text.to_owned()).unwrap();
+            store
+                .commit(collection, &root, entity! { crate::metadata::name: child })
+                .unwrap();
+        }
+        let snapshot = store.snapshot().unwrap();
+
+        let only_first = snapshot.index(&BTreeSet::from([first.handle()])).unwrap();
+        assert_eq!(only_first.published().len(), 1);
+        assert_eq!(only_first.parked(), 0, "the other lineage was never even offered");
+
+        let both = snapshot.index(&BTreeSet::from([second.handle()])).unwrap();
+        assert_eq!(both.published().len(), 2);
+        assert_eq!(both.parked(), 0);
+        assert_eq!(snapshot.coverage_index(), both, "the eager form has nothing left to decide");
+
+        // A later snapshot starts from what this one decided and pays only
+        // for what arrived since, for the collections already settled.
+        let child = store.put::<UTF8String, _>("three".to_owned()).unwrap();
+        store
+            .commit(first, &root, entity! { crate::metadata::name: child })
+            .unwrap();
+        let later = store.snapshot().unwrap();
+        let carried = later.index(&BTreeSet::from([first.handle()])).unwrap();
+        assert_eq!(carried.published().len(), 3);
     }
 
     /// Drive one store through every arrival the index reacts to -- a

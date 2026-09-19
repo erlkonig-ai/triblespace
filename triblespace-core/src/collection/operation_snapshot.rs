@@ -241,11 +241,7 @@ where
                 .expect("authored PATCH key must retain its record");
             index.park_record(record);
         }
-        index.settle(
-            &super::coverage::StoreWriters::new(self),
-            std::iter::empty(),
-            false,
-        );
+        index.settle_collections(&super::coverage::StoreWriters::new(self), lineage);
         Ok(index)
     }
 }
