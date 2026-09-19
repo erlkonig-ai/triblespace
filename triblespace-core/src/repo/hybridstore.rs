@@ -299,21 +299,22 @@ where
     }
 }
 
-/// A hybrid has no index of its own: its blobs -- and so the descriptors the
+/// A hybrid has no index of its own: its blobs -- and so the descriptors a
 /// fold resolves lineages from -- come from one side, its records and proofs
-/// from the other. Neither side's index would be built over the pair, so the
-/// fold over the pair is the correct answer, at the fold's full cost.
-impl<B, R> crate::collection::CoverageRead for HybridSnapshot<B, R>
+/// from the other. `Covered<HybridStore<B, R>>` maintains one over the pair,
+/// fed by the record side's difference, where this used to refold on every
+/// read.
+impl<B, R> crate::collection::covered::RecordDelta for HybridSnapshot<B, R>
 where
-    Self: crate::collection::CollectionRead
-        + crate::repo::BlobStoreGet
-        + crate::repo::CapabilityProofRead,
+    R: crate::collection::covered::RecordDelta,
 {
-    fn index(
+    fn for_each_record_since(
         &self,
-        _lineage: &std::collections::BTreeSet<crate::collection::CollectionHandle>,
-    ) -> Result<crate::collection::coverage::CoverageIndex, Self::RecordsError> {
-        crate::collection::fold_index(self)
+        since: Option<&Self>,
+        each: &mut dyn FnMut(&CollectionRecord),
+    ) {
+        self.records
+            .for_each_record_since(since.map(|since| &since.records), each)
     }
 }
 
@@ -506,7 +507,12 @@ mod tests {
 
     #[test]
     fn collection_publication_and_read_work_across_both_sides() {
-        let mut hybrid = HybridStore::new(MemoryRepo::default(), MemoryRepo::default());
+        // Reading a collection needs coverage, which a hybrid gets from the
+        // wrapper over the pair, not from either side.
+        let mut hybrid = crate::collection::covered::Covered::new(HybridStore::new(
+            MemoryRepo::default(),
+            MemoryRepo::default(),
+        ));
         let signing_key = SigningKey::from_bytes(&[8; 32]);
         let name = "hybrid";
         let target = hybrid
