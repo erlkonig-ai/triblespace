@@ -332,13 +332,6 @@ where
         self.records.records()
     }
 
-    fn record(
-        &self,
-        fingerprint: crate::collection::CollectionRecordFingerprint,
-    ) -> Result<Option<CollectionRecord>, Self::RecordsError> {
-        self.records.record(fingerprint)
-    }
-
     fn select_records(
         &self,
         selectors: &std::collections::BTreeSet<crate::collection::CollectionRecordSelector>,

@@ -23,8 +23,8 @@ use crate::repo::{
 
 use super::coverage::CoverageIndex;
 use super::{
-    CollectionHandle, CollectionRead, CollectionRecord, CollectionRecordFingerprint,
-    CollectionRecordSelector, CollectionStore, CoverageRead,
+    CollectionHandle, CollectionRead, CollectionRecord, CollectionRecordSelector, CollectionStore,
+    CoverageRead,
 };
 
 /// One read-set, shareable between every reader that should charge its
@@ -270,19 +270,6 @@ impl<R: CollectionRead> CollectionRead for ObservedStore<R> {
         self.inner.records()
     }
 
-    fn record(
-        &self,
-        fingerprint: CollectionRecordFingerprint,
-    ) -> Result<Option<CollectionRecord>, Self::RecordsError> {
-        self.tracker
-            .lock()
-            .expect("store dependency tracker is not poisoned")
-            .records
-            .insert(CollectionRecordSelector::Fingerprint(fingerprint));
-        self.inner.record(fingerprint)
-    }
-
-
     fn select_records(
         &self,
         selectors: &BTreeSet<CollectionRecordSelector>,
@@ -445,13 +432,17 @@ mod tests {
             after.get::<Bytes, _>(handle).unwrap().as_ref(),
             b"active member"
         );
-        assert!(before.record(record.fingerprint()).unwrap().is_none());
-        assert_eq!(after.record(record.fingerprint()).unwrap(), Some(record));
+        let produced = BTreeSet::from([CollectionRecordSelector::ProducedMember(
+            collection.handle(),
+            Handle::<UnknownBlob>::to_hash(handle),
+        )]);
+        assert!(before.select_records(&produced).unwrap().is_empty());
+        assert_eq!(after.select_records(&produced).unwrap(), vec![record]);
         assert!(before.proof(proof.id()).unwrap().is_none());
         assert_eq!(after.proof(proof.id()).unwrap(), Some(proof));
         let expected = StoreDependencies {
             blobs: BTreeSet::from([Handle::<UnknownBlob>::to_hash(handle)]),
-            records: BTreeSet::from([CollectionRecordSelector::Fingerprint(record.fingerprint())]),
+            records: produced.clone(),
             capability_proofs: true,
             ..StoreDependencies::default()
         };
@@ -459,7 +450,7 @@ mod tests {
         assert_eq!(before.dependencies(), expected);
         assert_eq!(after.dependencies(), expected);
         let native = after.into_inner();
-        assert_eq!(native.record(record.fingerprint()).unwrap(), Some(record));
+        assert_eq!(native.select_records(&produced).unwrap(), vec![record]);
         assert_eq!(
             observed
                 .into_inner()
@@ -551,16 +542,15 @@ mod tests {
             AdmissionPolicy::direct(key.verifying_key()),
         );
         let collection = store.collection("observed missing record", policy).unwrap();
-        let record = CollectionRecord::Commit(CollectionCommit::sign(
-            &key,
-            collection.handle(),
-            Handle::<UnknownBlob>::to_hash(blob("unpublished member").get_handle()),
-            empty_metadata_handle(),
-        ));
+        let unpublished = Handle::<UnknownBlob>::to_hash(blob("unpublished member").get_handle());
         let observed = ObservedStore::new(store.snapshot().unwrap());
+        let produced = BTreeSet::from([CollectionRecordSelector::ProducedMember(
+            collection.handle(),
+            unpublished,
+        )]);
         let selectors = BTreeSet::from([CollectionRecordSelector::Collection(collection.handle())]);
 
-        assert!(observed.record(record.fingerprint()).unwrap().is_none());
+        assert!(observed.select_records(&produced).unwrap().is_empty());
         assert!(observed.select_records(&selectors).unwrap().is_empty());
         assert!(observed
             .select_records(&BTreeSet::new())
@@ -571,7 +561,7 @@ mod tests {
             StoreDependencies {
                 records: BTreeSet::from([
                     CollectionRecordSelector::Collection(collection.handle()),
-                    CollectionRecordSelector::Fingerprint(record.fingerprint()),
+                    CollectionRecordSelector::ProducedMember(collection.handle(), unpublished),
                 ]),
                 ..StoreDependencies::default()
             }

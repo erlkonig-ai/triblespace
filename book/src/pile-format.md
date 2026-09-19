@@ -458,8 +458,10 @@ both their unsigned and their signed payload-only predecessors. They are
 timestamp. They are also distinct from operational wants and historical pins:
 collection records have no head, tombstone, or
 last-writer-wins update. Their exact canonical value is the semantic record; a
-collection record is not a trible entity. Physical indexes use a full-width
-BLAKE3 fingerprint only as a fixed-width lookup and deduplication key.
+collection record is not a trible entity. The pile indexes a record by the
+collection and member it names and the frame it sits in; a full-width BLAKE3
+fingerprint exists for anything that needs a fixed-width identity, such as the
+network delta.
 
 The collection itself is identified by a canonical `SimpleArchive` descriptor.
 Its 32-byte blob handle is the sole `CollectionHandle`. Records carry this
@@ -563,23 +565,18 @@ structure and the exact content-addressed key without repeating signatures.
 Foreign pile/import bytes need an explicit checked ingress or a user-approved
 trusted-source boundary; structural open alone is not an import verifier.
 
-An authorized equation producer endorses both the mathematical result and the
-validated support of its exact input records. Attachment applies WRITE to the
-target's candidate producers, then follows the selected records' fingerprint
-references to foundational COMMITs. The witness walk checks exact collection
-and output-handle matches, not ancestor signatures, grants, payloads, or
-metadata. It needs the descriptor lineage and the named native records to be
-available. A missing or mismatched witness does not stand for empty support.
-Only the selected output and its encoding-required blob dependencies need be
-resident for materialization; historical inputs may have been evicted.
-
-Fingerprints bind a particular support route even when distinct inputs map to
-the same output blob. Payload order still helps select a compact physical
-cover, but exact witness supports decide its denotation. A finer resident
-member remains necessary if a coarser payload does not endorse all of that
-member's support. Later unrelated equations cannot enlarge an existing
-signature's witness closure. This is producer trust, not proof of mathematical
-correctness: an authorized dishonest producer can still endorse a wrong result.
+An authorized equation producer endorses the mathematical result. What a
+result stands for is the coverage index's answer: the monotone union of
+everything believed beneath it, foundation COMMITs reached through admitted
+MERGE and DERIVE equations. Attachment applies WRITE to the target's candidate
+producers and reads their rows; it needs the descriptor lineage and the
+producing records to be available, and a payload no admitted record produces
+is reported rather than taken for empty support. A later admitted equation
+about the same payload extends that answer; an unauthorized one changes
+nothing. Only the selected output and its encoding-required blob dependencies
+need be resident for materialization; historical inputs may have been
+evicted. This is producer trust, not proof of mathematical correctness: an
+authorized dishonest producer can still endorse a wrong result.
 
 These are the complete native collection-record family: there is no
 accelerator-specific fourth variant. A Rank9-accelerated member is an ordinary
@@ -600,41 +597,41 @@ scan found no live records requiring migration.
 
 Every reserved byte must be zero; a nonzero reserved byte makes replay fail as
 corrupt rather than silently assigning meaning to a format extension. Merge
-inputs are sorted as `(payload digest, record fingerprint)` pairs. Witnesses
-move with their payloads, including when the two payload digests are equal, so
-swapping operands cannot create a second representation of the same endorsement.
+inputs are sorted by payload digest, so swapping operands cannot create a
+second representation of the same endorsement.
 
 There is no synthetic trible entity or separately stored ID for the record.
 On replay, the decoder reconstructs its exact dense typed payload: 192 bytes
-for a commit, 288 bytes for a merge, and 224 bytes for a derive. The store hashes
-the stable semantic kind ID followed by every canonical payload byte with
-BLAKE3 and retains the full 32-byte digest
-as a `CollectionRecordFingerprint`. Every current payload includes the
-public key and both signature components. This fingerprint serves both exact
-lookup/deduplication and signed input-record references. It names the actual
-persisted record, not a blob, invented entity, or member of `Support`.
+for a commit, 224 bytes for a merge, and 192 bytes for a derive. Every current
+payload includes the public key and both signature components. A
+`CollectionRecordFingerprint`, the BLAKE3 digest of the stable semantic kind ID
+followed by every canonical payload byte, names the actual persisted record
+wherever a fixed-width identity is needed, such as the network delta PATCH; it
+names a record, not a blob, invented entity, or member of `Support`. The pile
+computes none at replay.
 
-Pile replay keeps the records in fingerprint order. Re-inserting an identical
-record is an idempotent success; a different record producing the same
-full-width fingerprint is reported as a collision. Concatenating piles therefore gives set-union
-semantics for collection records: append order and duplicate copies do not
-change the discovered collection calculus. Current operational WANTs are
-likewise a grow-only set. Historical pins remain ordered evidence; retired
-WANT logs are only explicit migration input and do not participate in ordinary
-replay.
+Pile replay indexes each record once, by the collection it names, the member
+it produces, and the offset of the first frame holding it. A frame repeating
+an indexed record adds nothing, and inserting a record the file already holds
+appends nothing: the producers of the same member are the only records it
+could be, and they are compared as records. Concatenating piles therefore
+gives set-union semantics for collection records: append order and duplicate
+copies do not change the discovered collection calculus. Current operational
+WANTs are likewise a grow-only set. Historical pins remain ordered evidence;
+retired WANT logs are only explicit migration input and do not participate in
+ordinary replay.
 
 The immutable record read surface also provides raw relationship selectors.
-`ProducedMember(C, H)` selects every COMMIT data, MERGE result, or DERIVE output
-matching the exact collection and payload. `ReferencingRecord(FP)` selects
-every immediate MERGE/DERIVE consumer of that exact input-record fingerprint,
-even before the input arrives. Pile replay maintains snapshot-shared PATCH
-indexes keyed by `C | output | fingerprint` (96 bytes) and
-`input fingerprint | consumer fingerprint` (64 bytes), alongside the primary
-and per-collection indexes. Mixed selectors return one fingerprint-sorted,
-deduplicated union; unindexed backends retain the same scan-based contract.
-These indexes only project stored record fields: refresh performs no capability
-admission, witness resolution, signature recheck, or blob read for them. They
-change no record bytes, fingerprints, or encoding identities.
+`Collection(C)` selects every record naming `C`; `ProducedMember(C, H)`
+selects every COMMIT data, MERGE result, or DERIVE output matching the exact
+collection and payload; `CommitMember`, `MergeCollection` and `DeriveTarget`
+narrow those by kind. One snapshot-shared PATCH keyed
+`C | member | frame offset` (72 bytes) answers all of them by prefix, and the
+record itself is read from its frame. Mixed selectors return each record once,
+in index order; unindexed backends retain the same scan-based contract. The
+index only projects stored record fields: refresh performs no capability
+admission, signature recheck, or blob read for it, and changes no record bytes
+or encoding identities.
 
 ### Retired payload-only equations and reader cutover
 

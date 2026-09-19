@@ -54,8 +54,8 @@ use crate::capability::{
 use crate::collection::store::{selectors_match_record, CollectionRead};
 pub use crate::collection::LegacyUnsignedCollectionEquation;
 use crate::collection::{
-    CollectionCommit, CollectionDerive, CollectionHandle, CollectionMerge, CollectionRecord,
-    CollectionRecordFingerprint, CollectionRecordSelector, CollectionStore,
+    CollectionCommit, CollectionData, CollectionDerive, CollectionMerge, CollectionRecord,
+    CollectionRecordSelector, CollectionStore,
 };
 use crate::id::Id;
 use crate::id::RawId;
@@ -477,54 +477,90 @@ mod blob_occurrence_key {
     crate::key_schema!(Schema, Segments, 40, [0, 1]);
 }
 
-mod collection_record_collection_key {
-    crate::key_segmentation!(Segments, 64, [32, 32]);
-    crate::key_schema!(Schema, Segments, 64, [0, 1]);
-}
-
-mod collection_record_produced_member_key {
-    crate::key_segmentation!(Segments, 96, [32, 32, 32]);
-    crate::key_schema!(Schema, Segments, 96, [0, 1, 2]);
+/// `collection || produced member || frame offset_be`.
+///
+/// One relation answers every record route: a collection's records are the
+/// 32-byte prefix, the producers of one member are the 64-byte prefix, and
+/// the offset names the frame the record is read from. Nothing about the
+/// record itself is held; the file already holds it.
+mod collection_record_key {
+    crate::key_segmentation!(Segments, 72, [32, 32, 8]);
+    crate::key_schema!(Schema, Segments, 72, [0, 1, 2]);
 }
 
 type PileBlobIndex = PATCH<40, blob_occurrence_key::Schema, CachedValidation, XorSip128>;
-type CollectionRecordIndex = PATCH<32, IdentitySchema, CollectionRecord, XorSip128>;
-type CollectionRecordCollectionIndex =
-    PATCH<64, collection_record_collection_key::Schema, (), XorSip128>;
-type CollectionRecordProducedMemberIndex =
-    PATCH<96, collection_record_produced_member_key::Schema, (), XorSip128>;
+type CollectionRecordIndex = PATCH<72, collection_record_key::Schema, (), XorSip128>;
 type CapabilityProofIndex = PATCH<32, IdentitySchema, CapabilityProof, XorSip128>;
 type LegacyCollectionHeaderIndex = PATCH<V3_HEADER_LEN, IdentitySchema>;
 
-fn collection_record_collection(record: CollectionRecord) -> CollectionHandle {
+/// The member a record produces: a commit's data, a merge's result, a
+/// derive's output.
+fn collection_record_output(record: &CollectionRecord) -> CollectionData {
     match record {
-        CollectionRecord::Commit(record) => record.collection(),
-        CollectionRecord::Merge(record) => record.collection(),
-        CollectionRecord::Derive(record) => record.collection(),
-    }
-}
-
-fn collection_record_collection_key(record: CollectionRecord) -> [u8; 64] {
-    let mut key = [0; 64];
-    key[..32].copy_from_slice(&collection_record_collection(record).raw);
-    key[32..].copy_from_slice(&record.fingerprint().raw());
-    key
-}
-
-fn collection_record_produced_member_key(
-    record: CollectionRecord,
-    fingerprint: CollectionRecordFingerprint,
-) -> [u8; 96] {
-    let output = match record {
         CollectionRecord::Commit(commit) => commit.data(),
         CollectionRecord::Merge(merge) => merge.result(),
         CollectionRecord::Derive(derive) => derive.output(),
-    };
-    let mut key = [0; 96];
-    key[..32].copy_from_slice(&record.collection().raw);
-    key[32..64].copy_from_slice(&output.raw);
-    key[64..].copy_from_slice(&fingerprint.raw());
+    }
+}
+
+/// `collection || produced member`, the prefix under which every producer of
+/// one member is indexed.
+fn collection_record_member_prefix(record: &CollectionRecord) -> [u8; 64] {
+    let mut prefix = [0; 64];
+    prefix[..32].copy_from_slice(&record.collection().raw);
+    prefix[32..].copy_from_slice(&collection_record_output(record).raw);
+    prefix
+}
+
+fn collection_record_key(record: &CollectionRecord, offset: usize) -> [u8; 72] {
+    let mut key = [0; 72];
+    key[..64].copy_from_slice(&collection_record_member_prefix(record));
+    key[64..].copy_from_slice(&(offset as u64).to_be_bytes());
     key
+}
+
+fn collection_record_offset(key_offset: &[u8; 8]) -> usize {
+    usize::try_from(u64::from_be_bytes(*key_offset))
+        .expect("an indexed frame offset lies inside the applied prefix")
+}
+
+/// Read the collection record whose frame starts at `offset`, an offset the
+/// record index produced, so the frame is applied and decodes.
+fn collection_record_at(mmap: &MmapRaw, applied_length: usize, offset: usize) -> CollectionRecord {
+    debug_assert!(offset < applied_length);
+    let bytes = unsafe {
+        slice_from_raw_parts(mmap.as_ptr().add(offset), applied_length - offset)
+            .as_ref()
+            .expect("PileFile mapping pointer is valid for its applied prefix")
+    };
+    match decode_record(bytes, offset) {
+        Ok(PileRecord {
+            content: PileRecordContent::Collection { record },
+            ..
+        }) => record,
+        _ => unreachable!("an indexed frame offset names an applied collection record"),
+    }
+}
+
+/// Whether `record` is already indexed: some frame producing the same member
+/// of the same collection decodes to exactly it.
+fn collection_record_indexed(
+    index: &CollectionRecordIndex,
+    mmap: &MmapRaw,
+    applied_length: usize,
+    record: &CollectionRecord,
+) -> bool {
+    let mut present = false;
+    index.infixes(
+        &collection_record_member_prefix(record),
+        |offset: &[u8; 8]| {
+            if !present {
+                present = collection_record_at(mmap, applied_length, collection_record_offset(offset))
+                    == *record;
+            }
+        },
+    );
+    present
 }
 
 fn first_blob_occurrence(occurrences: &PileBlobIndex, hash: &RawInline) -> Option<IndexEntry> {
@@ -2625,7 +2661,7 @@ enum Applied {
     },
     RetiredWantState,
     Collection {
-        fingerprint: CollectionRecordFingerprint,
+        record: CollectionRecord,
     },
     CapabilityProof {
         id: CapabilityProofId,
@@ -2677,12 +2713,10 @@ pub struct PileFile {
     /// carries its own lazy validation byte inline.
     blobs: PileBlobIndex,
     branches: PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>,
-    /// Immutable collection records keyed by full-width canonical-byte fingerprint.
+    /// Every collection record's frame, keyed by
+    /// `collection || produced member || offset_be`. Key-only: the record is
+    /// read from its frame when asked for.
     collection_records: CollectionRecordIndex,
-    /// Derived selector index keyed by `collection_handle || record_fingerprint`.
-    collection_records_by_collection: CollectionRecordCollectionIndex,
-    /// Raw producer relationship: `collection || output || record_fingerprint`.
-    collection_records_by_produced_member: CollectionRecordProducedMemberIndex,
     /// Complete canonical proofs keyed by the BLAKE3 identity of exact bytes.
     /// Each value owns its validated mmap-backed view, shared by snapshots and readers.
     capability_proofs: CapabilityProofIndex,
@@ -2746,8 +2780,6 @@ pub struct PileFileSnapshot {
     /// validation state inline and is shared across immutable snapshots.
     blobs: PileBlobIndex,
     collection_records: CollectionRecordIndex,
-    collection_records_by_collection: CollectionRecordCollectionIndex,
-    collection_records_by_produced_member: CollectionRecordProducedMemberIndex,
     legacy_collection_headers: LegacyCollectionHeaderIndex,
     capability_proofs: CapabilityProofIndex,
     wants: PATCH<WANT_REQUEST_BYTES_LEN, IdentitySchema>,
@@ -2778,8 +2810,6 @@ impl PileFileSnapshot {
         opaque_records: usize,
         blobs: PileBlobIndex,
         collection_records: CollectionRecordIndex,
-        collection_records_by_collection: CollectionRecordCollectionIndex,
-        collection_records_by_produced_member: CollectionRecordProducedMemberIndex,
         legacy_collection_headers: LegacyCollectionHeaderIndex,
         capability_proofs: CapabilityProofIndex,
         wants: PATCH<WANT_REQUEST_BYTES_LEN, IdentitySchema>,
@@ -2790,8 +2820,6 @@ impl PileFileSnapshot {
             opaque_records,
             blobs,
             collection_records,
-            collection_records_by_collection,
-            collection_records_by_produced_member,
             legacy_collection_headers,
             capability_proofs,
             wants,
@@ -2979,30 +3007,24 @@ impl super::StoreSnapshot for PileFileSnapshot {
         } else {
             dependencies.records.iter().any(|selector| {
                 let collection = match selector {
-                    CollectionRecordSelector::Fingerprint(fingerprint) => {
-                        return !self
-                            .collection_records
-                            .shares_prefix(&previous.collection_records, &fingerprint.raw());
-                    }
                     CollectionRecordSelector::ProducedMember(collection, output)
                     | CollectionRecordSelector::CommitMember(collection, output) => {
                         let mut prefix = [0; 64];
                         prefix[..32].copy_from_slice(&collection.raw);
                         prefix[32..].copy_from_slice(&output.raw);
-                        return !self.collection_records_by_produced_member.shares_prefix(
-                            &previous.collection_records_by_produced_member,
-                            &prefix,
-                        );
+                        return !self
+                            .collection_records
+                            .shares_prefix(&previous.collection_records, &prefix);
                     }
                     CollectionRecordSelector::Collection(collection)
                     | CollectionRecordSelector::MergeCollection(collection)
                     | CollectionRecordSelector::DeriveTarget(collection) => collection,
                 };
-                // Kind/operation selectors conservatively share the whole
-                // collection prefix; exact producer routes above are narrower.
+                // Kind selectors conservatively share the whole collection
+                // prefix; exact producer routes above are narrower.
                 !self
-                    .collection_records_by_collection
-                    .shares_prefix(&previous.collection_records_by_collection, &collection.raw)
+                    .collection_records
+                    .shares_prefix(&previous.collection_records, &collection.raw)
             })
         };
         if records_changed {
@@ -3043,8 +3065,6 @@ impl super::SnapshotSource for PileFile {
             self.opaque_records,
             self.blobs.clone(),
             self.collection_records.clone(),
-            self.collection_records_by_collection.clone(),
-            self.collection_records_by_produced_member.clone(),
             self.legacy_collection_headers.clone(),
             self.capability_proofs.clone(),
             self.wants.clone(),
@@ -3228,10 +3248,6 @@ pub enum CollectionInsertError {
     Read(ReadError),
     /// The fixed record could not be appended or the file lock released.
     Io(std::io::Error),
-    /// A full-width fingerprint already names different canonical fields.
-    FingerprintCollision {
-        fingerprint: CollectionRecordFingerprint,
-    },
     /// Readback observed a record other than the exclusively appended one.
     UnexpectedReadback,
 }
@@ -3241,12 +3257,6 @@ impl std::fmt::Display for CollectionInsertError {
         match self {
             Self::Read(error) => write!(f, "failed to refresh collection records: {error}"),
             Self::Io(error) => write!(f, "failed to append collection record: {error}"),
-            Self::FingerprintCollision { fingerprint } => {
-                write!(
-                    f,
-                    "collection record fingerprint {fingerprint:X} names different fields"
-                )
-            }
             Self::UnexpectedReadback => {
                 f.write_str("collection append read back an unexpected pile record")
             }
@@ -3259,7 +3269,7 @@ impl Error for CollectionInsertError {
         match self {
             Self::Read(error) => Some(error),
             Self::Io(error) => Some(error),
-            Self::FingerprintCollision { .. } | Self::UnexpectedReadback => None,
+            Self::UnexpectedReadback => None,
         }
     }
 }
@@ -3432,8 +3442,6 @@ impl PileFile {
             blobs: PileBlobIndex::new(),
             branches: PATCH::<16, IdentitySchema, Inline<Handle<SimpleArchive>>>::new(),
             collection_records: CollectionRecordIndex::new(),
-            collection_records_by_collection: CollectionRecordCollectionIndex::new(),
-            collection_records_by_produced_member: CollectionRecordProducedMemberIndex::new(),
             capability_proofs: CapabilityProofIndex::new(),
             legacy_collection_headers: LegacyCollectionHeaderIndex::new(),
             opaque_records: 0,
@@ -3566,25 +3574,20 @@ impl PileFile {
             PileRecordContent::RetiredWantAssert { .. }
             | PileRecordContent::RetiredWantRetract { .. } => Applied::RetiredWantState,
             PileRecordContent::Collection { record } => {
-                let fingerprint = record.fingerprint();
-                if let Some(existing) = self.collection_records.get(&fingerprint.raw()) {
-                    if existing != &record {
-                        return Err(ReadError::CorruptPile {
-                            valid_length: start_offset,
-                        });
-                    }
-                } else {
+                // A frame repeating an indexed record adds nothing: the
+                // index names the first frame and reads the record from it.
+                // Nothing is hashed; the producers of this member are the
+                // only candidates, and they are compared as records.
+                if !collection_record_indexed(
+                    &self.collection_records,
+                    &self.mmap,
+                    self.applied_length,
+                    &record,
+                ) {
                     self.collection_records
-                        .insert(&Entry::with_value(&fingerprint.raw(), record));
-                    self.collection_records_by_collection
-                        .insert(&Entry::new(&collection_record_collection_key(record)));
-                    self.collection_records_by_produced_member
-                        .insert(&Entry::new(&collection_record_produced_member_key(
-                            record,
-                            fingerprint,
-                        )));
+                        .insert(&Entry::new(&collection_record_key(&record, start_offset)));
                 }
-                Applied::Collection { fingerprint }
+                Applied::Collection { record }
             }
             PileRecordContent::CapabilityProof {
                 id,
@@ -3781,8 +3784,6 @@ impl PileFile {
             std::ptr::drop_in_place(&mut this.blobs);
             std::ptr::drop_in_place(&mut this.branches);
             std::ptr::drop_in_place(&mut this.collection_records);
-            std::ptr::drop_in_place(&mut this.collection_records_by_collection);
-            std::ptr::drop_in_place(&mut this.collection_records_by_produced_member);
             std::ptr::drop_in_place(&mut this.capability_proofs);
             std::ptr::drop_in_place(&mut this.legacy_collection_headers);
             std::ptr::drop_in_place(&mut this.opaque_frames);
@@ -3935,10 +3936,12 @@ impl BlobStoreList for PileFileSnapshot {
     }
 }
 
-/// Deterministic owned snapshot of the pile's native collection records.
+/// Deterministic owned snapshot of the pile's native collection records:
+/// the index walked in key order, each record read from its frame.
 pub struct PileCollectionRecordIter {
-    keys: crate::patch::PATCHIntoOrderedIterator<32, IdentitySchema, CollectionRecord, XorSip128>,
-    lookup: CollectionRecordIndex,
+    keys: crate::patch::PATCHIntoOrderedIterator<72, collection_record_key::Schema, (), XorSip128>,
+    mmap: Arc<MmapRaw>,
+    covered_len: usize,
 }
 
 /// Deterministic owned snapshot of the pile's complete capability proofs.
@@ -3965,12 +3968,8 @@ impl Iterator for PileCollectionRecordIter {
 
     fn next(&mut self) -> Option<Self::Item> {
         let key = self.keys.next()?;
-        let record = *self
-            .lookup
-            .get(&key)
-            .expect("collection key from PATCH snapshot must retain its value");
-        debug_assert_eq!(record.fingerprint().raw(), key);
-        Some(Ok(record))
+        let offset = collection_record_offset(key[64..].try_into().expect("key tail is the offset"));
+        Some(Ok(collection_record_at(&self.mmap, self.covered_len, offset)))
     }
 }
 
@@ -4119,8 +4118,19 @@ impl crate::collection::covered::RecordDelta for PileFileSnapshot {
             None => self.collection_records.clone(),
         };
         for key in fresh.iter_ordered() {
-            each(fresh.get(key).expect("record index key retains its record"));
+            each(&self.record_at(&key[64..].try_into().expect("key tail is the offset")));
         }
+    }
+}
+
+impl PileFileSnapshot {
+    /// The record whose frame the index named.
+    fn record_at(&self, offset: &[u8; 8]) -> CollectionRecord {
+        collection_record_at(
+            &self.mmap,
+            self.covered_len,
+            collection_record_offset(offset),
+        )
     }
 }
 
@@ -4128,24 +4138,14 @@ impl CollectionRead for PileFileSnapshot {
     type RecordsError = ReadError;
     type RecordIter<'a> = PileCollectionRecordIter;
 
-    /// Hand out the index replay already folded, rather than folding again.
-    ///
-    /// One persistent-root clone. The answer is the same one the default fold
-    /// would reach from these records and this reader — `coverage_matches_a_fold_over_the_same_records`
-    /// pins that — because both decide admission from the same applied prefix.
+    /// Every indexed frame, read as it is reached: one persistent-root clone
+    /// of the index, and the mapping it reads from.
     fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
-        let keys = self.collection_records.clone().into_iter_ordered();
         Ok(PileCollectionRecordIter {
-            keys,
-            lookup: self.collection_records.clone(),
+            keys: self.collection_records.clone().into_iter_ordered(),
+            mmap: self.mmap.clone(),
+            covered_len: self.covered_len,
         })
-    }
-
-    fn record(
-        &self,
-        fingerprint: CollectionRecordFingerprint,
-    ) -> Result<Option<CollectionRecord>, Self::RecordsError> {
-        Ok(self.collection_records.get(&fingerprint.raw()).copied())
     }
 
     fn select_records(
@@ -4155,45 +4155,50 @@ impl CollectionRead for PileFileSnapshot {
         if selectors.is_empty() {
             return Ok(Vec::new());
         }
-        let mut ids = Vec::new();
+        let mut keys = Vec::new();
+        let mut frames_under = |prefix: [u8; 64]| {
+            self.collection_records
+                .infixes(&prefix, |offset: &[u8; 8]| {
+                    let mut key = [0; 72];
+                    key[..64].copy_from_slice(&prefix);
+                    key[64..].copy_from_slice(offset);
+                    keys.push(key);
+                });
+        };
         for selector in selectors {
             let collection = match selector {
-                CollectionRecordSelector::Fingerprint(fingerprint) => {
-                    if self.collection_records.get(&fingerprint.raw()).is_some() {
-                        ids.push(fingerprint.raw());
-                    }
-                    continue;
-                }
                 CollectionRecordSelector::ProducedMember(collection, output)
                 | CollectionRecordSelector::CommitMember(collection, output) => {
                     let mut prefix = [0; 64];
                     prefix[..32].copy_from_slice(&collection.raw);
                     prefix[32..].copy_from_slice(&output.raw);
-                    self.collection_records_by_produced_member
-                        .infixes(&prefix, |fingerprint: &[u8; 32]| ids.push(*fingerprint));
+                    frames_under(prefix);
                     continue;
                 }
                 CollectionRecordSelector::Collection(collection)
                 | CollectionRecordSelector::MergeCollection(collection)
                 | CollectionRecordSelector::DeriveTarget(collection) => collection,
             };
-            self.collection_records_by_collection
-                .infixes(&collection.raw, |fingerprint: &[u8; 32]| {
-                    ids.push(*fingerprint)
-                });
+            // An infix is one segment: the members first, then each
+            // member's frames.
+            let mut members = Vec::new();
+            self.collection_records
+                .infixes(&collection.raw, |member: &[u8; 32]| members.push(*member));
+            for member in members {
+                let mut prefix = [0; 64];
+                prefix[..32].copy_from_slice(&collection.raw);
+                prefix[32..].copy_from_slice(&member);
+                frames_under(prefix);
+            }
         }
-        // Index traversal follows PATCH's structural order. Overlapping and
-        // mixed routes still produce one union in canonical fingerprint order.
-        ids.sort_unstable();
-        ids.dedup();
-        Ok(ids
-            .into_iter()
-            .map(|id| {
-                *self
-                    .collection_records
-                    .get(&id)
-                    .expect("record selector index must reference the primary index")
-            })
+        // Overlapping routes name a frame more than once; each record is
+        // read and returned once, in the index's order, the same order
+        // `records` walks.
+        keys.sort_unstable();
+        keys.dedup();
+        Ok(keys
+            .iter()
+            .map(|key| self.record_at(key[64..].try_into().expect("key tail is the offset")))
             .filter(|record| selectors_match_record(selectors, *record))
             .collect())
     }
@@ -4203,19 +4208,19 @@ impl CollectionStore for PileFile {
     type InsertError = CollectionInsertError;
 
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
-        let fingerprint = record.fingerprint();
         let header = collection_record_header(&record);
 
         self.file.lock()?;
         let result = (|| {
             self.refresh_locked()?;
 
-            if let Some(existing) = self.collection_records.get(&fingerprint.raw()) {
-                return if existing == &record {
-                    Ok(())
-                } else {
-                    Err(CollectionInsertError::FingerprintCollision { fingerprint })
-                };
+            if collection_record_indexed(
+                &self.collection_records,
+                &self.mmap,
+                self.applied_length,
+                &record,
+            ) {
+                return Ok(());
             }
 
             self.dirty = true;
@@ -4228,9 +4233,7 @@ impl CollectionStore for PileFile {
             }
 
             match self.apply_next()? {
-                Some(Applied::Collection {
-                    fingerprint: applied,
-                }) if applied == fingerprint => Ok(()),
+                Some(Applied::Collection { record: applied }) if applied == record => Ok(()),
                 Some(_) | None => Err(CollectionInsertError::UnexpectedReadback),
             }
         })();
@@ -5305,10 +5308,8 @@ impl PileFile {
             }
         }
         for key in collection_records.iter() {
-            let record = collection_records
-                .get(key)
-                .expect("collection key from PATCH snapshot must retain its value");
-            retain_record_kind_if_resident(&mut roots, &reader, collection_record_kind(*record));
+            let record = reader.record_at(key[64..].try_into().expect("key tail is the offset"));
+            retain_record_kind_if_resident(&mut roots, &reader, collection_record_kind(record));
             for handle in record.blob_references() {
                 if reader
                     .contains_blob(handle)
@@ -5392,10 +5393,8 @@ impl PileFile {
                 .map_err(PileRewriteError::Collection)?;
         }
 
-        for key in collection_records.clone().into_iter_ordered() {
-            let record = *collection_records
-                .get(&key)
-                .expect("collection key from PATCH snapshot must retain its value");
+        for key in collection_records.iter_ordered() {
+            let record = reader.record_at(key[64..].try_into().expect("key tail is the offset"));
             destination
                 .insert(record)
                 .map_err(PileRewriteError::Collection)?;
@@ -6705,13 +6704,15 @@ mod tests {
             vec![WantRequest::blob(wanted)]
         );
         assert_eq!(
-            reopened
-                .snapshot()
-                .unwrap()
-                .records()
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
+            sorted_collection_records(
+                reopened
+                    .snapshot()
+                    .unwrap()
+                    .records()
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+            ),
             sorted_collection_records(collection_records)
         );
         reopened.close().unwrap();
@@ -6857,13 +6858,15 @@ mod tests {
             vec![current_want, retired_kept]
         );
         assert_eq!(
-            result
-                .snapshot()
-                .unwrap()
-                .records()
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
+            sorted_collection_records(
+                result
+                    .snapshot()
+                    .unwrap()
+                    .records()
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+            ),
             sorted_collection_records(records)
         );
 
@@ -8053,7 +8056,7 @@ mod tests {
     }
 
     #[test]
-    fn native_collection_records_replay_in_fingerprint_order_after_reopen() {
+    fn native_collection_records_replay_once_after_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "collections.pile");
         let records = collection_test_records();
@@ -8067,22 +8070,23 @@ mod tests {
 
         let mut reopened = Pile::open(&path).unwrap();
         let snapshot = reopened.snapshot().unwrap();
-        let actual = snapshot
-            .records()
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert_eq!(actual, expected);
-        assert_eq!(
-            snapshot.record(expected[1].fingerprint()).unwrap(),
-            Some(expected[1])
-        );
-        assert_eq!(
+        let actual = sorted_collection_records(
             snapshot
-                .record(CollectionRecordFingerprint::from_raw([0xff; 32]))
+                .records()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
                 .unwrap(),
-            None
         );
+        assert_eq!(actual, expected);
+        let probe = expected[1];
+        let producers = BTreeSet::from([CollectionRecordSelector::ProducedMember(
+            probe.collection(),
+            collection_record_output(&probe),
+        )]);
+        assert!(snapshot
+            .select_records(&producers)
+            .unwrap()
+            .contains(&probe));
         reopened.close().unwrap();
     }
 
@@ -8151,7 +8155,7 @@ mod tests {
         assert!(before.select_records(&selector).unwrap().is_empty());
         let after = pile.snapshot().unwrap();
         assert_eq!(
-            after.select_records(&selector).unwrap(),
+            sorted_collection_records(after.select_records(&selector).unwrap()),
             sorted_collection_records(records.clone())
         );
 
@@ -8161,17 +8165,21 @@ mod tests {
         ]);
         let mut expected_union = records.clone();
         expected_union.push(unrelated);
-        let selected_union = after.select_records(&collection_union).unwrap();
+        let selected_union =
+            sorted_collection_records(after.select_records(&collection_union).unwrap());
         assert_eq!(selected_union, sorted_collection_records(expected_union));
 
         let mixed = BTreeSet::from([
             CollectionRecordSelector::Collection(collection),
-            CollectionRecordSelector::Fingerprint(unrelated.fingerprint()),
+            CollectionRecordSelector::ProducedMember(
+                unrelated_collection,
+                collection_test_hash(47),
+            ),
         ]);
         let mut expected_mixed = records;
         expected_mixed.push(unrelated);
         assert_eq!(
-            after.select_records(&mixed).unwrap(),
+            sorted_collection_records(after.select_records(&mixed).unwrap()),
             sorted_collection_records(expected_mixed)
         );
 
@@ -8256,11 +8264,12 @@ mod tests {
             a.data(),
             output,
         ));
+        let descendant_output = collection_test_hash(47);
         let descendant = CollectionRecord::Derive(CollectionDerive::sign(
             &key,
             other,
             output,
-            collection_test_hash(47),
+            descendant_output,
         ));
         let records = vec![
             direct,
@@ -8286,17 +8295,19 @@ mod tests {
         let middle = reader.snapshot().unwrap();
         let cloned = middle.clone();
         assert!(cloned
-            .collection_records_by_produced_member
-            .shares_root(&middle.collection_records_by_produced_member));
+            .collection_records
+            .shares_root(&middle.collection_records));
+        let input_producers =
+            BTreeSet::from([CollectionRecordSelector::ProducedMember(collection, input)]);
         assert!(empty.select_records(&produced).unwrap().is_empty());
         assert_eq!(middle.blobs().count(), 0);
         assert_eq!(middle.proofs().unwrap().count(), 0);
-        assert_eq!(middle.record(a.fingerprint()).unwrap(), None);
-        assert_eq!(middle.select_records(&produced).unwrap(), expected_produced);
+        assert!(middle.select_records(&input_producers).unwrap().is_empty());
         assert_eq!(
-            middle.collection_records_by_produced_member.len(),
-            records.len() as u64
+            sorted_collection_records(middle.select_records(&produced).unwrap()),
+            expected_produced
         );
+        assert_eq!(middle.collection_records.len(), records.len() as u64);
 
         let once = std::fs::metadata(&path).unwrap().len();
         writer.insert(merge_a).unwrap();
@@ -8305,17 +8316,14 @@ mod tests {
             writer.insert(CollectionRecord::Commit(record)).unwrap();
         }
         let after = reader.snapshot().unwrap();
+        assert!(after
+            .select_records(&input_producers)
+            .unwrap()
+            .contains(&CollectionRecord::Commit(a)));
+        // The frozen snapshot never grows a producer it did not observe.
+        assert!(middle.select_records(&input_producers).unwrap().is_empty());
         assert_eq!(
-            after.record(a.fingerprint()).unwrap(),
-            Some(CollectionRecord::Commit(a))
-        );
-        assert_eq!(middle.record(a.fingerprint()).unwrap(), None);
-        assert_eq!(
-            after
-                .select_records(&BTreeSet::from([CollectionRecordSelector::ProducedMember(
-                    collection, input
-                ),]))
-                .unwrap(),
+            sorted_collection_records(after.select_records(&input_producers).unwrap()),
             sorted_collection_records(vec![
                 CollectionRecord::Commit(a),
                 CollectionRecord::Commit(b)
@@ -8339,8 +8347,7 @@ mod tests {
         let selectors = [
             CollectionRecordSelector::ProducedMember(collection, output),
             CollectionRecordSelector::ProducedMember(other, input),
-            CollectionRecordSelector::Fingerprint(a.fingerprint()),
-            CollectionRecordSelector::Fingerprint(descendant.fingerprint()),
+            CollectionRecordSelector::ProducedMember(other, descendant_output),
             CollectionRecordSelector::CommitMember(collection, output),
             CollectionRecordSelector::MergeCollection(collection),
             CollectionRecordSelector::DeriveTarget(other),
@@ -8363,12 +8370,13 @@ mod tests {
                     .unwrap(),
             );
             for query in &queries {
-                let selected = snapshot.select_records(query).unwrap();
+                let selected = sorted_collection_records(snapshot.select_records(query).unwrap());
                 assert_eq!(
                     selected,
-                    fallback.select_records(query).unwrap(),
+                    sorted_collection_records(fallback.select_records(query).unwrap()),
                     "{query:?}"
                 );
+                // Each matching record appears exactly once, whatever the order.
                 assert!(selected
                     .windows(2)
                     .all(|pair| pair[0].fingerprint() < pair[1].fingerprint()));
@@ -8380,11 +8388,14 @@ mod tests {
         let replayed = reopened.snapshot().unwrap();
         for query in &queries {
             assert_eq!(
-                replayed.select_records(query).unwrap(),
-                after.select_records(query).unwrap()
+                sorted_collection_records(replayed.select_records(query).unwrap()),
+                sorted_collection_records(after.select_records(query).unwrap())
             );
         }
-        assert_eq!(middle.select_records(&produced).unwrap(), expected_produced);
+        assert_eq!(
+            sorted_collection_records(middle.select_records(&produced).unwrap()),
+            expected_produced
+        );
         reopened.close().unwrap();
     }
 
@@ -8427,14 +8438,16 @@ mod tests {
         for path in [&path_ab, &path_ba] {
             let mut pile = Pile::open(path).unwrap();
             let snapshot = pile.snapshot().unwrap();
-            let actual = snapshot
-                .records()
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap();
+            let actual = sorted_collection_records(
+                snapshot
+                    .records()
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap(),
+            );
             assert_eq!(actual, expected);
             assert_eq!(
-                snapshot.select_records(&source_selector).unwrap(),
+                sorted_collection_records(snapshot.select_records(&source_selector).unwrap()),
                 source_expected
             );
             assert_eq!(
@@ -8509,7 +8522,10 @@ mod tests {
         for path in [&path_ab, &path_ba] {
             let mut pile = Pile::open(path).unwrap();
             let snapshot = pile.snapshot().unwrap();
-            assert_eq!(snapshot.select_records(&exact).unwrap(), expected);
+            assert_eq!(
+                sorted_collection_records(snapshot.select_records(&exact).unwrap()),
+                expected
+            );
             assert!(!snapshot
                 .select_records(&exact)
                 .unwrap()
@@ -8684,13 +8700,15 @@ mod tests {
             .unwrap();
         assert_eq!(stats.retained_blobs, 3);
         assert_eq!(
-            destination
-                .snapshot()
-                .unwrap()
-                .records()
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
+            sorted_collection_records(
+                destination
+                    .snapshot()
+                    .unwrap()
+                    .records()
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+            ),
             sorted_collection_records(records),
         );
 
@@ -8746,13 +8764,15 @@ mod tests {
             .unwrap();
         assert_eq!(stats.retained_blobs, 0);
         assert_eq!(
-            destination
-                .snapshot()
-                .unwrap()
-                .records()
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
+            sorted_collection_records(
+                destination
+                    .snapshot()
+                    .unwrap()
+                    .records()
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+            ),
             sorted_collection_records(records),
         );
 
@@ -8873,8 +8893,16 @@ mod tests {
         );
         source.insert(CollectionRecord::Merge(merge)).unwrap();
         let before_witnesses = source.snapshot().unwrap();
-        assert_eq!(before_witnesses.record(commit.fingerprint()).unwrap(), None);
-        assert_eq!(before_witnesses.record(derive.fingerprint()).unwrap(), None);
+        // The witnessed records are not stored yet: a record may be persisted
+        // before the records it names arrive.
+        assert_eq!(
+            before_witnesses
+                .records()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![CollectionRecord::Merge(merge)]
+        );
         assert_eq!(before_witnesses.proofs().unwrap().count(), 0);
         source.insert(CollectionRecord::Derive(derive)).unwrap();
         source.insert(CollectionRecord::Commit(commit)).unwrap();
@@ -8884,12 +8912,17 @@ mod tests {
             .rewrite_retained_into(&mut destination, &selected, WantRewritePolicy::Drop)
             .unwrap();
         let retained = destination.snapshot().unwrap();
+        let retained_records = retained
+            .records()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         for record in [
             CollectionRecord::Commit(commit),
             CollectionRecord::Derive(derive),
             CollectionRecord::Merge(merge),
         ] {
-            assert_eq!(retained.record(record.fingerprint()).unwrap(), Some(record));
+            assert!(retained_records.contains(&record));
         }
         assert!(retained.get::<Blob<UnknownBlob>, _>(input).is_ok());
         assert!(retained.get::<Blob<UnknownBlob>, _>(output).is_ok());
@@ -8968,13 +9001,15 @@ mod tests {
             .unwrap();
         assert_eq!(stats.retained_blobs, 5);
 
-        let actual_records = destination
-            .snapshot()
-            .unwrap()
-            .records()
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        let actual_records = sorted_collection_records(
+            destination
+                .snapshot()
+                .unwrap()
+                .records()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+        );
         assert_eq!(actual_records, sorted_collection_records(records));
         let reader = destination.snapshot().unwrap();
         for retained in [
@@ -10512,9 +10547,11 @@ mod tests {
         ));
         let routes = [
             CollectionRecordSelector::Collection(target),
-            CollectionRecordSelector::Fingerprint(produced.fingerprint()),
             CollectionRecordSelector::ProducedMember(target, output),
         ];
+        // A route into the source collection, which nothing below touches
+        // until the input commit itself arrives.
+        let untouched = CollectionRecordSelector::ProducedMember(source, input.data());
         let dependencies = StoreDependencies {
             records: routes.into_iter().collect(),
             ..StoreDependencies::default()
@@ -10588,7 +10625,7 @@ mod tests {
             ),
             StoreChanges::COLLECTION_RECORDS,
         );
-        for unchanged in [routes[1]] {
+        for unchanged in [untouched] {
             assert_eq!(
                 alternate_witness.changes_for(
                     &realized,
@@ -10611,15 +10648,16 @@ mod tests {
             input_arrived.changes_for(
                 &alternate_witness,
                 &StoreDependencies {
-                    records: BTreeSet::from([CollectionRecordSelector::Fingerprint(
-                        input.fingerprint()
-                    )]),
+                    records: BTreeSet::from([untouched]),
                     ..StoreDependencies::default()
                 }
             ),
             StoreChanges::COLLECTION_RECORDS,
         );
-        assert_eq!(realized.record(input.fingerprint()).unwrap(), None);
+        assert!(realized
+            .select_records(&BTreeSet::from([untouched]))
+            .unwrap()
+            .is_empty());
         assert_eq!(
             realized.select_records(&dependencies.records).unwrap(),
             vec![produced]

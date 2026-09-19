@@ -19,9 +19,7 @@ use triblespace_core::blob::encodings::entity_id_set::EntityIdSet;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::BlobEncoding;
 use triblespace_core::capability::{CapabilityProof, CapabilityProofId};
-use triblespace_core::collection::{
-    CollectionRecordFingerprint, CollectionSnapshotExt, CollectionStore,
-};
+use triblespace_core::collection::{CollectionSnapshotExt, CollectionStore};
 use triblespace_core::inline::InlineEncoding;
 use triblespace_core::macros::entity;
 use triblespace_core::repo::{
@@ -34,7 +32,6 @@ struct Counts {
     snapshots: usize,
     blob_gets: usize,
     record_enumerations: usize,
-    record_lookups: usize,
     selected_calls: BTreeMap<CollectionHandle, usize>,
     selected_rows: BTreeMap<CollectionHandle, usize>,
     proof_enumerations: usize,
@@ -242,14 +239,6 @@ impl<R: CollectionRead> CollectionRead for Counted<R> {
     fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
         self.count(|counts| counts.record_enumerations += 1);
         self.inner.records()
-    }
-
-    fn record(
-        &self,
-        fingerprint: CollectionRecordFingerprint,
-    ) -> Result<Option<CollectionRecord>, Self::RecordsError> {
-        self.count(|counts| counts.record_lookups += 1);
-        self.inner.record(fingerprint)
     }
 
     fn select_records(

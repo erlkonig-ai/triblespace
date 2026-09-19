@@ -17,8 +17,7 @@ use crate::capability::{CapabilityHandle, CapabilityProof, CapabilityProofId, Ca
 use crate::collection::{
     collection_read_audience, read_capability, write_capability, AdmissionPolicy, CollectionCommit,
     CollectionMerge, CollectionPolicy, CollectionRead, CollectionReadAudience,
-    CollectionRecordFingerprint, CollectionRecordSelector, CollectionSnapshotExt, CollectionStore,
-    CollectionStoreExt,
+    CollectionRecordSelector, CollectionSnapshotExt, CollectionStore, CollectionStoreExt,
 };
 use crate::id::{ExclusiveId, Id};
 use crate::id_hex;
@@ -534,13 +533,6 @@ impl CollectionRead for GuardSnapshot {
 
     fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
         self.inner.records()
-    }
-
-    fn record(
-        &self,
-        fingerprint: CollectionRecordFingerprint,
-    ) -> Result<Option<CollectionRecord>, Self::RecordsError> {
-        self.inner.record(fingerprint)
     }
 
     fn select_records(
@@ -1178,10 +1170,13 @@ fn exact_ensure_reendorses_a_resident_image_from_a_different_support_without_map
         })
         .collect();
     assert!(published.is_empty(), "nothing to re-endorse: {published:?}");
-    assert_eq!(
-        after.record(previous.fingerprint()).unwrap(),
-        Some(CollectionRecord::Derive(previous)),
-    );
+    assert!(after
+        .select_records(&BTreeSet::from([CollectionRecordSelector::ProducedMember(
+            first.handle(),
+            data(&output),
+        )]))
+        .unwrap()
+        .contains(&CollectionRecord::Derive(previous)));
 }
 
 #[test]
@@ -3054,10 +3049,13 @@ fn target_maintenance_reendorses_a_resident_upper_without_joining_again() {
     // maintenance published join(x, z) = z here to certify z at the wider
     // support, because its cited route carried only {b, c}.
     assert!(published.is_empty(), "nothing to endorse: {published:?}");
-    assert_eq!(
-        after.record(z_bc.fingerprint()).unwrap(),
-        Some(CollectionRecord::Merge(z_bc)),
-    );
+    assert!(after
+        .select_records(&BTreeSet::from([CollectionRecordSelector::ProducedMember(
+            second.handle(),
+            data(&z),
+        )]))
+        .unwrap()
+        .contains(&CollectionRecord::Merge(z_bc)));
 }
 
 #[test]

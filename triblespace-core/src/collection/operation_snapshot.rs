@@ -8,23 +8,20 @@
 //! `DERIVE` records authored by the operation itself are the sole overlay.
 
 use std::collections::BTreeSet;
-use std::iter::Peekable;
 use std::marker::PhantomData;
 
 use crate::blob::{BlobEncoding, TryFromBlob};
 use crate::capability::{CapabilityProof, CapabilityProofId};
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
-use crate::patch::{Entry, IdentitySchema, PATCHIntoOrderedIterator, XorSip128, PATCH};
+use crate::patch::{Entry, IdentitySchema, XorSip128, PATCH};
 use crate::repo::{
     BlobInfo, BlobMetadata, BlobStoreGet, BlobStoreList, BlobStoreMeta, CapabilityProofRead,
     StoreChanges, StoreSnapshot, WantRead,
 };
 
 use super::store::selectors_match_record;
-use super::{
-    CollectionRead, CollectionRecord, CollectionRecordFingerprint, CollectionRecordSelector,
-};
+use super::{CollectionRead, CollectionRecord, CollectionRecordSelector};
 
 type AuthoredRecords = PATCH<32, IdentitySchema, CollectionRecord, XorSip128>;
 
@@ -72,28 +69,15 @@ pub(crate) struct OperationSnapshot<C, R> {
     authored: AuthoredRecords,
 }
 
+/// The control snapshot's records, then the authored records it does not
+/// already hold.
 pub(crate) struct OperationRecordIter<I, E>
 where
     I: Iterator<Item = Result<CollectionRecord, E>>,
 {
-    control: Peekable<I>,
-    authored_keys:
-        Peekable<PATCHIntoOrderedIterator<32, IdentitySchema, CollectionRecord, XorSip128>>,
-    authored: AuthoredRecords,
+    control: I,
+    fresh: std::vec::IntoIter<CollectionRecord>,
     error: PhantomData<fn() -> E>,
-}
-
-impl<I, E> OperationRecordIter<I, E>
-where
-    I: Iterator<Item = Result<CollectionRecord, E>>,
-{
-    fn next_authored(&mut self) -> Option<Result<CollectionRecord, E>> {
-        let key = self.authored_keys.next()?;
-        Some(Ok(*self
-            .authored
-            .get(&key)
-            .expect("authored PATCH key must retain its record")))
-    }
 }
 
 impl<I, E> Iterator for OperationRecordIter<I, E>
@@ -103,22 +87,7 @@ where
     type Item = Result<CollectionRecord, E>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match (self.control.peek(), self.authored_keys.peek()) {
-            (Some(Err(_)), _) => self.control.next(),
-            (Some(Ok(control)), Some(authored)) => {
-                match control.fingerprint().raw().cmp(authored) {
-                    std::cmp::Ordering::Less => self.control.next(),
-                    std::cmp::Ordering::Equal => {
-                        self.authored_keys.next();
-                        self.control.next()
-                    }
-                    std::cmp::Ordering::Greater => self.next_authored(),
-                }
-            }
-            (Some(Ok(_)), None) => self.control.next(),
-            (None, Some(_)) => self.next_authored(),
-            (None, None) => None,
-        }
+        self.control.next().or_else(|| self.fresh.next().map(Ok))
     }
 }
 
@@ -257,23 +226,28 @@ where
         Self: 'a;
 
     fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
-        let authored = self.authored.clone();
+        // An authored record the control snapshot already holds is yielded
+        // once, from the control side. The producers of its member are the
+        // only records it could be, so ask for exactly those.
+        let mut fresh = Vec::new();
+        for key in self.authored.iter_ordered() {
+            let record = *self
+                .authored
+                .get(key)
+                .expect("authored PATCH key must retain its record");
+            let producers = BTreeSet::from([CollectionRecordSelector::ProducedMember(
+                record.collection(),
+                super::coverage::produced(record),
+            )]);
+            if !self.control.select_records(&producers)?.contains(&record) {
+                fresh.push(record);
+            }
+        }
         Ok(OperationRecordIter {
-            control: self.control.records()?.peekable(),
-            authored_keys: authored.clone().into_iter_ordered().peekable(),
-            authored,
+            control: self.control.records()?,
+            fresh: fresh.into_iter(),
             error: PhantomData,
         })
-    }
-
-    fn record(
-        &self,
-        fingerprint: CollectionRecordFingerprint,
-    ) -> Result<Option<CollectionRecord>, Self::RecordsError> {
-        if let Some(record) = self.authored.get(&fingerprint.raw()) {
-            return Ok(Some(*record));
-        }
-        self.control.record(fingerprint)
     }
 
     fn select_records(
@@ -282,29 +256,19 @@ where
     ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
         let mut selected = self.control.select_records(selectors)?;
         let control_len = selected.len();
-        selected.extend(self.authored.iter_ordered().filter_map(|key| {
+        for key in self.authored.iter_ordered() {
             let record = *self
                 .authored
                 .get(key)
                 .expect("authored PATCH key must retain its record");
-            selectors_match_record(selectors, record).then_some(record)
-        }));
-        if selected.len() == control_len {
-            // The control view already answers in the canonical deduplicated
-            // fingerprint order this trait promises.
-            return Ok(selected);
+            // Anything the control view selected by these routes is already
+            // in `selected`, so a duplicate can only be among those.
+            if selectors_match_record(selectors, record) && !selected[..control_len].contains(&record)
+            {
+                selected.push(record);
+            }
         }
-        // Appending authored records breaks that order, so restore it. A
-        // fingerprint is a BLAKE3 digest of the whole canonical payload, and
-        // sorting *by* it recomputes one per comparison; carry each record's
-        // own fingerprint instead so it is computed exactly once.
-        let mut ordered: Vec<_> = selected
-            .into_iter()
-            .map(|record| (record.fingerprint(), record))
-            .collect();
-        ordered.sort_unstable_by_key(|(fingerprint, _)| *fingerprint);
-        ordered.dedup_by_key(|(fingerprint, _)| *fingerprint);
-        Ok(ordered.into_iter().map(|(_, record)| record).collect())
+        Ok(selected)
     }
 }
 
@@ -445,11 +409,12 @@ mod tests {
     }
 
     /// A fingerprint is a BLAKE3 digest of the record's whole canonical
-    /// payload, so the canonical order must never be recovered by hashing the
-    /// same record once per comparison. A selection that adds nothing to the
-    /// control view is already in that order and hashes nothing at all.
+    /// payload. Selection no longer recovers any order from it: the control
+    /// view answers first and the authored records this operation added
+    /// follow, so nothing here is hashed at all -- with or without an
+    /// authored record in the result.
     #[test]
-    fn selection_hashes_each_record_at_most_once() {
+    fn selection_never_hashes_a_record() {
         use crate::collection::records::FINGERPRINT_CALLS;
 
         let mut store = MemoryRepo::default();
@@ -476,6 +441,6 @@ mod tests {
         let before = FINGERPRINT_CALLS.get();
         let selected = authored.select_records(&selectors).unwrap();
         assert_eq!(selected, warm);
-        assert_eq!(FINGERPRINT_CALLS.get() - before, 65);
+        assert_eq!(FINGERPRINT_CALLS.get() - before, 0);
     }
 }

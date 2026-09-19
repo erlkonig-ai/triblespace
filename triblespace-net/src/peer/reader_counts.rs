@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use triblespace_core::blob::TryFromBlob;
 use triblespace_core::capability::{CapabilityProof, CapabilityProofId};
 use triblespace_core::collection::{
-    CollectionRead, CollectionRecord, CollectionRecordFingerprint, CollectionRecordSelector,
+    CollectionRead, CollectionRecord, CollectionRecordSelector,
 };
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::pile::Pile;
@@ -203,13 +203,6 @@ impl<R: CollectionRead> CollectionRead for Counted<R> {
 
     fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
         self.inner.records()
-    }
-
-    fn record(
-        &self,
-        fingerprint: CollectionRecordFingerprint,
-    ) -> Result<Option<CollectionRecord>, Self::RecordsError> {
-        self.inner.record(fingerprint)
     }
 
     fn select_records(

@@ -386,7 +386,7 @@ fn require_support(lineage: &Lineage, support: &Support) -> Result<(), Collectio
 }
 
 pub(super) type InputWitnesses =
-    BTreeMap<(CollectionHandle, CollectionData), Vec<(CollectionRecordFingerprint, Support)>>;
+    BTreeMap<(CollectionHandle, CollectionData), Vec<(CollectionRecord, Support)>>;
 
 fn witnessed_support(
     witnesses: &InputWitnesses,
@@ -529,13 +529,7 @@ where
         if owner != collection {
             continue;
         }
-        for (id, support) in alternatives {
-            if let Some(record) = snapshot.record(id).map_err(|error| {
-                CollectionRealizationError::storage("read admitted input witness", error)
-            })? {
-                records.push((record, support));
-            }
-        }
+        records.extend(alternatives);
     }
     Ok(records)
 }
@@ -794,7 +788,7 @@ where
             continue;
         }
         certified.union(certificate);
-        roots.insert(record.fingerprint());
+        roots.insert(record);
     }
     // Support comes from the index now, but the RECORD set still has to be
     // expanded: `resolve_collection_semantics` needs the COMMIT records
@@ -823,7 +817,7 @@ where
         // Retain actual records, including equal-support signatures/routes.
         // Publication selects a small covering witness set when needed;
         // diagnostics and migrations must still see every persisted identity.
-        alternatives.push((record.fingerprint(), record_support));
+        alternatives.push((*record, record_support));
     }
     let discovered = super::DiscoveredCollectionRecords::from_records(records);
     // Exactly what the selected roots certify -- accumulated as they were

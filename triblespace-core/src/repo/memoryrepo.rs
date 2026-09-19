@@ -273,13 +273,6 @@ impl CollectionRead for MemoryStoreSnapshot {
         })
     }
 
-    fn record(
-        &self,
-        fingerprint: CollectionRecordFingerprint,
-    ) -> Result<Option<CollectionRecord>, Self::RecordsError> {
-        Ok(self.collection_records.get(&fingerprint.raw()).copied())
-    }
-
     fn select_records(
         &self,
         selectors: &BTreeSet<CollectionRecordSelector>,
@@ -600,13 +593,20 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(actual, expected);
-        assert_eq!(snapshot.record(merge.fingerprint()).unwrap(), Some(merge));
-        assert_eq!(
-            snapshot
-                .record(CollectionRecordFingerprint::from_raw([0xff; 32]))
-                .unwrap(),
-            None
-        );
+        assert!(snapshot
+            .select_records(&BTreeSet::from([CollectionRecordSelector::ProducedMember(
+                identity_for_tests(&descriptor),
+                Inline::new([6; 32]),
+            )]))
+            .unwrap()
+            .contains(&merge));
+        assert!(snapshot
+            .select_records(&BTreeSet::from([CollectionRecordSelector::ProducedMember(
+                identity_for_tests(&descriptor),
+                Inline::new([0xff; 32]),
+            )]))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -907,10 +907,14 @@ mod tests {
         repo.insert(record).unwrap();
         let after = repo.snapshot().unwrap();
 
+        let producers = BTreeSet::from([CollectionRecordSelector::ProducedMember(
+            target,
+            handle(83).into(),
+        )]);
         assert!(!before.contains_blob(blob).unwrap());
-        assert_eq!(before.record(record.fingerprint()).unwrap(), None);
+        assert!(before.select_records(&producers).unwrap().is_empty());
 
         assert!(after.contains_blob(blob).unwrap());
-        assert_eq!(after.record(record.fingerprint()).unwrap(), Some(record));
+        assert!(after.select_records(&producers).unwrap().contains(&record));
     }
 }

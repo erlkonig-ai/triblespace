@@ -18,7 +18,7 @@ use triblespace_core::capability::{
 };
 use triblespace_core::collection::{
     ACTION_READ, AdmissionPolicy, Collection, CollectionCommit, CollectionHandle, CollectionPolicy,
-    CollectionRead, CollectionRecord, CollectionRecordFingerprint, CollectionRecordSelector,
+    CollectionRead, CollectionRecord, CollectionRecordSelector,
     CollectionStore, CollectionStoreExt, KIND_COLLECTION_DESCRIPTOR, read_capability,
 };
 use triblespace_core::inline::encodings::hash::Handle;
@@ -168,13 +168,6 @@ impl<R: CollectionRead> CollectionRead for CountedSnapshot<R> {
     fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
         self.enumerations.fetch_add(1, Ordering::Relaxed);
         self.inner.records()
-    }
-
-    fn record(
-        &self,
-        fingerprint: CollectionRecordFingerprint,
-    ) -> Result<Option<CollectionRecord>, Self::RecordsError> {
-        self.inner.record(fingerprint)
     }
 
     fn select_records(

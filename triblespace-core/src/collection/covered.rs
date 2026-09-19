@@ -34,7 +34,7 @@ use crate::repo::{
 
 use super::coverage::{Coverage, CoverageIndex, StoreWriters};
 use super::{
-    CollectionHandle, CollectionRead, CollectionRecord, CollectionRecordFingerprint,
+    CollectionHandle, CollectionRead, CollectionRecord,
     CollectionRecordSelector, CollectionStore, CoverageRead,
 };
 
@@ -491,13 +491,6 @@ impl<T: CollectionRead> CollectionRead for CoveredSnapshot<T> {
 
     fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
         self.inner.records()
-    }
-
-    fn record(
-        &self,
-        fingerprint: CollectionRecordFingerprint,
-    ) -> Result<Option<CollectionRecord>, Self::RecordsError> {
-        self.inner.record(fingerprint)
     }
 
     fn select_records(

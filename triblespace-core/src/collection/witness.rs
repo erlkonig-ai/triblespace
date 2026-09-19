@@ -10,8 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
-    CollectionData, CollectionHandle, CollectionRead, CollectionRecord,
-    CollectionRecordFingerprint, CollectionRecordSelector,
+    CollectionData, CollectionHandle, CollectionRead, CollectionRecord, CollectionRecordSelector,
 };
 
 /// Retain every record needed to account for the selected endorsements.
@@ -28,27 +27,22 @@ use super::{
 /// alternatives is the conservative direction for a set whose purpose is to
 /// decide what to keep and transfer.
 ///
-/// Both steps are indexed selections -- one record by fingerprint, then the
-/// producers of one `(collection, payload)` -- so a store that maintains
-/// those relations answers without enumerating anything. An earlier version
-/// built the production map by scanning every record once per resolution,
-/// which is the same answer at the cost of a full pass over the pile.
+/// The one step is an indexed selection -- the producers of one
+/// `(collection, payload)` -- so a store that maintains that relation answers
+/// without enumerating anything. An earlier version built the production map
+/// by scanning every record once per resolution, which is the same answer at
+/// the cost of a full pass over the pile.
 pub(super) fn records_for<R: CollectionRead>(
     snapshot: &R,
-    roots: impl IntoIterator<Item = CollectionRecordFingerprint>,
+    roots: impl IntoIterator<Item = CollectionRecord>,
     source_by_target: &BTreeMap<CollectionHandle, CollectionHandle>,
 ) -> Result<Vec<CollectionRecord>, R::RecordsError> {
-    let mut selected = BTreeMap::new();
-    let mut visited = BTreeSet::new();
+    let mut selected = BTreeSet::new();
     let mut pending: Vec<_> = roots.into_iter().collect();
-    while let Some(id) = pending.pop() {
-        if !visited.insert(id) {
+    while let Some(record) = pending.pop() {
+        if !selected.insert(record) {
             continue;
         }
-        let Some(record) = snapshot.record(id)? else {
-            continue;
-        };
-        selected.insert(id, record);
         let collection = record.collection();
         let inputs: Vec<(CollectionHandle, CollectionData)> = match record {
             CollectionRecord::Commit(_) => Vec::new(),
@@ -68,8 +62,8 @@ pub(super) fn records_for<R: CollectionRead>(
             let producers = snapshot.select_records(&BTreeSet::from([
                 CollectionRecordSelector::ProducedMember(key.0, key.1),
             ]))?;
-            pending.extend(producers.into_iter().map(|record| record.fingerprint()));
+            pending.extend(producers);
         }
     }
-    Ok(selected.into_values().collect())
+    Ok(selected.into_iter().collect())
 }

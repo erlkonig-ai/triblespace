@@ -15,8 +15,8 @@ use crate::collection::{
     descriptor, read_capability, succinctarchive_union, write_capability, AdmissionPolicy,
     Collection, CollectionCommit, CollectionData, CollectionDerivation, CollectionDerive,
     CollectionMerge, CollectionPolicy, CollectionRead, CollectionRealizationError,
-    CollectionRecord, CollectionRecordFingerprint, CollectionRecordSelector, CollectionSnapshotExt,
-    CollectionStore, CollectionStoreExt,
+    CollectionRecord, CollectionRecordSelector, CollectionSnapshotExt, CollectionStore,
+    CollectionStoreExt,
 };
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
@@ -110,7 +110,6 @@ fn one_hop() -> OneHop {
 struct ReadCounts {
     gets: Mutex<Vec<CollectionData>>,
     metadata: Mutex<Vec<CollectionData>>,
-    point_records: Mutex<Vec<CollectionRecordFingerprint>>,
     selections: Mutex<Vec<BTreeSet<CollectionRecordSelector>>>,
     record_enumerations: AtomicUsize,
     proof_queries: AtomicUsize,
@@ -131,19 +130,9 @@ impl CountingSnapshot {
     }
 
     fn assert_no_ancestor_record_reads(&self) {
-        assert!(self.counts.point_records.lock().unwrap().is_empty());
+        // Reading a record by fingerprint is no longer expressible, so the
+        // remaining way to reach an ancestor's rows is a whole enumeration.
         assert_eq!(self.counts.record_enumerations.load(Ordering::SeqCst), 0);
-        assert!(self
-            .counts
-            .selections
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|selectors| {
-                selectors
-                    .iter()
-                    .all(|selector| !matches!(selector, CollectionRecordSelector::Fingerprint(_)))
-            }));
     }
 
     fn assert_not_loaded(&self, handle: CollectionData) {
@@ -248,13 +237,6 @@ impl CollectionRead for CountingSnapshot {
             .fetch_add(1, Ordering::SeqCst);
         self.inner.records()
     }
-    fn record(
-        &self,
-        fingerprint: CollectionRecordFingerprint,
-    ) -> Result<Option<CollectionRecord>, Self::RecordsError> {
-        self.counts.point_records.lock().unwrap().push(fingerprint);
-        self.inner.record(fingerprint)
-    }
     fn select_records(
         &self,
         selectors: &BTreeSet<CollectionRecordSelector>,
@@ -301,10 +283,14 @@ fn resident_target_reads_before_ancestry_and_support_requires_a_fresh_closed_sna
     fixture.store.insert(fixture.equation).unwrap();
     let before = CountingSnapshot::new(fixture.store.snapshot().unwrap());
     assert!(!before.inner.contains_blob(fixture.source.handle()).unwrap());
-    assert_eq!(
-        before.inner.record(fixture.commit.fingerprint()).unwrap(),
-        None
-    );
+    assert!(before
+        .inner
+        .select_records(&BTreeSet::from([CollectionRecordSelector::ProducedMember(
+            fixture.source.handle(),
+            fixture.commit.data(),
+        )]))
+        .unwrap()
+        .is_empty());
     let observed = before.collection(fixture.target).unwrap();
     assert_eq!(
         observed.cover().members().collect::<Vec<_>>(),
@@ -630,14 +616,11 @@ fn multihop_support_uses_exact_endorsed_records_without_ancestor_authority_or_pa
     );
     snapshot.assert_not_loaded(data(&fixture.source_blob));
     snapshot.assert_not_loaded(data(&fixture.metadata));
-    let point_reads = snapshot.counts.point_records.lock().unwrap().len();
+    let selections = snapshot.counts.selections.lock().unwrap().len();
     let blob_reads = snapshot.counts.gets.lock().unwrap().len();
     let cloned = observed.clone();
     assert_eq!(cloned.support().unwrap(), support);
-    assert_eq!(
-        snapshot.counts.point_records.lock().unwrap().len(),
-        point_reads
-    );
+    assert_eq!(snapshot.counts.selections.lock().unwrap().len(), selections);
     assert_eq!(snapshot.counts.gets.lock().unwrap().len(), blob_reads);
 }
 

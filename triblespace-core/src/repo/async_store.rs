@@ -277,7 +277,7 @@ pub trait AsyncCollectionRead {
     /// Failure while enumerating stored records.
     type RecordsError: Error + Debug + Send + Sync + 'static;
 
-    /// Return every record in deterministic fingerprint order.
+    /// Return every record once, in a deterministic order.
     fn records(
         &self,
     ) -> impl Future<Output = Result<Vec<CollectionRecord>, Self::RecordsError>> + Send;

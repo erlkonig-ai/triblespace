@@ -16,7 +16,7 @@ use triblespace_core::collection::{
     admitted_record_witnesses, collection_action_audience, descriptor, preview_record_witnesses,
     CollectionData, CollectionDerive, CollectionFunctionalConflict, CollectionHandle,
     CollectionMerge, CollectionRead, CollectionReadAudience, CollectionRecord,
-    CollectionRecordFingerprint, CollectionStore, ConflictingCollectionOutput,
+    CollectionRecordSelector, CollectionStore, ConflictingCollectionOutput,
     LegacyUnsignedCollectionEquation, RecordDecodeError, Support, ACTION_WRITE,
     COLLECTION_DERIVE_SIGNED_V2_BYTES_LEN, COLLECTION_MERGE_SIGNED_V2_BYTES_LEN,
     COLLECTION_RECORD_KIND_DERIVE_V2, COLLECTION_RECORD_KIND_MERGE_V2,
@@ -387,10 +387,19 @@ fn plan(
             }
         };
         proposed.push(record);
+        // The producers of the same member are the only records this could
+        // already be.
+        let member = match record {
+            CollectionRecord::Commit(commit) => commit.data(),
+            CollectionRecord::Merge(merge) => merge.result(),
+            CollectionRecord::Derive(derive) => derive.output(),
+        };
         if snapshot
-            .record(record.fingerprint())
+            .select_records(&BTreeSet::from([CollectionRecordSelector::ProducedMember(
+                collection, member,
+            )]))
             .context("inspect exact existing endorsement")?
-            .is_some()
+            .contains(&record)
         {
             report.already_present += 1;
         } else {

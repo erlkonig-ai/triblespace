@@ -155,9 +155,10 @@ interpretable without a separate registry entry.
 | `DERIVE(T, a, b, author, signature)` | The author endorses the mapping named by `T` from `a` to `b`. | 192 bytes |
 
 The exact canonical record value is the semantic object; none of the three has
-a synthetic entity ID. A repeat insert is a no-op. Fixed-width physical indexes
-and the network PATCH use a full-width BLAKE3 fingerprint of the kind and
-canonical payload, but that key is not collection semantics. All three records
+a synthetic entity ID. A repeat insert is a no-op. The network PATCH keys a
+record by a full-width BLAKE3 fingerprint of the kind and canonical payload;
+the pile keys it by the collection and member it names and the frame it sits
+in. Neither key is collection semantics. All three records
 are signed and admitted by WRITE on the collection they name. Multiple
 endorsers can sign the same equation: these are distinct provenance records
 but one semantic equation. Inferred equations carry only endpoints, not

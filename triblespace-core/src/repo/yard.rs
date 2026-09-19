@@ -2061,14 +2061,13 @@ mod tests {
         yard.collect(&roots).unwrap();
         yard.reclaim().unwrap();
         let retained = yard.snapshot().unwrap();
-        assert_eq!(
-            retained.record(commit.fingerprint()).unwrap(),
-            Some(CollectionRecord::Commit(commit))
-        );
-        assert_eq!(
-            retained.record(derive.fingerprint()).unwrap(),
-            Some(CollectionRecord::Derive(derive))
-        );
+        let retained_records = retained
+            .records()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(retained_records.contains(&CollectionRecord::Commit(commit)));
+        assert!(retained_records.contains(&CollectionRecord::Derive(derive)));
         assert!(get_raw(&retained, input).is_ok());
         assert!(get_raw(&retained, output).is_ok());
     }

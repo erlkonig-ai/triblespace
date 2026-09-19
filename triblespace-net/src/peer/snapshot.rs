@@ -10,9 +10,7 @@ use std::sync::{Arc, Mutex, Weak};
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::{BlobEncoding, TryFromBlob};
 use triblespace_core::capability::{CapabilityProof, CapabilityProofId};
-use triblespace_core::collection::{
-    CollectionRead, CollectionRecord, CollectionRecordFingerprint, CollectionRecordSelector,
-};
+use triblespace_core::collection::{CollectionRead, CollectionRecord, CollectionRecordSelector};
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{Inline, InlineEncoding};
 use triblespace_core::repo::async_store::AsyncBlobStoreGet;
@@ -313,13 +311,6 @@ where
 
     fn records(&self) -> Result<Self::RecordIter<'_>, Self::RecordsError> {
         self.frozen.records()
-    }
-
-    fn record(
-        &self,
-        fingerprint: CollectionRecordFingerprint,
-    ) -> Result<Option<CollectionRecord>, Self::RecordsError> {
-        self.frozen.record(fingerprint)
     }
 
     fn select_records(

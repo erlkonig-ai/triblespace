@@ -1,8 +1,8 @@
 //! Native storage for collection-calculus records.
 //!
-//! A collection store is a grow-only set keyed by a full-width fingerprint of
-//! each record's canonical bytes.
-//! It deliberately exposes no mutable head, deletion, compare-and-swap, or
+//! A collection store is a grow-only set of canonical records: a record's
+//! exact bytes are its identity, and inserting one the store already holds
+//! adds nothing. It deliberately exposes no mutable head, deletion, compare-and-swap, or
 //! read-through-writer path. A [`CollectionRead`] implementation belongs to an
 //! immutable store snapshot, while [`CollectionStore`] only admits new records.
 
@@ -13,7 +13,7 @@ use std::fmt::Debug;
 use crate::repo::{BlobStoreGet, CapabilityProofRead};
 
 use super::coverage::{coverage_of, Coverage, CoverageIndex};
-use super::{CollectionData, CollectionHandle, CollectionRecord, CollectionRecordFingerprint};
+use super::{CollectionData, CollectionHandle, CollectionRecord};
 
 /// One raw selection route into the grow-only collection-record set.
 ///
@@ -23,8 +23,6 @@ use super::{CollectionData, CollectionHandle, CollectionRecord, CollectionRecord
 /// authority, output residency, or the validity of an input witness closure.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum CollectionRecordSelector {
-    /// Select one record by its non-semantic canonical-byte fingerprint.
-    Fingerprint(CollectionRecordFingerprint),
     /// Select every record whose intrinsic collection is exactly `C`.
     ///
     /// This is the canonical construction route for one collection's sparse
@@ -87,23 +85,13 @@ pub(crate) fn selectors_match_record(
             selectors.contains(&CollectionRecordSelector::DeriveTarget(derive.collection()))
         }
     };
-    if matches_fields {
-        return true;
-    }
-    // Fingerprint sorts first in this enum's derived Ord. Most indexed reads
-    // ask only for fields already in the record, so do not hash its bytes just
-    // to test a route which is absent. A matching field also satisfies a mixed
-    // union without needing its physical fingerprint.
-    matches!(
-        selectors.first(),
-        Some(CollectionRecordSelector::Fingerprint(_))
-    ) && selectors.contains(&CollectionRecordSelector::Fingerprint(record.fingerprint()))
+    matches_fields
 }
 
 /// Immutable read surface for canonical collection-calculus records.
 ///
-/// Implementations enumerate one coherent store snapshot in deterministic
-/// fingerprint order. Mutation lives on [`CollectionStore`], so admission and
+/// Implementations enumerate one coherent store snapshot in a deterministic
+/// order of their own. Mutation lives on [`CollectionStore`], so admission and
 /// physical-cover resolution cannot accidentally observe different prefixes.
 /// Signatures are trusted here: foreign dense records are checked at ingress,
 /// and local constructors sign their own records. Opening or concatenating a
@@ -120,36 +108,17 @@ pub trait CollectionRead {
     where
         Self: 'a;
 
-    /// Enumerate currently known records in deterministic fingerprint order.
+    /// Enumerate currently known records, each once, in a deterministic
+    /// order.
     fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError>;
-
-    /// Look up one record by its canonical-byte fingerprint.
-    ///
-    /// The default implementation scans the deterministic record view once
-    /// and stops as soon as it reaches or passes `fingerprint`. Backends with a keyed
-    /// primary index should override this method.
-    fn record(
-        &self,
-        fingerprint: CollectionRecordFingerprint,
-    ) -> Result<Option<CollectionRecord>, Self::RecordsError> {
-        for record in self.records()? {
-            let record = record?;
-            match record.fingerprint().cmp(&fingerprint) {
-                std::cmp::Ordering::Less => {}
-                std::cmp::Ordering::Equal => return Ok(Some(record)),
-                std::cmp::Ordering::Greater => break,
-            }
-        }
-        Ok(None)
-    }
 
     /// Select one deterministic union of raw record routes.
     ///
     /// The default implementation performs exactly one ordinary enumeration
     /// and filters it. Backends with primary or secondary indexes may override
-    /// this method without changing the grow-only set contract. Returned
-    /// records remain deduplicated and sorted by fingerprint. An empty union
-    /// returns immediately without asking the backend for a view.
+    /// this method without changing the grow-only set contract. Each selected
+    /// record is returned once, in the backend's deterministic order. An empty
+    /// union returns immediately without asking the backend for a view.
     fn select_records(
         &self,
         selectors: &BTreeSet<CollectionRecordSelector>,
@@ -262,13 +231,6 @@ where
 
     fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
         (**self).records()
-    }
-
-    fn record(
-        &self,
-        fingerprint: CollectionRecordFingerprint,
-    ) -> Result<Option<CollectionRecord>, Self::RecordsError> {
-        (**self).record(fingerprint)
     }
 
     fn select_records(
@@ -454,50 +416,8 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_routes_hash_only_when_field_routes_do_not_match() {
-        use crate::collection::records::FINGERPRINT_CALLS;
-
-        let records = fixture();
-        for (index, &record) in records.iter().enumerate() {
-            let fingerprint = record.fingerprint();
-            let other = records[(index + 1) % records.len()].fingerprint();
-            let exact = BTreeSet::from([CollectionRecordSelector::Fingerprint(fingerprint)]);
-            let before = FINGERPRINT_CALLS.get();
-            assert!(selectors_match_record(&exact, record));
-            assert_eq!(FINGERPRINT_CALLS.get() - before, 1);
-
-            let mixed = BTreeSet::from([
-                CollectionRecordSelector::Fingerprint(other),
-                CollectionRecordSelector::Collection(record.collection()),
-            ]);
-            let before = FINGERPRINT_CALLS.get();
-            assert!(selectors_match_record(&mixed, record));
-            assert_eq!(FINGERPRINT_CALLS.get() - before, 0);
-
-            let absent = BTreeSet::from([
-                CollectionRecordSelector::Fingerprint(other),
-                CollectionRecordSelector::Collection(collection(99)),
-            ]);
-            let before = FINGERPRINT_CALLS.get();
-            assert!(!selectors_match_record(&absent, record));
-            assert_eq!(FINGERPRINT_CALLS.get() - before, 1);
-        }
-    }
-
-    #[test]
     fn default_relationship_selection_does_not_require_present_witnesses() {
         let records = fixture();
-        let derive = records
-            .iter()
-            .find_map(|record| match record {
-                CollectionRecord::Derive(derive)
-                    if derive.collection() == collection(2) && derive.output() == data(11) =>
-                {
-                    Some(*derive)
-                }
-                _ => None,
-            })
-            .unwrap();
         let store = FallbackStore {
             records: records.clone(),
             ..FallbackStore::default()
@@ -506,7 +426,6 @@ mod tests {
             CollectionRecordSelector::ProducedMember(collection(1), data(4)),
             CollectionRecordSelector::ProducedMember(collection(1), data(6)),
             CollectionRecordSelector::ProducedMember(collection(2), data(11)),
-            CollectionRecordSelector::Fingerprint(derive.fingerprint()),
         ]);
         let selected = store.select_records(&selectors).unwrap();
         assert_eq!(store.enumerations.get(), 1);
@@ -531,29 +450,6 @@ mod tests {
         assert!(selected
             .windows(2)
             .all(|pair| pair[0].fingerprint() < pair[1].fingerprint()));
-    }
-
-    #[test]
-    fn default_point_lookup_scans_one_ordered_view() {
-        let records = fixture();
-        let expected = records[records.len() / 2];
-        let store = FallbackStore {
-            records,
-            ..FallbackStore::default()
-        };
-
-        assert_eq!(
-            store.record(expected.fingerprint()).unwrap(),
-            Some(expected)
-        );
-        assert_eq!(store.enumerations.get(), 1);
-        assert_eq!(
-            store
-                .record(CollectionRecordFingerprint::from_raw([0xff; 32]))
-                .unwrap(),
-            None
-        );
-        assert_eq!(store.enumerations.get(), 2);
     }
 
     #[test]
@@ -696,11 +592,9 @@ mod tests {
     fn shared_reference_forwards_selection_override() {
         let store = OverrideStore::default();
         let borrowed = &store;
-        let selectors = [CollectionRecordSelector::Fingerprint(
-            CollectionRecordFingerprint::from_raw([1; 32]),
-        )]
-        .into_iter()
-        .collect();
+        let selectors = [CollectionRecordSelector::Collection(collection(1))]
+            .into_iter()
+            .collect();
         CollectionRead::select_records(&borrowed, &selectors).unwrap();
         assert_eq!(store.selection_calls.get(), 1);
         assert_eq!(store.records_calls.get(), 0);
