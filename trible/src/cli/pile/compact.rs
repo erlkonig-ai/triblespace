@@ -232,6 +232,10 @@ pub(super) fn run(source_path: PathBuf, destination_path: PathBuf) -> Result<()>
         stats.wants,
         stats.strong_pins,
     );
+    println!(
+        "  retired equations left behind, signed twin present: {}",
+        stats.superseded_equations
+    );
     Ok(())
 }
 

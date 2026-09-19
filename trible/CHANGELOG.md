@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+- `pile compact` leaves behind a retired equation frame whose current signed
+  twin is present, in every retired framing, and says how many it left; the
+  endorsement migration writes the twins, compaction sheds the originals.
+- `pile migrate <PILE> endorse-unsigned-equations` also reads the retired
+  witness-bound MERGE/DERIVE frames, verifying the old signature over the old
+  transcript before restating the equation under the migrator's key.
+
 - Replace `pile collection adopt` with `pile collection migrate`, which carries
   many sources into one target — `--from` repeated, `--siblings` for every
   same-named generation, or a `--plan` file of `source -> target` edges — and

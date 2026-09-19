@@ -5110,6 +5110,94 @@ pub fn reframe_into(
     Ok(stats)
 }
 
+/// Stands in for a derive's absent second input in [`equation_key`].
+const ENDORSED_DERIVE_MARK: [u8; 32] = [0xFF; 32];
+
+/// The semantic identity of an equation, signed or not, in any framing: its
+/// collection, its inputs in digest order, and its result.
+type EquationKey = ([u8; 32], [u8; 32], [u8; 32], [u8; 32]);
+
+fn equation_key(
+    collection: [u8; 32],
+    first: [u8; 32],
+    second: [u8; 32],
+    result: [u8; 32],
+) -> EquationKey {
+    let (low, high) = if first <= second {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    (collection, low, high, result)
+}
+
+fn record_equation_key(record: &CollectionRecord) -> Option<EquationKey> {
+    match record {
+        CollectionRecord::Merge(record) => {
+            let (low, high) = record.inputs();
+            Some(equation_key(
+                record.collection().raw,
+                low.raw,
+                high.raw,
+                record.result().raw,
+            ))
+        }
+        CollectionRecord::Derive(record) => Some(equation_key(
+            record.collection().raw,
+            record.input().raw,
+            ENDORSED_DERIVE_MARK,
+            record.output().raw,
+        )),
+        CollectionRecord::Commit(_) => None,
+    }
+}
+
+fn legacy_equation_key(equation: &LegacyUnsignedCollectionEquation) -> EquationKey {
+    match *equation {
+        LegacyUnsignedCollectionEquation::Merge {
+            collection,
+            low,
+            high,
+            result,
+        } => equation_key(collection.raw, low.raw, high.raw, result.raw),
+        LegacyUnsignedCollectionEquation::Derive {
+            collection,
+            input,
+            output,
+        } => equation_key(collection.raw, input.raw, ENDORSED_DERIVE_MARK, output.raw),
+    }
+}
+
+/// The equation a retired signed frame states, read from its fixed dense
+/// offsets. Every retired signed kind, with or without witnesses, laid the
+/// collection, the inputs and the result out first; nothing after them is
+/// read. `None` for a frame of any other kind.
+fn retired_signed_frame_equation_key(frame: &[u8]) -> Option<EquationKey> {
+    let kind = frame.get(FRAME_BODY_OFFSET - 32..FRAME_BODY_OFFSET)?;
+    let field = |index: usize| -> Option<[u8; 32]> {
+        frame
+            .get(FRAME_BODY_OFFSET + index * 32..FRAME_BODY_OFFSET + (index + 1) * 32)?
+            .try_into()
+            .ok()
+    };
+    if kind == record_kind::KIND_COLLECTION_MERGE_SIGNED_V2.as_slice()
+        || kind == record_kind::KIND_COLLECTION_MERGE_WITNESSED_V6.as_slice()
+    {
+        Some(equation_key(field(0)?, field(1)?, field(2)?, field(3)?))
+    } else if kind == record_kind::KIND_COLLECTION_DERIVE_SIGNED_V2.as_slice()
+        || kind == record_kind::KIND_COLLECTION_DERIVE_WITNESSED_V7.as_slice()
+    {
+        Some(equation_key(
+            field(0)?,
+            field(1)?,
+            ENDORSED_DERIVE_MARK,
+            field(2)?,
+        ))
+    } else {
+        None
+    }
+}
+
 /// Deterministic accounting for one retained pile rewrite.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PileRewriteStats {
@@ -5123,6 +5211,10 @@ pub struct PileRewriteStats {
     pub capability_proofs: usize,
     /// Number of frames of unknown kind carried exactly, by their own length.
     pub opaque_frames: usize,
+    /// Number of retired equation frames, unsigned or signed under a retired
+    /// kind, not carried because a current signed equation with the same
+    /// collection, inputs and result is present.
+    pub superseded_equations: usize,
 }
 
 /// Failure while copying one policy-selected pile state into another pile.
@@ -5240,13 +5332,40 @@ impl PileFile {
         self.physical_rewrite_guard()
             .map_err(PileRewriteError::Source)?;
         let covered = reader.covered_len;
+        let collection_records = reader.collection_records.clone();
+        // A retired equation, unsigned or signed under a retired kind, is
+        // inert evidence kept for one purpose, an explicit endorsement. Once
+        // a current signed equation with the same collection, inputs and
+        // result is present, that purpose is served and the old frame is
+        // baggage: it is not carried. One without a twin still is, as the
+        // only evidence something could endorse.
+        let mut signed_equations = BTreeSet::new();
+        for key in collection_records.iter_ordered() {
+            let record = reader.record_at(key[64..].try_into().expect("key tail is the offset"));
+            if let Some(equation) = record_equation_key(&record) {
+                signed_equations.insert(equation);
+            }
+        }
+        let mut superseded_equations = 0usize;
         let opaque_frames: Vec<(usize, usize)> = self
             .opaque_frames
             .iter()
             .copied()
             .filter(|(offset, len)| offset + len <= covered)
+            .filter(|(offset, len)| {
+                let frame = unsafe {
+                    slice_from_raw_parts(reader.mmap.as_ptr().add(*offset), *len)
+                        .as_ref()
+                        .expect("mapped opaque frame")
+                };
+                let superseded = retired_signed_frame_equation_key(frame)
+                    .is_some_and(|equation| signed_equations.contains(&equation));
+                if superseded {
+                    superseded_equations += 1;
+                }
+                !superseded
+            })
             .collect();
-        let collection_records = reader.collection_records.clone();
         let capability_proofs = reader
             .proofs()
             .map_err(PileRewriteError::Source)?
@@ -5377,6 +5496,16 @@ impl PileFile {
         }
 
         for header in legacy_collection_headers.into_iter_ordered() {
+            if let Ok(PileRecord {
+                content: PileRecordContent::LegacyUnsignedCollectionEquation { equation },
+                ..
+            }) = decode_record(&header, 0)
+            {
+                if signed_equations.contains(&legacy_equation_key(&equation)) {
+                    superseded_equations += 1;
+                    continue;
+                }
+            }
             destination
                 .preserve_legacy_collection_header(header)
                 .map_err(PileRewriteError::Collection)?;
@@ -5418,6 +5547,7 @@ impl PileFile {
             wants: preserved_wants.len(),
             capability_proofs: capability_proof_count,
             opaque_frames: opaque_frames.len(),
+            superseded_equations,
         })
     }
 }
@@ -8618,6 +8748,7 @@ mod tests {
                 wants: 1,
                 capability_proofs: 0,
                 opaque_frames: 0,
+                superseded_equations: 0,
             }
         );
 
@@ -11069,6 +11200,138 @@ mod tests {
             expected
         );
         reopened.close().unwrap();
+    }
+
+    /// A retired equation whose current signed twin is present is baggage
+    /// and stays behind; one without a twin is the only evidence of itself
+    /// and travels. The rule reads every retired framing the same way.
+    #[test]
+    fn retired_equations_with_a_signed_twin_are_left_behind_by_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "endorsed-source.pile");
+        let mut source = Pile::open(&source_path).unwrap();
+        let input = source
+            .put::<UnknownBlob, _>(Bytes::from_source(b"endorsed input".to_vec()))
+            .unwrap();
+        let output = source
+            .put::<UnknownBlob, _>(Bytes::from_source(b"endorsed output".to_vec()))
+            .unwrap();
+        let other = source
+            .put::<UnknownBlob, _>(Bytes::from_source(b"another output".to_vec()))
+            .unwrap();
+        let collection = source
+            .put::<SimpleArchive, _>(TribleSet::new().to_blob())
+            .unwrap();
+        source.close().unwrap();
+
+        // Unsigned: a merge that will have a twin, a derive that will not.
+        let unsigned_merge = LegacyCollectionMergeRecordHeader {
+            magic: FRAME_MAGIC,
+            span_blocks: ENVELOPE_HEADER_BLOCKS.to_le_bytes(),
+            record_kind: record_kind::KIND_COLLECTION_MERGE_UNSIGNED,
+            collection: collection.raw,
+            low: [0; 32],
+            high: input.raw,
+            result: output.raw,
+            reserved: [0; 64],
+        };
+        let unsigned_derive = CollectionDeriveHeaderEnvelopeV1 {
+            envelope_marker: MAGIC_MARKER_ENVELOPE,
+            record_kind: MAGIC_MARKER_COLLECTION_DERIVE_V5,
+            span_blocks: ENVELOPE_HEADER_BLOCKS.to_le_bytes(),
+            target: collection.raw,
+            input: input.raw,
+            output: output.raw,
+            reserved: [0; 124],
+        };
+        // Retired signed framings, opaque to replay: a witnessed merge stating
+        // the same equation as the unsigned merge (twinned), a signed-V2
+        // derive that will be twinned, and a signed-V2 merge that will not.
+        let retired_frame = |kind: RawInline, blocks: u32, fields: &[[u8; 32]]| {
+            let mut frame = test_envelope_bytes(kind, blocks, blocks as usize * 256);
+            for (index, field) in fields.iter().enumerate() {
+                frame[FRAME_BODY_OFFSET + index * 32..FRAME_BODY_OFFSET + (index + 1) * 32]
+                    .copy_from_slice(field);
+            }
+            frame
+        };
+        let witnessed_merge = retired_frame(
+            record_kind::KIND_COLLECTION_MERGE_WITNESSED_V6,
+            2,
+            &[collection.raw, [0; 32], input.raw, output.raw],
+        );
+        let signed_v2_derive = retired_frame(
+            record_kind::KIND_COLLECTION_DERIVE_SIGNED_V2,
+            1,
+            &[collection.raw, input.raw, other.raw],
+        );
+        let signed_v2_merge = retired_frame(
+            record_kind::KIND_COLLECTION_MERGE_SIGNED_V2,
+            2,
+            &[collection.raw, input.raw, output.raw, other.raw],
+        );
+        append_test_bytes(&source_path, unsigned_merge.as_bytes());
+        append_test_bytes(&source_path, unsigned_derive.as_bytes());
+        append_test_bytes(&source_path, &witnessed_merge);
+        append_test_bytes(&source_path, &signed_v2_derive);
+        append_test_bytes(&source_path, &signed_v2_merge);
+
+        let mut source = Pile::open(&source_path).unwrap();
+        let signer = SigningKey::from_bytes(&[9; 32]);
+        let merge_twin = CollectionRecord::Merge(CollectionMerge::sign(
+            &signer,
+            CollectionHandle::new(collection.raw),
+            Inline::<Hash<Blake3>>::new([0; 32]),
+            Inline::<Hash<Blake3>>::new(input.raw),
+            Inline::<Hash<Blake3>>::new(output.raw),
+        ));
+        let derive_twin = CollectionRecord::Derive(CollectionDerive::sign(
+            &signer,
+            CollectionHandle::new(collection.raw),
+            Inline::<Hash<Blake3>>::new(input.raw),
+            Inline::<Hash<Blake3>>::new(other.raw),
+        ));
+        source.insert(merge_twin).unwrap();
+        source.insert(derive_twin).unwrap();
+        assert_eq!(
+            source
+                .snapshot()
+                .unwrap()
+                .legacy_unsigned_collection_equations()
+                .count(),
+            2
+        );
+        assert_eq!(source.opaque_record_count().unwrap(), 3);
+
+        let destination_path = fresh_empty_pile_path(&dir, "endorsed-destination.pile");
+        let mut destination = Pile::open(&destination_path).unwrap();
+        let stats = source
+            .rewrite_retained_into(
+                &mut destination,
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+            )
+            .unwrap();
+        assert_eq!(stats.superseded_equations, 3);
+        assert_eq!(stats.opaque_frames, 1);
+        let reader = destination.snapshot().unwrap();
+        let carried: Vec<_> = reader.legacy_unsigned_collection_equations().collect();
+        assert_eq!(carried.len(), 1);
+        assert!(matches!(
+            carried[0],
+            LegacyUnsignedCollectionEquation::Derive { .. }
+        ));
+        let records: Vec<_> = reader
+            .records()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(records.contains(&merge_twin));
+        assert!(records.contains(&derive_twin));
+        drop(reader);
+        assert_eq!(destination.opaque_record_count().unwrap(), 1);
+        destination.close().unwrap();
+        source.close().unwrap();
     }
 
     /// Re-adding an existing set element is a no-op append.

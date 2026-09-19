@@ -93,14 +93,12 @@ pub const KIND_AUTH_PROOF_V2: RawInline =
 /// content addressing already holds. Ordinary replay crosses it as an inert
 /// frame. Its dense fields were collection, low, high, result, low_witness,
 /// high_witness, author, R, S (288 bytes), padded to two 256-byte blocks.
-#[cfg(test)]
 pub const KIND_COLLECTION_MERGE_WITNESSED_V6: RawInline =
     hex_literal::hex!("4D2087B6C4944A404E1D0BCF4898819267E00FCAE49B146F5955522CBE935909");
 
 /// Retired witness-bound DERIVE; see [`KIND_COLLECTION_MERGE_WITNESSED_V6`].
 /// Its dense fields were target, input, output, input_witness, author, R, S
 /// (224 bytes), padded to two 256-byte blocks.
-#[cfg(test)]
 pub const KIND_COLLECTION_DERIVE_WITNESSED_V7: RawInline =
     hex_literal::hex!("DBF641F31E772F6CE715087D954375AA44860BF411C0DE849C207B542ABDC583");
 
@@ -115,7 +113,6 @@ pub const KIND_COLLECTION_DERIVE_UNSIGNED: RawInline =
 /// explicit endorsement migration. Ordinary replay keeps its frame opaque.
 /// Its dense fields were collection, low, high, result, author, R, S (224
 /// bytes), followed by zero padding to two 256-byte framed blocks.
-#[cfg(test)]
 pub const KIND_COLLECTION_MERGE_SIGNED_V2: RawInline =
     hex_literal::hex!("9D9B962D46FA42168AB3A11FB367AC14692D4F51B5190196F2BDB08D5BC2BA07");
 
@@ -123,7 +120,6 @@ pub const KIND_COLLECTION_MERGE_SIGNED_V2: RawInline =
 /// explicit endorsement migration. Ordinary replay keeps its frame opaque.
 /// Its dense fields were target, input, output, author, R, S (192 bytes),
 /// filling one 256-byte framed block exactly.
-#[cfg(test)]
 pub const KIND_COLLECTION_DERIVE_SIGNED_V2: RawInline =
     hex_literal::hex!("B2EE8382C70161379E387D692B822946A60B602A909EED66B7D6DA2A62F36232");
 

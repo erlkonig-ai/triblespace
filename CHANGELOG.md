@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- A retained rewrite no longer carries a retired equation frame, unsigned or
+  signed under a retired kind (payload-only V2, witness-bound V6/V7), once a
+  current signed equation with the same collection, inputs and result is
+  present in the source: the endorsement it was kept for has happened. One
+  without a signed twin is still carried. Counted in
+  `PileRewriteStats::superseded_equations`.
+
 - Add `collection::migration`: carrying committed content between collections,
   and the survey that prices the carry before it happens. A carry re-signs each
   source commit's `(data, metadata)` pair as a COMMIT of the target instead of
