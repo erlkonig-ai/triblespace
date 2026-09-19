@@ -793,6 +793,11 @@ pub(crate) struct StoreWriters<'a, R> {
     reader: &'a R,
     evidence: RefCell<BTreeMap<CollectionHandle, Option<AdmissionEvidence>>>,
     sources: RefCell<BTreeMap<CollectionHandle, SourceResolution>>,
+    /// One answer per (collection, signer) for the life of this reader. A
+    /// fold asks once per record and a lattice holds thousands of records per
+    /// signer, while the quorum check behind the answer walks and verifies
+    /// the collection's proofs every time it is asked.
+    admitted: RefCell<BTreeMap<(CollectionHandle, Inline<ED25519PublicKey>), Admittance>>,
 }
 
 impl<'a, R: BlobStoreGet + CapabilityProofRead> StoreWriters<'a, R> {
@@ -802,6 +807,7 @@ impl<'a, R: BlobStoreGet + CapabilityProofRead> StoreWriters<'a, R> {
             reader,
             evidence: RefCell::new(BTreeMap::new()),
             sources: RefCell::new(BTreeMap::new()),
+            admitted: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -843,23 +849,12 @@ impl<'a, R: BlobStoreGet + CapabilityProofRead> StoreWriters<'a, R> {
         });
         entry.is_some()
     }
-}
 
-impl<R: BlobStoreGet + CapabilityProofRead> RecordAdmission for StoreWriters<'_, R> {
-    fn source(&self, collection: CollectionHandle) -> SourceResolution {
-        // Only a resolved answer is cached. A missing descriptor is a fact
-        // about now, and the next arrival should be able to change it.
-        if let Some(cached) = self.sources.borrow().get(&collection) {
-            return *cached;
-        }
-        let resolved = self.read_source(collection);
-        if !matches!(resolved, SourceResolution::Missing(_)) {
-            self.sources.borrow_mut().insert(collection, resolved);
-        }
-        resolved
-    }
-
-    fn admits(&self, collection: CollectionHandle, signer: Inline<ED25519PublicKey>) -> Admittance {
+    fn decide_admits(
+        &self,
+        collection: CollectionHandle,
+        signer: Inline<ED25519PublicKey>,
+    ) -> Admittance {
         if !self.write_evidence(collection) {
             // The descriptor is not resident, so nothing is known about who may
             // write here. Absence is pending, never refusal.
@@ -881,6 +876,31 @@ impl<R: BlobStoreGet + CapabilityProofRead> RecordAdmission for StoreWriters<'_,
         } else {
             Admittance::Pending
         }
+    }
+}
+
+impl<R: BlobStoreGet + CapabilityProofRead> RecordAdmission for StoreWriters<'_, R> {
+    fn source(&self, collection: CollectionHandle) -> SourceResolution {
+        // Only a resolved answer is cached. A missing descriptor is a fact
+        // about now, and the next arrival should be able to change it.
+        if let Some(cached) = self.sources.borrow().get(&collection) {
+            return *cached;
+        }
+        let resolved = self.read_source(collection);
+        if !matches!(resolved, SourceResolution::Missing(_)) {
+            self.sources.borrow_mut().insert(collection, resolved);
+        }
+        resolved
+    }
+
+    fn admits(&self, collection: CollectionHandle, signer: Inline<ED25519PublicKey>) -> Admittance {
+        let key = (collection, signer);
+        if let Some(cached) = self.admitted.borrow().get(&key) {
+            return *cached;
+        }
+        let answer = self.decide_admits(collection, signer);
+        self.admitted.borrow_mut().insert(key, answer);
+        answer
     }
 }
 
