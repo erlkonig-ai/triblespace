@@ -332,7 +332,7 @@ fn exact_old_support_ignores_a_later_commit_and_equation() {
         .insert(CollectionRecord::Derive(CollectionDerive::sign(
             &authority_key(),
             target.handle(),
-            (third.data(), third.fingerprint()),
+            third.data(),
             Handle::<PathSummaryBlob>::to_hash(later_summary.get_handle()),
         )))
         .unwrap();
@@ -380,8 +380,8 @@ fn resident_source_merge_is_lowered_once() {
         .insert(CollectionRecord::Merge(CollectionMerge::sign(
             &authority_key(),
             source.handle(),
-            (first.data(), first.fingerprint()),
-            (second.data(), second.fingerprint()),
+            first.data(),
+            second.data(),
             joined_data,
         )))
         .unwrap();
@@ -419,7 +419,7 @@ fn existing_target_merge_is_selected_as_one_physical_member() {
         let record = CollectionDerive::sign(
             &authority_key(),
             target.handle(),
-            (input.data(), input.fingerprint()),
+            input.data(),
             Handle::<PathSummaryBlob>::to_hash(output.get_handle()),
         );
         store.insert(CollectionRecord::Derive(record)).unwrap();
@@ -432,8 +432,8 @@ fn existing_target_merge_is_selected_as_one_physical_member() {
         .insert(CollectionRecord::Merge(CollectionMerge::sign(
             &authority_key(),
             target.handle(),
-            (derives[0].output(), derives[0].fingerprint()),
-            (derives[1].output(), derives[1].fingerprint()),
+            derives[0].output(),
+            derives[1].output(),
             joined_data,
         )))
         .unwrap();
