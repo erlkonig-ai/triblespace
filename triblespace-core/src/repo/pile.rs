@@ -4248,7 +4248,10 @@ impl CollectionRead for PileSnapshot {
     /// One persistent-root clone. The answer is the same one the default fold
     /// would reach from these records and this reader — `coverage_matches_a_fold_over_the_same_records`
     /// pins that — because both decide admission from the same applied prefix.
-    fn coverage(&self) -> Result<Coverage, Self::RecordsError> {
+    fn coverage(
+        &self,
+        _lineage: &BTreeSet<CollectionHandle>,
+    ) -> Result<Coverage, Self::RecordsError> {
         Ok(self.coverage.clone())
     }
 
@@ -6084,7 +6087,7 @@ mod tests {
         }
 
         let snapshot = pile.snapshot().unwrap();
-        let maintained = CollectionRead::coverage(&snapshot).unwrap();
+        let maintained = CollectionRead::coverage(&snapshot, &BTreeSet::new()).unwrap();
         let folded = coverage_of(&snapshot).unwrap().published().clone();
         assert_eq!(maintained, folded);
         assert!(!maintained.is_empty());

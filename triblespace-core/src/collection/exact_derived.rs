@@ -648,7 +648,7 @@ where
     // Support is a lookup, not a walk: every edge under a row was admitted
     // when the fold believed it, so nothing here re-derives or re-decides it.
     let coverage = snapshot
-        .coverage()
+        .coverage(&lineage.descriptors.keys().copied().collect())
         .map_err(|error| CollectionRealizationError::storage("read downward coverage", error))?;
     let mut certified = super::coverage::CoverageSet::new();
     let mut roots = BTreeSet::new();
@@ -1022,7 +1022,7 @@ where
 {
     let lineage = load_lineage(snapshot, target)?;
     let coverage = snapshot
-        .coverage()
+        .coverage(&lineage.descriptors.keys().copied().collect())
         .map_err(|error| CollectionRealizationError::storage("read downward coverage", error))?;
     let (members, unattested) = coverage.union_over(
         target.handle(),

@@ -177,10 +177,23 @@ pub trait CollectionRead {
     /// Bounded on `Self: Sized` and the two readers the fold needs, so the
     /// trait keeps every implementor that cannot answer the admission
     /// question, and stays object-safe.
-    fn coverage(&self) -> Result<Coverage, Self::RecordsError>
+    ///
+    /// `lineage` names every collection whose rows the caller may consult --
+    /// the target and each of its sources down to the foundation. The index
+    /// itself is snapshot-wide and no implementor needs to narrow what it
+    /// hands back, but a reader that TRACKS what was read does need it: the
+    /// fold only propagates along a lineage, so a row under one can change
+    /// only when a record arrives in one of these collections. Without the
+    /// parameter the honest read set of a coverage read is every record in
+    /// the store, which makes every observation wake on every arrival.
+    fn coverage(
+        &self,
+        lineage: &BTreeSet<CollectionHandle>,
+    ) -> Result<Coverage, Self::RecordsError>
     where
         Self: Sized + BlobStoreGet + CapabilityProofRead,
     {
+        let _ = lineage;
         Ok(coverage_of(self)?.published().clone())
     }
 
