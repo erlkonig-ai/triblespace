@@ -107,9 +107,12 @@ impl SuccinctBackend {
 pub enum Command {
     /// Register one named root collection and print its exact handle.
     ///
-    /// The existing signing key becomes the direct READ and WRITE root. This
-    /// stores only the canonical descriptor closure: it does not create a
-    /// synthetic commit, and repeating it is idempotent.
+    /// Without `--root`, the existing signing key becomes the direct READ
+    /// and WRITE root. With `--root` the listed public keys are the roots
+    /// and `--threshold` of them must support an admission; no signing key
+    /// is needed, because a descriptor is content. Root order does not
+    /// change the handle. This stores only the canonical descriptor closure:
+    /// it does not create a synthetic commit, and repeating it is idempotent.
     Init {
         /// Path to the pile file to update.
         pile: PathBuf,
@@ -117,8 +120,17 @@ pub enum Command {
         name: String,
         /// Existing READ/WRITE-root signing key. Defaults to TRIBLESPACE_KEY
         /// or self.key beside the pile; a missing key is never created.
+        /// Ignored when `--root` is given.
         #[arg(long)]
         key: Option<PathBuf>,
+        /// A READ and WRITE root's Ed25519 public key (hex or z-base-32).
+        /// Repeat for several roots.
+        #[arg(long = "root")]
+        roots: Vec<String>,
+        /// How many of the roots must support an admission. Defaults to 1.
+        /// Requires `--root`.
+        #[arg(long)]
+        threshold: Option<u32>,
     },
     /// List every collection the pile references, named ones first.
     ///
@@ -428,7 +440,13 @@ pub enum DeriveKind {
 
 pub fn run(cmd: Command) -> Result<()> {
     match cmd {
-        Command::Init { pile, name, key } => run_init(pile, name, key),
+        Command::Init {
+            pile,
+            name,
+            key,
+            roots,
+            threshold,
+        } => run_init(pile, name, key, roots, threshold),
         Command::List {
             path,
             named,
@@ -540,24 +558,38 @@ pub fn run(cmd: Command) -> Result<()> {
     }
 }
 
-fn run_init(path: PathBuf, name: String, key: Option<PathBuf>) -> Result<()> {
-    let key_path = triblespace_core::signing_key_file::resolve_path(key.as_deref(), &path);
-    let root = triblespace_core::signing_key_file::load_existing(&key_path).map_err(|error| {
-        anyhow!(
-            "load collection-root signing key {}: {error}",
-            key_path.display()
-        )
-    })?;
+fn run_init(
+    path: PathBuf,
+    name: String,
+    key: Option<PathBuf>,
+    roots: Vec<String>,
+    threshold: Option<u32>,
+) -> Result<()> {
+    let admission = if roots.is_empty() {
+        if threshold.is_some() {
+            bail!("--threshold needs at least one --root");
+        }
+        let key_path = triblespace_core::signing_key_file::resolve_path(key.as_deref(), &path);
+        let root =
+            triblespace_core::signing_key_file::load_existing(&key_path).map_err(|error| {
+                anyhow!(
+                    "load collection-root signing key {}: {error}",
+                    key_path.display()
+                )
+            })?;
+        AdmissionPolicy::direct(root.verifying_key())
+    } else {
+        let roots = roots
+            .iter()
+            .map(|root| parse_recipient_key(root))
+            .collect::<Result<Vec<_>>>()?;
+        AdmissionPolicy::quorum(roots, threshold.unwrap_or(1), None)
+            .map_err(|error| anyhow!("invalid root quorum: {error}"))?
+    };
 
     let mut pile = open_refreshed(&path)?;
     let handle_res = pile
-        .collection(
-            &name,
-            CollectionPolicy::new(
-                AdmissionPolicy::direct(root.verifying_key()),
-                AdmissionPolicy::direct(root.verifying_key()),
-            ),
-        )
+        .collection(&name, CollectionPolicy::new(admission.clone(), admission))
         .map(|collection| collection.handle())
         .map_err(|error| anyhow!("register collection descriptor: {error}"));
     let close_res = pile

@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `pile collection init --root <key> --root <key> --threshold N` mints a root
+  collection whose READ and WRITE policy is a quorum over the listed public
+  keys; no signing key is needed, because a descriptor is content, and root
+  order does not change the handle. Without `--root` the command still makes
+  the signing key the single direct root.
+
 ### Changed
 
 - `pile compact` leaves behind a retired equation frame whose current signed

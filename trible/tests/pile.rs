@@ -1,5 +1,5 @@
 use assert_cmd::Command;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use predicates::prelude::*;
 use tempfile::tempdir;
 use triblespace::prelude::BlobStoreGet;
@@ -721,6 +721,95 @@ fn collection_init_requires_an_existing_signing_key() {
 
     assert!(!key_path.exists());
     assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), 0);
+}
+
+#[test]
+fn collection_init_with_roots_mints_a_quorum_without_a_key_and_ignores_root_order() {
+    use triblespace::prelude::TryToInline;
+
+    let dir = tempdir().unwrap();
+    let pile_path = dir.path().join("quorum.pile");
+    std::fs::File::create(&pile_path).unwrap();
+    // No signing key anywhere near the pile: a descriptor is content.
+    let roots: Vec<VerifyingKey> = [11u8, 12, 13]
+        .into_iter()
+        .map(|byte| SigningKey::from_bytes(&[byte; 32]).verifying_key())
+        .collect();
+    let hex_of = |key: &VerifyingKey| hex::encode(key.to_bytes());
+
+    let invoke = |order: [usize; 3]| {
+        let mut command = Command::cargo_bin("trible").unwrap();
+        command
+            .args(["pile", "collection", "init"])
+            .arg(&pile_path)
+            .arg("colony")
+            .args(["--threshold", "2"]);
+        for index in order {
+            command.arg("--root").arg(hex_of(&roots[index]));
+        }
+        command.output().unwrap()
+    };
+
+    let first = invoke([0, 1, 2]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let output = std::str::from_utf8(&first.stdout).unwrap();
+    assert!(predicate::str::is_match(r"^blake3:[0-9a-f]{64}\n$")
+        .unwrap()
+        .eval(output));
+    let encoded: Inline<Hash<Blake3>> = output.trim().try_to_inline().unwrap();
+    let handle = encoded.into();
+    let first_len = std::fs::metadata(&pile_path).unwrap().len();
+
+    // The quorum canonicalises its roots, so the order on the command line
+    // does not mint a second collection.
+    let second = invoke([2, 0, 1]);
+    assert!(second.status.success());
+    assert_eq!(second.stdout, first.stdout);
+    assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), first_len);
+
+    let mut pile = Pile::open(&pile_path).unwrap();
+    let snapshot = pile.snapshot().unwrap();
+    let descriptor_blob: Blob<SimpleArchive> = snapshot.get(handle).unwrap();
+    let facts = <TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(descriptor_blob).unwrap();
+    let quorum = AdmissionPolicy::quorum(roots.iter().copied(), 2, None).unwrap();
+    assert_eq!(
+        descriptor::policy(&facts).unwrap(),
+        CollectionPolicy::new(quorum.clone(), quorum)
+    );
+    drop(snapshot);
+    pile.close().unwrap();
+
+    // A threshold the roots cannot meet, and a threshold without roots, are
+    // refused before anything is written.
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "collection", "init"])
+        .arg(&pile_path)
+        .arg("too-strict")
+        .args(["--threshold", "4"])
+        .arg("--root")
+        .arg(hex_of(&roots[0]))
+        .arg("--root")
+        .arg(hex_of(&roots[1]))
+        .arg("--root")
+        .arg(hex_of(&roots[2]))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid root quorum"));
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "collection", "init"])
+        .arg(&pile_path)
+        .arg("keyless")
+        .args(["--threshold", "2"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("needs at least one --root"));
+    assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), first_len);
 }
 
 #[test]
