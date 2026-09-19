@@ -51,7 +51,7 @@ use crate::capability::{
     CapabilityProof, CapabilityProofId, CAPABILITY_PROOF_EDGE_LEN, CAPABILITY_PROOF_HEADER_LEN,
     CAPABILITY_PROOF_MAGIC, MAX_CAPABILITY_PROOF_STEPS,
 };
-use crate::collection::coverage::{Coverage, CoverageIndex, StoreWriters};
+use crate::collection::coverage::{Coverage, CoverageArrivals, CoverageIndex, StoreWriters};
 use crate::collection::store::{selectors_match_record, CollectionRead};
 pub use crate::collection::LegacyUnsignedCollectionEquation;
 use crate::collection::{
@@ -2756,18 +2756,6 @@ pub struct Pile {
 /// Only arrivals something is actually waiting on are recorded: the blob arm
 /// probes the backlog before pushing, so an ordinary payload blob costs one
 /// map lookup and nothing else.
-#[derive(Debug, Default)]
-struct CoverageArrivals {
-    descriptors: Vec<CollectionHandle>,
-    proofs: bool,
-}
-
-impl CoverageArrivals {
-    fn woke_anything(&self) -> bool {
-        !self.descriptors.is_empty() || self.proofs
-    }
-}
-
 fn padding_for_blob(blob_size: usize) -> usize {
     (BLOB_ALIGNMENT - ((BLOB_HEADER_LEN + blob_size) % BLOB_ALIGNMENT)) % BLOB_ALIGNMENT
 }

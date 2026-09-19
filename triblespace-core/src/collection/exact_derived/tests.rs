@@ -556,6 +556,16 @@ impl CollectionRead for GuardSnapshot {
             .push(selectors.clone());
         self.inner.select_records(selectors)
     }
+
+    fn coverage(
+        &self,
+        lineage: &BTreeSet<crate::collection::CollectionHandle>,
+    ) -> Result<crate::collection::coverage::Coverage, Self::RecordsError>
+    where
+        Self: Sized + crate::repo::BlobStoreGet + crate::repo::CapabilityProofRead,
+    {
+        self.inner.coverage(lineage)
+    }
 }
 
 impl CapabilityProofRead for GuardSnapshot {

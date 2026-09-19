@@ -9,6 +9,7 @@ use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
 use crate::blob::{MemoryBlobStore, MemoryBlobStoreSnapshot, TryFromBlob};
 use crate::capability::{CapabilityProof, CapabilityProofId};
+use crate::collection::coverage::{Coverage, CoverageArrivals, CoverageIndex, StoreWriters};
 use crate::collection::store::selectors_match_record;
 use crate::collection::{
     CollectionRead, CollectionRecord, CollectionRecordFingerprint, CollectionRecordSelector,
@@ -45,6 +46,14 @@ pub struct MemoryRepo {
     collection_records: CollectionRecordIndex,
     /// Canonical complete capability proofs keyed by exact-body content id.
     capability_proofs: CapabilityProofIndex,
+    /// Downward coverage, folded incrementally as records arrive and settled
+    /// when a snapshot is taken -- the same arrangement a pile keeps across
+    /// appends. Without it every `coverage()` read is the trait default: a
+    /// full refold with an admission query per unadmitted record, which is
+    /// both the cost and, for a reader that must not repeat ancestors'
+    /// admission decisions, the wrong answer.
+    coverage: CoverageIndex,
+    coverage_arrivals: CoverageArrivals,
 }
 
 /// One O(1)-clone immutable observation of a [`MemoryRepo`].
@@ -58,6 +67,7 @@ pub struct MemoryRepoSnapshot {
     collection_records: CollectionRecordIndex,
     capability_proofs: CapabilityProofIndex,
     wants: HashSet<WantRequest>,
+    coverage: Coverage,
 }
 
 impl StoreSnapshot for MemoryRepoSnapshot {
@@ -88,12 +98,40 @@ impl SnapshotSource for MemoryRepo {
     type SnapshotError = Infallible;
 
     fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+        self.resolve_coverage();
         Ok(MemoryRepoSnapshot {
             blobs: self.blobs.snapshot()?,
             collection_records: self.collection_records.clone(),
             capability_proofs: self.capability_proofs.clone(),
             wants: self.wants.clone(),
+            coverage: self.coverage.published().clone(),
         })
+    }
+}
+
+impl MemoryRepo {
+    /// Decide every attestation parked since the last snapshot, and re-drive
+    /// any earlier decision that an arrival since then could change.
+    fn resolve_coverage(&mut self) {
+        let arrivals = std::mem::take(&mut self.coverage_arrivals);
+        if !self.coverage.has_fresh() && !arrivals.woke_anything() {
+            return;
+        }
+        let mut coverage = std::mem::take(&mut self.coverage);
+        let Ok(blobs) = self.blobs.snapshot();
+        let reader = MemoryRepoSnapshot {
+            blobs,
+            collection_records: self.collection_records.clone(),
+            capability_proofs: self.capability_proofs.clone(),
+            wants: self.wants.clone(),
+            coverage: Coverage::default(),
+        };
+        coverage.settle(
+            &StoreWriters::new(&reader),
+            arrivals.descriptors,
+            arrivals.proofs,
+        );
+        self.coverage = coverage;
     }
 }
 
@@ -234,6 +272,7 @@ impl CapabilityProofStore for MemoryRepo {
         }
         self.capability_proofs
             .insert(&Entry::with_value(&id.raw, proof));
+        self.coverage_arrivals.proofs = true;
         Ok(())
     }
 }
@@ -276,6 +315,16 @@ impl CollectionRead for MemoryRepoSnapshot {
             .filter(|record| selectors_match_record(selectors, *record))
             .collect())
     }
+
+    fn coverage(
+        &self,
+        _lineage: &BTreeSet<crate::collection::CollectionHandle>,
+    ) -> Result<Coverage, Self::RecordsError>
+    where
+        Self: Sized + BlobStoreGet + CapabilityProofRead,
+    {
+        Ok(self.coverage.clone())
+    }
 }
 
 impl CollectionStore for MemoryRepo {
@@ -292,6 +341,7 @@ impl CollectionStore for MemoryRepo {
         }
         self.collection_records
             .insert(&Entry::with_value(&fingerprint.raw(), record));
+        self.coverage.park_record(&record);
         Ok(())
     }
 }
@@ -304,7 +354,14 @@ impl crate::repo::BlobStorePut for MemoryRepo {
         T: IntoBlob<S>,
         Handle<S>: InlineEncoding,
     {
-        self.blobs.put(item)
+        let handle = self.blobs.put(item)?;
+        // A descriptor is an ordinary blob, so this is the arrival that can
+        // unblock an attestation parked on an unresolved lineage.
+        let descriptor = Inline::new(handle.raw);
+        if self.coverage.blob_arrived(descriptor) {
+            self.coverage_arrivals.descriptors.push(descriptor);
+        }
+        Ok(handle)
     }
 }
 

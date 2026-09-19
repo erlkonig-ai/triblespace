@@ -325,8 +325,26 @@ enum Awaiting {
     Proof(Inline<ED25519PublicKey>),
 }
 
+/// What arrived since the last settle that could change an earlier decision.
+///
+/// A parked attestation waits on a named thing: a descriptor blob that names
+/// a lineage, or any proof at all. A store records those arrivals as they
+/// happen and hands the batch to [`CoverageIndex::settle`] when it next
+/// publishes a snapshot, so an idle backlog costs a refresh nothing.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CoverageArrivals {
+    pub(crate) descriptors: Vec<CollectionHandle>,
+    pub(crate) proofs: bool,
+}
+
+impl CoverageArrivals {
+    pub(crate) fn woke_anything(&self) -> bool {
+        !self.descriptors.is_empty() || self.proofs
+    }
+}
+
 /// Downward coverage for every lattice node a store has admitted.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct CoverageIndex {
     /// The half a reader sees: result payload handle to the commits it covers.
     published: Coverage,
