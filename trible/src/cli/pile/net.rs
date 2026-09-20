@@ -10,8 +10,12 @@ use clap::{Parser, ValueEnum};
 use ed25519_dalek::SigningKey;
 use iroh_base::{EndpointAddr, EndpointId};
 use iroh_tickets::endpoint::EndpointTicket;
+use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::collection::CollectionHandle;
-use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
+use triblespace_core::collection::{
+    AdmissionPolicy, Collection, CollectionPolicy, CollectionStoreExt,
+};
+use triblespace_core::repo::SnapshotSource;
 use triblespace_core::repo::pile::Pile;
 use triblespace_net::health_record::{self, Recorder, DEFAULT_MAX_AGE, REPORT_EVERY};
 use triblespace_net::peer::{Peer, PeerConfig, ReconcileDirection, ReconcileQos};
@@ -110,6 +114,10 @@ pub enum Command {
         /// Reporting author, not the daemon's transport identity.
         #[arg(long)]
         key: Option<PathBuf>,
+        /// Read this existing health collection (descriptor handle) instead of
+        /// the key's own `swarm-health` generation.
+        #[arg(long, value_name = "HANDLE")]
+        collection: Option<String>,
         /// Maximum report age accepted by this reader; producer expiry is ignored.
         #[arg(
             long,
@@ -195,6 +203,11 @@ pub enum Command {
         /// The health collection is not automatically activated for sync.
         #[arg(long, value_name = "PATH")]
         health_key: Option<PathBuf>,
+        /// Record swarm health into this existing collection (descriptor
+        /// handle) instead of the reporting key's own `swarm-health`
+        /// generation; the key must be admitted there. Requires --health-key.
+        #[arg(long, value_name = "HANDLE", requires = "health_key")]
+        health_collection: Option<String>,
         #[command(flatten)]
         telemetry: telemetry::Options,
         /// Stop after at most N seconds.
@@ -209,7 +222,12 @@ pub enum Command {
 pub fn run(command: Command) -> Result<()> {
     match command {
         Command::Identity { key } => run_identity(key),
-        Command::Health { pile, key, max_age } => run_health(pile, key, max_age),
+        Command::Health {
+            pile,
+            key,
+            collection,
+            max_age,
+        } => run_health(pile, key, collection, max_age),
         Command::Dashboard {
             pile,
             key,
@@ -242,6 +260,7 @@ pub fn run(command: Command) -> Result<()> {
             replication,
             provider_publication_budget,
             health_key,
+            health_collection,
             telemetry,
             duration,
             quiescent_for,
@@ -256,6 +275,7 @@ pub fn run(command: Command) -> Result<()> {
             replication.into(),
             provider_publication_budget,
             health_key,
+            health_collection,
             telemetry,
             duration,
             quiescent_for,
@@ -284,6 +304,7 @@ fn run_sync(
     replication: ReplicationMode,
     provider_publication_budget: Option<u64>,
     health_key_path: Option<PathBuf>,
+    health_collection_value: Option<String>,
     telemetry_options: telemetry::Options,
     duration: Option<u64>,
     quiescent_for: Option<u64>,
@@ -310,13 +331,10 @@ fn run_sync(
         .transpose()?;
     let mut recorder = Recorder::new(key.verifying_key());
     let health_collection = if let Some(signer) = reporting_key.as_ref() {
-        let authority = signer.verifying_key();
-        let collection = pile.collection(
-            health_record::COLLECTION_NAME,
-            CollectionPolicy::new(
-                AdmissionPolicy::direct(authority),
-                AdmissionPolicy::direct(authority),
-            ),
+        let collection = open_health_collection(
+            &mut pile,
+            signer.verifying_key(),
+            health_collection_value.as_deref(),
         )?;
         // Publish before endpoint startup: failure to start must not look like
         // a monitor that was never configured at all.
@@ -482,7 +500,37 @@ fn run_sync(
     result.and(close)
 }
 
-fn run_health(pile_path: PathBuf, key_path: Option<PathBuf>, max_age: u64) -> Result<()> {
+/// The health collection reports go into: an explicit existing generation by
+/// handle, or the reporting key's own `swarm-health` generation (a direct
+/// policy on both sides, so the generation is a function of the key).
+fn open_health_collection(
+    pile: &mut Pile,
+    authority: ed25519_dalek::VerifyingKey,
+    value: Option<&str>,
+) -> Result<Collection<SimpleArchive>> {
+    match value {
+        Some(value) => {
+            let handle = parse_collection(value)?;
+            let snapshot = pile.snapshot()?;
+            Collection::<SimpleArchive>::open(&snapshot, handle)
+                .map_err(|error| anyhow!("open health collection {value}: {error}"))
+        }
+        None => Ok(pile.collection(
+            health_record::COLLECTION_NAME,
+            CollectionPolicy::new(
+                AdmissionPolicy::direct(authority),
+                AdmissionPolicy::direct(authority),
+            ),
+        )?),
+    }
+}
+
+fn run_health(
+    pile_path: PathBuf,
+    key_path: Option<PathBuf>,
+    collection_value: Option<String>,
+    max_age: u64,
+) -> Result<()> {
     use health_record::{attrs, KIND_REPORT};
     use triblespace_core::blob::encodings::succinctarchive::{
         OrderedUniverse, SuccinctArchiveBlob, UnionArchive,
@@ -494,13 +542,12 @@ fn run_health(pile_path: PathBuf, key_path: Option<PathBuf>, max_age: u64) -> Re
 
     let signer = load_existing_key(key_path, &pile_path)?;
     let authority = signer.verifying_key();
-    let policy = CollectionPolicy::new(
-        AdmissionPolicy::direct(authority),
-        AdmissionPolicy::direct(authority),
-    );
     let mut pile = open_pile(&pile_path)?;
     let result = (|| -> Result<()> {
-        let source = pile.collection(health_record::COLLECTION_NAME, policy.clone())?;
+        let source = open_health_collection(&mut pile, authority, collection_value.as_deref())?;
+        // Derived chains carry the source's policy, so an explicit shared
+        // generation yields the same chain handles every reader derives.
+        let policy = source.policy(&pile.snapshot()?)?;
         let facts = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
         let latest = pile.derive::<LwwRegisterBlob>(
             source,
@@ -683,6 +730,45 @@ mod tests {
             Command::try_parse_from(["net", "health", "test.pile"]).unwrap(),
             Command::Health { .. }
         ));
+    }
+
+    #[test]
+    fn an_explicit_health_collection_needs_the_reporting_key() {
+        let handle = hex::encode([0xCD; 32]);
+        assert!(Command::try_parse_from([
+            "net",
+            "sync",
+            "test.pile",
+            "--collection",
+            &handle,
+            "--health-collection",
+            &handle,
+        ])
+        .is_err());
+        let Command::Sync {
+            health_collection, ..
+        } = Command::try_parse_from([
+            "net",
+            "sync",
+            "test.pile",
+            "--collection",
+            &handle,
+            "--health-key",
+            "observer.key",
+            "--health-collection",
+            &handle,
+        ])
+        .unwrap() else {
+            panic!("sync expected")
+        };
+        assert_eq!(health_collection.as_deref(), Some(handle.as_str()));
+        let Command::Health { collection, .. } =
+            Command::try_parse_from(["net", "health", "test.pile", "--collection", &handle])
+                .unwrap()
+        else {
+            panic!("health expected")
+        };
+        assert_eq!(collection.as_deref(), Some(handle.as_str()));
     }
 
     #[test]

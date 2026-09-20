@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
+- `pile net sync --health-collection <handle>` (with `--health-key`) and
+  `pile net health --collection <handle>` report into and read from an
+  explicit existing health generation instead of the reporting key's own
+  `swarm-health` generation, whose identity is a function of that key. The
+  derived health chains take the source's policy, so every reader of a shared
+  generation derives the same chain handles.
 - `pile collection init --root <key> --root <key> --threshold N` mints a root
   collection whose READ and WRITE policy is a quorum over the listed public
   keys; no signing key is needed, because a descriptor is content, and root
