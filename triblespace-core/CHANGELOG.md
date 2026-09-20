@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `join_images` on `CollectionDerivation` and `CollectionMapping` no longer
+  takes a source union; it is the mapping's own route for joining two
+  images, defaulting to the encoding's `join_members`. The Rank9 route that
+  reused the raw union's bytes is gone, with the `source_union` parameter of
+  the archive merge. A source merge is mirrored by joining the two images
+  and recording `MERGE(image a, image b) -> image c` beside `DERIVE(c ->
+  image c)`, true by the homomorphism law; the merged source node is neither
+  read nor required to be resident, and the source frontier comes from the
+  index. The carry's absorbing merge takes the pairwise form whenever
+  exactly the two dominated images stand for their dominator. Rank9's tier
+  carry joins now instead of declining.
+
 - Remove the exact collection API. `ensure_exact`, `ensure_exact_with`,
   `maintain_exact`, `maintain_exact_with` and `collection_exact` are gone,
   and `CollectionRealization::ensure`/`maintain` take no support. A derived

@@ -28,7 +28,7 @@ use std::fmt;
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::succinctarchive::{
-    merge_accelerated_archives_with_source_union, merge_ordered_archives, OrderedUniverse,
+    merge_ordered_archives, OrderedUniverse,
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchive, SuccinctArchiveBlob,
     SuccinctArchiveRawBuildError, SuccinctArchiveRawMergeError,
 };
@@ -408,31 +408,6 @@ impl CollectionDerivation for Rank9AcceleratedSuccinctArchiveBlob {
             .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
 
-    fn join_images<R>(
-        _argument: &Self::Argument,
-        _target_descriptor: &Fragment,
-        source_union: Option<&Blob<Self::Source>>,
-        low: &Blob<Self>,
-        high: &Blob<Self>,
-        reader: &R,
-    ) -> Result<Option<Blob<Self>>, CollectionOperationError>
-    where
-        R: BlobStoreGet + BlobStoreMeta,
-    {
-        let Some(source_union) = source_union else {
-            return Ok(None);
-        };
-        let (_, low) = attach_rank9(low, reader)?;
-        let (_, high) = attach_rank9(high, reader)?;
-        // The accepted source equation supplies the exact resident raw union.
-        // Its existence already demonstrates raw capacity, even when summed
-        // child sizes overestimate the union. Reuse its bytes and cached handle
-        // without reconstructing it or replaying that equation.
-        Ok(Some(merge_accelerated_archives_with_source_union(
-            &[low, high],
-            source_union,
-        )))
-    }
 }
 
 /// A collection descriptor participating in a validation failure.
@@ -820,11 +795,7 @@ mod tests {
 
     use crate::blob::IntoBlob;
     use crate::collection::descriptor::identity_for_tests;
-    use crate::collection::encoding::CanonicalDerivation;
     use crate::collection::simplearchive_union;
-    use crate::collection::CollectionMapping;
-    use crate::repo::memoryrepo::MemoryRepo;
-    use crate::repo::{BlobStorePut, SnapshotSource};
     use crate::trible::{Trible, TribleSet, TRIBLE_LEN};
 
     fn authority() -> ed25519_dalek::VerifyingKey {
@@ -1023,102 +994,6 @@ mod tests {
             data_identity(&merge_after_derive),
         );
         validate_merge(&target_descriptor, &merge, low, high, &merge_after_derive).unwrap();
-    }
-
-    #[test]
-    fn default_join_images_uses_the_ordinary_join_with_or_without_a_source_union() {
-        let left = archive([row(1, 9, 3), row(2, 9, 4)]);
-        let right = archive([row(2, 9, 4), row(3, 9, 5)]);
-        let source_union = simplearchive_union::join(&left, &right).unwrap();
-        let low = derive_element(&left).unwrap();
-        let high = derive_element(&right).unwrap();
-        let expected = join(&low, &high).unwrap();
-        let mut store = MemoryRepo::default();
-        let handle = store.put::<SimpleArchive, _>(source_union).unwrap();
-        let snapshot = store.snapshot().unwrap();
-        let source_union = snapshot.get::<Blob<SimpleArchive>, _>(handle).unwrap();
-        let mapping = CanonicalDerivation::<SuccinctArchiveBlob>::new(());
-
-        for source_union in [None, Some(&source_union)] {
-            let joined = mapping
-                .join_images(&Fragment::empty(), source_union, &low, &high, &snapshot)
-                .unwrap()
-                .unwrap();
-            assert_eq!(joined.bytes, expected.bytes);
-            assert_eq!(joined.get_handle(), expected.get_handle());
-        }
-    }
-
-    #[test]
-    fn rank9_join_images_reuses_the_resident_union_for_overlap_and_reversed_children() {
-        let left = derive_element(&archive([row(1, 9, 3), row(2, 9, 4)])).unwrap();
-        let right = derive_element(&archive([row(2, 9, 4), row(3, 9, 5)])).unwrap();
-        let source_union = join(&left, &right).unwrap();
-        let low = SuccinctArchive::<OrderedUniverse>::build_accelerated_root(left.clone()).unwrap();
-        let high =
-            SuccinctArchive::<OrderedUniverse>::build_accelerated_root(right.clone()).unwrap();
-        let expected =
-            SuccinctArchive::<OrderedUniverse>::build_accelerated_root(source_union.clone())
-                .unwrap();
-        let source_handle = source_union.get_handle();
-        let mut store = MemoryRepo::default();
-        for raw in [left, right, source_union] {
-            store.put::<SuccinctArchiveBlob, _>(raw).unwrap();
-        }
-        let snapshot = store.snapshot().unwrap();
-        let source_union = snapshot
-            .get::<Blob<SuccinctArchiveBlob>, _>(source_handle)
-            .unwrap();
-        let mapping = CanonicalDerivation::<Rank9AcceleratedSuccinctArchiveBlob>::new(());
-
-        for (low, high) in [(&low, &high), (&high, &low)] {
-            let joined = mapping
-                .join_images(
-                    &Fragment::empty(),
-                    Some(&source_union),
-                    low,
-                    high,
-                    &snapshot,
-                )
-                .unwrap()
-                .unwrap();
-            assert_eq!(joined.bytes, expected.bytes);
-            assert_eq!(joined.get_handle(), expected.get_handle());
-            assert_eq!(
-                Rank9AcceleratedSuccinctArchiveBlob::source_handle(&joined).unwrap(),
-                source_handle,
-            );
-            SuccinctArchive::<OrderedUniverse>::from_accelerated_parts(
-                source_union.clone(),
-                joined,
-            )
-            .unwrap();
-        }
-    }
-
-    #[test]
-    fn rank9_join_images_without_a_witness_declines_before_reading_children() {
-        let left = derive_element(&archive([row(1, 9, 3)])).unwrap();
-        let right = derive_element(&archive([row(2, 9, 4)])).unwrap();
-        let low = SuccinctArchive::<OrderedUniverse>::build_accelerated_root(left).unwrap();
-        let high = SuccinctArchive::<OrderedUniverse>::build_accelerated_root(right).unwrap();
-        let mut store = MemoryRepo::default();
-        let snapshot = store.snapshot().unwrap();
-        let mapping = CanonicalDerivation::<Rank9AcceleratedSuccinctArchiveBlob>::new(());
-
-        assert_eq!(
-            mapping.join_images(&Fragment::empty(), None, &low, &high, &snapshot),
-            Ok(None),
-        );
-        assert!(matches!(
-            Rank9AcceleratedSuccinctArchiveBlob::join_members(
-                &Fragment::empty(),
-                &low,
-                &high,
-                &snapshot,
-            ),
-            Err(CollectionOperationError::MissingDependency(_)),
-        ));
     }
 
     #[test]

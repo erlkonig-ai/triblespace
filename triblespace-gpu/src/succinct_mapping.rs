@@ -79,7 +79,6 @@ where
     fn join_images<R>(
         &self,
         target_descriptor: &Fragment,
-        _source_union: Option<&Blob<SimpleArchive>>,
         low: &Blob<SuccinctArchiveBlob>,
         high: &Blob<SuccinctArchiveBlob>,
         reader: &R,

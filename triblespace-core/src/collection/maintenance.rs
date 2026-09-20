@@ -31,7 +31,7 @@ use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::Blob;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
-use crate::repo::{BlobStoreGet, Store, StoreRead};
+use crate::repo::{BlobStoreGet, BlobStoreMeta, Store, StoreRead};
 use crate::trible::Fragment;
 
 use super::coverage::{Coverage, CoverageSet};
@@ -537,15 +537,19 @@ where
     }
 }
 
-/// Reuse coarsening already paid for by the source. This is optional
-/// maintenance over a current target, never coverage repair or upstream work.
+/// Mirror the source's merges without the source's bytes.
 ///
-/// A resident source frontier node that no single image covers, while its
-/// support is covered by several, gets one image: when exactly two images
-/// sit beneath it and stand for all of it, the mapping may join them with
-/// the source union in hand and the join is published as a MERGE beside the
-/// DERIVE; otherwise the node is mapped. Without target WRITE authority, the
-/// existing finer realization is retained.
+/// A source frontier node that no single image covers, while exactly two
+/// images together stand for it, gets its image by joining those two with
+/// the target encoding's own join: `map(a) join map(b)` is `map(a join b)`
+/// by the homomorphism law, so the result is the merged node's image and the
+/// source's merge is recorded one level down, `MERGE(image a, image b) ->
+/// image c`, beside `DERIVE(c -> image c)`. Only the images move; the merged
+/// source node is neither read nor required to be here, which is what lets
+/// a replica hold the algebra, the authority, and the last derived layer
+/// alone. When the join declines, or more than two images sit under the
+/// node, the node is mapped if its bytes are here. Without target WRITE
+/// authority the finer realization is retained.
 fn coarsen_images<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
@@ -557,14 +561,24 @@ where
     S: Store,
     M: CollectionMapping,
 {
-    let source = Collection::<M::Source>::from_handle(bound.source);
     let mut attempted = BTreeSet::new();
     loop {
         let snapshot = open(store, frontier, "open source-guided maintenance snapshot")?;
         let coverage = coverage_of(&snapshot, &bound.handles)?;
         let targets = select(&snapshot, &coverage, target, &|_| true)?;
-        let sources = select(&snapshot, &coverage, source, &|_| true)?;
-        let candidate = sources.cover.iter().find(|(node, support)| {
+        // The source's frontier from the index, widest first, bytes or not.
+        let mut sources: Vec<Node> = coverage
+            .frontier(bound.source)
+            .filter_map(|node| coverage.of(bound.source, node).map(|support| (node, support.clone())))
+            .collect();
+        sources.sort_by(|left, right| {
+            right
+                .1
+                .len()
+                .cmp(&left.1.len())
+                .then_with(|| left.0.raw.cmp(&right.0.raw))
+        });
+        let candidate = sources.into_iter().find(|(node, support)| {
             !attempted.contains(node)
                 && support <= &targets.covered
                 && !targets
@@ -572,18 +586,13 @@ where
                     .iter()
                     .any(|(_, image)| support <= image)
         });
-        let Some((input_data, support)) = candidate.cloned() else {
+        let Some((input_data, support)) = candidate else {
             return Ok(());
         };
         if !producer_is_admitted(&snapshot, target, signing_key)? {
             return Ok(());
         }
         attempted.insert(input_data);
-        let input: Blob<M::Source> = snapshot
-            .get(Handle::<M::Source>::from_hash(input_data))
-            .map_err(|error| {
-                CollectionRealizationError::storage("load resident source coarsening", error)
-            })?;
         let under: Vec<&Node> = targets
             .cover
             .iter()
@@ -598,23 +607,17 @@ where
                 let low_blob: Blob<M::Target> = snapshot
                     .get(Handle::<M::Target>::from_hash(low))
                     .map_err(|error| {
-                        CollectionRealizationError::storage("load lower reusable target image", error)
+                        CollectionRealizationError::storage("load lower image to join", error)
                     })?;
                 let high_blob: Blob<M::Target> = snapshot
                     .get(Handle::<M::Target>::from_hash(high))
                     .map_err(|error| {
-                        CollectionRealizationError::storage(
-                            "load higher reusable target image",
-                            error,
-                        )
+                        CollectionRealizationError::storage("load higher image to join", error)
                     })?;
-                match bound.mapping.join_images(
-                    &bound.descriptor,
-                    Some(&input),
-                    &low_blob,
-                    &high_blob,
-                    &snapshot,
-                ) {
+                match bound
+                    .mapping
+                    .join_images(&bound.descriptor, &low_blob, &high_blob, &snapshot)
+                {
                     Ok(Some(output)) => joined = Some((output, low, high)),
                     Ok(None)
                     | Err(CollectionOperationError::Capacity(_))
@@ -627,22 +630,38 @@ where
         }
         let (output, pair) = match joined {
             Some((output, low, high)) => (output, Some((low, high))),
-            None => match bound.mapping.map(&input, &snapshot) {
-                Ok(output) => (output, None),
-                Err(CollectionOperationError::Capacity(_))
-                | Err(CollectionOperationError::MissingDependency(_)) => continue,
-                Err(CollectionOperationError::Fatal(reason)) => {
-                    return Err(CollectionRealizationError::Derive {
-                        input: input_data,
-                        reason,
-                    });
+            None => {
+                let resident = snapshot
+                    .metadata(Handle::<M::Source>::from_hash(input_data))
+                    .map_err(|error| {
+                        CollectionRealizationError::storage("inspect merged source node", error)
+                    })?
+                    .is_some();
+                if !resident {
+                    continue;
                 }
-            },
+                let input: Blob<M::Source> = snapshot
+                    .get(Handle::<M::Source>::from_hash(input_data))
+                    .map_err(|error| {
+                        CollectionRealizationError::storage("load merged source node", error)
+                    })?;
+                match bound.mapping.map(&input, &snapshot) {
+                    Ok(output) => (output, None),
+                    Err(CollectionOperationError::Capacity(_))
+                    | Err(CollectionOperationError::MissingDependency(_)) => continue,
+                    Err(CollectionOperationError::Fatal(reason)) => {
+                        return Err(CollectionRealizationError::Derive {
+                            input: input_data,
+                            reason,
+                        });
+                    }
+                }
+            }
         };
         drop(snapshot);
         let output_data = data_identity::<M::Target>(&output);
         store.put::<M::Target, _>(output).map_err(|error| {
-            CollectionRealizationError::storage("store source-guided target member", error)
+            CollectionRealizationError::storage("store mirrored target member", error)
         })?;
         if let Some((low, high)) = pair {
             publish(
@@ -655,7 +674,7 @@ where
                     high,
                     output_data,
                 )),
-                "publish source-guided target MERGE",
+                "publish mirrored target MERGE",
             )?;
         }
         publish(
@@ -667,7 +686,7 @@ where
                 input_data,
                 output_data,
             )),
-            "publish source-guided target DERIVE",
+            "publish mirrored target DERIVE",
         )?;
     }
 }
@@ -698,11 +717,7 @@ where
         signing_key,
         &handles,
         frontier,
-        |descriptor, low, high, reader| {
-            bound
-                .mapping
-                .join_images(descriptor, None, low, high, reader)
-        },
+        |descriptor, low, high, reader| bound.mapping.join_images(descriptor, low, high, reader),
     )
 }
 
@@ -771,25 +786,48 @@ where
         if nodes.len() < 2 {
             return Ok(());
         }
-        // A node inside another's support is consumed by that node. Two nodes
+        // A node inside another's support is consumed by that node, its
+        // widest dominator. When exactly two nodes under one dominator stand
+        // for all of it together, the record is the source's own merge one
+        // level down, "a joined with b is c", true by the homomorphism law;
+        // otherwise each is absorbed by "a joined with c is c". Two nodes
         // with one support keep the lower one, which is also the one a reader
-        // keeps.
-        let mut dominated = Vec::new();
+        // keeps. No bytes are loaded for any of this.
+        let mut under: BTreeMap<CollectionData, Vec<(CollectionData, &CoverageSet)>> =
+            BTreeMap::new();
         for (node, support) in &nodes {
             let dominator = nodes.iter().find(|(other, wider)| {
                 other != node && support <= wider && (support != wider || node.raw > other.raw)
             });
             if let Some((other, _)) = dominator {
-                dominated.push((*node, *other));
+                under.entry(*other).or_default().push((*node, support));
             }
         }
-        if !dominated.is_empty() {
+        if !under.is_empty() {
             if !producer_is_admitted(&snapshot, target, signing_key)? {
                 return Ok(());
             }
+            let mut merges = Vec::new();
+            for (result, members) in under {
+                let wider = nodes
+                    .iter()
+                    .find(|(node, _)| *node == result)
+                    .map(|(_, support)| support)
+                    .expect("a dominator is a frontier node");
+                if let [(left, left_support), (right, right_support)] = members[..] {
+                    let mut union = (*left_support).clone();
+                    union.union((*right_support).clone());
+                    if &union == wider {
+                        merges.push((ordered(left, right), result));
+                        continue;
+                    }
+                }
+                for (node, _) in members {
+                    merges.push((ordered(node, result), result));
+                }
+            }
             drop(snapshot);
-            for (node, result) in dominated {
-                let (low, high) = ordered(node, result);
+            for ((low, high), result) in merges {
                 publish(
                     store,
                     frontier,
