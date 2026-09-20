@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `trible pile diagnose conflicts <PILE>` lists MERGE and DERIVE equations
+  that name two results for one input set, with the keys that signed each
+  side, and exits non-zero when any exist. The lattice takes every signed
+  equation at its word and never recomputes a result, so this is the
+  functional check that reads and maintenance no longer perform.
+
 - `trible pile migrate endorse-unsigned-equations` is gone with the witness
   walk it stood on: reads and maintenance select from the coverage index and
   no longer re-resolve records, so there is nothing for a re-endorsement to

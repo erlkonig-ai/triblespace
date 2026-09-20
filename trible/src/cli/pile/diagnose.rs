@@ -45,6 +45,20 @@ pub enum Command {
         /// Path to the pile file to inspect
         pile: PathBuf,
     },
+    /// List equations that disagree: one input with two results.
+    ///
+    /// A MERGE names the join of two nodes and a DERIVE the image of one; the
+    /// lattice takes every signed equation at its word and never recomputes a
+    /// result to check it. Two records over the same inputs naming different
+    /// outputs are therefore a producer disagreeing with itself or with
+    /// another producer, which no reader can settle. This lists them by
+    /// collection with the keys that signed each side, and exits non-zero
+    /// when any exist. Admission is not checked here: a disagreement between
+    /// an admitted and an unadmitted producer is still worth a look.
+    Conflicts {
+        /// Path to the pile file to inspect
+        pile: PathBuf,
+    },
 }
 
 pub fn run(cmd: Command) -> Result<()> {
@@ -53,6 +67,7 @@ pub fn run(cmd: Command) -> Result<()> {
         Command::LocateHash { pile, handle } => locate_hash_in_pile(&pile, &handle),
         Command::RecordAt { pile, offset } => record_at(&pile, offset),
         Command::Census { pile } => census(&pile),
+        Command::Conflicts { pile } => conflicts(&pile),
     }
 }
 
@@ -903,4 +918,226 @@ fn census(path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// One input set of an equation, as a key: the collection it names and the
+/// node or nodes it reads.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum EquationInputs {
+    Merge {
+        collection: [u8; 32],
+        low: [u8; 32],
+        high: [u8; 32],
+    },
+    Derive {
+        target: [u8; 32],
+        input: [u8; 32],
+    },
+}
+
+fn conflicts(path: &Path) -> Result<()> {
+    use std::collections::{BTreeMap, BTreeSet};
+    use triblespace_core::collection::{CollectionRead, CollectionRecord};
+    use triblespace_core::repo::pile::Pile;
+    use triblespace_core::repo::SnapshotSource;
+
+    let mut pile = Pile::open(path).map_err(|error| super::pile_read_error(path, error))?;
+    let snapshot = pile
+        .snapshot()
+        .map_err(|error| super::pile_read_error(path, error))?;
+    // Every equation once: inputs -> (output -> the keys that signed it).
+    let mut equations: BTreeMap<EquationInputs, BTreeMap<[u8; 32], BTreeSet<[u8; 32]>>> =
+        BTreeMap::new();
+    let mut merges = 0usize;
+    let mut derives = 0usize;
+    for record in snapshot
+        .records()
+        .map_err(|error| anyhow::anyhow!("read collection records of {}: {error}", path.display()))?
+    {
+        let record = record
+            .map_err(|error| anyhow::anyhow!("read collection records of {}: {error}", path.display()))?;
+        let (inputs, output, signer) = match record {
+            CollectionRecord::Commit(_) => continue,
+            CollectionRecord::Merge(merge) => {
+                merges += 1;
+                let (low, high) = merge.inputs();
+                (
+                    EquationInputs::Merge {
+                        collection: merge.collection().raw,
+                        low: low.raw,
+                        high: high.raw,
+                    },
+                    merge.result().raw,
+                    merge.public_key().raw,
+                )
+            }
+            CollectionRecord::Derive(derive) => {
+                derives += 1;
+                (
+                    EquationInputs::Derive {
+                        target: derive.collection().raw,
+                        input: derive.input().raw,
+                    },
+                    derive.output().raw,
+                    derive.public_key().raw,
+                )
+            }
+        };
+        equations
+            .entry(inputs)
+            .or_default()
+            .entry(output)
+            .or_default()
+            .insert(signer);
+    }
+    let disagreeing: Vec<_> = equations
+        .iter()
+        .filter(|(_, outputs)| outputs.len() > 1)
+        .collect();
+    println!(
+        "{} MERGE and {} DERIVE record(s) over {} distinct input set(s) in {}",
+        merges,
+        derives,
+        equations.len(),
+        path.display()
+    );
+    if disagreeing.is_empty() {
+        println!("No equation names two results for one input set");
+        return Ok(());
+    }
+    let mut by_collection: BTreeMap<[u8; 32], usize> = BTreeMap::new();
+    for (inputs, _) in &disagreeing {
+        let collection = match inputs {
+            EquationInputs::Merge { collection, .. } => collection,
+            EquationInputs::Derive { target, .. } => target,
+        };
+        *by_collection.entry(*collection).or_default() += 1;
+    }
+    println!(
+        "{} input set(s) carry two or more results, in {} collection(s):",
+        disagreeing.len(),
+        by_collection.len()
+    );
+    for (collection, count) in &by_collection {
+        println!("  {} {:>8}", hex::encode(collection), count);
+    }
+    println!();
+    for (inputs, outputs) in &disagreeing {
+        match inputs {
+            EquationInputs::Merge {
+                collection,
+                low,
+                high,
+            } => println!(
+                "MERGE in {}\n  low  {}\n  high {}",
+                hex::encode(collection),
+                hex::encode(low),
+                hex::encode(high)
+            ),
+            EquationInputs::Derive { target, input } => println!(
+                "DERIVE into {}\n  input {}",
+                hex::encode(target),
+                hex::encode(input)
+            ),
+        }
+        for (output, signers) in outputs.iter() {
+            let signers: Vec<String> = signers.iter().map(hex::encode).collect();
+            println!("  -> {}  signed by {}", hex::encode(output), signers.join(", "));
+        }
+    }
+    anyhow::bail!(
+        "{} input set(s) name two or more results",
+        disagreeing.len()
+    )
+}
+
+#[cfg(test)]
+mod conflict_tests {
+    use super::conflicts;
+    use ed25519_dalek::SigningKey;
+    use triblespace_core::collection::{
+        CollectionDerive, CollectionMerge, CollectionRecord, CollectionStore,
+    };
+    use triblespace_core::inline::Inline;
+    use triblespace_core::repo::pile::Pile;
+
+    fn pile_with(records: impl IntoIterator<Item = CollectionRecord>) -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("equations.pile");
+        std::fs::File::create(&path).unwrap();
+        let mut pile = Pile::open(&path).unwrap();
+        for record in records {
+            pile.insert(record).unwrap();
+        }
+        pile.close().unwrap();
+        directory
+    }
+
+    #[test]
+    fn agreeing_equations_report_nothing_and_disagreeing_ones_fail() {
+        let one = SigningKey::from_bytes(&[1; 32]);
+        let two = SigningKey::from_bytes(&[2; 32]);
+        let collection = Inline::new([7; 32]);
+        let input = Inline::new([10; 32]);
+        let other = Inline::new([11; 32]);
+        let agreed = pile_with([
+            CollectionRecord::Derive(CollectionDerive::sign(
+                &one,
+                collection,
+                input,
+                Inline::new([20; 32]),
+            )),
+            // A second signer naming the same output agrees, and is one more
+            // key behind the same equation, not a conflict.
+            CollectionRecord::Derive(CollectionDerive::sign(
+                &two,
+                collection,
+                input,
+                Inline::new([20; 32]),
+            )),
+            CollectionRecord::Merge(CollectionMerge::sign(
+                &one,
+                collection,
+                input,
+                other,
+                Inline::new([30; 32]),
+            )),
+        ]);
+        conflicts(&agreed.path().join("equations.pile")).unwrap();
+
+        let disagreeing = pile_with([
+            CollectionRecord::Derive(CollectionDerive::sign(
+                &one,
+                collection,
+                input,
+                Inline::new([20; 32]),
+            )),
+            CollectionRecord::Derive(CollectionDerive::sign(
+                &two,
+                collection,
+                input,
+                Inline::new([21; 32]),
+            )),
+            // The same join named in either order is one input set.
+            CollectionRecord::Merge(CollectionMerge::sign(
+                &one,
+                collection,
+                input,
+                other,
+                Inline::new([30; 32]),
+            )),
+            CollectionRecord::Merge(CollectionMerge::sign(
+                &one,
+                collection,
+                other,
+                input,
+                Inline::new([31; 32]),
+            )),
+        ]);
+        let error = conflicts(&disagreeing.path().join("equations.pile")).unwrap_err();
+        assert!(
+            error.to_string().contains("2 input set(s)"),
+            "unexpected report: {error}"
+        );
+    }
 }

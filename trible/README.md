@@ -64,6 +64,9 @@ Run `trible <COMMAND>` to invoke a subcommand.
 - `pile create <PATH>` — initialize an empty pile, creating parent directories as needed.
 - `pile diagnose check <PILE>` — verify pile integrity.
 - `pile diagnose locate-hash <PILE> <HANDLE>` — scan raw pile bytes and report where a handle appears (blob header vs payload references).
+- `pile diagnose record-at <PILE> <OFFSET>` — decode the record at one exact byte offset.
+- `pile diagnose census <PILE>` — count records by kind with the bytes each kind occupies.
+- `pile diagnose conflicts <PILE>` — list MERGE and DERIVE equations that name two results for one input set, with the keys that signed each side; exits non-zero when any exist.
 - `pile compact <SOURCE> --into <DESTINATION>` — conservatively repack into a
   fresh pile. Every distinct valid blob and every distinct native collection,
   and proof record remains; active WANTs and legacy pins are projected once.
