@@ -504,7 +504,7 @@ impl<L: CollectionEncoding> Cover<L> {
     /// Whether every member of `self` is present in `other`.
     pub fn is_subset(&self, other: &Self) -> Result<bool, CoverAlgebraError> {
         self.ensure_same_collection(other)?;
-        Ok(self.members.difference(&other.members).is_empty())
+        Ok(self.members <= other.members)
     }
 
     /// Return the members added since an earlier observation.

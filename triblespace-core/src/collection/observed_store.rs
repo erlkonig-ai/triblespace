@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use crate::blob::encodings::UnknownBlob;
+use crate::patch::{IdentitySchema, PATCH};
 use crate::blob::{BlobEncoding, IntoBlob, TryFromBlob};
 use crate::capability::{CapabilityProof, CapabilityProofId};
 use crate::inline::encodings::hash::Handle;
@@ -228,6 +229,18 @@ impl<R: BlobStoreMeta> BlobStoreMeta for ObservedStore<R> {
     {
         self.observe_blob(handle);
         self.inner.metadata(handle)
+    }
+
+    fn resident(
+        &self,
+        handles: &PATCH<32, IdentitySchema, ()>,
+    ) -> Result<PATCH<32, IdentitySchema, ()>, Self::MetaError> {
+        // Every handle asked about is a dependency, present or not: the
+        // absent ones are what a later arrival changes.
+        for key in handles.iter_ordered() {
+            self.observe_blob(Inline::<Handle<UnknownBlob>>::new(*key));
+        }
+        self.inner.resident(handles)
     }
 }
 

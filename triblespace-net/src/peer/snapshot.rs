@@ -7,6 +7,7 @@ use std::future::Future;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, Weak};
 
+use triblespace_core::patch::{IdentitySchema, PATCH};
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::{BlobEncoding, TryFromBlob};
 use triblespace_core::capability::{CapabilityProof, CapabilityProofId};
@@ -280,6 +281,13 @@ where
         Handle<E>: InlineEncoding,
     {
         self.frozen.metadata(handle)
+    }
+
+    fn resident(
+        &self,
+        handles: &PATCH<32, IdentitySchema, ()>,
+    ) -> Result<PATCH<32, IdentitySchema, ()>, Self::MetaError> {
+        self.frozen.resident(handles)
     }
 }
 

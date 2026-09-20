@@ -4806,6 +4806,15 @@ impl crate::repo::BlobStoreMeta for PileFileSnapshot {
             Err(GetBlobError::ConversionError(error)) => match error {},
         }
     }
+
+    /// The occurrence relation projected at its hash segment is the resident
+    /// set; membership is one intersection, and no byte is validated here.
+    fn resident(
+        &self,
+        handles: &PATCH<32, IdentitySchema, ()>,
+    ) -> Result<PATCH<32, IdentitySchema, ()>, Self::MetaError> {
+        Ok(self.blobs.prefix_set::<32>().intersection(handles))
+    }
 }
 
 /// How a source pile's active wants participate in a retained rewrite.
@@ -9429,6 +9438,26 @@ mod tests {
             semantic_a.iter().collect::<BTreeSet<_>>(),
             semantic_b.iter().collect::<BTreeSet<_>>()
         );
+
+        // The resident set answers membership as one intersection, and says
+        // what per-handle metadata says, present or absent.
+        let absent = [0x5au8; 32];
+        let mut asked = PATCH::<32, IdentitySchema, ()>::new();
+        for key in [hash_a.raw, absent, hash_b.raw] {
+            asked.insert(&Entry::new(&key));
+        }
+        let resident = crate::repo::BlobStoreMeta::resident(&snapshot_a, &asked).unwrap();
+        assert_eq!(
+            resident.iter_ordered().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from([hash_a.raw, hash_b.raw])
+        );
+        assert!(resident <= asked);
+        assert!(crate::repo::BlobStoreMeta::metadata(
+            &snapshot_a,
+            Inline::<Handle<UnknownBlob>>::new(absent)
+        )
+        .unwrap()
+        .is_none());
         assert!(snapshot_a.blobs_diff(&snapshot_b).next().is_none());
         assert!(snapshot_b.blobs_diff(&snapshot_a).next().is_none());
 

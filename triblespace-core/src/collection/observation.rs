@@ -6,7 +6,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::repo::StoreRead;
+use crate::inline::Inline;
+use crate::repo::{BlobStoreMeta, StoreRead};
 use crate::trible::Fragment;
 
 use super::coverage::CoverageSet;
@@ -68,7 +69,8 @@ where
     E: CollectionEncoding,
 {
     let handle = target.handle();
-    let lineage_handles: BTreeSet<CollectionHandle> = lineage.descriptors.keys().copied().collect();
+    let lineage_handles: BTreeSet<CollectionHandle> =
+        lineage.descriptors.keys().copied().collect();
     // Settle the whole lineage on the untracked reader, then take the index
     // through the tracked one for the target alone: the target's frontier
     // moves only on the target's own records, so that is the honest read-set
@@ -87,22 +89,36 @@ where
     let coverage = observed
         .coverage(&charged)
         .map_err(|error| CollectionRealizationError::storage("read downward coverage", error))?;
+    let Some(frontier) = coverage.frontier_set(handle) else {
+        return Ok(None);
+    };
+    if frontier.is_empty() {
+        return Ok(None);
+    }
+    // Residency is the frontier intersected with the store's resident set:
+    // one set operation on the index, no byte validated. A record ahead of
+    // its bytes leaves a node out, and the walk knows how to attach that
+    // node's resident inputs instead.
+    let resident = observed
+        .resident(frontier)
+        .map_err(|error| CollectionRealizationError::storage("intersect frontier with residency", error))?;
+    if resident.len() != frontier.len() {
+        return Ok(None);
+    }
     let mut candidates = Vec::new();
-    for node in coverage.frontier(handle) {
+    for node in frontier.iter_ordered().map(|raw| Inline::new(*raw)) {
         let Some(support) = coverage.of(handle, node) else {
             return Ok(None);
         };
-        match collection_member_availability::<E, _>(node, observed).map_err(|error| {
-            CollectionRealizationError::storage("inspect target representation residency", error)
-        })? {
-            CollectionMemberAvailability::Complete => candidates.push((node, support)),
-            // A record ahead of its bytes: the walk falls back to the node's
-            // resident inputs, which the frontier no longer names.
-            _ => return Ok(None),
+        // An encoding may name representation dependencies beside a resident
+        // root; most name none, and this reads nothing then.
+        if !E::missing_representation_dependencies(node, observed)
+            .map_err(|error| CollectionRealizationError::Resolution(error.to_string()))?
+            .is_empty()
+        {
+            return Ok(None);
         }
-    }
-    if candidates.is_empty() {
-        return Ok(None);
+        candidates.push((node, support));
     }
     // Widest first, then drop every node whose support lies inside a kept
     // one: the image of a source node that a coarser image already covers
@@ -119,10 +135,7 @@ where
     let mut kept_supports: Vec<&CoverageSet> = Vec::new();
     let mut union = CoverageSet::new();
     for (node, support) in candidates {
-        if kept_supports
-            .iter()
-            .any(|wider| support.difference(wider).is_empty())
-        {
+        if kept_supports.iter().any(|wider| support <= *wider) {
             continue;
         }
         union.union(support.clone());

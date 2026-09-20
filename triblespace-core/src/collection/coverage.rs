@@ -191,6 +191,12 @@ impl Coverage {
             .flat_map(|frontier| frontier.iter_ordered().map(|raw| Inline::new(*raw)))
     }
 
+    /// The frontier of one collection as the set it is kept as, for set
+    /// operations against other indexes.
+    pub fn frontier_set(&self, collection: CollectionHandle) -> Option<&FrontierSet> {
+        self.frontiers.get(&collection.raw)
+    }
+
     /// The union of what the frontier of one collection covers: the support
     /// a reader attaching that frontier stands on. Frontier nodes without a
     /// support cannot exist, so the reported list is always empty; it is
@@ -901,7 +907,7 @@ impl CoverageIndex {
         reads_from: CollectionHandle,
         attestation: Attestation,
     ) -> Driven {
-        let mut contribution = match attestation {
+        let contribution = match attestation {
             Attestation::Foundation { data } => CoverageSet::from_keys(std::iter::once(data.raw)),
             Attestation::Join { low, high, .. } => {
                 let (Some(low), Some(high)) = (
@@ -930,19 +936,22 @@ impl CoverageIndex {
             }
         };
         self.mark_blocked(writes_to, attestation.result(), false);
+        // Union first, then ask whether anything changed: a PATCH compares
+        // by its root hash, so that question costs nothing after the union.
         let key = row_key(writes_to, attestation.result());
-        let grew = match self.published.rows.get(&key) {
-            Some(existing) if contribution.difference(existing).is_empty() => false,
+        let (support, grew) = match self.published.rows.get(&key) {
             Some(existing) => {
-                contribution.union(existing.clone());
-                true
+                let mut merged = existing.clone();
+                merged.union(contribution);
+                let grew = merged != *existing;
+                (merged, grew)
             }
-            None => true,
+            None => (contribution, true),
         };
         if grew {
             self.published
                 .rows
-                .replace(&Entry::with_value(&key, contribution));
+                .replace(&Entry::with_value(&key, support));
         }
         // The frontier moves whenever the attestation is driven, grown or
         // not: a second route to a result that already has its support still

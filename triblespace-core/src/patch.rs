@@ -28,7 +28,7 @@ use leaf::*;
 pub use bytetable::*;
 use rand::thread_rng;
 use rand::RngCore;
-use std::cmp::Reverse;
+use std::cmp::{Ordering, Reverse};
 use std::convert::TryInto;
 use std::fmt;
 use std::fmt::Debug;
@@ -2676,6 +2676,101 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> Head<KEY_LEN,
         // so we can't just take the key from self or other.
         Some(head_for_branch)
     }
+
+    /// Set inclusion between the keys under this head and under `other`:
+    /// `Equal` for the same keys, `Less` for a strict subset, `Greater` for a
+    /// strict superset, `None` when neither contains the other.
+    ///
+    /// The same walk as [`Self::difference`], constructing nothing: a shared
+    /// subtree is settled by its hash, and a key one side lacks decides the
+    /// direction the moment it is met.
+    pub(crate) fn inclusion(&self, other: &Self, at_depth: usize) -> Option<Ordering> {
+        if self.is_archive_singleton_pair(other) {
+            return self
+                .first_divergence(other, at_depth)
+                .is_none()
+                .then_some(Ordering::Equal);
+        }
+
+        if self.local_leaf_cardinality_allows_equality(other) && self.hash() == other.hash() {
+            return Some(Ordering::Equal);
+        }
+
+        if self.first_divergence(other, at_depth).is_some() {
+            // Two non-empty sets on divergent prefixes share no key.
+            return None;
+        }
+
+        let self_depth = self.end_depth();
+        let other_depth = other.end_depth();
+        if self_depth < other_depth {
+            // Self branches at a byte every key of other shares, so other
+            // lies under one child of self, if anywhere, and self has more.
+            let BodyRef::Branch(self_branch) = self.body_ref() else {
+                unreachable!();
+            };
+            let other_byte_key = other.childleaf_key()[O::TREE_TO_KEY[self_depth]];
+            return match self_branch.child_table.table_get(other_byte_key) {
+                Some(self_child) => match self_child.inclusion(other, at_depth) {
+                    Some(Ordering::Equal | Ordering::Greater) => Some(Ordering::Greater),
+                    _ => None,
+                },
+                None => None,
+            };
+        }
+
+        if other_depth < self_depth {
+            let BodyRef::Branch(other_branch) = other.body_ref() else {
+                unreachable!();
+            };
+            let self_byte_key = self.childleaf_key()[O::TREE_TO_KEY[other_depth]];
+            return match other_branch.child_table.table_get(self_byte_key) {
+                Some(other_child) => match self.inclusion(other_child, at_depth) {
+                    Some(Ordering::Equal | Ordering::Less) => Some(Ordering::Less),
+                    _ => None,
+                },
+                None => None,
+            };
+        }
+
+        // Equal depths: both are branches, because a leaf pair is settled
+        // above by the hash when equal and by the divergence when not. The
+        // order is the meet over the children at each byte: a child only
+        // self has says Greater, one only other has says Less, and a shared
+        // byte says what its subtrees say.
+        let BodyRef::Branch(self_branch) = self.body_ref() else {
+            unreachable!();
+        };
+        let BodyRef::Branch(other_branch) = other.body_ref() else {
+            unreachable!();
+        };
+        let mut order = Some(Ordering::Equal);
+        for self_child in self_branch.child_table.iter().filter_map(Option::as_ref) {
+            let child_order = match other_branch.child_table.table_get(self_child.key()) {
+                Some(other_child) => self_child.inclusion(other_child, self_depth),
+                None => Some(Ordering::Greater),
+            };
+            order = meet(order, child_order)?;
+        }
+        for other_child in other_branch.child_table.iter().filter_map(Option::as_ref) {
+            if self_branch.child_table.table_get(other_child.key()).is_none() {
+                order = meet(order, Some(Ordering::Less))?;
+            }
+        }
+        order
+    }
+}
+
+/// Combine the inclusion of two disjoint parts: equal parts do not move it,
+/// two parts leaning the same way keep leaning, and two parts leaning
+/// opposite ways make the wholes incomparable.
+fn meet(left: Option<Ordering>, right: Option<Ordering>) -> Option<Option<Ordering>> {
+    match (left?, right?) {
+        (Ordering::Equal, order) | (order, Ordering::Equal) => Some(Some(order)),
+        (Ordering::Less, Ordering::Less) => Some(Some(Ordering::Less)),
+        (Ordering::Greater, Ordering::Greater) => Some(Some(Ordering::Greater)),
+        _ => None,
+    }
 }
 
 unsafe impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> ByteEntry
@@ -3755,6 +3850,7 @@ where
         unsafe { self.difference_with_guard(other, &guard) }
     }
 
+
     /// Subtract under a left-owner receipt already combined by an aggregate.
     ///
     /// # Safety
@@ -4640,6 +4736,29 @@ where
 {
     fn eq(&self, other: &Self) -> bool {
         self.root.as_ref().map(|root| root.hash()) == other.root.as_ref().map(|root| root.hash())
+    }
+}
+
+/// Set inclusion over keys: `a <= b` says every key of `a` is in `b`, and
+/// `partial_cmp` is `None` when neither contains the other.
+///
+/// An early-exit walk over both tries with the shape of
+/// [`PATCH::difference`] that builds nothing: a shared subtree is settled by
+/// its hash, and a key one side lacks decides the direction the moment it is
+/// met. Prefer `a <= b` to `a.difference(&b).is_empty()`, which materializes
+/// the keys it then discards.
+impl<const KEY_LEN: usize, O, V, H> PartialOrd for PATCH<KEY_LEN, O, V, H>
+where
+    O: KeySchema<KEY_LEN>,
+    H: PatchHash,
+{
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        match (&self.root, &other.root) {
+            (None, None) => Some(Ordering::Equal),
+            (None, Some(_)) => Some(Ordering::Less),
+            (Some(_), None) => Some(Ordering::Greater),
+            (Some(root), Some(other_root)) => root.inclusion(other_root, 0),
+        }
     }
 }
 
@@ -7558,6 +7677,88 @@ mod tests {
 
         let res = left.difference(&right);
         assert_eq!(res.len(), 0);
+    }
+
+    fn inclusion_agrees_with_difference<const KEY_SIZE: usize>(
+        left: &PATCH<KEY_SIZE, IdentitySchema, ()>,
+        right: &PATCH<KEY_SIZE, IdentitySchema, ()>,
+    ) {
+        let left_inside = left.difference(right).is_empty();
+        let right_inside = right.difference(left).is_empty();
+        let expected = match (left_inside, right_inside) {
+            (true, true) => Some(std::cmp::Ordering::Equal),
+            (true, false) => Some(std::cmp::Ordering::Less),
+            (false, true) => Some(std::cmp::Ordering::Greater),
+            (false, false) => None,
+        };
+        assert_eq!(left.partial_cmp(right), expected);
+        assert_eq!(right.partial_cmp(left), expected.map(std::cmp::Ordering::reverse));
+        assert_eq!(left <= right, left_inside);
+        assert_eq!(right <= left, right_inside);
+    }
+
+    #[test]
+    fn inclusion_matches_the_difference_oracle_on_wide_random_keys() {
+        use rand::RngCore;
+        const KEY_SIZE: usize = 32;
+        let mut rng = thread_rng();
+        for _ in 0..64 {
+            let mut left = PATCH::<KEY_SIZE, IdentitySchema, ()>::new();
+            let mut right = PATCH::<KEY_SIZE, IdentitySchema, ()>::new();
+            for _ in 0..(rng.next_u32() % 48) {
+                let mut key = [0u8; KEY_SIZE];
+                rng.fill_bytes(&mut key);
+                // Shared, left-only, or right-only.
+                match rng.next_u32() % 3 {
+                    0 => {
+                        left.insert(&Entry::new(&key));
+                        right.insert(&Entry::new(&key));
+                    }
+                    1 => left.insert(&Entry::new(&key)),
+                    _ => right.insert(&Entry::new(&key)),
+                }
+            }
+            inclusion_agrees_with_difference(&left, &right);
+            let mut union = left.clone();
+            union.union(right.clone());
+            assert!(left <= union);
+            assert!(right <= union);
+            assert_eq!(union <= left, right <= left);
+            assert_eq!(union == left, right <= left);
+        }
+    }
+
+    #[test]
+    fn inclusion_matches_the_difference_oracle_on_narrow_alphabets() {
+        use rand::RngCore;
+        // Three symbols over eight bytes: keys collide on long prefixes, so
+        // every depth case of the walk is exercised, including subtrees the
+        // two tries hold with equal contents.
+        const KEY_SIZE: usize = 8;
+        let mut rng = thread_rng();
+        for _ in 0..256 {
+            let mut left = PATCH::<KEY_SIZE, IdentitySchema, ()>::new();
+            let mut right = PATCH::<KEY_SIZE, IdentitySchema, ()>::new();
+            for _ in 0..(rng.next_u32() % 24) {
+                let mut key = [0u8; KEY_SIZE];
+                for byte in &mut key {
+                    *byte = (rng.next_u32() % 3) as u8;
+                }
+                match rng.next_u32() % 3 {
+                    0 => {
+                        left.insert(&Entry::new(&key));
+                        right.insert(&Entry::new(&key));
+                    }
+                    1 => left.insert(&Entry::new(&key)),
+                    _ => right.insert(&Entry::new(&key)),
+                }
+            }
+            inclusion_agrees_with_difference(&left, &right);
+            let empty = PATCH::<KEY_SIZE, IdentitySchema, ()>::new();
+            assert!(empty <= left);
+            assert_eq!(left <= empty, left.is_empty());
+            assert_eq!(left.partial_cmp(&left), Some(std::cmp::Ordering::Equal));
+        }
     }
 
     #[test]

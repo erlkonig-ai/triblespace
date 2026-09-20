@@ -26,6 +26,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   2026-09-20, live 26 GB pile: a compass read that attaches only went from
   13.5 s to 4.4 s; the same read that maintained took 49 s.
 
+- `PartialOrd` for `PATCH` is set inclusion: `a <= b` says every key of `a`
+  is in `b`, and `partial_cmp` is `None` when neither contains the other. An
+  early-exit walk over both tries with the shape of `difference` that builds
+  nothing: a shared subtree is settled by its hash, and a key one side lacks
+  decides the direction the moment it is met. `Cover::is_subset` and the
+  read attach's narrowing of the frontier use it instead of materializing a
+  difference. The coverage fold's growth check is a union followed by one
+  hash comparison.
+
+- `BlobStoreMeta::resident`: the members of a key set that are present in
+  the store, as a set. Presence, not validity: the bytes are validated where
+  they are read. The pile answers with one intersection of its occurrence
+  relation projected at the hash segment; the default asks per handle; the
+  tracked reader charges every asked handle, present or absent. The read
+  attach intersects the target's frontier with it instead of probing each
+  node.
+
 - A cover attached from the frontier charges only the target's records to
   its observation, as the record walk did: a commit landing in the source
   does not make the target's cover stale. The one exception is a target

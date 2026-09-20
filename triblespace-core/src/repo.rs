@@ -497,6 +497,28 @@ pub trait BlobStoreMeta {
     where
         S: BlobEncoding + 'static,
         Handle<S>: InlineEncoding;
+
+    /// The members of `handles` that are present in this store, as a set.
+    ///
+    /// Presence, not validity: a store answers this from its index, and the
+    /// bytes are validated where they are read. A store whose index projects
+    /// to the resident hashes answers with one intersection; the default
+    /// asks per handle.
+    fn resident(
+        &self,
+        handles: &PATCH<32, IdentitySchema, ()>,
+    ) -> Result<PATCH<32, IdentitySchema, ()>, Self::MetaError> {
+        let mut resident = PATCH::new();
+        for key in handles.iter_ordered() {
+            if self
+                .metadata(Inline::<Handle<UnknownBlob>>::new(*key))?
+                .is_some()
+            {
+                resident.insert(&crate::patch::Entry::new(key));
+            }
+        }
+        Ok(resident)
+    }
 }
 
 /// Trait exposing a monotonic "forget" operation.

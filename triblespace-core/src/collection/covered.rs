@@ -24,6 +24,7 @@ use crate::blob::{BlobEncoding, IntoBlob, TryFromBlob};
 use crate::capability::{CapabilityProof, CapabilityProofId};
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
+use crate::patch::{IdentitySchema, PATCH};
 use crate::repo::async_store::AsyncBlobStoreAcquire;
 use crate::repo::{
     BlobChildren, BlobInfo, BlobMetadata, BlobStoreGet, BlobStoreKeep, BlobStoreList,
@@ -473,6 +474,13 @@ impl<T: BlobStoreMeta> BlobStoreMeta for CoveredSnapshot<T> {
         Handle<S>: InlineEncoding,
     {
         self.inner.metadata(handle)
+    }
+
+    fn resident(
+        &self,
+        handles: &PATCH<32, IdentitySchema, ()>,
+    ) -> Result<PATCH<32, IdentitySchema, ()>, Self::MetaError> {
+        self.inner.resident(handles)
     }
 }
 
