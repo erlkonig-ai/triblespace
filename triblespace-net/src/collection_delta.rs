@@ -411,6 +411,10 @@ mod tests {
             Ok(Vec::new().into_iter())
         }
 
+        fn collections(&self) -> Result<Vec<CollectionHandle>, Self::RecordsError> {
+            Ok(Vec::new())
+        }
+
         fn select_records(
             &self,
             selectors: &BTreeSet<CollectionRecordSelector>,

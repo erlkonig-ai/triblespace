@@ -1297,6 +1297,10 @@ mod tests {
         fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
             Err(std::io::Error::other("collection observation failed"))
         }
+
+        fn collections(&self) -> Result<Vec<CollectionHandle>, Self::RecordsError> {
+            Err(std::io::Error::other("collection observation failed"))
+        }
     }
 
     #[test]

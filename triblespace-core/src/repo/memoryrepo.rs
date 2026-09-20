@@ -273,6 +273,19 @@ impl CollectionRead for MemoryStoreSnapshot {
         })
     }
 
+    fn collections(&self) -> Result<Vec<crate::collection::CollectionHandle>, Self::RecordsError> {
+        // The memory index is keyed by fingerprint, so the collections are read
+        // off its values; a walk over an in-memory trie, for a test store.
+        Ok(crate::collection::distinct_collections(
+            self.collection_records.iter_ordered().map(|key| {
+                *self
+                    .collection_records
+                    .get(key)
+                    .expect("collection key from PATCH must retain its value")
+            }),
+        ))
+    }
+
     fn select_records(
         &self,
         selectors: &BTreeSet<CollectionRecordSelector>,

@@ -205,6 +205,12 @@ impl<R: CollectionRead> CollectionRead for Counted<R> {
         self.inner.records()
     }
 
+    fn collections(
+        &self,
+    ) -> Result<Vec<triblespace_core::collection::CollectionHandle>, Self::RecordsError> {
+        self.inner.collections()
+    }
+
     fn select_records(
         &self,
         selectors: &BTreeSet<CollectionRecordSelector>,

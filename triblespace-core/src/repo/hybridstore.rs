@@ -332,6 +332,10 @@ where
         self.records.records()
     }
 
+    fn collections(&self) -> Result<Vec<crate::collection::CollectionHandle>, Self::RecordsError> {
+        self.records.collections()
+    }
+
     fn select_records(
         &self,
         selectors: &std::collections::BTreeSet<crate::collection::CollectionRecordSelector>,

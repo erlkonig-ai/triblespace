@@ -281,6 +281,12 @@ pub trait AsyncCollectionRead {
     fn records(
         &self,
     ) -> impl Future<Output = Result<Vec<CollectionRecord>, Self::RecordsError>> + Send;
+
+    /// Every collection at least one known record names, each once, in
+    /// ascending handle order.
+    fn collections(
+        &self,
+    ) -> impl Future<Output = Result<Vec<crate::collection::CollectionHandle>, Self::RecordsError>> + Send;
 }
 
 /// Async counterpart of the insert-only [`CollectionStore`].
@@ -456,6 +462,12 @@ where
         &self,
     ) -> impl Future<Output = Result<Vec<CollectionRecord>, Self::RecordsError>> + Send {
         async move { self.0.records()?.collect() }
+    }
+
+    fn collections(
+        &self,
+    ) -> impl Future<Output = Result<Vec<crate::collection::CollectionHandle>, Self::RecordsError>> + Send {
+        async move { self.0.collections() }
     }
 }
 
@@ -663,6 +675,10 @@ impl<A: AsyncCollectionRead> CollectionRead for Blocking<A> {
         self.rt
             .block_on(self.inner.records())
             .map(|records| records.into_iter().map(Ok).collect::<Vec<_>>().into_iter())
+    }
+
+    fn collections(&self) -> Result<Vec<crate::collection::CollectionHandle>, Self::RecordsError> {
+        self.rt.block_on(self.inner.collections())
     }
 }
 

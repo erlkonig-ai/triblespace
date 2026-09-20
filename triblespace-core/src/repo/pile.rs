@@ -4148,6 +4148,17 @@ impl CollectionRead for PileFileSnapshot {
         })
     }
 
+    /// The first segment of the record index, one entry per collection; no
+    /// frame is read.
+    fn collections(&self) -> Result<Vec<CollectionHandle>, Self::RecordsError> {
+        let mut collections = Vec::new();
+        self.collection_records
+            .infixes(&[], |collection: &[u8; 32]| {
+                collections.push(Inline::new(*collection));
+            });
+        Ok(collections)
+    }
+
     fn select_records(
         &self,
         selectors: &BTreeSet<CollectionRecordSelector>,
@@ -8660,6 +8671,9 @@ mod tests {
                     .map(Ok)
                     .collect::<Vec<_>>()
                     .into_iter())
+            }
+            fn collections(&self) -> Result<Vec<CollectionHandle>, Self::RecordsError> {
+                Ok(crate::collection::distinct_collections(self.0.iter().copied()))
             }
         }
         let selectors = [

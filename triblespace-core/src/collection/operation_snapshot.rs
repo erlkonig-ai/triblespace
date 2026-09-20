@@ -260,6 +260,18 @@ where
         })
     }
 
+    fn collections(&self) -> Result<Vec<super::CollectionHandle>, Self::RecordsError> {
+        let mut collections: BTreeSet<_> = self.control.collections()?.into_iter().collect();
+        for key in self.authored.iter_ordered() {
+            let record = self
+                .authored
+                .get(key)
+                .expect("authored PATCH key must retain its record");
+            collections.insert(record.collection());
+        }
+        Ok(collections.into_iter().collect())
+    }
+
     fn select_records(
         &self,
         selectors: &BTreeSet<CollectionRecordSelector>,

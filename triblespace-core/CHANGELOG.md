@@ -33,6 +33,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the view error; `CollectionMaterializationError`, `CollectionCoverError`,
   `CoverAvailabilityError` and `FactMaterializationError` are gone.
 
+- `CollectionRead::collections`, required on every record reader: every
+  collection at least one known record names, read from the record index's
+  first segment on a pile and never by enumerating records. Composite readers
+  forward or union it; in-memory test stores read it off their values.
+
+- `collection::derived`: the collections derived from a source, found from
+  their descriptors. `derived_from` lists them each after its own source, one
+  descriptor read per known collection and no record walk. `ensure_derived`
+  realizes every one's missing images and publishes no merge, so a write that
+  calls it after its commit leaves the commit readable through every view at
+  the cost of that commit's own images; `maintain_derived` carries each to
+  its LSM fixed point, as a daemon does. A `RealizeDerived` realizer maps a
+  descriptor's representation to a typed `ensure` or `maintain`; `CoreRealizer`
+  knows this crate's encodings and a binary with more wraps it. The report
+  names what was realized, what the signer may not write, and what no
+  realizer knows; nothing is guessed and nothing decides what is too costly.
+  A derived collection joins the listing with its first record, so whoever
+  creates one ensures it right then, for the commits already there.
+
 - `join_images` on `CollectionDerivation` and `CollectionMapping` no longer
   takes a source union; it is the mapping's own route for joining two
   images, defaulting to the encoding's `join_members`. The Rank9 route that

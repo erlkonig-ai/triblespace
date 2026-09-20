@@ -45,6 +45,7 @@ pub mod api;
 pub mod coverage;
 pub mod covered;
 /// Reading one collection descriptor's facts.
+pub mod derived;
 pub mod descriptor;
 pub mod discovery;
 /// Canonical collection encodings and join-preserving mappings.
@@ -86,6 +87,7 @@ pub mod view;
 pub use ed25519_dalek::VerifyingKey;
 
 pub use api::*;
+pub use derived::*;
 pub use discovery::*;
 pub use encoding::*;
 pub use exact_derived::CollectionRealizationError;

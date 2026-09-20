@@ -249,6 +249,9 @@ impl CollectionRead for CountingSnapshot {
             .fetch_add(1, Ordering::SeqCst);
         self.inner.records()
     }
+    fn collections(&self) -> Result<Vec<crate::collection::CollectionHandle>, Self::RecordsError> {
+        self.inner.collections()
+    }
     fn select_records(
         &self,
         selectors: &BTreeSet<CollectionRecordSelector>,

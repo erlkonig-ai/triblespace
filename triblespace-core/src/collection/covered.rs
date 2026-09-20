@@ -501,6 +501,10 @@ impl<T: CollectionRead> CollectionRead for CoveredSnapshot<T> {
         self.inner.records()
     }
 
+    fn collections(&self) -> Result<Vec<CollectionHandle>, Self::RecordsError> {
+        self.inner.collections()
+    }
+
     fn select_records(
         &self,
         selectors: &BTreeSet<CollectionRecordSelector>,

@@ -859,6 +859,19 @@ impl CollectionRead for YardSnapshot {
         })
     }
 
+    fn collections(&self) -> Result<Vec<crate::collection::CollectionHandle>, Self::RecordsError> {
+        let mut collections = std::collections::BTreeSet::new();
+        for generation in &self.generations {
+            collections.extend(
+                generation
+                    .snapshot
+                    .collections()
+                    .map_err(YardCollectionRecordsError::Pile)?,
+            );
+        }
+        Ok(collections.into_iter().collect())
+    }
+
     fn select_records(
         &self,
         selectors: &BTreeSet<CollectionRecordSelector>,

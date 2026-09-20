@@ -283,6 +283,16 @@ impl<R: CollectionRead> CollectionRead for ObservedStore<R> {
         self.inner.records()
     }
 
+    fn collections(&self) -> Result<Vec<CollectionHandle>, Self::RecordsError> {
+        // A record naming a collection nobody had named before changes the
+        // answer, so the listing depends on every record.
+        self.tracker
+            .lock()
+            .expect("store dependency tracker is not poisoned")
+            .all_records = true;
+        self.inner.collections()
+    }
+
     fn select_records(
         &self,
         selectors: &BTreeSet<CollectionRecordSelector>,

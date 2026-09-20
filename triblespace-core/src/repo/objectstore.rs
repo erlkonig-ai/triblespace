@@ -404,6 +404,15 @@ impl AsyncCollectionRead for ObjectStoreSnapshot {
         let records = self.collection_records.as_ref().clone();
         async move { Ok(records) }
     }
+
+    fn collections(
+        &self,
+    ) -> impl Future<Output = Result<Vec<crate::collection::CollectionHandle>, Self::RecordsError>> + Send {
+        // The listing that produced this snapshot already read every record.
+        let collections =
+            crate::collection::distinct_collections(self.collection_records.iter().copied());
+        async move { Ok(collections) }
+    }
 }
 
 fn blob_handle_from_path(prefix: &Path, location: &Path) -> Result<RawInline, ListBlobsErr> {

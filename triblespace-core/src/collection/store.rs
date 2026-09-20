@@ -112,6 +112,15 @@ pub trait CollectionRead {
     /// order.
     fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError>;
 
+    /// Every collection at least one known record names, each once, in
+    /// ascending handle order.
+    ///
+    /// A store that indexes its records by collection answers from that
+    /// index's first segment; nothing enumerates records to find out. There
+    /// is no default: a reader that could only walk should say so in its own
+    /// implementation, where the cost is visible.
+    fn collections(&self) -> Result<Vec<CollectionHandle>, Self::RecordsError>;
+
     /// Select one deterministic union of raw record routes.
     ///
     /// The default implementation performs exactly one ordinary enumeration
@@ -233,12 +242,30 @@ where
         (**self).records()
     }
 
+    fn collections(&self) -> Result<Vec<CollectionHandle>, Self::RecordsError> {
+        (**self).collections()
+    }
+
     fn select_records(
         &self,
         selectors: &BTreeSet<CollectionRecordSelector>,
     ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
         (**self).select_records(selectors)
     }
+}
+
+/// The distinct collections a set of records names, in ascending handle
+/// order: what [`CollectionRead::collections`] answers for a reader that holds
+/// its records in memory rather than under an index.
+pub fn distinct_collections(
+    records: impl IntoIterator<Item = CollectionRecord>,
+) -> Vec<CollectionHandle> {
+    records
+        .into_iter()
+        .map(|record| record.collection())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 /// Grow-only write surface for canonical collection-calculus records.
@@ -375,6 +402,10 @@ mod tests {
                 .map(Ok)
                 .collect::<Vec<_>>()
                 .into_iter())
+        }
+
+        fn collections(&self) -> Result<Vec<CollectionHandle>, Self::RecordsError> {
+            Ok(distinct_collections(self.records.iter().copied()))
         }
     }
 
@@ -569,6 +600,10 @@ mod tests {
         fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
             self.records_calls.set(self.records_calls.get() + 1);
             Ok(Vec::new().into_iter())
+        }
+
+        fn collections(&self) -> Result<Vec<CollectionHandle>, Self::RecordsError> {
+            Ok(Vec::new())
         }
 
         fn select_records(

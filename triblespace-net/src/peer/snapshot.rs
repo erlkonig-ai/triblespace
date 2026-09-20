@@ -321,6 +321,12 @@ where
         self.frozen.records()
     }
 
+    fn collections(
+        &self,
+    ) -> Result<Vec<triblespace_core::collection::CollectionHandle>, Self::RecordsError> {
+        self.frozen.collections()
+    }
+
     fn select_records(
         &self,
         selectors: &BTreeSet<CollectionRecordSelector>,
