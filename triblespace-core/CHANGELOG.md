@@ -33,6 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the view error; `CollectionMaterializationError`, `CollectionCoverError`,
   `CoverAvailabilityError` and `FactMaterializationError` are gone.
 
+- `Cover::commits` is back, as an index probe: every COMMIT naming one of the
+  cover's members in its collection, whichever key signed it, read with one
+  `CommitMember` selector per member and no enumeration. The cover algebra
+  stays; only the walk behind the old implementation went.
+
 - `join_images` on `CollectionDerivation` and `CollectionMapping` no longer
   takes a source union; it is the mapping's own route for joining two
   images, defaulting to the encoding's `join_members`. The Rank9 route that

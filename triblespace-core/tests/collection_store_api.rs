@@ -130,6 +130,63 @@ fn fragment(entity: u8) -> Fragment {
 }
 
 #[test]
+fn cover_commits_probe_every_key_that_committed_a_member() {
+    let authority = key(1);
+    let stranger = key(2);
+    let mut store = MemoryRepo::default();
+    let collection = store
+        .collection("commits-probe", policy(authority.verifying_key()))
+        .unwrap();
+    let first = fragment(10);
+    let second = fragment(20);
+    store.commit(collection, &authority, first.clone()).unwrap();
+    store.commit(collection, &authority, second).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let admitted = collection.admitted(&snapshot).unwrap();
+    assert_eq!(admitted.len(), 2);
+    let existing = admitted.commits(&snapshot).unwrap();
+    assert_eq!(existing.len(), 2);
+
+    // A key nothing here admits committing the first payload again is one
+    // more record over the same member: provenance, which the probe returns,
+    // not admission, which it does not judge.
+    let first_blob = IntoBlob::<SimpleArchive>::to_blob(first.facts().clone());
+    let first_member = first_blob.get_handle();
+    store
+        .insert(CollectionRecord::Commit(
+            triblespace_core::collection::CollectionCommit::sign(
+                &stranger,
+                collection.handle(),
+                Handle::<SimpleArchive>::to_hash(first_member),
+                existing[0].metadata(),
+            ),
+        ))
+        .unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let admitted = collection.admitted(&snapshot).unwrap();
+    assert_eq!(admitted.len(), 2, "the stranger's record admits nothing new");
+    let commits = admitted.commits(&snapshot).unwrap();
+    assert_eq!(commits.len(), 3);
+    assert_eq!(
+        commits
+            .iter()
+            .filter(|commit| commit.public_key().raw == stranger.verifying_key().to_bytes())
+            .count(),
+        1
+    );
+    // The probe is per member of the cover asked about.
+    assert_eq!(
+        collection.cover([first_member]).commits(&snapshot).unwrap().len(),
+        2
+    );
+    assert!(collection
+        .cover([Inline::new([9; 32])])
+        .commits(&snapshot)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
 fn root_creation_registers_a_self_contained_descriptor() {
     let root = key(1);
     let expected_policy = policy(root.verifying_key());
