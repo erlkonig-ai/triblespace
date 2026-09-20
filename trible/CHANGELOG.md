@@ -32,6 +32,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   two stay separate because a carry reports what it wrote, not what the target
   was missing, so a partial carry looks exactly like a finished one.
 
+- Order explicitly selected maintenance targets by a stable rendezvous primary
+  among each 1-of-N WRITE policy's roots. Every other writer retains every
+  target after its primary queue, so independent hosts distribute first work
+  without making maintenance depend on one host being present. Open,
+  unreadable, and multi-signature policies keep the existing author-biased
+  ordering.
+
 - `pile compact --drop-drained RETIRED=CURRENT` (repeatable) leaves a drained
   generation behind, with every collection derived from it, after checking
   that every commit of RETIRED is present in CURRENT; it refuses otherwise
