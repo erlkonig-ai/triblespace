@@ -25,6 +25,28 @@ The project balances a few key goals:
 * Avoid writing asynchronous code. Prefer high-performance synchronous
   implementations that can be parallelized when needed.
 
+## Retained Collection State
+
+Do not use `BTreeMap` or `BTreeSet` for retained state in TribleSpace structs,
+including through aliases or wrappers. Use PATCH for sets and maps kept across
+observations, snapshots, calls, or worker iterations. Retained state includes
+in-memory state; the rule is not limited to data persisted to disk. Structural
+sharing and content-based set operations belong in the representation rather
+than being reconstructed by consumers.
+
+BTree collections are allowed for ephemeral scratch within one operation,
+including short-lived helper structs used for sorting, deduplication or planning.
+Make that lifetime clear at the declaration. A field is not exempt merely because
+its containing type is called a builder or a cache. Any non-ephemeral exception
+needs explicit justification and review.
+
+This is not a mechanical container-substitution rule. PATCH equality observes
+keys, not attached values: preserve observable value changes and invalidation
+explicitly, and choose keys according to the represented identity. Do not build a
+shadow catalogue of queryable facts in PATCH to satisfy this rule. Existing
+retained BTree uses are migration candidates to address in scoped changes, not
+permission for an unrelated bulk rewrite or a claim of measured speedup.
+
 ## Inventory
 
 Record future work and ideas in `INVENTORY.md`. Whenever you notice a task that

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Establish PATCH as the representation for retained set/map state in
+  TribleSpace structs. Reserve `BTreeMap`/`BTreeSet` for ephemeral per-operation
+  scratch; document exceptions and preserve observable value-change semantics
+  during scoped migrations. This is contributor guidance, not a runtime change.
+
 - Connect the existing CubeCL wavelet backend to canonical raw Succinct
   construction and target compaction through `BackendSuccinctMapping`.
   Collection identity remains backend-independent; CPU-reference plumbing tests
