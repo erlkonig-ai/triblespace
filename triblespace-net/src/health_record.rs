@@ -370,6 +370,8 @@ type Subject = (Component, Option<[u8; 32]>, Option<[u8; 32]>);
 struct Episode {
     state: State,
     alert: bool,
+    recovered: bool,
+    started_at: Inline<inlineencodings::NsTAIInterval>,
     evidence: Evidence,
     facts: Fragment,
 }
@@ -414,8 +416,9 @@ impl Recorder {
     }
 
     /// Construct one heartbeat with quantitative evidence. A counter change
-    /// starts a new episode even when the qualitative state is unchanged, so
-    /// the latest report never keeps stale measurements alive.
+    /// creates a fresh condition entity so the latest report never keeps stale
+    /// measurements alive, while `started_at` continues to identify the same
+    /// qualitative episode until state or alert status changes.
     pub fn record_measurements(
         &mut self,
         at: Epoch,
@@ -432,20 +435,30 @@ impl Recorder {
                 condition.peer.map(|key| key.to_bytes()),
             );
             let previous = self.episodes.get(&subject);
+            let same_episode = previous.is_some_and(|previous| {
+                previous.state == condition.state && previous.alert == condition.alert
+            });
             let episode = match previous {
-                Some(previous)
-                    if previous.state == condition.state
-                        && previous.alert == condition.alert
-                        && previous.evidence == evidence =>
-                {
-                    previous.clone()
-                }
+                Some(previous) if same_episode && previous.evidence == evidence => previous.clone(),
                 _ => {
                     // Recovery is evidence of a previously reported failure,
-                    // not an alert on an ordinary healthy startup.
-                    let recovered = previous.is_some_and(|episode| episode.alert)
-                        && !condition.alert
-                        && condition.state == State::Current;
+                    // not an alert on an ordinary healthy startup. Preserve it
+                    // across counter-only condition replacements in this same
+                    // episode, just as we preserve the episode start.
+                    let recovered = if same_episode {
+                        previous.is_some_and(|episode| episode.recovered)
+                    } else {
+                        previous.is_some_and(|episode| episode.alert)
+                            && !condition.alert
+                            && condition.state == State::Current
+                    };
+                    let started_at = if same_episode {
+                        previous
+                            .map(|episode| episode.started_at)
+                            .expect("same episode has a previous observation")
+                    } else {
+                        created
+                    };
                     let tags = [
                         Some(KIND_CONDITION),
                         Some(condition.component.tag()),
@@ -455,6 +468,8 @@ impl Recorder {
                     Episode {
                         state: condition.state,
                         alert: condition.alert,
+                        recovered,
+                        started_at,
                         evidence: evidence.clone(),
                         facts: entity! {
                             metadata::tag*: tags.into_iter().flatten(),
@@ -478,7 +493,7 @@ impl Recorder {
                             attrs::publication_acknowledged?: evidence.publication_acknowledged,
                             attrs::publication_rejected?: evidence.publication_rejected,
                             attrs::publication_unavailable?: evidence.publication_unavailable,
-                            metadata::started_at: created,
+                            metadata::started_at: started_at,
                         },
                     }
                 }
@@ -851,13 +866,11 @@ mod tests {
                 .collect::<Vec<_>>(),
                 vec![(created, created)]
             );
-            assert!(
-                find!(expiry: (i128, i128), pattern!(facts.facts(), [{
-                    report @ metadata::expires_at: ?expiry,
-                }]))
-                .next()
-                .is_none()
-            );
+            assert!(find!(expiry: (i128, i128), pattern!(facts.facts(), [{
+                report @ metadata::expires_at: ?expiry,
+            }]))
+            .next()
+            .is_none());
             assert!(conditions(facts, KIND_ALERT).is_empty());
             assert!(conditions(facts, KIND_RECOVERED).is_empty());
         }
@@ -883,7 +896,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_measurement_starts_a_new_episode_but_equal_measurement_reuses_it() {
+    fn changed_measurement_replaces_condition_inside_the_same_episode() {
         let endpoint = ed25519_dalek::SigningKey::from_bytes(&[4; 32]).verifying_key();
         let mut recorder = Recorder::new(endpoint);
         let at = Epoch::from_unix_seconds(1_700_000_000.0);
@@ -917,6 +930,15 @@ mod tests {
             conditions(&same, KIND_CONDITION),
             conditions(&changed, KIND_CONDITION)
         );
+        let started = |facts: &Fragment| {
+            let condition = conditions(facts, KIND_CONDITION)[0];
+            find!(started: (i128, i128), pattern!(facts.facts(), [{
+                condition @ metadata::started_at: ?started,
+            }]))
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(started(&first), started(&same));
+        assert_eq!(started(&same), started(&changed));
         let changed_condition = conditions(&changed, KIND_CONDITION)[0];
         assert_eq!(
             find!(count: u128, pattern!(changed.facts(), [{
@@ -961,5 +983,48 @@ mod tests {
             .record(at + 5.0, [condition(State::Unknown, false)])
             .unwrap();
         assert!(conditions(&unknown, KIND_RECOVERED).is_empty());
+    }
+
+    #[test]
+    fn recovery_and_episode_start_survive_counter_changes() {
+        let endpoint = ed25519_dalek::SigningKey::from_bytes(&[4; 32]).verifying_key();
+        let mut recorder = Recorder::new(endpoint);
+        let at = Epoch::from_unix_seconds(1_700_000_000.0);
+        let measurement = |state, alert, resident_blobs| Measurement {
+            condition: Condition {
+                component: Component::Store,
+                collection: None,
+                peer: None,
+                state,
+                alert,
+            },
+            evidence: Evidence {
+                resident_blobs: Some(resident_blobs),
+                ..Evidence::default()
+            },
+        };
+        recorder
+            .record_measurements(at, [measurement(State::Stalled, true, 17)])
+            .unwrap();
+        let recovered = recorder
+            .record_measurements(at + 1.0, [measurement(State::Current, false, 18)])
+            .unwrap();
+        let changed = recorder
+            .record_measurements(at + 2.0, [measurement(State::Current, false, 19)])
+            .unwrap();
+
+        let recovered_id = conditions(&recovered, KIND_RECOVERED)[0];
+        let changed_id = conditions(&changed, KIND_RECOVERED)[0];
+        assert_ne!(recovered_id, changed_id);
+        let started = |facts: &Fragment, condition| {
+            find!(started: (i128, i128), pattern!(facts.facts(), [{
+                condition @ metadata::started_at: ?started,
+            }]))
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            started(&recovered, recovered_id),
+            started(&changed, changed_id)
+        );
     }
 }
