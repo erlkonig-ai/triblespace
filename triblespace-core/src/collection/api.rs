@@ -433,34 +433,6 @@ impl<L: CollectionEncoding> Cover<L> {
         self.members.get(&member.raw).is_some()
     }
 
-    /// Every COMMIT record naming one of these members in this collection.
-    ///
-    /// Provenance, not admission: several keys may have committed one
-    /// payload, and every one of their records is returned whether or not
-    /// this snapshot admits its signer. Read from the store's record index
-    /// with one probe per member; nothing is enumerated.
-    pub fn commits<S>(&self, snapshot: &S) -> Result<Vec<CollectionCommit>, S::RecordsError>
-    where
-        S: super::CollectionRead,
-    {
-        let collection = self.collection.handle();
-        let selectors: BTreeSet<super::CollectionRecordSelector> = self
-            .data_members()
-            .map(|member| super::CollectionRecordSelector::CommitMember(collection, member))
-            .collect();
-        if selectors.is_empty() {
-            return Ok(Vec::new());
-        }
-        Ok(snapshot
-            .select_records(&selectors)?
-            .into_iter()
-            .filter_map(|record| match record {
-                super::CollectionRecord::Commit(commit) => Some(commit),
-                _ => None,
-            })
-            .collect())
-    }
-
     pub(crate) fn data_members(&self) -> impl ExactSizeIterator<Item = CollectionData> + '_ {
         self.members
             .iter_ordered()
