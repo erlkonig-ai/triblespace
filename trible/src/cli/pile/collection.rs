@@ -322,8 +322,10 @@ pub enum Command {
     /// Each target uses the immediate-source members already available. Use
     /// maintain-all to advance its source dependencies first. --watch keeps
     /// one pile open and retries after content or authorization changes.
-    /// Target priority is stable for the author's public key, spreading first
-    /// attempts across independent authors without changing the merge plan.
+    /// A 1-of-N target's WRITE roots choose one stable rendezvous primary;
+    /// every other admitted writer retains it as fallback. Other policies keep
+    /// ordinary scheduling. This spreads independent targets without changing
+    /// the merge plan or sacrificing failover.
     /// Reference summaries require the complete producer-side blob closure.
     Maintain {
         /// Path to the pile file to modify
@@ -353,8 +355,10 @@ pub enum Command {
     /// scheduling over ordinary one-edge operations; mappings and joins do not
     /// acquire recursive construction side effects. Only the requested targets
     /// and their descriptor source chains are selected, not historical indexes.
-    /// The author's public key biases which selected chain runs first; each
-    /// chain still runs upstream first, independently of argument order.
+    /// A 1-of-N target's WRITE roots choose one stable rendezvous primary;
+    /// every other admitted writer retains the chain as fallback. Other
+    /// policies keep ordinary scheduling. Each chain still runs upstream
+    /// first, independently of argument order.
     MaintainAll {
         /// Path to the pile file to modify
         pile: PathBuf,
@@ -1760,6 +1764,99 @@ mod tests {
     use triblespace_core::repo::{BlobStoreList, BlobStorePut};
 
     #[test]
+    fn write_roots_partition_targets_and_retain_every_fallback() {
+        let signers = [
+            SigningKey::from_bytes(&[71; 32]),
+            SigningKey::from_bytes(&[72; 32]),
+            SigningKey::from_bytes(&[73; 32]),
+        ];
+        let roots = signers.map(|signer| signer.verifying_key());
+        let policy = CollectionPolicy::new(
+            AdmissionPolicy::Open,
+            AdmissionPolicy::quorum(roots.iter().copied(), 1, None).unwrap(),
+        );
+        let mut store = MemoryRepo::default();
+        let targets: Vec<_> = (0..48)
+            .map(|index| {
+                store
+                    .collection(&format!("rendezvous target {index}"), policy.clone())
+                    .unwrap()
+                    .handle()
+            })
+            .collect();
+        let snapshot = store.snapshot().unwrap();
+        let mut wins = [0_usize; 3];
+
+        for target in &targets {
+            let primary: Vec<_> = roots
+                .iter()
+                .map(|root| maintenance_target_primary(&snapshot, *root, *target).unwrap())
+                .collect();
+            assert_eq!(primary.iter().filter(|primary| **primary).count(), 1);
+            wins[primary.iter().position(|primary| *primary).unwrap()] += 1;
+        }
+        assert!(wins.iter().all(|wins| *wins > 0), "partition was {wins:?}");
+
+        for (index, root) in roots.iter().enumerate() {
+            let mut ordered = targets.clone();
+            ordered.sort_by_cached_key(|target| {
+                maintenance_target_priority(&snapshot, *root, *target)
+            });
+            let priorities: Vec<_> = ordered
+                .iter()
+                .map(|target| maintenance_target_priority(&snapshot, *root, *target).0)
+                .collect();
+            assert!(priorities.is_sorted());
+            assert_eq!(priorities.iter().filter(|fallback| !**fallback).count(), wins[index]);
+            assert_eq!(ordered.len(), targets.len());
+        }
+
+        let outsider = SigningKey::from_bytes(&[74; 32]).verifying_key();
+        assert!(targets.iter().all(|target| {
+            maintenance_target_priority(&snapshot, outsider, *target).0
+        }));
+    }
+
+    #[test]
+    fn only_single_root_write_quorums_choose_a_primary() {
+        let signers = [
+            SigningKey::from_bytes(&[75; 32]),
+            SigningKey::from_bytes(&[76; 32]),
+            SigningKey::from_bytes(&[77; 32]),
+        ];
+        let roots = signers.map(|signer| signer.verifying_key());
+        let mut store = MemoryRepo::default();
+        let open = store
+            .collection(
+                "open write policy",
+                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+            )
+            .unwrap()
+            .handle();
+        let threshold_two = store
+            .collection(
+                "threshold-two write policy",
+                CollectionPolicy::new(
+                    AdmissionPolicy::Open,
+                    AdmissionPolicy::quorum(roots.iter().copied(), 2, None).unwrap(),
+                ),
+            )
+            .unwrap()
+            .handle();
+        let snapshot = store.snapshot().unwrap();
+
+        for root in roots {
+            assert_eq!(maintenance_target_primary(&snapshot, root, open), None);
+            assert_eq!(
+                maintenance_target_primary(&snapshot, root, threshold_two),
+                None
+            );
+            assert!(!maintenance_target_priority(&snapshot, root, open).0);
+            assert!(!maintenance_target_priority(&snapshot, root, threshold_two).0);
+        }
+    }
+
+    #[test]
     fn maintenance_catches_arrivals_during_a_pass_without_self_sustaining_work() {
         let mut store = MemoryRepo::default();
         let before = store.snapshot().unwrap();
@@ -2810,6 +2907,46 @@ async fn maintenance_hop<S: Store + AsyncBlobStoreAcquire + Send>(
     }
 }
 
+fn maintenance_target_priority<R: BlobStoreGet>(
+    snapshot: &R,
+    author: VerifyingKey,
+    target: CollectionHandle,
+) -> (bool, [u8; 32], [u8; 32]) {
+    let is_fallback = maintenance_target_primary(snapshot, author, target)
+        .map(|primary| !primary)
+        .unwrap_or(false);
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"trible/maintenance-target-order");
+    hash.update(author.as_bytes());
+    hash.update(&target.raw);
+    (is_fallback, *hash.finalize().as_bytes(), target.raw)
+}
+
+/// Pick one primary among the descriptor's canonical WRITE roots. This is a
+/// scheduling hint only: every non-primary keeps the target as fallback, and
+/// open or unreadable policies retain the ordinary author-biased ordering.
+fn maintenance_target_primary<R: BlobStoreGet>(
+    snapshot: &R,
+    author: VerifyingKey,
+    target: CollectionHandle,
+) -> Option<bool> {
+    let descriptor: Blob<SimpleArchive> = snapshot.get(target).ok()?;
+    let facts = TribleSet::try_from_blob(descriptor).ok()?;
+    let policy = descriptor::policy(&facts).ok()?;
+    if policy.write().invoke_threshold() != Some(1) {
+        return None;
+    }
+    let roots = policy.write().roots()?;
+    let owner = roots.iter().max_by_key(|root| {
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"trible/maintenance-target-owner-v1");
+        hash.update(&target.raw);
+        hash.update(root.as_bytes());
+        (*hash.finalize().as_bytes(), root.to_bytes())
+    })?;
+    Some(*owner == author)
+}
+
 async fn maintenance_pass_inner<S: Store + AsyncBlobStoreAcquire + Send>(
     pile: &mut S,
     references: &[String],
@@ -2836,23 +2973,16 @@ async fn maintenance_pass_inner<S: Store + AsyncBlobStoreAcquire + Send>(
             }
         }
     }
-    state.planning = snapshot.dependencies();
-    drop(snapshot);
-
-    // Give independent authors different stable priorities over the same
-    // explicit selection. This is local scheduling, not exclusive ownership:
-    // nodes may still choose the same first target or perform overlapping work.
-    // Only the outer chain order changes; the dependency walk and canonical
-    // per-collection merge/derive plans below remain untouched.
+    // Give each target one stable primary among its declared WRITE roots.
+    // This is local scheduling, not exclusive ownership: every other writer
+    // retains the target after its primary queue, so an absent root cannot
+    // strand work. Only the outer chain order changes; the dependency walk and
+    // canonical per-collection merge/derive plans below remain untouched.
     let author = signer.verifying_key();
     let mut targets: Vec<_> = selected.iter().copied().collect();
-    targets.sort_by_cached_key(|target| {
-        let mut hash = blake3::Hasher::new();
-        hash.update(b"trible/maintenance-target-order");
-        hash.update(author.as_bytes());
-        hash.update(&target.raw);
-        (*hash.finalize().as_bytes(), target.raw)
-    });
+    targets.sort_by_cached_key(|target| maintenance_target_priority(&snapshot, author, *target));
+    state.planning = snapshot.dependencies();
+    drop(snapshot);
 
     let mut attempted = BTreeSet::new();
     for target in targets {
