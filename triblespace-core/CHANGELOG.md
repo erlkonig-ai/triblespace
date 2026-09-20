@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Plan maintenance from the coverage index. The new `collection::maintenance`
+  module replaces the per-round semantic probes (`probe_mapping`,
+  `resolve_target`, `witnessed_physical_cover`, `source_residual`,
+  `coarsen_from_resident_source`, `attach_exact_resolution`) and the old
+  `exact_target_compaction` carry. A *selection* reads what a collection
+  stands on for a request straight from the frontier, widest node first,
+  and descends through a node's MERGE producers (one produced-member
+  lookup) only when the node is wider than the request, absent, incomplete,
+  or refused by the mapping; the same descent is the capacity fallback to
+  finer inputs. Requests are compared at lattice granularity, the closure
+  of the requested rows. A target holding attestations the fold could not
+  drive falls back to structural certificates from its own admitted records,
+  as reads do. The functional check stays: two admitted images for one input
+  is a `Resolution` error. `resolve_endorsed_lineage` remains only behind
+  `admitted_record_witnesses`.
+
+- Carry by support size. Tiers are keyed by `ilog2` of a node's support, not
+  its byte length, so a target's tiers mirror its source's. Before pairing,
+  a frontier node whose support lies inside another's is consumed by
+  `MERGE(fine, coarse -> coarse)`, no bytes loaded, so the redundancy between
+  a fine image and the coarser one that covers it disappears in the fold
+  instead of being coarsened at every read; two nodes with one support keep
+  the lower node, as readers do. Source-guided coarsening is kept for the
+  joins that need the source union (Rank9): exactly two images under a
+  source node that together stand for it are joined with the union in hand.
+
+- The operation view (`OperationSnapshot::index`) re-offers the lineage's
+  descriptor-parked and signer-parked attestations
+  (`CoverageIndex::wake_proofs_for`), so a descriptor or definition acquired
+  during an operation admits what the control snapshot could not. A root's
+  admitted support is read from the index (`Coverage::frontier_support`)
+  rather than from a witness walk.
+
 - Keep each collection's frontier in the coverage index. The fold now tracks,
   beside every node's support, the nodes no driven MERGE has consumed
   (`Coverage::frontier`, `Coverage::frontier_support`): a MERGE takes its

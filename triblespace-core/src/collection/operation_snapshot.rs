@@ -185,6 +185,13 @@ where
     {
         self.residency.metadata(handle)
     }
+
+    fn resident(
+        &self,
+        handles: &PATCH<32, IdentitySchema, ()>,
+    ) -> Result<PATCH<32, IdentitySchema, ()>, Self::MetaError> {
+        self.residency.resident(handles)
+    }
 }
 
 /// A frontier's coverage is its control's index, continued: clone it (every
@@ -195,7 +202,8 @@ where
 /// consulted sees the lineage it named rather than every record in the store.
 impl<C, R> super::store::CoverageRead for OperationSnapshot<C, R>
 where
-    C: super::store::CoverageRead,
+    C: super::store::CoverageRead + BlobStoreList,
+    R: BlobStoreList,
     Self: crate::repo::BlobStoreGet + crate::repo::CapabilityProofRead,
 {
     fn index(
@@ -203,6 +211,21 @@ where
         lineage: &BTreeSet<super::CollectionHandle>,
     ) -> Result<super::coverage::CoverageIndex, Self::RecordsError> {
         let mut index = self.control.index(lineage)?;
+        // A descriptor that landed after the control snapshot is a byte
+        // arrival, which is what a later residency contributes: everything
+        // that parked on it is decided again through this view.
+        for collection in lineage {
+            if matches!(self.control.contains_blob(*collection), Ok(false))
+                && matches!(self.residency.contains_blob(*collection), Ok(true))
+            {
+                index.wake_descriptor(*collection);
+            }
+        }
+        // Admission evidence is read through this view too, so a definition
+        // that landed since the control snapshot can admit a signer the
+        // control could not: re-offer this lineage's signer-parked
+        // attestations, and only those.
+        index.wake_proofs_for(lineage);
         for key in self.authored.iter_ordered() {
             let record = self
                 .authored

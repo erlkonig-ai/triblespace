@@ -789,6 +789,36 @@ impl CoverageIndex {
         }
     }
 
+    /// Evidence for these collections may read differently now: every
+    /// attestation of theirs waiting on a signer is fresh again, to be
+    /// decided when the collection is next settled. Other collections' parked
+    /// attestations stay where they are, unpaid for.
+    pub fn wake_proofs_for(&mut self, collections: &BTreeSet<CollectionHandle>) {
+        let mut woken = Vec::new();
+        let signers: Vec<[u8; 32]> = self.awaiting_proof.iter_ordered().copied().collect();
+        for signer in signers {
+            let Some(entries) = self.awaiting_proof.get(&signer).cloned() else {
+                continue;
+            };
+            let mut kept = Held::new();
+            for entry in held(&entries) {
+                if collections.contains(&entry.collection) {
+                    woken.push(entry);
+                } else {
+                    kept.insert(&Entry::with_value(&parked_key(&entry), entry));
+                }
+            }
+            if kept.is_empty() {
+                self.awaiting_proof.remove(&signer);
+            } else {
+                self.awaiting_proof.replace(&Entry::with_value(&signer, kept));
+            }
+        }
+        for entry in woken {
+            self.park(entry.collection, entry.attestation, entry.signer);
+        }
+    }
+
     /// A proof landed: every attestation waiting on a signer is fresh again,
     /// to be decided when its collection is next settled. Proofs are rare and
     /// the move is one insert per entry, without an admission query.

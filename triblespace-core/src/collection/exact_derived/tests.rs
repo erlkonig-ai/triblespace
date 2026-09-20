@@ -16,8 +16,9 @@ use crate::blob::{BlobEncoding, IntoBlob, TryFromBlob};
 use crate::capability::{CapabilityHandle, CapabilityProof, CapabilityProofId, CapabilityResource};
 use crate::collection::{
     collection_read_audience, read_capability, write_capability, AdmissionPolicy, CollectionCommit,
-    CollectionMerge, CollectionPolicy, CollectionRead, CollectionReadAudience,
-    CollectionRecordSelector, CollectionSnapshotExt, CollectionStore, CollectionStoreExt,
+    CollectionDerive, CollectionMerge, CollectionOperationError, CollectionPolicy, CollectionRead,
+    CollectionReadAudience, CollectionRecordSelector, CollectionSnapshotExt, CollectionStore,
+    CollectionStoreExt, Cover,
 };
 use crate::id::{ExclusiveId, Id};
 use crate::id_hex;
@@ -814,11 +815,6 @@ fn aggregate_support_uses_selected_dag_leaves_without_clipping_certificates() {
             resolved.support_of(lineage.foundation, first.handle()),
             expected
         );
-        // Image reuse remains independent of the requested-support filter.
-        assert_eq!(
-            resolved.images[&(first.handle(), data(&b))],
-            BTreeSet::from([data(&b_output)]),
-        );
     }
     assert_eq!(
         FIRST_MAP_CALLS.get(),
@@ -858,12 +854,8 @@ fn aggregate_support_excludes_missing_witnesses_and_unadmitted_producers() {
     let metadata = store.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
     // This is the actual predecessor, deliberately not persisted yet.
     let cb = CollectionCommit::sign(&signer, root.handle(), data(&b), metadata);
-    let mut a_output = None;
     for (key, source) in [(&signer, &a), (&signer, &b), (&other_signer, &c)] {
         let output = FirstEncoding::map(&(), source, &store.snapshot().unwrap()).unwrap();
-        if source.get_handle() == a.get_handle() {
-            a_output = Some(data(&output));
-        }
         store
             .insert(CollectionRecord::Derive(CollectionDerive::sign(
                 key,
@@ -887,11 +879,6 @@ fn aggregate_support_excludes_missing_witnesses_and_unadmitted_producers() {
         resolved.support_of(lineage.foundation, first.handle()),
         support(root, std::slice::from_ref(&a))
     );
-    assert_eq!(resolved.images.len(), 1);
-    assert_eq!(
-        resolved.images[&(first.handle(), data(&a))],
-        BTreeSet::from([a_output.unwrap()]),
-    );
 
     store.insert(CollectionRecord::Commit(cb)).unwrap();
     let after = store.snapshot().unwrap();
@@ -906,7 +893,6 @@ fn aggregate_support_excludes_missing_witnesses_and_unadmitted_producers() {
         resolved.support_of(lineage.foundation, first.handle()),
         support(root, &[a.clone(), b.clone()])
     );
-    assert_eq!(resolved.images.len(), 2);
 
     // Complete coverage is not an excuse to stop scanning: this admitted,
     // closed claim conflicts with the already certified image of a.
@@ -2048,7 +2034,7 @@ fn maintenance_drops_every_residency_snapshot_and_stores_the_blob_before_merge()
 }
 
 #[test]
-fn target_maintenance_reprobes_once_per_tier_not_per_carry() {
+fn target_maintenance_never_enumerates_records() {
     const MEMBERS: usize = 8;
 
     let (mut inner, root, first, second) = collections();
@@ -2076,8 +2062,8 @@ fn target_maintenance_reprobes_once_per_tier_not_per_carry() {
     assert_eq!(merges, MEMBERS - 1);
     assert_eq!(
         store.semantic_probes.load(Ordering::SeqCst),
-        6,
-        "one ensure probe, one source-guidance probe, and one target-resolution probe for each dyadic tier round",
+        0,
+        "every round reads the frontier from the index; no record is enumerated",
     );
 
     let snapshot = store.inner.snapshot().unwrap();
@@ -2882,16 +2868,24 @@ fn source_guidance_maps_only_the_resident_coarsest_upper_and_repeats_without_wor
         1,
         "skip the historical intermediate image"
     );
-    assert_eq!(
-        store.events.len(),
-        2,
-        "one target blob and one target DERIVE only"
-    );
+    // One target blob and one target DERIVE; then the three images the new
+    // one covers are consumed, each by a MERGE whose result is the new
+    // image, so they leave the frontier for good. No join runs for that.
+    assert_eq!(store.events.len(), 5, "one blob, one DERIVE, three consuming MERGEs");
     assert!(matches!(store.events[0], WriteEvent::Put(_)));
     assert!(
         matches!(store.events[1], WriteEvent::Insert(CollectionRecord::Derive(derive))
         if derive.collection() == first.handle() && derive.input() == data(&upper))
     );
+    let image = match store.events[1] {
+        WriteEvent::Insert(CollectionRecord::Derive(derive)) => derive.output(),
+        _ => unreachable!(),
+    };
+    assert!(store.events[2..].iter().all(|event| matches!(
+        event,
+        WriteEvent::Insert(CollectionRecord::Merge(merge))
+            if merge.collection() == first.handle() && merge.result() == image
+    )));
     assert!(store.acquired.is_empty());
 
     store.events.clear();

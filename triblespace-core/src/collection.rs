@@ -52,7 +52,7 @@ pub mod encoding;
 /// Exact realization over invariant foundational support.
 mod exact_derived;
 /// Deterministic size-tiered maintenance behind exact derived collections.
-mod exact_target_compaction;
+mod maintenance;
 /// Same-named collection generations, and the records they strand.
 pub mod generation;
 /// Maintained positive latest states and historical supersession evidence.

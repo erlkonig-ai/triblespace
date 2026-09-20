@@ -31,6 +31,7 @@ use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
 use crate::patch::{Blake3Merkle, IdentitySchema, PATCH};
+use super::store::CoverageRead;
 use crate::repo::async_store::AsyncBlobStoreAcquire;
 use crate::repo::{BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut, CapabilityProofRead};
 use crate::repo::{CapabilityProofStore, SnapshotSource, Store, StoreRead, StoreSnapshot};
@@ -1897,26 +1898,33 @@ where
     let support = match support {
         Some(support) => support,
         None => {
+            // What the root's frontier stands for is what its admitted
+            // commits stand for, read from the index.
             let snapshot = frontier.view(store.snapshot().map_err(|error| {
                 CollectionRealizationError::storage("observe root endorsements", error)
             })?);
-            let mut support = target.cover([]);
-            for (_, witness_support) in
-                super::admitted_record_witnesses(&snapshot, target.handle())?
-            {
-                support = support.union(&witness_support).expect("one foundation");
-            }
-            support
+            let coverage = snapshot
+                .coverage(&BTreeSet::from([target.handle()]))
+                .map_err(|error| {
+                    CollectionRealizationError::storage("settle root coverage", error)
+                })?;
+            let (support, _) = coverage.frontier_support(target.handle());
+            Support::from_patch(target, support)
         }
     };
     super::exact_derived::ensure_root_in_frontier(store, target, &support, &frontier).await?;
     if compact {
-        super::exact_target_compaction::maintain_target(
+        super::maintenance::carry_target(
             store,
             target,
             signing_key,
             &support,
+            target.handle(),
+            &BTreeSet::from([target.handle()]),
             &mut frontier,
+            |descriptor, low, high, reader| {
+                SimpleArchive::join_members(descriptor, low, high, reader).map(Some)
+            },
         )?;
     }
     store.snapshot().map_err(|error| {

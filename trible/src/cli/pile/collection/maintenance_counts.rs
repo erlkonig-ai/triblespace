@@ -259,7 +259,17 @@ impl<R: CollectionRead> CollectionRead for Counted<R> {
             }
         });
         if let Some(hook) = &self.selection_hook {
-            if selectors.contains(&CollectionRecordSelector::Collection(hook.collection)) {
+            // Any route into the hooked collection: maintenance planned
+            // from the coverage index never enumerates a source, it looks
+            // up the producers of the nodes it selects.
+            let named = selectors.iter().any(|selector| match selector {
+                CollectionRecordSelector::Collection(collection)
+                | CollectionRecordSelector::CommitMember(collection, _)
+                | CollectionRecordSelector::ProducedMember(collection, _)
+                | CollectionRecordSelector::MergeCollection(collection)
+                | CollectionRecordSelector::DeriveTarget(collection) => *collection == hook.collection,
+            });
+            if named {
                 let action = hook.action.lock().unwrap().take();
                 if let Some(action) = action {
                     action();
