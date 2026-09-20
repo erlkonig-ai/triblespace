@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   2026-09-20, live 26 GB pile: a compass read that attaches only went from
   13.5 s to 4.4 s; the same read that maintained took 49 s.
 
+- A cover attached from the frontier charges only the target's records to
+  its observation, as the record walk did: a commit landing in the source
+  does not make the target's cover stale. The one exception is a target
+  record still blocked on an input's support (`Coverage::has_blocked`),
+  while which the whole lineage is charged. The support taken from the
+  index charges the lineage when it is asked for.
+
 - Remove `uncovered_source_members` and `PatternUnion`, introduced only for
   hybrid editor reads. Indexed readers do not manufacture a source-freshness
   guarantee; maintenance and exact support queries retain their existing APIs.

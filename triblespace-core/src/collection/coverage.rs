@@ -101,6 +101,13 @@ pub struct Coverage {
     /// supports by the same fold, so a read is a lookup and not a walk over
     /// the records that produced the lattice.
     frontiers: PATCH<32, IdentitySchema, FrontierSet>,
+    /// Per collection, the results of believed attestations that could not be
+    /// driven yet because an input has no support: a record that arrived
+    /// ahead of its input. While a collection has any, its frontier can move
+    /// on a record landing in an ancestor; otherwise only its own records
+    /// move it, which is what a reader tracking its observation needs to
+    /// know.
+    blocked: PATCH<32, IdentitySchema, FrontierSet>,
 }
 
 /// One row's key: the collection a node belongs to, then the node itself.
@@ -193,6 +200,15 @@ impl Coverage {
         self.union_over(collection, nodes)
     }
 
+    /// Whether any believed attestation of this collection is still waiting
+    /// for an input's support: a record ahead of its input. Only then can a
+    /// record landing in an ancestor move this collection's frontier.
+    pub fn has_blocked(&self, collection: CollectionHandle) -> bool {
+        self.blocked
+            .get(&collection.raw)
+            .is_some_and(|blocked| !blocked.is_empty())
+    }
+
     /// Number of lattice nodes with a coverage row.
     pub fn len(&self) -> usize {
         self.rows.len().min(usize::MAX as u64) as usize
@@ -208,6 +224,17 @@ impl Coverage {
     pub fn shares_root(&self, other: &Self) -> bool {
         self.rows.shares_root(&other.rows)
     }
+}
+
+/// What driving one attestation did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Driven {
+    /// The result's support grew.
+    Grew,
+    /// Every member was already there.
+    Unchanged,
+    /// An input has no support yet; retried when it gets one.
+    Blocked,
 }
 
 /// What one record says about the relationship between payloads.
@@ -822,7 +849,7 @@ impl CoverageIndex {
             self.consumers.replace(&Entry::with_value(&key, edges));
         }
         let mut grown = Vec::new();
-        if self.drive(writes_to, reads_from, attestation) {
+        if self.drive(writes_to, reads_from, attestation) == Driven::Grew {
             grown.push((writes_to, attestation.result()));
         }
         // A row that grew may unblock or widen the attestations that read it,
@@ -836,23 +863,44 @@ impl CoverageIndex {
                 let Some(&(writes_to, reads_from, consumer)) = edges.get(key) else {
                     continue;
                 };
-                if self.drive(writes_to, reads_from, consumer) {
+                if self.drive(writes_to, reads_from, consumer) == Driven::Grew {
                     grown.push((writes_to, consumer.result()));
                 }
             }
         }
     }
 
+    /// Note whether an attestation's result is still waiting for an input.
+    fn mark_blocked(&mut self, collection: CollectionHandle, result: CollectionData, blocked: bool) {
+        let mut set = self
+            .published
+            .blocked
+            .get(&collection.raw)
+            .cloned()
+            .unwrap_or_default();
+        if blocked {
+            set.insert(&Entry::new(&result.raw));
+        } else if set.get(&result.raw).is_some() {
+            set.remove(&result.raw);
+        } else {
+            return;
+        }
+        self.published
+            .blocked
+            .replace(&Entry::with_value(&collection.raw, set));
+    }
+
     /// Union one attestation's contribution into its result row.
     ///
-    /// Returns whether the row actually grew — the termination condition for
-    /// the propagation worklist.
+    /// Says whether the row grew, which is the termination condition for the
+    /// propagation worklist, or whether the attestation is still blocked on
+    /// an input without a support.
     fn drive(
         &mut self,
         writes_to: CollectionHandle,
         reads_from: CollectionHandle,
         attestation: Attestation,
-    ) -> bool {
+    ) -> Driven {
         let mut contribution = match attestation {
             Attestation::Foundation { data } => CoverageSet::from_keys(std::iter::once(data.raw)),
             Attestation::Join { low, high, .. } => {
@@ -862,7 +910,8 @@ impl CoverageIndex {
                 ) else {
                     // All or nothing: a join that only saw one side would
                     // otherwise publish a support it never attested.
-                    return false;
+                    self.mark_blocked(writes_to, attestation.result(), true);
+                    return Driven::Blocked;
                 };
                 let mut union = low.clone();
                 union.union(high.clone());
@@ -874,11 +923,13 @@ impl CoverageIndex {
                 // unchanged, which is what makes the derived image denote the
                 // same logical value.
                 let Some(input) = self.published.rows.get(&row_key(reads_from, input)) else {
-                    return false;
+                    self.mark_blocked(writes_to, attestation.result(), true);
+                    return Driven::Blocked;
                 };
                 input.clone()
             }
         };
+        self.mark_blocked(writes_to, attestation.result(), false);
         let key = row_key(writes_to, attestation.result());
         let grew = match self.published.rows.get(&key) {
             Some(existing) if contribution.difference(existing).is_empty() => false,
@@ -897,7 +948,11 @@ impl CoverageIndex {
         // not: a second route to a result that already has its support still
         // consumes that route's inputs.
         self.advance_frontier(writes_to, attestation);
-        grew
+        if grew {
+            Driven::Grew
+        } else {
+            Driven::Unchanged
+        }
     }
 
     /// Move one collection's frontier for an attestation that has just been

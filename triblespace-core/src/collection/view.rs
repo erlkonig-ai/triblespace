@@ -6,6 +6,7 @@
 //! provenance query. Logical values remain caller-chosen projections
 //! reconstructed through [`TryFromCover`].
 
+use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
@@ -17,7 +18,7 @@ use crate::trible::Fragment;
 use super::observed_store::{DependencyTracker, ObservedStore};
 use super::{
     CollectionData, CollectionDescriptorError, CollectionEncoding, CollectionHandle,
-    CollectionRealizationError, CollectionRecord, Cover, RecordDecodeError, Support,
+    CollectionRealizationError, CollectionRecord, Cover, CoverageRead, RecordDecodeError, Support,
 };
 
 /// One immutable collection observation and its exact realized target cover.
@@ -37,6 +38,11 @@ where
     cover: Cover<E>,
     descriptor: Option<Fragment>,
     witnesses: Arc<[CollectionRecord]>,
+    /// The lineage a support taken from the coverage index stands on. Charged
+    /// to the read-set when the support is asked for, not when the cover is
+    /// attached: the cover moves on the target's records, the support on the
+    /// whole lineage's.
+    support_lineage: Option<BTreeSet<CollectionHandle>>,
     dependencies: DependencyTracker,
 }
 
@@ -52,6 +58,7 @@ where
             cover: self.cover.clone(),
             descriptor: self.descriptor.clone(),
             witnesses: self.witnesses.clone(),
+            support_lineage: self.support_lineage.clone(),
             dependencies: self.dependencies.clone(),
         }
     }
@@ -70,6 +77,7 @@ where
             cover,
             descriptor: None,
             witnesses: Arc::from([]),
+            support_lineage: None,
             // Exact observations constructed without a tracked reader remain
             // conservative. Ordinary attachment supplies its exact read-set.
             dependencies: Arc::new(Mutex::new(StoreDependencies {
@@ -78,6 +86,27 @@ where
                 capability_proofs: true,
                 ..StoreDependencies::default()
             })),
+        }
+    }
+
+    /// Pair one store observation with a cover and support taken from the
+    /// coverage index's frontier. The cover's read-set is already in
+    /// `dependencies`; the support's lineage is charged when it is asked for.
+    pub(crate) fn from_frontier(
+        snapshot: R,
+        support: Support,
+        cover: Cover<E>,
+        lineage: BTreeSet<CollectionHandle>,
+        dependencies: DependencyTracker,
+    ) -> Self {
+        Self {
+            snapshot,
+            support: Arc::new(OnceLock::from(support)),
+            cover,
+            descriptor: None,
+            witnesses: Arc::from([]),
+            support_lineage: Some(lineage),
+            dependencies,
         }
     }
 
@@ -95,6 +124,7 @@ where
             cover,
             descriptor: Some(descriptor),
             witnesses: witnesses.into(),
+            support_lineage: None,
             dependencies,
         }
     }
@@ -135,6 +165,15 @@ where
         R: StoreRead,
     {
         if let Some(support) = self.support.get() {
+            if let Some(lineage) = &self.support_lineage {
+                // A support taken from the index stands on the whole lineage's
+                // records; asking for it is what makes them a dependency.
+                let observed =
+                    ObservedStore::with_tracker(self.snapshot.clone(), self.dependencies.clone());
+                observed.coverage(lineage).map_err(|error| {
+                    CollectionRealizationError::storage("charge support lineage", error)
+                })?;
+            }
             return Ok(support);
         }
         let observed =

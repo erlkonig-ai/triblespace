@@ -67,10 +67,26 @@ where
     R: StoreRead,
     E: CollectionEncoding,
 {
-    let coverage = observed
-        .coverage(&lineage.descriptors.keys().copied().collect())
-        .map_err(|error| CollectionRealizationError::storage("read downward coverage", error))?;
     let handle = target.handle();
+    let lineage_handles: BTreeSet<CollectionHandle> = lineage.descriptors.keys().copied().collect();
+    // Settle the whole lineage on the untracked reader, then take the index
+    // through the tracked one for the target alone: the target's frontier
+    // moves only on the target's own records, so that is the honest read-set
+    // of this cover. The one exception is a target record that arrived ahead
+    // of its input; while the target holds one, a record landing anywhere in
+    // the lineage can drive it, and the whole lineage is charged.
+    let settled = observed
+        .inner()
+        .coverage(&lineage_handles)
+        .map_err(|error| CollectionRealizationError::storage("settle downward coverage", error))?;
+    let charged = if settled.has_blocked(handle) {
+        lineage_handles.clone()
+    } else {
+        BTreeSet::from([handle])
+    };
+    let coverage = observed
+        .coverage(&charged)
+        .map_err(|error| CollectionRealizationError::storage("read downward coverage", error))?;
     let mut candidates = Vec::new();
     for node in coverage.frontier(handle) {
         let Some(support) = coverage.of(handle, node) else {
@@ -115,10 +131,13 @@ where
     }
     let support = Support::from_patch(lineage.foundation, union);
     let cover = Cover::from_data(target, kept);
-    Ok(Some(
-        CollectionSnapshot::new(observed.inner().clone(), support, cover)
-            .with_dependencies(observed.tracker()),
-    ))
+    Ok(Some(CollectionSnapshot::from_frontier(
+        observed.inner().clone(),
+        support,
+        cover,
+        lineage_handles,
+        observed.tracker(),
+    )))
 }
 
 /// Admit only target producers and select their resident output frontier

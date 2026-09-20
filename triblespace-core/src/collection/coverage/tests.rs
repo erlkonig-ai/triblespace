@@ -574,11 +574,14 @@ fn a_merge_arriving_before_its_inputs_settles_on_the_same_frontier() {
     let c = collection(0);
     index.apply(&merge(1, c, data(1), data(2), data(5)), &AdmitEveryRecord);
     assert!(frontier(&index, c).is_empty());
+    assert!(index.published().has_blocked(c));
     index.apply(&commit(1, c, data(1)), &AdmitEveryRecord);
     // One side of a join that is not driven yet stays attachable on its own.
     assert_eq!(frontier(&index, c), vec![[1u8; 32]]);
+    assert!(index.published().has_blocked(c));
     index.apply(&commit(1, c, data(2)), &AdmitEveryRecord);
     assert_eq!(frontier(&index, c), vec![[5u8; 32]]);
+    assert!(!index.published().has_blocked(c));
 }
 
 #[test]
@@ -632,6 +635,12 @@ fn images_join_the_target_frontier_and_a_carry_consumes_them() {
     index.apply(&derive(1, target, data(1), data(11)), &lineages);
     index.apply(&derive(1, target, data(2), data(12)), &lineages);
     assert_eq!(frontier(&index, target), vec![[11u8; 32], [12u8; 32]]);
+    assert!(!index.published().has_blocked(target));
+    // An image ahead of its input blocks: the target's frontier can then move
+    // on a source record, and a reader tracking it must know.
+    index.apply(&derive(1, target, data(9), data(19)), &lineages);
+    assert!(index.published().has_blocked(target));
+    assert!(!index.published().has_blocked(source));
     // The source's frontier is its own: images consume nothing there.
     assert_eq!(frontier(&index, source), vec![[1u8; 32], [2u8; 32]]);
     // A carry inside the target consumes the two images.
