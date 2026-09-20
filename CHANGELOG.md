@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `trible pile migrate endorse-unsigned-equations` is gone with the witness
+  walk it stood on: reads and maintenance select from the coverage index and
+  no longer re-resolve records, so there is nothing for a re-endorsement to
+  certify. `pile migrate list` no longer names it.
+
 - Remove the exact collection API: `ensure_exact`, `ensure_exact_with`,
   `maintain_exact`, `maintain_exact_with` on `CollectionStoreExt` and
   `collection_exact` on `CollectionSnapshotExt` are gone. A target stands for
@@ -18,9 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   assertion had nothing left to check; requesting a narrower support was a
   selection nobody needed once maintenance keeps every target at its source's
   frontier. Incremental consumers compute the delta as
-  `next.support()?.additions_since(previous.support()?)` and read those
-  payloads from the source through `Cover::materialize`, letting the
-  maintained target answer the full side of `pattern_changes!`.
+  `next.support()?.additions_since(previous.support()?)` and fetch those
+  payloads from the source by handle, letting the maintained target answer
+  the full side of `pattern_changes!`.
 
 - A retained rewrite can leave a drained generation behind:
   `PileFile::rewrite_retained_into_leaving` takes `DrainedGeneration` pairs

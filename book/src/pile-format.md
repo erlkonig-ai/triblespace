@@ -669,48 +669,11 @@ An endorsement migration must append a new signature by a writer authorized
 for that exact collection (the target for DERIVE). It must not use every
 receiver's key or delete unsigned evidence that cannot yet be endorsed.
 
-The explicit same-pile command is:
-
-```bash
-trible pile migrate <PILE> endorse-unsigned-equations \
-  --collection blake3:<COLLECTION_HANDLE> \
-  --signing-key <EXISTING_WRITER_KEY> --dry-run
-```
-
-Despite its historical name, this command accepts both retired epochs. It
-checks old signed-frame signatures before using those equations as migration
-input; that check does not supply their missing witness provenance.
-
-Remove `--dry-run` only to make that writer's new endorsement. The command
-freezes target WRITE admission and plans the complete batch before appending.
-Results must be resident; historical input payloads and metadata need not be.
-The owner chooses a small deterministic covering set of actual admitted input
-record witnesses. Distinct legitimate supports for one payload are not a
-reason to recompute it: several new endorsements can together preserve their
-total support. For MERGE, input covers of sizes `k` and `l` require at most
-`max(k,l)` pairs, not their Cartesian product. This preserves total support,
-not every possible exact-subset realization.
-
-Every new record adds support not already certified for that exact payload
-equation. Retries and grounded payload cycles stop when that coverage stops
-growing; later admitted aliases can extend it. Missing or ungrounded cyclic
-witnesses remain unresolved. Missing outputs, missing/cyclic witnesses,
-unauthorized signing, and malformed or invalid old signed frames are reported
-separately. The report distinguishes new endorsement records from already-covered
-equations. Independent resolvable work may still be appended, with a nonzero
-exit when unresolved items remain. Migrate an upstream collection first when
-its new witnesses are needed downstream.
-
-Preflight resolves the complete planned overlay together with already-stored
-authorized records whose witness closures become available. Direct functional
-conflicts and ordinary commuting-square conflicts abort the entire plan before
-any append. Newly closed native support feeds back into the same worklist, so
-the first run reaches that closure rather than leaving it for a retry. This is
-not a global proof of order laws, a load of historical payloads, or a
-recomputation of the result.
-
-The operation does not fetch, recompute results, change collection/entity or
-payload identities, recover original authorship, or remove historical frames.
+No shipped command restates them any more. The `endorse-unsigned-equations`
+migration that re-signed retired equations under a current writer's key was
+applied to the live piles and then removed together with the witness-bound
+record kinds it produced; a pile that still holds unrestated frames keeps them
+as inert evidence that a current reader crosses without interpreting.
 Old signed opaque frames retain the ordinary
 conservative copying rule: preserve their bytes and all resident blobs; Yard
 and semantic reframe still refuse opaque ownership.

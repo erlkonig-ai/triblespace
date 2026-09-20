@@ -86,13 +86,13 @@ their ownership edges are unknown. A retained Pile rewrite instead preserves
 their bytes and every resident blob; semantic reframe and Yard reclamation
 still refuse them.
 
-The retired signed payload-only equation kinds are opaque to ordinary replay.
-Their old signatures are not input-record endorsements. Retained Pile copying
-therefore carries their frames and all resident blobs under the same opaque
-rule; Yard and semantic reframe refuse them. The explicit
-`endorse-unsigned-equations` command can author current witness-bound records
-from both retired epochs, but neither that command nor ordinary GC silently
-deletes the historical signed frames.
+The retired equation kinds -- the unsigned forms and the later witness-bound
+signed forms -- are opaque to ordinary replay. Retained Pile copying carries
+their frames and all resident blobs under the same opaque rule; Yard and
+semantic reframe refuse them. No shipped command restates them any more: the
+migration that once re-signed them under a current writer's key was applied
+to the live piles and then removed with the record kinds it produced. Ordinary
+GC never deletes the historical frames.
 
 ## Backend Boundaries
 

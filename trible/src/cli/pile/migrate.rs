@@ -7,7 +7,6 @@ use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::{BlobStoreGet, SnapshotSource};
 
 mod branch_to_collection;
-mod endorse_unsigned_equations;
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Migration {
@@ -55,29 +54,6 @@ pub enum Command {
         #[arg(long)]
         signing_key: PathBuf,
     },
-    /// Endorse historical payload equations with real admitted input witnesses.
-    ///
-    /// Handles both unsigned and retired signed MERGE/DERIVE frames. Plans
-    /// this exact collection topologically, then appends current writer
-    /// endorsements without changing old frames or payload identities.
-    /// Small witness covers preserve total admitted support without enumerating
-    /// every exact-subset alternative. Repeated runs certify only newly available
-    /// support. Missing or ungrounded cyclic witnesses are reported; conflicting
-    /// outputs abort before publication. Upstream collections must be migrated
-    /// explicitly first. Results are not recomputed: this signer takes
-    /// responsibility for their correctness in a fresh endorsement, not a
-    /// reconstruction of the original historical provenance.
-    EndorseUnsignedEquations {
-        /// Exact target collection descriptor, as blake3:HEX or 64 hex digits.
-        #[arg(long)]
-        collection: String,
-        /// Existing durable signing-key file; must hold target WRITE authority.
-        #[arg(long)]
-        signing_key: PathBuf,
-        /// Report eligible endorsements without appending anything.
-        #[arg(long)]
-        dry_run: bool,
-    },
     /// Run one explicitly named migration.
     Run {
         /// Migration name. `monotone-wants` is deliberately never implicit:
@@ -101,11 +77,6 @@ pub fn run(pile_path: PathBuf, cmd: Command) -> Result<()> {
             authority,
             signing_key,
         } => branch_to_collection::run(pile_path, branch, collection_name, authority, signing_key),
-        Command::EndorseUnsignedEquations {
-            collection,
-            signing_key,
-            dry_run,
-        } => endorse_unsigned_equations::run(pile_path, collection, signing_key, dry_run),
         Command::Run { migration, dry_run } => {
             match migration {
                 Migration::MonotoneWants => migrate_monotone_wants(&pile_path, dry_run)?,
