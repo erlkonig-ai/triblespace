@@ -230,22 +230,23 @@ That law makes equations on either side of the mapping reusable evidence.
 Construction and representation maintenance are separate operations. The
 foundational support is always `Support = Cover<SimpleArchive>`: the admitted
 committed payloads at the root of the descriptor lineage. Mapping and merging
-never change those denotational coordinates. Ordinary multi-hop maintenance
-invokes each mapping in order over whatever its immediate source already
-realizes. Explicit support is needed only when the caller requires matching
-representations of a chosen support; it is never an intermediate physical cover.
+never change those denotational coordinates. Multi-hop maintenance invokes
+each mapping in order over whatever its immediate source already realizes, so
+every target ends up standing for what its source's frontier stands on. There
+is no way to ask for a narrower support: a support is what a target stands on,
+read back from it, never an argument to select by. Two targets derived from one
+source and read from one snapshot agree on it by construction.
 
-`ensure` and `ensure_exact` are live asynchronous store operations. For a root
-`SimpleArchive` collection, they acquire missing blobs for admitted or explicit
-foundational support without publishing equations. For a derived target,
-ordinary `ensure` selects the admitted support already realized by resident
-immediate-source members; `ensure_exact` instead requires the explicit support.
-Both reuse resident target nodes and stored equations, acquire exact missing
-dependencies for selected work, and publish only missing `DERIVE` work for
-their one immediate mapping. Neither operation creates a `MERGE`, computes
-an upstream blob, or emits a durable `WANT`. `maintain` and `maintain_exact` first
-perform that same realization work and then repeatedly join target members in the
-deterministic dyadic serialized-size tiers. A target join whose exact immutable
+`ensure` is a live asynchronous store operation. For a root `SimpleArchive`
+collection it acquires missing blobs for the admitted foundational support
+without publishing equations. For a derived target it takes the support already
+realized by resident immediate-source members, reuses resident target nodes and
+stored equations, acquires exact missing dependencies for the selected work,
+and publishes only the missing `DERIVE` work for its one immediate mapping. It
+never creates a `MERGE`, computes an upstream blob, or emits a durable `WANT`.
+`maintain` first performs that same realization work and then repeatedly joins
+target members in the deterministic dyadic serialized-size tiers. A target join
+whose exact immutable
 dependency cannot be acquired leaves a finer target cover in place. Different
 target covers may denote the same join, and every lattice position uses the
 same `Cover<E>` shape while retaining its own typed member handles. Missing
@@ -254,11 +255,11 @@ derived artifacts are cache misses, not missing facts.
 Every store-level ensure or maintain operation returns a fresh
 `StoreSnapshot`. The result is the post-operation temporal boundary, including
 work concurrently published before that snapshot. Read-only
-`CollectionSnapshotExt::{collection, collection_exact}` selects a resident
-target cover from one such store snapshot and returns a `CollectionSnapshot`
-which owns that immutable observation, the invariant foundational support, and
-the realized target cover. A caller chooses the logical projection later with
-`CollectionSnapshot::view`.
+`CollectionSnapshotExt::collection` selects a resident target cover from one
+such store snapshot and returns a `CollectionSnapshot` which owns that
+immutable observation and the realized target cover; the foundational support
+it stands on is a separate `support()` query over the same observation. A
+caller chooses the logical projection later with `CollectionSnapshot::view`.
 
 `Cover` carries no route mode. The resolver checks its explicit members first
 and, only when needed, widens through stored `MERGE` equations to a resident

@@ -10,9 +10,9 @@ use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
-use crate::repo::{BlobStoreGet, StoreChanges, StoreDependencies, StoreRead, StoreSnapshot};
+use crate::repo::{BlobStoreGet, StoreChanges, StoreRead, StoreSnapshot};
 use crate::trible::Fragment;
 
 use super::observed_store::{DependencyTracker, ObservedStore};
@@ -69,26 +69,6 @@ where
     R: StoreSnapshot,
     E: CollectionEncoding,
 {
-    /// Pair one store observation with frozen support and its realization.
-    pub(crate) fn new(snapshot: R, support: Support, cover: Cover<E>) -> Self {
-        Self {
-            snapshot,
-            support: Arc::new(OnceLock::from(support)),
-            cover,
-            descriptor: None,
-            witnesses: Arc::from([]),
-            support_lineage: None,
-            // Exact observations constructed without a tracked reader remain
-            // conservative. Ordinary attachment supplies its exact read-set.
-            dependencies: Arc::new(Mutex::new(StoreDependencies {
-                all_records: true,
-                all_blobs: true,
-                capability_proofs: true,
-                ..StoreDependencies::default()
-            })),
-        }
-    }
-
     /// Pair one store observation with a cover and support taken from the
     /// coverage index's frontier. The cover's read-set is already in
     /// `dependencies`; the support's lineage is charged when it is asked for.
@@ -127,11 +107,6 @@ where
             support_lineage: None,
             dependencies,
         }
-    }
-
-    pub(crate) fn with_dependencies(mut self, dependencies: DependencyTracker) -> Self {
-        self.dependencies = dependencies;
-        self
     }
 
     /// Immutable store observation against which the cover and provenance are valid.
@@ -335,8 +310,11 @@ pub trait TryFromCover<L: CollectionEncoding>: Sized {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use crate::blob::encodings::simplearchive::SimpleArchive;
     use crate::blob::encodings::succinctarchive::SuccinctArchiveBlob;
+    use crate::collection::observed_store::ObservedStore;
     use crate::collection::{Collection, CollectionData, CollectionHandle};
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::repo::SnapshotSource;
@@ -352,8 +330,13 @@ mod tests {
         let mut store = MemoryRepo::default();
         let store_snapshot = store.snapshot().unwrap();
 
-        let snapshot =
-            CollectionSnapshot::new(store_snapshot.clone(), support.clone(), cover.clone());
+        let snapshot = CollectionSnapshot::from_frontier(
+            store_snapshot.clone(),
+            support.clone(),
+            cover.clone(),
+            BTreeSet::new(),
+            ObservedStore::new(store_snapshot.clone()).tracker(),
+        );
         assert!(snapshot.snapshot() == &store_snapshot);
         assert_eq!(snapshot.support().unwrap(), &support);
         assert_eq!(snapshot.cover(), &cover);

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Remove the exact collection API. `ensure_exact`, `ensure_exact_with`,
+  `maintain_exact`, `maintain_exact_with` and `collection_exact` are gone,
+  and `CollectionRealization::ensure`/`maintain` take no support. A derived
+  target stands for what its source's frontier stands for, a root for what
+  its admitted commits say, and `collection` attaches what a target stands
+  on; two derived views of one source attached from one snapshot agree by
+  construction. Gone with the request: the lattice-granularity closure,
+  explicit root members without an admitted COMMIT, the functional check on
+  conflicting images (a diagnostic now), and the structural-certificate
+  fallback for a target whose source writer is not admitted locally.
+  Derived ensure asks for absent source nodes it needs before giving up.
+
 - Plan maintenance from the coverage index. The new `collection::maintenance`
   module replaces the per-round semantic probes (`probe_mapping`,
   `resolve_target`, `witnessed_physical_cover`, `source_residual`,

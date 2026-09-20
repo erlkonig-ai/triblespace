@@ -93,29 +93,29 @@ saved cover only after the complete fallible fold succeeds, as the example
 does, to make a failed fold retry the same support.
 
 The two pattern inputs need not share a representation. The runnable example
-(`cargo run --example collection_pattern_changes`) uses immutable
-`CollectionSnapshot<R, E>` values which own the store observation and realized
-target cover. Their foundational support is a fallible, lazy provenance query;
-their shard-preserving query values are reconstructed separately with `view`.
+(`cargo run --example collection_pattern_changes`) keeps an immutable
+`CollectionSnapshot<R, E>` which owns the store observation and realized
+target cover. Its foundational support is a fallible, lazy provenance query;
+its shard-preserving query value is reconstructed separately with `view`.
 
-For a strict extension, compute `changed_support =
-current_support.additions_since(previous.support()?)`. Await `ensure_exact` or
-`maintain_exact` for that same foundational support through each desired
-mapping edge, then ask the returned store snapshot for
-`collection_exact(target, &changed_support)`. Do the same for complete
-`current_support` to obtain `full`. Every hop receives the same support; no
-intermediate physical cover becomes a watermark. Persisted `DERIVE` and
-`MERGE` equations make repeated work idempotent and let the complete path reuse
-the delta work without unioning temporary views or reconstructing a
-`TribleSet`.
+For a strict extension, await `maintain` through each mapping edge, attach
+the target from the snapshot the last step returned, and compute
+`changed_support = next.support()?.additions_since(previous.support()?)`. That
+delta is a set of source payloads, so read it from the source through the same
+snapshot — `changed_support.materialize::<TribleSet, _>(&snapshot)` — and let
+the maintained target's `view` answer the `full` side. A target stands for
+what its source's frontier stands on and nothing narrower, so there is no
+support to pass along the chain and no way to attach a target for only the
+delta; the delta is read where it lives. Persisted `DERIVE` and `MERGE`
+equations make repeated maintenance idempotent.
 
 Keep the previous collection snapshot until the complete fallible fold
-succeeds. A failed consumer therefore retries the same exact delta, while
-already completed lattice work is merely rediscovered. If the previous support
-is no longer a subset, `CoverAdvanceError::ResetRequired` asks the application
-to rebuild from the complete current snapshot. Exact support prevents payloads
-first observed after the chosen store watermark from leaking into either query
-input merely because their blobs are resident later.
+succeeds. A failed consumer therefore retries the same delta, while already
+completed lattice work is merely rediscovered. If the previous support is no
+longer a subset, `CoverAdvanceError::ResetRequired` asks the application to
+rebuild from the complete current snapshot. Because both inputs come from one
+snapshot, payloads first observed later cannot leak into either query input
+merely because their blobs are resident by then.
 
 Payload support is deliberately not an exact fact difference. A new payload
 may repeat a fact already present, and that new witness may legitimately make a

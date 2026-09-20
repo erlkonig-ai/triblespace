@@ -397,8 +397,6 @@ fn selected_endorsement_reads_without_ancestry_but_support_needs_exact_records()
     // unrequested support incomplete -- they are one record now.
     let requested = source.cover([input.get_handle()]);
     assert_eq!(attached.support().unwrap(), &requested);
-    let exact = snapshot.collection_exact(target, &requested).unwrap();
-    assert_eq!(exact.support().unwrap(), &requested);
     assert_eq!(
         attached
             .view::<UnionArchive<OrderedUniverse>>()

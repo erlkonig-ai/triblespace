@@ -16,7 +16,7 @@ use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::Inline;
 use triblespace_core::query::ContainsConstraint;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
-use triblespace_core::repo::{BlobStorePut, SnapshotSource};
+use triblespace_core::repo::BlobStorePut;
 use triblespace_core::trible::{Fragment, Trible, TribleSet};
 
 use triblespace_search::nvfp4::{NvFp4CosineIndex, NvFp4CosineSet, NvFp4EmbeddingAttribute};
@@ -62,11 +62,8 @@ fn simplearchive_mapping_lazy_view_and_exact_queries_compose() {
         .commit(source, &authority, Fragment::from(facts))
         .unwrap();
 
-    let snapshot = store.snapshot().unwrap();
-    let support = source.admitted(&snapshot).unwrap();
-    drop(snapshot);
-    let snapshot = block_on(store.maintain_exact(target, &authority, &support)).unwrap();
-    let collection = snapshot.collection_exact(target, &support).unwrap();
+    let snapshot = block_on(store.maintain(target, &authority)).unwrap();
+    let collection = snapshot.collection(target).unwrap();
     let index: NvFp4CosineIndex<Embedding> = collection.view().unwrap();
     let snapshot = collection.snapshot();
 

@@ -1,14 +1,15 @@
 //! Evolving-cover maintenance benchmark for canonical Succinct collections.
 //!
 //! This benchmark compares the two public maintenance paths on
-//! geometrically growing exact covers:
+//! geometrically growing source frontiers:
 //!
-//! - `maintain_exact`: deterministic size-tiered raw-target maintenance followed by
-//!   the exact Rank9-accelerated derivation.
-//! - functional snapshot advancement: maintain exact changed and full
-//!   Succinct covers, then return immutable candidates to the caller.
+//! - `maintain`: deterministic size-tiered raw-target maintenance followed by
+//!   the Rank9-accelerated derivation.
+//! - functional snapshot advancement: maintain the Succinct chain, read the
+//!   payloads the target newly stands on from the source as the delta, and
+//!   return immutable candidates to the caller.
 //!
-//! Stateless `maintain_exact` gets an independent warm store, a source-identical cold
+//! Stateless `maintain` gets an independent warm store, a source-identical cold
 //! store with no derived evidence, and an immediate unchanged warm no-op. The
 //! maintained view gets its own evolving store and immediate no-op. Source
 //! commits are appended outside the timers. Store deltas quantify new durable
@@ -250,19 +251,18 @@ struct RunContext<'a> {
     collections: &'a Collections,
 }
 
-fn maintain_succinct_exact(
+fn maintain_succinct(
     store: &mut MemoryRepo,
-    support: &Support,
     collections: &Collections,
     signing_key: &SigningKey,
 ) -> CollectionSnapshot<MemoryRepoSnapshot, Rank9AcceleratedSuccinctArchiveBlob> {
-    block_on(store.maintain_exact(collections.raw, signing_key, support))
-        .expect("maintain exact raw Succinct collection");
-    let snapshot = block_on(store.maintain_exact(collections.accelerated, signing_key, support))
-        .expect("maintain exact accelerated Succinct collection");
+    block_on(store.maintain(collections.raw, signing_key))
+        .expect("maintain raw Succinct collection");
+    let snapshot = block_on(store.maintain(collections.accelerated, signing_key))
+        .expect("maintain accelerated Succinct collection");
     snapshot
-        .collection_exact(collections.accelerated, support)
-        .expect("observe exact accelerated Succinct collection")
+        .collection(collections.accelerated)
+        .expect("observe accelerated Succinct collection")
 }
 
 fn time_ensure(
@@ -272,10 +272,14 @@ fn time_ensure(
     signing_key: &SigningKey,
 ) -> TimedOperation {
     let start = Instant::now();
-    let attached = maintain_succinct_exact(store, cover, collections, signing_key);
+    let attached = maintain_succinct(store, collections, signing_key);
     let elapsed = start.elapsed();
-    let union: UnionArchive<OrderedUniverse> =
-        attached.view().expect("materialize exact Succinct view");
+    assert_eq!(
+        attached.support().expect("resolve accelerated support"),
+        cover,
+        "the maintained target stands for the accounting cover",
+    );
+    let union: UnionArchive<OrderedUniverse> = attached.view().expect("materialize Succinct view");
     black_box(union.segment_count());
     TimedOperation { elapsed, union }
 }
@@ -292,8 +296,13 @@ fn observe_raw_cover(
         .snapshot()
         .expect("freeze pre-diagnostic store snapshot");
     let raw_cover = diagnostic_before
-        .collection_exact(raw, cover)
-        .expect("observe complete resident raw exact cover");
+        .collection(raw)
+        .expect("observe resident raw cover");
+    assert_eq!(
+        raw_cover.support().expect("resolve raw support"),
+        cover,
+        "the raw target stands for the accounting cover",
+    );
     let diagnostic_after = store
         .snapshot()
         .expect("freeze post-diagnostic store snapshot");
@@ -437,7 +446,7 @@ fn time_snapshot(
     let start = Instant::now();
     let (candidate, changed_members, reused_members) = match state.as_ref() {
         None => (
-            maintain_succinct_exact(store, cover, collections, signing_key),
+            maintain_succinct(store, collections, signing_key),
             cover.len(),
             0,
         ),
@@ -458,26 +467,22 @@ fn time_snapshot(
         }
         Some(previous) => match cover.additions_since(previous.support().unwrap()) {
             Ok(additions) => {
-                maintain_succinct_exact(store, &additions, collections, signing_key);
-                let next = maintain_succinct_exact(store, cover, collections, signing_key);
-                let changed = next
-                    .snapshot()
-                    .collection_exact(collections.accelerated, &additions)
-                    .expect("observe changed exact Succinct snapshot");
-                let changed_members = changed.support().unwrap().len();
-                let changed_view: UnionArchive<OrderedUniverse> = changed
-                    .view()
-                    .expect("materialize changed Succinct snapshot");
-                black_box(changed_view.segment_count());
-                (next, changed_members, previous.support().unwrap().len())
+                let next = maintain_succinct(store, collections, signing_key);
+                // The delta is a set of source payloads: read them from the
+                // source through the same snapshot the target came from.
+                let changed: TribleSet = additions
+                    .materialize(next.snapshot())
+                    .expect("materialize changed source payloads");
+                black_box(changed.len());
+                (next, additions.len(), previous.support().unwrap().len())
             }
             Err(CoverAdvanceError::ResetRequired { .. }) => (
-                maintain_succinct_exact(store, cover, collections, signing_key),
+                maintain_succinct(store, collections, signing_key),
                 cover.len(),
                 0,
             ),
             Err(error) => {
-                panic!("advance maintained exact Succinct snapshot: {error}")
+                panic!("advance maintained Succinct snapshot: {error}")
             }
         },
     };

@@ -30,8 +30,6 @@ use super::{
 #[cfg(test)]
 use super::{CanonicalDerivation, CollectionDerivation};
 
-pub(crate) use super::maintenance::attach_collection_exact;
-
 type BoxError = Box<dyn Error + Send + Sync + 'static>;
 
 /// Failure to observe, ensure, or maintain one collection realization.
@@ -348,47 +346,6 @@ where
     Ok(load_lineage(snapshot, target)?.foundation)
 }
 
-/// Select the admitted support actually realized by a mapping's immediate source.
-///
-/// An unbuilt or nonresident source member is not an obligation of ordinary
-/// downstream maintenance. Exact requests still specify their own support.
-pub(crate) fn source_support<R, M>(
-    snapshot: &R,
-    target: Collection<M::Target>,
-) -> Result<Support, CollectionRealizationError>
-where
-    R: StoreRead,
-    M: CollectionMapping,
-{
-    let lineage = load_lineage(snapshot, target)?;
-    let source = lineage
-        .source_by_target
-        .get(&target.handle())
-        .copied()
-        .ok_or_else(|| {
-            CollectionRealizationError::Resolution(
-                "maintenance requires a derived target descriptor".to_owned(),
-            )
-        })?;
-    // The source's resident frontier, read the way any reader reads it: what
-    // the index says is attachable now, and the support that stands on.
-    let attached =
-        super::observation::attach(snapshot, Collection::<M::Source>::from_handle(source))?;
-    let support = attached.support()?.clone();
-    Ok(support)
-}
-
-pub(super) fn require_support(lineage: &Lineage, support: &Support) -> Result<(), CollectionRealizationError> {
-    if support.collection() == lineage.foundation {
-        return Ok(());
-    }
-    Err(CollectionRealizationError::InvalidCover(format!(
-        "support foundation {} differs from target foundation {}",
-        hex::encode_upper(support.collection().handle().raw),
-        hex::encode_upper(lineage.foundation.handle().raw),
-    )))
-}
-
 pub(super) type InputWitnesses =
     BTreeMap<(CollectionHandle, CollectionData), Vec<(CollectionRecord, Support)>>;
 
@@ -433,12 +390,7 @@ where
     R: StoreRead,
 {
     let lineage = load_record_lineage(snapshot, collection)?;
-    let certified = resolve_endorsed_lineage(
-        snapshot,
-        &lineage,
-        &BTreeSet::from([collection]),
-        None,
-    )?;
+    let certified = resolve_endorsed_lineage(snapshot, &lineage, &BTreeSet::from([collection]))?;
     let mut records = Vec::new();
     for ((owner, _), alternatives) in certified.witnesses {
         if owner != collection {
@@ -546,7 +498,7 @@ fn record_certificate(
 /// lattice comparison absorbs.
 ///
 /// [`super::witness::records_for`] walks the same graph for retention.
-pub(super) fn structural_certificate<R>(
+fn structural_certificate<R>(
     snapshot: &R,
     lineage: &Lineage,
     record: CollectionRecord,
@@ -605,14 +557,10 @@ fn resolve_endorsed_lineage<R>(
     snapshot: &R,
     lineage: &Lineage,
     collections: &BTreeSet<CollectionHandle>,
-    requested: Option<&Support>,
 ) -> Result<CertifiedResolution, CollectionRealizationError>
 where
     R: StoreRead,
 {
-    if let Some(requested) = requested {
-        require_support(lineage, requested)?;
-    }
     let mut evidence = BTreeMap::new();
     for collection in collections {
         let descriptor = lineage.descriptor(*collection);
@@ -641,23 +589,6 @@ where
     let coverage = snapshot
         .coverage(&lineage.descriptors.keys().copied().collect())
         .map_err(|error| CollectionRealizationError::storage("read downward coverage", error))?;
-    // A request is compared at lattice granularity, not member identity. A
-    // certificate wider than the request still sits inside it when every
-    // extra member is BELOW a requested one, and `row(r)` is r's downward
-    // closure, so the union of the requested rows is the downward closure of
-    // the request. A requested member with no row stays in as itself, so this
-    // is never looser than the identity test was. Without this, a record
-    // certified for {a, b} where a <= b could not satisfy a request for {b},
-    // and the only way to make it could was a second record naming a
-    // narrower route -- the fan-out the witness field forced.
-    let requested_closure = requested.map(|requested| {
-        let (mut closure, unattested) =
-            coverage.union_over(lineage.foundation.handle(), requested.data_members());
-        closure.union(super::coverage::CoverageSet::from_keys(
-            unattested.into_iter().map(|member| member.raw),
-        ));
-        Support::from_patch(lineage.foundation, closure)
-    });
     let mut roots = BTreeSet::new();
     let mut witnesses = InputWitnesses::new();
     for record in candidates {
@@ -675,20 +606,10 @@ where
         if !accepted {
             continue;
         }
-        // The fold's row when it has one; that is the O(1) path and, where
-        // the whole ancestry is admitted, the same set. Otherwise certify
-        // from what the producer named.
-        let certificate = match record_certificate(&coverage, lineage, record) {
-            Some(certificate) => certificate,
-            None => match structural_certificate(snapshot, lineage, record)? {
-                Some(certificate) => certificate,
-                None => continue,
-            },
-        };
-        let record_support = Support::from_patch(lineage.foundation, certificate);
-        if requested_closure
-            .as_ref()
-            .is_some_and(|closure| !record_support.is_subset(closure).expect("one foundation"))
+        // A record certifies something when the fold has a row for it or,
+        // failing that, when what its producer named reduces to commits.
+        if record_certificate(&coverage, lineage, record).is_none()
+            && structural_certificate(snapshot, lineage, record)?.is_none()
         {
             continue;
         }
@@ -790,49 +711,45 @@ where
 /// records. A missing immediate-source cover is an error: downstream ensure
 /// never constructs upstream blobs.
 #[cfg(test)]
-fn ensure_exact_resident_with<S, M>(
+fn ensure_resident_with<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
     signing_key: &SigningKey,
-    support: &Support,
 ) -> Result<(), CollectionRealizationError>
 where
     S: Store,
     M: CollectionMapping,
 {
     let snapshot = store.snapshot().map_err(|error| {
-        CollectionRealizationError::storage("freeze exact mapping frontier", error)
+        CollectionRealizationError::storage("freeze mapping frontier", error)
     })?;
     let mut frontier = OperationFrontier::new(snapshot);
-    ensure_exact_resident_in_frontier_with::<S, M>(
+    ensure_resident_in_frontier_with::<S, M>(
         store,
         target,
         signing_key,
-        support,
         &BTreeSet::new(),
         &mut frontier,
     )
 }
 
 #[cfg(test)]
-fn ensure_exact_resident<S, T>(
+fn ensure_resident<S, T>(
     store: &mut S,
     target: Collection<T>,
     signing_key: &SigningKey,
-    support: &Support,
 ) -> Result<(), CollectionRealizationError>
 where
     S: Store,
     T: CollectionDerivation,
 {
-    ensure_exact_resident_with::<S, CanonicalDerivation<T>>(store, target, signing_key, support)
+    ensure_resident_with::<S, CanonicalDerivation<T>>(store, target, signing_key)
 }
 
-fn ensure_exact_resident_in_frontier_with<S, M>(
+fn ensure_resident_in_frontier_with<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
     signing_key: &SigningKey,
-    support: &Support,
     unavailable: &BTreeSet<CollectionData>,
     frontier: &mut OperationFrontier<S::Snapshot>,
 ) -> Result<(), CollectionRealizationError>
@@ -840,62 +757,51 @@ where
     S: Store,
     M: CollectionMapping,
 {
-    super::maintenance::realize_images::<S, M>(
-        store,
-        target,
-        signing_key,
-        support,
-        unavailable,
-        frontier,
-    )
+    super::maintenance::realize_images::<S, M>(store, target, signing_key, unavailable, frontier)
 }
 
 /// Ensure one mapping and then carry its target lattice to the deterministic
 /// LSM fixed point.
 #[cfg(test)]
-fn maintain_exact_resident_with<S, M>(
+fn maintain_resident_with<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
     signing_key: &SigningKey,
-    support: &Support,
 ) -> Result<(), CollectionRealizationError>
 where
     S: Store,
     M: CollectionMapping,
 {
     let snapshot = store.snapshot().map_err(|error| {
-        CollectionRealizationError::storage("freeze exact maintenance frontier", error)
+        CollectionRealizationError::storage("freeze maintenance frontier", error)
     })?;
     let mut frontier = OperationFrontier::new(snapshot);
-    maintain_exact_resident_in_frontier_with::<S, M>(
+    maintain_resident_in_frontier_with::<S, M>(
         store,
         target,
         signing_key,
-        support,
         &BTreeSet::new(),
         &mut frontier,
     )
 }
 
 #[cfg(test)]
-fn maintain_exact_resident<S, T>(
+fn maintain_resident<S, T>(
     store: &mut S,
     target: Collection<T>,
     signing_key: &SigningKey,
-    support: &Support,
 ) -> Result<(), CollectionRealizationError>
 where
     S: Store,
     T: CollectionDerivation,
 {
-    maintain_exact_resident_with::<S, CanonicalDerivation<T>>(store, target, signing_key, support)
+    maintain_resident_with::<S, CanonicalDerivation<T>>(store, target, signing_key)
 }
 
-fn maintain_exact_resident_in_frontier_with<S, M>(
+fn maintain_resident_in_frontier_with<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
     signing_key: &SigningKey,
-    support: &Support,
     unavailable: &BTreeSet<CollectionData>,
     frontier: &mut OperationFrontier<S::Snapshot>,
 ) -> Result<(), CollectionRealizationError>
@@ -903,14 +809,7 @@ where
     S: Store,
     M: CollectionMapping,
 {
-    super::maintenance::maintain_images::<S, M>(
-        store,
-        target,
-        signing_key,
-        support,
-        unavailable,
-        frontier,
-    )
+    super::maintenance::maintain_images::<S, M>(store, target, signing_key, unavailable, frontier)
 }
 
 pub(crate) async fn acquire_missing<S>(
@@ -1010,7 +909,6 @@ where
 pub(crate) async fn ensure_root_in_frontier<S>(
     store: &mut S,
     target: Collection<SimpleArchive>,
-    support: &Support,
     frontier: &OperationFrontier<S::Snapshot>,
 ) -> Result<(), CollectionRealizationError>
 where
@@ -1021,7 +919,7 @@ where
         let snapshot = frontier.view(store.snapshot().map_err(|error| {
             CollectionRealizationError::storage("observe root realization", error)
         })?);
-        let result = super::maintenance::root_acquisitions(&snapshot, target, support);
+        let result = super::maintenance::root_acquisitions(&snapshot, target);
         drop(snapshot);
         let missing = match result {
             Ok(None) => return Ok(()),
@@ -1037,7 +935,7 @@ where
             let snapshot = frontier.view(store.snapshot().map_err(|error| {
                 CollectionRealizationError::storage("observe incomplete root realization", error)
             })?);
-            return attach_collection_exact(&snapshot, target, support).map(|_| ());
+            return super::maintenance::root_incomplete(&snapshot, target);
         }
     }
 }
@@ -1045,10 +943,9 @@ where
 /// A resident target endorsement is sufficient for reuse. Binding still checks
 /// the requested encoding, mapping, and support foundation, but no immediate-
 /// source producer or capability definition is needed until new work remains.
-async fn prepare_exact_mapping<S, M>(
+async fn prepare_mapping<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
-    support: &Support,
     frontier: &OperationFrontier<S::Snapshot>,
 ) -> Result<bool, CollectionRealizationError>
 where
@@ -1057,9 +954,9 @@ where
 {
     let resident = {
         let snapshot = frontier.view(store.snapshot().map_err(|error| {
-            CollectionRealizationError::storage("observe exact target before acquisition", error)
+            CollectionRealizationError::storage("observe target before acquisition", error)
         })?);
-        match super::maintenance::images_exact::<_, M>(&snapshot, target, support) {
+        match super::maintenance::images_current::<_, M>(&snapshot, target) {
             Ok(exact) => exact,
             // A missing descriptor can still be acquired through the ordinary
             // active path. Semantic/type/mapping errors must not become misses.
@@ -1073,28 +970,26 @@ where
     Ok(resident)
 }
 
-pub(crate) async fn ensure_exact_in_frontier_with<S, M>(
+pub(crate) async fn ensure_in_frontier_with<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
     signing_key: &SigningKey,
-    support: &Support,
     frontier: &mut OperationFrontier<S::Snapshot>,
 ) -> Result<(), CollectionRealizationError>
 where
     S: Store + AsyncBlobStoreAcquire,
     M: CollectionMapping,
 {
-    if prepare_exact_mapping::<S, M>(store, target, support, frontier).await? {
+    if prepare_mapping::<S, M>(store, target, frontier).await? {
         return Ok(());
     }
     let mut attempted = BTreeSet::new();
     let mut unavailable = BTreeSet::new();
     loop {
-        match ensure_exact_resident_in_frontier_with::<S, M>(
+        match ensure_resident_in_frontier_with::<S, M>(
             store,
             target,
             signing_key,
-            support,
             &unavailable,
             frontier,
         ) {
@@ -1111,11 +1006,10 @@ where
     }
 }
 
-pub(crate) async fn maintain_exact_in_frontier_with<S, M>(
+pub(crate) async fn maintain_in_frontier_with<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
     signing_key: &SigningKey,
-    support: &Support,
     frontier: &mut OperationFrontier<S::Snapshot>,
 ) -> Result<(), CollectionRealizationError>
 where
@@ -1124,15 +1018,14 @@ where
 {
     // Warm maintenance may still coarsen the target, but source-guided
     // opportunities are optional and must use only already resident evidence.
-    prepare_exact_mapping::<S, M>(store, target, support, frontier).await?;
+    prepare_mapping::<S, M>(store, target, frontier).await?;
     let mut attempted = BTreeSet::new();
     let mut unavailable = BTreeSet::new();
     loop {
-        match maintain_exact_resident_in_frontier_with::<S, M>(
+        match maintain_resident_in_frontier_with::<S, M>(
             store,
             target,
             signing_key,
-            support,
             &unavailable,
             frontier,
         ) {

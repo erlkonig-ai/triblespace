@@ -1,4 +1,4 @@
-//! Publish intrinsic entities to a native collection, then query its exact
+//! Publish intrinsic entities to a native collection, then query its
 //! SuccinctArchive projection without a branch, checkout, hook, or manifest.
 //!
 //! Run with: `cargo run --example native_succinct_collection`
@@ -47,8 +47,8 @@ fn main() {
         .expect("publish person");
     }
 
-    // Freeze one coherent store observation, then discover its exact admitted
-    // target frontier without reading the commits' data or metadata blobs.
+    // Freeze one coherent store observation, then discover what the source
+    // stands on without reading the commits' data or metadata blobs.
     let snapshot = pile.snapshot().expect("freeze pile snapshot");
     let support = collection
         .admitted(&snapshot)
@@ -56,21 +56,23 @@ fn main() {
     assert_eq!(support.len(), 3);
     drop(snapshot);
 
-    // Build any missing canonical raw Succinct shards and their exact Rank9
-    // fibers, then query the admitted physical cover directly.
+    // Carry each mapping edge to its source's frontier: the raw Succinct
+    // shards first, then their Rank9 fibers. The snapshot returned by the last
+    // step observes all of that work, so the target read from it stands for
+    // exactly the support admitted above.
     let raw = pile
         .derive::<SuccinctArchiveBlob>(collection, (), policy.clone())
         .expect("register raw Succinct projection");
     let accelerated = pile
         .derive::<Rank9AcceleratedSuccinctArchiveBlob>(raw, (), policy)
         .expect("register Rank9-accelerated projection");
-    block_on(pile.maintain_exact(raw, &signing_key, &support))
-        .expect("maintain exact raw Succinct collection");
-    let snapshot = block_on(pile.maintain_exact(accelerated, &signing_key, &support))
-        .expect("maintain exact Rank9-accelerated collection");
+    block_on(pile.maintain(raw, &signing_key)).expect("maintain raw Succinct collection");
+    let snapshot = block_on(pile.maintain(accelerated, &signing_key))
+        .expect("maintain Rank9-accelerated collection");
     let archive = snapshot
-        .collection_exact(accelerated, &support)
-        .expect("observe exact Rank9-accelerated collection");
+        .collection(accelerated)
+        .expect("observe Rank9-accelerated collection");
+    assert_eq!(archive.support().expect("resolve support"), &support);
     let view: UnionArchive<OrderedUniverse> = archive.view().expect("reconstruct Succinct view");
     let mut names: Vec<String> = find!(
         name: Inline<_>,
@@ -80,7 +82,7 @@ fn main() {
     .collect();
     names.sort();
 
-    println!("queried exact Succinct cover: {names:?}");
+    println!("queried Succinct cover: {names:?}");
     assert_eq!(names, ["Ada", "Barbara", "Grace"]);
 
     pile.close().expect("close pile");

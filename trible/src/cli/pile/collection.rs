@@ -3440,7 +3440,6 @@ fn run_search(
     snippet: bool,
 ) -> Result<()> {
     use anybytes::View;
-    use anyhow::Context;
     use triblespace_core::blob::encodings::utf8string::UTF8String;
     use triblespace_core::collection::{CollectionDerivation, CollectionSnapshotExt};
     use triblespace_core::inline::encodings::genid::GenId;
@@ -3518,15 +3517,14 @@ fn run_search(
 
         // The normal source view is needed only for selected snippets. Query it
         // at the point of use; do not serialize it again or build a shadow map.
+        // Attaching the source from the same snapshot as the index reads what
+        // that snapshot holds of it, which covers everything the index stands on.
         let source_facts: Option<TribleSet> = if snippet && !hits.is_empty() {
             let source_collection: Collection<SimpleArchive> = Collection::open(&snapshot, source)
                 .map_err(|error| anyhow!("open source descriptor: {error}"))?;
-            let support = view
-                .support()
-                .context("resolve indexed support for snippets")?;
             Some(
                 snapshot
-                    .collection_exact(source_collection, support)
+                    .collection(source_collection)
                     .map_err(|error| anyhow!("attach source: {error:?}"))?
                     .view::<TribleSet>()
                     .map_err(|error| anyhow!("view source: {error:?}"))?,

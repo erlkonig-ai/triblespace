@@ -12,7 +12,7 @@ use triblespace_core::capability::{CapabilityProof, CapabilityResource};
 use triblespace_core::collection::succinctarchive_union;
 use triblespace_core::collection::{
     write_capability, AdmissionPolicy, CollectionCommit, CollectionDerive, CollectionMerge,
-    CollectionPolicy, CollectionRead, CollectionRealizationError, CollectionRecord,
+    CollectionPolicy, CollectionRead, CollectionRecord,
     CollectionSnapshotExt, CollectionStore, CollectionStoreExt,
 };
 use triblespace_core::inline::encodings::hash::Handle;
@@ -87,13 +87,7 @@ fn succinct_cover_materializes_as_a_typed_union_archive() {
     let snapshot = store.snapshot().unwrap();
     let source_cover = source.admitted(&snapshot).unwrap();
     let ensured = block_on(store.ensure(target, &authority)).unwrap();
-    let collection = ensured.collection_exact(target, &source_cover).unwrap();
-
-    // Later source growth cannot silently change the support paired with the
-    // completed target realization.
-    store
-        .commit(source, &authority, Fragment::from(one_fact(12)))
-        .unwrap();
+    let collection = ensured.collection(target).unwrap();
     assert_eq!(collection.support().unwrap(), &source_cover);
     let cover = collection.cover();
     assert_eq!(cover.collection(), target);
@@ -103,12 +97,22 @@ fn succinct_cover_materializes_as_a_typed_union_archive() {
     assert_eq!(materialized.segment_count(), 1);
     assert_eq!(materialized.iter().collect::<TribleSet>(), expected);
 
-    // The explicit-support ensure and admitted-support maintenance paths share
-    // the same immutable snapshot result shape.
-    block_on(store.ensure_exact(target, &authority, &source_cover)).unwrap();
-    block_on(store.maintain(target, &authority)).unwrap();
-    let maintained = block_on(store.maintain_exact(target, &authority, &source_cover)).unwrap();
-    let collection = maintained.collection_exact(target, &source_cover).unwrap();
+    // Ensure and maintenance share the same immutable snapshot result shape,
+    // and a warm target is a fixed point of both.
+    block_on(store.ensure(target, &authority)).unwrap();
+    let maintained = block_on(store.maintain(target, &authority)).unwrap();
+    let collection = maintained.collection(target).unwrap();
+    assert_eq!(collection.support().unwrap(), &source_cover);
+    assert_eq!(
+        collection.cover().members().collect::<Vec<_>>(),
+        vec![raw_handle]
+    );
+
+    // Later source growth cannot silently change the support paired with a
+    // completed target realization: the observation is immutable.
+    store
+        .commit(source, &authority, Fragment::from(one_fact(12)))
+        .unwrap();
     assert_eq!(collection.support().unwrap(), &source_cover);
     assert_eq!(
         collection.cover().members().collect::<Vec<_>>(),
@@ -117,7 +121,7 @@ fn succinct_cover_materializes_as_a_typed_union_archive() {
 }
 
 #[test]
-fn exact_apis_accept_a_derived_source_encoding() {
+fn derived_apis_accept_a_derived_source_encoding() {
     let authority = SigningKey::from_bytes(&[43; 32]);
     let expected = one_fact(13);
     let policy = CollectionPolicy::new(
@@ -141,38 +145,34 @@ fn exact_apis_accept_a_derived_source_encoding() {
 
     let snapshot = store.snapshot().unwrap();
     let support = source.admitted(&snapshot).unwrap();
-    // Explicit support is a strict obligation, even when no immediate-source
-    // member realizes it yet. Neither exact operation may construct raw input.
+    // The accelerated target stands for what the raw frontier stands on. With
+    // no raw member realized that is nothing: neither operation constructs
+    // the missing raw input, and neither errors.
     for compact in [false, true] {
-        let result = if compact {
-            block_on(store.maintain_exact(accelerated, &authority, &support))
+        let snapshot = if compact {
+            block_on(store.maintain(accelerated, &authority))
         } else {
-            block_on(store.ensure_exact(accelerated, &authority, &support))
-        };
-        match result {
-            Err(CollectionRealizationError::IncompleteCover {
-                unsupported_members,
-                ..
-            }) => assert_eq!(
-                unsupported_members,
-                support
-                    .members()
-                    .map(Handle::<SimpleArchive>::to_hash)
-                    .collect::<Vec<_>>()
-            ),
-            Err(error) => panic!("unexpected exact-source error: {error}"),
-            Ok(_) => panic!("exact Rank9 realization must not construct its missing raw input"),
+            block_on(store.ensure(accelerated, &authority))
         }
+        .unwrap();
+        let observed = snapshot.collection(accelerated).unwrap();
+        assert!(observed.support().unwrap().is_empty());
+        assert!(observed.cover().is_empty());
+        assert!(snapshot.collection(raw).unwrap().cover().is_empty());
+        assert!(!snapshot.records().unwrap().any(|record| matches!(
+            record.unwrap(),
+            CollectionRecord::Derive(derive) if derive.collection() == raw.handle()
+        )));
     }
-    block_on(store.ensure_exact(raw, &authority, &support)).unwrap();
-    let ensured = block_on(store.ensure_exact(accelerated, &authority, &support)).unwrap();
-    let observed = ensured.collection_exact(accelerated, &support).unwrap();
+    block_on(store.ensure(raw, &authority)).unwrap();
+    let ensured = block_on(store.ensure(accelerated, &authority)).unwrap();
+    let observed = ensured.collection(accelerated).unwrap();
     assert_eq!(observed.support().unwrap(), &support);
     assert_eq!(observed.cover().len(), 1);
 
-    let maintained = block_on(store.maintain_exact(accelerated, &authority, &support)).unwrap();
+    let maintained = block_on(store.maintain(accelerated, &authority)).unwrap();
     let materialized = maintained
-        .collection_exact(accelerated, &support)
+        .collection(accelerated)
         .unwrap()
         .view::<UnionArchive<OrderedUniverse>>()
         .unwrap();
@@ -760,7 +760,7 @@ fn collection_returns_the_maximal_resident_partial_realization() {
         .unwrap();
     let snapshot = store.snapshot().unwrap();
     let first_support = source.admitted(&snapshot).unwrap();
-    block_on(store.ensure_exact(target, &authority, &first_support)).unwrap();
+    block_on(store.ensure(target, &authority)).unwrap();
     store
         .commit(source, &authority, Fragment::from(second))
         .unwrap();

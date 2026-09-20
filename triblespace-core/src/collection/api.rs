@@ -31,7 +31,6 @@ use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
 use crate::patch::{Blake3Merkle, IdentitySchema, PATCH};
-use super::store::CoverageRead;
 use crate::repo::async_store::AsyncBlobStoreAcquire;
 use crate::repo::{BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut, CapabilityProofRead};
 use crate::repo::{CapabilityProofStore, SnapshotSource, Store, StoreRead, StoreSnapshot};
@@ -1746,26 +1745,6 @@ pub trait CollectionSnapshotExt: StoreRead + Sized {
     {
         super::observation::attach(self, target)
     }
-
-    /// Observe the complete target realization for one explicit support.
-    ///
-    /// Unlike [`Self::collection`], this is an assertion boundary: it fails
-    /// if the exact requested support is not fully realized in this snapshot.
-    fn collection_exact<E>(
-        &self,
-        target: Collection<E>,
-        support: &Support,
-    ) -> Result<CollectionSnapshot<Self, E>, CollectionRealizationError>
-    where
-        E: CollectionEncoding,
-        Handle<E>: InlineEncoding,
-    {
-        let observed = super::observed_store::ObservedStore::new(self.clone());
-        let (support, cover) =
-            super::exact_derived::attach_collection_exact(&observed, target, support)?;
-        Ok(CollectionSnapshot::new(self.clone(), support, cover)
-            .with_dependencies(observed.tracker()))
-    }
 }
 
 impl<R> CollectionSnapshotExt for R where R: StoreRead {}
@@ -1781,22 +1760,22 @@ impl<R> CollectionSnapshotExt for R where R: StoreRead {}
 /// Use the four [`CollectionStoreExt`] methods at call sites. Explicit foreign
 /// mappings remain available through their `*_with` counterparts.
 pub trait CollectionRealization: CollectionEncoding {
-    /// Ensure all admitted support, or one explicitly selected support.
+    /// Make the target stand for everything it can: a root acquires its
+    /// admitted commits, a derived collection publishes the images its
+    /// source's frontier is owed.
     fn ensure<'a, S>(
         store: &'a mut S,
         target: Collection<Self>,
         signing_key: &'a SigningKey,
-        support: Option<Support>,
     ) -> impl Future<Output = Result<S::Snapshot, CollectionRealizationError>> + Send + 'a
     where
         S: Store + AsyncBlobStoreAcquire + Send;
 
-    /// Ensure support and carry the target to its deterministic LSM fixed point.
+    /// Ensure, then carry the target to its deterministic LSM fixed point.
     fn maintain<'a, S>(
         store: &'a mut S,
         target: Collection<Self>,
         signing_key: &'a SigningKey,
-        support: Option<Support>,
     ) -> impl Future<Output = Result<S::Snapshot, CollectionRealizationError>> + Send + 'a
     where
         S: Store + AsyncBlobStoreAcquire + Send;
@@ -1807,46 +1786,26 @@ impl<T: CollectionDerivation> CollectionRealization for T {
         store: &'a mut S,
         target: Collection<Self>,
         signing_key: &'a SigningKey,
-        support: Option<Support>,
     ) -> Result<S::Snapshot, CollectionRealizationError>
     where
         S: Store + AsyncBlobStoreAcquire + Send,
     {
-        match support {
-            Some(support) => {
-                store
-                    .ensure_exact_with::<CanonicalDerivation<T>>(target, signing_key, &support)
-                    .await
-            }
-            None => {
-                store
-                    .ensure_with::<CanonicalDerivation<T>>(target, signing_key)
-                    .await
-            }
-        }
+        store
+            .ensure_with::<CanonicalDerivation<T>>(target, signing_key)
+            .await
     }
 
     async fn maintain<'a, S>(
         store: &'a mut S,
         target: Collection<Self>,
         signing_key: &'a SigningKey,
-        support: Option<Support>,
     ) -> Result<S::Snapshot, CollectionRealizationError>
     where
         S: Store + AsyncBlobStoreAcquire + Send,
     {
-        match support {
-            Some(support) => {
-                store
-                    .maintain_exact_with::<CanonicalDerivation<T>>(target, signing_key, &support)
-                    .await
-            }
-            None => {
-                store
-                    .maintain_with::<CanonicalDerivation<T>>(target, signing_key)
-                    .await
-            }
-        }
+        store
+            .maintain_with::<CanonicalDerivation<T>>(target, signing_key)
+            .await
     }
 }
 
@@ -1855,24 +1814,22 @@ impl CollectionRealization for SimpleArchive {
         store: &'a mut S,
         target: Collection<Self>,
         signing_key: &'a SigningKey,
-        support: Option<Support>,
     ) -> Result<S::Snapshot, CollectionRealizationError>
     where
         S: Store + AsyncBlobStoreAcquire + Send,
     {
-        realize_root(store, target, signing_key, support, false).await
+        realize_root(store, target, signing_key, false).await
     }
 
     async fn maintain<'a, S>(
         store: &'a mut S,
         target: Collection<Self>,
         signing_key: &'a SigningKey,
-        support: Option<Support>,
     ) -> Result<S::Snapshot, CollectionRealizationError>
     where
         S: Store + AsyncBlobStoreAcquire + Send,
     {
-        realize_root(store, target, signing_key, support, true).await
+        realize_root(store, target, signing_key, true).await
     }
 }
 
@@ -1880,7 +1837,6 @@ async fn realize_root<S>(
     store: &mut S,
     target: Collection<SimpleArchive>,
     signing_key: &SigningKey,
-    support: Option<Support>,
     compact: bool,
 ) -> Result<S::Snapshot, CollectionRealizationError>
 where
@@ -1891,35 +1847,12 @@ where
     })?;
     let mut frontier = OperationFrontier::new(before);
     super::exact_derived::acquire_authority(store, target, &frontier).await?;
-    // The empty cover acquires the descriptor and checks that it really is a
-    // root, before any admitted payload can trigger acquisition.
-    super::exact_derived::ensure_root_in_frontier(store, target, &target.cover([]), &frontier)
-        .await?;
-    let support = match support {
-        Some(support) => support,
-        None => {
-            // What the root's frontier stands for is what its admitted
-            // commits stand for, read from the index.
-            let snapshot = frontier.view(store.snapshot().map_err(|error| {
-                CollectionRealizationError::storage("observe root endorsements", error)
-            })?);
-            let coverage = snapshot
-                .coverage(&BTreeSet::from([target.handle()]))
-                .map_err(|error| {
-                    CollectionRealizationError::storage("settle root coverage", error)
-                })?;
-            let (support, _) = coverage.frontier_support(target.handle());
-            Support::from_patch(target, support)
-        }
-    };
-    super::exact_derived::ensure_root_in_frontier(store, target, &support, &frontier).await?;
+    super::exact_derived::ensure_root_in_frontier(store, target, &frontier).await?;
     if compact {
         super::maintenance::carry_target(
             store,
             target,
             signing_key,
-            &support,
-            target.handle(),
             &BTreeSet::from([target.handle()]),
             &mut frontier,
             |descriptor, low, high, reader| {
@@ -2046,7 +1979,7 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
         Self: Store + AsyncBlobStoreAcquire + Send,
         Handle<T>: InlineEncoding,
     {
-        T::ensure(self, target, signing_key, None)
+        T::ensure(self, target, signing_key)
     }
 
     /// Ensure resident, admitted immediate-source support through one mapping.
@@ -2066,71 +1999,10 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
             })?;
             let mut frontier = OperationFrontier::new(before);
             super::exact_derived::acquire_authority(self, target, &frontier).await?;
-            let support = {
-                let snapshot = frontier.view(self.snapshot().map_err(|error| {
-                    CollectionRealizationError::storage("observe source authority", error)
-                })?);
-                super::exact_derived::source_support::<_, M>(&snapshot, target)?
-            };
-            super::exact_derived::ensure_exact_in_frontier_with::<Self, M>(
+            super::exact_derived::ensure_in_frontier_with::<Self, M>(
                 self,
                 target,
                 signing_key,
-                &support,
-                &mut frontier,
-            )
-            .await?;
-            self.snapshot().map_err(|error| {
-                CollectionRealizationError::storage("freeze post-ensure snapshot", error)
-            })
-        }
-    }
-
-    /// Ensure one explicit foundational support in a collection.
-    ///
-    /// The target descriptor carries its immediate source, mapping parameters,
-    /// and policy. A root acquires the selected payloads. A derived collection
-    /// reuses existing equations and publishes only missing `DERIVE` work.
-    /// Any exact missing dependency may be acquired by the live store before
-    /// the operation gives up. If complete reuse is impossible, publishing
-    /// missing work requires the supplied key to hold target WRITE authority.
-    fn ensure_exact<'a, T>(
-        &'a mut self,
-        target: Collection<T>,
-        signing_key: &'a SigningKey,
-        support: &Support,
-    ) -> impl Future<Output = Result<Self::Snapshot, CollectionRealizationError>> + Send + 'a
-    where
-        T: CollectionRealization,
-        Self: Store + AsyncBlobStoreAcquire + Send,
-        Handle<T>: InlineEncoding,
-    {
-        T::ensure(self, target, signing_key, Some(support.clone()))
-    }
-
-    /// Ensure one explicit support through one explicit mapping type.
-    fn ensure_exact_with<'a, M>(
-        &'a mut self,
-        target: Collection<M::Target>,
-        signing_key: &'a SigningKey,
-        support: &Support,
-    ) -> impl Future<Output = Result<Self::Snapshot, CollectionRealizationError>> + Send + 'a
-    where
-        M: CollectionMapping,
-        Self: Store + AsyncBlobStoreAcquire + Send,
-        Handle<M::Target>: InlineEncoding,
-    {
-        let support = support.clone();
-        async move {
-            let before = self.snapshot().map_err(|error| {
-                CollectionRealizationError::storage("freeze exact ensure frontier", error)
-            })?;
-            let mut frontier = OperationFrontier::new(before);
-            super::exact_derived::ensure_exact_in_frontier_with::<Self, M>(
-                self,
-                target,
-                signing_key,
-                &support,
                 &mut frontier,
             )
             .await?;
@@ -2163,7 +2035,7 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
         Self: Store + AsyncBlobStoreAcquire + Send,
         Handle<T>: InlineEncoding,
     {
-        T::maintain(self, target, signing_key, None)
+        T::maintain(self, target, signing_key)
     }
 
     /// Maintain resident, admitted immediate-source support through one mapping.
@@ -2183,65 +2055,10 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
             })?;
             let mut frontier = OperationFrontier::new(before);
             super::exact_derived::acquire_authority(self, target, &frontier).await?;
-            let support = {
-                let snapshot = frontier.view(self.snapshot().map_err(|error| {
-                    CollectionRealizationError::storage("observe source authority", error)
-                })?);
-                super::exact_derived::source_support::<_, M>(&snapshot, target)?
-            };
-            super::exact_derived::maintain_exact_in_frontier_with::<Self, M>(
+            super::exact_derived::maintain_in_frontier_with::<Self, M>(
                 self,
                 target,
                 signing_key,
-                &support,
-                &mut frontier,
-            )
-            .await?;
-            self.snapshot().map_err(|error| {
-                CollectionRealizationError::storage("freeze post-maintenance snapshot", error)
-            })
-        }
-    }
-
-    /// Ensure one explicit foundational support, then maintain its target LSM
-    /// cover to the same deterministic fixed point as [`Self::maintain`].
-    fn maintain_exact<'a, T>(
-        &'a mut self,
-        target: Collection<T>,
-        signing_key: &'a SigningKey,
-        support: &Support,
-    ) -> impl Future<Output = Result<Self::Snapshot, CollectionRealizationError>> + Send + 'a
-    where
-        T: CollectionRealization,
-        Self: Store + AsyncBlobStoreAcquire + Send,
-        Handle<T>: InlineEncoding,
-    {
-        T::maintain(self, target, signing_key, Some(support.clone()))
-    }
-
-    /// Ensure and maintain one support through an explicit mapping type.
-    fn maintain_exact_with<'a, M>(
-        &'a mut self,
-        target: Collection<M::Target>,
-        signing_key: &'a SigningKey,
-        support: &Support,
-    ) -> impl Future<Output = Result<Self::Snapshot, CollectionRealizationError>> + Send + 'a
-    where
-        M: CollectionMapping,
-        Self: Store + AsyncBlobStoreAcquire + Send,
-        Handle<M::Target>: InlineEncoding,
-    {
-        let support = support.clone();
-        async move {
-            let before = self.snapshot().map_err(|error| {
-                CollectionRealizationError::storage("freeze exact maintenance frontier", error)
-            })?;
-            let mut frontier = OperationFrontier::new(before);
-            super::exact_derived::maintain_exact_in_frontier_with::<Self, M>(
-                self,
-                target,
-                signing_key,
-                &support,
                 &mut frontier,
             )
             .await?;

@@ -109,12 +109,10 @@ fn compiled_expression_roundtrips_through_native_collection_and_query_constraint
 
     let snapshot = store.snapshot().unwrap();
     let support = source.admitted(&snapshot).unwrap();
-    let snapshot = block_on(store.maintain_exact(target, &signing_key, &support)).unwrap();
-    let index: Arc<PathIndex> = snapshot
-        .collection_exact(target, &support)
-        .unwrap()
-        .view()
-        .unwrap();
+    let snapshot = block_on(store.maintain(target, &signing_key)).unwrap();
+    let observed = snapshot.collection(target).unwrap();
+    assert_eq!(observed.support().unwrap(), &support);
+    let index: Arc<PathIndex> = observed.view().unwrap();
     let end = Variable::<UnknownInline>::new(0);
     let start = Inline::<UnknownInline>::new(RawInline::from(id(1)));
     let reachable = Query::new(index.constraint(start, end), |binding: &Binding| {

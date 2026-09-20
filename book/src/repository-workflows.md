@@ -291,8 +291,9 @@ witness closure is a prerequisite for this read. The observation retains exact
 endorsements for its lazy `support()` query, not a fresh admission query over
 every source COMMIT. Admitted but not yet derived data is absent: an immutable
 snapshot never promises work which will happen later.
-`snapshot.collection_exact(target, &support)` is the assertion form and fails
-unless that exact foundational support is completely realized.
+There is no assertion form which takes a requested support: what a target
+stands on is read back through `support()`, and a caller who needs two views
+to agree attaches both from one snapshot and compares their supports.
 Neither observation method reads the clock: identical operations on one frozen
 store snapshot have identical results even while wall time passes. A decision
 using later-arriving proof or definition evidence requires a new snapshot.
@@ -397,9 +398,10 @@ not the opaque resource. A `WANT`
 is itself only an explicit durable demand record, never automatic cache-miss
 bookkeeping.
 
-The four live store operations are asynchronous even for local stores. They may
-fetch exact missing blobs named by frozen records, explicit support, or immutable
-dependencies needed for the work, publish target collection equations, and
+The live store operations, `ensure` and `maintain` and their `_with` forms,
+are asynchronous even for local stores. They may fetch exact missing blobs
+named by frozen records or immutable dependencies needed for the work, publish
+target collection equations, and
 return a fresh snapshot; they never emit `WANT`. Local stores implement the same
 contract with immediately ready acquisition from their resident snapshot, while
 a networked store may await exact-H fetch.
@@ -547,31 +549,30 @@ a network sync process can run independently over the same append-only pile.
 Readers attach the resident target from their own snapshot and do not wait
 for a global maintenance frontier.
 
-When a caller specifically needs matching representations for one selected
-support, use `maintain_exact(raw, &writer, &support)` and
-`maintain_exact(accelerated, &writer, &support)`, then
-`collection_exact(accelerated, &support)`. Those are explicit requirements,
-not necessary boilerplate for an ordinary multi-hop read.
+When a caller needs matching representations across a chain, maintain each
+edge in order — `maintain(raw, &writer)`, then `maintain(accelerated,
+&writer)` — and attach the targets from the snapshot the last step returned.
+Each target then stands for what its source's frontier stands on, so two
+targets of one source read from one snapshot agree by construction; there is
+no support argument to pass along, and none to request narrower.
 
 - `ensure(source, &writer)` freezes collection records, capability proofs, and
   resident authorization evidence before acquiring exact missing descriptor,
   selected data, and representation-dependency bytes needed for that root
   frontier. Historical metadata is not a materialization dependency.
   Concurrent records and proofs do not extend its work. The returned snapshot
-  is a fresh observation; select
-  support from it once and pass that same support across the following edges.
+  is a fresh observation; attach from it.
 - `snapshot.collection` remains the purely read-only alternative: it
   performs no acquisition or collection algebra and binds only the
-  support-aware resident target cover visible in that immutable snapshot.
-  `collection_exact` requires a complete realization for explicit support.
+  resident target cover visible in that immutable snapshot. What that cover
+  stands on is its `support()`.
 - For a derived target, `ensure` freezes the resident, admitted realization of
-  its immediate source, while `ensure_exact` accepts explicit foundational
-  support. Both publish only missing `DERIVE` work and return a fresh store
-  snapshot. Missing source members are invisible to ordinary selection, but
-  remain unsatisfied obligations when explicitly requested.
-- `maintain` and `maintain_exact` additionally reuse coarsening already resident
-  in the immediate source, then carry colliding target members by serialized-size
-  tier. They also return a fresh store snapshot.
+  its immediate source, publishes only missing `DERIVE` work, and returns a
+  fresh store snapshot. Missing source members are invisible to selection: an
+  immutable snapshot never promises work which will happen later.
+- `maintain` additionally reuses coarsening already resident in the immediate
+  source, then carries colliding target members by serialized-size tier. It
+  also returns a fresh store snapshot.
 
 An ensure may follow existing `MERGE` equations to reuse a resident
 support-equivalent target decomposition, but newly executed work crosses only

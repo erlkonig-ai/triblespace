@@ -13,8 +13,8 @@ use triblespace_core::capability::{CapabilityProof, CapabilityResource};
 use triblespace_core::collection::simplearchive_union;
 use triblespace_core::collection::{
     write_capability, Collection, CollectionCommit, CollectionDerive, CollectionEncoding,
-    CollectionMerge, CollectionPolicy, CollectionRead, CollectionRealizationError,
-    CollectionRecord, CollectionSnapshotExt, CollectionStore, CollectionStoreExt, Support,
+    CollectionMerge, CollectionPolicy, CollectionRead, CollectionRecord, CollectionSnapshotExt,
+    CollectionStore, CollectionStoreExt, Support,
 };
 use triblespace_core::id::ExclusiveId;
 use triblespace_core::inline::encodings::hash::Handle;
@@ -22,7 +22,7 @@ use triblespace_core::inline::{InlineEncoding, RawInline};
 use triblespace_core::metadata;
 use triblespace_core::prelude::entity;
 use triblespace_core::repo::async_store::AsyncBlobStoreAcquire;
-use triblespace_core::repo::memoryrepo::{MemoryRepo, MemoryRepoSnapshot};
+use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{BlobStoreGet, BlobStorePut, CapabilityProofStore, SnapshotSource};
 use triblespace_core::trible::{Fragment, TribleSet};
 
@@ -204,18 +204,6 @@ where
     Fragment::from(TribleSet::try_from_blob(blob).unwrap())
 }
 
-fn index(
-    snapshot: &MemoryRepoSnapshot,
-    target: Collection<PathSummaryBlob>,
-    support: &Support,
-) -> Arc<PathIndex> {
-    snapshot
-        .collection_exact(target, support)
-        .unwrap()
-        .view()
-        .unwrap()
-}
-
 fn assert_cross_fragment_path(index: &PathIndex) {
     assert!(index.contains(&RawInline::from(id(1)), &RawInline::from(id(3))));
 }
@@ -277,8 +265,12 @@ fn empty_support_is_local_bottom_and_writes_nothing() {
     let blobs = store.0.blobs.len();
     let record_count = records(&mut store).len();
     let support = support(&mut store, source, []);
-    let snapshot = block_on(store.maintain_exact(target, &authority_key(), &support)).unwrap();
-    assert_eq!(index(&snapshot, target, &support).accepted_pair_count(), 0);
+    assert!(support.is_empty());
+    let snapshot = block_on(store.maintain(target, &authority_key())).unwrap();
+    let observed = snapshot.collection(target).unwrap();
+    assert_eq!(observed.support().unwrap(), &support);
+    let index: Arc<PathIndex> = observed.view().unwrap();
+    assert_eq!(index.accepted_pair_count(), 0);
     assert_eq!(store.0.blobs.len(), blobs);
     assert_eq!(records(&mut store).len(), record_count);
 }
@@ -294,52 +286,17 @@ fn missing_then_maintain_closes_cross_fragment_path() {
     publish(&mut store, first);
     publish(&mut store, second);
     let support = support(&mut store, source, [first, second]);
+    // Admitted but not yet derived data is absent from a read: until it is
+    // maintained, the target stands on nothing.
     let before = store.snapshot().unwrap();
-    assert!(matches!(
-        before.collection_exact(target, &support),
-        Err(CollectionRealizationError::IncompleteCover {
-            unsupported_members,
-            ..
-        }) if unsupported_members.len() == 2
-    ));
+    let unrealized = before.collection(target).unwrap();
+    assert!(unrealized.cover().is_empty());
+    assert!(unrealized.support().unwrap().is_empty());
 
-    let after = block_on(store.maintain_exact(target, &authority_key(), &support)).unwrap();
-    assert_cross_fragment_path(&index(&after, target, &support));
-}
-
-#[test]
-fn exact_old_support_ignores_a_later_commit_and_equation() {
-    let mut store = CollectionOnly::default();
-    let automaton = plus();
-    let (source, target) = test_paths(&mut store, "paths", automaton.clone());
-    let left = put_data(&mut store, &edge(1, 2));
-    let right = put_data(&mut store, &edge(2, 3));
-    let first = signed_commit(&mut store, source, 1, &left);
-    let second = signed_commit(&mut store, source, 2, &right);
-    publish(&mut store, first);
-    publish(&mut store, second);
-    let old_support = support(&mut store, source, [first, second]);
-    block_on(store.maintain_exact(target, &authority_key(), &old_support)).unwrap();
-
-    let later = put_data(&mut store, &edge(3, 4));
-    let third = signed_commit(&mut store, source, 3, &later);
-    publish(&mut store, third);
-    let later_summary = path_summary_union::derive_element(&later, &automaton).unwrap();
-    store
-        .put::<PathSummaryBlob, _>(later_summary.clone())
-        .unwrap();
-    store
-        .insert(CollectionRecord::Derive(CollectionDerive::sign(
-            &authority_key(),
-            target.handle(),
-            third.data(),
-            Handle::<PathSummaryBlob>::to_hash(later_summary.get_handle()),
-        )))
-        .unwrap();
-
-    let snapshot = store.snapshot().unwrap();
-    let old = index(&snapshot, target, &old_support);
-    assert!(!old.contains(&RawInline::from(id(1)), &RawInline::from(id(4))));
+    let after = block_on(store.maintain(target, &authority_key())).unwrap();
+    let observed = after.collection(target).unwrap();
+    assert_eq!(observed.support().unwrap(), &support);
+    assert_cross_fragment_path(&observed.view::<Arc<PathIndex>>().unwrap());
 }
 
 #[test]
@@ -352,7 +309,8 @@ fn duplicate_payload_provenance_shares_one_derive() {
     publish(&mut store, first);
     publish(&mut store, second);
     let support = support(&mut store, source, [first, first, second]);
-    block_on(store.ensure_exact(target, &authority_key(), &support)).unwrap();
+    assert_eq!(support.len(), 1);
+    block_on(store.ensure(target, &authority_key())).unwrap();
     let derives = records(&mut store)
         .into_iter()
         .filter(|record| {
@@ -387,8 +345,10 @@ fn resident_source_merge_is_lowered_once() {
         .unwrap();
     let support = support(&mut store, source, [first, second]);
 
-    let snapshot = block_on(store.maintain_exact(target, &authority_key(), &support)).unwrap();
-    assert_cross_fragment_path(&index(&snapshot, target, &support));
+    let snapshot = block_on(store.maintain(target, &authority_key())).unwrap();
+    let observed = snapshot.collection(target).unwrap();
+    assert_eq!(observed.support().unwrap(), &support);
+    assert_cross_fragment_path(&observed.view::<Arc<PathIndex>>().unwrap());
     let inputs: Vec<_> = records(&mut store)
         .into_iter()
         .filter_map(|record| match record {
@@ -439,12 +399,13 @@ fn existing_target_merge_is_selected_as_one_physical_member() {
         .unwrap();
     let support = support(&mut store, source, [first, second]);
     let snapshot = store.snapshot().unwrap();
-    let observation = snapshot.collection_exact(target, &support).unwrap();
+    let observation = snapshot.collection(target).unwrap();
     assert_eq!(observation.cover().len(), 1);
     assert_eq!(
         observation.cover().members().next().unwrap(),
         joined.get_handle()
     );
+    assert_eq!(observation.support().unwrap(), &support);
     assert_cross_fragment_path(&observation.view::<Arc<PathIndex>>().unwrap());
 }
 
@@ -468,37 +429,22 @@ fn absent_source_bytes_delay_residency_but_not_record_admission() {
     assert!(support.contains(absent.get_handle()));
     let before_records = records(&mut store);
     let before = store.snapshot().unwrap();
+    // The commit is admitted, but its bytes are not here: neither the source
+    // nor the target has a resident member to stand on.
     assert!(before.collection(source).unwrap().cover().is_empty());
     assert!(before.collection(target).unwrap().cover().is_empty());
-    assert!(matches!(
-        before.collection_exact(source, &support),
-        Err(CollectionRealizationError::IncompleteCover {
-            unsupported_members,
-            ..
-        }) if unsupported_members == vec![commit.data()]
-    ));
-    assert!(matches!(
-        before.collection_exact(target, &support),
-        Err(CollectionRealizationError::IncompleteCover {
-            unsupported_members,
-            ..
-        }) if unsupported_members == vec![commit.data()]
-    ));
 
     store.put::<SimpleArchive, _>(absent.clone()).unwrap();
     let after = store.snapshot().unwrap();
     assert_eq!(source.admitted(&after).unwrap(), support);
-    let source_view = after.collection_exact(source, &support).unwrap();
+    let source_view = after.collection(source).unwrap();
+    assert_eq!(source_view.support().unwrap(), &support);
     assert_eq!(source_view.view::<TribleSet>().unwrap(), edge(1, 2));
     assert_eq!(records(&mut store), before_records);
     assert!(before.collection(source).unwrap().cover().is_empty());
     // Arriving source bytes need no new COMMIT, but do not manufacture a
-    // target DERIVE: the same exact request is still incomplete there.
-    assert!(matches!(
-        after.collection_exact(target, &support),
-        Err(CollectionRealizationError::IncompleteCover {
-            unsupported_members,
-            ..
-        }) if unsupported_members == vec![commit.data()]
-    ));
+    // target DERIVE: the target still stands on nothing.
+    let target_view = after.collection(target).unwrap();
+    assert!(target_view.cover().is_empty());
+    assert!(target_view.support().unwrap().is_empty());
 }

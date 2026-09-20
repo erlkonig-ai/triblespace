@@ -1,15 +1,15 @@
-//! End-to-end incremental-query maintenance over growing exact covers.
+//! End-to-end incremental-query maintenance over a growing source frontier.
 //!
 //! The two arms maintain the same application result set over source-identical
 //! stores. The incremental arm retains an immutable Succinct snapshot; their
 //! query strategy differs:
 //!
 //! - `full` re-runs the complete query and replaces the result set.
-//! - `incremental` obtains one exact payload-support delta, runs
-//!   `pattern_changes!`, and extends the result set.
+//! - `incremental` reads the payloads the target newly stands on from the
+//!   source as one delta, runs `pattern_changes!`, and extends the result set.
 //!
-//! Every timed observation includes exact-view admission and application-side
-//! `BTreeSet` maintenance. Source publication, cover discovery, fixture
+//! Every timed observation includes Succinct maintenance, target attachment,
+//! and application-side `BTreeSet` maintenance. Source publication, fixture
 //! construction, and the seed view are outside timing. Each measured run uses
 //! fresh independent stores and advances through every fixed-size commit;
 //! geometric checkpoints only control which observations are reported.
@@ -36,12 +36,13 @@ use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
 use futures::executor::block_on;
+use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
     OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
 };
 use triblespace::core::collection::{
     AdmissionPolicy, Collection, CollectionPolicy, CollectionSnapshot, CollectionSnapshotExt,
-    CollectionStoreExt, Support,
+    CollectionStoreExt,
 };
 use triblespace::core::examples::literature;
 use triblespace::core::repo::memoryrepo::MemoryRepoSnapshot;
@@ -51,12 +52,16 @@ type Entity = Inline<inlineencodings::GenId>;
 type Title = Inline<inlineencodings::ShortString>;
 type Row = (Entity, Entity, Title);
 
+/// The seed store holds the author and the registered projections; each arm
+/// clones it and publishes the book commits itself, one observation at a time,
+/// so the source frontier grows under the arm instead of being replayed
+/// against a store which already holds everything.
 #[derive(Clone)]
 struct Fixture {
     store: MemoryRepo,
     signing_key: SigningKey,
-    seed_cover: Support,
-    covers: Vec<Support>,
+    collection: Collection<SimpleArchive>,
+    commits: Vec<Fragment>,
     expected_batches: Vec<Vec<Row>>,
     raw: Collection<SuccinctArchiveBlob>,
     accelerated: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
@@ -92,10 +97,15 @@ fn build_fixture(commits: usize, books_per_commit: usize) -> Fixture {
         .commit(collection, &signing_key, author)
         .expect("publish seed author");
     let snapshot = store.snapshot().expect("freeze seed snapshot");
-    let seed_cover = collection.admitted(&snapshot).expect("freeze seed cover");
-    assert_eq!(seed_cover.len(), 1);
+    assert_eq!(
+        collection
+            .admitted(&snapshot)
+            .expect("freeze seed support")
+            .len(),
+        1
+    );
 
-    let mut covers = Vec::with_capacity(commits);
+    let mut fragments = Vec::with_capacity(commits);
     let mut expected_batches = Vec::with_capacity(commits);
     for commit in 0..commits {
         let mut fragment = Fragment::empty();
@@ -118,11 +128,7 @@ fn build_fixture(commits: usize, books_per_commit: usize) -> Fixture {
             ));
             fragment += entity;
         }
-        store
-            .commit(collection, &signing_key, fragment)
-            .expect("publish book commit");
-        let snapshot = store.snapshot().expect("freeze collection snapshot");
-        covers.push(collection.admitted(&snapshot).expect("freeze exact cover"));
+        fragments.push(fragment);
         expected_batches.push(expected);
     }
 
@@ -135,30 +141,61 @@ fn build_fixture(commits: usize, books_per_commit: usize) -> Fixture {
     Fixture {
         store,
         signing_key,
-        seed_cover,
-        covers,
+        collection,
+        commits: fragments,
         expected_batches,
         raw,
         accelerated,
     }
 }
 
+/// Carry both mapping edges to the source's frontier and attach the
+/// accelerated target from the snapshot which observes that work.
 fn maintain_succinct(
     store: &mut MemoryRepo,
     signing_key: &SigningKey,
     raw: Collection<SuccinctArchiveBlob>,
     accelerated: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
-    support: &Support,
-) -> MemoryRepoSnapshot {
-    block_on(store.maintain_exact(raw, signing_key, support))
-        .expect("maintain exact raw Succinct cover");
-    block_on(store.maintain_exact(accelerated, signing_key, support))
-        .expect("maintain exact accelerated Succinct cover")
+) -> CollectionSnapshot<MemoryRepoSnapshot, Rank9AcceleratedSuccinctArchiveBlob> {
+    block_on(store.maintain(raw, signing_key)).expect("maintain raw Succinct cover");
+    let snapshot = block_on(store.maintain(accelerated, signing_key))
+        .expect("maintain accelerated Succinct cover");
+    snapshot
+        .collection(accelerated)
+        .expect("observe accelerated Succinct cover")
+}
+
+fn seed_view(
+    fixture: &Fixture,
+) -> (
+    MemoryRepo,
+    CollectionSnapshot<MemoryRepoSnapshot, Rank9AcceleratedSuccinctArchiveBlob>,
+) {
+    let mut store = fixture.store.clone();
+    let seed = maintain_succinct(
+        &mut store,
+        &fixture.signing_key,
+        fixture.raw,
+        fixture.accelerated,
+    );
+    assert_eq!(
+        seed.support().expect("resolve seed support").len(),
+        1,
+        "the seed stands on the author commit alone"
+    );
+    let seed_view: UnionArchive<OrderedUniverse> = seed.view().expect("materialize seed view");
+    assert_eq!(
+        seed_view.iter().count(),
+        2,
+        "seed contains the author facts"
+    );
+    (store, seed)
 }
 
 struct FullState {
     store: MemoryRepo,
     signing_key: SigningKey,
+    collection: Collection<SimpleArchive>,
     raw: Collection<SuccinctArchiveBlob>,
     accelerated: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
     results: BTreeSet<Row>,
@@ -166,45 +203,28 @@ struct FullState {
 
 impl FullState {
     fn seeded(fixture: &Fixture) -> Self {
-        let mut store = fixture.store.clone();
-        let snapshot = maintain_succinct(
-            &mut store,
-            &fixture.signing_key,
-            fixture.raw,
-            fixture.accelerated,
-            &fixture.seed_cover,
-        );
-        let seed = snapshot
-            .collection_exact(fixture.accelerated, &fixture.seed_cover)
-            .expect("observe seed view");
-        let seed_view: UnionArchive<OrderedUniverse> = seed.view().expect("materialize seed view");
-        assert_eq!(
-            seed_view.iter().count(),
-            2,
-            "seed contains the author facts"
-        );
+        let (store, _) = seed_view(fixture);
         Self {
             store,
             signing_key: fixture.signing_key.clone(),
+            collection: fixture.collection,
             raw: fixture.raw,
             accelerated: fixture.accelerated,
             results: BTreeSet::new(),
         }
     }
 
-    fn observe(&mut self, cover: &Support) -> Step {
+    fn observe(&mut self, commit: &Fragment) -> Step {
+        self.store
+            .commit(self.collection, &self.signing_key, commit.clone())
+            .expect("publish book commit");
         let start = Instant::now();
-        let snapshot = maintain_succinct(
+        let full = maintain_succinct(
             &mut self.store,
             &self.signing_key,
             self.raw,
             self.accelerated,
-            cover,
         );
-        let full = snapshot
-            .collection_exact(self.accelerated, cover)
-            .expect("observe full-query view");
-        assert_eq!(full.support().unwrap(), cover);
         let full_view: UnionArchive<OrderedUniverse> =
             full.view().expect("materialize full-query view");
         let mut raw_rows = 0usize;
@@ -233,6 +253,7 @@ impl FullState {
 struct IncrementalState {
     store: MemoryRepo,
     signing_key: SigningKey,
+    collection: Collection<SimpleArchive>,
     raw: Collection<SuccinctArchiveBlob>,
     accelerated: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
     snapshot: CollectionSnapshot<MemoryRepoSnapshot, Rank9AcceleratedSuccinctArchiveBlob>,
@@ -241,26 +262,11 @@ struct IncrementalState {
 
 impl IncrementalState {
     fn seeded(fixture: &Fixture) -> Self {
-        let mut store = fixture.store.clone();
-        let snapshot = maintain_succinct(
-            &mut store,
-            &fixture.signing_key,
-            fixture.raw,
-            fixture.accelerated,
-            &fixture.seed_cover,
-        );
-        let seed = snapshot
-            .collection_exact(fixture.accelerated, &fixture.seed_cover)
-            .expect("observe seed view");
-        let seed_view: UnionArchive<OrderedUniverse> = seed.view().expect("materialize seed view");
-        assert_eq!(
-            seed_view.iter().count(),
-            2,
-            "seed contains the author facts"
-        );
+        let (store, seed) = seed_view(fixture);
         Self {
             store,
             signing_key: fixture.signing_key.clone(),
+            collection: fixture.collection,
             raw: fixture.raw,
             accelerated: fixture.accelerated,
             snapshot: seed,
@@ -268,42 +274,31 @@ impl IncrementalState {
         }
     }
 
-    fn observe(&mut self, cover: &Support) -> Step {
+    fn observe(&mut self, commit: &Fragment) -> Step {
+        self.store
+            .commit(self.collection, &self.signing_key, commit.clone())
+            .expect("publish book commit");
         let start = Instant::now();
-        let changed_support = cover
-            .additions_since(self.snapshot.support().unwrap())
-            .expect("benchmark cover grows monotonically");
-        assert!(!changed_support.is_empty(), "benchmark cover did not grow");
-        maintain_succinct(
+        let next = maintain_succinct(
             &mut self.store,
             &self.signing_key,
             self.raw,
             self.accelerated,
-            &changed_support,
         );
-        let snapshot = maintain_succinct(
-            &mut self.store,
-            &self.signing_key,
-            self.raw,
-            self.accelerated,
-            cover,
-        );
-        let next = snapshot
-            .collection_exact(self.accelerated, cover)
-            .expect("observe incremental full view");
-        let changed = snapshot
-            .collection_exact(self.accelerated, &changed_support)
-            .expect("observe incremental changed view");
-        assert_eq!(
-            changed.support().unwrap().len(),
-            1,
-            "one payload is observed per step"
-        );
+        // What the target newly stands on is the delta. It is a set of source
+        // payloads, so read it from the source through the same snapshot; the
+        // Succinct target answers the full side of the query.
+        let changed_support = next
+            .support()
+            .expect("resolve incremental support")
+            .additions_since(self.snapshot.support().expect("resolve previous support"))
+            .expect("benchmark support grows monotonically");
+        assert_eq!(changed_support.len(), 1, "one payload is observed per step");
+        let changed_view: TribleSet = changed_support
+            .materialize(next.snapshot())
+            .expect("materialize changed source payloads");
         let next_view: UnionArchive<OrderedUniverse> =
             next.view().expect("materialize complete incremental view");
-        let changed_view: UnionArchive<OrderedUniverse> = changed
-            .view()
-            .expect("materialize changed incremental view");
 
         let mut raw_rows = 0usize;
         let mut batch = BTreeSet::new();
@@ -370,14 +365,14 @@ fn run_full(fixture: &Fixture, checkpoints: &BTreeSet<usize>) -> Run {
     let mut state = FullState::seeded(fixture);
     let mut expected = BTreeSet::new();
     let mut samples = Vec::with_capacity(checkpoints.len());
-    for (index, (cover, batch)) in fixture
-        .covers
+    for (index, (commit, batch)) in fixture
+        .commits
         .iter()
         .zip(&fixture.expected_batches)
         .enumerate()
     {
         expected.extend(batch.iter().cloned());
-        let step = state.observe(cover);
+        let step = state.observe(commit);
         assert_eq!(step.raw_rows, expected.len());
         assert_eq!(step.distinct_rows, expected.len());
         assert_eq!(state.results, expected);
@@ -401,19 +396,24 @@ fn run_incremental(fixture: &Fixture, checkpoints: &BTreeSet<usize>) -> Run {
     let mut state = IncrementalState::seeded(fixture);
     let mut expected = BTreeSet::new();
     let mut samples = Vec::with_capacity(checkpoints.len());
-    for (index, (cover, batch)) in fixture
-        .covers
+    for (index, (commit, batch)) in fixture
+        .commits
         .iter()
         .zip(&fixture.expected_batches)
         .enumerate()
     {
         expected.extend(batch.iter().cloned());
-        let step = state.observe(cover);
+        let step = state.observe(commit);
         assert_eq!(step.raw_rows, batch.len());
         assert_eq!(step.distinct_rows, batch.len());
         assert_eq!(state.results, expected);
-        assert_eq!(state.snapshot.support().unwrap(), cover);
         let commits = index + 1;
+        // The seed author plus every commit so far: the retained snapshot
+        // stands on the whole source frontier.
+        assert_eq!(
+            state.snapshot.support().expect("resolve support").len(),
+            commits + 1
+        );
         if checkpoints.contains(&commits) {
             samples.push(Sample {
                 arm: Arm::Incremental,
@@ -547,6 +547,6 @@ fn main() {
         );
     }
     println!(
-        "\nEach row is median latency for one commit observation; both arms include exact-view admission and application BTreeSet maintenance."
+        "\nEach row is median latency for one commit observation; both arms include Succinct maintenance, target attachment, and application BTreeSet maintenance."
     );
 }

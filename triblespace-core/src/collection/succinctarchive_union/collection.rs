@@ -154,7 +154,7 @@ mod tests {
     use crate::collection::{
         Collection, CollectionCommit, CollectionData, CollectionDerivation, CollectionDerive,
         CollectionEncoding, CollectionHandle, CollectionMerge, CollectionOperationError,
-        CollectionPolicy, CollectionRead, CollectionRealizationError, CollectionRecord,
+        CollectionPolicy, CollectionRead, CollectionRecord,
         CollectionSnapshotExt, CollectionStore, CollectionStoreExt, Cover, Support,
     };
     use crate::inline::encodings::hash::Handle;
@@ -639,21 +639,15 @@ mod tests {
                 Handle::<SimpleArchive>::to_hash(source.get_handle()),
             ))
             .unwrap();
-        let support = Support::from_data(
-            source_collection,
-            [Handle::<SimpleArchive>::to_hash(source.get_handle())],
-        );
 
-        block_on(store.ensure_exact(raw_collection, &SigningKey::from_bytes(&[7; 32]), &support))
-            .unwrap();
-        let snapshot = block_on(store.ensure_exact(
+        block_on(store.ensure(raw_collection, &SigningKey::from_bytes(&[7; 32]))).unwrap();
+        let snapshot = block_on(store.ensure(
             accelerated_collection,
             &SigningKey::from_bytes(&[7; 32]),
-            &support,
         ))
         .unwrap();
         let attached = snapshot
-            .collection_exact(accelerated_collection, &support)
+            .collection(accelerated_collection)
             .unwrap();
         let view: UnionArchive<OrderedUniverse> = attached.view().unwrap();
         assert_eq!(view.iter().count(), 2);
@@ -702,6 +696,17 @@ mod tests {
                 Fragment::from([row(1, 2, 3)].into_iter().collect::<TribleSet>()),
             )
             .unwrap();
+        let first_support = Support::from_data(source_collection, [first.data()]);
+
+        block_on(store.ensure(raw_collection, &SigningKey::from_bytes(&[7; 32]))).unwrap();
+        let snapshot = block_on(store.ensure(
+            accelerated_collection,
+            &SigningKey::from_bytes(&[7; 32]),
+        ))
+        .unwrap();
+        // The source grows after the target was realized: the attachment
+        // reports what the target stands on in its snapshot, not what the
+        // source admits now.
         let second = store
             .commit(
                 source_collection,
@@ -709,37 +714,14 @@ mod tests {
                 Fragment::from([row(4, 5, 6)].into_iter().collect::<TribleSet>()),
             )
             .unwrap();
-        let first_support = Support::from_data(source_collection, [first.data()]);
         let full_support = Support::from_data(source_collection, [first.data(), second.data()]);
-
-        block_on(store.ensure_exact(
-            raw_collection,
-            &SigningKey::from_bytes(&[7; 32]),
-            &first_support,
-        ))
-        .unwrap();
-        let snapshot = block_on(store.ensure_exact(
-            accelerated_collection,
-            &SigningKey::from_bytes(&[7; 32]),
-            &first_support,
-        ))
-        .unwrap();
         let observed = snapshot.collection(accelerated_collection).unwrap();
         assert_eq!(observed.support().unwrap(), &first_support);
-        assert!(snapshot
-            .collection_exact(accelerated_collection, &full_support)
-            .is_err());
 
-        block_on(store.ensure_exact(
-            raw_collection,
-            &SigningKey::from_bytes(&[7; 32]),
-            &full_support,
-        ))
-        .unwrap();
-        let snapshot = block_on(store.ensure_exact(
+        block_on(store.ensure(raw_collection, &SigningKey::from_bytes(&[7; 32]))).unwrap();
+        let snapshot = block_on(store.ensure(
             accelerated_collection,
             &SigningKey::from_bytes(&[7; 32]),
-            &full_support,
         ))
         .unwrap();
         let observed = snapshot.collection(accelerated_collection).unwrap();
@@ -759,17 +741,19 @@ mod tests {
         store
             .insert(input_record(source_collection.handle(), source_data))
             .unwrap();
-        let support = Support::from_data(source_collection, [source_data]);
 
-        assert!(matches!(
-            block_on(store.ensure_exact(
-                accelerated_collection,
-                &SigningKey::from_bytes(&[7; 32]),
-                &support
-            )),
-            Err(CollectionRealizationError::IncompleteCover { .. })
-        ));
-        let before_raw = store.snapshot().unwrap();
+        // The accelerated target stands for what the raw frontier stands on;
+        // with no raw member realized that is nothing, and nothing is built.
+        let before_raw = block_on(store.ensure(
+            accelerated_collection,
+            &SigningKey::from_bytes(&[7; 32]),
+        ))
+        .unwrap();
+        assert!(before_raw
+            .collection(accelerated_collection)
+            .unwrap()
+            .cover()
+            .is_empty());
         assert!(!before_raw
             .records()
             .unwrap()
@@ -782,16 +766,14 @@ mod tests {
                     if derive.collection() == raw_collection.handle()
             )));
 
-        block_on(store.ensure_exact(raw_collection, &SigningKey::from_bytes(&[7; 32]), &support))
-            .unwrap();
-        let snapshot = block_on(store.ensure_exact(
+        block_on(store.ensure(raw_collection, &SigningKey::from_bytes(&[7; 32]))).unwrap();
+        let snapshot = block_on(store.ensure(
             accelerated_collection,
             &SigningKey::from_bytes(&[7; 32]),
-            &support,
         ))
         .unwrap();
         let attached = snapshot
-            .collection_exact(accelerated_collection, &support)
+            .collection(accelerated_collection)
             .unwrap();
         let view: UnionArchive<OrderedUniverse> = attached.view().unwrap();
         assert_eq!(view.iter().count(), 1);
@@ -864,7 +846,7 @@ mod tests {
         let support = Support::from_data(source_collection, [source_a_data, source_b_data]);
         let snapshot = store.snapshot().unwrap();
         let attached = snapshot
-            .collection_exact(accelerated_collection, &support)
+            .collection(accelerated_collection)
             .unwrap();
 
         assert_eq!(attached.support().unwrap(), &support);

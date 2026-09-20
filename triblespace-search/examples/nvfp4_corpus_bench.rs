@@ -20,7 +20,7 @@ use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{Inline, InlineEncoding};
 use triblespace_core::repo::memoryrepo::MemoryRepo;
-use triblespace_core::repo::{BlobStoreGet, BlobStorePut, SnapshotSource};
+use triblespace_core::repo::{BlobStoreGet, BlobStorePut};
 use triblespace_core::trible::{Fragment, Trible, TribleSet};
 
 use triblespace_search::nvfp4::{
@@ -195,14 +195,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         policy,
     )?;
     store.commit(source, &authority, Fragment::from(facts))?;
-    let snapshot = store.snapshot()?;
-    let support = source.admitted(&snapshot)?;
-    drop(snapshot);
 
     let construction_start = Instant::now();
-    let snapshot = block_on(store.maintain_exact(target, &authority, &support))?;
+    let snapshot = block_on(store.maintain(target, &authority))?;
     let construction = construction_start.elapsed();
-    let collection = snapshot.collection_exact(target, &support)?;
+    let collection = snapshot.collection(target)?;
     let snapshot = collection.snapshot();
     let members = collection
         .cover()

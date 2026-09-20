@@ -1,5 +1,5 @@
-//! Incrementally query a growing collection through exact Succinct full and
-//! changed snapshots.
+//! Incrementally query a growing collection: the Succinct target answers the
+//! full side, the source payloads it newly stands on are the delta.
 //!
 //! Run with: `cargo run --example collection_pattern_changes`
 
@@ -9,13 +9,12 @@ use std::io;
 use ed25519_dalek::SigningKey;
 use futures::executor::block_on;
 use rand::rngs::OsRng;
-use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
     OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
 };
 use triblespace::core::collection::{
     AdmissionPolicy, Collection, CollectionPolicy, CollectionSnapshot, CollectionSnapshotExt,
-    CollectionStoreExt,
+    CollectionStoreExt, CoverAdvanceError,
 };
 use triblespace::core::examples::literature;
 use triblespace::core::repo::memoryrepo::{MemoryRepo, MemoryRepoSnapshot};
@@ -44,7 +43,7 @@ fn rebuild(
 
 fn changes(
     full: &UnionArchive<OrderedUniverse>,
-    changed: &UnionArchive<OrderedUniverse>,
+    changed: &TribleSet,
     consume: &mut impl FnMut(&str) -> Result<(), Box<dyn Error>>,
 ) -> Result<Vec<String>, Box<dyn Error>> {
     let mut titles = Vec::new();
@@ -68,7 +67,6 @@ fn changes(
 fn observe(
     store: &mut MemoryRepo,
     signing_key: &SigningKey,
-    collection: Collection<SimpleArchive>,
     raw: Collection<SuccinctArchiveBlob>,
     accelerated: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
     checkpoint: &mut Option<
@@ -76,46 +74,40 @@ fn observe(
     >,
     mut consume: impl FnMut(&str) -> Result<(), Box<dyn Error>>,
 ) -> Result<Vec<String>, Box<dyn Error>> {
-    let snapshot = store.snapshot()?;
-    let current_support = collection.admitted(&snapshot)?;
-    let changed_support = match checkpoint.as_ref() {
+    // Carry each mapping edge to its source's frontier, then read the target
+    // from the snapshot that observes all of that work. What it stands on is
+    // the continuation token.
+    block_on(store.maintain(raw, signing_key))?;
+    let snapshot = block_on(store.maintain(accelerated, signing_key))?;
+    let next = snapshot.collection(accelerated)?;
+
+    // The delta is a set of source payloads. Read it from the source through
+    // the same snapshot; the Succinct target answers the full side.
+    let changed = match checkpoint.as_ref() {
         Some(previous) => {
             let previous_support = previous.support()?;
-            if previous_support == &current_support {
+            let current_support = next.support()?;
+            if previous_support == current_support {
                 return Ok(Vec::new());
             }
-            current_support.additions_since(previous_support).ok()
+            match current_support.additions_since(previous_support) {
+                Ok(additions) => Some(additions.materialize::<TribleSet, _>(&snapshot)?),
+                Err(CoverAdvanceError::ResetRequired { .. }) => None,
+                Err(error) => return Err(error.into()),
+            }
         }
         None => None,
     };
-    drop(snapshot);
 
-    // Every mapping edge receives the same foundational support. Maintaining
-    // the delta first lets complete maintenance reuse all persisted work.
-    if let Some(changed) = changed_support.as_ref() {
-        block_on(store.maintain_exact(raw, signing_key, changed))?;
-        block_on(store.maintain_exact(accelerated, signing_key, changed))?;
-    }
-    block_on(store.maintain_exact(raw, signing_key, &current_support))?;
-    let snapshot = block_on(store.maintain_exact(accelerated, signing_key, &current_support))?;
-    let next = snapshot.collection_exact(accelerated, &current_support)?;
-
-    let titles = match changed_support {
-        Some(changed_support) => {
-            let changed = snapshot.collection_exact(accelerated, &changed_support)?;
-            let full: UnionArchive<OrderedUniverse> = next.view()?;
-            let delta: UnionArchive<OrderedUniverse> = changed.view()?;
-            changes(&full, &delta, &mut consume)?
-        }
-        None => {
-            let full: UnionArchive<OrderedUniverse> = next.view()?;
-            rebuild(&full, &mut consume)?
-        }
+    let full: UnionArchive<OrderedUniverse> = next.view()?;
+    let titles = match changed {
+        Some(changed) => changes(&full, &changed, &mut consume)?,
+        None => rebuild(&full, &mut consume)?,
     };
 
     // Adopt only after the complete fold succeeds. A failed consumer retries
-    // the same exact Succinct delta, so external effects must be transactional
-    // or idempotent when exactly-once delivery matters.
+    // the same delta, so external effects must be transactional or idempotent
+    // when exactly-once delivery matters.
     *checkpoint = Some(next);
     Ok(titles)
 }
@@ -154,7 +146,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let first = observe(
         &mut store,
         &signing_key,
-        collection,
         raw,
         accelerated,
         &mut checkpoint,
@@ -178,7 +169,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let failed = observe(
         &mut store,
         &signing_key,
-        collection,
         raw,
         accelerated,
         &mut checkpoint,
@@ -196,7 +186,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let retry = observe(
         &mut store,
         &signing_key,
-        collection,
         raw,
         accelerated,
         &mut checkpoint,
@@ -207,7 +196,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let unchanged = observe(
         &mut store,
         &signing_key,
-        collection,
         raw,
         accelerated,
         &mut checkpoint,

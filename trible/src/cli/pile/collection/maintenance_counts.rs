@@ -220,12 +220,23 @@ impl<R: triblespace_core::collection::CoverageRead> triblespace_core::collection
     for Counted<R>
 {
     /// A coverage read is a handout of the inner index, not an enumeration,
-    /// so it counts as neither; the fold it replaced enumerated.
+    /// so it counts as neither; the fold it replaced enumerated. It is also
+    /// where maintenance planned from the index first names a source, which
+    /// is where the scoped race control injects its append.
     fn index(
         &self,
         lineage: &std::collections::BTreeSet<triblespace_core::collection::CollectionHandle>,
     ) -> Result<triblespace_core::collection::coverage::CoverageIndex, Self::RecordsError> {
-        self.inner.index(lineage)
+        let index = self.inner.index(lineage)?;
+        if let Some(hook) = &self.selection_hook {
+            if lineage.contains(&hook.collection) {
+                let action = hook.action.lock().unwrap().take();
+                if let Some(action) = action {
+                    action();
+                }
+            }
+        }
+        Ok(index)
     }
 }
 

@@ -746,7 +746,6 @@ fn aggregate_support_uses_selected_dag_leaves_without_clipping_certificates() {
     publish_root(&mut store, root, &a, 31);
     publish_root(&mut store, root, &b, 31);
     let a_support = support(root, std::slice::from_ref(&a));
-    let b_support = support(root, std::slice::from_ref(&b));
     let ab_support = support(root, &[a.clone(), b.clone()]);
     let a_output = FirstEncoding::map(&(), &a, &store.snapshot().unwrap()).unwrap();
     let da = CollectionDerive::sign(
@@ -759,18 +758,11 @@ fn aggregate_support_uses_selected_dag_leaves_without_clipping_certificates() {
     let selected = BTreeSet::from([first.handle()]);
     let before = store.snapshot().unwrap();
     let lineage = load_lineage(&before, first).unwrap();
-    let partial =
-        resolve_endorsed_lineage(
-            &before,
-            &lineage,
-            &selected,
-            Some(&ab_support)
-        )
-        .unwrap();
+    let partial = resolve_endorsed_lineage(&before, &lineage, &selected).unwrap();
     assert_eq!(
         partial.support_of(lineage.foundation, first.handle()),
         a_support,
-        "requested AB is not yet certified",
+        "only a is certified so far",
     );
 
     // b contains a, but its COMMIT is a distinct foundational member. The
@@ -793,29 +785,13 @@ fn aggregate_support_uses_selected_dag_leaves_without_clipping_certificates() {
     store.insert(CollectionRecord::Derive(dab)).unwrap();
     let after = store.snapshot().unwrap();
     reset_mapping_calls();
-    for requested in [None, Some(&ab_support), Some(&a_support), Some(&b_support)] {
-        let resolved = resolve_endorsed_lineage(
-            &after,
-            &lineage,
-            &selected,
-            requested
-        )
-        .unwrap();
-        let expected = match requested {
-            None => ab_support.clone(),
-            Some(requested) if requested == &ab_support => ab_support.clone(),
-            Some(requested) if requested == &a_support => a_support.clone(),
-            // dab's certificate is {a, b}. A request for {b} is the same
-            // lattice point -- a sits beneath b -- so the record is selected
-            // and its certificate is reported unclipped, as this test's name
-            // says. Member-identity comparison used to select nothing here.
-            Some(_) => ab_support.clone(),
-        };
-        assert_eq!(
-            resolved.support_of(lineage.foundation, first.handle()),
-            expected
-        );
-    }
+    // dab's certificate is {a, b} -- a sits beneath b -- and it is reported
+    // unclipped, as this test's name says.
+    let resolved = resolve_endorsed_lineage(&after, &lineage, &selected).unwrap();
+    assert_eq!(
+        resolved.support_of(lineage.foundation, first.handle()),
+        ab_support
+    );
     assert_eq!(
         FIRST_MAP_CALLS.get(),
         0,
@@ -868,13 +844,7 @@ fn aggregate_support_excludes_missing_witnesses_and_unadmitted_producers() {
     let before = store.snapshot().unwrap();
     let lineage = load_lineage(&before, first).unwrap();
     let selected = BTreeSet::from([first.handle()]);
-    let resolved = resolve_endorsed_lineage(
-        &before,
-        &lineage,
-        &selected,
-        None
-    )
-    .unwrap();
+    let resolved = resolve_endorsed_lineage(&before, &lineage, &selected).unwrap();
     assert_eq!(
         resolved.support_of(lineage.foundation, first.handle()),
         support(root, std::slice::from_ref(&a))
@@ -882,13 +852,7 @@ fn aggregate_support_excludes_missing_witnesses_and_unadmitted_producers() {
 
     store.insert(CollectionRecord::Commit(cb)).unwrap();
     let after = store.snapshot().unwrap();
-    let resolved = resolve_endorsed_lineage(
-        &after,
-        &lineage,
-        &selected,
-        None
-    )
-    .unwrap();
+    let resolved = resolve_endorsed_lineage(&after, &lineage, &selected).unwrap();
     assert_eq!(
         resolved.support_of(lineage.foundation, first.handle()),
         support(root, &[a.clone(), b.clone()])
@@ -906,33 +870,27 @@ fn aggregate_support_excludes_missing_witnesses_and_unadmitted_producers() {
         )))
         .unwrap();
     assert!(matches!(
-        resolve_endorsed_lineage(
-            &store.snapshot().unwrap(),
-            &lineage,
-            &selected,
-            None
-        ),
+        resolve_endorsed_lineage(&store.snapshot().unwrap(), &lineage, &selected),
         Err(CollectionRealizationError::Resolution(reason)) if reason.contains("conflicting outputs")
     ));
 }
 
 #[test]
-fn downstream_ensure_requires_an_existing_immediate_source_realization() {
+fn downstream_ensure_stands_on_nothing_without_an_immediate_source_realization() {
     let (mut store, root, first, second) = collections();
     let source = archive(1, 1);
     publish_root(&mut store, root, &source, 31);
-    let support = support(root, std::slice::from_ref(&source));
 
-    let result = ensure_exact_resident::<_, SecondEncoding>(
-        &mut store,
-        second,
-        &equation_signer(),
-        &support,
-    );
-    assert!(matches!(
-        result,
-        Err(CollectionRealizationError::IncompleteCover { .. })
-    ));
+    // The target stands for what its immediate source's frontier stands on.
+    // An unrealized source stands on nothing, so nothing is owed, nothing is
+    // an error, and nothing upstream is ever constructed.
+    ensure_resident::<_, SecondEncoding>(&mut store, second, &equation_signer()).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let observed = snapshot.collection(second).unwrap();
+    assert!(observed.support().unwrap().is_empty());
+    assert!(observed.cover().is_empty());
+    drop(observed);
+    drop(snapshot);
     assert!(!records(&mut store).iter().any(|record| matches!(
         record,
         CollectionRecord::Derive(derive)
@@ -947,12 +905,13 @@ fn two_hops_reuse_one_invariant_foundational_support() {
     publish_root(&mut store, root, &source, 31);
     let support = support(root, std::slice::from_ref(&source));
 
-    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &support)
+    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer())
         .unwrap();
-    ensure_exact_resident::<_, SecondEncoding>(&mut store, second, &equation_signer(), &support)
+    ensure_resident::<_, SecondEncoding>(&mut store, second, &equation_signer())
         .unwrap();
     let snapshot = store.snapshot().unwrap();
-    let (observed_support, cover) = attach_collection_exact(&snapshot, second, &support).unwrap();
+    let attached = snapshot.collection(second).unwrap();
+    let (observed_support, cover) = (attached.support().unwrap().clone(), attached.cover().clone());
 
     assert_eq!(observed_support, support);
     assert_eq!(cover.len(), 1);
@@ -977,10 +936,12 @@ fn ordinary_attachment_reports_only_support_realized_in_its_snapshot() {
     let left = archive(1, 1);
     let right = archive(2, 2);
     publish_root(&mut store, root, &left, 1);
-    publish_root(&mut store, root, &right, 2);
     let left_support = support(root, std::slice::from_ref(&left));
-    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &left_support)
+    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer())
         .unwrap();
+    // The source grows after the target was realized: an attachment reports
+    // what the target stands on in its snapshot, not what the source admits.
+    publish_root(&mut store, root, &right, 2);
 
     let snapshot = store.snapshot().unwrap();
     let observed = super::super::observation::attach(&snapshot, first).unwrap();
@@ -1007,10 +968,9 @@ fn ensure_drops_every_residency_snapshot_and_stores_the_blob_before_derive() {
     let (mut inner, root, first, _second) = collections();
     let source = archive(1, 1);
     publish_root(&mut inner, root, &source, 31);
-    let support = support(root, &[source]);
     let mut store = GuardStore::new(inner);
 
-    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &support)
+    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer())
         .unwrap();
 
     assert_eq!(store.live.load(Ordering::SeqCst), 0);
@@ -1034,345 +994,6 @@ fn ensure_drops_every_residency_snapshot_and_stores_the_blob_before_derive() {
         .position(|event| matches!(event, WriteEvent::Put(data) if *data == derive.output()))
         .expect("ensure must store its target member");
     assert!(put_position < insert_position);
-}
-
-#[test]
-fn exact_ensure_acquires_explicit_foundational_support_without_want() {
-    let (mut inner, root, first, _second) = collections();
-    let source = archive(1, 1);
-    let metadata = inner.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
-    inner
-        .insert(CollectionRecord::Commit(CollectionCommit::sign(
-            &equation_signer(),
-            root.handle(),
-            data(&source),
-            metadata,
-        )))
-        .unwrap();
-    let support = support(root, std::slice::from_ref(&source));
-    let mut store = GuardStore::new(inner);
-    store.offer(&source);
-
-    let snapshot = block_on(store.ensure_exact(first, &equation_signer(), &support)).unwrap();
-
-    assert_eq!(store.acquired, vec![data(&source)]);
-    assert_eq!(snapshot.wants().unwrap().count(), 0);
-    let (observed, cover) = attach_collection_exact(&snapshot, first, &support).unwrap();
-    assert_eq!(observed, support);
-    assert_eq!(cover.len(), 1);
-}
-
-#[test]
-fn exact_ensure_fetches_a_known_derive_output_without_recomputing() {
-    let (mut inner, root, first, _second) = collections();
-    let source = archive(1, 1);
-    let _source_commit = publish_root(&mut inner, root, &source, 31);
-    let support = support(root, std::slice::from_ref(&source));
-    let output = FirstEncoding::map(&(), &source, &inner.snapshot().unwrap()).unwrap();
-    let output_data = data(&output);
-    let pending = CollectionRecord::Derive(CollectionDerive::sign(
-        &equation_signer(),
-        first.handle(),
-        data(&source),
-        output_data,
-    ));
-    inner.insert(pending).unwrap();
-
-    let mut store = GuardStore::new(inner);
-    store.offer(&output);
-    reset_mapping_calls();
-    let snapshot = block_on(store.ensure_exact(first, &equation_signer(), &support)).unwrap();
-
-    assert_eq!(store.acquired, vec![output_data]);
-    assert_eq!(FIRST_MAP_CALLS.get(), 0);
-    assert_eq!(SECOND_MAP_CALLS.get(), 0);
-    assert!(
-        store.events.is_empty(),
-        "acquisition must not publish algebra"
-    );
-    assert_eq!(snapshot.wants().unwrap().count(), 0);
-    let observed = snapshot.collection_exact(first, &support).unwrap();
-    assert_eq!(observed.support().unwrap(), &support);
-    assert_eq!(
-        observed.cover().data_members().collect::<Vec<_>>(),
-        vec![output_data],
-    );
-}
-
-#[test]
-fn exact_ensure_reendorses_a_resident_image_from_a_different_support_without_mapping() {
-    let (mut inner, root, first, _second) = collections();
-    let signer = equation_signer();
-    let a = archive(1, 1);
-    let b = crate::collection::simplearchive_union::join(&a, &archive(2, 2)).unwrap();
-    let _a_commit = publish_root(&mut inner, root, &a, 31);
-    let _b_commit = publish_root(&mut inner, root, &b, 31);
-    // The same payload b has two genuine witnesses: its own COMMIT [B], and
-    // join(a, b) = b [A, B]. No mapping result is invented for this fixture.
-    assert_eq!(
-        data(&crate::collection::simplearchive_union::join(&a, &b).unwrap()),
-        data(&b),
-    );
-    let ab = CollectionMerge::sign(
-        &signer,
-        root.handle(),
-        data(&a),
-        data(&b),
-        data(&b),
-    );
-    inner.insert(CollectionRecord::Merge(ab)).unwrap();
-    let output = FirstEncoding::map(&(), &b, &inner.snapshot().unwrap()).unwrap();
-    inner.put::<FirstEncoding, _>(output.clone()).unwrap();
-    let previous = CollectionDerive::sign(
-        &signer,
-        first.handle(),
-        data(&b),
-        data(&output),
-    );
-    inner.insert(CollectionRecord::Derive(previous)).unwrap();
-    let requested = support(root, std::slice::from_ref(&b));
-    let before = inner.snapshot().unwrap();
-    assert_eq!(
-        before.collection(first).unwrap().support().unwrap(),
-        &support(root, &[a, b.clone()]),
-    );
-    // The resident image was endorsed with certificate {a, b}. A request for
-    // {b} is the same lattice point, so it is already exact: there is no
-    // "different support" to re-endorse under. That concept only existed
-    // while endorsements named routes.
-    before.collection_exact(first, &requested).unwrap();
-    drop(before);
-
-    let mut store = GuardStore::new(inner);
-    reset_mapping_calls();
-    let after = block_on(store.ensure_exact(first, &signer, &requested)).unwrap();
-
-    assert_eq!(FIRST_MAP_CALLS.get(), 0);
-    assert_eq!(SECOND_MAP_CALLS.get(), 0);
-    assert_eq!(SECOND_JOIN_CALLS.get(), 0);
-    assert!(store.acquired.is_empty());
-    let selected = after.collection_exact(first, &requested).unwrap();
-    assert_eq!(selected.support().unwrap(), &requested);
-    assert_eq!(
-        selected.cover().data_members().collect::<Vec<_>>(),
-        vec![data(&output)],
-    );
-    let published: Vec<_> = store
-        .events
-        .iter()
-        .filter_map(|event| match event {
-            WriteEvent::Insert(record) => Some(*record),
-            WriteEvent::Put(_) => None,
-        })
-        .collect();
-    assert!(published.is_empty(), "nothing to re-endorse: {published:?}");
-    assert!(after
-        .select_records(&BTreeSet::from([CollectionRecordSelector::ProducedMember(
-            first.handle(),
-            data(&output),
-        )]))
-        .unwrap()
-        .contains(&CollectionRecord::Derive(previous)));
-}
-
-#[test]
-fn exact_ensure_rejects_conflicting_images_before_reusing_a_pruned_support() {
-    let (mut inner, root, first, _second) = collections();
-    let signer = equation_signer();
-    let a = archive(1, 1);
-    let b = crate::collection::simplearchive_union::join(&a, &archive(2, 2)).unwrap();
-    let _a_commit = publish_root(&mut inner, root, &a, 31);
-    let _b_commit = publish_root(&mut inner, root, &b, 31);
-    let ab = CollectionMerge::sign(
-        &signer,
-        root.handle(),
-        data(&a),
-        data(&b),
-        data(&b),
-    );
-    inner.insert(CollectionRecord::Merge(ab)).unwrap();
-    let right = FirstEncoding::map(&(), &b, &inner.snapshot().unwrap()).unwrap();
-    let wrong = FirstEncoding::map(&(), &a, &inner.snapshot().unwrap()).unwrap();
-    assert_ne!(data(&right), data(&wrong));
-    for output in [&right, &wrong] {
-        inner.put::<FirstEncoding, _>(output.clone()).unwrap();
-        inner
-            .insert(CollectionRecord::Derive(CollectionDerive::sign(
-                &signer,
-                first.handle(),
-                data(&b),
-                data(output),
-            )))
-            .unwrap();
-    }
-    let requested = support(root, std::slice::from_ref(&b));
-    // Both claims certify {a, b}, which is the requested point {b} at lattice
-    // granularity, so both are candidates -- and two candidates mapping one
-    // input to different outputs is the conflict itself. Member-identity
-    // comparison used to exclude both and report the vaguer IncompleteCover.
-    assert!(matches!(
-        inner
-            .snapshot()
-            .unwrap()
-            .collection_exact(first, &requested),
-        Err(CollectionRealizationError::Resolution(reason)) if reason.contains("conflicting outputs")
-    ));
-    let mut store = GuardStore::new(inner);
-    reset_mapping_calls();
-
-    let error = match block_on(store.ensure_exact(first, &signer, &requested)) {
-        Err(error) => error,
-        Ok(_) => panic!("conflicting certified images must not be reused"),
-    };
-
-    assert!(matches!(
-        error,
-        CollectionRealizationError::Resolution(reason) if reason.contains("conflicting outputs")
-    ));
-    assert_eq!(FIRST_MAP_CALLS.get(), 0);
-    assert_eq!(SECOND_MAP_CALLS.get(), 0);
-    assert_eq!(SECOND_JOIN_CALLS.get(), 0);
-    assert!(store.acquired.is_empty());
-    assert!(store.events.is_empty(), "a conflict must publish nothing");
-}
-
-#[test]
-fn exact_ensure_rejects_a_cold_conflicting_image_before_fetch_or_publication() {
-    let (mut inner, root, first, _second) = collections();
-    let signer = equation_signer();
-    let a = archive(1, 1);
-    let b = crate::collection::simplearchive_union::join(&a, &archive(2, 2)).unwrap();
-    let _a_commit = publish_root(&mut inner, root, &a, 31);
-    let b_commit = publish_root(&mut inner, root, &b, 31);
-    let ab = CollectionMerge::sign(
-        &signer,
-        root.handle(),
-        data(&a),
-        data(&b),
-        data(&b),
-    );
-    inner.insert(CollectionRecord::Merge(ab)).unwrap();
-    let right = FirstEncoding::map(&(), &b, &inner.snapshot().unwrap()).unwrap();
-    let wrong = FirstEncoding::map(&(), &a, &inner.snapshot().unwrap()).unwrap();
-    assert_ne!(data(&right), data(&wrong));
-    // The existing [B] claim's image is cold; only the incompatible [A, B]
-    // image is resident. Residency cannot make that image safe to re-endorse.
-    inner.put::<FirstEncoding, _>(wrong.clone()).unwrap();
-    for (_witness, output) in [(b_commit.fingerprint(), &right), (ab.fingerprint(), &wrong)] {
-        inner
-            .insert(CollectionRecord::Derive(CollectionDerive::sign(
-                &signer,
-                first.handle(),
-                data(&b),
-                data(output),
-            )))
-            .unwrap();
-    }
-    let requested = support(root, std::slice::from_ref(&b));
-    let before = inner.snapshot().unwrap();
-    assert!(!before.contains_blob(right.get_handle()).unwrap());
-    assert!(before.contains_blob(wrong.get_handle()).unwrap());
-    assert!(matches!(
-        before.collection_exact(first, &requested),
-        Err(CollectionRealizationError::Resolution(reason)) if reason.contains("conflicting outputs")
-    ));
-    drop(before);
-    let mut store = GuardStore::new(inner);
-    reset_mapping_calls();
-
-    let error = match block_on(store.ensure_exact(first, &signer, &requested)) {
-        Err(error) => error,
-        Ok(_) => panic!("cold conflicting images must not be replaced by resident ones"),
-    };
-
-    assert!(matches!(
-        error,
-        CollectionRealizationError::Resolution(reason) if reason.contains("conflicting outputs")
-    ));
-    assert_eq!(FIRST_MAP_CALLS.get(), 0);
-    assert_eq!(SECOND_MAP_CALLS.get(), 0);
-    assert_eq!(SECOND_JOIN_CALLS.get(), 0);
-    assert!(store.acquired.is_empty());
-    assert!(store.events.is_empty(), "a conflict must publish nothing");
-}
-
-#[test]
-fn passive_derived_snapshot_keeps_dangling_output_as_raw_evidence_only() {
-    let (mut inner, root, first, _second) = collections();
-    let source = archive(1, 1);
-    let _source_commit = publish_root(&mut inner, root, &source, 42);
-    let support = support(root, std::slice::from_ref(&source));
-    let output = FirstEncoding::map(&(), &source, &inner.snapshot().unwrap()).unwrap();
-    let pending = CollectionRecord::Derive(CollectionDerive::sign(
-        &equation_signer(),
-        first.handle(),
-        data(&source),
-        data(&output),
-    ));
-    inner.insert(pending).unwrap();
-
-    let mut store = GuardStore::new(inner);
-    store.offer(&output);
-    reset_mapping_calls();
-    let snapshot = store.snapshot().unwrap();
-    assert_eq!(root.admitted(&snapshot).unwrap(), support);
-    let observed = snapshot.collection(first).unwrap();
-    assert!(observed.support().unwrap().is_empty());
-    assert!(observed.cover().is_empty());
-    assert!(matches!(
-        snapshot.collection_exact(first, &support),
-        Err(CollectionRealizationError::IncompleteCover { .. })
-    ));
-    let selectors = BTreeSet::from([CollectionRecordSelector::DeriveTarget(first.handle())]);
-    assert_eq!(snapshot.select_records(&selectors).unwrap(), vec![pending]);
-    assert!(store.acquired.is_empty());
-    assert!(store.events.is_empty());
-    assert_eq!(FIRST_MAP_CALLS.get(), 0);
-    assert_eq!(SECOND_MAP_CALLS.get(), 0);
-    assert_eq!(snapshot.wants().unwrap().count(), 0);
-}
-
-#[test]
-fn exact_maintenance_recovers_a_pending_derive_with_a_missing_output() {
-    let (mut inner, root, first, _second) = collections();
-    let source = archive(1, 1);
-    let _source_commit = publish_root(&mut inner, root, &source, 31);
-    let support = support(root, std::slice::from_ref(&source));
-    let snapshot = inner.snapshot().unwrap();
-    let output = FirstEncoding::map(&(), &source, &snapshot).unwrap();
-    drop(snapshot);
-    let output_data = data(&output);
-    let pending = CollectionDerive::sign(
-        &equation_signer(),
-        first.handle(),
-        data(&source),
-        output_data,
-    );
-    inner.insert(CollectionRecord::Derive(pending)).unwrap();
-    drop(output);
-
-    let mut store = GuardStore::new(inner);
-    reset_mapping_calls();
-    let snapshot = block_on(store.maintain_exact(first, &equation_signer(), &support)).unwrap();
-
-    assert_eq!(store.acquired, vec![output_data]);
-    assert_eq!(FIRST_MAP_CALLS.get(), 1);
-    assert!(snapshot
-        .metadata(Handle::<FirstEncoding>::from_hash(output_data))
-        .unwrap()
-        .is_some());
-    let (observed, cover) = attach_collection_exact(&snapshot, first, &support).unwrap();
-    assert_eq!(observed, support);
-    assert_eq!(cover.data_members().collect::<Vec<_>>(), vec![output_data]);
-    drop(snapshot);
-    assert_eq!(
-        records(&mut store.inner)
-            .iter()
-            .filter(|record| **record == CollectionRecord::Derive(pending))
-            .count(),
-        1,
-        "deterministic recovery reuses the pending equation",
-    );
 }
 
 #[test]
@@ -1428,6 +1049,194 @@ fn ordinary_derived_ensure_leaves_cold_source_records_for_explicit_root_acquisit
     );
     assert_eq!(observed.cover().len(), 2);
     assert_eq!(snapshot.wants().unwrap().count(), 0);
+}
+
+#[test]
+fn exact_ensure_fetches_a_known_derive_output_without_recomputing() {
+    let (mut inner, root, first, _second) = collections();
+    let source = archive(1, 1);
+    let _source_commit = publish_root(&mut inner, root, &source, 31);
+    let support = support(root, std::slice::from_ref(&source));
+    let output = FirstEncoding::map(&(), &source, &inner.snapshot().unwrap()).unwrap();
+    let output_data = data(&output);
+    let pending = CollectionRecord::Derive(CollectionDerive::sign(
+        &equation_signer(),
+        first.handle(),
+        data(&source),
+        output_data,
+    ));
+    inner.insert(pending).unwrap();
+
+    let mut store = GuardStore::new(inner);
+    store.offer(&output);
+    reset_mapping_calls();
+    let snapshot = block_on(store.ensure(first, &equation_signer())).unwrap();
+
+    assert_eq!(store.acquired, vec![output_data]);
+    assert_eq!(FIRST_MAP_CALLS.get(), 0);
+    assert_eq!(SECOND_MAP_CALLS.get(), 0);
+    assert!(
+        store.events.is_empty(),
+        "acquisition must not publish algebra"
+    );
+    assert_eq!(snapshot.wants().unwrap().count(), 0);
+    let observed = snapshot.collection(first).unwrap();
+    assert_eq!(observed.support().unwrap(), &support);
+    assert_eq!(
+        observed.cover().data_members().collect::<Vec<_>>(),
+        vec![output_data],
+    );
+}
+
+#[test]
+fn ensure_reuses_a_resident_image_without_mapping() {
+    let (mut inner, root, first, _second) = collections();
+    let signer = equation_signer();
+    let a = archive(1, 1);
+    let b = crate::collection::simplearchive_union::join(&a, &archive(2, 2)).unwrap();
+    let _a_commit = publish_root(&mut inner, root, &a, 31);
+    let _b_commit = publish_root(&mut inner, root, &b, 31);
+    // The same payload b has two genuine witnesses: its own COMMIT [B], and
+    // join(a, b) = b [A, B]. No mapping result is invented for this fixture.
+    assert_eq!(
+        data(&crate::collection::simplearchive_union::join(&a, &b).unwrap()),
+        data(&b),
+    );
+    let ab = CollectionMerge::sign(
+        &signer,
+        root.handle(),
+        data(&a),
+        data(&b),
+        data(&b),
+    );
+    inner.insert(CollectionRecord::Merge(ab)).unwrap();
+    let output = FirstEncoding::map(&(), &b, &inner.snapshot().unwrap()).unwrap();
+    inner.put::<FirstEncoding, _>(output.clone()).unwrap();
+    let previous = CollectionDerive::sign(
+        &signer,
+        first.handle(),
+        data(&b),
+        data(&output),
+    );
+    inner.insert(CollectionRecord::Derive(previous)).unwrap();
+    // The resident image was endorsed with certificate {a, b}, which is
+    // everything the root stands on, so the target is already current: there
+    // is no "different support" to re-endorse under. That concept only
+    // existed while endorsements named routes.
+    let requested = support(root, &[a, b.clone()]);
+    let before = inner.snapshot().unwrap();
+    assert_eq!(
+        before.collection(first).unwrap().support().unwrap(),
+        &requested,
+    );
+    drop(before);
+
+    let mut store = GuardStore::new(inner);
+    reset_mapping_calls();
+    let after = block_on(store.ensure(first, &signer)).unwrap();
+
+    assert_eq!(FIRST_MAP_CALLS.get(), 0);
+    assert_eq!(SECOND_MAP_CALLS.get(), 0);
+    assert_eq!(SECOND_JOIN_CALLS.get(), 0);
+    assert!(store.acquired.is_empty());
+    let selected = after.collection(first).unwrap();
+    assert_eq!(selected.support().unwrap(), &requested);
+    assert_eq!(
+        selected.cover().data_members().collect::<Vec<_>>(),
+        vec![data(&output)],
+    );
+    let published: Vec<_> = store
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            WriteEvent::Insert(record) => Some(*record),
+            WriteEvent::Put(_) => None,
+        })
+        .collect();
+    assert!(published.is_empty(), "nothing to re-endorse: {published:?}");
+    assert!(after
+        .select_records(&BTreeSet::from([CollectionRecordSelector::ProducedMember(
+            first.handle(),
+            data(&output),
+        )]))
+        .unwrap()
+        .contains(&CollectionRecord::Derive(previous)));
+}
+
+#[test]
+fn passive_derived_snapshot_keeps_dangling_output_as_raw_evidence_only() {
+    let (mut inner, root, first, _second) = collections();
+    let source = archive(1, 1);
+    let _source_commit = publish_root(&mut inner, root, &source, 42);
+    let support = support(root, std::slice::from_ref(&source));
+    let output = FirstEncoding::map(&(), &source, &inner.snapshot().unwrap()).unwrap();
+    let pending = CollectionRecord::Derive(CollectionDerive::sign(
+        &equation_signer(),
+        first.handle(),
+        data(&source),
+        data(&output),
+    ));
+    inner.insert(pending).unwrap();
+
+    let mut store = GuardStore::new(inner);
+    store.offer(&output);
+    reset_mapping_calls();
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!(root.admitted(&snapshot).unwrap(), support);
+    let observed = snapshot.collection(first).unwrap();
+    assert!(observed.support().unwrap().is_empty());
+    assert!(observed.cover().is_empty());
+    let selectors = BTreeSet::from([CollectionRecordSelector::DeriveTarget(first.handle())]);
+    assert_eq!(snapshot.select_records(&selectors).unwrap(), vec![pending]);
+    assert!(store.acquired.is_empty());
+    assert!(store.events.is_empty());
+    assert_eq!(FIRST_MAP_CALLS.get(), 0);
+    assert_eq!(SECOND_MAP_CALLS.get(), 0);
+    assert_eq!(snapshot.wants().unwrap().count(), 0);
+}
+
+#[test]
+fn exact_maintenance_recovers_a_pending_derive_with_a_missing_output() {
+    let (mut inner, root, first, _second) = collections();
+    let source = archive(1, 1);
+    let _source_commit = publish_root(&mut inner, root, &source, 31);
+    let support = support(root, std::slice::from_ref(&source));
+    let snapshot = inner.snapshot().unwrap();
+    let output = FirstEncoding::map(&(), &source, &snapshot).unwrap();
+    drop(snapshot);
+    let output_data = data(&output);
+    let pending = CollectionDerive::sign(
+        &equation_signer(),
+        first.handle(),
+        data(&source),
+        output_data,
+    );
+    inner.insert(CollectionRecord::Derive(pending)).unwrap();
+    drop(output);
+
+    let mut store = GuardStore::new(inner);
+    reset_mapping_calls();
+    let snapshot = block_on(store.maintain(first, &equation_signer())).unwrap();
+
+    assert_eq!(store.acquired, vec![output_data]);
+    assert_eq!(FIRST_MAP_CALLS.get(), 1);
+    assert!(snapshot
+        .metadata(Handle::<FirstEncoding>::from_hash(output_data))
+        .unwrap()
+        .is_some());
+    let attached = snapshot.collection(first).unwrap();
+    let (observed, cover) = (attached.support().unwrap().clone(), attached.cover().clone());
+    assert_eq!(observed, support);
+    assert_eq!(cover.data_members().collect::<Vec<_>>(), vec![output_data]);
+    drop(snapshot);
+    assert_eq!(
+        records(&mut store.inner)
+            .iter()
+            .filter(|record| **record == CollectionRecord::Derive(pending))
+            .count(),
+        1,
+        "deterministic recovery reuses the pending equation",
+    );
 }
 
 #[test]
@@ -1653,37 +1462,18 @@ fn root_ensure_reuses_a_signed_union_without_fetching_ancestor_bytes() {
 }
 
 #[test]
-fn root_ensure_exact_fetches_selected_payload_without_commits() {
-    let (inner, root, _, _) = collections();
-    let source = archive(35, 35);
-    let requested = support(root, std::slice::from_ref(&source));
-    let mut store = GuardStore::new(inner);
-    store.offer(&source);
-
-    let snapshot = block_on(store.ensure_exact(root, &equation_signer(), &requested)).unwrap();
-    let selected = snapshot.collection_exact(root, &requested).unwrap();
-    assert_eq!(selected.view::<TribleSet>().unwrap().len(), 1);
-    assert!(snapshot.collection(root).unwrap().cover().is_empty());
-    assert_eq!(store.acquired, vec![data(&source)]);
-    assert!(snapshot.records().unwrap().next().is_none());
-    assert_eq!(snapshot.wants().unwrap().count(), 0);
-    assert!(store.events.is_empty());
-}
-
-#[test]
 fn root_maintenance_only_merges_and_warm_ensure_is_write_free() {
     let (mut inner, root, _, _) = collections();
     let left = archive(36, 36);
     let right = archive(37, 37);
-    let requested = support(root, &[left.clone(), right.clone()]);
     publish_root(&mut inner, root, &left, 31);
     publish_root(&mut inner, root, &right, 31);
     let mut store = GuardStore::new(inner);
 
-    let maintained = block_on(store.maintain_exact(root, &equation_signer(), &requested)).unwrap();
+    let maintained = block_on(store.maintain(root, &equation_signer())).unwrap();
     assert_eq!(
         maintained
-            .collection_exact(root, &requested)
+            .collection(root)
             .unwrap()
             .cover()
             .len(),
@@ -1699,10 +1489,10 @@ fn root_maintenance_only_merges_and_warm_ensure_is_write_free() {
     )));
     drop(maintained);
     store.events.clear();
-    let ensured = block_on(store.ensure_exact(root, &equation_signer(), &requested)).unwrap();
+    let ensured = block_on(store.ensure(root, &equation_signer())).unwrap();
     assert_eq!(
         ensured
-            .collection_exact(root, &requested)
+            .collection(root)
             .unwrap()
             .view::<TribleSet>()
             .unwrap()
@@ -2000,14 +1790,13 @@ fn maintenance_drops_every_residency_snapshot_and_stores_the_blob_before_merge()
     for blob in [&left, &right] {
         publish_root(&mut inner, root, blob, 31);
     }
-    let support = support(root, &[left, right]);
-    ensure_exact_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer(), &support)
+    ensure_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer())
         .unwrap();
-    ensure_exact_resident::<_, SecondEncoding>(&mut inner, second, &equation_signer(), &support)
+    ensure_resident::<_, SecondEncoding>(&mut inner, second, &equation_signer())
         .unwrap();
     let mut store = GuardStore::new(inner);
 
-    maintain_exact_resident::<_, SecondEncoding>(&mut store, second, &equation_signer(), &support)
+    maintain_resident::<_, SecondEncoding>(&mut store, second, &equation_signer())
         .unwrap();
 
     assert_eq!(store.live.load(Ordering::SeqCst), 0);
@@ -2044,14 +1833,13 @@ fn target_maintenance_never_enumerates_records() {
     for member in &members {
         publish_root(&mut inner, root, member, 31);
     }
-    let support = support(root, &members);
-    ensure_exact_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer(), &support)
+    ensure_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer())
         .unwrap();
-    ensure_exact_resident::<_, SecondEncoding>(&mut inner, second, &equation_signer(), &support)
+    ensure_resident::<_, SecondEncoding>(&mut inner, second, &equation_signer())
         .unwrap();
 
     let mut store = GuardStore::new(inner);
-    maintain_exact_resident::<_, SecondEncoding>(&mut store, second, &equation_signer(), &support)
+    maintain_resident::<_, SecondEncoding>(&mut store, second, &equation_signer())
         .unwrap();
 
     let merges = store
@@ -2067,7 +1855,8 @@ fn target_maintenance_never_enumerates_records() {
     );
 
     let snapshot = store.inner.snapshot().unwrap();
-    let (_, cover) = attach_collection_exact(&snapshot, second, &support).unwrap();
+    let attached = snapshot.collection(second).unwrap();
+    let (_, cover) = (attached.support().unwrap().clone(), attached.cover().clone());
     assert_eq!(cover.len(), 1);
 }
 
@@ -2079,15 +1868,9 @@ fn failed_target_batch_preserves_every_published_prefix_carry() {
         for member in &members {
             publish_root(&mut inner, root, member, 31);
         }
-        let support = support(root, &members);
-        ensure_exact_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer(), &support)
+        ensure_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer())
             .unwrap();
-        ensure_exact_resident::<_, SecondEncoding>(
-            &mut inner,
-            second,
-            &equation_signer(),
-            &support,
-        )
+        ensure_resident::<_, SecondEncoding>(&mut inner, second, &equation_signer())
         .unwrap();
 
         let mut store = GuardStore::new(inner);
@@ -2098,12 +1881,7 @@ fn failed_target_batch_preserves_every_published_prefix_carry() {
         }
 
         assert!(matches!(
-            maintain_exact_resident::<_, SecondEncoding>(
-                &mut store,
-                second,
-                &equation_signer(),
-                &support
-            ),
+            maintain_resident::<_, SecondEncoding>(&mut store, second, &equation_signer()),
             Err(CollectionRealizationError::Storage { .. })
         ));
         assert_eq!(store.live.load(Ordering::SeqCst), 0);
@@ -2126,7 +1904,6 @@ fn later_put_or_insert_failure_preserves_the_published_prefix() {
         for blob in [&left, &right] {
             publish_root(&mut inner, root, blob, 31);
         }
-        let support = support(root, &[left, right]);
         let mut store = GuardStore::new(inner);
         if fail_insert {
             store.reject_insert_at = Some(2);
@@ -2135,12 +1912,7 @@ fn later_put_or_insert_failure_preserves_the_published_prefix() {
         }
 
         assert!(matches!(
-            ensure_exact_resident::<_, FirstEncoding>(
-                &mut store,
-                first,
-                &equation_signer(),
-                &support
-            ),
+            ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer()),
             Err(CollectionRealizationError::Storage { .. })
         ));
         let derives = records(&mut store.inner)
@@ -2158,12 +1930,11 @@ fn missing_mapping_dependency_publishes_nothing() {
     let (mut store, root, first, _second) = collections();
     let source = archive(1, 1);
     publish_root(&mut store, root, &source, 31);
-    let support = support(root, &[source]);
     let before = store.snapshot().unwrap();
     FIRST_MAP_MISSING.set(true);
 
     let result =
-        ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &support);
+        ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer());
     FIRST_MAP_MISSING.set(false);
 
     assert!(matches!(
@@ -2196,11 +1967,10 @@ fn capacity_blocked_source_upper_falls_back_to_its_resident_children() {
             data(&joined),
         )))
         .unwrap();
-    let support = support(root, &[left.clone(), right.clone()]);
     reset_mapping_calls();
     FIRST_MAP_CAPACITY.replace(Some(data(&joined)));
 
-    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &support)
+    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer())
         .unwrap();
     FIRST_MAP_CAPACITY.replace(None);
 
@@ -2225,28 +1995,25 @@ fn warm_exact_ensure_is_a_zero_write_zero_algebra_observation() {
     let (mut store, root, first, _second) = collections();
     let source = archive(1, 1);
     publish_root(&mut store, root, &source, 31);
-    let support = support(root, &[source]);
-    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &support)
+    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer())
         .unwrap();
 
     reset_mapping_calls();
     let before = store.snapshot().unwrap();
-    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &support)
+    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer())
         .unwrap();
     let after = store.snapshot().unwrap();
     assert!(after.changes_since(&before).is_empty());
     assert_eq!(FIRST_MAP_CALLS.get(), 0);
 }
 
-/// Produce a genuine two-hop endorsement, then replicate only the records and
-/// bytes needed at the chosen boundary. The first-hop grant remains in the
-/// replica but its definition does not; the root writer's proof is absent.
-fn cold_source_authority_fixture(
-    target_ready: bool,
-) -> (
+/// Produce a genuine first-hop endorsement, then replicate only what exists
+/// at the boundary before the target's own work: the root writer's proof and
+/// the first-hop grant remain in the replica, but the grant's definition and
+/// the root payload do not, so the first-hop producer is not admitted -- and
+/// the source has no rows -- until the definition arrives.
+fn cold_source_authority_fixture() -> (
     GuardStore,
-    Collection<SimpleArchive>,
-    Collection<FirstEncoding>,
     Collection<SecondEncoding>,
     Support,
     Blob<SimpleArchive>,
@@ -2284,14 +2051,13 @@ fn cold_source_authority_fixture(
     .clone()
     .to_blob();
     staging.put::<SimpleArchive, _>(definition.clone()).unwrap();
-    staging
-        .insert_proof(CapabilityProof::new(
-            CapabilityResource::from(root.handle()),
-            &authority,
-            write_capability(),
-            root_writer.verifying_key(),
-        ))
-        .unwrap();
+    let root_proof = CapabilityProof::new(
+        CapabilityResource::from(root.handle()),
+        &authority,
+        write_capability(),
+        root_writer.verifying_key(),
+    );
+    staging.insert_proof(root_proof.clone()).unwrap();
     let first_proof = CapabilityProof::new(
         CapabilityResource::from(first.handle()),
         &authority,
@@ -2302,32 +2068,12 @@ fn cold_source_authority_fixture(
     let source = archive(44, 44);
     let commit = publish_root(&mut staging, root, &source, 91);
     let selected = support(root, std::slice::from_ref(&source));
-    drop(block_on(staging.ensure_exact(first, &first_writer, &selected)).unwrap());
-    drop(block_on(staging.ensure_exact(target, &owner, &selected)).unwrap());
+    drop(block_on(staging.ensure(first, &first_writer)).unwrap());
     let realized = staging.snapshot().unwrap();
-    let first_data = realized
-        .collection(first)
-        .unwrap()
-        .cover()
-        .data_members()
-        .next()
-        .unwrap();
-    let target_data = realized
-        .collection(target)
-        .unwrap()
-        .cover()
-        .data_members()
-        .next()
-        .unwrap();
     let omitted = BTreeSet::from([
         commit.data(),
         Handle::<SimpleArchive>::to_hash(commit.metadata()),
         data(&definition),
-        if target_ready {
-            first_data
-        } else {
-            target_data
-        },
     ]);
     let mut inner = MemoryRepo::default();
     for info in realized.blobs() {
@@ -2339,103 +2085,44 @@ fn cold_source_authority_fixture(
         }
     }
     for record in realized.records().unwrap() {
-        let record = record.unwrap();
-        if target_ready || record.collection() != target.handle() {
-            inner.insert(record).unwrap();
-        }
+        inner.insert(record.unwrap()).unwrap();
     }
+    inner.insert_proof(root_proof).unwrap();
     inner.insert_proof(first_proof).unwrap();
     let observed = inner.snapshot().unwrap();
-    assert!(!root
+    assert!(root
         .writer_is_admitted(&observed, root_writer.verifying_key())
         .unwrap());
     assert!(!first
         .writer_is_admitted(&observed, first_writer.verifying_key())
         .unwrap());
-    assert_eq!(
-        observed.collection(target).unwrap().support().unwrap(),
-        &if target_ready {
-            selected.clone()
-        } else {
-            root.cover([])
-        },
-    );
+    assert!(observed
+        .collection(first)
+        .unwrap()
+        .support()
+        .unwrap()
+        .is_empty());
+    assert!(observed
+        .collection(target)
+        .unwrap()
+        .support()
+        .unwrap()
+        .is_empty());
     assert!(!observed.contains_blob(source.get_handle()).unwrap());
     assert!(!observed.contains_blob(commit.metadata()).unwrap());
     assert!(!observed.contains_blob(definition.get_handle()).unwrap());
-    (
-        GuardStore::new(inner),
-        root,
-        first,
-        target,
-        selected,
-        definition,
-    )
+    (GuardStore::new(inner), target, selected, definition)
 }
 
 #[test]
-fn exact_warm_target_reuse_does_not_acquire_or_admit_its_source() {
-    for maintain in [false, true] {
-        for key in [equation_signer(), SigningKey::from_bytes(&[93; 32])] {
-            let (mut store, _root, _first, target, selected, definition) =
-                cold_source_authority_fixture(true);
-            // If authority preparation crosses into the source, this available
-            // definition makes that unnecessary acquisition observable.
-            store.offer(&definition);
-            reset_mapping_calls();
-            let after = if maintain {
-                block_on(store.maintain_exact(target, &key, &selected))
-            } else {
-                block_on(store.ensure_exact(target, &key, &selected))
-            }
-            .unwrap();
-            if !maintain {
-                // The only collection ENUMERATED is the target's own. Walking
-                // the producers of a named payload is an indexed lookup -- not
-                // an enumeration, and not an admission decision -- so it may
-                // touch ancestors freely; that is how the target's endorsement
-                // is certified without admitting anything beneath it.
-                let enumerated: BTreeSet<_> = store
-                    .selected_collections
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .flatten()
-                    .filter_map(|selector| match selector {
-                        CollectionRecordSelector::Collection(collection) => Some(*collection),
-                        _ => None,
-                    })
-                    .collect();
-                assert_eq!(
-                    enumerated,
-                    BTreeSet::from([target.handle()]),
-                    "reuse authenticates the target, not its ancestral producers",
-                );
-            }
-            assert_eq!(
-                after.collection(target).unwrap().support().unwrap(),
-                &selected
-            );
-            assert_eq!(after.wants().unwrap().count(), 0);
-            assert!(store.acquired.is_empty());
-            assert!(store.events.is_empty());
-            assert_eq!(FIRST_MAP_CALLS.get(), 0);
-            assert_eq!(SECOND_MAP_CALLS.get(), 0);
-            assert_eq!(SECOND_JOIN_CALLS.get(), 0);
-        }
-    }
-}
-
-#[test]
-fn exact_new_work_still_requires_the_immediate_source_grant_definition() {
+fn new_work_still_requires_the_immediate_source_grant_definition() {
     for available_definition in [false, true] {
-        let (mut store, _root, _first, target, selected, definition) =
-            cold_source_authority_fixture(false);
+        let (mut store, target, selected, definition) = cold_source_authority_fixture();
         if available_definition {
             store.offer(&definition);
         }
         reset_mapping_calls();
-        let result = block_on(store.ensure_exact(target, &equation_signer(), &selected));
+        let result = block_on(store.ensure(target, &equation_signer()));
         assert_eq!(store.acquired, vec![data(&definition)]);
         assert_eq!(FIRST_MAP_CALLS.get(), 0, "never rebuild the source");
         if available_definition {
@@ -2446,10 +2133,16 @@ fn exact_new_work_still_requires_the_immediate_source_grant_definition() {
             );
             assert_eq!(SECOND_MAP_CALLS.get(), 1);
         } else {
-            assert!(matches!(
-                result,
-                Err(CollectionRealizationError::IncompleteCover { .. })
-            ));
+            // Without the grant's definition the source producer is not
+            // admitted, so the source has no rows: the target owes nothing,
+            // reports nothing, and has nothing until the grant arrives.
+            let after = result.unwrap();
+            assert!(after
+                .collection(target)
+                .unwrap()
+                .support()
+                .unwrap()
+                .is_empty());
             assert!(store.events.is_empty());
             assert_eq!(SECOND_MAP_CALLS.get(), 0);
         }
@@ -2457,7 +2150,7 @@ fn exact_new_work_still_requires_the_immediate_source_grant_definition() {
 }
 
 #[test]
-fn warm_exact_reuse_keeps_foundation_representation_and_mapping_checks() {
+fn warm_reuse_keeps_representation_and_mapping_checks() {
     struct WrongSecondMapping;
 
     impl CollectionMapping for WrongSecondMapping {
@@ -2486,34 +2179,19 @@ fn warm_exact_reuse_keeps_foundation_representation_and_mapping_checks() {
     }
 
     for maintain in [false, true] {
-        let (mut store, _root, _first, target, selected, definition) =
-            cold_source_authority_fixture(true);
-        let unrelated = store
-            .inner
-            .collection("unrelated-support-foundation", policy())
-            .unwrap();
-        let foreign_support = unrelated.cover(
-            selected
-                .data_members()
-                .map(Handle::<SimpleArchive>::from_hash),
-        );
-        store.offer(&definition);
+        let (mut inner, root, first, target) = collections();
+        let source = archive(1, 1);
+        publish_root(&mut inner, root, &source, 31);
+        ensure_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer()).unwrap();
+        ensure_resident::<_, SecondEncoding>(&mut inner, target, &equation_signer()).unwrap();
+        let mut store = GuardStore::new(inner);
         reset_mapping_calls();
-        let wrong_foundation = if maintain {
-            block_on(store.maintain_exact(target, &equation_signer(), &foreign_support))
-        } else {
-            block_on(store.ensure_exact(target, &equation_signer(), &foreign_support))
-        };
-        assert!(matches!(
-            wrong_foundation,
-            Err(CollectionRealizationError::InvalidCover(_)),
-        ));
 
         let wrong_type = Collection::<FirstEncoding>::from_handle(target.handle());
         let wrong_representation = if maintain {
-            block_on(store.maintain_exact(wrong_type, &equation_signer(), &selected))
+            block_on(store.maintain(wrong_type, &equation_signer()))
         } else {
-            block_on(store.ensure_exact(wrong_type, &equation_signer(), &selected))
+            block_on(store.ensure(wrong_type, &equation_signer()))
         };
         assert!(matches!(
             wrong_representation,
@@ -2522,17 +2200,9 @@ fn warm_exact_reuse_keeps_foundation_representation_and_mapping_checks() {
         ));
 
         let wrong_mapping = if maintain {
-            block_on(store.maintain_exact_with::<WrongSecondMapping>(
-                target,
-                &equation_signer(),
-                &selected,
-            ))
+            block_on(store.maintain_with::<WrongSecondMapping>(target, &equation_signer()))
         } else {
-            block_on(store.ensure_exact_with::<WrongSecondMapping>(
-                target,
-                &equation_signer(),
-                &selected,
-            ))
+            block_on(store.ensure_with::<WrongSecondMapping>(target, &equation_signer()))
         };
         assert!(matches!(
             wrong_mapping,
@@ -2563,21 +2233,20 @@ fn complete_realization_is_reused_without_write_authority() {
         .unwrap();
     let source = archive(1, 1);
     publish_root(&mut inner, root, &source, 31);
-    let support = support(root, &[source]);
-    block_on(inner.ensure_exact(target, &owner, &support)).unwrap();
+    block_on(inner.ensure(target, &owner)).unwrap();
     let mut store = GuardStore::new(inner);
     reset_mapping_calls();
 
     for maintain in [false, true] {
         let snapshot = if maintain {
-            block_on(store.maintain_exact(target, &reader, &support))
+            block_on(store.maintain(target, &reader))
         } else {
-            block_on(store.ensure_exact(target, &reader, &support))
+            block_on(store.ensure(target, &reader))
         }
         .unwrap();
         assert_eq!(
             snapshot
-                .collection_exact(target, &support)
+                .collection(target)
                 .unwrap()
                 .cover()
                 .len(),
@@ -2606,15 +2275,14 @@ fn missing_realization_requires_write_before_computation_or_publication() {
         .unwrap();
     let source = archive(1, 1);
     publish_root(&mut inner, root, &source, 31);
-    let support = support(root, &[source]);
     let mut store = GuardStore::new(inner);
     reset_mapping_calls();
 
     for maintain in [false, true] {
         let result = if maintain {
-            block_on(store.maintain_exact(target, &reader, &support))
+            block_on(store.maintain(target, &reader))
         } else {
-            block_on(store.ensure_exact(target, &reader, &support))
+            block_on(store.ensure(target, &reader))
         };
         assert!(matches!(result,
             Err(CollectionRealizationError::UnauthorizedProducer { collection })
@@ -2647,9 +2315,8 @@ fn optional_maintenance_without_write_keeps_the_fine_cover_without_algebra() {
     for member in [&left, &right] {
         publish_root(&mut inner, root, member, 31);
     }
-    let support = support(root, &[left.clone(), right.clone()]);
-    block_on(inner.ensure_exact(first, &owner, &support)).unwrap();
-    block_on(inner.ensure_exact(second, &owner, &support)).unwrap();
+    block_on(inner.ensure(first, &owner)).unwrap();
+    block_on(inner.ensure(second, &owner)).unwrap();
     let upper = crate::collection::simplearchive_union::join(&left, &right).unwrap();
     inner.put::<SimpleArchive, _>(upper.clone()).unwrap();
     let before = inner.snapshot().unwrap();
@@ -2668,10 +2335,10 @@ fn optional_maintenance_without_write_keeps_the_fine_cover_without_algebra() {
     let mut store = GuardStore::new(inner);
     reset_mapping_calls();
 
-    let snapshot = block_on(store.maintain_exact(first, &reader, &support)).unwrap();
+    let snapshot = block_on(store.maintain(first, &reader)).unwrap();
     assert_eq!(
         snapshot
-            .collection_exact(first, &support)
+            .collection(first)
             .unwrap()
             .cover()
             .len(),
@@ -2683,13 +2350,13 @@ fn optional_maintenance_without_write_keeps_the_fine_cover_without_algebra() {
 
     // The authorized source producer can pay for its upper image. A downstream
     // reader still must not join or republish it under an unauthorized key.
-    drop(block_on(store.maintain_exact(first, &owner, &support)).unwrap());
+    drop(block_on(store.maintain(first, &owner)).unwrap());
     store.events.clear();
     reset_mapping_calls();
-    let snapshot = block_on(store.maintain_exact(second, &reader, &support)).unwrap();
+    let snapshot = block_on(store.maintain(second, &reader)).unwrap();
     assert_eq!(
         snapshot
-            .collection_exact(second, &support)
+            .collection(second)
             .unwrap()
             .cover()
             .len(),
@@ -2706,16 +2373,13 @@ fn existing_target_support_is_not_mapped_again_when_support_grows() {
     let (mut store, root, first, _second) = collections();
     let left = archive(1, 1);
     let right = archive(2, 2);
-    for blob in [&left, &right] {
-        publish_root(&mut store, root, blob, 31);
-    }
-    let left_support = support(root, std::slice::from_ref(&left));
-    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &left_support)
+    publish_root(&mut store, root, &left, 31);
+    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer())
         .unwrap();
 
     reset_mapping_calls();
-    let full_support = support(root, &[left, right]);
-    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &full_support)
+    publish_root(&mut store, root, &right, 31);
+    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer())
         .unwrap();
     assert_eq!(FIRST_MAP_CALLS.get(), 1);
 }
@@ -2728,12 +2392,12 @@ fn resident_source_upper_is_mapped_instead_of_its_finer_children() {
     for blob in [&left, &right] {
         publish_root(&mut store, root, blob, 31);
     }
-    let support = support(root, &[left, right]);
-    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &support)
+    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer())
         .unwrap();
 
     let snapshot = store.snapshot().unwrap();
-    let (_, first_cover) = attach_collection_exact(&snapshot, first, &support).unwrap();
+    let attached = snapshot.collection(first).unwrap();
+    let (_, first_cover) = (attached.support().unwrap().clone(), attached.cover().clone());
     let mut children = first_cover.members().map(|handle| {
         snapshot
             .get::<Blob<FirstEncoding>, FirstEncoding>(handle)
@@ -2757,7 +2421,7 @@ fn resident_source_upper_is_mapped_instead_of_its_finer_children() {
         .unwrap();
 
     reset_mapping_calls();
-    ensure_exact_resident::<_, SecondEncoding>(&mut store, second, &equation_signer(), &support)
+    ensure_resident::<_, SecondEncoding>(&mut store, second, &equation_signer())
         .unwrap();
     assert_eq!(SECOND_MAP_CALLS.get(), 1);
     assert!(records(&mut store).iter().any(|record| matches!(
@@ -2775,16 +2439,16 @@ fn optional_target_dependency_keeps_the_finer_cover() {
     for blob in [&left, &right] {
         publish_root(&mut store, root, blob, 31);
     }
-    let support = support(root, &[left, right]);
 
-    maintain_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &support)
+    maintain_resident::<_, FirstEncoding>(&mut store, first, &equation_signer())
         .unwrap();
     let snapshot = store.snapshot().unwrap();
-    let (_, cover) = attach_collection_exact(&snapshot, first, &support).unwrap();
+    let attached = snapshot.collection(first).unwrap();
+    let (_, cover) = (attached.support().unwrap().clone(), attached.cover().clone());
     assert_eq!(cover.len(), 2);
     drop(snapshot);
     let first_result = store.snapshot().unwrap();
-    maintain_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &support)
+    maintain_resident::<_, FirstEncoding>(&mut store, first, &equation_signer())
         .unwrap();
     assert!(store
         .snapshot()
@@ -2804,13 +2468,12 @@ fn source_guidance_maps_only_the_resident_coarsest_upper_and_repeats_without_wor
     for member in &members {
         publish_root(&mut inner, root, member, 31);
     }
-    let support = support(root, &members);
-    ensure_exact_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer(), &support)
+    ensure_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer())
         .unwrap();
     let mut store = GuardStore::new(inner);
 
     reset_mapping_calls();
-    block_on(store.maintain_exact(first, &equation_signer(), &support)).unwrap();
+    block_on(store.maintain(first, &equation_signer())).unwrap();
     assert!(
         store.events.is_empty(),
         "missing source unions stay missing"
@@ -2824,18 +2487,12 @@ fn source_guidance_maps_only_the_resident_coarsest_upper_and_repeats_without_wor
     let intermediate =
         crate::collection::simplearchive_union::join(&members[0], &members[1]).unwrap();
     let upper = crate::collection::simplearchive_union::join(&intermediate, &members[2]).unwrap();
-    // A resident upper outside the requested foundational support must not
-    // become a coarsening candidate merely because its bytes and record exist.
-    let outside = archive(4, 4);
-    publish_root(&mut store.inner, root, &outside, 31);
-    let overreach = crate::collection::simplearchive_union::join(&upper, &outside).unwrap();
-    for member in [&intermediate, &upper, &outside, &overreach] {
+    for member in [&intermediate, &upper] {
         store.inner.put::<SimpleArchive, _>(member.clone()).unwrap();
     }
     for (low, high, result) in [
         (&members[0], &members[1], &intermediate),
         (&intermediate, &members[2], &upper),
-        (&upper, &outside, &overreach),
     ] {
         let before = store.inner.snapshot().unwrap();
         let low_witness = data(low);
@@ -2853,10 +2510,10 @@ fn source_guidance_maps_only_the_resident_coarsest_upper_and_repeats_without_wor
             .unwrap();
     }
 
-    let after = block_on(store.maintain_exact(first, &equation_signer(), &support)).unwrap();
+    let after = block_on(store.maintain(first, &equation_signer())).unwrap();
     assert_eq!(
         after
-            .collection_exact(first, &support)
+            .collection(first)
             .unwrap()
             .cover()
             .len(),
@@ -2890,7 +2547,7 @@ fn source_guidance_maps_only_the_resident_coarsest_upper_and_repeats_without_wor
 
     store.events.clear();
     reset_mapping_calls();
-    block_on(store.maintain_exact(first, &equation_signer(), &support)).unwrap();
+    block_on(store.maintain(first, &equation_signer())).unwrap();
     assert!(store.events.is_empty());
     assert_eq!(
         FIRST_MAP_CALLS.get(),
@@ -2907,14 +2564,14 @@ fn target_maintenance_publishes_only_horizontal_target_merges() {
     for blob in [&left, &right] {
         publish_root(&mut store, root, blob, 31);
     }
-    let support = support(root, &[left, right]);
-    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &support)
+    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer())
         .unwrap();
-    maintain_exact_resident::<_, SecondEncoding>(&mut store, second, &equation_signer(), &support)
+    maintain_resident::<_, SecondEncoding>(&mut store, second, &equation_signer())
         .unwrap();
 
     let snapshot = store.snapshot().unwrap();
-    let (_, cover) = attach_collection_exact(&snapshot, second, &support).unwrap();
+    let attached = snapshot.collection(second).unwrap();
+    let (_, cover) = (attached.support().unwrap().clone(), attached.cover().clone());
     assert_eq!(cover.len(), 1);
     let all = records(&mut store);
     assert!(all.iter().any(|record| matches!(
@@ -3016,7 +2673,7 @@ fn target_maintenance_reendorses_a_resident_upper_without_joining_again() {
     let requested = support(root, &[a, b, c]);
     assert_eq!(x.bytes.len().ilog2(), z.bytes.len().ilog2());
     let before = inner.snapshot().unwrap();
-    let selected = before.collection_exact(second, &requested).unwrap();
+    let selected = before.collection(second).unwrap();
     assert_eq!(selected.support().unwrap(), &requested);
     // z = join(x, y) covers {a, b, c} outright, so x is already beneath it
     // and nothing needs a second endorsement to say so.
@@ -3029,13 +2686,13 @@ fn target_maintenance_reendorses_a_resident_upper_without_joining_again() {
 
     let mut store = GuardStore::new(inner);
     reset_mapping_calls();
-    let after = block_on(store.maintain_exact(second, &signer, &requested)).unwrap();
+    let after = block_on(store.maintain(second, &signer)).unwrap();
 
     assert_eq!(FIRST_MAP_CALLS.get(), 0);
     assert_eq!(SECOND_MAP_CALLS.get(), 0);
     assert_eq!(SECOND_JOIN_CALLS.get(), 0);
     assert!(store.acquired.is_empty());
-    let selected = after.collection_exact(second, &requested).unwrap();
+    let selected = after.collection(second).unwrap();
     assert_eq!(selected.support().unwrap(), &requested);
     assert_eq!(
         selected.cover().data_members().collect::<Vec<_>>(),
@@ -3070,14 +2727,13 @@ fn target_maintenance_is_deterministic_and_repeatedly_idempotent() {
     for blob in [&left, &right] {
         publish_root(&mut store, root, blob, 31);
     }
-    let support = support(root, &[left, right]);
-    ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &equation_signer(), &support)
+    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer())
         .unwrap();
-    maintain_exact_resident::<_, SecondEncoding>(&mut store, second, &equation_signer(), &support)
+    maintain_resident::<_, SecondEncoding>(&mut store, second, &equation_signer())
         .unwrap();
     let first_result = store.snapshot().unwrap();
 
-    maintain_exact_resident::<_, SecondEncoding>(&mut store, second, &equation_signer(), &support)
+    maintain_resident::<_, SecondEncoding>(&mut store, second, &equation_signer())
         .unwrap();
     let second_result = store.snapshot().unwrap();
     assert!(second_result.changes_since(&first_result).is_empty());
@@ -3143,7 +2799,7 @@ fn support_repair_removes_an_earlier_member_made_redundant_by_a_later_one() {
     let [a, _b, z, _] = &blobs;
     let requested = support(collection, &blobs);
     let snapshot = store.snapshot().unwrap();
-    let selected = snapshot.collection_exact(collection, &requested).unwrap();
+    let selected = snapshot.collection(collection).unwrap();
     assert_eq!(selected.support().unwrap(), &requested);
     // Z's row is the whole requested support, so it subsumes every other
     // member. The old expectation {b, z} was the route-selected cover.
@@ -3166,8 +2822,8 @@ fn target_maintenance_does_not_repeat_a_support_redundant_carry() {
     let mut store = GuardStore::new(inner);
     // On the unfixed selector this tries A | B = B even though B's existing
     // witnesses already cover A, then errors on the same three-member cover.
-    let after = block_on(store.maintain_exact(collection, &equation_signer(), &requested)).unwrap();
-    let selected = after.collection_exact(collection, &requested).unwrap();
+    let after = block_on(store.maintain(collection, &equation_signer())).unwrap();
+    let selected = after.collection(collection).unwrap();
     assert_eq!(selected.support().unwrap(), &requested);
     assert_eq!(
         selected.cover().data_members().collect::<Vec<_>>(),
@@ -3188,10 +2844,10 @@ fn target_maintenance_does_not_repeat_a_support_redundant_carry() {
 
     let before = records(&mut store.inner);
     store.events.clear();
-    let after = block_on(store.maintain_exact(collection, &equation_signer(), &requested)).unwrap();
+    let after = block_on(store.maintain(collection, &equation_signer())).unwrap();
     assert_eq!(
         after
-            .collection_exact(collection, &requested)
+            .collection(collection)
             .unwrap()
             .support()
             .unwrap(),
@@ -3207,43 +2863,19 @@ fn target_maintenance_does_not_repeat_a_support_redundant_carry() {
 }
 
 #[test]
-fn support_repair_does_not_clip_a_wider_certificate_to_the_requested_support() {
-    let (mut store, collection, blobs) = redundant_support_fixture();
-    let [a, b, z, _] = &blobs;
-    let requested = support(collection, &[a.clone(), b.clone(), z.clone()]);
-    let snapshot = store.snapshot().unwrap();
-    let selected = snapshot.collection_exact(collection, &requested).unwrap();
-    assert_eq!(selected.support().unwrap(), &requested);
-    // Requested {a, b, z} without d. B's row is {a, b, d} and Z's is
-    // {a, b, d, z}: neither is a member-identity subset of the request, but
-    // every member is AT OR BELOW a requested one, so both certificates sit
-    // inside the request at lattice granularity and Z alone represents it.
-    // The old expectation {a, z} kept a beside z because certificates were
-    // compared by member identity.
-    assert_eq!(
-        selected.cover().data_members().collect::<BTreeSet<_>>(),
-        BTreeSet::from([data(z)]),
-    );
-    assert_eq!(
-        selected.view::<TribleSet>().unwrap(),
-        TribleSet::try_from_blob(z.clone()).unwrap(),
-    );
-}
-
-#[test]
 fn equal_payload_commit_does_not_restart_completed_target_maintenance() {
     let (mut store, collection, blobs) = redundant_support_fixture();
     let requested = support(collection, &blobs);
-    drop(block_on(store.maintain_exact(collection, &equation_signer(), &requested)).unwrap());
+    drop(block_on(store.maintain(collection, &equation_signer())).unwrap());
     // A different signer attests B, not a new foundational payload. This must
     // not make the old fine member or its redundant carries reappear.
     publish_root(&mut store, collection, &blobs[1], 32);
     let before = records(&mut store);
     let mut store = GuardStore::new(store);
-    let after = block_on(store.maintain_exact(collection, &equation_signer(), &requested)).unwrap();
+    let after = block_on(store.maintain(collection, &equation_signer())).unwrap();
     assert_eq!(
         after
-            .collection_exact(collection, &requested)
+            .collection(collection)
             .unwrap()
             .support()
             .unwrap(),

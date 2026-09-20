@@ -723,9 +723,18 @@ fn failed_upstream_upkeep_does_not_suppress_available_downstream_work() {
     let fixture = Fixture::new();
     let mut pile = Pile::open(&fixture.path).unwrap();
     let other = SigningKey::from_bytes(&[82; 32]);
+    // A source of our own, so the upstream can be seeded on its first commit
+    // and then left behind by a second one.
+    let source = pile.collection("staged", policy(&fixture.signer)).unwrap();
+    pile.commit(
+        source,
+        &fixture.signer,
+        entity! { metadata::description: "first fact" },
+    )
+    .unwrap();
     let succinct = pile
         .derive::<SuccinctArchiveBlob>(
-            fixture.source,
+            source,
             (),
             CollectionPolicy::new(
                 AdmissionPolicy::direct(fixture.signer.verifying_key()),
@@ -736,15 +745,13 @@ fn failed_upstream_upkeep_does_not_suppress_available_downstream_work() {
     let rank9 = pile
         .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy(&fixture.signer))
         .unwrap();
-    let snapshot = pile.snapshot().unwrap();
-    let all = fixture.source.admitted(&snapshot).unwrap();
-    assert_eq!(all.len(), 2);
-    let first = fixture.source.cover([all.members().next().unwrap()]);
     let seeded = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap()
-        .block_on(pile.ensure_exact(succinct, &other, &first))
+        .block_on(pile.ensure(succinct, &other))
         .unwrap();
+    let first = source.admitted(&seeded).unwrap();
+    assert_eq!(first.len(), 1);
     let available = seeded.collection(succinct).unwrap();
     assert_eq!(available.support().unwrap(), &first);
     let expected = available
@@ -758,6 +765,17 @@ fn failed_upstream_upkeep_does_not_suppress_available_downstream_work() {
         .support()
         .unwrap()
         .is_empty());
+    // The second commit leaves the upstream behind. Carrying it needs a DERIVE
+    // signed under `other`'s WRITE authority, which the command's key lacks.
+    pile.commit(
+        source,
+        &fixture.signer,
+        entity! { metadata::description: "other fact" },
+    )
+    .unwrap();
+    let snapshot = pile.snapshot().unwrap();
+    let all = source.admitted(&snapshot).unwrap();
+    assert_eq!(all.len(), 2);
     pile.close().unwrap();
     let upstream_before = records(&fixture.path)
         .into_iter()
@@ -798,7 +816,9 @@ fn failed_upstream_upkeep_does_not_suppress_available_downstream_work() {
 
     let mut pile = Pile::open(&fixture.path).unwrap();
     let snapshot = pile.snapshot().unwrap();
-    assert_eq!(fixture.source.admitted(&snapshot).unwrap(), all);
+    assert_eq!(source.admitted(&snapshot).unwrap(), all);
+    // The upstream still stands on what it had; the downstream now stands on
+    // everything its source realized, which is that same first commit.
     assert_eq!(
         snapshot.collection(succinct).unwrap().support().unwrap(),
         &first

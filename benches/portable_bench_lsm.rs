@@ -7,12 +7,12 @@
 //! file into the main bench.
 //!
 //! WHAT IT MEASURES:
-//!   build_exact — one end-to-end query-ready exact-Succinct build. Every
+//!   build_exact — one end-to-end query-ready Succinct build. Every
 //!                 iteration first publishes the input chunks as independent
-//!                 native `SimpleArchive` collection commits and freezes that
-//!                 collection's exact payload cover OUTSIDE the timer. The
-//!                 timer then covers the two direct `maintain_exact` stages:
-//!                 exact source validation/derivation, canonical raw blob puts,
+//!                 native `SimpleArchive` collection commits and freezes what
+//!                 that collection stands on OUTSIDE the timer. The timer then
+//!                 covers the two direct `maintain` stages:
+//!                 source validation/derivation, canonical raw blob puts,
 //!                 deterministic dyadic target maintenance, ordinary
 //!                 raw-to-Rank9 derivation, equation publication, and final
 //!                 attachment. Source serialization, signing, and publication
@@ -740,10 +740,11 @@ fn main() {
     };
 
     // -- BUILD-EXACT -------------------------------------------------------
-    // Per iteration: publish the source chunks and freeze their exact cover
-    // in a fresh scratch store (untimed), then time one fixed end-to-end call
-    // that returns a query-ready exact cover. Source signing/publication is an
-    // admission setup cost, not part of Succinct construction.
+    // Per iteration: publish the source chunks and freeze what the source
+    // stands on in a fresh scratch store (untimed), then time one fixed
+    // end-to-end call that returns a query-ready cover. Source
+    // signing/publication is an admission setup cost, not part of Succinct
+    // construction.
     let name = benchmark_name();
     let authority = benchmark_authority();
     let policy = CollectionPolicy::new(
@@ -774,32 +775,34 @@ fn main() {
                     .expect("publish source chunk");
             }
             let snapshot = store.snapshot().expect("freeze source snapshot");
-            let support: Support = source
-                .admitted(&snapshot)
-                .expect("freeze exact source support");
+            let support: Support = source.admitted(&snapshot).expect("freeze source support");
             drop(snapshot);
 
             let t = Instant::now();
-            block_on(store.maintain_exact(raw, &signing_key, &support))
-                .expect("maintain exact raw Succinct cover");
-            let snapshot = block_on(store.maintain_exact(accelerated, &signing_key, &support))
-                .expect("maintain exact accelerated Succinct cover");
+            block_on(store.maintain(raw, &signing_key)).expect("maintain raw Succinct cover");
+            let snapshot = block_on(store.maintain(accelerated, &signing_key))
+                .expect("maintain accelerated Succinct cover");
             let attached = snapshot
-                .collection_exact(accelerated, &support)
-                .expect("observe exact accelerated Succinct cover");
+                .collection(accelerated)
+                .expect("observe accelerated Succinct cover");
             let union: UnionArchive<OrderedUniverse> =
-                attached.view().expect("materialize exact Succinct cover");
+                attached.view().expect("materialize Succinct cover");
             if recording {
                 samples.push(t.elapsed().as_secs_f64() * 1000.0);
             }
+            assert_eq!(
+                attached.support().expect("resolve accelerated support"),
+                &support,
+                "the maintained target stands for the source's frontier",
+            );
 
             // Inspect the resident raw physical cover outside the timer. This
             // reports construction shape through a lookup-only attachment
             // which executes no collection algebra.
             let raw_cover = attached
                 .snapshot()
-                .collection_exact(raw, &support)
-                .expect("observe exact raw cover for metrics");
+                .collection(raw)
+                .expect("observe raw cover for metrics");
             let shape = BuildShape {
                 source_cover_members: support.len(),
                 raw_cover_members: raw_cover.cover().len(),

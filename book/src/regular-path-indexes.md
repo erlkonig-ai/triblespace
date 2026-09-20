@@ -181,12 +181,9 @@ let index_policy = CollectionPolicy::new(
 let source = store.collection("social", source_policy)?;
 let paths = store.derive::<PathSummaryBlob>(source, friend_automaton, index_policy)?;
 
-let before = store.snapshot()?;
-let support = source.admitted(&before)?;
-drop(before);
-
-let after = store.maintain_exact(paths, &writer, &support).await?;
-let observed = after.collection_exact(paths, &support)?;
+let after = store.maintain(paths, &writer).await?;
+let observed = after.collection(paths)?;
+let support = observed.support()?;
 let index: Arc<PathIndex> = observed.view()?;
 ```
 
@@ -210,16 +207,13 @@ intentionally unnecessary for replay or path semantics.
 
 `snapshot.collection(paths)` never writes or executes collection algebra. It
 follows existing source `MERGE`, path-summary `MERGE`, and source-to-target
-`DERIVE` equations and returns the maximal complete resident target cover plus
-exactly the foundational support represented by it.
+`DERIVE` equations and returns the maximal complete resident target cover;
+`support()` on that observation is exactly the foundational support it
+represents. After `maintain`, that is what the source's frontier stands on.
+There is no form which takes a requested support: a support is read back from
+a target, never asked of one.
 
-`snapshot.collection_exact(paths, &support)` additionally requires both:
-
-1. the union of support on the logical target frontier is exactly the supplied
-   payload set; and
-2. the target frontier has a complete resident target `Cover`.
-
-Only then does `view::<PathSummaryView>()` attach the selected summaries: it
+`view::<PathSummaryView>()` attaches the selected summaries: it
 keeps them as stored, checks that each names the descriptor's automaton by
 the handle in its header, and decodes that automaton once from its blob.
 Nothing is re-encoded or hashed to believe a stored equation. Closing the
@@ -235,8 +229,8 @@ in a lifecycle facade. The canonical audit of a member (`PathSummaryBlob::audit`
 `PathAutomatonBlob::audit`) is explicit: `validate_member` and the producer's
 `join_members` run it, a warm read does not.
 
-`CollectionStoreExt::ensure{_exact}` asynchronously acquires exact missing
-dependencies and publishes missing `DERIVE` work only; `maintain{_exact}`
+`CollectionStoreExt::ensure` asynchronously acquires exact missing
+dependencies and publishes missing `DERIVE` work only; `maintain`
 additionally performs deterministic size-tiered target `MERGE` work. Both
 return a fresh store snapshot rather than pretending that mutation itself
 selected one final physical cover. Every successful artifact is persisted

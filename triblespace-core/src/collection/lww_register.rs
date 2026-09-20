@@ -1423,7 +1423,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_collection_lifecycle_joins_fact_halves_from_distinct_commits() {
+    fn collection_lifecycle_joins_fact_halves_from_distinct_commits() {
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
         let team = signing_key.verifying_key();
         let mut store = MemoryRepo::default();
@@ -1439,21 +1439,20 @@ mod tests {
             .unwrap();
         let register = ufoid();
         let state = ufoid();
-        let identity_commit = store
+        store
             .commit(
                 source,
                 &signing_key,
                 Fragment::from(identity(&state, &register)),
             )
             .unwrap();
-        let order_commit = store
+        store
             .commit(source, &signing_key, Fragment::from(order(&state, 42)))
             .unwrap();
-        let support = Support::from_data(source, [identity_commit.data(), order_commit.data()]);
 
-        let snapshot = block_on(store.maintain_exact(target, &signing_key, &support)).unwrap();
+        let snapshot = block_on(store.maintain(target, &signing_key)).unwrap();
         let ensured: LwwIndex = snapshot
-            .collection_exact(target, &support)
+            .collection(target)
             .unwrap()
             .view()
             .unwrap();
@@ -1461,7 +1460,7 @@ mod tests {
         let attached: LwwIndex = store
             .snapshot()
             .unwrap()
-            .collection_exact(target, &support)
+            .collection(target)
             .unwrap()
             .view()
             .unwrap();

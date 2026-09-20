@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Remove the exact collection API: `ensure_exact`, `ensure_exact_with`,
+  `maintain_exact`, `maintain_exact_with` on `CollectionStoreExt` and
+  `collection_exact` on `CollectionSnapshotExt` are gone. A target stands for
+  what its source's frontier stands on: `ensure` and `maintain` carry a
+  derived target to everything its source realizes, a root acquires every
+  admitted commit, and `snapshot.collection(target).support()` reads that
+  support back. Two targets derived from one source, both maintained and read
+  from one snapshot, agree on it by construction, so the requested-support
+  assertion had nothing left to check; requesting a narrower support was a
+  selection nobody needed once maintenance keeps every target at its source's
+  frontier. Incremental consumers compute the delta as
+  `next.support()?.additions_since(previous.support()?)` and read those
+  payloads from the source through `Cover::materialize`, letting the
+  maintained target answer the full side of `pattern_changes!`.
+
 - A retained rewrite can leave a drained generation behind:
   `PileFile::rewrite_retained_into_leaving` takes `DrainedGeneration` pairs
   (retired, current), refuses with `PileRewriteError::Undrained` unless every

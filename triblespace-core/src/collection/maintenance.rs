@@ -12,10 +12,15 @@
 //! the fold instead of being coarsened at every read.
 //!
 //! No record is enumerated on the ordinary path. Records are read only to
-//! descend: when a frontier node is too wide for the request, or its bytes are
-//! not here, or the mapping cannot take it, the MERGE that produced it names
-//! the finer nodes beneath, and the produced-member index finds that MERGE
-//! without a walk.
+//! descend: when a frontier node's bytes are not here, or the mapping cannot
+//! take it, the MERGE that produced it names the finer nodes beneath, and the
+//! produced-member index finds that MERGE without a walk.
+//!
+//! There is no request. A target stands for what its source stands on --
+//! the resident source frontier, never a source node whose bytes are
+//! elsewhere, which is the root's business to fetch -- and a root stands for
+//! what its admitted commits say; two targets of one source read from one
+//! snapshot agree by construction.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
@@ -26,30 +31,27 @@ use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::Blob;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
-use crate::patch::Entry;
 use crate::repo::{BlobStoreGet, Store, StoreRead};
 use crate::trible::Fragment;
 
 use super::coverage::{Coverage, CoverageSet};
-use super::encoding::{collection_member_availability, CollectionMemberAvailability};
 use super::exact_derived::{
-    data_identity, load_lineage, producer_is_admitted, require_support, structural_certificate,
-    CollectionRealizationError, Lineage,
+    data_identity, load_lineage, producer_is_admitted, CollectionRealizationError, Lineage,
 };
 use super::operation_snapshot::{OperationFrontier, OperationSnapshot};
 use super::{
     Collection, CollectionData, CollectionDerive, CollectionEncoding, CollectionHandle,
     CollectionMapping, CollectionMerge, CollectionOperationError, CollectionRecord,
-    CollectionRecordSelector, Cover, Support,
+    CollectionRecordSelector,
 };
 
 /// One lattice node and what it stands for.
 type Node = (CollectionData, CoverageSet);
 
-/// What one collection can stand on for a requested support.
+/// What one collection stands on right now.
 struct Selection {
-    /// Resident, complete nodes whose supports lie inside the request, widest
-    /// first, none inside the union of the ones before it.
+    /// Resident, complete nodes, widest first, none inside the union of the
+    /// ones before it.
     cover: Vec<Node>,
     /// The union of the cover's supports.
     covered: CoverageSet,
@@ -57,16 +59,9 @@ struct Selection {
     absent: Vec<Node>,
     /// Representation dependencies missing beside resident roots.
     dependencies: Vec<CollectionData>,
-    /// Every DERIVE met on the way, by input: the outputs it was given.
-    images: BTreeMap<CollectionData, BTreeSet<CollectionData>>,
 }
 
 impl Selection {
-    /// What the request still lacks.
-    fn needed(&self, requested: &CoverageSet) -> CoverageSet {
-        requested.difference(&self.covered)
-    }
-
     /// Something to fetch before computing: an absent node whose support
     /// meets what is still needed, or a missing representation dependency,
     /// skipping what has been tried.
@@ -95,58 +90,24 @@ impl Selection {
     fn nodes(&self) -> Vec<CollectionData> {
         self.cover.iter().map(|(node, _)| *node).collect()
     }
-
-    /// A mapping is a function: one input given two different admitted
-    /// outputs is a conflict, and residency must never decide which of the
-    /// two a reader or a producer endorses next.
-    fn conflict(&self, target: CollectionHandle) -> Result<(), CollectionRealizationError> {
-        for (input, outputs) in &self.images {
-            let mut outputs = outputs.iter();
-            if let (Some(first), Some(second)) = (outputs.next(), outputs.next()) {
-                return Err(CollectionRealizationError::Resolution(format!(
-                    "derivation into {} has conflicting outputs {} and {} for {}",
-                    hex::encode_upper(target.raw),
-                    hex::encode_upper(first.raw),
-                    hex::encode_upper(second.raw),
-                    hex::encode_upper(input.raw),
-                )));
-            }
-        }
-        Ok(())
-    }
-}
-
-/// The request at lattice granularity: a row is a node's downward closure,
-/// so the union of the requested rows is the closure of the request, and a
-/// node whose row lies inside it stands for nothing the request did not ask
-/// for. A requested member with no row stays in as itself.
-fn closure(coverage: &Coverage, foundation: CollectionHandle, requested: &Support) -> CoverageSet {
-    let (mut set, unattested) = coverage.union_over(foundation, requested.data_members());
-    set.union(CoverageSet::from_keys(
-        unattested.into_iter().map(|member| member.raw),
-    ));
-    set
 }
 
 fn members(set: &CoverageSet) -> Vec<CollectionData> {
     set.iter_ordered().map(|raw| Inline::new(*raw)).collect()
 }
 
-/// Choose what `collection` stands on for `requested`, from the index.
+/// What `collection` stands on, from the index.
 ///
-/// The frontier is the starting point, widest node first. A node whose
-/// support lies inside the request and inside nothing chosen before it is
-/// taken when its bytes are here and complete and `usable` allows it. Any
-/// other node -- wider than the request, absent, incomplete, refused -- is
-/// descended: the MERGEs that produced it name the finer nodes beneath. A node
-/// inside what is already covered adds nothing and is neither taken nor
+/// The frontier is the starting point, widest node first. A node inside
+/// nothing chosen before it is taken when its bytes are here and complete
+/// and `usable` allows it. Any other node -- absent, incomplete, refused --
+/// is descended: the MERGEs that produced it name the finer nodes beneath. A
+/// node inside what is already covered adds nothing and is neither taken nor
 /// descended.
 fn select<R, E>(
     snapshot: &R,
     coverage: &Coverage,
-    lineage: &Lineage,
     collection: Collection<E>,
-    requested: &CoverageSet,
     usable: &dyn Fn(CollectionData) -> bool,
 ) -> Result<Selection, CollectionRealizationError>
 where
@@ -159,10 +120,10 @@ where
         covered: CoverageSet::new(),
         absent: Vec::new(),
         dependencies: Vec::new(),
-        images: BTreeMap::new(),
     };
-    let empty = super::coverage::FrontierSet::new();
-    let frontier = coverage.frontier_set(handle).unwrap_or(&empty);
+    let Some(frontier) = coverage.frontier_set(handle) else {
+        return Ok(selection);
+    };
     let resident = snapshot.resident(frontier).map_err(|error| {
         CollectionRealizationError::storage("intersect frontier with residency", error)
     })?;
@@ -175,181 +136,68 @@ where
             pending.push((support.len(), Reverse(node.raw), node));
         }
     }
-    let consider = |selection: &mut Selection,
-                        node: CollectionData,
-                        support: &CoverageSet,
-                        descend: bool,
-                        pending: &mut BinaryHeap<(u64, Reverse<[u8; 32]>, CollectionData)>,
-                        visited: &mut BTreeSet<CollectionData>|
-     -> Result<(), CollectionRealizationError> {
-        let already = support <= &selection.covered;
-        let mut taken = false;
-        if !already && support <= requested {
-            let is_resident = if frontier.get(&node.raw).is_some() {
-                resident.get(&node.raw).is_some()
-            } else {
-                snapshot
-                    .metadata(Handle::<E>::from_hash(node))
-                    .map_err(|error| {
-                        CollectionRealizationError::storage("inspect lattice node residency", error)
-                    })?
-                    .is_some()
-            };
-            if is_resident {
-                let missing = E::missing_representation_dependencies(node, snapshot)
-                    .map_err(|error| CollectionRealizationError::Resolution(error.to_string()))?;
-                if missing.is_empty() {
-                    if usable(node) {
-                        selection.covered.union(support.clone());
-                        selection.cover.push((node, support.clone()));
-                        taken = true;
-                    }
-                } else {
-                    selection.dependencies.extend(missing);
+    while let Some((_, _, node)) = pending.pop() {
+        let support = coverage
+            .of(handle, node)
+            .expect("a pending node was pushed with its row");
+        if support <= &selection.covered {
+            continue;
+        }
+        let is_resident = if frontier.get(&node.raw).is_some() {
+            resident.get(&node.raw).is_some()
+        } else {
+            snapshot
+                .metadata(Handle::<E>::from_hash(node))
+                .map_err(|error| {
+                    CollectionRealizationError::storage("inspect lattice node residency", error)
+                })?
+                .is_some()
+        };
+        if is_resident {
+            let missing = E::missing_representation_dependencies(node, snapshot)
+                .map_err(|error| CollectionRealizationError::Resolution(error.to_string()))?;
+            if missing.is_empty() {
+                if usable(node) {
+                    selection.covered.union(support.clone());
+                    selection.cover.push((node, support.clone()));
+                    continue;
                 }
             } else {
-                selection.absent.push((node, support.clone()));
+                selection.dependencies.extend(missing);
             }
+        } else {
+            selection.absent.push((node, support.clone()));
         }
-        // The node's producers: one indexed lookup. A DERIVE is remembered
-        // for the functional check, also for a node that adds nothing -- a
-        // second image of one input is exactly such a node. A MERGE names the
-        // finer nodes beneath, descended when this node was neither taken nor
-        // already covered.
+        // Descend: the MERGEs that produced this node name the finer nodes
+        // beneath it, one indexed lookup.
         let producers = BTreeSet::from([CollectionRecordSelector::ProducedMember(handle, node)]);
         let records = snapshot.select_records(&producers).map_err(|error| {
             CollectionRealizationError::storage("select the producers of a lattice node", error)
         })?;
         for record in records {
-            match record {
-                CollectionRecord::Derive(derive) => {
-                    selection
-                        .images
-                        .entry(derive.input())
-                        .or_default()
-                        .insert(node);
+            let CollectionRecord::Merge(merge) = record else {
+                continue;
+            };
+            let (low, high) = merge.inputs();
+            for input in [low, high] {
+                if input == node || !visited.insert(input) {
+                    continue;
                 }
-                CollectionRecord::Merge(merge) if descend && !taken && !already => {
-                    let (low, high) = merge.inputs();
-                    for input in [low, high] {
-                        if input == node || !visited.insert(input) {
-                            continue;
-                        }
-                        if let Some(support) = coverage.of(handle, input) {
-                            pending.push((support.len(), Reverse(input.raw), input));
-                        }
-                    }
+                if let Some(support) = coverage.of(handle, input) {
+                    pending.push((support.len(), Reverse(input.raw), input));
                 }
-                _ => {}
             }
-        }
-        Ok(())
-    };
-    while let Some((_, _, node)) = pending.pop() {
-        let support = coverage
-            .of(handle, node)
-            .expect("a pending node was pushed with its row");
-        consider(
-            &mut selection,
-            node,
-            support,
-            true,
-            &mut pending,
-            &mut visited,
-        )?;
-    }
-    // A record of this collection ahead of its input's support -- an input
-    // whose producer is not admitted here, though its records exist -- has
-    // no row, and the fold holds it. What its admitted producer named is
-    // still a certificate, read structurally from the records beneath it,
-    // the way the record walk reads it. Nothing beneath is re-admitted.
-    if coverage.has_blocked(handle) {
-        for (node, support) in structural_nodes::<R, E>(snapshot, lineage, collection, &visited)? {
-            visited.insert(node);
-            consider(
-                &mut selection,
-                node,
-                &support,
-                false,
-                &mut pending,
-                &mut visited,
-            )?;
         }
     }
     Ok(selection)
 }
 
-/// The nodes this collection's own admitted records produce that the fold
-/// has no row for, each with the certificate its record's inputs reduce to.
-/// Records that reduce to an unknown, or that the fold already indexed, are
-/// left out. Widest first.
-fn structural_nodes<R, E>(
-    snapshot: &R,
-    lineage: &Lineage,
-    collection: Collection<E>,
-    indexed: &BTreeSet<CollectionData>,
-) -> Result<Vec<Node>, CollectionRealizationError>
-where
-    R: StoreRead,
-    E: CollectionEncoding,
-{
-    let handle = collection.handle();
-    let descriptor = lineage.descriptor(handle);
-    let evidence = super::api::discover_admission_evidence(
-        snapshot,
-        super::descriptor::admission_policies(
-            snapshot,
-            descriptor.facts(),
-            super::ACTION_WRITE,
-            Some(E::id()),
-        ),
-        super::ACTION_WRITE,
-        handle,
-    )
-    .map_err(|error| CollectionRealizationError::storage("read target WRITE evidence", error))?;
-    let candidates = snapshot
-        .select_records(&BTreeSet::from([CollectionRecordSelector::Collection(handle)]))
-        .map_err(|error| CollectionRealizationError::storage("read target records", error))?;
-    let mut admitted = BTreeMap::new();
-    let mut nodes = BTreeMap::<CollectionData, CoverageSet>::new();
-    for record in candidates {
-        if matches!(record, CollectionRecord::Commit(_)) {
-            continue;
-        }
-        let produced = super::coverage::produced(record);
-        if indexed.contains(&produced) || nodes.contains_key(&produced) {
-            continue;
-        }
-        let authorized = *admitted.entry(record.public_key().raw).or_insert_with(|| {
-            ed25519_dalek::VerifyingKey::from_bytes(&record.public_key().raw)
-                .ok()
-                .is_some_and(|key| evidence.authorizes(snapshot, key))
-        });
-        if !authorized {
-            continue;
-        }
-        if let Some(certificate) = structural_certificate(snapshot, lineage, record)? {
-            nodes.insert(produced, certificate);
-        }
-    }
-    let mut nodes: Vec<Node> = nodes.into_iter().collect();
-    nodes.sort_by(|left, right| {
-        right
-            .1
-            .len()
-            .cmp(&left.1.len())
-            .then_with(|| left.0.raw.cmp(&right.0.raw))
-    });
-    Ok(nodes)
-}
-
-/// Every resident frontier node of one collection inside `within`, widest
-/// first, dominated nodes included: what a carry works on.
+/// Every resident frontier node of one collection, widest first, dominated
+/// nodes included: what a carry works on.
 fn resident_frontier<R>(
     snapshot: &R,
     coverage: &Coverage,
     collection: CollectionHandle,
-    within: &CoverageSet,
 ) -> Result<Vec<Node>, CollectionRealizationError>
 where
     R: StoreRead,
@@ -364,9 +212,7 @@ where
     for raw in resident.iter_ordered() {
         let node: CollectionData = Inline::new(*raw);
         if let Some(support) = coverage.of(collection, node) {
-            if support <= within {
-                nodes.push((node, support.clone()));
-            }
+            nodes.push((node, support.clone()));
         }
     }
     nodes.sort_by(|left, right| {
@@ -424,57 +270,16 @@ fn ordered(left: CollectionData, right: CollectionData) -> (CollectionData, Coll
     }
 }
 
-/// Observe the complete target realization for one explicit support.
-pub(crate) fn attach_collection_exact<R, E>(
-    snapshot: &R,
-    target: Collection<E>,
-    requested: &Support,
-) -> Result<(Support, Cover<E>), CollectionRealizationError>
-where
-    R: StoreRead,
-    E: CollectionEncoding,
-{
-    let lineage = load_lineage(snapshot, target)?;
-    require_support(&lineage, requested)?;
-    let coverage = coverage_of(snapshot, &lineage.handles())?;
-    let closure = closure(&coverage, lineage.foundation.handle(), requested);
-    let selection = select(snapshot, &coverage, &lineage, target, &closure, &|_| true)?;
-    selection.conflict(target.handle())?;
-    let mut cover = selection.nodes();
-    let mut covered = selection.covered.clone();
-    if target.handle() == lineage.foundation.handle() {
-        // An explicit root cover is also a low-level content selection: its
-        // directly resident members need no COMMIT to be read. This does not
-        // manufacture admission; publication still requires real records.
-        for member in members(&closure.difference(&covered)) {
-            if matches!(
-                collection_member_availability::<E, _>(member, snapshot).map_err(|error| {
-                    CollectionRealizationError::storage("inspect explicit root member", error)
-                })?,
-                CollectionMemberAvailability::Complete
-            ) {
-                cover.push(member);
-                covered.insert(&Entry::new(&member.raw));
-            }
-        }
-    }
-    let needed = closure.difference(&covered);
-    if !needed.is_empty() {
-        return Err(CollectionRealizationError::IncompleteCover {
-            missing: selection.missing(&needed),
-            unsupported_members: members(&needed),
-        });
-    }
-    Ok((requested.clone(), Cover::from_data(target, cover)))
+/// What a root still lacks before it stands on every admitted commit.
+struct RootGap {
+    needed: CoverageSet,
+    selection: Selection,
 }
 
-/// What a root still has to acquire for one explicit support: `None` when the
-/// support is readable now.
-pub(super) fn root_acquisitions<R>(
+fn root_gap<R>(
     snapshot: &R,
     target: Collection<SimpleArchive>,
-    requested: &Support,
-) -> Result<Option<Vec<CollectionData>>, CollectionRealizationError>
+) -> Result<RootGap, CollectionRealizationError>
 where
     R: StoreRead,
 {
@@ -484,43 +289,56 @@ where
             "a derived SimpleArchive target requires an explicit mapping".into(),
         ));
     }
-    require_support(&lineage, requested)?;
     let coverage = coverage_of(snapshot, &lineage.handles())?;
-    let closure = closure(&coverage, lineage.foundation.handle(), requested);
-    let selection = select(snapshot, &coverage, &lineage, target, &closure, &|_| true)?;
-    let mut needed = selection.needed(&closure);
-    if needed.is_empty() {
-        return Ok(None);
-    }
-    // Explicit root covers remain useful for reading content without
-    // publishing a COMMIT. New equations still require record witnesses.
-    for member in members(&needed) {
-        if snapshot
-            .metadata(Handle::<SimpleArchive>::from_hash(member))
-            .map_err(|error| {
-                CollectionRealizationError::storage("inspect explicit root member", error)
-            })?
-            .is_some()
-        {
-            needed.remove(&member.raw);
-        }
-    }
-    if needed.is_empty() {
+    let (admitted, _) = coverage.frontier_support(target.handle());
+    let selection = select(snapshot, &coverage, target, &|_| true)?;
+    let needed = admitted.difference(&selection.covered);
+    Ok(RootGap { needed, selection })
+}
+
+/// What a root still has to acquire before it stands on every admitted
+/// commit: `None` when it does.
+pub(super) fn root_acquisitions<R>(
+    snapshot: &R,
+    target: Collection<SimpleArchive>,
+) -> Result<Option<Vec<CollectionData>>, CollectionRealizationError>
+where
+    R: StoreRead,
+{
+    let gap = root_gap(snapshot, target)?;
+    if gap.needed.is_empty() {
         return Ok(None);
     }
     // A merge that stands for a needed payload before the payload itself:
     // one fetch instead of many. Then the payloads.
-    let mut acquisitions = selection.missing(&needed);
-    acquisitions.extend(selection.dependencies.iter().copied());
-    acquisitions.extend(members(&needed));
+    let mut acquisitions = gap.selection.missing(&gap.needed);
+    acquisitions.extend(gap.selection.dependencies.iter().copied());
+    acquisitions.extend(members(&gap.needed));
     Ok(Some(acquisitions))
+}
+
+/// The error a root reports when it cannot stand on every admitted commit
+/// and nothing more can be acquired.
+pub(super) fn root_incomplete<R>(
+    snapshot: &R,
+    target: Collection<SimpleArchive>,
+) -> Result<(), CollectionRealizationError>
+where
+    R: StoreRead,
+{
+    let gap = root_gap(snapshot, target)?;
+    if gap.needed.is_empty() {
+        return Ok(());
+    }
+    Err(CollectionRealizationError::IncompleteCover {
+        missing: gap.selection.missing(&gap.needed),
+        unsupported_members: members(&gap.needed),
+    })
 }
 
 /// One mapping bound to its lineage.
 struct Bound<M> {
-    foundation: CollectionHandle,
     handles: BTreeSet<CollectionHandle>,
-    lineage: Lineage,
     source: CollectionHandle,
     mapping: M,
     descriptor: Fragment,
@@ -529,14 +347,12 @@ struct Bound<M> {
 fn bind<R, M>(
     snapshot: &R,
     target: Collection<M::Target>,
-    requested: &Support,
 ) -> Result<Bound<M>, CollectionRealizationError>
 where
     R: StoreRead,
     M: CollectionMapping,
 {
     let lineage = load_lineage(snapshot, target)?;
-    require_support(&lineage, requested)?;
     let source = lineage
         .source_by_target
         .get(&target.handle())
@@ -560,9 +376,7 @@ where
     })?;
     let descriptor = target_descriptor.clone();
     Ok(Bound {
-        foundation: lineage.foundation.handle(),
         handles: lineage.handles(),
-        lineage,
         source,
         mapping,
         descriptor,
@@ -575,37 +389,37 @@ impl Lineage {
     }
 }
 
-/// Whether the target already stands for the whole requested support with
-/// resident images, read from the index alone.
-pub(super) fn images_exact<R, M>(
+/// Whether the target already stands for everything its source stands on,
+/// with resident images, read from the index alone.
+pub(super) fn images_current<R, M>(
     snapshot: &R,
     target: Collection<M::Target>,
-    requested: &Support,
 ) -> Result<bool, CollectionRealizationError>
 where
     R: StoreRead,
     M: CollectionMapping,
 {
-    let bound: Bound<M> = bind(snapshot, target, requested)?;
+    let bound: Bound<M> = bind(snapshot, target)?;
     let coverage = coverage_of(snapshot, &bound.handles)?;
-    let closure = closure(&coverage, bound.foundation, requested);
-    let targets = select(snapshot, &coverage, &bound.lineage, target, &closure, &|_| true)?;
-    targets.conflict(target.handle())?;
-    Ok(targets.needed(&closure).is_empty())
+    let source = Collection::<M::Source>::from_handle(bound.source);
+    let targets = select(snapshot, &coverage, target, &|_| true)?;
+    let sources = select(snapshot, &coverage, source, &|_| true)?;
+    Ok(sources.covered <= targets.covered)
 }
 
-/// Publish the images one mapping owes for the requested support.
+/// Publish the images one mapping owes its source.
 ///
-/// Each round reads both frontiers from the index: what the target stands
-/// for, what the request still lacks, and which resident source nodes meet
-/// that lack, widest first. An existing image whose bytes are elsewhere is
-/// asked for before anything is computed. A source node the mapping cannot
-/// take at its size is descended to the nodes its MERGE consumed.
+/// Each round reads both frontiers from the index: what the resident source
+/// stands on, what the target stands on, and which resident source nodes
+/// meet the difference, widest first. An existing image whose bytes are
+/// elsewhere is asked for before anything is computed. A source node whose
+/// bytes are elsewhere is not an obligation here; fetching payloads is the
+/// root's job. A source node the mapping cannot take at its size is
+/// descended to the nodes its MERGE consumed.
 pub(super) fn realize_images<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
     signing_key: &SigningKey,
-    requested: &Support,
     unavailable: &BTreeSet<CollectionData>,
     frontier: &mut OperationFrontier<S::Snapshot>,
 ) -> Result<(), CollectionRealizationError>
@@ -613,32 +427,40 @@ where
     S: Store,
     M: CollectionMapping,
 {
-    let bound: Bound<M> = bind(
-        &open(store, frontier, "open exact mapping snapshot")?,
-        target,
-        requested,
-    )?;
+    let bound: Bound<M> = bind(&open(store, frontier, "open mapping snapshot")?, target)?;
     let source = Collection::<M::Source>::from_handle(bound.source);
     let mut blocked = BTreeMap::<CollectionData, String>::new();
     // Stall detection: the work is identified by the input being mapped.
     let mut published = BTreeSet::<CollectionData>::new();
     loop {
-        let snapshot = open(store, frontier, "open exact mapping snapshot")?;
+        let snapshot = open(store, frontier, "open mapping snapshot")?;
         let coverage = coverage_of(&snapshot, &bound.handles)?;
-        let closure = closure(&coverage, bound.foundation, requested);
-        let targets = select(&snapshot, &coverage, &bound.lineage, target, &closure, &|_| true)?;
-        targets.conflict(target.handle())?;
-        let needed = targets.needed(&closure);
+        let targets = select(&snapshot, &coverage, target, &|_| true)?;
+        let sources = select(&snapshot, &coverage, source, &|node| {
+            !blocked.contains_key(&node)
+        })?;
+        // What the resident source stands on that the target does not.
+        let needed = sources.covered.difference(&targets.covered);
         if needed.is_empty() {
-            return Ok(());
+            if blocked.is_empty() {
+                return Ok(());
+            }
+            // The resident source is covered, but a blocked node stood for
+            // more than its resident inputs do: say so rather than pass.
+            let (source_support, _) = coverage.frontier_support(source.handle());
+            let uncovered = source_support.difference(&targets.covered);
+            if uncovered.is_empty() {
+                return Ok(());
+            }
+            return Err(CollectionRealizationError::UnrepresentableCover {
+                blocked: blocked.into_iter().collect(),
+                missing: members(&uncovered),
+            });
         }
         // Fetch an existing image before computing one.
         if let Some(member) = targets.acquirable(&needed, unavailable) {
             return Err(CollectionRealizationError::MissingDependency { member });
         }
-        let sources = select(&snapshot, &coverage, &bound.lineage, source, &closure, &|node| {
-            !blocked.contains_key(&node)
-        })?;
         let candidates: Vec<Node> = sources
             .cover
             .iter()
@@ -646,20 +468,11 @@ where
             .cloned()
             .collect();
         if candidates.is_empty() {
-            if let Some(member) = sources.acquirable(&needed, unavailable) {
-                return Err(CollectionRealizationError::MissingDependency { member });
-            }
-            let missing = members(&needed);
-            return Err(if blocked.is_empty() {
-                CollectionRealizationError::IncompleteCover {
-                    missing: sources.missing(&needed),
-                    unsupported_members: missing,
-                }
-            } else {
-                CollectionRealizationError::UnrepresentableCover {
-                    blocked: blocked.into_iter().collect(),
-                    missing,
-                }
+            // Cannot happen: `needed` lies inside the union of the candidates'
+            // supports. Report rather than spin.
+            return Err(CollectionRealizationError::IncompleteCover {
+                missing: sources.missing(&needed),
+                unsupported_members: members(&needed),
             });
         }
         if !producer_is_admitted(&snapshot, target, signing_key)? {
@@ -725,7 +538,7 @@ where
 }
 
 /// Reuse coarsening already paid for by the source. This is optional
-/// maintenance over an exact target, never coverage repair or upstream work.
+/// maintenance over a current target, never coverage repair or upstream work.
 ///
 /// A resident source frontier node that no single image covers, while its
 /// support is covered by several, gets one image: when exactly two images
@@ -737,7 +550,6 @@ fn coarsen_images<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
     signing_key: &SigningKey,
-    requested: &Support,
     bound: &Bound<M>,
     frontier: &mut OperationFrontier<S::Snapshot>,
 ) -> Result<(), CollectionRealizationError>
@@ -750,11 +562,11 @@ where
     loop {
         let snapshot = open(store, frontier, "open source-guided maintenance snapshot")?;
         let coverage = coverage_of(&snapshot, &bound.handles)?;
-        let closure = closure(&coverage, bound.foundation, requested);
-        let targets = select(&snapshot, &coverage, &bound.lineage, target, &closure, &|_| true)?;
-        let sources = select(&snapshot, &coverage, &bound.lineage, source, &closure, &|_| true)?;
+        let targets = select(&snapshot, &coverage, target, &|_| true)?;
+        let sources = select(&snapshot, &coverage, source, &|_| true)?;
         let candidate = sources.cover.iter().find(|(node, support)| {
             !attempted.contains(node)
+                && support <= &targets.covered
                 && !targets
                     .cover
                     .iter()
@@ -866,7 +678,6 @@ pub(super) fn maintain_images<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
     signing_key: &SigningKey,
-    requested: &Support,
     unavailable: &BTreeSet<CollectionData>,
     frontier: &mut OperationFrontier<S::Snapshot>,
 ) -> Result<(), CollectionRealizationError>
@@ -874,20 +685,17 @@ where
     S: Store,
     M: CollectionMapping,
 {
-    realize_images::<S, M>(store, target, signing_key, requested, unavailable, frontier)?;
+    realize_images::<S, M>(store, target, signing_key, unavailable, frontier)?;
     let bound: Bound<M> = bind(
         &open(store, frontier, "open source-guided maintenance snapshot")?,
         target,
-        requested,
     )?;
-    coarsen_images(store, target, signing_key, requested, &bound, frontier)?;
+    coarsen_images(store, target, signing_key, &bound, frontier)?;
     let handles = bound.handles.clone();
     carry_target(
         store,
         target,
         signing_key,
-        requested,
-        bound.foundation,
         &handles,
         frontier,
         |descriptor, low, high, reader| {
@@ -920,8 +728,6 @@ pub(super) fn carry_target<S, E, J>(
     store: &mut S,
     target: Collection<E>,
     signing_key: &SigningKey,
-    requested: &Support,
-    foundation: CollectionHandle,
     lineage: &BTreeSet<CollectionHandle>,
     frontier: &mut OperationFrontier<S::Snapshot>,
     mut join: J,
@@ -957,8 +763,7 @@ where
     loop {
         let snapshot = open(store, frontier, "open target-maintenance snapshot")?;
         let coverage = coverage_of(&snapshot, lineage)?;
-        let closure = closure(&coverage, foundation, requested);
-        let nodes = resident_frontier(&snapshot, &coverage, target.handle(), &closure)?;
+        let nodes = resident_frontier(&snapshot, &coverage, target.handle())?;
         let identity: Vec<CollectionData> = nodes.iter().map(|(node, _)| *node).collect();
         if !seen.insert(identity.clone()) {
             return Err(CollectionRealizationError::Stalled { cover: identity });
