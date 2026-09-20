@@ -91,7 +91,14 @@ fn observe(
                 return Ok(Vec::new());
             }
             match current_support.additions_since(previous_support) {
-                Ok(additions) => Some(additions.materialize::<TribleSet, _>(&snapshot)?),
+                Ok(additions) => {
+                    let mut changed = TribleSet::new();
+                    for member in additions.members() {
+                        let payload: TribleSet = snapshot.get(member)?;
+                        changed.union(payload);
+                    }
+                    Some(changed)
+                }
                 Err(CoverAdvanceError::ResetRequired { .. }) => None,
                 Err(error) => return Err(error.into()),
             }

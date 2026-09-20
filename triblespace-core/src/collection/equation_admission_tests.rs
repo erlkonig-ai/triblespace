@@ -107,13 +107,6 @@ fn read_rights_do_not_admit_merges_or_inject_conflicts() {
         vec![c_handle]
     );
     assert_eq!(attached.view::<TribleSet>().unwrap().len(), 2);
-    // The lower-level constructed-cover path must apply the same producer
-    // policy even though the caller selected its membership coordinates.
-    let cover = collection.cover([a.get_handle(), b.get_handle()]);
-    assert_eq!(
-        cover.materialize::<TribleSet, _>(&snapshot).unwrap().len(),
-        2
-    );
 }
 
 #[test]
@@ -272,7 +265,7 @@ fn equation_admission_uses_frozen_proof_evidence() {
 }
 
 #[test]
-fn selected_endorsement_reads_without_ancestry_but_support_needs_exact_records() {
+fn target_stands_for_nothing_until_its_source_input_is_admitted() {
     let source_owner = SigningKey::from_bytes(&[41; 32]);
     let source_writer = SigningKey::from_bytes(&[42; 32]);
     let target_owner = SigningKey::from_bytes(&[43; 32]);
@@ -302,35 +295,16 @@ fn selected_endorsement_reads_without_ancestry_but_support_needs_exact_records()
         .put::<SuccinctArchiveBlob, _>(succinctarchive_union::derive_element(&input).unwrap())
         .unwrap();
     // The producing node validated this input. This receiving store has the
-    // signed record but neither its payload nor the source writer's grant.
-    let ancestor = CollectionRecord::Commit(CollectionCommit::sign(
-        &source_writer,
-        source.handle(),
-        input_data,
-        empty_metadata_handle(),
-    ));
-    let selected = CollectionRecord::Derive(CollectionDerive::sign(
-        &target_owner,
-        target.handle(),
-        input_data,
-        Handle::<SuccinctArchiveBlob>::to_hash(output),
-    ));
-    store.insert(selected).unwrap();
-    let missing = store.snapshot().unwrap().collection(target).unwrap();
-    assert_eq!(missing.cover().members().collect::<Vec<_>>(), vec![output]);
-    assert!(matches!(
-        missing.support(),
-        Err(CollectionRealizationError::IncompleteSupport { .. })
-    ));
-
-    // An existing record in the wrong collection cannot satisfy a witness.
-    let wrong_collection = CollectionRecord::Commit(CollectionCommit::sign(
-        &source_writer,
-        target.handle(),
-        input_data,
-        empty_metadata_handle(),
-    ));
-    store.insert(wrong_collection).unwrap();
+    // signed records but neither the input's payload nor the source writer's
+    // grant.
+    store
+        .insert(CollectionRecord::Commit(CollectionCommit::sign(
+            &source_writer,
+            source.handle(),
+            input_data,
+            empty_metadata_handle(),
+        )))
+        .unwrap();
     store
         .insert(CollectionRecord::Derive(CollectionDerive::sign(
             &target_owner,
@@ -339,63 +313,47 @@ fn selected_endorsement_reads_without_ancestry_but_support_needs_exact_records()
             Handle::<SuccinctArchiveBlob>::to_hash(output),
         )))
         .unwrap();
-    let mismatched = store.snapshot().unwrap().collection(target).unwrap();
-    assert_eq!(
-        mismatched.cover().members().collect::<Vec<_>>(),
-        vec![output]
-    );
-    assert!(matches!(
-        mismatched.support(),
-        Err(CollectionRealizationError::IncompleteSupport { .. })
-    ));
-
-    // A source record with a different output is not evidence for this input.
-    let other_data = Handle::<SimpleArchive>::to_hash(archive(8).get_handle());
-    let wrong_payload = CollectionRecord::Commit(CollectionCommit::sign(
-        &source_writer,
-        source.handle(),
-        other_data,
-        empty_metadata_handle(),
-    ));
-    store.insert(wrong_payload).unwrap();
-    store
-        .insert(CollectionRecord::Derive(CollectionDerive::sign(
-            &target_owner,
-            target.handle(),
-            input_data,
-            Handle::<SuccinctArchiveBlob>::to_hash(output),
-        )))
-        .unwrap();
-    let mismatched = store.snapshot().unwrap().collection(target).unwrap();
-    assert_eq!(
-        mismatched.cover().members().collect::<Vec<_>>(),
-        vec![output]
-    );
-    assert!(matches!(
-        mismatched.support(),
-        Err(CollectionRealizationError::IncompleteSupport { .. })
-    ));
-
-    store.insert(ancestor).unwrap();
     let snapshot = store.snapshot().unwrap();
-    assert!(!snapshot.contains_blob(input.get_handle()).unwrap());
     assert!(!source
         .writer_is_admitted(&snapshot, source_writer.verifying_key())
         .unwrap());
-    assert!(!source
-        .reader_is_admitted(&snapshot, target_owner.verifying_key())
-        .unwrap());
     assert!(source.admitted(&snapshot).unwrap().is_empty());
+    // An admitted producer named an input nothing admitted here stands
+    // behind. The fold has no row for that input, so the image is blocked
+    // and the target stands for nothing -- an empty cover and an empty
+    // support -- rather than for a foundation this store cannot vouch for.
+    // No record is walked to certify it from what the producer named.
+    let unadmitted = snapshot.collection(target).unwrap();
+    assert!(unadmitted.cover().is_empty());
+    assert!(unadmitted.support().unwrap().is_empty());
+
+    // A commit written straight into the derived target, even by its own
+    // admitted writer, names no foundation and is not evidence either.
+    store
+        .insert(CollectionRecord::Commit(CollectionCommit::sign(
+            &target_owner,
+            target.handle(),
+            input_data,
+            empty_metadata_handle(),
+        )))
+        .unwrap();
+    let mismatched = store.snapshot().unwrap().collection(target).unwrap();
+    assert!(mismatched.cover().is_empty());
+    assert!(mismatched.support().unwrap().is_empty());
+
+    grant_collection_write(
+        &mut store,
+        source.handle(),
+        &source_owner,
+        source_writer.verifying_key(),
+    )
+    .unwrap();
+    let snapshot = store.snapshot().unwrap();
+    assert!(!snapshot.contains_blob(input.get_handle()).unwrap());
+    let requested = source.cover([input.get_handle()]);
+    assert_eq!(source.admitted(&snapshot).unwrap(), requested);
     let attached = snapshot.collection(target).unwrap();
     assert_eq!(attached.cover().members().collect::<Vec<_>>(), vec![output]);
-    // The one target endorsement names input, whose COMMIT now exists in
-    // source. That the COMMIT's writer is not admitted here is the source's
-    // own question, asserted above; it does not stop the target's admitted
-    // producer from being certified for what it named. Before witnesses were
-    // removed this fixture held three endorsements differing only in the
-    // record each cited, two of them malformed routes that kept the
-    // unrequested support incomplete -- they are one record now.
-    let requested = source.cover([input.get_handle()]);
     assert_eq!(attached.support().unwrap(), &requested);
     assert_eq!(
         attached

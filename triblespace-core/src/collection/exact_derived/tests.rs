@@ -17,8 +17,8 @@ use crate::capability::{CapabilityHandle, CapabilityProof, CapabilityProofId, Ca
 use crate::collection::{
     collection_read_audience, read_capability, write_capability, AdmissionPolicy, CollectionCommit,
     CollectionDerive, CollectionMerge, CollectionOperationError, CollectionPolicy, CollectionRead,
-    CollectionReadAudience, CollectionRecordSelector, CollectionSnapshotExt, CollectionStore,
-    CollectionStoreExt, Cover,
+    CollectionReadAudience, CollectionRecord, CollectionRecordSelector, CollectionSnapshotExt,
+    CollectionStore, CollectionStoreExt, Cover, Support,
 };
 use crate::id::{ExclusiveId, Id};
 use crate::id_hex;
@@ -579,7 +579,6 @@ impl CapabilityProofRead for GuardSnapshot {
 struct GuardStore {
     inner: MemoryRepo,
     live: Arc<AtomicUsize>,
-    expected_live_during_write: usize,
     semantic_probes: Arc<AtomicUsize>,
     selected_collections: Arc<Mutex<Vec<BTreeSet<CollectionRecordSelector>>>>,
     events: Vec<WriteEvent>,
@@ -598,7 +597,6 @@ impl GuardStore {
         Self {
             inner,
             live: Arc::new(AtomicUsize::new(0)),
-            expected_live_during_write: 1,
             semantic_probes: Arc::new(AtomicUsize::new(0)),
             selected_collections: Arc::new(Mutex::new(Vec::new())),
             events: Vec::new(),
@@ -620,11 +618,22 @@ impl GuardStore {
         self.acquirable.insert(data(blob), blob.bytes.clone());
     }
 
+    /// A publishing operation holds exactly its frozen control snapshot.
     fn assert_only_control_snapshot(&self) {
         assert_eq!(
             self.live.load(Ordering::SeqCst),
-            self.expected_live_during_write,
-            "unexpected number of live snapshots while acquiring immutable residency",
+            1,
+            "unexpected number of live snapshots while publishing",
+        );
+    }
+
+    /// Acquisition ends the operation: nothing observes the store while bytes
+    /// are fetched, so the retry's fresh snapshot sees everything that landed.
+    fn assert_no_snapshot_while_acquiring(&self) {
+        assert_eq!(
+            self.live.load(Ordering::SeqCst),
+            0,
+            "a snapshot was held across an acquisition",
         );
     }
 }
@@ -636,7 +645,7 @@ impl AsyncBlobStoreAcquire for GuardStore {
         &mut self,
         handle: Inline<Handle<UnknownBlob>>,
     ) -> impl std::future::Future<Output = Result<Option<Bytes>, Self::AcquireError>> + Send {
-        self.assert_only_control_snapshot();
+        self.assert_no_snapshot_while_acquiring();
         let member = Handle::<UnknownBlob>::to_hash(handle);
         self.acquired.push(member);
         let result = match self.acquirable.get(&member).cloned() {
@@ -738,144 +747,6 @@ fn foundation_walks_the_complete_descriptor_ancestry() {
 }
 
 #[test]
-fn aggregate_support_uses_selected_dag_leaves_without_clipping_certificates() {
-    let (mut store, root, first, _second) = collections();
-    let signer = equation_signer();
-    let a = archive(1, 1);
-    let b = crate::collection::simplearchive_union::join(&a, &archive(2, 2)).unwrap();
-    publish_root(&mut store, root, &a, 31);
-    publish_root(&mut store, root, &b, 31);
-    let a_support = support(root, std::slice::from_ref(&a));
-    let ab_support = support(root, &[a.clone(), b.clone()]);
-    let a_output = FirstEncoding::map(&(), &a, &store.snapshot().unwrap()).unwrap();
-    let da = CollectionDerive::sign(
-        &signer,
-        first.handle(),
-        data(&a),
-        data(&a_output),
-    );
-    store.insert(CollectionRecord::Derive(da)).unwrap();
-    let selected = BTreeSet::from([first.handle()]);
-    let before = store.snapshot().unwrap();
-    let lineage = load_lineage(&before, first).unwrap();
-    let partial = resolve_endorsed_lineage(&before, &lineage, &selected).unwrap();
-    assert_eq!(
-        partial.support_of(lineage.foundation, first.handle()),
-        a_support,
-        "only a is certified so far",
-    );
-
-    // b contains a, but its COMMIT is a distinct foundational member. The
-    // source merge certifies both members despite producing b's same bytes.
-    let ab = CollectionMerge::sign(
-        &signer,
-        root.handle(),
-        data(&a),
-        data(&b),
-        data(&b),
-    );
-    store.insert(CollectionRecord::Merge(ab)).unwrap();
-    let b_output = FirstEncoding::map(&(), &b, &store.snapshot().unwrap()).unwrap();
-    let dab = CollectionDerive::sign(
-        &signer,
-        first.handle(),
-        data(&b),
-        data(&b_output),
-    );
-    store.insert(CollectionRecord::Derive(dab)).unwrap();
-    let after = store.snapshot().unwrap();
-    reset_mapping_calls();
-    // dab's certificate is {a, b} -- a sits beneath b -- and it is reported
-    // unclipped, as this test's name says.
-    let resolved = resolve_endorsed_lineage(&after, &lineage, &selected).unwrap();
-    assert_eq!(
-        resolved.support_of(lineage.foundation, first.handle()),
-        ab_support
-    );
-    assert_eq!(
-        FIRST_MAP_CALLS.get(),
-        0,
-        "resolution never recomputes a map"
-    );
-}
-
-// `aggregate_support_deduplicates_leaves_but_keeps_alternative_certifications`
-// lived here. It published four DERIVEs over one (collection, input, output)
-// that differed only in which record each cited, and asserted four distinct
-// certificates. Records are content-addressed, so without citations those four
-// are one record per signer -- the test states the property we removed rather
-// than one we lost.
-
-#[test]
-fn aggregate_support_excludes_missing_witnesses_and_unadmitted_producers() {
-    let mut store = MemoryRepo::default();
-    let signer = equation_signer();
-    let other_signer = SigningKey::from_bytes(&[32; 32]);
-    let root = store.collection("root", policy()).unwrap();
-    let first = store
-        .derive::<FirstEncoding>(
-            root,
-            (),
-            CollectionPolicy::new(
-                AdmissionPolicy::Open,
-                AdmissionPolicy::direct(signer.verifying_key()),
-            ),
-        )
-        .unwrap();
-    let a = archive(1, 1);
-    let b = archive(2, 2);
-    let c = archive(3, 3);
-    publish_root(&mut store, root, &a, 31);
-    publish_root(&mut store, root, &c, 31);
-    let metadata = store.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
-    // This is the actual predecessor, deliberately not persisted yet.
-    let cb = CollectionCommit::sign(&signer, root.handle(), data(&b), metadata);
-    for (key, source) in [(&signer, &a), (&signer, &b), (&other_signer, &c)] {
-        let output = FirstEncoding::map(&(), source, &store.snapshot().unwrap()).unwrap();
-        store
-            .insert(CollectionRecord::Derive(CollectionDerive::sign(
-                key,
-                first.handle(),
-                data(source),
-                data(&output),
-            )))
-            .unwrap();
-    }
-    let before = store.snapshot().unwrap();
-    let lineage = load_lineage(&before, first).unwrap();
-    let selected = BTreeSet::from([first.handle()]);
-    let resolved = resolve_endorsed_lineage(&before, &lineage, &selected).unwrap();
-    assert_eq!(
-        resolved.support_of(lineage.foundation, first.handle()),
-        support(root, std::slice::from_ref(&a))
-    );
-
-    store.insert(CollectionRecord::Commit(cb)).unwrap();
-    let after = store.snapshot().unwrap();
-    let resolved = resolve_endorsed_lineage(&after, &lineage, &selected).unwrap();
-    assert_eq!(
-        resolved.support_of(lineage.foundation, first.handle()),
-        support(root, &[a.clone(), b.clone()])
-    );
-
-    // Complete coverage is not an excuse to stop scanning: this admitted,
-    // closed claim conflicts with the already certified image of a.
-    let wrong = FirstEncoding::map(&(), &b, &after).unwrap();
-    store
-        .insert(CollectionRecord::Derive(CollectionDerive::sign(
-            &signer,
-            first.handle(),
-            data(&a),
-            data(&wrong),
-        )))
-        .unwrap();
-    assert!(matches!(
-        resolve_endorsed_lineage(&store.snapshot().unwrap(), &lineage, &selected),
-        Err(CollectionRealizationError::Resolution(reason)) if reason.contains("conflicting outputs")
-    ));
-}
-
-#[test]
 fn downstream_ensure_stands_on_nothing_without_an_immediate_source_realization() {
     let (mut store, root, first, second) = collections();
     let source = archive(1, 1);
@@ -960,7 +831,16 @@ fn duplicate_commit_fibers_collapse_to_one_support_member() {
     let admitted = root.admitted(&snapshot).unwrap();
     assert_eq!(admitted.len(), 1);
     assert_eq!(admitted.members().next(), Some(source.get_handle()));
-    assert_eq!(admitted.commits(&snapshot).unwrap().len(), 2);
+    assert_eq!(
+        snapshot
+            .select_records(&BTreeSet::from([CollectionRecordSelector::CommitMember(
+                root.handle(),
+                data(&source),
+            )]))
+            .unwrap()
+            .len(),
+        2
+    );
 }
 
 #[test]
@@ -1240,7 +1120,7 @@ fn exact_maintenance_recovers_a_pending_derive_with_a_missing_output() {
 }
 
 #[test]
-fn root_ensure_hydrates_admitted_payloads_and_defers_concurrent_authority() {
+fn root_ensure_admits_authority_that_arrives_during_acquisition() {
     let authority = SigningKey::from_bytes(&[83; 32]);
     let first_writer = SigningKey::from_bytes(&[84; 32]);
     let concurrent_writer = SigningKey::from_bytes(&[85; 32]);
@@ -1302,11 +1182,17 @@ fn root_ensure_hydrates_admitted_payloads_and_defers_concurrent_authority() {
     store.inject_proof_on_acquire = Some(proof(&concurrent_writer));
 
     let first_snapshot = block_on(store.ensure(root, &equation_signer())).unwrap();
-    assert_eq!(store.acquired, vec![data(&descriptor), data(&first_source)]);
+    // Acquiring the descriptor ended the first look. The grant that landed
+    // with it is ordinary evidence to the next one, so the concurrent commit
+    // is admitted and its payload fetched within the same ensure.
+    assert_eq!(store.acquired[0], data(&descriptor));
+    assert_eq!(
+        store.acquired[1..].iter().copied().collect::<BTreeSet<_>>(),
+        BTreeSet::from([data(&first_source), data(&concurrent_source)]),
+    );
     assert_eq!(
         first_snapshot.collection(root).unwrap().support().unwrap(),
-        &support(root, std::slice::from_ref(&first_source)),
-        "a grant arriving during descriptor acquisition must not initiate more acquisition",
+        &support(root, &[first_source.clone(), concurrent_source.clone()]),
     );
     assert_eq!(first_snapshot.wants().unwrap().count(), 0);
     assert!(
@@ -1318,9 +1204,9 @@ fn root_ensure_hydrates_admitted_payloads_and_defers_concurrent_authority() {
     let second_snapshot = block_on(store.ensure(root, &equation_signer())).unwrap();
     assert_eq!(
         second_snapshot.collection(root).unwrap().support().unwrap(),
-        &support(root, &[first_source, concurrent_source.clone()]),
+        &support(root, &[first_source, concurrent_source]),
     );
-    assert_eq!(&store.acquired[2..], &[data(&concurrent_source)],);
+    assert_eq!(store.acquired.len(), 3, "nothing was left to acquire");
     assert_eq!(second_snapshot.wants().unwrap().count(), 0);
 }
 

@@ -24,10 +24,9 @@ use std::fmt;
 use std::marker::PhantomData;
 
 use crate::blob::{Blob, BlobEncoding};
-use crate::inline::encodings::hash::Handle;
 use crate::metadata::{self, MetaDescribe};
 use crate::prelude::{exists, pattern};
-use crate::repo::{BlobStoreGet, BlobStoreList, BlobStoreMeta, StoreRead};
+use crate::repo::{BlobStoreGet, BlobStoreMeta, StoreRead};
 use crate::trible::Fragment;
 
 use super::{
@@ -149,68 +148,6 @@ pub trait CollectionEncoding: BlobEncoding + MetaDescribe + Sized + 'static {
     ) -> Result<Blob<Self>, CollectionOperationError>
     where
         R: BlobStoreGet + BlobStoreMeta;
-}
-
-/// Physical availability of one semantic collection member in a snapshot.
-pub(crate) enum CollectionMemberAvailability {
-    /// The member root itself is absent.
-    Absent,
-    /// The root and every representation dependency are resident.
-    Complete,
-    /// The root exists but named immutable representation dependencies do not.
-    Incomplete,
-    /// The resident root could not expose a valid representation closure.
-    Unusable,
-}
-
-/// Inspect root and representation-closure residency through one snapshot.
-///
-/// Residency failure remains distinct so callers with a typed storage error can
-/// propagate it, while read paths whose legacy surface treats observation
-/// failure as unavailability may conservatively collapse it to
-/// [`Absent`](CollectionMemberAvailability::Absent).
-pub(crate) fn collection_member_structural_availability<E, R>(
-    member: CollectionData,
-    reader: &R,
-) -> Result<CollectionMemberAvailability, R::Err>
-where
-    E: CollectionEncoding,
-    R: BlobStoreGet + BlobStoreList + BlobStoreMeta,
-{
-    if !reader.contains_blob(Handle::<E>::from_hash(member))? {
-        return Ok(CollectionMemberAvailability::Absent);
-    }
-    Ok(resident_member_availability::<E, _>(member, reader))
-}
-
-/// Inspect validated root and representation-closure residency.
-pub(crate) fn collection_member_availability<E, R>(
-    member: CollectionData,
-    reader: &R,
-) -> Result<CollectionMemberAvailability, R::MetaError>
-where
-    E: CollectionEncoding,
-    R: BlobStoreGet + BlobStoreMeta,
-{
-    if reader.metadata(Handle::<E>::from_hash(member))?.is_none() {
-        return Ok(CollectionMemberAvailability::Absent);
-    }
-    Ok(resident_member_availability::<E, _>(member, reader))
-}
-
-fn resident_member_availability<E, R>(
-    member: CollectionData,
-    reader: &R,
-) -> CollectionMemberAvailability
-where
-    E: CollectionEncoding,
-    R: BlobStoreGet + BlobStoreMeta,
-{
-    match E::missing_representation_dependencies(member, reader) {
-        Ok(missing) if missing.is_empty() => CollectionMemberAvailability::Complete,
-        Ok(_) => CollectionMemberAvailability::Incomplete,
-        Err(_) => CollectionMemberAvailability::Unusable,
-    }
 }
 
 /// The canonical incoming derivation owned by one target encoding.

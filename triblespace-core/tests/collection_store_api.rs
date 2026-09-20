@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use futures::executor::block_on;
@@ -25,7 +25,7 @@ use triblespace_core::collection::{
     collection_action_audience, collection_read_audience, grant_collection_capability,
     grant_collection_read, grant_collection_write, read_capability, write_capability,
     AdmissionPolicy, Collection, CollectionOpenError, CollectionPolicy, CollectionRead,
-    CollectionReadAudience, CollectionReadGrantError, CollectionRecord,
+    CollectionReadAudience, CollectionReadGrantError, CollectionRecord, CollectionRecordSelector,
     CollectionRegistrationError, CollectionSnapshotExt, CollectionStore, CollectionStoreExt,
     CollectionTypeError, CollectionWriteGrantError, PreparedCollectionCommit, ACTION_READ,
     ACTION_WRITE, KIND_ADMISSION_POLICY_QUORUM,
@@ -1128,11 +1128,16 @@ fn read_and_write_policies_are_independent() {
 
     // Provenance is every valid signature over the selected payload, not the
     // set of authorized membership claims that admitted that payload.
-    let commits = cover.commits(&snapshot).unwrap();
+    let commits = snapshot
+        .select_records(&BTreeSet::from([CollectionRecordSelector::CommitMember(
+            collection.handle(),
+            authorized.data(),
+        )]))
+        .unwrap();
     assert_eq!(commits.len(), 2);
-    assert!(commits.contains(&authorized));
-    assert!(commits.contains(&attestation));
-    assert!(!commits.contains(&unauthorized));
+    assert!(commits.contains(&CollectionRecord::Commit(authorized)));
+    assert!(commits.contains(&CollectionRecord::Commit(attestation)));
+    assert!(!commits.contains(&CollectionRecord::Commit(unauthorized)));
 }
 
 #[test]

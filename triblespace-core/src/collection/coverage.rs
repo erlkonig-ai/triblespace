@@ -70,6 +70,7 @@ use crate::patch::{Blake3Merkle, Entry, IdentitySchema, PATCH};
 use crate::repo::{BlobStoreGet, CapabilityProofRead};
 
 use super::api::AdmissionEvidence;
+use crate::capability::QuorumOutcome;
 use super::store::CollectionRead;
 use super::records::{CollectionData, CollectionHandle, CollectionRecord};
 
@@ -319,7 +320,7 @@ impl Attestation {
 ///
 /// There is no third `Refused` state on purpose. Capability proofs only ever
 /// arrive, so the absence of one is a fact about *now*, not about the record.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Admittance {
     /// The signer is admitted; the attestation may be believed.
     Admitted,
@@ -330,6 +331,13 @@ pub enum Admittance {
     /// it is an ordinary blob, and its arrival is what re-offers the record --
     /// a proof would not.
     Undescribed,
+    /// No resident evidence admits this signer, and some evidence is not
+    /// resident: a policy definition the descriptor names, or a capability
+    /// definition a proof for this signer names. Any of those blobs landing
+    /// could change the answer, and so could a proof, so the attestation is
+    /// parked under each of them and under the signer; whichever arrives
+    /// first re-offers it, and that decision reads everything again.
+    Undefined(Vec<CollectionHandle>),
 }
 
 /// What the fold must know about a collection before it can believe an
@@ -671,6 +679,13 @@ impl CoverageIndex {
                 self.hold(Awaiting::Lineage(entry.collection), entry);
                 return;
             }
+            Admittance::Undefined(definitions) => {
+                for definition in definitions {
+                    self.hold(Awaiting::Lineage(definition), entry);
+                }
+                self.hold(Awaiting::Proof(entry.signer), entry);
+                return;
+            }
         }
         self.believe(entry.collection, reads_from, entry.attestation);
     }
@@ -785,36 +800,6 @@ impl CoverageIndex {
         };
         self.awaiting_lineage.remove(&descriptor.raw);
         for entry in held(&entries) {
-            self.park(entry.collection, entry.attestation, entry.signer);
-        }
-    }
-
-    /// Evidence for these collections may read differently now: every
-    /// attestation of theirs waiting on a signer is fresh again, to be
-    /// decided when the collection is next settled. Other collections' parked
-    /// attestations stay where they are, unpaid for.
-    pub fn wake_proofs_for(&mut self, collections: &BTreeSet<CollectionHandle>) {
-        let mut woken = Vec::new();
-        let signers: Vec<[u8; 32]> = self.awaiting_proof.iter_ordered().copied().collect();
-        for signer in signers {
-            let Some(entries) = self.awaiting_proof.get(&signer).cloned() else {
-                continue;
-            };
-            let mut kept = Held::new();
-            for entry in held(&entries) {
-                if collections.contains(&entry.collection) {
-                    woken.push(entry);
-                } else {
-                    kept.insert(&Entry::with_value(&parked_key(&entry), entry));
-                }
-            }
-            if kept.is_empty() {
-                self.awaiting_proof.remove(&signer);
-            } else {
-                self.awaiting_proof.replace(&Entry::with_value(&signer, kept));
-            }
-        }
-        for entry in woken {
             self.park(entry.collection, entry.attestation, entry.signer);
         }
     }
@@ -1062,13 +1047,17 @@ enum Absent {
     /// arrival is what would change that.
     Descriptor,
     /// The descriptor is resident but yields no admission evidence this
-    /// reader can use.
+    /// reader can use: it decodes to no policy, or to several descriptor
+    /// entities, none of which may lend the others its policy.
     Evidence,
 }
 
 pub(crate) struct StoreWriters<'a, R> {
     reader: &'a R,
-    evidence: RefCell<BTreeMap<CollectionHandle, Result<AdmissionEvidence, Absent>>>,
+    /// Per collection: the evidence its resident policy definitions give,
+    /// and the definitions that are not resident yet.
+    evidence:
+        RefCell<BTreeMap<CollectionHandle, Result<(AdmissionEvidence, Vec<CollectionHandle>), Absent>>>,
     sources: RefCell<BTreeMap<CollectionHandle, SourceResolution>>,
     /// One answer per (collection, signer) for the life of this reader. A
     /// fold asks once per record and a lattice holds thousands of records per
@@ -1118,17 +1107,23 @@ impl<'a, R: BlobStoreGet + CapabilityProofRead> StoreWriters<'a, R> {
                 }
                 Err(_) => return Err(Absent::Evidence),
             };
+            let facts = descriptor.fragment.facts();
+            if super::descriptor::sole_descriptor_entity(facts).is_none() {
+                return Err(Absent::Evidence);
+            }
+            let (policies, missing) = super::descriptor::admission_policies_with_missing(
+                self.reader,
+                facts,
+                super::ACTION_WRITE,
+                None,
+            );
             super::api::discover_admission_evidence(
                 self.reader,
-                super::descriptor::admission_policies(
-                    self.reader,
-                    descriptor.fragment.facts(),
-                    super::ACTION_WRITE,
-                    None,
-                ),
+                policies.into_iter(),
                 super::ACTION_WRITE,
                 collection,
             )
+            .map(|evidence| (evidence, missing))
             .map_err(|_| Absent::Evidence)
         });
         entry.as_ref().map(|_| ()).map_err(|absent| *absent)
@@ -1149,7 +1144,7 @@ impl<'a, R: BlobStoreGet + CapabilityProofRead> StoreWriters<'a, R> {
             Ok(()) => {}
         }
         let cache = self.evidence.borrow();
-        let evidence = cache
+        let (evidence, missing) = cache
             .get(&collection)
             .and_then(|state| state.as_ref().ok())
             .expect("write evidence was just resolved");
@@ -1159,10 +1154,19 @@ impl<'a, R: BlobStoreGet + CapabilityProofRead> StoreWriters<'a, R> {
             // does not need one: this attestation simply never applies.
             return Admittance::Pending;
         };
-        if evidence.authorizes(self.reader, subject) {
-            Admittance::Admitted
-        } else {
+        let mut definitions = missing.clone();
+        match evidence.decide(self.reader, subject) {
+            QuorumOutcome::Met => return Admittance::Admitted,
+            QuorumOutcome::Unmet => {}
+            QuorumOutcome::Undefined(handles) => definitions.extend(handles),
+        }
+        if definitions.is_empty() {
             Admittance::Pending
+        } else {
+            // A definition this reader could not read -- a policy the
+            // descriptor names, or a capability a proof for this signer
+            // names -- may be the one that admits the signer.
+            Admittance::Undefined(definitions)
         }
     }
 }
@@ -1184,10 +1188,10 @@ impl<R: BlobStoreGet + CapabilityProofRead> RecordAdmission for StoreWriters<'_,
     fn admits(&self, collection: CollectionHandle, signer: Inline<ED25519PublicKey>) -> Admittance {
         let key = (collection, signer);
         if let Some(cached) = self.admitted.borrow().get(&key) {
-            return *cached;
+            return cached.clone();
         }
         let answer = self.decide_admits(collection, signer);
-        self.admitted.borrow_mut().insert(key, answer);
+        self.admitted.borrow_mut().insert(key, answer.clone());
         answer
     }
 }

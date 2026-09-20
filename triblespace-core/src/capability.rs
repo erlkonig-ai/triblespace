@@ -565,17 +565,83 @@ pub fn capability_quorum_authorizes_if<'a, R, F>(
     expected_subject: VerifyingKey,
     request: CapabilityRequest,
     threshold: NonZeroUsize,
-    mut accepts_prefix: F,
+    accepts_prefix: F,
 ) -> bool
 where
     R: BlobStoreGet,
     F: FnMut(CapabilityProofPrefix<'_>) -> bool,
 {
+    matches!(
+        capability_quorum_decide_if(
+            reader,
+            proofs,
+            trust_roots,
+            expected_subject,
+            request,
+            threshold,
+            accepts_prefix,
+        ),
+        QuorumOutcome::Met
+    )
+}
+
+/// What a quorum walk found for one subject, and what could still change it.
+///
+/// A proof only ever arrives and a definition only ever becomes resident, so
+/// a walk that does not meet the threshold is a fact about *now*. The two
+/// unmet forms say which arrival would make it worth asking again.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QuorumOutcome {
+    /// Enough roots' shares reach the subject.
+    Met,
+    /// Not met, and every proof this reader holds that names the subject was
+    /// read to its end: only a new proof can change the answer.
+    Unmet,
+    /// Not met, and a proof naming the subject as a delegate stopped at a
+    /// capability definition this reader does not hold. Those definitions'
+    /// arrival could change the answer, as could a new proof.
+    Undefined(Vec<CapabilityHandle>),
+}
+
+/// Decide an invocation and say what could still change the decision.
+pub fn capability_quorum_decide<'a, R: BlobStoreGet>(
+    reader: &R,
+    proofs: impl IntoIterator<Item = &'a CapabilityProof>,
+    trust_roots: impl IntoIterator<Item = VerifyingKey>,
+    expected_subject: VerifyingKey,
+    request: CapabilityRequest,
+    threshold: NonZeroUsize,
+) -> QuorumOutcome {
+    capability_quorum_decide_if(
+        reader,
+        proofs,
+        trust_roots,
+        expected_subject,
+        request,
+        threshold,
+        |_| true,
+    )
+}
+
+/// As [`capability_quorum_decide`], with action-specific prefix restrictions.
+pub fn capability_quorum_decide_if<'a, R, F>(
+    reader: &R,
+    proofs: impl IntoIterator<Item = &'a CapabilityProof>,
+    trust_roots: impl IntoIterator<Item = VerifyingKey>,
+    expected_subject: VerifyingKey,
+    request: CapabilityRequest,
+    threshold: NonZeroUsize,
+    mut accepts_prefix: F,
+) -> QuorumOutcome
+where
+    R: BlobStoreGet,
+    F: FnMut(CapabilityProofPrefix<'_>) -> bool,
+{
     if !is_valid_capability_principal(&expected_subject) {
-        return false;
+        return QuorumOutcome::Unmet;
     }
     let Some(roots) = canonical_roots(trust_roots, threshold) else {
-        return false;
+        return QuorumOutcome::Unmet;
     };
     let subject = expected_subject.to_bytes();
     let mut support = BTreeSet::new();
@@ -583,9 +649,10 @@ where
         support.insert(subject);
     }
     if support.len() >= threshold.get() {
-        return true;
+        return QuorumOutcome::Met;
     }
     let mut definitions = BTreeMap::new();
+    let mut undefined = Vec::new();
     for proof in proofs {
         let root = proof.root_key().to_bytes();
         if !roots.contains(&root)
@@ -594,7 +661,7 @@ where
         {
             continue;
         }
-        let _ = visit_prefixes(proof, reader, &mut definitions, |prefix, definition| {
+        let walked = visit_prefixes(proof, reader, &mut definitions, |prefix, definition| {
             if prefix.subject() == expected_subject
                 && invokes(definition, request.action())
                 && accepts_prefix(prefix)
@@ -605,10 +672,25 @@ where
             true
         });
         if support.len() >= threshold.get() {
-            return true;
+            return QuorumOutcome::Met;
+        }
+        // A chain cut short by a definition this reader lacks could still
+        // carry this root's share to the subject, if the subject is on it at
+        // all; a proof that never names the subject cannot admit it however
+        // much of it becomes readable.
+        if let Err(CapabilityProofError::UnavailableDefinition { handle, .. }) = walked {
+            if proof.edges().any(|edge| edge.delegate == expected_subject)
+                && !undefined.contains(&handle)
+            {
+                undefined.push(handle);
+            }
         }
     }
-    false
+    if undefined.is_empty() {
+        QuorumOutcome::Unmet
+    } else {
+        QuorumOutcome::Undefined(undefined)
+    }
 }
 
 /// Enumerate the finite audience of one action-specific rooted policy.
@@ -1069,6 +1151,69 @@ mod tests {
         assert!(!audience.contains(&middle.verifying_key()));
         assert!(audience.contains(&bridge.verifying_key()));
         assert!(audience.contains(&leaf.verifying_key()));
+    }
+
+    #[test]
+    fn a_quorum_names_the_definition_it_could_not_read_for_the_subject() {
+        // The definition is minted in a staging repo so the proofs can name
+        // its handle before the reader under test holds the bytes.
+        let mut staging = MemoryRepo::default();
+        let read = definition(&mut staging, &[ACTION_READ], &[]);
+        let root = key(1);
+        let subject = key(2);
+        let other = key(3);
+        let for_subject = CapabilityProof::new(resource(9), &root, read, subject.verifying_key());
+        let for_other = CapabilityProof::new(resource(9), &root, read, other.verifying_key());
+        let mut repo = MemoryRepo::default();
+        let cold = repo.snapshot().unwrap();
+        // A proof for someone else that stops at an unreadable definition
+        // says nothing about this subject: only a proof could change that.
+        assert_eq!(
+            capability_quorum_decide(
+                &cold,
+                [&for_other],
+                [root.verifying_key()],
+                subject.verifying_key(),
+                read_request(),
+                threshold(1),
+            ),
+            QuorumOutcome::Unmet
+        );
+        // A proof naming the subject that stops there names what to wait for.
+        assert_eq!(
+            capability_quorum_decide(
+                &cold,
+                [&for_other, &for_subject],
+                [root.verifying_key()],
+                subject.verifying_key(),
+                read_request(),
+                threshold(1),
+            ),
+            QuorumOutcome::Undefined(vec![read])
+        );
+        assert!(!capability_quorum_authorizes(
+            &cold,
+            [&for_subject],
+            [root.verifying_key()],
+            subject.verifying_key(),
+            read_request(),
+            threshold(1),
+        ));
+        // Once the definition is resident the same proof admits.
+        let facts: TribleSet = staging.snapshot().unwrap().get(read).unwrap();
+        assert_eq!(repo.put::<SimpleArchive, _>(facts).unwrap(), read);
+        let warm = repo.snapshot().unwrap();
+        assert_eq!(
+            capability_quorum_decide(
+                &warm,
+                [&for_subject],
+                [root.verifying_key()],
+                subject.verifying_key(),
+                read_request(),
+                threshold(1),
+            ),
+            QuorumOutcome::Met
+        );
     }
 
     #[test]

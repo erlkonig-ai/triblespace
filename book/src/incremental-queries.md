@@ -101,9 +101,10 @@ its shard-preserving query value is reconstructed separately with `view`.
 For a strict extension, await `maintain` through each mapping edge, attach
 the target from the snapshot the last step returned, and compute
 `changed_support = next.support()?.additions_since(previous.support()?)`. That
-delta is a set of source payloads, so read it from the source through the same
-snapshot — `changed_support.materialize::<TribleSet, _>(&snapshot)` — and let
-the maintained target's `view` answer the `full` side. A target stands for
+delta is a set of source payloads, so read them from the source by handle
+through the same snapshot — `snapshot.get(member)` for each of
+`changed_support.members()`, unioned — and let the maintained target's `view`
+answer the `full` side. A target stands for
 what its source's frontier stands on and nothing narrower, so there is no
 support to pass along the chain and no way to attach a target for only the
 delta; the delta is read where it lives. Persisted `DERIVE` and `MERGE`

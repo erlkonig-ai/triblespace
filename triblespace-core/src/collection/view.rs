@@ -2,15 +2,14 @@
 //! covers.
 //!
 //! A [`CollectionSnapshot`] owns the store observation against which its
-//! realized target cover is valid. Foundational support is a separate, lazy
-//! provenance query. Logical values remain caller-chosen projections
-//! reconstructed through [`TryFromCover`].
+//! realized target cover is valid. Its support comes with it, read from the
+//! coverage index by the same selection. Logical values remain caller-chosen
+//! projections reconstructed through [`TryFromCover`].
 
 use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
-use std::sync::{Arc, OnceLock};
 
 use crate::repo::{BlobStoreGet, StoreChanges, StoreRead, StoreSnapshot};
 use crate::trible::Fragment;
@@ -18,31 +17,28 @@ use crate::trible::Fragment;
 use super::observed_store::{DependencyTracker, ObservedStore};
 use super::{
     CollectionData, CollectionDescriptorError, CollectionEncoding, CollectionHandle,
-    CollectionRealizationError, CollectionRecord, Cover, CoverageRead, RecordDecodeError, Support,
+    CollectionRealizationError, Cover, CoverageRead, RecordDecodeError, Support,
 };
 
-/// One immutable collection observation and its exact realized target cover.
+/// One immutable collection observation and what it stands on.
 ///
-/// The target's admitted producer endorsements determine its resident cover.
-/// Reading that value does not require the historical inputs to be present.
-/// [`Self::support`] explicitly resolves the foundational support through the
-/// exact endorsed record routes, using this same frozen store observation.
-/// Logical views are reconstructed on demand with [`Self::view`].
+/// The cover is the target's resident frontier, selected from the coverage
+/// index; the support is the union of what those nodes stand for, taken from
+/// the same index in the same selection. Reading the value does not require
+/// the historical inputs to be present. Logical views are reconstructed on
+/// demand with [`Self::view`].
 pub struct CollectionSnapshot<R, E>
 where
     R: StoreSnapshot,
     E: CollectionEncoding,
 {
     snapshot: R,
-    support: Arc<OnceLock<Support>>,
+    support: Support,
     cover: Cover<E>,
-    descriptor: Option<Fragment>,
-    witnesses: Arc<[CollectionRecord]>,
-    /// The lineage a support taken from the coverage index stands on. Charged
-    /// to the read-set when the support is asked for, not when the cover is
-    /// attached: the cover moves on the target's records, the support on the
-    /// whole lineage's.
-    support_lineage: Option<BTreeSet<CollectionHandle>>,
+    /// The lineage the support stands on. Charged to the read-set when the
+    /// support is asked for, not when the cover is attached: the cover moves
+    /// on the target's records, the support on the whole lineage's.
+    support_lineage: BTreeSet<CollectionHandle>,
     dependencies: DependencyTracker,
 }
 
@@ -56,8 +52,6 @@ where
             snapshot: self.snapshot.clone(),
             support: self.support.clone(),
             cover: self.cover.clone(),
-            descriptor: self.descriptor.clone(),
-            witnesses: self.witnesses.clone(),
             support_lineage: self.support_lineage.clone(),
             dependencies: self.dependencies.clone(),
         }
@@ -81,30 +75,9 @@ where
     ) -> Self {
         Self {
             snapshot,
-            support: Arc::new(OnceLock::from(support)),
+            support,
             cover,
-            descriptor: None,
-            witnesses: Arc::from([]),
-            support_lineage: Some(lineage),
-            dependencies,
-        }
-    }
-
-    /// Retain accepted target endorsements without expanding their ancestry.
-    pub(crate) fn from_endorsements(
-        snapshot: R,
-        cover: Cover<E>,
-        descriptor: Fragment,
-        witnesses: Vec<CollectionRecord>,
-        dependencies: DependencyTracker,
-    ) -> Self {
-        Self {
-            snapshot,
-            support: Arc::new(OnceLock::new()),
-            cover,
-            descriptor: Some(descriptor),
-            witnesses: witnesses.into(),
-            support_lineage: None,
+            support_lineage: lineage,
             dependencies,
         }
     }
@@ -129,40 +102,25 @@ where
         snapshot.changes_for(&self.snapshot, &dependencies) == StoreChanges::NONE
     }
 
-    /// Resolve the exact foundational support endorsed by this observation.
+    /// The foundational support this observation stands on.
     ///
-    /// This is an explicit provenance query, independent of reading the target
-    /// value. Missing historical records make support unavailable, not empty,
-    /// and do not prevent [`Self::view`]. Successful expansion is shared by
-    /// clones of this immutable collection observation.
+    /// The support stands on the whole lineage's records, so asking for it is
+    /// what makes them a dependency of this observation; the cover alone
+    /// depends only on the target's own. The one storage read this performs
+    /// is that charge.
     pub fn support(&self) -> Result<&Support, CollectionRealizationError>
     where
         R: StoreRead,
     {
-        if let Some(support) = self.support.get() {
-            if let Some(lineage) = &self.support_lineage {
-                // A support taken from the index stands on the whole lineage's
-                // records; asking for it is what makes them a dependency.
-                let observed =
-                    ObservedStore::with_tracker(self.snapshot.clone(), self.dependencies.clone());
-                observed.coverage(lineage).map_err(|error| {
-                    CollectionRealizationError::storage("charge support lineage", error)
-                })?;
-            }
-            return Ok(support);
-        }
         let observed =
             ObservedStore::with_tracker(self.snapshot.clone(), self.dependencies.clone());
-        let support = super::exact_derived::support_of_records(
-            &observed,
-            self.cover.collection(),
-            &self.witnesses,
-        )?;
-        let _ = self.support.set(support);
-        Ok(self.support.get().expect("resolved support was installed"))
+        observed
+            .coverage(&self.support_lineage)
+            .map_err(|error| CollectionRealizationError::storage("charge support lineage", error))?;
+        Ok(&self.support)
     }
 
-    /// Resident target cover selected from the admitted producer endorsements.
+    /// Resident target cover selected from the coverage index.
     pub fn cover(&self) -> &Cover<E> {
         &self.cover
     }
@@ -175,17 +133,10 @@ where
     {
         let observed =
             ObservedStore::with_tracker(self.snapshot.clone(), self.dependencies.clone());
-        match &self.descriptor {
-            Some(descriptor) => V::try_from_cover(&self.cover, descriptor, &observed),
-            None => {
-                let descriptor = super::api::load_collection_descriptor(
-                    &observed,
-                    self.cover.collection().handle(),
-                )
+        let descriptor =
+            super::api::load_collection_descriptor(&observed, self.cover.collection().handle())
                 .map_err(TryFromCoverError::from)?;
-                V::try_from_cover(&self.cover, &descriptor.fragment, &observed)
-            }
-        }
+        V::try_from_cover(&self.cover, &descriptor.fragment, &observed)
     }
 
     /// Consume this snapshot into its store observation and exact covers.
@@ -193,8 +144,8 @@ where
     where
         R: StoreRead,
     {
-        let support = self.support()?.clone();
-        Ok((self.snapshot, support, self.cover))
+        self.support()?;
+        Ok((self.snapshot, self.support, self.cover))
     }
 }
 

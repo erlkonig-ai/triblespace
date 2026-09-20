@@ -1,11 +1,14 @@
 //! One frozen control plane observed through a later blob snapshot.
 //!
-//! Active collection work may acquire immutable bytes and therefore has to
-//! resnapshot the backing store. It must not accidentally admit collection
-//! records or capability proofs which arrived while that work was in flight.
-//! The initial snapshot remains the exact control-plane observation, while a
-//! later snapshot contributes only newly resident blob bytes. `MERGE` and
-//! `DERIVE` records authored by the operation itself are the sole overlay.
+//! A publishing operation stores the blobs it computes and must see them,
+//! so it resnapshots the backing store as it goes. It must not admit
+//! collection records or capability proofs which arrived while it ran: the
+//! initial snapshot remains the exact control-plane observation, a later
+//! snapshot contributes only newly resident blob bytes, and the `MERGE` and
+//! `DERIVE` records the operation authored are the sole overlay. Anything
+//! that has to be acquired from elsewhere ends the operation; the retry is
+//! a new operation on a fresh control snapshot, which is how an acquired
+//! descriptor or definition comes to count.
 
 use std::collections::BTreeSet;
 use std::marker::PhantomData;
@@ -202,8 +205,7 @@ where
 /// consulted sees the lineage it named rather than every record in the store.
 impl<C, R> super::store::CoverageRead for OperationSnapshot<C, R>
 where
-    C: super::store::CoverageRead + BlobStoreList,
-    R: BlobStoreList,
+    C: super::store::CoverageRead,
     Self: crate::repo::BlobStoreGet + crate::repo::CapabilityProofRead,
 {
     fn index(
@@ -211,21 +213,6 @@ where
         lineage: &BTreeSet<super::CollectionHandle>,
     ) -> Result<super::coverage::CoverageIndex, Self::RecordsError> {
         let mut index = self.control.index(lineage)?;
-        // A descriptor that landed after the control snapshot is a byte
-        // arrival, which is what a later residency contributes: everything
-        // that parked on it is decided again through this view.
-        for collection in lineage {
-            if matches!(self.control.contains_blob(*collection), Ok(false))
-                && matches!(self.residency.contains_blob(*collection), Ok(true))
-            {
-                index.wake_descriptor(*collection);
-            }
-        }
-        // Admission evidence is read through this view too, so a definition
-        // that landed since the control snapshot can admit a signer the
-        // control could not: re-offer this lineage's signer-parked
-        // attestations, and only those.
-        index.wake_proofs_for(lineage);
         for key in self.authored.iter_ordered() {
             let record = self
                 .authored

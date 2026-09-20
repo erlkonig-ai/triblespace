@@ -188,16 +188,15 @@ Reads are exact about what they observed, not magical about global time:
 
 - `store.snapshot()` freezes blob bytes, collection records, capability proofs,
   and backend state from one coherent known prefix;
-- `collection.admitted(&snapshot)` applies the descriptor WRITE policy and
-  resident capability evidence to obtain one semantic `Cover<E>` without
-  fetching member data;
-- `cover.available(&snapshot)` projects complete resident realizations back
-  into the cover's semantic coordinates; and
-- `cover.materialize::<V, _>(&snapshot)` privately selects a resident
-  support-equivalent physical decomposition and reconstructs the logical value
+- `collection.admitted(&snapshot)` reads the coverage index in that
+  observation -- every record decided once against the descriptor's WRITE
+  policy and the resident capability evidence -- and returns one semantic
+  `Cover<E>`, the union of what the collection's frontier stands for, without
+  fetching member data; and
+- `collection.read(&snapshot)` attaches that frontier from the same index and
+  reconstructs the logical value from the nodes whose bytes are resident,
+  descending through the `MERGE` that produced a node whose bytes are not,
   through that same immutable observation.
-  `collection.read(&snapshot)` concisely observes and materializes the maximal
-  resident collection view at that same frozen prefix.
 
 Snapshots carry no clock. Content-change masks compare stored evidence, and
 collection authorization does not expire with wall time. An application action

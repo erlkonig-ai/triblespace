@@ -1,8 +1,8 @@
-//! Canonical records, discovery, and semantic resolution for typed collections.
+//! Canonical records, coverage, and typed views for collections.
 //!
-//! Wire decoding and strict self-signature checks remain structural. Production
-//! [resolution](crate::collection::resolution) admits only authorized,
-//! representation-validated claims. The larger generic oracle remains
+//! Wire decoding and strict self-signature checks remain structural. What a
+//! collection stands for is read from the coverage index, which admits only
+//! authorized records as it folds them. The larger generic oracle remains
 //! test-only: it exercises algebraic laws rather than serving as another
 //! runtime implementation.
 
@@ -69,8 +69,6 @@ pub mod policy;
 pub mod records;
 /// Unionable summaries of complete producer-side referenced-blob closures.
 pub mod reference_summary;
-/// Stateless semantic admission, closure, provenance, and physical-cover view.
-pub mod resolution;
 /// Canonical `SimpleArchive` set-union collection kind.
 pub mod simplearchive_union;
 /// Native grow-only storage for collection-calculus records.
@@ -79,7 +77,6 @@ pub mod store;
 pub mod succinctarchive_union;
 /// Logical values reconstructed from typed physical covers.
 pub mod view;
-mod witness;
 
 /// Ed25519 public key, re-exported for collection admission policies.
 ///
@@ -91,13 +88,10 @@ pub use ed25519_dalek::VerifyingKey;
 pub use api::*;
 pub use discovery::*;
 pub use encoding::*;
-pub use exact_derived::{
-    admitted_record_witnesses, preview_record_witnesses, CollectionRealizationError,
-};
+pub use exact_derived::CollectionRealizationError;
 pub use generation::*;
 pub use policy::*;
 pub use records::*;
-pub use resolution::*;
 pub use simplearchive_union::{PreparedCollectionCommit, StagedCollectionCommit};
 pub use store::*;
 pub use view::*;

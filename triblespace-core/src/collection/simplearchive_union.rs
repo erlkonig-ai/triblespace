@@ -593,8 +593,8 @@ mod tests {
     use crate::blob::{BlobEncoding, IntoBlob};
     use crate::collection::descriptor::identity_for_tests;
     use crate::collection::{
-        discover_collection_records, empty_metadata_handle, resolve_collection_semantics,
-        CollectionClaimValidation, CollectionDerive, CollectionStoreExt,
+        empty_metadata_handle, CollectionDerive, CollectionRead, CollectionRecordSelector,
+        CollectionStoreExt,
     };
     use crate::inline::InlineEncoding;
     use crate::macros::entity;
@@ -890,10 +890,12 @@ mod tests {
         let withheld = *staged.commit();
         {
             let reader = staged.store_mut().snapshot().unwrap();
-            let discovered = discover_collection_records(&reader).unwrap();
-            assert!(discovered.commits().is_empty());
-            assert!(discovered.merges().is_empty());
-            assert!(discovered.derives().is_empty());
+            assert!(reader
+                .select_records(&BTreeSet::from([CollectionRecordSelector::Collection(
+                    collection.handle(),
+                )]))
+                .unwrap()
+                .is_empty());
             let descriptor_blob: Blob<SimpleArchive> =
                 reader.get(identity_for_tests(&descriptor)).unwrap();
             assert_eq!(
@@ -904,18 +906,6 @@ mod tests {
                 *descriptor.facts()
             );
 
-            let resolution = resolve_collection_semantics(
-                &discovered,
-                &std::collections::BTreeMap::new(),
-                &BTreeSet::new(),
-                |_| Ok::<_, Infallible>(CollectionClaimValidation::<()>::Pending),
-            )
-            .unwrap();
-            assert!(resolution.admitted_claims().is_empty());
-            assert!(resolution
-                .semantics()
-                .members(identity_for_tests(&descriptor))
-                .is_none());
             let content: Blob<SimpleArchive> = reader
                 .get::<Blob<SimpleArchive>, SimpleArchive>(withheld.data().transmute())
                 .unwrap();
@@ -935,12 +925,13 @@ mod tests {
 
         let mut reopened = Pile::open(&path).unwrap();
         let reader = reopened.snapshot().unwrap();
-        let discovered = discover_collection_records(&reader).unwrap();
-        assert!(discovered.commits().is_empty());
-        assert!(!discovered
-            .commits()
-            .iter()
-            .any(|commit| *commit == withheld));
+        let records = reader
+            .select_records(&BTreeSet::from([CollectionRecordSelector::Collection(
+                collection.handle(),
+            )]))
+            .unwrap();
+        assert!(records.is_empty());
+        assert!(!records.contains(&CollectionRecord::Commit(withheld)));
         let descriptor_blob: Blob<SimpleArchive> =
             reader.get(identity_for_tests(&descriptor)).unwrap();
         assert_eq!(
@@ -972,17 +963,19 @@ mod tests {
             let name: View<str> = reader.get(name_handle).unwrap();
             assert_eq!(&*name, "attached descriptor name");
         }
+        let selectors = BTreeSet::from([CollectionRecordSelector::Collection(
+            collection.handle(),
+        )]);
         let snapshot = staged.store_mut().snapshot().unwrap();
-        assert!(discover_collection_records(&snapshot)
-            .unwrap()
-            .commits()
-            .is_empty());
+        assert!(snapshot.select_records(&selectors).unwrap().is_empty());
         drop(snapshot);
         staged.finalize().unwrap();
 
         let snapshot = store.snapshot().unwrap();
-        let discovered = discover_collection_records(&snapshot).unwrap();
-        assert_eq!(discovered.commits(), &[commit]);
+        assert_eq!(
+            snapshot.select_records(&selectors).unwrap(),
+            vec![CollectionRecord::Commit(commit)]
+        );
     }
 
     #[test]
@@ -1028,18 +1021,18 @@ mod tests {
             .stage_for(&mut store, collection, &signing_key)
             .unwrap();
         let commit = *staged.commit();
+        let selectors = BTreeSet::from([CollectionRecordSelector::Collection(
+            collection.handle(),
+        )]);
         let snapshot = staged.store_mut().snapshot().unwrap();
-        assert!(discover_collection_records(&snapshot)
-            .unwrap()
-            .commits()
-            .is_empty());
+        assert!(snapshot.select_records(&selectors).unwrap().is_empty());
         drop(snapshot);
         staged.finalize().unwrap();
 
         let snapshot = store.snapshot().unwrap();
         assert_eq!(
-            discover_collection_records(&snapshot).unwrap().commits(),
-            &[commit]
+            snapshot.select_records(&selectors).unwrap(),
+            vec![CollectionRecord::Commit(commit)]
         );
     }
 

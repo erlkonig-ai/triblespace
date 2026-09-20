@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Reads select from the coverage index, as maintenance does. `collection`
+  attaches the target's frontier from the index -- widest node first, a node
+  whose bytes are here taken, a node whose bytes are not descended through
+  the MERGE that produced it -- and its support is the union of what those
+  nodes stand for, read from the same index in the same selection. A target
+  the fold has nothing for stands for nothing until its records are
+  admitted; a target whose source descriptor is not resident is a
+  `MissingDependency`. Gone with the walk: the record-walk fallback behind
+  `collection`, the per-record certificates (`record_certificate`,
+  `structural_certificate`, `CollectionRealizationError::IncompleteSupport`),
+  the semantic re-resolution behind `Cover::available`, `Cover::materialize`
+  and `Cover::commits` (the whole `collection::resolution` module:
+  `CollectionSemantics`, `resolve_collection_semantics`,
+  `CollectionFunctionalConflict`, `CollectionValidationRequest`,
+  `CollectionClaimValidation`, `CollectionResolutionError`), record
+  discovery (`DiscoveredCollectionRecords` and every `discover_*` function;
+  `CollectionDiscoveryError` stays, with only its `Records` variant, as the
+  error of the generation and migration walks), and the witness walk behind
+  the unsigned-equation migration (`admitted_record_witnesses`,
+  `preview_record_witnesses`). `Collection::admitted` reads the index: the
+  union of what the collection's frontier stands for, resident or not, as
+  `Result<Cover, S::RecordsError>` for any `StoreRead`. `Collection::read`
+  returns `CollectionReadError<GetError, ViewError>` -- the attach error or
+  the view error; `CollectionMaterializationError`, `CollectionCoverError`,
+  `CoverAvailabilityError` and `FactMaterializationError` are gone.
+
 - `join_images` on `CollectionDerivation` and `CollectionMapping` no longer
   takes a source union; it is the mapping's own route for joining two
   images, defaulting to the encoding's `join_members`. The Rank9 route that
@@ -57,12 +83,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   joins that need the source union (Rank9): exactly two images under a
   source node that together stand for it are joined with the union in hand.
 
-- The operation view (`OperationSnapshot::index`) re-offers the lineage's
-  descriptor-parked and signer-parked attestations
-  (`CoverageIndex::wake_proofs_for`), so a descriptor or definition acquired
-  during an operation admits what the control snapshot could not. A root's
-  admitted support is read from the index (`Coverage::frontier_support`)
-  rather than from a witness walk.
+- An acquisition ends the operation. `ensure_with`, `maintain_with` and the
+  root ensure no longer freeze one control snapshot and then fetch through
+  it: `acquire_authority` and the root's commit acquisition run on fresh
+  snapshots holding nothing across a fetch, and a publishing operation that
+  names a missing image or descriptor returns, releases its control
+  snapshot, acquires, and runs again as a new operation on a fresh
+  snapshot -- which sees every record, proof and blob that landed
+  meanwhile, so an acquired descriptor or definition simply counts. The
+  operation view (`OperationSnapshot::index`) therefore re-offers nothing
+  (`CoverageIndex::wake_proofs_for` is gone) and needs no `BlobStoreList`
+  bounds. A root's admitted support is read from the index
+  (`Coverage::frontier_support`) rather than from a witness walk.
+
+- Park on the definition a proof needs. A capability proof whose
+  definition blob is not resident used to be dropped silently by the quorum
+  walk, so the record it would admit parked on its signer and no blob
+  arrival could wake it. `capability_quorum_decide` (and `_if`) now returns
+  a `QuorumOutcome`: `Met`, `Unmet` (only a proof could change it), or
+  `Undefined(definitions)` naming the capability definitions that proofs
+  for this subject stopped at; `AdmissionEvidence::decide` folds the
+  alternatives. `Admittance::Undefined` carries every definition the fold
+  could not read -- the descriptor's policy definitions and the proofs'
+  capability definitions -- and the attestation is parked under each of
+  them and under its signer, so whichever arrives first re-offers it and
+  that decision reads everything again.
 
 - Keep each collection's frontier in the coverage index. The fold now tracks,
   beside every node's support, the nodes no driven MERGE has consumed

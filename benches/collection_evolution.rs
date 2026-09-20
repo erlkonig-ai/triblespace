@@ -469,10 +469,16 @@ fn time_snapshot(
             Ok(additions) => {
                 let next = maintain_succinct(store, collections, signing_key);
                 // The delta is a set of source payloads: read them from the
-                // source through the same snapshot the target came from.
-                let changed: TribleSet = additions
-                    .materialize(next.snapshot())
-                    .expect("materialize changed source payloads");
+                // source by handle through the same snapshot the target came
+                // from.
+                let mut changed = TribleSet::new();
+                for member in additions.members() {
+                    let payload: TribleSet = next
+                        .snapshot()
+                        .get(member)
+                        .expect("read changed source payload");
+                    changed.union(payload);
+                }
                 black_box(changed.len());
                 (next, additions.len(), previous.support().unwrap().len())
             }

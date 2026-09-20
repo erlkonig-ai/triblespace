@@ -63,6 +63,7 @@ struct OneHop {
     commit: CollectionCommit,
     output: Blob<SuccinctArchiveBlob>,
     equation: CollectionRecord,
+    source_owner: SigningKey,
     producer: SigningKey,
 }
 
@@ -102,8 +103,19 @@ fn one_hop() -> OneHop {
         commit,
         output,
         equation,
+        source_owner,
         producer,
     }
+}
+
+/// Make the fixture's lineage whole: the source descriptor and the admitted
+/// COMMIT the target's one image stands on.
+fn admit_source(fixture: &mut OneHop) {
+    descriptor::put_closure(&mut fixture.store, &fixture.source_descriptor).unwrap();
+    fixture
+        .store
+        .insert(CollectionRecord::Commit(fixture.commit))
+        .unwrap();
 }
 
 #[derive(Default)]
@@ -129,9 +141,9 @@ impl CountingSnapshot {
         }
     }
 
-    fn assert_no_ancestor_record_reads(&self) {
-        // Reading a record by fingerprint is no longer expressible, so the
-        // remaining way to reach an ancestor's rows is a whole enumeration.
+    fn assert_no_record_enumeration(&self) {
+        // The index answers every read; the only way left to reach an
+        // ancestor's rows would be a whole enumeration, and there is none.
         assert_eq!(self.counts.record_enumerations.load(Ordering::SeqCst), 0);
     }
 
@@ -278,12 +290,22 @@ impl WantRead for CountingSnapshot {
 }
 
 #[test]
-fn resident_target_reads_before_ancestry_and_support_requires_a_fresh_closed_snapshot() {
+fn target_stands_for_nothing_until_its_input_is_admitted_then_reads_from_the_index() {
     let mut fixture = one_hop();
     fixture.store.insert(fixture.equation).unwrap();
-    let before = CountingSnapshot::new(fixture.store.snapshot().unwrap());
-    assert!(!before.inner.contains_blob(fixture.source.handle()).unwrap());
-    assert!(before
+    // Without the source descriptor the lineage beneath the target is not
+    // known, so a read cannot say which foundation the target stands on.
+    let before = fixture.store.snapshot().unwrap();
+    assert!(!before.contains_blob(fixture.source.handle()).unwrap());
+    assert!(matches!(
+        before.collection(fixture.target),
+        Err(CollectionRealizationError::MissingDependency { member })
+            if member == Handle::<SimpleArchive>::to_hash(fixture.source.handle())
+    ));
+
+    descriptor::put_closure(&mut fixture.store, &fixture.source_descriptor).unwrap();
+    let without_commit = CountingSnapshot::new(fixture.store.snapshot().unwrap());
+    assert!(without_commit
         .inner
         .select_records(&BTreeSet::from([CollectionRecordSelector::ProducedMember(
             fixture.source.handle(),
@@ -291,78 +313,58 @@ fn resident_target_reads_before_ancestry_and_support_requires_a_fresh_closed_sna
         )]))
         .unwrap()
         .is_empty());
-    let observed = before.collection(fixture.target).unwrap();
-    assert_eq!(
-        observed.cover().members().collect::<Vec<_>>(),
-        [fixture.output.get_handle()]
-    );
-    let view: UnionArchive<OrderedUniverse> = observed.view().unwrap();
-    assert_eq!(view.iter().collect::<TribleSet>(), facts(1, 21));
-    before.assert_no_ancestor_record_reads();
-    before.assert_not_loaded(data(&fixture.source_blob));
-    before.assert_not_loaded(data(&fixture.metadata));
-    before.assert_not_loaded(Handle::<SimpleArchive>::to_hash(fixture.source.handle()));
-    // Selected output residency is legitimate work; do not confuse it with
-    // recursively loading source payloads or ancestry.
-    assert!(before
-        .counts
-        .metadata
-        .lock()
+    // The producer's image names an input no admitted record stands behind.
+    // The fold has no row for it, so the target stands for nothing: an empty
+    // cover and an empty support, and no record walked to certify more from
+    // what the producer named.
+    let observed = without_commit.collection(fixture.target).unwrap();
+    assert!(observed.cover().is_empty());
+    assert!(observed.support().unwrap().is_empty());
+    assert!(observed
+        .view::<UnionArchive<OrderedUniverse>>()
         .unwrap()
-        .contains(&data(&fixture.output)));
-    assert!(matches!(observed.support(),
-        Err(CollectionRealizationError::MissingDependency { member })
-            if member == Handle::<SimpleArchive>::to_hash(fixture.source.handle())
-    ));
+        .iter()
+        .next()
+        .is_none());
+    without_commit.assert_no_record_enumeration();
+    without_commit.assert_not_loaded(data(&fixture.source_blob));
+    without_commit.assert_not_loaded(data(&fixture.metadata));
 
-    descriptor::put_closure(&mut fixture.store, &fixture.source_descriptor).unwrap();
-    let without_commit = fixture
-        .store
-        .snapshot()
-        .unwrap()
-        .collection(fixture.target)
-        .unwrap();
-    assert!(matches!(without_commit.support(),
-        Err(CollectionRealizationError::IncompleteSupport { records })
-            if records == vec![fixture.equation.fingerprint()]
-    ));
     fixture
         .store
         .insert(CollectionRecord::Commit(fixture.commit))
         .unwrap();
     let after = CountingSnapshot::new(fixture.store.snapshot().unwrap());
     let complete = after.collection(fixture.target).unwrap();
+    assert_eq!(
+        complete.cover().members().collect::<Vec<_>>(),
+        [fixture.output.get_handle()]
+    );
+    let view: UnionArchive<OrderedUniverse> = complete.view().unwrap();
+    assert_eq!(view.iter().collect::<TribleSet>(), facts(1, 21));
     let support = complete.support().unwrap();
     assert_eq!(support.collection(), fixture.source);
     assert_eq!(support.len(), 1);
     assert!(support.contains(fixture.source_blob.get_handle()));
+    // The source payload and metadata are neither resident nor asked for:
+    // support is a lookup in the index, and reading the target loads only
+    // its own output.
     assert!(!after
         .inner
         .contains_blob(fixture.source_blob.get_handle())
         .unwrap());
+    after.assert_no_record_enumeration();
     after.assert_not_loaded(data(&fixture.source_blob));
     after.assert_not_loaded(data(&fixture.metadata));
-    assert!(matches!(
-        observed.support(),
-        Err(CollectionRealizationError::MissingDependency { .. })
-    ));
-    assert!(matches!(
-        without_commit.support(),
-        Err(CollectionRealizationError::IncompleteSupport { .. })
-    ));
-    assert_eq!(
-        observed
-            .view::<UnionArchive<OrderedUniverse>>()
-            .unwrap()
-            .iter()
-            .collect::<TribleSet>(),
-        facts(1, 21)
-    );
+    // The earlier observation keeps standing for nothing.
+    assert!(observed.cover().is_empty());
+    assert!(observed.support().unwrap().is_empty());
 }
 
 #[test]
 fn unauthorized_target_producers_neither_admit_outputs_nor_hide_authorized_inputs() {
     let mut fixture = one_hop();
+    admit_source(&mut fixture);
     fixture.store.insert(fixture.equation).unwrap();
     let outsider = SigningKey::from_bytes(&[31; 32]);
     let other_source: Blob<SimpleArchive> = facts(3, 23).to_blob();
@@ -414,16 +416,21 @@ fn unauthorized_target_producers_neither_admit_outputs_nor_hide_authorized_input
 }
 
 #[test]
-fn unavailable_target_parent_falls_back_to_its_resident_exact_inputs() {
+fn absent_target_parent_is_read_through_its_resident_merge_inputs() {
     let mut fixture = one_hop();
+    admit_source(&mut fixture);
     fixture.store.insert(fixture.equation).unwrap();
     let other_source: Blob<SimpleArchive> = facts(3, 23).to_blob();
     let other_commit = CollectionCommit::sign(
-        &fixture.producer,
+        &fixture.source_owner,
         fixture.source.handle(),
         data(&other_source),
         fixture.metadata.get_handle(),
     );
+    fixture
+        .store
+        .insert(CollectionRecord::Commit(other_commit))
+        .unwrap();
     let other_output = succinctarchive_union::derive_element(&other_source).unwrap();
     fixture
         .store
@@ -439,6 +446,9 @@ fn unavailable_target_parent_falls_back_to_its_resident_exact_inputs() {
     let mut union = facts(1, 21);
     union.union(facts(3, 23));
     let union_blob = succinctarchive_union::derive_element(&union.clone().to_blob()).unwrap();
+    // The parent's record is here; its bytes are not. The frontier is the
+    // parent alone, and the read descends through the MERGE that produced
+    // it to the two resident images beneath.
     let parent = CollectionRecord::Merge(CollectionMerge::sign(
         &fixture.producer,
         fixture.target.handle(),
@@ -447,6 +457,9 @@ fn unavailable_target_parent_falls_back_to_its_resident_exact_inputs() {
         data(&union_blob),
     ));
     fixture.store.insert(parent).unwrap();
+    let both = fixture
+        .source
+        .cover([fixture.source_blob.get_handle(), other_source.get_handle()]);
     let before = fixture
         .store
         .snapshot()
@@ -456,6 +469,7 @@ fn unavailable_target_parent_falls_back_to_its_resident_exact_inputs() {
     assert_eq!(before.cover().len(), 2);
     assert!(before.cover().contains(fixture.output.get_handle()));
     assert!(before.cover().contains(other_output.get_handle()));
+    assert_eq!(before.support().unwrap(), &both);
     assert_eq!(
         before
             .view::<UnionArchive<OrderedUniverse>>()
@@ -479,6 +493,7 @@ fn unavailable_target_parent_falls_back_to_its_resident_exact_inputs() {
         after.cover().members().collect::<Vec<_>>(),
         [union_blob.get_handle()]
     );
+    assert_eq!(after.support().unwrap(), &both);
     assert_eq!(
         after
             .view::<UnionArchive<OrderedUniverse>>()
@@ -501,6 +516,7 @@ fn unavailable_target_parent_falls_back_to_its_resident_exact_inputs() {
 #[test]
 fn direct_commit_in_a_derived_target_does_not_become_foundational_membership() {
     let mut fixture = one_hop();
+    admit_source(&mut fixture);
     fixture
         .store
         .insert(CollectionRecord::Commit(CollectionCommit::sign(
@@ -517,6 +533,7 @@ fn direct_commit_in_a_derived_target_does_not_become_foundational_membership() {
         .collection(fixture.target)
         .unwrap();
     assert!(before.cover().is_empty());
+    assert!(before.support().unwrap().is_empty());
     assert!(before
         .view::<UnionArchive<OrderedUniverse>>()
         .unwrap()
@@ -537,35 +554,18 @@ fn direct_commit_in_a_derived_target_does_not_become_foundational_membership() {
     assert!(before.cover().is_empty());
 }
 
-#[test]
-fn multihop_support_uses_exact_endorsed_records_without_ancestor_authority_or_payload_rechecks() {
-    let mut fixture = one_hop();
-    descriptor::put_closure(&mut fixture.store, &fixture.source_descriptor).unwrap();
-    // The historical source/intermediate grants are absent here. The final
-    // accepted producer endorses these exact signed inputs, rather than making
-    // this reader repeat their former admission decisions.
-    let historical = SigningKey::from_bytes(&[41; 32]);
-    let commit = CollectionCommit::sign(
-        &historical,
-        fixture.source.handle(),
-        data(&fixture.source_blob),
-        fixture.metadata.get_handle(),
-    );
-    let raw_record = CollectionRecord::Derive(CollectionDerive::sign(
-        &historical,
-        fixture.target.handle(),
-        commit.data(),
-        data(&fixture.output),
-    ));
-    fixture
-        .store
-        .insert(CollectionRecord::Commit(commit))
-        .unwrap();
-    fixture.store.insert(raw_record).unwrap();
-    let final_owner = SigningKey::from_bytes(&[42; 32]);
+/// A second hop on top of the fixture: the Rank9 image of the target's one
+/// output, produced by `final_owner`.
+fn second_hop(
+    fixture: &mut OneHop,
+    final_owner: &SigningKey,
+) -> (
+    Collection<Rank9AcceleratedSuccinctArchiveBlob>,
+    Blob<Rank9AcceleratedSuccinctArchiveBlob>,
+) {
     let final_target = fixture
         .store
-        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(fixture.target, (), policy(&final_owner))
+        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(fixture.target, (), policy(final_owner))
         .unwrap();
     let accelerated = Rank9AcceleratedSuccinctArchiveBlob::map(
         &(),
@@ -580,15 +580,35 @@ fn multihop_support_uses_exact_endorsed_records_without_ancestor_authority_or_pa
     fixture
         .store
         .insert(CollectionRecord::Derive(CollectionDerive::sign(
-            &final_owner,
+            final_owner,
             final_target.handle(),
             data(&fixture.output),
             data(&accelerated),
         )))
         .unwrap();
+    (final_target, accelerated)
+}
+
+#[test]
+fn multihop_read_takes_cover_and_support_from_the_index_without_payload_reads() {
+    let mut fixture = one_hop();
+    admit_source(&mut fixture);
+    fixture.store.insert(fixture.equation).unwrap();
+    let final_owner = SigningKey::from_bytes(&[42; 32]);
+    let (final_target, accelerated) = second_hop(&mut fixture, &final_owner);
     let inner = fixture.store.snapshot().unwrap();
+    // The source's one commit payload is not resident, so the source itself
+    // has no resident cover; the images above it are read all the same.
     assert!(inner.collection(fixture.source).unwrap().cover().is_empty());
-    assert!(inner.collection(fixture.target).unwrap().cover().is_empty());
+    assert_eq!(
+        inner
+            .collection(fixture.target)
+            .unwrap()
+            .cover()
+            .members()
+            .collect::<Vec<_>>(),
+        [fixture.output.get_handle()]
+    );
     assert_eq!(inner.proofs().unwrap().count(), 0);
     let snapshot = CountingSnapshot::new(inner);
     let observed = snapshot.collection(final_target).unwrap();
@@ -598,30 +618,97 @@ fn multihop_support_uses_exact_endorsed_records_without_ancestor_authority_or_pa
     );
     let view: UnionArchive<OrderedUniverse> = observed.view().unwrap();
     assert_eq!(view.iter().collect::<TribleSet>(), facts(1, 21));
-    snapshot.assert_no_ancestor_record_reads();
+    snapshot.assert_no_record_enumeration();
     snapshot.assert_not_loaded(data(&fixture.source_blob));
     snapshot.assert_not_loaded(data(&fixture.metadata));
-    let proof_queries = snapshot.counts.proof_queries.load(Ordering::SeqCst);
     let support = observed.support().unwrap();
     assert_eq!(support.collection(), fixture.source);
     assert!(support.contains(fixture.source_blob.get_handle()));
     assert_eq!(support.len(), 1);
-    // The chain is followed by the payloads its records name, through the
-    // produced-member index, so no cited fingerprint is point-read; what the
-    // walk must not do -- enumerate a collection, load a payload, or ask
-    // for a proof -- is asserted around this.
-    assert_eq!(
-        snapshot.counts.proof_queries.load(Ordering::SeqCst),
-        proof_queries
-    );
+    // Support is the row the index already holds. Asking for it charges the
+    // lineage to the observation and reads nothing else: no record is
+    // selected, no payload loaded, no proof asked for.
+    snapshot.assert_no_record_enumeration();
     snapshot.assert_not_loaded(data(&fixture.source_blob));
     snapshot.assert_not_loaded(data(&fixture.metadata));
     let selections = snapshot.counts.selections.lock().unwrap().len();
     let blob_reads = snapshot.counts.gets.lock().unwrap().len();
+    let proof_queries = snapshot.counts.proof_queries.load(Ordering::SeqCst);
     let cloned = observed.clone();
     assert_eq!(cloned.support().unwrap(), support);
     assert_eq!(snapshot.counts.selections.lock().unwrap().len(), selections);
     assert_eq!(snapshot.counts.gets.lock().unwrap().len(), blob_reads);
+    assert_eq!(
+        snapshot.counts.proof_queries.load(Ordering::SeqCst),
+        proof_queries
+    );
+}
+
+#[test]
+fn multihop_read_stands_for_nothing_beneath_an_unadmitted_ancestor() {
+    let mut fixture = one_hop();
+    descriptor::put_closure(&mut fixture.store, &fixture.source_descriptor).unwrap();
+    // The historical source commit and the target's image of it are signed
+    // by a key nothing here admits. The final producer is admitted, and its
+    // record is believed, but the image it names has no row to stand on.
+    let historical = SigningKey::from_bytes(&[41; 32]);
+    fixture
+        .store
+        .insert(CollectionRecord::Commit(CollectionCommit::sign(
+            &historical,
+            fixture.source.handle(),
+            data(&fixture.source_blob),
+            fixture.metadata.get_handle(),
+        )))
+        .unwrap();
+    fixture
+        .store
+        .insert(CollectionRecord::Derive(CollectionDerive::sign(
+            &historical,
+            fixture.target.handle(),
+            fixture.commit.data(),
+            data(&fixture.output),
+        )))
+        .unwrap();
+    let final_owner = SigningKey::from_bytes(&[42; 32]);
+    let (final_target, accelerated) = second_hop(&mut fixture, &final_owner);
+    let snapshot = CountingSnapshot::new(fixture.store.snapshot().unwrap());
+    let observed = snapshot.collection(final_target).unwrap();
+    assert!(observed.cover().is_empty());
+    assert!(observed.support().unwrap().is_empty());
+    assert!(observed
+        .view::<UnionArchive<OrderedUniverse>>()
+        .unwrap()
+        .iter()
+        .next()
+        .is_none());
+    // Nothing walked the chain to certify the final image from what its
+    // producer named: no enumeration, no ancestor payload.
+    snapshot.assert_no_record_enumeration();
+    snapshot.assert_not_loaded(data(&fixture.source_blob));
+    snapshot.assert_not_loaded(data(&fixture.output));
+
+    // Admitted records for the same payloads make the chain stand.
+    fixture
+        .store
+        .insert(CollectionRecord::Commit(fixture.commit))
+        .unwrap();
+    fixture.store.insert(fixture.equation).unwrap();
+    let admitted = fixture
+        .store
+        .snapshot()
+        .unwrap()
+        .collection(final_target)
+        .unwrap();
+    assert_eq!(
+        admitted.cover().members().collect::<Vec<_>>(),
+        [accelerated.get_handle()]
+    );
+    assert_eq!(
+        admitted.support().unwrap(),
+        &fixture.source.cover([fixture.source_blob.get_handle()])
+    );
+    assert!(observed.cover().is_empty());
 }
 
 fn empty_pile(dir: &tempfile::TempDir) -> Pile {
@@ -631,7 +718,7 @@ fn empty_pile(dir: &tempfile::TempDir) -> Pile {
 }
 
 #[test]
-fn pile_observation_tracks_only_consulted_ancestry_and_target_changes() {
+fn pile_observation_tracks_only_consulted_lineage_and_target_changes() {
     let fixture = one_hop();
     let dir = tempfile::tempdir().unwrap();
     let mut pile = empty_pile(&dir);
@@ -640,28 +727,18 @@ fn pile_observation_tracks_only_consulted_ancestry_and_target_changes() {
             .unwrap(),
         fixture.target
     );
+    descriptor::put_closure(&mut pile, &fixture.source_descriptor).unwrap();
     pile.put::<SuccinctArchiveBlob, _>(fixture.output.clone())
         .unwrap();
     pile.insert(fixture.equation).unwrap();
     let before = pile.snapshot().unwrap();
-    let basic = before.collection(fixture.target).unwrap();
-    assert_eq!(
-        basic
-            .view::<UnionArchive<OrderedUniverse>>()
-            .unwrap()
-            .iter()
-            .collect::<TribleSet>(),
-        facts(1, 21)
-    );
-    assert!(basic.is_current(&before));
+    // The image is ahead of its input: the target holds a blocked record,
+    // so a record landing anywhere in the lineage can move its frontier and
+    // the whole lineage is what this read depends on.
+    let blocked = before.collection(fixture.target).unwrap();
+    assert!(blocked.cover().is_empty());
+    assert!(blocked.is_current(&before));
 
-    // A separate attachment keeps the basic read's dependencies independent
-    // of this explicit provenance request. Clones intentionally share them.
-    let missing_descriptor = before.collection(fixture.target).unwrap();
-    assert!(matches!(missing_descriptor.support(),
-        Err(CollectionRealizationError::MissingDependency { member })
-            if member == Handle::<SimpleArchive>::to_hash(fixture.source.handle())
-    ));
     let unrelated_descriptor = descriptor::naming::<SimpleArchive>(
         "unrelated-observation-source",
         policy(&fixture.producer),
@@ -678,44 +755,47 @@ fn pile_observation_tracks_only_consulted_ancestry_and_target_changes() {
     )))
     .unwrap();
     let after_unrelated = pile.snapshot().unwrap();
-    assert!(basic.is_current(&after_unrelated));
-    assert!(missing_descriptor.is_current(&after_unrelated));
-
-    descriptor::put_closure(&mut pile, &fixture.source_descriptor).unwrap();
-    let after_descriptor = pile.snapshot().unwrap();
-    assert!(basic.is_current(&after_descriptor));
-    assert!(!missing_descriptor.is_current(&after_descriptor));
-    assert!(matches!(
-        missing_descriptor.support(),
-        Err(CollectionRealizationError::MissingDependency { .. })
-    ));
-    let missing_witness = after_descriptor.collection(fixture.target).unwrap();
-    assert!(matches!(missing_witness.support(),
-        Err(CollectionRealizationError::IncompleteSupport { records })
-            if records == vec![fixture.equation.fingerprint()]
-    ));
-    assert!(missing_witness.is_current(&after_descriptor));
+    assert!(blocked.is_current(&after_unrelated));
 
     pile.insert(CollectionRecord::Commit(fixture.commit))
         .unwrap();
-    let after_witness = pile.snapshot().unwrap();
-    assert!(basic.is_current(&after_witness));
-    assert!(!missing_witness.is_current(&after_witness));
-    assert!(matches!(
-        missing_witness.support(),
-        Err(CollectionRealizationError::IncompleteSupport { .. })
-    ));
-    let complete = after_witness.collection(fixture.target).unwrap();
+    let after_commit = pile.snapshot().unwrap();
+    assert!(!blocked.is_current(&after_commit));
+    assert!(blocked.is_current(&before));
+    assert!(blocked.cover().is_empty());
+    let complete = after_commit.collection(fixture.target).unwrap();
+    assert_eq!(
+        complete.cover().members().collect::<Vec<_>>(),
+        [fixture.output.get_handle()]
+    );
+    assert!(complete.is_current(&after_commit));
+
+    // With nothing blocked, the cover depends on the target's own records
+    // only. A second source commit leaves it current until its support is
+    // asked for, which is what charges the lineage.
+    let second_blob: Blob<SimpleArchive> = facts(8, 28).to_blob();
+    pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
+        &fixture.source_owner,
+        fixture.source.handle(),
+        data(&second_blob),
+        fixture.metadata.get_handle(),
+    )))
+    .unwrap();
+    let after_second = pile.snapshot().unwrap();
+    assert!(complete.is_current(&after_second));
     let support = complete.support().unwrap();
     assert_eq!(support.collection(), fixture.source);
     assert_eq!(support.len(), 1);
     assert!(support.contains(fixture.source_blob.get_handle()));
-    assert!(!after_witness
+    assert!(!after_second
         .contains_blob(fixture.source_blob.get_handle())
         .unwrap());
+    assert!(!complete.is_current(&after_second));
+    assert!(complete.is_current(&after_commit));
 
-    // Even a new target equation with the same visible bytes invalidates the
-    // old observation: target membership, not only output hashes, was read.
+    // A new target equation with the same visible bytes invalidates the
+    // observation too: target membership, not only output hashes, was read.
+    let fresh = after_second.collection(fixture.target).unwrap();
     pile.insert(CollectionRecord::Merge(CollectionMerge::sign(
         &fixture.producer,
         fixture.target.handle(),
@@ -725,9 +805,8 @@ fn pile_observation_tracks_only_consulted_ancestry_and_target_changes() {
     )))
     .unwrap();
     let after_target = pile.snapshot().unwrap();
-    assert!(!basic.is_current(&after_target));
-    assert!(!complete.is_current(&after_target));
-    assert!(basic.is_current(&after_witness));
+    assert!(!fresh.is_current(&after_target));
+    assert!(fresh.is_current(&after_second));
     assert_eq!(
         after_target
             .collection(fixture.target)
@@ -750,6 +829,9 @@ fn pile_observation_tracks_a_missing_selected_output_occurrence() {
             .unwrap(),
         fixture.target
     );
+    descriptor::put_closure(&mut pile, &fixture.source_descriptor).unwrap();
+    pile.insert(CollectionRecord::Commit(fixture.commit))
+        .unwrap();
     pile.insert(fixture.equation).unwrap();
     let before = pile.snapshot().unwrap();
     let observed = before.collection(fixture.target).unwrap();
@@ -808,10 +890,15 @@ fn pile_observation_tracks_missing_target_write_definition_without_new_records()
     let read_definition: Blob<SimpleArchive> = fixture_snapshot.get(read_capability()).unwrap();
     let write_definition: Blob<SimpleArchive> = fixture_snapshot.get(write_capability()).unwrap();
     // Copy exact descriptor bytes, not their closure, to isolate one missing
-    // policy definition. The signed target and its payload are already here.
+    // policy definition. The signed records and the target payload are
+    // already here.
     pile.put::<SimpleArchive, _>(target_descriptor).unwrap();
+    pile.put::<SimpleArchive, _>(fixture.source_descriptor.facts().clone())
+        .unwrap();
     pile.put::<SimpleArchive, _>(read_definition).unwrap();
     pile.put::<SuccinctArchiveBlob, _>(fixture.output.clone())
+        .unwrap();
+    pile.insert(CollectionRecord::Commit(fixture.commit))
         .unwrap();
     pile.insert(fixture.equation).unwrap();
     let before = pile.snapshot().unwrap();

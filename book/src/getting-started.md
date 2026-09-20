@@ -142,10 +142,7 @@ append order is never an implicit winner.
 ```rust,ignore
 let snapshot = storage.snapshot()?;
 let admitted = library.admitted(&snapshot)?;
-let available = admitted.available(&snapshot)?;
-let missing = admitted.difference(&available)?;
-assert!(missing.is_empty());
-let facts = admitted.materialize::<TribleSet, _>(&snapshot)?;
+let facts: TribleSet = library.read(&snapshot)?;
 let title = "Dune";
 
 for (first, last, quote) in find!(
@@ -168,17 +165,17 @@ for (first, last, quote) in find!(
 ```
 
 `storage.snapshot()` freezes blobs, collection records, capability proofs, and
-backend state at one coherent known prefix. `library.admitted(&snapshot)` then
-applies the descriptor's WRITE policy in that same observation and returns the
-exact semantic payload cover. `available` returns the greatest subset of those
-same semantic members which has a complete resident realization, so equality
-with `admitted` means the full value is local and `difference` names missing
-semantic support. `materialize` privately selects a support-equivalent physical
-decomposition and constructs the logical value through the same immutable
-snapshot. `library.read(&snapshot)` concisely reads the maximal resident
-collection view at that same frozen prefix. Snapshots carry no clock: later
-proof or content arrivals require a new observation, while an application
-evaluates its own time-sensitive rules at an explicit instant.
+backend state at one coherent known prefix. `library.admitted(&snapshot)` reads
+the coverage index in that same observation and returns the exact semantic
+payload cover: the union of what the collection's frontier stands for, whether
+or not every byte is here. `library.read(&snapshot)` attaches that frontier
+from the same index and constructs the logical value from the nodes whose
+bytes are resident, through the same immutable snapshot; a node whose bytes
+are elsewhere is descended through the `MERGE` that produced it, so the value
+stands on whatever is local and the support says exactly what that is.
+Snapshots carry no clock: later proof or content arrivals require a new
+observation, while an application evaluates its own time-sensitive rules at
+an explicit instant.
 
 Provenance for an exact cover is available through `cover.commits(&snapshot)`.
 These are strictly verified attestations over its payloads, not necessarily

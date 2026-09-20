@@ -46,19 +46,19 @@ use super::{
 };
 
 /// One lattice node and what it stands for.
-type Node = (CollectionData, CoverageSet);
+pub(super) type Node = (CollectionData, CoverageSet);
 
 /// What one collection stands on right now.
-struct Selection {
+pub(super) struct Selection {
     /// Resident, complete nodes, widest first, none inside the union of the
     /// ones before it.
-    cover: Vec<Node>,
+    pub(super) cover: Vec<Node>,
     /// The union of the cover's supports.
-    covered: CoverageSet,
+    pub(super) covered: CoverageSet,
     /// Nodes met on the way whose bytes are not resident.
-    absent: Vec<Node>,
+    pub(super) absent: Vec<Node>,
     /// Representation dependencies missing beside resident roots.
-    dependencies: Vec<CollectionData>,
+    pub(super) dependencies: Vec<CollectionData>,
 }
 
 impl Selection {
@@ -87,7 +87,7 @@ impl Selection {
             .collect()
     }
 
-    fn nodes(&self) -> Vec<CollectionData> {
+    pub(super) fn nodes(&self) -> Vec<CollectionData> {
         self.cover.iter().map(|(node, _)| *node).collect()
     }
 }
@@ -104,7 +104,7 @@ fn members(set: &CoverageSet) -> Vec<CollectionData> {
 /// is descended: the MERGEs that produced it name the finer nodes beneath. A
 /// node inside what is already covered adds nothing and is neither taken nor
 /// descended.
-fn select<R, E>(
+pub(super) fn select<R, E>(
     snapshot: &R,
     coverage: &Coverage,
     collection: Collection<E>,

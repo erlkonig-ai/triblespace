@@ -346,6 +346,42 @@ pub fn admission_policies<'a, R: BlobStoreGet>(
     })
 }
 
+/// The supported policies for an action whose definitions are resident, and
+/// the handles of the definitions that are not.
+///
+/// A policy whose definition blob is elsewhere is not silently absent: the
+/// fold parks on that blob and is woken when it lands, the way it waits for
+/// a descriptor.
+pub(crate) fn admission_policies_with_missing<R: BlobStoreGet>(
+    reader: &R,
+    facts: &TribleSet,
+    action: Id,
+    representation: Option<Id>,
+) -> (Vec<AdmissionPolicy>, Vec<CapabilityHandle>) {
+    let mut policies = Vec::new();
+    let mut missing = Vec::new();
+    for (handle, policy) in capability_policies(facts, representation) {
+        let Ok(definition) = reader.get::<TribleSet, _>(handle) else {
+            missing.push(handle);
+            continue;
+        };
+        if exists!(pattern!(&definition, [{ _?definition @ crate::capability::capability_action: action }])) {
+            policies.push(policy);
+        }
+    }
+    (policies, missing)
+}
+
+/// The one descriptor entity of a descriptor blob, or `None` when the blob
+/// carries none or several. A blob with two descriptor entities does not say
+/// which one a collection handle names, and no policy may be borrowed from a
+/// sibling entity, so an untyped reader admits nobody through it.
+pub(crate) fn sole_descriptor_entity(facts: &TribleSet) -> Option<Id> {
+    let mut entities = descriptor_entities(facts, None);
+    let first = entities.next()?;
+    entities.next().is_none().then_some(first)
+}
+
 fn descriptor_entities<'a>(
     facts: &'a TribleSet,
     representation: Option<Id>,

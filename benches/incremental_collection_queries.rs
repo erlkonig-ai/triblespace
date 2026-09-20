@@ -45,6 +45,7 @@ use triblespace::core::collection::{
     CollectionStoreExt,
 };
 use triblespace::core::examples::literature;
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::core::repo::memoryrepo::MemoryRepoSnapshot;
 use triblespace::prelude::*;
 
@@ -294,9 +295,14 @@ impl IncrementalState {
             .additions_since(self.snapshot.support().expect("resolve previous support"))
             .expect("benchmark support grows monotonically");
         assert_eq!(changed_support.len(), 1, "one payload is observed per step");
-        let changed_view: TribleSet = changed_support
-            .materialize(next.snapshot())
-            .expect("materialize changed source payloads");
+        let mut changed_view = TribleSet::new();
+        for member in changed_support.members() {
+            let payload: TribleSet = next
+                .snapshot()
+                .get(member)
+                .expect("read changed source payload");
+            changed_view.union(payload);
+        }
         let next_view: UnionArchive<OrderedUniverse> =
             next.view().expect("materialize complete incremental view");
 

@@ -317,7 +317,7 @@ fn returned_backend_failures_use_canonical_cpu_without_partial_output() {
     assert_eq!(output.get_handle(), cpu.get_handle());
     let other = SuccinctArchiveBlob::build_from_simple_archive(&facts(32, 65).to_blob()).unwrap();
     let joined = mapping
-        .join_images(&Fragment::empty(), None, &output, &other, &snapshot)
+        .join_images(&Fragment::empty(), &output, &other, &snapshot)
         .unwrap()
         .unwrap();
     let expected = SuccinctArchiveBlob::merge(&[cpu, other]).unwrap();

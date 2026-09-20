@@ -53,9 +53,29 @@ struct Counted<R> {
 
 // A one-shot external append after one frozen selection, used only by the
 // scoped race control. It adds no queries and is absent from ordinary counts.
+// `skip` routes into the collection pass before the append fires, so a test
+// can choose which look at the source the append lands after.
 struct SelectionHook {
     collection: CollectionHandle,
+    skip: std::sync::atomic::AtomicUsize,
     action: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl SelectionHook {
+    fn route(&self) {
+        use std::sync::atomic::Ordering;
+        if self
+            .skip
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |skip| skip.checked_sub(1))
+            .is_ok()
+        {
+            return;
+        }
+        let action = self.action.lock().unwrap().take();
+        if let Some(action) = action {
+            action();
+        }
+    }
 }
 
 impl<R> Counted<R> {
@@ -230,10 +250,7 @@ impl<R: triblespace_core::collection::CoverageRead> triblespace_core::collection
         let index = self.inner.index(lineage)?;
         if let Some(hook) = &self.selection_hook {
             if lineage.contains(&hook.collection) {
-                let action = hook.action.lock().unwrap().take();
-                if let Some(action) = action {
-                    action();
-                }
+                hook.route();
             }
         }
         Ok(index)
@@ -281,10 +298,7 @@ impl<R: CollectionRead> CollectionRead for Counted<R> {
                 | CollectionRecordSelector::DeriveTarget(collection) => *collection == hook.collection,
             });
             if named {
-                let action = hook.action.lock().unwrap().take();
-                if let Some(action) = action {
-                    action();
-                }
+                hook.route();
             }
         }
         Ok(records)

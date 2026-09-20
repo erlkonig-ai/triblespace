@@ -22,10 +22,8 @@ use crate::trible::Fragment;
 
 use super::operation_snapshot::OperationFrontier;
 use super::{
-    descriptor, resolve_collection_semantics, Collection,
-    CollectionClaimValidation, CollectionData, CollectionEncoding,
-    CollectionHandle, CollectionMapping, CollectionRecord, CollectionRecordFingerprint,
-    CollectionRecordSelector, CollectionResolutionError, Support,
+    descriptor, Collection, CollectionData, CollectionEncoding, CollectionHandle,
+    CollectionMapping,
 };
 #[cfg(test)]
 use super::{CanonicalDerivation, CollectionDerivation};
@@ -81,12 +79,6 @@ pub enum CollectionRealizationError {
     MissingDependency {
         /// Exact missing content identity.
         member: CollectionData,
-    },
-    /// The selected target is readable, but one or more exact endorsed
-    /// historical record routes cannot be reconstructed in this snapshot.
-    IncompleteSupport {
-        /// Target endorsements with missing or mismatched witness ancestry.
-        records: Vec<CollectionRecordFingerprint>,
     },
     /// No resident physical source cover remains after deterministic capacity
     /// failures exclude members which cannot be represented downstream.
@@ -177,12 +169,6 @@ impl fmt::Display for CollectionRealizationError {
                 formatter,
                 "mapping requires resident blob {}",
                 hex::encode_upper(member.raw),
-            ),
-            Self::IncompleteSupport { records } => write!(
-                formatter,
-                "collection support is unavailable ({} incomplete endorsed record route(s): {})",
-                records.len(),
-                name_some(records.iter().map(|r| hex::encode_upper(r.raw()))),
             ),
             Self::UnrepresentableCover { blocked, missing } => write!(
                 formatter,
@@ -346,364 +332,6 @@ where
     Ok(load_lineage(snapshot, target)?.foundation)
 }
 
-pub(super) type InputWitnesses =
-    BTreeMap<(CollectionHandle, CollectionData), Vec<(CollectionRecord, Support)>>;
-
-struct CertifiedResolution {
-    witnesses: InputWitnesses,
-}
-
-#[cfg(test)]
-impl CertifiedResolution {
-    /// The support the selected records of one collection certify: the union
-    /// of their witnesses' supports. A read no longer accumulates this; the
-    /// tests of the selection filter still ask for it.
-    fn support_of(
-        &self,
-        foundation: Collection<SimpleArchive>,
-        collection: CollectionHandle,
-    ) -> Support {
-        let mut support = Support::from_data(foundation, []);
-        for ((owner, _), alternatives) in &self.witnesses {
-            if *owner != collection {
-                continue;
-            }
-            for (_, alternative) in alternatives {
-                support = support.union(alternative).expect("one foundation");
-            }
-        }
-        support
-    }
-}
-
-/// Enumerate exact admitted input witnesses for explicit equation imports.
-///
-/// This diagnostic/migration surface preserves distinct supports of a lossy
-/// mapping. It does not load member payloads, publish records, or choose among
-/// ambiguous historical provenance. Endorsed descendants are usable witnesses
-/// even when their original authority proof is no longer locally available.
-pub fn admitted_record_witnesses<R>(
-    snapshot: &R,
-    collection: CollectionHandle,
-) -> Result<Vec<(CollectionRecord, Support)>, CollectionRealizationError>
-where
-    R: StoreRead,
-{
-    let lineage = load_record_lineage(snapshot, collection)?;
-    let certified = resolve_endorsed_lineage(snapshot, &lineage, &BTreeSet::from([collection]))?;
-    let mut records = Vec::new();
-    for ((owner, _), alternatives) in certified.witnesses {
-        if owner != collection {
-            continue;
-        }
-        records.extend(alternatives);
-    }
-    Ok(records)
-}
-
-/// Preview equation imports against one frozen store without publishing them.
-///
-/// This diagnostic/migration operation overlays actual signed MERGE and DERIVE
-/// records, then uses ordinary admission and witness resolution. Existing native
-/// records whose missing witnesses are supplied by the preview participate too.
-/// Functional and commuting-square conflicts are reported before any append;
-/// payloads are neither loaded nor recomputed. The returned witnesses include
-/// the complete admitted collection in this preview, not just the proposed rows.
-/// COMMIT publication remains a separate operation and is not previewed here.
-pub fn preview_record_witnesses<R>(
-    snapshot: &R,
-    collection: CollectionHandle,
-    records: impl IntoIterator<Item = CollectionRecord>,
-) -> Result<Vec<(CollectionRecord, Support)>, CollectionRealizationError>
-where
-    R: StoreRead,
-{
-    let mut frontier = OperationFrontier::new(snapshot.clone());
-    for record in records {
-        if matches!(record, CollectionRecord::Commit(_)) {
-            return Err(CollectionRealizationError::InvalidCover(
-                "equation preview does not publish COMMIT records".to_owned(),
-            ));
-        }
-        frontier.include_record(record);
-    }
-    admitted_record_witnesses(&frontier.view(snapshot.clone()), collection)
-}
-
-/// What ONE cited record certifies, read straight out of the coverage index.
-///
-/// A coverage row is the denotational answer for a value: every route to it
-/// unions in, because either way of building it is a way it could have been
-/// built. Citing a record is narrower -- it chooses a route -- so a
-/// certificate is the union over the inputs *that record* names, and the rows
-/// supply those inputs' answers without a walk.
-///
-/// All-or-nothing, like a row: one input with no row makes the certificate
-/// unknown, never a smaller set that would pass a subset test it should fail.
-fn record_certificate(
-    coverage: &super::coverage::Coverage,
-    lineage: &Lineage,
-    record: CollectionRecord,
-) -> Option<super::coverage::CoverageSet> {
-    use super::coverage::{Attestation, CoverageSet};
-    let collection = record.collection();
-    match Attestation::of(&record) {
-        // A commit stands for its own payload. The row is consulted only to
-        // ask whether it was admitted; the row itself may be wider, and that
-        // width belongs to the value rather than to this citation.
-        Attestation::Foundation { data } => {
-            // A commit anywhere but the foundation is a malformed route --
-            // the structural walk says the same -- and certifies nothing.
-            if collection != lineage.foundation.handle() {
-                return None;
-            }
-            coverage
-                .of(collection, data)
-                .map(|_| CoverageSet::from_keys(std::iter::once(data.raw)))
-        }
-        Attestation::Join { low, high, .. } => {
-            let mut set = coverage.of(collection, low)?.clone();
-            set.union(coverage.of(collection, high)?.clone());
-            Some(set)
-        }
-        Attestation::Image { input, .. } => {
-            // The input is a node in this collection's source, which the
-            // lineage already names -- no descriptor read needed here.
-            let source = lineage.source_by_target.get(&collection)?;
-            coverage.of(*source, input).cloned()
-        }
-    }
-}
-
-/// The foundation payloads a record's stated inputs reduce to, walking
-/// producers structurally through the produced-member index.
-///
-/// This is what an admitted producer vouches for when it names its inputs,
-/// and it is the certificate to use when the coverage fold has no row for the
-/// record -- which happens exactly when something beneath it is not admitted
-/// HERE. Records below the certified one must EXIST: every payload on the way
-/// down needs a producing record, and a foundation payload needs a COMMIT. A
-/// missing record anywhere makes the certificate unknown (`None`), not
-/// narrower. But none of them is re-admitted, and no payload is loaded: the
-/// reader trusts the producer it admitted for what that producer named.
-///
-/// Two named tests hold the two halves apart.
-/// `aggregate_support_excludes_missing_witnesses_and_unadmitted_producers`
-/// keeps a derive out of the support until its input's COMMIT lands;
-/// `multihop_support_uses_exact_endorsed_records_without_ancestor_authority_
-/// or_payload_rechecks` follows a chain whose every ancestor is signed by a
-/// key this store does not admit. The witness field satisfied both by citing
-/// one exact record; naming the payload and walking every producer of it
-/// satisfies both without the field, wider where routes diverge -- which the
-/// lattice comparison absorbs.
-///
-/// [`super::witness::records_for`] walks the same graph for retention.
-fn structural_certificate<R>(
-    snapshot: &R,
-    lineage: &Lineage,
-    record: CollectionRecord,
-) -> Result<Option<super::coverage::CoverageSet>, CollectionRealizationError>
-where
-    R: StoreRead,
-{
-    let foundation = lineage.foundation.handle();
-    let mut certificate = super::coverage::CoverageSet::new();
-    let mut visited = BTreeSet::new();
-    let mut pending = vec![record];
-    while let Some(record) = pending.pop() {
-        if !visited.insert(record.fingerprint()) {
-            continue;
-        }
-        let collection = record.collection();
-        let inputs: Vec<(CollectionHandle, CollectionData)> = match record {
-            CollectionRecord::Commit(commit) if collection == foundation => {
-                certificate.union(super::coverage::CoverageSet::from_keys([commit.data().raw]));
-                Vec::new()
-            }
-            // A COMMIT anywhere but the foundation is a raw membership claim
-            // with no derivation behind it: its foundation provenance is not
-            // empty, it is unknown.
-            CollectionRecord::Commit(_) => return Ok(None),
-            CollectionRecord::Merge(merge) => {
-                let (low, high) = merge.inputs();
-                vec![(collection, low), (collection, high)]
-            }
-            CollectionRecord::Derive(derive) => match lineage.source_by_target.get(&collection) {
-                Some(source) => vec![(*source, derive.input())],
-                None => return Ok(None),
-            },
-        };
-        for (owner, payload) in inputs {
-            let producers = snapshot
-                .select_records(&BTreeSet::from([CollectionRecordSelector::ProducedMember(
-                    owner, payload,
-                )]))
-                .map_err(|error| {
-                    CollectionRealizationError::storage("expand producing records", error)
-                })?;
-            if producers.is_empty() {
-                return Ok(None);
-            }
-            pending.extend(producers);
-        }
-    }
-    Ok(Some(certificate))
-}
-
-/// Admit selected producers, then follow only their immutable witness DAGs.
-/// Read attachment selects only the target; maintenance additionally admits
-/// immediate-source candidates it may use to publish new equations.
-fn resolve_endorsed_lineage<R>(
-    snapshot: &R,
-    lineage: &Lineage,
-    collections: &BTreeSet<CollectionHandle>,
-) -> Result<CertifiedResolution, CollectionRealizationError>
-where
-    R: StoreRead,
-{
-    let mut evidence = BTreeMap::new();
-    for collection in collections {
-        let descriptor = lineage.descriptor(*collection);
-        let writers = super::api::discover_admission_evidence(
-            snapshot,
-            descriptor::admission_policies(snapshot, descriptor.facts(), super::ACTION_WRITE, None),
-            super::ACTION_WRITE,
-            *collection,
-        )
-        .map_err(|error| {
-            CollectionRealizationError::storage("discover equation WRITE admission", error)
-        })?;
-        evidence.insert(*collection, writers);
-    }
-    let mut admitted = BTreeMap::new();
-    let selectors = collections
-        .iter()
-        .copied()
-        .map(CollectionRecordSelector::Collection)
-        .collect();
-    let candidates = snapshot.select_records(&selectors).map_err(|error| {
-        CollectionRealizationError::storage("select endorsed collection records", error)
-    })?;
-    // Support is a lookup, not a walk: every edge under a row was admitted
-    // when the fold believed it, so nothing here re-derives or re-decides it.
-    let coverage = snapshot
-        .coverage(&lineage.descriptors.keys().copied().collect())
-        .map_err(|error| CollectionRealizationError::storage("read downward coverage", error))?;
-    let mut roots = BTreeSet::new();
-    let mut witnesses = InputWitnesses::new();
-    for record in candidates {
-        let accepted = *admitted
-            .entry((record.collection(), record.public_key().raw))
-            .or_insert_with(|| {
-                ed25519_dalek::VerifyingKey::from_bytes(&record.public_key().raw)
-                    .ok()
-                    .is_some_and(|subject| {
-                        evidence
-                            .get(&record.collection())
-                            .is_some_and(|writers| writers.authorizes(snapshot, subject))
-                    })
-            });
-        if !accepted {
-            continue;
-        }
-        // A record certifies something when the fold has a row for it or,
-        // failing that, when what its producer named reduces to commits.
-        if record_certificate(&coverage, lineage, record).is_none()
-            && structural_certificate(snapshot, lineage, record)?.is_none()
-        {
-            continue;
-        }
-        roots.insert(record);
-    }
-    // Support comes from the index now, but the RECORD set still has to be
-    // expanded: `resolve_collection_semantics` needs the COMMIT records
-    // underneath the selected endorsements, and record retention is exactly
-    // what the coverage index forgets. Two different questions, and only one
-    // of them is denotational.
-    let records = super::witness::records_for(snapshot, roots, &lineage.source_by_target)
-        .map_err(|error| CollectionRealizationError::storage("expand producing records", error))?;
-    for record in &records {
-        let record_support = Support::from_patch(
-            lineage.foundation,
-            match record_certificate(&coverage, lineage, *record) {
-                Some(certificate) => certificate,
-                None => structural_certificate(snapshot, lineage, *record)?.unwrap_or_default(),
-            },
-        );
-        let alternatives = witnesses
-            .entry((record.collection(), super::coverage::produced(*record)))
-            .or_default();
-        // Retain actual records, including equal-support signatures/routes.
-        // Publication selects a small covering witness set when needed;
-        // diagnostics and migrations must still see every persisted identity.
-        alternatives.push((*record, record_support));
-    }
-    let discovered = super::DiscoveredCollectionRecords::from_records(records);
-    let commits = discovered.commits().iter().copied().collect();
-    let resolution =
-        resolve_collection_semantics(&discovered, &lineage.source_by_target, &commits, |_| {
-            Ok::<CollectionClaimValidation<()>, std::convert::Infallible>(
-                CollectionClaimValidation::Accepted,
-            )
-        });
-
-    match resolution {
-        Ok(_) => Ok(CertifiedResolution { witnesses }),
-        Err(CollectionResolutionError::Validation { source, .. }) => match source {},
-        Err(CollectionResolutionError::Conflict(conflict)) => {
-            Err(CollectionRealizationError::Resolution(conflict.to_string()))
-        }
-    }
-}
-
-/// Read what an immutable target's retained endorsements stand for.
-///
-/// Every edge these records rest on was admitted when the coverage index
-/// folded it, so nothing is re-decided here and no witness is consulted: a
-/// record's support is the row its result already has. A record whose result
-/// has no row is reported rather than skipped, because a caller asking for
-/// support needs to know when its answer is partial.
-pub(crate) fn support_of_records<R, E>(
-    snapshot: &R,
-    target: Collection<E>,
-    records: &[CollectionRecord],
-) -> Result<Support, CollectionRealizationError>
-where
-    R: StoreRead,
-    E: CollectionEncoding,
-{
-    let lineage = load_lineage(snapshot, target)?;
-    let coverage = snapshot
-        .coverage(&lineage.descriptors.keys().copied().collect())
-        .map_err(|error| CollectionRealizationError::storage("read downward coverage", error))?;
-    let (mut members, unattested) = coverage.union_over(
-        target.handle(),
-        records.iter().copied().map(super::coverage::produced),
-    );
-    // A record the fold has no row for is certified from what it named,
-    // minus the admission of everything beneath it -- see
-    // `structural_certificate`. Unknown stays unknown, and is reported.
-    let mut incomplete = Vec::new();
-    for record in records
-        .iter()
-        .filter(|record| unattested.contains(&super::coverage::produced(**record)))
-    {
-        match structural_certificate(snapshot, &lineage, *record)? {
-            Some(certificate) => members.union(certificate),
-            None => incomplete.push(record.fingerprint()),
-        }
-    }
-    if incomplete.is_empty() {
-        Ok(Support::from_patch(lineage.foundation, members))
-    } else {
-        // Name the records, not the payloads: a caller repairing this needs
-        // to know which endorsements it is missing evidence for.
-        Err(CollectionRealizationError::IncompleteSupport {
-            records: incomplete,
-        })
-    }
-}
-
 /// Ensure one immediate mapping for invariant foundational support.
 ///
 /// Existing equations throughout the ancestry are reused, but new work only
@@ -832,13 +460,14 @@ where
         .map(|bytes| bytes.is_some())
 }
 
-/// Acquire the reusable authority definitions for an explicitly selected
-/// lineage. Records and proofs stay frozen; only byte availability advances.
-/// No member payload is followed until its producer has been admitted.
+/// Acquire the reusable authority definitions for a target and its immediate
+/// source: descriptors, policy definitions, and the definitions the proofs
+/// admitting their roots reference. This is acquisition, not an operation:
+/// it reads fresh snapshots and publishes nothing. No member payload is
+/// followed until its producer has been admitted.
 pub(crate) async fn acquire_authority<S, E>(
     store: &mut S,
     target: Collection<E>,
-    frontier: &OperationFrontier<S::Snapshot>,
 ) -> Result<(), CollectionRealizationError>
 where
     S: Store + AsyncBlobStoreAcquire,
@@ -846,9 +475,9 @@ where
 {
     let mut attempted = BTreeSet::new();
     loop {
-        let snapshot = frontier.view(store.snapshot().map_err(|error| {
+        let snapshot = store.snapshot().map_err(|error| {
             CollectionRealizationError::storage("observe authority definitions", error)
-        })?);
+        })?;
         let lineage = match load_lineage(&snapshot, target) {
             Ok(lineage) => lineage,
             Err(CollectionRealizationError::MissingDependency { member }) => {
@@ -904,21 +533,21 @@ where
     }
 }
 
-/// Make one explicit root support readable, without needing provenance records
-/// or publishing equations. Existing resident MERGEs may already cover it.
-pub(crate) async fn ensure_root_in_frontier<S>(
+/// Make a root stand on every admitted commit, acquiring what is missing.
+/// This publishes nothing, so it needs no operation: every look is a fresh
+/// snapshot, and a commit admitted while it runs is simply seen.
+pub(crate) async fn ensure_root<S>(
     store: &mut S,
     target: Collection<SimpleArchive>,
-    frontier: &OperationFrontier<S::Snapshot>,
 ) -> Result<(), CollectionRealizationError>
 where
     S: Store + AsyncBlobStoreAcquire,
 {
     let mut attempted = BTreeSet::new();
     loop {
-        let snapshot = frontier.view(store.snapshot().map_err(|error| {
+        let snapshot = store.snapshot().map_err(|error| {
             CollectionRealizationError::storage("observe root realization", error)
-        })?);
+        })?;
         let result = super::maintenance::root_acquisitions(&snapshot, target);
         drop(snapshot);
         let missing = match result {
@@ -932,85 +561,103 @@ where
             let _ = acquire_missing(store, &mut attempted, member).await?;
         }
         if attempted.len() == previous_attempts {
-            let snapshot = frontier.view(store.snapshot().map_err(|error| {
+            let snapshot = store.snapshot().map_err(|error| {
                 CollectionRealizationError::storage("observe incomplete root realization", error)
-            })?);
+            })?;
             return super::maintenance::root_incomplete(&snapshot, target);
         }
     }
 }
 
-/// A resident target endorsement is sufficient for reuse. Binding still checks
-/// the requested encoding, mapping, and support foundation, but no immediate-
-/// source producer or capability definition is needed until new work remains.
+/// A current target is reused as it is. Binding still checks the encoding
+/// and the mapping, but no immediate-source producer or capability
+/// definition is needed until new work remains.
 async fn prepare_mapping<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
-    frontier: &OperationFrontier<S::Snapshot>,
 ) -> Result<bool, CollectionRealizationError>
 where
     S: Store + AsyncBlobStoreAcquire,
     M: CollectionMapping,
 {
-    let resident = {
-        let snapshot = frontier.view(store.snapshot().map_err(|error| {
+    let current = {
+        let snapshot = store.snapshot().map_err(|error| {
             CollectionRealizationError::storage("observe target before acquisition", error)
-        })?);
+        })?;
         match super::maintenance::images_current::<_, M>(&snapshot, target) {
-            Ok(exact) => exact,
+            Ok(current) => current,
             // A missing descriptor can still be acquired through the ordinary
             // active path. Semantic/type/mapping errors must not become misses.
             Err(CollectionRealizationError::MissingDependency { .. }) => false,
             Err(error) => return Err(error),
         }
     };
-    if !resident {
-        acquire_authority(store, target, frontier).await?;
+    if !current {
+        acquire_authority(store, target).await?;
     }
-    Ok(resident)
+    Ok(current)
 }
 
-pub(crate) async fn ensure_in_frontier_with<S, M>(
+/// Run one operation against a fresh control snapshot, acquiring what it
+/// names as missing and running it again from a fresh snapshot after every
+/// acquisition. An operation never sees bytes, records, or proofs that
+/// arrived while it ran; the next one sees all of them, which is what makes
+/// an acquired definition or descriptor count without re-deciding anything
+/// inside the operation that asked for it.
+async fn acquiring<S, F>(store: &mut S, mut operation: F) -> Result<(), CollectionRealizationError>
+where
+    S: Store + AsyncBlobStoreAcquire,
+    F: FnMut(
+        &mut S,
+        &BTreeSet<CollectionData>,
+        &mut OperationFrontier<S::Snapshot>,
+    ) -> Result<(), CollectionRealizationError>,
+{
+    let mut attempted = BTreeSet::new();
+    let mut unavailable = BTreeSet::new();
+    loop {
+        let missing = {
+            let mut frontier = OperationFrontier::new(store.snapshot().map_err(|error| {
+                CollectionRealizationError::storage("freeze operation control snapshot", error)
+            })?);
+            match operation(store, &unavailable, &mut frontier) {
+                Err(CollectionRealizationError::MissingDependency { member }) => member,
+                result => return result,
+            }
+        };
+        // The operation is over and its control snapshot released before
+        // anything is fetched: acquisition holds no view of the store.
+        if attempted.contains(&missing) {
+            return Err(CollectionRealizationError::MissingDependency { member: missing });
+        }
+        if !acquire_missing(store, &mut attempted, missing).await? {
+            unavailable.insert(missing);
+        }
+    }
+}
+
+pub(crate) async fn ensure_acquiring_with<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
     signing_key: &SigningKey,
-    frontier: &mut OperationFrontier<S::Snapshot>,
 ) -> Result<(), CollectionRealizationError>
 where
     S: Store + AsyncBlobStoreAcquire,
     M: CollectionMapping,
 {
-    if prepare_mapping::<S, M>(store, target, frontier).await? {
+    if prepare_mapping::<S, M>(store, target).await? {
         return Ok(());
     }
-    let mut attempted = BTreeSet::new();
-    let mut unavailable = BTreeSet::new();
-    loop {
-        match ensure_resident_in_frontier_with::<S, M>(
-            store,
-            target,
-            signing_key,
-            &unavailable,
-            frontier,
-        ) {
-            Err(CollectionRealizationError::MissingDependency { member }) => {
-                if attempted.contains(&member) {
-                    return Err(CollectionRealizationError::MissingDependency { member });
-                }
-                if !acquire_missing(store, &mut attempted, member).await? {
-                    unavailable.insert(member);
-                }
-            }
-            result => return result,
-        }
-    }
+    acquiring(store, |store, unavailable, frontier| {
+        ensure_resident_in_frontier_with::<S, M>(store, target, signing_key, unavailable, frontier)
+    })
+    .await
 }
 
-pub(crate) async fn maintain_in_frontier_with<S, M>(
+pub(crate) async fn maintain_acquiring_with<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
     signing_key: &SigningKey,
-    frontier: &mut OperationFrontier<S::Snapshot>,
 ) -> Result<(), CollectionRealizationError>
 where
     S: Store + AsyncBlobStoreAcquire,
@@ -1018,28 +665,11 @@ where
 {
     // Warm maintenance may still coarsen the target, but source-guided
     // opportunities are optional and must use only already resident evidence.
-    prepare_mapping::<S, M>(store, target, frontier).await?;
-    let mut attempted = BTreeSet::new();
-    let mut unavailable = BTreeSet::new();
-    loop {
-        match maintain_resident_in_frontier_with::<S, M>(
-            store,
-            target,
-            signing_key,
-            &unavailable,
-            frontier,
-        ) {
-            Err(CollectionRealizationError::MissingDependency { member }) => {
-                if attempted.contains(&member) {
-                    return Err(CollectionRealizationError::MissingDependency { member });
-                }
-                if !acquire_missing(store, &mut attempted, member).await? {
-                    unavailable.insert(member);
-                }
-            }
-            result => return result,
-        }
-    }
+    prepare_mapping::<S, M>(store, target).await?;
+    acquiring(store, |store, unavailable, frontier| {
+        maintain_resident_in_frontier_with::<S, M>(store, target, signing_key, unavailable, frontier)
+    })
+    .await
 }
 
 pub(super) fn data_identity<E: CollectionEncoding>(blob: &Blob<E>) -> CollectionData {

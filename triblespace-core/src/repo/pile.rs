@@ -5759,8 +5759,8 @@ mod tests {
     };
     use crate::collection::descriptor::named_for_tests;
     use crate::collection::{
-        empty_metadata_handle, AdmissionPolicy, Collection, CollectionData, CollectionHandle,
-        CollectionPolicy, CollectionStoreExt, Cover,
+        empty_metadata_handle, AdmissionPolicy, Collection, CollectionCommit, CollectionData,
+        CollectionHandle, CollectionPolicy, CollectionSnapshotExt, CollectionStoreExt, Cover,
     };
     use crate::macros::entity;
     use crate::repo::yard::{Yard, YardCollectError, YardConfig, YardReclaimError};
@@ -9576,7 +9576,7 @@ mod tests {
     }
 
     #[test]
-    fn cover_availability_does_not_validate_a_cold_simplearchive_root() {
+    fn attaching_a_cold_simplearchive_root_does_not_validate_it_but_viewing_does() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "cold-cover-availability.pile");
         let mut pile = Pile::open(&path).unwrap();
@@ -9589,27 +9589,37 @@ mod tests {
         );
 
         let collection = register_simplearchive_collection(&mut pile, "cold-cover-availability");
-        let cover = Cover::from_members(collection, [handle]);
+        pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
+            &SigningKey::from_bytes(&[0xAA; 32]),
+            collection.handle(),
+            Handle::<SimpleArchive>::to_hash(handle),
+            empty_metadata_handle(),
+        )))
+        .unwrap();
         let snapshot = pile.snapshot().unwrap();
-        assert_eq!(cover.available(&snapshot).unwrap(), cover);
+        // Residency is an occurrence in the index, so attaching the cover
+        // validates no byte; reading the value is what does.
+        let attached = snapshot.collection(collection).unwrap();
+        assert_eq!(attached.cover(), &Cover::from_members(collection, [handle]));
         assert_eq!(
             blob_occurrence_validation(&pile.blobs, &handle.raw, occurrence).cached(),
             None,
         );
 
-        let materialized = cover.materialize::<TribleSet, _>(&snapshot).unwrap();
-        assert!(materialized.is_empty());
+        let viewed: TribleSet = attached.view().unwrap();
+        assert!(viewed.is_empty());
         assert_eq!(
             blob_occurrence_validation(&pile.blobs, &handle.raw, occurrence).cached(),
             Some(ValidationState::Validated),
         );
 
+        drop(attached);
         drop(snapshot);
         pile.close().unwrap();
     }
 
     #[test]
-    fn structural_cover_availability_does_not_bypass_materialize_validation() {
+    fn attaching_a_corrupt_root_does_not_bypass_view_validation() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "corrupt-cover-availability.pile");
         let expected = Blob::<SimpleArchive>::new(Bytes::from_source(Vec::<u8>::new()));
@@ -9618,68 +9628,28 @@ mod tests {
 
         let mut pile = Pile::open(&path).unwrap();
         let collection = register_simplearchive_collection(&mut pile, "corrupt-cover-availability");
-        let cover = Cover::from_members(collection, [handle]);
+        pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
+            &SigningKey::from_bytes(&[0xAA; 32]),
+            collection.handle(),
+            Handle::<SimpleArchive>::to_hash(handle),
+            empty_metadata_handle(),
+        )))
+        .unwrap();
         let snapshot = pile.snapshot().unwrap();
         let occurrence = first_blob_occurrence(&snapshot.blobs, &handle.raw).unwrap();
-        assert_eq!(cover.available(&snapshot).unwrap(), cover);
+        let attached = snapshot.collection(collection).unwrap();
+        assert_eq!(attached.cover(), &Cover::from_members(collection, [handle]));
         assert_eq!(
             blob_occurrence_validation(&snapshot.blobs, &handle.raw, occurrence).cached(),
             None,
         );
-        assert!(cover.materialize::<TribleSet, _>(&snapshot).is_err());
+        assert!(attached.view::<TribleSet>().is_err());
         assert_eq!(
             blob_occurrence_validation(&snapshot.blobs, &handle.raw, occurrence).cached(),
             Some(ValidationState::Invalid),
         );
 
-        drop(snapshot);
-        pile.close().unwrap();
-    }
-
-    #[test]
-    fn corrupt_compacted_root_does_not_shadow_valid_finer_materialization() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = fresh_empty_pile_path(&dir, "corrupt-compacted-cover.pile");
-        let a_facts: TribleSet = entity! {
-            crate::metadata::tag: collection_test_id(92)
-        }
-        .into();
-        let b_facts: TribleSet = entity! {
-            crate::metadata::tag: collection_test_id(93)
-        }
-        .into();
-        let expected = a_facts.clone() + b_facts.clone();
-        let a = a_facts.to_blob();
-        let b = b_facts.to_blob();
-        let c = expected.clone().to_blob();
-        let a_handle = a.get_handle();
-        let b_handle = b.get_handle();
-        let c_handle = c.get_handle();
-
-        let mut pile = Pile::open(&path).unwrap();
-        let collection = register_simplearchive_collection(&mut pile, "corrupt-compacted-cover");
-        pile.put::<SimpleArchive, _>(a).unwrap();
-        pile.put::<SimpleArchive, _>(b).unwrap();
-        pile.insert(CollectionRecord::Merge(CollectionMerge::sign(
-            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-            collection.handle(),
-            Handle::<SimpleArchive>::to_hash(a_handle),
-            Handle::<SimpleArchive>::to_hash(b_handle),
-            Handle::<SimpleArchive>::to_hash(c_handle),
-        )))
-        .unwrap();
-        pile.close().unwrap();
-
-        append_v3_blob_candidate(&path, c_handle.into(), b"corrupt compacted archive", 3);
-        let mut pile = Pile::open(&path).unwrap();
-        let cover = Cover::from_members(collection, [a_handle, b_handle]);
-        let snapshot = pile.snapshot().unwrap();
-        assert_eq!(cover.available(&snapshot).unwrap(), cover);
-        assert_eq!(
-            cover.materialize::<TribleSet, _>(&snapshot).unwrap(),
-            expected,
-        );
-
+        drop(attached);
         drop(snapshot);
         pile.close().unwrap();
     }

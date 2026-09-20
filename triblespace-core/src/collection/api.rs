@@ -24,36 +24,25 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::Blob;
 use crate::capability::{
-    capability_quorum_authorized_subjects, capability_quorum_authorizes, CapabilityHandle,
-    CapabilityProof, CapabilityRequest, CapabilityResource,
+    capability_quorum_authorized_subjects, capability_quorum_decide, CapabilityHandle,
+    CapabilityProof, CapabilityRequest, CapabilityResource, QuorumOutcome,
 };
 use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
 use crate::patch::{Blake3Merkle, IdentitySchema, PATCH};
 use crate::repo::async_store::AsyncBlobStoreAcquire;
-use crate::repo::{BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut, CapabilityProofRead};
+use crate::repo::{BlobStoreGet, BlobStorePut, CapabilityProofRead};
 use crate::repo::{CapabilityProofStore, SnapshotSource, Store, StoreRead, StoreSnapshot};
 use crate::trible::{Fragment, TribleSet};
 
-use super::discovery::{
-    discover_collection_claims_for_cover, discover_collection_equations_for_cover,
-};
-use super::encoding::{
-    collection_member_availability, collection_member_structural_availability,
-    CollectionMemberAvailability,
-};
 use super::exact_derived::CollectionRealizationError;
 use super::operation_snapshot::OperationFrontier;
-use super::simplearchive_union::{FactViewError, PreparedCollectionCommit};
+use super::simplearchive_union::PreparedCollectionCommit;
 use super::{
-    collection_complete_physical_cover, descriptor, discover_collection_records_authorized,
-    read_capability, resolve_collection_semantics_from_roots, write_capability, Collection,
-    CollectionClaimValidation, CollectionCommit, CollectionData, CollectionDiscoveryError,
-    CollectionEncoding, CollectionFunctionalConflict, CollectionHandle, CollectionOperationError,
-    CollectionRead, CollectionResolutionError, CollectionSemantics, CollectionSnapshot,
-    CollectionStore, CollectionTypeError, CollectionValidationRequest, DiscoveredCollectionRecords,
-    RecordDecodeError, TryFromCover, TryFromCoverError,
+    descriptor, read_capability, write_capability, Collection, CollectionCommit, CollectionData,
+    CollectionEncoding, CollectionHandle, CollectionSnapshot, CollectionStore,
+    CollectionTypeError, RecordDecodeError, TryFromCover, TryFromCoverError,
 };
 use super::{
     AdmissionPolicy, CanonicalDerivation, CollectionDerivation, CollectionMapping, CollectionPolicy,
@@ -450,10 +439,6 @@ impl<L: CollectionEncoding> Cover<L> {
             .map(|member| Inline::new(*member))
     }
 
-    pub(crate) fn contains_data(&self, member: CollectionData) -> bool {
-        self.members.get(&member.raw).is_some()
-    }
-
     /// Number of distinct collection members.
     pub fn len(&self) -> usize {
         self.members.len().min(usize::MAX as u64) as usize
@@ -595,59 +580,6 @@ impl fmt::Display for CoverAlgebraError {
 
 impl Error for CoverAlgebraError {}
 
-/// Failure to determine the greatest resident subset of a semantic cover.
-///
-/// An absent or representation-incomplete blob is ordinary unavailability,
-/// not an error. These variants mean the immutable snapshot itself could not
-/// be observed coherently or its stored equations were contradictory.
-#[derive(Debug)]
-pub enum CoverAvailabilityError<RecordsError, ResidencyError> {
-    /// Native collection-record discovery did not complete.
-    Discovery(CollectionDiscoveryError<RecordsError>),
-    /// Blob residency could not be observed for one semantic member.
-    Residency {
-        /// Exact member whose residency was being inspected.
-        member: CollectionData,
-        /// Backend residency-observation failure.
-        source: ResidencyError,
-    },
-    /// Stored equations contradicted operation functionality.
-    ResolutionConflict(Box<CollectionFunctionalConflict>),
-}
-
-impl<RecordsError, ResidencyError> fmt::Display
-    for CoverAvailabilityError<RecordsError, ResidencyError>
-where
-    RecordsError: fmt::Display,
-    ResidencyError: fmt::Display,
-{
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Discovery(source) => source.fmt(formatter),
-            Self::Residency { member, source } => write!(
-                formatter,
-                "failed to inspect residency of collection member {}: {source}",
-                hex::encode_upper(member.raw),
-            ),
-            Self::ResolutionConflict(source) => source.fmt(formatter),
-        }
-    }
-}
-
-impl<RecordsError, ResidencyError> Error for CoverAvailabilityError<RecordsError, ResidencyError>
-where
-    RecordsError: Error + 'static,
-    ResidencyError: Error + 'static,
-{
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Discovery(source) => Some(source),
-            Self::Residency { source, .. } => Some(source),
-            Self::ResolutionConflict(source) => Some(source),
-        }
-    }
-}
-
 /// Failure to treat two covers as one additions-only continuation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CoverAdvanceError {
@@ -684,49 +616,6 @@ impl fmt::Display for CoverAdvanceError {
 }
 
 impl Error for CoverAdvanceError {}
-
-/// Failure to discover one exact admitted payload cover.
-#[derive(Debug)]
-pub enum CollectionCoverError<RecordsError, ProofsError, GetError> {
-    /// The collection descriptor was unavailable or malformed.
-    Descriptor(CollectionDescriptorError<GetError>),
-    /// The resident capability-proof observation could not be completed.
-    Evidence(CollectionEvidenceDiscoveryError<ProofsError>),
-    /// Target collection-record discovery did not complete.
-    Discovery(CollectionDiscoveryError<RecordsError>),
-}
-
-impl<RecordsError, ProofsError, GetError> fmt::Display
-    for CollectionCoverError<RecordsError, ProofsError, GetError>
-where
-    RecordsError: fmt::Display,
-    ProofsError: fmt::Display,
-    GetError: fmt::Display,
-{
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Descriptor(source) => source.fmt(formatter),
-            Self::Evidence(source) => source.fmt(formatter),
-            Self::Discovery(source) => source.fmt(formatter),
-        }
-    }
-}
-
-impl<RecordsError, ProofsError, GetError> Error
-    for CollectionCoverError<RecordsError, ProofsError, GetError>
-where
-    RecordsError: Error + 'static,
-    ProofsError: Error + 'static,
-    GetError: Error + 'static,
-{
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Descriptor(source) => Some(source),
-            Self::Evidence(source) => Some(source),
-            Self::Discovery(source) => Some(source),
-        }
-    }
-}
 
 /// Failure to publish one collection element into local storage.
 #[derive(Debug)]
@@ -767,211 +656,36 @@ where
     }
 }
 
-/// Failure to materialize the complete value named by an opaque cover.
-///
-/// Signatures and metadata remain queryable provenance rather than becoming
-/// coordinates of the payload lattice. Stored equations are materialized LSM
-/// work: resolution follows them without replaying their algebra. Missing
-/// bytes remain an ordinary physical-cover miss, and the eventual typed view
-/// owns decoding of the selected members.
+/// Failure to read one logical value through a snapshot.
 #[derive(Debug)]
-pub enum CollectionMaterializationError<
-    RecordsError,
-    GetError,
-    ViewError,
-    EvidenceError = Infallible,
-> {
-    /// The snapshot could not resolve a collection realization.
+pub enum CollectionReadError<GetError, ViewError> {
+    /// The snapshot could not attach the collection.
     Realization(CollectionRealizationError),
-    /// Resident admission evidence could not be observed.
-    Evidence(EvidenceError),
-    /// Native collection-record discovery did not complete.
-    Discovery(CollectionDiscoveryError<RecordsError>),
-    /// The cover's canonical descriptor blob could not be fetched.
-    DescriptorGet {
-        /// Canonical collection-descriptor handle.
-        collection: CollectionHandle,
-        /// Backend fetch failure.
-        source: GetError,
-    },
-    /// The fetched descriptor bytes were not the exact canonical descriptor
-    /// archive named by the collection handle.
-    InvalidDescriptor {
-        /// Canonical collection-descriptor handle.
-        collection: CollectionHandle,
-        /// Structural descriptor decoding failure.
-        source: RecordDecodeError,
-    },
-    /// A cover member's data blob could not be fetched.
-    MemberGet {
-        /// Exact payload identity.
-        member: CollectionData,
-        /// Backend fetch failure.
-        source: GetError,
-    },
-    /// One resident optional materialization could not expose its immutable
-    /// representation closure and no valid alternate cover was available.
-    InvalidMember {
-        /// Exact payload identity of the unusable materialization.
-        member: CollectionData,
-        /// Encoding-specific availability failure.
-        source: CollectionOperationError,
-    },
-    /// Stored equations contradicted operation functionality.
-    ResolutionConflict(Box<CollectionFunctionalConflict>),
-    /// No resident physical cover spans every semantic obligation.
-    Missing {
-        /// Requested semantic members lacking a complete resident realization.
-        obligations: BTreeSet<CollectionData>,
-        /// Named immutable representation dependencies which would make an
-        /// otherwise useful resident member complete.
-        dependencies: BTreeSet<CollectionData>,
-    },
-    /// The selected physical cover could not form the requested logical view.
-    View(ViewError),
+    /// The attached cover could not form the requested logical view.
+    View(TryFromCoverError<GetError, ViewError>),
 }
 
-/// Materialization failure for the canonical SimpleArchive fact view.
-pub type FactMaterializationError<RecordsError, GetError> =
-    CollectionMaterializationError<RecordsError, GetError, FactViewError>;
-
-/// Read failure including typed discovery of resident authorization evidence.
-pub type CollectionReadError<RecordsError, ProofsError, GetError, ViewError> =
-    CollectionMaterializationError<
-        RecordsError,
-        GetError,
-        ViewError,
-        CollectionEvidenceDiscoveryError<ProofsError>,
-    >;
-
-impl<RecordsError, ProofsError, GetError, ViewError>
-    From<CollectionCoverError<RecordsError, ProofsError, GetError>>
-    for CollectionReadError<RecordsError, ProofsError, GetError, ViewError>
-{
-    fn from(source: CollectionCoverError<RecordsError, ProofsError, GetError>) -> Self {
-        match source {
-            CollectionCoverError::Descriptor(CollectionDescriptorError::Get {
-                collection,
-                source,
-            }) => Self::DescriptorGet { collection, source },
-            CollectionCoverError::Descriptor(CollectionDescriptorError::Invalid {
-                collection,
-                source,
-            }) => Self::InvalidDescriptor { collection, source },
-            CollectionCoverError::Evidence(source) => Self::Evidence(source),
-            CollectionCoverError::Discovery(source) => Self::Discovery(source),
-        }
-    }
-}
-
-impl<RecordsError, GetError, ViewError, EvidenceError> From<CollectionDescriptorError<GetError>>
-    for CollectionMaterializationError<RecordsError, GetError, ViewError, EvidenceError>
-{
-    fn from(source: CollectionDescriptorError<GetError>) -> Self {
-        match source {
-            CollectionDescriptorError::Get { collection, source } => {
-                Self::DescriptorGet { collection, source }
-            }
-            CollectionDescriptorError::Invalid { collection, source } => {
-                Self::InvalidDescriptor { collection, source }
-            }
-        }
-    }
-}
-
-impl<RecordsError, GetError, ViewError, EvidenceError> From<TryFromCoverError<GetError, ViewError>>
-    for CollectionMaterializationError<RecordsError, GetError, ViewError, EvidenceError>
-{
-    fn from(source: TryFromCoverError<GetError, ViewError>) -> Self {
-        match source {
-            TryFromCoverError::DescriptorGet { collection, source } => {
-                Self::DescriptorGet { collection, source }
-            }
-            TryFromCoverError::InvalidDescriptor { collection, source } => {
-                Self::InvalidDescriptor { collection, source }
-            }
-            TryFromCoverError::MemberGet { member, source } => Self::MemberGet { member, source },
-            TryFromCoverError::View(source) => Self::View(source),
-        }
-    }
-}
-
-impl<RecordsError, GetError, ViewError, EvidenceError> fmt::Display
-    for CollectionMaterializationError<RecordsError, GetError, ViewError, EvidenceError>
+impl<GetError, ViewError> fmt::Display for CollectionReadError<GetError, ViewError>
 where
-    RecordsError: fmt::Display,
     GetError: fmt::Display,
     ViewError: fmt::Display,
-    EvidenceError: fmt::Display,
 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Realization(source) => source.fmt(f),
-            Self::Evidence(source) => source.fmt(f),
-            Self::Discovery(source) => source.fmt(f),
-            Self::DescriptorGet { collection, source } => write!(
-                f,
-                "failed to fetch collection descriptor {}: {source}",
-                hex::encode_upper(collection.raw),
-            ),
-            Self::InvalidDescriptor { collection, source } => write!(
-                f,
-                "collection descriptor {} is invalid: {source}",
-                hex::encode_upper(collection.raw),
-            ),
-            Self::MemberGet { member, source } => write!(
-                f,
-                "failed to fetch cover member {}: {source}",
-                hex::encode_upper(member.raw),
-            ),
-            Self::InvalidMember { member, source } => write!(
-                f,
-                "resident collection member {} is unusable: {source}",
-                hex::encode_upper(member.raw),
-            ),
-            Self::ResolutionConflict(source) => source.fmt(f),
-            Self::Missing {
-                obligations,
-                dependencies,
-            } => {
-                write!(
-                    f,
-                    "{} requested semantic member(s) have no complete resident realization",
-                    obligations.len(),
-                )?;
-                if !dependencies.is_empty() {
-                    write!(
-                        f,
-                        " ({} representation dependency blob(s) missing)",
-                        dependencies.len(),
-                    )?;
-                }
-                Ok(())
-            }
-            Self::View(source) => source.fmt(f),
+            Self::Realization(source) => source.fmt(formatter),
+            Self::View(source) => source.fmt(formatter),
         }
     }
 }
 
-impl<RecordsError, GetError, ViewError, EvidenceError> Error
-    for CollectionMaterializationError<RecordsError, GetError, ViewError, EvidenceError>
+impl<GetError, ViewError> Error for CollectionReadError<GetError, ViewError>
 where
-    RecordsError: Error + 'static,
     GetError: Error + 'static,
     ViewError: Error + 'static,
-    EvidenceError: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Realization(source) => Some(source),
-            Self::Evidence(source) => Some(source),
-            Self::Discovery(source) => Some(source),
-            Self::DescriptorGet { source, .. } => Some(source),
-            Self::InvalidDescriptor { source, .. } => Some(source),
-            Self::MemberGet { source, .. } => Some(source),
-            Self::InvalidMember { source, .. } => Some(source),
-            Self::ResolutionConflict(source) => Some(source),
-            Self::Missing { .. } => None,
             Self::View(source) => Some(source),
         }
     }
@@ -1015,17 +729,40 @@ pub(crate) enum AdmissionEvidence {
 
 impl AdmissionEvidence {
     pub(crate) fn authorizes<R: BlobStoreGet>(&self, reader: &R, subject: VerifyingKey) -> bool {
+        matches!(self.decide(reader, subject), QuorumOutcome::Met)
+    }
+
+    /// Decide one subject, and say which arrival could change the decision:
+    /// a proof, or the capability definitions a proof for the subject named
+    /// and this reader could not read.
+    pub(crate) fn decide<R: BlobStoreGet>(
+        &self,
+        reader: &R,
+        subject: VerifyingKey,
+    ) -> QuorumOutcome {
         match self {
-            Self::Open => true,
-            Self::Alternatives(alternatives) => alternatives
-                .iter()
-                .any(|evidence| evidence.authorizes(reader, subject)),
+            Self::Open => QuorumOutcome::Met,
+            Self::Alternatives(alternatives) => {
+                let mut undefined = Vec::new();
+                for evidence in alternatives {
+                    match evidence.decide(reader, subject) {
+                        QuorumOutcome::Met => return QuorumOutcome::Met,
+                        QuorumOutcome::Unmet => {}
+                        QuorumOutcome::Undefined(handles) => undefined.extend(handles),
+                    }
+                }
+                if undefined.is_empty() {
+                    QuorumOutcome::Unmet
+                } else {
+                    QuorumOutcome::Undefined(undefined)
+                }
+            }
             Self::Quorum {
                 roots,
                 invoke_threshold,
                 request,
                 proofs,
-            } => capability_quorum_authorizes(
+            } => capability_quorum_decide(
                 reader,
                 proofs.iter(),
                 roots.iter().copied(),
@@ -1123,48 +860,6 @@ where
             })
             .collect(),
     ))
-}
-
-fn discover_admitted_cover<S, L>(
-    snapshot: &S,
-    collection: Collection<L>,
-) -> Result<
-    (Fragment, DiscoveredCollectionRecords, Cover<L>),
-    CollectionCoverError<S::RecordsError, S::ProofsError, S::GetError<Infallible>>,
->
-where
-    S: StoreSnapshot + BlobStoreGet + BlobStoreList + CapabilityProofRead + CollectionRead,
-    L: CollectionEncoding,
-{
-    let loaded = load_collection_descriptor(snapshot, collection.handle())
-        .map_err(CollectionCoverError::Descriptor)?;
-    let evidence = discover_admission_evidence(
-        snapshot,
-        descriptor::admission_policies(
-            snapshot,
-            loaded.fragment.facts(),
-            super::ACTION_WRITE,
-            Some(L::id()),
-        ),
-        super::ACTION_WRITE,
-        collection.handle(),
-    )
-    .map_err(CollectionCoverError::Evidence)?;
-    let mut authorized = BTreeMap::<[u8; 32], bool>::new();
-    let discovered =
-        discover_collection_records_authorized(snapshot, collection.handle(), |subject| {
-            *authorized.entry(subject.raw).or_insert_with(|| {
-                VerifyingKey::from_bytes(&subject.raw)
-                    .map(|subject| evidence.authorizes(snapshot, subject))
-                    .unwrap_or(false)
-            })
-        })
-        .map_err(CollectionCoverError::Discovery)?;
-    let cover = Cover::from_data(
-        collection,
-        discovered.commits().iter().map(CollectionCommit::data),
-    );
-    Ok((loaded.fragment, discovered, cover))
 }
 
 /// Persist one deterministic root-issued READ/Invoke proof for `recipient`.
@@ -1599,23 +1294,20 @@ impl<L: CollectionEncoding> Collection<L> {
         Ok(admitted)
     }
 
-    /// Discover the exact payload cover admitted in this snapshot.
+    /// What this collection stands for in this snapshot, from the coverage
+    /// index.
     ///
-    /// The result is the semantic COMMIT frontier. It deliberately does not
-    /// expose a replaceable physical decomposition. Use [`Cover::available`]
-    /// to inspect resident semantic support or [`Cover::materialize`] to
-    /// construct a logical value through this same snapshot.
-    pub fn admitted<S>(
-        self,
-        snapshot: &S,
-    ) -> Result<
-        Cover<L>,
-        CollectionCoverError<S::RecordsError, S::ProofsError, S::GetError<Infallible>>,
-    >
+    /// For a root these are its admitted COMMIT payloads, resident or not.
+    /// For a derived collection they are what its frontier stands for, the
+    /// same question one lattice up. Nothing is enumerated: the index is
+    /// settled for this one handle and its frontier's supports are unioned.
+    pub fn admitted<S>(self, snapshot: &S) -> Result<Cover<L>, S::RecordsError>
     where
-        S: StoreSnapshot + BlobStoreGet + BlobStoreList + CapabilityProofRead + CollectionRead,
+        S: StoreRead,
     {
-        discover_admitted_cover(snapshot, self).map(|(_, _, cover)| cover)
+        let coverage = snapshot.coverage(&BTreeSet::from([self.handle()]))?;
+        let (support, _) = coverage.frontier_support(self.handle());
+        Ok(Cover::from_patch(self, support))
     }
 
     /// Read one logical value through this snapshot's realized collection.
@@ -1625,99 +1317,16 @@ impl<L: CollectionEncoding> Collection<L> {
     pub fn read<V, S>(
         self,
         snapshot: &S,
-    ) -> Result<
-        V,
-        CollectionReadError<S::RecordsError, S::ProofsError, S::GetError<Infallible>, V::Error>,
-    >
+    ) -> Result<V, CollectionReadError<S::GetError<Infallible>, V::Error>>
     where
         S: StoreRead,
         V: TryFromCover<L>,
     {
         snapshot
             .collection(self)
-            .map_err(CollectionMaterializationError::Realization)?
+            .map_err(CollectionReadError::Realization)?
             .view()
-            .map_err(CollectionMaterializationError::from)
-    }
-}
-
-impl<L: CollectionEncoding> Cover<L> {
-    /// Return the greatest subset with a structurally resident realization.
-    ///
-    /// The result remains in this cover's semantic coordinates. A compacted
-    /// resident member may therefore make several requested members available
-    /// without appearing in the returned value itself. Consequently
-    /// `cover.available(snapshot)? == cover` means a complete representation
-    /// closure is structurally resident in that same immutable snapshot, while
-    /// `cover.difference(&available)?` names its missing semantic support. This
-    /// is not a payload-validation claim: [`Self::materialize`] remains the
-    /// boundary which validates content addresses and decodes the selected
-    /// representation.
-    ///
-    /// This method does not acquire missing content or record demand. An
-    /// encoding may read a structurally resident root to discover its named
-    /// representation dependencies. Network acquisition belongs to a
-    /// store-level workflow which produces a later snapshot.
-    pub fn available<S>(
-        &self,
-        snapshot: &S,
-    ) -> Result<Cover<L>, CoverAvailabilityError<S::RecordsError, S::Err>>
-    where
-        S: StoreRead,
-    {
-        let discovered = if self.is_empty() {
-            DiscoveredCollectionRecords::default()
-        } else {
-            discover_collection_equations_for_cover(snapshot, self)
-                .map_err(CoverAvailabilityError::Discovery)?
-        };
-        let semantics = resolve_cover_semantics(&discovered, self)
-            .map_err(CoverAvailabilityError::ResolutionConflict)?;
-        available_cover_from_semantics(snapshot, &semantics, self)
-    }
-
-    /// Materialize this semantic cover through one immutable snapshot.
-    ///
-    /// Physical LSM decomposition is deliberately private and is recomputed
-    /// from the supplied snapshot for every call. Passing a later or otherwise
-    /// different snapshot which lacks the necessary realization therefore
-    /// reports [`CollectionMaterializationError::Missing`] instead of pairing
-    /// semantic coordinates with stale physical assumptions.
-    pub fn materialize<V, S>(
-        &self,
-        snapshot: &S,
-    ) -> Result<V, CollectionMaterializationError<S::RecordsError, S::GetError<Infallible>, V::Error>>
-    where
-        S: StoreRead,
-        V: TryFromCover<L>,
-    {
-        let descriptor = load_collection_descriptor(snapshot, self.collection().handle())
-            .map_err(CollectionMaterializationError::from)?;
-        let discovered = if self.is_empty() {
-            DiscoveredCollectionRecords::default()
-        } else {
-            discover_collection_equations_for_cover(snapshot, self)
-                .map_err(CollectionMaterializationError::Discovery)?
-        };
-        materialize_cover_from_observation::<S, L, V, Infallible>(
-            snapshot,
-            &descriptor.fragment,
-            discovered,
-            self.clone(),
-        )
-    }
-
-    /// Return every strictly verified provenance COMMIT currently present for
-    /// these payload members in `snapshot`.
-    pub fn commits<S>(
-        &self,
-        snapshot: &S,
-    ) -> Result<Vec<CollectionCommit>, CollectionDiscoveryError<S::RecordsError>>
-    where
-        S: BlobStoreList + CollectionRead,
-    {
-        let discovered = discover_collection_claims_for_cover(snapshot, self)?;
-        Ok(discovered.commits().to_vec())
+            .map_err(CollectionReadError::View)
     }
 }
 
@@ -1842,13 +1451,13 @@ async fn realize_root<S>(
 where
     S: Store + AsyncBlobStoreAcquire,
 {
-    let before = store.snapshot().map_err(|error| {
-        CollectionRealizationError::storage("freeze root collection frontier", error)
-    })?;
-    let mut frontier = OperationFrontier::new(before);
-    super::exact_derived::acquire_authority(store, target, &frontier).await?;
-    super::exact_derived::ensure_root_in_frontier(store, target, &frontier).await?;
+    super::exact_derived::acquire_authority(store, target).await?;
+    super::exact_derived::ensure_root(store, target).await?;
     if compact {
+        let before = store.snapshot().map_err(|error| {
+            CollectionRealizationError::storage("freeze root collection frontier", error)
+        })?;
+        let mut frontier = OperationFrontier::new(before);
         super::maintenance::carry_target(
             store,
             target,
@@ -1956,19 +1565,18 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
 
     /// Ensure the currently available input of one collection.
     ///
-    /// The initial record/proof frontier is frozen once. Exact-H acquisition
-    /// may make those same records semantically
-    /// visible in later blob snapshots; concurrent records never extend this
-    /// operation, and no acquisition emits a durable WANT. A root acquires its
-    /// signed support; a derived collection selects only the admitted support
-    /// already realized by its immediate source and publishes missing
-    /// cross-lattice `DERIVE` work for that support. Missing source artifacts
-    /// remain invisible rather than becoming downstream obligations.
-    /// Newly published equations are signed by `signing_key`; reusing a
-    /// complete realization does not require that key to hold WRITE authority.
-    /// The returned store snapshot
-    /// observes everything published by this work and by any concurrent
-    /// writer before that final observation.
+    /// A root acquires its admitted commits. A derived collection makes its
+    /// frontier stand on what its immediate source's resident frontier stands
+    /// on, publishing the missing `DERIVE` work; a source node whose bytes are
+    /// elsewhere is the root's to fetch, not a downstream obligation. Each
+    /// publishing operation runs against one frozen control snapshot; when it
+    /// names a missing image or descriptor, acquisition ends the operation
+    /// and the retry starts from a fresh snapshot that sees everything that
+    /// arrived, records and proofs included. No acquisition emits a durable
+    /// WANT. Newly published equations are signed by `signing_key`; reusing a
+    /// current realization does not require that key to hold WRITE authority.
+    /// The returned store snapshot observes everything published by this work
+    /// and by any concurrent writer before that final observation.
     fn ensure<'a, T>(
         &'a mut self,
         target: Collection<T>,
@@ -1994,18 +1602,9 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
         Handle<M::Target>: InlineEncoding,
     {
         async move {
-            let before = self.snapshot().map_err(|error| {
-                CollectionRealizationError::storage("freeze pre-ensure frontier", error)
-            })?;
-            let mut frontier = OperationFrontier::new(before);
-            super::exact_derived::acquire_authority(self, target, &frontier).await?;
-            super::exact_derived::ensure_in_frontier_with::<Self, M>(
-                self,
-                target,
-                signing_key,
-                &mut frontier,
-            )
-            .await?;
+            super::exact_derived::acquire_authority(self, target).await?;
+            super::exact_derived::ensure_acquiring_with::<Self, M>(self, target, signing_key)
+                .await?;
             self.snapshot().map_err(|error| {
                 CollectionRealizationError::storage("freeze post-ensure snapshot", error)
             })
@@ -2050,18 +1649,9 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
         Handle<M::Target>: InlineEncoding,
     {
         async move {
-            let before = self.snapshot().map_err(|error| {
-                CollectionRealizationError::storage("freeze pre-maintenance frontier", error)
-            })?;
-            let mut frontier = OperationFrontier::new(before);
-            super::exact_derived::acquire_authority(self, target, &frontier).await?;
-            super::exact_derived::maintain_in_frontier_with::<Self, M>(
-                self,
-                target,
-                signing_key,
-                &mut frontier,
-            )
-            .await?;
+            super::exact_derived::acquire_authority(self, target).await?;
+            super::exact_derived::maintain_acquiring_with::<Self, M>(self, target, signing_key)
+                .await?;
             self.snapshot().map_err(|error| {
                 CollectionRealizationError::storage("freeze post-maintenance snapshot", error)
             })
@@ -2094,241 +1684,6 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
 }
 
 impl<S> CollectionStoreExt for S where S: BlobStorePut + CollectionStore {}
-
-/// Resolve the semantic closure of one already-discovered exact payload cover.
-fn resolve_cover_semantics<L>(
-    discovered: &DiscoveredCollectionRecords,
-    cover: &Cover<L>,
-) -> Result<CollectionSemantics, Box<CollectionFunctionalConflict>>
-where
-    L: CollectionEncoding,
-{
-    let collection = cover.collection().handle();
-    let mut members: BTreeSet<_> = cover.data_members().collect();
-    let mut equations_by_member = BTreeMap::<CollectionData, Vec<_>>::new();
-    for merge in discovered.merges() {
-        if merge.collection() != collection {
-            continue;
-        }
-        let (low, high) = merge.inputs();
-        for member in [low, high, merge.result()] {
-            equations_by_member.entry(member).or_default().push(merge);
-        }
-    }
-    // Each payload enters the worklist once. An equation has three indexed
-    // occurrences, so even a reverse-ordered chain needs at most three visits
-    // per equation instead of repeated whole-collection scans.
-    let mut pending: Vec<_> = members.iter().copied().collect();
-    while let Some(member) = pending.pop() {
-        for merge in equations_by_member.get(&member).into_iter().flatten() {
-            #[cfg(test)]
-            cover_resolution_tests::EQUATION_VISITS.with(|visits| visits.set(visits.get() + 1));
-            let (low, high) = merge.inputs();
-            // A known result licenses its exact decomposition; known inputs
-            // license their join. One input alone never introduces a sibling.
-            if members.contains(&merge.result())
-                || (members.contains(&low) && members.contains(&high))
-            {
-                for next in [low, high, merge.result()] {
-                    if members.insert(next) {
-                        pending.push(next);
-                    }
-                }
-            }
-        }
-    }
-    let equations = DiscoveredCollectionRecords::from_records(
-        discovered.merges().iter().copied().filter_map(|merge| {
-            let (low, high) = merge.inputs();
-            (merge.collection() == collection
-                && members.contains(&low)
-                && members.contains(&high)
-                && members.contains(&merge.result()))
-            .then_some(super::CollectionRecord::Merge(merge))
-        }),
-    );
-    // These are private payload coordinates licensed by the supplied cover
-    // and trusted equations, never inferred COMMIT membership or Support.
-    let explicit_roots = members.into_iter().map(|data| (collection, data)).collect();
-
-    // MERGE records are materialized LSM equations. They are operational
-    // evidence, not algebra which needs to be replayed during a read.
-    let resolution = resolve_collection_semantics_from_roots(
-        &equations,
-        &BTreeMap::new(),
-        &explicit_roots,
-        |request| {
-            Ok::<CollectionClaimValidation<()>, Infallible>(match request {
-                CollectionValidationRequest::Merge { claim }
-                    if claim.collection() == collection =>
-                {
-                    CollectionClaimValidation::Accepted
-                }
-                CollectionValidationRequest::Commit { .. }
-                | CollectionValidationRequest::Merge { .. }
-                | CollectionValidationRequest::Derive { .. } => CollectionClaimValidation::Pending,
-            })
-        },
-    );
-
-    match resolution {
-        Ok(resolution) => Ok(resolution.into_semantics()),
-        Err(CollectionResolutionError::Validation { source, .. }) => match source {},
-        Err(CollectionResolutionError::Conflict(source)) => Err(source),
-    }
-}
-
-/// Project complete resident realizations back into requested coordinates.
-fn available_cover_from_semantics<S, L>(
-    snapshot: &S,
-    semantics: &CollectionSemantics,
-    cover: &Cover<L>,
-) -> Result<Cover<L>, CoverAvailabilityError<S::RecordsError, S::Err>>
-where
-    S: BlobStoreGet + BlobStoreList + BlobStoreMeta + CollectionRead,
-    L: CollectionEncoding,
-{
-    let collection = cover.collection().handle();
-    let mut complete = BTreeSet::new();
-    for member in semantics.members(collection).into_iter().flatten().copied() {
-        match collection_member_structural_availability::<L, _>(member, snapshot) {
-            Ok(CollectionMemberAvailability::Complete) => {
-                complete.insert(member);
-            }
-            Ok(CollectionMemberAvailability::Absent)
-            | Ok(CollectionMemberAvailability::Incomplete)
-            | Ok(CollectionMemberAvailability::Unusable) => {}
-            Err(source) => {
-                return Err(CoverAvailabilityError::Residency { member, source });
-            }
-        }
-    }
-
-    let requested = cover.data_members().collect();
-    let physical = super::resolution::collection_physical_cover_for(
-        semantics, collection, &requested, &complete,
-    );
-    Ok(Cover::from_data(
-        cover.collection(),
-        cover
-            .data_members()
-            .filter(|member| !physical.missing.contains(member)),
-    ))
-}
-
-/// Resolve one already-discovered exact payload cover to a private physical
-/// decomposition.
-///
-/// Stored equations describe support; blob metadata describes residency. This
-/// lookup performs no collection algebra and never reads a payload merely to
-/// prove work which was already materialized. The eventual [`TryFromCover`]
-/// implementation interprets exactly the physical members selected here;
-/// eager views may decode them, while lazy views may retain their shards.
-fn resolve_physical_cover_from_observation<S, L, ViewError, EvidenceError>(
-    snapshot: &S,
-    discovered: DiscoveredCollectionRecords,
-    cover: Cover<L>,
-) -> Result<
-    Cover<L>,
-    CollectionMaterializationError<
-        S::RecordsError,
-        S::GetError<Infallible>,
-        ViewError,
-        EvidenceError,
-    >,
->
-where
-    S: BlobStoreGet + BlobStoreList + BlobStoreMeta + CollectionRead,
-    L: CollectionEncoding,
-{
-    let collection = cover.collection().handle();
-    let reader = snapshot;
-
-    if cover.is_empty() {
-        return Ok(cover);
-    }
-
-    let semantics = resolve_cover_semantics(&discovered, &cover)
-        .map_err(CollectionMaterializationError::ResolutionConflict)?;
-
-    // Equation semantics and blob residency are orthogonal. Select from every
-    // currently complete resident semantic member. Absent roots and incomplete
-    // Merkle closures remain uncovered obligations, allowing the physical
-    // cover algorithm to fall back to finer support-equivalent members. Exact
-    // semantic validation still belongs to the eventual view.
-    let mut resident_roots = BTreeSet::new();
-    for data in semantics.members(collection).into_iter().flatten().copied() {
-        if matches!(reader.metadata(Handle::<L>::from_hash(data)), Ok(Some(_))) {
-            resident_roots.insert(data);
-        }
-    }
-
-    let selected =
-        collection_complete_physical_cover::<L, _>(&semantics, collection, &resident_roots, reader);
-    if selected.physical.missing.is_empty() {
-        return Ok(Cover::from_data(
-            cover.collection(),
-            selected.physical.cover,
-        ));
-    }
-    if let Some((member, source)) = selected.unusable {
-        return Err(CollectionMaterializationError::InvalidMember { member, source });
-    }
-
-    // Report missing support in the caller's semantic coordinates, never in
-    // the private physical frontier selected while searching. Metadata errors
-    // retain the historical materialization behavior of counting as absent;
-    // callers that need the distinction use `available`, which propagates it.
-    let complete = semantics
-        .members(collection)
-        .into_iter()
-        .flatten()
-        .copied()
-        .filter(|member| {
-            matches!(
-                collection_member_availability::<L, _>(*member, reader),
-                Ok(CollectionMemberAvailability::Complete)
-            )
-        })
-        .collect();
-    let requested = cover.data_members().collect();
-    let obligations = super::resolution::collection_physical_cover_for(
-        &semantics, collection, &requested, &complete,
-    )
-    .missing;
-
-    Err(CollectionMaterializationError::Missing {
-        obligations,
-        dependencies: selected.dependencies,
-    })
-}
-
-/// Materialize through the private physical decomposition selected from the
-/// same immutable snapshot.
-fn materialize_cover_from_observation<S, L, V, EvidenceError>(
-    snapshot: &S,
-    descriptor: &Fragment,
-    discovered: DiscoveredCollectionRecords,
-    cover: Cover<L>,
-) -> Result<
-    V,
-    CollectionMaterializationError<
-        S::RecordsError,
-        S::GetError<Infallible>,
-        V::Error,
-        EvidenceError,
-    >,
->
-where
-    S: BlobStoreGet + BlobStoreList + BlobStoreMeta + CollectionRead,
-    L: CollectionEncoding,
-    V: TryFromCover<L>,
-{
-    let physical = resolve_physical_cover_from_observation::<S, L, V::Error, EvidenceError>(
-        snapshot, discovered, cover,
-    )?;
-    V::try_from_cover(&physical, descriptor, snapshot).map_err(CollectionMaterializationError::from)
-}
 
 #[cfg(test)]
 mod grant_tests {
@@ -2593,69 +1948,5 @@ mod grant_tests {
             Err(CollectionGrantError::OpenPolicy { .. })
         ));
         assert_eq!(store.snapshot().unwrap().proofs().unwrap().count(), 1);
-    }
-}
-
-#[cfg(test)]
-mod cover_resolution_tests {
-    use std::cell::Cell;
-
-    use super::*;
-    use crate::collection::{CollectionMerge, CollectionRecord};
-
-    thread_local! {
-        pub(super) static EQUATION_VISITS: Cell<usize> = const { Cell::new(0) };
-    }
-
-    fn data(namespace: u8, index: u32) -> CollectionData {
-        let mut bytes = [0; 32];
-        bytes[0] = namespace;
-        bytes[28..].copy_from_slice(&index.to_be_bytes());
-        Inline::new(bytes)
-    }
-
-    #[test]
-    fn reverse_cover_chain_visits_each_equation_at_most_three_times() {
-        const LENGTH: u32 = 512;
-        let signer = SigningKey::from_bytes(&[17; 32]);
-        let collection = Collection::<SimpleArchive>::from_handle(Inline::new([7; 32]));
-        let mut previous = data(1, 0);
-        let mut records = Vec::new();
-        for index in 1..=LENGTH {
-            let atom = data(1, index);
-            let result = data(2, index);
-            let merge = CollectionMerge::sign(
-                &signer,
-                collection.handle(),
-                atom,
-                previous,
-                result,
-            );
-            previous = result;
-            records.push(CollectionRecord::Merge(merge));
-        }
-        let discovered = DiscoveredCollectionRecords::from_records(records);
-        // Canonical order runs opposite the requested reverse decomposition:
-        // a repeated full scan would unlock only one predecessor per pass.
-        assert_eq!(discovered.merges().first().unwrap().result(), data(2, 1));
-        assert_eq!(discovered.merges().last().unwrap().result(), previous);
-        let cover = Cover::from_data(collection, [previous]);
-        EQUATION_VISITS.with(|visits| visits.set(0));
-
-        let semantics = resolve_cover_semantics(&discovered, &cover).unwrap();
-
-        assert_eq!(
-            semantics.members(collection.handle()).unwrap().len(),
-            2 * LENGTH as usize + 1,
-        );
-        assert_eq!(
-            semantics.frontier(collection.handle()),
-            Some(&BTreeSet::from([previous])),
-        );
-        assert_eq!(
-            EQUATION_VISITS.with(Cell::get),
-            3 * LENGTH as usize,
-            "each equation is visited only for its three newly known payloads",
-        );
     }
 }

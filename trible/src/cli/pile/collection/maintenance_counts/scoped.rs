@@ -530,8 +530,13 @@ fn append_during_frozen_hop_is_not_absorbed_by_end_baseline() {
     let source = fixture.sources[0];
     let signer = fixture.signer.clone();
     let new_value = Id::new([4; 16]).unwrap();
+    // The first route into the source is the current-check maintenance takes
+    // before it begins an operation; a commit landing there is simply part of
+    // the world the operation then freezes. The second route is the
+    // operation's own control snapshot, and that is the frozen hop.
     let hook = Arc::new(SelectionHook {
         collection: source.handle(),
+        skip: std::sync::atomic::AtomicUsize::new(1),
         action: Mutex::new(Some(Box::new(move || {
             arriving_writer
                 .commit(

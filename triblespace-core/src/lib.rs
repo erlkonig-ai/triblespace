@@ -26,7 +26,7 @@ pub mod blob;
 pub mod capability;
 /// Attribute definition and usage metadata.
 pub mod clock;
-/// Typed collection records, storage, publication, discovery, and resolution.
+/// Typed collection records, storage, publication, and coverage.
 pub mod collection;
 /// Export utilities for serialising trible data.
 pub mod export;
