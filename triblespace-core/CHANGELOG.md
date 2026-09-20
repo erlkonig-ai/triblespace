@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Keep each collection's frontier in the coverage index. The fold now tracks,
+  beside every node's support, the nodes no driven MERGE has consumed
+  (`Coverage::frontier`, `Coverage::frontier_support`): a MERGE takes its
+  inputs off and puts its result on, a DERIVE or COMMIT puts its node on
+  unless a driven MERGE already consumes it. A COMMIT written straight into
+  a derived collection attests nothing.
+
+- Attach a target from its frontier. `observation::attach` reads the
+  frontier from the index when the whole lineage is resident and every
+  frontier node's bytes are here, drops a node whose support lies inside a
+  kept one, and takes the union as the support; a missing descriptor, an
+  empty frontier or a node ahead of its bytes still walks the target's own
+  records. Maintenance reads its source through the same attach. The
+  certified read path (`attach_collection`) and the accumulated certified
+  support in `resolve_endorsed_lineage`, one Merkle union per record on
+  every maintenance pass, had no reader left and are gone. Measured on sky,
+  2026-09-20, live 26 GB pile: a compass read that attaches only went from
+  13.5 s to 4.4 s; the same read that maintained took 49 s.
+
 - Remove `uncovered_source_members` and `PatternUnion`, introduced only for
   hybrid editor reads. Indexed readers do not manufacture a source-freshness
   guarantee; maintenance and exact support queries retain their existing APIs.

@@ -7,15 +7,27 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::repo::StoreRead;
+use crate::trible::Fragment;
 
+use super::coverage::CoverageSet;
 use super::encoding::{collection_member_availability, CollectionMemberAvailability};
+use super::exact_derived::Lineage;
+use super::observed_store::ObservedStore;
+use super::store::CoverageRead;
 use super::{
     descriptor, Collection, CollectionData, CollectionEncoding, CollectionHandle, CollectionRead,
     CollectionRealizationError, CollectionRecord, CollectionRecordFingerprint,
-    CollectionRecordSelector, CollectionSnapshot, Cover,
+    CollectionRecordSelector, CollectionSnapshot, Cover, Support,
 };
 
-/// Admit only target producers and select their resident output frontier.
+/// Attach the target's frontier.
+///
+/// The coverage index already says which nodes of the target are maximal and
+/// what each one stands for, so when the target's whole lineage is resident
+/// and every frontier node's bytes are here, a read is a lookup: the frontier,
+/// one support per node, their union. Otherwise -- a descriptor still on its
+/// way, a record ahead of its bytes, nothing admitted yet -- the target's own
+/// records are walked, which knows how to fall back to a node's inputs.
 pub(super) fn attach<R, E>(
     snapshot: &R,
     target: Collection<E>,
@@ -25,18 +37,110 @@ where
     E: CollectionEncoding,
 {
     let observed = super::observed_store::ObservedStore::new(snapshot.clone());
-    let snapshot = &observed;
-    let loaded = super::api::load_collection_descriptor(snapshot, target.handle())
+    let loaded = super::api::load_collection_descriptor(&observed, target.handle())
         .map_err(|error| CollectionRealizationError::storage("read target descriptor", error))?;
     super::encoding::validate_descriptor_type::<E>(&loaded.fragment)
         .map_err(|error| CollectionRealizationError::Resolution(error.to_string()))?;
-    let source = descriptor::source(loaded.fragment.facts())
+    // The lineage probe runs on the untracked reader on purpose. A descriptor
+    // that is still missing sends this read down the record walk, whose cover
+    // does not depend on that descriptor; its later arrival changes the
+    // support a reader may ask for, which is tracked when it is asked for,
+    // and not the cover.
+    if let Ok(lineage) =
+        super::exact_derived::load_record_lineage(observed.inner(), target.handle())
+    {
+        if let Some(attached) = attach_frontier(&observed, target, &lineage)? {
+            return Ok(attached);
+        }
+    }
+    attach_by_records(observed, target, loaded.fragment)
+}
+
+/// The target's frontier from the coverage index, when every node of it is
+/// resident. `None` sends the read to the record walk.
+fn attach_frontier<R, E>(
+    observed: &ObservedStore<R>,
+    target: Collection<E>,
+    lineage: &Lineage,
+) -> Result<Option<CollectionSnapshot<R, E>>, CollectionRealizationError>
+where
+    R: StoreRead,
+    E: CollectionEncoding,
+{
+    let coverage = observed
+        .coverage(&lineage.descriptors.keys().copied().collect())
+        .map_err(|error| CollectionRealizationError::storage("read downward coverage", error))?;
+    let handle = target.handle();
+    let mut candidates = Vec::new();
+    for node in coverage.frontier(handle) {
+        let Some(support) = coverage.of(handle, node) else {
+            return Ok(None);
+        };
+        match collection_member_availability::<E, _>(node, observed).map_err(|error| {
+            CollectionRealizationError::storage("inspect target representation residency", error)
+        })? {
+            CollectionMemberAvailability::Complete => candidates.push((node, support)),
+            // A record ahead of its bytes: the walk falls back to the node's
+            // resident inputs, which the frontier no longer names.
+            _ => return Ok(None),
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    // Widest first, then drop every node whose support lies inside a kept
+    // one: the image of a source node that a coarser image already covers
+    // adds nothing to the view. Ties break on the node, so the cover is a
+    // function of the index and not of iteration order.
+    candidates.sort_by(|left, right| {
+        right
+            .1
+            .len()
+            .cmp(&left.1.len())
+            .then_with(|| left.0.raw.cmp(&right.0.raw))
+    });
+    let mut kept: Vec<CollectionData> = Vec::new();
+    let mut kept_supports: Vec<&CoverageSet> = Vec::new();
+    let mut union = CoverageSet::new();
+    for (node, support) in candidates {
+        if kept_supports
+            .iter()
+            .any(|wider| support.difference(wider).is_empty())
+        {
+            continue;
+        }
+        union.union(support.clone());
+        kept.push(node);
+        kept_supports.push(support);
+    }
+    let support = Support::from_patch(lineage.foundation, union);
+    let cover = Cover::from_data(target, kept);
+    Ok(Some(
+        CollectionSnapshot::new(observed.inner().clone(), support, cover)
+            .with_dependencies(observed.tracker()),
+    ))
+}
+
+/// Admit only target producers and select their resident output frontier
+/// from the target's own records.
+fn attach_by_records<R, E>(
+    observed: ObservedStore<R>,
+    target: Collection<E>,
+    descriptor: Fragment,
+) -> Result<CollectionSnapshot<R, E>, CollectionRealizationError>
+where
+    R: StoreRead,
+    E: CollectionEncoding,
+{
+    let snapshot = &observed;
+    let loaded = descriptor;
+    let source = descriptor::source(loaded.facts())
         .map_err(|error| CollectionRealizationError::Resolution(error.to_string()))?;
     let evidence = super::api::discover_admission_evidence(
         snapshot,
         descriptor::admission_policies(
             snapshot,
-            loaded.fragment.facts(),
+            loaded.facts(),
             super::ACTION_WRITE,
             Some(E::id()),
         ),
@@ -166,7 +270,7 @@ where
     Ok(CollectionSnapshot::from_endorsements(
         observed.inner().clone(),
         cover,
-        loaded.fragment,
+        loaded,
         witnesses,
         observed.tracker(),
     ))

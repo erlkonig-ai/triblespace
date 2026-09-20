@@ -535,3 +535,125 @@ fn folding_a_realistic_lattice_is_cheap_enough_to_do_on_open() {
     probe(100_000, 2);
 }
 
+
+fn frontier(index: &CoverageIndex, collection: CollectionHandle) -> Vec<[u8; 32]> {
+    index
+        .published()
+        .frontier(collection)
+        .map(|node| node.raw)
+        .collect()
+}
+
+#[test]
+fn the_frontier_is_the_set_of_unmerged_nodes() {
+    let mut index = CoverageIndex::new();
+    let c = collection(0);
+    for payload in 1..=4 {
+        index.apply(&commit(1, c, data(payload)), &AdmitEveryRecord);
+    }
+    assert_eq!(
+        frontier(&index, c),
+        vec![[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]]
+    );
+    index.apply(&merge(1, c, data(1), data(2), data(5)), &AdmitEveryRecord);
+    index.apply(&merge(1, c, data(3), data(4), data(6)), &AdmitEveryRecord);
+    assert_eq!(frontier(&index, c), vec![[5u8; 32], [6u8; 32]]);
+    index.apply(&merge(1, c, data(5), data(6), data(7)), &AdmitEveryRecord);
+    assert_eq!(frontier(&index, c), vec![[7u8; 32]]);
+    let (support, unattested) = index.published().frontier_support(c);
+    assert!(unattested.is_empty());
+    assert_eq!(
+        support.iter_ordered().copied().collect::<Vec<_>>(),
+        vec![[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]]
+    );
+}
+
+#[test]
+fn a_merge_arriving_before_its_inputs_settles_on_the_same_frontier() {
+    let mut index = CoverageIndex::new();
+    let c = collection(0);
+    index.apply(&merge(1, c, data(1), data(2), data(5)), &AdmitEveryRecord);
+    assert!(frontier(&index, c).is_empty());
+    index.apply(&commit(1, c, data(1)), &AdmitEveryRecord);
+    // One side of a join that is not driven yet stays attachable on its own.
+    assert_eq!(frontier(&index, c), vec![[1u8; 32]]);
+    index.apply(&commit(1, c, data(2)), &AdmitEveryRecord);
+    assert_eq!(frontier(&index, c), vec![[5u8; 32]]);
+}
+
+#[test]
+fn a_commit_arriving_after_the_merge_that_consumes_it_is_not_put_back() {
+    let mut index = CoverageIndex::new();
+    let c = collection(0);
+    index.apply(&commit(1, c, data(2)), &AdmitEveryRecord);
+    index.apply(&merge(1, c, data(1), data(2), data(5)), &AdmitEveryRecord);
+    index.apply(&commit(1, c, data(1)), &AdmitEveryRecord);
+    assert_eq!(frontier(&index, c), vec![[5u8; 32]]);
+    // Driving the same records again moves nothing.
+    index.apply(&commit(1, c, data(1)), &AdmitEveryRecord);
+    index.apply(&merge(1, c, data(1), data(2), data(5)), &AdmitEveryRecord);
+    assert_eq!(frontier(&index, c), vec![[5u8; 32]]);
+}
+
+#[test]
+fn two_routes_to_one_result_consume_both_routes() {
+    let mut index = CoverageIndex::new();
+    let c = collection(0);
+    for payload in 1..=4 {
+        index.apply(&commit(1, c, data(payload)), &AdmitEveryRecord);
+    }
+    index.apply(&merge(1, c, data(1), data(2), data(5)), &AdmitEveryRecord);
+    // A second route producing the same payload: its support only grows.
+    index.apply(&merge(1, c, data(3), data(4), data(5)), &AdmitEveryRecord);
+    assert_eq!(frontier(&index, c), vec![[5u8; 32]]);
+    assert_eq!(
+        members(&index, c, data(5)),
+        vec![[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]]
+    );
+}
+
+#[test]
+fn a_self_merge_keeps_its_node_on_the_frontier() {
+    let mut index = CoverageIndex::new();
+    let c = collection(0);
+    index.apply(&commit(1, c, data(1)), &AdmitEveryRecord);
+    index.apply(&merge(1, c, data(1), data(1), data(1)), &AdmitEveryRecord);
+    assert_eq!(frontier(&index, c), vec![[1u8; 32]]);
+}
+
+#[test]
+fn images_join_the_target_frontier_and_a_carry_consumes_them() {
+    let source = collection(0);
+    let target = collection(7);
+    let lineages = Lineages([(target, source)].into_iter().collect());
+    let mut index = CoverageIndex::new();
+    index.apply(&commit(1, source, data(1)), &lineages);
+    index.apply(&commit(1, source, data(2)), &lineages);
+    index.apply(&derive(1, target, data(1), data(11)), &lineages);
+    index.apply(&derive(1, target, data(2), data(12)), &lineages);
+    assert_eq!(frontier(&index, target), vec![[11u8; 32], [12u8; 32]]);
+    // The source's frontier is its own: images consume nothing there.
+    assert_eq!(frontier(&index, source), vec![[1u8; 32], [2u8; 32]]);
+    // A carry inside the target consumes the two images.
+    index.apply(&merge(1, target, data(11), data(12), data(13)), &lineages);
+    assert_eq!(frontier(&index, target), vec![[13u8; 32]]);
+    assert_eq!(members(&index, target, data(13)), vec![[1u8; 32], [2u8; 32]]);
+    // A source merge changes the source's frontier, and an image of it lands
+    // on the target's beside the carry that already covers the same commits.
+    index.apply(&merge(1, source, data(1), data(2), data(3)), &lineages);
+    assert_eq!(frontier(&index, source), vec![[3u8; 32]]);
+    index.apply(&derive(1, target, data(3), data(13)), &lineages);
+    assert_eq!(frontier(&index, target), vec![[13u8; 32]]);
+}
+
+#[test]
+fn a_commit_written_into_a_derived_collection_attests_nothing() {
+    let source = collection(0);
+    let target = collection(7);
+    let lineages = Lineages([(target, source)].into_iter().collect());
+    let mut index = CoverageIndex::new();
+    index.apply(&commit(1, target, data(9)), &lineages);
+    assert!(index.coverage(target, data(9)).is_none());
+    assert!(frontier(&index, target).is_empty());
+    assert_eq!(index.parked(), 0);
+}

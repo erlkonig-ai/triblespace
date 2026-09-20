@@ -234,10 +234,10 @@ where
 
 /// Runtime descriptor ancestry from one `SimpleArchive` foundation to a
 /// typed target.
-struct Lineage {
-    foundation: Collection<SimpleArchive>,
-    descriptors: BTreeMap<CollectionHandle, Fragment>,
-    source_by_target: BTreeMap<CollectionHandle, CollectionHandle>,
+pub(super) struct Lineage {
+    pub(super) foundation: Collection<SimpleArchive>,
+    pub(super) descriptors: BTreeMap<CollectionHandle, Fragment>,
+    pub(super) source_by_target: BTreeMap<CollectionHandle, CollectionHandle>,
 }
 
 impl Lineage {
@@ -267,7 +267,7 @@ where
     Ok(lineage)
 }
 
-fn load_record_lineage<R>(
+pub(super) fn load_record_lineage<R>(
     snapshot: &R,
     target: CollectionHandle,
 ) -> Result<Lineage, CollectionRealizationError>
@@ -370,7 +370,11 @@ where
                 "maintenance requires a derived target descriptor".to_owned(),
             )
         })?;
-    let (support, _) = attach_collection(snapshot, Collection::<M::Source>::from_handle(source))?;
+    // The source's resident frontier, read the way any reader reads it: what
+    // the index says is attachable now, and the support that stands on.
+    let attached =
+        super::observation::attach(snapshot, Collection::<M::Source>::from_handle(source))?;
+    let support = attached.support()?.clone();
     Ok(support)
 }
 
@@ -499,9 +503,31 @@ where
 
 struct CertifiedResolution {
     resolution: super::CollectionResolution<()>,
-    support: Support,
     witnesses: InputWitnesses,
     images: BTreeMap<(CollectionHandle, CollectionData), BTreeSet<CollectionData>>,
+}
+
+#[cfg(test)]
+impl CertifiedResolution {
+    /// The support the selected records of one collection certify: the union
+    /// of their witnesses' supports. A read no longer accumulates this; the
+    /// tests of the selection filter still ask for it.
+    fn support_of(
+        &self,
+        foundation: Collection<SimpleArchive>,
+        collection: CollectionHandle,
+    ) -> Support {
+        let mut support = Support::from_data(foundation, []);
+        for ((owner, _), alternatives) in &self.witnesses {
+            if *owner != collection {
+                continue;
+            }
+            for (_, alternative) in alternatives {
+                support = support.union(alternative).expect("one foundation");
+            }
+        }
+        support
+    }
 }
 
 /// Enumerate exact admitted input witnesses for explicit equation imports.
@@ -743,7 +769,6 @@ where
         ));
         Support::from_patch(lineage.foundation, closure)
     });
-    let mut certified = super::coverage::CoverageSet::new();
     let mut roots = BTreeSet::new();
     let mut witnesses = InputWitnesses::new();
     let mut images = BTreeMap::<_, BTreeSet<_>>::new();
@@ -772,7 +797,7 @@ where
                 None => continue,
             },
         };
-        let record_support = Support::from_patch(lineage.foundation, certificate.clone());
+        let record_support = Support::from_patch(lineage.foundation, certificate);
         // Reusing a computed image is independent of which exact support the
         // caller wants to endorse today. Keep this index before that filter.
         if let CollectionRecord::Derive(derive) = record {
@@ -787,7 +812,6 @@ where
         {
             continue;
         }
-        certified.union(certificate);
         roots.insert(record);
     }
     // Support comes from the index now, but the RECORD set still has to be
@@ -820,11 +844,6 @@ where
         alternatives.push((*record, record_support));
     }
     let discovered = super::DiscoveredCollectionRecords::from_records(records);
-    // Exactly what the selected roots certify -- accumulated as they were
-    // selected, so the filter and the answer are the same quantity. Reading
-    // the expanded record set's COMMITs instead let those two diverge: a root
-    // admitted on a narrow certificate could still drag a wider one in.
-    let support = Support::from_patch(lineage.foundation, certified);
     let commits = discovered.commits().iter().copied().collect();
     let resolution =
         resolve_collection_semantics(&discovered, &lineage.source_by_target, &commits, |_| {
@@ -836,7 +855,6 @@ where
     match resolution {
         Ok(resolution) => Ok(CertifiedResolution {
             resolution,
-            support,
             witnesses,
             images,
         }),
@@ -1075,31 +1093,6 @@ where
         return Err(resolved.incomplete_error(requested));
     }
     Ok(resolved)
-}
-
-/// Attach one target collection using its snapshot's proof and definition state.
-///
-/// The target's endorsed records define the search boundary. The result
-/// contains only resident target members and the exact foundational support
-/// their record witnesses establish. A static snapshot promises no future work.
-pub(crate) fn attach_collection<R, E>(
-    snapshot: &R,
-    target: Collection<E>,
-) -> Result<(Support, Cover<E>), CollectionRealizationError>
-where
-    R: StoreRead,
-    E: CollectionEncoding,
-{
-    let lineage = load_lineage(snapshot, target)?;
-    let certified = resolve_endorsed_lineage(
-        snapshot,
-        &lineage,
-        &BTreeSet::from([target.handle()]),
-        None,
-    )?;
-    let represented = certified.support.clone();
-    let resolved = resolve_certified_target(snapshot, target, &lineage, &represented, certified)?;
-    Ok((resolved.support, resolved.cover))
 }
 
 /// Who may WRITE each collection in one lineage.

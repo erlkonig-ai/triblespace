@@ -767,7 +767,8 @@ fn aggregate_support_uses_selected_dag_leaves_without_clipping_certificates() {
         )
         .unwrap();
     assert_eq!(
-        partial.support, a_support,
+        partial.support_of(lineage.foundation, first.handle()),
+        a_support,
         "requested AB is not yet certified",
     );
 
@@ -809,7 +810,10 @@ fn aggregate_support_uses_selected_dag_leaves_without_clipping_certificates() {
             // says. Member-identity comparison used to select nothing here.
             Some(_) => ab_support.clone(),
         };
-        assert_eq!(resolved.support, expected);
+        assert_eq!(
+            resolved.support_of(lineage.foundation, first.handle()),
+            expected
+        );
         // Image reuse remains independent of the requested-support filter.
         assert_eq!(
             resolved.images[&(first.handle(), data(&b))],
@@ -879,7 +883,10 @@ fn aggregate_support_excludes_missing_witnesses_and_unadmitted_producers() {
         None
     )
     .unwrap();
-    assert_eq!(resolved.support, support(root, std::slice::from_ref(&a)));
+    assert_eq!(
+        resolved.support_of(lineage.foundation, first.handle()),
+        support(root, std::slice::from_ref(&a))
+    );
     assert_eq!(resolved.images.len(), 1);
     assert_eq!(
         resolved.images[&(first.handle(), data(&a))],
@@ -895,7 +902,10 @@ fn aggregate_support_excludes_missing_witnesses_and_unadmitted_producers() {
         None
     )
     .unwrap();
-    assert_eq!(resolved.support, support(root, &[a.clone(), b.clone()]));
+    assert_eq!(
+        resolved.support_of(lineage.foundation, first.handle()),
+        support(root, &[a.clone(), b.clone()])
+    );
     assert_eq!(resolved.images.len(), 2);
 
     // Complete coverage is not an excuse to stop scanning: this admitted,
@@ -987,9 +997,9 @@ fn ordinary_attachment_reports_only_support_realized_in_its_snapshot() {
         .unwrap();
 
     let snapshot = store.snapshot().unwrap();
-    let (observed, cover) = attach_collection(&snapshot, first).unwrap();
-    assert_eq!(observed, left_support);
-    assert_eq!(cover.len(), 1);
+    let observed = super::super::observation::attach(&snapshot, first).unwrap();
+    assert_eq!(*observed.support().unwrap(), left_support);
+    assert_eq!(observed.cover().len(), 1);
 }
 
 #[test]

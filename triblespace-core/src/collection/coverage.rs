@@ -23,6 +23,14 @@
 //! nodes are then PATCH union and intersection over shared subtries rather than
 //! per-member work.
 //!
+//! Beside the supports the fold keeps each collection's *frontier*: the nodes
+//! whose support no driven MERGE of that collection has consumed. A MERGE takes
+//! its inputs off and puts its result on; a DERIVE puts its output on the
+//! target's frontier; a COMMIT puts itself on its root's. That is the set a
+//! reader attaches, and it makes a read a lookup: the frontier, one support
+//! per frontier node, and their union. Without it every read re-derived from
+//! the records which nodes are maximal and what they stand for.
+//!
 //! Nothing here is persisted. The index is rebuilt by replaying the records a
 //! store already holds, which is affordable precisely because the fold is a
 //! union.
@@ -71,16 +79,28 @@ use super::records::{CollectionData, CollectionHandle, CollectionRecord};
 /// share subtries instead of copying members.
 pub type CoverageSet = PATCH<32, IdentitySchema, (), Blake3Merkle>;
 
+/// The frontier of one collection: the nodes with a support that no driven
+/// MERGE in that collection has consumed.
+///
+/// A plain key set, not a Merkle one: nothing compares two frontiers by
+/// digest, and a frontier changes on every believed record.
+pub type FrontierSet = PATCH<32, IdentitySchema, ()>;
+
 /// One immutable observation of downward coverage.
 ///
-/// This is the half of [`CoverageIndex`] a reader needs, and it is a single
-/// persistent PATCH root, so publishing it into a snapshot is a constant-time
+/// This is the half of [`CoverageIndex`] a reader needs, and it is two
+/// persistent PATCH roots, so publishing it into a snapshot is a constant-time
 /// clone rather than a copy of the fold's bookkeeping. The builder's consumer
 /// map and backlog exist to keep the index growing incrementally; nothing that
 /// only asks questions has any use for them.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Coverage {
     rows: PATCH<64, IdentitySchema, CoverageSet>,
+    /// Per collection, the nodes a reader attaches: those with a support that
+    /// no driven MERGE of the same collection has consumed. Kept beside the
+    /// supports by the same fold, so a read is a lookup and not a walk over
+    /// the records that produced the lattice.
+    frontiers: PATCH<32, IdentitySchema, FrontierSet>,
 }
 
 /// One row's key: the collection a node belongs to, then the node itself.
@@ -141,6 +161,36 @@ impl Coverage {
             }
         }
         (union, unattested)
+    }
+
+    /// The frontier of one collection: every node with a support that no
+    /// driven MERGE of that collection has consumed, in ascending byte order.
+    ///
+    /// These are the nodes a reader attaches. A MERGE takes its two inputs
+    /// off the frontier and puts its result on; a DERIVE puts its output on
+    /// the target's frontier; a COMMIT puts itself on its root's. Records may
+    /// arrive in any order, so a node is only put on when no MERGE that has
+    /// already been driven consumes it. An image of a source node that a
+    /// coarser image also covers stays on the frontier until a MERGE in the
+    /// target consumes it: the frontier is about consumption, and a reader
+    /// that wants the narrowest cover compares supports.
+    pub fn frontier(
+        &self,
+        collection: CollectionHandle,
+    ) -> impl Iterator<Item = CollectionData> + '_ {
+        self.frontiers
+            .get(&collection.raw)
+            .into_iter()
+            .flat_map(|frontier| frontier.iter_ordered().map(|raw| Inline::new(*raw)))
+    }
+
+    /// The union of what the frontier of one collection covers: the support
+    /// a reader attaching that frontier stands on. Frontier nodes without a
+    /// support cannot exist, so the reported list is always empty; it is
+    /// kept for symmetry with [`Self::union_over`].
+    pub fn frontier_support(&self, collection: CollectionHandle) -> (CoverageSet, Vec<CollectionData>) {
+        let nodes: Vec<_> = self.frontier(collection).collect();
+        self.union_over(collection, nodes)
     }
 
     /// Number of lattice nodes with a coverage row.
@@ -565,7 +615,18 @@ impl CoverageIndex {
                     return;
                 }
             },
-            _ => entry.collection,
+            Attestation::Foundation { .. } => {
+                // A commit is a foundation attestation, which only a root can
+                // make: a derived collection's members are images of its
+                // source's, so a commit written straight into one names no
+                // foundation and attests nothing. A missing descriptor is
+                // decided below, where admission parks it on that blob.
+                if let SourceResolution::Derived(_) = admission.source(entry.collection) {
+                    return;
+                }
+                entry.collection
+            }
+            Attestation::Join { .. } => entry.collection,
         };
         match admission.admits(entry.collection, entry.signer) {
             Admittance::Admitted => {}
@@ -819,16 +880,76 @@ impl CoverageIndex {
             }
         };
         let key = row_key(writes_to, attestation.result());
-        if let Some(existing) = self.published.rows.get(&key) {
-            if contribution.difference(existing).is_empty() {
-                return false;
+        let grew = match self.published.rows.get(&key) {
+            Some(existing) if contribution.difference(existing).is_empty() => false,
+            Some(existing) => {
+                contribution.union(existing.clone());
+                true
             }
-            contribution.union(existing.clone());
+            None => true,
+        };
+        if grew {
+            self.published
+                .rows
+                .replace(&Entry::with_value(&key, contribution));
+        }
+        // The frontier moves whenever the attestation is driven, grown or
+        // not: a second route to a result that already has its support still
+        // consumes that route's inputs.
+        self.advance_frontier(writes_to, attestation);
+        grew
+    }
+
+    /// Move one collection's frontier for an attestation that has just been
+    /// driven: a join takes its inputs off and puts its result on, a
+    /// foundation or an image puts its node on. Idempotent, because a driven
+    /// attestation is driven again whenever one of its inputs grows.
+    fn advance_frontier(&mut self, collection: CollectionHandle, attestation: Attestation) {
+        let mut frontier = self
+            .published
+            .frontiers
+            .get(&collection.raw)
+            .cloned()
+            .unwrap_or_default();
+        let result = attestation.result();
+        if let Attestation::Join { low, high, .. } = attestation {
+            // `MERGE(x, x) -> x` is legal and appears in practice; it must not
+            // take its own result off.
+            for input in [low, high] {
+                if input != result {
+                    frontier.remove(&input.raw);
+                }
+            }
+        }
+        if !self.consumed(collection, result) {
+            frontier.insert(&Entry::new(&result.raw));
         }
         self.published
-            .rows
-            .replace(&Entry::with_value(&key, contribution));
-        true
+            .frontiers
+            .replace(&Entry::with_value(&collection.raw, frontier));
+    }
+
+    /// Whether a driven join of this collection reads this node: one whose
+    /// result and other input both have supports. A join that was only
+    /// registered, its other input still absent, has not consumed anything
+    /// yet; it takes the node off the frontier when it is driven.
+    fn consumed(&self, collection: CollectionHandle, node: CollectionData) -> bool {
+        let Some(edges) = self.consumers.get(&row_key(collection, node)) else {
+            return false;
+        };
+        edges
+            .iter_ordered()
+            .filter_map(|key| edges.get(key))
+            .any(|&(writes_to, _, consumer)| {
+                let Attestation::Join { low, high, result } = consumer else {
+                    return false;
+                };
+                let other = if node == low { high } else { low };
+                writes_to == collection
+                    && result != node
+                    && self.published.rows.get(&row_key(collection, result)).is_some()
+                    && self.published.rows.get(&row_key(collection, other)).is_some()
+            })
     }
 }
 
