@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Update the README example to use the current `Collection::read` API instead
+  of the removed `Cover::materialize` method.
+
 - `trible pile diagnose conflicts <PILE>` lists MERGE and DERIVE equations
   that name two results for one input set, with the keys that signed each
   side, and exits non-zero when any exist. The lattice takes every signed
