@@ -152,8 +152,24 @@ opt-level = 3
 debug = true
 opt-level = 3
 
+# The same arithmetic as `[profile.dev]` above, measured on the shipped daemon
+# 2026-09-21: `trible` at 5ded5c3b was 574.8 MB, of which 498.2 MB was DWARF and
+# 19.3 MB was `.text`. 87% of every release binary was debug info for code nobody
+# attaches a debugger to, and sky was holding 44 such generations at 26 GB.
+#
+# This profile only applies to builds ROOTED here, which is `trible` and this
+# workspace's own tests; `faculties` declares no release override, so its cohort
+# was never carrying this. macOS hid it entirely -- Mach-O leaves DWARF in the
+# .o files unless `dsymutil` runs, so the same settings produced 43 MB there and
+# 574 MB on Linux, which is why file size was a useless fingerprint for what a
+# binary actually contains.
+#
+# `panicked at file.rs:12:3` comes from `#[track_caller]`, not DWARF, so panics
+# keep their location. What goes is file:line inside RUST_BACKTRACE frames and
+# gdb locals. `[profile.bench]` keeps `debug = true` on purpose, because
+# profiling a benchmark needs the symbols.
 [profile.release]
-debug = true
+debug = 0
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(nightly)', 'cfg(kani)'] }
