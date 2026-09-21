@@ -1,4 +1,4 @@
-//! End-to-end migration on a real pile file.
+//! End-to-end collection adoption on a real pile file.
 //!
 //! The unit tests in `triblespace_core::collection::migration` prove the
 //! arithmetic. These prove the thing an operator actually does: a generation is
@@ -70,7 +70,7 @@ impl Cutover {
     /// new one, so the fixture can be a fresh cutover or a half-done one.
     fn new(retired: &[u8], already: &[u8]) -> Self {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("migrate.pile");
+        let path = directory.path().join("adopt.pile");
         std::fs::File::create(&path).unwrap();
         let old_key_file = directory.path().join("old.key");
         let new_key_file = directory.path().join("new.key");
@@ -116,12 +116,12 @@ impl Cutover {
             .unwrap()
     }
 
-    fn migrate(&self, key: &Path, extra: &[&str]) -> Output {
+    fn adopt(&self, key: &Path, extra: &[&str]) -> Output {
         let into = handle_text(self.new.handle());
         let key = key.to_str().unwrap().to_owned();
         let pile = self.path.to_str().unwrap().to_owned();
         let mut args = vec![
-            "migrate",
+            "adopt",
             pile.as_str(),
             "--into",
             into.as_str(),
@@ -133,10 +133,10 @@ impl Cutover {
         self.run(&args)
     }
 
-    fn reconcile(&self, extra: &[&str]) -> Output {
+    fn adopted(&self, extra: &[&str]) -> Output {
         let target = handle_text(self.new.handle());
         let pile = self.path.to_str().unwrap().to_owned();
-        let mut args = vec!["reconcile", pile.as_str(), target.as_str()];
+        let mut args = vec!["adopted", pile.as_str(), target.as_str()];
         args.extend_from_slice(extra);
         self.run(&args)
     }
@@ -172,19 +172,19 @@ fn text(output: &Output) -> String {
 
 /// The whole arc, through the command line.
 #[test]
-fn a_dry_run_prices_the_carry_the_apply_performs_it_and_reconcile_proves_it() {
+fn a_dry_run_prices_the_carry_the_apply_performs_it_and_adopted_proves_it() {
     let fixture = Cutover::new(&[0x11, 0x22, 0x33, 0x44], &[]);
     let before = std::fs::metadata(&fixture.path).unwrap().len();
 
     // Before anything: the completeness check fails, by content, and says so.
-    let check = fixture.reconcile(&[]);
+    let check = fixture.adopted(&[]);
     assert!(!check.status.success(), "{}", text(&check));
     let rendered = text(&check);
     assert!(rendered.contains("4"), "{rendered}");
     assert!(rendered.contains("incomplete"), "{rendered}");
 
     // The dry run is the default: it writes nothing and prices the carry.
-    let dry = fixture.migrate(&fixture.new_key_file, &[]);
+    let dry = fixture.adopt(&fixture.new_key_file, &[]);
     assert!(dry.status.success(), "{}", text(&dry));
     let rendered = text(&dry);
     assert!(
@@ -200,7 +200,7 @@ fn a_dry_run_prices_the_carry_the_apply_performs_it_and_reconcile_proves_it() {
     assert_eq!(fixture.commits(fixture.new.handle()), 0);
 
     // The apply appends exactly what the dry run promised.
-    let applied = fixture.migrate(&fixture.new_key_file, &["--apply"]);
+    let applied = fixture.adopt(&fixture.new_key_file, &["--apply"]);
     assert!(applied.status.success(), "{}", text(&applied));
     let rendered = text(&applied);
     assert!(rendered.contains("appended 4 record(s)"), "{rendered}");
@@ -220,12 +220,12 @@ fn a_dry_run_prices_the_carry_the_apply_performs_it_and_reconcile_proves_it() {
     );
 
     // And now the standalone proof passes.
-    let check = fixture.reconcile(&[]);
+    let check = fixture.adopted(&[]);
     assert!(check.status.success(), "{}", text(&check));
     assert!(text(&check).contains("complete"), "{}", text(&check));
 
     // A second run is free: re-signing is deterministic.
-    let again = fixture.migrate(&fixture.new_key_file, &[]);
+    let again = fixture.adopt(&fixture.new_key_file, &[]);
     assert!(again.status.success(), "{}", text(&again));
     assert!(
         text(&again).contains("records this key would append (NET NEW)     : 0"),
@@ -233,25 +233,25 @@ fn a_dry_run_prices_the_carry_the_apply_performs_it_and_reconcile_proves_it() {
         text(&again)
     );
     let settled = std::fs::metadata(&fixture.path).unwrap().len();
-    let reapplied = fixture.migrate(&fixture.new_key_file, &["--apply"]);
+    let reapplied = fixture.adopt(&fixture.new_key_file, &["--apply"]);
     assert!(reapplied.status.success(), "{}", text(&reapplied));
     assert_eq!(
         std::fs::metadata(&fixture.path).unwrap().len(),
         settled,
-        "an already-applied migration appends no bytes at all"
+        "an already-applied carry appends no bytes at all"
     );
 }
 
-/// The regression test for a migration that quietly left records behind.
+/// The regression test for a carry that quietly left records behind.
 ///
 /// A previous cutover under-delivered by 428 archives and nothing said so. Here
 /// the shortfall is built on purpose — the new generation holds two of four —
-/// and `reconcile` has to fail, name the count, and exit non-zero, standalone,
-/// with no migration in flight.
+/// and `adopted` has to fail, name the count, and exit non-zero, standalone,
+/// with no carry in flight.
 #[test]
-fn reconcile_detects_a_deliberately_incomplete_migration() {
+fn adopted_detects_a_deliberately_incomplete_carry() {
     let fixture = Cutover::new(&[0x11, 0x22, 0x33, 0x44], &[]);
-    // Carry half of it by hand, exactly as an interrupted migration would.
+    // Carry half of it by hand, exactly as an interrupted adoption would.
     {
         let mut pile = Pile::open(&fixture.path).unwrap();
         let new_key =
@@ -262,10 +262,10 @@ fn reconcile_detects_a_deliberately_incomplete_migration() {
         pile.close().unwrap();
     }
 
-    let check = fixture.reconcile(&["--list"]);
+    let check = fixture.adopted(&["--list"]);
     assert!(
         !check.status.success(),
-        "an incomplete migration must not report success: {}",
+        "an incomplete carry must not report success: {}",
         text(&check)
     );
     let rendered = text(&check);
@@ -285,7 +285,7 @@ fn the_wrong_key_is_priced_and_the_inadmissible_one_is_refused() {
     let fixture = Cutover::new(&[0x11, 0x22, 0x33], &[0x11, 0x22, 0x33]);
 
     // The target's own writer has nothing to do: its records are already here.
-    let right = fixture.migrate(&fixture.new_key_file, &[]);
+    let right = fixture.adopt(&fixture.new_key_file, &[]);
     assert!(right.status.success(), "{}", text(&right));
     assert!(
         text(&right).contains("records this key would append (NET NEW)     : 0"),
@@ -295,7 +295,7 @@ fn the_wrong_key_is_priced_and_the_inadmissible_one_is_refused() {
 
     // A stranger re-signs all of it, gains nothing, and is refused outright
     // because the target does not admit it as a writer.
-    let wrong = fixture.migrate(&fixture.stranger_key_file, &[]);
+    let wrong = fixture.adopt(&fixture.stranger_key_file, &[]);
     assert!(
         !wrong.status.success(),
         "an inadmissible signer must be refused: {}",
@@ -330,7 +330,7 @@ fn the_wrong_key_is_priced_and_the_inadmissible_one_is_refused() {
         .unwrap();
         pile.close().unwrap();
     }
-    let granted = fixture.migrate(&fixture.stranger_key_file, &[]);
+    let granted = fixture.adopt(&fixture.stranger_key_file, &[]);
     assert!(granted.status.success(), "{}", text(&granted));
     assert!(
         text(&granted).contains("admitted as a writer on the target: yes"),
@@ -354,7 +354,7 @@ fn unadmitted_content_forces_an_explicit_choice() {
         pile.close().unwrap();
     }
 
-    let undecided = fixture.migrate(&fixture.new_key_file, &["--apply"]);
+    let undecided = fixture.adopt(&fixture.new_key_file, &["--apply"]);
     assert!(
         !undecided.status.success(),
         "neither promoting nor dropping may be the silent default: {}",
@@ -367,7 +367,7 @@ fn unadmitted_content_forces_an_explicit_choice() {
     );
     assert_eq!(fixture.commits(fixture.new.handle()), 0);
 
-    let skipped = fixture.migrate(&fixture.new_key_file, &["--apply", "--skip-unadmitted"]);
+    let skipped = fixture.adopt(&fixture.new_key_file, &["--apply", "--skip-unadmitted"]);
     assert!(skipped.status.success(), "{}", text(&skipped));
     assert_eq!(
         fixture.commits(fixture.new.handle()),
@@ -375,7 +375,7 @@ fn unadmitted_content_forces_an_explicit_choice() {
         "only the admitted"
     );
 
-    let promoted = fixture.migrate(&fixture.new_key_file, &["--apply", "--carry-unadmitted"]);
+    let promoted = fixture.adopt(&fixture.new_key_file, &["--apply", "--carry-unadmitted"]);
     assert!(promoted.status.success(), "{}", text(&promoted));
     assert_eq!(
         fixture.commits(fixture.new.handle()),
@@ -403,7 +403,7 @@ fn a_cross_name_carry_is_refused_unless_it_is_meant() {
     let from = handle_text(compass.handle());
     let key = fixture.new_key_file.to_str().unwrap().to_owned();
     let refused = fixture.run(&[
-        "migrate", &pile, "--into", &into, "--from", &from, "--key", &key,
+        "adopt", &pile, "--into", &into, "--from", &from, "--key", &key,
     ]);
     assert!(!refused.status.success(), "{}", text(&refused));
     assert!(
@@ -413,7 +413,7 @@ fn a_cross_name_carry_is_refused_unless_it_is_meant() {
     );
 
     let allowed = fixture.run(&[
-        "migrate",
+        "adopt",
         &pile,
         "--into",
         &into,
@@ -428,7 +428,7 @@ fn a_cross_name_carry_is_refused_unless_it_is_meant() {
 
 /// A plan file carries many names in one reviewed artifact.
 #[test]
-fn a_plan_file_migrates_several_names_at_once() {
+fn a_plan_file_adopts_several_names_at_once() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("plan.pile");
     std::fs::File::create(&path).unwrap();
@@ -463,7 +463,7 @@ fn a_plan_file_migrates_several_names_at_once() {
 
     let mut command = trible();
     command
-        .args(["pile", "collection", "migrate"])
+        .args(["pile", "collection", "adopt"])
         .arg(&path)
         .arg("--plan")
         .arg(&plan)
@@ -486,7 +486,7 @@ fn a_plan_file_migrates_several_names_at_once() {
     for target in [new_wiki.handle(), new_compass.handle()] {
         let mut command = trible();
         command
-            .args(["pile", "collection", "reconcile"])
+            .args(["pile", "collection", "adopted"])
             .arg(&path)
             .arg(handle_text(target));
         let check = Command::from_std(command)
@@ -517,7 +517,7 @@ fn a_plan_that_uses_a_target_as_a_source_is_refused() {
 
     let mut command = trible();
     command
-        .args(["pile", "collection", "migrate"])
+        .args(["pile", "collection", "adopt"])
         .arg(&fixture.path)
         .arg("--plan")
         .arg(&plan)
@@ -543,7 +543,7 @@ fn the_sweep_names_the_command_that_repairs_it() {
     let fixture = Cutover::new(&[0x11, 0x22], &[0x33, 0x44, 0x55]);
     let mut command = trible();
     command
-        .args(["pile", "collection", "reconcile"])
+        .args(["pile", "collection", "adopted"])
         .arg(&fixture.path);
     let output = Command::from_std(command)
         .timeout(Duration::from_secs(60))
@@ -557,21 +557,21 @@ fn the_sweep_names_the_command_that_repairs_it() {
     );
 }
 
-/// Why naming the live generation is the form a migration must use.
+/// Why naming the live generation is the form an adoption check must use.
 ///
 /// The sweep groups by name and takes the member holding the most records as
 /// the basis. Mid-drain that is always the *retired* generation, and the new
 /// one's content is a subset of it, so the sweep reports nothing outstanding
 /// and exits zero while most of the records are unreachable through the name.
-/// The pile is held in that state between every source of a migration. Naming
+/// The pile is held in that state between every source of a carry. Naming
 /// the generation you believe is live asks the question that is actually meant.
 #[test]
-fn the_exact_form_sees_a_half_finished_migration_the_sweep_calls_settled() {
+fn the_exact_form_sees_a_half_finished_carry_the_sweep_calls_settled() {
     let fixture = Cutover::new(&[0x11, 0x22, 0x33, 0x44], &[0x11]);
 
     let mut command = trible();
     command
-        .args(["pile", "collection", "reconcile"])
+        .args(["pile", "collection", "adopted"])
         .arg(&fixture.path);
     let sweep = Command::from_std(command)
         .timeout(Duration::from_secs(60))
@@ -588,7 +588,7 @@ fn the_exact_form_sees_a_half_finished_migration_the_sweep_calls_settled() {
         text(&sweep)
     );
 
-    let exact = fixture.reconcile(&[]);
+    let exact = fixture.adopted(&[]);
     assert!(
         !exact.status.success(),
         "naming the live generation must find the shortfall: {}",
@@ -626,7 +626,7 @@ fn the_sweep_reports_what_it_could_not_name() {
 
     let mut command = trible();
     command
-        .args(["pile", "collection", "reconcile"])
+        .args(["pile", "collection", "adopted"])
         .arg(&fixture.path);
     let output = Command::from_std(command)
         .timeout(Duration::from_secs(60))

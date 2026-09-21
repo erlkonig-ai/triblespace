@@ -20,9 +20,9 @@
 //! command per edge run by hand at three in the morning; `--plan` does many
 //! names at once and prints the whole thing before writing any of it.
 //!
-//! **A proof that it finished.** `reconcile` compares source and target by
+//! **A proof that it finished.** `adopted` compares source and target by
 //! content on the merged pile, names the difference, and exits non-zero while
-//! anything the source admitted is missing. It stands alone, so a migration
+//! anything the source admitted is missing. It stands alone, so a carry
 //! somebody else ran months ago can be checked today.
 //!
 //! Not to be confused with `trible pile migrate`, which converts a pile's
@@ -106,7 +106,7 @@ pub struct AdoptArgs {
     pub allow_cross_name: bool,
     /// Permit a signing key the target does not admit as a writer.
     ///
-    /// Such a migration lands every record and reads as empty, which is the
+    /// Such a carry lands every record and reads as empty, which is the
     /// exact silence this tooling exists to break. Grant first where you can.
     #[arg(long)]
     pub allow_inadmissible_signer: bool,

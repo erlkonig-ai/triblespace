@@ -164,12 +164,12 @@ pub enum Command {
     ///
     /// This is the completeness check a carry needs and that carrying the
     /// records does not provide on its own: a carry reports how many records it
-    /// wrote, not how many the target was missing, so a partial migration looks
+    /// wrote, not how many the target was missing, so a partial carry looks
     /// exactly like a finished one. Name a collection and this compares source
     /// against target by content and exits non-zero while anything a source
     /// admits is absent; name none and it sweeps the whole pile for names
     /// claimed by more than one collection. It takes no key and writes nothing,
-    /// so a migration somebody else ran months ago can be checked today.
+    /// so a carry somebody else ran months ago can be checked today.
     Adopted {
         /// Path to the pile file to inspect.
         pile: PathBuf,
@@ -1463,7 +1463,7 @@ fn run_grant(
 /// caller resolved — which is the one their build actually uses. Without one it
 /// is the pile-wide sweep, which groups by name and compares against whichever
 /// member holds the most records. That heuristic is honest about being one, and
-/// it is blind in the state a migration passes through: mid-drain the retired
+/// it is blind in the state a carry passes through: mid-drain the retired
 /// generation is still the largest, its content is a superset, and the sweep
 /// reports nothing outstanding while half the records are unreachable.
 fn run_adopted(
