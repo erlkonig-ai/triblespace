@@ -15,7 +15,7 @@
   maintenance re-derives its own; that is believed correct because a merge is an
   equation between a collection's own members, but it has not been demonstrated
   on a source with a deep merge chain.
-- `pile collection adopted` and `migrate --siblings` find same-named siblings
+- `pile collection adopted` and `adopt --siblings` find same-named siblings
   through the collections this pile *references*, so a generation that holds no
   records is invisible to sibling discovery. That is the right domain for a
   carry — an empty sibling has nothing to move — but a handle-level worklist is
@@ -23,6 +23,6 @@
 - Neither command detects the physical duplication a `cat a.pile >> b.pile`
   merge leaves behind: `Pile` keys records by fingerprint, so duplicates are
   invisible to the record stream. `pile diagnose` counts them from the raw log
-  and `pile compact` reclaims them; `migrate` only says so.
+  and `pile compact` reclaims them; `adopt` only says so.
 - Object store operations rely on an async runtime; consider synchronous alternatives.
 - Preflight script and test suite take an unusually long time to run; investigate ways to reduce build and execution time.
