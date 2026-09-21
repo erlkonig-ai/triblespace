@@ -29,8 +29,22 @@ pub mod yard;
 /// Exact content absent from an immutable blob snapshot.
 ///
 /// A live caller may acquire this handle and retry against a later snapshot;
-/// the failing snapshot itself never fetches or records demand. Keep the
-/// bearer capability available to code rather than printing it in diagnostics.
+/// the failing snapshot itself never fetches or records demand.
+///
+/// The handle IS printed, and this was once deliberately mute. JP, 2026-09-21,
+/// on why it should not be: a program that already holds the handle in
+/// plaintext cannot leak it by printing it, because it is already on that
+/// machine. What the capability means is that a handle must not become
+/// available in plaintext to someone who does not already have it, either
+/// through a record or through a blob that contains it. That is a property of
+/// what you TRANSMIT and to whom, not of whether a value is formatted, and
+/// the one channel here that carries an error to a party who may hold neither
+/// -- a renderer showing a backend failure to a viewer -- is held by a
+/// separate finite error type that never receives this material.
+///
+/// It prints `blake3:<hex>` so the text can be pasted straight into
+/// `trible pile blob inspect`; that command answers `BadProtocol` for a bare
+/// hex string, which reads exactly like a missing blob and is not one.
 #[derive(Clone, Copy)]
 pub struct MissingBlob {
     pub handle: Inline<Handle<UnknownBlob>>,
@@ -38,7 +52,11 @@ pub struct MissingBlob {
 
 impl std::fmt::Display for MissingBlob {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("blob is not resident in this snapshot")
+        write!(
+            f,
+            "blob blake3:{} is not resident in this snapshot",
+            hex::encode(self.handle.raw)
+        )
     }
 }
 
@@ -210,6 +228,36 @@ pub trait StoreSnapshot: Clone + Send + Sync + 'static {
             relevant = relevant.union(StoreChanges::CAPABILITY_PROOFS);
         }
         relevant
+    }
+}
+
+#[cfg(test)]
+mod missing_blob_tests {
+    use super::*;
+
+    /// The error names the handle it failed on, so a reader can act on it
+    /// rather than guess. A process that already holds the handle in plaintext
+    /// discloses nothing by printing it; the capability rule is about a handle
+    /// reaching someone who holds neither a record nor a blob containing it.
+    #[test]
+    fn missing_blob_names_the_handle_it_wanted() {
+        let raw = [0xABu8; INLINE_LEN];
+        let missing = MissingBlob {
+            handle: Inline::<Handle<UnknownBlob>>::new(raw),
+        };
+        let shown = missing.to_string();
+        assert!(
+            shown.contains(&hex::encode(raw)),
+            "the handle must appear in the message, got {shown:?}"
+        );
+        // Prefixed so the text pastes straight into `trible pile blob inspect`,
+        // which answers BadProtocol for a bare hex string.
+        assert!(
+            shown.contains("blake3:"),
+            "the handle must carry its scheme, got {shown:?}"
+        );
+        // Debug forwards to Display, so neither form is silently mute.
+        assert_eq!(format!("{missing:?}"), shown);
     }
 }
 
