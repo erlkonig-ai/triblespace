@@ -1,9 +1,9 @@
-//! `trible pile collection migrate` and the completeness proof beside it.
+//! `trible pile collection adopt` and the completeness proof beside it.
 //!
 //! Content moves between collections by being **re-signed**, never by being
 //! pointed at. A record naming the retired collection was admitted under the
 //! retired policy; unioning it into the new collection at read time would hand
-//! whoever still holds the old key a way into the new one. So a migration signs
+//! whoever still holds the old key a way into the new one. So a carry signs
 //! each assertion afresh under a key the target admits, and the old records stay
 //! exactly where they are. [`triblespace_core::collection::migration`] holds the
 //! semantics; this is the operator surface over them.
@@ -59,7 +59,7 @@ use super::{
 /// Nothing is written without `--apply`. The default is the dry run, and the
 /// dry run's net-new figure is exactly what `--apply` then appends.
 #[derive(clap::Args)]
-pub struct MigrateArgs {
+pub struct AdoptArgs {
     /// Path to the pile file to update.
     pub pile: PathBuf,
     /// Target collection: name, or descriptor handle (`name:` / `blake3:`).
@@ -195,7 +195,7 @@ fn label(snapshot: &PileSnapshot, handle: CollectionHandle) -> String {
 fn plan_groups(
     snapshot: &PileSnapshot,
     rows: &[Enumerated],
-    args: &MigrateArgs,
+    args: &AdoptArgs,
 ) -> Result<Vec<Group>> {
     let mut by_target: Vec<Group> = Vec::new();
     let mut push = |target: CollectionHandle, source: CollectionHandle| match by_target
@@ -435,7 +435,7 @@ fn report(
 }
 
 /// Carry content between collections.
-pub fn run_migrate(args: MigrateArgs) -> Result<()> {
+pub fn run_adopt(args: AdoptArgs) -> Result<()> {
     let key_path =
         triblespace_core::signing_key_file::resolve_path(args.key.as_deref(), &args.pile);
     let signing_key = triblespace_core::signing_key_file::load_existing(&key_path)
@@ -601,7 +601,7 @@ pub fn run_migrate(args: MigrateArgs) -> Result<()> {
         if outstanding > 0 {
             bail!(
                 "{outstanding} content pair(s) are still held only by a source. The migration is \
-                 not complete; re-run, and check `trible pile collection reconcile`"
+                 not complete; re-run, and check `trible pile collection adopted`"
             );
         }
         Ok(())
@@ -620,7 +620,7 @@ fn file_len(path: &Path) -> u64 {
 ///
 /// The standalone half of the tool: it takes no key, appends nothing, and can
 /// be pointed at a migration somebody else ran months ago.
-pub fn run_reconcile_exact(
+pub fn run_adopted_exact(
     pile: &mut Pile,
     target_reference: &str,
     from: &[String],
@@ -769,7 +769,7 @@ pub fn run_reconcile_exact(
     }
     bail!(
         "{} content pair(s) are held by a source and absent from the target. The \
-         migration is incomplete; `trible pile collection migrate --into {} --siblings` carries \
+         carry is incomplete; `trible pile collection adopt --into {} --siblings` carries \
          them forward",
         missing_admitted.len(),
         handle_hex(target)

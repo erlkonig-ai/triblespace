@@ -22,6 +22,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+- `pile collection migrate` is now `pile collection adopt`, and
+  `pile collection reconcile` is now `pile collection adopted`. The old names
+  both borrowed a word that already meant something else here: `migrate` is the
+  format migration under `pile migrate`, an irreversible semantic boundary with
+  its own identity, and `reconcile` belonged to the branching model collections
+  replaced. The pair now says what it does -- `adopt` carries committed content
+  into a collection, `adopted` answers whether everything has been -- and the
+  two stay separate because a carry reports what it wrote, not what the target
+  was missing, so a partial carry looks exactly like a finished one.
+
 - `pile compact --drop-drained RETIRED=CURRENT` (repeatable) leaves a drained
   generation behind, with every collection derived from it, after checking
   that every commit of RETIRED is present in CURRENT; it refuses otherwise
@@ -33,7 +43,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   witness-bound MERGE/DERIVE frames, verifying the old signature over the old
   transcript before restating the equation under the migrator's key.
 
-- Replace `pile collection adopt` with `pile collection migrate`, which carries
+- Replace `pile collection adopt` with `pile collection adopt`, which carries
   many sources into one target — `--from` repeated, `--siblings` for every
   same-named generation, or a `--plan` file of `source -> target` edges — and
   whose dry run is the default. The dry run reports NET NEW, the records the
@@ -47,7 +57,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   `--apply` the pile is re-read and every carried pair asserted present, and
   the merge-then-compact discipline is stated rather than assumed.
 
-- Prove containment in `pile collection reconcile <pile> <collection>` source by
+- Prove containment in `pile collection adopted <pile> <collection>` source by
   source against the generation the caller resolved, rather than grouping by
   name and comparing against whichever member holds the most records — a basis
   that reads a half-finished migration as finished, because mid-drain the

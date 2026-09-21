@@ -551,7 +551,7 @@ fn the_sweep_names_the_command_that_repairs_it() {
         .unwrap();
     assert!(!output.status.success(), "{}", text(&output));
     assert!(
-        text(&output).contains("collection migrate --into <current> --siblings"),
+        text(&output).contains("collection adopt --into <current> --siblings"),
         "the advice names the tool that fixes it: {}",
         text(&output)
     );

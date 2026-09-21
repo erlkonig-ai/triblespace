@@ -10,12 +10,12 @@
 - Consolidate shared blob-handling logic across `pile` and `store` commands.
 
 ## Discovered Issues
-- `pile collection migrate` carries COMMIT records only. MERGE and DERIVE
+- `pile collection adopt` carries COMMIT records only. MERGE and DERIVE
   equations are counted and left behind on the assumption that the target's own
   maintenance re-derives its own; that is believed correct because a merge is an
   equation between a collection's own members, but it has not been demonstrated
   on a source with a deep merge chain.
-- `pile collection reconcile` and `migrate --siblings` find same-named siblings
+- `pile collection adopted` and `migrate --siblings` find same-named siblings
   through the collections this pile *references*, so a generation that holds no
   records is invisible to sibling discovery. That is the right domain for a
   carry — an empty sibling has nothing to move — but a handle-level worklist is

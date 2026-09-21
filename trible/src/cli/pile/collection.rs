@@ -67,7 +67,7 @@ use super::open_refreshed;
 #[cfg(test)]
 mod maintenance_counts;
 mod maintenance_telemetry;
-mod migrate;
+mod adopt;
 
 /// Hex characters shown for a handle or key when the full value is not asked
 /// for. Sixteen is far past the point where two collections in one pile
@@ -162,7 +162,7 @@ pub enum Command {
     /// the call site notices: the caller asks for the name, gets the new
     /// generation, and finds it empty.
     ///
-    /// This is the completeness check a migration needs and that carrying the
+    /// This is the completeness check a carry needs and that carrying the
     /// records does not provide on its own: a carry reports how many records it
     /// wrote, not how many the target was missing, so a partial migration looks
     /// exactly like a finished one. Name a collection and this compares source
@@ -170,7 +170,7 @@ pub enum Command {
     /// admits is absent; name none and it sweeps the whole pile for names
     /// claimed by more than one collection. It takes no key and writes nothing,
     /// so a migration somebody else ran months ago can be checked today.
-    Reconcile {
+    Adopted {
         /// Path to the pile file to inspect.
         pile: PathBuf,
         /// The collection that must hold everything: name, or `blake3:`
@@ -234,7 +234,7 @@ pub enum Command {
     ///
     /// Nothing is written without `--apply`; the dry run is the default, and
     /// its net-new figure is exactly what `--apply` appends.
-    Migrate(migrate::MigrateArgs),
+    Adopt(adopt::AdoptArgs),
     /// Register one derived collection over a source and print its exact handle.
     ///
     /// The kind picks the encoding and its mapping. The descriptor then carries
@@ -453,12 +453,12 @@ pub fn run(cmd: Command) -> Result<()> {
             metadata,
             long,
         } => run_list(path, named, metadata, long),
-        Command::Reconcile {
+        Command::Adopted {
             pile,
             collection,
             from,
             list,
-        } => run_reconcile(pile, collection, from, list),
+        } => run_adopted(pile, collection, from, list),
         Command::Show { pile, collection } => run_show(pile, collection),
         Command::Log {
             pile,
@@ -466,7 +466,7 @@ pub fn run(cmd: Command) -> Result<()> {
             limit,
             long,
         } => run_log(pile, collection, limit, long),
-        Command::Migrate(args) => migrate::run_migrate(args),
+        Command::Adopt(args) => adopt::run_adopt(args),
         Command::Derive {
             pile,
             source,
@@ -1462,7 +1462,7 @@ fn run_grant(
 /// it is blind in the state a migration passes through: mid-drain the retired
 /// generation is still the largest, its content is a superset, and the sweep
 /// reports nothing outstanding while half the records are unreachable.
-fn run_reconcile(
+fn run_adopted(
     path: PathBuf,
     reference: Option<String>,
     from: Vec<String>,
@@ -1471,7 +1471,7 @@ fn run_reconcile(
     let mut pile = open_refreshed(&path)?;
     let res = (|| -> Result<()> {
         if let Some(reference) = reference {
-            return migrate::run_reconcile_exact(&mut pile, &reference, &from, list);
+            return adopt::run_adopted_exact(&mut pile, &reference, &from, list);
         }
         if !from.is_empty() {
             bail!("--from needs a collection to compare against; name the target as well");
@@ -1488,7 +1488,7 @@ fn run_reconcile(
         // not in any group and is never mentioned — and that is exactly where
         // the largest arrears have been found.
         let rows = enumerate(&snapshot)?;
-        let unnamed = migrate::unnamed_with_commits(&rows);
+        let unnamed = adopt::unnamed_with_commits(&rows);
 
         if reports.is_empty() {
             println!("no name in this pile is claimed by more than one collection");
@@ -1503,14 +1503,14 @@ fn run_reconcile(
             println!(
                 "{unnamed} collection(s) in this pile hold commits under no name this build can \
                  read. They are in no name group, so nothing above accounts for them; ask about \
-                 one directly with `trible pile collection reconcile <pile> blake3:<handle>`."
+                 one directly with `trible pile collection adopted <pile> blake3:<handle>`."
             );
         }
         if stranded > 0 {
             bail!(
                 "{stranded} record(s) across {} name(s) are held only by a retired generation and \
                  cannot be reached under their name; carry them forward with `trible pile \
-                 collection migrate --into <current> --siblings`, then re-run this check",
+                 collection adopt --into <current> --siblings`, then re-run this check",
                 reports.iter().filter(|r| r.strands_records()).count(),
             );
         }

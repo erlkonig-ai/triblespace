@@ -330,7 +330,7 @@ where
 /// Compare two exact collections, whichever names they carry.
 ///
 /// [`named_generations`] answers "is something hiding behind this name?".
-/// This answers the narrower question a migration needs: *after adopting
+/// This answers the narrower question a carry needs: *after adopting
 /// `source` into `target`, is anything left behind?* It is the completeness
 /// assertion that adopting on its own does not provide — a re-signing pass
 /// reports how many records it processed, not how many the target was missing,
