@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `ensure_derived`, `maintain_derived` and `upkeep_derived` are now
+  `ensure_downstream`, `maintain_downstream` and `upkeep_downstream`.
+  `derived` names what a collection *is*; `downstream` names where it sits
+  relative to the one you asked about, which is what these functions walk.
+  Naming them by direction makes the pair visible and the missing member
+  obvious: under the old names `maintain_derived` had no upstream counterpart
+  and nobody noticed. `seed_derived` keeps its name, because it names the kind
+  of collection it registers rather than a direction of travel.
+
 - Reads select from the coverage index, as maintenance does. `collection`
   attaches the target's frontier from the index -- widest node first, a node
   whose bytes are here taken, a node whose bytes are not descended through

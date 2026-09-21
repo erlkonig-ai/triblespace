@@ -9,7 +9,7 @@ use triblespace_core::blob::encodings::succinctarchive::{
     OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
 };
 use triblespace_core::collection::{
-    derived_from, ensure_derived, maintain_derived, AdmissionPolicy, Collection,
+    derived_from, ensure_downstream, maintain_downstream, AdmissionPolicy, Collection,
     CollectionPolicy, CollectionRead, CollectionRecord, CollectionSnapshotExt,
     CollectionStoreExt, CoreRealizer, Derived, RealizeDerived, Realized, Upkeep,
 };
@@ -120,7 +120,7 @@ fn ensure_derived_makes_a_commit_readable_through_every_view_and_publishes_no_me
     store
         .commit(chain.source, &owner, fragment("two"))
         .unwrap();
-    let report = block_on(ensure_derived(
+    let report = block_on(ensure_downstream(
         &mut store,
         chain.source.handle(),
         &owner,
@@ -145,7 +145,7 @@ fn ensure_derived_makes_a_commit_readable_through_every_view_and_publishes_no_me
     assert_eq!(derives, 4, "each commit's image in each lattice");
 
     // Maintenance carries what ensure left as leaves.
-    let report = block_on(maintain_derived(
+    let report = block_on(maintain_downstream(
         &mut store,
         chain.source.handle(),
         &owner,
@@ -177,7 +177,7 @@ fn a_signer_the_target_does_not_admit_and_an_unknown_representation_are_named_no
     block_on(store.ensure(chain.succinct, &owner)).unwrap();
     block_on(store.ensure(chain.rank9, &owner)).unwrap();
 
-    let report = block_on(ensure_derived(
+    let report = block_on(ensure_downstream(
         &mut store,
         chain.source.handle(),
         &stranger,
@@ -202,7 +202,7 @@ fn a_signer_the_target_does_not_admit_and_an_unknown_representation_are_named_no
             Ok(Realized::Unknown)
         }
     }
-    let report = block_on(ensure_derived(
+    let report = block_on(ensure_downstream(
         &mut store,
         chain.source.handle(),
         &owner,
@@ -267,7 +267,7 @@ fn a_descriptor_naming_another_mapping_is_left_to_whoever_registered_it() {
     store.commit(source, &owner, fragment("mapped")).unwrap();
     block_on(store.ensure_with::<OtherWay>(other, &owner)).unwrap();
 
-    let report = block_on(ensure_derived(
+    let report = block_on(ensure_downstream(
         &mut store,
         source.handle(),
         &owner,

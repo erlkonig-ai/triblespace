@@ -9,12 +9,12 @@
 //! with its first record: a store lists the collections its records name,
 //! and a descriptor alone is a blob like any other. So whoever registers a
 //! derived collection realizes it once, then, when the source has something
-//! to image; from then on every write's [`ensure_derived`] finds it.
+//! to image; from then on every write's [`ensure_downstream`] finds it.
 //!
-//! [`ensure_derived`] realizes every derived collection's missing images and
+//! [`ensure_downstream`] realizes every derived collection's missing images and
 //! publishes no merge; a write that calls it after its commit leaves the
 //! commit readable through every view, at the cost of that commit's own
-//! images. [`maintain_derived`] carries each of them to its LSM fixed point
+//! images. [`maintain_downstream`] carries each of them to its LSM fixed point
 //! as the daemon does. Neither decides what is cheap: the first call on a
 //! cold store may take as long as the backlog is, and says so by taking it.
 //! A representation this binary cannot map, or a descriptor naming a mapping
@@ -252,7 +252,7 @@ pub struct UpkeepReport {
 
 /// Visit every collection derived from `source`, each after its own source,
 /// and take it as far as `upkeep` asks with `realizer`.
-pub async fn upkeep_derived<S, R>(
+pub async fn upkeep_downstream<S, R>(
     store: &mut S,
     source: CollectionHandle,
     signer: &SigningKey,
@@ -283,7 +283,7 @@ where
 /// Realize the missing images of every collection derived from `source`, so
 /// that what `source` stands on is readable through each of them; publish no
 /// merge. A write calls this after its commit.
-pub async fn ensure_derived<S, R>(
+pub async fn ensure_downstream<S, R>(
     store: &mut S,
     source: CollectionHandle,
     signer: &SigningKey,
@@ -293,12 +293,12 @@ where
     S: Store + AsyncBlobStoreAcquire + Send,
     R: RealizeDerived<S>,
 {
-    upkeep_derived(store, source, signer, Upkeep::Ensure, realizer).await
+    upkeep_downstream(store, source, signer, Upkeep::Ensure, realizer).await
 }
 
 /// Carry every collection derived from `source` to its LSM fixed point, each
 /// after its own source. What the daemon does for its configured sources.
-pub async fn maintain_derived<S, R>(
+pub async fn maintain_downstream<S, R>(
     store: &mut S,
     source: CollectionHandle,
     signer: &SigningKey,
@@ -308,5 +308,5 @@ where
     S: Store + AsyncBlobStoreAcquire + Send,
     R: RealizeDerived<S>,
 {
-    upkeep_derived(store, source, signer, Upkeep::Maintain, realizer).await
+    upkeep_downstream(store, source, signer, Upkeep::Maintain, realizer).await
 }
