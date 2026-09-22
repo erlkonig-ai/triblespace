@@ -521,13 +521,12 @@ pub struct CoverageIndex {
 /// of the backlog. So a per-collection question is a scan of the backlog, which
 /// is the right trade for a view: the backlog is small in the steady state, and
 /// re-keying it to make this cheaper would make the drain expensive instead.
-fn parked_in(waiters: &Waiters, collection: CollectionHandle) -> usize {
+fn parked_in(waiters: &Waiters, collection: CollectionHandle) -> impl Iterator<Item = Parked> + '_ {
     waiters
         .iter_ordered()
         .filter_map(|key| waiters.get(key))
         .flat_map(held)
-        .filter(|parked| parked.collection == collection)
-        .count()
+        .filter(move |parked| parked.collection == collection)
 }
 
 fn waiting(waiters: &Waiters) -> usize {
@@ -626,7 +625,32 @@ impl CoverageIndex {
     /// marking collections needs the second, and the backlog already carries
     /// each entry's collection, so this costs a filter rather than a fold.
     pub fn unadmitted_in(&self, collection: CollectionHandle) -> usize {
+        parked_in(&self.awaiting_proof, collection).count()
+    }
+
+    /// WHICH members of `collection` no capability proof admits yet.
+    ///
+    /// The per-member form of [`unadmitted_in`](Self::unadmitted_in). A count
+    /// says a collection holds unadmitted work; this says which elements it is,
+    /// which is the difference between a number an operator can read and a mark
+    /// an operator can point at.
+    ///
+    /// Nothing else answers this. Asking `coverage(collection, node)` and
+    /// finding nothing conflates three different facts: a node no proof admits,
+    /// a node reached only as somebody else's join input, and a node whose own
+    /// inputs have not arrived. They need different remedies and belong to
+    /// different people, so a view that draws them alike is worse than one that
+    /// draws none of them.
+    ///
+    /// A set rather than a count of rows: two attestations may name one result,
+    /// and that is agreement about a member rather than two unadmitted members.
+    /// It follows that the size of this set can be SMALLER than
+    /// [`unadmitted_in`](Self::unadmitted_in), and neither is wrong -- one
+    /// counts waiting attestations, the other names waiting members.
+    pub fn unadmitted_nodes_in(&self, collection: CollectionHandle) -> BTreeSet<CollectionData> {
         parked_in(&self.awaiting_proof, collection)
+            .map(|parked| parked.attestation.result())
+            .collect()
     }
 
     /// The same, for attestations waiting on a descriptor chain to land
@@ -637,7 +661,7 @@ impl CoverageIndex {
     /// somebody must issue, a missing lineage is bytes that have not
     /// replicated yet and may simply arrive.
     pub fn awaiting_lineage_in(&self, collection: CollectionHandle) -> usize {
-        parked_in(&self.awaiting_lineage, collection)
+        parked_in(&self.awaiting_lineage, collection).count()
     }
 
     /// Number waiting specifically on a descriptor chain becoming resident.

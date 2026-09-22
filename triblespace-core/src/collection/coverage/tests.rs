@@ -293,6 +293,53 @@ fn unadmitted_is_attributed_to_the_collection_that_holds_it() {
     assert_eq!(index.unadmitted_in(b), 0);
 }
 
+/// A count marks a collection; only a set of members marks a node.
+///
+/// A view draws one shape per member, so "this collection holds 2 unadmitted
+/// records" cannot be painted: it does not say which two shapes to colour.
+/// Naming the members is what turns the number into a mark. And it is a SET
+/// because two signers attesting one result is agreement about a single
+/// member, not two unadmitted members.
+#[test]
+fn unadmitted_members_are_named_not_merely_counted() {
+    let mut index = CoverageIndex::new();
+    let a = collection(0);
+    let b = collection(1);
+    let untouched = collection(2);
+
+    // The same shape as the count test above, so the two read together.
+    index.apply(&commit(2, a, data(1)), &OnlySigner(1));
+    index.apply(&commit(2, a, data(2)), &OnlySigner(1));
+    index.apply(&commit(2, b, data(3)), &OnlySigner(1));
+
+    assert_eq!(
+        index.unadmitted_nodes_in(a),
+        BTreeSet::from([data(1), data(2)]),
+        "the members themselves, not how many of them there are"
+    );
+    assert_eq!(index.unadmitted_nodes_in(b), BTreeSet::from([data(3)]));
+    // Not a's members, and not the index's: its own empty set.
+    assert!(index.unadmitted_nodes_in(untouched).is_empty());
+
+    // A second unadmitted signer agreeing about data(1) adds a waiting
+    // ATTESTATION without adding a waiting MEMBER, so the count goes to three
+    // while the set stays at two. Both are right; they answer different
+    // questions, which is why the view wants the set and the operator's
+    // summary line wants the count.
+    index.apply(&commit(3, a, data(1)), &OnlySigner(1));
+    assert_eq!(index.unadmitted_in(a), 3);
+    assert_eq!(
+        index.unadmitted_nodes_in(a),
+        BTreeSet::from([data(1), data(2)])
+    );
+
+    // And a member stops being named the moment a proof admits it, rather
+    // than lingering as a stale mark on something that has since arrived.
+    index.resolve(&AdmitEveryRecord);
+    assert!(index.unadmitted_nodes_in(a).is_empty());
+    assert!(index.unadmitted_nodes_in(b).is_empty());
+}
+
 #[test]
 fn an_unadmitted_route_contributes_nothing_to_a_node_an_admitted_route_reached() {
     let mut index = CoverageIndex::new();
