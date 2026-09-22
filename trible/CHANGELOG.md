@@ -22,6 +22,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+- `pile net sync` uses Peer-owned hydration and latest-snapshot network
+  publication. Ready payload downloads no longer trigger an intermediate
+  serving rebuild each; replication selection and its default are unchanged.
+
 - Use the command's existing durable key for sync transport, health and
   telemetry, and for maintenance work and its local telemetry endpoint.
   Remove `--health-key`, `--telemetry-key` and maintenance `--telemetry-node`.

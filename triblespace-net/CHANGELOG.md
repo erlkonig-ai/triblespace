@@ -50,6 +50,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Replace the store-to-host observation FIFO with one coherent latest snapshot.
+  The host derives provider and collection changes from its last processed
+  PATCH-backed observation; outgoing root announcements coalesce as well.
+  Keep authenticated incoming evidence on its bounded admission bridge.
+  Peer now owns optional hydration, landing ready bodies before one final
+  serving refresh instead of rebuilding the inventory after each blob.
+
 - Remove ordinary per-blob and repair-drain disk flushes and the reconciler's
   retained durable-answer mirror. Local put/refresh visibility precedes the
   explicit close persistence boundary; manual flush and close still propagate

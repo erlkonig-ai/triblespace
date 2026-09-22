@@ -19,7 +19,7 @@
 //! protocol bug *above* this line (snapshot ordering and authentication
 //! subject binding), which is why the
 //! host loop must run inside the simulator rather than being mocked
-//! out at the `NetCommand`/`NetEvent` channel boundary.
+//! out at the latest serving-observation / authenticated evidence boundary.
 //!
 //! Stream IO is plain `tokio::io::{AsyncRead, AsyncWrite}` — iroh's
 //! QUIC streams already implement both, and an in-memory duplex pipe

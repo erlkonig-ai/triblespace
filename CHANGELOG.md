@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Peer-to-host synchronization publishes one latest coherent store snapshot,
+  not a FIFO of intermediate serving/provider observations. The host computes
+  PATCH differences from the snapshot it last processed; per-topic root wakes
+  also retain only the latest root. Authenticated incoming evidence remains
+  bounded and lossless. `Peer` owns optional payload hydration, landing ready
+  downloads before publishing one serving snapshot for the completed batch.
+
 - The sync daemon and maintenance CLI use one existing durable node key for
   transport, authored work, health and local telemetry. Remove independent
   `--health-key`, `--telemetry-key` and maintenance `--telemetry-node` settings;

@@ -37,7 +37,7 @@ struct Fixture {
     sender: NetSender,
     provider: PeerId,
     provider_routes: Arc<Mutex<RoutingTable>>,
-    provider_snapshot: SnapshotSlot,
+    provider_snapshot: tokio::sync::watch::Sender<Option<SharedSnapshot>>,
     provider_directory: Arc<Mutex<ProviderDirectory>>,
     provider_health: Health,
     blob_reads: Arc<AtomicUsize>,
@@ -111,11 +111,12 @@ impl Fixture {
         }
         let (events_tx, events) = tokio::sync::mpsc::channel(16);
         let provider_routes = Arc::new(Mutex::new(RoutingTable::new(provider, [])));
-        let provider_snapshot = Arc::new(Mutex::new(Some(Arc::new(snapshot))));
+        let (provider_snapshot, serving_snapshot) =
+            tokio::sync::watch::channel(Some(Arc::new(snapshot)));
         let provider_directory = Arc::new(Mutex::new(providers));
         let provider_health = Health::new(EndpointId::from_bytes(&provider).unwrap());
         let handler = SnapshotHandler {
-            snapshot: provider_snapshot.clone(),
+            snapshot: serving_snapshot,
             health: provider_health.clone(),
             candidates: provider_routes.clone(),
             providers: provider_directory.clone(),
@@ -191,7 +192,7 @@ impl RecoveryNode {
         let directory = Arc::new(Mutex::new(ProviderDirectory::new(peer)));
         let (events_tx, events) = tokio::sync::mpsc::channel(16);
         let handler = SnapshotHandler {
-            snapshot: Arc::new(Mutex::new(snapshot)),
+            snapshot: tokio::sync::watch::channel(snapshot).1,
             health: Health::new(EndpointId::from_bytes(&peer).unwrap()),
             candidates: Arc::new(Mutex::new(RoutingTable::new(peer, []))),
             providers: directory.clone(),
@@ -564,7 +565,7 @@ async fn stale_provider_lease_survives_loss_alternate_fetch_and_same_endpoint_re
     // Its cached connection must fail without preventing the alternate fetch.
     fixture.net.crash(fixture.provider);
     fixture.server.abort();
-    let serving = fixture.provider_snapshot.lock().unwrap().clone();
+    let serving = fixture.provider_snapshot.borrow().clone();
     let mut alternate = RecoveryNode::new(&fixture.net, &alternate_key, serving);
     let last_advertised = directory.advertise(fixture.hash, alternate.peer);
     let before = directory
@@ -790,14 +791,13 @@ async fn mid_transfer_crash_rejects_old_bytes_after_restart_and_allows_fresh_ret
     // receive permit which would also block unrelated transfers.
     let mut fixture = Fixture::with_bytes(false, Bytes::from_source(vec![b'x'; 8 * 1024 * 1024]));
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-    {
-        let mut slot = fixture.provider_snapshot.lock().unwrap();
+    fixture.provider_snapshot.send_modify(|slot| {
         let snapshot = Arc::get_mut(slot.as_mut().unwrap()).unwrap();
         snapshot.blobs = Arc::new(SignallingBlobReader {
             inner: snapshot.blobs.clone(),
             started: Mutex::new(Some(started_tx)),
         });
-    }
+    });
     let sender = fixture.sender.clone();
     let hash = fixture.hash;
     let fetch =
@@ -1224,7 +1224,7 @@ async fn self_hint_requires_a_present_serving_snapshot() {
     let _guard = crate::protocol::exact_blob_receive_test_guard();
     let mut fixture = Fixture::new(false);
     let key = blob_locator(fixture.hash);
-    let snapshot = fixture.provider_snapshot.lock().unwrap().take();
+    let snapshot = fixture.provider_snapshot.send_replace(None);
     assert!(
         fixture
             .client
@@ -1234,7 +1234,7 @@ async fn self_hint_requires_a_present_serving_snapshot() {
             .is_empty()
     );
 
-    *fixture.provider_snapshot.lock().unwrap() = snapshot;
+    fixture.provider_snapshot.send_replace(snapshot);
     assert_eq!(
         fixture.client.get(fixture.provider, key).await.unwrap(),
         vec![(
@@ -1242,7 +1242,7 @@ async fn self_hint_requires_a_present_serving_snapshot() {
             blob_provider_token(fixture.hash, fixture.provider)
         )]
     );
-    fixture.provider_snapshot.lock().unwrap().take();
+    fixture.provider_snapshot.send_replace(None);
     assert!(
         fixture
             .client
@@ -1376,7 +1376,9 @@ async fn resident_descriptor_is_not_a_collection_participant_hint() {
         StoreChanges::ALL,
     )
     .unwrap();
-    *fixture.provider_snapshot.lock().unwrap() = Some(Arc::new(snapshot));
+    fixture
+        .provider_snapshot
+        .send_replace(Some(Arc::new(snapshot)));
 
     assert_eq!(
         fixture
@@ -1432,7 +1434,7 @@ async fn known_resident_outside_selected_dht_replicas_is_not_directly_probed() {
         let peer = signer.verifying_key().to_bytes();
         let mut harness = fixture.net.join(signer);
         let handler = SnapshotHandler {
-            snapshot: Arc::new(Mutex::new(None)),
+            snapshot: tokio::sync::watch::channel(None).1,
             health: Health::new(EndpointId::from_bytes(&peer).unwrap()),
             candidates: Arc::new(Mutex::new(RoutingTable::new(peer, []))),
             providers: Arc::new(Mutex::new(ProviderDirectory::new(peer))),
@@ -1524,10 +1526,7 @@ async fn zero_announcement_budget_still_answers_resident_self_hints() {
                 StoreChanges::ALL,
             )
             .unwrap();
-            let observation =
-                ProviderObservation::from_locators([], false, serving.bearer_locators());
             sender.update_snapshot(serving, &ActiveCollections::new());
-            sender.update_providers(observation);
             let host = tokio::task::spawn_local(run_host(
                 server_harness,
                 PeerConfig {

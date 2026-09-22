@@ -19,7 +19,7 @@ use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::SnapshotSource;
 use triblespace_net::health_record::{self, Recorder, DEFAULT_MAX_AGE, REPORT_EVERY};
 use triblespace_net::peer::{Peer, PeerConfig, ReconcileDirection, ReconcileQos};
-use triblespace_net::reconcile::{Reconciler, ReplicationMode};
+use triblespace_net::reconcile::ReplicationMode;
 
 fn open_pile(path: &PathBuf) -> Result<Pile> {
     crate::cli::pile::open_refreshed(path)
@@ -415,7 +415,7 @@ fn run_sync(
     let started = std::time::Instant::now();
     let duration_limit = duration.map(std::time::Duration::from_secs);
     let quiescent_limit = quiescent_for.map(std::time::Duration::from_secs);
-    let mut reconciler = Reconciler::new().with_replication(replication, collections);
+    peer.set_replication(replication, collections);
     let reconcile_every = std::time::Duration::from_secs(1);
     let mut next_reconcile = std::time::Instant::now();
     let mut next_health = std::time::Instant::now();
@@ -463,7 +463,7 @@ fn run_sync(
             }
             if next_reconcile <= std::time::Instant::now() {
                 let measured = telemetry.as_ref().map(|_| std::time::Instant::now());
-                let stats = reconciler.tick(&mut peer).await;
+                let stats = peer.reconcile().await;
                 if let (Some(telemetry), Some(measured)) = (telemetry.as_mut(), measured) {
                     telemetry.reconciled(&stats, measured.elapsed());
                 }

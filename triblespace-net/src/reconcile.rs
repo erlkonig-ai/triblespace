@@ -15,7 +15,6 @@ use std::time::Duration;
 
 use anybytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
-use triblespace_core::blob::Blob;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::locator::blob_locator;
 use triblespace_core::collection::reference_summary::{ReferenceSummaryBlob, ReferenceSummaryView};
@@ -30,7 +29,7 @@ use triblespace_core::repo::{
     StoreRead, WantRead, WantRequest, WantStore,
 };
 
-use crate::peer::Peer;
+use crate::peer::{Peer, PeerSnapshot};
 use crate::protocol::RawHash;
 
 /// How much content an explicit collection selection asks this process to obtain.
@@ -250,6 +249,15 @@ impl Reconciler {
         mode: ReplicationMode,
         collections: impl IntoIterator<Item = CollectionHandle>,
     ) -> Self {
+        self.set_replication(mode, collections);
+        self
+    }
+
+    pub(crate) fn set_replication(
+        &mut self,
+        mode: ReplicationMode,
+        collections: impl IntoIterator<Item = CollectionHandle>,
+    ) {
         self.mode = mode;
         self.collections = collections
             .into_iter()
@@ -262,7 +270,6 @@ impl Reconciler {
             state.root_since = None;
             state.first_root_attempt = false;
         }
-        self
     }
 
     fn observe_missing(&mut self, wanted: &BTreeSet<RawHash>, roots: &BTreeSet<RawHash>) {
@@ -381,7 +388,7 @@ impl Reconciler {
     async fn tick_with_reference_filter<S, F>(
         &mut self,
         peer: &mut Peer<S>,
-        mut reference_filter: F,
+        reference_filter: F,
     ) -> ReconcileStats
     where
         S: BlobStore
@@ -394,21 +401,36 @@ impl Reconciler {
         S::Snapshot: StoreRead + BlobChildren,
         F: FnMut(RawHash, RawHash) -> Option<bool>,
     {
-        let mut stats = ReconcileStats::default();
-
         // This is also the explicit external-Pile reobservation and inventory
         // admission boundary.
-        peer.refresh();
-        let mut snapshot = match peer.snapshot() {
+        let snapshot = match peer.snapshot() {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 tracing::warn!(
                     ?error,
                     "store snapshot unavailable; skipping reconcile pass"
                 );
-                return stats;
+                return ReconcileStats::default();
             }
         };
+        let stats = self.tick_snapshot(snapshot, reference_filter).await;
+        if stats.landed != 0 {
+            peer.refresh();
+        }
+        stats
+    }
+
+    pub(crate) async fn tick_snapshot<S, F>(
+        &mut self,
+        mut snapshot: PeerSnapshot<S>,
+        mut reference_filter: F,
+    ) -> ReconcileStats
+    where
+        S: BlobStore + Send + 'static,
+        S::Snapshot: StoreRead + BlobChildren,
+        F: FnMut(RawHash, RawHash) -> Option<bool>,
+    {
+        let mut stats = ReconcileStats::default();
         let requests: Vec<WantRequest> = match snapshot
             .wants()
             .and_then(|wants| wants.collect::<Result<Vec<_>, _>>())
@@ -507,7 +529,7 @@ impl Reconciler {
                     if wanted_blob_handles.contains(&handle) {
                         stats.attempted += 1;
                     }
-                    let fetch = peer.fetch_verified_with_deadline(
+                    let fetch = snapshot.fetch_verified_with_deadline(
                         handle,
                         deadline.saturating_duration_since(tokio::time::Instant::now()),
                     );
@@ -532,7 +554,7 @@ impl Reconciler {
                 };
                 in_flight.remove(&handle);
                 let is_want = wanted_blob_handles.contains(&handle);
-                let landed = verified.and_then(|verified| land_exact(peer, verified));
+                let landed = verified.and_then(|verified| snapshot.land_verified(verified));
                 let Some(bytes) = landed else {
                     self.record_unavailable(handle);
                     continue;
@@ -550,7 +572,6 @@ impl Reconciler {
                 if roots.contains(&handle) {
                     stats.replication.acquired += 1;
                 }
-                peer.refresh();
             }
             // Expiry cancels admitted unfinished requests, not untouched tail
             // candidates. Charge each once; no answer is present until its
@@ -579,13 +600,6 @@ impl Reconciler {
         if !scan_turn {
             return stats;
         }
-        snapshot = match peer.snapshot() {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                tracing::warn!(?error, "cannot observe hydrated blobs; deferring full scan");
-                return stats;
-            }
-        };
         // Summaries are ordinary, explicitly selected derived collections.
         // Observe only their resident realization; never ensure/map here:
         // this consumer need not possess the producer's complete blob closure.
@@ -712,7 +726,7 @@ impl Reconciler {
             // A request may consume the entire deadline. Persist the next lane
             // and this source's exact progress before awaiting it.
             self.scan.yield_source();
-            let Some(bytes) = fetch_and_land(peer, candidate, speculative_budget).await else {
+            let Some(bytes) = fetch_and_land(&snapshot, candidate, speculative_budget).await else {
                 stats.replication.speculative_misses += 1;
                 continue;
             };
@@ -720,8 +734,7 @@ impl Reconciler {
             stats.received_bytes = stats.received_bytes.saturating_add(bytes);
             stats.replication.acquired += 1;
             self.scan.observe(root, candidate);
-            peer.refresh();
-            snapshot = match peer.snapshot() {
+            snapshot = match snapshot.reobserve() {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
                     tracing::warn!(?error, "cannot observe scan progress; deferring full scan");
@@ -1082,43 +1095,19 @@ where
     Ok(roots)
 }
 
-async fn fetch_and_land<S>(peer: &mut Peer<S>, handle: RawHash, budget: Duration) -> Option<u64>
+async fn fetch_and_land<S>(
+    snapshot: &PeerSnapshot<S>,
+    handle: RawHash,
+    budget: Duration,
+) -> Option<u64>
 where
-    S: BlobStore
-        + CollectionStore
-        + CapabilityProofStore
-        + WantStore
-        + StorageFlush
-        + Send
-        + 'static,
+    S: BlobStore + Send + 'static,
     S::Snapshot: StoreRead + BlobChildren,
 {
-    let verified = peer.fetch_verified_with_deadline(handle, budget).await?;
-    land_exact(peer, verified)
-}
-
-fn land_exact<S>(peer: &Peer<S>, verified: Blob<UnknownBlob>) -> Option<u64>
-where
-    S: BlobStore
-        + CollectionStore
-        + CapabilityProofStore
-        + WantStore
-        + StorageFlush
-        + Send
-        + 'static,
-    S::Snapshot: StoreRead + BlobChildren,
-{
-    // Verified on the wire and matched against the requested handle at the
-    // capability boundary. Put preserves its cached H; close owns persistence.
-    let bytes = verified.bytes.len() as u64;
-    if let Err(error) = peer.store().put::<UnknownBlob, _>(verified) {
-        tracing::warn!(
-            ?error,
-            "exact blob put failed; acquisition remains unfinished"
-        );
-        return None;
-    }
-    Some(bytes)
+    let verified = snapshot
+        .fetch_verified_with_deadline(handle, budget)
+        .await?;
+    snapshot.land_verified(verified)
 }
 
 #[cfg(test)]
@@ -1132,7 +1121,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use ed25519_dalek::SigningKey;
-    use triblespace_core::blob::{BlobEncoding, IntoBlob};
+    use triblespace_core::blob::{Blob, BlobEncoding, IntoBlob};
     use triblespace_core::capability::CapabilityProof;
     use triblespace_core::collection::{
         CollectionCommit, CollectionDerive, CollectionMerge, CollectionRecord,
@@ -1900,11 +1889,13 @@ mod tests {
     #[derive(Default)]
     struct LandingTrace {
         put: Vec<RawHash>,
+        snapshot_put_counts: Vec<usize>,
         snapshots: usize,
         flushes: usize,
         closes: usize,
         fail_next_snapshot: bool,
         fail_snapshot: bool,
+        fail_snapshot_after_puts: Option<usize>,
         fail_flush: bool,
         fail_close: bool,
         fail_put: bool,
@@ -1922,7 +1913,14 @@ mod tests {
         fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
             let mut trace = self.trace.lock().unwrap();
             trace.snapshots += 1;
-            if trace.fail_snapshot || std::mem::take(&mut trace.fail_next_snapshot) {
+            let puts = trace.put.len();
+            trace.snapshot_put_counts.push(puts);
+            if trace.fail_snapshot
+                || std::mem::take(&mut trace.fail_next_snapshot)
+                || trace
+                    .fail_snapshot_after_puts
+                    .is_some_and(|limit| puts >= limit)
+            {
                 return Err(std::io::Error::other("test snapshot failed once"));
             }
             drop(trace);
@@ -2191,6 +2189,78 @@ mod tests {
         assert_eq!(stats.replication.speculative_attempted, 0);
         assert_eq!(fixture.fetches.trace.lock().unwrap().cancelled, 0);
         assert!(reconciler.states.is_empty());
+    }
+
+    #[tokio::test]
+    async fn peer_hydration_lands_ready_batch_before_publishing_its_snapshot() {
+        let mut fixture = exact_fixture(9, 0);
+        // READ/activation do not imply downloading the collection's payloads.
+        let demand = fixture.peer.reconcile().await;
+        assert_eq!(demand.landed, 0);
+        assert!(fixture.fetches.trace.lock().unwrap().calls.is_empty());
+
+        fixture
+            .peer
+            .set_replication(ReplicationMode::Shallow, [fixture.collection]);
+        fixture.landings.lock().unwrap().snapshot_put_counts.clear();
+        let stats = fixture.peer.reconcile().await;
+        assert_eq!(stats.landed, 9);
+        assert_eq!(stats.replication.pending, 0);
+        let trace = fixture.landings.lock().unwrap();
+        assert_eq!(trace.put.len(), 9);
+        assert!(trace.snapshot_put_counts.contains(&0));
+        assert!(trace.snapshot_put_counts.contains(&9));
+        assert!(
+            trace
+                .snapshot_put_counts
+                .iter()
+                .all(|&puts| puts == 0 || puts == 9),
+            "no intermediate serving rebuild may consume the ready fetch window: {:?}",
+            trace.snapshot_put_counts,
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_peer_hydration_keeps_selection_and_resumes_from_resident_state() {
+        let mut fixture = exact_fixture(9, 1);
+        fixture
+            .peer
+            .set_replication(ReplicationMode::Shallow, [fixture.collection]);
+        let mut turn = Box::pin(fixture.peer.reconcile());
+        assert!(futures::poll!(turn.as_mut()).is_pending());
+        assert_eq!(fixture.landings.lock().unwrap().put.len(), 8);
+        drop(turn);
+        assert_eq!(fixture.fetches.trace.lock().unwrap().active, 0);
+        assert_eq!(fixture.fetches.trace.lock().unwrap().cancelled, 1);
+        fixture.fetches.release();
+        let stats = fixture.peer.reconcile().await;
+        assert_eq!(stats.landed, 1);
+        assert_eq!(stats.replication.pending, 0);
+        assert_eq!(fixture.landings.lock().unwrap().put.len(), 9);
+        let calls = &fixture.fetches.trace.lock().unwrap().calls;
+        for &handle in &fixture.roots[1..] {
+            assert_eq!(calls.iter().filter(|&&called| called == handle).count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_batch_publication_withdraws_serving_without_losing_landed_bytes() {
+        let mut fixture = exact_fixture(9, 0);
+        fixture
+            .peer
+            .set_replication(ReplicationMode::Shallow, [fixture.collection]);
+        assert!(fixture.peer.health().store.serving_snapshot);
+        fixture.landings.lock().unwrap().fail_snapshot_after_puts = Some(9);
+        let stats = fixture.peer.reconcile().await;
+        assert_eq!(stats.landed, 9);
+        assert!(!fixture.peer.health().store.serving_snapshot);
+        assert_eq!(fixture.landings.lock().unwrap().put.len(), 9);
+        fixture.landings.lock().unwrap().fail_snapshot_after_puts = None;
+        let retry = fixture.peer.reconcile().await;
+        assert!(fixture.peer.health().store.serving_snapshot);
+        assert_eq!(retry.landed, 0);
+        assert_eq!(retry.replication.pending, 0);
+        assert_eq!(fixture.fetches.trace.lock().unwrap().calls.len(), 9);
     }
 
     #[tokio::test]
@@ -2762,6 +2832,55 @@ mod tests {
         assert_eq!(trace.peak, 1);
         assert_eq!(trace.active, 0);
         assert_eq!(peer.snapshot().unwrap().wants().unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_full_scan_retains_landed_children_and_revisits_pending_descendants() {
+        let grandchild_bytes = Bytes::from_source(b"nested body".to_vec());
+        let grandchild = Blob::<UnknownBlob>::new(grandchild_bytes.clone())
+            .get_handle()
+            .raw;
+        let child_bytes = Bytes::from_source(grandchild.to_vec());
+        let child = Blob::<UnknownBlob>::new(child_bytes.clone())
+            .get_handle()
+            .raw;
+        let mut store = MemoryRepo::default();
+        let descriptor = put(&mut store, b"scan descriptor".to_vec());
+        let metadata = put(&mut store, Vec::new());
+        let data = put(&mut store, child.to_vec());
+        raw_commit(&mut store, descriptor, data, metadata);
+        let (mut peer, fetches, landings) = controlled_peer(
+            store,
+            BTreeMap::from([(child, child_bytes), (grandchild, grandchild_bytes)]),
+            BTreeSet::from([grandchild]),
+        );
+        let mut reconciler = Reconciler::with_backoff(Duration::ZERO, Duration::ZERO)
+            .with_replication(ReplicationMode::Full, [Inline::new(descriptor)]);
+        let mut turn = Box::pin(reconciler.tick(&mut peer));
+        assert!(futures::poll!(turn.as_mut()).is_pending());
+        assert_eq!(landings.lock().unwrap().put, [child]);
+        drop(turn);
+        assert_eq!(fetches.trace.lock().unwrap().active, 0);
+        assert_eq!(fetches.trace.lock().unwrap().cancelled, 1);
+        fetches.release();
+        for _ in 0..4 {
+            reconciler.tick(&mut peer).await;
+            if landings.lock().unwrap().put.contains(&grandchild) {
+                break;
+            }
+        }
+        assert_eq!(landings.lock().unwrap().put, [child, grandchild]);
+        assert_eq!(
+            fetches
+                .trace
+                .lock()
+                .unwrap()
+                .calls
+                .iter()
+                .filter(|&&h| h == child)
+                .count(),
+            1,
+        );
     }
 
     #[tokio::test]

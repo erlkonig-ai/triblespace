@@ -146,6 +146,24 @@ protocol does not automatically transport a cross-collection witness closure.
 
 ## Opaque wakes over stock gossip
 
+Locally, `Peer::refresh()` admits bounded incoming evidence and freezes one
+coherent store observation: collection repair overlays, blob serving reader,
+and resident provider locators. A latest-value handoff replaces the previous
+observation rather than queuing successive snapshots. The host pins the newest
+one once per turn and uses PATCH differences against its last processed
+observation to update subscriptions and provider publication. Roots and
+provider locators therefore cannot come from different store observations.
+An unavailable active descriptor still retains its subscription, and a failed
+snapshot immediately withdraws serving. An unchanged snapshot requires no
+provider reinstallation. Per-topic outgoing root announcements likewise read
+the latest value rather than draining intermediate roots.
+
+This coalescing applies to replaceable observations, not new remote evidence:
+authenticated incoming records, proofs, and blobs still cross the bounded
+admission bridge into the store. It does not discard records or turn a dropped
+notification into a lost update; later observations and periodic Merkle repair
+derive the outstanding work from current state.
+
 The `iroh-gossip` topic ID is a domain-separated one-way image of the collection
 handle. Anyone who knows C can derive and join that topic, while generic gossip
 routers do not learn raw C. There is no authorization handshake merely to hear
@@ -631,7 +649,7 @@ explicit rewrite/retention-policy choice.
 
 ### Local replication policy and reference summaries
 
-`Reconciler::with_replication(mode, collections)` selects local acquisition
+`Peer::set_replication(mode, collections)` selects local acquisition
 work, separately from Peer activation and collection authorization:
 
 | Mode | Blob acquisition |
@@ -651,7 +669,13 @@ are skipped without taking a quantum. Exact WANT/root turns use an experimental
 window of at most four concurrent H-only fetches from that frozen candidate
 round. Ready verified bodies land one at a time through ordinary local put,
 preserving their cached handles without a per-body disk flush; a slow first
-request does not hold later ready answers.
+request does not hold later ready answers. `Peer::reconcile()` owns this
+bounded quantum and retains its retry/traversal state across cancellation.
+It observes the store at entry, lands ready answers without rebuilding serving
+state between them, and publishes one snapshot after the completed batch. A
+cancelled batch leaves already landed bytes for the next refresh to publish.
+Recursive scanning may reobserve local bytes after acquiring a child, but that
+does not rebuild or publish the network inventory.
 Refills share the original turn deadline rather than starting another budget.
 Expiry drops unfinished requests and charges their normal retry backoff, while
 unstarted candidates retain their priority. Cancelling the whole tick drops
@@ -660,7 +684,8 @@ admitted attempts retain their consumed cursor/first-attempt position, just as
 with a cancelled serial await. Peer fetch futures start the lazy host only when
 polled and hold no store or host guard across network I/O. This is bounded
 concurrency, not a measured throughput or end-to-end completion guarantee:
-synchronous landing/refresh still takes serial time, and with the default
+synchronous observation, landing, and final publication still take serial time,
+and with the default
 budget, several 30-second quanta plus the caller's tick intervals may pass before a fresh root
 or its body receives service. There is no low-latency guarantee.
 

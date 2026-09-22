@@ -32,7 +32,7 @@ use triblespace_core::repo::{
 use crate::channel::{MAX_ADMISSION_BRIDGE_BATCHES, NetEvent};
 use crate::host::{self, ActiveCollections, NetReceiver, NetSender, StoreSnapshot};
 use crate::protocol::RawHash;
-use crate::provider::ProviderObservation;
+use crate::reconcile::{ReconcileStats, Reconciler, ReplicationMode};
 use crate::wake::CollectionWakePlane;
 
 pub use crate::host::PeerConfig;
@@ -198,12 +198,12 @@ where
     qos: ReconcileQos,
     active: ActiveCollections,
     active_dirty: bool,
+    /// Local retry/cursor state; demand and residency are observed in the store.
+    reconciler: Reconciler,
     /// Last local observation used to build the installed immutable inventory.
     /// Equality is a cheap invalidation check supplied by the store; it is not
     /// a portable generation or a semantic version.
     last_store_snapshot: Option<S::Snapshot>,
-    /// Last snapshot-bound provider set sent to the host.
-    last_provider_observation: ProviderObservation,
     last_event_at: crate::clock::Mono,
     #[cfg(test)]
     serving_snapshot_rebuilds: usize,
@@ -294,8 +294,8 @@ where
             qos,
             active: PATCH::new(),
             active_dirty: true,
+            reconciler: Reconciler::new(),
             last_store_snapshot: None,
-            last_provider_observation: ProviderObservation::default(),
             last_event_at: crate::clock::mono_now(),
             #[cfg(test)]
             serving_snapshot_rebuilds: 0,
@@ -319,6 +319,37 @@ where
 
     pub fn id(&self) -> EndpointId {
         self.sender.id()
+    }
+
+    /// Select optional payload replication, independently of collection READ
+    /// admission or activation. The default remains explicit demand only.
+    pub fn set_replication(
+        &mut self,
+        mode: ReplicationMode,
+        collections: impl IntoIterator<Item = CollectionHandle>,
+    ) {
+        self.reconciler.set_replication(mode, collections);
+    }
+
+    /// Service one bounded hydration quantum from a coherent local snapshot.
+    /// Network reads hold no store lock; verified results land serially and
+    /// the completed batch is published once through `refresh`.
+    ///
+    /// Cancellation leaves retry/traversal state here in the peer, drops all
+    /// outstanding fetches, and leaves landed bytes for the next refresh.
+    pub async fn reconcile(&mut self) -> ReconcileStats {
+        let snapshot = match self.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!(%error, "store snapshot unavailable; skipping reconcile pass");
+                return ReconcileStats::default();
+            }
+        };
+        let stats = self.reconciler.tick_snapshot(snapshot, |_, _| None).await;
+        if stats.landed != 0 {
+            self.refresh();
+        }
+        stats
     }
 
     /// Inspect local runtime evidence without refreshing the store, starting a
@@ -455,7 +486,6 @@ where
         if result.is_err() {
             self.sender.clear_snapshot();
             self.last_store_snapshot = None;
-            self.last_provider_observation = ProviderObservation::default();
         }
         result
     }
@@ -554,14 +584,6 @@ where
             changes,
         )
         .map_err(PeerSnapshotError::Overlay)?;
-        let serves_collections = self.qos.direction.serves();
-        let provider_observation = ProviderObservation::from_locators(
-            serving
-                .collections()
-                .map(|collection| collection.collection()),
-            serves_collections,
-            serving.bearer_locators(),
-        );
         self.sender.update_snapshot(serving, &self.active);
         #[cfg(test)]
         {
@@ -569,23 +591,7 @@ where
         }
         self.active_dirty = false;
         self.last_store_snapshot = Some(snapshot);
-        Self::observe_provider_observation(
-            &self.sender,
-            &mut self.last_provider_observation,
-            provider_observation,
-        );
         Ok(())
-    }
-
-    fn observe_provider_observation(
-        sender: &NetSender,
-        last: &mut ProviderObservation,
-        observation: ProviderObservation,
-    ) {
-        if *last != observation {
-            sender.update_providers(observation.clone());
-            *last = observation;
-        }
     }
 
     /// Borrow the local backend without starting the host.

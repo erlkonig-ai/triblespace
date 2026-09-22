@@ -301,6 +301,12 @@ impl ProviderPublisher {
     }
 
     pub(crate) fn install(&mut self, resident: ProviderSet, now: Mono) {
+        // Record/AUTH refreshes may publish a new serving snapshot with the
+        // same resident PATCH. Its pending work and renewal clocks already
+        // describe this set; do not rebuild those sets for an unchanged input.
+        if self.initialized && self.resident == resident {
+            return;
+        }
         if self.initialized {
             let added = resident.leases.difference(&self.resident.leases);
             self.startup.leases = self.startup.leases.intersect(&resident.leases);
@@ -1351,6 +1357,68 @@ mod tests {
                 .next(now + crate::RETRY_BACKOFF_BASE)
                 .map(|work| (work.key, work.identity)),
             Some((key, token))
+        );
+    }
+
+    #[test]
+    fn latest_inventory_preserves_pending_and_retry_work_without_intermediate_installs() {
+        let now = crate::clock::mono_now();
+        let inventory = |keys: &[u8]| {
+            let mut set = ProviderSet::default();
+            for key in keys {
+                set.leases
+                    .replace(&PatchEntry::with_value(&[*key; 32], [*key; 32]));
+            }
+            set
+        };
+        let mut replayed = ProviderPublisher::new(now);
+        let mut latest = ProviderPublisher::new(now);
+        for publisher in [&mut replayed, &mut latest] {
+            publisher.install(inventory(&[1, 2, 3, 4]), now);
+            assert_eq!(publisher.next(now).unwrap().key, [1; 32]);
+            assert!(publisher.retry([1; 32], now));
+        }
+        replayed.install(inventory(&[1, 2, 3, 4, 5]), now);
+        replayed.install(inventory(&[1, 2, 3, 4, 5, 6]), now);
+        latest.install(inventory(&[1, 2, 3, 4, 5, 6]), now);
+        assert_eq!(replayed.resident, latest.resident);
+        assert_eq!(replayed.startup, latest.startup);
+        assert_eq!(replayed.additions, latest.additions);
+        assert_eq!(replayed.retries, latest.retries);
+        assert_eq!(latest.startup, inventory(&[2, 3, 4]));
+        assert_eq!(latest.additions, inventory(&[5, 6]));
+        assert_eq!(latest.retries, inventory(&[1]));
+
+        let renewal = latest.next_renewal;
+        let retry = latest.retry_at;
+        latest.install(inventory(&[1, 2, 3, 4, 5, 6]), now + Duration::from_secs(1));
+        assert_eq!(latest.next_renewal, renewal);
+        assert_eq!(latest.retry_at, retry);
+        assert_eq!(latest.startup, replayed.startup);
+        assert_eq!(latest.additions, replayed.additions);
+        assert_eq!(latest.retries, replayed.retries);
+
+        latest.install(inventory(&[3, 4, 5, 6]), now);
+        assert_eq!(latest.startup, inventory(&[3, 4]));
+        assert_eq!(latest.additions, inventory(&[5, 6]));
+        assert!(latest.retries.leases.is_empty());
+        // A late failure from the old generation cannot resurrect a withdrawn key.
+        assert!(latest.retry([1; 32], now));
+        assert!(latest.retries.leases.is_empty());
+        let mut scheduled = BTreeSet::new();
+        while let Some(work) = latest.next(now) {
+            scheduled.insert(work.key);
+        }
+        assert_eq!(
+            scheduled,
+            BTreeSet::from([[3; 32], [4; 32], [5; 32], [6; 32]])
+        );
+        latest.install(ProviderSet::default(), now);
+        assert!(latest.next(now + PROVIDER_RENEWAL_PERIOD).is_none());
+        latest.install(inventory(&[7]), now + PROVIDER_RENEWAL_PERIOD);
+        assert_eq!(
+            latest.next(now + PROVIDER_RENEWAL_PERIOD).unwrap().key,
+            [7; 32]
         );
     }
 

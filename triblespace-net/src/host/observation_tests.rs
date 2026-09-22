@@ -18,8 +18,8 @@ use triblespace_core::capability::{
 };
 use triblespace_core::collection::{
     ACTION_READ, AdmissionPolicy, Collection, CollectionCommit, CollectionHandle, CollectionPolicy,
-    CollectionRead, CollectionRecord, CollectionRecordSelector,
-    CollectionStore, CollectionStoreExt, KIND_COLLECTION_DESCRIPTOR, read_capability,
+    CollectionRead, CollectionRecord, CollectionRecordSelector, CollectionStore,
+    CollectionStoreExt, KIND_COLLECTION_DESCRIPTOR, read_capability,
 };
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{Inline, InlineEncoding};
@@ -256,6 +256,222 @@ fn active(collection: CollectionHandle) -> ActiveCollections {
     let mut active = ActiveCollections::new();
     active.insert(&PatchEntry::new(&collection.raw));
     active
+}
+
+#[test]
+fn serving_handoff_keeps_only_the_latest_coherent_observation() {
+    let mut fixture = Fixture::new();
+    let local = fixture.root.verifying_key();
+    let mut selected = active(fixture.collection.handle());
+    // Missing descriptors still require a subscription and bootstrap attempt,
+    // but must never become serving/provider advertisements.
+    let unavailable = CollectionHandle::new([0xFE; 32]);
+    selected.insert(&PatchEntry::new(&unavailable.raw));
+    let (sender, _evidence, mut wiring) =
+        super::wire(iroh_base::EndpointId::from_bytes(local.as_bytes()).unwrap());
+    assert!(!wiring.snapshot.has_changed().unwrap());
+    let mut retired = Vec::new();
+    let mut newest_blob = None;
+    for label in ["handoff-one", "handoff-two", "handoff-three"] {
+        let record = fixture
+            .store
+            .commit(
+                fixture.collection,
+                &fixture.root,
+                entity! { metadata::name: label },
+            )
+            .unwrap();
+        newest_blob = Some(record.data().raw);
+        let serving = StoreSnapshot::from_store_changes(
+            fixture.snapshot(),
+            &selected,
+            local,
+            None,
+            None,
+            StoreChanges::ALL,
+        )
+        .unwrap();
+        sender.update_snapshot(serving, &selected);
+        retired.push(Arc::downgrade(&sender.current_snapshot().unwrap()));
+    }
+    assert!(retired[0].upgrade().is_none());
+    assert!(retired[1].upgrade().is_none());
+    assert!(retired[2].upgrade().is_some());
+    assert!(wiring.snapshot.has_changed().unwrap());
+    let latest = wiring.snapshot.borrow_and_update().clone().unwrap();
+    assert!(!wiring.snapshot.has_changed().unwrap());
+    assert!(Arc::ptr_eq(&latest, &sender.current_snapshot().unwrap()));
+    assert!(latest.collections.get(&unavailable.raw).is_some());
+    assert!(latest.collection(unavailable).is_none());
+    let advertised = crate::provider::ProviderObservation::from_locators(
+        latest.collections().map(|entry| entry.collection()),
+        true,
+        latest.bearer_locators(),
+    )
+    .into_set();
+    assert!(
+        advertised.contains(&crate::provider::collection_provider_key(
+            fixture.collection.handle()
+        ))
+    );
+    assert!(!advertised.contains(&crate::provider::collection_provider_key(unavailable)));
+    let blob = newest_blob.unwrap();
+    assert!(advertised.contains(&crate::bearer::blob_locator(blob)));
+    assert!(latest.get_blob(&blob).is_some());
+}
+
+#[test]
+fn serving_handoff_withdrawal_recovery_and_last_owner_drop_are_observable() {
+    let mut fixture = Fixture::new();
+    let local = fixture.root.verifying_key();
+    let collection = fixture.collection.handle();
+    let selected = active(collection);
+    let (sender, _evidence, mut wiring) =
+        super::wire(iroh_base::EndpointId::from_bytes(local.as_bytes()).unwrap());
+    let mut install = |selected: &ActiveCollections| {
+        let serving = StoreSnapshot::from_store_changes(
+            fixture.snapshot(),
+            selected,
+            local,
+            None,
+            None,
+            StoreChanges::ALL,
+        )
+        .unwrap();
+        sender.update_snapshot(serving, selected);
+    };
+    install(&selected);
+    assert!(wiring.snapshot.borrow_and_update().is_some());
+    sender.clear_snapshot();
+    assert!(sender.current_snapshot().is_none());
+    assert!(
+        wiring.snapshot.borrow().is_none(),
+        "serving withdraws immediately"
+    );
+    assert!(wiring.snapshot.has_changed().unwrap());
+    assert!(wiring.snapshot.borrow_and_update().is_none());
+    install(&selected);
+    assert!(
+        wiring
+            .snapshot
+            .borrow_and_update()
+            .as_ref()
+            .unwrap()
+            .collection(collection)
+            .is_some()
+    );
+    // Deactivation is a newer valid observation; it does not withdraw blobs.
+    install(&ActiveCollections::new());
+    let deactivated = wiring.snapshot.borrow_and_update().clone().unwrap();
+    assert!(deactivated.collections.is_empty());
+    assert!(!deactivated.bearer_locators().is_empty());
+    let clone = sender.clone();
+    drop(sender);
+    assert!(!wiring.snapshot.has_changed().unwrap());
+    drop(clone);
+    assert!(wiring.snapshot.has_changed().is_err());
+}
+
+#[tokio::test]
+async fn wake_topic_broadcasts_latest_root_without_retaining_snapshot_history() {
+    use crate::wake::{CollectionWake, CollectionWakeEvent, CollectionWakeRoot};
+
+    #[derive(Clone)]
+    struct Plane(
+        tokio::sync::mpsc::UnboundedSender<CollectionWakeRoot>,
+        tokio::sync::mpsc::UnboundedSender<Vec<iroh_base::EndpointId>>,
+    );
+    struct Topic {
+        plane: Plane,
+        collection: CollectionHandle,
+    }
+    impl crate::wake::CollectionWakeNetwork for Plane {
+        type Topic = Topic;
+
+        async fn subscribe_network(
+            &self,
+            collection: CollectionHandle,
+            _bootstrap: Vec<iroh_base::EndpointId>,
+        ) -> anyhow::Result<Self::Topic> {
+            Ok(Topic {
+                plane: self.clone(),
+                collection,
+            })
+        }
+    }
+    impl crate::wake::CollectionWakeSubscription for Topic {
+        async fn join_wake_peers(&self, peers: Vec<iroh_base::EndpointId>) -> anyhow::Result<()> {
+            self.plane.1.send(peers).unwrap();
+            Ok(())
+        }
+
+        async fn broadcast_wake(&self, root: CollectionWakeRoot) -> anyhow::Result<CollectionWake> {
+            self.plane.0.send(root).unwrap();
+            Ok(CollectionWake::sign(
+                self.collection,
+                root,
+                [0; 16],
+                &SigningKey::from_bytes(&[33; 32]),
+            ))
+        }
+
+        async fn next_wake_event(&mut self) -> anyhow::Result<Option<CollectionWakeEvent>> {
+            std::future::pending().await
+        }
+    }
+
+    let (broadcasts, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let (joins, mut joined) = tokio::sync::mpsc::unbounded_channel();
+    let (notices, _notice_rx) = tokio::sync::mpsc::channel(1);
+    let topic = super::spawn_wake_topic(
+        Plane(broadcasts, joins),
+        CollectionHandle::new([44; 32]),
+        Vec::new(),
+        notices,
+    );
+    for byte in 1..=200 {
+        topic.observe(Some(CollectionWakeRoot::new([byte; 32])));
+    }
+    // Root observations coalesce, but discovering more peers than a bounded
+    // hint channel could hold must not silently lose their gossip joins.
+    let peers: Vec<_> = (1..=32)
+        .map(|byte| {
+            iroh_base::EndpointId::from_bytes(
+                SigningKey::from_bytes(&[byte; 32])
+                    .verifying_key()
+                    .as_bytes(),
+            )
+            .unwrap()
+        })
+        .collect();
+    for peer in &peers {
+        assert!(topic.send(super::WakeCommand::Join(vec![*peer])).is_ok());
+    }
+    assert_eq!(
+        received.recv().await,
+        Some(CollectionWakeRoot::new([200; 32]))
+    );
+    assert!(received.try_recv().is_err());
+    for peer in peers {
+        assert_eq!(joined.recv().await, Some(vec![peer]));
+    }
+    topic.observe(None);
+    tokio::task::yield_now().await;
+    assert!(received.try_recv().is_err());
+    topic.observe(Some(CollectionWakeRoot::new([201; 32])));
+    topic.observe(Some(CollectionWakeRoot::new([202; 32])));
+    assert_eq!(
+        received.recv().await,
+        Some(CollectionWakeRoot::new([202; 32]))
+    );
+    assert!(received.try_recv().is_err());
+    drop(topic);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), received.recv())
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 fn assert_same_record_leaves(
@@ -842,7 +1058,7 @@ fn scoped_missing_descriptor_stays_pending_until_its_exact_blob_arrives() {
     let selected = active(cold.handle());
     let before = fixture.observe(&selected, None);
     assert!(before.1.collection(cold.handle()).is_none());
-    assert!(before.1.notices().is_empty());
+    assert_eq!(before.1.collections().count(), 0);
     assert_eq!(fixture.take_counts(), (0, 0, 1));
 
     fixture
@@ -855,7 +1071,7 @@ fn scoped_missing_descriptor_stays_pending_until_its_exact_blob_arrives() {
         .unwrap();
     let unrelated = fixture.observe(&selected, Some(&before));
     assert!(unrelated.1.collection(cold.handle()).is_none());
-    assert!(unrelated.1.notices().is_empty());
+    assert_eq!(unrelated.1.collections().count(), 0);
     assert_eq!(fixture.take_counts(), (0, 0, 0));
 
     assert_eq!(
@@ -864,7 +1080,7 @@ fn scoped_missing_descriptor_stays_pending_until_its_exact_blob_arrives() {
     );
     let arrived = fixture.observe(&selected, Some(&unrelated));
     assert!(arrived.1.collection(cold.handle()).is_some());
-    assert_eq!(arrived.1.notices().len(), 1);
+    assert_eq!(arrived.1.collections().count(), 1);
     let (records, proofs, reads) = fixture.take_counts();
     assert_eq!((records, proofs), (1, 1));
     assert!(reads > 0);

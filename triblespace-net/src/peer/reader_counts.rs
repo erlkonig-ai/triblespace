@@ -20,9 +20,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use triblespace_core::blob::TryFromBlob;
 use triblespace_core::capability::{CapabilityProof, CapabilityProofId};
-use triblespace_core::collection::{
-    CollectionRead, CollectionRecord, CollectionRecordSelector,
-};
+use triblespace_core::collection::{CollectionRead, CollectionRecord, CollectionRecordSelector};
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::{
@@ -439,11 +437,8 @@ async fn first_peer_resnapshot_enumerates_all_handles_then_only_deltas() {
             "inventory construction reads no payloads"
         );
         assert_eq!(peer.serving_snapshot_rebuilds, 1);
-        assert_eq!(
-            peer.last_provider_observation.clone().into_set().len(),
-            (resident + 1) as u64
-        );
         let serving = peer.sender.current_snapshot().unwrap();
+        assert_eq!(serving.bearer_locators().len(), (resident + 1) as u64);
         assert_eq!(
             serving
                 .bearer_locators()
@@ -545,8 +540,6 @@ fn assert_leech_has_no_serving_inventory(leech: &Leech<Counted<Pile>>, counts: &
     assert!(leech.peer.last_store_snapshot.is_none());
     assert!(leech.peer.sender.current_snapshot().is_none());
     assert_eq!(leech.peer.serving_snapshot_rebuilds, 0);
-    let providers = leech.peer.last_provider_observation.clone().into_set();
-    assert_eq!(providers.len(), 0);
     let health = leech.health();
     assert!(!health.store.serving_snapshot);
     assert!(health.store.last_snapshot_published_at.is_none());

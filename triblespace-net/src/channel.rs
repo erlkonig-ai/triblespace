@@ -1,11 +1,14 @@
-//! Messages crossing the synchronous store / asynchronous host boundary.
+//! Evidence crossing the asynchronous host / synchronous store boundary.
+//!
+//! The reverse direction publishes one latest immutable serving observation,
+//! not a history of notifications. These messages are different: authenticated
+//! evidence must be admitted even when a newer observation arrives.
 //!
 //! Collection repair admission is monotone. The host streams authenticated leaves to
 //! the store side in bounded batches, where one refresh drain inserts all
 //! available batches into the next immutable observation without a disk flush.
 //! Explicit close (or an application-chosen flush) owns persistence.
 
-use crate::provider::ProviderObservation;
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::capability::CapabilityProof;
@@ -13,25 +16,6 @@ use triblespace_core::collection::{
     COLLECTION_COMMIT_BYTES_LEN, COLLECTION_DERIVE_BYTES_LEN, COLLECTION_MERGE_BYTES_LEN,
     CollectionRecord,
 };
-
-/// A changed immutable local serving observation.
-///
-/// The snapshot slot is replaced before this command is sent. The host uses
-/// notices update exact-handle wake subscriptions and periodic repair roots.
-pub(crate) struct SnapshotNotice {
-    /// Exact active collection handles and their opaque semantic repair roots.
-    pub(crate) collections: Vec<(triblespace_core::collection::CollectionHandle, [u8; 32])>,
-    /// Whether an immutable serving snapshot is now installed.
-    pub(crate) installed: bool,
-}
-
-/// Commands sent from [`crate::peer::Peer`] to the host runtime.
-pub(crate) enum NetCommand {
-    SnapshotChanged(SnapshotNotice),
-    /// Replace the exact opaque provider keys selected by the current admitted
-    /// artifact observation. Raw handles never cross this boundary.
-    ProvidersUpdated(ProviderObservation),
-}
 
 /// Authenticated, structurally canonical collection items returned by repair.
 ///
