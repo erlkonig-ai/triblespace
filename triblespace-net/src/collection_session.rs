@@ -22,6 +22,24 @@ use crate::patch_repair::{
 };
 use crate::transport::Conn;
 
+/// A valid, collection-scoped reply, not a broken shared transport.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CollectionRepairRefusal {
+    Rejected,
+    Unavailable,
+}
+
+impl std::fmt::Display for CollectionRepairRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Rejected => "remote rejected READ(C) evidence",
+            Self::Unavailable => "remote does not retain the requested collection",
+        })
+    }
+}
+
+impl std::error::Error for CollectionRepairRefusal {}
+
 /// Evidence missing from the caller's immutable local observation.
 #[derive(Clone, Debug)]
 pub(crate) struct CollectionRepairDelta {
@@ -220,9 +238,9 @@ where
     send_repair_bootstrap(send, &read_bootstrap).await?;
     let remote = match recv_repair_admission(recv).await? {
         CollectionRepairAdmission::Admitted(manifest) => manifest,
-        CollectionRepairAdmission::Rejected => bail!("remote rejected READ(C) evidence"),
+        CollectionRepairAdmission::Rejected => return Err(CollectionRepairRefusal::Rejected.into()),
         CollectionRepairAdmission::Unavailable => {
-            bail!("remote does not retain the requested collection")
+            return Err(CollectionRepairRefusal::Unavailable.into());
         }
     };
     // A long repair must not make its older pinned manifest appear fresh at

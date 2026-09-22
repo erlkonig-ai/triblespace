@@ -18,6 +18,7 @@ use crate::transport::sim::{SimConfig, SimNet, SimTransport};
 use super::*;
 
 mod exact_h_diagnostics;
+mod repair_refusal;
 mod request_backpressure;
 
 struct CountedBlobReader {

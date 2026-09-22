@@ -33,7 +33,9 @@ use triblespace_core::repo::{
 use crate::bearer::{BearerLocatorIndex, blob_locator, locator_index, update_locator_index};
 use crate::channel::{NetEvent, NetEventBatch};
 use crate::collection_activation::{CollectionRepairOverlay, CollectionRepairOverlayError};
-use crate::collection_session::{manifest, pull_collection, serve_collection_repair};
+use crate::collection_session::{
+    CollectionRepairRefusal, manifest, pull_collection, serve_collection_repair,
+};
 use crate::collection_wire::{MAX_COLLECTION_READ_BOOTSTRAP_PROOFS, OP_COLLECTION_REPAIR};
 use crate::health::{
     CollectionHealth, Health, HealthSnapshot, RepairComparison, RepairFailure, StoreHealth,
@@ -1898,7 +1900,11 @@ async fn reconcile_collection_peer<T: Transport>(
     {
         Ok(delta) => delta,
         Err(error) => {
-            pool_invalidate(pool, target.peer, &connection.entry);
+            // READ refusal or absent C is a valid answer on this stream.
+            // Other collections may be repairing over this same connection.
+            if !error.is::<CollectionRepairRefusal>() {
+                pool_invalidate(pool, target.peer, &connection.entry);
+            }
             return Err(error);
         }
     };

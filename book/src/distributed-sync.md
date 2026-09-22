@@ -573,6 +573,10 @@ Iroh's transport authentication binds each connection to its endpoint ID.
 There is no generic AUTH or SYNC_TEAM exchange: collection evidence is gated by
 READ(C). Exact bytes are gated only by the endpoint-bound mutual proof of H.
 
+A valid READ refusal or unavailable-collection reply ends only that repair
+stream. It does not evict the shared connection or cancel unrelated requests.
+Malformed replies and transport failures still invalidate the pooled connection.
+
 Pending dial ownership is cancellation-safe: the final departing waiter removes
 an uninitialized pool entry, while concurrent callers retain the same shared
 dial and can take over its cancelled initializer. The established-connection

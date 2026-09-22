@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Keep a shared peer connection after a valid collection-repair READ refusal
+  or unavailable-collection reply. These answers end only their own stream;
+  malformed replies and transport failures still invalidate the connection.
+
 - Peer-to-host synchronization publishes one latest coherent store snapshot,
   not a FIFO of intermediate serving/provider observations. The host computes
   PATCH differences from the snapshot it last processed; per-topic root wakes

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Preserve shared connections after valid collection READ refusals or
+  unavailable replies. Malformed replies still invalidate the connection;
+  refusal cannot cancel another collection's in-flight stream.
+
 ### Added
 
 - Expose bounded inbound GET activity/completion/byte counters in host health,
