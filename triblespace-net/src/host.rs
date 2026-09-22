@@ -2554,14 +2554,14 @@ impl SnapshotHandler {
                     return;
                 };
                 tracing::trace!(target: "triblespace_net::handoff", "host accepted RPC stream");
-                let Ok(connection_permit) = per_connection.clone().try_acquire_owned() else {
-                    debug!(target: "triblespace_net::handoff", "host per-connection request limit reached");
-                    connection.close(1, b"request concurrency exceeded");
+                // Backpressure a burst instead of closing its entire connection:
+                // other streams may already be repairing independent collections.
+                // This loop retains at most one accepted, waiting stream per
+                // bounded connection, and spawns a task only with both permits.
+                let Ok(connection_permit) = per_connection.clone().acquire_owned().await else {
                     return;
                 };
-                let Ok(global_permit) = self.inbound_requests.clone().try_acquire_owned() else {
-                    debug!(target: "triblespace_net::handoff", "host global request limit reached");
-                    connection.close(1, b"global request concurrency exceeded");
+                let Ok(global_permit) = self.inbound_requests.clone().acquire_owned().await else {
                     return;
                 };
                 let handler = self.clone();

@@ -102,6 +102,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Apply bounded backpressure when inbound RPC request slots are occupied,
+  instead of closing the shared connection and cancelling unrelated repair
+  streams. The existing connection and active-request limits are unchanged.
+
 - Reuse selected collections' fixed repair components and READ bootstrap
   witnesses when their observed raw inputs are unchanged. Missing descriptors
   and definitions remain dependencies; record-only changes preserve authority

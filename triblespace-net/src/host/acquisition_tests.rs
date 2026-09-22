@@ -18,6 +18,7 @@ use crate::transport::sim::{SimConfig, SimNet, SimTransport};
 use super::*;
 
 mod exact_h_diagnostics;
+mod request_backpressure;
 
 struct CountedBlobReader {
     inner: Arc<dyn BlobSnapshotReader>,

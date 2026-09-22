@@ -563,6 +563,11 @@ of future integration, not an optional cache optimization.
 
 ### Live request scheduling
 
+Inbound RPC streams wait for the existing per-connection and process-wide
+request permits. Saturation does not close the connection carrying other
+active repairs. Each bounded connection retains at most one accepted waiting
+stream, and no handler task is spawned until both permits are held.
+
 One connection pool is shared by collection repair and bearer/DHT operations.
 Iroh's transport authentication binds each connection to its endpoint ID.
 There is no generic AUTH or SYNC_TEAM exchange: collection evidence is gated by
