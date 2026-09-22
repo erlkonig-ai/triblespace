@@ -561,6 +561,46 @@ fn observe_lattice<R: triblespace_core::repo::StoreRead>(
     Ok(out)
 }
 
+/// A node's label: the host its own daemons declare, beside the short handle.
+///
+/// The handle alone is unreadable, and a name alone is ambiguous: mid-cutover
+/// one host appears TWICE, once under its signing key and once under its old
+/// transport endpoint, and both sets of daemons call themselves `sky`. Showing
+/// both is what lets a reader see that those two marks are one machine without
+/// having to be told.
+///
+/// The name is not looked up anywhere. A worker report carries the name its own
+/// daemon chose -- `sky-sync`, `mac-maintenance` -- so the host is the part
+/// before the first `-`. Nothing is invented when that evidence is absent or
+/// disagrees: a peer named only inside somebody else's condition has no daemon
+/// here to name it, and it keeps the bare handle rather than borrowing a name
+/// from a neighbour.
+fn node_label(frame: &Frame, node: &[u8; 32]) -> String {
+    let mut host: Option<&str> = None;
+    for worker in frame.workers.iter().filter(|worker| worker.node == *node) {
+        // Only read the convention where it is visibly followed. `sky-sync`
+        // names a host and a role; a bare `maintainer` names only a role, and
+        // taking its whole name as a host would invent one.
+        let Some((declared, _)) = worker.worker.split_once('-') else {
+            continue;
+        };
+        if declared.is_empty() {
+            continue;
+        }
+        match host {
+            None => host = Some(declared),
+            // Two daemons on one node disagreeing about which host they are on
+            // is not something to average. Fall back to the handle.
+            Some(seen) if seen != declared => return short(node),
+            Some(_) => {}
+        }
+    }
+    match host {
+        Some(host) => format!("{host} · {}", short(node)),
+        None => short(node),
+    }
+}
+
 /// Members above which the join lattice is reported but not drawn.
 ///
 /// A truncated graph is a false picture rather than a partial one: dropping
@@ -1053,7 +1093,7 @@ fn render_terminal(frame: &Frame) -> String {
         let _ = writeln!(
             out,
             "NODE {} · {} observed worker scopes{converged}",
-            short(&node),
+            node_label(frame, &node),
             workers
                 .iter()
                 .map(|worker| worker.subject)
@@ -1712,6 +1752,58 @@ mod tests {
             targets: vec![],
             metrics: vec![],
         }
+    }
+
+    /// A node is labelled by the host its own daemons declare, and never by a
+    /// name invented from evidence that does not carry one.
+    #[test]
+    fn a_node_is_named_by_its_daemons_or_not_at_all() {
+        let mut frame = Frame {
+            workers: vec![],
+            health: vec![],
+            lattice: None,
+            members: None,
+            warnings: vec![],
+            sampled: Instant::now(),
+            observation_time: Duration::ZERO,
+            readable_sources: 1,
+            selected_sources: 1,
+            max_age: Duration::from_secs(30),
+        };
+
+        // A role-only worker name carries no host. Inventing one from it would
+        // put "maintainer" where a machine belongs.
+        let mut role_only = worker();
+        role_only.node = [7; 32];
+        role_only.worker = "maintainer".into();
+        frame.workers = vec![role_only];
+        assert_eq!(node_label(&frame, &[7; 32]), short(&[7; 32]));
+
+        // The live convention is host-role, and the handle STAYS: mid-cutover
+        // one machine reports under two identities and both sets of daemons
+        // call themselves the same host.
+        let mut host_role = worker();
+        host_role.node = [8; 32];
+        host_role.worker = "sky-maintenance".into();
+        frame.workers = vec![host_role];
+        let labelled = node_label(&frame, &[8; 32]);
+        assert!(labelled.starts_with("sky · "), "{labelled}");
+        assert!(labelled.ends_with(&short(&[8; 32])), "{labelled}");
+
+        // Two daemons on one node disagreeing is not something to average.
+        let mut one = worker();
+        one.node = [9; 32];
+        one.worker = "sky-sync".into();
+        let mut two = worker();
+        two.node = [9; 32];
+        two.worker = "mac-sync".into();
+        frame.workers = vec![one, two];
+        assert_eq!(node_label(&frame, &[9; 32]), short(&[9; 32]));
+
+        // A peer named only inside somebody else's condition has no daemon
+        // here to name it.
+        frame.workers = vec![];
+        assert_eq!(node_label(&frame, &[1; 32]), short(&[1; 32]));
     }
 
     #[test]
