@@ -396,10 +396,15 @@ fn capture_generated_colony_dashboard() -> Result<()> {
                 settle_timeout: Duration::from_secs(2),
             },
             move |notebook| {
+                // The capture exercises the LIVE card graph over a fixed
+                // observation, rather than a second arrangement that merely
+                // resembles it: only the pull and the publish differ.
                 let frame = frame.clone();
-                notebook.view(move |ctx| {
-                    ctx.with_padding(DEFAULT_CARD_PADDING, |ui| render(ui, &frame));
-                });
+                super::compose(
+                    notebook,
+                    move || (Some(Ok(frame.clone())), None),
+                    |_chosen| {},
+                );
                 notebook.settled();
             },
             |image| {

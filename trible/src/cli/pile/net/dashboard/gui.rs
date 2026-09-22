@@ -4,63 +4,282 @@
 use super::*;
 use anyhow::anyhow;
 use GORBIE::cards::DEFAULT_CARD_PADDING;
-use GORBIE::NotebookConfig;
+use GORBIE::{CardCtx, NotebookConfig};
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[path = "gui_capture_tests.rs"]
 mod capture_tests;
 
+/// One read-only part of the colony. The lattice is deliberately NOT here:
+/// it owns the selection, so it is a `state` card rather than a `view` one.
+///
+/// Each of these becomes its OWN notebook card rather than a heading inside one
+/// long card. That is not cosmetic: GORBIE detaches a card, so one card per
+/// section is what lets a reader pull the mesh onto one side of the workspace
+/// and keep the members list on the other. A single card detaches whole or not
+/// at all.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Section {
+    Overview,
+    Mesh,
+    Members,
+    Nodes,
+    Links,
+}
+
+impl Section {
+    /// Shown before a frame arrives, so an empty workspace still says what each
+    /// card is going to be instead of showing identical placeholders.
+    const fn title(self) -> &'static str {
+        match self {
+            Self::Overview => "Colony overview",
+            Self::Mesh => "Observed mesh",
+            Self::Members => "Collection members",
+            Self::Nodes => "Nodes and workers",
+            Self::Links => "Observed links",
+        }
+    }
+
+    fn draw(self, ui: &mut egui::Ui, frame: &Frame, selected: Option<[u8; 32]>) {
+        match self {
+            Self::Overview => render_overview(ui, frame),
+            Self::Mesh => styled(ui, |ui| render_mesh(ui, frame)),
+            Self::Members => styled(ui, |ui| render_members(ui, frame, selected)),
+            Self::Nodes => render_nodes(ui, frame),
+            Self::Links => render_links(ui, frame),
+        }
+    }
+}
+
+/// The cards that only READ. The overview is drawn by the producer and the
+/// lattice by the selector, because each of those owns a value.
+const CONSUMERS: [Section; 4] = [
+    Section::Mesh,
+    Section::Members,
+    Section::Nodes,
+    Section::Links,
+];
+
+/// What a card has to draw from: the latest frame, the reason there is none,
+/// or nothing observed yet.
+type Observed = Option<std::result::Result<Frame, ReadFailure>>;
+
+/// What the sampler can say right now: the latest observation, and when the
+/// pass currently running began, if one is.
+type Pulled = (Observed, Option<Instant>);
+
+/// Say that a pass is running, and how long it has been.
+///
+/// A bar needs a denominator. The only one available is how long the LAST pass
+/// took, so there is no bar on the first observation -- which is exactly the
+/// one that keeps a reader waiting longest on a large pile. Drawing a fraction
+/// there would mean inventing the denominator, and a bar that fills at an
+/// invented rate is worse than a number that is merely honest.
+fn render_loading(ui: &mut egui::Ui, elapsed: Duration, previous: Option<Duration>) {
+    let waited = elapsed.as_secs_f64();
+    match previous.map(|previous| previous.as_secs_f32()).filter(|seconds| *seconds > 0.0) {
+        Some(expected) if elapsed.as_secs_f32() <= expected => {
+            ui.add(
+                GORBIE::widgets::ProgressBar::new(elapsed.as_secs_f32() / expected)
+                    .text(format!("observing · {waited:.1}s of about {expected:.1}s")),
+            );
+            ui.small("The estimate is the previous pass's duration, not a measured remainder.");
+        }
+        Some(expected) => {
+            ui.add(GORBIE::widgets::ProgressBar::new(1.0).text(format!(
+                "observing · {waited:.1}s, longer than the previous pass ({expected:.1}s)"
+            )));
+            ui.small("Past the estimate, so the bar is full and the number is the real one.");
+        }
+        None => {
+            ui.label(format!("Observing · {waited:.1}s"));
+            ui.small(
+                "No previous pass to estimate from, so no bar: a fraction here would need a \
+                 denominator nobody has.",
+            );
+        }
+    }
+}
+
+/// Draw one card's body, or say why there is nothing to draw.
+fn draw<F>(ctx: &mut CardCtx<'_>, observed: &Observed, title: &str, body: F)
+where
+    F: FnOnce(&mut egui::Ui, &Frame),
+{
+    ctx.with_padding(DEFAULT_CARD_PADDING, |ctx| match observed {
+        Some(Ok(frame)) => body(ctx, frame),
+        Some(Err(error)) => {
+            ctx.heading(title);
+            ctx.label(error.message());
+        }
+        None => {
+            ctx.heading(title);
+            ctx.label("Opening one local reader; no networking or maintenance is started.");
+        }
+    });
+}
+
+/// The dashboard's card graph: one producer, one selector, four consumers.
+///
+/// GORBIE's cards are a DATAFLOW model rather than a layout. A `state` card
+/// produces a value and hands back a handle; every card that `read`s that
+/// handle thereby declares a dependency on it. Written this way the graph says
+/// what it is — one observation feeds every panel, and the selected collection
+/// feeds only the member list — and detachable cards fall out of it rather
+/// than being the reason for it.
+///
+/// What this replaces drew the same pixels and said none of that: one card for
+/// everything, a selection smuggled through `egui` temp storage so a second
+/// reader could find it, and — in the intermediate version — five stateless
+/// cards each locking the sampler and cloning the whole frame for itself. The
+/// last one is the instructive failure: it looked decomposed, and the shared
+/// dependency was still invisible, so the frame was cloned once per card per
+/// repaint instead of once.
+///
+/// `pull` and `publish` are the only things that differ between the live
+/// dashboard and a capture of a fixed frame, so a capture exercises this exact
+/// graph rather than a second arrangement that merely resembles it.
+fn compose<P, S>(notebook: &mut GORBIE::NotebookCtx, pull: P, publish: S)
+where
+    P: Fn() -> Pulled + 'static,
+    S: Fn(Option<[u8; 32]>) + 'static,
+{
+    // The producer. It draws the overview because a card IS a node: the value
+    // it publishes and the panel it draws are the same thing, not two.
+    let observed = notebook.state(
+        "colony-frame",
+        None as Observed,
+        move |ctx, held: &mut Observed| {
+            ctx.ctx().request_repaint_after(Duration::from_millis(250));
+            let (observed, since) = pull();
+            *held = observed;
+            // The previous pass's duration is the only estimate available, and
+            // it lives on the frame the previous pass produced.
+            let previous = held
+                .as_ref()
+                .and_then(|observed| observed.as_ref().ok())
+                .map(|frame| frame.observation_time);
+            ctx.with_padding(DEFAULT_CARD_PADDING, |ctx| {
+                styled(ctx, |ui| {
+                    if let Some(since) = since {
+                        render_loading(ui, since.elapsed(), previous);
+                        ui.separator();
+                    }
+                    match held.as_ref() {
+                        Some(Ok(frame)) => render_overview(ui, frame),
+                        Some(Err(error)) => {
+                            ui.heading(Section::Overview.title());
+                            ui.label(error.message());
+                        }
+                        None => {
+                            ui.heading(Section::Overview.title());
+                            ui.label(
+                                "Opening one local reader; no networking or maintenance is \
+                                 started.",
+                            );
+                        }
+                    }
+                });
+            });
+        },
+    );
+
+    // The selector. Reading `observed` here is safe and is the point: each
+    // state is its own lock, so a card may hold its own value for writing
+    // while reading another's.
+    let selection = notebook.state(
+        "colony-selection",
+        None as Option<[u8; 32]>,
+        move |ctx, selected: &mut Option<[u8; 32]>| {
+            let held = observed.read(ctx);
+            draw(ctx, &held, "Collection lattice", |ui, frame| {
+                styled(ui, |ui| render_lattice(ui, frame, selected));
+            });
+            // Publish only a change. It bumps the revision the sampler waits
+            // on, so a click is answered on the next pass rather than at the
+            // end of the current interval.
+            publish(*selected);
+        },
+    );
+
+    for section in CONSUMERS {
+        notebook.view(move |ctx| {
+            let held = observed.read(ctx);
+            let chosen = *selection.read(ctx);
+            draw(ctx, &held, section.title(), |ui, frame| {
+                section.draw(ui, frame, chosen);
+            });
+        });
+    }
+}
+
 pub(super) fn run(options: Options) -> Result<()> {
     let mut sampler = Sampler::start(options)?;
     let shared = Arc::clone(&sampler.shared);
     let result = NotebookConfig::new("TribleSpace colony").run(move |notebook| {
-        let shared = Arc::clone(&shared);
-        notebook.view(move |ctx| {
-            ctx.ctx().request_repaint_after(Duration::from_millis(250));
-            let latest = shared
-                .0
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .latest
-                .clone();
-            // Forward the viewer's selection to the sampler, which owns the
-            // store. Only a change is published, and it bumps the revision the
-            // sampler waits on so a click is answered on the next pass rather
-            // than at the end of the current interval.
-            let chosen: Option<[u8; 32]> =
-                ctx.ctx().data(|data| data.get_temp(selection_id()));
-            {
-                let mut state = shared
+        let pulling = Arc::clone(&shared);
+        let publishing = Arc::clone(&shared);
+        compose(
+            notebook,
+            move || {
+                let state = pulling
+                    .0
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let since = state.sampling_since;
+                let latest = state.latest.clone();
+                drop(state);
+                (
+                    latest.map(|latest| {
+                        latest.map(|frame| {
+                            frame.at(triblespace_core::clock::epoch_now()
+                                .to_tai_duration()
+                                .total_nanoseconds())
+                        })
+                    }),
+                    since,
+                )
+            },
+            move |chosen| {
+                let mut state = publishing
                     .0
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
                 if state.focus != chosen {
                     state.focus = chosen;
                     state.focus_revision = state.focus_revision.wrapping_add(1);
-                    shared.1.notify_all();
+                    publishing.1.notify_all();
                 }
-            }
-            ctx.with_padding(DEFAULT_CARD_PADDING, |ctx| match latest {
-                Some(Ok(frame)) => render(
-                    ctx,
-                    &frame.at(triblespace_core::clock::epoch_now()
-                        .to_tai_duration()
-                        .total_nanoseconds()),
-                ),
-                Some(Err(error)) => {
-                    ctx.heading("Colony state unknown");
-                    ctx.label(error.message());
-                }
-                None => {
-                    ctx.heading("Observing colony");
-                    ctx.label("Opening one local reader; no networking or maintenance is started.");
-                }
-            });
-        });
+            },
+        );
     });
     let closed = sampler.finish();
     result.map_err(|error| anyhow!("open colony notebook: {error}"))?;
     closed
+}
+
+/// The dashboard type scale, applied per card.
+///
+/// A dashboard carries denser information than a prose notebook. This keeps the
+/// notebook's font families and theme and scopes only the sizes and spacing --
+/// and it has to be applied in EVERY card, because each one is now its own
+/// `Ui` and none of them inherits a scope from a sibling.
+fn styled(ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui)) {
+    ui.scope(|ui| {
+        for (style, size) in [
+            (egui::TextStyle::Heading, 25.0),
+            (egui::TextStyle::Body, 16.0),
+            (egui::TextStyle::Button, 16.0),
+            (egui::TextStyle::Monospace, 16.0),
+        ] {
+            if let Some(font) = ui.style_mut().text_styles.get_mut(&style) {
+                font.size = size;
+            }
+        }
+        ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
+        ui.spacing_mut().interact_size.y = 20.0;
+        body(ui);
+    });
 }
 
 /// The observed mesh, drawn once above the per-node detail.
@@ -251,7 +470,7 @@ fn render_mesh(ui: &mut egui::Ui, frame: &Frame) {
 /// Clicking a node dims everything off its chain and prints that chain in full
 /// underneath, which is how a derived collection gets walked back to the root
 /// it was computed from.
-fn render_lattice(ui: &mut egui::Ui, frame: &Frame) {
+fn render_lattice(ui: &mut egui::Ui, frame: &Frame, selected: &mut Option<[u8; 32]>) {
     use GORBIE::widgets::{LatticeEdge, LatticeGraph, LatticeMark, LatticeNode, LatticePresence};
 
     ui.label(
@@ -329,21 +548,15 @@ fn render_lattice(ui: &mut egui::Ui, frame: &Frame) {
 
     // The selection is stored as a handle, not as an index: the projection is
     // re-sorted every observation, and an index would quietly come to mean a
-    // different collection. The id is fixed rather than salted by the Ui stack
-    // so the sampler thread can read the same value back.
-    let id = selection_id();
-    let chosen: Option<[u8; 32]> = ui.data(|data| data.get_temp::<[u8; 32]>(id));
-    let selected = chosen.and_then(position);
-    let drawn = LatticeGraph::new(&nodes, &edges).selected(selected).show(ui);
+    // different collection. The selection lives in notebook state, owned by
+    // this card and readable by every other one, so a detached card keeps
+    // answering for the same collection.
+    let chosen = *selected;
+    let position_of = chosen.and_then(position);
+    let drawn = LatticeGraph::new(&nodes, &edges).selected(position_of).show(ui);
     if let Some(clicked) = drawn.clicked {
         let handle = collections[clicked].handle;
-        ui.data_mut(|data| {
-            if chosen == Some(handle) {
-                data.remove::<[u8; 32]>(id);
-            } else {
-                data.insert_temp(id, handle);
-            }
-        });
+        *selected = (chosen != Some(handle)).then_some(handle);
     }
 
     let derived = collections.iter().filter(|c| c.source.is_some()).count();
@@ -389,7 +602,7 @@ fn render_lattice(ui: &mut egui::Ui, frame: &Frame) {
 
     // Hover previews a chain; a click pins it. Previewing on hover is what
     // makes a wide lattice explorable without committing to a selection.
-    match drawn.hovered.or(selected) {
+    match drawn.hovered.or(position_of) {
         None => ui.small("Click a collection to walk its source chain."),
         Some(index) => {
             let mut chain = Vec::new();
@@ -441,17 +654,7 @@ fn render_lattice(ui: &mut egui::Ui, frame: &Frame) {
             })
         }
     };
-    render_members(ui, frame, chosen);
     ui.separator();
-}
-
-/// The fixed key the selected collection is stored under.
-///
-/// Fixed, not salted by the Ui stack, because two different holders read it:
-/// the panel that draws the lattice and the loop that forwards the selection
-/// to the sampler.
-fn selection_id() -> egui::Id {
-    egui::Id::new("colony-lattice-selection")
 }
 
 /// The join lattice inside the selected collection.
@@ -550,22 +753,9 @@ fn render_members(ui: &mut egui::Ui, frame: &Frame, chosen: Option<[u8; 32]>) {
     );
 }
 
-fn render(ui: &mut egui::Ui, frame: &Frame) {
-    // A dashboard has denser information than a prose notebook. Keep the
-    // notebook's font families and theme, but scope spacing and sizes locally.
-    ui.scope(|ui| {
-        for (style, size) in [
-            (egui::TextStyle::Heading, 25.0),
-            (egui::TextStyle::Body, 16.0),
-            (egui::TextStyle::Button, 16.0),
-            (egui::TextStyle::Monospace, 16.0),
-        ] {
-            if let Some(font) = ui.style_mut().text_styles.get_mut(&style) {
-                font.size = size;
-            }
-        }
-        ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
-        ui.spacing_mut().interact_size.y = 20.0;
+/// Heading, coverage and the warnings, as their own card.
+fn render_overview(ui: &mut egui::Ui, frame: &Frame) {
+    styled(ui, |ui| {
         ui.heading("Colony overview");
         ui.label(frame.coverage());
         let scopes = |freshness| {
@@ -594,10 +784,12 @@ fn render(ui: &mut egui::Ui, frame: &Frame) {
         for warning in &frame.warnings {
             ui.colored_label(ui.visuals().warn_fg_color, warning);
         }
-        ui.separator();
-        render_mesh(ui, frame);
-        render_lattice(ui, frame);
+    });
+}
 
+/// Per-node worker scopes and each node's health conditions.
+fn render_nodes(ui: &mut egui::Ui, frame: &Frame) {
+    styled(ui, |ui| {
         for node in frame.nodes() {
             ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new(format!("Node {}", short(&node))).strong().size(19.0));
@@ -653,8 +845,12 @@ fn render(ui: &mut egui::Ui, frame: &Frame) {
             }
             ui.add_space(3.0);
         }
+    });
+}
 
-        ui.separator();
+/// Observed links, which are measured payload rates and not link capacity.
+fn render_links(ui: &mut egui::Ui, frame: &Frame) {
+    styled(ui, |ui| {
         ui.label(egui::RichText::new("Observed links").strong().size(19.0));
         ui.small("Observer → peer · measured payload rates, not link capacity.");
         let mut links: Vec<_> = frame.workers.iter()

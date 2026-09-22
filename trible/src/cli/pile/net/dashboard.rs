@@ -868,6 +868,13 @@ struct Shared {
     /// from "asked for something else" without comparing frames.
     focus: Option<[u8; 32]>,
     focus_revision: u64,
+    /// When the pass now running began, or `None` between passes.
+    ///
+    /// A viewer opening a large pile waits tens of seconds for the first
+    /// observation, and without this the only honest thing it could say was
+    /// that it had started. The sampler is the only holder that knows a pass
+    /// is in flight, so it is the only one that can say so.
+    sampling_since: Option<Instant>,
 }
 
 type SharedState = Arc<(Mutex<Shared>, Condvar)>;
@@ -952,12 +959,17 @@ fn sample_until_stopped(options: &Options, shared: &SharedState) -> ReadResult<(
             (state.focus, state.focus_revision)
         };
         reader.focus = focus;
+        {
+            let mut state = shared.0.lock().unwrap_or_else(|error| error.into_inner());
+            state.sampling_since = Some(Instant::now());
+        }
         let observation = reader.sample().map(Arc::new);
         if options.once {
             once_error = observation.as_ref().err().cloned();
         }
         let mut state = shared.0.lock().unwrap_or_else(|error| error.into_inner());
         state.latest = Some(observation);
+        state.sampling_since = None;
         state.revision += 1;
         shared.1.notify_all();
         if options.once || state.stop {
