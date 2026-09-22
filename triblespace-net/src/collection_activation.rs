@@ -2,7 +2,8 @@
 //!
 //! Collection records and authorization proofs are independent grow-only
 //! sets. A newly arrived proof may activate an old COMMIT or admit a new reader
-//! without changing the record PATCH, so a collection wake commits to both.
+//! without changing the record PATCH. A collection wake commits to both and to
+//! its pinned positive resident-blob inventory, without disclosing those handles.
 //! The authorization projection contains byte-valid proofs for exact C and its
 //! configured roots. Definition residency determines authority, not membership.
 
@@ -10,6 +11,7 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 use ed25519_dalek::VerifyingKey;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
@@ -37,7 +39,7 @@ use crate::host::ResidentBlobReader;
 use crate::patch_repair::PatchSummary;
 
 const COLLECTION_REPAIR_ROOT_DOMAIN: &[u8] = b"triblespace.collection.repair-overlay\0";
-const COLLECTION_REPAIR_ROOT_VERSION: u32 = 1;
+const COLLECTION_REPAIR_ROOT_VERSION: u32 = 2;
 
 type AuthorizationEvidencePatch = PATCH<64, IdentitySchema, CapabilityProof, Blake3Merkle>;
 
@@ -91,6 +93,33 @@ impl CollectionAuthorizationEvidencePatch {
         &self,
     ) -> impl Iterator<Item = (CapabilityHandle, AdmissionPolicy)> + '_ {
         descriptor::capability_policies(&self.descriptor, None)
+    }
+
+    /// Plausible endpoint keys named by this collection's authority evidence.
+    ///
+    /// Descriptor-declared policy roots are followed by the root and every
+    /// delegate of each retained proof, including intermediate issuers. This
+    /// uses only recognized policy geometry and signature-valid evidence;
+    /// missing capability definitions or READ admission do not hide candidates.
+    /// Subordinate-resource proofs contribute only after their immutable
+    /// same-entity route and own policy roots selected them into this PATCH.
+    ///
+    /// These are routing hints, not authorization or evidence that an endpoint
+    /// is online, serves this collection, or has any payloads. Duplicates and
+    /// the caller's own key are retained. Callers deduplicate, exclude self,
+    /// and schedule attempts without truncating this evidence projection.
+    pub fn discovery_candidates(&self) -> impl Iterator<Item = VerifyingKey> + '_ {
+        let roots = self
+            .capability_policies()
+            .filter_map(|(_, policy)| match policy {
+                AdmissionPolicy::Open => None,
+                AdmissionPolicy::Quorum(quorum) => Some(quorum),
+            })
+            .flat_map(|quorum| (0..quorum.roots().len()).map(move |index| quorum.roots()[index]));
+        roots.chain(
+            self.proofs()
+                .flat_map(|proof| std::iter::once(proof.root_key()).chain(proof.delegated_keys())),
+        )
     }
 
     /// Validate exact resource, configured root, and the signed byte chain.
@@ -272,16 +301,17 @@ impl CollectionAuthorizationEvidencePatch {
     }
 }
 
-/// The two immutable components which determine collection repair semantics.
+/// Pinned semantic repair evidence and positive resident-blob inventory.
 #[derive(Clone, Debug)]
 pub struct CollectionRepairOverlay {
     collection: CollectionHandle,
     records: CollectionRecordPatch,
     authorization_evidence: CollectionAuthorizationEvidencePatch,
+    blob_inventory: Arc<PATCH<32, IdentitySchema, (), Blake3Merkle>>,
 }
 
 impl CollectionRepairOverlay {
-    /// Exact collection represented by both component PATCHes.
+    /// Exact collection represented by this repair observation.
     pub const fn collection(&self) -> CollectionHandle {
         self.collection
     }
@@ -306,11 +336,36 @@ impl CollectionRepairOverlay {
         &self.authorization_evidence
     }
 
+    /// Positive resident handles associated with this collection observation.
+    /// Absence is not evidence of deletion or unavailability elsewhere.
+    pub fn blob_inventory(&self) -> &PATCH<32, IdentitySchema, (), Blake3Merkle> {
+        &self.blob_inventory
+    }
+
+    /// Bind inventory from the same immutable observation as the repair evidence.
+    /// Its handles are disclosed only inside the READ-authorized pinned session.
+    pub fn with_blob_inventory(
+        mut self,
+        inventory: Arc<PATCH<32, IdentitySchema, (), Blake3Merkle>>,
+    ) -> Self {
+        self.blob_inventory = inventory;
+        self
+    }
+
+    /// Route candidates from descriptor roots and structurally relevant AUTH.
+    ///
+    /// See [`CollectionAuthorizationEvidencePatch::discovery_candidates`] for
+    /// the hint-only contract and caller-owned deduplication and scheduling.
+    pub fn discovery_candidates(&self) -> impl Iterator<Item = VerifyingKey> + '_ {
+        self.authorization_evidence.discovery_candidates()
+    }
+
     /// Opaque digest suitable for the collection gossip wake root.
     ///
     /// Counts participate alongside roots so the digest commits to the same
     /// authenticated component summaries used by PATCH repair. Neither a
-    /// proof, record, count, nor component root is disclosed by this value.
+    /// proof, record, blob handle, count, nor component root is disclosed by
+    /// this value.
     pub fn wake_root(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
         hasher.update(COLLECTION_REPAIR_ROOT_DOMAIN);
@@ -318,6 +373,7 @@ impl CollectionRepairOverlay {
         hasher.update(&self.collection.raw);
         update_summary(&mut hasher, self.records.summary());
         update_summary(&mut hasher, self.authorization_evidence.summary());
+        update_summary(&mut hasher, PatchSummary::from_patch(self.blob_inventory()));
         *hasher.finalize().as_bytes()
     }
 
@@ -365,6 +421,7 @@ impl CollectionRepairOverlay {
             collection,
             records,
             authorization_evidence,
+            blob_inventory: Arc::new(PATCH::new()),
         })
     }
 
@@ -892,6 +949,100 @@ mod tests {
 
     fn store_proof(store: &mut MemoryRepo, proof: CapabilityProof) {
         store.insert_proof(proof).unwrap();
+    }
+
+    #[test]
+    fn discovery_keeps_descriptor_roots_without_definitions_proofs_or_admission() {
+        let first = key(110);
+        let second = key(111);
+        let unbound = key(112);
+        let missing_definition = Inline::new([113; 32]);
+        let descriptor = entity! {
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            resource_policy*: AdmissionPolicy::quorum(
+                [first.verifying_key(), second.verifying_key()], 2, None,
+            ).unwrap().binding(missing_definition)
+                + AdmissionPolicy::Open.binding(write_capability()),
+        } + AdmissionPolicy::direct(unbound.verifying_key())
+            .binding(read_capability());
+        let mut store = MemoryRepo::default();
+        let collection = store
+            .put::<SimpleArchive, _>(descriptor.facts().clone())
+            .unwrap();
+        let overlay = collection_repair_overlay(&store.snapshot().unwrap(), collection).unwrap();
+        let evidence = overlay.authorization_evidence();
+        assert!(evidence.is_empty());
+        assert_eq!(evidence.read_policies().count(), 0);
+        assert!(!evidence.reader_is_admitted_by(first.verifying_key(), &[]));
+        let mut expected =
+            [first.verifying_key(), second.verifying_key()].map(|key| key.to_bytes());
+        expected.sort();
+        let mut actual = overlay
+            .discovery_candidates()
+            .map(|key| key.to_bytes())
+            .collect::<Vec<_>>();
+        actual.sort();
+        assert_eq!(actual, expected, "unbound policy roots are not candidates");
+        assert_eq!(
+            overlay.discovery_candidates().collect::<Vec<_>>(),
+            evidence.discovery_candidates().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn discovery_keeps_exact_resource_proof_chain_but_not_unrelated_or_invalid_proofs() {
+        let root = key(114);
+        let intermediate = key(115);
+        let leaf = key(116);
+        let unrelated = key(117);
+        let unconfigured = key(118);
+        let invalid_subject = key(119);
+        let collection = Inline::new([120; 32]);
+        let missing_definition = Inline::new([121; 32]);
+        let chain = root_proof(&root, &intermediate, scope(missing_definition, collection))
+            .delegate(&intermediate, missing_definition, leaf.verifying_key())
+            .unwrap();
+        let wrong_resource = root_proof(
+            &root,
+            &unrelated,
+            scope(missing_definition, Inline::new([122; 32])),
+        );
+        let wrong_root = root_proof(
+            &unconfigured,
+            &unrelated,
+            scope(missing_definition, collection),
+        );
+        let mut invalid = root_proof(
+            &root,
+            &invalid_subject,
+            scope(missing_definition, collection),
+        )
+        .into_bytes();
+        *invalid.last_mut().unwrap() ^= 1;
+        let invalid = CapabilityProof::from_bytes(&invalid).unwrap();
+        let evidence = canonical_authorization_evidence(
+            &MemoryBlobStore::new().snapshot().unwrap(),
+            collection,
+            policy_facts(CollectionPolicy::new(
+                AdmissionPolicy::direct(root.verifying_key()),
+                AdmissionPolicy::Open,
+            )),
+            [chain.clone(), wrong_resource, wrong_root, invalid],
+        )
+        .unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert!(!evidence.reader_is_admitted_by(leaf.verifying_key(), &[chain]));
+        let candidates = evidence.discovery_candidates().collect::<Vec<_>>();
+        assert_eq!(
+            candidates,
+            [
+                root.verifying_key(),
+                root.verifying_key(),
+                intermediate.verifying_key(),
+                leaf.verifying_key(),
+            ],
+            "raw hint projection preserves duplicates and every chain principal"
+        );
     }
 
     #[test]
@@ -1493,6 +1644,7 @@ mod tests {
         let collection_root = key(92);
         let resource_root = key(93);
         let reader = key(94);
+        let unrelated_readers = [key(97), key(98), key(99), key(100)];
         let mut store = MemoryRepo::default();
         let collection = store
             .collection(
@@ -1549,22 +1701,22 @@ mod tests {
         let rejected = [
             root_proof(
                 &collection_root,
-                &reader,
+                &unrelated_readers[0],
                 scope(unknown_definition, resource),
             ),
             root_proof(
                 &resource_root,
-                &reader,
+                &unrelated_readers[1],
                 scope(read_capability(), wrong_audience),
             ),
             root_proof(
                 &resource_root,
-                &reader,
+                &unrelated_readers[2],
                 scope(read_capability(), split_resource),
             ),
             root_proof(
                 &resource_root,
-                &reader,
+                &unrelated_readers[3],
                 scope(read_capability(), Inline::new([96; 32])),
             ),
         ];
@@ -1584,6 +1736,23 @@ mod tests {
             assert!(evidence.get(proof.id()).is_none());
         }
         assert!(!evidence.reader_is_admitted_by(reader.verifying_key(), &accepted));
+        let mut candidates = overlay
+            .discovery_candidates()
+            .map(|key| key.to_bytes())
+            .collect::<Vec<_>>();
+        candidates.sort();
+        candidates.dedup();
+        let mut expected = [
+            collection_root.verifying_key(),
+            resource_root.verifying_key(),
+            reader.verifying_key(),
+        ]
+        .map(|key| key.to_bytes());
+        expected.sort();
+        assert_eq!(
+            candidates, expected,
+            "only routed R evidence contributes; wrong roots, other audiences, split routes and missing R descriptors do not"
+        );
         assert!(
             collection_read_bootstrap_proofs(
                 &snapshot,

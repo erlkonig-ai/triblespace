@@ -303,18 +303,12 @@ fn serving_handoff_keeps_only_the_latest_coherent_observation() {
     assert!(Arc::ptr_eq(&latest, &sender.current_snapshot().unwrap()));
     assert!(latest.collections.get(&unavailable.raw).is_some());
     assert!(latest.collection(unavailable).is_none());
-    let advertised = crate::provider::ProviderObservation::from_locators(
-        latest.collections().map(|entry| entry.collection()),
-        true,
-        latest.bearer_locators(),
-    )
-    .into_set();
-    assert!(
-        advertised.contains(&crate::provider::collection_provider_key(
-            fixture.collection.handle()
-        ))
-    );
-    assert!(!advertised.contains(&crate::provider::collection_provider_key(unavailable)));
+    let advertised =
+        crate::provider::ProviderObservation::from_locators(latest.bearer_locators()).into_set();
+    assert!(advertised.contains(&crate::bearer::blob_locator(
+        fixture.collection.handle().raw
+    )));
+    assert!(!advertised.contains(&crate::bearer::blob_locator(unavailable.raw)));
     let blob = newest_blob.unwrap();
     assert!(advertised.contains(&crate::bearer::blob_locator(blob)));
     assert!(latest.get_blob(&blob).is_some());
@@ -418,6 +412,10 @@ async fn wake_topic_broadcasts_latest_root_without_retaining_snapshot_history() 
         async fn next_wake_event(&mut self) -> anyhow::Result<Option<CollectionWakeEvent>> {
             std::future::pending().await
         }
+
+        async fn relay_wake(&self, _wake: &CollectionWake) -> anyhow::Result<()> {
+            unreachable!("this fixture receives no incoming wakes")
+        }
     }
 
     let (broadcasts, mut received) = tokio::sync::mpsc::unbounded_channel();
@@ -426,6 +424,7 @@ async fn wake_topic_broadcasts_latest_root_without_retaining_snapshot_history() 
     let topic = super::spawn_wake_topic(
         Plane(broadcasts, joins),
         CollectionHandle::new([44; 32]),
+        true,
         Vec::new(),
         notices,
     );
@@ -472,6 +471,29 @@ async fn wake_topic_broadcasts_latest_root_without_retaining_snapshot_history() 
             .unwrap()
             .is_none()
     );
+
+    // Read-only interests still join the topic, but cannot offer a root as
+    // a repair source that their own direction policy refuses to serve.
+    let (broadcasts, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let (joins, mut joined) = tokio::sync::mpsc::unbounded_channel();
+    let (notices, _notice_rx) = tokio::sync::mpsc::channel(1);
+    let topic = super::spawn_wake_topic(
+        Plane(broadcasts, joins),
+        CollectionHandle::new([45; 32]),
+        false,
+        Vec::new(),
+        notices,
+    );
+    topic.observe(Some(CollectionWakeRoot::new([203; 32])));
+    topic.send(super::WakeCommand::Join(Vec::new())).unwrap();
+    assert_eq!(joined.recv().await, Some(Vec::new()));
+    // The first emission opportunity is strictly before two seconds.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(3), received.recv())
+            .await
+            .is_err()
+    );
+    drop(topic);
 }
 
 fn assert_same_record_leaves(
@@ -800,7 +822,17 @@ fn arriving_read_definition_refreshes_admission_with_same_wake_root_and_record_l
     let new = serving_after.collection(collection).unwrap();
     assert_eq!(enumerations.load(Ordering::Relaxed), 0);
     assert_same_record_leaves(&old, &new, &[record]);
-    assert_eq!(old.wake_root(), new.wake_root());
+    assert_eq!(
+        old.repair.records().summary(),
+        new.repair.records().summary()
+    );
+    assert_eq!(
+        old.repair.authorization_evidence().summary(),
+        new.repair.authorization_evidence().summary()
+    );
+    // The proof bytes are unchanged, but its now-resident definition is a
+    // newly available blob, independently visible in the product wake root.
+    assert_ne!(old.wake_root(), new.wake_root());
     assert!(!Arc::ptr_eq(&old.repair, &new.repair));
     assert_eq!(new.read_bootstrap.as_ref(), &[proof.clone()]);
     assert!(
@@ -920,7 +952,7 @@ impl ScopedFixture {
 }
 
 #[test]
-fn scoped_unrelated_blobs_reuse_proofs_bootstrap_and_records_without_point_reads() {
+fn scoped_unrelated_blobs_reuse_proofs_bootstrap_and_records_with_bounded_inventory_reads() {
     let mut fixture = ScopedFixture::new();
     let selected = fixture.active();
     let mut before = fixture.observe(&selected, None);
@@ -937,11 +969,16 @@ fn scoped_unrelated_blobs_reuse_proofs_bootstrap_and_records_without_point_reads
             .unwrap();
         let after = fixture.observe(&selected, Some(&before));
         assert_eq!(after.0.changes_since(&before.0), StoreChanges::BLOBS);
-        assert_eq!(fixture.take_counts(), (0, 0, 0));
+        let (records, proofs, reads) = fixture.take_counts();
+        assert_eq!((records, proofs), (0, 0));
+        // New local bytes can satisfy an earlier missing reference. Revisit
+        // the positive inventory, but do not rebuild semantic components.
+        assert!(reads <= 2 * (1024 + 64));
         for index in 0..2 {
             let collection = fixture.collections[index].handle();
             let old = before.1.collection(collection).unwrap();
             let new = after.1.collection(collection).unwrap();
+            assert!(new.repair.blob_inventory().get(&arrived.raw).is_none());
             assert_same_record_leaves(&old, &new, &[fixture.records[index]]);
             assert!(Arc::ptr_eq(&old.read_bootstrap, &new.read_bootstrap));
             let id = fixture.proofs[index].id();
@@ -973,7 +1010,9 @@ fn scoped_record_changes_rebuild_only_the_selected_c_and_keep_authorization() {
             )
             .unwrap();
         let after = fixture.observe(&selected, Some(&before));
-        assert_eq!(fixture.take_counts(), (1, 0, 0));
+        let (records, proofs, reads) = fixture.take_counts();
+        assert_eq!((records, proofs), (1, 0));
+        assert!(reads <= 2 * (1024 + 64));
         let old = before
             .1
             .collection(fixture.collections[0].handle())
@@ -1029,7 +1068,9 @@ fn scoped_proof_change_refreshes_authorization_without_losing_record_interests()
         )
         .unwrap();
     let final_observation = fixture.observe(&selected, Some(&after));
-    assert_eq!(fixture.take_counts(), (1, 0, 0));
+    let (records, proofs, reads) = fixture.take_counts();
+    assert_eq!((records, proofs), (1, 0));
+    assert!(reads <= 2 * (1024 + 64));
     let new = final_observation
         .1
         .collection(fixture.collections[0].handle())
@@ -1128,7 +1169,9 @@ fn scoped_missing_definition_landing_changes_bootstrap_without_rebuilding_record
         )
         .unwrap();
     let unrelated = fixture.observe(&selected, Some(&before));
-    assert_eq!(fixture.take_counts(), (0, 0, 0));
+    let (records, proofs, reads) = fixture.take_counts();
+    assert_eq!((records, proofs), (0, 0));
+    assert!(reads <= 1024 + 64);
     assert!(
         unrelated
             .1
@@ -1144,7 +1187,16 @@ fn scoped_missing_definition_landing_changes_bootstrap_without_rebuilding_record
     assert_eq!((records, proofs), (0, 1));
     assert!(reads > 0);
     let new = arrived.1.collection(collection).unwrap();
-    assert_eq!(old.wake_root(), new.wake_root());
+    assert_eq!(
+        old.repair.records().summary(),
+        new.repair.records().summary()
+    );
+    assert_eq!(
+        old.repair.authorization_evidence().summary(),
+        new.repair.authorization_evidence().summary()
+    );
+    assert_ne!(old.wake_root(), new.wake_root());
+    assert!(new.repair.blob_inventory().get(&capability.raw).is_some());
     assert_eq!(new.read_bootstrap.as_ref(), &[proof.clone()]);
     assert!(
         new.repair
@@ -1197,7 +1249,9 @@ fn scoped_reuse_rebinds_novel_request_resource_and_definition_reads() {
     fixture.store.put::<SimpleArchive, _>(resource).unwrap();
     fixture.store.put::<SimpleArchive, _>(definition).unwrap();
     let after = fixture.observe(&selected, Some(&before));
-    assert_eq!(fixture.take_counts(), (0, 0, 0));
+    let (records, proofs, reads) = fixture.take_counts();
+    assert_eq!((records, proofs), (0, 0));
+    assert!(reads <= 1024 + 64);
     let old = before.1.collection(collection).unwrap();
     let new = after.1.collection(collection).unwrap();
     assert!(Arc::ptr_eq(&old.read_bootstrap, &new.read_bootstrap));

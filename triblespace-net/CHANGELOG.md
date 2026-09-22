@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Extend collection repair to records, scoped AUTH and a positive resident-blob
+  PATCH through new opcode `0x0E` on ALPN `/triblespace/pile-sync/26`;
+  retired repair opcode `0x0D` is rejected, while unchanged bearer/DHT clients
+  remain compatible. All summaries contribute to the
+  opaque root. A bounded passive local scan constructs partial readable closure.
+  Separate 128-node inventory passes retain progress across successful RPCs;
+  changed roots restart validation above the last visited key, then wrap.
+  Bounded hint windows preserve unattempted work and advance serviced cohorts
+  past unavailable prefixes, wrapping only after a completed inventory pass.
+  Progress is independent of payload acquisition. Full hydration now
+  fetches positive known handles in the bounded parallel exact-H window; remove
+  speculative recursive DHT probes and reference-summary filtering. This does
+  not certify complete residency, semantic references or decryption authority.
+  Semantic health compares record/AUTH evidence independently of inventory
+  changes, preserving real stall grace without treating cache differences as
+  divergence.
+
+- Replace collection-participant DHT advertisements with authority-key and
+  ordinary descriptor-provider gossip bootstrap. Contacts do not imply READ
+  authority or participation. Randomized periodic latest-root offers suppress
+  redundant local emissions. Version-isolated neighbor messages let the host
+  defer relaying for repair, then offer its actual serving root or forward the
+  original signed contact within a bounded fallback. Latest per-origin state
+  coalesces by root; equal direct-neighbor evidence suppresses replay only when
+  every known neighbor matches. Equivalent signed origins share repair load.
+  Retry healthy-subset discovery fairly with bounded owned work,
+  cancel discovery on deactivation, and retain confirmation after failed repair.
+
 - Retry transiently failed collection participants under their original lease
   and bounded backoff, even while another replica remains reachable. Failure
   never renews that lease, and no healthy candidate still triggers discovery.

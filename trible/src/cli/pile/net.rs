@@ -83,7 +83,7 @@ pub(crate) enum ReplicationArg {
     Demand,
     /// Also fetch the direct blob references of selected collection records.
     Shallow,
-    /// Also conservatively walk their recursively referenced blobs.
+    /// Also fetch positive recursive-residency hints from authorized peers.
     Full,
 }
 
@@ -188,8 +188,8 @@ pub enum Command {
         direction: DirectionArg,
         /// Local blob acquisition for exactly the --collection selections.
         /// READ grants alone never subscribe this process to hydration.
-        /// Select a producer-maintained reference-summary collection as well
-        /// to accelerate full walks; missing summaries leave them unfiltered.
+        /// Full mode also acquires positive resident-blob handles learned through
+        /// READ-authorized collection repair; it never probes arbitrary payload words.
         #[arg(long, value_enum, default_value = "demand")]
         replication: ReplicationArg,
         /// Maximum DHT provider-announcement attempts for this process.
@@ -473,16 +473,14 @@ fn run_sync(
                 if stats.fulfilled > 0 || stats.replication.acquired > 0 {
                     last_want_progress = std::time::Instant::now();
                 }
-                if stats.replication.acquired > 0 || stats.replication.speculative_attempted > 0 {
+                if stats.replication.acquired > 0 || stats.replication.inventory > 0 {
                     eprintln!(
-                        "  hydration: {} roots, {} pending, {} acquired; {} candidates, {} filtered, {} speculative reads, {} misses",
+                        "  hydration: {} direct roots, {} pending; {} positive inventory hints, {} still missing; {} acquired",
                         stats.replication.roots,
                         stats.replication.pending,
+                        stats.replication.inventory,
+                        stats.replication.inventory_pending,
                         stats.replication.acquired,
-                        stats.replication.candidates,
-                        stats.replication.filtered,
-                        stats.replication.speculative_attempted,
-                        stats.replication.speculative_misses,
                     );
                 }
                 if stats.fulfilled > 0 || last_pending_logged != Some(stats.pending) {

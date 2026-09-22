@@ -634,6 +634,12 @@ mod tests {
                 RepairComparison {
                     observed_at: now,
                     local,
+                    // Remote cache churn cannot hide unchanged divergent
+                    // record/AUTH evidence behind a new composite wake root.
+                    remote: RepairFrontier {
+                        wake_root: [99; 32],
+                        ..peer.comparison.unwrap().remote
+                    },
                     ..peer.comparison.unwrap()
                 },
                 now,
@@ -711,6 +717,63 @@ mod tests {
             .unwrap();
         assert_eq!(pair.state, State::Unknown);
         assert!(!pair.alert);
+    }
+
+    #[test]
+    fn demand_or_shallow_cache_differences_cannot_age_into_semantic_stall() {
+        use crate::health::RepairFrontier;
+
+        let at = crate::clock::mono_now();
+        let (health, collection, remote_key) = aged_matching_pair(at, at);
+        // Demand/shallow replication deliberately allows unequal resident
+        // inventories even when every record and AUTH proof agrees. The mode
+        // is local hydration policy, not a missing piece of health evidence.
+        health.with_peer(collection, remote_key, |peer| {
+            let previous = peer.comparison.unwrap();
+            peer.compared(
+                crate::health::RepairComparison {
+                    remote: RepairFrontier {
+                        wake_root: [6; 32],
+                        ..previous.remote
+                    },
+                    ..previous
+                },
+                at,
+            );
+        });
+        for multiplier in 1..=3 {
+            let now = at + PROGRESS_GRACE * multiplier + Duration::from_secs(1);
+            health.update(|sample| {
+                sample.observed_at = Some(now);
+                sample.store.last_snapshot_observed_at = Some(now);
+                // A newer local partial inventory must not invalidate an
+                // otherwise current semantic comparison either.
+                sample.collections[0]
+                    .local_frontier
+                    .as_mut()
+                    .unwrap()
+                    .wake_root = [7; 32];
+            });
+            health.with_peer(collection, remote_key, |peer| {
+                let previous = peer.comparison.unwrap();
+                peer.compared(
+                    crate::health::RepairComparison {
+                        observed_at: now,
+                        ..previous
+                    },
+                    now,
+                );
+                peer.last_completed_at = Some(now);
+                assert_eq!(peer.last_remote_change_at, Some(at));
+            });
+            let conditions = super::conditions(&health.snapshot(), now);
+            let pair = conditions
+                .iter()
+                .find(|condition| condition.component == Component::Collection)
+                .unwrap();
+            assert_eq!(pair.state, State::Current);
+            assert!(!pair.alert);
+        }
     }
 
     #[test]
@@ -866,11 +929,13 @@ mod tests {
                 .collect::<Vec<_>>(),
                 vec![(created, created)]
             );
-            assert!(find!(expiry: (i128, i128), pattern!(facts.facts(), [{
-                report @ metadata::expires_at: ?expiry,
-            }]))
-            .next()
-            .is_none());
+            assert!(
+                find!(expiry: (i128, i128), pattern!(facts.facts(), [{
+                    report @ metadata::expires_at: ?expiry,
+                }]))
+                .next()
+                .is_none()
+            );
             assert!(conditions(facts, KIND_ALERT).is_empty());
             assert!(conditions(facts, KIND_RECOVERED).is_empty());
         }

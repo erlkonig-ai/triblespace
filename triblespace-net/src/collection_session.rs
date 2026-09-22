@@ -7,6 +7,7 @@ use ed25519_dalek::VerifyingKey;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use triblespace_core::capability::{CapabilityProof, CapabilityProofId};
 use triblespace_core::collection::{CollectionHandle, CollectionRecord};
+use triblespace_core::patch::{Blake3Merkle, IdentitySchema, PATCH};
 
 use crate::collection_activation::{CollectionAuthorizationEvidenceError, CollectionRepairOverlay};
 use crate::collection_delta::{decode_record, encode_record};
@@ -17,9 +18,10 @@ use crate::collection_wire::{
     send_repair_done, send_repair_node_request, send_repair_node_response,
 };
 use crate::patch_repair::{
-    PatchNodeResponse, PatchRepairRequest, PatchRepairWalker, PatchSummary, patch_node_response,
-    validate_patch_node,
+    PatchNode, PatchNodeResponse, PatchRepairRequest, PatchRepairWalker, PatchSummary,
+    patch_node_response, validate_patch_node,
 };
+use crate::protocol::RawHash;
 use crate::transport::Conn;
 
 /// A valid, collection-scoped reply, not a broken shared transport.
@@ -48,13 +50,35 @@ pub(crate) struct CollectionRepairDelta {
     pub(crate) remote: CollectionRepairManifest,
     pub(crate) records: Vec<CollectionRecord>,
     pub(crate) authorization_evidence: Vec<CapabilityProof>,
+    /// Positive hints from the peer's pinned resident inventory, never payloads.
+    pub(crate) blob_handles: Vec<RawHash>,
+    pub(crate) inventory_cursor: Option<InventoryRepairCursor>,
+    /// Semantic evidence remains incomplete, independently of inventory hints.
     pub(crate) more: bool,
+}
+
+/// Bounded DFS frontier for one remote inventory, reusable across admitted streams.
+/// The host owns its per-target retention bound. A changed summary starts a
+/// freshly authenticated walk above the last visited key, then wraps to low
+/// keys after that suffix completes. Local comparisons stay on the original PATCH.
+/// A 32-byte key bounds DFS pending siblings to at most 32 * 255 nodes.
+#[derive(Clone, Debug)]
+pub(crate) struct InventoryRepairCursor {
+    collection: CollectionHandle,
+    remote: PatchSummary,
+    local: PATCH<32, IdentitySchema, (), Blake3Merkle>,
+    walker: PatchRepairWalker<CollectionRepairComponent>,
+    visited: Option<RawHash>,
+    /// Lower bound only for a freshly pinned walk; never an old Merkle proof.
+    resume_after: Option<RawHash>,
+    wrap: bool,
 }
 
 impl CollectionRepairDelta {
     /// Incompleteness alone is not progress: absent resource descriptors can
     /// leave AUTH deferred indefinitely. Retry those on the ordinary cadence,
     /// while immediately continuing a bounded pass that actually added data.
+    /// Inventory hints alone do not prove that any body was acquired.
     pub(crate) fn retry_immediately(&self) -> bool {
         self.more && (!self.records.is_empty() || !self.authorization_evidence.is_empty())
     }
@@ -63,18 +87,24 @@ impl CollectionRepairDelta {
 const MAX_REPAIR_RECORD_ITEMS: usize = 4_096;
 const MAX_REPAIR_AUTHORIZATION_EVIDENCE_ITEMS: usize = 16;
 const MAX_REPAIR_NODE_REQUESTS: usize = 16_384;
-const MAX_SERVER_REPAIR_COMMANDS: usize = 512;
-const MAX_SERVER_NODE_RESPONSE_BYTES: usize = 64 << 20;
+const MAX_SEMANTIC_REPAIR_NODE_REQUESTS: usize = 511;
+const MAX_BLOB_INVENTORY_NODE_REQUESTS: usize = 128;
+const MAX_SERVER_REPAIR_COMMANDS: usize =
+    MAX_SEMANTIC_REPAIR_NODE_REQUESTS + MAX_BLOB_INVENTORY_NODE_REQUESTS + 1;
+const MAX_SEMANTIC_NODE_RESPONSE_BYTES: usize = 64 << 20;
+const MAX_BLOB_INVENTORY_RESPONSE_BYTES: usize = 2 << 20;
+const MAX_SERVER_NODE_RESPONSE_BYTES: usize =
+    MAX_SEMANTIC_NODE_RESPONSE_BYTES + MAX_BLOB_INVENTORY_RESPONSE_BYTES;
 // AUTH runs first, but deferred leaves must not consume the entire stream and
 // prevent independent collection records from making progress.
-const MAX_AUTHORIZATION_REPAIR_NODE_REQUESTS: usize = (MAX_SERVER_REPAIR_COMMANDS - 1) / 2;
+const MAX_AUTHORIZATION_REPAIR_NODE_REQUESTS: usize = MAX_SEMANTIC_REPAIR_NODE_REQUESTS / 2;
 
 /// Serve the body of one collection-repair operation after its operation byte
 /// has already been consumed.
 ///
 /// `lookup` must return an immutable overlay. Its lifetime is the stream's
 /// snapshot lease: every manifest and node response comes from the exact same
-/// semantic PATCH roots, so no historical-root cache is needed. Returned
+/// semantic and inventory PATCH roots, so no historical-root cache is needed. Returned
 /// bootstrap proofs are inert inputs for a later coherent authorization
 /// observation; they never authorize this pinned session.
 pub(crate) async fn serve_collection_repair<R, W>(
@@ -179,6 +209,7 @@ pub(crate) fn manifest(overlay: &CollectionRepairOverlay) -> CollectionRepairMan
         wake_root: overlay.wake_root(),
         records: overlay.records().summary(),
         authorization_evidence: overlay.authorization_evidence().summary(),
+        resident_blobs: PatchSummary::from_patch(overlay.blob_inventory()),
     }
 }
 
@@ -207,6 +238,12 @@ fn node_response(
                 Ok(proof.as_bytes().to_vec())
             },
         ),
+        CollectionRepairComponent::ResidentBlob => patch_node_response(
+            overlay.blob_inventory(),
+            &[],
+            prefix,
+            |_, ()| Ok(Vec::new()),
+        ),
     }
 }
 
@@ -214,13 +251,24 @@ fn node_response(
 /// connection. TLS binds `conn.remote_id()`; the supplied native proof forest
 /// can bootstrap a cold server, while same-session READ(C) comes only from its
 /// already pinned local evidence.
+/// An inventory cursor resumes the same summary's authenticated DFS, or starts
+/// a fresh root-validated suffix after a summary change. Failed exchanges may
+/// discard it; successful bounded passes progress without any payload landing.
 pub(crate) async fn pull_collection<C: Conn>(
     conn: &C,
     local: &CollectionRepairOverlay,
     read_bootstrap: Vec<CapabilityProof>,
+    inventory_cursor: Option<InventoryRepairCursor>,
 ) -> Result<CollectionRepairDelta> {
     let (mut send, mut recv) = conn.open_bi().await?;
-    pull_collection_stream(&mut send, &mut recv, local, read_bootstrap).await
+    pull_collection_stream(
+        &mut send,
+        &mut recv,
+        local,
+        read_bootstrap,
+        inventory_cursor,
+    )
+    .await
 }
 
 async fn pull_collection_stream<W, R>(
@@ -228,6 +276,7 @@ async fn pull_collection_stream<W, R>(
     recv: &mut R,
     local: &CollectionRepairOverlay,
     read_bootstrap: Vec<CapabilityProof>,
+    inventory_cursor: Option<InventoryRepairCursor>,
 ) -> Result<CollectionRepairDelta>
 where
     W: AsyncWrite + Unpin,
@@ -247,7 +296,7 @@ where
     // completion. This is the observation instant, not the completion instant.
     let compared_at = crate::clock::mono_now();
 
-    let mut remaining_requests = MAX_SERVER_REPAIR_COMMANDS - 1;
+    let mut remaining_requests = MAX_SEMANTIC_REPAIR_NODE_REQUESTS;
     let mut response_bytes = 0_usize;
     let (authorization_evidence, authorization_more) = pull_authorization_evidence_patch(
         send,
@@ -267,6 +316,17 @@ where
         &mut response_bytes,
     )
     .await?;
+    // Inventory cannot consume the semantic repair reservation. It has its own
+    // bounded allowance and never performs a body fetch or WRITE admission.
+    let (blob_handles, inventory_cursor) = pull_blob_inventory_patch(
+        send,
+        recv,
+        local,
+        remote.resident_blobs,
+        inventory_cursor,
+        &mut response_bytes,
+    )
+    .await?;
     send_repair_done(send).await?;
     send.shutdown().await?;
     require_eof(recv).await?;
@@ -276,6 +336,8 @@ where
         remote,
         records,
         authorization_evidence,
+        blob_handles,
+        inventory_cursor,
         more: authorization_more || record_more,
     })
 }
@@ -300,7 +362,7 @@ where
     loop {
         if requests >= MAX_REPAIR_NODE_REQUESTS
             || *remaining_requests == 0
-            || *response_bytes >= MAX_SERVER_NODE_RESPONSE_BYTES
+            || *response_bytes >= MAX_SEMANTIC_NODE_RESPONSE_BYTES
             || missing.len() >= MAX_REPAIR_RECORD_ITEMS
         {
             break;
@@ -380,7 +442,7 @@ where
     loop {
         if requests >= MAX_AUTHORIZATION_REPAIR_NODE_REQUESTS
             || *remaining_requests == 0
-            || *response_bytes >= MAX_SERVER_NODE_RESPONSE_BYTES / 2
+            || *response_bytes >= MAX_SEMANTIC_NODE_RESPONSE_BYTES / 2
             || missing.len() >= MAX_REPAIR_AUTHORIZATION_EVIDENCE_ITEMS
         {
             break;
@@ -434,6 +496,117 @@ where
     Ok((missing, !complete || deferred))
 }
 
+async fn pull_blob_inventory_patch<W, R>(
+    send: &mut W,
+    recv: &mut R,
+    local: &CollectionRepairOverlay,
+    remote: PatchSummary,
+    cursor: Option<InventoryRepairCursor>,
+    response_bytes: &mut usize,
+) -> Result<(Vec<RawHash>, Option<InventoryRepairCursor>)>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    let component = CollectionRepairComponent::ResidentBlob;
+    let mut cursor = match cursor {
+        Some(mut cursor) if cursor.collection == local.collection() => {
+            if cursor.remote != remote {
+                cursor.remote = remote;
+                cursor.walker = PatchRepairWalker::new(component, remote, component.key_len())?;
+                cursor.resume_after = cursor.visited;
+                cursor.wrap |= cursor.resume_after.is_some();
+            }
+            cursor
+        }
+        _ => InventoryRepairCursor {
+            collection: local.collection(),
+            remote,
+            local: local.blob_inventory().clone(),
+            walker: PatchRepairWalker::new(component, remote, component.key_len())?,
+            visited: None,
+            resume_after: None,
+            wrap: false,
+        },
+    };
+    let mut missing = Vec::new();
+    let started_bytes = *response_bytes;
+    for _ in 0..MAX_BLOB_INVENTORY_NODE_REQUESTS {
+        if response_bytes.saturating_sub(started_bytes) >= MAX_BLOB_INVENTORY_RESPONSE_BYTES
+            || *response_bytes >= MAX_SERVER_NODE_RESPONSE_BYTES
+        {
+            break;
+        }
+        let request = cursor.walker.next_request_after(
+            |_, prefix| {
+                cursor.local.merkle_node(prefix).map(|node| {
+                    PatchSummary::new(Some(node.digest()), node.leaf_count())
+                        .expect("a PATCH node is nonempty")
+                })
+            },
+            cursor.resume_after.as_ref().map(|key| key.as_slice()),
+        )?;
+        let Some(request) = request else {
+            cursor.walker.finish()?;
+            if cursor.wrap {
+                // Earlier additions were deliberately outside the suffix.
+                // Revisit them on a subsequent bounded session, not recursively
+                // in this one. This says nothing about absence in either range.
+                cursor.walker = PatchRepairWalker::new(component, remote, component.key_len())?;
+                cursor.visited = None;
+                cursor.resume_after = None;
+                cursor.wrap = false;
+                return Ok((missing, Some(cursor)));
+            }
+            return Ok((missing, None));
+        };
+        send_repair_node_request(send, &request, component).await?;
+        let response = recv_repair_node_response(recv, component).await?;
+        *response_bytes = response_bytes.saturating_add(node_response_wire_len(&response));
+        validate_response(
+            &request,
+            component,
+            local.collection(),
+            &response,
+            validate_inventory_leaf_bytes,
+        )?;
+        let visited = match &response {
+            PatchNodeResponse::Found(PatchNode::Leaf { leaf, .. }) => {
+                Some(<RawHash>::try_from(leaf.key.as_slice()).map_err(|_| {
+                    anyhow::anyhow!("resident blob inventory leaf has an invalid handle length")
+                })?)
+            }
+            _ => None,
+        };
+        let leaf = cursor.walker.accept(&request, response, |_, key| {
+            let Ok(key) = <RawHash>::try_from(key) else {
+                return false;
+            };
+            cursor.resume_after.is_some_and(|bound| key <= bound)
+                || cursor.local.get(&key).is_some()
+        })?;
+        if let Some(visited) = visited {
+            cursor.visited = Some(cursor.visited.map_or(visited, |prior| prior.max(visited)));
+        }
+        if let Some(leaf) = leaf {
+            missing.push(<RawHash>::try_from(leaf.key.as_slice()).map_err(|_| {
+                anyhow::anyhow!("resident blob inventory leaf has an invalid handle length")
+            })?);
+        }
+    }
+    // Preserve the authenticated frontier instead of revisiting the same early
+    // missing leaves on every bounded session. No payload must land for this
+    // traversal to progress, and no negative residency claim is inferred.
+    Ok((missing, Some(cursor)))
+}
+
+fn validate_inventory_leaf_bytes(key: &[u8], bytes: &[u8]) -> Result<()> {
+    if key.len() != 32 || !bytes.is_empty() {
+        bail!("resident blob inventory leaf must be an exact handle with an empty value");
+    }
+    Ok(())
+}
+
 fn validate_authorization_leaf_bytes(
     audience: CollectionHandle,
     key: &[u8],
@@ -457,7 +630,7 @@ fn validate_response<S>(
     match response {
         PatchNodeResponse::Found(node) => {
             let base: &[u8] = match component {
-                CollectionRepairComponent::Record => &[],
+                CollectionRepairComponent::Record | CollectionRepairComponent::ResidentBlob => &[],
                 CollectionRepairComponent::AuthorizationEvidence => &collection.raw,
             };
             validate_patch_node(
@@ -508,10 +681,29 @@ mod tests {
 
     use super::*;
 
+    fn inventory(
+        handles: impl IntoIterator<Item = RawHash>,
+    ) -> Arc<PATCH<32, IdentitySchema, (), Blake3Merkle>> {
+        let mut patch = PATCH::new();
+        for handle in handles {
+            patch.insert(&triblespace_core::patch::Entry::with_value(&handle, ()));
+        }
+        Arc::new(patch)
+    }
+
     async fn pull(
         local: &CollectionRepairOverlay,
         remote: Arc<CollectionRepairOverlay>,
         reader: VerifyingKey,
+    ) -> Result<CollectionRepairDelta> {
+        pull_with_cursor(local, remote, reader, None).await
+    }
+
+    async fn pull_with_cursor(
+        local: &CollectionRepairOverlay,
+        remote: Arc<CollectionRepairOverlay>,
+        reader: VerifyingKey,
+        cursor: Option<InventoryRepairCursor>,
     ) -> Result<CollectionRepairDelta> {
         let (server_io, client_io) = tokio::io::duplex(1 << 20);
         let (mut server_recv, mut server_send) = tokio::io::split(server_io);
@@ -530,9 +722,274 @@ mod tests {
             assert!(retained.is_empty());
         });
         let result =
-            pull_collection_stream(&mut client_send, &mut client_recv, local, vec![]).await;
+            pull_collection_stream(&mut client_send, &mut client_recv, local, vec![], cursor).await;
         server.await.unwrap();
         result
+    }
+
+    #[tokio::test]
+    async fn resident_inventory_returns_positive_hints_without_payloads_or_writes() {
+        let mut store = MemoryRepo::default();
+        let collection = store
+            .collection(
+                "resident-inventory",
+                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+            )
+            .unwrap()
+            .handle();
+        let snapshot = store.snapshot().unwrap();
+        let local = collection_repair_overlay(&snapshot, collection)
+            .unwrap()
+            .with_blob_inventory(inventory([[2; 32], [4; 32]]));
+        let mut remote_inventory = inventory([[1; 32], [2; 32], [3; 32]]);
+        let remote = Arc::new(
+            collection_repair_overlay(&snapshot, collection)
+                .unwrap()
+                .with_blob_inventory(remote_inventory.clone()),
+        );
+        let pinned_root = remote.wake_root();
+        Arc::make_mut(&mut remote_inventory)
+            .insert(&triblespace_core::patch::Entry::with_value(&[5; 32], ()));
+        assert_eq!(remote.wake_root(), pinned_root);
+        assert_ne!(local.wake_root(), pinned_root);
+        let refreshed = remote
+            .as_ref()
+            .clone()
+            .with_blob_inventory(remote_inventory);
+        assert_ne!(refreshed.wake_root(), pinned_root);
+        let delta = pull(
+            &local,
+            remote,
+            SigningKey::from_bytes(&[90; 32]).verifying_key(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(delta.blob_handles, [[1; 32], [3; 32]]);
+        assert!(delta.records.is_empty());
+        assert!(delta.authorization_evidence.is_empty());
+        assert!(!delta.more);
+        assert!(delta.inventory_cursor.is_none());
+        assert!(delta.inventory_cursor.is_none());
+        assert!(!delta.retry_immediately());
+        assert_eq!(delta.remote.resident_blobs.leaf_count(), 3);
+        assert_eq!(delta.local.records, delta.remote.records);
+        assert_eq!(
+            delta.local.authorization_evidence,
+            delta.remote.authorization_evidence
+        );
+        assert_eq!(
+            snapshot.blobs().count(),
+            store.snapshot().unwrap().blobs().count()
+        );
+        assert!(snapshot.wants().unwrap().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn inventory_cursor_enumerates_large_patch_without_local_residency_progress() {
+        let mut store = MemoryRepo::default();
+        let collection = store
+            .collection(
+                "large-resident-inventory",
+                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+            )
+            .unwrap()
+            .handle();
+        let snapshot = store.snapshot().unwrap();
+        let local = collection_repair_overlay(&snapshot, collection).unwrap();
+        let handles = (0_u32..2048)
+            .map(|index| *blake3::hash(&index.to_be_bytes()).as_bytes())
+            .collect::<std::collections::BTreeSet<_>>();
+        let remote = Arc::new(
+            local
+                .clone()
+                .with_blob_inventory(inventory(handles.iter().copied())),
+        );
+        let reader = SigningKey::from_bytes(&[91; 32]).verifying_key();
+        let mut cursor = None;
+        let mut received = std::collections::BTreeSet::new();
+        let mut sessions = 0;
+        loop {
+            let delta = pull_with_cursor(&local, remote.clone(), reader, cursor)
+                .await
+                .unwrap();
+            sessions += 1;
+            assert!(sessions < 64, "retained DFS frontier must reach every leaf");
+            assert!(!delta.more);
+            assert!(
+                !delta.retry_immediately(),
+                "hints alone must not create a hot loop"
+            );
+            assert!(delta.blob_handles.len() <= MAX_BLOB_INVENTORY_NODE_REQUESTS);
+            for handle in delta.blob_handles {
+                assert!(
+                    received.insert(handle),
+                    "a continued walk must not repeat hints"
+                );
+            }
+            cursor = delta.inventory_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert!(sessions > 1);
+        assert_eq!(received, handles);
+        assert!(local.blob_inventory().is_empty());
+        assert!(snapshot.wants().unwrap().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn changed_inventory_summary_reauthenticates_then_wraps_to_earlier_keys() {
+        let mut store = MemoryRepo::default();
+        let collection = store
+            .collection(
+                "changed-resident-inventory",
+                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+            )
+            .unwrap()
+            .handle();
+        let local = collection_repair_overlay(&store.snapshot().unwrap(), collection).unwrap();
+        let remote = Arc::new(local.clone().with_blob_inventory(inventory(
+            (0_u32..512).map(|index| *blake3::hash(&index.to_be_bytes()).as_bytes()),
+        )));
+        let reader = SigningKey::from_bytes(&[92; 32]).verifying_key();
+        let first = pull(&local, remote, reader).await.unwrap();
+        assert!(first.inventory_cursor.is_some());
+        let changed = Arc::new(local.clone().with_blob_inventory(inventory([[0; 32]])));
+        let suffix = pull_with_cursor(&local, changed.clone(), reader, first.inventory_cursor)
+            .await
+            .unwrap();
+        assert!(suffix.blob_handles.is_empty());
+        assert!(
+            suffix.inventory_cursor.is_some(),
+            "a changed-root suffix must wrap"
+        );
+        let delta = pull_with_cursor(&local, changed, reader, suffix.inventory_cursor)
+            .await
+            .unwrap();
+        assert_eq!(delta.blob_handles, [[0; 32]]);
+        assert!(delta.inventory_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn inventory_cursor_reaches_late_original_handles_while_every_session_appends() {
+        let mut store = MemoryRepo::default();
+        let collection = store
+            .collection(
+                "growing-resident-inventory",
+                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+            )
+            .unwrap()
+            .handle();
+        let local = collection_repair_overlay(&store.snapshot().unwrap(), collection).unwrap();
+        let originals = (0_u32..2048)
+            .map(|index| {
+                let mut hash = *blake3::hash(&index.to_be_bytes()).as_bytes();
+                hash[0] |= 128;
+                hash
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut handles = originals.clone();
+        let reader = SigningKey::from_bytes(&[96; 32]).verifying_key();
+        let mut cursor = None;
+        let mut received = std::collections::BTreeSet::new();
+        let mut wrapped = false;
+        for session in 0_u32..64 {
+            // Every root differs. These new low keys must not send traversal
+            // back to its beginning before it reaches old high handles.
+            let mut added = [0; 32];
+            added[28..].copy_from_slice(&session.to_be_bytes());
+            assert!(handles.insert(added));
+            let remote = Arc::new(
+                local
+                    .clone()
+                    .with_blob_inventory(inventory(handles.iter().copied())),
+            );
+            let delta = pull_with_cursor(&local, remote, reader, cursor)
+                .await
+                .unwrap();
+            assert!(!delta.more);
+            assert!(!delta.retry_immediately());
+            assert!(delta.blob_handles.len() <= MAX_BLOB_INVENTORY_NODE_REQUESTS);
+            received.extend(delta.blob_handles);
+            cursor = delta.inventory_cursor;
+            if originals.is_subset(&received) {
+                assert!(session > 0);
+                wrapped = true;
+                break;
+            }
+            assert!(cursor.is_some());
+        }
+        assert!(
+            wrapped,
+            "root churn must not starve the original late prefixes"
+        );
+        assert!(
+            local.blob_inventory().is_empty(),
+            "no hinted payload landed"
+        );
+
+        // Once the suffix ends, the continuation wraps and exposes additions
+        // that were behind the watermark. No old proof is reused after a root change.
+        let remote = Arc::new(
+            local
+                .clone()
+                .with_blob_inventory(inventory(handles.iter().copied())),
+        );
+        for _ in 0..64 {
+            let delta = pull_with_cursor(&local, remote.clone(), reader, cursor)
+                .await
+                .unwrap();
+            received.extend(delta.blob_handles);
+            cursor = delta.inventory_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert!(cursor.is_none());
+        assert_eq!(received, handles);
+    }
+
+    #[test]
+    fn inventory_leaf_binds_exact_handle_and_requires_empty_value() {
+        let patch = inventory([[94; 32]]);
+        let component = CollectionRepairComponent::ResidentBlob;
+        let summary = PatchSummary::from_patch(&patch);
+        let request =
+            PatchRepairRequest::new(component, summary, 32, vec![], summary.root().unwrap())
+                .unwrap();
+        let valid = patch_node_response(&patch, &[], &[], |_, ()| Ok(Vec::new())).unwrap();
+        let collection = CollectionHandle::new([95; 32]);
+        validate_response(
+            &request,
+            component,
+            collection,
+            &valid,
+            validate_inventory_leaf_bytes,
+        )
+        .unwrap();
+        for changed_key in [false, true] {
+            let mut invalid = valid.clone();
+            let PatchNodeResponse::Found(crate::patch_repair::PatchNode::Leaf { leaf, .. }) =
+                &mut invalid
+            else {
+                panic!("one inventory entry is a leaf");
+            };
+            if changed_key {
+                leaf.key[0] ^= 1;
+            } else {
+                leaf.value.push(1);
+            }
+            assert!(
+                validate_response(
+                    &request,
+                    component,
+                    collection,
+                    &invalid,
+                    validate_inventory_leaf_bytes
+                )
+                .is_err()
+            );
+        }
     }
 
     #[tokio::test]
@@ -575,7 +1032,11 @@ mod tests {
                 !after.contains_blob(custom).unwrap(),
                 "AUTH must not need the capability definition blob"
             );
-            let server = Arc::new(collection_repair_overlay(&after, collection).unwrap());
+            let server = Arc::new(
+                collection_repair_overlay(&after, collection)
+                    .unwrap()
+                    .with_blob_inventory(inventory([[87; 32], [88; 32]])),
+            );
             assert_eq!(server.authorization_evidence().len(), 1);
             let (server_io, client_io) = tokio::io::duplex(1 << 20);
             let (mut server_recv, mut server_send) = tokio::io::split(server_io);
@@ -600,19 +1061,21 @@ mod tests {
                 &mut client_recv,
                 &client,
                 vec![proof.clone()],
+                None,
             )
             .await;
             if open_read {
                 let delta = result.unwrap();
                 assert_eq!(delta.authorization_evidence, [proof]);
                 assert!(delta.records.is_empty());
+                assert_eq!(delta.blob_handles, [[87; 32], [88; 32]]);
             } else {
                 assert!(result.unwrap_err().to_string().contains("rejected READ(C)"));
                 let mut remainder = Vec::new();
                 client_recv.read_to_end(&mut remainder).await.unwrap();
                 assert!(
                     remainder.is_empty(),
-                    "no generic AUTH inventory before READ admission"
+                    "no manifest, AUTH or blob inventory before READ admission"
                 );
             }
             server_task.await.unwrap();
@@ -791,7 +1254,10 @@ mod tests {
         server_store.insert(commit).unwrap();
         let remote = Arc::new(
             collection_repair_overlay(&server_store.snapshot().unwrap(), collection.handle())
-                .unwrap(),
+                .unwrap()
+                .with_blob_inventory(inventory(
+                    (0_u32..2048).map(|index| *blake3::hash(&index.to_be_bytes()).as_bytes()),
+                )),
         );
         assert_eq!(
             remote.authorization_evidence().len(),
@@ -802,6 +1268,11 @@ mod tests {
         let first = pull(&local, remote.clone(), reader).await.unwrap();
         assert_eq!(first.records, [commit], "AUTH reserves a C-record budget");
         assert!(first.authorization_evidence.is_empty());
+        assert!(
+            !first.blob_handles.is_empty(),
+            "inventory has a separate reservation"
+        );
+        assert!(first.inventory_cursor.is_some());
         assert!(first.more);
         assert!(first.retry_immediately());
         client_store.insert(commit).unwrap();
@@ -971,7 +1442,8 @@ mod tests {
                 assert!(bootstrap.is_empty());
             });
             let result =
-                pull_collection_stream(&mut client_send, &mut client_recv, &client, vec![]).await;
+                pull_collection_stream(&mut client_send, &mut client_recv, &client, vec![], None)
+                    .await;
             if allowed {
                 assert_eq!(result.unwrap().records.len(), 1);
             } else {
@@ -1031,9 +1503,10 @@ mod tests {
             assert!(bootstrap.is_empty());
         });
 
-        let delta = pull_collection_stream(&mut client_send, &mut client_recv, &client, vec![])
-            .await
-            .unwrap();
+        let delta =
+            pull_collection_stream(&mut client_send, &mut client_recv, &client, vec![], None)
+                .await
+                .unwrap();
         assert_eq!(delta.records.len(), 1);
         assert!(delta.authorization_evidence.is_empty());
         assert_eq!(delta.local, expected_local);
@@ -1088,9 +1561,10 @@ mod tests {
             assert!(bootstrap.is_empty());
         });
 
-        let delta = pull_collection_stream(&mut client_send, &mut client_recv, &client, vec![])
-            .await
-            .unwrap();
+        let delta =
+            pull_collection_stream(&mut client_send, &mut client_recv, &client, vec![], None)
+                .await
+                .unwrap();
         assert_eq!(delta.authorization_evidence, [proof]);
         assert!(delta.records.is_empty());
         server_task.await.unwrap();
@@ -1151,6 +1625,7 @@ mod tests {
             &mut client_recv,
             &client,
             vec![proof.clone(), other_proof],
+            None,
         )
         .await
         .unwrap_err();

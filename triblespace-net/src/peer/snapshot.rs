@@ -99,23 +99,6 @@ where
     S: SnapshotSource + BlobStorePut + Send,
     S::Snapshot: BlobStoreGet + BlobStoreList,
 {
-    /// A later local observation for the hydration worker, not a replacement
-    /// of this frozen reader or a publication to the network host.
-    pub(crate) fn reobserve(&self) -> Result<Self, PeerAcquireError> {
-        let mut guard = self.store.lock().expect("store mutex");
-        let store = guard
-            .as_mut()
-            .ok_or_else(|| PeerAcquireError("peer is closed".into()))?;
-        let frozen = store
-            .snapshot()
-            .map_err(|error| PeerAcquireError(format!("cannot observe blob cache: {error}")))?;
-        Ok(Self {
-            frozen,
-            store: self.store.clone(),
-            host: self.host.clone(),
-        })
-    }
-
     pub(crate) fn fetch_verified_with_deadline(
         &self,
         hash: RawHash,

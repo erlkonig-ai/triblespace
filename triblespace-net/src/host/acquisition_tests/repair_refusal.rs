@@ -179,8 +179,10 @@ impl RepairFixture {
             self.snapshot.collection(collection).unwrap(),
             &self.events,
             &self.health,
+            None,
         )
         .await
+        .map(|(retry, _)| retry)
     }
 }
 

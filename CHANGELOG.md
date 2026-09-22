@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add a READ(C)-gated resident-blob PATCH as the third pinned collection-repair
+  component and include it in the opaque wake root. Allocate repair opcode
+  `0x0E` on ALPN `/triblespace/pile-sync/26`, rejecting the retired `0x0D`
+  grammar while retaining unchanged exact-blob clients. Bounded passive local scans expose only positive
+  readable handles; resumable 128-node inventory passes continue across RPCs
+  without requiring payload landing. Explicit full hydration acquires known
+  handles through the existing bounded parallel exact-H path, replacing
+  speculative aligned-word network probing and reference-summary filtering.
+  Inventories remain partial observations, not closure or decryption certificates.
+  Preserve inventory traversal progress across changing roots with freshly
+  validated suffix walks and low-key revisits. Rotate bounded hint windows only
+  after actual service, so unavailable early handles cannot permanently crowd
+  out later reachable blobs. Semantic health compares only
+  record/AUTH evidence, so cache-policy differences neither create false stalls
+  nor let availability churn extend the grace of a real semantic stall.
+
+- Bootstrap collection gossip through descriptor policy roots, scoped AUTH
+  root/delegate identities and ordinary descriptor-blob providers; remove the
+  separate collection-participant DHT namespace. Descriptor holders remain
+  candidates, not admitted repair sources. Periodically offer the latest root
+  with randomized equal-root suppression. Use a version-isolated neighbor-only
+  topic with application relaying: coalesce latest per-origin observations by R,
+  permit repair before a bounded original-offer fallback, and replace the contact
+  only from a published serving snapshot. Replay remains available for downstream
+  liveness; suppress it only with matching evidence from every known neighbor.
+  Select among fresh signed origins advertising the same root to share repair
+  load. Retry discovery even beside healthy replicas, with bounded fair lookup
+  ownership; healthy peers no longer require blind periodic repair pulls.
+
 - Retain a failed collection participant until its existing lease expires,
   retrying under the existing bounded backoff. A reachable replica no longer
   hides another replica's recovery after a transient partition or restart.

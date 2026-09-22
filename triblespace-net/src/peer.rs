@@ -345,7 +345,7 @@ where
                 return ReconcileStats::default();
             }
         };
-        let stats = self.reconciler.tick_snapshot(snapshot, |_, _| None).await;
+        let stats = self.reconciler.tick_snapshot(snapshot).await;
         if stats.landed != 0 {
             self.refresh();
         }
@@ -356,6 +356,14 @@ where
     /// lazy host, issuing probes, or changing the observation's age.
     pub fn health(&self) -> Arc<crate::health::HealthSnapshot> {
         self.sender.health()
+    }
+
+    pub(crate) fn reconciler(&self) -> &Reconciler {
+        &self.reconciler
+    }
+
+    pub(crate) fn reconciler_mut(&mut self) -> &mut Reconciler {
+        &mut self.reconciler
     }
 
     /// Stock gossip wake plane for a production iroh peer.
@@ -507,6 +515,18 @@ where
         for batch in incoming {
             for event in batch.into_events() {
                 match event {
+                    NetEvent::BlobHint {
+                        collection,
+                        source,
+                        handle,
+                    } => {
+                        self.reconciler
+                            .observe_blob_hint_from(collection, source, handle);
+                    }
+                    NetEvent::BlobInventoryPassCompleted { collection, source } => {
+                        self.reconciler
+                            .finish_blob_inventory_pass(collection, source);
+                    }
                     NetEvent::Blob(verified) => {
                         // Verified on the wire against the handle it was fetched
                         // by; it lands under that handle without a second hash.
@@ -550,6 +570,7 @@ where
             );
         }
         let snapshot = store.snapshot().map_err(PeerSnapshotError::Store)?;
+        self.reconciler.prune_blob_hints(&snapshot);
         self.sender.observe_store(|health| {
             health.last_snapshot_observed_at = Some(crate::clock::mono_now());
         });
@@ -567,6 +588,9 @@ where
             && changes == StoreChanges::NONE
             && !self.active_dirty
             && previous_snapshot.is_some()
+            && !previous_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.inventory_pending())
         {
             self.last_store_snapshot = Some(snapshot);
             return Ok(());

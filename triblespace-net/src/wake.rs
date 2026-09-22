@@ -1,4 +1,4 @@
-//! Opaque, collection-scoped wakeups over stock `iroh-gossip`.
+//! Opaque, collection-scoped wakeups over stock `iroh-gossip` membership.
 //!
 //! A collection handle derives a domain-separated opaque gossip topic id and
 //! is the discovery capability for that topic. Joining therefore has no
@@ -6,7 +6,9 @@
 //! fixed-width signed wake: it
 //! says that one endpoint has some anti-entropy state under an opaque root.
 //! Records, counts, blobs, proofs, and the anti-entropy protocol itself stay
-//! outside this plane.
+//! outside this plane. Neighbor-only delivery lets the application coalesce
+//! state by root, update repair contacts, and decide when to relay after repair.
+//! Stock gossip does not forward these messages on the application's behalf.
 
 use std::fmt;
 use std::sync::Arc;
@@ -163,7 +165,8 @@ impl CollectionWake {
         self.root
     }
 
-    /// Per-broadcast identity with no ordering or authority meaning.
+    /// Authenticated transport freshness annotation, not semantic identity.
+    /// It has no ordering or authority meaning.
     pub const fn nonce(&self) -> [u8; 16] {
         self.nonce
     }
@@ -179,15 +182,15 @@ impl CollectionWake {
         bytes
     }
 
-    /// Exact stock Plumtree message identity for this envelope.
+    /// Semantic state identity within the exact collection topic.
     ///
-    /// `iroh-gossip` 0.101 identifies messages by the BLAKE3 hash of their
-    /// complete content. A fresh signed nonce makes repeated rebroadcasts
-    /// distinct even when the semantic root is unchanged, so late subscribers
-    /// do not depend on upstream's bounded duplicate-retention window. The
-    /// nonce has no ordering or authority semantics.
-    pub fn dedup_id(&self) -> [u8; 32] {
-        *blake3::hash(&self.to_bytes()).as_bytes()
+    /// Repair contacts, signatures, and freshness annotations may change
+    /// without creating a new state. Callers must scope this key by collection
+    /// and may still consume those annotations on a repeated root. Stock
+    /// gossip's wire hash is deliberately not this application identity;
+    /// neighbor-only delivery leaves semantic suppression to the application.
+    pub const fn dedup_id(&self) -> [u8; 32] {
+        self.root.0
     }
 }
 
@@ -240,16 +243,26 @@ pub trait CollectionWakeNetwork: Clone + Send + Sync + 'static {
 
 /// Transport-neutral live subscription for signed collection wakes.
 pub trait CollectionWakeSubscription: Send + 'static {
-    /// Join additional endpoint-bound participants discovered through KDF(C).
+    /// Try candidate contacts from authority, descriptor providers or prior wakes.
     fn join_wake_peers(
         &self,
         peers: Vec<EndpointId>,
     ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
-    /// Broadcast a fresh signed observation of the current opaque root.
+    /// Offer the local serving endpoint's current root to direct neighbors.
     fn broadcast_wake(
         &self,
         root: CollectionWakeRoot,
     ) -> impl std::future::Future<Output = anyhow::Result<CollectionWake>> + Send;
+
+    /// Forward an existing offer unchanged to direct neighbors.
+    ///
+    /// The exact collection signature is checked before sending. Relaying
+    /// neither claims that this endpoint serves the root nor changes the
+    /// original authenticated repair contact.
+    fn relay_wake(
+        &self,
+        wake: &CollectionWake,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     /// Receive the next typed transport or wake event.
     fn next_wake_event(
@@ -309,9 +322,12 @@ impl CollectionWakePlane {
     /// Derive an opaque rendezvous topic from the collection handle.
     /// Gossip routers see only this domain-separated one-way image; the raw
     /// collection handle remains in local state and signed repair transcripts.
+    ///
+    /// This namespace isolates neighbor-only application relaying from the
+    /// former v1 topic's automatic Swarm forwarding and duplicate pruning.
     pub fn topic_id(collection: CollectionHandle) -> TopicId {
         TopicId::from_bytes(blake3::derive_key(
-            "triblespace/collection-wake-topic/v1",
+            "triblespace/collection-wake-topic/v2",
             &collection.raw,
         ))
     }
@@ -383,7 +399,7 @@ impl CollectionWakeTopic {
         self.sender.join_peers(peers).await
     }
 
-    /// Sign and gossip only an opaque root wake for this collection.
+    /// Sign and offer a local serving root to direct topic neighbors only.
     pub async fn broadcast(&self, root: CollectionWakeRoot) -> Result<CollectionWake, ApiError> {
         let wake = CollectionWake::sign(
             self.collection,
@@ -392,9 +408,18 @@ impl CollectionWakeTopic {
             &self.signing_key,
         );
         self.sender
-            .broadcast(wake.to_bytes().to_vec().into())
+            .broadcast_neighbors(wake.to_bytes().to_vec().into())
             .await?;
         Ok(wake)
+    }
+
+    /// Relay an existing signed offer without substituting the local identity.
+    pub async fn relay(&self, wake: &CollectionWake) -> anyhow::Result<()> {
+        wake.verify(self.collection)?;
+        self.sender
+            .broadcast_neighbors(wake.to_bytes().to_vec().into())
+            .await?;
+        Ok(())
     }
 
     /// Receive the next typed topology, wake, rejection, or lag event.
@@ -432,6 +457,10 @@ impl CollectionWakeSubscription for CollectionWakeTopic {
         Ok(self.broadcast(root).await?)
     }
 
+    async fn relay_wake(&self, wake: &CollectionWake) -> anyhow::Result<()> {
+        self.relay(wake).await
+    }
+
     async fn next_wake_event(&mut self) -> anyhow::Result<Option<CollectionWakeEvent>> {
         Ok(self.next_event().await?)
     }
@@ -466,7 +495,8 @@ pub struct ReceivedCollectionWake {
     pub wake: CollectionWake,
     /// Immediate gossip hop, which may be a relay and is not an author claim.
     pub delivered_from: EndpointId,
-    /// Whether stock gossip delivered this directly or through the swarm.
+    /// Transport scope, not evidence that the signed origin is the last hop.
+    /// Application-relayed offers arrive with neighbor scope too.
     pub scope: DeliveryScope,
 }
 
@@ -580,7 +610,7 @@ mod tests {
     }
 
     #[test]
-    fn dedup_is_deterministic_exact_wire_identity_not_root_coalescing() {
+    fn semantic_dedup_is_root_scoped_not_contact_or_nonce_identity() {
         let collection = collection(0x51);
         let signing_key = key(0x61);
         let first = CollectionWake::sign(
@@ -617,12 +647,13 @@ mod tests {
         assert_eq!(first.to_bytes(), same.to_bytes());
         assert_eq!(first.dedup_id(), same.dedup_id());
         assert_ne!(first.dedup_id(), next_root.dedup_id());
-        assert_ne!(first.dedup_id(), next_nonce.dedup_id());
-        assert_ne!(first.dedup_id(), next_origin.dedup_id());
-        assert_eq!(
-            first.dedup_id(),
-            *blake3::hash(&first.to_bytes()).as_bytes()
-        );
+        assert_eq!(first.dedup_id(), next_nonce.dedup_id());
+        assert_eq!(first.dedup_id(), next_origin.dedup_id());
+        assert_eq!(first.dedup_id(), *first.root().as_bytes());
+        assert_ne!(first.to_bytes(), next_nonce.to_bytes());
+        assert_ne!(first.to_bytes(), next_origin.to_bytes());
+        assert!(next_nonce.verify(collection).is_ok());
+        assert!(next_origin.verify(collection).is_ok());
     }
 
     #[test]
@@ -632,6 +663,11 @@ mod tests {
         assert_eq!(topic, CollectionWakePlane::topic_id(handle));
         assert_ne!(topic.as_bytes(), &handle.raw);
         assert_ne!(topic, CollectionWakePlane::topic_id(collection(0x53)));
+        let legacy_swarm_topic = TopicId::from_bytes(blake3::derive_key(
+            "triblespace/collection-wake-topic/v1",
+            &handle.raw,
+        ));
+        assert_ne!(topic, legacy_swarm_topic);
     }
 
     #[test]
@@ -649,7 +685,7 @@ mod tests {
             collection,
             Message {
                 content: wake.to_bytes().to_vec().into(),
-                scope: DeliveryScope::Swarm(1u16.into()),
+                scope: DeliveryScope::Neighbors,
                 delivered_from: relay,
             },
         );
@@ -660,6 +696,115 @@ mod tests {
         assert_eq!(received.wake.origin(), wake.origin());
         assert_ne!(received.wake.origin(), received.delivered_from);
         assert_eq!(received.delivered_from, relay);
-        assert!(!received.scope.is_direct());
+        // Neighbor scope describes the transport hop even for an application
+        // relay. The signed serving origin remains independent of that hop.
+        assert!(received.scope.is_direct());
+        assert_eq!(received.wake.to_bytes(), wake.to_bytes());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn neighbor_transport_relays_unchanged_offers_and_delivers_same_root_contacts() {
+        use std::time::Duration;
+
+        use iroh::endpoint::presets;
+        use iroh::protocol::Router;
+        use iroh::test_utils::test_transport::TestNetwork;
+
+        async fn endpoint(network: &TestNetwork, key: &SigningKey) -> iroh::Endpoint {
+            let secret = crate::identity::iroh_secret(key);
+            let transport = network.create_transport(secret.public()).unwrap();
+            iroh::Endpoint::builder(presets::N0)
+                .secret_key(secret)
+                .relay_mode(iroh::RelayMode::Disabled)
+                .ca_tls_config(iroh::tls::CaTlsConfig::insecure_skip_verify())
+                .add_custom_transport(transport)
+                .clear_ip_transports()
+                .clear_address_lookup()
+                .address_lookup(network.address_lookup())
+                .bind()
+                .await
+                .unwrap()
+        }
+
+        async fn receive(topic: &mut CollectionWakeTopic) -> ReceivedCollectionWake {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match topic.next_wake_event().await.unwrap().unwrap() {
+                        CollectionWakeEvent::Received(received) => return received,
+                        CollectionWakeEvent::NeighborUp(_) => {}
+                        other => panic!("unexpected wake event: {other:?}"),
+                    }
+                }
+            })
+            .await
+            .expect("signed neighbor offer must arrive")
+        }
+
+        let network = TestNetwork::new();
+        let relay_endpoint = endpoint(&network, &key(0x91)).await;
+        let reader_endpoint = endpoint(&network, &key(0x92)).await;
+        let relay_plane = CollectionWakePlane::spawn(&relay_endpoint);
+        let reader_plane = CollectionWakePlane::spawn(&reader_endpoint);
+        let relay_router = Router::builder(relay_endpoint)
+            .accept(iroh_gossip::ALPN, relay_plane.protocol_handler())
+            .spawn();
+        let reader_router = Router::builder(reader_endpoint)
+            .accept(iroh_gossip::ALPN, reader_plane.protocol_handler())
+            .spawn();
+        let collection = collection(0x93);
+        let mut relay = relay_plane.subscribe(collection, Vec::new()).await.unwrap();
+        let mut reader = reader_plane
+            .subscribe(collection, vec![relay_plane.origin()])
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            relay.joined().await.unwrap();
+            reader.joined().await.unwrap();
+        })
+        .await
+        .expect("stock topic neighbors must join");
+
+        // This serving origin is not the forwarding endpoint. Relaying it
+        // must not claim that the forwarding endpoint can serve the root.
+        let offered = CollectionWake::sign(
+            collection,
+            CollectionWakeRoot::new([0x94; 32]),
+            [0x95; 16],
+            &key(0x90),
+        );
+        for _ in 0..2 {
+            relay.relay_wake(&offered).await.unwrap();
+            let received = receive(&mut reader).await;
+            assert_eq!(received.wake.to_bytes(), offered.to_bytes());
+            assert_eq!(received.delivered_from, relay_plane.origin());
+            assert_ne!(received.wake.origin(), received.delivered_from);
+            assert_eq!(received.scope, DeliveryScope::Neighbors);
+        }
+
+        // A new serving contact for the same semantic state must reach the
+        // application, even after identical signed offers were delivered.
+        let local_offer = relay.broadcast_wake(offered.root()).await.unwrap();
+        let received = receive(&mut reader).await;
+        assert_eq!(received.wake, local_offer);
+        assert_eq!(received.wake.origin(), relay_plane.origin());
+        assert_eq!(received.wake.dedup_id(), offered.dedup_id());
+        assert_eq!(received.scope, DeliveryScope::Neighbors);
+
+        let other_collection = CollectionHandle::new([0x96; 32]);
+        let wrong_context =
+            CollectionWake::sign(other_collection, offered.root(), [0x97; 16], &key(0x90));
+        let error = relay.relay_wake(&wrong_context).await.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<CollectionWakeError>(),
+            Some(&CollectionWakeError::InvalidSignature)
+        );
+
+        drop((relay, reader));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            relay_router.shutdown().await.unwrap();
+            reader_router.shutdown().await.unwrap();
+        })
+        .await
+        .expect("stock gossip routers must shut down");
     }
 }

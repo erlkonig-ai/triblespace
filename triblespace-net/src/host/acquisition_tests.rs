@@ -1127,7 +1127,7 @@ async fn background_publication_retries_past_a_stale_issued_batch() {
     let locators = locator_index(&fixture.store.snapshot().unwrap()).unwrap();
     let mut publisher = ProviderPublisher::new(now);
     publisher.install(
-        ProviderObservation::from_locators([], false, &locators).into_set(),
+        ProviderObservation::from_locators(&locators).into_set(),
         now,
     );
     let work = publisher.next(now).expect("initial publication attempt");
@@ -1395,11 +1395,12 @@ async fn resident_descriptor_is_not_a_collection_participant_hint() {
     );
     assert!(
         fixture
-            .client
-            .get(fixture.provider, collection_provider_key(handle))
-            .await
+            .provider_snapshot
+            .borrow()
+            .as_ref()
             .unwrap()
-            .is_empty()
+            .collection(handle)
+            .is_none()
     );
     assert_eq!(
         fixture.provider_directory.lock().unwrap().retained_counts(),

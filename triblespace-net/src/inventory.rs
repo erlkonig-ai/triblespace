@@ -3,7 +3,7 @@
 //! Collection authority is carried by each repair request. Immutable bytes
 //! remain on the independent bearer-addressed demand path.
 
-/// Local direction policy for periodic collection repair.
+/// Local direction policy for collection repair.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ReconcileDirection {
     /// Pull explicitly active collections and serve them to admitted readers.

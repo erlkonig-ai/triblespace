@@ -361,6 +361,7 @@ pub(crate) struct PatchRepairResult<S> {
 /// The local callbacks must describe one immutable observation for the entire
 /// walk. Later admissions can make work redundant, but must not manufacture a
 /// subtree equality against a moving snapshot.
+#[derive(Clone, Debug)]
 pub(crate) struct PatchRepairWalker<S> {
     scope: S,
     summary: PatchSummary,
@@ -407,14 +408,39 @@ where
     /// Return the next pinned request, skipping exact local subtrees.
     pub(crate) fn next_request(
         &mut self,
+        local_summary: impl FnMut(&S, &[u8]) -> Option<PatchSummary>,
+    ) -> Result<Option<PatchRepairRequest<S>>> {
+        self.next_request_after(local_summary, None)
+    }
+
+    /// Exclude prefix ranges entirely below a lexicographic watermark. Excluded
+    /// subtrees are accounted by their authenticated counts, not asserted to
+    /// exist locally. The resulting missing count therefore describes this
+    /// suffix only, never equality or absence in the excluded range.
+    /// A compressed leaf can straddle the prefix bound: the caller must also
+    /// discharge leaves at or below the watermark in `accept`'s callback.
+    pub(crate) fn next_request_after(
+        &mut self,
         mut local_summary: impl FnMut(&S, &[u8]) -> Option<PatchSummary>,
+        exclusive_lower_bound: Option<&[u8]>,
     ) -> Result<Option<PatchRepairRequest<S>>> {
         if self.failed {
             bail!("PATCH repair walker is failed");
         }
+        if exclusive_lower_bound.is_some_and(|bound| bound.len() != self.relative_key_len) {
+            bail!("PATCH traversal watermark has the wrong key length");
+        }
         while let Some(pending) = self.frontier.pop() {
-            if local_summary(&self.scope, &pending.prefix)
-                == Some(PatchSummary::new(Some(pending.digest), pending.leaf_count)?)
+            // A prefix covers prefix || 00.. through prefix || FF... Only
+            // discard it if even the upper end is at or below the watermark.
+            let excluded = exclusive_lower_bound.is_some_and(|bound| {
+                let mut upper = pending.prefix.clone();
+                upper.resize(self.relative_key_len, u8::MAX);
+                upper.as_slice() <= bound
+            });
+            if excluded
+                || local_summary(&self.scope, &pending.prefix)
+                    == Some(PatchSummary::new(Some(pending.digest), pending.leaf_count)?)
             {
                 self.accounted = self
                     .accounted
@@ -899,5 +925,38 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn suffix_walk_skips_only_wholly_excluded_prefixes() {
+        let keys = [
+            key([0, 255, 0, 0]),
+            key([1, 0, 0, 0]),
+            key([1, 1, 0, 0]),
+            key([2, 0, 0, 0]),
+        ];
+        let patch = TestPatch::from_keys(keys);
+        let bound = keys[1];
+        let summary = PatchSummary::from_patch(&patch);
+        let mut walker = PatchRepairWalker::new((), summary, 32).unwrap();
+        let mut received = Vec::new();
+        while let Some(request) = walker
+            .next_request_after(|_, _| None, Some(&bound))
+            .unwrap()
+        {
+            assert_ne!(request.prefix().first(), Some(&0));
+            let response = response(&patch, request.prefix());
+            if let PatchNodeResponse::Found(node) = &response {
+                validate_patch_node(&request, 32, &[], node, |_, ()| Ok(())).unwrap();
+            }
+            if let Some(leaf) = walker
+                .accept(&request, response, |_, key| key <= bound.as_slice())
+                .unwrap()
+            {
+                received.push(<[u8; 32]>::try_from(leaf.key.as_slice()).unwrap());
+            }
+        }
+        assert_eq!(received, keys[2..]);
+        assert_eq!(walker.finish().unwrap().missing_count, 2);
     }
 }

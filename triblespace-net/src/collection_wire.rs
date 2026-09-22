@@ -2,8 +2,8 @@
 //!
 //! One bidirectional stream pins one [`CollectionRepairManifest`]. The client
 //! may send bounded native READ(C) bootstrap proofs before admission, then an
-//! admitted client walks the record and authorization-evidence PATCHes
-//! interactively beneath those exact roots. Blob acquisition is a separate
+//! admitted client walks the record, authorization-evidence and positive
+//! resident-blob PATCHes beneath those exact roots. Blob acquisition is a separate
 //! bearer-addressed protocol and never participates in collection repair.
 
 use anyhow::{Result, anyhow, bail};
@@ -21,9 +21,10 @@ use crate::protocol::{
 
 /// Direct-RPC operation which opens one collection repair session.
 ///
-/// `0x0D` was a pre-v17 provider-cover operation. The ALPN generation change
-/// deliberately frees the byte for this clean-slate meaning.
-pub(crate) const OP_COLLECTION_REPAIR: u8 = 0x0D;
+/// `0x0E` introduces the resident-inventory manifest. The former record/AUTH-only
+/// `0x0D` operation is no longer accepted; its manifest is not interchangeable.
+/// The common ALPN remains unchanged for exact bearer and directory clients.
+pub(crate) const OP_COLLECTION_REPAIR: u8 = 0x0E;
 
 /// Maximum native READ proof branches accepted at one session boundary.
 pub(crate) const MAX_COLLECTION_READ_BOOTSTRAP_PROOFS: usize = 16;
@@ -45,11 +46,12 @@ const NODE_PREFIX_ABSENT: u8 = 0x01;
 const NODE_LEAF: u8 = 0x00;
 const NODE_BRANCH: u8 = 0x01;
 
-/// One of the two grow-only PATCHes in collection repair.
+/// One pinned PATCH component in collection repair.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum CollectionRepairComponent {
     Record,
     AuthorizationEvidence,
+    ResidentBlob,
 }
 
 impl CollectionRepairComponent {
@@ -57,6 +59,7 @@ impl CollectionRepairComponent {
         match self {
             Self::Record => 32,
             Self::AuthorizationEvidence => 32,
+            Self::ResidentBlob => 32,
         }
     }
 
@@ -64,6 +67,7 @@ impl CollectionRepairComponent {
         match self {
             Self::Record => 0,
             Self::AuthorizationEvidence => 1,
+            Self::ResidentBlob => 2,
         }
     }
 
@@ -71,6 +75,7 @@ impl CollectionRepairComponent {
         match byte {
             0 => Ok(Self::Record),
             1 => Ok(Self::AuthorizationEvidence),
+            2 => Ok(Self::ResidentBlob),
             other => bail!("unknown collection repair component {other:#x}"),
         }
     }
@@ -88,6 +93,7 @@ pub(crate) struct CollectionRepairManifest {
     pub(crate) wake_root: [u8; 32],
     pub(crate) records: PatchSummary,
     pub(crate) authorization_evidence: PatchSummary,
+    pub(crate) resident_blobs: PatchSummary,
 }
 
 impl CollectionRepairManifest {
@@ -95,6 +101,7 @@ impl CollectionRepairManifest {
         match component {
             CollectionRepairComponent::Record => self.records,
             CollectionRepairComponent::AuthorizationEvidence => self.authorization_evidence,
+            CollectionRepairComponent::ResidentBlob => self.resident_blobs,
         }
     }
 }
@@ -223,6 +230,7 @@ pub(crate) async fn send_repair_admission<W: AsyncWrite + Unpin>(
             send_hash(send, &manifest.wake_root).await?;
             send_summary(send, manifest.records).await?;
             send_summary(send, manifest.authorization_evidence).await?;
+            send_summary(send, manifest.resident_blobs).await?;
         }
         CollectionRepairAdmission::Rejected => send_u8(send, REPAIR_REJECTED).await?,
         CollectionRepairAdmission::Unavailable => send_u8(send, REPAIR_UNAVAILABLE).await?,
@@ -238,6 +246,7 @@ pub(crate) async fn recv_repair_admission<R: AsyncRead + Unpin>(
             wake_root: recv_hash(recv).await?,
             records: recv_summary(recv).await?,
             authorization_evidence: recv_summary(recv).await?,
+            resident_blobs: recv_summary(recv).await?,
         }),
         REPAIR_REJECTED => CollectionRepairAdmission::Rejected,
         REPAIR_UNAVAILABLE => CollectionRepairAdmission::Unavailable,
@@ -344,6 +353,11 @@ pub(crate) async fn send_repair_node_response<W: AsyncWrite + Unpin>(
                     if leaf.key.len() != component.key_len() {
                         bail!("collection PATCH leaf key has the wrong length");
                     }
+                    if component == CollectionRepairComponent::ResidentBlob
+                        && !leaf.value.is_empty()
+                    {
+                        bail!("resident blob inventory leaf value must be empty");
+                    }
                     if leaf.value.len() > MAX_COLLECTION_LEAF_BYTES {
                         bail!(
                             "collection PATCH leaf is {} bytes; limit is {MAX_COLLECTION_LEAF_BYTES}",
@@ -419,6 +433,9 @@ pub(crate) async fn recv_repair_node_response<R: AsyncRead + Unpin>(
                         .await
                         .map_err(|error| anyhow!("receive collection PATCH leaf key: {error}"))?;
                     let length = recv_u32_be(recv).await? as usize;
+                    if component == CollectionRepairComponent::ResidentBlob && length != 0 {
+                        bail!("resident blob inventory leaf value must be empty");
+                    }
                     if length > MAX_COLLECTION_LEAF_BYTES {
                         bail!(
                             "collection PATCH leaf is {length} bytes; limit is {MAX_COLLECTION_LEAF_BYTES}"
@@ -502,6 +519,7 @@ mod tests {
             wake_root: [4; 32],
             records: PatchSummary::new(Some([5; 32]), 7).unwrap(),
             authorization_evidence: PatchSummary::new(None, 0).unwrap(),
+            resident_blobs: PatchSummary::new(Some([6; 32]), 9).unwrap(),
         };
         let sent_hello = hello.clone();
         let writer = tokio::spawn(async move {
@@ -544,6 +562,51 @@ mod tests {
         assert!(
             error.to_string().contains("collection READ proof is"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resident_blob_leaf_rejects_nonempty_value_before_reading_its_body() {
+        let mut frame = Vec::new();
+        frame.push(NODE_FOUND);
+        frame.push(NODE_LEAF);
+        frame.extend_from_slice(&[1; 32]);
+        frame.extend_from_slice(&[2; 32]);
+        frame.extend_from_slice(&1_u32.to_be_bytes());
+        // No body follows: rejection must come from the inventory grammar,
+        // rather than accepting or trying to read a purported payload.
+        let error = recv_repair_node_response(
+            &mut frame.as_slice(),
+            CollectionRepairComponent::ResidentBlob,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("value must be empty"));
+    }
+
+    #[tokio::test]
+    async fn resident_blob_leaf_roundtrips_with_handle_only() {
+        let component = CollectionRepairComponent::ResidentBlob;
+        let response = PatchNodeResponse::Found(PatchNode::Leaf {
+            digest: [7; 32],
+            leaf: PatchLeaf {
+                key: vec![8; 32],
+                value: Vec::new(),
+            },
+        });
+        let mut frame = Vec::new();
+        send_repair_node_response(&mut frame, &response, component)
+            .await
+            .unwrap();
+        assert_eq!(
+            recv_repair_node_response(&mut frame.as_slice(), component)
+                .await
+                .unwrap(),
+            response
+        );
+        assert_eq!(
+            component,
+            CollectionRepairComponent::from_wire(component.wire()).unwrap()
         );
     }
 

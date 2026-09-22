@@ -1,4 +1,8 @@
-//! A reachable second replica must not erase recovery work for a failed first one.
+//! Lost root announcements recover after a partition, beside a healthy replica.
+//!
+//! SimNet directly delivers topic wakes to unpartitioned subscribers. It models
+//! packet loss and periodic-announcement recovery here, not stock gossip mesh
+//! membership, forwarding, discovery, or partition reconnection.
 #![cfg(feature = "sim")]
 
 use std::sync::Arc;
@@ -15,6 +19,7 @@ use triblespace_core::collection::{
 };
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{BlobStorePut, SnapshotSource};
+use triblespace_net::health::RepairFrontier;
 use triblespace_net::host::{self, PeerConfig};
 use triblespace_net::inventory::{ReconcileDirection, ReconcileQos};
 use triblespace_net::peer::Peer;
@@ -74,6 +79,14 @@ fn contains(peer: &mut Peer<MemoryRepo>, expected: CollectionRecord) -> bool {
         .any(|record| record.unwrap() == expected)
 }
 
+fn frontier(peer: &Peer<MemoryRepo>, collection: CollectionHandle) -> Option<RepairFrontier> {
+    peer.health()
+        .collections
+        .iter()
+        .find(|state| state.collection == collection)
+        .and_then(|state| state.local_frontier)
+}
+
 async fn step(clock: &Arc<VirtualClock>, peers: &mut [&mut Peer<MemoryRepo>]) {
     SimNet::step(clock, Duration::from_millis(100)).await;
     for peer in peers {
@@ -82,7 +95,7 @@ async fn step(clock: &Arc<VirtualClock>, peers: &mut [&mut Peer<MemoryRepo>]) {
 }
 
 #[test]
-fn transient_failed_replica_remains_retryable_with_a_healthy_other_replica() {
+fn periodic_root_announcements_recover_a_healed_partition_beside_a_healthy_replica() {
     // This integration-test binary has one independent virtual timeline.
     let clock = VirtualClock::new(hifitime::Epoch::from_gregorian_utc_at_midnight(2026, 1, 1));
     clock::install_virtual(clock.clone()).expect("install virtual clock before any store use");
@@ -132,6 +145,13 @@ fn transient_failed_replica_remains_retryable_with_a_healthy_other_replica() {
         // Both sources begin with the exact same signed record. B is not a
         // relay for later A writes: WriteOnly is an explicit supported mode.
         b_store.insert(original).unwrap();
+        // An exact blob read will prove B's connection stays usable without
+        // making a new collection root or forcing a gratuitous repair pull.
+        let control_bytes =
+            Bytes::from_source(b"B remains reachable during A's partition".to_vec());
+        let control = b_store
+            .put::<UnknownBlob, _>(control_bytes.clone())
+            .unwrap();
         let mut a = bring_up(
             &net,
             &a_key,
@@ -156,30 +176,33 @@ fn transient_failed_replica_remains_retryable_with_a_healthy_other_replica() {
         for peer in [&mut a, &mut b, &mut c] {
             peer.activate_collection(collection);
         }
-        let mut initially_compared = false;
+        let mut initial_root = None;
         for _ in 0..400 {
             step(&clock, &mut [&mut a, &mut b, &mut c]).await;
-            let health = c.health();
-            initially_compared = [a_id, b_id].into_iter().all(|id| {
-                health.collections.iter().any(|state| {
-                    state.collection == collection
-                        && state
-                            .peers
-                            .iter()
-                            .any(|peer| peer.peer == id && peer.comparison.is_some())
+            let root = frontier(&a, collection);
+            if root.is_some()
+                && [&b, &c].into_iter().all(|peer| {
+                    frontier(peer, collection).is_some_and(|other| {
+                        let root = root.unwrap();
+                        other.records == root.records
+                            && other.authorization_evidence == root.authorization_evidence
+                    })
                 })
-            });
-            if initially_compared && contains(&mut c, original) {
+                && contains(&mut c, original)
+            {
+                initial_root = root;
                 break;
             }
         }
-        assert!(
-            initially_compared,
-            "both replicas must be known before the fault"
-        );
+        let initial_root = initial_root.expect("all three replicas must start at R0");
+        // These peers share semantic state, not necessarily payload residency.
+        // Keep each peer's own product root as the unchanged-state control.
+        let initial_b = frontier(&b, collection).unwrap();
+        let initial_c = frontier(&c, collection).unwrap();
         assert!(contains(&mut c, original));
         let cut_at = clock::mono_now();
         net.partition(a_id, c_id);
+        net.partition(a_id, b_id);
         let fresh = append(
             &mut *a.store(),
             &a_key,
@@ -187,47 +210,54 @@ fn transient_failed_replica_remains_retryable_with_a_healthy_other_replica() {
             b"only A has this later record",
         );
         a.refresh();
-        let mut failed_at = None;
-        let mut healthy_b_after_cut = false;
+        // A's first changed-root wake, and later announcements while isolated,
+        // cannot cross either cut. There should be no blind repair request to
+        // manufacture an error for a root that C has not heard about.
         for _ in 0..400 {
             step(&clock, &mut [&mut a, &mut b, &mut c]).await;
-            let health = c.health();
-            for state in &health.collections {
-                if state.collection != collection {
-                    continue;
-                }
-                for peer in &state.peers {
-                    if peer.peer == a_id {
-                        failed_at = peer.last_failure_at.filter(|at| *at >= cut_at);
-                    } else if peer.peer == b_id {
-                        healthy_b_after_cut = peer.comparison.is_some()
-                            && peer.last_completed_at.is_some_and(|at| at > cut_at)
-                            && peer.last_failure_at.is_none();
-                    }
-                }
-            }
-            if failed_at.is_some() && healthy_b_after_cut {
-                break;
-            }
         }
-        assert!(
-            failed_at.is_some(),
-            "the A repair must actually fail before healing"
-        );
-        assert!(
-            healthy_b_after_cut,
-            "B must remain a successfully repaired candidate"
-        );
+        let isolated_root = frontier(&a, collection).expect("A has the new R1");
+        assert_ne!(isolated_root, initial_root);
+        assert!(contains(&mut a, fresh));
+        assert_eq!(frontier(&b, collection), Some(initial_b));
+        assert_eq!(frontier(&c, collection), Some(initial_c));
         assert!(!contains(&mut c, fresh));
         assert!(
             !contains(&mut b, fresh),
             "the healthy replica must not mask A's loss"
         );
 
+        let serves_before = b.health().blob_serving.completed;
+        let acquired = {
+            let mut read = Box::pin(c.acquire(control));
+            let mut acquired = None;
+            for _ in 0..400 {
+                tokio::select! {
+                    result = &mut read => {
+                        acquired = result.unwrap();
+                        break;
+                    }
+                    () = async { step(&clock, &mut [&mut a, &mut b]).await } => {}
+                }
+            }
+            acquired
+        };
+        assert_eq!(
+            acquired,
+            Some(control_bytes),
+            "the uncut C-to-B path must work"
+        );
+        step(&clock, &mut [&mut a, &mut b, &mut c]).await;
+        assert!(b.health().blob_serving.completed > serves_before);
+        assert_eq!(frontier(&b, collection), Some(initial_b));
+        assert_eq!(frontier(&c, collection), Some(initial_c));
+        assert!(!contains(&mut c, fresh));
+
         // Healing SimNet only restores dialing; it emits no gossip wake or
-        // NeighborUp. A's new root was published while cut, so there is no new
-        // root transition to rescue a forgotten participant. Recovery must
-        // use bounded periodic retries before the existing five-minute lease.
+        // NeighborUp. A's root does not change again. Its next periodic
+        // announcement must rescue C while B remains healthy at R0. The A-B
+        // cut stays in place, preventing B from masking the direct recovery.
+        let healed_at = clock::mono_now();
         net.heal(a_id, c_id);
         let mut recovered = false;
         for _ in 0..1_000 {
@@ -239,9 +269,19 @@ fn transient_failed_replica_remains_retryable_with_a_healthy_other_replica() {
         }
         assert!(
             recovered,
-            "a transiently failed A was forgotten while healthy B suppressed rediscovery",
+            "A's lost root wake did not recover periodically beside healthy B",
         );
+        assert!(clock::mono_now().duration_since(healed_at) <= Duration::from_secs(100));
         assert!(clock::mono_now().duration_since(cut_at) < Duration::from_secs(300));
+        assert!(contains(&mut c, original));
+        assert!(
+            !contains(&mut b, fresh),
+            "B cannot supply A's missing record"
+        );
+        assert_eq!(frontier(&a, collection), Some(isolated_root));
+        for peer in [&a, &b, &c] {
+            assert_eq!(peer.health().publication.attempts, 0);
+        }
         drop((a.into_store(), b.into_store(), c.into_store()));
     }));
 }
