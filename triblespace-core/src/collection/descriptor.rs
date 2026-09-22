@@ -128,6 +128,44 @@ where
     }
 }
 
+/// The handle a named root collection *would* have, for a reader that must
+/// find it without writing to the pile.
+///
+/// This is [`naming`] plus the content address, with no store involved. It
+/// mirrors [`CollectionStorage::collection`] deliberately non-generically, so
+/// the two cannot drift: that method is fixed to `SimpleArchive`, and a derived
+/// handle is only useful if it equals the one registration returns.
+///
+/// # Why this is narrow, and why [`identity_for_tests`] stays test-only
+///
+/// The reason that constructor is not public is recorded and still stands:
+/// production code takes its handle from what `put` hands back, because a
+/// handle computed *beside* a store rather than *by* it can name a descriptor
+/// that was never written, leaving records that reference something nothing can
+/// decode.
+///
+/// That hazard belongs to **writers**. A reader deriving this handle and finding
+/// no descriptor simply reads an absent collection, which is the honest
+/// open-world answer and the correct fallback for a host not yet configured. So
+/// use this to OPEN a collection someone else registered; never to name one in a
+/// record you are about to write. For that, register it and take the handle.
+///
+/// The motivating case is a pile's own configuration: a collection admitting
+/// only the pile's signing key, whose handle is therefore a function of a key
+/// the process already holds. Nothing external has to remember it, which is the
+/// point -- an external note of a handle is one more copy that can go stale.
+///
+/// Identity is a function of the name, the policy and the encoding;
+/// [`PINNED_ROOT_DESCRIPTOR_IDENTITY`] is what keeps that from moving silently.
+pub fn root_handle_to_read(name: &str, policy: CollectionPolicy) -> CollectionHandle {
+    crate::blob::IntoBlob::<crate::blob::encodings::simplearchive::SimpleArchive>::to_blob(
+        naming::<crate::blob::encodings::simplearchive::SimpleArchive>(name, policy)
+            .facts()
+            .clone(),
+    )
+    .get_handle()
+}
+
 /// Build a derived descriptor around one explicit mapping value.
 ///
 /// The mapping Fragment is spread into the same descriptor archive. Its root
@@ -793,6 +831,57 @@ mod policy_tests {
                 "admission_invoke_threshold"
             ))
         );
+    }
+
+    /// The whole value of a derived handle is that it equals the registered one.
+    ///
+    /// If registration ever stops going through `naming::<SimpleArchive>`, or
+    /// `put_closure` stops returning the descriptor blob's own handle, a reader
+    /// deriving its configuration collection would silently open nothing and
+    /// read "unconfigured" on a configured host. That is the failure this test
+    /// exists to make loud.
+    #[test]
+    fn a_derived_root_handle_equals_the_one_registration_returns() {
+        use crate::collection::CollectionStoreExt;
+        use crate::repo::memoryrepo::MemoryRepo;
+
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x11; 32]).verifying_key();
+        let policy = CollectionPolicy::new(
+            AdmissionPolicy::direct(key),
+            AdmissionPolicy::direct(key),
+        );
+
+        let mut store = MemoryRepo::default();
+        let registered = store
+            .collection("self-config", policy.clone())
+            .expect("register")
+            .handle();
+
+        assert_eq!(
+            super::root_handle_to_read("self-config", policy),
+            registered,
+            "a derived handle must name the collection registration created"
+        );
+    }
+
+    /// The control: the key is part of the identity, so one pile's
+    /// configuration is not another's. Without this, every host would derive
+    /// the same handle and a "local" collection would be colony-wide.
+    #[test]
+    fn a_derived_root_handle_differs_with_the_key_and_with_the_name() {
+        let one = ed25519_dalek::SigningKey::from_bytes(&[0x11; 32]).verifying_key();
+        let two = ed25519_dalek::SigningKey::from_bytes(&[0x22; 32]).verifying_key();
+        let policy_of = |key| CollectionPolicy::new(
+            AdmissionPolicy::direct(key),
+            AdmissionPolicy::direct(key),
+        );
+
+        let a = super::root_handle_to_read("self-config", policy_of(one));
+        let b = super::root_handle_to_read("self-config", policy_of(two));
+        let c = super::root_handle_to_read("other-config", policy_of(one));
+
+        assert_ne!(a, b, "a different signing key must give a different collection");
+        assert_ne!(a, c, "a different name must give a different collection");
     }
 
     #[test]
