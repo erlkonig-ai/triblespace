@@ -629,6 +629,34 @@ struct Member {
     /// reader could not point at. It is now carried per member so the mark can
     /// carry it too.
     produced: bool,
+    /// Whether an admitted record put it here.
+    ///
+    /// The three flags above come from the record scan, which does not consult
+    /// the admission oracle at all: a `COMMIT` nobody is allowed to write sets
+    /// `committed` exactly as an admitted one does. So a member waiting on a
+    /// grant was indistinguishable from a folded-in one, which is the absence
+    /// this field exists to name.
+    admission: Admission,
+}
+
+/// Whether the record that put a member here is one the store admits.
+///
+/// Admitted wins over waiting, and the core already says so: an unadmitted
+/// route contributes nothing to a node an admitted route reached. A member
+/// somebody is allowed to write and somebody else is not is not half-waiting;
+/// it is here, by the route that was allowed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum Admission {
+    /// An admitted record attested it.
+    Admitted,
+    /// A record attests it and no capability proof admits that record's signer
+    /// yet. Waiting on a grant somebody must issue.
+    Unadmitted,
+    /// Neither. Either nothing here produced it — it was reached as somebody
+    /// else's join input — or its lineage has not replicated, which is waiting
+    /// on bytes rather than on a grant and belongs to nobody in particular.
+    #[default]
+    Unknown,
 }
 
 /// The join lattice *inside* one collection.
@@ -668,7 +696,7 @@ fn observe_members<R: triblespace_core::repo::StoreRead>(
     collection: [u8; 32],
     limit: usize,
 ) -> ReadResult<MemberLattice> {
-    use triblespace_core::collection::records::CollectionRecord;
+    use triblespace_core::collection::records::{CollectionData, CollectionRecord};
     use triblespace_core::collection::CollectionRecordSelector;
 
     let selectors = BTreeSet::from([CollectionRecordSelector::Collection(
@@ -721,6 +749,20 @@ fn observe_members<R: triblespace_core::repo::StoreRead>(
         });
     }
 
+    // Admission is the one fact above the scan cannot see, so it comes from the
+    // fold rather than from the records. Settling this one collection is what
+    // makes its answers mean anything: an index never asked about a lineage
+    // holds no parked rows for it, so a per-collection question asked without
+    // settling first reports a clean zero for exactly the collections nobody
+    // has looked at. The snapshot memoises the fold, so asking again for a
+    // collection the lattice pass already settled costs the clone and nothing
+    // else.
+    let target = CollectionHandle::new(collection);
+    let coverage = snapshot
+        .index(&BTreeSet::from([target]))
+        .map_err(|_| ReadFailure::RefreshPile)?;
+    let waiting = coverage.unadmitted_nodes_in(target);
+
     let order: Vec<[u8; 32]> = handles.into_iter().collect();
     let members = order
         .iter()
@@ -733,6 +775,16 @@ fn observe_members<R: triblespace_core::repo::StoreRead>(
                 .contains_blob(Inline::<Handle<UnknownBlob>>::new(*handle))
                 .unwrap_or(false),
             produced: produced.contains(handle),
+            admission: {
+                let node = CollectionData::new(*handle);
+                if coverage.coverage(target, node).is_some() {
+                    Admission::Admitted
+                } else if waiting.contains(&node) {
+                    Admission::Unadmitted
+                } else {
+                    Admission::Unknown
+                }
+            },
         })
         .collect();
     let index = |handle: &[u8; 32]| order.binary_search(handle).ok();
@@ -1684,6 +1736,87 @@ mod tests {
         assert_eq!(members.too_large, Some(3));
         assert!(members.members.is_empty());
         assert!(members.joins.is_empty());
+    }
+
+    #[test]
+    fn a_member_waiting_on_a_grant_is_told_apart_from_a_folded_in_one() {
+        // The record scan does not consult the admission oracle, so a COMMIT
+        // nobody is allowed to write sets `committed` exactly as an admitted
+        // one does. Before this the two were one picture, and the reader had
+        // no way to ask which members the store had actually folded in.
+        use triblespace_core::collection::CollectionStore;
+        let mut store = MemoryRepo::default();
+        let root = ed25519_dalek::SigningKey::from_bytes(&[21; 32]);
+        let stranger = ed25519_dalek::SigningKey::from_bytes(&[22; 32]);
+        let collection: Collection<SimpleArchive> = store
+            .collection(
+                "guarded",
+                CollectionPolicy::new(
+                    AdmissionPolicy::Open,
+                    AdmissionPolicy::direct(root.verifying_key()),
+                ),
+            )
+            .unwrap();
+
+        // Two commits into one collection, identical in every way the scan can
+        // see and differing only in who signed them.
+        let vouched = Inline::new([0x41; 32]);
+        let parked = Inline::new([0x42; 32]);
+        for (signer, payload) in [(&root, vouched), (&stranger, parked)] {
+            store
+                .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                    signer,
+                    collection.handle(),
+                    payload,
+                    empty_metadata_handle(),
+                )))
+                .unwrap();
+        }
+
+        let snapshot = store.snapshot().unwrap();
+        let members = observe_members(&snapshot, collection.handle().raw, MEMBER_LIMIT).unwrap();
+        let at = |handle: [u8; 32]| {
+            members
+                .members
+                .iter()
+                .find(|member| member.handle == handle)
+                .expect("member projected")
+        };
+
+        // Both are members and both are committed -- that is the point.
+        assert!(at(vouched.raw).committed && at(parked.raw).committed);
+        assert_eq!(at(vouched.raw).admission, Admission::Admitted);
+        assert_eq!(
+            at(parked.raw).admission,
+            Admission::Unadmitted,
+            "the one whose signer no proof admits is the one waiting"
+        );
+    }
+
+    #[test]
+    fn a_member_reached_only_as_a_join_input_is_neither_admitted_nor_waiting() {
+        // Three answers, not two. A member nothing here produced is not
+        // waiting on a grant -- nobody can issue one, because there is no
+        // record here to admit -- and drawing it as such would send a reader
+        // to ask the wrong person for the wrong thing.
+        let (mut store, collection, first, _second, result) = member_fixture();
+        let snapshot = store.snapshot().unwrap();
+        let members = observe_members(&snapshot, collection, MEMBER_LIMIT).unwrap();
+        let at = |handle: [u8; 32]| {
+            members
+                .members
+                .iter()
+                .find(|member| member.handle == handle)
+                .expect("member projected")
+        };
+        // The fixture is an open collection, so everything it records is
+        // admitted; nothing here is ever Unadmitted.
+        assert_eq!(at(first).admission, Admission::Admitted);
+        assert_eq!(at(result).admission, Admission::Admitted);
+        assert!(members
+            .members
+            .iter()
+            .all(|member| member.admission != Admission::Unadmitted));
     }
 
     #[test]

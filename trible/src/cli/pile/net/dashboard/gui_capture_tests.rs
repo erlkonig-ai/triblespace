@@ -188,6 +188,34 @@ fn generated_frame(directory: &Path) -> Result<(Frame, i128)> {
         }
     }
     writer.commit(collection, &signer, facts)?;
+    // A commit into the same collection by a key the policy does not admit.
+    // The record scan cannot tell it from the one above -- both name a payload
+    // as data -- so without it the capture cannot show the difference between a
+    // member the store folded in and one waiting on a grant, which is the whole
+    // state the member card was taught to draw. Inserted as a raw record
+    // because the writing API refuses it, which is the point.
+    {
+        use triblespace_core::collection::records::CollectionCommit;
+        use triblespace_core::collection::{
+            empty_metadata_handle, CollectionRecord, CollectionStore,
+        };
+        use triblespace_core::repo::BlobStorePut;
+        // Its payload is STORED, so the mark is a member that is here and
+        // unvouched-for rather than a hole. The two are different absences
+        // with different owners -- one waits on a grant, the other on bytes --
+        // and a fixture that conflated them would draw only the hole.
+        let payload = writer.put::<SimpleArchive, _>(entity! {
+            metadata::name: "signed by a key the policy does not admit",
+        })?;
+        // A disposable fixture key, not any node's.
+        let stranger = ed25519_dalek::SigningKey::from_bytes(&[91; 32]);
+        writer.insert(CollectionRecord::Commit(CollectionCommit::sign(
+            &stranger,
+            collection.handle(),
+            Inline::new(payload.raw),
+            empty_metadata_handle(),
+        )))?;
+    }
     let health_facts = health_record::Recorder::new(nodes[4]).record(
         observed_at - hifitime::Duration::from_seconds(1.0),
         [
@@ -263,6 +291,21 @@ fn assert_mixed_states(frame: &Frame) {
     assert!(
         !members.members.is_empty(),
         "the selected collection has members to draw"
+    );
+    // Both admission answers, in one collection, told apart by nothing the
+    // record scan can see.
+    let admissions = |wanted| {
+        members
+            .members
+            .iter()
+            .filter(|member| member.admission == wanted)
+            .count()
+    };
+    assert_eq!(admissions(Admission::Admitted), 1, "the authority's commit");
+    assert_eq!(
+        admissions(Admission::Unadmitted),
+        1,
+        "and the one signed by a key the policy does not admit"
     );
     assert_eq!(frame.nodes().len(), 5);
     assert_eq!(frame.workers.len(), 9);
@@ -383,6 +426,12 @@ fn capture_generated_colony_dashboard() -> Result<()> {
         .tempdir_in(&artifacts)?;
     let (frame, observed_ns) = generated_frame(fixture.path())?;
     assert_mixed_states(&frame);
+    // Open on the collection the reader focused. Without this the selection is
+    // empty, the member card correctly draws nothing, and the capture emits a
+    // 2px stub for it -- the exact failure the card count was added to catch,
+    // sailing straight past the card count.
+    let selected = frame.members.as_ref().map(|members| members.collection);
+    anyhow::ensure!(selected.is_some(), "the fixture focused a collection");
     let pile_path = fixture.path().join("generated-telemetry.pile");
     let before = fs::read(&pile_path)?;
     let mut manifest = format!(
@@ -410,6 +459,7 @@ fn capture_generated_colony_dashboard() -> Result<()> {
                     notebook,
                     move || (Some(Ok(frame.clone())), None),
                     |_chosen| {},
+                    selected,
                 );
                 notebook.settled();
             },
@@ -495,6 +545,21 @@ fn capture_generated_colony_dashboard() -> Result<()> {
             *tallest <= 1800,
             "card {} is too tall: {tallest}px (budget 1800px per card); all cards {card_heights:?}, \
              total {rendered_height}px",
+            index + 1
+        );
+    }
+    // And a FLOOR, which is the half the count could not express. Six cards
+    // were captured the whole time one of them was a 2px stub: the count says
+    // a card exists, and only a height says it drew anything. Every card here
+    // renders at least a heading.
+    if let Some((index, shortest)) = card_heights
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, height)| **height)
+    {
+        anyhow::ensure!(
+            *shortest >= 24,
+            "card {} drew nothing: {shortest}px; all cards {card_heights:?}",
             index + 1
         );
     }

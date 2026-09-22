@@ -139,8 +139,18 @@ where
 /// `pull` and `publish` are the only things that differ between the live
 /// dashboard and a capture of a fixed frame, so a capture exercises this exact
 /// graph rather than a second arrangement that merely resembles it.
-fn compose<P, S>(notebook: &mut GORBIE::NotebookCtx, pull: P, publish: S)
-where
+/// Wire the card graph.
+///
+/// `selected` is the selection the graph opens on. It is a parameter rather
+/// than a hardcoded `None` because the capture needs to open on a collection:
+/// with nothing selected the member card correctly draws nothing, and the
+/// evidence was then blind to exactly the card it claims to guard.
+fn compose<P, S>(
+    notebook: &mut GORBIE::NotebookCtx,
+    pull: P,
+    publish: S,
+    selected: Option<[u8; 32]>,
+) where
     P: Fn() -> Pulled + 'static,
     S: Fn(Option<[u8; 32]>) + 'static,
 {
@@ -189,7 +199,7 @@ where
     // while reading another's.
     let selection = notebook.state(
         "colony-selection",
-        None as Option<[u8; 32]>,
+        selected,
         move |ctx, selected: &mut Option<[u8; 32]>| {
             let held = observed.read(ctx);
             draw(ctx, &held, "Collection lattice", |ui, frame| {
@@ -251,6 +261,8 @@ pub(super) fn run(options: Options) -> Result<()> {
                     publishing.1.notify_all();
                 }
             },
+            // A live dashboard opens on nothing selected: the reader picks.
+            None,
         );
     });
     let closed = sampler.finish();
@@ -471,7 +483,9 @@ fn render_mesh(ui: &mut egui::Ui, frame: &Frame) {
 /// underneath, which is how a derived collection gets walked back to the root
 /// it was computed from.
 fn render_lattice(ui: &mut egui::Ui, frame: &Frame, selected: &mut Option<[u8; 32]>) {
-    use GORBIE::widgets::{LatticeEdge, LatticeGraph, LatticeMark, LatticeNode, LatticePresence};
+    use GORBIE::widgets::{
+        LatticeAdmission, LatticeEdge, LatticeGraph, LatticeMark, LatticeNode, LatticePresence,
+    };
 
     ui.label(
         egui::RichText::new("Collection lattice")
@@ -513,6 +527,12 @@ fn render_lattice(ui: &mut egui::Ui, frame: &Frame, selected: &mut Option<[u8; 3
             },
             // No records naming it means nothing to divide, which draws as an
             // empty track. That is absence of evidence, not full residency.
+            // Deliberately not the admission channel. A collection is not
+            // itself admitted or waiting; some of its MEMBERS are, and that
+            // count already has a home in the text below. Spending one channel
+            // on "this element is waiting" and "this element contains
+            // something waiting" would make the mark mean two things.
+            admission: LatticeAdmission::Unknown,
             coverage: (collection.stored() > 0)
                 .then(|| collection.result_resident as f32 / collection.stored() as f32),
             // A collection is named or derived, so something produced it by
@@ -665,7 +685,9 @@ fn render_lattice(ui: &mut egui::Ui, frame: &Frame, selected: &mut Option<[u8; 3
 /// above it is a maximal element — nothing has joined it into anything yet,
 /// which is the merge work this collection still owes.
 fn render_members(ui: &mut egui::Ui, frame: &Frame, chosen: Option<[u8; 32]>) {
-    use GORBIE::widgets::{LatticeEdge, LatticeGraph, LatticeMark, LatticeNode, LatticePresence};
+    use GORBIE::widgets::{
+        LatticeAdmission, LatticeEdge, LatticeGraph, LatticeMark, LatticeNode, LatticePresence,
+    };
 
     let Some(chosen) = chosen else { return };
     let Some(members) = &frame.members else {
@@ -705,6 +727,15 @@ fn render_members(ui: &mut egui::Ui, frame: &Frame, chosen: Option<[u8; 32]>) {
             // Residency is already carried by the mark's stroke; a second
             // channel saying the same thing would be decoration.
             coverage: None,
+            // The absence the record scan cannot see: a COMMIT nobody is
+            // allowed to write names its payload exactly as an admitted one
+            // does, so without this the member waiting on a grant and the one
+            // folded in drew the same mark.
+            admission: match member.admission {
+                Admission::Admitted => LatticeAdmission::Admitted,
+                Admission::Unadmitted => LatticeAdmission::Unadmitted,
+                Admission::Unknown => LatticeAdmission::Unknown,
+            },
             // A commit is produced by definition — an author asserted it. For
             // the rest, this is whether a record HERE made it. False is the
             // member reached only as somebody else's join input, which until
@@ -736,11 +767,30 @@ fn render_members(ui: &mut egui::Ui, frame: &Frame, chosen: Option<[u8; 32]>) {
             nodes.len(),
             edges.len()
         ));
+        // The clauses are separate labels so the row can wrap between them,
+        // which means each one carries its own separator: without it they run
+        // together into one unreadable sentence at any width that fits them
+        // both on a line.
         if members.unproduced != 0 {
             ui.small(format!(
-                "{} reached only as a join input — each one drawn with a gap at \
-                 the bottom of its mark, so you can point at them",
+                "· {} reached only as a join input — each one drawn with a gap \
+                 at the bottom of its mark, so you can point at them",
                 members.unproduced
+            ));
+        }
+        // The one absence here with a named owner: a grant somebody has to
+        // issue. Said in the summary as well as drawn, because it is the line
+        // that tells a reader the picture is waiting on a person rather than
+        // on the network.
+        let waiting = members
+            .members
+            .iter()
+            .filter(|member| matches!(member.admission, Admission::Unadmitted))
+            .count();
+        if waiting != 0 {
+            ui.small(format!(
+                "· {waiting} waiting on a capability grant — drawn as outlines, \
+                 and they stay put until somebody issues one"
             ));
         }
     });
@@ -748,8 +798,9 @@ fn render_members(ui: &mut egui::Ui, frame: &Frame, chosen: Option<[u8; 32]>) {
         "Inside the selection: square is a commit, circle a join result or mapping \
          output, a circle with a gap at the bottom a member nothing here produced — \
          it was reached as somebody else's join input and the record that made it is \
-         elsewhere. Dashed is a member whose bytes are not here. Each join's two \
-         edges are its MERGE inputs.",
+         elsewhere. A solid mark is vouched for, an outline is a member here that no \
+         capability proof admits yet, and dashed is a member whose bytes are not here \
+         at all. Each join's two edges are its MERGE inputs.",
     );
 }
 
