@@ -107,22 +107,21 @@ fn equations() -> [CollectionRecord; 3] {
     let low = Handle::<SimpleArchive>::to_hash(low_handle);
     let high = Handle::<SimpleArchive>::to_hash(high_handle);
     let a = CollectionCommit::sign(&signer, collection.handle(), low, low_handle);
-    let b = CollectionCommit::sign(&signer, collection.handle(), high, high_handle);
     [
         CollectionRecord::Commit(a),
         CollectionRecord::Merge(CollectionMerge::sign(
-    &signer,
-    collection.handle(),
-    low,
-    high,
-    high,
-)),
+            &signer,
+            collection.handle(),
+            low,
+            high,
+            high,
+        )),
         CollectionRecord::Derive(CollectionDerive::sign(
-    &signer,
-    collection.handle(),
-    low,
-    high,
-)),
+            &signer,
+            collection.handle(),
+            low,
+            high,
+        )),
     ]
 }
 

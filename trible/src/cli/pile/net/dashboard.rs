@@ -1696,25 +1696,27 @@ mod tests {
         // in the target's lattice would mix two collections' members into one
         // order, which is not a lattice at all.
         use triblespace_core::collection::CollectionStore;
-        let (mut store, _source, target) = lattice_fixture();
+        let (mut store, source, target) = lattice_fixture();
         let signer = ed25519_dalek::SigningKey::from_bytes(&[17; 32]);
         let input = Inline::new([0x31; 32]);
         let output = Inline::new([0x32; 32]);
-        let commit = CollectionCommit::sign(
-            &signer,
-            CollectionHandle::new([0x99; 32]),
-            input,
-            empty_metadata_handle(),
-        );
-        let derive = CollectionDerive::sign(
-    &signer,
-    CollectionHandle::new(target.raw),
-    input,
-    output,
-);
+        // The input really IS a member, of the source collection. This commit
+        // was built and never inserted, which left the test proving only that
+        // an input nothing anywhere commits is not drawn here -- a far easier
+        // property than the one the comment claims. With it inserted the
+        // input exists, in a neighbouring lattice, and the assertion below
+        // says the target's picture still does not borrow it.
         store
-            .insert(CollectionRecord::Derive(derive))
+            .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                &signer,
+                CollectionHandle::new(source.raw),
+                input,
+                empty_metadata_handle(),
+            )))
             .unwrap();
+        let derive =
+            CollectionDerive::sign(&signer, CollectionHandle::new(target.raw), input, output);
+        store.insert(CollectionRecord::Derive(derive)).unwrap();
         let snapshot = store.snapshot().unwrap();
         let members = observe_members(&snapshot, target.raw, MEMBER_LIMIT).unwrap();
         let handles: Vec<[u8; 32]> = members.members.iter().map(|m| m.handle).collect();
@@ -1722,6 +1724,16 @@ mod tests {
         assert!(
             !handles.contains(&input.raw),
             "the input belongs to the source collection"
+        );
+        // And it is genuinely there to be borrowed, which is what makes the
+        // line above an assertion rather than a tautology.
+        let next_door = observe_members(&snapshot, source.raw, MEMBER_LIMIT).unwrap();
+        assert!(
+            next_door
+                .members
+                .iter()
+                .any(|member| member.handle == input.raw),
+            "the input is a member of the source collection"
         );
         assert!(members.joins.is_empty(), "a derive is not a join");
     }
@@ -1825,20 +1837,19 @@ mod tests {
         let (mut store, collection, first, _second, result) = member_fixture();
         let signer = ed25519_dalek::SigningKey::from_bytes(&[19; 32]);
         // Join the earlier result with a member nothing here produces.
+        // Deliberately NOT committed anywhere: `unproduced` counts handles
+        // that are neither committed nor produced, so a commit for the orphan
+        // would make the assertion below false. One was built here and never
+        // inserted, which is the only reason the test passed -- it contradicts
+        // the premise rather than establishing it.
         let orphan = Inline::new([0x44; 32]);
-        let commit = CollectionCommit::sign(
+        let merge = CollectionMerge::sign(
             &signer,
             CollectionHandle::new(collection),
+            Inline::new(result),
             orphan,
-            empty_metadata_handle(),
+            Inline::new([0x55; 32]),
         );
-        let merge = CollectionMerge::sign(
-    &signer,
-    CollectionHandle::new(collection),
-    Inline::new(result),
-    orphan,
-    Inline::new([0x55; 32]),
-);
         store.insert(CollectionRecord::Merge(merge)).unwrap();
         let snapshot = store.snapshot().unwrap();
         let members = observe_members(&snapshot, collection, MEMBER_LIMIT).unwrap();
