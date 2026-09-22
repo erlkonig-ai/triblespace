@@ -354,6 +354,11 @@ fn generated_colony_reader_preserves_mixed_states_and_pile_bytes() -> Result<()>
 #[test]
 #[ignore = "requires explicit evidence directory and externally bounded software-renderer scope"]
 fn capture_generated_colony_dashboard() -> Result<()> {
+    /// One producer, one selector, four consumers. Asserting the count is what
+    /// catches a card that silently stops rendering -- the failure that once
+    /// read as a 2px stub and got misdiagnosed as a GPU fault.
+    const EXPECTED_CARDS: usize = 6;
+
     // The opt-in driver can record wgpu's actual adapter selection. This is
     // diagnostic evidence, not a substitute for selecting software drivers.
     let _ = tracing_subscriber::fmt()
@@ -388,6 +393,7 @@ fn capture_generated_colony_dashboard() -> Result<()> {
     let mut images = 0_usize;
     let mut encoded_bytes = 0_usize;
     let mut rendered_height = 0_usize;
+    let mut card_heights: Vec<usize> = Vec::new();
     let capture = NotebookConfig::new("Generated colony dashboard fixture")
         .with_headless_theme(HeadlessTheme::Dark)
         .capture(
@@ -438,6 +444,7 @@ fn capture_generated_colony_dashboard() -> Result<()> {
                 images += 1;
                 encoded_bytes += image.bytes.len();
                 rendered_height += image.height as usize;
+                card_heights.push(image.height as usize);
                 Ok(())
             },
         );
@@ -466,10 +473,30 @@ fn capture_generated_colony_dashboard() -> Result<()> {
     capture.map_err(|error| anyhow!("generated dashboard capture: {error}"))?;
     anyhow::ensure!(images != 0, "capture emitted no PNGs");
     // Preserve failed screenshots first, so an expanded-layout regression can
-    // be inspected. The default nine-scope overview must not become a dump.
+    // be inspected.
+    //
+    // The budget is PER CARD, not over their sum. It exists to stop one card
+    // becoming a dump, and the dashboard is now a card graph: summing every
+    // card measures the whole page instead, which grows with each card added
+    // and would charge a tax for the decomposition rather than guarding
+    // anything. The overview this assertion was written for is 143px now
+    // precisely because the rest moved into cards of their own.
     anyhow::ensure!(
-        rendered_height <= 1800,
-        "default generated overview is too tall: {rendered_height}px (budget 1800px)"
+        card_heights.len() == EXPECTED_CARDS,
+        "expected {EXPECTED_CARDS} cards, captured {}: {card_heights:?}",
+        card_heights.len()
     );
+    if let Some((index, tallest)) = card_heights
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, height)| **height)
+    {
+        anyhow::ensure!(
+            *tallest <= 1800,
+            "card {} is too tall: {tallest}px (budget 1800px per card); all cards {card_heights:?}, \
+             total {rendered_height}px",
+            index + 1
+        );
+    }
     Ok(())
 }
