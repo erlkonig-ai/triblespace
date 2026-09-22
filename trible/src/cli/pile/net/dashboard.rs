@@ -65,6 +65,9 @@ pub(super) fn run(mut options: Options) -> Result<()> {
 // retain it. Control stripping and truncation are not capability redaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReadFailure {
+    PileMissing,
+    PileNotARegularFile,
+    PileUnreadable,
     OpenPile,
     RefreshPile,
     ClosePile,
@@ -79,6 +82,12 @@ enum ReadFailure {
 impl ReadFailure {
     fn message(self) -> &'static str {
         match self {
+            Self::PileMissing => {
+                "no pile at the given path -- pass the ABSOLUTE path to the pile file, since a \
+                 relative one resolves against the current directory"
+            }
+            Self::PileNotARegularFile => "the given path exists but is not a regular file",
+            Self::PileUnreadable => "the pile path cannot be read (permissions?)",
             Self::OpenPile => "cannot open existing regular dashboard pile",
             Self::RefreshPile => "cannot refresh dashboard pile",
             Self::ClosePile => "cannot close dashboard pile",
@@ -164,11 +173,19 @@ struct Reader {
 
 impl Reader {
     fn open(options: &Options) -> ReadResult<Self> {
-        if !std::fs::metadata(&options.pile)
-            .map_err(|_| ReadFailure::OpenPile)?
-            .is_file()
-        {
-            return Err(ReadFailure::OpenPile);
+        // Say WHICH of the three this is. The path is deliberately not named:
+        // a pile filename can itself be a hex capability handle, which is what
+        // `reader_open_failure_does_not_retain_a_sensitive_path` guards. An
+        // `io::ErrorKind` is a closed enum and carries no storage error text.
+        match std::fs::metadata(&options.pile) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ReadFailure::PileMissing);
+            }
+            Err(_) => return Err(ReadFailure::PileUnreadable),
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(ReadFailure::PileNotARegularFile);
+            }
+            Ok(_) => {}
         }
         let mut setup_warnings = Vec::new();
         let health = match super::load_existing_key(options.key.clone(), &options.pile) {
@@ -2022,10 +2039,15 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("missing pile must not be opened or created"),
         };
-        assert_eq!(failure, ReadFailure::OpenPile);
-        assert_eq!(
-            failure.to_string(),
-            "cannot open existing regular dashboard pile"
+        assert_eq!(failure, ReadFailure::PileMissing);
+        assert!(
+            failure.to_string().contains("ABSOLUTE path"),
+            "the message must say what to do: {failure}"
+        );
+        let shown = failure.to_string();
+        assert!(
+            !shown.contains(&options.pile.display().to_string()),
+            "a pile filename can be a capability handle and must never be echoed: {shown}"
         );
         assert!(std::error::Error::source(&failure).is_none());
         assert!(!options.pile.exists());

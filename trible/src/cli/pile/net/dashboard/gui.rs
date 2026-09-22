@@ -74,6 +74,41 @@ pub(super) fn run(options: Options) -> Result<()> {
 /// That is backlog, which is what "behind" actually means here — it is not a
 /// record count, and it is deliberately `None` rather than 1.0 when a node
 /// reported no work at all, because no evidence is not agreement.
+/// A node's label: the host its own daemons declare, beside the short handle.
+///
+/// The handle alone is unreadable, and a name alone is ambiguous: mid-cutover
+/// one host appears TWICE, once under its signing key and once under its old
+/// transport endpoint, and both sets of daemons call themselves `sky`. Showing
+/// both is what lets a reader see that those two marks are one machine without
+/// having to be told.
+///
+/// The name is not looked up anywhere. A worker report carries the name its own
+/// daemon chose -- `sky-sync`, `mac-maintenance` -- so the host is the part
+/// before the first `-`. Nothing is invented when that evidence is absent or
+/// disagrees: a peer named only inside somebody else's condition has no daemon
+/// here to name it, and it keeps the bare handle rather than borrowing a name
+/// from a neighbour.
+fn node_label(frame: &Frame, node: &[u8; 32]) -> String {
+    let mut host: Option<&str> = None;
+    for worker in frame.workers.iter().filter(|worker| worker.node == *node) {
+        let declared = worker.worker.split('-').next().unwrap_or_default();
+        if declared.is_empty() {
+            continue;
+        }
+        match host {
+            None => host = Some(declared),
+            // Two daemons on one node disagreeing about which host they are on
+            // is not something to average. Fall back to the handle.
+            Some(seen) if seen != declared => return short(node),
+            Some(_) => {}
+        }
+    }
+    match host {
+        Some(host) => format!("{host} · {}", short(node)),
+        None => short(node),
+    }
+}
+
 fn render_mesh(ui: &mut egui::Ui, frame: &Frame) {
     use GORBIE::widgets::{MeshGraph, MeshLink, MeshNode, MeshNodeState};
 
@@ -147,7 +182,7 @@ fn render_mesh(ui: &mut egui::Ui, frame: &Frame) {
             }
             let total = done + pending;
             MeshNode {
-                label: short(node),
+                label: node_label(frame, node),
                 state,
                 convergence: (total > 0).then(|| done as f32 / total as f32),
             }
@@ -209,9 +244,33 @@ fn render_mesh(ui: &mut egui::Ui, frame: &Frame) {
          Separating them needs the sampler to say whether the node reported \
          these metrics at all, which it does not currently carry.",
     );
-    if links.is_empty() {
-        ui.small("No link telemetry observed, so no edges are drawn.");
-    }
+    // An edge here is an OBSERVATION, not a link, and the difference is the
+    // whole reading. Worker link telemetry would give real edges and is
+    // usually absent, so on a live pile every line comes from a health
+    // condition naming a peer. A pair with nothing to report therefore draws
+    // NO line, which means a healthy, fully connected colony draws an empty
+    // graph. Saying so is the point: a mesh picture invites "these two are
+    // connected", and the marks cannot support it.
+    let from_telemetry = frame
+        .workers
+        .iter()
+        .any(|worker| worker.role == "link" || !worker.peers.is_empty());
+    ui.small(if links.is_empty() {
+        "No edges. Nothing reported a peer, which is NOT the same as nothing \
+         being connected: edges here come from reports, so an idle healthy \
+         colony draws none."
+    } else if from_telemetry {
+        "A line is an observation, not a link. Some edges come from worker \
+         link telemetry and some from a health condition naming a peer; the \
+         marks do not separate them. A missing line means neither reported \
+         that pair, never that they cannot reach each other."
+    } else {
+        "A line is an observation, not a link. No worker link telemetry was \
+         observed, so every edge here is a health condition naming a peer — \
+         which means edges appear where something was REPORTED about a pair. A \
+         missing line means nothing was reported, never that they cannot reach \
+         each other."
+    });
     ui.separator();
 }
 
