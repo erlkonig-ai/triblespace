@@ -1,11 +1,10 @@
 //! Optional aggregate publication at the existing sync-loop boundary.
 //! No inventory, acquisition, new subscription or implicit flush lives here.
 
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::SigningKey;
 use triblespace_core::collection::{descriptor, Collection, CollectionStoreExt};
 use triblespace_core::metadata;
 use triblespace_core::prelude::*;
@@ -18,12 +17,9 @@ use triblespace_net::telemetry as t;
 #[derive(clap::Args)]
 pub(crate) struct Options {
     /// Existing source collection receiving signed aggregate work samples.
-    /// Does not create a descriptor or activate collection replication.
-    #[arg(long, value_name = "HANDLE", requires = "telemetry_key")]
+    /// Uses the node key; does not create a descriptor or activate replication.
+    #[arg(long, value_name = "HANDLE")]
     telemetry_collection: Option<String>,
-    /// Existing reporting key, independently admitted by the destination WRITE policy.
-    #[arg(long, value_name = "PATH", requires = "telemetry_collection")]
-    telemetry_key: Option<PathBuf>,
     /// Distinguish simultaneous workers on the same endpoint (at most 32 UTF-8 bytes).
     #[arg(long, value_name = "NAME", default_value = "sync")]
     telemetry_worker: String,
@@ -33,6 +29,7 @@ pub(crate) struct Options {
 mod tests {
     use super::*;
     use clap::Parser;
+    use ed25519_dalek::VerifyingKey;
     use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionSnapshotExt};
     use triblespace_net::dashboard::CountMetric;
 
@@ -40,14 +37,12 @@ mod tests {
         tempfile::TempDir,
         Pile,
         Collection<blobencodings::SimpleArchive>,
-        PathBuf,
         SigningKey,
     ) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("telemetry.pile");
         std::fs::File::create(&path).unwrap();
-        let key_path = directory.path().join("reporting.key");
-        let signer = triblespace_core::signing_key_file::init(&key_path).unwrap();
+        let signer = SigningKey::from_bytes(&[8; 32]);
         let mut pile = Pile::open(&path).unwrap();
         let collection = pile
             .collection(
@@ -58,13 +53,12 @@ mod tests {
                 ),
             )
             .unwrap();
-        (directory, pile, collection, key_path, signer)
+        (directory, pile, collection, signer)
     }
 
-    fn options(collection: Collection<blobencodings::SimpleArchive>, key: PathBuf) -> Options {
+    fn options(collection: Collection<blobencodings::SimpleArchive>) -> Options {
         Options {
             telemetry_collection: Some(hex::encode(collection.handle().raw)),
-            telemetry_key: Some(key),
             telemetry_worker: "test-sync".to_owned(),
         }
     }
@@ -83,7 +77,7 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_is_opt_in_and_requires_both_destination_and_writer() {
+    fn telemetry_is_opt_in_and_has_no_independent_writer() {
         let handle = hex::encode([0xAC; 32]);
         let args = ["net", "sync", "test.pile", "--collection", handle.as_str()];
         let super::super::Command::Sync { telemetry, .. } =
@@ -92,22 +86,15 @@ mod tests {
             panic!("sync expected")
         };
         assert!(telemetry.telemetry_collection.is_none());
-        assert!(telemetry.telemetry_key.is_none());
         assert_eq!(telemetry.telemetry_worker, "sync");
-        for incomplete in [
-            ["--telemetry-collection", handle.as_str()],
-            ["--telemetry-key", "writer.key"],
-        ] {
-            assert!(
-                super::super::Command::try_parse_from(args.into_iter().chain(incomplete)).is_err()
-            );
-        }
+        assert!(super::super::Command::try_parse_from(
+            args.into_iter().chain(["--telemetry-key", "writer.key"])
+        )
+        .is_err());
         assert!(
             super::super::Command::try_parse_from(args.into_iter().chain([
                 "--telemetry-collection",
                 handle.as_str(),
-                "--telemetry-key",
-                "writer.key",
                 "--telemetry-worker",
                 "custody",
             ]))
@@ -117,41 +104,25 @@ mod tests {
 
     #[test]
     fn opening_disabled_or_rejected_reporting_never_appends_or_creates_authority() {
-        let (directory, pile, collection, key_path, signer) = fixture();
+        let (directory, pile, collection, signer) = fixture();
         pile.close().unwrap();
         let path = directory.path().join("telemetry.pile");
         let before = std::fs::read(&path).unwrap();
         let mut pile = Pile::open(&path).unwrap();
         assert!(Publisher::open(
             &mut pile,
-            signer.verifying_key(),
+            &signer,
             Options {
                 telemetry_collection: None,
-                telemetry_key: None,
                 telemetry_worker: "sync".into(),
             }
         )
         .unwrap()
         .is_none());
-        let absent_key = directory.path().join("private-reporting-key-is-absent");
-        let error = Publisher::open(
-            &mut pile,
-            signer.verifying_key(),
-            options(collection, absent_key.clone()),
-        )
-        .err()
-        .unwrap();
-        assert_eq!(error.to_string(), "telemetry reporting key is unavailable");
-        assert!(!absent_key.exists());
-        let other_path = directory.path().join("not-admitted.key");
-        triblespace_core::signing_key_file::init(&other_path).unwrap();
-        let error = Publisher::open(
-            &mut pile,
-            signer.verifying_key(),
-            options(collection, other_path),
-        )
-        .err()
-        .unwrap();
+        let other = SigningKey::from_bytes(&[9; 32]);
+        let error = Publisher::open(&mut pile, &other, options(collection))
+            .err()
+            .unwrap();
         assert_eq!(
             error.to_string(),
             "telemetry reporting key is not admitted by the destination"
@@ -160,11 +131,9 @@ mod tests {
             b"unpublished telemetry descriptor".to_vec(),
         ))
         .get_handle();
-        let mut unknown = options(collection, key_path);
+        let mut unknown = options(collection);
         unknown.telemetry_collection = Some(hex::encode(missing.raw));
-        let error = Publisher::open(&mut pile, signer.verifying_key(), unknown)
-            .err()
-            .unwrap();
+        let error = Publisher::open(&mut pile, &signer, unknown).err().unwrap();
         assert_eq!(
             error.to_string(),
             "telemetry destination is not a readable source collection"
@@ -176,7 +145,7 @@ mod tests {
 
     #[test]
     fn reporting_commits_only_to_the_selected_existing_collection() {
-        let (_directory, mut pile, collection, key_path, signer) = fixture();
+        let (_directory, mut pile, collection, signer) = fixture();
         let other: Collection<blobencodings::SimpleArchive> = pile
             .collection(
                 "unselected",
@@ -190,8 +159,8 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        let node = SigningKey::from_bytes(&[9; 32]).verifying_key();
-        let publisher = Publisher::open(&mut pile, node, options(collection, key_path))
+        let node = signer.verifying_key();
+        let publisher = Publisher::open(&mut pile, &signer, options(collection))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -257,7 +226,13 @@ mod tests {
         assert!(collection
             .writer_is_admitted(&snapshot, signer.verifying_key())
             .unwrap());
-        assert!(!collection.writer_is_admitted(&snapshot, node).unwrap());
+        assert!(collection.writer_is_admitted(&snapshot, node).unwrap());
+        for record in snapshot.records().unwrap().map(Result::unwrap) {
+            if record.collection() == collection.handle() {
+                assert_eq!(record.public_key().raw, node.to_bytes());
+                record.verify_strict().unwrap();
+            }
+        }
         drop(snapshot);
         pile.close().unwrap();
     }
@@ -271,7 +246,7 @@ mod tests {
         };
         use triblespace_core::metadata::MetaDescribe;
 
-        let (_directory, mut pile, source, key_path, signer) = fixture();
+        let (_directory, mut pile, source, signer) = fixture();
         let algorithm = ufoid();
         let mapping =
             entity! { metadata::tag: KIND_COLLECTION_MAPPING, mapping_algorithm: &algorithm };
@@ -296,13 +271,9 @@ mod tests {
             .writer_is_admitted(&snapshot, signer.verifying_key())
             .unwrap());
         let before = snapshot.records().unwrap().count();
-        let error = Publisher::open(
-            &mut pile,
-            signer.verifying_key(),
-            options(derived, key_path),
-        )
-        .err()
-        .unwrap();
+        let error = Publisher::open(&mut pile, &signer, options(derived))
+            .err()
+            .unwrap();
         assert_eq!(
             error.to_string(),
             "telemetry destination must be a source collection"
@@ -329,14 +300,10 @@ mod tests {
 
     #[test]
     fn samples_keep_unknowns_sessions_and_successful_landing_counters_distinct() {
-        let (_directory, mut pile, collection, key_path, signer) = fixture();
-        let mut publisher = Publisher::open(
-            &mut pile,
-            signer.verifying_key(),
-            options(collection, key_path),
-        )
-        .unwrap()
-        .unwrap();
+        let (_directory, mut pile, collection, signer) = fixture();
+        let mut publisher = Publisher::open(&mut pile, &signer, options(collection))
+            .unwrap()
+            .unwrap();
         let mut health = health(signer.verifying_key());
         let now = triblespace_core::clock::epoch_now();
         let first = publisher
@@ -524,17 +491,13 @@ pub(super) struct Publisher {
 impl Publisher {
     pub(super) fn open(
         pile: &mut Pile,
-        node: VerifyingKey,
+        signer: &SigningKey,
         options: Options,
     ) -> Result<Option<Self>> {
         let Some(handle) = options.telemetry_collection else {
             return Ok(None);
         };
-        let path = options
-            .telemetry_key
-            .ok_or_else(|| anyhow!("telemetry requires an explicit reporting key"))?;
-        let signer = triblespace_core::signing_key_file::load_existing(&path)
-            .map_err(|_| anyhow!("telemetry reporting key is unavailable"))?;
+        let node = signer.verifying_key();
         let handle = super::parse_collection(&handle)
             .map_err(|_| anyhow!("telemetry destination is not a collection handle"))?;
         let worker: Inline<inlineencodings::ShortString> = options
@@ -575,7 +538,7 @@ impl Publisher {
         }
         Ok(Some(Self {
             collection,
-            signer,
+            signer: signer.clone(),
             session: ufoid(),
             started: Instant::now(),
             subjects: ["hydration", "serve", "repair", "publication", "process"].map(|role| {

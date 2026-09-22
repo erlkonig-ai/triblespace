@@ -22,6 +22,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+- Use the command's existing durable key for sync transport, health and
+  telemetry, and for maintenance work and its local telemetry endpoint.
+  Remove `--health-key`, `--telemetry-key` and maintenance `--telemetry-node`.
+  `sync --health` enables private reporting; `--health-collection HANDLE`
+  enables reporting into an existing destination admitting the same key.
+  Telemetry remains opt-in by destination, with unchanged worker/session
+  scopes and no automatic grant or key creation.
+
 - `pile collection migrate` is now `pile collection adopt`, and
   `pile collection reconcile` is now `pile collection adopted`. The old names
   both borrowed a word that already meant something else here: `migrate` is the

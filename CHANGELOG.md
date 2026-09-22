@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- The sync daemon and maintenance CLI use one existing durable node key for
+  transport, authored work, health and local telemetry. Remove independent
+  `--health-key`, `--telemetry-key` and maintenance `--telemetry-node` settings;
+  `sync --health` or `--health-collection` enables health with the node key.
+  Existing collection admission and worker/session boundaries are unchanged.
+
 - `trible pile diagnose conflicts <PILE>` lists MERGE and DERIVE equations
   that name two results for one input set, with the keys that signed each
   side, and exits non-zero when any exist. The lattice takes every signed

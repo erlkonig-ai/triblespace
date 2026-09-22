@@ -23,18 +23,13 @@ use triblespace_net::{health_record, telemetry};
 
 #[derive(Clone, Debug, Default, clap::Args)]
 pub(crate) struct Options {
-    /// Existing telemetry collection handle; never creates a descriptor or grant
-    #[arg(long, requires_all = ["telemetry_node", "telemetry_worker"])]
+    /// Existing telemetry collection; the maintenance key identifies and signs this worker.
+    /// Never creates a descriptor or grant.
+    #[arg(long, requires = "telemetry_worker")]
     pub telemetry_collection: Option<String>,
-    /// Hex public endpoint being reported (not inferred from the author key)
-    #[arg(long, requires = "telemetry_collection")]
-    pub telemetry_node: Option<String>,
     /// Stable worker label, at most 32 UTF-8 bytes
     #[arg(long, requires = "telemetry_collection")]
     pub telemetry_worker: Option<String>,
-    /// Existing telemetry signing key; defaults to the maintenance signer
-    #[arg(long, requires = "telemetry_collection")]
-    pub telemetry_key: Option<PathBuf>,
     /// Minimum seconds between telemetry attempts (default 60); final close adds one sample
     #[arg(long, requires = "telemetry_collection", value_parser = clap::value_parser!(u64).range(1..))]
     pub telemetry_interval_secs: Option<u64>,
@@ -42,16 +37,13 @@ pub(crate) struct Options {
 
 pub(super) struct Config {
     collection: CollectionHandle,
-    node: VerifyingKey,
     worker: String,
     interval: Duration,
-    key: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Failure {
     Parameters,
-    Key,
     Snapshot,
     Descriptor,
     DerivedDestination,
@@ -63,7 +55,6 @@ impl std::fmt::Display for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Parameters => "invalid maintenance telemetry parameters",
-            Self::Key => "cannot read existing maintenance telemetry signing key",
             Self::Snapshot => "cannot observe maintenance telemetry store",
             Self::Descriptor => "maintenance telemetry descriptor unavailable or invalid",
             Self::DerivedDestination => {
@@ -80,23 +71,13 @@ impl std::error::Error for Failure {}
 impl Options {
     pub(super) fn config(self) -> std::result::Result<Option<Config>, Failure> {
         let Some(handle) = self.telemetry_collection else {
-            return if self.telemetry_node.is_none()
-                && self.telemetry_worker.is_none()
-                && self.telemetry_key.is_none()
-                && self.telemetry_interval_secs.is_none()
-            {
+            return if self.telemetry_worker.is_none() && self.telemetry_interval_secs.is_none() {
                 Ok(None)
             } else {
                 Err(Failure::Parameters)
             };
         };
         let collection = parse_collection_handle(&handle).map_err(|_| Failure::Parameters)?;
-        let node = self.telemetry_node.ok_or(Failure::Parameters)?;
-        let bytes: [u8; 32] = hex::decode(node)
-            .map_err(|_| Failure::Parameters)?
-            .try_into()
-            .map_err(|_| Failure::Parameters)?;
-        let node = VerifyingKey::from_bytes(&bytes).map_err(|_| Failure::Parameters)?;
         let worker = self.telemetry_worker.ok_or(Failure::Parameters)?;
         let _: Inline<inlineencodings::ShortString> = worker
             .as_str()
@@ -107,10 +88,8 @@ impl Options {
         }
         Ok(Some(Config {
             collection,
-            node,
             worker,
             interval: Duration::from_secs(self.telemetry_interval_secs.unwrap_or(60)),
-            key: self.telemetry_key,
         }))
     }
 }
@@ -237,12 +216,8 @@ impl Telemetry {
         config: Config,
         signer: &SigningKey,
     ) -> std::result::Result<Self, Failure> {
-        let signer = match config.key.as_deref() {
-            Some(path) => {
-                triblespace_core::signing_key_file::load_existing(path).map_err(|_| Failure::Key)?
-            }
-            None => signer.clone(),
-        };
+        let signer = signer.clone();
+        let node = signer.verifying_key();
         let snapshot = store.snapshot().map_err(|_| Failure::Snapshot)?;
         let collection = Collection::<SimpleArchive>::open(&snapshot, config.collection)
             .map_err(|_| Failure::Descriptor)?;
@@ -266,24 +241,24 @@ impl Telemetry {
         // Identity gives emission idempotence only: readers query these facts,
         // never recompute the IDs. A restart changes the session, not the worker.
         let process = entity! {
-            health_record::attrs::endpoint: config.node,
+            health_record::attrs::endpoint: node,
             telemetry::attrs::worker: config.worker.as_str(),
             telemetry::attrs::role: "process",
         };
         let hop = entity! {
-            health_record::attrs::endpoint: config.node,
+            health_record::attrs::endpoint: node,
             telemetry::attrs::worker: config.worker.as_str(),
             telemetry::attrs::role: "maintenance",
             telemetry::attrs::stage: "maintenance-hop",
         };
         let pass = entity! {
-            health_record::attrs::endpoint: config.node,
+            health_record::attrs::endpoint: node,
             telemetry::attrs::worker: config.worker.as_str(),
             telemetry::attrs::role: "maintenance",
             telemetry::attrs::stage: "pass",
         };
         let no_publication_pass = entity! {
-            health_record::attrs::endpoint: config.node,
+            health_record::attrs::endpoint: node,
             telemetry::attrs::worker: config.worker.as_str(),
             telemetry::attrs::role: "maintenance",
             telemetry::attrs::stage: "no-publication-pass",

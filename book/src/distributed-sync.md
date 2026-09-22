@@ -808,10 +808,19 @@ The CLI selects explicit collections and bootstrap peers:
 
 ```text
 trible pile net sync DATA.pile \
+    [--key EXISTING_SELF_KEY] \
     --collection COLLECTION_HANDLE [--collection COLLECTION_HANDLE ...] \
     [--peers ENDPOINT_TICKET ...] [--direction bidirectional|read-only|write-only] \
     [--replication demand|shallow|full]
 ```
+
+The long-running daemon uses one existing durable key for its authenticated
+endpoint, signed wakes, health reports and telemetry. Key resolution is
+`--key`, then `TRIBLESPACE_KEY`, then `self.key` beside the pile's lexical path.
+There is no independently configured network or reporting key. Maintenance
+uses that same local key for its work and telemetry; worker labels distinguish
+processes, not identities. This CLI convention does not change the separate
+ephemeral H-only foreground-reader use described above or grant any authority.
 
 Direction gates only the collection loop: `ReadOnly` pulls collection repair,
 `WriteOnly` serves it, and `Bidirectional` does both. Every direction may
@@ -861,7 +870,10 @@ frontier has changed, or the serving snapshot has been withdrawn. Receiving
 records is progress evidence, not proof they have already become admitted.
 
 The long-running CLI can publish these observations as native facts using
-`pile net sync --health-key <existing-author-key>`. The private `swarm-health`
+`pile net sync --health`. Reports use the same key as the endpoint. An explicit
+`--health-collection <HANDLE>` also enables reporting into an existing admitted
+source collection; otherwise the node's private `swarm-health` collection is
+used. The health
 collection is deliberately not activated for replication, so a broken network
 cannot prevent the local reader from seeing its own warning. A new report is
 published every minute with `created_at` only: freshness is reader policy, not
@@ -995,8 +1007,9 @@ belongs in these colony observations.
 
 #### Sync producer
 
-`pile net sync` opts in with `--telemetry-collection <H>` and
-`--telemetry-key <PATH>`, optionally `--telemetry-worker <NAME>`. The destination
+`pile net sync` opts in with `--telemetry-collection <H>`, optionally
+`--telemetry-worker <NAME>`. The node's existing key signs the samples and its
+public key identifies their endpoint. The destination
 must already be a resident SimpleArchive **source** collection admitting that
 writer. A derived SimpleArchive is not a source: its reader ignores root
 COMMITs. Reporting never creates a descriptor, key, grant, derived index or
@@ -1042,10 +1055,11 @@ observe the new records.
 #### Maintenance producer
 
 `pile collection maintain` and `maintain-all` can opt in with
-`--telemetry-collection HANDLE --telemetry-node ENDPOINT --telemetry-worker LABEL`.
-The endpoint is explicit: a signing key is not a transport identity. The
-existing maintenance key signs samples unless `--telemetry-key EXISTING_KEY`
-is supplied. The collection must already exist as a SimpleArchive source and
+`--telemetry-collection HANDLE --telemetry-worker LABEL`.
+The existing maintenance key signs samples and its public key identifies the
+local endpoint, matching the daemon's durable identity. Neither the endpoint
+nor the telemetry signer has a separate override. The collection must already
+exist as a SimpleArchive source and
 admit that writer; a derived view ignores root COMMITs and is rejected. This
 option does not create keys, descriptors, grants, maintenance targets or sync
 selections. After configuration is validated, publication errors use finite,
