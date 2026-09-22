@@ -259,6 +259,40 @@ fn a_record_whose_signer_is_not_admitted_yet_is_parked_not_dropped() {
     assert_eq!(members(&index, c, data(3)), vec![[1u8; 32], [2u8; 32]]);
 }
 
+/// The whole-pile figure cannot be acted on; the per-collection one can.
+///
+/// "This pile holds 127,912 unadmitted records" is true of almost any live
+/// pile, never changes much, and tells nobody where to look. "This collection
+/// holds 204" names the thing to carry. A reader that marks collections needs
+/// the second, which is why the backlog's per-entry collection is worth
+/// reading back out.
+#[test]
+fn unadmitted_is_attributed_to_the_collection_that_holds_it() {
+    let mut index = CoverageIndex::new();
+    let a = collection(0);
+    let b = collection(1);
+    let untouched = collection(2);
+
+    // Signer 2 is not admitted anywhere: two of its attestations land in a,
+    // one in b.
+    index.apply(&commit(2, a, data(1)), &OnlySigner(1));
+    index.apply(&commit(2, a, data(2)), &OnlySigner(1));
+    index.apply(&commit(2, b, data(3)), &OnlySigner(1));
+
+    assert_eq!(index.parked_on_signers(), 3, "the aggregate is the sum");
+    assert_eq!(index.unadmitted_in(a), 2);
+    assert_eq!(index.unadmitted_in(b), 1);
+    // A collection with nothing parked reports its own zero, not the total.
+    assert_eq!(index.unadmitted_in(untouched), 0);
+
+    // And it empties with the aggregate when the proofs arrive, rather than
+    // going stale behind it.
+    index.resolve(&AdmitEveryRecord);
+    assert_eq!(index.parked_on_signers(), 0);
+    assert_eq!(index.unadmitted_in(a), 0);
+    assert_eq!(index.unadmitted_in(b), 0);
+}
+
 #[test]
 fn an_unadmitted_route_contributes_nothing_to_a_node_an_admitted_route_reached() {
     let mut index = CoverageIndex::new();

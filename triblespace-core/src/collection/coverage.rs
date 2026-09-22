@@ -514,6 +514,22 @@ pub struct CoverageIndex {
 }
 
 /// How many attestations a waiter map holds.
+/// Count the parked attestations of one collection in a waiter map.
+///
+/// The map is keyed by the awaited evidence rather than by collection, because
+/// that is what lets a drain cost the events that happened rather than the size
+/// of the backlog. So a per-collection question is a scan of the backlog, which
+/// is the right trade for a view: the backlog is small in the steady state, and
+/// re-keying it to make this cheaper would make the drain expensive instead.
+fn parked_in(waiters: &Waiters, collection: CollectionHandle) -> usize {
+    waiters
+        .iter_ordered()
+        .filter_map(|key| waiters.get(key))
+        .flat_map(held)
+        .filter(|parked| parked.collection == collection)
+        .count()
+}
+
 fn waiting(waiters: &Waiters) -> usize {
     waiters
         .iter_ordered()
@@ -598,6 +614,30 @@ impl CoverageIndex {
     /// Number waiting specifically on a proof admitting their signer.
     pub fn parked_on_signers(&self) -> usize {
         waiting(&self.awaiting_proof)
+    }
+
+    /// Attestations OF ONE COLLECTION parked because no proof admits their
+    /// signer yet: the per-collection form of [`Self::parked_on_signers`].
+    ///
+    /// Per-collection because the index-wide count cannot be acted on. Almost
+    /// any live pile holds some unadmitted work, so "this pile has 127,912
+    /// unadmitted records" is true, unchanging, and tells nobody where to
+    /// look; "this collection has 204" names the thing to carry. A reader
+    /// marking collections needs the second, and the backlog already carries
+    /// each entry's collection, so this costs a filter rather than a fold.
+    pub fn unadmitted_in(&self, collection: CollectionHandle) -> usize {
+        parked_in(&self.awaiting_proof, collection)
+    }
+
+    /// The same, for attestations waiting on a descriptor chain to land
+    /// instead of on a proof.
+    ///
+    /// Kept apart from [`Self::unadmitted_in`] because the two absences have
+    /// different remedies and different owners: a missing proof is a grant
+    /// somebody must issue, a missing lineage is bytes that have not
+    /// replicated yet and may simply arrive.
+    pub fn awaiting_lineage_in(&self, collection: CollectionHandle) -> usize {
+        parked_in(&self.awaiting_lineage, collection)
     }
 
     /// Number waiting specifically on a descriptor chain becoming resident.
