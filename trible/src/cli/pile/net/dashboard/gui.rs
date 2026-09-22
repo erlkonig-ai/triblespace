@@ -327,6 +327,8 @@ fn render_lattice(ui: &mut egui::Ui, frame: &Frame) {
         .iter()
         .filter(|c| !c.descriptor_resident)
         .count();
+    let unadmitted: u64 = collections.iter().map(|c| c.unadmitted).sum();
+    let holding = collections.iter().filter(|c| c.unadmitted > 0).count();
     ui.horizontal_wrapped(|ui| {
         ui.small(format!(
             "{} collections · {derived} derived",
@@ -336,6 +338,21 @@ fn render_lattice(ui: &mut egui::Ui, frame: &Frame) {
             ui.colored_label(
                 ui.visuals().warn_fg_color,
                 format!("{absent} with no resident descriptor"),
+            );
+        }
+        // Deliberately its own line rather than folded into the one above.
+        // Missing bytes arrive on their own once replication catches up; an
+        // unadmitted signer waits on a grant somebody has to issue. Folding
+        // them together would report work as weather.
+        //
+        // Both the total and the spread, because they answer different
+        // questions: the total says how much is waiting on a grant, the count
+        // of collections says how many places to go and look. The whole-pile
+        // aggregate on its own is the figure nobody can act on.
+        if unadmitted != 0 {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                format!("{unadmitted} unadmitted across {holding}"),
             );
         }
     });

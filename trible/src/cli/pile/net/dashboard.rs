@@ -395,6 +395,15 @@ struct LatticeCollection {
     /// concrete "what is missing": endorsed work whose bytes this store does
     /// not hold.
     result_resident: u64,
+    /// Attestations of this collection that no capability proof admits yet.
+    ///
+    /// A different absence from `result_resident`, and the reason it is worth
+    /// its own field: missing bytes arrive on their own once replication
+    /// catches up, while an unadmitted signer waits on a grant somebody has to
+    /// issue. One is weather, the other is work, and a view that showed only
+    /// the first would report a collection as merely behind when it is
+    /// actually blocked on a person.
+    unadmitted: u64,
 }
 
 impl LatticeCollection {
@@ -499,7 +508,30 @@ fn observe_lattice<R: triblespace_core::repo::StoreRead>(
             merges,
             derives,
             result_resident,
+            // Filled below: admission is a question about the whole lattice at
+            // once, not about one collection as it is discovered.
+            unadmitted: 0,
         });
+    }
+
+    // Admission, asked ONCE for the whole lattice.
+    //
+    // The index decides only the lineages it is asked about, and a collection
+    // it has never been asked about holds no parked rows at all -- so asking
+    // per-collection as they were discovered would report zero unadmitted for
+    // exactly the collections nobody has looked at, which reads as "clean" and
+    // is the opposite of the truth. Settling every collection in the lattice as
+    // one lineage first is what makes a zero here mean zero.
+    let lineage: BTreeSet<CollectionHandle> = out
+        .iter()
+        .map(|collection| CollectionHandle::new(collection.handle))
+        .collect();
+    let coverage = snapshot
+        .index(&lineage)
+        .map_err(|_| ReadFailure::RefreshPile)?;
+    for collection in &mut out {
+        collection.unadmitted =
+            coverage.unadmitted_in(CollectionHandle::new(collection.handle)) as u64;
     }
 
     // A stable order: named collections alphabetically, then the rest by
