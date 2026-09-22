@@ -1519,11 +1519,14 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
                     enqueue_repair(&mut immediate, &mut pending, outcome.target);
                 }
             } else {
-                let participants_exhausted = forget_participant(
+                let now = crate::clock::mono_now();
+                let peers = live_participants(
                     &mut participants.lock().unwrap(),
                     outcome.target.collection.raw,
-                    outcome.target.peer,
+                    now,
                 );
+                let had_candidate =
+                    has_repair_candidate(outcome.target.collection, &peers, &failures, my_id);
                 let attempts = failures
                     .get(&outcome.target)
                     .map_or(1, |(attempts, _)| attempts.saturating_add(1));
@@ -1533,17 +1536,34 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
                         outcome.target,
                         (
                             attempts,
-                            crate::clock::mono_now()
-                                + crate::RETRY_BACKOFF_BASE.saturating_mul(1u32 << shift),
+                            now + crate::RETRY_BACKOFF_BASE.saturating_mul(1u32 << shift),
                         ),
                     );
+                    // Keep the original participant lease across a transient
+                    // failure. A healthy second replica suppresses discovery,
+                    // but need not hold this peer's latest records. Periodic
+                    // repair can retry after backoff; failure never renews it.
+                } else {
+                    // Without room for a failure marker this peer would look
+                    // healthy to discovery. Preserve the existing hard bound.
+                    forget_participant(
+                        &mut participants.lock().unwrap(),
+                        outcome.target.collection.raw,
+                        outcome.target.peer,
+                    );
                 }
-                if participants_exhausted
+                let peers = live_participants(
+                    &mut participants.lock().unwrap(),
+                    outcome.target.collection.raw,
+                    now,
+                );
+                if had_candidate
+                    && !has_repair_candidate(outcome.target.collection, &peers, &failures, my_id)
                     && let Some(topic) = wake_topics.get(&outcome.target.collection.raw)
                 {
                     let _ = topic.send(WakeCommand::Resubscribe);
                 }
-                next_discovery = next_discovery.min(crate::clock::mono_now());
+                next_discovery = next_discovery.min(now);
             }
         }
         while let Ok(outcome) = publication_rx.try_recv() {

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Retain a failed collection participant until its existing lease expires,
+  retrying under the existing bounded backoff. A reachable replica no longer
+  hides another replica's recovery after a transient partition or restart.
+  Failed attempts never extend leases; exhausted candidates still rediscover.
+
 - Keep a shared peer connection after a valid collection-repair READ refusal
   or unavailable-collection reply. These answers end only their own stream;
   malformed replies and transport failures still invalidate the connection.

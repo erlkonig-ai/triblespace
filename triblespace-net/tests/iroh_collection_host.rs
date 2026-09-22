@@ -1,6 +1,6 @@
 //! Real-Iroh collection wake and repair coverage.
 
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use anybytes::Bytes;
@@ -22,6 +22,65 @@ use triblespace_net::peer::Peer;
 
 fn key(byte: u8) -> SigningKey {
     SigningKey::from_bytes(&[byte; 32])
+}
+
+fn init_tracing() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+            )
+            .with_test_writer()
+            .try_init();
+    });
+}
+
+fn restart_health(phase: &str, peers: &[(&str, &Peer<MemoryRepo>)]) {
+    for (name, peer) in peers {
+        let health = peer.health();
+        eprintln!(
+            "restart health {phase}: {name} node={} started={:?} observed={:?} serving={} published={:?}",
+            health.node,
+            health.started_at,
+            health.observed_at,
+            health.store.serving_snapshot,
+            health.store.last_snapshot_published_at,
+        );
+        for collection in &health.collections {
+            eprintln!(
+                "  C={} local_root={:?} local_change={:?}",
+                hex::encode(collection.collection.raw),
+                collection
+                    .local_frontier
+                    .map(|frontier| hex::encode(frontier.wake_root)),
+                collection.last_local_change_at,
+            );
+            for remote in &collection.peers {
+                eprintln!(
+                    "    peer={} in_flight={} first_started={:?} started={:?} completed={:?} failure_at={:?} failure={:?} progress={:?} remote_change={:?} comparison={:?}",
+                    hex::encode(remote.peer),
+                    remote.in_flight,
+                    remote.first_started_at,
+                    remote.last_started_at,
+                    remote.last_completed_at,
+                    remote.last_failure_at,
+                    remote.last_failure,
+                    remote.last_progress_at,
+                    remote.last_remote_change_at,
+                    remote.comparison.map(|comparison| (
+                        comparison.observed_at,
+                        hex::encode(comparison.local.wake_root),
+                        hex::encode(comparison.remote.wake_root),
+                        comparison.records_received,
+                        comparison.proofs_received,
+                        comparison.more,
+                    )),
+                );
+            }
+        }
+    }
 }
 
 async fn test_endpoint(network: &TestNetwork, secret: SecretKey) -> Endpoint {
@@ -79,13 +138,7 @@ async fn bring_up_owned(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn signed_collection_wake_repairs_before_periodic_fallback() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .with_test_writer()
-        .try_init();
+    init_tracing();
     let network = TestNetwork::new();
     let server_key = key(0xA1);
     let reader_key = key(0xB1);
@@ -174,6 +227,7 @@ async fn three_root_fresh_records_survive_same_key_restart() {
 }
 
 async fn three_root_current_state_scenario(restart: bool) {
+    init_tracing();
     let network = TestNetwork::new();
     let source_key = key(0xA3);
     let reader_key = key(0xB3);
@@ -309,6 +363,10 @@ async fn three_root_current_state_scenario(restart: bool) {
         return;
     }
 
+    restart_health(
+        "before restart",
+        &[("source", &source), ("reader", &reader), ("other", &other)],
+    );
     let source_store = source.into_store();
     // Await the owner that shuts down the router and endpoint. Calling close
     // ourselves could race its close: Iroh returns early when already closing,
@@ -338,6 +396,9 @@ async fn three_root_current_state_scenario(restart: bool) {
     source.refresh();
     source.refresh();
     expected.push(after_restart);
+    let restarted_at = Instant::now();
+    let mut diagnostic_index = 0;
+    let diagnostic_thresholds = [1, 31];
     let repaired = tokio::time::timeout(Duration::from_secs(45), async {
         loop {
             source.refresh();
@@ -352,6 +413,19 @@ async fn three_root_current_state_scenario(restart: bool) {
                     .unwrap();
                 complete &= expected.iter().all(|record| records.contains(record));
             }
+            if diagnostic_index < diagnostic_thresholds.len()
+                && restarted_at.elapsed()
+                    >= Duration::from_secs(diagnostic_thresholds[diagnostic_index])
+            {
+                restart_health(
+                    &format!(
+                        "after restart +{:.3}s",
+                        restarted_at.elapsed().as_secs_f64()
+                    ),
+                    &[("source", &source), ("reader", &reader), ("other", &other)],
+                );
+                diagnostic_index += 1;
+            }
             if complete {
                 break;
             }
@@ -359,6 +433,15 @@ async fn three_root_current_state_scenario(restart: bool) {
         }
     })
     .await;
+    if repaired.is_err() {
+        restart_health(
+            &format!(
+                "restart timeout +{:.3}s",
+                restarted_at.elapsed().as_secs_f64()
+            ),
+            &[("source", &source), ("reader", &reader), ("other", &other)],
+        );
+    }
     assert!(
         repaired.is_ok(),
         "readers did not receive the fresh record after same-key restart"

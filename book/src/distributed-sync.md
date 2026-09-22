@@ -236,6 +236,14 @@ unsuccessful recovery with exponential backoff from one to 60 seconds. This
 makes healthy steady-state DHT lookup load zero while preserving bounded
 recovery after restarts and partitions.
 
+A failed repair keeps its participant's original lease while bounded failure
+state records backoff. Periodic repair retries that participant even if another
+replica remains healthy: that replica need not have the missing records.
+Failure never renews a lease. If every candidate has failed, recovery discovery
+and topic reconnection proceed without waiting for expiry. If the bounded
+failure table cannot track a peer, its lease is dropped so it cannot falsely
+look like a healthy candidate and suppress discovery.
+
 Every request pins the manifest's expected component root. The server serves
 the whole stream from one immutable overlay lease, so responses cannot splice
 two moments together and need no historical-root cache. The client validates

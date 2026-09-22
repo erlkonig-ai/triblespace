@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Retry transiently failed collection participants under their original lease
+  and bounded backoff, even while another replica remains reachable. Failure
+  never renews that lease, and no healthy candidate still triggers discovery.
+
 - Preserve shared connections after valid collection READ refusals or
   unavailable replies. Malformed replies still invalidate the connection;
   refusal cannot cancel another collection's in-flight stream.
