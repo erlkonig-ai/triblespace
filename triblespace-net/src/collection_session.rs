@@ -252,8 +252,9 @@ fn node_response(
 /// can bootstrap a cold server, while same-session READ(C) comes only from its
 /// already pinned local evidence.
 /// An inventory cursor resumes the same summary's authenticated DFS, or starts
-/// a fresh root-validated suffix after a summary change. Failed exchanges may
-/// discard it; successful bounded passes progress without any payload landing.
+/// a fresh root-validated suffix after a summary change. The caller retains its
+/// last successful cursor across failed exchanges; no progress from a failed
+/// exchange is committed. Bounded passes progress without any payload landing.
 pub(crate) async fn pull_collection<C: Conn>(
     conn: &C,
     local: &CollectionRepairOverlay,
@@ -659,7 +660,7 @@ async fn require_eof<R: AsyncRead + Unpin>(recv: &mut R) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use ed25519_dalek::SigningKey;
     use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace_core::capability::policy::resource_policy;
@@ -681,7 +682,7 @@ mod tests {
 
     use super::*;
 
-    fn inventory(
+    pub(crate) fn inventory(
         handles: impl IntoIterator<Item = RawHash>,
     ) -> Arc<PATCH<32, IdentitySchema, (), Blake3Merkle>> {
         let mut patch = PATCH::new();
@@ -699,15 +700,65 @@ mod tests {
         pull_with_cursor(local, remote, reader, None).await
     }
 
-    async fn pull_with_cursor(
+    pub(crate) async fn pull_with_cursor(
         local: &CollectionRepairOverlay,
         remote: Arc<CollectionRepairOverlay>,
         reader: VerifyingKey,
         cursor: Option<InventoryRepairCursor>,
     ) -> Result<CollectionRepairDelta> {
+        pull_with_cursor_ending(local, remote, reader, cursor, TestEnding::Complete).await
+    }
+
+    #[derive(Clone, Copy)]
+    pub(crate) enum TestEnding {
+        Complete,
+        ReadError,
+        Timeout,
+    }
+
+    struct TestReader<R> {
+        inner: R,
+        ending: TestEnding,
+    }
+
+    impl<R: AsyncRead + Unpin> AsyncRead for TestReader<R> {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            let before = buffer.filled().len();
+            match std::pin::Pin::new(&mut this.inner).poll_read(cx, buffer) {
+                std::task::Poll::Ready(Ok(())) if buffer.filled().len() == before => {
+                    match this.ending {
+                        TestEnding::Complete => std::task::Poll::Ready(Ok(())),
+                        TestEnding::ReadError => std::task::Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionReset,
+                            "injected failure after the authenticated inventory page",
+                        ))),
+                        TestEnding::Timeout => std::task::Poll::Pending,
+                    }
+                }
+                result => result,
+            }
+        }
+    }
+
+    pub(crate) async fn pull_with_cursor_ending(
+        local: &CollectionRepairOverlay,
+        remote: Arc<CollectionRepairOverlay>,
+        reader: VerifyingKey,
+        cursor: Option<InventoryRepairCursor>,
+        ending: TestEnding,
+    ) -> Result<CollectionRepairDelta> {
         let (server_io, client_io) = tokio::io::duplex(1 << 20);
         let (mut server_recv, mut server_send) = tokio::io::split(server_io);
-        let (mut client_recv, mut client_send) = tokio::io::split(client_io);
+        let (client_recv, mut client_send) = tokio::io::split(client_io);
+        let mut client_recv = TestReader {
+            inner: client_recv,
+            ending,
+        };
         let server = tokio::spawn(async move {
             assert_eq!(
                 recv_u8(&mut server_recv).await.unwrap(),
@@ -721,8 +772,14 @@ mod tests {
                 .unwrap();
             assert!(retained.is_empty());
         });
-        let result =
-            pull_collection_stream(&mut client_send, &mut client_recv, local, vec![], cursor).await;
+        let pull =
+            pull_collection_stream(&mut client_send, &mut client_recv, local, vec![], cursor);
+        let result = match ending {
+            TestEnding::Timeout => tokio::time::timeout(std::time::Duration::from_secs(1), pull)
+                .await
+                .unwrap_or_else(|error| Err(anyhow::Error::new(error))),
+            _ => pull.await,
+        };
         server.await.unwrap();
         result
     }

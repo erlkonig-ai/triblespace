@@ -511,6 +511,14 @@ impl<T: CollectionRead> CollectionRead for CoveredSnapshot<T> {
     ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
         self.inner.select_records(selectors)
     }
+
+    fn select_record_changes(
+        &self,
+        previous: &Self,
+        selectors: &BTreeSet<CollectionRecordSelector>,
+    ) -> Result<(Vec<CollectionRecord>, Vec<CollectionRecord>), Self::RecordsError> {
+        self.inner.select_record_changes(&previous.inner, selectors)
+    }
 }
 
 impl<T: CapabilityProofRead> CapabilityProofRead for CoveredSnapshot<T> {

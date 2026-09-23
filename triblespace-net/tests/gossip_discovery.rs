@@ -320,6 +320,17 @@ async fn inactive_descriptor_cache_is_discoverable_but_never_a_repair_participan
             .contains_blob(collection)
             .unwrap()
     );
+    // Activate after the empty host's first periodic turn, not in a startup
+    // race that accidentally includes C in that turn. Cold activation must
+    // acquire its descriptor promptly without waiting for the 30-second retry.
+    drive_until(&mut [&mut reader], |peers| {
+        let health = peers[0].health();
+        health
+            .started_at
+            .zip(health.observed_at)
+            .is_some_and(|(started, observed)| observed > started)
+    })
+    .await;
     reader.activate_collection(collection);
     drive_until(&mut [&mut directory, &mut cache, &mut reader], |peers| {
         peers[1].health().blob_serving.completed != 0

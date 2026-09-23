@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Apply selected native record-index differences to retained collection Merkle
+  PATCHes instead of rebuilding a changed collection's complete history on each
+  peer refresh. Preserve the last successful blob-inventory traversal checkpoint
+  across failed or timed-out repair attempts; clear it on completion or
+  deactivation, and revalidate changed remote roots before continuing.
+  Expedite descriptor acquisition when a collection is activated after the
+  host's first timer turn rather than waiting for the next retry interval.
+
 - Carry independent collection gossip topics over one ordered, topic-tagged
   stream per peer connection. The previous persistent stream per topic stopped
   at QUIC's default 100-stream limit with 126–130 active collections. Vendor

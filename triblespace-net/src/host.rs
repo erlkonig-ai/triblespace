@@ -36,6 +36,7 @@ use crate::collection_activation::{CollectionRepairOverlay, CollectionRepairOver
 use crate::collection_blob_inventory::{
     BlobInventoryChange, CollectionBlobInventory, ResidentBlobPatch, ScanBudget,
 };
+use crate::collection_delta::update_collection_record_patch;
 use crate::collection_session::{
     CollectionRepairRefusal, InventoryRepairCursor, manifest, pull_collection,
     serve_collection_repair,
@@ -367,9 +368,23 @@ impl StoreSnapshot {
             }
             let observed = ObservedStore::new(snapshot.clone());
             let prior_value = prior.and_then(|prior| prior.value.as_ref());
-            let records = prior_value
-                .filter(|_| !relevant.contains(StoreChanges::COLLECTION_RECORDS))
-                .map(|prior| prior.repair.records());
+            let updated_records = match (previous_store, prior_value) {
+                (Some(before), Some(prior))
+                    if relevant.contains(StoreChanges::COLLECTION_RECORDS) =>
+                {
+                    Some(update_collection_record_patch(
+                        &observed,
+                        &ObservedStore::new(before.clone()),
+                        prior.repair.records(),
+                    )?)
+                }
+                _ => None,
+            };
+            let records = updated_records.as_ref().or_else(|| {
+                prior_value
+                    .filter(|_| !relevant.contains(StoreChanges::COLLECTION_RECORDS))
+                    .map(|prior| prior.repair.records())
+            });
             let authorization = prior_value
                 .filter(|_| {
                     !relevant.contains(StoreChanges::BLOBS)
@@ -1327,6 +1342,37 @@ fn retain_active_repair_state<T>(
     state.retain(|target, _| is_active(&target.collection.raw));
 }
 
+fn resume_inventory_repair(
+    cursors: &HashMap<RepairTarget, InventoryRepairCursor>,
+    target: RepairTarget,
+) -> Option<InventoryRepairCursor> {
+    // The attempt owns a working copy. Only a completed authenticated exchange
+    // can replace the checkpoint; transport failure and cancellation cannot.
+    cursors.get(&target).cloned()
+}
+
+fn complete_inventory_repair(
+    cursors: &mut HashMap<RepairTarget, InventoryRepairCursor>,
+    outcome: &mut RepairOutcome,
+    active: bool,
+) {
+    if !active {
+        cursors.remove(&outcome.target);
+    } else if outcome.success {
+        match outcome.inventory_cursor.take() {
+            Some(cursor)
+                if cursors.len() < MAX_PENDING_REPAIRS || cursors.contains_key(&outcome.target) =>
+            {
+                cursors.insert(outcome.target, cursor);
+            }
+            None => {
+                cursors.remove(&outcome.target);
+            }
+            Some(_) => {}
+        }
+    }
+}
+
 enum WakeCommand {
     Join(Vec<EndpointId>),
     Resubscribe,
@@ -1637,6 +1683,9 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
                         let now = crate::clock::mono_now();
                         discovery.insert(*raw, DiscoveryState::new(now));
                         next_discovery = next_discovery.min(now);
+                        // A cold activation needs descriptor bytes, not just
+                        // provider contacts. Do not wait for the retry tick.
+                        next_period = next_period.min(now);
                     }
                     let root = after
                         .get(raw)
@@ -1789,7 +1838,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
                 );
             }
         }
-        while let Ok(outcome) = repair_rx.try_recv() {
+        while let Ok(mut outcome) = repair_rx.try_recv() {
             in_flight.remove(&outcome.target);
             wiring
                 .health
@@ -1801,6 +1850,11 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
                         health.last_failure = Some(failure);
                     }
                 });
+            let active = current_collections
+                .get(&outcome.target.collection.raw)
+                .is_some()
+                && outcome.target.peer != my_id;
+            complete_inventory_repair(&mut inventory_cursors, &mut outcome, active);
             if current_collections
                 .get(&outcome.target.collection.raw)
                 .is_none()
@@ -1813,13 +1867,6 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
                 continue;
             }
             if outcome.success {
-                if let Some(cursor) = outcome.inventory_cursor {
-                    if inventory_cursors.len() < MAX_PENDING_REPAIRS
-                        || inventory_cursors.contains_key(&outcome.target)
-                    {
-                        inventory_cursors.insert(outcome.target, cursor);
-                    }
-                }
                 failures.remove(&outcome.target);
                 let now = crate::clock::mono_now();
                 observe_participant(
@@ -2089,7 +2136,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
                 let events = wiring.evt_tx.clone();
                 let repair_tx = repair_tx.clone();
                 let health = wiring.health.clone();
-                let inventory_cursor = inventory_cursors.remove(&target);
+                let inventory_cursor = resume_inventory_repair(&inventory_cursors, target);
                 tokio::spawn(async move {
                     let result = tokio::time::timeout(
                         REPAIR_DEADLINE,
@@ -4023,6 +4070,153 @@ mod tests {
         retain_active_repair_state(&mut state, |raw| active.contains(raw));
 
         assert_eq!(state, HashMap::from([(retained, 1u8)]));
+    }
+
+    async fn inventory_checkpoint_resumes_after_failed_page(
+        ending: crate::collection_session::tests::TestEnding,
+        failure: crate::health::RepairFailure,
+    ) {
+        use crate::collection_session::tests::{TestEnding, inventory, pull_with_cursor_ending};
+        use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
+        use triblespace_core::repo::{SnapshotSource, memoryrepo::MemoryRepo};
+
+        let mut store = MemoryRepo::default();
+        let collection = store
+            .collection(
+                "inventory-repair-checkpoint",
+                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+            )
+            .unwrap()
+            .handle();
+        let local = crate::collection_activation::collection_repair_overlay(
+            &store.snapshot().unwrap(),
+            collection,
+        )
+        .unwrap();
+        let handles = (0_u32..2048)
+            .map(|index| *blake3::hash(&index.to_be_bytes()).as_bytes())
+            .collect::<BTreeSet<_>>();
+        let remote = std::sync::Arc::new(
+            local
+                .clone()
+                .with_blob_inventory(inventory(handles.iter().copied())),
+        );
+        let target = RepairTarget {
+            collection,
+            peer: [0x56; 32],
+        };
+        let reader = SigningKey::from_bytes(&[0x57; 32]).verifying_key();
+        let mut cursors = HashMap::new();
+        let mut received = BTreeSet::new();
+        let mut completed = false;
+        for attempt in 0..64 {
+            let interrupted = attempt == 1;
+            let delta = pull_with_cursor_ending(
+                &local,
+                remote.clone(),
+                reader,
+                super::resume_inventory_repair(&cursors, target),
+                if interrupted {
+                    ending
+                } else {
+                    TestEnding::Complete
+                },
+            )
+            .await;
+            let (success, cursor) = if interrupted {
+                let error = delta.unwrap_err();
+                match ending {
+                    TestEnding::ReadError => {
+                        assert!(error.downcast_ref::<std::io::Error>().is_some())
+                    }
+                    TestEnding::Timeout => {
+                        assert!(
+                            error
+                                .downcast_ref::<tokio::time::error::Elapsed>()
+                                .is_some()
+                        )
+                    }
+                    TestEnding::Complete => unreachable!(),
+                }
+                assert!(
+                    !received.is_empty(),
+                    "the first bounded page must have advanced"
+                );
+                (false, None)
+            } else {
+                let delta = delta.unwrap();
+                assert!(!delta.more);
+                for handle in delta.blob_handles {
+                    assert!(
+                        received.insert(handle),
+                        "failed repair must not restart the accepted prefix"
+                    );
+                }
+                (true, delta.inventory_cursor)
+            };
+            let mut outcome = super::RepairOutcome {
+                target,
+                success,
+                retry_immediately: false,
+                completed_at: crate::clock::mono_now(),
+                failure: interrupted.then_some(failure),
+                inventory_cursor: cursor,
+            };
+            super::complete_inventory_repair(&mut cursors, &mut outcome, true);
+            if interrupted {
+                assert!(cursors.contains_key(&target));
+            } else if !cursors.contains_key(&target) {
+                completed = true;
+                break;
+            }
+        }
+        assert!(completed, "late inventory suffix must remain reachable");
+        assert_eq!(received, handles);
+        assert!(
+            cursors.is_empty(),
+            "completed success releases the checkpoint"
+        );
+        assert!(
+            local.blob_inventory().is_empty(),
+            "no hinted payload landed"
+        );
+
+        // Deactivation discards the saved cursor and an already-running
+        // successful attempt cannot put it back while C remains inactive.
+        let delta = pull_with_cursor_ending(&local, remote, reader, None, TestEnding::Complete)
+            .await
+            .unwrap();
+        let mut outcome = super::RepairOutcome {
+            target,
+            success: true,
+            retry_immediately: false,
+            completed_at: crate::clock::mono_now(),
+            failure: None,
+            inventory_cursor: delta.inventory_cursor,
+        };
+        assert!(outcome.inventory_cursor.is_some());
+        cursors.insert(target, outcome.inventory_cursor.clone().unwrap());
+        retain_active_repair_state(&mut cursors, |_| false);
+        super::complete_inventory_repair(&mut cursors, &mut outcome, false);
+        assert!(cursors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn inventory_checkpoint_survives_transport_failure_and_reaches_late_handles() {
+        inventory_checkpoint_resumes_after_failed_page(
+            crate::collection_session::tests::TestEnding::ReadError,
+            crate::health::RepairFailure::Failed,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn inventory_checkpoint_survives_timeout_and_reaches_late_handles() {
+        inventory_checkpoint_resumes_after_failed_page(
+            crate::collection_session::tests::TestEnding::Timeout,
+            crate::health::RepairFailure::Deadline,
+        )
+        .await;
     }
 
     #[test]

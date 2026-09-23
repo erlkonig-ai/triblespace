@@ -181,6 +181,14 @@ impl<R: CollectionRead> CollectionRead for CountedSnapshot<R> {
         self.enumerations.fetch_add(1, Ordering::Relaxed);
         self.inner.select_records(selectors)
     }
+
+    fn select_record_changes(
+        &self,
+        previous: &Self,
+        selectors: &BTreeSet<CollectionRecordSelector>,
+    ) -> Result<(Vec<CollectionRecord>, Vec<CollectionRecord>), Self::RecordsError> {
+        self.inner.select_record_changes(&previous.inner, selectors)
+    }
 }
 
 impl<R: WantRead> WantRead for CountedSnapshot<R> {
@@ -505,6 +513,14 @@ fn assert_same_record_leaves(
         before.repair.records().summary(),
         after.repair.records().summary()
     );
+    assert_shared_record_leaves(before, after, records);
+}
+
+fn assert_shared_record_leaves(
+    before: &CollectionSnapshot,
+    after: &CollectionSnapshot,
+    records: &[CollectionRecord],
+) {
     for record in records {
         let key = record.fingerprint().raw();
         assert!(
@@ -620,7 +636,7 @@ fn proof_arrival_refreshes_read_bootstrap_without_record_enumeration() {
 }
 
 #[test]
-fn new_commit_enumerates_and_updates_the_record_summary() {
+fn new_commit_updates_the_record_summary_without_reenumeration() {
     let mut fixture = Fixture::new();
     let active = active(fixture.collection.handle());
     let local = fixture.root.verifying_key();
@@ -645,7 +661,7 @@ fn new_commit_enumerates_and_updates_the_record_summary() {
     let changes = after.changes_since(&before);
     assert_eq!(changes, StoreChanges::COLLECTION_RECORDS);
     let serving_after = StoreSnapshot::from_store_changes(
-        after,
+        after.clone(),
         &active,
         local,
         Some(&before),
@@ -656,7 +672,7 @@ fn new_commit_enumerates_and_updates_the_record_summary() {
     let new = serving_after
         .collection(fixture.collection.handle())
         .unwrap();
-    assert_eq!(fixture.enumerations.load(Ordering::Relaxed), 1);
+    assert_eq!(fixture.enumerations.load(Ordering::Relaxed), 0);
     assert_eq!(new.repair.records().summary().leaf_count(), 3);
     assert_ne!(
         old.repair.records().summary(),
@@ -667,6 +683,32 @@ fn new_commit_enumerates_and_updates_the_record_summary() {
         Some(fixture.pending)
     );
     assert_ne!(old.wake_root(), new.wake_root());
+    assert_shared_record_leaves(&old, &new, &fixture.records);
+
+    // A replacement observation need not grow. Apply its actual reverse
+    // difference, rather than retaining an absent record forever.
+    let restored = StoreSnapshot::from_store_changes(
+        before.clone(),
+        &active,
+        local,
+        Some(&after),
+        Some(&serving_after),
+        before.changes_since(&after),
+    )
+    .unwrap();
+    let restored = restored.collection(fixture.collection.handle()).unwrap();
+    assert_eq!(fixture.enumerations.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        restored.repair.records().summary(),
+        old.repair.records().summary()
+    );
+    assert!(
+        restored
+            .repair
+            .records()
+            .get(fixture.pending.fingerprint())
+            .is_none()
+    );
 }
 
 #[test]
@@ -995,7 +1037,7 @@ fn scoped_unrelated_blobs_reuse_proofs_bootstrap_and_records_with_bounded_invent
 }
 
 #[test]
-fn scoped_record_changes_rebuild_only_the_selected_c_and_keep_authorization() {
+fn scoped_record_changes_update_only_the_selected_c_and_keep_authorization() {
     let mut fixture = ScopedFixture::new();
     let selected = fixture.active();
     let mut before = fixture.observe(&selected, None);
@@ -1011,7 +1053,7 @@ fn scoped_record_changes_rebuild_only_the_selected_c_and_keep_authorization() {
             .unwrap();
         let after = fixture.observe(&selected, Some(&before));
         let (records, proofs, reads) = fixture.take_counts();
-        assert_eq!((records, proofs), (1, 0));
+        assert_eq!((records, proofs), (0, 0));
         assert!(reads <= 2 * (1024 + 64));
         let old = before
             .1
@@ -1020,6 +1062,7 @@ fn scoped_record_changes_rebuild_only_the_selected_c_and_keep_authorization() {
         let new = after.1.collection(fixture.collections[0].handle()).unwrap();
         assert_ne!(old.wake_root(), new.wake_root());
         assert!(new.repair.records().get(record.fingerprint()).is_some());
+        assert_shared_record_leaves(&old, &new, &[fixture.records[0]]);
         assert!(Arc::ptr_eq(&old.read_bootstrap, &new.read_bootstrap));
         let old_other = before
             .1
@@ -1069,7 +1112,7 @@ fn scoped_proof_change_refreshes_authorization_without_losing_record_interests()
         .unwrap();
     let final_observation = fixture.observe(&selected, Some(&after));
     let (records, proofs, reads) = fixture.take_counts();
-    assert_eq!((records, proofs), (1, 0));
+    assert_eq!((records, proofs), (0, 0));
     assert!(reads <= 2 * (1024 + 64));
     let new = final_observation
         .1
@@ -1311,5 +1354,6 @@ fn scoped_bootstrap_is_bound_to_the_local_subject_as_well_as_store_inputs() {
             .is_empty()
     );
     let (records, proofs, _) = fixture.take_counts();
-    assert_eq!((records, proofs), (1, 1));
+    // Subject changes invalidate authorization, not the underlying records.
+    assert_eq!((records, proofs), (0, 1));
 }

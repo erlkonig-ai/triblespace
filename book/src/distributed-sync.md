@@ -113,7 +113,10 @@ its own WRITE grant merely to replicate an inert signed record.
 
 The host also updates these components independently. When a store snapshot
 reports unchanged collection records, its existing record PATCH is shared into
-the next repair overlay without re-enumeration or Merkle hashing. Blob arrival
+the next repair overlay without re-enumeration or Merkle hashing. Changed
+collections apply selected record additions and removals to that retained PATCH.
+Native stores obtain the difference from persistent indexes; cold activation
+still constructs the initial full overlay. Blob arrival
 still refreshes the authorization observation: a newly resident capability or
 subordinate-resource descriptor can enable admission or proof routing without
 changing any record. Resident-inventory scanning advances in bounded passive
@@ -165,7 +168,9 @@ one once per turn and uses PATCH differences against its last processed
 observation to update subscriptions and provider publication. Roots and
 provider locators therefore cannot come from different store observations.
 An unavailable active descriptor still retains its subscription, and a failed
-snapshot immediately withdraws serving. An unchanged snapshot requires no
+snapshot immediately withdraws serving. New activation expedites both provider
+discovery and missing-descriptor acquisition, even after an empty host has
+already started its periodic retry clock. An unchanged snapshot requires no
 provider reinstallation. Per-topic outgoing root announcements likewise read
 the latest value rather than draining intermediate roots.
 
@@ -303,7 +308,12 @@ then schedules a later wrap to earlier keys. No proof from an old root is reused
 against the new one. This avoids repeatedly enumerating an early missing prefix
 while none of its payloads has landed, even during continuous appends. An incomplete
 inventory cursor is separate from incomplete semantic evidence and retains
-its own continuation opportunity. No absent handle is inferred from an
+its own continuation opportunity. An attempt receives a copy of the last
+successful checkpoint: a failed or timed-out session cannot discard that
+checkpoint. Successful completion or collection deactivation clears it. Each
+new session still checks READ admission and the current manifest, so retaining
+a traversal position does not retain authority or trust an obsolete root.
+No absent handle is inferred from an
 unfinished walk.
 
 Healthy participants are no longer pulled blindly at a thirty-second cadence.

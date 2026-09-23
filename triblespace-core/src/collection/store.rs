@@ -145,6 +145,39 @@ pub trait CollectionRead {
         }
         Ok(selected)
     }
+
+    /// Canonical records added and removed between two immutable observations
+    /// of exactly these routes, returned as `(added, removed)`.
+    ///
+    /// This is a semantic set difference, not a difference of physical frame
+    /// locations. Removing one duplicate occurrence must not remove a record
+    /// still present in the current view. The snapshots need not be ordered,
+    /// related, or grow-only relative to each other. Indexed backends override
+    /// this selected-read boundary with persistent native index differences;
+    /// the fallback explicitly selects both sides and compares their records.
+    fn select_record_changes(
+        &self,
+        previous: &Self,
+        selectors: &BTreeSet<CollectionRecordSelector>,
+    ) -> Result<(Vec<CollectionRecord>, Vec<CollectionRecord>), Self::RecordsError> {
+        selected_record_changes(self, previous, selectors)
+    }
+}
+
+pub(crate) fn selected_record_changes<R: CollectionRead + ?Sized>(
+    current: &R,
+    previous: &R,
+    selectors: &BTreeSet<CollectionRecordSelector>,
+) -> Result<(Vec<CollectionRecord>, Vec<CollectionRecord>), R::RecordsError> {
+    if selectors.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let current: BTreeSet<_> = current.select_records(selectors)?.into_iter().collect();
+    let previous: BTreeSet<_> = previous.select_records(selectors)?.into_iter().collect();
+    Ok((
+        current.difference(&previous).copied().collect(),
+        previous.difference(&current).copied().collect(),
+    ))
 }
 
 /// Downward coverage for every lattice node this store has admitted.
@@ -251,6 +284,14 @@ where
         selectors: &BTreeSet<CollectionRecordSelector>,
     ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
         (**self).select_records(selectors)
+    }
+
+    fn select_record_changes(
+        &self,
+        previous: &Self,
+        selectors: &BTreeSet<CollectionRecordSelector>,
+    ) -> Result<(Vec<CollectionRecord>, Vec<CollectionRecord>), Self::RecordsError> {
+        (**self).select_record_changes(*previous, selectors)
     }
 }
 
