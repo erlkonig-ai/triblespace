@@ -34,7 +34,7 @@ members = [
 # repointable symlink (tribleset-bench/subjects/current) that may aim at
 # any checkout of any era — it must never be resolved as part of this
 # workspace. It builds standalone from inside tribleset-bench/.
-exclude = ["tribleset-bench"]
+exclude = ["tribleset-bench", "vendor/iroh-gossip"]
 resolver = "2"
 
 [dependencies]

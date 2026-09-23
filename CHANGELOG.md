@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Carry independent collection gossip topics over one ordered, topic-tagged
+  stream per peer connection. The previous persistent stream per topic stopped
+  at QUIC's default 100-stream limit with 126–130 active collections. Vendor
+  the exact iroh-gossip 0.101.0 source and isolate the framing under private
+  ALPN `/triblespace/gossip/C6858FA15B24B264151DB34DAA9C1964` (anchor minted
+  with `trible genid`). Keep membership, per-collection root semantics and
+  authorized repair separate from transport multiplexing. Add production-sized
+  topic-capacity regressions and an ephemeral read-only gossip probe.
+  Isolate unavailable writers from the shared actor, fail both halves on a
+  transport error, and preserve intentional directional half-closes during
+  simultaneous dials. Reject cancelled dials even after completion.
+
 - Add a READ(C)-gated resident-blob PATCH as the third pinned collection-repair
   component and include it in the opaque wake root. Allocate repair opcode
   `0x0E` on ALPN `/triblespace/pile-sync/26`, rejecting the retired `0x0D`

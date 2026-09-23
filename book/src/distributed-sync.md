@@ -206,6 +206,27 @@ Hearing one equal-root offer suppresses this interval's redundant local offer;
 disagreement and local changes shorten long intervals. A new neighbor gets one
 forced offer. Missed intervals are not replayed as a queue.
 
+The vendored gossip transport carries topic-tagged frames on one ordered
+unidirectional stream per connection. Topics still have independent membership
+and dissemination; this is transport multiplexing, not a global collection
+topic. Upstream's persistent stream per topic exhausted QUIC's default 100
+stream credits with the colony's 126–130 collections. Its blocked writer could
+then fill the connection queue and stop the shared gossip actor. A regression
+joins 130 topics at default limits and 257 topics with only one stream allowed.
+The private ALPN
+`/triblespace/gossip/C6858FA15B24B264151DB34DAA9C1964` isolates the new framing
+from `/iroh-gossip/1`; the anchor was minted with `trible genid`. Collection
+topic IDs, wake signatures, and the separate pile-sync ALPN are unchanged.
+The shared gossip actor never waits for a full peer output queue: it gives a
+healthy writer one scheduling turn, then fails an unavailable connection so
+ordinary membership recovery can proceed. Failed send/receive halves close
+their connection, while clean EOF preserves the opposite direction: simultaneous
+connections can legitimately carry the two directions separately. Both halves
+finishing closes the obsolete connection. Pending dial history is bounded by
+live subscriptions. Cancelled dials are checked again when their
+completed results are consumed, so a late success cannot revive discarded
+membership controls.
+
 Relaying retains one latest observation per signed origin, with equal roots
 sharing one deadline rather than one event per contact or nonce. A receiver
 allows up to five seconds for repair. If its published serving snapshot reaches

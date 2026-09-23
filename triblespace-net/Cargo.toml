@@ -13,7 +13,9 @@ iroh-base = "1.0"
 # Constrain Iroh's transitive selection to the tested patched release. Without
 # this, a newer registry version can silently outrank the root netwatch patch.
 netwatch = "=0.19.1"
-iroh-gossip = { version = "=0.101.0", default-features = false, features = ["net"] }
+# Ordered, bounded-stream wire adapter over unchanged per-topic mesh semantics.
+# See vendor/iroh-gossip for exact upstream provenance and the private ALPN.
+iroh-gossip = { version = "=0.101.0", path = "../vendor/iroh-gossip", default-features = false, features = ["net"] }
 # mDNS (LAN) address lookup — moved out of `iroh` core in 1.0. pkarr-DHT
 # address discovery was also removed in 1.0 and we deliberately do NOT
 # re-add it (N0 pkarr+DNS preset + mDNS cover our local/LAN use; staying
