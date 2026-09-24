@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Extend collection repair to records, scoped AUTH and a positive resident-blob
+  PATCH through new opcode `0x0E` on ALPN `/triblespace/pile-sync/26`;
+  retired repair opcode `0x0D` is rejected, while unchanged bearer/DHT clients
+  remain compatible. All summaries contribute to the
+  opaque root. A bounded passive local scan constructs partial readable closure.
+  Separate 128-node inventory passes retain progress across successful RPCs;
+  changed roots restart validation above the last visited key, then wrap.
+  Bounded hint windows preserve unattempted work and advance serviced cohorts
+  past unavailable prefixes, wrapping only after a completed inventory pass.
+  Progress is independent of payload acquisition. Full hydration now
+  fetches positive known handles in the bounded parallel exact-H window; remove
+  speculative recursive DHT probes and reference-summary filtering. This does
+  not certify complete residency, semantic references or decryption authority.
+  Semantic health compares record/AUTH evidence independently of inventory
+  changes, preserving real stall grace without treating cache differences as
+  divergence.
+
+- Replace collection-participant DHT advertisements with authority-key and
+  ordinary descriptor-provider gossip bootstrap. Contacts do not imply READ
+  authority or participation. Randomized periodic latest-root offers suppress
+  redundant local emissions. Version-isolated neighbor messages let the host
+  defer relaying for repair, then offer its actual serving root or forward the
+  original signed contact within a bounded fallback. Latest per-origin state
+  coalesces by root; equal direct-neighbor evidence suppresses replay only when
+  every known neighbor matches. Equivalent signed origins share repair load.
+  Retry healthy-subset discovery fairly with bounded owned work,
+  cancel discovery on deactivation, and retain confirmation after failed repair.
+
+- Retry transiently failed collection participants under their original lease
+  and bounded backoff, even while another replica remains reachable. Failure
+  never renews that lease, and no healthy candidate still triggers discovery.
+
+- Preserve shared connections after valid collection READ refusals or
+  unavailable replies. Malformed replies still invalidate the connection;
+  refusal cannot cancel another collection's in-flight stream.
+
 ### Added
 
 - Expose bounded inbound GET activity/completion/byte counters in host health,
@@ -49,6 +85,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dialing.
 
 ### Changed
+
+- Replace the store-to-host observation FIFO with one coherent latest snapshot.
+  The host derives provider and collection changes from its last processed
+  PATCH-backed observation; outgoing root announcements coalesce as well.
+  Keep authenticated incoming evidence on its bounded admission bridge.
+  Peer now owns optional hydration, landing ready bodies before one final
+  serving refresh instead of rebuilding the inventory after each blob.
 
 - Remove ordinary per-blob and repair-drain disk flushes and the reconciler's
   retained durable-answer mirror. Local put/refresh visibility precedes the
@@ -94,6 +137,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   artifacts are not mirrored.
 
 ### Fixed
+
+- Apply bounded backpressure when inbound RPC request slots are occupied,
+  instead of closing the shared connection and cancelling unrelated repair
+  streams. The existing connection and active-request limits are unchanged.
 
 - Reuse selected collections' fixed repair components and READ bootstrap
   witnesses when their observed raw inputs are unchanged. Missing descriptors

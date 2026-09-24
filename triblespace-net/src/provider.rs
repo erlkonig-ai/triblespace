@@ -1,13 +1,12 @@
-//! Exact soft-state provider leases for collections and bearer blobs.
+//! Exact soft-state provider leases for resident bearer blobs.
 //!
-//! Collections and resident blob handles map to separate opaque full-width
-//! rendezvous keys. Providers renew them at their K closest DHT nodes;
-//! directory nodes receive neither raw collection handles nor raw blob handles.
+//! Resident blob handles map to opaque full-width rendezvous keys. Providers
+//! renew them at their K closest DHT nodes; directory nodes receive neither raw
+//! blob handles nor collection membership.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use triblespace_core::collection::CollectionHandle;
 use triblespace_core::patch::{
     Entry as PatchEntry, IdentitySchema, PATCH, PATCHIntoOrderedIterator,
 };
@@ -25,7 +24,7 @@ mod directory_model;
 #[path = "provider/patch_directory.rs"]
 mod patch_directory;
 
-/// Opaque rendezvous key for one exact collection or bearer identity.
+/// Opaque rendezvous key for one exact bearer identity.
 pub(crate) type ProviderKey = [u8; 32];
 pub(crate) type ProviderToken = [u8; 32];
 type ProviderIdentity = [u8; 32];
@@ -47,19 +46,11 @@ const MAX_PROVIDER_MEMBERSHIPS: usize = 1 << 24;
 /// Bound opportunistic expiry reclamation performed by one RPC.
 const MAX_EXPIRED_PROVIDER_MEMBERSHIPS_PER_CALL: usize = 64;
 
-/// Derive the opaque provider rendezvous key for one collection session.
-pub(crate) fn collection_provider_key(collection: CollectionHandle) -> ProviderKey {
-    let mut hasher = blake3::Hasher::new_derive_key("triblespace.net/collection-provider-key/v1");
-    hasher.update(&collection.raw);
-    *hasher.finalize().as_bytes()
-}
-
 /// Endpoint-bound directory proof for one opaque rendezvous key.
 ///
-/// `identity` is H for an exact blob lease and C for a collection-participant
-/// hint. Keying by H makes the blob token a proof of bearer-handle knowledge;
-/// C need not be secret. Including the already domain-separated rendezvous key
-/// keeps both lease roles distinct without storing a second per-H token trie.
+/// `identity` is H for an exact blob lease. Keying by H makes the token a proof
+/// of bearer-handle knowledge, bound to the domain-separated rendezvous key and
+/// the provider endpoint without storing a second per-H token trie.
 pub(crate) fn provider_lease_token(
     identity: [u8; 32],
     key: ProviderKey,
@@ -70,14 +61,6 @@ pub(crate) fn provider_lease_token(
     hasher.update(&key);
     hasher.update(&provider);
     *hasher.finalize().as_bytes()
-}
-
-pub(crate) fn collection_provider_token(identity: [u8; 32], provider: PeerId) -> ProviderToken {
-    provider_lease_token(
-        identity,
-        collection_provider_key(CollectionHandle::new(identity)),
-        provider,
-    )
 }
 
 /// Derive the expected endpoint-bound directory token for one exact blob.
@@ -91,7 +74,7 @@ pub fn blob_provider_token(identity: [u8; 32], provider: PeerId) -> [u8; 32] {
 }
 
 /// Canonical exact publication set for one serving snapshot. Values retain the
-/// hidden identity (H or C); endpoint-bound tokens are derived only when the
+/// hidden identity H; endpoint-bound tokens are derived only when the
 /// publisher schedules a key.
 type ProviderLeasePatch = PATCH<32, IdentitySchema, ProviderIdentity>;
 
@@ -108,39 +91,28 @@ pub(crate) struct ProviderObservation {
 
 impl ProviderObservation {
     #[cfg(test)]
-    pub(crate) fn from_collections(
-        collections: impl IntoIterator<Item = CollectionHandle>,
-        serves: bool,
-    ) -> Self {
-        Self::from_locators(collections, serves, &BearerLocatorIndex::new())
+    pub(crate) fn from_blob_handles(handles: impl IntoIterator<Item = [u8; 32]>) -> Self {
+        let mut locators = BearerLocatorIndex::new();
+        for handle in handles {
+            locators.replace(&PatchEntry::with_value(&blob_locator(handle), handle));
+        }
+        Self::from_locators(&locators)
     }
 
     pub(crate) fn into_set(self) -> ProviderSet {
         self.set
     }
 
-    /// Reuse the snapshot's L→H PATCH and COW-insert the tiny set of served
-    /// collection-participant keys. Exact H transport is independent of the
-    /// collection-repair direction, so every resident bearer locator remains
-    /// publishable even when this peer does not serve collection repair.
+    /// Share the snapshot's L→H PATCH unchanged. Exact H transport is independent
+    /// of collection repair, so every resident bearer locator is publishable.
     /// Publication tokens are computed only when a key is scheduled, so this
     /// adds no second per-H trie.
-    pub(crate) fn from_locators(
-        collections: impl IntoIterator<Item = CollectionHandle>,
-        serves_collections: bool,
-        locators: &BearerLocatorIndex,
-    ) -> Self {
-        let mut set = ProviderSet {
-            leases: locators.clone(),
-        };
-        if serves_collections {
-            for collection in collections {
-                let key = collection_provider_key(collection);
-                set.leases
-                    .replace(&PatchEntry::with_value(&key, collection.raw));
-            }
+    pub(crate) fn from_locators(locators: &BearerLocatorIndex) -> Self {
+        Self {
+            set: ProviderSet {
+                leases: locators.clone(),
+            },
         }
-        Self { set }
     }
 }
 
@@ -301,6 +273,12 @@ impl ProviderPublisher {
     }
 
     pub(crate) fn install(&mut self, resident: ProviderSet, now: Mono) {
+        // Record/AUTH refreshes may publish a new serving snapshot with the
+        // same resident PATCH. Its pending work and renewal clocks already
+        // describe this set; do not rebuild those sets for an unchanged input.
+        if self.initialized && self.resident == resident {
+            return;
+        }
         if self.initialized {
             let added = resident.leases.difference(&self.resident.leases);
             self.startup.leases = self.startup.leases.intersect(&resident.leases);
@@ -776,18 +754,11 @@ mod tests {
     use std::time::Instant;
 
     use anybytes::Bytes;
-    use ed25519_dalek::SigningKey;
     use triblespace_core::blob::encodings::UnknownBlob;
-    use triblespace_core::capability::{CapabilityProof, CapabilityResource};
-    use triblespace_core::collection::{
-        AdmissionPolicy, CollectionCommit, CollectionData, CollectionHandle, CollectionPolicy,
-        CollectionRecord, CollectionStore, CollectionStoreExt, write_capability,
-    };
     use triblespace_core::inline::Inline;
     use triblespace_core::inline::encodings::hash::Handle;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
-    use triblespace_core::repo::{BlobStorePut, CapabilityProofStore, SnapshotSource};
-    use triblespace_core::trible::TribleSet;
+    use triblespace_core::repo::{BlobStorePut, SnapshotSource};
 
     use super::*;
 
@@ -858,189 +829,96 @@ mod tests {
         }
     }
 
-    fn signing_key(byte: u8) -> SigningKey {
-        SigningKey::from_bytes(&[byte; 32])
-    }
-
     fn put_blob(store: &mut MemoryRepo, byte: u8) -> BlobHandle {
         store
             .put::<UnknownBlob, _>(Bytes::from_source(vec![byte; 257]))
             .unwrap()
     }
 
-    fn commit(
-        store: &mut MemoryRepo,
-        collection: CollectionHandle,
-        signer: &SigningKey,
-        member: BlobHandle,
-    ) -> CollectionCommit {
-        let metadata = store
-            .put::<triblespace_core::blob::encodings::simplearchive::SimpleArchive, _>(
-                TribleSet::new(),
-            )
-            .unwrap();
-        let commit = CollectionCommit::sign(
-            signer,
-            collection,
-            CollectionData::new(member.raw),
-            metadata,
-        );
-        store.insert(CollectionRecord::Commit(commit)).unwrap();
-        commit
-    }
-
     #[test]
-    fn publication_set_contains_only_explicit_collection_participation() {
-        let writer = signing_key(11);
-        let write_root = signing_key(12);
+    fn observation_contains_every_resident_blob_without_collection_participation() {
         let mut store = MemoryRepo::default();
-        let open = store
-            .collection(
-                "open",
-                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
-            )
-            .unwrap();
-        let restricted = store
-            .collection(
-                "restricted",
-                CollectionPolicy::new(
-                    AdmissionPolicy::direct(signing_key(13).verifying_key()),
-                    AdmissionPolicy::Open,
-                ),
-            )
-            .unwrap();
-        let unauthorized = store
-            .collection(
-                "unauthorized",
-                CollectionPolicy::new(
-                    AdmissionPolicy::Open,
-                    AdmissionPolicy::direct(write_root.verifying_key()),
-                ),
-            )
-            .unwrap();
-        let public_member = put_blob(&mut store, 21);
-        let restricted_member = put_blob(&mut store, 22);
-        let unauthorized_member = put_blob(&mut store, 23);
-        let _uncommitted_resident = put_blob(&mut store, 24);
-        let public_commit = commit(&mut store, open.handle(), &writer, public_member);
-        let restricted_commit = commit(&mut store, restricted.handle(), &writer, restricted_member);
-        commit(
-            &mut store,
-            unauthorized.handle(),
-            &writer,
-            unauthorized_member,
-        );
-
-        let set = ProviderObservation::from_collections(
-            [open.handle(), restricted.handle(), unauthorized.handle()],
-            true,
-        )
-        .into_set();
-
-        for artifact in [open.handle(), restricted.handle(), unauthorized.handle()] {
-            assert!(set.contains(&collection_provider_key(artifact)));
-        }
+        let handles = [
+            put_blob(&mut store, 21).raw,
+            put_blob(&mut store, 22).raw,
+            put_blob(&mut store, 23).raw,
+        ];
+        let snapshot = store.snapshot().unwrap();
+        let locators = crate::bearer::locator_index(&snapshot).unwrap();
+        let observation = ProviderObservation::from_locators(&locators);
+        assert_eq!(observation, ProviderObservation::from_blob_handles(handles));
+        let set = observation.into_set();
         assert_eq!(set.len(), 3);
+        assert_eq!(set.leases, locators);
+        for handle in handles {
+            assert_eq!(set.identity(&blob_locator(handle)), Some(handle));
+            assert!(
+                !set.contains(&handle),
+                "raw bearer handles are not directory keys"
+            );
+        }
         assert_eq!(
-            restricted_commit.metadata(),
-            public_commit.metadata(),
-            "content-addressed empty metadata is shared across both closures"
-        );
-        assert_eq!(
-            ProviderObservation::from_collections([open.handle()], false),
-            ProviderObservation::default(),
-            "non-serving QoS cannot publish admitted artifacts"
+            ProviderObservation::from_locators(&BearerLocatorIndex::new()),
+            ProviderObservation::default()
         );
     }
 
     #[test]
-    fn collection_participation_is_independent_of_write_authority() {
-        let root = signing_key(31);
-        let writer = signing_key(32);
-        let mut store = MemoryRepo::default();
-        let collection = store
-            .collection(
-                "expiring",
-                CollectionPolicy::new(
-                    AdmissionPolicy::Open,
-                    AdmissionPolicy::direct(root.verifying_key()),
-                ),
-            )
-            .unwrap();
-        let proof = CapabilityProof::new(
-            CapabilityResource::from(collection.handle()),
-            &root,
-            write_capability(),
-            writer.verifying_key(),
-        );
-        store.insert_proof(proof).unwrap();
-        let member = put_blob(&mut store, 33);
-        commit(&mut store, collection.handle(), &writer, member);
-
-        let during_set =
-            ProviderObservation::from_collections([collection.handle()], true).into_set();
-        let after_set =
-            ProviderObservation::from_collections([collection.handle()], true).into_set();
-        assert!(during_set.contains(&collection_provider_key(collection.handle())));
-        assert!(after_set.contains(&collection_provider_key(collection.handle())));
-    }
-
-    #[test]
-    fn observation_reuses_resident_locators_and_adds_collection_keys() {
+    fn observation_remains_bound_to_its_resident_snapshot() {
         let mut store = MemoryRepo::default();
         let resident = put_blob(&mut store, 44);
         let snapshot = store.snapshot().unwrap();
+        let mut locators = crate::bearer::locator_index(&snapshot).unwrap();
+        let mut observed = ProviderObservation::from_locators(&locators).into_set();
+        assert_eq!(observed.leases, locators);
+
+        let later = [45; 32];
+        locators.replace(&PatchEntry::with_value(&blob_locator(later), later));
+        assert!(!observed.contains(&blob_locator(later)));
+        observed.leases.remove(&blob_locator(resident.raw));
+        assert_eq!(
+            locators.get(&blob_locator(resident.raw)),
+            Some(&resident.raw)
+        );
+        assert!(observed.leases.is_empty());
+    }
+
+    #[test]
+    fn blob_handle_fixture_uses_exact_locators_and_deduplicates() {
+        let handle = [44; 32];
+        let set = ProviderObservation::from_blob_handles([handle, handle]).into_set();
+        assert_eq!(set.len(), 1);
+        assert_eq!(set.identity(&blob_locator(handle)), Some(handle));
+        assert!(!set.contains(&handle));
+    }
+
+    #[test]
+    fn blob_lease_tokens_are_handle_key_and_endpoint_bound() {
+        let handle = [44; 32];
+        let key = blob_locator(handle);
         let provider = [45; 32];
-        let collection = store
-            .collection(
-                "locator-projection",
-                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
-            )
-            .unwrap()
-            .handle();
-        let locators = crate::bearer::locator_index(&snapshot).unwrap();
-        let blob_key = blob_locator(resident.raw);
-        let collection_key = collection_provider_key(collection);
-
-        let collection_disabled =
-            ProviderObservation::from_locators([collection], false, &locators).into_set();
-        assert_eq!(collection_disabled.identity(&blob_key), Some(resident.raw));
-        assert!(!collection_disabled.contains(&collection_key));
-
-        let enabled = ProviderObservation::from_locators([collection], true, &locators).into_set();
-        assert_eq!(enabled.identity(&blob_key), Some(resident.raw));
-        assert_eq!(enabled.identity(&collection_key), Some(collection.raw));
-        assert_eq!(locators.get(&blob_key), Some(&resident.raw));
-        assert!(
-            locators.get(&collection_key).is_none(),
-            "COW insertion must not mutate the snapshot's bearer index"
-        );
         assert_eq!(
-            provider_lease_token(resident.raw, blob_key, provider),
-            blob_provider_token(resident.raw, provider)
-        );
-        assert_eq!(
-            provider_lease_token(collection.raw, collection_key, provider),
-            collection_provider_token(collection.raw, provider)
+            provider_lease_token(handle, key, provider),
+            blob_provider_token(handle, provider)
         );
         assert_ne!(
-            provider_lease_token(resident.raw, blob_key, provider),
-            provider_lease_token(resident.raw, blob_key, [46; 32])
+            provider_lease_token(handle, key, provider),
+            provider_lease_token(handle, key, [46; 32])
         );
         assert_ne!(
-            provider_lease_token(resident.raw, blob_key, provider),
-            provider_lease_token([47; 32], blob_key, provider)
+            provider_lease_token(handle, key, provider),
+            provider_lease_token([47; 32], key, provider)
         );
         assert_ne!(
-            provider_lease_token(resident.raw, blob_key, provider),
-            provider_lease_token(resident.raw, [48; 32], provider)
+            provider_lease_token(handle, key, provider),
+            provider_lease_token(handle, [48; 32], provider)
         );
     }
 
     #[test]
-    fn directory_is_addressed_by_exact_provider_key_not_raw_artifact() {
+    fn directory_is_addressed_by_exact_blob_locator_not_raw_handle() {
         let artifact = [6; 32];
-        let key = collection_provider_key(CollectionHandle::new(artifact));
+        let key = blob_locator(artifact);
         let provider = [7; 32];
         let now = crate::clock::mono_now();
         let mut directory = ProviderDirectory::default();
@@ -1355,6 +1233,68 @@ mod tests {
     }
 
     #[test]
+    fn latest_inventory_preserves_pending_and_retry_work_without_intermediate_installs() {
+        let now = crate::clock::mono_now();
+        let inventory = |keys: &[u8]| {
+            let mut set = ProviderSet::default();
+            for key in keys {
+                set.leases
+                    .replace(&PatchEntry::with_value(&[*key; 32], [*key; 32]));
+            }
+            set
+        };
+        let mut replayed = ProviderPublisher::new(now);
+        let mut latest = ProviderPublisher::new(now);
+        for publisher in [&mut replayed, &mut latest] {
+            publisher.install(inventory(&[1, 2, 3, 4]), now);
+            assert_eq!(publisher.next(now).unwrap().key, [1; 32]);
+            assert!(publisher.retry([1; 32], now));
+        }
+        replayed.install(inventory(&[1, 2, 3, 4, 5]), now);
+        replayed.install(inventory(&[1, 2, 3, 4, 5, 6]), now);
+        latest.install(inventory(&[1, 2, 3, 4, 5, 6]), now);
+        assert_eq!(replayed.resident, latest.resident);
+        assert_eq!(replayed.startup, latest.startup);
+        assert_eq!(replayed.additions, latest.additions);
+        assert_eq!(replayed.retries, latest.retries);
+        assert_eq!(latest.startup, inventory(&[2, 3, 4]));
+        assert_eq!(latest.additions, inventory(&[5, 6]));
+        assert_eq!(latest.retries, inventory(&[1]));
+
+        let renewal = latest.next_renewal;
+        let retry = latest.retry_at;
+        latest.install(inventory(&[1, 2, 3, 4, 5, 6]), now + Duration::from_secs(1));
+        assert_eq!(latest.next_renewal, renewal);
+        assert_eq!(latest.retry_at, retry);
+        assert_eq!(latest.startup, replayed.startup);
+        assert_eq!(latest.additions, replayed.additions);
+        assert_eq!(latest.retries, replayed.retries);
+
+        latest.install(inventory(&[3, 4, 5, 6]), now);
+        assert_eq!(latest.startup, inventory(&[3, 4]));
+        assert_eq!(latest.additions, inventory(&[5, 6]));
+        assert!(latest.retries.leases.is_empty());
+        // A late failure from the old generation cannot resurrect a withdrawn key.
+        assert!(latest.retry([1; 32], now));
+        assert!(latest.retries.leases.is_empty());
+        let mut scheduled = BTreeSet::new();
+        while let Some(work) = latest.next(now) {
+            scheduled.insert(work.key);
+        }
+        assert_eq!(
+            scheduled,
+            BTreeSet::from([[3; 32], [4; 32], [5; 32], [6; 32]])
+        );
+        latest.install(ProviderSet::default(), now);
+        assert!(latest.next(now + PROVIDER_RENEWAL_PERIOD).is_none());
+        latest.install(inventory(&[7]), now + PROVIDER_RENEWAL_PERIOD);
+        assert_eq!(
+            latest.next(now + PROVIDER_RENEWAL_PERIOD).unwrap().key,
+            [7; 32]
+        );
+    }
+
+    #[test]
     fn find_node_responder_then_put_unavailable_preserves_the_large_pending_sweep() {
         let now = crate::clock::mono_now();
         let local = [0x11; 32];
@@ -1368,11 +1308,10 @@ mod tests {
         );
         assert_eq!(unavailable, PublicationResult::NoAuthenticatedRemoteReplica);
         let key_count = MAX_PROVIDER_PUBLICATION_RETRIES as usize + 1025;
-        let mut resident = ProviderSet::default();
-        for index in 0..key_count {
-            let key = deterministic_bytes("triblespace.net/isolated-provider-key/v1", index);
-            resident.leases.replace(&PatchEntry::with_value(&key, key));
-        }
+        let resident = ProviderObservation::from_blob_handles((0..key_count).map(|index| {
+            deterministic_bytes("triblespace.net/isolated-provider-handle/v1", index)
+        }))
+        .into_set();
         let mut publisher = ProviderPublisher::new(now);
         publisher.install(resident, now);
 
@@ -1412,11 +1351,11 @@ mod tests {
         let published =
             PublicationResult::from_put_results(local, [(remote, ProviderPutResult::Accepted)]);
         let key_count = MAX_PROVIDER_PUBLICATION_RETRIES as usize + 1025;
-        let mut resident = ProviderSet::default();
-        for index in 0..key_count {
-            let key = deterministic_bytes("triblespace.net/resumed-provider-key/v1", index);
-            resident.leases.replace(&PatchEntry::with_value(&key, key));
-        }
+        let resident =
+            ProviderObservation::from_blob_handles((0..key_count).map(|index| {
+                deterministic_bytes("triblespace.net/resumed-provider-handle/v1", index)
+            }))
+            .into_set();
         let mut publisher = ProviderPublisher::new(now);
         publisher.install(resident, now);
 
@@ -1510,12 +1449,12 @@ mod tests {
     #[test]
     fn first_sweep_renews_its_last_key_with_a_full_cycle_of_margin() {
         let now = crate::clock::mono_now();
-        let mut resident = ProviderSet::default();
-        for index in 0_u16..257 {
-            let mut key = [0; 32];
-            key[..2].copy_from_slice(&index.to_be_bytes());
-            resident.leases.replace(&PatchEntry::with_value(&key, key));
-        }
+        let resident = ProviderObservation::from_blob_handles((0_u16..257).map(|index| {
+            let mut handle = [0; 32];
+            handle[..2].copy_from_slice(&index.to_be_bytes());
+            handle
+        }))
+        .into_set();
         let mut publisher = ProviderPublisher::new(now);
         publisher.install(resident, now);
         while publisher.next(now).is_some() {}

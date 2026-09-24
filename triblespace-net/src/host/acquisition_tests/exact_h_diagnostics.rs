@@ -478,7 +478,7 @@ impl Node {
         let directory = Arc::new(Mutex::new(ProviderDirectory::new(peer)));
         let (events_tx, events) = tokio::sync::mpsc::channel(16);
         let handler = SnapshotHandler {
-            snapshot: Arc::new(Mutex::new(snapshot)),
+            snapshot: tokio::sync::watch::channel(snapshot).1,
             health: Health::new(EndpointId::from_bytes(&peer).unwrap()),
             candidates: candidates.clone(),
             providers: directory.clone(),

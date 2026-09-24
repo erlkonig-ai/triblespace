@@ -23,12 +23,23 @@ use crate::transport::PeerId;
 /// Hard per-active-collection bound on retained pairwise runtime evidence.
 pub const MAX_HEALTH_PEERS_PER_COLLECTION: usize = 128;
 
-/// The existing immutable manifest received after READ(C) admission.
+/// Semantic evidence from an immutable manifest received after READ(C)
+/// admission, plus its composite wake root for diagnostics. The wake root also
+/// includes a partial resident-blob inventory; cache equality is deliberately
+/// not required for record/AUTH health.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RepairFrontier {
     pub wake_root: [u8; 32],
     pub records: PatchSummary,
     pub authorization_evidence: PatchSummary,
+}
+
+impl RepairFrontier {
+    /// Equality of the collection's repair evidence, independent of caching.
+    /// Demand and shallow peers may intentionally retain different bodies.
+    pub fn same_evidence(&self, other: &Self) -> bool {
+        self.records == other.records && self.authorization_evidence == other.authorization_evidence
+    }
 }
 
 impl From<CollectionRepairManifest> for RepairFrontier {
@@ -70,11 +81,13 @@ pub struct RepairHealth {
     pub first_started_at: Option<Mono>,
     pub last_started_at: Option<Mono>,
     pub last_completed_at: Option<Mono>,
-    /// Last validated nonempty repair delta; not a durability receipt. Repeated
-    /// downloads can advance this while store admission remains blocked.
+    /// Last validated nonempty record/AUTH delta; not a durability receipt.
+    /// Repeated downloads can advance this while store admission is blocked.
+    /// Blob inventory hints are neither semantic progress nor fetched bodies.
     pub last_progress_at: Option<Mono>,
-    /// First authorized comparison, or a change in its remote frontier. Local
-    /// writes and repeated identical remote replies never advance this clock.
+    /// First authorized comparison, or a change in its remote record/AUTH
+    /// frontier. Local writes, cache changes and repeated identical remote
+    /// evidence never advance this clock.
     /// This is evidence of a changing remote frontier, not proof of gap closure.
     pub last_remote_change_at: Option<Mono>,
     pub last_failure_at: Option<Mono>,
@@ -111,7 +124,7 @@ impl RepairHealth {
     pub(crate) fn compared(&mut self, comparison: RepairComparison, completed_at: Mono) {
         if self
             .comparison
-            .is_none_or(|previous| previous.remote != comparison.remote)
+            .is_none_or(|previous| !previous.remote.same_evidence(&comparison.remote))
         {
             self.last_remote_change_at = Some(comparison.observed_at);
         }
@@ -252,7 +265,7 @@ impl HealthSnapshot {
         fresh(self.observed_at, now, max_age)
     }
 
-    /// Pairwise, time-bounded evidence only. A local frontier advance or
+    /// Pairwise, time-bounded evidence only. A local record/AUTH advance or
     /// unavailable/stale store observation invalidates a former match.
     /// Catching-up/stalled policy belongs to the observer: use actual local
     /// changes, in-flight work, failures and progress, not successful RPC counts.
@@ -289,11 +302,13 @@ impl HealthSnapshot {
             return ComparisonState::Unknown;
         };
         if !fresh(Some(comparison.observed_at), now, max_age)
-            || collection.local_frontier != Some(comparison.local)
+            || !collection
+                .local_frontier
+                .is_some_and(|local| local.same_evidence(&comparison.local))
         {
             return ComparisonState::Unknown;
         }
-        if comparison.local == comparison.remote {
+        if comparison.local.same_evidence(&comparison.remote) {
             ComparisonState::Matching
         } else {
             ComparisonState::Different
@@ -539,6 +554,60 @@ mod tests {
                 .snapshot()
                 .comparison(collection, peer, now, Duration::from_secs(180)),
             ComparisonState::Different,
+        );
+    }
+
+    #[test]
+    fn cache_only_root_changes_preserve_semantic_comparison_and_progress_clock() {
+        let (health, collection, peer, now) = fixture();
+        let local = frontier(5, 1);
+        let remote = RepairFrontier {
+            wake_root: [6; 32],
+            ..local
+        };
+        health.with_peer(collection, peer, |peer| {
+            peer.compared(
+                RepairComparison {
+                    observed_at: now,
+                    local,
+                    remote,
+                    records_received: 0,
+                    proofs_received: 0,
+                    more: false,
+                },
+                now,
+            );
+        });
+        let later = now + Duration::from_secs(1);
+        health.update(|health| {
+            // A local inventory pass changes only the composite scheduling root.
+            health.collections[0]
+                .local_frontier
+                .as_mut()
+                .unwrap()
+                .wake_root = [7; 32];
+        });
+        health.with_peer(collection, peer, |peer| {
+            let previous = peer.comparison.unwrap();
+            peer.compared(
+                RepairComparison {
+                    observed_at: later,
+                    remote: RepairFrontier {
+                        wake_root: [8; 32],
+                        ..previous.remote
+                    },
+                    ..previous
+                },
+                later,
+            );
+            assert_eq!(peer.last_remote_change_at, Some(now));
+            assert_eq!(peer.last_progress_at, None);
+        });
+        assert_eq!(
+            health
+                .snapshot()
+                .comparison(collection, peer, later, Duration::from_secs(180)),
+            ComparisonState::Matching,
         );
     }
 

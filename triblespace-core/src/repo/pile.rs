@@ -526,7 +526,14 @@ fn collection_record_offset(key_offset: &[u8; 8]) -> usize {
 
 /// Read the collection record whose frame starts at `offset`, an offset the
 /// record index produced, so the frame is applied and decodes.
+#[cfg(test)]
+thread_local! {
+    static COLLECTION_RECORD_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn collection_record_at(mmap: &MmapRaw, applied_length: usize, offset: usize) -> CollectionRecord {
+    #[cfg(test)]
+    COLLECTION_RECORD_READS.with(|reads| reads.set(reads.get() + 1));
     debug_assert!(offset < applied_length);
     let bytes = unsafe {
         slice_from_raw_parts(mmap.as_ptr().add(offset), applied_length - offset)
@@ -539,6 +546,40 @@ fn collection_record_at(mmap: &MmapRaw, applied_length: usize, offset: usize) ->
             ..
         }) => record,
         _ => unreachable!("an indexed frame offset names an applied collection record"),
+    }
+}
+
+/// Records already read under the member a key-ordered walk is currently in.
+///
+/// Replay indexes every frame, so a pile made by concatenation can hold one
+/// record in several frames. Every copy produces the same member of the same
+/// collection, so they share the key's 64-byte prefix and a walk in key order
+/// meets all of them inside one contiguous run; only that run needs to be
+/// remembered to hand out each record once.
+struct MemberRun {
+    member: Option<[u8; 64]>,
+    seen: BTreeSet<CollectionRecord>,
+}
+
+impl MemberRun {
+    fn new() -> Self {
+        Self {
+            member: None,
+            seen: BTreeSet::new(),
+        }
+    }
+
+    /// Whether `record`, read from the frame `key` names, is the first copy
+    /// of it this walk has met.
+    fn first(&mut self, key: &[u8; 72], record: CollectionRecord) -> bool {
+        let member: [u8; 64] = key[..64]
+            .try_into()
+            .expect("key head is collection and member");
+        if self.member != Some(member) {
+            self.member = Some(member);
+            self.seen.clear();
+        }
+        self.seen.insert(record)
     }
 }
 
@@ -2701,6 +2742,9 @@ impl Pile {
 /// dangling [`Bytes`] handles.
 pub struct PileFile {
     file: File,
+    /// Identity of this append-only reader lineage, preserved across remaps.
+    /// Physical record offsets are comparable only within this lineage.
+    record_origin: Arc<()>,
     mmap: Arc<MmapRaw>,
     /// Whether this handle has appended or truncated bytes since its last
     /// successful durability barrier. Refreshing bytes written by another
@@ -2770,6 +2814,7 @@ fn padding_for_blob(blob_size: usize) -> usize {
 /// cloning and [`StoreSnapshot::changes_since`](super::StoreSnapshot::changes_since)
 /// constant-time in the number of semantic components.
 pub struct PileFileSnapshot {
+    record_origin: Arc<()>,
     mmap: Arc<MmapRaw>,
     covered_len: usize,
     opaque_records: usize,
@@ -2805,6 +2850,7 @@ pub struct WantCutoverStatus {
 
 impl PileFileSnapshot {
     fn new(
+        record_origin: Arc<()>,
         mmap: Arc<MmapRaw>,
         covered_len: usize,
         opaque_records: usize,
@@ -2815,6 +2861,7 @@ impl PileFileSnapshot {
         wants: PATCH<WANT_REQUEST_BYTES_LEN, IdentitySchema>,
     ) -> Self {
         Self {
+            record_origin,
             mmap,
             covered_len,
             opaque_records,
@@ -2982,7 +3029,9 @@ impl super::StoreSnapshot for PileFileSnapshot {
         if !previous.blobs.shares_root(&self.blobs) {
             changes = changes.union(super::StoreChanges::BLOBS);
         }
-        if previous.collection_records != self.collection_records {
+        if !Arc::ptr_eq(&self.record_origin, &previous.record_origin)
+            || previous.collection_records != self.collection_records
+        {
             changes = changes.union(super::StoreChanges::COLLECTION_RECORDS);
         }
         if previous.capability_proofs != self.capability_proofs {
@@ -3060,6 +3109,7 @@ impl super::SnapshotSource for PileFile {
     fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
         self.refresh()?;
         Ok(PileFileSnapshot::new(
+            self.record_origin.clone(),
             self.mmap.clone(),
             self.applied_length,
             self.opaque_records,
@@ -3437,6 +3487,7 @@ impl PileFile {
 
         Ok(Self {
             file,
+            record_origin: Arc::new(()),
             mmap,
             dirty: false,
             blobs: PileBlobIndex::new(),
@@ -3574,19 +3625,23 @@ impl PileFile {
             PileRecordContent::RetiredWantAssert { .. }
             | PileRecordContent::RetiredWantRetract { .. } => Applied::RetiredWantState,
             PileRecordContent::Collection { record } => {
-                // A frame repeating an indexed record adds nothing: the
-                // index names the first frame and reads the record from it.
-                // Nothing is hashed; the producers of this member are the
-                // only candidates, and they are compared as records.
-                if !collection_record_indexed(
-                    &self.collection_records,
-                    &self.mmap,
-                    self.applied_length,
-                    &record,
-                ) {
-                    self.collection_records
-                        .insert(&Entry::new(&collection_record_key(&record, start_offset)));
-                }
+                // Every frame is indexed, including one that repeats a record
+                // an earlier frame already holds. Replay used to compare each
+                // frame against every earlier producer of the same member,
+                // decoding each to check, so a member with k producers cost
+                // about k²/2 decodes: 294 million per open of a 68 GB pile,
+                // ~98% of a faculty call's CPU, and it never collapsed
+                // anything, since a byte-level scan of that pile found all
+                // 1,367,796 of its collection frames distinct. Nothing needs
+                // it here. `insert` still refuses to append a record the file
+                // holds, so a repeated frame can only come from concatenating
+                // piles; the coverage fold is idempotent, so seeing a record
+                // twice changes nothing it derives; and the reads that promise
+                // each record once skip repeats within the member's run of
+                // keys. The price is an extra index entry per repeated frame,
+                // until a compaction rewrites the pile through `insert`.
+                self.collection_records
+                    .insert(&Entry::new(&collection_record_key(&record, start_offset)));
                 Applied::Collection { record }
             }
             PileRecordContent::CapabilityProof {
@@ -3779,6 +3834,7 @@ impl PileFile {
 
         let mut this = std::mem::ManuallyDrop::new(self);
         unsafe {
+            std::ptr::drop_in_place(&mut this.record_origin);
             std::ptr::drop_in_place(&mut this.mmap);
             std::ptr::drop_in_place(&mut this.file);
             std::ptr::drop_in_place(&mut this.blobs);
@@ -3937,11 +3993,13 @@ impl BlobStoreList for PileFileSnapshot {
 }
 
 /// Deterministic owned snapshot of the pile's native collection records:
-/// the index walked in key order, each record read from its frame.
+/// the index walked in key order, each record read from its frame and handed
+/// out once, however many frames hold it.
 pub struct PileCollectionRecordIter {
     keys: crate::patch::PATCHIntoOrderedIterator<72, collection_record_key::Schema, (), XorSip128>,
     mmap: Arc<MmapRaw>,
     covered_len: usize,
+    run: MemberRun,
 }
 
 /// Deterministic owned snapshot of the pile's complete capability proofs.
@@ -3967,9 +4025,15 @@ impl Iterator for PileCollectionRecordIter {
     type Item = Result<CollectionRecord, ReadError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let key = self.keys.next()?;
-        let offset = collection_record_offset(key[64..].try_into().expect("key tail is the offset"));
-        Some(Ok(collection_record_at(&self.mmap, self.covered_len, offset)))
+        loop {
+            let key = self.keys.next()?;
+            let offset =
+                collection_record_offset(key[64..].try_into().expect("key tail is the offset"));
+            let record = collection_record_at(&self.mmap, self.covered_len, offset);
+            if self.run.first(&key, record) {
+                return Some(Ok(record));
+            }
+        }
     }
 }
 
@@ -4124,6 +4188,65 @@ impl crate::collection::covered::RecordDelta for PileFileSnapshot {
 }
 
 impl PileFileSnapshot {
+    fn select_record_index(
+        &self,
+        index: &CollectionRecordIndex,
+        selectors: &BTreeSet<CollectionRecordSelector>,
+    ) -> Result<Vec<CollectionRecord>, ReadError> {
+        if selectors.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut keys = Vec::new();
+        let mut frames_under = |prefix: [u8; 64]| {
+            index.infixes(&prefix, |offset: &[u8; 8]| {
+                let mut key = [0; 72];
+                key[..64].copy_from_slice(&prefix);
+                key[64..].copy_from_slice(offset);
+                keys.push(key);
+            });
+        };
+        for selector in selectors {
+            let collection = match selector {
+                CollectionRecordSelector::ProducedMember(collection, output)
+                | CollectionRecordSelector::CommitMember(collection, output) => {
+                    let mut prefix = [0; 64];
+                    prefix[..32].copy_from_slice(&collection.raw);
+                    prefix[32..].copy_from_slice(&output.raw);
+                    frames_under(prefix);
+                    continue;
+                }
+                CollectionRecordSelector::Collection(collection)
+                | CollectionRecordSelector::MergeCollection(collection)
+                | CollectionRecordSelector::DeriveTarget(collection) => collection,
+            };
+            // An infix is one segment: the members first, then each
+            // member's frames.
+            let mut members = Vec::new();
+            index.infixes(&collection.raw, |member: &[u8; 32]| members.push(*member));
+            for member in members {
+                let mut prefix = [0; 64];
+                prefix[..32].copy_from_slice(&collection.raw);
+                prefix[32..].copy_from_slice(&member);
+                frames_under(prefix);
+            }
+        }
+        // Overlapping routes name a frame more than once, and a pile made
+        // by concatenation can hold one record in more than one frame; each
+        // record is read and returned once, in the index's order, the same
+        // order `records` walks.
+        keys.sort_unstable();
+        keys.dedup();
+        let mut run = MemberRun::new();
+        Ok(keys
+            .iter()
+            .filter_map(|key| {
+                let record = self.record_at(key[64..].try_into().expect("key tail is the offset"));
+                (selectors_match_record(selectors, record) && run.first(key, record))
+                    .then_some(record)
+            })
+            .collect())
+    }
+
     /// The record whose frame the index named.
     fn record_at(&self, offset: &[u8; 8]) -> CollectionRecord {
         collection_record_at(
@@ -4145,6 +4268,7 @@ impl CollectionRead for PileFileSnapshot {
             keys: self.collection_records.clone().into_iter_ordered(),
             mmap: self.mmap.clone(),
             covered_len: self.covered_len,
+            run: MemberRun::new(),
         })
     }
 
@@ -4163,55 +4287,54 @@ impl CollectionRead for PileFileSnapshot {
         &self,
         selectors: &BTreeSet<CollectionRecordSelector>,
     ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
+        self.select_record_index(&self.collection_records, selectors)
+    }
+
+    fn select_record_changes(
+        &self,
+        previous: &Self,
+        selectors: &BTreeSet<CollectionRecordSelector>,
+    ) -> Result<(Vec<CollectionRecord>, Vec<CollectionRecord>), Self::RecordsError> {
         if selectors.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
-        let mut keys = Vec::new();
-        let mut frames_under = |prefix: [u8; 64]| {
-            self.collection_records
-                .infixes(&prefix, |offset: &[u8; 8]| {
-                    let mut key = [0; 72];
-                    key[..64].copy_from_slice(&prefix);
-                    key[64..].copy_from_slice(offset);
-                    keys.push(key);
-                });
-        };
-        for selector in selectors {
-            let collection = match selector {
-                CollectionRecordSelector::ProducedMember(collection, output)
-                | CollectionRecordSelector::CommitMember(collection, output) => {
-                    let mut prefix = [0; 64];
-                    prefix[..32].copy_from_slice(&collection.raw);
-                    prefix[32..].copy_from_slice(&output.raw);
-                    frames_under(prefix);
-                    continue;
-                }
-                CollectionRecordSelector::Collection(collection)
-                | CollectionRecordSelector::MergeCollection(collection)
-                | CollectionRecordSelector::DeriveTarget(collection) => collection,
-            };
-            // An infix is one segment: the members first, then each
-            // member's frames.
-            let mut members = Vec::new();
-            self.collection_records
-                .infixes(&collection.raw, |member: &[u8; 32]| members.push(*member));
-            for member in members {
-                let mut prefix = [0; 64];
-                prefix[..32].copy_from_slice(&collection.raw);
-                prefix[32..].copy_from_slice(&member);
-                frames_under(prefix);
-            }
+        // Physical keys can name different bytes in independently opened or
+        // rewritten piles. Only a shared append-only reader lineage proves
+        // offset identity. In-place overwrites violate snapshot immutability.
+        if !Arc::ptr_eq(&self.record_origin, &previous.record_origin) {
+            return crate::collection::store::selected_record_changes(self, previous, selectors);
         }
-        // Overlapping routes name a frame more than once; each record is
-        // read and returned once, in the index's order, the same order
-        // `records` walks.
-        keys.sort_unstable();
-        keys.dedup();
-        Ok(keys
-            .iter()
-            .map(|key| self.record_at(key[64..].try_into().expect("key tail is the offset")))
-            .filter(|record| selectors_match_record(selectors, *record))
-            .collect())
+        let added = self
+            .collection_records
+            .difference(&previous.collection_records);
+        let removed = previous
+            .collection_records
+            .difference(&self.collection_records);
+        let added: BTreeSet<_> = self
+            .select_record_index(&added, selectors)?
+            .into_iter()
+            .filter(|record| {
+                !collection_record_indexed(
+                    &previous.collection_records,
+                    &previous.mmap,
+                    previous.covered_len,
+                    record,
+                )
+            })
+            .collect();
+        let removed: BTreeSet<_> = previous
+            .select_record_index(&removed, selectors)?
+            .into_iter()
+            .filter(|record| {
+                !collection_record_indexed(
+                    &self.collection_records,
+                    &self.mmap,
+                    self.covered_len,
+                    record,
+                )
+            })
+            .collect();
+        Ok((added.into_iter().collect(), removed.into_iter().collect()))
     }
 }
 
@@ -8420,6 +8543,131 @@ mod tests {
     }
 
     #[test]
+    fn selected_record_delta_reads_only_changed_bodies_across_append_and_remap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "selected-delta.pile");
+        let mut pile = PileFile::open(&path).unwrap();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let collection = collection_test_collection(21);
+        let selectors = BTreeSet::from([CollectionRecordSelector::Collection(collection)]);
+        for number in 0_u64..256 {
+            let mut raw = [0; 32];
+            raw[..8].copy_from_slice(&number.to_le_bytes());
+            pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
+                &key,
+                collection,
+                Inline::new(raw),
+                empty_metadata_handle(),
+            )))
+            .unwrap();
+        }
+        let before = pile.snapshot().unwrap();
+        // A remap is not a new physical lineage and must retain the delta path.
+        pile.ensure_mapped(pile.mmap.len() + 1).unwrap();
+        let added = CollectionRecord::Commit(CollectionCommit::sign(
+            &key,
+            collection,
+            collection_test_hash(90),
+            empty_metadata_handle(),
+        ));
+        pile.insert(added).unwrap();
+        pile.insert(collection_test_records()[0]).unwrap();
+        let after = pile.snapshot().unwrap();
+        assert!(!Arc::ptr_eq(&before.mmap, &after.mmap));
+        assert!(Arc::ptr_eq(&before.record_origin, &after.record_origin));
+
+        COLLECTION_RECORD_READS.with(|reads| reads.set(0));
+        assert_eq!(
+            after.select_record_changes(&before, &selectors).unwrap(),
+            (vec![added], vec![])
+        );
+        assert_eq!(
+            COLLECTION_RECORD_READS.with(|reads| reads.get()),
+            1,
+            "unchanged and unrelated record bodies must not be enumerated"
+        );
+        COLLECTION_RECORD_READS.with(|reads| reads.set(0));
+        assert_eq!(
+            before.select_record_changes(&after, &selectors).unwrap(),
+            (vec![], vec![added])
+        );
+        assert_eq!(COLLECTION_RECORD_READS.with(|reads| reads.get()), 1);
+        COLLECTION_RECORD_READS.with(|reads| reads.set(0));
+        assert_eq!(
+            after.select_record_changes(&after, &selectors).unwrap(),
+            (vec![], vec![])
+        );
+        assert_eq!(COLLECTION_RECORD_READS.with(|reads| reads.get()), 0);
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn selected_record_delta_handles_rewrites_reopens_and_duplicate_occurrences() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_path = fresh_empty_pile_path(&dir, "record-old.pile");
+        let second_path = fresh_empty_pile_path(&dir, "record-new.pile");
+        let record = collection_test_records()[0];
+        let CollectionRecord::Commit(commit) = record else {
+            panic!("fixture commit")
+        };
+        let replacement = CollectionRecord::Commit(CollectionCommit::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[99; 32]),
+            commit.collection(),
+            commit.data(),
+            commit.metadata(),
+        ));
+        let selectors = BTreeSet::from([CollectionRecordSelector::Collection(record.collection())]);
+        let mut first = PileFile::open(&first_path).unwrap();
+        first.insert(record).unwrap();
+        append_test_bytes(&first_path, &collection_record_header(&record));
+        let before = first.snapshot().unwrap();
+        let mut second = PileFile::open(&second_path).unwrap();
+        second.insert(replacement).unwrap();
+        let replaced = second.snapshot().unwrap();
+        // `before` also indexes the repeated frame, so the control is that
+        // every key `replaced` holds is one `before` holds too.
+        assert_eq!(before.collection_records.len(), 2);
+        assert!(
+            replaced
+                .collection_records
+                .difference(&before.collection_records)
+                .is_empty(),
+            "control: identical C/member/offset keys can hold different record bodies"
+        );
+        assert_eq!(
+            replaced.select_record_changes(&before, &selectors).unwrap(),
+            (vec![replacement], vec![record])
+        );
+
+        let mut reopened = PileFile::open(&first_path).unwrap();
+        let replay = reopened.snapshot().unwrap();
+        assert!(!Arc::ptr_eq(&before.record_origin, &replay.record_origin));
+        assert_eq!(
+            replay.select_record_changes(&before, &selectors).unwrap(),
+            (vec![], vec![])
+        );
+
+        let compact_path = fresh_empty_pile_path(&dir, "record-one-occurrence.pile");
+        let mut compact = PileFile::open(&compact_path).unwrap();
+        let empty = compact.snapshot().unwrap();
+        compact.insert(record).unwrap();
+        let one = compact.snapshot().unwrap();
+        assert_eq!(
+            one.select_record_changes(&before, &selectors).unwrap(),
+            (vec![], vec![]),
+            "dropping the duplicate physical occurrence must not remove the record"
+        );
+        assert_eq!(
+            empty.select_record_changes(&before, &selectors).unwrap(),
+            (vec![], vec![record])
+        );
+        compact.close().unwrap();
+        reopened.close().unwrap();
+        second.close().unwrap();
+        first.close().unwrap();
+    }
+
+    #[test]
     fn native_collection_record_insert_is_physically_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "idempotent.pile");
@@ -8435,6 +8683,178 @@ mod tests {
         assert_eq!(twice, once);
         assert_eq!(pile.snapshot().unwrap().records().unwrap().count(), 1);
         pile.close().unwrap();
+    }
+
+    /// Replay must not read earlier records back to compare against them.
+    /// It once compared every frame with each earlier producer of the same
+    /// member, which is quadratic in a member's producers and cost a live
+    /// 68 GB pile 294 million decodes per open.
+    ///
+    /// This counts records read back through the index rather than timing
+    /// replay. A wall-clock bound is either loose enough to let a quadratic
+    /// through at test sizes or tight enough to flake on a loaded runner; the
+    /// count is exact and names the property itself. Replay decodes each
+    /// frame from the bytes it is walking and has no reason to read any
+    /// record back, so the count is zero; the comparison read this fixture's
+    /// 64 producers back 64 * 63 / 2 = 2016 times.
+    #[test]
+    fn replay_reads_no_earlier_producer_of_a_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "many-producers.pile");
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let collection = collection_test_collection(60);
+        let output = collection_test_hash(61);
+        let producers = 64_u64;
+        let mut pile = PileFile::open(&path).unwrap();
+        for number in 0..producers {
+            let mut input = [0; 32];
+            input[..8].copy_from_slice(&number.to_le_bytes());
+            pile.insert(CollectionRecord::Derive(CollectionDerive::sign(
+                &key,
+                collection,
+                Inline::new(input),
+                output,
+            )))
+            .unwrap();
+        }
+        pile.close().unwrap();
+
+        COLLECTION_RECORD_READS.with(|reads| reads.set(0));
+        let mut reopened = PileFile::open(&path).unwrap();
+        let snapshot = reopened.snapshot().unwrap();
+        assert_eq!(
+            COLLECTION_RECORD_READS.with(|reads| reads.get()),
+            0,
+            "replay read earlier records back"
+        );
+        // Control: every producer is indexed under the one member.
+        let member = BTreeSet::from([CollectionRecordSelector::ProducedMember(collection, output)]);
+        assert_eq!(
+            snapshot.select_records(&member).unwrap().len() as u64,
+            producers
+        );
+        reopened.close().unwrap();
+    }
+
+    /// `cat a.pile >> a.pile` gives every record a second frame, and replay
+    /// indexes both without comparing them. No read may tell the difference:
+    /// enumeration and selection return each record once, coverage and the
+    /// frontier are those of the single copy, inserting a held record still
+    /// appends nothing, and a compaction, which rewrites through `insert`,
+    /// leaves one frame per record.
+    #[test]
+    fn a_repeated_frame_changes_no_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let single_path = fresh_empty_pile_path(&dir, "repeat-single.pile");
+        let doubled_path = dir.path().join("repeat-doubled.pile");
+        let compact_path = fresh_empty_pile_path(&dir, "repeat-compact.pile");
+        let authority = SigningKey::from_bytes(&[0xAA; 32]);
+        let low = collection_test_hash(6);
+        let high = collection_test_hash(7);
+        let result = collection_test_hash(8);
+        let (lineage, records) = {
+            let mut pile = Pile::open(&single_path).unwrap();
+            let lineage = register_simplearchive_collection(&mut pile, "repeat").handle();
+            let mut records: Vec<_> = [low, high]
+                .into_iter()
+                .map(|payload| {
+                    CollectionRecord::Commit(CollectionCommit::sign(
+                        &authority,
+                        lineage,
+                        payload,
+                        empty_metadata_handle(),
+                    ))
+                })
+                .collect();
+            records.push(CollectionRecord::Merge(CollectionMerge::sign(
+                &authority, lineage, low, high, result,
+            )));
+            for record in &records {
+                pile.insert(*record).unwrap();
+            }
+            pile.close().unwrap();
+            (lineage, records)
+        };
+        let bytes = std::fs::read(&single_path).unwrap();
+        let mut doubled = bytes.clone();
+        doubled.extend_from_slice(&bytes);
+        std::fs::write(&doubled_path, doubled).unwrap();
+
+        let mut single = Pile::open(&single_path).unwrap();
+        let mut repeated = Pile::open(&doubled_path).unwrap();
+        let one = single.snapshot().unwrap();
+        let two = repeated.snapshot().unwrap();
+        // Control: the repeat really is indexed, once per frame.
+        assert_eq!(
+            two.collection_records.len(),
+            2 * one.collection_records.len()
+        );
+        assert_eq!(
+            two.records()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            one.records()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        );
+        let selectors = BTreeSet::from([
+            CollectionRecordSelector::Collection(lineage),
+            CollectionRecordSelector::ProducedMember(lineage, result),
+        ]);
+        assert_eq!(
+            two.select_records(&selectors).unwrap(),
+            one.select_records(&selectors).unwrap()
+        );
+        assert_eq!(
+            one.coverage_index()
+                .coverage(lineage, result)
+                .map(|row| row.len()),
+            Some(2),
+            "control: the fixture derives something"
+        );
+        let (one_coverage, two_coverage) = (one.coverage(), two.coverage());
+        assert_eq!(two_coverage, one_coverage);
+        assert_eq!(
+            one_coverage.frontier(lineage).collect::<Vec<_>>(),
+            vec![result],
+            "control: the merge consumed both commits"
+        );
+        assert_eq!(
+            two_coverage.frontier(lineage).collect::<Vec<_>>(),
+            one_coverage.frontier(lineage).collect::<Vec<_>>()
+        );
+
+        let length = std::fs::metadata(&doubled_path).unwrap().len();
+        for record in &records {
+            repeated.insert(*record).unwrap();
+        }
+        assert_eq!(std::fs::metadata(&doubled_path).unwrap().len(), length);
+
+        let mut compacted = Pile::open(&compact_path).unwrap();
+        repeated
+            .rewrite_retained_into(
+                &mut compacted,
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+            )
+            .unwrap();
+        let three = compacted.snapshot().unwrap();
+        assert_eq!(three.collection_records.len(), one.collection_records.len());
+        assert_eq!(
+            sorted_collection_records(
+                three
+                    .records()
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+            ),
+            sorted_collection_records(records)
+        );
+        compacted.close().unwrap();
+        repeated.close().unwrap();
+        single.close().unwrap();
     }
 
     #[test]

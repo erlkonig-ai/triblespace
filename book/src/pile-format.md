@@ -610,13 +610,21 @@ wherever a fixed-width identity is needed, such as the network delta PATCH; it
 names a record, not a blob, invented entity, or member of `Support`. The pile
 computes none at replay.
 
-Pile replay indexes each record once, by the collection it names, the member
-it produces, and the offset of the first frame holding it. A frame repeating
-an indexed record adds nothing, and inserting a record the file already holds
-appends nothing: the producers of the same member are the only records it
-could be, and they are compared as records. Concatenating piles therefore
-gives set-union semantics for collection records: append order and duplicate
-copies do not change the discovered collection calculus. Current operational
+Pile replay indexes every collection frame, by the collection it names, the
+member it produces, and the frame's offset. Inserting a record the file already
+holds appends nothing: the producers of the same member are the only records it
+could be, and they are compared as records. Replay does not make that
+comparison. Done per frame it is quadratic in a member's producers, and on a
+68&nbsp;GB pile it cost 294 million record decodes per open while collapsing
+nothing, because that pile's 1,367,796 collection frames were all distinct.
+Since `insert` never writes a repeat, a record can only occupy two frames when
+piles are concatenated, and then each frame gets its own index entry until a
+compaction rewrites the pile through `insert`. Reads hide the repeat: every copy
+of a record sits under the same `collection | member` prefix, so a walk in key
+order meets them together and hands the record out once, and the coverage fold
+is idempotent. Concatenating piles therefore gives set-union semantics for
+collection records: append order and duplicate copies do not change the
+discovered collection calculus. Current operational
 WANTs are likewise a grow-only set. Historical pins remain ordered evidence;
 retired WANT logs are only explicit migration input and do not participate in
 ordinary replay.

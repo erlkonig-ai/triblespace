@@ -1,4 +1,5 @@
 use super::*;
+use clap::Parser;
 use triblespace_core::collection::{CollectionCommit, CollectionDerive, CollectionMerge};
 use triblespace_core::prelude::*;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
@@ -54,9 +55,7 @@ impl<S: Store> Fixture<S> {
     fn options(&self) -> Options {
         Options {
             telemetry_collection: Some(hex::encode(self.reports.handle().raw)),
-            telemetry_node: Some(hex::encode(self.signer.verifying_key().to_bytes())),
             telemetry_worker: Some("test-maintainer".into()),
-            telemetry_key: None,
             telemetry_interval_secs: Some(60),
         }
     }
@@ -223,10 +222,6 @@ fn options_are_opt_in_and_require_valid_explicit_scope() {
     let valid = fixture.options();
     for invalid in [
         Options {
-            telemetry_node: None,
-            ..valid.clone()
-        },
-        Options {
             telemetry_worker: None,
             ..valid.clone()
         },
@@ -236,10 +231,6 @@ fn options_are_opt_in_and_require_valid_explicit_scope() {
         },
         Options {
             telemetry_worker: Some("nul\0label".into()),
-            ..valid.clone()
-        },
-        Options {
-            telemetry_node: Some("not an endpoint".into()),
             ..valid.clone()
         },
         Options {
@@ -260,6 +251,33 @@ fn options_are_opt_in_and_require_valid_explicit_scope() {
 }
 
 #[test]
+fn maintenance_cli_rejects_independent_telemetry_identities() {
+    let fixture = Fixture::new();
+    let handle = hex::encode(fixture.reports.handle().raw);
+    for command in ["maintain", "maintain-all"] {
+        let args = [
+            "collection",
+            command,
+            "test.pile",
+            "target",
+            "--telemetry-collection",
+            handle.as_str(),
+            "--telemetry-worker",
+            "test-maintainer",
+        ];
+        assert!(super::super::Command::try_parse_from(args).is_ok());
+        for option in ["--telemetry-key", "--telemetry-node"] {
+            let error = super::super::Command::try_parse_from(
+                args.into_iter().chain([option, "independent-identity"]),
+            )
+            .err()
+            .expect("independent telemetry identity must be rejected");
+            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        }
+    }
+}
+
+#[test]
 fn telemetry_preflight_does_not_create_authority_or_accept_the_wrong_writer() {
     let mut fixture = Fixture::new();
     let before = fixture.store.snapshot().unwrap();
@@ -270,21 +288,30 @@ fn telemetry_preflight_does_not_create_authority_or_accept_the_wrong_writer() {
         Err(Failure::Authority)
     ));
     assert!(fixture.store.snapshot().unwrap() == before);
-    let directory = tempfile::tempdir().unwrap();
-    let missing_key = directory.path().join("missing.key");
-    let config = Options {
-        telemetry_key: Some(missing_key.clone()),
-        ..fixture.options()
+}
+
+#[test]
+fn telemetry_endpoint_and_commit_author_are_the_maintenance_signer() {
+    let mut fixture = Fixture::new();
+    let mut producer = fixture.telemetry();
+    producer.emit_due(&mut fixture.store);
+    let expected = fixture.signer.verifying_key().to_bytes();
+    let reports = fixture.reports();
+    assert_eq!(reports.len(), 4);
+    assert!(reports.iter().all(|report| report.node == expected));
+
+    let snapshot = fixture.store.snapshot().unwrap();
+    let mut commits = 0;
+    for record in snapshot.records().unwrap() {
+        let record = record.unwrap();
+        if record.collection() == fixture.reports.handle() {
+            assert!(matches!(record, CollectionRecord::Commit(_)));
+            assert!(record.verify_strict().is_ok());
+            assert_eq!(record.public_key().raw, expected);
+            commits += 1;
+        }
     }
-    .config()
-    .unwrap()
-    .unwrap();
-    assert!(matches!(
-        Telemetry::open(&mut fixture.store, config, &fixture.signer),
-        Err(Failure::Key)
-    ));
-    assert!(!missing_key.exists());
-    assert!(fixture.store.snapshot().unwrap() == before);
+    assert_eq!(commits, 1);
 }
 
 #[test]

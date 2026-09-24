@@ -1,11 +1,12 @@
 //! Collection-scoped anti-entropy for triblespace.
 //!
-//! [`Peer<S>`](peer::Peer) wraps one store. Periodic per-request authorized
+//! [`Peer<S>`](peer::Peer) wraps one store. Root-driven, per-request authorized
 //! PATCH walks converge one explicitly active collection's records and
 //! collection-scoped native evidence for descriptor-declared capabilities. A separate
-//! stock-gossip wake plane carries only a signed endpoint origin and opaque
-//! per-collection anti-entropy root; knowing the collection handle is its
-//! discovery capability, while every useful collection byte remains
+//! stock-gossip wake plane periodically offers a signed endpoint origin and
+//! opaque per-collection anti-entropy root, suppressing redundant local offers.
+//! Policy roots, scoped AUTH keys and ordinary descriptor-blob providers supply
+//! candidate contacts, never authority; every useful collection byte remains
 //! capability-gated.
 //! Exact content reads are independent: every served resident blob may publish
 //! a full-width opaque locator derived from its bearer handle H. The selected
@@ -21,6 +22,7 @@
 pub(crate) mod bearer;
 mod channel;
 pub mod collection_activation;
+pub(crate) mod collection_blob_inventory;
 pub mod collection_delta;
 pub(crate) mod collection_session;
 pub(crate) mod collection_wire;
@@ -35,7 +37,6 @@ pub(crate) const RETRY_BACKOFF_BASE: std::time::Duration = std::time::Duration::
 pub(crate) const RETRY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(60);
 pub mod clock;
 pub mod dashboard;
-pub mod telemetry;
 pub mod health;
 pub mod health_record;
 pub mod host;
@@ -47,5 +48,8 @@ pub mod protocol;
 pub mod provider;
 pub mod reconcile;
 pub(crate) mod routing;
+pub mod telemetry;
 pub mod transport;
 pub mod wake;
+mod wake_relay;
+mod wake_schedule;

@@ -304,6 +304,21 @@ impl<R: CollectionRead> CollectionRead for ObservedStore<R> {
             .extend(selectors.iter().copied());
         self.inner.select_records(selectors)
     }
+
+    fn select_record_changes(
+        &self,
+        previous: &Self,
+        selectors: &BTreeSet<CollectionRecordSelector>,
+    ) -> Result<(Vec<CollectionRecord>, Vec<CollectionRecord>), Self::RecordsError> {
+        for tracker in [&self.tracker, &previous.tracker] {
+            tracker
+                .lock()
+                .expect("store dependency tracker is not poisoned")
+                .records
+                .extend(selectors.iter().copied());
+        }
+        self.inner.select_record_changes(&previous.inner, selectors)
+    }
 }
 
 impl<R: CapabilityProofRead> CapabilityProofRead for ObservedStore<R> {
@@ -599,6 +614,37 @@ mod tests {
         assert!(observed.proof(proof.id()).unwrap().is_none());
         assert!(observed.dependencies().capability_proofs);
         assert!(!observed.dependencies().all_records);
+    }
+
+    #[test]
+    fn selected_record_changes_track_both_observations_without_global_reads() {
+        use crate::collection::CollectionStore;
+
+        let mut store = MemoryRepo::default();
+        let before = ObservedStore::new(store.snapshot().unwrap());
+        let collection = crate::collection::CollectionHandle::new([73; 32]);
+        let record = CollectionRecord::Commit(CollectionCommit::sign(
+            &SigningKey::from_bytes(&[7; 32]),
+            collection,
+            crate::collection::CollectionData::new([74; 32]),
+            empty_metadata_handle(),
+        ));
+        store.insert(record).unwrap();
+        let after = ObservedStore::new(store.snapshot().unwrap());
+        let selectors = BTreeSet::from([CollectionRecordSelector::Collection(collection)]);
+        assert_eq!(
+            after.select_record_changes(&before, &selectors).unwrap(),
+            (vec![record], vec![]),
+        );
+        for observed in [&before, &after] {
+            assert_eq!(
+                observed.dependencies(),
+                StoreDependencies {
+                    records: selectors.clone(),
+                    ..StoreDependencies::default()
+                }
+            );
+        }
     }
 
     #[test]

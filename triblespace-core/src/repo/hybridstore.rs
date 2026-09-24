@@ -342,6 +342,15 @@ where
     ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
         self.records.select_records(selectors)
     }
+
+    fn select_record_changes(
+        &self,
+        previous: &Self,
+        selectors: &std::collections::BTreeSet<crate::collection::CollectionRecordSelector>,
+    ) -> Result<(Vec<CollectionRecord>, Vec<CollectionRecord>), Self::RecordsError> {
+        self.records
+            .select_record_changes(&previous.records, selectors)
+    }
 }
 
 impl<B, R> CapabilityProofRead for HybridSnapshot<B, R>

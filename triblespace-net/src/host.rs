@@ -5,9 +5,9 @@
 //! one stream admitted from the server's complete local READ(C) closure. A
 //! client's bounded native-proof bootstrap is retained as inert authorization
 //! evidence for later coherent observations. DHT routing and provider-directory
-//! operations discover collection participants through an opaque KDF(C). Exact bytes use
-//! a separate H-only DHT rendezvous and mutual key-confirmation stream;
-//! collection identity never participates.
+//! operations discover exact blob holders through opaque KDF(H) locators.
+//! Descriptor holders and scoped authority keys are collection gossip bootstrap
+//! hints, never declarations of membership or authority.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, mpsc};
@@ -31,9 +31,16 @@ use triblespace_core::repo::{
 };
 
 use crate::bearer::{BearerLocatorIndex, blob_locator, locator_index, update_locator_index};
-use crate::channel::{NetCommand, NetEvent, NetEventBatch, SnapshotNotice};
+use crate::channel::{NetEvent, NetEventBatch};
 use crate::collection_activation::{CollectionRepairOverlay, CollectionRepairOverlayError};
-use crate::collection_session::{manifest, pull_collection, serve_collection_repair};
+use crate::collection_blob_inventory::{
+    BlobInventoryChange, CollectionBlobInventory, ResidentBlobPatch, ScanBudget,
+};
+use crate::collection_delta::update_collection_record_patch;
+use crate::collection_session::{
+    CollectionRepairRefusal, InventoryRepairCursor, manifest, pull_collection,
+    serve_collection_repair,
+};
 use crate::collection_wire::{MAX_COLLECTION_READ_BOOTSTRAP_PROOFS, OP_COLLECTION_REPAIR};
 use crate::health::{
     CollectionHealth, Health, HealthSnapshot, RepairComparison, RepairFailure, StoreHealth,
@@ -47,8 +54,7 @@ use crate::protocol::{
 };
 use crate::provider::{
     ProviderDirectory, ProviderKey, ProviderObservation, ProviderPublication, ProviderPublisher,
-    ProviderPutResult, ProviderToken, PublicationResult, blob_provider_token,
-    collection_provider_key, collection_provider_token, provider_lease_token,
+    ProviderPutResult, ProviderToken, PublicationResult, blob_provider_token, provider_lease_token,
 };
 use crate::routing::{ALPHA, IterativeLookup, K, RoutingKey, RoutingTable};
 use crate::transport::{Conn, Harness, PeerId, Transport};
@@ -56,6 +62,7 @@ use crate::wake::{
     CollectionWakeEvent, CollectionWakeNetwork, CollectionWakePlane, CollectionWakeRoot,
     CollectionWakeSubscription, ReceivedCollectionWake,
 };
+use crate::wake_schedule::WakeSchedule;
 
 /// Ephemeral local collection interest. It is deliberately not a durable
 /// marker or ambient registry.
@@ -150,9 +157,12 @@ impl BlobStoreGet for ResidentBlobReader {
 pub(crate) struct CollectionSnapshot {
     repair: Arc<CollectionRepairOverlay>,
     read_bootstrap: Arc<[CapabilityProof]>,
+    blob_seeds: ResidentBlobPatch,
+    blob_scan: CollectionBlobInventory,
 }
 
 impl CollectionSnapshot {
+    #[cfg(test)]
     pub(crate) fn collection(&self) -> CollectionHandle {
         self.repair.collection()
     }
@@ -160,6 +170,89 @@ impl CollectionSnapshot {
     fn wake_root(&self) -> [u8; 32] {
         self.repair.wake_root()
     }
+
+    fn with_resident_inventory<R: BlobStoreGet>(
+        repair: CollectionRepairOverlay,
+        read_bootstrap: Arc<[CapabilityProof]>,
+        prior: Option<&Self>,
+        reader: &R,
+        change: BlobInventoryChange,
+        budget: ScanBudget,
+    ) -> Self {
+        let mut seeds = prior.map_or_else(ResidentBlobPatch::new, |prior| prior.blob_seeds.clone());
+        let records = repair.records().patch();
+        let empty = triblespace_core::patch::PATCH::new();
+        let previous_records = prior.map_or(&empty, |prior| prior.repair.records().patch());
+        let removed = !previous_records.difference(records).is_empty();
+        let authority_changed = prior.is_none_or(|prior| {
+            prior.repair.authorization_evidence().summary()
+                != repair.authorization_evidence().summary()
+        });
+        if removed || authority_changed {
+            seeds = ResidentBlobPatch::new();
+        }
+        seeds.insert(&PatchEntry::new(&repair.collection().raw));
+        let additions = if removed || authority_changed {
+            records.clone()
+        } else {
+            records.difference(previous_records)
+        };
+        for id in additions.iter_ordered() {
+            for handle in additions
+                .get(id)
+                .expect("PATCH entry exists")
+                .blob_references()
+            {
+                seeds.insert(&PatchEntry::new(&handle.raw));
+            }
+        }
+        if removed || authority_changed {
+            for proof in repair.authorization_evidence().proofs() {
+                for handle in proof.blob_references() {
+                    seeds.insert(&PatchEntry::new(&handle.raw));
+                }
+            }
+        }
+        let mut scan = prior.map_or_else(CollectionBlobInventory::default, |prior| {
+            prior.blob_scan.clone()
+        });
+        scan.observe_patch(seeds.clone(), change);
+        // A bounded CPU quantum per active collection; no network operation
+        // or complete payload walk is hidden in snapshot publication.
+        scan.advance(reader, budget);
+        let repair = repair.with_blob_inventory(Arc::new(scan.patch().clone()));
+        Self {
+            repair: Arc::new(repair),
+            read_bootstrap,
+            blob_seeds: seeds,
+            blob_scan: scan,
+        }
+    }
+}
+
+/// Bounded, rotating sample of authority identities. These are only possible
+/// topic contacts; neither an AUTH edge nor a descriptor asserts residency.
+fn collection_bootstrap_candidates(
+    snapshot: &CollectionSnapshot,
+    local: PeerId,
+    salt: PeerId,
+) -> Vec<EndpointId> {
+    let mut selected = BTreeSet::new();
+    for key in snapshot.repair.discovery_candidates() {
+        let peer = key.to_bytes();
+        if peer == local {
+            continue;
+        }
+        let rank = std::array::from_fn::<_, 32, _>(|index| peer[index] ^ salt[index]);
+        selected.insert((rank, peer));
+        if selected.len() > MAX_COLLECTION_PARTICIPANTS {
+            selected.pop_last();
+        }
+    }
+    selected
+        .into_iter()
+        .filter_map(|(_, peer)| EndpointId::from_bytes(&peer).ok())
+        .collect()
 }
 
 /// Fixed results and their raw lookup interests, including a missing descriptor.
@@ -171,11 +264,26 @@ struct CollectionObservation {
 
 type CollectionSnapshotIndex = PATCH<32, IdentitySchema, Arc<CollectionObservation>>;
 
+/// Resume after the last issued lookup, not the first collection on each turn.
+/// Slow early lookups must not repeatedly consume every discovery slot.
+fn discovery_order(
+    collections: &CollectionSnapshotIndex,
+    after: Option<RawHash>,
+) -> impl Iterator<Item = &RawHash> {
+    collections
+        .iter_ordered()
+        .filter(move |raw| after.is_none_or(|after| **raw > after))
+        .chain(
+            collections
+                .iter_ordered()
+                .take_while(move |raw| after.is_some_and(|after| **raw <= after)),
+        )
+}
+
 /// Immutable host observation indexed exactly by active collection handle.
 ///
-/// Each value pins the repair product: record PATCH × native
-/// authorization-evidence PATCH. No global team inventory, proof list, or
-/// blob manifest is retained.
+/// Each value pins record, native authorization-evidence, and positive resident
+/// blob PATCHes. There is no global team or plaintext payload inventory.
 pub(crate) struct StoreSnapshot {
     collections: CollectionSnapshotIndex,
     local: VerifyingKey,
@@ -211,6 +319,24 @@ impl StoreSnapshot {
         // not change. A later peer request may name a previously unseen R or
         // capability definition, outside any construction-time read set.
         let reader = ResidentBlobReader::new(&snapshot);
+        let active_count = usize::try_from(active.len()).unwrap_or(usize::MAX).max(1);
+        let scan_budget = ScanBudget {
+            words: (16_384 / active_count).clamp(1, 1024),
+            sources: (1024 / active_count).clamp(1, 64),
+        };
+        let blob_change = match previous {
+            None => BlobInventoryChange::MayRemove,
+            Some(previous)
+                if !previous
+                    .bearer_locators
+                    .difference(&bearer_locators)
+                    .is_empty() =>
+            {
+                BlobInventoryChange::MayRemove
+            }
+            Some(_) if changes.contains(StoreChanges::BLOBS) => BlobInventoryChange::Additions,
+            Some(_) => BlobInventoryChange::Unchanged,
+        };
         for raw in active.iter_ordered() {
             let collection = CollectionHandle::new(*raw);
             let prior = previous.and_then(|prior| prior.collections.get(&collection.raw));
@@ -222,10 +348,14 @@ impl StoreSnapshot {
             };
             if let Some(prior) = prior.filter(|_| relevant.is_empty()) {
                 let value = prior.value.as_ref().map(|prior| {
-                    Arc::new(CollectionSnapshot {
-                        repair: Arc::new(prior.repair.as_ref().clone().with_reader(reader.clone())),
-                        read_bootstrap: prior.read_bootstrap.clone(),
-                    })
+                    Arc::new(CollectionSnapshot::with_resident_inventory(
+                        prior.repair.as_ref().clone().with_reader(reader.clone()),
+                        prior.read_bootstrap.clone(),
+                        Some(prior),
+                        &reader,
+                        blob_change,
+                        scan_budget,
+                    ))
                 });
                 collections.insert(&PatchEntry::with_value(
                     raw,
@@ -238,9 +368,23 @@ impl StoreSnapshot {
             }
             let observed = ObservedStore::new(snapshot.clone());
             let prior_value = prior.and_then(|prior| prior.value.as_ref());
-            let records = prior_value
-                .filter(|_| !relevant.contains(StoreChanges::COLLECTION_RECORDS))
-                .map(|prior| prior.repair.records());
+            let updated_records = match (previous_store, prior_value) {
+                (Some(before), Some(prior))
+                    if relevant.contains(StoreChanges::COLLECTION_RECORDS) =>
+                {
+                    Some(update_collection_record_patch(
+                        &observed,
+                        &ObservedStore::new(before.clone()),
+                        prior.repair.records(),
+                    )?)
+                }
+                _ => None,
+            };
+            let records = updated_records.as_ref().or_else(|| {
+                prior_value
+                    .filter(|_| !relevant.contains(StoreChanges::COLLECTION_RECORDS))
+                    .map(|prior| prior.repair.records())
+            });
             let authorization = prior_value
                 .filter(|_| {
                     !relevant.contains(StoreChanges::BLOBS)
@@ -294,10 +438,14 @@ impl StoreSnapshot {
             dependencies
                 .records
                 .insert(CollectionRecordSelector::Collection(collection));
-            let value = Arc::new(CollectionSnapshot {
-                repair: Arc::new(repair.with_reader(reader.clone())),
+            let value = Arc::new(CollectionSnapshot::with_resident_inventory(
+                repair.with_reader(reader.clone()),
                 read_bootstrap,
-            });
+                prior_value.map(Arc::as_ref),
+                &reader,
+                blob_change,
+                scan_budget,
+            ));
             collections.insert(&PatchEntry::with_value(
                 raw,
                 Arc::new(CollectionObservation {
@@ -318,16 +466,11 @@ impl StoreSnapshot {
         self.collections.get(&collection.raw)?.value.clone()
     }
 
+    #[cfg(test)]
     pub(crate) fn collections(&self) -> impl Iterator<Item = Arc<CollectionSnapshot>> + '_ {
         self.collections
             .iter_ordered()
             .filter_map(move |key| self.collections.get(key)?.value.clone())
-    }
-
-    fn notices(&self) -> Vec<(CollectionHandle, [u8; 32])> {
-        self.collections()
-            .map(|collection| (collection.collection(), collection.wake_root()))
-            .collect()
     }
 
     fn get_blob(&self, hash: &RawHash) -> Option<Bytes> {
@@ -341,10 +484,19 @@ impl StoreSnapshot {
     pub(crate) fn bearer_locators(&self) -> &BearerLocatorIndex {
         &self.bearer_locators
     }
+
+    pub(crate) fn inventory_pending(&self) -> bool {
+        self.collections.iter_ordered().any(|key| {
+            self.collections
+                .get(key)
+                .and_then(|entry| entry.value.as_ref())
+                .is_some_and(|entry| entry.blob_scan.has_pending_work())
+        })
+    }
 }
 
 type SharedSnapshot = Arc<StoreSnapshot>;
-type SnapshotSlot = Arc<Mutex<Option<SharedSnapshot>>>;
+type SnapshotSlot = tokio::sync::watch::Receiver<Option<SharedSnapshot>>;
 
 /// The async capability cloned into lazy readers.
 /// Implementations return Blobs constructed from the received bytes, with the
@@ -360,16 +512,13 @@ pub(crate) trait NetCapability: Send + Sync {
 type RoutingCandidates = Arc<Mutex<RoutingTable>>;
 const MAX_COLLECTION_PARTICIPANTS: usize = 128;
 const COLLECTION_PARTICIPANT_LEASE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
-const PERIODIC_REPAIR_SAMPLE: usize = 8;
 
-/// Recovery state for one collection-provider rendezvous.
-///
-/// DHT discovery is a way into a collection, not its heartbeat. Once a leased
-/// repair candidate exists, signed wakes and periodic exact repair keep that
-/// lease alive without repeating the lookup traversal.
+/// Bounded descriptor-holder rediscovery. A healthy subset must not prevent
+/// eventual contact with another disconnected subset of the same collection.
 #[derive(Clone, Copy, Debug)]
 struct DiscoveryState {
     in_flight: bool,
+    healthy: bool,
     attempts: u32,
     retry_at: crate::clock::Mono,
 }
@@ -378,15 +527,25 @@ impl DiscoveryState {
     fn new(now: crate::clock::Mono) -> Self {
         Self {
             in_flight: false,
+            healthy: false,
             attempts: 0,
             retry_at: now,
         }
     }
 
     fn start_if_due(&mut self, now: crate::clock::Mono, has_candidate: bool) -> bool {
-        if self.in_flight || has_candidate || now < self.retry_at {
+        if self.in_flight {
             return false;
         }
+        if self.healthy && !has_candidate {
+            self.healthy = false;
+            self.attempts = 0;
+            self.retry_at = now;
+        }
+        if now < self.retry_at {
+            return false;
+        }
+        self.healthy = has_candidate;
         self.in_flight = true;
         true
     }
@@ -396,19 +555,26 @@ impl DiscoveryState {
         let shift = self.attempts.min(6);
         self.attempts = self.attempts.saturating_add(1);
         self.retry_at = now
-            + crate::RETRY_BACKOFF_BASE
-                .saturating_mul(1u32 << shift)
-                .min(crate::RETRY_BACKOFF_CAP);
+            + if self.healthy {
+                COLLECTION_RECONNECT_PERIOD
+            } else {
+                crate::RETRY_BACKOFF_BASE
+                    .saturating_mul(1u32 << shift)
+                    .min(crate::RETRY_BACKOFF_CAP)
+            };
     }
 
     fn observe_success(&mut self, now: crate::clock::Mono) {
-        self.attempts = 0;
-        self.retry_at = now;
+        if !self.healthy {
+            self.healthy = true;
+            self.attempts = 0;
+            self.retry_at = now + COLLECTION_RECONNECT_PERIOD;
+        }
     }
 }
 
 /// Configured peers remain permanent bootstrap routes. Recently learned DHT
-/// participants are a bounded, recency-ordered supplement which survives a
+/// candidates are a bounded, recency-ordered supplement which survives a
 /// stock-gossip topic resubscription.
 struct WakeBootstrapPeers {
     configured: Vec<EndpointId>,
@@ -462,42 +628,54 @@ impl WakeBootstrapPeers {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Participant {
+    seen: crate::clock::Mono,
+    root: Option<CollectionWakeRoot>,
+}
+
 fn observe_participant(
-    participants: &mut HashMap<[u8; 32], HashMap<PeerId, crate::clock::Mono>>,
+    participants: &mut HashMap<[u8; 32], HashMap<PeerId, Participant>>,
     collection: [u8; 32],
     peer: PeerId,
     now: crate::clock::Mono,
 ) {
     let peers = participants.entry(collection).or_default();
-    peers.retain(|_, seen| now.duration_since(*seen) <= COLLECTION_PARTICIPANT_LEASE);
+    peers.retain(|_, observed| now.duration_since(observed.seen) <= COLLECTION_PARTICIPANT_LEASE);
     if !peers.contains_key(&peer)
         && peers.len() >= MAX_COLLECTION_PARTICIPANTS
         && let Some(oldest) = peers
             .iter()
-            .min_by_key(|(peer, seen)| (**seen, **peer))
+            .min_by_key(|(peer, observed)| (observed.seen, **peer))
             .map(|(peer, _)| *peer)
     {
         peers.remove(&oldest);
     }
-    peers.insert(peer, now);
+    peers
+        .entry(peer)
+        .and_modify(|observed| observed.seen = now)
+        .or_insert(Participant {
+            seen: now,
+            root: None,
+        });
 }
 
 fn live_participants(
-    participants: &mut HashMap<[u8; 32], HashMap<PeerId, crate::clock::Mono>>,
+    participants: &mut HashMap<[u8; 32], HashMap<PeerId, Participant>>,
     collection: [u8; 32],
     now: crate::clock::Mono,
 ) -> Vec<PeerId> {
     let Some(peers) = participants.get_mut(&collection) else {
         return Vec::new();
     };
-    peers.retain(|_, seen| now.duration_since(*seen) <= COLLECTION_PARTICIPANT_LEASE);
+    peers.retain(|_, observed| now.duration_since(observed.seen) <= COLLECTION_PARTICIPANT_LEASE);
     let mut live = peers.keys().copied().collect::<Vec<_>>();
     live.sort_unstable();
     live
 }
 
 fn forget_participant(
-    participants: &mut HashMap<[u8; 32], HashMap<PeerId, crate::clock::Mono>>,
+    participants: &mut HashMap<[u8; 32], HashMap<PeerId, Participant>>,
     collection: [u8; 32],
     peer: PeerId,
 ) -> bool {
@@ -732,8 +910,7 @@ pub const INTERACTIVE_FETCH_DEADLINE: std::time::Duration = std::time::Duration:
 
 #[derive(Clone)]
 pub struct NetSender {
-    cmd_tx: mpsc::Sender<NetCommand>,
-    snapshot: SnapshotSlot,
+    snapshot: tokio::sync::watch::Sender<Option<SharedSnapshot>>,
     cap: tokio::sync::watch::Receiver<Option<Arc<dyn NetCapability>>>,
     id: EndpointId,
     health: Health,
@@ -784,19 +961,15 @@ impl NetSender {
     }
 
     pub(crate) fn current_snapshot(&self) -> Option<SharedSnapshot> {
-        self.snapshot.lock().unwrap().clone()
+        self.snapshot.borrow().clone()
     }
 
     pub(crate) fn update_snapshot(&self, snapshot: StoreSnapshot, active: &ActiveCollections) {
         self.observe_active_collections(active);
         let snapshot = Arc::new(snapshot);
-        let mut notices = snapshot.notices();
-        for raw in active.iter_ordered() {
-            if !notices.iter().any(|(collection, _)| collection.raw == *raw) {
-                notices.push((CollectionHandle::new(*raw), [0; 32]));
-            }
-        }
-        let retired = self.snapshot.lock().unwrap().replace(snapshot.clone());
+        // Serving and the coordinator observe exactly the same generation.
+        // Slow consumers skip obsolete observations, never authenticated data.
+        let retired = self.snapshot.send_replace(Some(snapshot.clone()));
         drop(retired);
         let now = crate::clock::mono_now();
         self.health.update(|health| {
@@ -807,22 +980,17 @@ impl NetSender {
                 let frontier = snapshot
                     .collection(entry.collection)
                     .map(|collection| manifest(&collection.repair).into());
-                if entry.local_frontier != frontier {
+                let changed = match (entry.local_frontier, frontier) {
+                    (Some(before), Some(after)) => !before.same_evidence(&after),
+                    (None, None) => false,
+                    _ => true,
+                };
+                if changed {
                     entry.last_local_change_at = Some(now);
-                    entry.local_frontier = frontier;
                 }
+                entry.local_frontier = frontier;
             }
         });
-        let _ = self
-            .cmd_tx
-            .send(NetCommand::SnapshotChanged(SnapshotNotice {
-                collections: notices,
-                installed: true,
-            }));
-    }
-
-    pub(crate) fn update_providers(&self, providers: ProviderObservation) {
-        let _ = self.cmd_tx.send(NetCommand::ProvidersUpdated(providers));
     }
 
     pub fn clear_snapshot(&self) {
@@ -835,16 +1003,10 @@ impl NetSender {
                 collection.local_frontier = None;
             }
         });
-        let had_snapshot = self.snapshot.lock().unwrap().take().is_some();
-        if had_snapshot {
-            let _ = self
-                .cmd_tx
-                .send(NetCommand::SnapshotChanged(SnapshotNotice {
-                    collections: Vec::new(),
-                    installed: false,
-                }));
-        }
-        self.update_providers(ProviderObservation::default());
+        // Fail closed immediately; neither the server nor the next scheduler
+        // observation can pair a withdrawn snapshot with old provider state.
+        let retired = self.snapshot.send_replace(None);
+        drop(retired);
     }
 
     async fn ready_capability(&self) -> anyhow::Result<Arc<dyn NetCapability>> {
@@ -911,7 +1073,6 @@ impl NetReceiver {
 }
 
 pub struct HostWiring {
-    cmd_rx: mpsc::Receiver<NetCommand>,
     evt_tx: tokio::sync::mpsc::Sender<NetEventBatch>,
     snapshot: SnapshotSlot,
     cap_tx: tokio::sync::watch::Sender<Option<Arc<dyn NetCapability>>>,
@@ -930,22 +1091,19 @@ impl HostWiring {
 }
 
 pub fn wire(id: EndpointId) -> (NetSender, NetReceiver, HostWiring) {
-    let (cmd_tx, cmd_rx) = mpsc::channel();
     let (evt_tx, evt_rx) = tokio::sync::mpsc::channel(crate::channel::MAX_ADMISSION_BRIDGE_BATCHES);
-    let snapshot = Arc::new(Mutex::new(None));
+    let (snapshot_tx, snapshot) = tokio::sync::watch::channel(None);
     let (cap_tx, cap_rx) = tokio::sync::watch::channel(None);
     let health = Health::new(id);
     (
         NetSender {
-            cmd_tx,
-            snapshot: snapshot.clone(),
+            snapshot: snapshot_tx,
             cap: cap_rx,
             id,
             health: health.clone(),
         },
         NetReceiver { evt_rx },
         HostWiring {
-            cmd_rx,
             evt_tx,
             snapshot,
             cap_tx,
@@ -1013,6 +1171,7 @@ const BACKGROUND_LOOKUP_DEADLINE: std::time::Duration = std::time::Duration::fro
 const OP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 const REPAIR_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
 const REPAIR_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
+const COLLECTION_RECONNECT_PERIOD: std::time::Duration = std::time::Duration::from_secs(300);
 const HOST_POLL_PERIOD: std::time::Duration = std::time::Duration::from_millis(10);
 const PROVIDER_PROGRESS_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
 const CONNECTION_IDLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
@@ -1035,6 +1194,7 @@ struct RepairOutcome {
     retry_immediately: bool,
     completed_at: crate::clock::Mono,
     failure: Option<RepairFailure>,
+    inventory_cursor: Option<InventoryRepairCursor>,
 }
 
 struct PublicationOutcome {
@@ -1058,10 +1218,55 @@ impl DescriptorFetches {
             .or_insert_with(|| fetch.boxed());
     }
 
-    fn poll(&mut self, active: &HashMap<RawHash, RawHash>) {
+    fn poll(&mut self, mut is_active: impl FnMut(&RawHash) -> bool) {
         self.pending.retain(|collection, fetch| {
-            active.contains_key(collection) && fetch.as_mut().now_or_never().is_none()
+            is_active(collection) && fetch.as_mut().now_or_never().is_none()
         });
+    }
+}
+
+/// Own the actual discovery futures, not detached tasks counted by soft state.
+/// Removing an interest drops its attempt before that handle can be reactivated;
+/// no old completion remains in a channel to finish the replacement attempt.
+#[derive(Default)]
+struct CollectionDiscoveries {
+    pending: HashMap<RawHash, futures::future::BoxFuture<'static, Vec<PeerId>>>,
+}
+
+impl CollectionDiscoveries {
+    fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    fn start(
+        &mut self,
+        collection: RawHash,
+        lookup: impl Future<Output = Vec<PeerId>> + Send + 'static,
+    ) -> bool {
+        if self.pending.len() >= ALPHA || self.pending.contains_key(&collection) {
+            return false;
+        }
+        self.pending.insert(collection, lookup.boxed());
+        true
+    }
+
+    fn poll(
+        &mut self,
+        mut is_active: impl FnMut(&RawHash) -> bool,
+    ) -> Vec<(CollectionHandle, Vec<PeerId>)> {
+        let mut completed = Vec::new();
+        self.pending.retain(|collection, lookup| {
+            if !is_active(collection) {
+                return false;
+            }
+            if let Some(peers) = lookup.as_mut().now_or_never() {
+                completed.push((CollectionHandle::new(*collection), peers));
+                false
+            } else {
+                true
+            }
+        });
+        completed
     }
 }
 
@@ -1104,6 +1309,17 @@ fn enqueue_repair(
     }
 }
 
+/// A signed equal-root hint can avoid ordinary work, but cannot clear a failed
+/// repair's confirmation obligation. Only an actual successful RPC supersedes
+/// the retained failure evidence used by health reporting.
+fn can_skip_repair(
+    local_root: RawHash,
+    advertised_root: Option<CollectionWakeRoot>,
+    previously_failed: bool,
+) -> bool {
+    !previously_failed && advertised_root.is_some_and(|root| root.as_bytes() == &local_root)
+}
+
 fn has_repair_candidate(
     collection: CollectionHandle,
     peers: &[PeerId],
@@ -1119,15 +1335,69 @@ fn has_repair_candidate(
     })
 }
 
-fn retain_active_repair_state<T>(state: &mut HashMap<RepairTarget, T>, active: &HashSet<[u8; 32]>) {
-    state.retain(|target, _| active.contains(&target.collection.raw));
+fn retain_active_repair_state<T>(
+    state: &mut HashMap<RepairTarget, T>,
+    mut is_active: impl FnMut(&RawHash) -> bool,
+) {
+    state.retain(|target, _| is_active(&target.collection.raw));
+}
+
+fn resume_inventory_repair(
+    cursors: &HashMap<RepairTarget, InventoryRepairCursor>,
+    target: RepairTarget,
+) -> Option<InventoryRepairCursor> {
+    // The attempt owns a working copy. Only a completed authenticated exchange
+    // can replace the checkpoint; transport failure and cancellation cannot.
+    cursors.get(&target).cloned()
+}
+
+fn complete_inventory_repair(
+    cursors: &mut HashMap<RepairTarget, InventoryRepairCursor>,
+    outcome: &mut RepairOutcome,
+    active: bool,
+) {
+    if !active {
+        cursors.remove(&outcome.target);
+    } else if outcome.success {
+        match outcome.inventory_cursor.take() {
+            Some(cursor)
+                if cursors.len() < MAX_PENDING_REPAIRS || cursors.contains_key(&outcome.target) =>
+            {
+                cursors.insert(outcome.target, cursor);
+            }
+            None => {
+                cursors.remove(&outcome.target);
+            }
+            Some(_) => {}
+        }
+    }
 }
 
 enum WakeCommand {
-    Observe(CollectionWakeRoot),
     Join(Vec<EndpointId>),
     Resubscribe,
-    Shutdown,
+}
+
+/// A topic has one current root, not a backlog of superseded broadcasts.
+/// Operational join/recovery commands retain their delivery semantics; they
+/// carry no store snapshots. Dropping the owner closes both paths and stops
+/// the topic.
+struct WakeTopic {
+    root: tokio::sync::watch::Sender<Option<CollectionWakeRoot>>,
+    commands: tokio::sync::mpsc::UnboundedSender<WakeCommand>,
+}
+
+impl WakeTopic {
+    fn observe(&self, root: Option<CollectionWakeRoot>) {
+        self.root.send_replace(root);
+    }
+
+    fn send(
+        &self,
+        command: WakeCommand,
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<WakeCommand>> {
+        self.commands.send(command)
+    }
 }
 
 enum WakeNotice {
@@ -1143,14 +1413,18 @@ enum WakeNotice {
 fn spawn_wake_topic<P: CollectionWakeNetwork>(
     plane: P,
     collection: CollectionHandle,
+    advertise: bool,
     bootstrap: Vec<EndpointId>,
     notices: tokio::sync::mpsc::Sender<WakeNotice>,
-) -> tokio::sync::mpsc::UnboundedSender<WakeCommand> {
+) -> WakeTopic {
     let (commands, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (root, mut root_rx) = tokio::sync::watch::channel(None);
     tokio::spawn(async move {
-        let mut current_root = None;
         let mut bootstrap = WakeBootstrapPeers::new(bootstrap);
         loop {
+            if root_rx.has_changed().is_err() {
+                return;
+            }
             let mut topic = loop {
                 match plane
                     .subscribe_network(collection, bootstrap.current())
@@ -1160,35 +1434,65 @@ fn spawn_wake_topic<P: CollectionWakeNetwork>(
                     Err(error) => {
                         debug!(%error, "collection gossip subscription failed; retrying");
                         tokio::select! {
+                            changed = root_rx.changed() => {
+                                if changed.is_err() { return; }
+                            },
                             command = command_rx.recv() => match command {
-                                Some(WakeCommand::Observe(root)) => current_root = Some(root),
                                 Some(WakeCommand::Join(peers)) => bootstrap.remember(peers),
                                 Some(WakeCommand::Resubscribe) => {}
-                                Some(WakeCommand::Shutdown) | None => return,
+                                None => return,
                             },
                             () = tokio::time::sleep(crate::RETRY_BACKOFF_BASE) => {}
                         }
                     }
                 }
             };
-            if let Some(root) = current_root
-                && let Err(error) = topic.broadcast_wake(root).await
-            {
-                debug!(%error, "collection wake broadcast after subscribe failed");
-            }
+            let _ = root_rx.borrow_and_update();
+            let mut schedule = WakeSchedule::new(crate::clock::mono_now(), rand::random());
+            let mut relay = crate::wake_relay::WakeRelay::default();
             'events: loop {
+                let deadline = relay
+                    .deadline()
+                    .map_or(schedule.deadline(), |at| at.min(schedule.deadline()));
                 tokio::select! {
-                    command = command_rx.recv() => match command {
-                        Some(WakeCommand::Observe(root)) => {
-                            current_root = Some(root);
-                            if let Err(error) = topic.broadcast_wake(root).await {
-                                debug!(%error, "collection wake broadcast failed");
+                    changed = root_rx.changed() => {
+                        if changed.is_err() { return; }
+                        let current = *root_rx.borrow_and_update();
+                        let now = crate::clock::mono_now();
+                        schedule.local_changed(now, rand::random());
+                        // A changed union root is an honest new local offer,
+                        // not a claim to serve the exact upstream root.
+                        schedule.neighbor_joined(now, rand::random());
+                        relay.refreshed(current.filter(|_| advertise), now);
+                    },
+                    () = tokio::time::sleep(deadline.duration_since(crate::clock::mono_now())) => {
+                        let now = crate::clock::mono_now();
+                        let serving = (*root_rx.borrow()).filter(|_| advertise);
+                        let mut offered_local = false;
+                        for offer in relay.poll(serving, now) {
+                            let result = match offer {
+                                crate::wake_relay::RelayOffer::Local(root) => {
+                                    offered_local = true;
+                                    topic.broadcast_wake(root).await.map(|_| ())
+                                }
+                                crate::wake_relay::RelayOffer::Original(wake) => topic.relay_wake(&wake).await,
+                            };
+                            if let Err(error) = result {
+                                debug!(%error, "collection state hint relay failed");
                             }
                         }
+                        if schedule.poll(now, rand::random()) && !offered_local
+                            && let Some(root) = serving
+                            && let Err(error) = topic.broadcast_wake(root).await
+                        {
+                            debug!(%error, "periodic collection wake broadcast failed");
+                        }
+                    },
+                    command = command_rx.recv() => match command {
                         Some(WakeCommand::Join(peers)) => {
                             bootstrap.remember(peers.iter().copied());
                             if let Err(error) = topic.join_wake_peers(peers).await {
-                                debug!(%error, "joining DHT-discovered collection wake peers failed");
+                                debug!(%error, "joining candidate collection wake peers failed");
                             }
                         }
                         Some(WakeCommand::Resubscribe) => {
@@ -1197,11 +1501,22 @@ fn spawn_wake_topic<P: CollectionWakeNetwork>(
                                 break 'events;
                             }
                         }
-                        Some(WakeCommand::Shutdown) | None => return,
+                        None => return,
                     },
                     event = topic.next_wake_event() => match event {
                         Ok(Some(CollectionWakeEvent::Received(received))) => {
                         bootstrap.remember([received.wake.origin()]);
+                        let now = crate::clock::mono_now();
+                        let current = *root_rx.borrow();
+                        relay.received_from(&received.wake, received.delivered_from);
+                        relay.observe(&received.wake, current.filter(|_| advertise), now);
+                        if let Some(root) = current {
+                            if root == received.wake.root() {
+                                schedule.consistent_root(now);
+                            } else {
+                                schedule.different_root(now, rand::random());
+                            }
+                        }
                         // Wakes are repeatable hints. Dropping one under load
                         // preserves correctness while keeping a nonce flood
                         // behind a hard process-wide memory bound.
@@ -1209,21 +1524,19 @@ fn spawn_wake_topic<P: CollectionWakeNetwork>(
                         }
                         Ok(Some(CollectionWakeEvent::Lagged)) => {
                             let _ = notices.try_send(WakeNotice::Lagged { collection });
-                            if let Some(root) = current_root {
-                                let _ = topic.broadcast_wake(root).await;
-                            }
+                            let now = crate::clock::mono_now();
+                            schedule.neighbor_joined(now, rand::random());
+                            relay.neighbor_joined(now);
                         }
                         Ok(Some(CollectionWakeEvent::Rejected { error, .. })) => {
                             debug!(%error, "rejected invalid collection wake");
                         }
-                        Ok(Some(CollectionWakeEvent::NeighborUp(_))) => {
-                            if let Some(root) = current_root
-                                && let Err(error) = topic.broadcast_wake(root).await
-                            {
-                                debug!(%error, "collection wake rebroadcast failed");
-                            }
+                        Ok(Some(CollectionWakeEvent::NeighborUp(peer))) => {
+                            let now = crate::clock::mono_now();
+                            schedule.neighbor_joined(now, rand::random());
+                            relay.neighbor_up(peer, now);
                         }
-                        Ok(Some(CollectionWakeEvent::NeighborDown(_))) => {}
+                        Ok(Some(CollectionWakeEvent::NeighborDown(peer))) => { relay.neighbor_down(peer); }
                         Ok(None) => {
                             debug!("collection wake subscription ended; retrying");
                             break 'events;
@@ -1237,10 +1550,10 @@ fn spawn_wake_topic<P: CollectionWakeNetwork>(
             }
         }
     });
-    commands
+    WakeTopic { root, commands }
 }
 
-async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring: HostWiring) {
+async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wiring: HostWiring) {
     let Harness {
         transport,
         mut incoming,
@@ -1314,20 +1627,24 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
     let wake_plane = transport.collection_wake_plane();
     let bootstrap_ids = config.peers.iter().map(|peer| peer.id).collect::<Vec<_>>();
     let (wake_tx, mut wake_rx) = tokio::sync::mpsc::channel::<WakeNotice>(256);
-    let mut wake_topics: HashMap<[u8; 32], tokio::sync::mpsc::UnboundedSender<WakeCommand>> =
-        HashMap::new();
+    let mut inventory_cursors: HashMap<RepairTarget, InventoryRepairCursor> = HashMap::new();
+    let mut wake_topics: HashMap<[u8; 32], WakeTopic> = HashMap::new();
     let (repair_tx, mut repair_rx) = tokio::sync::mpsc::unbounded_channel::<RepairOutcome>();
-    let (discovery_tx, mut discovery_rx) =
-        tokio::sync::mpsc::channel::<(CollectionHandle, Vec<PeerId>)>(64);
-    let mut immediate = VecDeque::new();
-    let mut pending = HashSet::new();
+    let mut discovery_attempts = CollectionDiscoveries::default();
+    let mut immediate = VecDeque::<RepairTarget>::new();
+    let mut pending = HashSet::<RepairTarget>::new();
     let mut in_flight = HashSet::new();
     let mut failures: HashMap<RepairTarget, (u32, crate::clock::Mono)> = HashMap::new();
     let mut discovery: HashMap<[u8; 32], DiscoveryState> = HashMap::new();
-    let mut current_roots: HashMap<[u8; 32], [u8; 32]> = HashMap::new();
+    // Retain the last observation accounted for, not a second root catalog.
+    // Its PATCH values pin the roots against which the next observation is
+    // compared. ProviderPublisher separately retains genuinely pending work.
+    let mut processed_snapshot: Option<SharedSnapshot> = None;
+    let empty_collections = CollectionSnapshotIndex::new();
     let mut descriptor_fetches = DescriptorFetches::default();
     let mut next_period = crate::clock::mono_now();
     let mut next_discovery = crate::clock::mono_now();
+    let mut discovery_cursor = None;
     let mut publisher = ProviderPublisher::new(crate::clock::mono_now());
     let publication_limit = config.provider_publication_budget;
     let mut publication_budget = ProviderPublicationBudget::new(publication_limit);
@@ -1348,81 +1665,101 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
     let mut unavailable_attempts = 0u64;
 
     loop {
-        let mut disconnected = false;
-        loop {
-            match wiring.cmd_rx.try_recv() {
-                Ok(NetCommand::SnapshotChanged(notice)) => {
-                    if !notice.installed {
-                        current_roots.clear();
-                        descriptor_fetches.pending.clear();
-                        participants.lock().unwrap().clear();
-                        discovery.clear();
-                        immediate.clear();
-                        pending.clear();
-                        failures.clear();
-                        for (_, topic) in wake_topics.drain() {
-                            let _ = topic.send(WakeCommand::Shutdown);
-                        }
-                        continue;
+        match wiring.snapshot.has_changed() {
+            Ok(true) => {
+                // Exactly one current observation per turn, even if refresh
+                // published many generations while the host was busy. Clone
+                // before doing work so no watch read lock crosses a wait.
+                let next = wiring.snapshot.borrow_and_update().clone();
+                let before = processed_snapshot
+                    .as_ref()
+                    .map_or(&empty_collections, |snapshot| &snapshot.collections);
+                let after = next
+                    .as_ref()
+                    .map_or(&empty_collections, |snapshot| &snapshot.collections);
+                for raw in after.iter_ordered() {
+                    let collection = CollectionHandle::new(*raw);
+                    if before.get(raw).is_none() {
+                        let now = crate::clock::mono_now();
+                        discovery.insert(*raw, DiscoveryState::new(now));
+                        next_discovery = next_discovery.min(now);
+                        // A cold activation needs descriptor bytes, not just
+                        // provider contacts. Do not wait for the retry tick.
+                        next_period = next_period.min(now);
                     }
-                    let mut observed = HashSet::new();
-                    for (collection, semantic_root) in notice.collections {
-                        observed.insert(collection.raw);
-                        if !current_roots.contains_key(&collection.raw) {
-                            let now = crate::clock::mono_now();
-                            discovery.insert(collection.raw, DiscoveryState::new(now));
-                            next_discovery = next_discovery.min(now);
-                        }
-                        let changed = current_roots.insert(collection.raw, semantic_root)
-                            != Some(semantic_root);
-                        let topic = wake_topics.entry(collection.raw).or_insert_with(|| {
-                            spawn_wake_topic(
-                                wake_plane.clone(),
-                                collection,
-                                bootstrap_ids.clone(),
-                                wake_tx.clone(),
-                            )
-                        });
-                        if changed && semantic_root != [0; 32] {
-                            let _ = topic
-                                .send(WakeCommand::Observe(CollectionWakeRoot::new(semantic_root)));
-                        }
+                    let root = after
+                        .get(raw)
+                        .and_then(|entry| entry.value.as_ref())
+                        .map(|entry| CollectionWakeRoot::new(entry.wake_root()));
+                    let prior = before
+                        .get(raw)
+                        .and_then(|entry| entry.value.as_ref())
+                        .map(|entry| CollectionWakeRoot::new(entry.wake_root()));
+                    let topic = wake_topics.entry(*raw).or_insert_with(|| {
+                        spawn_wake_topic(
+                            wake_plane.clone(),
+                            collection,
+                            config.qos.direction.serves(),
+                            bootstrap_ids.clone(),
+                            wake_tx.clone(),
+                        )
+                    });
+                    if root != prior {
+                        topic.observe(root);
                     }
-                    current_roots.retain(|collection, _| observed.contains(collection));
-                    discovery.retain(|collection, _| observed.contains(collection));
-                    retain_active_repair_state(&mut failures, &observed);
-                    participants
-                        .lock()
-                        .unwrap()
-                        .retain(|collection, _| observed.contains(collection));
-                    let stale = wake_topics
-                        .keys()
-                        .filter(|collection| !observed.contains(*collection))
-                        .copied()
-                        .collect::<Vec<_>>();
-                    for collection in stale {
-                        if let Some(topic) = wake_topics.remove(&collection) {
-                            let _ = topic.send(WakeCommand::Shutdown);
+                    if let Some(entry) = after.get(raw).and_then(|entry| entry.value.as_ref()) {
+                        let changed_authority = before
+                            .get(raw)
+                            .and_then(|entry| entry.value.as_ref())
+                            .is_none_or(|previous| {
+                                previous.repair.authorization_evidence().summary()
+                                    != entry.repair.authorization_evidence().summary()
+                            });
+                        if changed_authority {
+                            let peers =
+                                collection_bootstrap_candidates(entry, my_id, rand::random());
+                            let _ = topic.send(WakeCommand::Join(peers));
                         }
                     }
                 }
-                Ok(NetCommand::ProvidersUpdated(observation)) => {
-                    publisher.install(observation.into_set(), crate::clock::mono_now());
+                // PATCH difference skips unchanged active subtries. A cold
+                // descriptor remains an active entry with no root, not a
+                // deactivated collection.
+                for raw in before.difference(after).iter_ordered() {
+                    if let Some(topic) = wake_topics.remove(raw) {
+                        drop(topic);
+                    }
                 }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    disconnected = true;
-                    break;
-                }
+                discovery.retain(|collection, _| after.get(collection).is_some());
+                retain_active_repair_state(&mut failures, |raw| after.get(raw).is_some());
+                retain_active_repair_state(&mut inventory_cursors, |raw| after.get(raw).is_some());
+                participants
+                    .lock()
+                    .unwrap()
+                    .retain(|collection, _| after.get(collection).is_some());
+                immediate.retain(|target| after.get(&target.collection.raw).is_some());
+                pending.retain(|target| after.get(&target.collection.raw).is_some());
+                let providers = next
+                    .as_ref()
+                    .map_or_else(ProviderObservation::default, |snapshot| {
+                        ProviderObservation::from_locators(snapshot.bearer_locators())
+                    });
+                publisher.install(providers.into_set(), crate::clock::mono_now());
+                processed_snapshot = next;
+            }
+            Ok(false) => {}
+            Err(_) => {
+                drop(descriptor_fetches);
+                drop(discovery_attempts);
+                transport.shutdown().await;
+                return;
             }
         }
-        if disconnected {
-            drop(descriptor_fetches);
-            transport.shutdown().await;
-            return;
-        }
+        let current_collections = processed_snapshot
+            .as_ref()
+            .map_or(&empty_collections, |snapshot| &snapshot.collections);
 
-        descriptor_fetches.poll(&current_roots);
+        descriptor_fetches.poll(|raw| current_collections.get(raw).is_some());
 
         while let Ok(notice) = wake_rx.try_recv() {
             let (collection, received) = match notice {
@@ -1431,7 +1768,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                     received,
                 } => (collection, received),
                 WakeNotice::Lagged { collection } => {
-                    if current_roots.contains_key(&collection.raw) {
+                    if current_collections.get(&collection.raw).is_some() {
                         let now = crate::clock::mono_now();
                         next_period = next_period.min(now);
                         next_discovery = next_discovery.min(now);
@@ -1443,7 +1780,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
             if wake.origin().as_bytes() == &my_id {
                 continue;
             }
-            if !current_roots.contains_key(&collection.raw) {
+            if current_collections.get(&collection.raw).is_none() {
                 continue;
             }
             observe_participant(
@@ -1452,21 +1789,56 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                 *wake.origin().as_bytes(),
                 crate::clock::mono_now(),
             );
-            if current_roots
-                .get(&collection.raw)
-                .is_some_and(|semantic| *semantic != [0; 32] && semantic != wake.root().as_bytes())
+            if let Some(observed) = participants
+                .lock()
+                .unwrap()
+                .get_mut(&collection.raw)
+                .and_then(|peers| peers.get_mut(wake.origin().as_bytes()))
             {
+                observed.root = Some(wake.root());
+            }
+            if current_collections
+                .get(&collection.raw)
+                .and_then(|entry| entry.value.as_ref())
+                .is_some_and(|entry| &entry.wake_root() != wake.root().as_bytes())
+                && !pending.iter().any(|target| target.collection == collection)
+                && !in_flight
+                    .iter()
+                    .any(|target: &RepairTarget| target.collection == collection)
+            {
+                // A forwarded notice proves only its signed origin's state.
+                // Prefer any fresh origin advertising the same root, spreading
+                // pulls without mistaking a forwarding hop for a holder.
+                let peers = participants.lock().unwrap();
+                let sources = peers
+                    .get(&collection.raw)
+                    .unwrap()
+                    .iter()
+                    .filter(|(peer, observed)| {
+                        observed.root == Some(wake.root())
+                            && !failures
+                                .get(&RepairTarget {
+                                    collection,
+                                    peer: **peer,
+                                })
+                                .is_some_and(|(_, retry)| crate::clock::mono_now() < *retry)
+                    })
+                    .map(|(peer, _)| *peer)
+                    .collect::<Vec<_>>();
+                let peer = sources
+                    .get(rand::random::<usize>() % sources.len().max(1))
+                    .copied();
+                let Some(peer) = peer else {
+                    continue;
+                };
                 enqueue_repair(
                     &mut immediate,
                     &mut pending,
-                    RepairTarget {
-                        collection,
-                        peer: *wake.origin().as_bytes(),
-                    },
+                    RepairTarget { collection, peer },
                 );
             }
         }
-        while let Ok(outcome) = repair_rx.try_recv() {
+        while let Ok(mut outcome) = repair_rx.try_recv() {
             in_flight.remove(&outcome.target);
             wiring
                 .health
@@ -1478,7 +1850,15 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                         health.last_failure = Some(failure);
                     }
                 });
-            if !current_roots.contains_key(&outcome.target.collection.raw) {
+            let active = current_collections
+                .get(&outcome.target.collection.raw)
+                .is_some()
+                && outcome.target.peer != my_id;
+            complete_inventory_repair(&mut inventory_cursors, &mut outcome, active);
+            if current_collections
+                .get(&outcome.target.collection.raw)
+                .is_none()
+            {
                 failures.remove(&outcome.target);
                 continue;
             }
@@ -1503,11 +1883,14 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                     enqueue_repair(&mut immediate, &mut pending, outcome.target);
                 }
             } else {
-                let participants_exhausted = forget_participant(
+                let now = crate::clock::mono_now();
+                let peers = live_participants(
                     &mut participants.lock().unwrap(),
                     outcome.target.collection.raw,
-                    outcome.target.peer,
+                    now,
                 );
+                let had_candidate =
+                    has_repair_candidate(outcome.target.collection, &peers, &failures, my_id);
                 let attempts = failures
                     .get(&outcome.target)
                     .map_or(1, |(attempts, _)| attempts.saturating_add(1));
@@ -1517,17 +1900,34 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                         outcome.target,
                         (
                             attempts,
-                            crate::clock::mono_now()
-                                + crate::RETRY_BACKOFF_BASE.saturating_mul(1u32 << shift),
+                            now + crate::RETRY_BACKOFF_BASE.saturating_mul(1u32 << shift),
                         ),
                     );
+                    // Keep the original participant lease across a transient
+                    // failure. A healthy second replica need not hold this
+                    // peer's latest records. Periodic
+                    // repair can retry after backoff; failure never renews it.
+                } else {
+                    // Without room for a failure marker this peer would look
+                    // healthy to discovery. Preserve the existing hard bound.
+                    forget_participant(
+                        &mut participants.lock().unwrap(),
+                        outcome.target.collection.raw,
+                        outcome.target.peer,
+                    );
                 }
-                if participants_exhausted
+                let peers = live_participants(
+                    &mut participants.lock().unwrap(),
+                    outcome.target.collection.raw,
+                    now,
+                );
+                if had_candidate
+                    && !has_repair_candidate(outcome.target.collection, &peers, &failures, my_id)
                     && let Some(topic) = wake_topics.get(&outcome.target.collection.raw)
                 {
                     let _ = topic.send(WakeCommand::Resubscribe);
                 }
-                next_discovery = next_discovery.min(crate::clock::mono_now());
+                next_discovery = next_discovery.min(now);
             }
         }
         while let Ok(outcome) = publication_rx.try_recv() {
@@ -1563,39 +1963,33 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                 );
             }
         }
-        while let Ok((collection, peers)) = discovery_rx.try_recv() {
+        for (collection, peers) in
+            discovery_attempts.poll(|raw| current_collections.get(raw).is_some())
+        {
             let now = crate::clock::mono_now();
             let Some(state) = discovery.get_mut(&collection.raw) else {
                 continue;
             };
             state.finish_attempt(now);
             next_discovery = next_discovery.min(state.retry_at);
-            if !current_roots.contains_key(&collection.raw) {
+            if current_collections.get(&collection.raw).is_none() {
                 continue;
             }
             let peers = peers
                 .into_iter()
                 .filter(|peer| *peer != my_id)
                 .collect::<Vec<_>>();
-            if peers.is_empty() {
-                if let Some(topic) = wake_topics.get(&collection.raw) {
-                    let _ = topic.send(WakeCommand::Resubscribe);
-                }
-            } else if let Some(topic) = wake_topics.get(&collection.raw) {
+            if !peers.is_empty()
+                && let Some(topic) = wake_topics.get(&collection.raw)
+            {
                 let joined = peers
                     .iter()
                     .filter_map(|peer| EndpointId::from_bytes(peer).ok())
                     .collect();
                 let _ = topic.send(WakeCommand::Join(joined));
             }
-            for peer in peers {
-                observe_participant(&mut participants.lock().unwrap(), collection.raw, peer, now);
-                enqueue_repair(
-                    &mut immediate,
-                    &mut pending,
-                    RepairTarget { collection, peer },
-                );
-            }
+            // A descriptor holder may be only a cache. It becomes a repair
+            // source after its own signed root advertisement, not this lookup.
         }
 
         let now = crate::clock::mono_now();
@@ -1604,13 +1998,12 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
             // The anti-entropy tick also notices expired participant leases,
             // but DHT recovery keeps its own backoff and in-flight state.
             next_discovery = next_discovery.min(now);
-            for raw in current_roots.keys() {
+            for raw in current_collections.iter_ordered() {
                 if config.qos.direction.pulls() {
                     let collection = CollectionHandle::new(*raw);
                     let descriptor_missing = wiring
                         .snapshot
-                        .lock()
-                        .unwrap()
+                        .borrow()
                         .as_ref()
                         .is_none_or(|snapshot| snapshot.get_blob(raw).is_none());
                     if descriptor_missing {
@@ -1633,23 +2026,18 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                             }
                         });
                     }
-                    let mut peers = live_participants(&mut participants.lock().unwrap(), *raw, now);
-                    if !peers.is_empty() {
-                        let rotation = (now.as_nanos() as usize
-                            / REPAIR_PERIOD.as_nanos() as usize)
-                            % peers.len();
-                        peers.rotate_left(rotation);
-                        peers.truncate(PERIODIC_REPAIR_SAMPLE);
-                    }
-                    for peer in peers {
-                        enqueue_repair(
-                            &mut immediate,
-                            &mut pending,
-                            RepairTarget {
-                                collection: CollectionHandle::new(*raw),
-                                peer,
-                            },
-                        );
+                    // Periodic gossip replaces blind pulls of every remembered
+                    // participant. Only incomplete/failed work needs a retry;
+                    // ordinary new work is derived from advertised roots.
+                    for peer in live_participants(&mut participants.lock().unwrap(), *raw, now) {
+                        let target = RepairTarget { collection, peer };
+                        if failures
+                            .get(&target)
+                            .is_some_and(|(_, retry_at)| now >= *retry_at)
+                            || inventory_cursors.contains_key(&target)
+                        {
+                            enqueue_repair(&mut immediate, &mut pending, target);
+                        }
                     }
                 }
             }
@@ -1657,7 +2045,11 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
 
         if config.qos.direction.pulls() && now >= next_discovery {
             next_discovery = now + REPAIR_PERIOD;
-            for raw in current_roots.keys() {
+            for raw in discovery_order(current_collections, discovery_cursor) {
+                if discovery_attempts.len() >= ALPHA {
+                    next_discovery = now + HOST_POLL_PERIOD;
+                    break;
+                }
                 let collection = CollectionHandle::new(*raw);
                 let peers = live_participants(&mut participants.lock().unwrap(), *raw, now);
                 let has_candidate = has_repair_candidate(collection, &peers, &failures, my_id);
@@ -1665,13 +2057,23 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                     .entry(*raw)
                     .or_insert_with(|| DiscoveryState::new(now));
                 if state.start_if_due(now, has_candidate) {
+                    discovery_cursor = Some(*raw);
+                    if let Some(snapshot) = current_collections
+                        .get(raw)
+                        .and_then(|entry| entry.value.as_ref())
+                        && let Some(topic) = wake_topics.get(raw)
+                    {
+                        let mut peers =
+                            collection_bootstrap_candidates(snapshot, my_id, rand::random());
+                        peers.extend(bootstrap_ids.iter().copied());
+                        let _ = topic.send(WakeCommand::Join(peers));
+                    }
                     let client = provider_client.clone();
-                    let discovery_tx = discovery_tx.clone();
-                    tokio::spawn(async move {
-                        let peers = client
+                    let started = discovery_attempts.start(collection.raw, async move {
+                        client
                             .find_key(
-                                collection_provider_key(collection),
-                                collection_provider_token,
+                                blob_locator(collection.raw),
+                                blob_provider_token,
                                 collection.raw,
                                 Some(BACKGROUND_LOOKUP_DEADLINE),
                             )
@@ -1679,9 +2081,9 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                             .unwrap_or_else(|error| {
                                 debug!(%error, "collection provider lookup failed");
                                 Vec::new()
-                            });
-                        let _ = discovery_tx.send((collection, peers)).await;
+                            })
                     });
+                    debug_assert!(started, "discovery state and owned attempt must agree");
                 } else if !has_candidate && !state.in_flight {
                     next_discovery = next_discovery.min(state.retry_at);
                 }
@@ -1703,13 +2105,26 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                 }
                 let Some(local) = wiring
                     .snapshot
-                    .lock()
-                    .unwrap()
+                    .borrow()
                     .as_ref()
                     .and_then(|snapshot| snapshot.collection(target.collection))
                 else {
                     continue;
                 };
+                let advertised_root = participants
+                    .lock()
+                    .unwrap()
+                    .get(&target.collection.raw)
+                    .and_then(|peers| peers.get(&target.peer))
+                    .and_then(|observed| observed.root);
+                if can_skip_repair(
+                    local.wake_root(),
+                    advertised_root,
+                    failures.contains_key(&target),
+                ) && !inventory_cursors.contains_key(&target)
+                {
+                    continue;
+                }
                 in_flight.insert(target);
                 wiring
                     .health
@@ -1721,21 +2136,30 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                 let events = wiring.evt_tx.clone();
                 let repair_tx = repair_tx.clone();
                 let health = wiring.health.clone();
+                let inventory_cursor = resume_inventory_repair(&inventory_cursors, target);
                 tokio::spawn(async move {
                     let result = tokio::time::timeout(
                         REPAIR_DEADLINE,
                         reconcile_collection_peer(
-                            &transport, &pool, target, local, &events, &health,
+                            &transport,
+                            &pool,
+                            target,
+                            local,
+                            &events,
+                            &health,
+                            inventory_cursor,
                         ),
                     )
                     .await;
-                    let (success, retry_immediately, failure) = match result {
-                        Ok(Ok(retry_immediately)) => (true, retry_immediately, None),
+                    let (success, retry_immediately, failure, inventory_cursor) = match result {
+                        Ok(Ok((retry_immediately, cursor))) => {
+                            (true, retry_immediately, None, cursor)
+                        }
                         Ok(Err(error)) => {
                             debug!(%error, "collection repair failed");
-                            (false, false, Some(RepairFailure::Failed))
+                            (false, false, Some(RepairFailure::Failed), None)
                         }
-                        Err(_) => (false, false, Some(RepairFailure::Deadline)),
+                        Err(_) => (false, false, Some(RepairFailure::Deadline), None),
                     };
                     let _ = repair_tx.send(RepairOutcome {
                         target,
@@ -1743,6 +2167,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                         retry_immediately,
                         completed_at: crate::clock::mono_now(),
                         failure,
+                        inventory_cursor,
                     });
                 });
             }
@@ -1875,18 +2300,24 @@ async fn reconcile_collection_peer<T: Transport>(
     local: Arc<CollectionSnapshot>,
     events: &tokio::sync::mpsc::Sender<NetEventBatch>,
     health: &Health,
-) -> anyhow::Result<bool> {
+    inventory_cursor: Option<InventoryRepairCursor>,
+) -> anyhow::Result<(bool, Option<InventoryRepairCursor>)> {
     let connection = pool_get(transport, pool, target.peer).await?;
     let delta = match pull_collection(
         connection.conn(),
         &local.repair,
         local.read_bootstrap.iter().cloned().collect(),
+        inventory_cursor,
     )
     .await
     {
         Ok(delta) => delta,
         Err(error) => {
-            pool_invalidate(pool, target.peer, &connection.entry);
+            // READ refusal or absent C is a valid answer on this stream.
+            // Other collections may be repairing over this same connection.
+            if !error.is::<CollectionRepairRefusal>() {
+                pool_invalidate(pool, target.peer, &connection.entry);
+            }
             return Err(error);
         }
     };
@@ -1917,8 +2348,25 @@ async fn reconcile_collection_peer<T: Transport>(
     for record in delta.records {
         admissions.push(NetEvent::CollectionRecord(record)).await?;
     }
+    for handle in delta.blob_handles {
+        admissions
+            .push(NetEvent::BlobHint {
+                collection: target.collection,
+                source: target.peer,
+                handle,
+            })
+            .await?;
+    }
+    if delta.inventory_cursor.is_none() {
+        admissions
+            .push(NetEvent::BlobInventoryPassCompleted {
+                collection: target.collection,
+                source: target.peer,
+            })
+            .await?;
+    }
     admissions.flush().await?;
-    Ok(retry_immediately)
+    Ok((retry_immediately, delta.inventory_cursor))
 }
 
 impl<T: Transport> ProviderClient<T> {
@@ -2542,14 +2990,14 @@ impl SnapshotHandler {
                     return;
                 };
                 tracing::trace!(target: "triblespace_net::handoff", "host accepted RPC stream");
-                let Ok(connection_permit) = per_connection.clone().try_acquire_owned() else {
-                    debug!(target: "triblespace_net::handoff", "host per-connection request limit reached");
-                    connection.close(1, b"request concurrency exceeded");
+                // Backpressure a burst instead of closing its entire connection:
+                // other streams may already be repairing independent collections.
+                // This loop retains at most one accepted, waiting stream per
+                // bounded connection, and spawns a task only with both permits.
+                let Ok(connection_permit) = per_connection.clone().acquire_owned().await else {
                     return;
                 };
-                let Ok(global_permit) = self.inbound_requests.clone().try_acquire_owned() else {
-                    debug!(target: "triblespace_net::handoff", "host global request limit reached");
-                    connection.close(1, b"global request concurrency exceeded");
+                let Ok(global_permit) = self.inbound_requests.clone().acquire_owned().await else {
                     return;
                 };
                 let handler = self.clone();
@@ -2590,7 +3038,7 @@ impl SnapshotHandler {
                 if !self.serve_collections {
                     let _ = serve_collection_repair(recv, send, peer, |_| None).await?;
                 } else {
-                    let snapshot = self.snapshot.lock().unwrap().clone();
+                    let snapshot = self.snapshot.borrow().clone();
                     let bootstrap = serve_collection_repair(recv, send, peer, move |collection| {
                         snapshot
                             .as_ref()
@@ -2607,7 +3055,7 @@ impl SnapshotHandler {
             }
             OP_GET_BLOB => {
                 let activity = self.health.begin_blob_serve();
-                let snapshot = self.snapshot.lock().unwrap().clone();
+                let snapshot = self.snapshot.borrow().clone();
                 let blob_snapshot = snapshot.clone();
                 let mut payload_bytes = None;
                 serve_get_blob(
@@ -2660,8 +3108,7 @@ impl SnapshotHandler {
                     .get(key, crate::clock::mono_now());
                 let resident = self
                     .snapshot
-                    .lock()
-                    .unwrap()
+                    .borrow()
                     .as_ref()
                     .and_then(|snapshot| snapshot.bearer_handle(key));
                 if let Some(handle) = resident {
@@ -2752,7 +3199,7 @@ mod tests {
     use triblespace_core::collection::CollectionHandle;
 
     use super::{
-        COLLECTION_PARTICIPANT_LEASE, DescriptorFetches, DiscoveryState,
+        COLLECTION_PARTICIPANT_LEASE, CollectionDiscoveries, DescriptorFetches, DiscoveryState,
         MAX_COLLECTION_PARTICIPANTS, MAX_PENDING_REPAIRS, ProgressiveBlobProviders,
         ProgressiveBlobReplicas, ProviderPublicationBudget, RepairTarget, WakeBootstrapPeers,
         canonical_provider_subset, enqueue_repair, forget_participant, has_repair_candidate,
@@ -2766,6 +3213,109 @@ mod tests {
                 .as_bytes(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn owned_discoveries_bound_actual_futures_and_release_completed_slots() {
+        let mut lookups = CollectionDiscoveries::default();
+        let mut senders = Vec::new();
+        for index in 0..super::ALPHA + 2 {
+            let (send, receive) = tokio::sync::oneshot::channel::<Vec<PeerId>>();
+            let started = lookups.start([index as u8; 32], async move {
+                receive.await.unwrap_or_default()
+            });
+            assert_eq!(started, index < super::ALPHA);
+            assert_eq!(send.is_closed(), !started);
+            senders.push(send);
+        }
+        assert_eq!(lookups.len(), super::ALPHA);
+        assert!(lookups.poll(|_| true).is_empty());
+        assert!(!lookups.start([0; 32], async { Vec::new() }));
+
+        senders.remove(0).send(vec![[91; 32]]).unwrap();
+        assert_eq!(
+            lookups.poll(|_| true),
+            vec![(CollectionHandle::new([0; 32]), vec![[91; 32]])]
+        );
+        assert_eq!(lookups.len(), super::ALPHA - 1);
+        let (send, receive) = tokio::sync::oneshot::channel::<Vec<PeerId>>();
+        assert!(lookups.start([99; 32], async move { receive.await.unwrap_or_default() }));
+        assert_eq!(lookups.len(), super::ALPHA);
+
+        drop(lookups);
+        assert!(send.is_closed());
+        assert!(senders.iter().all(|send| send.is_closed()));
+    }
+
+    #[test]
+    fn deactivation_cancels_discovery_before_same_handle_reactivation() {
+        let collection = [31; 32];
+        let mut lookups = CollectionDiscoveries::default();
+        let (old_send, old_receive) = tokio::sync::oneshot::channel::<Vec<PeerId>>();
+        assert!(lookups.start(
+            collection,
+            async move { old_receive.await.unwrap_or_default() }
+        ));
+        assert!(lookups.poll(|_| true).is_empty());
+        assert!(lookups.poll(|_| false).is_empty());
+        assert!(old_send.is_closed(), "deactivation drops the actual lookup");
+        assert_eq!(lookups.len(), 0);
+
+        let (new_send, new_receive) = tokio::sync::oneshot::channel::<Vec<PeerId>>();
+        assert!(lookups.start(
+            collection,
+            async move { new_receive.await.unwrap_or_default() }
+        ));
+        assert!(old_send.send(vec![[71; 32]]).is_err());
+        assert!(lookups.poll(|_| true).is_empty());
+        assert_eq!(lookups.len(), 1, "old completion cannot finish new work");
+        new_send.send(vec![[72; 32]]).unwrap();
+        assert_eq!(
+            lookups.poll(|_| true),
+            vec![(CollectionHandle::new(collection), vec![[72; 32]])]
+        );
+    }
+
+    #[test]
+    fn deactivation_discards_discovery_even_when_its_result_is_ready() {
+        let collection = [31; 32];
+        let mut lookups = CollectionDiscoveries::default();
+        assert!(lookups.start(collection, async { vec![[71; 32]] }));
+        assert!(lookups.poll(|_| false).is_empty());
+        assert!(lookups.start(collection, async { vec![[72; 32]] }));
+        assert_eq!(
+            lookups.poll(|_| true),
+            vec![(CollectionHandle::new(collection), vec![[72; 32]])]
+        );
+    }
+
+    #[test]
+    fn equal_advertisement_does_not_cancel_failed_repair_confirmation() {
+        let local = [81; 32];
+        let equal = Some(super::CollectionWakeRoot::new(local));
+        let target = RepairTarget {
+            collection: CollectionHandle::new([82; 32]),
+            peer: [83; 32],
+        };
+        let mut failures = HashMap::from([(target, (1, crate::clock::mono_now()))]);
+        assert!(!super::can_skip_repair(
+            local,
+            equal,
+            failures.contains_key(&target),
+        ));
+        // This is the successful-outcome transition, not an equality hint.
+        failures.remove(&target);
+        assert!(super::can_skip_repair(
+            local,
+            equal,
+            failures.contains_key(&target)
+        ));
+        assert!(!super::can_skip_repair(local, None, false));
+        assert!(!super::can_skip_repair(
+            local,
+            Some(super::CollectionWakeRoot::new([84; 32])),
+            false,
+        ));
     }
 
     #[tokio::test]
@@ -2793,13 +3343,13 @@ mod tests {
                 batch.try_push(super::NetEvent::Blob(verified)).unwrap();
                 let _ = events.send(batch).await;
             });
-            fetches.poll(&active);
+            fetches.poll(|raw| active.contains_key(raw));
             assert_eq!(fetches.pending.len(), 1);
         }
         assert_eq!(attempts.load(Ordering::Relaxed), 1);
 
         assert!(received.recv().await.unwrap().is_empty());
-        fetches.poll(&active);
+        fetches.poll(|raw| active.contains_key(raw));
         assert!(fetches.pending.is_empty());
         assert_eq!(received.recv().await.unwrap().len(), 1);
         assert!(received.try_recv().is_err());
@@ -2821,11 +3371,11 @@ mod tests {
             let _owner = second_owner;
             std::future::pending::<()>().await;
         });
-        fetches.poll(&active);
+        fetches.poll(|raw| active.contains_key(raw));
         assert_eq!(fetches.pending.len(), 2);
 
         active.remove(&first);
-        fetches.poll(&active);
+        fetches.poll(|raw| active.contains_key(raw));
         assert_eq!(fetches.pending.len(), 1);
         assert_eq!(
             first_observer.try_recv(),
@@ -2853,7 +3403,7 @@ mod tests {
             fetches.start(collection, async move {
                 complete.send(()).unwrap();
             });
-            fetches.poll(&active);
+            fetches.poll(|raw| active.contains_key(raw));
             assert!(fetches.pending.is_empty());
             completion.await.unwrap();
         }
@@ -2926,7 +3476,7 @@ mod tests {
     }
 
     #[test]
-    fn arriving_definition_refreshes_admission_even_when_wake_root_is_unchanged() {
+    fn arriving_definition_refreshes_admission_and_inventory_without_semantic_changes() {
         use std::sync::Arc;
         use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
         use triblespace_core::capability::policy::resource_policy;
@@ -2991,7 +3541,22 @@ mod tests {
         )
         .unwrap();
         let after_collection = serving_after.collection(collection).unwrap();
-        assert_eq!(after_collection.wake_root(), before_collection.wake_root());
+        assert_eq!(
+            after_collection.repair.records().summary(),
+            before_collection.repair.records().summary()
+        );
+        assert_eq!(
+            after_collection.repair.authorization_evidence().summary(),
+            before_collection.repair.authorization_evidence().summary()
+        );
+        assert_ne!(after_collection.wake_root(), before_collection.wake_root());
+        assert!(
+            after_collection
+                .repair
+                .blob_inventory()
+                .get(&read_capability().raw)
+                .is_some()
+        );
         assert!(!Arc::ptr_eq(
             &before_collection.repair,
             &after_collection.repair
@@ -3044,7 +3609,7 @@ mod tests {
         let mut budget = ProviderPublicationBudget::new(Some(2));
 
         publisher.install(
-            ProviderObservation::from_collections([first], true).into_set(),
+            ProviderObservation::from_blob_handles([first.raw]).into_set(),
             now,
         );
         assert!(budget.permits_attempt());
@@ -3052,7 +3617,7 @@ mod tests {
         budget.consume_attempt();
 
         publisher.install(
-            ProviderObservation::from_collections([first, second], true).into_set(),
+            ProviderObservation::from_blob_handles([first.raw, second.raw]).into_set(),
             now,
         );
         assert!(budget.permits_attempt());
@@ -3061,7 +3626,7 @@ mod tests {
         assert!(budget.is_exhausted());
 
         publisher.install(
-            ProviderObservation::from_collections([first, second, third], true).into_set(),
+            ProviderObservation::from_blob_handles([first.raw, second.raw, third.raw]).into_set(),
             now,
         );
         assert!(
@@ -3298,7 +3863,44 @@ mod tests {
     }
 
     #[test]
-    fn healthy_collection_performs_only_its_initial_discovery() {
+    fn discovery_slots_rotate_even_when_every_earlier_lookup_is_due_again() {
+        let mut collections = super::CollectionSnapshotIndex::new();
+        for byte in 1..=9 {
+            collections.insert(&super::PatchEntry::with_value(
+                &[byte; 32],
+                std::sync::Arc::new(super::CollectionObservation {
+                    value: None,
+                    dependencies: Default::default(),
+                }),
+            ));
+        }
+        let mut cursor = None;
+        let mut issued = Vec::new();
+        // Model three slow waves: by each completion all older lookups can
+        // already be due again, but none may overtake an unvisited interest.
+        for _ in 0..3 {
+            let wave = super::discovery_order(&collections, cursor)
+                .take(super::ALPHA)
+                .copied()
+                .collect::<Vec<_>>();
+            cursor = wave.last().copied();
+            issued.extend(wave);
+        }
+        assert_eq!(issued, (1..=9).map(|byte| [byte; 32]).collect::<Vec<_>>());
+        assert_eq!(
+            super::discovery_order(&collections, cursor).next(),
+            Some(&[1; 32])
+        );
+        assert_eq!(
+            super::discovery_order(&collections, Some([5; 32]))
+                .copied()
+                .collect::<Vec<_>>(),
+            [6, 7, 8, 9, 1, 2, 3, 4, 5].map(|byte| [byte; 32])
+        );
+    }
+
+    #[test]
+    fn healthy_subset_does_not_suppress_descriptor_rediscovery_forever() {
         let started = crate::clock::mono_now();
         let mut discovery = DiscoveryState::new(started);
         let mut lookups = 0;
@@ -3306,14 +3908,19 @@ mod tests {
         assert!(discovery.start_if_due(started, false));
         lookups += 1;
         discovery.finish_attempt(started);
+        discovery.observe_success(started);
 
         for period in 1..=100 {
             let now = started + super::REPAIR_PERIOD.saturating_mul(period);
             if discovery.start_if_due(now, true) {
                 lookups += 1;
+                discovery.finish_attempt(now);
             }
         }
-        assert_eq!(lookups, 1, "a leased repair candidate replaces DHT polling");
+        assert_eq!(
+            lookups, 11,
+            "healthy subsets still retry bootstrap every five minutes"
+        );
     }
 
     #[test]
@@ -3460,9 +4067,156 @@ mod tests {
         let mut state = HashMap::from([(retained, 1u8), (removed, 2u8)]);
         let active = std::collections::HashSet::from([retained.collection.raw]);
 
-        retain_active_repair_state(&mut state, &active);
+        retain_active_repair_state(&mut state, |raw| active.contains(raw));
 
         assert_eq!(state, HashMap::from([(retained, 1u8)]));
+    }
+
+    async fn inventory_checkpoint_resumes_after_failed_page(
+        ending: crate::collection_session::tests::TestEnding,
+        failure: crate::health::RepairFailure,
+    ) {
+        use crate::collection_session::tests::{TestEnding, inventory, pull_with_cursor_ending};
+        use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
+        use triblespace_core::repo::{SnapshotSource, memoryrepo::MemoryRepo};
+
+        let mut store = MemoryRepo::default();
+        let collection = store
+            .collection(
+                "inventory-repair-checkpoint",
+                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+            )
+            .unwrap()
+            .handle();
+        let local = crate::collection_activation::collection_repair_overlay(
+            &store.snapshot().unwrap(),
+            collection,
+        )
+        .unwrap();
+        let handles = (0_u32..2048)
+            .map(|index| *blake3::hash(&index.to_be_bytes()).as_bytes())
+            .collect::<BTreeSet<_>>();
+        let remote = std::sync::Arc::new(
+            local
+                .clone()
+                .with_blob_inventory(inventory(handles.iter().copied())),
+        );
+        let target = RepairTarget {
+            collection,
+            peer: [0x56; 32],
+        };
+        let reader = SigningKey::from_bytes(&[0x57; 32]).verifying_key();
+        let mut cursors = HashMap::new();
+        let mut received = BTreeSet::new();
+        let mut completed = false;
+        for attempt in 0..64 {
+            let interrupted = attempt == 1;
+            let delta = pull_with_cursor_ending(
+                &local,
+                remote.clone(),
+                reader,
+                super::resume_inventory_repair(&cursors, target),
+                if interrupted {
+                    ending
+                } else {
+                    TestEnding::Complete
+                },
+            )
+            .await;
+            let (success, cursor) = if interrupted {
+                let error = delta.unwrap_err();
+                match ending {
+                    TestEnding::ReadError => {
+                        assert!(error.downcast_ref::<std::io::Error>().is_some())
+                    }
+                    TestEnding::Timeout => {
+                        assert!(
+                            error
+                                .downcast_ref::<tokio::time::error::Elapsed>()
+                                .is_some()
+                        )
+                    }
+                    TestEnding::Complete => unreachable!(),
+                }
+                assert!(
+                    !received.is_empty(),
+                    "the first bounded page must have advanced"
+                );
+                (false, None)
+            } else {
+                let delta = delta.unwrap();
+                assert!(!delta.more);
+                for handle in delta.blob_handles {
+                    assert!(
+                        received.insert(handle),
+                        "failed repair must not restart the accepted prefix"
+                    );
+                }
+                (true, delta.inventory_cursor)
+            };
+            let mut outcome = super::RepairOutcome {
+                target,
+                success,
+                retry_immediately: false,
+                completed_at: crate::clock::mono_now(),
+                failure: interrupted.then_some(failure),
+                inventory_cursor: cursor,
+            };
+            super::complete_inventory_repair(&mut cursors, &mut outcome, true);
+            if interrupted {
+                assert!(cursors.contains_key(&target));
+            } else if !cursors.contains_key(&target) {
+                completed = true;
+                break;
+            }
+        }
+        assert!(completed, "late inventory suffix must remain reachable");
+        assert_eq!(received, handles);
+        assert!(
+            cursors.is_empty(),
+            "completed success releases the checkpoint"
+        );
+        assert!(
+            local.blob_inventory().is_empty(),
+            "no hinted payload landed"
+        );
+
+        // Deactivation discards the saved cursor and an already-running
+        // successful attempt cannot put it back while C remains inactive.
+        let delta = pull_with_cursor_ending(&local, remote, reader, None, TestEnding::Complete)
+            .await
+            .unwrap();
+        let mut outcome = super::RepairOutcome {
+            target,
+            success: true,
+            retry_immediately: false,
+            completed_at: crate::clock::mono_now(),
+            failure: None,
+            inventory_cursor: delta.inventory_cursor,
+        };
+        assert!(outcome.inventory_cursor.is_some());
+        cursors.insert(target, outcome.inventory_cursor.clone().unwrap());
+        retain_active_repair_state(&mut cursors, |_| false);
+        super::complete_inventory_repair(&mut cursors, &mut outcome, false);
+        assert!(cursors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn inventory_checkpoint_survives_transport_failure_and_reaches_late_handles() {
+        inventory_checkpoint_resumes_after_failed_page(
+            crate::collection_session::tests::TestEnding::ReadError,
+            crate::health::RepairFailure::Failed,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn inventory_checkpoint_survives_timeout_and_reaches_late_handles() {
+        inventory_checkpoint_resumes_after_failed_page(
+            crate::collection_session::tests::TestEnding::Timeout,
+            crate::health::RepairFailure::Deadline,
+        )
+        .await;
     }
 
     #[test]
@@ -3577,3 +4331,9 @@ pub(crate) fn dot_stripped_default_relay_map() -> iroh::RelayMap {
     iroh::RelayMap::try_from_iter(urls.iter().map(String::as_str))
         .expect("default relay URLs remain valid after hostname normalization")
 }
+
+#[cfg(test)]
+mod wake_relay_tests;
+
+#[cfg(test)]
+mod blob_inventory_tests;

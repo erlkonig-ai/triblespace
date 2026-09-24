@@ -305,6 +305,37 @@ impl CollectionRead for MemoryStoreSnapshot {
             .filter(|record| selectors_match_record(selectors, *record))
             .collect())
     }
+
+    fn select_record_changes(
+        &self,
+        previous: &Self,
+        selectors: &BTreeSet<CollectionRecordSelector>,
+    ) -> Result<(Vec<CollectionRecord>, Vec<CollectionRecord>), Self::RecordsError> {
+        if selectors.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let select = |records: &CollectionRecordIndex| {
+            records
+                .iter_ordered()
+                .filter_map(|key| {
+                    let record = *records.get(key).expect("record index retains its value");
+                    selectors_match_record(selectors, record).then_some(record)
+                })
+                .collect()
+        };
+        Ok((
+            select(
+                &self
+                    .collection_records
+                    .difference(&previous.collection_records),
+            ),
+            select(
+                &previous
+                    .collection_records
+                    .difference(&self.collection_records),
+            ),
+        ))
+    }
 }
 
 impl CollectionStore for MemoryStore {

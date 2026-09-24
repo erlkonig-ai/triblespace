@@ -7,6 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Apply selected native record-index differences to retained collection Merkle
+  PATCHes instead of rebuilding a changed collection's complete history on each
+  peer refresh. Preserve the last successful blob-inventory traversal checkpoint
+  across failed or timed-out repair attempts; clear it on completion or
+  deactivation, and revalidate changed remote roots before continuing.
+  Expedite descriptor acquisition when a collection is activated after the
+  host's first timer turn rather than waiting for the next retry interval.
+
+- Carry independent collection gossip topics over one ordered, topic-tagged
+  stream per peer connection. The previous persistent stream per topic stopped
+  at QUIC's default 100-stream limit with 126–130 active collections. Vendor
+  the exact iroh-gossip 0.101.0 source and isolate the framing under private
+  ALPN `/triblespace/gossip/C6858FA15B24B264151DB34DAA9C1964` (anchor minted
+  with `trible genid`). Keep membership, per-collection root semantics and
+  authorized repair separate from transport multiplexing. Add production-sized
+  topic-capacity regressions and an ephemeral read-only gossip probe.
+  Isolate unavailable writers from the shared actor, fail both halves on a
+  transport error, and preserve intentional directional half-closes during
+  simultaneous dials. Reject cancelled dials even after completion.
+
+- Add a READ(C)-gated resident-blob PATCH as the third pinned collection-repair
+  component and include it in the opaque wake root. Allocate repair opcode
+  `0x0E` on ALPN `/triblespace/pile-sync/26`, rejecting the retired `0x0D`
+  grammar while retaining unchanged exact-blob clients. Bounded passive local scans expose only positive
+  readable handles; resumable 128-node inventory passes continue across RPCs
+  without requiring payload landing. Explicit full hydration acquires known
+  handles through the existing bounded parallel exact-H path, replacing
+  speculative aligned-word network probing and reference-summary filtering.
+  Inventories remain partial observations, not closure or decryption certificates.
+  Preserve inventory traversal progress across changing roots with freshly
+  validated suffix walks and low-key revisits. Rotate bounded hint windows only
+  after actual service, so unavailable early handles cannot permanently crowd
+  out later reachable blobs. Semantic health compares only
+  record/AUTH evidence, so cache-policy differences neither create false stalls
+  nor let availability churn extend the grace of a real semantic stall.
+
+- Bootstrap collection gossip through descriptor policy roots, scoped AUTH
+  root/delegate identities and ordinary descriptor-blob providers; remove the
+  separate collection-participant DHT namespace. Descriptor holders remain
+  candidates, not admitted repair sources. Periodically offer the latest root
+  with randomized equal-root suppression. Use a version-isolated neighbor-only
+  topic with application relaying: coalesce latest per-origin observations by R,
+  permit repair before a bounded original-offer fallback, and replace the contact
+  only from a published serving snapshot. Replay remains available for downstream
+  liveness; suppress it only with matching evidence from every known neighbor.
+  Select among fresh signed origins advertising the same root to share repair
+  load. Retry discovery even beside healthy replicas, with bounded fair lookup
+  ownership; healthy peers no longer require blind periodic repair pulls.
+
+- Retain a failed collection participant until its existing lease expires,
+  retrying under the existing bounded backoff. A reachable replica no longer
+  hides another replica's recovery after a transient partition or restart.
+  Failed attempts never extend leases; exhausted candidates still rediscover.
+
+- Keep a shared peer connection after a valid collection-repair READ refusal
+  or unavailable-collection reply. These answers end only their own stream;
+  malformed replies and transport failures still invalidate the connection.
+
+- Peer-to-host synchronization publishes one latest coherent store snapshot,
+  not a FIFO of intermediate serving/provider observations. The host computes
+  PATCH differences from the snapshot it last processed; per-topic root wakes
+  also retain only the latest root. Authenticated incoming evidence remains
+  bounded and lossless. `Peer` owns optional payload hydration, landing ready
+  downloads before publishing one serving snapshot for the completed batch.
+
+- The sync daemon and maintenance CLI use one existing durable node key for
+  transport, authored work, health and local telemetry. Remove independent
+  `--health-key`, `--telemetry-key` and maintenance `--telemetry-node` settings;
+  `sync --health` or `--health-collection` enables health with the node key.
+  Existing collection admission and worker/session boundaries are unchanged.
+
 - `trible pile diagnose conflicts <PILE>` lists MERGE and DERIVE equations
   that name two results for one input set, with the keys that signed each
   side, and exits non-zero when any exist. The lattice takes every signed

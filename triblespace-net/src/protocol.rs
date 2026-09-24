@@ -21,17 +21,19 @@ use crate::bearer::{blob_locator, proof_matches, provider_proof, requester_proof
 use crate::transport::Conn;
 use crate::transport::PeerId;
 
-/// Descriptor-driven AUTH generation. Old proof bytes are not interchangeable.
+/// Shared bearer/DHT transport generation. Collection repair versions its own
+/// operation byte so unchanged exact-H clients need not replace their endpoint.
 pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/26";
 
 // Operation types — first byte on each stream.
 // 0x01 was branch-list; 0x03 was blob-children; 0x04 was branch-head;
-// 0x05 was connection AUTH. None are accepted in v26.
+// 0x05 was connection AUTH; 0x0D was record/AUTH-only collection repair.
+// None are accepted. Incompatible operation layouts require a fresh byte.
 pub const OP_GET_BLOB: u8 = 0x02;
 pub const OP_PROVIDER_PUT: u8 = 0x06;
 pub const OP_PROVIDER_GET: u8 = 0x07;
 pub const OP_FIND_NODE: u8 = 0x0C;
-// 0x0D is OP_COLLECTION_REPAIR, owned by collection_wire.
+// 0x0E is OP_COLLECTION_REPAIR, owned by collection_wire.
 
 pub const PROVIDER_PUT_OK: u8 = 0x00;
 pub const PROVIDER_PUT_FULL: u8 = 0x01;

@@ -153,6 +153,44 @@ where
     canonical_records(collection, records).map_err(CollectionRecordPatchError::Evidence)
 }
 
+/// Advance the PATCH built from `previous` using only selected semantic record
+/// additions and removals. `prior` must describe that previous snapshot and
+/// retains its unchanged persistent Merkle subtrees; no old record body is
+/// rehashed simply because another record arrived in its collection.
+pub fn update_collection_record_patch<R>(
+    current: &R,
+    previous: &R,
+    prior: &CollectionRecordPatch,
+) -> Result<CollectionRecordPatch, CollectionRecordPatchError<R::RecordsError>>
+where
+    R: CollectionRead,
+{
+    let expected = prior.collection;
+    let selectors = BTreeSet::from([CollectionRecordSelector::Collection(expected)]);
+    let (added, removed) = current
+        .select_record_changes(previous, &selectors)
+        .map_err(CollectionRecordPatchError::Store)?;
+    let mut next = prior.clone();
+    for record in removed {
+        validate_record(expected, record).map_err(CollectionRecordPatchError::Evidence)?;
+        let fingerprint = record.fingerprint();
+        let key = fingerprint.raw();
+        if let Some(existing) = next.records.get(&key) {
+            if existing != &record {
+                return Err(CollectionRecordPatchError::Evidence(
+                    CollectionDeltaError::FingerprintCollision(fingerprint),
+                ));
+            }
+            next.records.remove(&key);
+        }
+    }
+    for record in added {
+        insert_record(expected, &mut next.records, record)
+            .map_err(CollectionRecordPatchError::Evidence)?;
+    }
+    Ok(next)
+}
+
 /// Encode one trusted local record after checking its intrinsic collection.
 /// Signatures are not re-verified on output. WRITE authorization is absent: it
 /// governs derived admission, not whether canonical inert evidence may exist.
@@ -192,21 +230,30 @@ fn canonical_records(
 ) -> Result<CollectionRecordPatch, CollectionDeltaError> {
     let mut canonical = PATCH::new();
     for record in records {
-        validate_record(expected, record)?;
-        let fingerprint = record.fingerprint();
-        let key = fingerprint.raw();
-        if let Some(existing) = canonical.get(&key) {
-            if existing != &record {
-                return Err(CollectionDeltaError::FingerprintCollision(fingerprint));
-            }
-            continue;
-        }
-        canonical.insert(&PatchEntry::with_value(&key, record));
+        insert_record(expected, &mut canonical, record)?;
     }
     Ok(CollectionRecordPatch {
         collection: expected,
         records: canonical,
     })
+}
+
+fn insert_record(
+    expected: CollectionHandle,
+    canonical: &mut PATCH<32, IdentitySchema, CollectionRecord, Blake3Merkle>,
+    record: CollectionRecord,
+) -> Result<(), CollectionDeltaError> {
+    validate_record(expected, record)?;
+    let fingerprint = record.fingerprint();
+    let key = fingerprint.raw();
+    if let Some(existing) = canonical.get(&key) {
+        if existing != &record {
+            return Err(CollectionDeltaError::FingerprintCollision(fingerprint));
+        }
+        return Ok(());
+    }
+    canonical.insert(&PatchEntry::with_value(&key, record));
+    Ok(())
 }
 
 #[cfg(test)]

@@ -15,11 +15,11 @@ use triblespace_core::collection::CollectionHandle;
 use triblespace_core::collection::{
     AdmissionPolicy, Collection, CollectionPolicy, CollectionStoreExt,
 };
-use triblespace_core::repo::SnapshotSource;
 use triblespace_core::repo::pile::Pile;
+use triblespace_core::repo::SnapshotSource;
 use triblespace_net::health_record::{self, Recorder, DEFAULT_MAX_AGE, REPORT_EVERY};
 use triblespace_net::peer::{Peer, PeerConfig, ReconcileDirection, ReconcileQos};
-use triblespace_net::reconcile::{Reconciler, ReplicationMode};
+use triblespace_net::reconcile::ReplicationMode;
 
 fn open_pile(path: &PathBuf) -> Result<Pile> {
     crate::cli::pile::open_refreshed(path)
@@ -83,7 +83,7 @@ pub(crate) enum ReplicationArg {
     Demand,
     /// Also fetch the direct blob references of selected collection records.
     Shallow,
-    /// Also conservatively walk their recursively referenced blobs.
+    /// Also fetch positive recursive-residency hints from authorized peers.
     Full,
 }
 
@@ -111,7 +111,7 @@ pub enum Command {
     /// about every possible replica or the availability of every blob.
     Health {
         pile: PathBuf,
-        /// Reporting author, not the daemon's transport identity.
+        /// Path to the node's durable signing key.
         #[arg(long)]
         key: Option<PathBuf>,
         /// Read this existing health collection (descriptor handle) instead of
@@ -177,7 +177,7 @@ pub enum Command {
         /// Canonical iroh endpoint tickets or bare endpoint ids.
         #[arg(long, value_delimiter = ',')]
         peers: Vec<String>,
-        /// Path to the node's signing key.
+        /// Existing durable key for the endpoint, health and telemetry signatures.
         #[arg(long)]
         key: Option<PathBuf>,
         /// Exact collection descriptor handle to activate. Repeat as needed.
@@ -188,8 +188,8 @@ pub enum Command {
         direction: DirectionArg,
         /// Local blob acquisition for exactly the --collection selections.
         /// READ grants alone never subscribe this process to hydration.
-        /// Select a producer-maintained reference-summary collection as well
-        /// to accelerate full walks; missing summaries leave them unfiltered.
+        /// Full mode also acquires positive resident-blob handles learned through
+        /// READ-authorized collection repair; it never probes arbitrary payload words.
         #[arg(long, value_enum, default_value = "demand")]
         replication: ReplicationArg,
         /// Maximum DHT provider-announcement attempts for this process.
@@ -198,15 +198,14 @@ pub enum Command {
         /// Retries and renewals consume the same budget as first publication.
         #[arg(long, value_name = "ATTEMPTS")]
         provider_publication_budget: Option<u64>,
-        /// Publish local, timestamped swarm-health observations signed by this
-        /// existing key. The transport key is not implicitly a reporting author.
+        /// Publish local, timestamped swarm-health observations using the node key.
         /// The health collection is not automatically activated for sync.
-        #[arg(long, value_name = "PATH")]
-        health_key: Option<PathBuf>,
+        #[arg(long)]
+        health: bool,
         /// Record swarm health into this existing collection (descriptor
         /// handle) instead of the reporting key's own `swarm-health`
-        /// generation; the key must be admitted there. Requires --health-key.
-        #[arg(long, value_name = "HANDLE", requires = "health_key")]
+        /// generation; the node key must be admitted there. Enables reporting.
+        #[arg(long, value_name = "HANDLE")]
         health_collection: Option<String>,
         #[command(flatten)]
         telemetry: telemetry::Options,
@@ -259,7 +258,7 @@ pub fn run(command: Command) -> Result<()> {
             direction,
             replication,
             provider_publication_budget,
-            health_key,
+            health,
             health_collection,
             telemetry,
             duration,
@@ -274,7 +273,7 @@ pub fn run(command: Command) -> Result<()> {
             },
             replication.into(),
             provider_publication_budget,
-            health_key,
+            health,
             health_collection,
             telemetry,
             duration,
@@ -303,7 +302,7 @@ fn run_sync(
     qos: ReconcileQos,
     replication: ReplicationMode,
     provider_publication_budget: Option<u64>,
-    health_key_path: Option<PathBuf>,
+    health: bool,
     health_collection_value: Option<String>,
     telemetry_options: telemetry::Options,
     duration: Option<u64>,
@@ -324,18 +323,35 @@ fn run_sync(
         crate::cli::util::shutdown_signal()?
     };
     let mut pile = open_pile(&pile_path)?;
-    let mut telemetry =
-        telemetry::Publisher::open(&mut pile, key.verifying_key(), telemetry_options)?;
-    let reporting_key = health_key_path
-        .map(|path| load_existing_key(Some(path), &pile_path))
-        .transpose()?;
+    let mut telemetry = telemetry::Publisher::open(&mut pile, &key, telemetry_options)?;
     let mut recorder = Recorder::new(key.verifying_key());
-    let health_collection = if let Some(signer) = reporting_key.as_ref() {
+    let health_collection = if health || health_collection_value.is_some() {
         let collection = open_health_collection(
             &mut pile,
-            signer.verifying_key(),
+            key.verifying_key(),
             health_collection_value.as_deref(),
         )?;
+        // Local appends are deliberately permissive. This producer must not
+        // silently publish reports that its selected destination cannot read.
+        let admission = (|| -> Result<()> {
+            use triblespace_core::collection::descriptor;
+            use triblespace_core::repo::BlobStoreGet;
+            let snapshot = pile.snapshot()?;
+            let facts: triblespace_core::trible::TribleSet = snapshot.get(collection.handle())?;
+            if descriptor::source(&facts)?.is_some() {
+                return Err(anyhow!("health destination must be a source collection"));
+            }
+            if !collection.writer_is_admitted(&snapshot, key.verifying_key())? {
+                return Err(anyhow!(
+                    "node key is not admitted by the health destination"
+                ));
+            }
+            Ok(())
+        })();
+        if let Err(error) = admission {
+            pile.close()?;
+            return Err(error);
+        }
         // Publish before endpoint startup: failure to start must not look like
         // a monitor that was never configured at all.
         let mut fragment = recorder.record(
@@ -349,14 +365,14 @@ fn run_sync(
             }],
         )?;
         fragment += health_record::vocabulary();
-        pile.commit(collection, signer, fragment)?;
+        pile.commit(collection, &key, fragment)?;
         Some(collection)
     } else {
         None
     };
     let mut peer = Peer::new(
         pile,
-        key,
+        key.clone(),
         PeerConfig {
             peers,
             qos,
@@ -371,7 +387,7 @@ fn run_sync(
     if health_collection.is_some() {
         eprintln!("local swarm health: every 60s; freshness is reader policy");
     } else {
-        eprintln!("local swarm health: not recording (set --health-key)");
+        eprintln!("local swarm health: not recording (set --health or --health-collection)");
     }
     eprintln!(
         "direction: {}",
@@ -399,7 +415,7 @@ fn run_sync(
     let started = std::time::Instant::now();
     let duration_limit = duration.map(std::time::Duration::from_secs);
     let quiescent_limit = quiescent_for.map(std::time::Duration::from_secs);
-    let mut reconciler = Reconciler::new().with_replication(replication, collections);
+    peer.set_replication(replication, collections);
     let reconcile_every = std::time::Duration::from_secs(1);
     let mut next_reconcile = std::time::Instant::now();
     let mut next_health = std::time::Instant::now();
@@ -434,20 +450,20 @@ fn run_sync(
                     next_telemetry = std::time::Instant::now() + REPORT_EVERY;
                 }
             }
-            if let (Some(collection), Some(signer)) = (health_collection, reporting_key.as_ref()) {
+            if let Some(collection) = health_collection {
                 if std::time::Instant::now() >= next_health {
                     let health = peer.health();
                     let fragment = recorder.record_measurements(
                         triblespace_core::clock::epoch_now(),
                         health_record::measurements(&health, triblespace_core::clock::mono_now()),
                     )?;
-                    peer.store().commit(collection, signer, fragment)?;
+                    peer.store().commit(collection, &key, fragment)?;
                     next_health = std::time::Instant::now() + REPORT_EVERY;
                 }
             }
             if next_reconcile <= std::time::Instant::now() {
                 let measured = telemetry.as_ref().map(|_| std::time::Instant::now());
-                let stats = reconciler.tick(&mut peer).await;
+                let stats = peer.reconcile().await;
                 if let (Some(telemetry), Some(measured)) = (telemetry.as_mut(), measured) {
                     telemetry.reconciled(&stats, measured.elapsed());
                 }
@@ -457,16 +473,14 @@ fn run_sync(
                 if stats.fulfilled > 0 || stats.replication.acquired > 0 {
                     last_want_progress = std::time::Instant::now();
                 }
-                if stats.replication.acquired > 0 || stats.replication.speculative_attempted > 0 {
+                if stats.replication.acquired > 0 || stats.replication.inventory > 0 {
                     eprintln!(
-                        "  hydration: {} roots, {} pending, {} acquired; {} candidates, {} filtered, {} speculative reads, {} misses",
+                        "  hydration: {} direct roots, {} pending; {} positive inventory hints, {} still missing; {} acquired",
                         stats.replication.roots,
                         stats.replication.pending,
+                        stats.replication.inventory,
+                        stats.replication.inventory_pending,
                         stats.replication.acquired,
-                        stats.replication.candidates,
-                        stats.replication.filtered,
-                        stats.replication.speculative_attempted,
-                        stats.replication.speculative_misses,
                     );
                 }
                 if stats.fulfilled > 0 || last_pending_logged != Some(stats.pending) {
@@ -638,9 +652,7 @@ fn run_health(
             }
         }
         if count == 0 {
-            println!(
-                "Swarm health: not observed. Enable sync --health-key with this reporting key."
-            );
+            println!("Swarm health: not observed. Enable sync --health with this node key.");
         }
         println!(
             "Scope: recent known-participant record/proof comparisons; no all-swarm or all-blob availability claim."
@@ -705,15 +717,27 @@ mod tests {
     }
 
     #[test]
-    fn health_reporting_requires_an_explicit_author_key() {
+    fn health_reporting_is_opt_in_without_a_second_key() {
         let handle = hex::encode([0xCD; 32]);
-        let Command::Sync { health_key, .. } =
+        let Command::Sync { health, .. } =
             Command::try_parse_from(["net", "sync", "test.pile", "--collection", &handle]).unwrap()
         else {
             panic!("sync expected")
         };
-        assert!(health_key.is_none());
-        let Command::Sync { health_key, .. } = Command::try_parse_from([
+        assert!(!health);
+        let Command::Sync { health, .. } = Command::try_parse_from([
+            "net",
+            "sync",
+            "test.pile",
+            "--collection",
+            &handle,
+            "--health",
+        ])
+        .unwrap() else {
+            panic!("sync expected")
+        };
+        assert!(health);
+        assert!(Command::try_parse_from([
             "net",
             "sync",
             "test.pile",
@@ -722,10 +746,7 @@ mod tests {
             "--health-key",
             "observer.key",
         ])
-        .unwrap() else {
-            panic!("sync expected")
-        };
-        assert_eq!(health_key, Some(PathBuf::from("observer.key")));
+        .is_err());
         assert!(matches!(
             Command::try_parse_from(["net", "health", "test.pile"]).unwrap(),
             Command::Health { .. }
@@ -733,18 +754,8 @@ mod tests {
     }
 
     #[test]
-    fn an_explicit_health_collection_needs_the_reporting_key() {
+    fn an_explicit_health_collection_enables_reporting_with_the_node_key() {
         let handle = hex::encode([0xCD; 32]);
-        assert!(Command::try_parse_from([
-            "net",
-            "sync",
-            "test.pile",
-            "--collection",
-            &handle,
-            "--health-collection",
-            &handle,
-        ])
-        .is_err());
         let Command::Sync {
             health_collection, ..
         } = Command::try_parse_from([
@@ -753,12 +764,11 @@ mod tests {
             "test.pile",
             "--collection",
             &handle,
-            "--health-key",
-            "observer.key",
             "--health-collection",
             &handle,
         ])
-        .unwrap() else {
+        .unwrap()
+        else {
             panic!("sync expected")
         };
         assert_eq!(health_collection.as_deref(), Some(handle.as_str()));

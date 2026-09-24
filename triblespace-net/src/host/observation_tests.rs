@@ -18,8 +18,8 @@ use triblespace_core::capability::{
 };
 use triblespace_core::collection::{
     ACTION_READ, AdmissionPolicy, Collection, CollectionCommit, CollectionHandle, CollectionPolicy,
-    CollectionRead, CollectionRecord, CollectionRecordSelector,
-    CollectionStore, CollectionStoreExt, KIND_COLLECTION_DESCRIPTOR, read_capability,
+    CollectionRead, CollectionRecord, CollectionRecordSelector, CollectionStore,
+    CollectionStoreExt, KIND_COLLECTION_DESCRIPTOR, read_capability,
 };
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{Inline, InlineEncoding};
@@ -181,6 +181,14 @@ impl<R: CollectionRead> CollectionRead for CountedSnapshot<R> {
         self.enumerations.fetch_add(1, Ordering::Relaxed);
         self.inner.select_records(selectors)
     }
+
+    fn select_record_changes(
+        &self,
+        previous: &Self,
+        selectors: &BTreeSet<CollectionRecordSelector>,
+    ) -> Result<(Vec<CollectionRecord>, Vec<CollectionRecord>), Self::RecordsError> {
+        self.inner.select_record_changes(&previous.inner, selectors)
+    }
 }
 
 impl<R: WantRead> WantRead for CountedSnapshot<R> {
@@ -258,6 +266,244 @@ fn active(collection: CollectionHandle) -> ActiveCollections {
     active
 }
 
+#[test]
+fn serving_handoff_keeps_only_the_latest_coherent_observation() {
+    let mut fixture = Fixture::new();
+    let local = fixture.root.verifying_key();
+    let mut selected = active(fixture.collection.handle());
+    // Missing descriptors still require a subscription and bootstrap attempt,
+    // but must never become serving/provider advertisements.
+    let unavailable = CollectionHandle::new([0xFE; 32]);
+    selected.insert(&PatchEntry::new(&unavailable.raw));
+    let (sender, _evidence, mut wiring) =
+        super::wire(iroh_base::EndpointId::from_bytes(local.as_bytes()).unwrap());
+    assert!(!wiring.snapshot.has_changed().unwrap());
+    let mut retired = Vec::new();
+    let mut newest_blob = None;
+    for label in ["handoff-one", "handoff-two", "handoff-three"] {
+        let record = fixture
+            .store
+            .commit(
+                fixture.collection,
+                &fixture.root,
+                entity! { metadata::name: label },
+            )
+            .unwrap();
+        newest_blob = Some(record.data().raw);
+        let serving = StoreSnapshot::from_store_changes(
+            fixture.snapshot(),
+            &selected,
+            local,
+            None,
+            None,
+            StoreChanges::ALL,
+        )
+        .unwrap();
+        sender.update_snapshot(serving, &selected);
+        retired.push(Arc::downgrade(&sender.current_snapshot().unwrap()));
+    }
+    assert!(retired[0].upgrade().is_none());
+    assert!(retired[1].upgrade().is_none());
+    assert!(retired[2].upgrade().is_some());
+    assert!(wiring.snapshot.has_changed().unwrap());
+    let latest = wiring.snapshot.borrow_and_update().clone().unwrap();
+    assert!(!wiring.snapshot.has_changed().unwrap());
+    assert!(Arc::ptr_eq(&latest, &sender.current_snapshot().unwrap()));
+    assert!(latest.collections.get(&unavailable.raw).is_some());
+    assert!(latest.collection(unavailable).is_none());
+    let advertised =
+        crate::provider::ProviderObservation::from_locators(latest.bearer_locators()).into_set();
+    assert!(advertised.contains(&crate::bearer::blob_locator(
+        fixture.collection.handle().raw
+    )));
+    assert!(!advertised.contains(&crate::bearer::blob_locator(unavailable.raw)));
+    let blob = newest_blob.unwrap();
+    assert!(advertised.contains(&crate::bearer::blob_locator(blob)));
+    assert!(latest.get_blob(&blob).is_some());
+}
+
+#[test]
+fn serving_handoff_withdrawal_recovery_and_last_owner_drop_are_observable() {
+    let mut fixture = Fixture::new();
+    let local = fixture.root.verifying_key();
+    let collection = fixture.collection.handle();
+    let selected = active(collection);
+    let (sender, _evidence, mut wiring) =
+        super::wire(iroh_base::EndpointId::from_bytes(local.as_bytes()).unwrap());
+    let mut install = |selected: &ActiveCollections| {
+        let serving = StoreSnapshot::from_store_changes(
+            fixture.snapshot(),
+            selected,
+            local,
+            None,
+            None,
+            StoreChanges::ALL,
+        )
+        .unwrap();
+        sender.update_snapshot(serving, selected);
+    };
+    install(&selected);
+    assert!(wiring.snapshot.borrow_and_update().is_some());
+    sender.clear_snapshot();
+    assert!(sender.current_snapshot().is_none());
+    assert!(
+        wiring.snapshot.borrow().is_none(),
+        "serving withdraws immediately"
+    );
+    assert!(wiring.snapshot.has_changed().unwrap());
+    assert!(wiring.snapshot.borrow_and_update().is_none());
+    install(&selected);
+    assert!(
+        wiring
+            .snapshot
+            .borrow_and_update()
+            .as_ref()
+            .unwrap()
+            .collection(collection)
+            .is_some()
+    );
+    // Deactivation is a newer valid observation; it does not withdraw blobs.
+    install(&ActiveCollections::new());
+    let deactivated = wiring.snapshot.borrow_and_update().clone().unwrap();
+    assert!(deactivated.collections.is_empty());
+    assert!(!deactivated.bearer_locators().is_empty());
+    let clone = sender.clone();
+    drop(sender);
+    assert!(!wiring.snapshot.has_changed().unwrap());
+    drop(clone);
+    assert!(wiring.snapshot.has_changed().is_err());
+}
+
+#[tokio::test]
+async fn wake_topic_broadcasts_latest_root_without_retaining_snapshot_history() {
+    use crate::wake::{CollectionWake, CollectionWakeEvent, CollectionWakeRoot};
+
+    #[derive(Clone)]
+    struct Plane(
+        tokio::sync::mpsc::UnboundedSender<CollectionWakeRoot>,
+        tokio::sync::mpsc::UnboundedSender<Vec<iroh_base::EndpointId>>,
+    );
+    struct Topic {
+        plane: Plane,
+        collection: CollectionHandle,
+    }
+    impl crate::wake::CollectionWakeNetwork for Plane {
+        type Topic = Topic;
+
+        async fn subscribe_network(
+            &self,
+            collection: CollectionHandle,
+            _bootstrap: Vec<iroh_base::EndpointId>,
+        ) -> anyhow::Result<Self::Topic> {
+            Ok(Topic {
+                plane: self.clone(),
+                collection,
+            })
+        }
+    }
+    impl crate::wake::CollectionWakeSubscription for Topic {
+        async fn join_wake_peers(&self, peers: Vec<iroh_base::EndpointId>) -> anyhow::Result<()> {
+            self.plane.1.send(peers).unwrap();
+            Ok(())
+        }
+
+        async fn broadcast_wake(&self, root: CollectionWakeRoot) -> anyhow::Result<CollectionWake> {
+            self.plane.0.send(root).unwrap();
+            Ok(CollectionWake::sign(
+                self.collection,
+                root,
+                [0; 16],
+                &SigningKey::from_bytes(&[33; 32]),
+            ))
+        }
+
+        async fn next_wake_event(&mut self) -> anyhow::Result<Option<CollectionWakeEvent>> {
+            std::future::pending().await
+        }
+
+        async fn relay_wake(&self, _wake: &CollectionWake) -> anyhow::Result<()> {
+            unreachable!("this fixture receives no incoming wakes")
+        }
+    }
+
+    let (broadcasts, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let (joins, mut joined) = tokio::sync::mpsc::unbounded_channel();
+    let (notices, _notice_rx) = tokio::sync::mpsc::channel(1);
+    let topic = super::spawn_wake_topic(
+        Plane(broadcasts, joins),
+        CollectionHandle::new([44; 32]),
+        true,
+        Vec::new(),
+        notices,
+    );
+    for byte in 1..=200 {
+        topic.observe(Some(CollectionWakeRoot::new([byte; 32])));
+    }
+    // Root observations coalesce, but discovering more peers than a bounded
+    // hint channel could hold must not silently lose their gossip joins.
+    let peers: Vec<_> = (1..=32)
+        .map(|byte| {
+            iroh_base::EndpointId::from_bytes(
+                SigningKey::from_bytes(&[byte; 32])
+                    .verifying_key()
+                    .as_bytes(),
+            )
+            .unwrap()
+        })
+        .collect();
+    for peer in &peers {
+        assert!(topic.send(super::WakeCommand::Join(vec![*peer])).is_ok());
+    }
+    assert_eq!(
+        received.recv().await,
+        Some(CollectionWakeRoot::new([200; 32]))
+    );
+    assert!(received.try_recv().is_err());
+    for peer in peers {
+        assert_eq!(joined.recv().await, Some(vec![peer]));
+    }
+    topic.observe(None);
+    tokio::task::yield_now().await;
+    assert!(received.try_recv().is_err());
+    topic.observe(Some(CollectionWakeRoot::new([201; 32])));
+    topic.observe(Some(CollectionWakeRoot::new([202; 32])));
+    assert_eq!(
+        received.recv().await,
+        Some(CollectionWakeRoot::new([202; 32]))
+    );
+    assert!(received.try_recv().is_err());
+    drop(topic);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), received.recv())
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Read-only interests still join the topic, but cannot offer a root as
+    // a repair source that their own direction policy refuses to serve.
+    let (broadcasts, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let (joins, mut joined) = tokio::sync::mpsc::unbounded_channel();
+    let (notices, _notice_rx) = tokio::sync::mpsc::channel(1);
+    let topic = super::spawn_wake_topic(
+        Plane(broadcasts, joins),
+        CollectionHandle::new([45; 32]),
+        false,
+        Vec::new(),
+        notices,
+    );
+    topic.observe(Some(CollectionWakeRoot::new([203; 32])));
+    topic.send(super::WakeCommand::Join(Vec::new())).unwrap();
+    assert_eq!(joined.recv().await, Some(Vec::new()));
+    // The first emission opportunity is strictly before two seconds.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(3), received.recv())
+            .await
+            .is_err()
+    );
+    drop(topic);
+}
+
 fn assert_same_record_leaves(
     before: &CollectionSnapshot,
     after: &CollectionSnapshot,
@@ -267,6 +513,14 @@ fn assert_same_record_leaves(
         before.repair.records().summary(),
         after.repair.records().summary()
     );
+    assert_shared_record_leaves(before, after, records);
+}
+
+fn assert_shared_record_leaves(
+    before: &CollectionSnapshot,
+    after: &CollectionSnapshot,
+    records: &[CollectionRecord],
+) {
     for record in records {
         let key = record.fingerprint().raw();
         assert!(
@@ -382,7 +636,7 @@ fn proof_arrival_refreshes_read_bootstrap_without_record_enumeration() {
 }
 
 #[test]
-fn new_commit_enumerates_and_updates_the_record_summary() {
+fn new_commit_updates_the_record_summary_without_reenumeration() {
     let mut fixture = Fixture::new();
     let active = active(fixture.collection.handle());
     let local = fixture.root.verifying_key();
@@ -407,7 +661,7 @@ fn new_commit_enumerates_and_updates_the_record_summary() {
     let changes = after.changes_since(&before);
     assert_eq!(changes, StoreChanges::COLLECTION_RECORDS);
     let serving_after = StoreSnapshot::from_store_changes(
-        after,
+        after.clone(),
         &active,
         local,
         Some(&before),
@@ -418,7 +672,7 @@ fn new_commit_enumerates_and_updates_the_record_summary() {
     let new = serving_after
         .collection(fixture.collection.handle())
         .unwrap();
-    assert_eq!(fixture.enumerations.load(Ordering::Relaxed), 1);
+    assert_eq!(fixture.enumerations.load(Ordering::Relaxed), 0);
     assert_eq!(new.repair.records().summary().leaf_count(), 3);
     assert_ne!(
         old.repair.records().summary(),
@@ -429,6 +683,32 @@ fn new_commit_enumerates_and_updates_the_record_summary() {
         Some(fixture.pending)
     );
     assert_ne!(old.wake_root(), new.wake_root());
+    assert_shared_record_leaves(&old, &new, &fixture.records);
+
+    // A replacement observation need not grow. Apply its actual reverse
+    // difference, rather than retaining an absent record forever.
+    let restored = StoreSnapshot::from_store_changes(
+        before.clone(),
+        &active,
+        local,
+        Some(&after),
+        Some(&serving_after),
+        before.changes_since(&after),
+    )
+    .unwrap();
+    let restored = restored.collection(fixture.collection.handle()).unwrap();
+    assert_eq!(fixture.enumerations.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        restored.repair.records().summary(),
+        old.repair.records().summary()
+    );
+    assert!(
+        restored
+            .repair
+            .records()
+            .get(fixture.pending.fingerprint())
+            .is_none()
+    );
 }
 
 #[test]
@@ -584,7 +864,17 @@ fn arriving_read_definition_refreshes_admission_with_same_wake_root_and_record_l
     let new = serving_after.collection(collection).unwrap();
     assert_eq!(enumerations.load(Ordering::Relaxed), 0);
     assert_same_record_leaves(&old, &new, &[record]);
-    assert_eq!(old.wake_root(), new.wake_root());
+    assert_eq!(
+        old.repair.records().summary(),
+        new.repair.records().summary()
+    );
+    assert_eq!(
+        old.repair.authorization_evidence().summary(),
+        new.repair.authorization_evidence().summary()
+    );
+    // The proof bytes are unchanged, but its now-resident definition is a
+    // newly available blob, independently visible in the product wake root.
+    assert_ne!(old.wake_root(), new.wake_root());
     assert!(!Arc::ptr_eq(&old.repair, &new.repair));
     assert_eq!(new.read_bootstrap.as_ref(), &[proof.clone()]);
     assert!(
@@ -704,7 +994,7 @@ impl ScopedFixture {
 }
 
 #[test]
-fn scoped_unrelated_blobs_reuse_proofs_bootstrap_and_records_without_point_reads() {
+fn scoped_unrelated_blobs_reuse_proofs_bootstrap_and_records_with_bounded_inventory_reads() {
     let mut fixture = ScopedFixture::new();
     let selected = fixture.active();
     let mut before = fixture.observe(&selected, None);
@@ -721,11 +1011,16 @@ fn scoped_unrelated_blobs_reuse_proofs_bootstrap_and_records_without_point_reads
             .unwrap();
         let after = fixture.observe(&selected, Some(&before));
         assert_eq!(after.0.changes_since(&before.0), StoreChanges::BLOBS);
-        assert_eq!(fixture.take_counts(), (0, 0, 0));
+        let (records, proofs, reads) = fixture.take_counts();
+        assert_eq!((records, proofs), (0, 0));
+        // New local bytes can satisfy an earlier missing reference. Revisit
+        // the positive inventory, but do not rebuild semantic components.
+        assert!(reads <= 2 * (1024 + 64));
         for index in 0..2 {
             let collection = fixture.collections[index].handle();
             let old = before.1.collection(collection).unwrap();
             let new = after.1.collection(collection).unwrap();
+            assert!(new.repair.blob_inventory().get(&arrived.raw).is_none());
             assert_same_record_leaves(&old, &new, &[fixture.records[index]]);
             assert!(Arc::ptr_eq(&old.read_bootstrap, &new.read_bootstrap));
             let id = fixture.proofs[index].id();
@@ -742,7 +1037,7 @@ fn scoped_unrelated_blobs_reuse_proofs_bootstrap_and_records_without_point_reads
 }
 
 #[test]
-fn scoped_record_changes_rebuild_only_the_selected_c_and_keep_authorization() {
+fn scoped_record_changes_update_only_the_selected_c_and_keep_authorization() {
     let mut fixture = ScopedFixture::new();
     let selected = fixture.active();
     let mut before = fixture.observe(&selected, None);
@@ -757,7 +1052,9 @@ fn scoped_record_changes_rebuild_only_the_selected_c_and_keep_authorization() {
             )
             .unwrap();
         let after = fixture.observe(&selected, Some(&before));
-        assert_eq!(fixture.take_counts(), (1, 0, 0));
+        let (records, proofs, reads) = fixture.take_counts();
+        assert_eq!((records, proofs), (0, 0));
+        assert!(reads <= 2 * (1024 + 64));
         let old = before
             .1
             .collection(fixture.collections[0].handle())
@@ -765,6 +1062,7 @@ fn scoped_record_changes_rebuild_only_the_selected_c_and_keep_authorization() {
         let new = after.1.collection(fixture.collections[0].handle()).unwrap();
         assert_ne!(old.wake_root(), new.wake_root());
         assert!(new.repair.records().get(record.fingerprint()).is_some());
+        assert_shared_record_leaves(&old, &new, &[fixture.records[0]]);
         assert!(Arc::ptr_eq(&old.read_bootstrap, &new.read_bootstrap));
         let old_other = before
             .1
@@ -813,7 +1111,9 @@ fn scoped_proof_change_refreshes_authorization_without_losing_record_interests()
         )
         .unwrap();
     let final_observation = fixture.observe(&selected, Some(&after));
-    assert_eq!(fixture.take_counts(), (1, 0, 0));
+    let (records, proofs, reads) = fixture.take_counts();
+    assert_eq!((records, proofs), (0, 0));
+    assert!(reads <= 2 * (1024 + 64));
     let new = final_observation
         .1
         .collection(fixture.collections[0].handle())
@@ -842,7 +1142,7 @@ fn scoped_missing_descriptor_stays_pending_until_its_exact_blob_arrives() {
     let selected = active(cold.handle());
     let before = fixture.observe(&selected, None);
     assert!(before.1.collection(cold.handle()).is_none());
-    assert!(before.1.notices().is_empty());
+    assert_eq!(before.1.collections().count(), 0);
     assert_eq!(fixture.take_counts(), (0, 0, 1));
 
     fixture
@@ -855,7 +1155,7 @@ fn scoped_missing_descriptor_stays_pending_until_its_exact_blob_arrives() {
         .unwrap();
     let unrelated = fixture.observe(&selected, Some(&before));
     assert!(unrelated.1.collection(cold.handle()).is_none());
-    assert!(unrelated.1.notices().is_empty());
+    assert_eq!(unrelated.1.collections().count(), 0);
     assert_eq!(fixture.take_counts(), (0, 0, 0));
 
     assert_eq!(
@@ -864,7 +1164,7 @@ fn scoped_missing_descriptor_stays_pending_until_its_exact_blob_arrives() {
     );
     let arrived = fixture.observe(&selected, Some(&unrelated));
     assert!(arrived.1.collection(cold.handle()).is_some());
-    assert_eq!(arrived.1.notices().len(), 1);
+    assert_eq!(arrived.1.collections().count(), 1);
     let (records, proofs, reads) = fixture.take_counts();
     assert_eq!((records, proofs), (1, 1));
     assert!(reads > 0);
@@ -912,7 +1212,9 @@ fn scoped_missing_definition_landing_changes_bootstrap_without_rebuilding_record
         )
         .unwrap();
     let unrelated = fixture.observe(&selected, Some(&before));
-    assert_eq!(fixture.take_counts(), (0, 0, 0));
+    let (records, proofs, reads) = fixture.take_counts();
+    assert_eq!((records, proofs), (0, 0));
+    assert!(reads <= 1024 + 64);
     assert!(
         unrelated
             .1
@@ -928,7 +1230,16 @@ fn scoped_missing_definition_landing_changes_bootstrap_without_rebuilding_record
     assert_eq!((records, proofs), (0, 1));
     assert!(reads > 0);
     let new = arrived.1.collection(collection).unwrap();
-    assert_eq!(old.wake_root(), new.wake_root());
+    assert_eq!(
+        old.repair.records().summary(),
+        new.repair.records().summary()
+    );
+    assert_eq!(
+        old.repair.authorization_evidence().summary(),
+        new.repair.authorization_evidence().summary()
+    );
+    assert_ne!(old.wake_root(), new.wake_root());
+    assert!(new.repair.blob_inventory().get(&capability.raw).is_some());
     assert_eq!(new.read_bootstrap.as_ref(), &[proof.clone()]);
     assert!(
         new.repair
@@ -981,7 +1292,9 @@ fn scoped_reuse_rebinds_novel_request_resource_and_definition_reads() {
     fixture.store.put::<SimpleArchive, _>(resource).unwrap();
     fixture.store.put::<SimpleArchive, _>(definition).unwrap();
     let after = fixture.observe(&selected, Some(&before));
-    assert_eq!(fixture.take_counts(), (0, 0, 0));
+    let (records, proofs, reads) = fixture.take_counts();
+    assert_eq!((records, proofs), (0, 0));
+    assert!(reads <= 1024 + 64);
     let old = before.1.collection(collection).unwrap();
     let new = after.1.collection(collection).unwrap();
     assert!(Arc::ptr_eq(&old.read_bootstrap, &new.read_bootstrap));
@@ -1041,5 +1354,6 @@ fn scoped_bootstrap_is_bound_to_the_local_subject_as_well_as_store_inputs() {
             .is_empty()
     );
     let (records, proofs, _) = fixture.take_counts();
-    assert_eq!((records, proofs), (1, 1));
+    // Subject changes invalidate authorization, not the underlying records.
+    assert_eq!((records, proofs), (0, 1));
 }

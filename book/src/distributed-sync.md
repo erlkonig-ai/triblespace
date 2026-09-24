@@ -4,16 +4,17 @@
 store inventory. Its protocol follows the same decomposition as the collection
 model:
 
-1. stock `iroh-gossip` announces that an endpoint has a new opaque state for
-   one collection;
-2. one READ(C)-authorized PATCH walk repairs the exact evidence which can
-   change that collection's value; and
+1. stock `iroh-gossip` membership carries neighbor-only opaque root offers,
+   with application-controlled relaying;
+2. one READ(C)-authorized exchange walks collection records, scoped AUTH and
+   a positive resident-blob inventory; and
 3. exact blob handles fetch only the immutable bytes a resolver actually
    chooses through a collection-independent, mutually authenticated bearer
    protocol.
 
 No global team, mutable roster, durable OFFER/GOSSIP bit, or second replicated
-inventory is needed. The collection descriptor already states independent
+inventory is needed. Resident inventories are local observations, not durable
+claims merged into a collection. The descriptor already states independent
 READ and WRITE policy, and iroh authenticates the endpoint key on each direct
 connection.
 
@@ -23,17 +24,17 @@ The boundaries are deliberately small:
 
 ```text
 know C           -> join C's wake topic and learn (origin, opaque state root)
-prove READ(C)    -> receive and repair C's authorization evidence
+prove READ(C)    -> receive C's records, scoped proofs and resident-blob handles
 know H           -> derive its opaque locator, discover providers, and authorize H
 satisfy WRITE(C) -> make a signed COMMIT, MERGE, or DERIVE active in C
 ```
 
 `C` is the exact 32-byte collection descriptor handle. `H` is an exact blob
-handle. They name immutable objects but do different jobs: `C` discovers a
-collection participant, while `H` is the bearer
-capability and private discovery secret for one exact immutable value. The
-provider directory sees only separately domain-separated KDF images and
-endpoint-bound tokens, never either raw handle.
+handle. Knowing C permits discovery of its ordinary descriptor-blob providers
+(H=C), possible contacts for its gossip topic rather than certified collection
+participants. H is the bearer capability and private discovery secret for one
+exact immutable value. The provider directory sees only blob-locator KDF images
+and endpoint-bound tokens, never raw handles or a collection-participant namespace.
 
 READ and WRITE are independent `AdmissionPolicy` values embedded in the
 descriptor. Each is either `Open` or a canonical quorum over Ed25519 roots with
@@ -49,16 +50,18 @@ proof evidence may activate an old commit without rewriting or retracting it.
 
 ## The collection repair product
 
-For one collection, semantic repair derives two independent grow-only sets:
+For one collection, repair pins three independent PATCH components:
 
 - every structurally valid native collection record naming exact C: signed
   `COMMIT`, `MERGE`, and `DERIVE` records independent of current WRITE(C)
-  admission; and
+  admission;
 - every signature-valid native proof scoped to exact resource C and beginning
   at a root named by C's supported policy bindings, without requiring its grant
   handles to match those bindings. Subordinate-resource transport
   also includes proofs for R whose immutable descriptor declares C as its repair
-  audience, under R's own policy roots.
+  audience, under R's own policy roots; and
+- a positive partial inventory of locally readable blob handles reached from
+  C's descriptor and direct record/proof references.
 
 Each set is represented by an immutable BLAKE3-Merkle PATCH. Collection
 records are keyed physically by the full 32-byte fingerprint of their exact
@@ -66,9 +69,10 @@ canonical value; authorization evidence uses a `repair_collection | proof_hash` 
 whose values share ownership of the original proof bytes. Only C's prefix is
 exposed; the wire leaf key is the 32-byte proof hash and its payload is the
 complete native proof body. The host currently keeps one such index per
-overlay, not a shared global inventory. There is no companion claim blob or
-authorization closure to transfer. The opaque semantic repair root
-commits to C, both PATCH roots, and both leaf counts under a versioned domain.
+overlay, not a shared global inventory. Resident-blob leaves use exact H as
+their 32-byte key and have an empty value. There is no companion claim blob or
+authorization closure to transfer. The opaque repair root commits to C and all
+three PATCH summaries, including their leaf counts, under a versioned domain.
 
 The authorization projection authenticates proof bytes rather than taking a
 snapshot of who is admitted. Unavailable definitions, delegate-only grants,
@@ -83,8 +87,8 @@ subject the self-contained proof bytes. That is the capability invitation
 boundary, not a Secrets-specific delivery channel. Once one collection
 participant has the proof, authorization-evidence repair distributes that one
 record to READ(C) peers. Interpretation needs any referenced capability
-definitions to be resident, but this record-only repair stream neither fetches
-nor carries them. An application may use the same proof kernel for another
+definitions to be resident, but this repair stream neither fetches nor carries
+their bodies. An application may use the same proof kernel for another
 resource, such as Secrets key delivery, without treating collection READ as
 decryption authority.
 
@@ -100,17 +104,24 @@ remain explicitly non-enumerable.
 This product matters. Synchronizing only collection records would miss the
 case where a newly arrived proof activates an old COMMIT. Synchronizing a whole
 proof store would disclose unrelated capability structure. The complete repair
-algebra is therefore `Record × AuthorizationEvidence`, with both components
-scoped to C. The receiver always derives its admitted view locally; record and
+evidence algebra remains `Record × AuthorizationEvidence`, scoped to C.
+The resident component is different: it observes physical availability and may
+shrink or be rebuilt. It does not create semantic membership or change WRITE
+admission. The receiver always derives its admitted view locally; record and
 proof arrival therefore commute, and a publisher need not possess or present
 its own WRITE grant merely to replicate an inert signed record.
 
 The host also updates these components independently. When a store snapshot
 reports unchanged collection records, its existing record PATCH is shared into
-the next repair overlay without re-enumeration or Merkle hashing. Blob arrival
+the next repair overlay without re-enumeration or Merkle hashing. Changed
+collections apply selected record additions and removals to that retained PATCH.
+Native stores obtain the difference from persistent indexes; cold activation
+still constructs the initial full overlay. Blob arrival
 still refreshes the authorization observation: a newly resident capability or
 subordinate-resource descriptor can enable admission or proof routing without
-changing any record. Cold collection activation constructs both components.
+changing any record. Resident-inventory scanning advances in bounded passive
+quanta against the same frozen reader; inventory changes can change the wake
+root even when records and AUTH are unchanged.
 
 Signed MERGE and DERIVE records are input-record-bound endorsements and
 first-class members of the exact-C record PATCH and ordinary collection
@@ -126,7 +137,10 @@ participate in repair is not permission to endorse an equation. Signature
 verification happens when decoding foreign record bytes, not when rebuilding
 the local repair PATCH or observing the local store again.
 
-This combined equation/AUTH-v5 epoch uses `/triblespace/pile-sync/26`. Dense
+The three-component repair epoch uses opcode `0x0E` on
+`/triblespace/pile-sync/26`; the retired `0x0D` repair grammar is rejected
+before decoding. Unchanged bearer and DHT operations remain compatible with
+installed `Leech` readers, which never join collection repair. Dense
 record tag 6 carries a 288-byte MERGE body and tag 7 a 224-byte DERIVE body;
 each wire value has one additional tag byte. MERGE signs two input-record
 fingerprints paired with its payloads; DERIVE signs one. Unsigned tags 2/3 and
@@ -144,10 +158,31 @@ support merely because it received the output endorsement; source-record
 provisioning remains a separately authorized concern. In particular, the current
 protocol does not automatically transport a cross-collection witness closure.
 
-## Opaque wakes over stock gossip
+## Opaque neighbor offers and state-based relaying
 
-The `iroh-gossip` topic ID is a domain-separated one-way image of the collection
-handle. Anyone who knows C can derive and join that topic, while generic gossip
+Locally, `Peer::refresh()` admits bounded incoming evidence and freezes one
+coherent store observation: collection repair overlays, blob serving reader,
+and resident provider locators. A latest-value handoff replaces the previous
+observation rather than queuing successive snapshots. The host pins the newest
+one once per turn and uses PATCH differences against its last processed
+observation to update subscriptions and provider publication. Roots and
+provider locators therefore cannot come from different store observations.
+An unavailable active descriptor still retains its subscription, and a failed
+snapshot immediately withdraws serving. New activation expedites both provider
+discovery and missing-descriptor acquisition, even after an empty host has
+already started its periodic retry clock. An unchanged snapshot requires no
+provider reinstallation. Per-topic outgoing root announcements likewise read
+the latest value rather than draining intermediate roots.
+
+This coalescing applies to replaceable observations, not new remote evidence:
+authenticated incoming records, proofs, and blobs still cross the bounded
+admission bridge into the store. It does not discard records or turn a dropped
+notification into a lost update; later root announcements and Merkle repair
+derive the outstanding work from current state.
+
+The `iroh-gossip` topic ID uses the version-isolated
+`triblespace/collection-wake-topic/v2` domain over the collection handle.
+Anyone who knows C can derive and join that topic, while generic gossip
 routers do not learn raw C. There is no authorization handshake merely to hear
 that something changed. The application payload is fixed width (145 bytes):
 
@@ -162,24 +197,78 @@ the iroh endpoint and tells receivers which peer can answer repair.
 
 A wake contains no record, proof, blob handle, leaf count, component root, or
 human-readable collection metadata. It is a latency hint, not durable evidence
-and not authorization. The fresh nonce makes repeated change and neighbor
-announcements distinct.
-Stock gossip supplies bounded duplicate suppression and an efficient
-dissemination tree; bounded leased wake-origin sampling supplies eventual
-anti-entropy when a wake is delayed or missed.
+and not authorization. Its semantic identity is `(C, R)`, not the signed
+contact, signature or nonce. Contact annotations can change without becoming
+a fresh state event. The wire envelope remains nonce-v4; the separate topic
+namespace prevents old automatic Swarm forwarding from mixing with the new
+neighbor-only relay rule.
+
+Stock gossip maintains membership and delivers to direct neighbors. It does
+not automatically forward these neighbor-scope offers. The application
+periodically offers its latest root with a randomized timer:
+intervals grow from two to sixty seconds, with transmission in the second half.
+Hearing one equal-root offer suppresses this interval's redundant local offer;
+disagreement and local changes shorten long intervals. A new neighbor gets one
+forced offer. Missed intervals are not replayed as a queue.
+
+The vendored gossip transport carries topic-tagged frames on one ordered
+unidirectional stream per connection. Topics still have independent membership
+and dissemination; this is transport multiplexing, not a global collection
+topic. Upstream's persistent stream per topic exhausted QUIC's default 100
+stream credits with the colony's 126–130 collections. Its blocked writer could
+then fill the connection queue and stop the shared gossip actor. A regression
+joins 130 topics at default limits and 257 topics with only one stream allowed.
+The private ALPN
+`/triblespace/gossip/C6858FA15B24B264151DB34DAA9C1964` isolates the new framing
+from `/iroh-gossip/1`; the anchor was minted with `trible genid`. Collection
+topic IDs, wake signatures, and the separate pile-sync ALPN are unchanged.
+The shared gossip actor never waits for a full peer output queue: it gives a
+healthy writer one scheduling turn, then fails an unavailable connection so
+ordinary membership recovery can proceed. Failed send/receive halves close
+their connection, while clean EOF preserves the opposite direction: simultaneous
+connections can legitimately carry the two directions separately. Both halves
+finishing closes the obsolete connection. Pending dial history is bounded by
+live subscriptions. Cancelled dials are checked again when their
+completed results are consumed, so a late success cannot revive discarded
+membership controls.
+
+Relaying retains one latest observation per signed origin, with equal roots
+sharing one deadline rather than one event per contact or nonce. A receiver
+allows up to five seconds for repair. If its published serving snapshot reaches
+the offered root, it can replace the contact with itself. A different union
+root is offered as the actual resulting root, never as a claim to serve the old
+one. If repair is slow, fails, or is unavailable to a read-only/unauthorized
+bridge, the original validated signed offer is forwarded unchanged.
+
+Retained offers have bounded replay opportunities and five-minute lifetimes;
+changing annotations cannot renew the root episode or postpone its deadline.
+New topology advances forwarding. Repeated equal state suppresses retained
+relay only when every known direct neighbor has itself signed that same root.
+A forwarded origin's signature does not establish the last hop's state, and
+one upstream match does not establish downstream coverage. Equality includes
+the partial resident inventory, but is not proof of complete recursive payload
+closure or permission to interpret/decrypt its blobs.
+
+Bootstrap contacts come from descriptor policy roots, roots/delegates in
+structurally validated scoped AUTH paths, configured/recent endpoints, and
+ordinary providers of the descriptor blob H=C. None is an admission decision
+or a promise of an online participant. In particular, a descriptor-only cache
+never becomes a repair source just by answering the blob directory. A signed
+root offer names its origin as a candidate repair source, not the forwarding hop.
 
 Neighbor churn stays inside stock gossip: its active and passive views repair a
 `NeighborDown`, and a reported `Lagged` event does not end the subscription.
-The host treats lag as a reason to advance exact repair, not as a second mesh
+The host treats lag as a reason to advance recovery and offer its latest root, not as a second mesh
 algorithm. If the topic stream itself ends, configured endpoints plus a bounded
 recent set of signed and DHT-discovered origins seed the replacement
 subscription.
 
 ## READ(C)-authorized exact repair
 
-After observing a changed wake root—or when periodically sampling live signed
-wake origins—a node opens one bidirectional collection-repair stream to that
-origin. Its hello names C and may carry a bounded set of self-contained READ
+After observing a different wake root, a node selects a fresh signed origin
+advertising that root and opens one bidirectional collection-repair stream.
+Random selection among equivalent advertised roots spreads repair load; it
+does not yet prefer low-latency paths. Its hello names C and may carry a bounded set of self-contained READ
 proofs for cold bootstrap. The server admits the TLS-authenticated client only
 from READ(C) evidence in its pinned local projection before returning any
 manifest. Unknown hello proofs are signature/root checked and stored inertly.
@@ -190,14 +279,16 @@ READ the bootstrap is empty. A WRITE-only publisher needs no READ authority
 merely to serve an authorized replica.
 
 The server loads one immutable repair overlay for C and applies the
-descriptor's READ action policy against that frozen evidence. Rejection returns no manifest.
-On admission it returns record and authorization-evidence PATCH summaries plus
-the same opaque root. The client may then walk only differing prefixes and
+descriptor's READ action policy against that frozen evidence. Rejection returns
+no manifest. On admission it returns record, authorization-evidence and
+resident-blob PATCH summaries plus the same opaque root. The client may then
+walk only differing prefixes and
 receive missing leaf bodies:
 
 - canonical signature-valid `COMMIT`, `MERGE`, and `DERIVE` records naming C,
   whether active or inert;
-- native proofs relevant to C's repair audience and their resource's policy roots.
+- native proofs relevant to C's repair audience and their resource's policy roots;
+- exact H keys from the pinned positive resident inventory, without blob bodies.
 
 Each proof leaf contains the complete signed path and the handles of its
 capability definitions, not those definitions' facts.
@@ -209,14 +300,45 @@ records even when AUTH has deferred leaves. An incomplete pass continues
 immediately only when it adds records or proofs; unchanged deferrals retry on
 the ordinary cadence, without claiming convergence or initiating blob fetches.
 
-The exact-repair scheduler samples at a 30-second cadence. Participant leases
-last five minutes and every successful repair, including an identical result,
-renews the selected peer. KDF(C) lookup is recovery-only: initial activation or
-restart, exhaustion of every participant lease, or failure of every leased
-candidate. Each collection permits one lookup in flight and retries an empty or
-unsuccessful recovery with exponential backoff from one to 60 seconds. This
-makes healthy steady-state DHT lookup load zero while preserving bounded
-recovery after restarts and partitions.
+Inventory walks have a separate allowance of 128 node requests and 2 MiB of
+response bytes per pass. A successful bounded pass retains its authenticated
+walk cursor across RPCs for the same collection and remote inventory summary.
+A changed summary starts fresh Merkle validation above the last visited handle,
+then schedules a later wrap to earlier keys. No proof from an old root is reused
+against the new one. This avoids repeatedly enumerating an early missing prefix
+while none of its payloads has landed, even during continuous appends. An incomplete
+inventory cursor is separate from incomplete semantic evidence and retains
+its own continuation opportunity. An attempt receives a copy of the last
+successful checkpoint: a failed or timed-out session cannot discard that
+checkpoint. Successful completion or collection deactivation clears it. Each
+new session still checks READ admission and the current manifest, so retaining
+a traversal position does not retain authority or trust an obsolete root.
+No absent handle is inferred from an
+unfinished walk.
+
+Healthy participants are no longer pulled blindly at a thirty-second cadence.
+The periodic tick retries failed work; normal repair follows mismatched roots.
+Five-minute participant leases renew on signed notices and successful repair.
+Before opening a queued repair, the host checks the latest advertised root
+against its current root again. Equality skips redundant work, except that a
+previous failed exchange still gets a real confirmation rather than leaving a
+permanent failure alert or inventing an RPC comparison from a gossip hint.
+
+Descriptor-provider lookup retries use one-to-sixty-second backoff without a
+viable repair source. Even with healthy participants, bootstrap is retried every
+five minutes: a healthy subset must not permanently mask a disconnected one.
+At most three collection lookups run, one per collection, with fair rotation
+among due interests; deactivation cancels outstanding discovery. Root/AUTH and
+configured contacts are retried alongside descriptor-provider discovery.
+These bounds provide retry opportunities, not a global convergence deadline.
+
+A failed repair keeps its participant's original lease while bounded failure
+state records backoff. Periodic repair retries that participant even if another
+replica remains healthy: that replica need not have the missing records.
+Failure never renews a lease. If every candidate has failed, recovery discovery
+and topic reconnection proceed without waiting for expiry. If the bounded
+failure table cannot track a peer, its lease is dropped so it cannot falsely
+look like a healthy candidate and delay recovery discovery.
 
 Every request pins the manifest's expected component root. The server serves
 the whole stream from one immutable overlay lease, so responses cannot splice
@@ -228,7 +350,7 @@ Exact-content GET is not part of this collection stream. An independent
 exact-content request is authorized solely by knowledge of H.
 
 Repair is one-way pull. Two peers converge by each eventually pulling after a
-wake or periodic sweep. This keeps authorization and failure local to one
+wake or a failed-work retry. This keeps authorization and failure local to one
 stream while set union makes direction irrelevant to the final value. A node
 which holds no overlay for C answers unavailable rather than exposing a global
 inventory.
@@ -236,8 +358,9 @@ inventory.
 ## Blob transfer is lazy and bearer-addressed
 
 Activation repair does not fetch descriptor dependencies, payloads, metadata,
-attachments, or derived artifacts. It transfers the lattice evidence needed to
-decide what exists. A resolver can then select the cheapest resident
+attachments, or derived artifacts. It transfers lattice evidence and positive
+resident-handle observations, not those bytes. A resolver can then select the
+cheapest resident
 support-equivalent cover and request only the missing immutable handles that
 matter to that computation.
 
@@ -457,12 +580,12 @@ withdraws the previous serving observation; existing frozen readers stay frozen.
 
 Initial endpoint identities come from `PeerConfig` or the CLI. Configured relay
 URLs only provide iroh transport paths; they are not collection participants or
-KDF(C) rendezvous identities. A verified wake origin and DHT referrals may
+collection rendezvous identities. A verified wake origin and DHT referrals may
 become live routing candidates, but there is no synchronized PEER roster and no
 durable peer record in the current protocol. Liveness, backoff, connection
 pooling, DHT buckets, and provider leases are operational soft state;
 restarting may forget them without losing semantic data and deliberately
-re-enters KDF(C) discovery for each active collection.
+re-enters authority/descriptor-provider discovery for each active collection.
 
 ### Restart contact experiment
 
@@ -545,10 +668,19 @@ of future integration, not an optional cache optimization.
 
 ### Live request scheduling
 
+Inbound RPC streams wait for the existing per-connection and process-wide
+request permits. Saturation does not close the connection carrying other
+active repairs. Each bounded connection retains at most one accepted waiting
+stream, and no handler task is spawned until both permits are held.
+
 One connection pool is shared by collection repair and bearer/DHT operations.
 Iroh's transport authentication binds each connection to its endpoint ID.
 There is no generic AUTH or SYNC_TEAM exchange: collection evidence is gated by
 READ(C). Exact bytes are gated only by the endpoint-bound mutual proof of H.
+
+A valid READ refusal or unavailable-collection reply ends only that repair
+stream. It does not evict the shared connection or cancel unrelated requests.
+Malformed replies and transport failures still invalidate the pooled connection.
 
 Pending dial ownership is cancellation-safe: the final departing waiter removes
 an uninitialized pool entry, while concurrent callers retain the same shared
@@ -629,169 +761,86 @@ direct blob references alive through the normal record-root GC rules. GC never
 fetches missing references merely to retain them; dropping WANT records is an
 explicit rewrite/retention-policy choice.
 
-### Local replication policy and reference summaries
+### Local residency inventory and replication policy
 
-`Reconciler::with_replication(mode, collections)` selects local acquisition
-work, separately from Peer activation and collection authorization:
+Each active collection's serving snapshot includes a passive, positive
+resident-handle PATCH. Seeds are the collection descriptor and direct blob
+references from its structural records and scoped AUTH proofs. A local scan
+follows an aligned 32-byte word only when that exact H is readable through the
+same passive snapshot. It does not issue network requests, create WANTs, or
+remember arbitrary absent words as possible downloads.
+
+Scanning advances with bounded source/word quanta and retained offsets rather
+than restarting every payload walk on refresh. Each refresh divides a budget
+of 1,024 source reads and 16,384 aligned words across active collections, with
+per-collection caps of 64 sources and 1,024 words and at least one of each. Each
+source yields after at most 64 words. These bound operations, not the backend's
+cost of reading a large body. PATCH clones share structure; no body is pinned
+between calls. Additions preserve traversal progress; removed seeds or
+readable-membership removals reset the closure
+so disconnected descendants are not advertised indefinitely.
+
+This inventory is partial and conservative. A readable aligned word is not a
+typed semantic reference; an absent word says nothing about global residency.
+Finishing the local scan does not prove that every intended dependency exists.
+For encrypted blobs, H identifies the stored ciphertext; neither READ(C), this
+inventory, nor the exact-H protocol supplies an application's decryption keys.
+
+`Peer::set_replication(mode, collections)` selects acquisition independently
+of activation and authority:
 
 | Mode | Blob acquisition |
 |---|---|
-| `Demand` (default) | Existing explicit WANTs only. |
-| `Shallow` | Also the direct blob references of the selected collection records. |
-| `Full` | Also recursively scan those roots at aligned 32-byte boundaries. |
+| `Demand` (default) | Explicit WANTs only. |
+| `Shallow` | Also direct blob references of selected collection records. |
+| `Full` | Also positive resident handles learned through selected collections' READ-authorized repair. |
 
-The selection is explicit: possessing READ authority does not subscribe a node
-to fetching another person's collection. Shallow hydration follows structurally
-valid records, including signed but WRITE-inert commits; obtaining bytes does
-not admit their claims. One eligible service class receives each tick's existing
-fetch-budget quantum: explicit WANTs, newly observed direct roots, ordinary
-direct roots, then recursive scanning. The turn is retained before awaiting
-network work. Empty classes and classes whose entire work is in retry backoff
-are skipped without taking a quantum. Exact WANT/root turns use an experimental
-window of at most four concurrent H-only fetches from that frozen candidate
-round. Ready verified bodies land one at a time through ordinary local put,
-preserving their cached handles without a per-body disk flush; a slow first
-request does not hold later ready answers.
-Refills share the original turn deadline rather than starting another budget.
-Expiry drops unfinished requests and charges their normal retry backoff, while
-unstarted candidates retain their priority. Cancelling the whole tick drops
-its owned futures without detached work or fabricated fulfillment; already
-admitted attempts retain their consumed cursor/first-attempt position, just as
-with a cancelled serial await. Peer fetch futures start the lazy host only when
-polled and hold no store or host guard across network I/O. This is bounded
-concurrency, not a measured throughput or end-to-end completion guarantee:
-synchronous landing/refresh still takes serial time, and with the default
-budget, several 30-second quanta plus the caller's tick intervals may pass before a fresh root
-or its body receives service. There is no low-latency guarantee.
+Selecting a collection does not grant READ or WRITE and does not activate it.
+Structurally valid but WRITE-inert records can name direct roots; acquiring
+their bytes does not admit those records. Full mode no longer sends arbitrary
+aligned payload words to the DHT or uses reference-summary Bloom filters to
+choose speculative requests. Local aligned-word scanning constructs positive
+serving inventory only; remote hydration consumes the resulting known H keys.
 
-A missing root gets one first-attempt priority when newly observed, newest
-observation first; repeated observations do not renew it. Ordinary WANT/root
-rounds freeze an observation-generation cutoff and retain their hash cursor, so
-continued arrivals cannot indefinitely lengthen a round ahead of old demand.
-The existing exact-handle retry map holds those scheduling fields only for
-positively named missing roots/WANTs. Failed attempts retain the same shared
-exponential backoff regardless of the class that attempted them. A pending
-direct-root backlog cannot consume recursive scanning's reserved turn.
+The reconciler retains a bounded positive window per selected collection
+(currently 4,096 handles), pruning locally readable entries as bodies arrive.
+Unattempted handles cannot be evicted by later offers. Once that finite cohort
+has received an actual acquisition attempt or become locally readable, later
+offers advance the window beyond its serviced prefix. Progress and pass
+completion are scoped to the supplying peer: a small peer's completed inventory
+cannot reset a larger peer's cursor. A completed pass from that source permits
+wrapping to earlier keys, including after its inventory shrinks. At most 128
+source cursors are retained per collection; fully serviced, least-recently
+observed sources can be replaced, while protected work defers new admissions.
+This keeps unavailable early handles from permanently excluding later ones;
+it does not make a remote positive hint a guarantee of current availability.
+These windows,
+bounded remote inventory passes and unavailable providers prevent a promise
+that `Full` has reached complete closure. An empty acquisition backlog is not
+a completeness certificate. Hints create no durable WANT and do not widen the
+explicit collection selection.
 
-There is no retained mirror of durable blob answers. The selected required set
-minus the current tick's readable resident observation supplies missing work;
-only genuine started futures occupy its in-flight set. A successful put satisfies
-local presence before persistence, and the next tick observes the store again.
-The existing selected-input reads remain, including Pile's lazy physical
-validation and valid-duplicate fallback: raw `contains_blob` membership alone
-cannot establish that a corrupt imported occurrence is readable. This is not yet
-a PATCH-only missing-set optimization and does not erase first-read hash costs.
+Exact WANTs, direct roots and positive hints use the existing KDF(H) discovery,
+mutual bearer proof and final hash verification. A shared four-wide fetch
+window serves one eligible class's finite round under its original deadline.
+Ready verified bodies land individually, without a per-body flush or serving
+rebuild; `Peer::reconcile()` publishes one snapshot after the completed batch.
+Cancellation drops owned network futures, leaving already landed bytes for
+the next refresh. Unstarted work is not falsely fulfilled, and failed exact
+requests retain bounded retry backoff.
 
-The walker retains only positively reached `(root, blob)` pairs and their
-resumable offsets in a PATCH. Frozen
-regular rounds grant one bounded quantum per source, rather than draining one
-large blob before serving another. An alternating recent-positive lane gives
-new arrivals a bounded startup window; the lane turn survives tick and fetch
-deadline exits. Completed parents become eligible again on their own bounded
-backoff, independently of large partial sources and subsequent arrivals.
-Candidate work and speculative requests remain bounded per pass; at most one
-speculative request is issued in a quantum. Absent candidates do not become
-WANTs or an ever-growing negative frontier, because a DHT miss does not
-establish absence. Full mode does not recursively widen an explicit `WANT(H)`
-that lies outside the selected collection roots.
-
-This is service fairness, not a wall-clock hydration guarantee. A large initial
-burst cannot all receive immediate service, sustained arrivals can outgrow the
-recent lane, and a slow request may consume its class's whole fetch deadline.
-Recent work never takes away the reserved regular turns, including revisits;
-it only accelerates a finite prefix of newly observed positive sources. The
-recent lane chooses an unstarted source newest-first, then retains its remaining
-startup allowance across yields: later arrivals cannot displace that source's
-second word. The existing allowance is at most 128 aligned words, including any
-progress made in ordinary turns. EOF or local unavailability releases the
-startup position too. This continuation does not hold a collection lane or take
-an ordinary turn; regular quanta still inspect at most 64 words. For a finite
-burst of A newcomers, the last first-service bound is O(A times the startup
-window), not constant time or round-robin service within that burst.
-
-Full scans grant sustained quanta round-robin between the explicitly selected
-collections, each retaining the regular/recent walk above. A large selection's
-root inventory cannot consume a small selection's regular share after its
-startup window ends. Exact WANTs, the physical root union, the fetch deadline,
-CPU steps and speculative-request allowance remain global. A selected but
-unattempted word retains its collection turn across budget exits. Native record
-indexes supply each selection's roots; there is no separate membership catalog.
-Shared roots have separate positive traversal observations in their actual
-selecting collections, but physical acquisition and per-tick negative-request
-deduplication remain shared. This trades duplicate traversal of genuinely shared
-closures for sustained service without an arbitrary root owner. The selection's
-own large closure, resident-child expansion, provider failures and exhausted
-class quanta still prevent a general finite hydration deadline.
-
-When seeding a full scan, ordinary resident record roots are observed before
-explicitly selected collection descriptors. A descriptor already present in
-both that root set and the readable resident set therefore receives its finite
-recent startup window ahead of the bulk inventory. This is ordering only:
-selection alone never invents a closure root, repeated snapshots do not reset
-offsets or requeue descriptors, and regular turns still progress. Many selected
-descriptors, later arrivals, unavailable providers, and exhausted scan quanta
-can still delay a descriptor child; no special blob authorization or
-publisher priority is implied.
-
-A producer can maintain an ordinary `ReferenceSummaryBlob` collection to make
-negative recursive probes cheap. Its mapping scans the complete source blob
-closure and projects referenced handles through the same opaque `KDF(H)` used
-by discovery. Fixed Bloom geometry lives in the descriptor; member join is
-bit-set union. Canonical sparse positive-gap bytes or a shorter dense bit vector
-represent the same value, and a lazy cover view probes their logical union.
-No Peer subtype, new pile record, or network operation is involved.
-
-```rust,ignore
-use triblespace::core::collection::reference_summary::{
-    ReferenceSummaryBlob, ReferenceSummaryLayout,
-};
-
-let summaries = storage.derive::<ReferenceSummaryBlob>(
-    facts,
-    ReferenceSummaryLayout::default(),
-    summary_policy,
-)?;
-// Producer only: all recursively reachable attachments were stored before
-// the source COMMIT. This scan cannot infer that precondition on a replica.
-storage.maintain(summaries, &writer).await?;
-```
-
-The source archive's own handle is not automatically inserted: it is a
-materialization identity, not part of the referenced closure. Under the
-complete-producer precondition, projection therefore distributes over source
-union. An incomplete replica cannot distinguish an ordinary inline value from
-a missing reference, and **must not derive a replacement summary locally**.
-
-Consumers explicitly select the summary collection alongside its source. The
-same shallow acquisition obtains known `DERIVE`/`MERGE` outputs; ordinary
-passive collection observation then supplies a resident summary and its support.
-Only descendants of a source data root contained in that support may use its
-negative answers. An older summary cannot filter a newer, uncovered commit;
-the mapping must also read that foundational collection directly, rather than
-some intermediate projection which might have discarded references. Chained
-summaries remain valid collections, but this walker does not apply their
-negatives to the original commit bytes. Likewise,
-metadata, descriptors, and unrelated physical artifacts are not covered merely
-because they belong to the same collection. Missing summaries mean an unfiltered
-walk, not an empty closure. Positive matches still use ordinary exact-H DHT
-discovery and mutual bearer proof. Neither filter possession nor a positive
-answer is read authority.
-
-From the command line, register and maintain on the complete producer:
-
-```text
-trible pile collection derive DATA.pile facts reference-summary --log2-bits 32 --probes 4
-trible pile collection maintain DATA.pile SUMMARY_HANDLE
-```
-
-Then select both handles on a consumer's existing sync command with
-`--replication full`. Merely repairing a source collection does not repair the
-separate derived collection's records. These modes change physical residency,
-not collection identity, authorization, or the union semantics of repair.
+Missing work is derived from known required handles and the current readable
+snapshot, not a retained mirror of durable answers. A raw physical occurrence
+alone is insufficient: ordinary reads retain corruption detection and valid
+duplicate fallback. Explicit close remains the persistence boundary. None of
+these scheduling bounds is a measured throughput or end-to-end completion
+guarantee.
 
 ## Wire surface
 
-Protocol version 26 keeps the direct operation set narrow:
+The `/triblespace/pile-sync/26` ALPN keeps the direct operation set narrow;
+collection repair has its own new opcode rather than changing unchanged
+bearer/DHT framing:
 
 | Operation | Code | Meaning |
 |---|---:|---|
@@ -799,7 +848,11 @@ Protocol version 26 keeps the direct operation set narrow:
 | `PROVIDER_PUT` | `0x06` | renew this endpoint's opaque provider lease |
 | `PROVIDER_GET` | `0x07` | obtain bounded candidates for one opaque key |
 | `FIND_NODE` | `0x0C` | iterative XOR-DHT routing step |
-| `COLLECTION_REPAIR` | `0x0D` | receiver-authorized record and authorization-evidence PATCH repair |
+| `COLLECTION_REPAIR` | `0x0E` | READ-gated record, authorization-evidence and resident-blob PATCH walks |
+
+Opcode `0x0D` is no longer served. Mixed-generation collection repair is not
+supported: deploy the new repair cohort together. Per-collection topic v2
+separates its root advertisements from the previous forwarding protocol.
 
 There is deliberately no store manifest, global inventory authorization,
 push-broadcast record, receipt RPC, remote mutable head, or unpublish operation.
@@ -808,10 +861,19 @@ The CLI selects explicit collections and bootstrap peers:
 
 ```text
 trible pile net sync DATA.pile \
+    [--key EXISTING_SELF_KEY] \
     --collection COLLECTION_HANDLE [--collection COLLECTION_HANDLE ...] \
     [--peers ENDPOINT_TICKET ...] [--direction bidirectional|read-only|write-only] \
     [--replication demand|shallow|full]
 ```
+
+The long-running daemon uses one existing durable key for its authenticated
+endpoint, signed wakes, health reports and telemetry. Key resolution is
+`--key`, then `TRIBLESPACE_KEY`, then `self.key` beside the pile's lexical path.
+There is no independently configured network or reporting key. Maintenance
+uses that same local key for its work and telemetry; worker labels distinguish
+processes, not identities. This CLI convention does not change the separate
+ephemeral H-only foreground-reader use described above or grant any authority.
 
 Direction gates only the collection loop: `ReadOnly` pulls collection repair,
 `WriteOnly` serves it, and `Bidirectional` does both. Every direction may
@@ -828,13 +890,14 @@ are not preemptible, so this cooperative boundary is not a shutdown-time bound.
 
 ## Convergence and failure model
 
-- Concatenation, local insertion, and remote repair all perform set union.
+- Concatenation, local insertion, and remote semantic repair perform set union;
+  resident inventories remain replaceable local observations.
 - Duplicate records collapse by their complete canonical value; fixed-width
   indexes and the wire use a full-width BLAKE3 fingerprint of that value.
   Native capability proofs continue to collapse by their cryptographic
   identity.
-- A missed wake only adds latency; periodic repair still converges connected
-  readers.
+- A missed wake does not consume the only opportunity: periodic latest-root
+  offers and bootstrap retries can re-establish repair between connected readers.
 - An invalid wake, record, proof, PATCH node, or blob fails that input and
   cannot retract previously accepted evidence.
 - Missing selected output/dependency blobs leave that realization unavailable;
@@ -846,7 +909,8 @@ are not preemptible, so this cooperative boundary is not a shutdown-time bound.
   byte order.
 
 The result is two orthogonal elemental loops: gossip plus READ(C)-gated PATCH
-repair says *what changed in a collection*, while KDF(H) discovery plus mutual
+repair says *what changed in a collection* and which blob handles a peer has
+positively observed, while KDF(H) discovery plus mutual
 bearer proof retrieves only the immutable bytes the local lattice resolver
 decides to use.
 
@@ -855,13 +919,20 @@ decides to use.
 `Peer::health()` and `NetSender::health()` expose a bounded immutable sample of
 work the host already performs. Sampling does not run a probe or advance the
 host's observation clock. Each repair comparison retains the local and remote
-record/authorization frontiers pinned when its authenticated manifest arrived.
+record/AUTH frontiers and composite opaque root pinned when its authenticated
+manifest arrived. Semantic health compares record and AUTH evidence, not blob
+cache equality: Demand and Full peers can legitimately cache different bytes.
+The composite root still schedules repair, including inventory-only changes;
+cache churn neither creates semantic stalls nor extends their progress grace.
 A comparison stops implying convergence when that sample is stale, the local
-frontier has changed, or the serving snapshot has been withdrawn. Receiving
+semantic frontier has changed, or the serving snapshot has been withdrawn. Receiving
 records is progress evidence, not proof they have already become admitted.
 
 The long-running CLI can publish these observations as native facts using
-`pile net sync --health-key <existing-author-key>`. The private `swarm-health`
+`pile net sync --health`. Reports use the same key as the endpoint. An explicit
+`--health-collection <HANDLE>` also enables reporting into an existing admitted
+source collection; otherwise the node's private `swarm-health` collection is
+used. The health
 collection is deliberately not activated for replication, so a broken network
 cannot prevent the local reader from seeing its own warning. A new report is
 published every minute with `created_at` only: freshness is reader policy, not
@@ -995,8 +1066,9 @@ belongs in these colony observations.
 
 #### Sync producer
 
-`pile net sync` opts in with `--telemetry-collection <H>` and
-`--telemetry-key <PATH>`, optionally `--telemetry-worker <NAME>`. The destination
+`pile net sync` opts in with `--telemetry-collection <H>`, optionally
+`--telemetry-worker <NAME>`. The node's existing key signs the samples and its
+public key identifies their endpoint. The destination
 must already be a resident SimpleArchive **source** collection admitting that
 writer. A derived SimpleArchive is not a source: its reader ignores root
 COMMITs. Reporting never creates a descriptor, key, grant, derived index or
@@ -1007,13 +1079,12 @@ The producer attempts an ordinary signed append every sixty seconds at the
 existing sync-loop boundary. Five subjects distinguish the measurements:
 
 - `hydration`: successful verified reconciler puts and their payload bytes;
-  one landing shared by an explicit WANT and a selected root counts once.
-  Local hits, failed puts and speculative misses add no received bytes.
-  `queued` is the distinct unreadable exact WANT plus selected direct-root
-  set at the end of that tick's exact acquisition window, not recursive
-  descendants or a global blob inventory. A failed exact-set
-  observation leaves it absent; a later scan-only snapshot failure does not
-  erase the earlier valid count.
+  one landing shared by a WANT, selected root or positive hint counts once.
+  Local hits and failed puts add no received bytes. `queued` counts distinct
+  unreadable known handles from exact WANTs, selected direct roots and retained
+  positive hints at the end of that tick's acquisition window. It excludes
+  unknown descendants and is not a global blob inventory. A failed exact-set
+  observation leaves it absent.
 - `serve`: actual accepted inbound GET exchanges in flight, successfully
   sent payloads/bytes and interrupted or failed exchanges. A payload counts
   only after its write and stream shutdown succeed, not merely after lookup.
@@ -1042,10 +1113,11 @@ observe the new records.
 #### Maintenance producer
 
 `pile collection maintain` and `maintain-all` can opt in with
-`--telemetry-collection HANDLE --telemetry-node ENDPOINT --telemetry-worker LABEL`.
-The endpoint is explicit: a signing key is not a transport identity. The
-existing maintenance key signs samples unless `--telemetry-key EXISTING_KEY`
-is supplied. The collection must already exist as a SimpleArchive source and
+`--telemetry-collection HANDLE --telemetry-worker LABEL`.
+The existing maintenance key signs samples and its public key identifies the
+local endpoint, matching the daemon's durable identity. Neither the endpoint
+nor the telemetry signer has a separate override. The collection must already
+exist as a SimpleArchive source and
 admit that writer; a derived view ignores root COMMITs and is rejected. This
 option does not create keys, descriptors, grants, maintenance targets or sync
 selections. After configuration is validated, publication errors use finite,

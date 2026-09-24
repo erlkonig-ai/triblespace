@@ -480,6 +480,12 @@ impl CollectionWakeSubscription for SimWakeTopic {
         nonce[..8].copy_from_slice(&self.subscription.to_be_bytes());
         nonce[8..].copy_from_slice(&self.sequence.fetch_add(1, Ordering::Relaxed).to_be_bytes());
         let wake = CollectionWake::sign(self.collection, root, nonce, &self.signing_key);
+        self.relay_wake(&wake).await?;
+        Ok(wake)
+    }
+
+    async fn relay_wake(&self, wake: &CollectionWake) -> anyhow::Result<()> {
+        wake.verify(self.collection)?;
         let recipients = {
             let inner = self.net.inner.lock().unwrap();
             inner
@@ -495,15 +501,15 @@ impl CollectionWakeSubscription for SimWakeTopic {
                 .map(|(_, (_, tx))| tx.clone())
                 .collect::<Vec<_>>()
         };
-        let origin = EndpointId::from_bytes(&self.id)?;
+        let delivered_from = EndpointId::from_bytes(&self.id)?;
         for tx in recipients {
             let _ = tx.send(CollectionWakeEvent::Received(ReceivedCollectionWake {
                 wake: wake.clone(),
-                delivered_from: origin,
+                delivered_from,
                 scope: DeliveryScope::Neighbors,
             }));
         }
-        Ok(wake)
+        Ok(())
     }
 
     async fn next_wake_event(&mut self) -> anyhow::Result<Option<CollectionWakeEvent>> {
@@ -715,6 +721,69 @@ fn hex_prefix(id: &PeerId) -> String {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test(start_paused = true)]
+    async fn wake_relay_preserves_signed_origin_and_rejects_another_collection() {
+        let net = SimNet::new(0x41, SimConfig::default());
+        let relay_key = SigningKey::from_bytes(&[0x42; 32]);
+        let reader_key = SigningKey::from_bytes(&[0x43; 32]);
+        let source_key = SigningKey::from_bytes(&[0x44; 32]);
+        let relay_harness = net.join(&relay_key);
+        let reader_harness = net.join(&reader_key);
+        let collection = triblespace_core::collection::CollectionHandle::new([0x45; 32]);
+        let mut relay = relay_harness
+            .transport
+            .collection_wake_plane()
+            .subscribe_network(collection, Vec::new())
+            .await
+            .unwrap();
+        let mut reader = reader_harness
+            .transport
+            .collection_wake_plane()
+            .subscribe_network(collection, Vec::new())
+            .await
+            .unwrap();
+        assert!(matches!(
+            relay.next_wake_event().await.unwrap(),
+            Some(CollectionWakeEvent::NeighborUp(_))
+        ));
+        assert!(matches!(
+            reader.next_wake_event().await.unwrap(),
+            Some(CollectionWakeEvent::NeighborUp(_))
+        ));
+
+        let offered = CollectionWake::sign(
+            collection,
+            CollectionWakeRoot::new([0x46; 32]),
+            [0x47; 16],
+            &source_key,
+        );
+        relay.relay_wake(&offered).await.unwrap();
+        let Some(CollectionWakeEvent::Received(received)) = reader.next_wake_event().await.unwrap()
+        else {
+            panic!("expected the unchanged signed offer");
+        };
+        assert_eq!(received.wake.to_bytes(), offered.to_bytes());
+        assert_eq!(
+            received.delivered_from.as_bytes(),
+            relay_key.verifying_key().as_bytes()
+        );
+        assert_ne!(received.wake.origin(), received.delivered_from);
+        assert_eq!(received.scope, DeliveryScope::Neighbors);
+
+        let other_collection = triblespace_core::collection::CollectionHandle::new([0x48; 32]);
+        let wrong_context =
+            CollectionWake::sign(other_collection, offered.root(), [0x49; 16], &source_key);
+        let error = relay.relay_wake(&wrong_context).await.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<crate::wake::CollectionWakeError>(),
+            Some(&crate::wake::CollectionWakeError::InvalidSignature)
+        );
+        assert!(matches!(
+            reader.rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
 
     #[derive(Default)]
     struct WakeCount(std::sync::atomic::AtomicUsize);

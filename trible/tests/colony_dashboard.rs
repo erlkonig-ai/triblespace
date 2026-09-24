@@ -24,7 +24,6 @@ struct Fixture {
     path: PathBuf,
     key: PathBuf,
     author: VerifyingKey,
-    endpoint: VerifyingKey,
     source: Collection<blobencodings::SimpleArchive>,
     target: Collection<EntityIdSetBlob>,
     reports: Collection<blobencodings::SimpleArchive>,
@@ -35,15 +34,10 @@ impl Fixture {
     fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("colony.pile");
-        let key = directory.path().join("writer.key");
+        let key = directory.path().join("self.key");
         std::fs::File::create(&path).unwrap();
         let signer = triblespace_core::signing_key_file::init(&key).unwrap();
         let author = signer.verifying_key();
-        let endpoint =
-            triblespace_core::signing_key_file::init(&directory.path().join("endpoint.key"))
-                .unwrap()
-                .verifying_key();
-        assert!(endpoint != author, "fixture identities must be distinct");
         let policy = CollectionPolicy::new(
             AdmissionPolicy::direct(author),
             AdmissionPolicy::direct(author),
@@ -60,7 +54,6 @@ impl Fixture {
         let snapshot = pile.snapshot().unwrap();
         for collection in [source, reports] {
             assert!(collection.writer_is_admitted(&snapshot, author).unwrap());
-            assert!(!collection.writer_is_admitted(&snapshot, endpoint).unwrap());
         }
         drop(snapshot);
         pile.close().unwrap();
@@ -69,7 +62,6 @@ impl Fixture {
             path,
             key,
             author,
-            endpoint,
             source,
             target,
             reports,
@@ -86,12 +78,8 @@ impl Fixture {
             .arg(hex::encode(self.target.handle().raw))
             .arg("--key")
             .arg(&self.key)
-            .arg("--telemetry-key")
-            .arg(&self.key)
             .arg("--telemetry-collection")
             .arg(hex::encode(self.reports.handle().raw))
-            .arg("--telemetry-node")
-            .arg(hex::encode(self.endpoint.to_bytes()))
             .args(["--telemetry-worker", WORKER]);
         command
     }
@@ -134,6 +122,7 @@ impl Fixture {
                 && matches!(record, CollectionRecord::Derive(_))
             {
                 assert!(record.verify_strict().is_ok(), "invalid derive signature");
+                assert_eq!(record.public_key().raw, self.author.to_bytes());
                 derives += 1;
             }
         }
@@ -203,7 +192,7 @@ fn assert_finished(fixture: &Fixture, reports: &[WorkerReport]) {
     assert_eq!(reports.len(), 4);
     assert!(reports
         .iter()
-        .all(|report| report.node == fixture.endpoint.to_bytes() && report.worker == WORKER));
+        .all(|report| report.node == fixture.author.to_bytes() && report.worker == WORKER));
     for stage in [None, Some("maintenance-hop"), Some("pass")] {
         assert_eq!(metric(scope(reports, stage), Metric::Active), 0);
     }
@@ -266,7 +255,7 @@ fn maintained_signed_telemetry_reaches_dashboard_without_reader_writes() {
     }
     assert!(text.contains(&format!(
         "NODE {}",
-        hex::encode(&fixture.endpoint.to_bytes()[..6])
+        hex::encode(&fixture.author.to_bytes()[..6])
     )));
     assert!(text.contains(&format!("derive publications {derive_rate:.2}/s")));
     for handle in [

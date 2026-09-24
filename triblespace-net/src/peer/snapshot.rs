@@ -7,13 +7,13 @@ use std::future::Future;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, Weak};
 
-use triblespace_core::patch::{IdentitySchema, PATCH};
 use triblespace_core::blob::encodings::UnknownBlob;
-use triblespace_core::blob::{BlobEncoding, TryFromBlob};
+use triblespace_core::blob::{Blob, BlobEncoding, TryFromBlob};
 use triblespace_core::capability::{CapabilityProof, CapabilityProofId};
 use triblespace_core::collection::{CollectionRead, CollectionRecord, CollectionRecordSelector};
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{Inline, InlineEncoding};
+use triblespace_core::patch::{IdentitySchema, PATCH};
 use triblespace_core::repo::async_store::AsyncBlobStoreGet;
 use triblespace_core::repo::{
     BlobChildren, BlobInfo, BlobMetadata, BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut,
@@ -23,6 +23,7 @@ use triblespace_core::repo::{
 
 use super::{PeerAcquireError, SharedHost};
 use crate::host::INTERACTIVE_FETCH_DEADLINE;
+use crate::protocol::RawHash;
 
 /// A peer's frozen records, proofs, and residency index.
 ///
@@ -98,6 +99,42 @@ where
     S: SnapshotSource + BlobStorePut + Send,
     S::Snapshot: BlobStoreGet + BlobStoreList,
 {
+    pub(crate) fn fetch_verified_with_deadline(
+        &self,
+        hash: RawHash,
+        budget: std::time::Duration,
+    ) -> impl Future<Output = Option<Blob<UnknownBlob>>> + Send + 'static + use<S> {
+        let host = self.host.clone();
+        async move {
+            let sender = {
+                let host = host.upgrade()?;
+                let mut host = host.lock().expect("host mutex");
+                if let Err(error) = host.start() {
+                    tracing::warn!(%error, "cannot start hydration fetch");
+                    return None;
+                }
+                host.sender.clone()
+            };
+            sender.fetch_blob(hash, budget).await
+        }
+    }
+
+    /// Serial landing uses the wire-verified cached hash. It deliberately does
+    /// not rebuild the serving inventory between ready network completions.
+    pub(crate) fn land_verified(&self, verified: Blob<UnknownBlob>) -> Option<u64> {
+        let bytes = verified.bytes.len() as u64;
+        let mut guard = self.store.lock().expect("store mutex");
+        let store = guard.as_mut()?;
+        if let Err(error) = store.put::<UnknownBlob, _>(verified) {
+            tracing::warn!(
+                ?error,
+                "exact blob put failed; acquisition remains unfinished"
+            );
+            return None;
+        }
+        Some(bytes)
+    }
+
     /// Read the exact immutable content named by `handle`, fetching it if
     /// necessary. The snapshot's semantic observation remains unchanged.
     pub fn get<T, E>(

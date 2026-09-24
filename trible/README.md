@@ -198,9 +198,10 @@ changes admission for the immutable current session or creates blob WANTs.
   a maximum age of 180 seconds by default; set `--max-age` or
   `TRIBLESPACE_HEALTH_MAX_AGE_SECS` to change it. Future reports stay unknown,
   and any producer expiry annotations are ignored. Add
-  `--health-key REPORTING_KEY` to `pile net sync` to publish once a minute.
-  This is an existing durable reporting-author key, independent of the
-  transport key. The private `swarm-health` collection is not activated for
+  `--health` to `pile net sync` to publish once a minute with the same existing
+  durable key as the transport endpoint. `--health-collection HANDLE` also
+  enables reporting, into that existing admitted source collection instead of
+  the node's private generation. The health collection is not activated for
   replication automatically. Reports distinguish a live host, serving
   snapshot, per-peer collection comparison, and DHT publication; matching
   records do not establish that every referenced blob is available.
@@ -222,13 +223,19 @@ changes admission for the immutable current session or creates blob WANTs.
   throughput is not link capacity, and known work is not a complete denominator
   for an unknown colony. Producer instrumentation and explicit telemetry
   publication must be configured separately; the dashboard invents no values.
-  Maintenance can opt in with an existing `--telemetry-collection`, explicit
-  `--telemetry-node` and stable `--telemetry-worker`; an optional existing
-  `--telemetry-key` overrides the maintenance signer. Samples distinguish
+  Maintenance can opt in with an existing `--telemetry-collection` and stable
+  `--telemetry-worker`. Its existing maintenance key signs samples and its
+  public key identifies their local endpoint. Samples distinguish
   process CPU, outer-hop work, successful equation-publication calls and
   successful passes with no such calls. Neither record census nor a skipped
   poll is counted as performed work. No telemetry source or grant is created.
 - `pile net sync <PILE> --collection HANDLE [--collection HANDLE ...] [--peers ID_OR_TICKET,...] [--key PATH] [--direction bidirectional|read-only|write-only]` — activate the named collections and run periodic repair. `read-only` pulls but does not serve collection repair, while `write-only` serves admitted readers but does not pull collection repair. Every direction still services ordinary exact-blob WANTs. `--duration SECS` and `--quiescent-for SECS` provide optional process-lifecycle bounds.
+
+  The one existing key resolves from `--key`, `TRIBLESPACE_KEY`, or `self.key`
+  beside the pile's lexical path. It identifies the endpoint and signs local
+  health and telemetry; there is no second reporting-key setting. Sync telemetry
+  opts in with `--telemetry-collection HANDLE` and optionally
+  `--telemetry-worker NAME`; the existing destination must admit that same key.
 
   Ctrl-C, or SIGTERM on Unix, cancels awaited reconciliation or the idle wait,
   withdraws the serving observation and explicitly closes the pile. Unix
