@@ -253,8 +253,11 @@ fn maintained_signed_telemetry_reaches_dashboard_without_reader_writes() {
             "dashboard omitted a generated scope or metric"
         );
     }
+    // A node is named by the host its own daemons declare -- `WORKER` is
+    // `generated-maintainer`, so the host is `generated` -- beside the short
+    // handle, so a reader can tell two identities of one machine apart.
     assert!(text.contains(&format!(
-        "NODE {}",
+        "NODE generated · {}",
         hex::encode(&fixture.author.to_bytes()[..6])
     )));
     assert!(text.contains(&format!("derive publications {derive_rate:.2}/s")));
