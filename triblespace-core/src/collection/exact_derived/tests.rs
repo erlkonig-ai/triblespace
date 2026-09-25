@@ -901,7 +901,7 @@ fn ensure_drops_every_residency_snapshot_and_stores_the_blob_before_derive() {
 }
 
 #[test]
-fn ordinary_derived_ensure_leaves_cold_source_records_for_explicit_root_acquisition() {
+fn derived_ensure_acquires_only_its_maintainers_own_cold_payload() {
     let (mut inner, root, first, _second) = collections();
     let source = archive(1, 1);
     let metadata = inner
@@ -942,14 +942,27 @@ fn ordinary_derived_ensure_leaves_cold_source_records_for_explicit_root_acquisit
     drop(observed);
     drop(snapshot);
 
-    // Acquisition belongs to the root. Each writer's subsequent downstream
-    // operation observes its own immediate-source snapshot, including the
-    // concurrently published member now that both inputs are resident and
-    // admitted, and derives what that writer wrote.
-    drop(block_on(store.ensure(root, &equation_signer())).unwrap());
+    // The cold commit's writer owes its leaf, and fetches its own payload
+    // to map it -- that one blob and nothing else. The commit that lands
+    // while it fetches is somebody else's, so not its to derive.
+    drop(block_on(store.ensure(first, &SigningKey::from_bytes(&[42; 32]))).unwrap());
     assert_eq!(store.acquired, vec![data(&source)]);
     assert!(store.inject_record_on_acquire.is_none());
-    drop(block_on(store.ensure(first, &SigningKey::from_bytes(&[42; 32]))).unwrap());
+    let leaves: Vec<_> = records(&mut store.inner)
+        .into_iter()
+        .filter_map(|record| match record {
+            CollectionRecord::Derive(derive) if derive.collection() == first.handle() => {
+                Some(derive.input())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        leaves,
+        vec![crate::collection::SourceLocator::of(data(&source).raw)]
+    );
+
+    // Its writer derives the concurrent one, and fetches nothing.
     let snapshot = block_on(store.ensure(first, &SigningKey::from_bytes(&[43; 32]))).unwrap();
     assert_eq!(store.acquired, vec![data(&source)]);
     let observed = snapshot.collection(first).unwrap();
@@ -962,7 +975,7 @@ fn ordinary_derived_ensure_leaves_cold_source_records_for_explicit_root_acquisit
 }
 
 #[test]
-fn exact_ensure_fetches_a_known_derive_output_without_recomputing() {
+fn exact_maintenance_fetches_a_known_derive_output_without_recomputing() {
     let (mut inner, root, first, _second) = collections();
     let source = archive(1, 1);
     let _source_commit = publish_root(&mut inner, root, &source, 31);
@@ -980,7 +993,12 @@ fn exact_ensure_fetches_a_known_derive_output_without_recomputing() {
     let mut store = GuardStore::new(inner);
     store.offer(&output);
     reset_mapping_calls();
-    let snapshot = block_on(store.ensure(first, &equation_signer())).unwrap();
+    // The per-write ensure owes nothing here: the leaf exists, and fetching
+    // its absent image back is maintenance's work, never the write path's.
+    drop(block_on(store.ensure(first, &equation_signer())).unwrap());
+    assert!(store.acquired.is_empty());
+    assert!(store.events.is_empty());
+    let snapshot = block_on(store.maintain(first, &equation_signer())).unwrap();
 
     assert_eq!(store.acquired, vec![output_data]);
     assert_eq!(FIRST_MAP_CALLS.get(), 0);
@@ -2205,7 +2223,11 @@ fn complete_realization_is_reused_without_write_authority() {
         )
         .unwrap();
     let source = archive(1, 1);
+    // Both keys wrote the commit, so both own it; the owner, who may write
+    // the view, derived its leaf. The reader owes nothing, and so needs no
+    // WRITE to find its own work already done.
     publish_root(&mut inner, root, &source, 31);
+    publish_root(&mut inner, root, &source, 32);
     block_on(inner.ensure(target, &owner)).unwrap();
     let mut store = GuardStore::new(inner);
     reset_mapping_calls();
@@ -2218,6 +2240,12 @@ fn complete_realization_is_reused_without_write_authority() {
         }
         .unwrap();
         assert_eq!(snapshot.collection(target).unwrap().cover().len(), 1);
+        assert!(snapshot
+            .collection(target)
+            .unwrap()
+            .missing_from(&snapshot.collection(root).unwrap())
+            .unwrap()
+            .is_empty());
     }
     assert!(store.events.is_empty());
     assert!(store.acquired.is_empty());
@@ -2280,28 +2308,30 @@ fn optional_maintenance_without_write_keeps_the_fine_cover_without_algebra() {
         .unwrap();
     let left = archive(1, 1);
     let right = archive(2, 2);
+    // Both keys wrote both members, so both own them; only the owner may
+    // write either view, and it derived the leaves.
     for member in [&left, &right] {
         publish_root(&mut inner, root, member, 31);
+        publish_root(&mut inner, root, member, 32);
     }
     block_on(inner.ensure(first, &owner)).unwrap();
     block_on(inner.ensure(second, &owner)).unwrap();
     let upper = crate::collection::simplearchive_union::join(&left, &right).unwrap();
     inner.put::<SimpleArchive, _>(upper.clone()).unwrap();
-    let before = inner.snapshot().unwrap();
-    let left_witness = data(&left);
-    let right_witness = data(&right);
-    drop(before);
-    inner
-        .insert(CollectionRecord::Merge(
+    let root_merge = |key: &SigningKey| {
+        CollectionRecord::Merge(
             CollectionMerge::sign(
-                &owner,
+                key,
                 root.handle(),
-                [left_witness, right_witness],
+                [data(&left), data(&right)],
                 data(&upper),
             )
             .unwrap(),
-        ))
-        .unwrap();
+        )
+    };
+    // The reader's own root MERGE is owed a mirror in `first`, which the
+    // reader may not write.
+    inner.insert(root_merge(&reader)).unwrap();
     let mut store = GuardStore::new(inner);
     reset_mapping_calls();
 
@@ -2309,19 +2339,72 @@ fn optional_maintenance_without_write_keeps_the_fine_cover_without_algebra() {
     assert_eq!(snapshot.collection(first).unwrap().cover().len(), 2);
     drop(snapshot);
     assert!(store.events.is_empty());
-    assert_eq!(FIRST_MAP_CALLS.get(), 0);
+    assert!(store.acquired.is_empty());
+    assert_eq!(
+        FIRST_MAP_CALLS.get(),
+        0,
+        "no image is computed for a mirror that cannot be published"
+    );
 
-    // The authorized source producer can pay for its upper image. A downstream
-    // reader still must not join or republish it under an unauthorized key.
+    // The owner signs the same MERGE and pays for its image in `first`.
+    // Then the reader gains WRITE on `first` and co-signs everything there,
+    // so it owns `first`'s nodes too -- and still may not write `second`.
+    store.inner.insert(root_merge(&owner)).unwrap();
     drop(block_on(store.maintain(first, &owner)).unwrap());
+    store
+        .inner
+        .insert_proof(CapabilityProof::new(
+            CapabilityResource::from(first.handle()),
+            &owner,
+            write_capability(),
+            reader.verifying_key(),
+        ))
+        .unwrap();
+    let mut mirrored = 0;
+    for record in records(&mut store.inner) {
+        let copy = match record {
+            CollectionRecord::Derive(derive) if derive.collection() == first.handle() => {
+                CollectionRecord::Derive(CollectionDerive::sign(
+                    &reader,
+                    first.handle(),
+                    derive.input(),
+                    derive.output(),
+                ))
+            }
+            CollectionRecord::Merge(merge) if merge.collection() == first.handle() => {
+                mirrored += 1;
+                CollectionRecord::Merge(
+                    CollectionMerge::sign(
+                        &reader,
+                        first.handle(),
+                        merge.inputs().iter().copied(),
+                        merge.result(),
+                    )
+                    .unwrap(),
+                )
+            }
+            _ => continue,
+        };
+        store.inner.insert(copy).unwrap();
+    }
+    assert_eq!(
+        mirrored, 1,
+        "the owner mirrored its root MERGE into `first`"
+    );
     store.events.clear();
     reset_mapping_calls();
     let snapshot = block_on(store.maintain(second, &reader)).unwrap();
     assert_eq!(snapshot.collection(second).unwrap().cover().len(), 2);
+    drop(snapshot);
     assert!(store.events.is_empty());
     assert!(store.acquired.is_empty());
     assert_eq!(SECOND_MAP_CALLS.get(), 0);
     assert_eq!(SECOND_JOIN_CALLS.get(), 0);
+
+    // WRITE is the only thing that held it back: the owner mirrors it.
+    let snapshot = block_on(store.maintain(second, &owner)).unwrap();
+    assert_eq!(snapshot.collection(second).unwrap().cover().len(), 1);
+    assert_eq!(SECOND_MAP_CALLS.get(), 1);
 }
 
 #[test]
@@ -3463,5 +3546,165 @@ mod lattice_v2 {
         let source = snapshot.collection(root).unwrap();
         assert!(raw_view.missing_from(&source).unwrap().is_empty());
         assert!(view.missing_from(&raw_view).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_view_mirrors_only_merges_its_maintainer_signed() {
+        let owner = key(41);
+        let mut store = MemoryRepo::default();
+        // The owner roots the root's WRITE and grants it to 42; 43 is
+        // admitted nowhere.
+        let root = store
+            .collection(
+                "claims about somebody else's node",
+                CollectionPolicy::new(
+                    AdmissionPolicy::Open,
+                    AdmissionPolicy::direct(owner.verifying_key()),
+                ),
+            )
+            .unwrap();
+        let first = store.derive::<FirstEncoding>(root, (), policy()).unwrap();
+        store
+            .insert_proof(CapabilityProof::new(
+                CapabilityResource::from(root.handle()),
+                &owner,
+                write_capability(),
+                key(42).verifying_key(),
+            ))
+            .unwrap();
+        let own: Vec<_> = (0..8)
+            .map(|entity| own_commit(&mut store, root, 41, entity))
+            .collect();
+        block_on(store.maintain(root, &owner)).unwrap();
+        let merged = merges_in(&mut store, root.handle())[0].result();
+        let theirs = own_commit(&mut store, root, 42, 0);
+        block_on(store.ensure(first, &key(42))).unwrap();
+        // Claims about the owner's node the owner never made: that it
+        // absorbed the other writer's commit, and that it is the join of two
+        // of its own commits. 43's are unbelieved; 42's are believed, and
+        // still not the owner's to mirror.
+        for signer in [43, 42] {
+            for inputs in [[theirs, merged], [own[0], own[1]]] {
+                store
+                    .insert(CollectionRecord::Merge(
+                        CollectionMerge::sign(&key(signer), root.handle(), inputs, merged).unwrap(),
+                    ))
+                    .unwrap();
+            }
+        }
+
+        block_on(store.maintain(first, &owner)).unwrap();
+        let their_image = first_image(&payload(42, 0));
+        let mirrors = merges_in(&mut store, first.handle());
+        assert_eq!(mirrors.len(), 1, "only the owner's own carry is mirrored");
+        assert_eq!(mirrors[0].public_key(), public(41));
+        assert_eq!(
+            inputs(&mirrors[0]),
+            (0..8)
+                .map(|entity| first_image(&payload(41, entity)))
+                .collect()
+        );
+        assert_eq!(
+            frontier(&mut store, first.handle()),
+            BTreeSet::from([mirrors[0].result(), their_image]),
+            "the other writer's image is nobody's input in the view"
+        );
+    }
+
+    #[test]
+    fn a_derived_collection_in_a_roots_encoding_has_no_carry() {
+        struct Identity;
+
+        impl CollectionMapping for Identity {
+            type Source = SimpleArchive;
+            type Target = SimpleArchive;
+
+            fn fragment(&self) -> Fragment {
+                FirstEncoding::fragment(&())
+            }
+
+            fn bind(
+                _source: &Fragment,
+                _target: &Fragment,
+            ) -> Result<Self, CollectionOperationError> {
+                Ok(Self)
+            }
+
+            fn map<R>(
+                &self,
+                source: &Blob<SimpleArchive>,
+                _reader: &R,
+            ) -> Result<Blob<SimpleArchive>, CollectionOperationError>
+            where
+                R: StoreRead,
+            {
+                Ok(source.clone())
+            }
+        }
+
+        let owner = key(41);
+        let (mut store, root, _, _) = collections();
+        let copy = store.derive_with(root, Identity, policy()).unwrap();
+        for entity in 0..8 {
+            own_commit(&mut store, root, 41, entity);
+        }
+        block_on(store.ensure_with::<Identity>(copy, &owner)).unwrap();
+        assert_eq!(derives_in(&mut store, copy.handle()).len(), 8);
+        // Eight own leaves in one tier, and still no carry: the view's merges
+        // are its source's, mirrored through its mapping.
+        let before = records(&mut store);
+        let result = block_on(store.maintain(copy, &owner));
+        assert!(
+            matches!(result, Err(CollectionRealizationError::InvalidCover(_))),
+            "{:?}",
+            result.err()
+        );
+        assert_eq!(records(&mut store), before);
+    }
+
+    #[test]
+    fn an_own_merge_that_returns_one_of_its_inputs_is_mirrored_onto_its_leaf() {
+        reset_mapping_calls();
+        let (mut store, root, first, _) = collections();
+        let owner = key(41);
+        // Seven members, and an eighth holding all of them and one fact
+        // more: the join of the eight is the eighth's own bytes.
+        let members: Vec<_> = (0..7).map(|entity| payload(41, entity)).collect();
+        let mut all = TribleSet::new();
+        for member in &members {
+            all.union(TribleSet::try_from_blob(member.clone()).unwrap());
+        }
+        all.insert(&row(99, 41));
+        let wide: Blob<SimpleArchive> = all.to_blob();
+        for member in members.iter().chain([&wide]) {
+            publish_root(&mut store, root, member, 41);
+        }
+        block_on(store.maintain(root, &owner)).unwrap();
+        let carried = merges_in(&mut store, root.handle());
+        assert_eq!(carried.len(), 1);
+        assert_eq!(carried[0].result(), data(&wide));
+        assert_eq!(
+            frontier(&mut store, root.handle()),
+            BTreeSet::from([data(&wide)])
+        );
+
+        block_on(store.maintain(first, &owner)).unwrap();
+        assert_eq!(derives_in(&mut store, first.handle()).len(), 8);
+        let mirrors = merges_in(&mut store, first.handle());
+        assert_eq!(mirrors.len(), 1);
+        assert_eq!(mirrors[0].result(), first_image(&wide));
+        assert_eq!(
+            inputs(&mirrors[0]),
+            members.iter().chain([&wide]).map(first_image).collect()
+        );
+        assert_eq!(
+            frontier(&mut store, first.handle()),
+            BTreeSet::from([first_image(&wide)])
+        );
+        assert_eq!(FIRST_MAP_CALLS.get(), 8, "the leaves alone are mapped");
+
+        let before = records(&mut store).len();
+        block_on(store.maintain(first, &owner)).unwrap();
+        assert_eq!(records(&mut store).len(), before);
     }
 }

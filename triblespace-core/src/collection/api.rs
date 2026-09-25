@@ -1616,10 +1616,12 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
     /// own node's support is absorbed, and every tier (`floor(log_8
     /// |support|)`) holding eight own nodes is joined by one n-ary `MERGE`,
     /// until none does. Other owners' nodes are neither merged nor read. A
-    /// derived collection is ensured, then every source `MERGE` producing a
-    /// node the key owns is mirrored, bottom-up, as a target `MERGE` over its
-    /// inputs' images, the result mapped from the merged source node's bytes.
-    /// A derived collection has no carry of its own. There is no
+    /// derived collection is ensured, an own leaf whose image is absent is
+    /// fetched or mapped again, and every believed source `MERGE` the key
+    /// signed is mirrored, bottom-up, as a target `MERGE` over its inputs'
+    /// images, the result mapped from the merged source node's bytes. A
+    /// derived collection has no carry of its own, and one stored in a
+    /// root's encoding is refused rather than carried. There is no
     /// caller-visible budget or tuning knob; every useful result is published
     /// independently. The live store may acquire exact dependencies while
     /// doing so. The supplied key signs each newly published `MERGE` or

@@ -2,8 +2,9 @@
 //!
 //! Every collection is a lattice of its own foundations joined by MERGEs,
 //! and a maintainer merges or derives only what it owns
-//! ([`owns`](super::ownership::owns)). There are two kinds of work, and
-//! neither compares supports across collections:
+//! ([`owns`](super::ownership::owns),
+//! [`owns_merge`](super::ownership::owns_merge)). There are two kinds of
+//! work, and neither compares supports across collections:
 //!
 //! - A root carries its maintainer's own frontier nodes. A node whose support
 //!   lies inside another own node's is absorbed by it, `MERGE(node, wider) ->
@@ -14,16 +15,17 @@
 //! - A derived collection derives what its maintainer wrote. Every source
 //!   foundation it owns whose locator has no leaf in the target yet is mapped
 //!   and published as `DERIVE(target, L(F), f(F))`, empty images included.
-//!   Every source MERGE producing a node it owns is mirrored, bottom-up, as a
+//!   Every believed source MERGE it signed is mirrored, bottom-up, as a
 //!   target MERGE over the images of its inputs, the result computed by
 //!   mapping the merged source node's own bytes. A derived collection has no
 //!   carry of its own: its merges are its source's merges, one level down.
 //!
 //! Records are selected only to descend: the MERGEs that produced a merged
-//! source node come from the produced-member index, and a mirror already
-//! published is found through the target's consumer edges, the MERGE
-//! relation read by its own key. The only link between a view and its source
-//! is the locator each leaf carries.
+//! source node come from the produced-member index, and are kept only when
+//! the key signed them and the source's coverage believes them. A mirror
+//! already published is found through the target's consumer edges, the
+//! MERGE relation read by its own key. The only link between a view and its
+//! source is the locator each leaf carries.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
@@ -36,14 +38,13 @@ use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
 use crate::patch::Entry;
 use crate::repo::{BlobStoreGet, BlobStoreMeta, Store, StoreRead};
-use crate::trible::Fragment;
 
 use super::coverage::{Coverage, CoverageIndex, CoverageSet, FrontierSet};
 use super::exact_derived::{
     data_identity, load_lineage, producer_is_admitted, CollectionRealizationError, Lineage,
 };
 use super::operation_snapshot::{OperationFrontier, OperationSnapshot};
-use super::ownership::owns;
+use super::ownership::{owns, owns_merge};
 use super::{
     Collection, CollectionData, CollectionDerive, CollectionEncoding, CollectionHandle,
     CollectionMapping, CollectionMerge, CollectionOperationError, CollectionRecord,
@@ -383,29 +384,6 @@ where
     Ok(nodes)
 }
 
-fn load_descriptor<R, E>(
-    snapshot: &R,
-    target: Collection<E>,
-) -> Result<Fragment, CollectionRealizationError>
-where
-    R: StoreRead,
-    E: CollectionEncoding,
-{
-    let descriptor = super::api::load_collection_descriptor(snapshot, target.handle())
-        .map_err(|error| {
-            CollectionRealizationError::Resolution(format!(
-                "load target descriptor for maintenance: {error}"
-            ))
-        })?
-        .fragment;
-    super::encoding::validate_descriptor_type::<E>(&descriptor).map_err(|error| {
-        CollectionRealizationError::Resolution(format!(
-            "invalid target descriptor for maintenance: {error}"
-        ))
-    })?;
-    Ok(descriptor)
-}
-
 /// Carry the maintaining key's own nodes of one root to their LSM fixed
 /// point.
 ///
@@ -417,6 +395,10 @@ where
 /// again. Each result is stored and published at once, so a later failure
 /// keeps the complete successful prefix. Without WRITE authority nothing is
 /// published; the own finer cover is then the fixed point.
+///
+/// Only a root carries. A derived collection whose encoding happens to be a
+/// root's is refused: its merges are its source's, mirrored through its
+/// mapping, and it has no carry of its own.
 pub(super) fn carry_root<S, E>(
     store: &mut S,
     target: Collection<E>,
@@ -430,7 +412,13 @@ where
 {
     let key = signing_key.verifying_key();
     let scope = BTreeSet::from([target.handle()]);
-    let descriptor = load_descriptor(&open(store, frontier, "open root-carry snapshot")?, target)?;
+    let lineage = load_lineage(&open(store, frontier, "open root-carry snapshot")?, target)?;
+    if lineage.foundation.handle() != target.handle() {
+        return Err(CollectionRealizationError::InvalidCover(
+            "a derived collection has no carry of its own; maintain it through its mapping".into(),
+        ));
+    }
+    let descriptor = lineage.descriptor(target.handle()).clone();
     let mut seen = BTreeSet::new();
     let mut declined = BTreeSet::<Vec<CollectionData>>::new();
     let mut progressed = true;
@@ -447,18 +435,33 @@ where
         }
         // A node inside another own node's support is consumed by its widest
         // such node. Two nodes with one support keep the lower handle, which
-        // is also the one a reader keeps.
+        // is also the one a reader keeps. Only a strictly wider node can hold
+        // a node properly, and `nodes` is widest first, so each node tests
+        // inclusion against the nodes before its own width alone; an equal
+        // support is found by its Merkle root. Fresh commits -- pairwise
+        // disjoint singletons, all of one width -- then cost no inclusion
+        // test at all, however many of them a root holds.
+        let mut keepers = BTreeMap::<[u8; 32], CollectionData>::new();
+        for (node, support) in &nodes {
+            if let Some(root) = support.merkle_root() {
+                // Within one width `nodes` ascends by handle: the first seen
+                // is the lowest.
+                keepers.entry(root).or_insert(*node);
+            }
+        }
         let absorbed: Vec<(CollectionData, CollectionData)> = nodes
             .iter()
             .filter_map(|(node, support)| {
-                nodes
+                let wider = nodes
                     .iter()
-                    .find(|(other, wider)| {
-                        other != node
-                            && support <= wider
-                            && (support != wider || node.raw > other.raw)
-                    })
-                    .map(|(wider, _)| (*node, *wider))
+                    .take_while(|(_, wider)| wider.len() > support.len())
+                    .find(|(_, wider)| support <= wider)
+                    .map(|(wider, _)| *wider)
+                    .or_else(|| {
+                        let keeper = *keepers.get(&support.merkle_root()?)?;
+                        (keeper != *node).then_some(keeper)
+                    })?;
+                Some((*node, wider))
             })
             .collect();
         if !absorbed.is_empty() {
@@ -619,7 +622,15 @@ where
     M: CollectionMapping,
 {
     let bound: Bound<M> = bind(&open(store, frontier, "open mapping snapshot")?, target)?;
-    let blocked = derive_leaves(store, target, &bound, signing_key, unavailable, frontier)?;
+    let blocked = derive_leaves(
+        store,
+        target,
+        &bound,
+        signing_key,
+        unavailable,
+        frontier,
+        aligned,
+    )?;
     if aligned {
         mirror_merges(store, target, &bound, signing_key, unavailable, frontier)?;
     }
@@ -634,17 +645,18 @@ where
 /// has none for: `DERIVE(target, L(F), f(F))`, an empty image included.
 ///
 /// The source's foundations are what its frontier stands for; the ones the
-/// key owns are its to derive. An own leaf that exists but whose image is
-/// not here is fetched; when it cannot be, the foundation is mapped again to
+/// key owns are its to derive. With `restore` -- maintenance, never the
+/// per-write `ensure` -- an own leaf that exists but whose image is not here
+/// is fetched too; when it cannot be, the foundation is mapped again to
 /// restore the bytes, and a leaf is published only if the image differs.
 ///
-/// An own source foundation whose bytes are not here is fetched too. When
-/// nobody can hand them over, a root commit's payload is reported, because
-/// nothing upstream can restore it. A derived source's image is that
-/// source's own lag instead: maintaining the source maps it again from what
-/// the source derives from, and until then this view lags on it too, the
-/// same way a reader of the source does. Downstream work neither requires
-/// nor repairs it.
+/// An own source foundation owed a leaf whose bytes are not here is fetched.
+/// When nobody can hand them over, a root commit's payload is reported,
+/// because nothing upstream can restore it. A derived source's leaf image is
+/// that source's own lag instead: maintaining the source maps it again from
+/// what the source derives from, and until then this view lags on it too,
+/// the same way a reader of the source does. Downstream work neither
+/// requires nor repairs it.
 /// Returns the foundations the mapping could not represent.
 fn derive_leaves<S, M>(
     store: &mut S,
@@ -653,6 +665,7 @@ fn derive_leaves<S, M>(
     signing_key: &SigningKey,
     unavailable: &BTreeSet<CollectionData>,
     frontier: &mut OperationFrontier<S::Snapshot>,
+    restore: bool,
 ) -> Result<Vec<(CollectionData, String)>, CollectionRealizationError>
 where
     S: Store,
@@ -676,7 +689,7 @@ where
         let outputs = coverage.leaf_outputs(target.handle(), locator);
         if outputs.is_empty() {
             owed.push((foundation, locator, outputs));
-        } else {
+        } else if restore {
             derived.push((foundation, locator, outputs));
         }
     }
@@ -792,16 +805,30 @@ where
     Ok(blocked)
 }
 
-/// Mirror every source MERGE producing a node the key owns, bottom-up.
+/// Mirror every source MERGE the key owns, bottom-up.
 ///
 /// The walk starts at the key's own source frontier and descends through the
-/// MERGEs that produced each merged node. A foundation's image is its leaf. A
-/// merged node's image is found, in order: all its inputs share one image,
-/// which is then its image too; a target MERGE of exactly its inputs' images
-/// is already believed, whose result is its image; or the key owns it, and it
-/// is mapped from its own bytes and `MERGE(target; images -> image)` is
-/// published. A node the mapping declines is not mirrored, and neither is
-/// anything that needs it; its inputs' images stay on the target frontier.
+/// MERGEs that produced each merged node: only the key's own, and only ones
+/// the source's coverage believes. A MERGE somebody else signed -- admitted
+/// or not, true or not -- is theirs to mirror; mirroring it would merge
+/// nodes of the view the key does not own.
+///
+/// A foundation's image is its leaf. A merged node's image is found, in
+/// order: all its inputs share one image, which is then its image too; a
+/// target MERGE of exactly its inputs' images is already believed, whose
+/// result is its image; or the key owns it, and it is mapped from its own
+/// bytes and `MERGE(target; images -> image)` is published. A node the
+/// mapping declines is not mirrored, and neither is anything that needs it;
+/// its inputs' images stay on the target frontier.
+///
+/// A foundation can be a merge result too: a join whose union is exactly one
+/// input's bytes returns that input, `MERGE(p0, p1, ..) -> p0`. Its image is
+/// still its leaf, and each such own MERGE is mirrored onto it without any
+/// mapping, the same way an absorption is.
+///
+/// An own mirror whose image is absent here is reused as it stands; nothing
+/// maps it again. A view deriving from this one lags on that node -- it
+/// keeps the finer images beneath it -- until the bytes arrive.
 fn mirror_merges<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
@@ -832,12 +859,26 @@ where
     let mut pending = tops.clone();
     let mut seen = BTreeSet::new();
     while let Some(node) = pending.pop() {
-        if !seen.insert(node) || coverage.covers(source, node, node) {
+        if !seen.insert(node) {
+            continue;
+        }
+        // A foundation that stands for itself alone was produced by nothing
+        // but its own commit or leaf: no lookup. One that stands for more is
+        // a merge result as well.
+        if coverage.covers(source, node, node)
+            && coverage
+                .of(source, node)
+                .map_or(true, |support| support.len() <= 1)
+        {
             continue;
         }
         let merges: Vec<MergeInputs> = producers(&planning, source, node)?
-            .iter()
-            .map(CollectionMerge::merge_inputs)
+            .into_iter()
+            .filter(|merge| {
+                owns_merge(merge, &key)
+                    && index.believes_join(source, &merge.merge_inputs(), merge.result())
+            })
+            .map(|merge| merge.merge_inputs())
             .collect();
         pending.extend(merges.iter().flat_map(|inputs| inputs.iter()));
         produced.insert(node, merges);
@@ -881,8 +922,8 @@ where
     key: VerifyingKey,
     unavailable: &'a BTreeSet<CollectionData>,
     index: CoverageIndex,
-    /// The input sets of the MERGEs producing each merged source node the
-    /// walk can reach.
+    /// The input sets of the key's own believed MERGEs producing each source
+    /// node the walk can reach.
     produced: BTreeMap<CollectionData, Vec<MergeInputs>>,
     /// Each source node's image, or `None` when it has none to give.
     images: BTreeMap<CollectionData, Option<CollectionData>>,
@@ -925,14 +966,16 @@ where
         let source = self.bound.source;
         let target = self.target.handle();
         let coverage = self.index.published();
-        if coverage.covers(source, node, node) {
-            // A foundation's image is its leaf, whoever derived it.
-            return Ok(coverage
-                .leaf_outputs(target, SourceLocator::of(node.raw))
-                .first()
-                .copied());
-        }
+        let foundation = coverage.covers(source, node, node);
         let owned = owns(coverage, source, node, &self.key);
+        let leaf = foundation
+            .then(|| {
+                coverage
+                    .leaf_outputs(target, SourceLocator::of(node.raw))
+                    .first()
+                    .copied()
+            })
+            .flatten();
         let (absorbing, proper): (Vec<MergeInputs>, Vec<MergeInputs>) = self
             .produced
             .get(&node)
@@ -940,22 +983,37 @@ where
             .unwrap_or_default()
             .into_iter()
             .partition(|inputs| inputs.contains(node));
-        let mut image = None;
-        for inputs in proper {
-            let Some(images) = self.input_images(inputs.as_slice(), None)? else {
-                continue;
+        let (image, onto) = if foundation {
+            // A foundation's image is its leaf, whoever derived it. Every own
+            // MERGE producing it is mirrored onto that image: by homomorphism
+            // the image of a join that returned this foundation's bytes is
+            // this foundation's image, so nothing is mapped.
+            let Some(image) = leaf else {
+                return Ok(None);
             };
-            // The result is a property of the node, not of the producer: one
-            // attempt settles it.
-            image = self.join_of(images, node, owned)?;
-            break;
-        }
-        let Some(image) = image else {
-            return Ok(None);
+            (
+                image,
+                absorbing.into_iter().chain(proper).collect::<Vec<_>>(),
+            )
+        } else {
+            let mut image = None;
+            for inputs in proper {
+                let Some(images) = self.input_images(inputs.as_slice(), None)? else {
+                    continue;
+                };
+                // The result is a property of the node, not of the producer:
+                // one attempt settles it.
+                image = self.join_of(images, node, owned)?;
+                break;
+            }
+            let Some(image) = image else {
+                return Ok(None);
+            };
+            (image, absorbing)
         };
         // `MERGE(a, node) -> node` in the source is `MERGE(f(a), f(node)) ->
         // f(node)` in the target: an absorption needs no mapping.
-        for inputs in absorbing {
+        for inputs in onto {
             let Some(images) = self.input_images(inputs.as_slice(), Some((node, image)))? else {
                 continue;
             };

@@ -334,8 +334,9 @@ fn missing_then_maintain_closes_cross_fragment_path() {
     let (source, target) = test_paths(&mut store, "paths", plus());
     let left = put_data(&mut store, &edge(1, 2));
     let right = put_data(&mut store, &edge(2, 3));
+    // The maintaining key wrote both fragments, so both are its to derive.
     let first = signed_commit(&mut store, source, 1, &left);
-    let second = signed_commit(&mut store, source, 2, &right);
+    let second = signed_commit(&mut store, source, 1, &right);
     publish(&mut store, first);
     publish(&mut store, second);
     let support = support(&mut store, source, [first, second]);
@@ -345,11 +346,49 @@ fn missing_then_maintain_closes_cross_fragment_path() {
     let unrealized = before.collection(target).unwrap();
     assert!(unrealized.cover().is_empty());
     assert!(unrealized.support().unwrap().is_empty());
+    assert_eq!(
+        unrealized
+            .missing_from(&before.collection(source).unwrap())
+            .unwrap(),
+        support
+    );
 
     let after = block_on(store.maintain(target, &authority_key())).unwrap();
     let observed = after.collection(target).unwrap();
     assert_eq!(stood_for(&observed), support);
+    assert!(observed
+        .missing_from(&after.collection(source).unwrap())
+        .unwrap()
+        .is_empty());
     assert_cross_fragment_path(&observed.view::<Arc<PathIndex>>().unwrap());
+}
+
+#[test]
+fn another_writers_fragment_is_its_writers_to_derive() {
+    let mut store = CollectionOnly::default();
+    let (source, target) = test_paths(&mut store, "paths", plus());
+    let left = put_data(&mut store, &edge(1, 2));
+    let right = put_data(&mut store, &edge(2, 3));
+    let first = signed_commit(&mut store, source, 1, &left);
+    let second = signed_commit(&mut store, source, 2, &right);
+    publish(&mut store, first);
+    publish(&mut store, second);
+    support(&mut store, source, [first, second]);
+
+    // The maintaining key derives what it wrote; the other writer's
+    // fragment is that writer's lag, and freshness names exactly it.
+    let after = block_on(store.maintain(target, &authority_key())).unwrap();
+    let observed = after.collection(target).unwrap();
+    assert_eq!(stood_for(&observed).len(), 1);
+    let missing = observed
+        .missing_from(&after.collection(source).unwrap())
+        .unwrap();
+    assert_eq!(
+        missing.members().collect::<Vec<_>>(),
+        vec![right.get_handle()]
+    );
+    let index: Arc<PathIndex> = observed.view().unwrap();
+    assert!(!index.contains(&RawInline::from(id(1)), &RawInline::from(id(3))));
 }
 
 #[test]
@@ -377,11 +416,12 @@ fn duplicate_payload_provenance_shares_one_derive() {
 #[test]
 fn resident_source_merge_is_lowered_once() {
     let mut store = CollectionOnly::default();
-    let (source, target) = test_paths(&mut store, "paths", plus());
+    let automaton = plus();
+    let (source, target) = test_paths(&mut store, "paths", automaton.clone());
     let left = put_data(&mut store, &edge(1, 2));
     let right = put_data(&mut store, &edge(2, 3));
     let first = signed_commit(&mut store, source, 1, &left);
-    let second = signed_commit(&mut store, source, 2, &right);
+    let second = signed_commit(&mut store, source, 1, &right);
     publish(&mut store, first);
     publish(&mut store, second);
     let joined = simplearchive_union::join(&left, &right).unwrap();
@@ -404,8 +444,12 @@ fn resident_source_merge_is_lowered_once() {
     let observed = snapshot.collection(target).unwrap();
     assert_eq!(stood_for(&observed), support);
     assert_cross_fragment_path(&observed.view::<Arc<PathIndex>>().unwrap());
-    let inputs: Vec<_> = records(&mut store)
-        .into_iter()
+    // One leaf per source foundation, never one for the merged node, and
+    // the source MERGE lowered once: a target MERGE of the two leaf images
+    // whose result is the merged node's own bytes mapped.
+    let published = records(&mut store);
+    let mut leaves: Vec<_> = published
+        .iter()
         .filter_map(|record| match record {
             CollectionRecord::Derive(claim) if claim.collection() == target.handle() => {
                 Some(claim.input())
@@ -413,12 +457,39 @@ fn resident_source_merge_is_lowered_once() {
             _ => None,
         })
         .collect();
-    assert_eq!(
-        inputs,
-        vec![triblespace_core::collection::SourceLocator::of(
-            joined_data.raw
-        )]
-    );
+    leaves.sort();
+    let mut expected = vec![
+        triblespace_core::collection::SourceLocator::of(first.data().raw),
+        triblespace_core::collection::SourceLocator::of(second.data().raw),
+    ];
+    expected.sort();
+    assert_eq!(leaves, expected);
+    let mirrors: Vec<_> = published
+        .iter()
+        .filter_map(|record| match record {
+            CollectionRecord::Merge(merge) if merge.collection() == target.handle() => Some(*merge),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(mirrors.len(), 1);
+    let image = |blob: &Blob<SimpleArchive>| {
+        Handle::<PathSummaryBlob>::to_hash(
+            path_summary_union::derive_element(blob, &automaton)
+                .unwrap()
+                .get_handle(),
+        )
+    };
+    let mut images = vec![image(&left), image(&right)];
+    images.sort_by(|a, b| a.raw.cmp(&b.raw));
+    assert_eq!(mirrors[0].inputs(), images.as_slice());
+    assert_eq!(mirrors[0].result(), image(&joined));
+    assert_eq!(observed.cover().len(), 1);
+
+    // Lowered once: a second pass publishes nothing.
+    drop(observed);
+    drop(snapshot);
+    block_on(store.maintain(target, &authority_key())).unwrap();
+    assert_eq!(records(&mut store), published);
 }
 
 #[test]

@@ -701,64 +701,69 @@ fn maintain_all_schedules_a_shared_upstream_once() {
 
 #[test]
 fn maintain_all_carries_a_reached_root_once_before_its_views() {
-    let fixture = Fixture::new();
-    // Six more own commits fill the root's first tier.
-    let mut pile = Pile::open(&fixture.path).unwrap();
-    let mut expected = fixture.expected.clone();
-    for text in ["third", "fourth", "fifth", "sixth", "seventh", "eighth"] {
-        let fragment = entity! { metadata::description: text };
-        expected += fragment.facts().clone();
-        pile.commit(fixture.source, &fixture.signer, fragment)
-            .unwrap();
-    }
-    pile.close().unwrap();
-    // Every root the pass reaches is carried, whether it is selected or only
-    // reached; selecting it after its descendant schedules it once, first.
-    let output = fixture.run(
-        "maintain-all",
-        &[fixture.rank9.handle(), fixture.source.handle()],
-    );
-    assert_success(&output);
-    assert_eq!(
-        scheduled_handles(&output),
-        [
+    // Every root the pass reaches is carried, whether it is only reached as
+    // a dependency or also selected; selecting it after its descendant
+    // schedules it once, first.
+    for select_root in [false, true] {
+        let fixture = Fixture::new();
+        // Six more own commits fill the root's first tier.
+        let mut pile = Pile::open(&fixture.path).unwrap();
+        let mut expected = fixture.expected.clone();
+        for text in ["third", "fourth", "fifth", "sixth", "seventh", "eighth"] {
+            let fragment = entity! { metadata::description: text };
+            expected += fragment.facts().clone();
+            pile.commit(fixture.source, &fixture.signer, fragment)
+                .unwrap();
+        }
+        pile.close().unwrap();
+        let mut selection = vec![fixture.rank9.handle()];
+        if select_root {
+            selection.push(fixture.source.handle());
+        }
+        let output = fixture.run("maintain-all", &selection);
+        assert_success(&output);
+        assert_eq!(
+            scheduled_handles(&output),
+            [
+                fixture.source.handle(),
+                fixture.succinct.handle(),
+                fixture.rank9.handle(),
+            ]
+            .map(handle_text),
+            "select_root = {select_root}"
+        );
+        let after = records(&fixture.path);
+        for collection in [
             fixture.source.handle(),
             fixture.succinct.handle(),
             fixture.rank9.handle(),
-        ]
-        .map(handle_text)
-    );
-    let after = records(&fixture.path);
-    for collection in [
-        fixture.source.handle(),
-        fixture.succinct.handle(),
-        fixture.rank9.handle(),
-    ] {
+        ] {
+            assert_eq!(
+                after
+                    .iter()
+                    .filter(|record| matches!(
+                        record,
+                        CollectionRecord::Merge(record) if record.collection() == collection
+                    ))
+                    .count(),
+                1,
+                "the root's one carry, and its mirror in each view (select_root = {select_root})"
+            );
+        }
+        let mut pile = Pile::open(&fixture.path).unwrap();
+        let snapshot = pile.snapshot().unwrap();
+        let observed = snapshot.collection(fixture.rank9).unwrap();
+        assert_eq!(observed.cover().len(), 1);
         assert_eq!(
-            after
-                .iter()
-                .filter(|record| matches!(
-                    record,
-                    CollectionRecord::Merge(record) if record.collection() == collection
-                ))
-                .count(),
-            1,
-            "the root's one carry, and its mirror in each view"
+            stood_for(&observed),
+            fixture.source.admitted(&snapshot).unwrap()
         );
+        let facts = observed.view::<UnionArchive<OrderedUniverse>>().unwrap();
+        assert_eq!(facts.iter().collect::<TribleSet>(), expected);
+        drop(observed);
+        drop(snapshot);
+        pile.close().unwrap();
     }
-    let mut pile = Pile::open(&fixture.path).unwrap();
-    let snapshot = pile.snapshot().unwrap();
-    let observed = snapshot.collection(fixture.rank9).unwrap();
-    assert_eq!(observed.cover().len(), 1);
-    assert_eq!(
-        stood_for(&observed),
-        fixture.source.admitted(&snapshot).unwrap()
-    );
-    let facts = observed.view::<UnionArchive<OrderedUniverse>>().unwrap();
-    assert_eq!(facts.iter().collect::<TribleSet>(), expected);
-    drop(observed);
-    drop(snapshot);
-    pile.close().unwrap();
 }
 
 #[test]

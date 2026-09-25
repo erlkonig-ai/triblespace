@@ -71,13 +71,24 @@ seen earlier when a new fact supplies another proof. Applications that require
 global once-only delivery retain the projected tuples they have consumed;
 applications interested in witness events should project the witness identity.
 
-## Use foundational support as the continuation token
+## Use absorbed source payloads as the continuation token
 
-A `Support` is exactly the `Cover<SimpleArchive>` of distinct foundational
-payload handles represented by one immutable collection snapshot. Its
-PATCH-backed membership makes a natural storage-level continuation token.
-`Cover::additions_since` verifies that the earlier support remains a subset of
-the later support and returns only newly observed members:
+A `Support` is a `Cover` of one collection's own foundations: a root's
+distinct committed payload handles, a derived collection's leaf images. Its
+PATCH-backed membership makes a natural storage-level continuation token, and
+`Cover::additions_since` verifies that the earlier token remains a subset of
+the later one and returns only newly observed members.
+
+The token has to name what the queried view answers for, and a derived view
+answers for the source payloads that have a leaf in it, not for everything
+the source holds. Every writer derives the payloads it wrote, so another
+writer's payload is in the source before it is in the view. A token taken
+from the source's own support would advance past that payload and never
+deliver it. So the example asks each hop's freshness instead: the source
+payloads the first view has a leaf for (the source's support minus
+`raw.missing_from(&source)`), and only while the second view has caught up
+with the first (`accelerated.missing_from(&raw)` is empty). A view that lags
+holds the token back:
 
 ```rust,ignore
 {{#include ../../examples/collection_pattern_changes.rs:collection_pattern_changes_observe}}
@@ -89,34 +100,24 @@ metadata claim over an existing payload is provenance and produces no data
 delta. If a previous member is absent, the helper returns
 `CoverAdvanceError::ResetRequired`: additions-only maintenance is no longer
 sound, so rebuild the accumulated application state from `current`. Advance the
-saved cover only after the complete fallible fold succeeds, as the example
-does, to make a failed fold retry the same support.
+saved token only after the complete fallible fold succeeds, as the example
+does, to make a failed fold retry the same delta.
 
-The two pattern inputs need not share a representation. The runnable example
-(`cargo run --example collection_pattern_changes`) keeps an immutable
-`CollectionSnapshot<R, E>` which owns the store observation and realized
-target cover. Its foundational support is a fallible, lazy provenance query;
-its shard-preserving query value is reconstructed separately with `view`.
+The two pattern inputs need not share a representation. The delta is a set of
+source payloads, so it is read from the source by handle through the same
+snapshot -- `snapshot.get(member)` for each new member, unioned -- and the
+maintained target's `view` answers the `full` side. Supports of two
+collections are never compared: a view's support is its own leaf images,
+and whether it has caught up with its source is `missing_from`. There is no
+way to attach a target for only the delta; the delta is read where it
+lives. Persisted `DERIVE` and `MERGE` equations make repeated maintenance
+idempotent.
 
-For a strict extension, await `maintain` through each mapping edge, attach
-the target from the snapshot the last step returned, and compute
-`changed_support = next.support()?.additions_since(previous.support()?)`. That
-delta is a set of source payloads, so read them from the source by handle
-through the same snapshot — `snapshot.get(member)` for each of
-`changed_support.members()`, unioned — and let the maintained target's `view`
-answer the `full` side. A target stands for
-what its source's frontier stands on and nothing narrower, so there is no
-support to pass along the chain and no way to attach a target for only the
-delta; the delta is read where it lives. Persisted `DERIVE` and `MERGE`
-equations make repeated maintenance idempotent.
-
-Keep the previous collection snapshot until the complete fallible fold
-succeeds. A failed consumer therefore retries the same delta, while already
-completed lattice work is merely rediscovered. If the previous support is no
-longer a subset, `CoverAdvanceError::ResetRequired` asks the application to
-rebuild from the complete current snapshot. Because both inputs come from one
-snapshot, payloads first observed later cannot leak into either query input
-merely because their blobs are resident by then.
+Keep the previous token until the complete fallible fold succeeds. A failed
+consumer therefore retries the same delta, while already completed lattice
+work is merely rediscovered. Because both inputs come from one snapshot,
+payloads first observed later cannot leak into either query input merely
+because their blobs are resident by then.
 
 Payload support is deliberately not an exact fact difference. A new payload
 may repeat a fact already present, and that new witness may legitimately make a

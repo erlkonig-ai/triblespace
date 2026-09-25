@@ -794,6 +794,27 @@ impl CoverageIndex {
             .collect()
     }
 
+    /// Whether the index believes the join of exactly `inputs` into
+    /// `result` in `collection`.
+    ///
+    /// A raw MERGE is not a belief: a store keeps records whose signer no
+    /// policy admits. Only believed joins have consumer edges, so this reads
+    /// the edges of the join's first input, the MERGE relation by its own
+    /// key, and looks for this one among them.
+    pub fn believes_join(
+        &self,
+        collection: CollectionHandle,
+        inputs: &MergeInputs,
+        result: CollectionData,
+    ) -> bool {
+        let Some(first) = inputs.iter().next() else {
+            return false;
+        };
+        self.joins_reading(collection, first)
+            .iter()
+            .any(|(read, produced)| read == inputs && *produced == result)
+    }
+
     /// How many distinct joins the index keeps inputs for, believed or
     /// parked: one entry per join, whatever its arity or the number of its
     /// edges and parked copies.

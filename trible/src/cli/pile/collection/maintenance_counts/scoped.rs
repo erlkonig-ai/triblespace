@@ -354,11 +354,10 @@ fn upstream_publication_rechecks_downstream_in_the_same_pass() {
     let mut references = warm(&mut fixture, &mut state);
     let source = fixture.sources[0].handle();
     let target = fixture.targets[0].handle();
-    // Seven more own members fill the root's first tier: this pass's own
-    // carry of the root publishes a MERGE, and the target must be checked
-    // after that publication -- even when target ordering puts its chain
-    // first -- or it could not mirror it. Repeated references do not change
-    // the selected set or the upstream-first walk.
+    // Seven more own members fill the root's first tier. A pass over the
+    // target alone, without its dependencies, derives their leaves and
+    // leaves the root uncarried, so the target starts the next pass with
+    // nothing to do.
     let values: Vec<Id> = (2..=triblespace_core::collection::MERGE_FAN_IN as u8)
         .map(|byte| Id::new([byte; 16]).unwrap())
         .collect();
@@ -372,10 +371,33 @@ fn upstream_publication_rechecks_downstream_in_the_same_pass() {
             )
             .unwrap();
     }
+    let (failures, leaves) = pass(&mut fixture, &[handle_hex(target)], false, &mut state, None);
+    assert_eq!(failures, 0);
+    assert!(
+        leaves.insertions[&target][2] > 0,
+        "the target derived its leaves"
+    );
+    assert!(
+        !leaves.insertions.contains_key(&source),
+        "the root was not reached"
+    );
+    // Its own writes ask for one catch-up, which finds nothing to do.
+    let (_, catch_up) = pass(&mut fixture, &[handle_hex(target)], false, &mut state, None);
+    assert!(catch_up.insertions.is_empty());
     let before = fixture.pile.snapshot().unwrap();
     assert!(selected_records(&before, source)
         .iter()
         .all(|record| matches!(record, CollectionRecord::Commit(_))));
+    assert!(!maintenance_changed(
+        &state.hops[&target].before.inner,
+        &before,
+        &state.hops[&target].interests
+    ));
+    // A pass with dependencies reaches the root and carries it, and only
+    // that publication gives the target work: the target must be checked
+    // after the root's carry -- even when target ordering puts its chain
+    // first -- or it could not mirror it. Repeated references do not change
+    // the selected set or the upstream-first walk.
     references.extend([handle_hex(source), handle_hex(target)]);
     let (failures, counts) = pass(&mut fixture, &references, true, &mut state, None);
     assert_eq!(failures, 0);
@@ -385,7 +407,11 @@ fn upstream_publication_rechecks_downstream_in_the_same_pass() {
         "the target mirrored the carry in the same pass"
     );
     assert!(counts.selected_calls[&target] >= 2);
-    assert_skipped(&counts, &fixture, 1);
+    // The target-only passes above never reached the other chain, so this
+    // pass visits it afresh; it has nothing to publish.
+    for handle in [fixture.sources[1].handle(), fixture.targets[1].handle()] {
+        assert_eq!(counts.insertions.get(&handle), None);
+    }
     let snapshot = fixture.pile.snapshot().unwrap();
     let observed = snapshot.collection(fixture.targets[0]).unwrap();
     let mut expected = vec![fixture.first_value];

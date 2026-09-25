@@ -1,5 +1,5 @@
 //! Incrementally query a growing collection: the Succinct target answers the
-//! full side, the source payloads it newly stands on are the delta.
+//! full side, the source payloads the view chain newly absorbed are the delta.
 //!
 //! Run with: `cargo run --example collection_pattern_changes`
 
@@ -14,8 +14,8 @@ use triblespace::core::blob::encodings::succinctarchive::{
     OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
 };
 use triblespace::core::collection::{
-    AdmissionPolicy, Collection, CollectionPolicy, CollectionSnapshot, CollectionSnapshotExt,
-    CollectionStoreExt, CoverAdvanceError,
+    AdmissionPolicy, Collection, CollectionPolicy, CollectionSnapshotExt, CollectionStoreExt,
+    CoverAdvanceError, Support,
 };
 use triblespace::core::examples::literature;
 use triblespace::core::repo::memoryrepo::{MemoryRepo, MemoryRepoSnapshot};
@@ -65,38 +65,60 @@ fn changes(
 }
 
 // ANCHOR: collection_pattern_changes_observe
+/// The source payloads the view chain has absorbed: every source foundation
+/// the first view has a leaf for, provided the second view has caught up
+/// with the first. `None` while the second view lags, since then the
+/// accelerated view does not yet answer for everything the first stands on.
+fn absorbed(
+    snapshot: &MemoryRepoSnapshot,
+    source: Collection<SimpleArchive>,
+    raw: Collection<SuccinctArchiveBlob>,
+    accelerated: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
+) -> Result<Option<Support>, Box<dyn Error>> {
+    let source = snapshot.collection(source)?;
+    let raw = snapshot.collection(raw)?;
+    if !snapshot
+        .collection(accelerated)?
+        .missing_from(&raw)?
+        .is_empty()
+    {
+        return Ok(None);
+    }
+    let lag = raw.missing_from(&source)?;
+    Ok(Some(source.support()?.difference(&lag)?))
+}
+
 fn observe(
     store: &mut MemoryRepo,
     signing_key: &SigningKey,
     source: Collection<SimpleArchive>,
     raw: Collection<SuccinctArchiveBlob>,
     accelerated: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
-    checkpoint: &mut Option<
-        CollectionSnapshot<MemoryRepoSnapshot, Rank9AcceleratedSuccinctArchiveBlob>,
-    >,
+    checkpoint: &mut Option<Support>,
     mut consume: impl FnMut(&str) -> Result<(), Box<dyn Error>>,
 ) -> Result<Vec<String>, Box<dyn Error>> {
-    // Carry each mapping edge to its source's frontier, then read the target
-    // from the snapshot that observes all of that work. What the source stood
-    // on in that snapshot is the continuation token: supports are
-    // collection-local, and the payloads are the source's.
+    // Maintain each mapping edge -- this key's own leaves and merges -- then
+    // read everything from the snapshot that observes all of that work.
     block_on(store.maintain(raw, signing_key))?;
     let snapshot = block_on(store.maintain(accelerated, signing_key))?;
-    let next = snapshot.collection(accelerated)?;
 
-    // The delta is a set of source payloads. Read it from the source through
-    // the same snapshot; the Succinct target answers the full side.
+    // The continuation token is the set of source payloads the view chain
+    // has absorbed, not what the source stands on: another writer's payload
+    // is in the source before its writer derives it, and a token that
+    // advanced past it would never deliver it. A view that lags holds the
+    // token back.
+    let Some(current) = absorbed(&snapshot, source, raw, accelerated)? else {
+        return Ok(Vec::new());
+    };
     let changed = match checkpoint.as_ref() {
         Some(previous) => {
-            let previous_source = previous.snapshot().collection(source)?;
-            let current_source = snapshot.collection(source)?;
-            let previous_support = previous_source.support()?;
-            let current_support = current_source.support()?;
-            if previous_support == current_support {
+            if previous == &current {
                 return Ok(Vec::new());
             }
-            match current_support.additions_since(previous_support) {
+            match current.additions_since(previous) {
                 Ok(additions) => {
+                    // The delta is a set of source payloads: read them from
+                    // the source through the same snapshot.
                     let mut changed = TribleSet::new();
                     for member in additions.members() {
                         let payload: TribleSet = snapshot.get(member)?;
@@ -111,7 +133,9 @@ fn observe(
         None => None,
     };
 
-    let full: UnionArchive<OrderedUniverse> = next.view()?;
+    // The accelerated view answers the full side: it stands for everything
+    // the token names.
+    let full: UnionArchive<OrderedUniverse> = snapshot.collection(accelerated)?.view()?;
     let titles = match changed {
         Some(changed) => changes(&full, &changed, &mut consume)?,
         None => rebuild(&full, &mut consume)?,
@@ -120,7 +144,7 @@ fn observe(
     // Adopt only after the complete fold succeeds. A failed consumer retries
     // the same delta, so external effects must be transactional or idempotent
     // when exactly-once delivery matters.
-    *checkpoint = Some(next);
+    *checkpoint = Some(current);
     Ok(titles)
 }
 // ANCHOR_END: collection_pattern_changes_observe
@@ -175,10 +199,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         },
     )?;
 
-    let before_failure = checkpoint
-        .as_ref()
-        .map(|snapshot| snapshot.support().cloned())
-        .transpose()?;
+    let before_failure = checkpoint.clone();
     let failed = observe(
         &mut store,
         &signing_key,
@@ -189,13 +210,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         |_| Err(io::Error::other("simulated consumer failure").into()),
     );
     assert!(failed.is_err());
-    assert_eq!(
-        checkpoint
-            .as_ref()
-            .map(|snapshot| snapshot.support().cloned())
-            .transpose()?,
-        before_failure,
-    );
+    assert_eq!(checkpoint, before_failure);
 
     let retry = observe(
         &mut store,

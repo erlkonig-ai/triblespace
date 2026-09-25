@@ -302,9 +302,26 @@ fn time_ensure(
     let start = Instant::now();
     let attached = maintain_succinct(store, collections, signing_key);
     let elapsed = start.elapsed();
+    // Supports are collection-local: the source stands on the accounting
+    // cover, and each hop's leaves answer for every foundation of its source.
     assert_eq!(
         &source_support(&attached, collections),
         cover,
+        "the source stands on the accounting cover",
+    );
+    let snapshot = attached.snapshot();
+    let source = snapshot
+        .collection(collections.source)
+        .expect("observe the source");
+    let raw = snapshot
+        .collection(collections.raw)
+        .expect("observe the raw Succinct collection");
+    assert!(
+        raw.missing_from(&source).expect("raw freshness").is_empty()
+            && attached
+                .missing_from(&raw)
+                .expect("accelerated freshness")
+                .is_empty(),
         "the maintained target stands for the accounting cover",
     );
     let union: UnionArchive<OrderedUniverse> = attached.view().expect("materialize Succinct view");
@@ -326,17 +343,20 @@ fn observe_raw_cover(
     let raw_cover = diagnostic_before
         .collection(raw)
         .expect("observe resident raw cover");
+    let source = diagnostic_before
+        .collection(collections_source(&diagnostic_before, raw))
+        .expect("observe the raw target's source");
+    assert_eq!(
+        source.support().expect("resolve source support"),
+        cover,
+        "the raw target's source stands on the accounting cover",
+    );
     assert!(
         raw_cover
-            .missing_from(
-                &diagnostic_before
-                    .collection(collections_source(&diagnostic_before, raw))
-                    .expect("observe the raw target's source"),
-            )
+            .missing_from(&source)
             .expect("raw freshness")
-            .is_empty()
-            && raw_cover.support().expect("resolve raw support").len() == cover.len(),
-        "the raw target stands for the accounting cover",
+            .is_empty(),
+        "the raw target has a leaf for every accounting payload",
     );
     let diagnostic_after = store
         .snapshot()

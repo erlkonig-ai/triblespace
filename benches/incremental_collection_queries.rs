@@ -289,11 +289,28 @@ impl IncrementalState {
         // The delta is the source payloads added since the previous step,
         // read from the root through the same two snapshots: supports are
         // collection-local, and the Succinct target answers the full side of
-        // the query.
+        // the query. The root's support is a valid token only because this
+        // single writer's chain has absorbed all of it, which each hop's
+        // freshness confirms.
         let root_now = next
             .snapshot()
             .collection(self.collection)
             .expect("observe the source now");
+        let raw_now = next
+            .snapshot()
+            .collection(self.raw)
+            .expect("observe the raw view now");
+        assert!(
+            raw_now
+                .missing_from(&root_now)
+                .expect("raw freshness")
+                .is_empty()
+                && next
+                    .missing_from(&raw_now)
+                    .expect("accelerated freshness")
+                    .is_empty(),
+            "the view chain has absorbed every source payload"
+        );
         let root_before = self
             .snapshot
             .snapshot()
