@@ -17,7 +17,7 @@ use std::process::{Command, Output};
 
 use anybytes::Bytes;
 use ed25519_dalek::{Signer, SigningKey};
-use serde_json::Value;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
@@ -197,7 +197,8 @@ struct Fixture {
     retired_view: CollectionHandle,
     other: CollectionHandle,
     /// P1 (owner A, two metadata), P2 (owner B), P3 (only C, unadmitted),
-    /// P5 (A's frame corrupted first, then B), Q1 (retired only, adopted).
+    /// P5 (A's frame corrupted first, then B), Q1 (retired only, adopted),
+    /// Q3 (retired only, by C, whom it never admitted), U (only in `other`).
     p1: CollectionData,
     p1_metadata: [Raw; 2],
     p2: CollectionData,
@@ -205,6 +206,12 @@ struct Fixture {
     p5: CollectionData,
     q1: CollectionData,
     q1_metadata: Raw,
+    q3: CollectionData,
+    q3_metadata: Raw,
+    unrelated: CollectionData,
+    /// Both retired roots, which every run over the fixture may drop unless a
+    /// test says otherwise: Q3 and U exist nowhere else.
+    discard_file: PathBuf,
     /// Leaf images: S* in Succinct, K* in Rank9.
     s1: CollectionData,
     s2: CollectionData,
@@ -337,9 +344,11 @@ impl Fixture {
         .unwrap();
         pile.commit(retired, &a, entity! { metadata::description: "first fact" })
             .unwrap();
-        pile.commit(retired, &c, entity! { metadata::description: "stray fact" })
+        let stray = pile
+            .commit(retired, &c, entity! { metadata::description: "stray fact" })
             .unwrap();
-        pile.commit(other, &a, entity! { metadata::description: "unrelated" })
+        let unrelated = pile
+            .commit(other, &a, entity! { metadata::description: "unrelated" })
             .unwrap();
 
         // A current n-ary MERGE, dropped like every other MERGE.
@@ -441,6 +450,16 @@ impl Fixture {
 
         let roots_file = dir.path().join("roots.txt");
         std::fs::write(&roots_file, format!("# current\n{}", handle_line(root.raw))).unwrap();
+        let discard_file = dir.path().join("discard.txt");
+        std::fs::write(
+            &discard_file,
+            format!(
+                "{} # the retired generation; Q3 is a stray\n{} # unrelated\n",
+                handle_line(retired.raw),
+                handle_line(other.raw)
+            ),
+        )
+        .unwrap();
 
         let q1_metadata = adopted.metadata().raw;
         Fixture {
@@ -466,6 +485,10 @@ impl Fixture {
             p5,
             q1,
             q1_metadata,
+            q3: stray.data(),
+            q3_metadata: stray.metadata().raw,
+            unrelated: unrelated.data(),
+            discard_file,
             s1,
             s2,
             s5,
@@ -480,6 +503,14 @@ impl Fixture {
     }
 
     fn clean(&self, source: &Path, into: &Path, extra: &[&str], keys: &[&Path]) -> Output {
+        let discard = self.discard_file.to_str().unwrap();
+        let mut extra = extra.to_vec();
+        extra.extend(["--discard", discard]);
+        self.clean_unguarded(source, into, &extra, keys)
+    }
+
+    /// Without the fixture's `--discard`.
+    fn clean_unguarded(&self, source: &Path, into: &Path, extra: &[&str], keys: &[&Path]) -> Output {
         let report = into.with_extension("json");
         let mut command = trible();
         command
@@ -750,9 +781,19 @@ fn clean_keeps_one_owner_adopts_and_reemits_leaves() {
         retired["duplicate_owner"], 1,
         "B's later metadata for Q1 is not adopted"
     );
+    // What dropping each retired root drops, now that Q1 is adopted: Q3
+    // there, U here. The fixture discards both, so the run goes ahead.
+    assert_eq!(retired["payloads"], 3);
+    assert_eq!(retired["absent_resident"], 1);
+    assert_eq!(retired["discarded"], true);
     let other = find(&report["retired"], fixture.other);
     assert!(other["adopted_into"].is_null());
     assert_eq!(other["records"], 1);
+    assert_eq!(other["payloads"], 1);
+    assert_eq!(other["absent_resident"], 1);
+    assert_eq!(other["discarded"], true);
+    assert_eq!(report["unkept_guard"]["discarded_roots"], 2);
+    assert_eq!(report["unkept_guard"]["would_refuse"], json!([]));
     let dropped_view = find(&report["dropped_collections"], fixture.retired_view);
     assert_eq!(dropped_view["records"], 1);
 
@@ -1183,4 +1224,118 @@ fn a_read_only_source_handle_replays_and_cannot_append() {
     );
     source.close().unwrap();
     assert_eq!(sha256(&path), before);
+}
+
+#[test]
+fn the_guard_refuses_to_drop_what_exists_nowhere_else() {
+    let fixture = Fixture::new();
+    let keys = [&*fixture.key_a, &*fixture.key_b];
+    // Without a decision about the two retired roots, a real run refuses and
+    // leaves nothing behind: Q3 and U are held by no kept root.
+    let dst = fixture.path("refused.pile");
+    let output = fixture.clean_unguarded(&fixture.src, &dst, &["--adopt-by-name"], &keys);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("refusing to drop 2 retired root(s)"), "{stderr}");
+    assert!(stderr.contains(&hex::encode(fixture.retired.raw)), "{stderr}");
+    assert!(stderr.contains(&hex::encode(fixture.other.raw)), "{stderr}");
+    assert!(!dst.exists());
+    assert!(!fixture.path("refused.pile.partial").exists());
+
+    // A dry run reports the same two roots instead of refusing.
+    let dry = fixture.path("dry.pile");
+    assert_success(&fixture.clean_unguarded(
+        &fixture.src,
+        &dry,
+        &["--adopt-by-name", "--dry-run"],
+        &keys,
+    ));
+    let refused = fixture.report(&dry)["unkept_guard"]["would_refuse"].clone();
+    let refused: BTreeSet<String> = refused
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["handle"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        refused,
+        BTreeSet::from([
+            hex::encode(fixture.retired.raw),
+            hex::encode(fixture.other.raw)
+        ])
+    );
+
+    // Discarding a kept root contradicts --roots.
+    let discard_root = fixture.path("discard-root.txt");
+    std::fs::write(&discard_root, handle_line(fixture.root.raw)).unwrap();
+    let output = fixture.clean_unguarded(
+        &fixture.src,
+        &fixture.path("contradiction.pile"),
+        &["--discard", discard_root.to_str().unwrap()],
+        &keys,
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("one of the --roots"));
+}
+
+#[test]
+fn adopt_payloads_rescues_exactly_the_listed_payloads() {
+    let fixture = Fixture::new();
+    // Q3's author was never admitted and U's collection is retired: neither
+    // can be adopted as a collection, both can be rescued one by one. With
+    // them and Q1 carried, nothing is left for the guard to refuse.
+    let list = fixture.path("rescue.txt");
+    std::fs::write(
+        &list,
+        format!(
+            "# rescued\n{} {}\n{} {}\n",
+            hex::encode(fixture.q3.raw),
+            handle_line(fixture.root.raw),
+            hex::encode(fixture.unrelated.raw),
+            handle_line(fixture.root.raw)
+        ),
+    )
+    .unwrap();
+    let dst = fixture.path("rescued.pile");
+    assert_success(&fixture.clean_unguarded(
+        &fixture.src,
+        &dst,
+        &["--adopt-by-name", "--adopt-payloads", list.to_str().unwrap()],
+        &[&fixture.key_a, &fixture.key_b],
+    ));
+    let written = records(&dst);
+    let a = fixture.a.verifying_key().to_bytes();
+    // Re-signed by the first key into the current root, carrying the
+    // metadata of the payload's own earliest strictly verifying commit.
+    assert_eq!(
+        commits_of(&written, fixture.q3),
+        BTreeSet::from([(a, fixture.q3_metadata)])
+    );
+    assert_eq!(commits_of(&written, fixture.unrelated).len(), 1);
+    assert_eq!(commits_of(&written, fixture.unrelated).first().unwrap().0, a);
+    let report = fixture.report(&dst);
+    assert_eq!(report["payload_adoption"]["listed"], 2);
+    assert_eq!(report["payload_adoption"]["adopted"], 2);
+    assert_eq!(report["unkept_guard"]["would_refuse"], json!([]));
+    assert_eq!(find(&report["retired"], fixture.retired)["absent_resident"], 0);
+    assert_eq!(find(&report["retired"], fixture.other)["absent_resident"], 0);
+    assert_eq!(find(&report["roots"], fixture.root)["adopted_payloads"], 3);
+
+    // Listing a payload the root already holds adopts nothing again.
+    let again = fixture.path("again.txt");
+    std::fs::write(
+        &again,
+        format!("{} {}\n", hex::encode(fixture.p1.raw), handle_line(fixture.root.raw)),
+    )
+    .unwrap();
+    let dst = fixture.path("present.pile");
+    assert_success(&fixture.clean(
+        &fixture.src,
+        &dst,
+        &["--adopt-by-name", "--adopt-payloads", again.to_str().unwrap()],
+        &[&fixture.key_a],
+    ));
+    let report = fixture.report(&dst);
+    assert_eq!(report["payload_adoption"]["adopted"], 0);
+    assert_eq!(report["payload_adoption"]["already_present"], 1);
 }

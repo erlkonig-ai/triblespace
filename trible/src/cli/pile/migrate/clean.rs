@@ -108,6 +108,20 @@ pub struct CleanArgs {
     /// name of exactly one current root.
     #[arg(long)]
     pub adopt_by_name: bool,
+    /// Payload adoption: `PAYLOAD_HANDLE CURRENT_HANDLE` per line. Exactly
+    /// that payload is re-signed into that current root with the first
+    /// `--key`, carrying the metadata of its earliest strictly verifying
+    /// commit anywhere in the source, whether or not the collection it was
+    /// committed to is admitted or even readable. For rescuing single
+    /// payloads without adopting a whole retired collection.
+    #[arg(long)]
+    pub adopt_payloads: Option<PathBuf>,
+    /// Retired roots whose payloads may be dropped although no kept root
+    /// holds them: one handle per line, `#` starts the reason. Without it a
+    /// real run refuses to drop any resident payload that exists nowhere
+    /// else in the destination; a dry run reports them.
+    #[arg(long)]
+    pub discard: Option<PathBuf>,
     /// Signing key file (64 hex characters) this run may sign with; repeat
     /// for several. The first adopts; each re-signs the leaf DERIVEs of the
     /// foundations it owns. No key is used implicitly.
@@ -144,6 +158,14 @@ pub fn run(source: PathBuf, args: CleanArgs) -> Result<()> {
         Some(path) => parse_adoptions(&read_text(path)?)?,
         None => Vec::new(),
     };
+    let payload_adoptions = match &args.adopt_payloads {
+        Some(path) => parse_payload_adoptions(&read_text(path)?)?,
+        None => Vec::new(),
+    };
+    let discard = match &args.discard {
+        Some(path) => parse_discard(&read_text(path)?)?,
+        None => BTreeSet::new(),
+    };
     let keys = args
         .keys
         .iter()
@@ -174,7 +196,16 @@ pub fn run(source: PathBuf, args: CleanArgs) -> Result<()> {
             snapshot.prefix_len(),
             started.elapsed().as_secs_f64()
         );
-        let run = Run::new(&snapshot, &args, keys, roots, explicit_adoptions, started)?;
+        let run = Run::new(
+            &snapshot,
+            &args,
+            keys,
+            roots,
+            explicit_adoptions,
+            payload_adoptions,
+            discard,
+            started,
+        )?;
         run.execute(&snapshot, &source, &args)
     })();
     let closed = src
@@ -295,6 +326,31 @@ fn parse_adoptions(text: &str) -> Result<Vec<(Raw, Raw)>> {
         ));
     }
     Ok(pairs)
+}
+
+fn parse_payload_adoptions(text: &str) -> Result<Vec<(Raw, Raw)>> {
+    let mut pairs = Vec::new();
+    for (number, words) in words(text) {
+        let [payload, current] = words[..] else {
+            bail!("--adopt-payloads line {number}: expected `PAYLOAD_HANDLE CURRENT_HANDLE`");
+        };
+        let payload =
+            parse_handle(payload).with_context(|| format!("--adopt-payloads line {number}"))?;
+        let current =
+            parse_handle(current).with_context(|| format!("--adopt-payloads line {number}"))?;
+        if !pairs.contains(&(payload, current)) {
+            pairs.push((payload, current));
+        }
+    }
+    Ok(pairs)
+}
+
+fn parse_discard(text: &str) -> Result<BTreeSet<Raw>> {
+    let mut handles = BTreeSet::new();
+    for (number, words) in words(text) {
+        handles.insert(parse_handle(words[0]).with_context(|| format!("--discard line {number}"))?);
+    }
+    Ok(handles)
 }
 
 fn hex(raw: &Raw) -> String {
@@ -509,6 +565,14 @@ struct Plan {
     retired: BTreeMap<Raw, (Option<String>, Option<usize>)>,
     /// Known collections that are neither kept nor retired roots, and why.
     dropped: BTreeMap<Raw, String>,
+    /// Single payloads adopted into a current root: `(payload, root)`.
+    adopted_payloads: Vec<(Raw, usize)>,
+    adopt_payload_set: HashSet<Raw>,
+    /// Retired roots whose payloads may be dropped although no kept root
+    /// holds them.
+    discard: BTreeSet<Raw>,
+    /// `--discard` handles that are not retired roots of this source.
+    unused_discards: Vec<Raw>,
 }
 
 impl Plan {
@@ -528,6 +592,8 @@ fn plan(
     roots: Vec<Raw>,
     explicit_adoptions: &[(Raw, Raw)],
     adopt_by_name: bool,
+    payload_adoptions: &[(Raw, Raw)],
+    discard: BTreeSet<Raw>,
 ) -> Result<Plan> {
     let mut known: BTreeSet<Raw> = snapshot
         .collections()
@@ -732,6 +798,33 @@ fn plan(
         }
     }
 
+    let mut adopted_payloads = Vec::new();
+    for (payload, current) in payload_adoptions {
+        let Some(&root) = root_index.get(current) else {
+            bail!(
+                "--adopt-payloads adopts into blake3:{}, which is not one of the --roots",
+                hex(current)
+            );
+        };
+        adopted_payloads.push((*payload, root));
+    }
+    // Discarding a kept root contradicts --roots and is refused. A handle
+    // that is not a retired root of this source discards nothing; it is
+    // reported, so one list can serve several piles and a typo is visible.
+    let mut unused_discards = Vec::new();
+    for handle in &discard {
+        if root_index.contains_key(handle) {
+            bail!("--discard names blake3:{}, one of the --roots", hex(handle));
+        }
+        if !retired.contains_key(handle) {
+            eprintln!(
+                "clean: --discard names blake3:{}, not a retired root of this source; ignored",
+                hex(handle)
+            );
+            unused_discards.push(*handle);
+        }
+    }
+
     Ok(Plan {
         roots,
         root_names,
@@ -740,6 +833,10 @@ fn plan(
         derived_index,
         retired,
         dropped,
+        adopt_payload_set: adopted_payloads.iter().map(|(payload, _)| *payload).collect(),
+        adopted_payloads,
+        discard,
+        unused_discards,
     })
 }
 
@@ -1328,6 +1425,29 @@ struct Roots {
     retired: BTreeMap<Raw, RetiredStats>,
     owners: HashMap<(u32, Raw), u32>,
     adoptable: BTreeMap<(usize, Raw, Raw), Raw>,
+    /// Every payload any commit of a retired root names, whatever its
+    /// signature or admission: what dropping that root would drop.
+    retired_payloads: BTreeMap<Raw, BTreeSet<Raw>>,
+    /// Metadata of the earliest strictly verifying commit of each payload
+    /// listed for payload adoption, from any collection.
+    payload_metadata: HashMap<Raw, Raw>,
+    payload_adoption: PayloadAdoptionStats,
+}
+
+/// What dropping one retired root would drop.
+#[derive(Default, Clone, Copy)]
+struct Unkept {
+    payloads: u64,
+    /// Resident in the source, held by no kept root.
+    absent_resident: u64,
+    /// Held by no kept root and not resident here either.
+    absent_elsewhere: u64,
+}
+
+#[derive(Default)]
+struct PayloadAdoptionStats {
+    adopted: u64,
+    already_present: u64,
 }
 
 impl Roots {
@@ -1374,6 +1494,7 @@ impl Writing<'_, '_> {
 
 struct Run {
     plan: Plan,
+    dry_run: bool,
     keys: Vec<SigningKey>,
     key_index: HashMap<Raw, usize>,
     started: Instant,
@@ -1388,9 +1509,18 @@ impl Run {
         keys: Vec<SigningKey>,
         roots: Vec<Raw>,
         explicit_adoptions: Vec<(Raw, Raw)>,
+        payload_adoptions: Vec<(Raw, Raw)>,
+        discard: BTreeSet<Raw>,
         started: Instant,
     ) -> Result<Self> {
-        let plan = plan(snapshot, roots, &explicit_adoptions, args.adopt_by_name)?;
+        let plan = plan(
+            snapshot,
+            roots,
+            &explicit_adoptions,
+            args.adopt_by_name,
+            &payload_adoptions,
+            discard,
+        )?;
         let key_index = keys
             .iter()
             .enumerate()
@@ -1403,6 +1533,7 @@ impl Run {
         );
         Ok(Self {
             plan,
+            dry_run: args.dry_run,
             keys,
             key_index,
             started,
@@ -1427,6 +1558,7 @@ impl Run {
             .retired
             .values()
             .filter_map(|(_, mapped)| *mapped)
+            .chain(plan.adopted_payloads.iter().map(|(_, root)| *root))
             .collect();
         let adopter = if adoption_targets.is_empty() {
             None
@@ -1628,7 +1760,10 @@ impl Run {
         );
         if let Some(adopter) = adopter {
             self.adopt(&mut out, &mut roots, signers, adopter)?;
+            self.adopt_payloads(&mut out, &mut roots, signers, adopter)?;
         }
+        let unkept = self.unkept(snapshot, &roots)?;
+        self.refuse_unkept(&unkept)?;
         let derived_stats = self.reemit_leaves(&mut out, pass, &roots, signers, admission)?;
         self.mark(
             "derived",
@@ -1656,6 +1791,7 @@ impl Run {
             signers,
             &out,
             &roots,
+            &unkept,
             &derived_stats,
             proofs_kept,
             proofs_invalid,
@@ -1715,6 +1851,9 @@ impl Run {
             retired: BTreeMap::new(),
             owners: HashMap::new(),
             adoptable: BTreeMap::new(),
+            retired_payloads: BTreeMap::new(),
+            payload_metadata: HashMap::new(),
+            payload_adoption: PayloadAdoptionStats::default(),
         };
         let mut run: Option<((usize, Raw), Option<u32>)> = None;
         // The same owner rule per `(retired collection, data)`: only the
@@ -1735,7 +1874,8 @@ impl Run {
                             || plan
                                 .retired
                                 .get(&collection)
-                                .is_some_and(|(_, mapped)| mapped.is_some()))
+                                .is_some_and(|(_, mapped)| mapped.is_some())
+                            || plan.adopt_payload_set.contains(&commit.data().raw))
                             && commit.verify_strict().is_ok()
                     }
                     _ => false,
@@ -1750,6 +1890,12 @@ impl Run {
             let collection = commit.collection().raw;
             let data = commit.data().raw;
             let signer = commit.public_key().raw;
+            if verified && plan.adopt_payload_set.contains(&data) {
+                roots
+                    .payload_metadata
+                    .entry(data)
+                    .or_insert(commit.metadata().raw);
+            }
             if let Some(&root) = plan.root_index.get(&collection) {
                 if run.map(|(key, _)| key) != Some((root, data)) {
                     roots.close_run(run.take());
@@ -1776,6 +1922,11 @@ impl Run {
                 stats.kept_commits += 1;
                 out.record(record, "commit")?;
             } else if let Some((_, mapped)) = plan.retired.get(&collection) {
+                roots
+                    .retired_payloads
+                    .entry(collection)
+                    .or_default()
+                    .insert(data);
                 let Some(root) = mapped else { continue };
                 if retired_run.map(|(key, _)| key) != Some((collection, data)) {
                     retired_run = Some(((collection, data), None));
@@ -1844,6 +1995,113 @@ impl Run {
             let stats = &mut roots.stats[root];
             stats.adopted_payloads += 1;
             *stats.foundations.entry(adopter_signer).or_default() += 1;
+        }
+        Ok(())
+    }
+
+    /// Exactly the listed payloads, re-signed into their current root by the
+    /// first key with the metadata of their earliest strictly verifying
+    /// commit. A payload the root already holds is left as it is.
+    fn adopt_payloads(
+        &self,
+        out: &mut Writing,
+        roots: &mut Roots,
+        signers: &mut Signers,
+        adopter: &SigningKey,
+    ) -> Result<()> {
+        let adopter_signer = signers.intern(adopter.verifying_key().to_bytes());
+        for (payload, root) in &self.plan.adopted_payloads {
+            if roots.owners.contains_key(&(*root as u32, *payload)) {
+                roots.payload_adoption.already_present += 1;
+                continue;
+            }
+            let Some(metadata) = roots.payload_metadata.get(payload) else {
+                bail!(
+                    "--adopt-payloads lists blake3:{}, but no commit of it in the source \
+                     verifies strictly; there is no metadata to carry",
+                    hex(payload)
+                );
+            };
+            let commit = CollectionCommit::sign(
+                adopter,
+                Inline::new(self.plan.roots[*root]),
+                Inline::new(*payload),
+                Inline::new(*metadata),
+            );
+            out.record(CollectionRecord::Commit(commit), "adopted_payload_commit")?;
+            roots.owners.insert((*root as u32, *payload), adopter_signer);
+            let stats = &mut roots.stats[*root];
+            stats.adopted_commits += 1;
+            stats.adopted_payloads += 1;
+            *stats.foundations.entry(adopter_signer).or_default() += 1;
+            roots.payload_adoption.adopted += 1;
+        }
+        Ok(())
+    }
+
+    /// Per retired root: its payloads, and those of them resident in the
+    /// source that no kept root of the destination holds. Those are what
+    /// dropping the root would lose.
+    fn unkept(&self, snapshot: &PileFileSnapshot, roots: &Roots) -> Result<BTreeMap<Raw, Unkept>> {
+        let kept: HashSet<Raw> = roots.owners.keys().map(|(_, data)| *data).collect();
+        let mut unkept = BTreeMap::new();
+        for (collection, payloads) in &roots.retired_payloads {
+            let mut entry = Unkept {
+                payloads: payloads.len() as u64,
+                ..Unkept::default()
+            };
+            for payload in payloads {
+                if kept.contains(payload) {
+                    continue;
+                }
+                let resident = snapshot
+                    .contains_blob(Inline::<Handle<UnknownBlob>>::new(*payload))
+                    .map_err(|error| anyhow!("inspect retired payload: {error}"))?;
+                if resident {
+                    entry.absent_resident += 1;
+                } else {
+                    entry.absent_elsewhere += 1;
+                }
+            }
+            unkept.insert(*collection, entry);
+        }
+        Ok(unkept)
+    }
+
+    /// Refuse, in a real run, to drop a resident payload no kept root holds
+    /// unless its retired root is listed in `--discard`. A dry run reports.
+    fn refuse_unkept(&self, unkept: &BTreeMap<Raw, Unkept>) -> Result<()> {
+        if self.dry_run {
+            return Ok(());
+        }
+        let refused: Vec<String> = unkept
+            .iter()
+            .filter(|(collection, entry)| {
+                entry.absent_resident > 0 && !self.plan.discard.contains(*collection)
+            })
+            .map(|(collection, entry)| {
+                let name = self
+                    .plan
+                    .retired
+                    .get(collection)
+                    .and_then(|(name, _)| name.clone())
+                    .unwrap_or_else(|| "(unnamed)".to_owned());
+                format!(
+                    "  blake3:{} {name}: {} of {} payload(s) exist nowhere else",
+                    hex(collection),
+                    entry.absent_resident,
+                    entry.payloads
+                )
+            })
+            .collect();
+        if !refused.is_empty() {
+            bail!(
+                "refusing to drop {} retired root(s) holding resident payloads that no kept \
+                 root holds:\n{}\nKeep them with --roots, carry payloads with --adopt or \
+                 --adopt-payloads, or list the root in --discard after deciding it may go",
+                refused.len(),
+                refused.join("\n")
+            );
         }
         Ok(())
     }
@@ -2051,12 +2309,14 @@ impl Run {
         signers: &Signers,
         out: &Writing,
         roots: &Roots,
+        unkept: &BTreeMap<Raw, Unkept>,
         derived_stats: &[DerivedStats],
         proofs_kept: u64,
         proofs_invalid: u64,
         descriptions: u64,
     ) -> Value {
         let (root_stats, retired_stats) = (&roots.stats, &roots.retired);
+        let payload_adoption = &roots.payload_adoption;
         let retainer = &out.retainer;
         let plan = &self.plan;
         let by_owner = |counts: &BTreeMap<u32, u64>| -> Value {
@@ -2122,6 +2382,10 @@ impl Run {
                     "adopted_payloads": stats.map_or(0, |s| s.adopted_payloads),
                     "adopted_commits": stats.map_or(0, |s| s.adopted_commits),
                     "already_present": stats.map_or(0, |s| s.already_present),
+                    "payloads": unkept.get(handle).map_or(0, |u| u.payloads),
+                    "absent_resident": unkept.get(handle).map_or(0, |u| u.absent_resident),
+                    "absent_elsewhere": unkept.get(handle).map_or(0, |u| u.absent_elsewhere),
+                    "discarded": plan.discard.contains(handle),
                 })
             })
             .collect();
@@ -2193,15 +2457,31 @@ impl Run {
             .sum();
         let kept_current: u64 = derived_stats.iter().map(|stats| stats.kept_current).sum();
         let stats = &retainer.stats;
+        let refused: Vec<Value> = unkept
+            .iter()
+            .filter(|(handle, entry)| entry.absent_resident > 0 && !plan.discard.contains(*handle))
+            .map(|(handle, entry)| json!({"handle": hex(handle), "absent_resident": entry.absent_resident}))
+            .collect();
         json!({
             "roots": roots,
             "retired": retired,
+            "payload_adoption": {
+                "listed": plan.adopted_payloads.len(),
+                "adopted": payload_adoption.adopted,
+                "already_present": payload_adoption.already_present,
+            },
+            "unkept_guard": {
+                "discarded_roots": plan.discard.len() - plan.unused_discards.len(),
+                "unused_discards": plan.unused_discards.iter().map(hex).collect::<Vec<_>>(),
+                "would_refuse": refused,
+            },
             "derived": derived,
             "dropped_collections": dropped,
             "source_census": census.json(),
             "records_written": {
                 "commit": out.written("commit"),
                 "adopted_commit": out.written("adopted_commit"),
+                "adopted_payload_commit": out.written("adopted_payload_commit"),
                 "derive": out.written("derive"),
                 "capability_proof": proofs_kept,
             },
@@ -2353,6 +2633,17 @@ fn print_summary(report: &Value) {
         get(&["blobs", "record_kind_descriptions_added"]),
     );
     println!(
+        "  rescued: {} of {} listed payload(s) adopted ({} already present); guard: {} retired \
+         root(s) discarded, {} holding payloads found nowhere else",
+        get(&["payload_adoption", "adopted"]),
+        get(&["payload_adoption", "listed"]),
+        get(&["payload_adoption", "already_present"]),
+        get(&["unkept_guard", "discarded_roots"]),
+        get(&["unkept_guard", "would_refuse"])
+            .as_array()
+            .map_or(0, Vec::len),
+    );
+    println!(
         "  dropped: {} MERGE v10, {} MERGE v8, {} DERIVE v9 frame(s), {} WANT(s), {} pin record(s), \
          {} of {} distinct source blob(s) ({} payload bytes)",
         get(&["dropped_frames", "merge_v10"]),
@@ -2461,6 +2752,21 @@ mod tests {
         assert_eq!(pairs, vec![([1; 32], root)]);
         assert!(parse_adoptions(&hex(&root)).is_err());
         assert!(parse_roots("# nothing\n").is_err());
+        // Payload adoptions: pairs, repeats collapsed. Discards: the first
+        // word of each line, the rest of the line is the reason.
+        let payloads = parse_payload_adoptions(&format!(
+            "{p} blake3:{r}\n{p} {r} # again\n",
+            p = hex(&[2; 32]),
+            r = hex(&root)
+        ))
+        .unwrap();
+        assert_eq!(payloads, vec![([2; 32], root)]);
+        assert!(parse_payload_adoptions(&hex(&[2; 32])).is_err());
+        let discard =
+            parse_discard(&format!("blake3:{} # secrets v1, superseded\n", hex(&[3; 32])))
+                .unwrap();
+        assert_eq!(discard, BTreeSet::from([[3; 32]]));
+        assert!(parse_discard("# none\n").unwrap().is_empty());
     }
 
     #[test]
@@ -2501,6 +2807,10 @@ mod tests {
             derived_index: HashMap::new(),
             retired: BTreeMap::new(),
             dropped: BTreeMap::new(),
+            adopted_payloads: Vec::new(),
+            adopt_payload_set: HashSet::new(),
+            discard: BTreeSet::new(),
+            unused_discards: Vec::new(),
         };
         let census = |snapshot: &PileFileSnapshot| {
             let pass = raw_pass(snapshot, &plan, &mut Signers::default()).unwrap();
