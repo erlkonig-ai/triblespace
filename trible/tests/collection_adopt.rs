@@ -121,7 +121,7 @@ impl Cutover {
         let key = key.to_str().unwrap().to_owned();
         let pile = self.path.to_str().unwrap().to_owned();
         let mut args = vec![
-            "migrate",
+            "adopt",
             pile.as_str(),
             "--into",
             into.as_str(),
@@ -136,7 +136,7 @@ impl Cutover {
     fn reconcile(&self, extra: &[&str]) -> Output {
         let target = handle_text(self.new.handle());
         let pile = self.path.to_str().unwrap().to_owned();
-        let mut args = vec!["reconcile", pile.as_str(), target.as_str()];
+        let mut args = vec!["adopted", pile.as_str(), target.as_str()];
         args.extend_from_slice(extra);
         self.run(&args)
     }
@@ -403,7 +403,7 @@ fn a_cross_name_carry_is_refused_unless_it_is_meant() {
     let from = handle_text(compass.handle());
     let key = fixture.new_key_file.to_str().unwrap().to_owned();
     let refused = fixture.run(&[
-        "migrate", &pile, "--into", &into, "--from", &from, "--key", &key,
+        "adopt", &pile, "--into", &into, "--from", &from, "--key", &key,
     ]);
     assert!(!refused.status.success(), "{}", text(&refused));
     assert!(
@@ -413,7 +413,7 @@ fn a_cross_name_carry_is_refused_unless_it_is_meant() {
     );
 
     let allowed = fixture.run(&[
-        "migrate",
+        "adopt",
         &pile,
         "--into",
         &into,
@@ -463,7 +463,7 @@ fn a_plan_file_migrates_several_names_at_once() {
 
     let mut command = trible();
     command
-        .args(["pile", "collection", "migrate"])
+        .args(["pile", "collection", "adopt"])
         .arg(&path)
         .arg("--plan")
         .arg(&plan)
@@ -486,7 +486,7 @@ fn a_plan_file_migrates_several_names_at_once() {
     for target in [new_wiki.handle(), new_compass.handle()] {
         let mut command = trible();
         command
-            .args(["pile", "collection", "reconcile"])
+            .args(["pile", "collection", "adopted"])
             .arg(&path)
             .arg(handle_text(target));
         let check = Command::from_std(command)
@@ -517,7 +517,7 @@ fn a_plan_that_uses_a_target_as_a_source_is_refused() {
 
     let mut command = trible();
     command
-        .args(["pile", "collection", "migrate"])
+        .args(["pile", "collection", "adopt"])
         .arg(&fixture.path)
         .arg("--plan")
         .arg(&plan)
@@ -543,7 +543,7 @@ fn the_sweep_names_the_command_that_repairs_it() {
     let fixture = Cutover::new(&[0x11, 0x22], &[0x33, 0x44, 0x55]);
     let mut command = trible();
     command
-        .args(["pile", "collection", "reconcile"])
+        .args(["pile", "collection", "adopted"])
         .arg(&fixture.path);
     let output = Command::from_std(command)
         .timeout(Duration::from_secs(60))
@@ -571,7 +571,7 @@ fn the_exact_form_sees_a_half_finished_migration_the_sweep_calls_settled() {
 
     let mut command = trible();
     command
-        .args(["pile", "collection", "reconcile"])
+        .args(["pile", "collection", "adopted"])
         .arg(&fixture.path);
     let sweep = Command::from_std(command)
         .timeout(Duration::from_secs(60))
@@ -626,7 +626,7 @@ fn the_sweep_reports_what_it_could_not_name() {
 
     let mut command = trible();
     command
-        .args(["pile", "collection", "reconcile"])
+        .args(["pile", "collection", "adopted"])
         .arg(&fixture.path);
     let output = Command::from_std(command)
         .timeout(Duration::from_secs(60))
