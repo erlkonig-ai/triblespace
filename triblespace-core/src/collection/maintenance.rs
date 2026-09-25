@@ -557,6 +557,9 @@ where
 /// One mapping bound to its target and its immediate source.
 struct Bound<M> {
     source: CollectionHandle,
+    /// Whether the source is the root of the lineage, whose foundations are
+    /// commits rather than images of something further up.
+    source_is_root: bool,
     mapping: M,
 }
 
@@ -590,7 +593,11 @@ where
             "target descriptor does not bind the requested mapping: {error}"
         ))
     })?;
-    Ok(Bound { source, mapping })
+    Ok(Bound {
+        source,
+        source_is_root: source == lineage.foundation.handle(),
+        mapping,
+    })
 }
 
 /// Derive the maintaining key's missing leaves into one derived collection,
@@ -630,6 +637,14 @@ where
 /// key owns are its to derive. An own leaf that exists but whose image is
 /// not here is fetched; when it cannot be, the foundation is mapped again to
 /// restore the bytes, and a leaf is published only if the image differs.
+///
+/// An own source foundation whose bytes are not here is fetched too. When
+/// nobody can hand them over, a root commit's payload is reported, because
+/// nothing upstream can restore it. A derived source's image is that
+/// source's own lag instead: maintaining the source maps it again from what
+/// the source derives from, and until then this view lags on it too, the
+/// same way a reader of the source does. Downstream work neither requires
+/// nor repairs it.
 /// Returns the foundations the mapping could not represent.
 fn derive_leaves<S, M>(
     store: &mut S,
@@ -713,10 +728,13 @@ where
             .is_some();
         if !resident {
             if unavailable.contains(&foundation) {
-                blocked.push((
-                    foundation,
-                    "the source foundation is not resident and could not be acquired".to_owned(),
-                ));
+                if bound.source_is_root {
+                    blocked.push((
+                        foundation,
+                        "the source commit's payload is not resident and could not be acquired"
+                            .to_owned(),
+                    ));
+                }
                 continue;
             }
             return Err(CollectionRealizationError::MissingDependency { member: foundation });

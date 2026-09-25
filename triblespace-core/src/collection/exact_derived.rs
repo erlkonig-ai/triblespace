@@ -79,8 +79,9 @@ pub enum CollectionRealizationError {
         member: CollectionData,
     },
     /// Own source foundations the mapping cannot represent as leaves: its
-    /// capacity refused them, or their bytes or a dependency could not be
-    /// acquired. Everything else was derived and mirrored.
+    /// capacity refused them, a dependency of the mapping could not be
+    /// acquired, or the payload of a root commit could not be. Everything
+    /// else was derived and mirrored.
     Unmappable {
         /// Each foundation left without a leaf, and why.
         blocked: Vec<(CollectionData, String)>,
