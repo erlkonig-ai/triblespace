@@ -112,16 +112,20 @@ where
         Ok(&self.support)
     }
 
-    /// The foundations of `source` this derived collection has no leaf for
-    /// yet: the freshness of a view against a source observation.
+    /// The foundations of `source` this observation does not answer for:
+    /// the freshness of a view against a source observation.
     ///
     /// Each source foundation `F` is looked up by its locator `L(F)` in this
-    /// collection's leaves, the DERIVE relation read by its own key. Nothing
-    /// is compared between the two collections' supports, and whoever owns a
-    /// missing foundation is the one expected to derive it. `source` must be
-    /// the collection this one's descriptor names as its source; the two
-    /// observations may be of different store snapshots, and the answer is
-    /// then this view's leaves against that source's foundations.
+    /// collection's leaves, the DERIVE relation read by its own key, and
+    /// counts as answered only when one of its outputs is in this
+    /// observation's support, which is what [`Self::view`] reads. A leaf whose
+    /// image is not here yet, and is under no resident merge, is still
+    /// missing: a caller that treated the leaf record as delivery would skip
+    /// facts it never saw. Nothing is compared between the two collections'
+    /// supports. `source` must be the collection this one's descriptor names
+    /// as its source; the two observations may be of different store
+    /// snapshots, and the answer is then this view against that source's
+    /// foundations.
     pub fn missing_from<RS, S>(
         &self,
         source: &CollectionSnapshot<RS, S>,
@@ -150,10 +154,12 @@ where
         let coverage = observed
             .coverage(&BTreeSet::from([target]))
             .map_err(|error| CollectionRealizationError::storage("read view leaves", error))?;
-        let missing = source
-            .support()?
-            .data_members()
-            .filter(|foundation| !coverage.has_leaf(target, SourceLocator::of(foundation.raw)));
+        let missing = source.support()?.data_members().filter(|foundation| {
+            !coverage
+                .leaf_outputs(target, SourceLocator::of(foundation.raw))
+                .into_iter()
+                .any(|output| self.support.contains(crate::inline::Inline::new(output.raw)))
+        });
         Ok(Cover::from_data(source_collection, missing))
     }
 

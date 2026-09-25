@@ -3707,4 +3707,98 @@ mod lattice_v2 {
         block_on(store.maintain(first, &owner)).unwrap();
         assert_eq!(records(&mut store).len(), before);
     }
+
+    /// A payload holding one fact per entity in `entities`, all signed `41`.
+    fn facts(entities: &[u8]) -> Blob<SimpleArchive> {
+        let mut facts = TribleSet::new();
+        for &entity in entities {
+            facts.insert(&row(entity, 41));
+        }
+        facts.to_blob()
+    }
+
+    #[test]
+    fn every_own_producer_of_a_merged_node_is_mirrored() {
+        // A review control, 2026-09-25: R = A+B = C+D, both merges the owner's.
+        let (mut store, root, first, _) = collections();
+        let owner = key(41);
+        let [a, b, c, d] = [[1, 2], [3, 4], [1, 3], [2, 4]].map(|entities| facts(&entities));
+        let r = facts(&[1, 2, 3, 4]);
+        for payload in [&a, &b, &c, &d] {
+            publish_root(&mut store, root, payload, 41);
+        }
+        store.put::<SimpleArchive, _>(r.clone()).unwrap();
+        for pair in [[&a, &b], [&c, &d]] {
+            store
+                .insert(CollectionRecord::Merge(
+                    CollectionMerge::sign(&owner, root.handle(), pair.map(data), data(&r))
+                        .unwrap(),
+                ))
+                .unwrap();
+        }
+
+        block_on(store.maintain(first, &owner)).unwrap();
+        let mirrors = merges_in(&mut store, first.handle());
+        assert_eq!(mirrors.len(), 2, "one mirror per producer");
+        assert!(mirrors
+            .iter()
+            .all(|mirror| mirror.result() == first_image(&r)));
+        assert_eq!(
+            mirrors.iter().map(inputs).collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                BTreeSet::from([first_image(&a), first_image(&b)]),
+                BTreeSet::from([first_image(&c), first_image(&d)]),
+            ])
+        );
+        assert_eq!(
+            frontier(&mut store, first.handle()),
+            BTreeSet::from([first_image(&r)])
+        );
+        let snapshot = store.snapshot().unwrap();
+        assert_eq!(snapshot.collection(first).unwrap().support().unwrap().len(), 4);
+        drop(snapshot);
+
+        let before = records(&mut store).len();
+        block_on(store.maintain(first, &owner)).unwrap();
+        assert_eq!(records(&mut store).len(), before);
+    }
+
+    #[test]
+    fn a_leaf_whose_image_is_not_here_is_still_missing() {
+        // A review control, 2026-09-25: the DERIVE arrives before its output.
+        let (mut store, root, first, _) = collections();
+        let commit = own_commit(&mut store, root, 41, 0);
+        let mut image = payload(41, 0).bytes.as_ref().to_vec();
+        image.push(0xA5);
+        let image = Blob::<FirstEncoding>::new(image.into());
+        store
+            .insert(CollectionRecord::Derive(CollectionDerive::sign(
+                &key(41),
+                first.handle(),
+                SourceLocator::of(commit.raw),
+                data(&image),
+            )))
+            .unwrap();
+
+        let snapshot = store.snapshot().unwrap();
+        let view = snapshot.collection(first).unwrap();
+        assert!(view.support().unwrap().is_empty());
+        assert_eq!(
+            view.missing_from(&snapshot.collection(root).unwrap())
+                .unwrap()
+                .len(),
+            1,
+            "a leaf record is not delivery"
+        );
+        drop((view, snapshot));
+
+        store.put::<FirstEncoding, _>(image).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let view = snapshot.collection(first).unwrap();
+        assert_eq!(view.support().unwrap().len(), 1);
+        assert!(view
+            .missing_from(&snapshot.collection(root).unwrap())
+            .unwrap()
+            .is_empty());
+    }
 }

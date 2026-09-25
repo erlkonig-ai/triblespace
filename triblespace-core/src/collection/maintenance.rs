@@ -997,7 +997,7 @@ where
             )
         } else {
             let mut image = None;
-            for inputs in proper {
+            for inputs in &proper {
                 let Some(images) = self.input_images(inputs.as_slice(), None)? else {
                     continue;
                 };
@@ -1009,7 +1009,11 @@ where
             let Some(image) = image else {
                 return Ok(None);
             };
-            (image, absorbing)
+            // Every other own producer is mirrored onto that image, as for a
+            // foundation: the target's support of it must be the source's,
+            // and there is no target carry to finish a missed one. The
+            // producer just settled is found by `existing` and skipped.
+            (image, absorbing.into_iter().chain(proper).collect())
         };
         // `MERGE(a, node) -> node` in the source is `MERGE(f(a), f(node)) ->
         // f(node)` in the target: an absorption needs no mapping.

@@ -66,9 +66,10 @@ fn changes(
 
 // ANCHOR: collection_pattern_changes_observe
 /// The source payloads the view chain has absorbed: every source foundation
-/// the first view has a leaf for, provided the second view has caught up
-/// with the first. `None` while the second view lags, since then the
-/// accelerated view does not yet answer for everything the first stands on.
+/// the first view answers for, provided the second view answers for all the
+/// first stands on. `None` while the second view lags. A leaf whose image has
+/// not arrived is lag too: `missing_from` counts what each observation reads,
+/// never a record alone, so the token cannot pass facts the view never held.
 fn absorbed(
     snapshot: &MemoryRepoSnapshot,
     source: Collection<SimpleArchive>,
