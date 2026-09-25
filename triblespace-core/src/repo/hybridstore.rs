@@ -308,11 +308,7 @@ impl<B, R> crate::collection::covered::RecordDelta for HybridSnapshot<B, R>
 where
     R: crate::collection::covered::RecordDelta,
 {
-    fn for_each_record_since(
-        &self,
-        since: Option<&Self>,
-        each: &mut dyn FnMut(&CollectionRecord),
-    ) {
+    fn for_each_record_since(&self, since: Option<&Self>, each: &mut dyn FnMut(&CollectionRecord)) {
         self.records
             .for_each_record_since(since.map(|since| &since.records), each)
     }
@@ -482,13 +478,15 @@ mod tests {
         let facts = descriptor::named_for_tests("hybrid", id(2)).into_facts();
         // Only the identity matters here; nothing resolves this descriptor.
         let collection: CollectionHandle = IntoBlob::<SimpleArchive>::to_blob(facts).get_handle();
-        let record = CollectionRecord::Merge(CollectionMerge::sign(
-            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-            collection,
-            Inline::new([4; 32]),
-            Inline::new([5; 32]),
-            Inline::new([6; 32]),
-        ));
+        let record = CollectionRecord::Merge(
+            CollectionMerge::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                collection,
+                [Inline::new([4; 32]), Inline::new([5; 32])],
+                Inline::new([6; 32]),
+            )
+            .unwrap(),
+        );
         let mut hybrid = HybridStore::new(MemoryRepo::default(), MemoryRepo::default());
 
         CollectionStore::insert(&mut hybrid, record).unwrap();

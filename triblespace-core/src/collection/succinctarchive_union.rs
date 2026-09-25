@@ -28,9 +28,8 @@ use std::fmt;
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::succinctarchive::{
-    merge_ordered_archives, OrderedUniverse,
-    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchive, SuccinctArchiveBlob,
-    SuccinctArchiveRawBuildError, SuccinctArchiveRawMergeError,
+    merge_ordered_archives, OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchive,
+    SuccinctArchiveBlob, SuccinctArchiveRawBuildError, SuccinctArchiveRawMergeError,
 };
 use crate::blob::{Blob, BlobEncoding};
 use crate::id::Id;
@@ -41,7 +40,7 @@ use crate::repo::{BlobStoreGet, BlobStoreMeta};
 
 use super::{
     CollectionData, CollectionDerivation, CollectionDerive, CollectionEncoding, CollectionHandle,
-    CollectionMerge, CollectionOperationError,
+    CollectionMerge, CollectionOperationError, SourceLocator,
 };
 
 mod collection;
@@ -407,7 +406,6 @@ impl CollectionDerivation for Rank9AcceleratedSuccinctArchiveBlob {
         SuccinctArchive::<OrderedUniverse>::build_accelerated_root(source.clone())
             .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
-
 }
 
 /// A collection descriptor participating in a validation failure.
@@ -511,6 +509,16 @@ pub enum SuccinctArchiveUnionValidationError {
     WrongDeriveOutput,
     /// The claimed merge result is not the canonical union of its inputs.
     WrongMergeResult,
+    /// The supplied source's locator is not the one the DERIVE names.
+    WrongDeriveLocator {
+        /// Locator named by the record.
+        expected: SourceLocator,
+        /// Locator of the supplied source blob's handle.
+        actual: SourceLocator,
+    },
+    /// This validator checks two-input joins; the claim names this many
+    /// inputs.
+    UnsupportedMergeArity(usize),
 }
 
 impl fmt::Display for SuccinctArchiveUnionValidationError {
@@ -580,6 +588,14 @@ impl fmt::Display for SuccinctArchiveUnionValidationError {
                 .write_str("derive output is not the canonical raw SuccinctArchive of its input"),
             Self::WrongMergeResult => formatter.write_str(
                 "merge result is not the exact canonical union of its raw SuccinctArchive inputs",
+            ),
+            Self::WrongDeriveLocator { expected, actual } => write!(
+                formatter,
+                "derive source locator {actual} does not match claimed {expected}"
+            ),
+            Self::UnsupportedMergeArity(inputs) => write!(
+                formatter,
+                "cannot validate a merge of {inputs} inputs; expected two"
             ),
         }
     }
@@ -668,9 +684,17 @@ pub fn validate_derive(
         claim.collection(),
     )?;
 
-    let (expected_input, expected_output) = (claim.input(), claim.output());
-    validate_endpoint(ElementRole::DeriveInput, expected_input, input)?;
-    validate_endpoint(ElementRole::DeriveOutput, expected_output, output)?;
+    // The record names its source foundation by locator; bind the supplied
+    // source bytes to it through their handle.
+    let actual_locator =
+        SourceLocator::of(Handle::<SimpleArchive>::to_hash(input.get_handle()).raw);
+    if actual_locator != claim.input() {
+        return Err(SuccinctArchiveUnionValidationError::WrongDeriveLocator {
+            expected: claim.input(),
+            actual: actual_locator,
+        });
+    }
+    validate_endpoint(ElementRole::DeriveOutput, claim.output(), output)?;
     let expected =
         derive_element(input).map_err(SuccinctArchiveUnionValidationError::SourceBuild)?;
     if output.bytes != expected.bytes {
@@ -697,7 +721,12 @@ pub fn validate_merge(
         crate::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone()).get_handle();
     validate_collection(DescriptorRole::Target, collection, claim.collection())?;
 
-    let (expected_low, expected_high) = claim.inputs();
+    // A2: n-ary validation. This still checks two-input joins only.
+    let &[expected_low, expected_high] = claim.inputs() else {
+        return Err(SuccinctArchiveUnionValidationError::UnsupportedMergeArity(
+            claim.inputs().len(),
+        ));
+    };
     validate_endpoint(ElementRole::MergeLow, expected_low, low)?;
     validate_endpoint(ElementRole::MergeHigh, expected_high, high)?;
     validate_endpoint(ElementRole::MergeResult, claim.result(), result)?;
@@ -915,7 +944,7 @@ mod tests {
         let derive = CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&target_descriptor),
-            data_identity(&source_empty),
+            crate::collection::SourceLocator::of(data_identity(&source_empty).raw),
             data_identity(&canonical_empty),
         );
         validate_derive(
@@ -937,10 +966,10 @@ mod tests {
         let merge = CollectionMerge::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&target_descriptor),
-            data_identity(low),
-            data_identity(high),
+            [data_identity(low), data_identity(high)],
             data_identity(&joined),
-        );
+        )
+        .unwrap();
         validate_merge(&target_descriptor, &merge, low, high, &joined).unwrap();
     }
 
@@ -972,7 +1001,7 @@ mod tests {
             let claim = CollectionDerive::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 identity_for_tests(&target_descriptor),
-                data_identity(input),
+                crate::collection::SourceLocator::of(data_identity(input).raw),
                 data_identity(output),
             );
             validate_derive(
@@ -989,10 +1018,10 @@ mod tests {
         let merge = CollectionMerge::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&target_descriptor),
-            data_identity(low),
-            data_identity(high),
+            [data_identity(low), data_identity(high)],
             data_identity(&merge_after_derive),
-        );
+        )
+        .unwrap();
         validate_merge(&target_descriptor, &merge, low, high, &merge_after_derive).unwrap();
     }
 
@@ -1006,7 +1035,7 @@ mod tests {
         let claim = CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&target_descriptor),
-            data_identity(&input),
+            crate::collection::SourceLocator::of(data_identity(&input).raw),
             data_identity(&wrong_output),
         );
 
@@ -1029,10 +1058,10 @@ mod tests {
         let merge = CollectionMerge::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&target_descriptor),
-            data_identity(low),
-            data_identity(high),
+            [data_identity(low), data_identity(high)],
             data_identity(&wrong),
-        );
+        )
+        .unwrap();
         assert_ne!(correct.bytes, wrong.bytes);
         assert!(matches!(
             validate_merge(&target_descriptor, &merge, low, high, &wrong),
@@ -1049,7 +1078,7 @@ mod tests {
         let claim = CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&target_descriptor),
-            data_identity(&input),
+            crate::collection::SourceLocator::of(data_identity(&input).raw),
             data_identity(&malformed),
         );
 

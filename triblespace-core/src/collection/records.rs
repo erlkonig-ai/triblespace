@@ -2,8 +2,8 @@
 //!
 //! [`CollectionCommit`], [`CollectionMerge`], and [`CollectionDerive`] are
 //! native algebra records, not graph data. Their canonical representations are
-//! the fixed-width byte layouts exposed by their `to_bytes`/`from_bytes`
-//! methods. A collection *descriptor* is not a record at all: it is an
+//! the 32-byte-aligned dense byte layouts exposed by their
+//! `to_bytes`/`from_bytes` methods; a MERGE's length varies with its arity. A collection *descriptor* is not a record at all: it is an
 //! ordinary [`TribleSet`] stored as a self-describing [`SimpleArchive`], and
 //! that blob's handle is the collection identity. See
 //! [`descriptor`](crate::collection::descriptor) for reading one.
@@ -61,18 +61,50 @@ pub const KIND_COLLECTION_MAPPING: Id = id_hex!("8725AF624FE719B70289A67B21174FE
 ///
 /// Minted with `trible genid` on 2026-08-11.
 pub const KIND_COLLECTION_COMMIT: Id = id_hex!("B34817308188C4515A3C51967A91A603");
-/// Stable semantic kind of a signed, witness-bound commutative `MERGE` equation.
-/// Minted with `trible genid` on 2026-09-14.
-pub const KIND_COLLECTION_MERGE: Id = id_hex!("96AB9DE7389DD621D44C55E593898A69");
-/// Stable semantic kind of a signed, witness-bound `DERIVE` equation.
-/// Minted with `trible genid` on 2026-09-14.
-pub const KIND_COLLECTION_DERIVE: Id = id_hex!("529D8F57A20FCA0BC921121313DC619B");
-/// Retired signed MERGE kind without input-record witnesses.
-/// Minted with `trible genid` on 2026-09-13, retired 2026-09-14.
-pub const KIND_COLLECTION_MERGE_SIGNED_V2: Id = id_hex!("1E5277B23D177FD692B074FBF0EF28F1");
-/// Retired signed DERIVE kind without an input-record witness.
-/// Minted with `trible genid` on 2026-09-13, retired 2026-09-14.
-pub const KIND_COLLECTION_DERIVE_SIGNED_V2: Id = id_hex!("CE6A838612D0AA0812C05A50CCD11DC1");
+/// Stable semantic kind of a signed n-ary `MERGE(collection; inputs -> result)`.
+///
+/// Minted with `trible genid` on 2026-09-25 for lattice v2. It names the
+/// [`CollectionMerge`] transcript and fingerprint, dense tag
+/// [`COLLECTION_RECORD_KIND_MERGE_V4`] and pile kind
+/// `pile-collection-merge-v10`.
+pub const KIND_COLLECTION_MERGE: Id = id_hex!("D0D98881093C0A6F318E1E1525521F80");
+/// Stable semantic kind of a signed locator `DERIVE(target, L(source) -> output)`.
+///
+/// Minted with `trible genid` on 2026-09-25 for lattice v2. It names the
+/// [`CollectionDerive`] transcript and fingerprint, dense tag
+/// [`COLLECTION_RECORD_KIND_DERIVE_V4`] and pile kind
+/// `pile-collection-derive-v11`.
+pub const KIND_COLLECTION_DERIVE: Id = id_hex!("630BF5B294A3A1D85C0A7B185C9BC899");
+/// RETIRED tombstone: the witness-bound MERGE (pile kind v6, dense tag 6).
+///
+/// Minted with `trible genid` on 2026-09-14 and retired without ever being
+/// the live merge kind. Nothing signs or fingerprints under it; it is kept so
+/// the id is never minted twice. Formerly named `KIND_COLLECTION_MERGE`.
+pub const KIND_COLLECTION_MERGE_WITNESSED_RETIRED: Id = id_hex!("96AB9DE7389DD621D44C55E593898A69");
+/// RETIRED tombstone: the witness-bound DERIVE (pile kind v7, dense tag 7).
+///
+/// Minted with `trible genid` on 2026-09-14; see
+/// [`KIND_COLLECTION_MERGE_WITNESSED_RETIRED`]. Formerly named
+/// `KIND_COLLECTION_DERIVE`.
+pub const KIND_COLLECTION_DERIVE_WITNESSED_RETIRED: Id =
+    id_hex!("529D8F57A20FCA0BC921121313DC619B");
+/// RETIRED: semantic kind of the signed binary MERGE.
+///
+/// Minted with `trible genid` on 2026-09-13 for the first witness-free
+/// signed merge, then signed and fingerprinted under again by pile kind v8
+/// and dense tag 4 until lattice v2 (2026-09-25), under the misleading name
+/// `KIND_COLLECTION_MERGE_SIGNED_V2`. Only
+/// [`RetiredCollectionEquation`] still reads it, to verify and fingerprint
+/// the retired records exactly as they were written.
+pub const KIND_COLLECTION_MERGE_BINARY_RETIRED: Id = id_hex!("1E5277B23D177FD692B074FBF0EF28F1");
+/// RETIRED: semantic kind of the signed handle DERIVE.
+///
+/// Minted with `trible genid` on 2026-09-13 for the first witness-free
+/// signed derive, then used again by pile kind v9 and dense tag 5 until
+/// lattice v2 (2026-09-25), under the misleading name
+/// `KIND_COLLECTION_DERIVE_SIGNED_V2`. See
+/// [`KIND_COLLECTION_MERGE_BINARY_RETIRED`].
+pub const KIND_COLLECTION_DERIVE_HANDLE_RETIRED: Id = id_hex!("CE6A838612D0AA0812C05A50CCD11DC1");
 /// Retired unsigned MERGE kind; never interpreted as a signed equation.
 /// Minted with `trible genid` on 2026-08-11, retired 2026-09-13.
 pub const KIND_COLLECTION_MERGE_UNSIGNED: Id = id_hex!("5F20FFC64313969B7E046A7677874D39");
@@ -110,24 +142,28 @@ pub const KIND_COLLECTION_GOSSIP_V1: Id = id_hex!("9BB5B1F4D6FD8FB850B494C2CF51B
 
 /// Byte length of a dense signed commit.
 pub const COLLECTION_COMMIT_BYTES_LEN: usize = 6 * 32;
-/// Byte length of a dense merge equation.
-pub const COLLECTION_MERGE_BYTES_LEN: usize = 7 * 32;
-/// Byte length of a dense derive equation.
+/// Fewest distinct inputs a MERGE may join.
+pub const MIN_MERGE_INPUTS: usize = 2;
+/// Most distinct inputs a MERGE may join.
+pub const MAX_MERGE_INPUTS: usize = 16;
+/// Byte length of the fixed part of a dense MERGE: collection, result,
+/// author, R, S and the input-count slot. The inputs follow it.
+pub const COLLECTION_MERGE_FIXED_BYTES_LEN: usize = 6 * 32;
+/// Byte length of the widest dense MERGE, [`MAX_MERGE_INPUTS`] inputs.
+pub const COLLECTION_MERGE_MAX_BYTES_LEN: usize = collection_merge_bytes_len(MAX_MERGE_INPUTS);
+/// Byte length of a dense locator derive.
 pub const COLLECTION_DERIVE_BYTES_LEN: usize = 6 * 32;
+/// Byte length of a dense retired binary MERGE (dense tag 4): collection,
+/// low, high, result, author, R, S.
+pub const RETIRED_MERGE_BINARY_BYTES_LEN: usize = 7 * 32;
+/// Byte length of a dense retired handle DERIVE (dense tag 5): target, input,
+/// output, author, R, S.
+pub const RETIRED_DERIVE_HANDLE_BYTES_LEN: usize = 6 * 32;
 
-/// Dense byte length of a witness-free `MERGE`: collection, two inputs, the
-/// result, the author key and its signature. One 32-byte field shorter per
-/// input than the witness-bearing form it replaces.
-pub const COLLECTION_MERGE_V4_BYTES_LEN: usize = 7 * 32;
-
-/// Dense byte length of a witness-free `DERIVE`. Structurally identical to a
-/// COMMIT -- a collection, the payloads, the key and the signature -- which is
-/// the tell that all three records are now one kind of statement.
-pub const COLLECTION_DERIVE_V4_BYTES_LEN: usize = 6 * 32;
-/// Byte length of a retired signed merge without input-record witnesses.
-pub const COLLECTION_MERGE_SIGNED_V2_BYTES_LEN: usize = 7 * 32;
-/// Byte length of a retired signed derive without an input-record witness.
-pub const COLLECTION_DERIVE_SIGNED_V2_BYTES_LEN: usize = 6 * 32;
+/// Exact dense byte length of a MERGE over `inputs` distinct inputs.
+pub const fn collection_merge_bytes_len(inputs: usize) -> usize {
+    COLLECTION_MERGE_FIXED_BYTES_LEN + inputs * 32
+}
 
 attributes! {
     /// The human-readable name of a root collection.
@@ -248,26 +284,38 @@ pub const COMMIT_TRANSCRIPT_LEN: usize = COMMIT_TRANSCRIPT_DOMAIN.len()
     + 32 // data hash
     + 32; // metadata handle
 
-/// Signature domain for witness-bound MERGE endorsements.
-pub const MERGE_TRANSCRIPT_DOMAIN: &[u8] = b"triblespace.collection.merge.endorsement";
-/// Signature domain for witness-bound DERIVE endorsements.
-pub const DERIVE_TRANSCRIPT_DOMAIN: &[u8] = b"triblespace.collection.derive.endorsement";
-/// Retired signature domain for MERGE equations without input witnesses.
-pub const MERGE_SIGNED_V2_TRANSCRIPT_DOMAIN: &[u8] = b"triblespace.collection.merge.transcript";
-/// Retired signature domain for DERIVE equations without an input witness.
-pub const DERIVE_SIGNED_V2_TRANSCRIPT_DOMAIN: &[u8] = b"triblespace.collection.derive.transcript";
-
-/// Witness-free equation transcripts.
+/// Signature domain of the n-ary MERGE transcript.
 ///
-/// An equation is a statement about PAYLOADS: these inputs combine to this
-/// output in this collection. Which record happened to assert an input is not
-/// part of that statement. Binding one made support narrower than the facts
-/// warranted -- a reader holding a different but equally admitted assertion of
-/// the same payload had the support and was told it did not, because the cited
-/// record was missing. An annotation may only widen; a witness narrowed.
-pub const MERGE_V4_TRANSCRIPT_DOMAIN: &[u8] = b"triblespace.collection.merge.equation";
-/// See [`MERGE_V4_TRANSCRIPT_DOMAIN`].
-pub const DERIVE_V4_TRANSCRIPT_DOMAIN: &[u8] = b"triblespace.collection.derive.equation";
+/// 32 bytes from the OS random source, chosen for lattice v2 on 2026-09-25.
+/// A binary domain rather than a string context: it separates this
+/// transcript from every other signed input without costing a readable
+/// string anybody could reuse by accident.
+pub const MERGE_TRANSCRIPT_DOMAIN: [u8; 32] =
+    hex_literal::hex!("B75F4382781F565972D759D69C72703B2A2E525B9D3B13A249590235C7BE8C40");
+/// Signature domain of the locator DERIVE transcript. See
+/// [`MERGE_TRANSCRIPT_DOMAIN`].
+pub const DERIVE_TRANSCRIPT_DOMAIN: [u8; 32] =
+    hex_literal::hex!("3F33151333CCDE3566D792C723DF70A74ACCF357CD0B9A7E7E1C61913020D22F");
+/// RETIRED signature domain of the witness-bound MERGE. Reserved: never reuse.
+pub const MERGE_WITNESSED_TRANSCRIPT_DOMAIN_RETIRED: &[u8] =
+    b"triblespace.collection.merge.endorsement";
+/// RETIRED signature domain of the witness-bound DERIVE. Reserved: never reuse.
+pub const DERIVE_WITNESSED_TRANSCRIPT_DOMAIN_RETIRED: &[u8] =
+    b"triblespace.collection.derive.endorsement";
+/// RETIRED signature domain of the binary MERGE (dense tag 4, pile kind v8).
+/// [`RetiredCollectionEquation`] still verifies under it.
+pub const MERGE_BINARY_TRANSCRIPT_DOMAIN_RETIRED: &[u8] =
+    b"triblespace.collection.merge.transcript";
+/// RETIRED signature domain of the handle DERIVE (dense tag 5, pile kind v9).
+/// [`RetiredCollectionEquation`] still verifies under it.
+pub const DERIVE_HANDLE_TRANSCRIPT_DOMAIN_RETIRED: &[u8] =
+    b"triblespace.collection.derive.transcript";
+/// RETIRED, never used by a written record. Reserved: never reuse.
+pub const MERGE_EQUATION_TRANSCRIPT_DOMAIN_RETIRED: &[u8] =
+    b"triblespace.collection.merge.equation";
+/// RETIRED, never used by a written record. Reserved: never reuse.
+pub const DERIVE_EQUATION_TRANSCRIPT_DOMAIN_RETIRED: &[u8] =
+    b"triblespace.collection.derive.equation";
 
 /// Return the canonical handle of an empty metadata archive.
 ///
@@ -293,8 +341,16 @@ pub enum RecordDecodeError {
     InvalidLength { expected: usize, actual: usize },
     /// A tagged dense record used an unknown variant byte.
     UnknownKind(u8),
-    /// A merge did not carry its (payload digest, witness) pairs in ascending order.
+    /// A tagged dense record used a retired variant byte: a record of a kind
+    /// this binary no longer serves. See [`RetiredCollectionEquation`].
+    RetiredKind(u8),
+    /// A merge's inputs were not strictly increasing by raw bytes.
     NonCanonicalMergeInputs,
+    /// A merge named fewer than [`MIN_MERGE_INPUTS`] or more than
+    /// [`MAX_MERGE_INPUTS`] inputs.
+    InvalidMergeArity(u32),
+    /// Bytes a canonical record leaves zero were not zero.
+    NonCanonicalPadding,
     /// Public ingress rejected the embedded key or signature.
     Verification(RecordVerificationError),
 }
@@ -315,8 +371,18 @@ impl fmt::Display for RecordDecodeError {
             Self::UnknownKind(kind) => {
                 write!(f, "collection record has unknown dense kind {kind}")
             }
+            Self::RetiredKind(kind) => {
+                write!(f, "collection record has retired dense kind {kind}")
+            }
             Self::NonCanonicalMergeInputs => {
-                write!(f, "collection merge inputs are not canonically ordered")
+                write!(f, "collection merge inputs are not strictly increasing")
+            }
+            Self::InvalidMergeArity(count) => write!(
+                f,
+                "collection merge names {count} inputs; expected {MIN_MERGE_INPUTS}..={MAX_MERGE_INPUTS}"
+            ),
+            Self::NonCanonicalPadding => {
+                write!(f, "collection record has nonzero padding")
             }
             Self::Verification(error) => error.fmt(f),
         }
@@ -338,6 +404,26 @@ impl From<UnarchiveError> for RecordDecodeError {
         Self::Archive(error)
     }
 }
+
+/// A MERGE was asked to join fewer than [`MIN_MERGE_INPUTS`] or more than
+/// [`MAX_MERGE_INPUTS`] distinct inputs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MergeArityError {
+    /// Number of distinct inputs after sorting and removing duplicates.
+    pub distinct_inputs: usize,
+}
+
+impl fmt::Display for MergeArityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "a MERGE joins {MIN_MERGE_INPUTS}..={MAX_MERGE_INPUTS} distinct inputs; got {}",
+            self.distinct_inputs
+        )
+    }
+}
+
+impl Error for MergeArityError {}
 
 /// Signature verification failure for any signed collection record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -366,7 +452,7 @@ impl From<RecordVerificationError> for RecordDecodeError {
 }
 
 /// Signed exogenous membership assertion.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CollectionCommit {
     collection: CollectionHandle,
     data: CollectionData,
@@ -506,17 +592,133 @@ impl CollectionCommit {
     }
 }
 
-/// Signed exact join equation endorsing two specific input records.
+/// The distinct inputs of one MERGE, strictly increasing by raw bytes.
 ///
-/// The input payloads describe the computation. Their record fingerprints
-/// bind the producer's validation endorsement to one support route, rather
-/// than to every other record that happens to produce the same payload.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+/// A fixed-capacity array plus a length, so a record stays `Copy` and its
+/// derived `Eq`/`Ord`/`Hash` stay canonical: every slot past `len` is zero.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct MergeInputs {
+    inputs: [CollectionData; MAX_MERGE_INPUTS],
+    len: u8,
+}
+
+impl MergeInputs {
+    /// Sort and deduplicate `inputs`; fewer than [`MIN_MERGE_INPUTS`] or more
+    /// than [`MAX_MERGE_INPUTS`] distinct inputs is refused.
+    pub fn new(inputs: impl IntoIterator<Item = CollectionData>) -> Result<Self, MergeArityError> {
+        let mut distinct: Vec<CollectionData> = inputs.into_iter().collect();
+        distinct.sort_unstable_by(|left, right| left.raw.cmp(&right.raw));
+        distinct.dedup_by(|left, right| left.raw == right.raw);
+        Self::from_sorted(&distinct).map_err(|_| MergeArityError {
+            distinct_inputs: distinct.len(),
+        })
+    }
+
+    /// Accept inputs that are already canonical: 2..=16 of them, strictly
+    /// increasing. This is the decoder's check; it never reorders.
+    pub(crate) fn from_canonical(inputs: &[CollectionData]) -> Result<Self, RecordDecodeError> {
+        if inputs.len() < MIN_MERGE_INPUTS || inputs.len() > MAX_MERGE_INPUTS {
+            return Err(RecordDecodeError::InvalidMergeArity(inputs.len() as u32));
+        }
+        if inputs.windows(2).any(|pair| pair[0].raw >= pair[1].raw) {
+            return Err(RecordDecodeError::NonCanonicalMergeInputs);
+        }
+        Self::from_sorted(inputs)
+    }
+
+    fn from_sorted(inputs: &[CollectionData]) -> Result<Self, RecordDecodeError> {
+        if inputs.len() < MIN_MERGE_INPUTS || inputs.len() > MAX_MERGE_INPUTS {
+            return Err(RecordDecodeError::InvalidMergeArity(inputs.len() as u32));
+        }
+        let mut slots = [Inline::new([0u8; 32]); MAX_MERGE_INPUTS];
+        slots[..inputs.len()].copy_from_slice(inputs);
+        Ok(Self {
+            inputs: slots,
+            len: inputs.len() as u8,
+        })
+    }
+
+    /// The inputs, strictly increasing.
+    pub fn as_slice(&self) -> &[CollectionData] {
+        &self.inputs[..usize::from(self.len)]
+    }
+
+    /// Number of distinct inputs, `2..=16`.
+    pub fn len(&self) -> usize {
+        usize::from(self.len)
+    }
+
+    /// Never true for a valid merge; present for API symmetry.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Iterate the inputs in ascending order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = CollectionData> + '_ {
+        self.as_slice().iter().copied()
+    }
+
+    /// Whether `node` is one of the inputs.
+    pub fn contains(&self, node: CollectionData) -> bool {
+        self.as_slice()
+            .binary_search_by(|input| input.raw.cmp(&node.raw))
+            .is_ok()
+    }
+}
+
+/// The locator of one source foundation: `L(H) = BLAKE3(LOCATOR_CONTEXT || H)`.
+///
+/// This is what a [`CollectionDerive`] names instead of the source payload's
+/// handle. It is a one-way image of the handle, so it names the source
+/// foundation without being able to fetch it: never confuse it with a handle,
+/// and never treat it as a blob reference. See
+/// [`blob_locator`](crate::blob::locator::blob_locator).
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SourceLocator([u8; 32]);
+
+impl SourceLocator {
+    /// The locator of the source payload whose handle is `handle_raw`.
+    pub fn of(handle_raw: [u8; 32]) -> Self {
+        Self(crate::blob::locator::blob_locator(handle_raw))
+    }
+
+    /// Reinterpret raw locator bytes read from a record. This does not hash:
+    /// the bytes already are a locator.
+    pub const fn from_raw(raw: [u8; 32]) -> Self {
+        Self(raw)
+    }
+
+    /// The raw locator bytes.
+    pub const fn raw(self) -> [u8; 32] {
+        self.0
+    }
+
+    /// Borrow the raw locator bytes.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Display for SourceLocator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Signed n-ary join: these distinct payloads of one collection join to this
+/// result.
+///
+/// The statement is about PAYLOADS. Which records produce the inputs is not
+/// part of it; a reader finds those by content. The result may equal one of
+/// the inputs: `MERGE(a, c) -> c` says `c` absorbs `a`.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CollectionMerge {
     collection: CollectionHandle,
-    low: CollectionData,
-    high: CollectionData,
     result: CollectionData,
+    inputs: MergeInputs,
     public_key: Inline<ED25519PublicKey>,
     signature_r: Inline<ED25519RComponent>,
     signature_s: Inline<ED25519SComponent>,
@@ -528,85 +730,96 @@ impl CollectionMerge {
         CollectionRecord::Merge(*self).fingerprint()
     }
 
-    /// Sign a join of two payloads, in canonical order.
+    /// Sign a join of `inputs` to `result` in `collection`.
     ///
-    /// The statement is about PAYLOADS: these two join to this result. Which
-    /// records happen to produce the inputs is not part of it -- a reader
-    /// finds those by content, and naming one here only chose a route nobody
-    /// needed and made the same join publishable several times over.
+    /// The inputs are sorted by raw bytes and deduplicated before signing, so
+    /// the same join signs identically however it is listed. Fewer than two
+    /// or more than [`MAX_MERGE_INPUTS`] distinct inputs is refused.
     pub fn sign(
         signing_key: &SigningKey,
         collection: CollectionHandle,
-        mut low: CollectionData,
-        mut high: CollectionData,
+        inputs: impl IntoIterator<Item = CollectionData>,
         result: CollectionData,
-    ) -> Self {
-        if high < low {
-            std::mem::swap(&mut low, &mut high);
-        }
+    ) -> Result<Self, MergeArityError> {
+        let inputs = MergeInputs::new(inputs)?;
         let public_key = Inline::new(signing_key.verifying_key().to_bytes());
-        let transcript = equation_transcript(
-            MERGE_SIGNED_V2_TRANSCRIPT_DOMAIN,
-            KIND_COLLECTION_MERGE_SIGNED_V2,
-            public_key,
-            [collection.raw, low.raw, high.raw, result.raw],
-        );
+        let transcript = merge_transcript(public_key, collection, &inputs, result);
         let signature: Signature = signing_key.sign(&transcript);
-        Self::from_parts(
+        Ok(Self::from_parts(
             collection,
-            low,
-            high,
             result,
+            inputs,
             public_key,
             Inline::new(*signature.r_bytes()),
             Inline::new(*signature.s_bytes()),
-        )
+        ))
     }
 
     pub(crate) fn from_parts(
         collection: CollectionHandle,
-        low: CollectionData,
-        high: CollectionData,
         result: CollectionData,
+        inputs: MergeInputs,
         public_key: Inline<ED25519PublicKey>,
         signature_r: Inline<ED25519RComponent>,
         signature_s: Inline<ED25519SComponent>,
     ) -> Self {
         Self {
             collection,
-            low,
-            high,
             result,
+            inputs,
             public_key,
             signature_r,
             signature_s,
         }
     }
 
-    /// Decode foreign dense bytes, requiring canonical order and a strict signature.
-    pub fn from_bytes(bytes: [u8; COLLECTION_MERGE_BYTES_LEN]) -> Result<Self, RecordDecodeError> {
+    /// Decode foreign dense bytes, requiring canonical form and a strict
+    /// signature.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, RecordDecodeError> {
         let record = Self::from_bytes_trusted(bytes)?;
         record.verify_strict()?;
         Ok(record)
     }
 
     /// Structural decoding for explicitly trusted persisted bytes and audits.
-    pub(crate) fn from_bytes_trusted(
-        bytes: [u8; COLLECTION_MERGE_BYTES_LEN],
-    ) -> Result<Self, RecordDecodeError> {
-        let low = Inline::new(field(&bytes, 1));
-        let high = Inline::new(field(&bytes, 2));
-        if high < low {
-            return Err(RecordDecodeError::NonCanonicalMergeInputs);
+    ///
+    /// Refuses a count outside `2..=16`, a nonzero count-slot pad, a length
+    /// that is not exactly the fixed part plus 32 bytes per input, and inputs
+    /// that are not strictly increasing.
+    pub(crate) fn from_bytes_trusted(bytes: &[u8]) -> Result<Self, RecordDecodeError> {
+        if bytes.len() < COLLECTION_MERGE_FIXED_BYTES_LEN {
+            return Err(RecordDecodeError::InvalidLength {
+                expected: COLLECTION_MERGE_FIXED_BYTES_LEN,
+                actual: bytes.len(),
+            });
         }
+        let count_slot = slice_field(bytes, 5);
+        if count_slot[..28].iter().any(|byte| *byte != 0) {
+            return Err(RecordDecodeError::NonCanonicalPadding);
+        }
+        let count = u32::from_be_bytes(count_slot[28..].try_into().expect("four bytes"));
+        if (count as usize) < MIN_MERGE_INPUTS || (count as usize) > MAX_MERGE_INPUTS {
+            return Err(RecordDecodeError::InvalidMergeArity(count));
+        }
+        let expected = collection_merge_bytes_len(count as usize);
+        if bytes.len() != expected {
+            return Err(RecordDecodeError::InvalidLength {
+                expected,
+                actual: bytes.len(),
+            });
+        }
+        let mut inputs = [Inline::new([0u8; 32]); MAX_MERGE_INPUTS];
+        for (index, slot) in inputs[..count as usize].iter_mut().enumerate() {
+            *slot = Inline::new(slice_field(bytes, 6 + index));
+        }
+        let inputs = MergeInputs::from_canonical(&inputs[..count as usize])?;
         Ok(Self::from_parts(
-            Inline::new(field(&bytes, 0)),
-            low,
-            high,
-            Inline::new(field(&bytes, 3)),
-            Inline::new(field(&bytes, 4)),
-            Inline::new(field(&bytes, 5)),
-            Inline::new(field(&bytes, 6)),
+            Inline::new(slice_field(bytes, 0)),
+            Inline::new(slice_field(bytes, 1)),
+            inputs,
+            Inline::new(slice_field(bytes, 2)),
+            Inline::new(slice_field(bytes, 3)),
+            Inline::new(slice_field(bytes, 4)),
         ))
     }
 
@@ -619,19 +832,11 @@ impl CollectionMerge {
         )
     }
 
-    /// Exact domain-separated bytes signed by the author.
+    /// Exact domain-separated bytes signed by the author:
+    /// `domain || kind || author || collection || count (u32 BE) || inputs ||
+    /// result`.
     pub fn signing_transcript(&self) -> Vec<u8> {
-        equation_transcript(
-            MERGE_SIGNED_V2_TRANSCRIPT_DOMAIN,
-            KIND_COLLECTION_MERGE_SIGNED_V2,
-            self.public_key,
-            [
-                self.collection.raw,
-                self.low.raw,
-                self.high.raw,
-                self.result.raw,
-            ],
-        )
+        merge_transcript(self.public_key, self.collection, &self.inputs, self.result)
     }
 
     /// Author's public key.
@@ -649,9 +854,14 @@ impl CollectionMerge {
         self.collection
     }
 
-    /// Canonically ordered merge inputs.
-    pub fn inputs(&self) -> (CollectionData, CollectionData) {
-        (self.low, self.high)
+    /// The distinct inputs, strictly increasing by raw bytes.
+    pub fn inputs(&self) -> &[CollectionData] {
+        self.inputs.as_slice()
+    }
+
+    /// The inputs as the fixed-capacity value the record holds.
+    pub fn merge_inputs(&self) -> MergeInputs {
+        self.inputs
     }
 
     /// Asserted exact join result.
@@ -659,38 +869,48 @@ impl CollectionMerge {
         self.result
     }
 
-    /// Blob handles named directly by this record.
-    ///
-    /// A retained equation owns its descriptor, both inputs, and result when
-    /// those blobs are resident. Residency of each handle is independent.
-    pub fn blob_references(&self) -> [Inline<Handle<UnknownBlob>>; 4] {
-        [
-            self.collection.transmute(),
-            Handle::<UnknownBlob>::from_hash(self.low),
-            Handle::<UnknownBlob>::from_hash(self.high),
-            Handle::<UnknownBlob>::from_hash(self.result),
-        ]
+    /// Blob handles named directly by this record: the result, then every
+    /// input. Residency of each handle is independent.
+    pub fn blob_references(&self) -> impl ExactSizeIterator<Item = Inline<Handle<UnknownBlob>>> {
+        let mut references = arrayvec::ArrayVec::<_, { MAX_MERGE_INPUTS + 1 }>::new();
+        references.push(Handle::<UnknownBlob>::from_hash(self.result));
+        references.extend(self.inputs.iter().map(Handle::<UnknownBlob>::from_hash));
+        references.into_iter()
     }
 
-    /// Encode this endorsement into its exact dense 288-byte layout.
-    pub fn to_bytes(&self) -> [u8; COLLECTION_MERGE_BYTES_LEN] {
-        concat_fields([
-            self.collection.raw,
-            self.low.raw,
-            self.high.raw,
-            self.result.raw,
-            self.public_key.raw,
-            self.signature_r.raw,
-            self.signature_s.raw,
-        ])
+    /// Exact dense byte length: 192 plus 32 per input.
+    pub fn dense_len(&self) -> usize {
+        collection_merge_bytes_len(self.inputs.len())
+    }
+
+    /// Encode into the exact dense layout: `collection | result | author | R
+    /// | S | count | inputs[count]`, every field 32 bytes, the count a
+    /// big-endian `u32` in the last four bytes of its slot.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(self.dense_len());
+        bytes.extend_from_slice(&self.collection.raw);
+        bytes.extend_from_slice(&self.result.raw);
+        bytes.extend_from_slice(&self.public_key.raw);
+        bytes.extend_from_slice(&self.signature_r.raw);
+        bytes.extend_from_slice(&self.signature_s.raw);
+        bytes.extend_from_slice(&count_slot(self.inputs.len()));
+        for input in self.inputs.iter() {
+            bytes.extend_from_slice(&input.raw);
+        }
+        bytes
     }
 }
 
-/// One signed exact mapping equation endorsing a specific source record.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+/// Signed leaf of a derived collection: the target's mapping takes the
+/// source foundation whose locator is `input` to `output`.
+///
+/// The record names the source foundation by its [`SourceLocator`], never by
+/// its handle: a DERIVE is a foundation of the TARGET collection, and the
+/// locator is the only link between a derived collection and its source.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CollectionDerive {
-    collection: CollectionHandle,
-    input: CollectionData,
+    target: CollectionHandle,
+    input: SourceLocator,
     output: CollectionData,
     public_key: Inline<ED25519PublicKey>,
     signature_r: Inline<ED25519RComponent>,
@@ -703,31 +923,22 @@ impl CollectionDerive {
         CollectionRecord::Derive(*self).fingerprint()
     }
 
-    /// Sign a canonical input-record-bound `DERIVE` endorsement.
+    /// Sign `DERIVE(target, input -> output)`.
     ///
-    /// The output collection is named by descriptor handle, exactly as a commit names its
-    /// collection, and that descriptor already says which collection is the
-    /// source and embeds the exact mapping facts. A derive therefore
-    /// says *which input/output equation* was computed, never restates the
-    /// mapping definition. The input witness additionally names the exact
-    /// source record the producer validated; another equation for the same
-    /// payload cannot silently change the endorsed route.
+    /// The target is named by descriptor handle, and that descriptor already
+    /// names the source and the mapping, so the record only says which source
+    /// foundation (by locator) maps to which output.
     pub fn sign(
         signing_key: &SigningKey,
-        collection: CollectionHandle,
-        input: CollectionData,
+        target: CollectionHandle,
+        input: SourceLocator,
         output: CollectionData,
     ) -> Self {
         let public_key = Inline::new(signing_key.verifying_key().to_bytes());
-        let transcript = equation_transcript(
-            DERIVE_SIGNED_V2_TRANSCRIPT_DOMAIN,
-            KIND_COLLECTION_DERIVE_SIGNED_V2,
-            public_key,
-            [collection.raw, input.raw, output.raw],
-        );
+        let transcript = derive_transcript(public_key, target, input, output);
         let signature: Signature = signing_key.sign(&transcript);
         Self::from_parts(
-            collection,
+            target,
             input,
             output,
             public_key,
@@ -737,15 +948,15 @@ impl CollectionDerive {
     }
 
     pub(crate) fn from_parts(
-        collection: CollectionHandle,
-        input: CollectionData,
+        target: CollectionHandle,
+        input: SourceLocator,
         output: CollectionData,
         public_key: Inline<ED25519PublicKey>,
         signature_r: Inline<ED25519RComponent>,
         signature_s: Inline<ED25519SComponent>,
     ) -> Self {
         Self {
-            collection,
+            target,
             input,
             output,
             public_key,
@@ -765,7 +976,7 @@ impl CollectionDerive {
     pub(crate) fn from_bytes_trusted(bytes: [u8; COLLECTION_DERIVE_BYTES_LEN]) -> Self {
         Self::from_parts(
             Inline::new(field(&bytes, 0)),
-            Inline::new(field(&bytes, 1)),
+            SourceLocator::from_raw(field(&bytes, 1)),
             Inline::new(field(&bytes, 2)),
             Inline::new(field(&bytes, 3)),
             Inline::new(field(&bytes, 4)),
@@ -782,18 +993,10 @@ impl CollectionDerive {
         )
     }
 
-    /// Exact domain-separated bytes signed by the author.
+    /// Exact domain-separated bytes signed by the author:
+    /// `domain || kind || author || target || locator || output`.
     pub fn signing_transcript(&self) -> Vec<u8> {
-        equation_transcript(
-            DERIVE_SIGNED_V2_TRANSCRIPT_DOMAIN,
-            KIND_COLLECTION_DERIVE_SIGNED_V2,
-            self.public_key,
-            [
-                self.collection.raw,
-                self.input.raw,
-                self.output.raw,
-            ],
-        )
+        derive_transcript(self.public_key, self.target, self.input, self.output)
     }
 
     /// Author's public key.
@@ -806,13 +1009,19 @@ impl CollectionDerive {
         (self.signature_r, self.signature_s)
     }
 
-    /// Collection containing the output member.
+    /// The target collection, which holds the output.
     pub fn collection(&self) -> CollectionHandle {
-        self.collection
+        self.target
     }
 
-    /// Source member mapped by this equation.
-    pub fn input(&self) -> CollectionData {
+    /// The target collection, which holds the output. Same as
+    /// [`Self::collection`].
+    pub fn target(&self) -> CollectionHandle {
+        self.target
+    }
+
+    /// Locator of the source foundation this leaf maps. Not a blob handle.
+    pub fn input(&self) -> SourceLocator {
         self.input
     }
 
@@ -821,28 +1030,336 @@ impl CollectionDerive {
         self.output
     }
 
-    /// Blob handles named directly by this record.
-    ///
-    /// A retained equation owns its target descriptor, input, and output when
-    /// those blobs are resident. Residency of each handle is independent.
-    pub fn blob_references(&self) -> [Inline<Handle<UnknownBlob>>; 3] {
-        [
-            self.collection.transmute(),
-            Handle::<UnknownBlob>::from_hash(self.input),
-            Handle::<UnknownBlob>::from_hash(self.output),
-        ]
+    /// Blob handles named directly by this record: the output only. The
+    /// locator is not fetchable.
+    pub fn blob_references(&self) -> [Inline<Handle<UnknownBlob>>; 1] {
+        [Handle::<UnknownBlob>::from_hash(self.output)]
     }
 
-    /// Encode this endorsement into its exact dense 224-byte layout.
+    /// Encode into the exact dense 192-byte layout: `target | locator |
+    /// output | author | R | S`.
     pub fn to_bytes(&self) -> [u8; COLLECTION_DERIVE_BYTES_LEN] {
         concat_fields([
-            self.collection.raw,
-            self.input.raw,
+            self.target.raw,
+            self.input.raw(),
             self.output.raw,
             self.public_key.raw,
             self.signature_r.raw,
             self.signature_s.raw,
         ])
+    }
+}
+
+/// A signed equation under one of the two kinds lattice v2 retired.
+///
+/// Until 2026-09-25 these were the live MERGE and DERIVE: the binary MERGE
+/// (pile kind v8, dense tag 4) and the handle DERIVE (pile kind v9, dense tag
+/// 5). They decode into this separate inert type with every field kept, so
+/// the clean-pile migration can read them and rewrites can carry them byte
+/// for byte, but they are never folded, never served as current records, and
+/// never counted as opaque.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum RetiredCollectionEquation {
+    /// `MERGE(collection, low, high) -> result`, `low <= high`.
+    MergeV8 {
+        collection: CollectionHandle,
+        low: CollectionData,
+        high: CollectionData,
+        result: CollectionData,
+        public_key: Inline<ED25519PublicKey>,
+        signature_r: Inline<ED25519RComponent>,
+        signature_s: Inline<ED25519SComponent>,
+    },
+    /// `DERIVE(target, input handle) -> output`.
+    DeriveV9 {
+        target: CollectionHandle,
+        input: CollectionData,
+        output: CollectionData,
+        public_key: Inline<ED25519PublicKey>,
+        signature_r: Inline<ED25519RComponent>,
+        signature_s: Inline<ED25519SComponent>,
+    },
+}
+
+impl RetiredCollectionEquation {
+    /// Structurally decode the retired self-tagged dense form (tag 4 or 5).
+    /// Nothing is verified: this is evidence for an explicit migration.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, RecordDecodeError> {
+        let Some((&kind, payload)) = bytes.split_first() else {
+            return Err(RecordDecodeError::InvalidLength {
+                expected: 1,
+                actual: 0,
+            });
+        };
+        match kind {
+            COLLECTION_RECORD_KIND_MERGE_V2 => {
+                let bytes = exact_array::<RETIRED_MERGE_BINARY_BYTES_LEN>(payload)?;
+                let low = Inline::new(field(&bytes, 1));
+                let high = Inline::new(field(&bytes, 2));
+                Self::merge_v8(
+                    Inline::new(field(&bytes, 0)),
+                    low,
+                    high,
+                    Inline::new(field(&bytes, 3)),
+                    Inline::new(field(&bytes, 4)),
+                    Inline::new(field(&bytes, 5)),
+                    Inline::new(field(&bytes, 6)),
+                )
+            }
+            COLLECTION_RECORD_KIND_DERIVE_V2 => {
+                let bytes = exact_array::<RETIRED_DERIVE_HANDLE_BYTES_LEN>(payload)?;
+                Ok(Self::DeriveV9 {
+                    target: Inline::new(field(&bytes, 0)),
+                    input: Inline::new(field(&bytes, 1)),
+                    output: Inline::new(field(&bytes, 2)),
+                    public_key: Inline::new(field(&bytes, 3)),
+                    signature_r: Inline::new(field(&bytes, 4)),
+                    signature_s: Inline::new(field(&bytes, 5)),
+                })
+            }
+            unknown => Err(RecordDecodeError::UnknownKind(unknown)),
+        }
+    }
+
+    /// A retired binary merge from its fields, refusing `high < low` exactly
+    /// as the retired decoders did.
+    pub(crate) fn merge_v8(
+        collection: CollectionHandle,
+        low: CollectionData,
+        high: CollectionData,
+        result: CollectionData,
+        public_key: Inline<ED25519PublicKey>,
+        signature_r: Inline<ED25519RComponent>,
+        signature_s: Inline<ED25519SComponent>,
+    ) -> Result<Self, RecordDecodeError> {
+        if high.raw < low.raw {
+            return Err(RecordDecodeError::NonCanonicalMergeInputs);
+        }
+        Ok(Self::MergeV8 {
+            collection,
+            low,
+            high,
+            result,
+            public_key,
+            signature_r,
+            signature_s,
+        })
+    }
+
+    /// Sign a retired binary merge. Test fixtures only: nothing writes this
+    /// kind any more.
+    #[cfg(test)]
+    pub(crate) fn sign_merge_v8(
+        signing_key: &SigningKey,
+        collection: CollectionHandle,
+        mut low: CollectionData,
+        mut high: CollectionData,
+        result: CollectionData,
+    ) -> Self {
+        if high.raw < low.raw {
+            std::mem::swap(&mut low, &mut high);
+        }
+        let public_key = Inline::new(signing_key.verifying_key().to_bytes());
+        let transcript = equation_transcript(
+            MERGE_BINARY_TRANSCRIPT_DOMAIN_RETIRED,
+            KIND_COLLECTION_MERGE_BINARY_RETIRED,
+            public_key,
+            [collection.raw, low.raw, high.raw, result.raw],
+        );
+        let signature: Signature = signing_key.sign(&transcript);
+        Self::MergeV8 {
+            collection,
+            low,
+            high,
+            result,
+            public_key,
+            signature_r: Inline::new(*signature.r_bytes()),
+            signature_s: Inline::new(*signature.s_bytes()),
+        }
+    }
+
+    /// Sign a retired handle derive. Test fixtures only.
+    #[cfg(test)]
+    pub(crate) fn sign_derive_v9(
+        signing_key: &SigningKey,
+        target: CollectionHandle,
+        input: CollectionData,
+        output: CollectionData,
+    ) -> Self {
+        let public_key = Inline::new(signing_key.verifying_key().to_bytes());
+        let transcript = equation_transcript(
+            DERIVE_HANDLE_TRANSCRIPT_DOMAIN_RETIRED,
+            KIND_COLLECTION_DERIVE_HANDLE_RETIRED,
+            public_key,
+            [target.raw, input.raw, output.raw],
+        );
+        let signature: Signature = signing_key.sign(&transcript);
+        Self::DeriveV9 {
+            target,
+            input,
+            output,
+            public_key,
+            signature_r: Inline::new(*signature.r_bytes()),
+            signature_s: Inline::new(*signature.s_bytes()),
+        }
+    }
+
+    /// The collection the equation names (the target for a DERIVE).
+    pub fn collection(&self) -> CollectionHandle {
+        match self {
+            Self::MergeV8 { collection, .. } => *collection,
+            Self::DeriveV9 { target, .. } => *target,
+        }
+    }
+
+    /// The member the equation produced: the merge result or derive output.
+    pub fn produced(&self) -> CollectionData {
+        match self {
+            Self::MergeV8 { result, .. } => *result,
+            Self::DeriveV9 { output, .. } => *output,
+        }
+    }
+
+    /// The author's public key.
+    pub fn public_key(&self) -> Inline<ED25519PublicKey> {
+        match self {
+            Self::MergeV8 { public_key, .. } | Self::DeriveV9 { public_key, .. } => *public_key,
+        }
+    }
+
+    /// The exact signature components.
+    pub fn signature(&self) -> (Inline<ED25519RComponent>, Inline<ED25519SComponent>) {
+        match self {
+            Self::MergeV8 {
+                signature_r,
+                signature_s,
+                ..
+            }
+            | Self::DeriveV9 {
+                signature_r,
+                signature_s,
+                ..
+            } => (*signature_r, *signature_s),
+        }
+    }
+
+    /// The exact bytes the author signed, under the retired domain and kind.
+    pub fn signing_transcript(&self) -> Vec<u8> {
+        match *self {
+            Self::MergeV8 {
+                collection,
+                low,
+                high,
+                result,
+                public_key,
+                ..
+            } => equation_transcript(
+                MERGE_BINARY_TRANSCRIPT_DOMAIN_RETIRED,
+                KIND_COLLECTION_MERGE_BINARY_RETIRED,
+                public_key,
+                [collection.raw, low.raw, high.raw, result.raw],
+            ),
+            Self::DeriveV9 {
+                target,
+                input,
+                output,
+                public_key,
+                ..
+            } => equation_transcript(
+                DERIVE_HANDLE_TRANSCRIPT_DOMAIN_RETIRED,
+                KIND_COLLECTION_DERIVE_HANDLE_RETIRED,
+                public_key,
+                [target.raw, input.raw, output.raw],
+            ),
+        }
+    }
+
+    /// Strictly verify the retired signature. Authorship only.
+    pub fn verify_strict(&self) -> Result<(), RecordVerificationError> {
+        verify_record_signature(
+            self.public_key(),
+            self.signature(),
+            &self.signing_transcript(),
+        )
+    }
+
+    /// The untagged dense bytes, exactly as the retired codec wrote them.
+    pub fn dense_bytes(&self) -> Vec<u8> {
+        match *self {
+            Self::MergeV8 {
+                collection,
+                low,
+                high,
+                result,
+                public_key,
+                signature_r,
+                signature_s,
+            } => concat_fields::<7, RETIRED_MERGE_BINARY_BYTES_LEN>([
+                collection.raw,
+                low.raw,
+                high.raw,
+                result.raw,
+                public_key.raw,
+                signature_r.raw,
+                signature_s.raw,
+            ])
+            .to_vec(),
+            Self::DeriveV9 {
+                target,
+                input,
+                output,
+                public_key,
+                signature_r,
+                signature_s,
+            } => concat_fields::<6, RETIRED_DERIVE_HANDLE_BYTES_LEN>([
+                target.raw,
+                input.raw,
+                output.raw,
+                public_key.raw,
+                signature_r.raw,
+                signature_s.raw,
+            ])
+            .to_vec(),
+        }
+    }
+
+    /// The retired self-tagged dense form (tag 4 or 5).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let tag = match self {
+            Self::MergeV8 { .. } => COLLECTION_RECORD_KIND_MERGE_V2,
+            Self::DeriveV9 { .. } => COLLECTION_RECORD_KIND_DERIVE_V2,
+        };
+        tagged_bytes(tag, &self.dense_bytes())
+    }
+
+    /// The fingerprint the record had while it was live: BLAKE3 of the
+    /// retired semantic kind followed by the dense bytes. Object stores keyed
+    /// such records by it.
+    pub fn fingerprint(&self) -> CollectionRecordFingerprint {
+        let kind = match self {
+            Self::MergeV8 { .. } => KIND_COLLECTION_MERGE_BINARY_RETIRED,
+            Self::DeriveV9 { .. } => KIND_COLLECTION_DERIVE_HANDLE_RETIRED,
+        };
+        collection_record_fingerprint(kind, &self.dense_bytes())
+    }
+
+    /// Every blob the retired record named, as it named them: the collection
+    /// and every payload, the input handle of a DERIVE included. Resident
+    /// ones stay owned until the clean migration has read them.
+    pub fn blob_references(&self) -> impl ExactSizeIterator<Item = Inline<Handle<UnknownBlob>>> {
+        let mut references = arrayvec::ArrayVec::<_, 4>::new();
+        references.push(self.collection().transmute());
+        match *self {
+            Self::MergeV8 {
+                low, high, result, ..
+            } => {
+                references.extend([low, high, result].map(Handle::<UnknownBlob>::from_hash));
+            }
+            Self::DeriveV9 { input, output, .. } => {
+                references.extend([input, output].map(Handle::<UnknownBlob>::from_hash));
+            }
+        }
+        references.into_iter()
     }
 }
 
@@ -950,13 +1467,13 @@ impl LegacyUnsignedCollectionEquation {
 }
 
 /// A canonical signed native collection record.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum CollectionRecord {
-    /// Signed membership assertion whose embedded signature can be verified.
+    /// Signed membership assertion: a foundation of a root collection.
     Commit(CollectionCommit),
-    /// Signed exact join equation.
+    /// Signed n-ary join inside one collection.
     Merge(CollectionMerge),
-    /// Signed exact mapping equation.
+    /// Signed locator leaf: a foundation of a derived collection.
     Derive(CollectionDerive),
 }
 
@@ -990,11 +1507,14 @@ impl CollectionRecord {
 
     /// Blob handles named directly by this native record.
     ///
-    /// The returned handles express physical ownership only. Callers must not
-    /// filter them through signature validity, collection admission, or
-    /// algebraic usefulness before applying retention.
+    /// A commit names its descriptor, data and metadata; a merge its result
+    /// and every input; a derive only its output, because its input is a
+    /// locator, not a fetchable handle. The returned handles express physical
+    /// ownership only. Callers must not filter them through signature
+    /// validity, collection admission, or algebraic usefulness before
+    /// applying retention.
     pub fn blob_references(&self) -> impl ExactSizeIterator<Item = Inline<Handle<UnknownBlob>>> {
-        let mut references = arrayvec::ArrayVec::<_, 4>::new();
+        let mut references = arrayvec::ArrayVec::<_, { MAX_MERGE_INPUTS + 1 }>::new();
         match self {
             Self::Commit(record) => references.extend(record.blob_references()),
             Self::Merge(record) => references.extend(record.blob_references()),
@@ -1003,12 +1523,14 @@ impl CollectionRecord {
         references.into_iter()
     }
 
-    /// Actual input records whose support route this endorsement binds.
-    ///
-    /// These are record fingerprints, not blob handles or support members.
-    /// Retention follows them even when the referenced payload is absent;
-    /// authority and network disclosure remain separate decisions.
-
+    /// Exact byte length of this record's untagged dense form.
+    pub fn dense_len(&self) -> usize {
+        match self {
+            Self::Commit(_) => COLLECTION_COMMIT_BYTES_LEN,
+            Self::Merge(record) => record.dense_len(),
+            Self::Derive(_) => COLLECTION_DERIVE_BYTES_LEN,
+        }
+    }
 
     /// Decode the self-tagged dense form and strictly verify its signature.
     ///
@@ -1023,6 +1545,10 @@ impl CollectionRecord {
 
     /// Decode explicitly trusted persisted values without repeating crypto.
     /// This is not an ingress boundary for external imports or repair.
+    ///
+    /// The retired live tags 4 and 5 answer [`RecordDecodeError::RetiredKind`]
+    /// so a store can skip them; [`RetiredCollectionEquation::from_bytes`]
+    /// reads them.
     pub(crate) fn from_bytes_trusted(bytes: &[u8]) -> Result<Self, RecordDecodeError> {
         let Some((&kind, payload)) = bytes.split_first() else {
             return Err(RecordDecodeError::InvalidLength {
@@ -1035,19 +1561,22 @@ impl CollectionRecord {
                 let bytes = exact_array::<COLLECTION_COMMIT_BYTES_LEN>(payload)?;
                 Ok(Self::Commit(CollectionCommit::from_bytes_trusted(bytes)))
             }
-            COLLECTION_RECORD_KIND_MERGE_V2 => {
-                let bytes = exact_array::<COLLECTION_MERGE_BYTES_LEN>(payload)?;
-                Ok(Self::Merge(CollectionMerge::from_bytes_trusted(bytes)?))
+            COLLECTION_RECORD_KIND_MERGE_V4 => {
+                Ok(Self::Merge(CollectionMerge::from_bytes_trusted(payload)?))
             }
-            COLLECTION_RECORD_KIND_DERIVE_V2 => {
+            COLLECTION_RECORD_KIND_DERIVE_V4 => {
                 let bytes = exact_array::<COLLECTION_DERIVE_BYTES_LEN>(payload)?;
                 Ok(Self::Derive(CollectionDerive::from_bytes_trusted(bytes)))
+            }
+            COLLECTION_RECORD_KIND_MERGE_V2 | COLLECTION_RECORD_KIND_DERIVE_V2 => {
+                Err(RecordDecodeError::RetiredKind(kind))
             }
             unknown => Err(RecordDecodeError::UnknownKind(unknown)),
         }
     }
 
-    /// Recompute the exact content fingerprint of this canonical record.
+    /// Recompute the exact content fingerprint of this canonical record:
+    /// BLAKE3 of the semantic kind followed by the dense bytes.
     pub fn fingerprint(&self) -> CollectionRecordFingerprint {
         #[cfg(test)]
         FINGERPRINT_CALLS.set(FINGERPRINT_CALLS.get() + 1);
@@ -1056,10 +1585,10 @@ impl CollectionRecord {
                 collection_record_fingerprint(KIND_COLLECTION_COMMIT, &record.to_bytes())
             }
             Self::Merge(record) => {
-                collection_record_fingerprint(KIND_COLLECTION_MERGE_SIGNED_V2, &record.to_bytes())
+                collection_record_fingerprint(KIND_COLLECTION_MERGE, &record.to_bytes())
             }
             Self::Derive(record) => {
-                collection_record_fingerprint(KIND_COLLECTION_DERIVE_SIGNED_V2, &record.to_bytes())
+                collection_record_fingerprint(KIND_COLLECTION_DERIVE, &record.to_bytes())
             }
         }
     }
@@ -1071,10 +1600,10 @@ impl CollectionRecord {
                 tagged_bytes(COLLECTION_RECORD_KIND_COMMIT_V1, &record.to_bytes())
             }
             Self::Merge(record) => {
-                tagged_bytes(COLLECTION_RECORD_KIND_MERGE_V2, &record.to_bytes())
+                tagged_bytes(COLLECTION_RECORD_KIND_MERGE_V4, &record.to_bytes())
             }
             Self::Derive(record) => {
-                tagged_bytes(COLLECTION_RECORD_KIND_DERIVE_V2, &record.to_bytes())
+                tagged_bytes(COLLECTION_RECORD_KIND_DERIVE_V4, &record.to_bytes())
             }
         }
     }
@@ -1089,16 +1618,22 @@ pub const COLLECTION_RECORD_KIND_COMMIT_V1: u8 = 1;
 pub const COLLECTION_RECORD_KIND_MERGE_V1: u8 = 2;
 /// Retired dense tag for the unsigned DERIVE layout. Never reused.
 pub const COLLECTION_RECORD_KIND_DERIVE_V1: u8 = 3;
-/// Dense generic-store tag for signed MERGE. An equation names the payloads it
-/// relates, never the particular records that happened to assert them.
+/// RETIRED dense tag of the signed binary MERGE, live until lattice v2.
+/// Never reused. Object stores skip it; [`RetiredCollectionEquation`] reads it.
 pub const COLLECTION_RECORD_KIND_MERGE_V2: u8 = 4;
-/// Dense generic-store tag for signed DERIVE. See the MERGE tag above.
+/// RETIRED dense tag of the signed handle DERIVE, live until lattice v2.
+/// Never reused. See [`COLLECTION_RECORD_KIND_MERGE_V2`].
 pub const COLLECTION_RECORD_KIND_DERIVE_V2: u8 = 5;
 /// Retired dense tag for the witness-bound MERGE layout. Never reused: those
 /// bytes carried a second copy of a relation content addressing already holds.
 pub const COLLECTION_RECORD_KIND_MERGE_V3: u8 = 6;
 /// Retired dense tag for the witness-bound DERIVE layout. Never reused.
 pub const COLLECTION_RECORD_KIND_DERIVE_V3: u8 = 7;
+/// Dense generic-store tag of the n-ary [`CollectionMerge`] (lattice v2). Its
+/// payload is variable: 192 bytes plus 32 per input.
+pub const COLLECTION_RECORD_KIND_MERGE_V4: u8 = 8;
+/// Dense generic-store tag of the locator [`CollectionDerive`] (lattice v2).
+pub const COLLECTION_RECORD_KIND_DERIVE_V4: u8 = 9;
 
 fn commit_bytes(
     collection: CollectionHandle,
@@ -1250,6 +1785,59 @@ fn one_inline<S: InlineEncoding>(
     Ok(value)
 }
 
+/// `domain || kind || author || collection || count (u32 BE) || inputs ||
+/// result`: the n-ary MERGE transcript.
+fn merge_transcript(
+    public_key: Inline<ED25519PublicKey>,
+    collection: CollectionHandle,
+    inputs: &MergeInputs,
+    result: CollectionData,
+) -> Vec<u8> {
+    let mut transcript = Vec::with_capacity(32 + 16 + 32 + 32 + 4 + inputs.len() * 32 + 32);
+    transcript.extend_from_slice(&MERGE_TRANSCRIPT_DOMAIN);
+    transcript.extend_from_slice(&KIND_COLLECTION_MERGE.raw());
+    transcript.extend_from_slice(&public_key.raw);
+    transcript.extend_from_slice(&collection.raw);
+    transcript.extend_from_slice(&(inputs.len() as u32).to_be_bytes());
+    for input in inputs.iter() {
+        transcript.extend_from_slice(&input.raw);
+    }
+    transcript.extend_from_slice(&result.raw);
+    transcript
+}
+
+/// `domain || kind || author || target || locator || output`: the locator
+/// DERIVE transcript.
+fn derive_transcript(
+    public_key: Inline<ED25519PublicKey>,
+    target: CollectionHandle,
+    input: SourceLocator,
+    output: CollectionData,
+) -> Vec<u8> {
+    let mut transcript = Vec::with_capacity(32 + 16 + 32 * 4);
+    transcript.extend_from_slice(&DERIVE_TRANSCRIPT_DOMAIN);
+    transcript.extend_from_slice(&KIND_COLLECTION_DERIVE.raw());
+    transcript.extend_from_slice(&public_key.raw);
+    transcript.extend_from_slice(&target.raw);
+    transcript.extend_from_slice(&input.raw());
+    transcript.extend_from_slice(&output.raw);
+    transcript
+}
+
+/// A MERGE's count slot: a big-endian `u32` in the last four bytes of a
+/// 32-byte field, the rest zero.
+pub(crate) fn count_slot(count: usize) -> [u8; 32] {
+    let mut slot = [0u8; 32];
+    slot[28..].copy_from_slice(&(count as u32).to_be_bytes());
+    slot
+}
+
+fn slice_field(bytes: &[u8], index: usize) -> [u8; 32] {
+    bytes[index * 32..(index + 1) * 32]
+        .try_into()
+        .expect("dense record field lies inside the checked length")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1272,8 +1860,22 @@ mod tests {
         Inline::new([byte; 32])
     }
 
+    fn locator(byte: u8) -> SourceLocator {
+        SourceLocator::of([byte; 32])
+    }
+
     fn fixture_key() -> SigningKey {
         SigningKey::from_bytes(&[7; 32])
+    }
+
+    fn merge(inputs: &[u8], result: u8) -> CollectionMerge {
+        CollectionMerge::sign(
+            &fixture_key(),
+            collection(1),
+            inputs.iter().map(|byte| input(*byte)),
+            hash(result),
+        )
+        .expect("fixture merges join two to sixteen distinct inputs")
     }
 
     #[test]
@@ -1414,31 +2016,152 @@ mod tests {
     }
 
     #[test]
-    fn merge_is_commutative_in_dense_encoding() {
-        let forward =
-            CollectionMerge::sign(&fixture_key(), collection(1), input(2), input(3), hash(4));
-        let reverse =
-            CollectionMerge::sign(&fixture_key(), collection(1), input(3), input(2), hash(4));
+    fn merge_sorts_and_deduplicates_its_inputs() {
+        let forward = merge(&[2, 3], 4);
+        let reverse = merge(&[3, 2, 3], 4);
         assert_eq!(forward, reverse);
         assert_eq!(forward.to_bytes(), reverse.to_bytes());
+        assert_eq!(forward.inputs(), &[input(2), input(3)]);
         assert_eq!(
-            CollectionMerge::from_bytes(forward.to_bytes()).unwrap(),
+            CollectionMerge::from_bytes(&forward.to_bytes()).unwrap(),
             forward
         );
     }
 
-    // Two tests lived here that existed only to pin witness behaviour --
-    // that equal payloads sorted by their citation, and that changing a
-    // citation changed record identity. A merge names no record now, so
-    // neither statement is expressible, let alone true.
+    #[test]
+    fn merge_joins_two_to_sixteen_distinct_inputs() {
+        let key = fixture_key();
+        assert_eq!(
+            CollectionMerge::sign(&key, collection(1), [input(2)], hash(4)),
+            Err(MergeArityError { distinct_inputs: 1 })
+        );
+        assert_eq!(
+            CollectionMerge::sign(&key, collection(1), [input(2), input(2)], hash(4)),
+            Err(MergeArityError { distinct_inputs: 1 })
+        );
+        assert_eq!(
+            CollectionMerge::sign(&key, collection(1), (0..17).map(input), hash(99)),
+            Err(MergeArityError {
+                distinct_inputs: 17
+            })
+        );
+        let widest = CollectionMerge::sign(&key, collection(1), (0..16).map(input), hash(99))
+            .expect("sixteen distinct inputs are the widest legal merge");
+        assert_eq!(widest.inputs().len(), MAX_MERGE_INPUTS);
+        assert_eq!(widest.to_bytes().len(), COLLECTION_MERGE_MAX_BYTES_LEN);
+        assert_eq!(
+            CollectionRecord::Merge(widest).blob_references().len(),
+            MAX_MERGE_INPUTS + 1
+        );
+        assert_eq!(
+            CollectionMerge::from_bytes(&widest.to_bytes()).unwrap(),
+            widest
+        );
+    }
+
+    /// `MERGE(a, c) -> c` is how a node absorbs another; the result naming
+    /// one of the inputs is legal.
+    #[test]
+    fn merge_result_may_be_one_of_its_inputs() {
+        let absorbing = merge(&[2, 3], 3);
+        absorbing.verify_strict().unwrap();
+        assert_eq!(
+            CollectionMerge::from_bytes(&absorbing.to_bytes()).unwrap(),
+            absorbing
+        );
+    }
 
     #[test]
-    fn derive_roundtrips() {
-        let record = CollectionDerive::sign(&fixture_key(), collection(2), input(3), hash(4));
+    fn merge_dense_layout_is_exact() {
+        let record = merge(&[2, 3, 5, 6, 7, 8, 9, 10], 4);
+        let bytes = record.to_bytes();
+        // k = 8: six fixed slots and eight inputs, 448 bytes, which with the
+        // 64-byte pile header is exactly two blocks.
+        assert_eq!(bytes.len(), 448);
+        assert_eq!(bytes.len(), record.dense_len());
+        assert_eq!(&bytes[..32], &collection(1).raw);
+        assert_eq!(&bytes[32..64], &hash(4).raw);
+        assert_eq!(&bytes[64..96], &record.public_key().raw);
+        assert_eq!(&bytes[96..128], &record.signature().0.raw);
+        assert_eq!(&bytes[128..160], &record.signature().1.raw);
+        assert_eq!(&bytes[160..188], &[0u8; 28]);
+        assert_eq!(&bytes[188..192], &8u32.to_be_bytes());
+        for (index, byte) in [2u8, 3, 5, 6, 7, 8, 9, 10].into_iter().enumerate() {
+            assert_eq!(&bytes[192 + index * 32..224 + index * 32], &[byte; 32]);
+        }
+    }
+
+    #[test]
+    fn merge_decoder_rejects_every_noncanonical_form() {
+        let record = merge(&[2, 3, 5], 4);
+        let bytes = record.to_bytes();
+
+        let mut swapped = bytes.clone();
+        swapped[192..224].fill(5);
+        swapped[256..288].fill(2);
+        assert_eq!(
+            CollectionMerge::from_bytes(&swapped),
+            Err(RecordDecodeError::NonCanonicalMergeInputs)
+        );
+
+        let mut duplicate = bytes.clone();
+        duplicate[224..256].fill(2);
+        assert_eq!(
+            CollectionMerge::from_bytes(&duplicate),
+            Err(RecordDecodeError::NonCanonicalMergeInputs)
+        );
+
+        let mut padded = bytes.clone();
+        padded[160] = 1;
+        assert_eq!(
+            CollectionMerge::from_bytes(&padded),
+            Err(RecordDecodeError::NonCanonicalPadding)
+        );
+
+        for count in [0u32, 1, 17, u32::MAX] {
+            let mut arity = bytes.clone();
+            arity[188..192].copy_from_slice(&count.to_be_bytes());
+            assert_eq!(
+                CollectionMerge::from_bytes(&arity),
+                Err(RecordDecodeError::InvalidMergeArity(count))
+            );
+        }
+
+        let mut long = bytes.clone();
+        long.extend_from_slice(&[0; 32]);
+        assert_eq!(
+            CollectionMerge::from_bytes(&long),
+            Err(RecordDecodeError::InvalidLength {
+                expected: collection_merge_bytes_len(3),
+                actual: collection_merge_bytes_len(4),
+            })
+        );
+        assert_eq!(
+            CollectionMerge::from_bytes(&bytes[..bytes.len() - 32]),
+            Err(RecordDecodeError::InvalidLength {
+                expected: collection_merge_bytes_len(3),
+                actual: collection_merge_bytes_len(2),
+            })
+        );
+        assert!(matches!(
+            CollectionMerge::from_bytes(&bytes[..100]),
+            Err(RecordDecodeError::InvalidLength { .. })
+        ));
+    }
+
+    #[test]
+    fn derive_roundtrips_and_names_a_locator_not_a_handle() {
+        let record = CollectionDerive::sign(&fixture_key(), collection(2), locator(3), hash(4));
         assert_eq!(
             CollectionDerive::from_bytes(record.to_bytes()).unwrap(),
             record
         );
+        assert_eq!(
+            record.input(),
+            SourceLocator::from_raw(crate::blob::locator::blob_locator([3; 32]))
+        );
+        assert_ne!(record.input().raw(), [3; 32]);
+        assert_eq!(&record.to_bytes()[32..64], &record.input().raw());
     }
 
     #[test]
@@ -1449,19 +2172,28 @@ mod tests {
             hash(2),
             empty_metadata_handle(),
         );
-        let merge =
-            CollectionMerge::sign(&fixture_key(), collection(1), input(2), input(3), hash(4));
-        let derive = CollectionDerive::sign(&fixture_key(), collection(2), input(3), hash(4));
-        for record in [
-            CollectionRecord::Commit(commit),
-            CollectionRecord::Merge(merge),
-            CollectionRecord::Derive(derive),
+        let derive = CollectionDerive::sign(&fixture_key(), collection(2), locator(3), hash(4));
+        for (record, tag) in [
+            (
+                CollectionRecord::Commit(commit),
+                COLLECTION_RECORD_KIND_COMMIT_V1,
+            ),
+            (
+                CollectionRecord::Merge(merge(&[2, 3], 4)),
+                COLLECTION_RECORD_KIND_MERGE_V4,
+            ),
+            (
+                CollectionRecord::Derive(derive),
+                COLLECTION_RECORD_KIND_DERIVE_V4,
+            ),
         ] {
-            assert_eq!(
-                CollectionRecord::from_bytes(&record.to_bytes()).unwrap(),
-                record
-            );
+            let bytes = record.to_bytes();
+            assert_eq!(bytes[0], tag);
+            assert_eq!(bytes.len(), 1 + record.dense_len());
+            assert_eq!(CollectionRecord::from_bytes(&bytes).unwrap(), record);
         }
+        assert_eq!(COLLECTION_RECORD_KIND_MERGE_V4, 8);
+        assert_eq!(COLLECTION_RECORD_KIND_DERIVE_V4, 9);
         assert_eq!(
             CollectionRecord::from_bytes(&[99]),
             Err(RecordDecodeError::UnknownKind(99))
@@ -1472,9 +2204,14 @@ mod tests {
     fn native_records_enumerate_every_direct_blob_reference() {
         let metadata = Inline::<Handle<SimpleArchive>>::new([3; 32]);
         let commit = CollectionCommit::sign(&fixture_key(), collection(1), hash(2), metadata);
-        let merge =
-            CollectionMerge::sign(&fixture_key(), collection(4), input(5), input(6), hash(7));
-        let derive = CollectionDerive::sign(&fixture_key(), collection(8), input(9), hash(10));
+        let merge = CollectionMerge::sign(
+            &fixture_key(),
+            collection(4),
+            [input(6), input(5), input(8)],
+            hash(7),
+        )
+        .unwrap();
+        let derive = CollectionDerive::sign(&fixture_key(), collection(8), locator(9), hash(10));
 
         assert_eq!(
             CollectionRecord::Commit(commit)
@@ -1483,53 +2220,22 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![[1; 32], [2; 32], [3; 32]],
         );
+        // The result, then every input; never the collection.
         assert_eq!(
             CollectionRecord::Merge(merge)
                 .blob_references()
                 .map(|handle| handle.raw)
                 .collect::<Vec<_>>(),
-            vec![[4; 32], [5; 32], [6; 32], [7; 32]],
+            vec![[7; 32], [5; 32], [6; 32], [8; 32]],
         );
+        // The output only: a locator is not fetchable.
         assert_eq!(
             CollectionRecord::Derive(derive)
                 .blob_references()
                 .map(|handle| handle.raw)
                 .collect::<Vec<_>>(),
-            vec![[8; 32], [9; 32], [10; 32]],
+            vec![[10; 32]],
         );
-    }
-
-    #[test]
-    fn endorsements_reference_actual_records_separately_from_blobs() {
-        let _first = CollectionRecord::Commit(CollectionCommit::sign(
-            &fixture_key(),
-            collection(1),
-            hash(2),
-            empty_metadata_handle(),
-        ));
-        let _second = CollectionRecord::Commit(CollectionCommit::sign(
-            &fixture_key(),
-            collection(1),
-            hash(3),
-            empty_metadata_handle(),
-        ));
-        let merged = CollectionRecord::Merge(CollectionMerge::sign(
-            &fixture_key(),
-            collection(1),
-            hash(2),
-            hash(3),
-            hash(4),
-        ));
-        let derived = CollectionRecord::Derive(CollectionDerive::sign(
-            &fixture_key(),
-            collection(5),
-            hash(4),
-            hash(6),
-        ));
-        // Record references were the citation graph. A record names payloads
-        // now, and a reader relates it to its inputs by content.
-        assert_eq!(merged.blob_references().len(), 4);
-        assert_eq!(derived.blob_references().len(), 3);
     }
 
     #[test]
@@ -1541,41 +2247,43 @@ mod tests {
                 actual: 0,
             })
         );
-    }
-
-    #[test]
-    fn merge_decoder_rejects_noncanonical_input_order() {
-        let record =
-            CollectionMerge::sign(&fixture_key(), collection(1), input(2), input(3), hash(4));
-        let mut bytes = record.to_bytes();
-        bytes[32..64].fill(9);
-        bytes[64..96].fill(1);
         assert_eq!(
-            CollectionMerge::from_bytes(bytes),
-            Err(RecordDecodeError::NonCanonicalMergeInputs)
+            CollectionRecord::from_bytes(&[COLLECTION_RECORD_KIND_DERIVE_V4]),
+            Err(RecordDecodeError::InvalidLength {
+                expected: COLLECTION_DERIVE_BYTES_LEN,
+                actual: 0,
+            })
+        );
+        assert_eq!(
+            CollectionRecord::from_bytes(&[COLLECTION_RECORD_KIND_MERGE_V4]),
+            Err(RecordDecodeError::InvalidLength {
+                expected: COLLECTION_MERGE_FIXED_BYTES_LEN,
+                actual: 0,
+            })
         );
     }
 
     #[test]
     fn equations_bind_every_field_and_reject_weak_authors_at_ingress() {
         let records = [
-            CollectionRecord::Merge(CollectionMerge::sign(
-                &fixture_key(),
-                collection(1),
-                input(2),
-                input(3),
-                hash(4),
-            )),
+            CollectionRecord::Merge(merge(&[2, 3], 4)),
             CollectionRecord::Derive(CollectionDerive::sign(
                 &fixture_key(),
                 collection(2),
-                input(3),
+                locator(3),
                 hash(4),
             )),
         ];
         for record in records {
             let encoded = record.to_bytes();
-            for field_start in (1..encoded.len()).step_by(32) {
+            // Every 32-byte field but a merge's count slot, which is
+            // structure: changing it changes the record's length.
+            let fields: Vec<usize> = match record {
+                CollectionRecord::Merge(_) => (0..5).chain(6..8).collect(),
+                _ => (0..6).collect(),
+            };
+            for field_index in fields {
+                let field_start = 1 + field_index * 32;
                 let mut altered = encoded.clone();
                 altered[field_start] ^= 1;
                 assert!(CollectionRecord::from_bytes(&altered).is_err());
@@ -1584,7 +2292,7 @@ mod tests {
                 assert!(retained.verify_strict().is_err());
             }
             let key_start = match record {
-                CollectionRecord::Merge(_) => 1 + 4 * 32,
+                CollectionRecord::Merge(_) => 1 + 2 * 32,
                 CollectionRecord::Derive(_) => 1 + 3 * 32,
                 CollectionRecord::Commit(_) => unreachable!(),
             };
@@ -1602,15 +2310,14 @@ mod tests {
 
     #[test]
     fn distinct_writers_endorse_distinct_equation_records() {
-        let first =
-            CollectionMerge::sign(&fixture_key(), collection(1), input(2), input(3), hash(4));
+        let first = merge(&[2, 3], 4);
         let second = CollectionMerge::sign(
             &SigningKey::from_bytes(&[8; 32]),
             collection(1),
-            input(2),
-            input(3),
+            [input(2), input(3)],
             hash(4),
-        );
+        )
+        .unwrap();
         assert_ne!(first, second);
         assert_ne!(
             CollectionRecord::Merge(first).fingerprint(),
@@ -1622,22 +2329,22 @@ mod tests {
 
     #[test]
     fn retired_dense_equations_are_inert_exact_evidence() {
-        let merge = tagged_bytes(
+        let merge_v1 = tagged_bytes(
             COLLECTION_RECORD_KIND_MERGE_V1,
             &concat_fields::<4, 128>([collection(1).raw, hash(2).raw, hash(3).raw, hash(4).raw]),
         );
-        let derive = tagged_bytes(
+        let derive_v1 = tagged_bytes(
             COLLECTION_RECORD_KIND_DERIVE_V1,
             &concat_fields::<3, 96>([collection(2).raw, hash(3).raw, hash(4).raw]),
         );
         for (bytes, fingerprint, references) in [
             (
-                merge,
+                merge_v1,
                 hex!("92A19C12DAF4046397A43C607051ECCB1DD1EFB74D8B977B8A19AE7846521170"),
                 vec![[1; 32], [2; 32], [3; 32], [4; 32]],
             ),
             (
-                derive,
+                derive_v1,
                 hex!("2CF7BBFA3A8567AECED029BC0A0A74925501AC0E60D51CC5AAA32E5225F54B4B"),
                 vec![[2; 32], [3; 32], [4; 32]],
             ),
@@ -1660,16 +2367,87 @@ mod tests {
             assert!(LegacyUnsignedCollectionEquation::from_bytes(&trailing).is_err());
         }
         assert!(LegacyUnsignedCollectionEquation::from_bytes(
-            &CollectionRecord::Merge(CollectionMerge::sign(
-                &fixture_key(),
-                collection(1),
-                input(2),
-                input(3),
-                hash(4)
-            ),)
-            .to_bytes()
+            &CollectionRecord::Merge(merge(&[2, 3], 4)).to_bytes()
         )
         .is_err());
+    }
+
+    /// The retired live kinds keep their exact bytes, signatures and
+    /// fingerprints, and no current decoder serves them.
+    #[test]
+    fn retired_live_equations_keep_their_fields_and_golden_bytes() {
+        let merge_v8 = RetiredCollectionEquation::sign_merge_v8(
+            &fixture_key(),
+            collection(1),
+            input(3),
+            input(2),
+            hash(4),
+        );
+        let derive_v9 = RetiredCollectionEquation::sign_derive_v9(
+            &fixture_key(),
+            collection(2),
+            input(3),
+            hash(4),
+        );
+        // Signatures and fingerprints pinned while these were the live kinds.
+        assert_eq!(
+            concat_fields::<2, 64>([merge_v8.signature().0.raw, merge_v8.signature().1.raw]),
+            hex!("39D1BE8DC91EE25298CD4B03D4CDD9D1D021994A0B5999EFCD86F1BB4D87EE08A64EE5C40BBBAA21F01C6963BCF2F259CD76D93CBBB4D4351879CB7167ADB00B")
+        );
+        assert_eq!(
+            concat_fields::<2, 64>([derive_v9.signature().0.raw, derive_v9.signature().1.raw]),
+            hex!("10325E15C286E263AFE7D7219F4F637F852F1EB61ECA68916DA4793C6BE9BAB5287380B741FF9D1AE6AD5FA36329785AAA36C6FAABFEB759A7E5387F1F2D140B")
+        );
+        assert_eq!(
+            merge_v8.fingerprint().raw(),
+            hex!("BF31C64514D9721278866D2AD87819D0C4282D5AC59A7AEBC37729D078038BDC")
+        );
+        assert_eq!(
+            derive_v9.fingerprint().raw(),
+            hex!("2CEC0E4B0A78362E7EC93F5951B4FE6B1BB8233A1A6377C51ECF455A5B945672")
+        );
+        assert_eq!(merge_v8.signing_transcript().len(), 215);
+        assert_eq!(derive_v9.signing_transcript().len(), 184);
+        for (retired, tag, references) in [
+            (
+                merge_v8,
+                COLLECTION_RECORD_KIND_MERGE_V2,
+                vec![[1; 32], [2; 32], [3; 32], [4; 32]],
+            ),
+            (
+                derive_v9,
+                COLLECTION_RECORD_KIND_DERIVE_V2,
+                vec![[2; 32], [3; 32], [4; 32]],
+            ),
+        ] {
+            retired.verify_strict().unwrap();
+            let bytes = retired.to_bytes();
+            assert_eq!(bytes[0], tag);
+            assert_eq!(
+                RetiredCollectionEquation::from_bytes(&bytes).unwrap(),
+                retired
+            );
+            assert_eq!(
+                retired
+                    .blob_references()
+                    .map(|handle| handle.raw)
+                    .collect::<Vec<_>>(),
+                references
+            );
+            assert_eq!(
+                CollectionRecord::from_bytes(&bytes),
+                Err(RecordDecodeError::RetiredKind(tag))
+            );
+        }
+        assert_eq!(merge_v8.produced(), hash(4));
+        assert_eq!(derive_v9.collection(), collection(2));
+        // A binary merge whose inputs are out of order is not canonical.
+        let mut swapped = merge_v8.to_bytes();
+        swapped[33..65].fill(9);
+        assert_eq!(
+            RetiredCollectionEquation::from_bytes(&swapped),
+            Err(RecordDecodeError::NonCanonicalMergeInputs)
+        );
     }
 
     #[test]
@@ -1687,22 +2465,63 @@ mod tests {
         );
         let commit =
             CollectionCommit::sign(&fixture_key(), collection(1), hash(2), Inline::new([3; 32]));
-        let merge =
-            CollectionMerge::sign(&fixture_key(), collection(1), input(2), input(3), hash(4));
-        let derive = CollectionDerive::sign(&fixture_key(), collection(2), input(3), hash(4));
+        let merge = merge(&[2, 3], 4);
+        let derive = CollectionDerive::sign(&fixture_key(), collection(2), locator(3), hash(4));
 
         assert_eq!(commit.to_bytes().len(), COLLECTION_COMMIT_BYTES_LEN);
-        assert_eq!(merge.to_bytes().len(), COLLECTION_MERGE_BYTES_LEN);
+        assert_eq!(merge.to_bytes().len(), collection_merge_bytes_len(2));
         assert_eq!(derive.to_bytes().len(), COLLECTION_DERIVE_BYTES_LEN);
-        assert_eq!(merge.signing_transcript().len(), 215);
-        assert_eq!(derive.signing_transcript().len(), 184);
+
+        // domain || kind || author || collection || count || inputs || result
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&MERGE_TRANSCRIPT_DOMAIN);
+        expected.extend_from_slice(&KIND_COLLECTION_MERGE.raw());
+        expected.extend_from_slice(&merge.public_key().raw);
+        expected.extend_from_slice(&collection(1).raw);
+        expected.extend_from_slice(&2u32.to_be_bytes());
+        expected.extend_from_slice(&[2; 32]);
+        expected.extend_from_slice(&[3; 32]);
+        expected.extend_from_slice(&[4; 32]);
+        assert_eq!(merge.signing_transcript(), expected);
+        assert_eq!(merge.signing_transcript().len(), 212);
+
+        // domain || kind || author || target || locator || output
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&DERIVE_TRANSCRIPT_DOMAIN);
+        expected.extend_from_slice(&KIND_COLLECTION_DERIVE.raw());
+        expected.extend_from_slice(&derive.public_key().raw);
+        expected.extend_from_slice(&collection(2).raw);
+        expected.extend_from_slice(&locator(3).raw());
+        expected.extend_from_slice(&[4; 32]);
+        assert_eq!(derive.signing_transcript(), expected);
+        assert_eq!(derive.signing_transcript().len(), 176);
+
+        // Fingerprints are BLAKE3(kind || dense bytes).
+        for (record, kind) in [
+            (CollectionRecord::Merge(merge), KIND_COLLECTION_MERGE),
+            (CollectionRecord::Derive(derive), KIND_COLLECTION_DERIVE),
+        ] {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&kind.raw());
+            hasher.update(&record.to_bytes()[1..]);
+            assert_eq!(record.fingerprint().raw(), *hasher.finalize().as_bytes());
+        }
+        // Pinned at lattice v2 (2026-09-25): these are wire format.
         assert_eq!(
             concat_fields::<2, 64>([merge.signature().0.raw, merge.signature().1.raw]),
-            hex!("39D1BE8DC91EE25298CD4B03D4CDD9D1D021994A0B5999EFCD86F1BB4D87EE08A64EE5C40BBBAA21F01C6963BCF2F259CD76D93CBBB4D4351879CB7167ADB00B")
+            hex!("D55D87F954FE0387950F87A83854023A7523AFEF609DAEFC459FD07132DCBDD2C8A9FF024376020A24E4E00394C82E71B33F34B4552D51953D49EDDB51869308")
         );
         assert_eq!(
             concat_fields::<2, 64>([derive.signature().0.raw, derive.signature().1.raw]),
-            hex!("10325E15C286E263AFE7D7219F4F637F852F1EB61ECA68916DA4793C6BE9BAB5287380B741FF9D1AE6AD5FA36329785AAA36C6FAABFEB759A7E5387F1F2D140B")
+            hex!("BD0AB9CD39C01F21FF7C81657DF0B9B478962047052CB49E2E557B9966510F27FAD9550769E6A31891CF5A0E8B0F175B12FD5CFBA731775476553141644ABC06")
+        );
+        assert_eq!(
+            CollectionRecord::Merge(merge).fingerprint().raw(),
+            hex!("2B3A051CFECDCDA75BCEE8CE25157B38632FEC992902D95082DCA1710C2068A9")
+        );
+        assert_eq!(
+            CollectionRecord::Derive(derive).fingerprint().raw(),
+            hex!("2CA5233360BA208B1EE09C0B79CA064578BC79D1EB84E449282500A070A422BF")
         );
 
         assert_eq!(commit.signing_transcript().len(), COMMIT_TRANSCRIPT_LEN);
@@ -1717,14 +2536,6 @@ mod tests {
         assert_eq!(
             commit.signature_s.raw,
             hex!("F684108AF3E8E3898904D20EA458DCAE68F0F97F4E5C06DAFA0FAE0691F68D0B")
-        );
-        assert_eq!(
-            CollectionRecord::Merge(merge).fingerprint().raw(),
-            hex!("BF31C64514D9721278866D2AD87819D0C4282D5AC59A7AEBC37729D078038BDC")
-        );
-        assert_eq!(
-            CollectionRecord::Derive(derive).fingerprint().raw(),
-            hex!("2CEC0E4B0A78362E7EC93F5951B4FE6B1BB8233A1A6377C51ECF455A5B945672")
         );
         assert_eq!(
             commit.signing_transcript(),

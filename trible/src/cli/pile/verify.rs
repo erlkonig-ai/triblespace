@@ -17,6 +17,7 @@ pub(super) fn run(path: &Path) -> Result<()> {
     let mut invalid = 0usize;
     let mut unsigned = 0usize;
     let mut opaque = 0usize;
+    let mut retired = 0usize;
     let mut other = 0usize;
     while let Some(raw) = records.next() {
         let raw = raw.map_err(|error| super::pile_read_error(path, error))?;
@@ -53,6 +54,15 @@ pub(super) fn run(path: &Path) -> Result<()> {
                 unsigned += 1;
                 continue;
             }
+            PileRecordContent::RetiredCollectionEquation { equation } => {
+                // The live MERGE and DERIVE until lattice v2. Inert, but still
+                // signed evidence the clean-pile migration reads.
+                retired += 1;
+                (
+                    "retired EQUATION",
+                    equation.verify_strict().map_err(anyhow::Error::from),
+                )
+            }
             PileRecordContent::Opaque { .. } => {
                 opaque += 1;
                 continue;
@@ -71,6 +81,7 @@ pub(super) fn run(path: &Path) -> Result<()> {
         "Native record audit: COMMIT={}, MERGE={}, DERIVE={}, AUTH={}",
         checked[0], checked[1], checked[2], checked[3]
     );
+    println!("Retired signed equations checked (pile kinds v8/v9): {retired}");
     println!("Invalid native records: {invalid}");
     println!(
         "Not checked: unsigned legacy equations={unsigned}, opaque records={opaque}, other records={other}"

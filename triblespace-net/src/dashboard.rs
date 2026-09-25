@@ -16,9 +16,9 @@ use triblespace_core::attribute::Attribute;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::collection::{CollectionHandle, CollectionRecord};
 use triblespace_core::exists;
-use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::encodings::iu256::U256BE;
+use triblespace_core::inline::Inline;
 use triblespace_core::macros::{find, pattern};
 use triblespace_core::metadata;
 use triblespace_core::prelude::Id;
@@ -669,8 +669,7 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use triblespace_core::blob::encodings::UnknownBlob;
     use triblespace_core::collection::{
-        AdmissionPolicy, CollectionMerge, CollectionPolicy,
-        CollectionStore, CollectionStoreExt,
+        AdmissionPolicy, CollectionMerge, CollectionPolicy, CollectionStore, CollectionStoreExt,
     };
     use triblespace_core::inline::Inline;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
@@ -692,13 +691,15 @@ mod tests {
             .unwrap();
         let missing_result = Inline::new([9; 32]);
         store
-            .insert(CollectionRecord::Merge(CollectionMerge::sign(
-                &key,
-                collection.handle(),
-                Inline::new(input.raw),
-                Inline::new(input.raw),
-                missing_result,
-            )))
+            .insert(CollectionRecord::Merge(
+                CollectionMerge::sign(
+                    &key,
+                    collection.handle(),
+                    [Inline::new(input.raw), Inline::new([10; 32])],
+                    missing_result,
+                )
+                .unwrap(),
+            ))
             .unwrap();
         store.want(WantRequest::blob(input)).unwrap();
         let absent_blob =

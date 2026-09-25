@@ -64,10 +64,10 @@ use triblespace_core::trible::TribleSet;
 
 use super::open_refreshed;
 
+mod adopt;
 #[cfg(test)]
 mod maintenance_counts;
 mod maintenance_telemetry;
-mod adopt;
 
 /// Hex characters shown for a handle or key when the full value is not asked
 /// for. Sixteen is far past the point where two collections in one pile
@@ -1698,22 +1698,24 @@ fn run_log(path: PathBuf, reference: String, limit: usize, long: bool) -> Result
                     );
                 }
                 CollectionRecord::Merge(merge) => {
-                    let (low, high) = merge.inputs();
+                    let inputs: Vec<String> = merge
+                        .inputs()
+                        .iter()
+                        .map(|input| short(input.raw))
+                        .collect();
                     println!(
-                        "merge   {:X}  low={}  high={}  result={}  signer={signer}  signature={signature}",
+                        "merge   {:X}  inputs=[{}]  result={}  signer={signer}  signature={signature}",
                         fingerprint,
-                        short(low.raw),
-                        short(high.raw),
+                        inputs.join(","),
                         short(merge.result().raw),
                     );
                 }
                 CollectionRecord::Derive(derive) => {
-                    let (input, output) = (derive.input(), derive.output());
                     println!(
-                        "derive  {:X}  input={}  output={}  signer={signer}  signature={signature}",
+                        "derive  {:X}  locator={}  output={}  signer={signer}  signature={signature}",
                         fingerprint,
-                        short(input.raw),
-                        short(output.raw),
+                        short(derive.input().raw()),
+                        short(derive.output().raw),
                     );
                 }
             }
@@ -2253,17 +2255,19 @@ mod tests {
         }
 
         let records = vec![
-            CollectionRecord::Merge(CollectionMerge::sign(
-                &SigningKey::from_bytes(&[1; 32]),
-                collection(1),
-                data(10),
-                data(11),
-                data(12),
-            )),
+            CollectionRecord::Merge(
+                CollectionMerge::sign(
+                    &SigningKey::from_bytes(&[1; 32]),
+                    collection(1),
+                    [data(10), data(11)],
+                    data(12),
+                )
+                .unwrap(),
+            ),
             CollectionRecord::Derive(CollectionDerive::sign(
                 &SigningKey::from_bytes(&[1; 32]),
                 collection(3),
-                data(20),
+                triblespace_core::collection::SourceLocator::of(data(20).raw),
                 data(21),
             )),
         ];
@@ -2411,17 +2415,19 @@ mod tests {
         }
 
         let records = vec![
-            CollectionRecord::Merge(CollectionMerge::sign(
-                &SigningKey::from_bytes(&[1; 32]),
-                collection(1),
-                data(10),
-                data(11),
-                data(12),
-            )),
+            CollectionRecord::Merge(
+                CollectionMerge::sign(
+                    &SigningKey::from_bytes(&[1; 32]),
+                    collection(1),
+                    [data(10), data(11)],
+                    data(12),
+                )
+                .unwrap(),
+            ),
             CollectionRecord::Derive(CollectionDerive::sign(
                 &SigningKey::from_bytes(&[1; 32]),
                 collection(3),
-                data(20),
+                triblespace_core::collection::SourceLocator::of(data(20).raw),
                 data(21),
             )),
         ];

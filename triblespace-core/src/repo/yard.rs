@@ -582,6 +582,13 @@ impl Yard {
                     combined.retain_recursive(handle);
                 }
             }
+            // The signed equations lattice v2 retired are inert the same way,
+            // and own what they name until the clean-pile migration reads them.
+            for handle in generation.snapshot.retired_collection_equation_references() {
+                if present.get(&handle.raw).is_some() {
+                    combined.retain_recursive(handle);
+                }
+            }
         }
         Ok(combined)
     }
@@ -1327,6 +1334,9 @@ where
     old_pile
         .preserve_legacy_collection_headers_into(&mut new_pile)
         .map_err(YardReclaimError::CollectionRecord)?;
+    old_pile
+        .preserve_retired_collection_equations_into(&mut new_pile)
+        .map_err(YardReclaimError::CollectionRecord)?;
     before_final_guard();
     // Opaque-record refusal must come from one final source refresh. An opaque
     // addition observed here must not escape an earlier count and then be
@@ -1719,13 +1729,18 @@ mod tests {
 
     fn merge_record(tag: u8) -> CollectionRecord {
         let descriptor = named_for_tests(&format!("tagged-{tag}"), pin_id(tag.wrapping_add(1)));
-        CollectionRecord::Merge(CollectionMerge::sign(
-            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-            identity_for_tests(&descriptor),
-            Inline::new([tag.wrapping_add(3); 32]),
-            Inline::new([tag.wrapping_add(4); 32]),
-            Inline::new([tag.wrapping_add(5); 32]),
-        ))
+        CollectionRecord::Merge(
+            CollectionMerge::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                identity_for_tests(&descriptor),
+                [
+                    Inline::new([tag.wrapping_add(3); 32]),
+                    Inline::new([tag.wrapping_add(4); 32]),
+                ],
+                Inline::new([tag.wrapping_add(5); 32]),
+            )
+            .unwrap(),
+        )
     }
 
     fn invalidate_collection_commit(commit: CollectionCommit) -> CollectionCommit {
@@ -1926,23 +1941,23 @@ mod tests {
         let config = YardConfig::default();
         let (_dir, paths, mut yard) = yard_with_paths(2, config);
         let target = Inline::new([42; 32]);
-        let input = Inline::new([43; 32]);
+        let input = [43u8; 32];
         let first = CollectionRecord::Derive(CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             target,
-            input,
+            crate::collection::SourceLocator::of(input),
             Inline::new([44; 32]),
         ));
         let conflicting = CollectionRecord::Derive(CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             target,
-            input,
+            crate::collection::SourceLocator::of(input),
             Inline::new([45; 32]),
         ));
         let unrelated = CollectionRecord::Derive(CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             Inline::new([46; 32]),
-            input,
+            crate::collection::SourceLocator::of(input),
             Inline::new([47; 32]),
         ));
         yard.generations[1]
@@ -2058,7 +2073,7 @@ mod tests {
         let derive = CollectionDerive::sign(
             &signer,
             Inline::new([88; 32]),
-            commit.data(),
+            crate::collection::SourceLocator::of(commit.data().raw),
             Inline::new(output.raw),
         );
         // Young evidence can arrive first; the later witness belongs to an
@@ -2114,17 +2129,19 @@ mod tests {
         commit.verify_strict().unwrap();
         let records = vec![
             CollectionRecord::Commit(commit),
-            CollectionRecord::Merge(CollectionMerge::sign(
-                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                collection,
-                Inline::new(equation_owned.raw),
-                Inline::new([35; 32]),
-                Inline::new([36; 32]),
-            )),
+            CollectionRecord::Merge(
+                CollectionMerge::sign(
+                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                    collection,
+                    [Inline::new(equation_owned.raw), Inline::new([35; 32])],
+                    Inline::new([36; 32]),
+                )
+                .unwrap(),
+            ),
             CollectionRecord::Derive(CollectionDerive::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 identity_for_tests(&named_for_tests("derived", pin_id(38))),
-                Inline::new([36; 32]),
+                crate::collection::SourceLocator::of([36; 32]),
                 Inline::new(equation_owned.raw),
             )),
         ];
@@ -2745,8 +2762,7 @@ mod tests {
         let (_dir, paths, yard) = yard_with_paths(2, YardConfig::default());
         drop(yard);
 
-        let young_request =
-            WantRequest::blob(Inline::<Handle<UnknownBlob>>::new([63; INLINE_LEN]));
+        let young_request = WantRequest::blob(Inline::<Handle<UnknownBlob>>::new([63; INLINE_LEN]));
         let old_request = WantRequest::blob(Inline::<Handle<UnknownBlob>>::new([62; INLINE_LEN]));
         let mut young = Pile::open(&paths[0]).unwrap();
         young.want(young_request).unwrap();

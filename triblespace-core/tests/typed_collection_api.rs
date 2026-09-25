@@ -12,8 +12,8 @@ use triblespace_core::capability::{CapabilityProof, CapabilityResource};
 use triblespace_core::collection::succinctarchive_union;
 use triblespace_core::collection::{
     write_capability, AdmissionPolicy, CollectionCommit, CollectionDerive, CollectionMerge,
-    CollectionPolicy, CollectionRead, CollectionRecord,
-    CollectionSnapshotExt, CollectionStore, CollectionStoreExt,
+    CollectionPolicy, CollectionRead, CollectionRecord, CollectionSnapshotExt, CollectionStore,
+    CollectionStoreExt,
 };
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
@@ -259,13 +259,15 @@ fn maintenance_follows_a_resident_source_union_across_target_size_tiers() {
         })
         .collect::<Vec<_>>();
     store
-        .insert(CollectionRecord::Merge(CollectionMerge::sign(
-            &authority,
-            raw.handle(),
-            input_records[0],
-            input_records[1],
-            Handle::<SuccinctArchiveBlob>::to_hash(union_handle),
-        )))
+        .insert(CollectionRecord::Merge(
+            CollectionMerge::sign(
+                &authority,
+                raw.handle(),
+                [input_records[0], input_records[1]],
+                Handle::<SuccinctArchiveBlob>::to_hash(union_handle),
+            )
+            .unwrap(),
+        ))
         .unwrap();
     let before = store.snapshot().unwrap();
     assert_eq!(before.collection(raw).unwrap().cover().len(), 1);
@@ -530,7 +532,7 @@ fn ordinary_derived_operations_ignore_pending_immediate_source_output() {
     let pending = CollectionDerive::sign(
         &authority,
         raw.handle(),
-        later_commit.data(),
+        triblespace_core::collection::SourceLocator::of(later_commit.data().raw),
         Handle::<SuccinctArchiveBlob>::to_hash(missing_raw),
     );
     store.insert(CollectionRecord::Derive(pending)).unwrap();
@@ -633,7 +635,7 @@ fn ordinary_derived_operations_exclude_unauthorized_immediate_source_equations()
         .insert(CollectionRecord::Derive(CollectionDerive::sign(
             &unauthorized,
             raw.handle(),
-            denied_commit.data(),
+            triblespace_core::collection::SourceLocator::of(denied_commit.data().raw),
             Handle::<SuccinctArchiveBlob>::to_hash(denied_raw),
         )))
         .unwrap();
@@ -666,7 +668,10 @@ fn ordinary_derived_operations_exclude_unauthorized_immediate_source_equations()
             record.unwrap(),
             CollectionRecord::Derive(record)
                 if record.collection() == accelerated.handle()
-                    && record.input() == Handle::<SuccinctArchiveBlob>::to_hash(denied_raw)
+                    && record.input()
+                        == triblespace_core::collection::SourceLocator::of(
+                            Handle::<SuccinctArchiveBlob>::to_hash(denied_raw).raw
+                        )
         )));
     }
 }

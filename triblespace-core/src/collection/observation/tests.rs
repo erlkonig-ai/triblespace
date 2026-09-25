@@ -90,7 +90,7 @@ fn one_hop() -> OneHop {
     let equation = CollectionRecord::Derive(CollectionDerive::sign(
         &producer,
         target.handle(),
-        commit.data(),
+        crate::collection::SourceLocator::of(commit.data().raw),
         data(&output),
     ));
     OneHop {
@@ -387,19 +387,22 @@ fn unauthorized_target_producers_neither_admit_outputs_nor_hide_authorized_input
         .insert(CollectionRecord::Derive(CollectionDerive::sign(
             &outsider,
             fixture.target.handle(),
-            other_commit.data(),
+            crate::collection::SourceLocator::of(other_commit.data().raw),
             data(&wrong),
         )))
         .unwrap();
     fixture
         .store
-        .insert(CollectionRecord::Merge(CollectionMerge::sign(
-            &outsider,
-            fixture.target.handle(),
-            data(&fixture.output),
-            data(&fixture.output),
-            data(&wrong),
-        )))
+        .insert(CollectionRecord::Merge(
+            CollectionMerge::sign(
+                &outsider,
+                fixture.target.handle(),
+                // An unauthorized absorption of the authorized output.
+                [data(&fixture.output), data(&wrong)],
+                data(&wrong),
+            )
+            .unwrap(),
+        ))
         .unwrap();
     let snapshot = fixture.store.snapshot().unwrap();
     let observed = snapshot.collection(fixture.target).unwrap();
@@ -442,7 +445,7 @@ fn absent_target_parent_is_read_through_its_resident_merge_inputs() {
     let other_equation = CollectionRecord::Derive(CollectionDerive::sign(
         &fixture.producer,
         fixture.target.handle(),
-        other_commit.data(),
+        crate::collection::SourceLocator::of(other_commit.data().raw),
         data(&other_output),
     ));
     fixture.store.insert(other_equation).unwrap();
@@ -452,13 +455,15 @@ fn absent_target_parent_is_read_through_its_resident_merge_inputs() {
     // The parent's record is here; its bytes are not. The frontier is the
     // parent alone, and the read descends through the MERGE that produced
     // it to the two resident images beneath.
-    let parent = CollectionRecord::Merge(CollectionMerge::sign(
-        &fixture.producer,
-        fixture.target.handle(),
-        data(&fixture.output),
-        data(&other_output),
-        data(&union_blob),
-    ));
+    let parent = CollectionRecord::Merge(
+        CollectionMerge::sign(
+            &fixture.producer,
+            fixture.target.handle(),
+            [data(&fixture.output), data(&other_output)],
+            data(&union_blob),
+        )
+        .unwrap(),
+    );
     fixture.store.insert(parent).unwrap();
     let both = fixture
         .source
@@ -585,7 +590,7 @@ fn second_hop(
         .insert(CollectionRecord::Derive(CollectionDerive::sign(
             final_owner,
             final_target.handle(),
-            data(&fixture.output),
+            crate::collection::SourceLocator::of(data(&fixture.output).raw),
             data(&accelerated),
         )))
         .unwrap();
@@ -669,7 +674,7 @@ fn multihop_read_stands_for_nothing_beneath_an_unadmitted_ancestor() {
         .insert(CollectionRecord::Derive(CollectionDerive::sign(
             &historical,
             fixture.target.handle(),
-            fixture.commit.data(),
+            crate::collection::SourceLocator::of(fixture.commit.data().raw),
             data(&fixture.output),
         )))
         .unwrap();
@@ -799,13 +804,20 @@ fn pile_observation_tracks_only_consulted_lineage_and_target_changes() {
     // A new target equation with the same visible bytes invalidates the
     // observation too: target membership, not only output hashes, was read.
     let fresh = after_second.collection(fixture.target).unwrap();
-    pile.insert(CollectionRecord::Merge(CollectionMerge::sign(
-        &fixture.producer,
-        fixture.target.handle(),
-        data(&fixture.output),
-        data(&fixture.output),
-        data(&fixture.output),
-    )))
+    pile.insert(CollectionRecord::Merge(
+        CollectionMerge::sign(
+            &fixture.producer,
+            fixture.target.handle(),
+            // An absorbing merge whose other input is not here: it adds no
+            // row, yet it is a new target record the observation read past.
+            [
+                data(&fixture.output),
+                crate::collection::CollectionData::new([0xAB; 32]),
+            ],
+            data(&fixture.output),
+        )
+        .unwrap(),
+    ))
     .unwrap();
     let after_target = pile.snapshot().unwrap();
     assert!(!fresh.is_current(&after_target));

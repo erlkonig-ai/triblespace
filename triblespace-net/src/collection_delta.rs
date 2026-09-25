@@ -263,8 +263,8 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
     use triblespace_core::collection::{
-        COLLECTION_RECORD_KIND_MERGE_V2, CollectionCommit, CollectionData, CollectionDerive,
-        CollectionMerge, empty_metadata_handle,
+        empty_metadata_handle, CollectionCommit, CollectionData, CollectionDerive, CollectionMerge,
+        COLLECTION_RECORD_KIND_MERGE_V4,
     };
     use triblespace_core::inline::Inline;
 
@@ -286,17 +286,19 @@ mod tests {
                 data(1),
                 empty_metadata_handle(),
             )),
-            CollectionRecord::Merge(CollectionMerge::sign(
-                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                expected,
-                data(2),
-                data(3),
-                data(4),
-            )),
+            CollectionRecord::Merge(
+                CollectionMerge::sign(
+                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                    expected,
+                    [data(2), data(3)],
+                    data(4),
+                )
+                .unwrap(),
+            ),
             CollectionRecord::Derive(CollectionDerive::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 expected,
-                data(4),
+                triblespace_core::collection::SourceLocator::of(data(4).raw),
                 data(5),
             )),
         ]
@@ -384,7 +386,7 @@ mod tests {
         let derive = CollectionRecord::Derive(CollectionDerive::sign(
             &signer,
             target,
-            commit.data(),
+            triblespace_core::collection::SourceLocator::of(commit.data().raw),
             data(47),
         ));
         let bytes = encode_record(target, derive).unwrap();
@@ -408,15 +410,16 @@ mod tests {
         let merge = CollectionMerge::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             expected,
-            data(2),
-            data(3),
+            [data(2), data(3)],
             data(4),
-        );
+        )
+        .unwrap();
         let mut bytes = merge.to_bytes();
-        bytes[32..64].fill(9);
-        bytes[64..96].fill(1);
+        // The inputs follow the six fixed 32-byte slots.
+        bytes[192..224].fill(9);
+        bytes[224..256].fill(1);
         let mut tagged = Vec::with_capacity(1 + bytes.len());
-        tagged.push(COLLECTION_RECORD_KIND_MERGE_V2);
+        tagged.push(COLLECTION_RECORD_KIND_MERGE_V4);
         tagged.extend_from_slice(&bytes);
         assert!(matches!(
             decode_record(expected, &tagged),
@@ -489,11 +492,9 @@ mod tests {
         let overlay = collection_record_patch(&store, expected).unwrap();
 
         assert_eq!(overlay.len(), selected.len() as u64);
-        assert!(
-            selected
-                .iter()
-                .all(|record| { overlay.get(record.fingerprint()) == Some(*record) })
-        );
+        assert!(selected
+            .iter()
+            .all(|record| { overlay.get(record.fingerprint()) == Some(*record) }));
         assert_eq!(store.selections.get(), 1);
         assert_eq!(store.global_enumerations.get(), 0);
     }

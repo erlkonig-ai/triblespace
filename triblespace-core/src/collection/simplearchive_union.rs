@@ -123,6 +123,9 @@ pub enum SimpleArchiveUnionValidationError {
     },
     /// The claimed result is not the exact canonical union of the two inputs.
     WrongMergeResult,
+    /// This validator checks two-input joins; the claim names this many
+    /// inputs.
+    UnsupportedMergeArity(usize),
 }
 
 impl fmt::Display for SimpleArchiveUnionValidationError {
@@ -154,6 +157,12 @@ impl fmt::Display for SimpleArchiveUnionValidationError {
             }
             Self::WrongMergeResult => {
                 write!(f, "merge result is not the exact canonical input union")
+            }
+            Self::UnsupportedMergeArity(inputs) => {
+                write!(
+                    f,
+                    "cannot validate a merge of {inputs} inputs; expected two"
+                )
             }
         }
     }
@@ -396,7 +405,12 @@ pub fn validate_merge(
         crate::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone()).get_handle();
     validate_collection(collection, claim.collection())?;
 
-    let (expected_low, expected_high) = claim.inputs();
+    // A2: n-ary validation. This still checks two-input joins only.
+    let &[expected_low, expected_high] = claim.inputs() else {
+        return Err(SimpleArchiveUnionValidationError::UnsupportedMergeArity(
+            claim.inputs().len(),
+        ));
+    };
     validate_handle(ElementRole::MergeLow, expected_low, low)?;
     validate_handle(ElementRole::MergeHigh, expected_high, high)?;
     validate_handle(ElementRole::MergeResult, claim.result(), result)?;
@@ -828,7 +842,7 @@ mod tests {
         let derive = CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&target),
-            expected.data(),
+            crate::collection::SourceLocator::of(expected.data().raw),
             Inline::new([0x42; 32]),
         );
         let derive_record = CollectionRecord::Derive(derive);
@@ -963,9 +977,7 @@ mod tests {
             let name: View<str> = reader.get(name_handle).unwrap();
             assert_eq!(&*name, "attached descriptor name");
         }
-        let selectors = BTreeSet::from([CollectionRecordSelector::Collection(
-            collection.handle(),
-        )]);
+        let selectors = BTreeSet::from([CollectionRecordSelector::Collection(collection.handle())]);
         let snapshot = staged.store_mut().snapshot().unwrap();
         assert!(snapshot.select_records(&selectors).unwrap().is_empty());
         drop(snapshot);
@@ -1021,9 +1033,7 @@ mod tests {
             .stage_for(&mut store, collection, &signing_key)
             .unwrap();
         let commit = *staged.commit();
-        let selectors = BTreeSet::from([CollectionRecordSelector::Collection(
-            collection.handle(),
-        )]);
+        let selectors = BTreeSet::from([CollectionRecordSelector::Collection(collection.handle())]);
         let snapshot = staged.store_mut().snapshot().unwrap();
         assert!(snapshot.select_records(&selectors).unwrap().is_empty());
         drop(snapshot);
@@ -1201,20 +1211,20 @@ mod tests {
         let claim = CollectionMerge::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&descriptor),
-            data(&left),
-            data(&right),
+            [data(&left), data(&right)],
             data(&result),
-        );
+        )
+        .unwrap();
         let (low, high) = ordered_inputs(&left, &right);
         validate_merge(&descriptor, &claim, low, high, &result).unwrap();
 
         let wrong_collection = CollectionMerge::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&root("ninth")),
-            data(low),
-            data(high),
+            [data(low), data(high)],
             data(&result),
-        );
+        )
+        .unwrap();
         assert!(matches!(
             validate_merge(&descriptor, &wrong_collection, low, high, &result),
             Err(SimpleArchiveUnionValidationError::WrongCollection { .. })
@@ -1241,10 +1251,10 @@ mod tests {
         let wrong_claim = CollectionMerge::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&descriptor),
-            data(low),
-            data(high),
+            [data(low), data(high)],
             data(&wrong_result),
-        );
+        )
+        .unwrap();
         assert_eq!(
             validate_merge(&descriptor, &wrong_claim, low, high, &wrong_result),
             Err(SimpleArchiveUnionValidationError::WrongMergeResult)
@@ -1254,10 +1264,10 @@ mod tests {
         let invalid_claim = CollectionMerge::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&descriptor),
-            data(low),
-            data(high),
+            [data(low), data(high)],
             data(&invalid_result),
-        );
+        )
+        .unwrap();
         assert_eq!(
             validate_merge(&descriptor, &invalid_claim, low, high, &invalid_result),
             Err(SimpleArchiveUnionValidationError::InvalidElement {
@@ -1313,11 +1323,8 @@ mod tests {
                 prop_assert_eq!(&actual, &expected);
                 let collection = root("first");
                 let claim = CollectionMerge::sign(&ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                    identity_for_tests(&collection),
-                    data(&left),
-                    data(&right),
-                    data(&actual),
-                );
+                    identity_for_tests(&collection), [data(&left), data(&right)],
+                    data(&actual),).unwrap();
                 let (low, high) = ordered_inputs(&left, &right);
                 prop_assert!(validate_merge(&collection, &claim, low, high, &actual).is_ok());
                 prop_assert_eq!(actual, join(&right, &left).unwrap());

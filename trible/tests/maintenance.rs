@@ -879,7 +879,7 @@ fn bm25_search_without_selected_snippets_does_not_load_source_payloads() {
     pile.insert(CollectionRecord::Derive(CollectionDerive::sign(
         &fixture.signer,
         index.handle(),
-        commit.data(),
+        triblespace_core::collection::SourceLocator::of(commit.data().raw),
         Handle::<PortableBM25Blob>::to_hash(output),
     )))
     .unwrap();

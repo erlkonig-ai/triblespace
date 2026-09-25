@@ -154,8 +154,8 @@ mod tests {
     use crate::collection::{
         Collection, CollectionCommit, CollectionData, CollectionDerivation, CollectionDerive,
         CollectionEncoding, CollectionHandle, CollectionMerge, CollectionOperationError,
-        CollectionPolicy, CollectionRead, CollectionRecord,
-        CollectionSnapshotExt, CollectionStore, CollectionStoreExt, Support,
+        CollectionPolicy, CollectionRead, CollectionRecord, CollectionSnapshotExt, CollectionStore,
+        CollectionStoreExt, Support,
     };
     use crate::inline::encodings::hash::Handle;
     use crate::metadata::MetaDescribe;
@@ -412,14 +412,10 @@ mod tests {
             .unwrap();
 
         block_on(store.ensure(raw_collection, &SigningKey::from_bytes(&[7; 32]))).unwrap();
-        let snapshot = block_on(store.ensure(
-            accelerated_collection,
-            &SigningKey::from_bytes(&[7; 32]),
-        ))
-        .unwrap();
-        let attached = snapshot
-            .collection(accelerated_collection)
-            .unwrap();
+        let snapshot =
+            block_on(store.ensure(accelerated_collection, &SigningKey::from_bytes(&[7; 32])))
+                .unwrap();
+        let attached = snapshot.collection(accelerated_collection).unwrap();
         let view: UnionArchive<OrderedUniverse> = attached.view().unwrap();
         assert_eq!(view.iter().count(), 2);
 
@@ -446,7 +442,10 @@ mod tests {
                 CollectionRecord::Derive(derive)
                     if derive.collection() == accelerated_collection.handle() =>
                 {
-                    assert_eq!(derive.input(), raw);
+                    assert_eq!(
+                        derive.input(),
+                        crate::collection::SourceLocator::of(raw.raw)
+                    );
                     Some(derive.output())
                 }
                 _ => None,
@@ -470,11 +469,9 @@ mod tests {
         let first_support = Support::from_data(source_collection, [first.data()]);
 
         block_on(store.ensure(raw_collection, &SigningKey::from_bytes(&[7; 32]))).unwrap();
-        let snapshot = block_on(store.ensure(
-            accelerated_collection,
-            &SigningKey::from_bytes(&[7; 32]),
-        ))
-        .unwrap();
+        let snapshot =
+            block_on(store.ensure(accelerated_collection, &SigningKey::from_bytes(&[7; 32])))
+                .unwrap();
         // The source grows after the target was realized: the attachment
         // reports what the target stands on in its snapshot, not what the
         // source admits now.
@@ -490,11 +487,9 @@ mod tests {
         assert_eq!(observed.support().unwrap(), &first_support);
 
         block_on(store.ensure(raw_collection, &SigningKey::from_bytes(&[7; 32]))).unwrap();
-        let snapshot = block_on(store.ensure(
-            accelerated_collection,
-            &SigningKey::from_bytes(&[7; 32]),
-        ))
-        .unwrap();
+        let snapshot =
+            block_on(store.ensure(accelerated_collection, &SigningKey::from_bytes(&[7; 32])))
+                .unwrap();
         let observed = snapshot.collection(accelerated_collection).unwrap();
         assert_eq!(observed.support().unwrap(), &full_support);
         let view: UnionArchive<OrderedUniverse> = observed.view().unwrap();
@@ -515,11 +510,9 @@ mod tests {
 
         // The accelerated target stands for what the raw frontier stands on;
         // with no raw member realized that is nothing, and nothing is built.
-        let before_raw = block_on(store.ensure(
-            accelerated_collection,
-            &SigningKey::from_bytes(&[7; 32]),
-        ))
-        .unwrap();
+        let before_raw =
+            block_on(store.ensure(accelerated_collection, &SigningKey::from_bytes(&[7; 32])))
+                .unwrap();
         assert!(before_raw
             .collection(accelerated_collection)
             .unwrap()
@@ -538,14 +531,10 @@ mod tests {
             )));
 
         block_on(store.ensure(raw_collection, &SigningKey::from_bytes(&[7; 32]))).unwrap();
-        let snapshot = block_on(store.ensure(
-            accelerated_collection,
-            &SigningKey::from_bytes(&[7; 32]),
-        ))
-        .unwrap();
-        let attached = snapshot
-            .collection(accelerated_collection)
-            .unwrap();
+        let snapshot =
+            block_on(store.ensure(accelerated_collection, &SigningKey::from_bytes(&[7; 32])))
+                .unwrap();
+        let attached = snapshot.collection(accelerated_collection).unwrap();
         let view: UnionArchive<OrderedUniverse> = attached.view().unwrap();
         assert_eq!(view.iter().count(), 1);
     }
@@ -589,7 +578,7 @@ mod tests {
                 CollectionRecord::Derive(CollectionDerive::sign(
                     &SigningKey::from_bytes(&[7; 32]),
                     raw_collection.handle(),
-                    input,
+                    crate::collection::SourceLocator::of(input.raw),
                     output,
                 ))
             })
@@ -597,28 +586,28 @@ mod tests {
         for record in &raw_records {
             store.insert(*record).unwrap();
         }
-        let merged = CollectionRecord::Merge(CollectionMerge::sign(
-            &SigningKey::from_bytes(&[7; 32]),
-            raw_collection.handle(),
-            a_data,
-            b_data,
-            c_data,
-        ));
+        let merged = CollectionRecord::Merge(
+            CollectionMerge::sign(
+                &SigningKey::from_bytes(&[7; 32]),
+                raw_collection.handle(),
+                [a_data, b_data],
+                c_data,
+            )
+            .unwrap(),
+        );
         store.insert(merged).unwrap();
         store
             .insert(CollectionRecord::Derive(CollectionDerive::sign(
                 &SigningKey::from_bytes(&[7; 32]),
                 accelerated_collection.handle(),
-                c_data,
+                crate::collection::SourceLocator::of(c_data.raw),
                 fc_data,
             )))
             .unwrap();
 
         let support = Support::from_data(source_collection, [source_a_data, source_b_data]);
         let snapshot = store.snapshot().unwrap();
-        let attached = snapshot
-            .collection(accelerated_collection)
-            .unwrap();
+        let attached = snapshot.collection(accelerated_collection).unwrap();
 
         assert_eq!(attached.support().unwrap(), &support);
         assert_eq!(

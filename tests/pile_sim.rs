@@ -179,15 +179,18 @@ proptest! {
                                 piles[actor].insert(record).unwrap();
                                 expected_records.insert(record.fingerprint(), record);
                             }
-                            let record = CollectionRecord::Merge(CollectionMerge::sign(
+                            // A merge joins distinct payloads; indices that
+                            // name one payload twice make no merge.
+                            if let Ok(merge) = CollectionMerge::sign(
                                 &signing_key,
                                 collection,
-                                left.data(),
-                                right.data(),
+                                [left.data(), right.data()],
                                 at(result).into(),
-                            ));
-                            piles[actor].insert(record).unwrap();
-                            expected_records.insert(record.fingerprint(), record);
+                            ) {
+                                let record = CollectionRecord::Merge(merge);
+                                piles[actor].insert(record).unwrap();
+                                expected_records.insert(record.fingerprint(), record);
+                            }
                         }
                     }
                     Op::CollectionList => {

@@ -285,7 +285,8 @@ where
                 .expect("authored PATCH key must retain its record");
             // Anything the control view selected by these routes is already
             // in `selected`, so a duplicate can only be among those.
-            if selectors_match_record(selectors, record) && !selected[..control_len].contains(&record)
+            if selectors_match_record(selectors, record)
+                && !selected[..control_len].contains(&record)
             {
                 selected.push(record);
             }
@@ -356,7 +357,7 @@ mod tests {
         CollectionRecord::Derive(CollectionDerive::sign(
             &key,
             Inline::<Handle<SimpleArchive>>::new([1; 32]),
-            Inline::new([byte; 32]),
+            crate::collection::SourceLocator::of([byte; 32]),
             Inline::new([byte.wrapping_add(1); 32]),
         ))
     }
@@ -445,9 +446,11 @@ mod tests {
             store.insert(*record).unwrap();
         }
         let control = store.snapshot().unwrap();
-        let selectors = BTreeSet::from([CollectionRecordSelector::Collection(
-            Inline::<Handle<SimpleArchive>>::new([1; 32]),
-        )]);
+        let selectors = BTreeSet::from([CollectionRecordSelector::Collection(Inline::<
+            Handle<SimpleArchive>,
+        >::new(
+            [1; 32]
+        ))]);
 
         let warm = OperationFrontier::new(control.clone()).view(control.clone());
         assert_eq!(warm.select_records(&selectors).unwrap().len(), 64);

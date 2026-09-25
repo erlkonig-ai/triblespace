@@ -76,22 +76,26 @@ fn read_rights_do_not_admit_merges_or_inject_conflicts() {
     let low = Handle::<SimpleArchive>::to_hash(a.get_handle());
     let high = Handle::<SimpleArchive>::to_hash(b.get_handle());
     store
-        .insert(CollectionRecord::Merge(CollectionMerge::sign(
-            &root,
-            collection.handle(),
-            low,
-            high,
-            Handle::<SimpleArchive>::to_hash(c_handle),
-        )))
+        .insert(CollectionRecord::Merge(
+            CollectionMerge::sign(
+                &root,
+                collection.handle(),
+                [low, high],
+                Handle::<SimpleArchive>::to_hash(c_handle),
+            )
+            .unwrap(),
+        ))
         .unwrap();
     store
-        .insert(CollectionRecord::Merge(CollectionMerge::sign(
-            &reader,
-            collection.handle(),
-            low,
-            high,
-            Handle::<SimpleArchive>::to_hash(wrong),
-        )))
+        .insert(CollectionRecord::Merge(
+            CollectionMerge::sign(
+                &reader,
+                collection.handle(),
+                [low, high],
+                Handle::<SimpleArchive>::to_hash(wrong),
+            )
+            .unwrap(),
+        ))
         .unwrap();
 
     let snapshot = store.snapshot().unwrap();
@@ -142,7 +146,7 @@ fn derive_before_write_proof_is_inert_then_admitted_without_reinsertion() {
     let equation = CollectionRecord::Derive(CollectionDerive::sign(
         &producer,
         target.handle(),
-        ca.data(),
+        crate::collection::SourceLocator::of(ca.data().raw),
         Handle::<SuccinctArchiveBlob>::to_hash(output),
     ));
     store.insert(equation).unwrap();
@@ -155,7 +159,7 @@ fn derive_before_write_proof_is_inert_then_admitted_without_reinsertion() {
         .insert(CollectionRecord::Derive(CollectionDerive::sign(
             &source_owner,
             target.handle(),
-            ca.data(),
+            crate::collection::SourceLocator::of(ca.data().raw),
             Handle::<SuccinctArchiveBlob>::to_hash(output),
         )))
         .unwrap();
@@ -227,13 +231,15 @@ fn equation_admission_uses_frozen_proof_evidence() {
         .put::<SimpleArchive, _>(simplearchive_union::join(&a, &b).unwrap())
         .unwrap();
     store
-        .insert(CollectionRecord::Merge(CollectionMerge::sign(
-            &producer,
-            collection.handle(),
-            ca.data(),
-            cb.data(),
-            Handle::<SimpleArchive>::to_hash(joined),
-        )))
+        .insert(CollectionRecord::Merge(
+            CollectionMerge::sign(
+                &producer,
+                collection.handle(),
+                [ca.data(), cb.data()],
+                Handle::<SimpleArchive>::to_hash(joined),
+            )
+            .unwrap(),
+        ))
         .unwrap();
     let before = store.snapshot().unwrap();
     store
@@ -309,7 +315,7 @@ fn target_stands_for_nothing_until_its_source_input_is_admitted() {
         .insert(CollectionRecord::Derive(CollectionDerive::sign(
             &target_owner,
             target.handle(),
-            input_data,
+            crate::collection::SourceLocator::of(input_data.raw),
             Handle::<SuccinctArchiveBlob>::to_hash(output),
         )))
         .unwrap();
@@ -393,7 +399,7 @@ fn indexed_reads_do_not_replace_absent_target_outputs_with_source_members() {
     let b_record = CollectionRecord::Derive(CollectionDerive::sign(
         &owner,
         succinct.handle(),
-        ca.data(),
+        crate::collection::SourceLocator::of(ca.data().raw),
         b_data,
     ));
     store.insert(b_record).unwrap();
@@ -406,7 +412,7 @@ fn indexed_reads_do_not_replace_absent_target_outputs_with_source_members() {
         .insert(CollectionRecord::Derive(CollectionDerive::sign(
             &owner,
             rank9.handle(),
-            b_data,
+            crate::collection::SourceLocator::of(b_data.raw),
             r_data,
         )))
         .unwrap();

@@ -108,17 +108,13 @@ fn equations() -> [CollectionRecord; 3] {
     let a = CollectionCommit::sign(&signer, collection.handle(), low, low_handle);
     [
         CollectionRecord::Commit(a),
-        CollectionRecord::Merge(CollectionMerge::sign(
-            &signer,
-            collection.handle(),
-            low,
-            high,
-            high,
-        )),
+        CollectionRecord::Merge(
+            CollectionMerge::sign(&signer, collection.handle(), [low, high], high).unwrap(),
+        ),
         CollectionRecord::Derive(CollectionDerive::sign(
             &signer,
             collection.handle(),
-            low,
+            triblespace_core::collection::SourceLocator::of(low.raw),
             high,
         )),
     ]

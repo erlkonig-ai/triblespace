@@ -43,15 +43,16 @@ fn only_believed_alternative_equations_change_an_endorsed_results_support() {
     let c = Handle::<SimpleArchive>::to_hash(store.put::<SimpleArchive, _>(c).unwrap());
     let t =
         Handle::<SuccinctArchiveBlob>::to_hash(store.put::<SuccinctArchiveBlob, _>(raw).unwrap());
-    let merged = CollectionRecord::Merge(CollectionMerge::sign(
-        &owner,
-        source.handle(),
-        ca.data(),
-        cb.data(),
-        c,
-    ));
+    let merged = CollectionRecord::Merge(
+        CollectionMerge::sign(&owner, source.handle(), [ca.data(), cb.data()], c).unwrap(),
+    );
     store.insert(merged).unwrap();
-    let selected = CollectionDerive::sign(&owner, target.handle(), c, t);
+    let selected = CollectionDerive::sign(
+        &owner,
+        target.handle(),
+        triblespace_core::collection::SourceLocator::of(c.raw),
+        t,
+    );
     store.insert(CollectionRecord::Derive(selected)).unwrap();
 
     let observe = |store: &mut MemoryRepo| {
@@ -80,13 +81,9 @@ fn only_believed_alternative_equations_change_an_endorsed_results_support() {
     // absorption claims `c` already contains `z`. Signed by a key with no
     // source WRITE it is not believed, so nothing downstream moves.
     let absorb = |signer: &SigningKey| {
-        CollectionRecord::Merge(CollectionMerge::sign(
-            signer,
-            source.handle(),
-            c,
-            cz.data(),
-            c,
-        ))
+        CollectionRecord::Merge(
+            CollectionMerge::sign(signer, source.handle(), [c, cz.data()], c).unwrap(),
+        )
     };
     store.insert(absorb(&unrelated)).unwrap();
     assert_eq!(observe(&mut store), original);

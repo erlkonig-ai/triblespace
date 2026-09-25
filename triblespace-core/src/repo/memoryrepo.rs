@@ -246,13 +246,11 @@ impl CapabilityProofStore for MemoryStore {
 }
 
 impl crate::collection::covered::RecordDelta for MemoryStoreSnapshot {
-    fn for_each_record_since(
-        &self,
-        since: Option<&Self>,
-        each: &mut dyn FnMut(&CollectionRecord),
-    ) {
+    fn for_each_record_since(&self, since: Option<&Self>, each: &mut dyn FnMut(&CollectionRecord)) {
         let fresh = match since {
-            Some(since) => self.collection_records.difference(&since.collection_records),
+            Some(since) => self
+                .collection_records
+                .difference(&since.collection_records),
             None => self.collection_records.clone(),
         };
         for key in fresh.iter_ordered() {
@@ -609,17 +607,19 @@ mod tests {
     fn collection_records_are_idempotent_and_fingerprint_ordered() {
         let descriptor = named_for_tests("merged", Id::new([2; 16]).unwrap());
         let target = named_for_tests("derived", Id::new([8; 16]).unwrap());
-        let merge = CollectionRecord::Merge(CollectionMerge::sign(
-            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-            identity_for_tests(&descriptor),
-            Inline::new([4; 32]),
-            Inline::new([5; 32]),
-            Inline::new([6; 32]),
-        ));
+        let merge = CollectionRecord::Merge(
+            CollectionMerge::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                identity_for_tests(&descriptor),
+                [Inline::new([4; 32]), Inline::new([5; 32])],
+                Inline::new([6; 32]),
+            )
+            .unwrap(),
+        );
         let derive = CollectionRecord::Derive(CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             identity_for_tests(&target),
-            Inline::new([10; 32]),
+            crate::collection::SourceLocator::of([10; 32]),
             Inline::new([11; 32]),
         ));
         let mut expected = vec![derive, merge];
@@ -659,13 +659,13 @@ mod tests {
         let expected = CollectionRecord::Derive(CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             target,
-            Inline::new([14; 32]),
+            crate::collection::SourceLocator::of([14; 32]),
             Inline::new([15; 32]),
         ));
         let mismatched = CollectionRecord::Derive(CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             target,
-            Inline::new([16; 32]),
+            crate::collection::SourceLocator::of([16; 32]),
             Inline::new([17; 32]),
         ));
         let fingerprint = expected.fingerprint();
@@ -690,36 +690,38 @@ mod tests {
         let source = identity_for_tests(&named_for_tests("source", Id::new([22; 16]).unwrap()));
         let target = identity_for_tests(&named_for_tests("target", Id::new([25; 16]).unwrap()));
         let other = identity_for_tests(&named_for_tests("other", Id::new([28; 16]).unwrap()));
-        let input = Inline::new([30; 32]);
-        let merge = CollectionRecord::Merge(CollectionMerge::sign(
-            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-            source,
-            Inline::new([31; 32]),
-            Inline::new([32; 32]),
-            Inline::new([33; 32]),
-        ));
+        let input = [30u8; 32];
+        let merge = CollectionRecord::Merge(
+            CollectionMerge::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                source,
+                [Inline::new([31; 32]), Inline::new([32; 32])],
+                Inline::new([33; 32]),
+            )
+            .unwrap(),
+        );
         let first = CollectionRecord::Derive(CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             target,
-            input,
+            crate::collection::SourceLocator::of(input),
             Inline::new([34; 32]),
         ));
         let conflicting = CollectionRecord::Derive(CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             target,
-            input,
+            crate::collection::SourceLocator::of(input),
             Inline::new([35; 32]),
         ));
         let sibling = CollectionRecord::Derive(CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             target,
-            Inline::new([36; 32]),
+            crate::collection::SourceLocator::of([36; 32]),
             Inline::new([37; 32]),
         ));
         let unrelated = CollectionRecord::Derive(CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             other,
-            input,
+            crate::collection::SourceLocator::of(input),
             Inline::new([38; 32]),
         ));
         let mut repo = MemoryRepo::default();
@@ -808,22 +810,27 @@ mod tests {
             .put::<UnknownBlob, _>(Bytes::from_source(b"orphan".to_vec()))
             .unwrap();
 
-        repo.insert(CollectionRecord::Merge(CollectionMerge::sign(
-            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-            descriptor.transmute(),
-            Inline::new(merge_input.raw),
-            Inline::new([0xff; 32]),
-            Inline::new(merge_output.raw),
-        )))
+        repo.insert(CollectionRecord::Merge(
+            CollectionMerge::sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                descriptor.transmute(),
+                [Inline::new(merge_input.raw), Inline::new([0xff; 32])],
+                Inline::new(merge_output.raw),
+            )
+            .unwrap(),
+        ))
         .unwrap();
         repo.want(WantRequest::blob(wanted_input)).unwrap();
 
         repo.keep(std::iter::empty::<Inline<Handle<UnknownBlob>>>());
 
         let reader = repo.snapshot().unwrap();
-        for retained in [child, merge_input, merge_output, descriptor, wanted_input] {
+        for retained in [child, merge_input, merge_output, wanted_input] {
             assert!(reader.get::<Blob<UnknownBlob>, _>(retained).is_ok());
         }
+        // A lattice-v2 MERGE owns its result and inputs, not its collection's
+        // descriptor.
+        assert!(reader.get::<Blob<UnknownBlob>, _>(descriptor).is_err());
         assert!(reader.get::<Blob<UnknownBlob>, _>(orphan).is_err());
     }
 
@@ -901,7 +908,7 @@ mod tests {
         repo.insert(CollectionRecord::Derive(CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             target,
-            handle(73).into(),
+            crate::collection::SourceLocator::of(handle(73).raw),
             handle(74).into(),
         )))
         .unwrap();
@@ -945,7 +952,7 @@ mod tests {
         let record = CollectionRecord::Derive(CollectionDerive::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             target,
-            handle(82).into(),
+            crate::collection::SourceLocator::of(handle(82).raw),
             handle(83).into(),
         ));
         repo.insert(record).unwrap();

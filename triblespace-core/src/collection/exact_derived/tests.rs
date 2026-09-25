@@ -780,13 +780,14 @@ fn two_hops_reuse_one_invariant_foundational_support() {
     publish_root(&mut store, root, &source, 31);
     let support = support(root, std::slice::from_ref(&source));
 
-    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer())
-        .unwrap();
-    ensure_resident::<_, SecondEncoding>(&mut store, second, &equation_signer())
-        .unwrap();
+    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer()).unwrap();
+    ensure_resident::<_, SecondEncoding>(&mut store, second, &equation_signer()).unwrap();
     let snapshot = store.snapshot().unwrap();
     let attached = snapshot.collection(second).unwrap();
-    let (observed_support, cover) = (attached.support().unwrap().clone(), attached.cover().clone());
+    let (observed_support, cover) = (
+        attached.support().unwrap().clone(),
+        attached.cover().clone(),
+    );
 
     assert_eq!(observed_support, support);
     assert_eq!(cover.len(), 1);
@@ -802,7 +803,10 @@ fn two_hops_reuse_one_invariant_foundational_support() {
             _ => None,
         })
         .unwrap();
-    assert_ne!(second_derive.input(), data(&source));
+    assert_ne!(
+        second_derive.input(),
+        crate::collection::SourceLocator::of(data(&source).raw)
+    );
 }
 
 #[test]
@@ -812,8 +816,7 @@ fn ordinary_attachment_reports_only_support_realized_in_its_snapshot() {
     let right = archive(2, 2);
     publish_root(&mut store, root, &left, 1);
     let left_support = support(root, std::slice::from_ref(&left));
-    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer())
-        .unwrap();
+    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer()).unwrap();
     // The source grows after the target was realized: an attachment reports
     // what the target stands on in its snapshot, not what the source admits.
     publish_root(&mut store, root, &right, 2);
@@ -854,8 +857,7 @@ fn ensure_drops_every_residency_snapshot_and_stores_the_blob_before_derive() {
     publish_root(&mut inner, root, &source, 31);
     let mut store = GuardStore::new(inner);
 
-    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer())
-        .unwrap();
+    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer()).unwrap();
 
     assert_eq!(store.live.load(Ordering::SeqCst), 0);
     let (insert_position, derive) = store
@@ -946,7 +948,7 @@ fn exact_ensure_fetches_a_known_derive_output_without_recomputing() {
     let pending = CollectionRecord::Derive(CollectionDerive::sign(
         &equation_signer(),
         first.handle(),
-        data(&source),
+        crate::collection::SourceLocator::of(data(&source).raw),
         output_data,
     ));
     inner.insert(pending).unwrap();
@@ -986,20 +988,14 @@ fn ensure_reuses_a_resident_image_without_mapping() {
         data(&crate::collection::simplearchive_union::join(&a, &b).unwrap()),
         data(&b),
     );
-    let ab = CollectionMerge::sign(
-        &signer,
-        root.handle(),
-        data(&a),
-        data(&b),
-        data(&b),
-    );
+    let ab = CollectionMerge::sign(&signer, root.handle(), [data(&a), data(&b)], data(&b)).unwrap();
     inner.insert(CollectionRecord::Merge(ab)).unwrap();
     let output = FirstEncoding::map(&(), &b, &inner.snapshot().unwrap()).unwrap();
     inner.put::<FirstEncoding, _>(output.clone()).unwrap();
     let previous = CollectionDerive::sign(
         &signer,
         first.handle(),
-        data(&b),
+        crate::collection::SourceLocator::of(data(&b).raw),
         data(&output),
     );
     inner.insert(CollectionRecord::Derive(previous)).unwrap();
@@ -1057,7 +1053,7 @@ fn passive_derived_snapshot_keeps_dangling_output_as_raw_evidence_only() {
     let pending = CollectionRecord::Derive(CollectionDerive::sign(
         &equation_signer(),
         first.handle(),
-        data(&source),
+        crate::collection::SourceLocator::of(data(&source).raw),
         data(&output),
     ));
     inner.insert(pending).unwrap();
@@ -1092,7 +1088,7 @@ fn exact_maintenance_recovers_a_pending_derive_with_a_missing_output() {
     let pending = CollectionDerive::sign(
         &equation_signer(),
         first.handle(),
-        data(&source),
+        crate::collection::SourceLocator::of(data(&source).raw),
         output_data,
     );
     inner.insert(CollectionRecord::Derive(pending)).unwrap();
@@ -1109,7 +1105,10 @@ fn exact_maintenance_recovers_a_pending_derive_with_a_missing_output() {
         .unwrap()
         .is_some());
     let attached = snapshot.collection(first).unwrap();
-    let (observed, cover) = (attached.support().unwrap().clone(), attached.cover().clone());
+    let (observed, cover) = (
+        attached.support().unwrap().clone(),
+        attached.cover().clone(),
+    );
     assert_eq!(observed, support);
     assert_eq!(cover.data_members().collect::<Vec<_>>(), vec![output_data]);
     drop(snapshot);
@@ -1320,13 +1319,15 @@ fn root_ensure_reuses_a_signed_union_without_fetching_ancestor_bytes() {
     let joined = crate::collection::simplearchive_union::join(&left, &right).unwrap();
     inner.put::<SimpleArchive, _>(joined.clone()).unwrap();
     inner
-        .insert(CollectionRecord::Merge(CollectionMerge::sign(
-            &equation_signer(),
-            root.handle(),
-            data(&left),
-            data(&right),
-            data(&joined),
-        )))
+        .insert(CollectionRecord::Merge(
+            CollectionMerge::sign(
+                &equation_signer(),
+                root.handle(),
+                [data(&left), data(&right)],
+                data(&joined),
+            )
+            .unwrap(),
+        ))
         .unwrap();
     let mut store = GuardStore::new(inner);
     for blob in [&left, &right, &metadata] {
@@ -1361,14 +1362,7 @@ fn root_maintenance_only_merges_and_warm_ensure_is_write_free() {
     let mut store = GuardStore::new(inner);
 
     let maintained = block_on(store.maintain(root, &equation_signer())).unwrap();
-    assert_eq!(
-        maintained
-            .collection(root)
-            .unwrap()
-            .cover()
-            .len(),
-        1
-    );
+    assert_eq!(maintained.collection(root).unwrap().cover().len(), 1);
     assert!(store
         .events
         .iter()
@@ -1680,14 +1674,11 @@ fn maintenance_drops_every_residency_snapshot_and_stores_the_blob_before_merge()
     for blob in [&left, &right] {
         publish_root(&mut inner, root, blob, 31);
     }
-    ensure_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer())
-        .unwrap();
-    ensure_resident::<_, SecondEncoding>(&mut inner, second, &equation_signer())
-        .unwrap();
+    ensure_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer()).unwrap();
+    ensure_resident::<_, SecondEncoding>(&mut inner, second, &equation_signer()).unwrap();
     let mut store = GuardStore::new(inner);
 
-    maintain_resident::<_, SecondEncoding>(&mut store, second, &equation_signer())
-        .unwrap();
+    maintain_resident::<_, SecondEncoding>(&mut store, second, &equation_signer()).unwrap();
 
     assert_eq!(store.live.load(Ordering::SeqCst), 0);
     let (insert_position, merge) = store
@@ -1723,14 +1714,11 @@ fn target_maintenance_never_enumerates_records() {
     for member in &members {
         publish_root(&mut inner, root, member, 31);
     }
-    ensure_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer())
-        .unwrap();
-    ensure_resident::<_, SecondEncoding>(&mut inner, second, &equation_signer())
-        .unwrap();
+    ensure_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer()).unwrap();
+    ensure_resident::<_, SecondEncoding>(&mut inner, second, &equation_signer()).unwrap();
 
     let mut store = GuardStore::new(inner);
-    maintain_resident::<_, SecondEncoding>(&mut store, second, &equation_signer())
-        .unwrap();
+    maintain_resident::<_, SecondEncoding>(&mut store, second, &equation_signer()).unwrap();
 
     let merges = store
         .events
@@ -1746,7 +1734,10 @@ fn target_maintenance_never_enumerates_records() {
 
     let snapshot = store.inner.snapshot().unwrap();
     let attached = snapshot.collection(second).unwrap();
-    let (_, cover) = (attached.support().unwrap().clone(), attached.cover().clone());
+    let (_, cover) = (
+        attached.support().unwrap().clone(),
+        attached.cover().clone(),
+    );
     assert_eq!(cover.len(), 1);
 }
 
@@ -1758,10 +1749,8 @@ fn failed_target_batch_preserves_every_published_prefix_carry() {
         for member in &members {
             publish_root(&mut inner, root, member, 31);
         }
-        ensure_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer())
-            .unwrap();
-        ensure_resident::<_, SecondEncoding>(&mut inner, second, &equation_signer())
-        .unwrap();
+        ensure_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer()).unwrap();
+        ensure_resident::<_, SecondEncoding>(&mut inner, second, &equation_signer()).unwrap();
 
         let mut store = GuardStore::new(inner);
         if fail_insert {
@@ -1823,8 +1812,7 @@ fn missing_mapping_dependency_publishes_nothing() {
     let before = store.snapshot().unwrap();
     FIRST_MAP_MISSING.set(true);
 
-    let result =
-        ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer());
+    let result = ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer());
     FIRST_MAP_MISSING.set(false);
 
     assert!(matches!(
@@ -1849,19 +1837,20 @@ fn capacity_blocked_source_upper_falls_back_to_its_resident_children() {
     let right_witness = data(&right);
     drop(before);
     store
-        .insert(CollectionRecord::Merge(CollectionMerge::sign(
-            &equation_signer(),
-            root.handle(),
-            left_witness,
-            right_witness,
-            data(&joined),
-        )))
+        .insert(CollectionRecord::Merge(
+            CollectionMerge::sign(
+                &equation_signer(),
+                root.handle(),
+                [left_witness, right_witness],
+                data(&joined),
+            )
+            .unwrap(),
+        ))
         .unwrap();
     reset_mapping_calls();
     FIRST_MAP_CAPACITY.replace(Some(data(&joined)));
 
-    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer())
-        .unwrap();
+    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer()).unwrap();
     FIRST_MAP_CAPACITY.replace(None);
 
     assert_eq!(FIRST_MAP_CALLS.get(), 3);
@@ -1876,7 +1865,10 @@ fn capacity_blocked_source_upper_falls_back_to_its_resident_children() {
         .collect();
     assert_eq!(
         inputs,
-        std::collections::BTreeSet::from([data(&left), data(&right)])
+        std::collections::BTreeSet::from([
+            crate::collection::SourceLocator::of(data(&left).raw),
+            crate::collection::SourceLocator::of(data(&right).raw),
+        ])
     );
 }
 
@@ -1885,13 +1877,11 @@ fn warm_exact_ensure_is_a_zero_write_zero_algebra_observation() {
     let (mut store, root, first, _second) = collections();
     let source = archive(1, 1);
     publish_root(&mut store, root, &source, 31);
-    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer())
-        .unwrap();
+    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer()).unwrap();
 
     reset_mapping_calls();
     let before = store.snapshot().unwrap();
-    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer())
-        .unwrap();
+    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer()).unwrap();
     let after = store.snapshot().unwrap();
     assert!(after.changes_since(&before).is_empty());
     assert_eq!(FIRST_MAP_CALLS.get(), 0);
@@ -2134,14 +2124,7 @@ fn complete_realization_is_reused_without_write_authority() {
             block_on(store.ensure(target, &reader))
         }
         .unwrap();
-        assert_eq!(
-            snapshot
-                .collection(target)
-                .unwrap()
-                .cover()
-                .len(),
-            1
-        );
+        assert_eq!(snapshot.collection(target).unwrap().cover().len(), 1);
     }
     assert!(store.events.is_empty());
     assert!(store.acquired.is_empty());
@@ -2214,26 +2197,21 @@ fn optional_maintenance_without_write_keeps_the_fine_cover_without_algebra() {
     let right_witness = data(&right);
     drop(before);
     inner
-        .insert(CollectionRecord::Merge(CollectionMerge::sign(
-            &owner,
-            root.handle(),
-            left_witness,
-            right_witness,
-            data(&upper),
-        )))
+        .insert(CollectionRecord::Merge(
+            CollectionMerge::sign(
+                &owner,
+                root.handle(),
+                [left_witness, right_witness],
+                data(&upper),
+            )
+            .unwrap(),
+        ))
         .unwrap();
     let mut store = GuardStore::new(inner);
     reset_mapping_calls();
 
     let snapshot = block_on(store.maintain(first, &reader)).unwrap();
-    assert_eq!(
-        snapshot
-            .collection(first)
-            .unwrap()
-            .cover()
-            .len(),
-        2
-    );
+    assert_eq!(snapshot.collection(first).unwrap().cover().len(), 2);
     drop(snapshot);
     assert!(store.events.is_empty());
     assert_eq!(FIRST_MAP_CALLS.get(), 0);
@@ -2244,14 +2222,7 @@ fn optional_maintenance_without_write_keeps_the_fine_cover_without_algebra() {
     store.events.clear();
     reset_mapping_calls();
     let snapshot = block_on(store.maintain(second, &reader)).unwrap();
-    assert_eq!(
-        snapshot
-            .collection(second)
-            .unwrap()
-            .cover()
-            .len(),
-        2
-    );
+    assert_eq!(snapshot.collection(second).unwrap().cover().len(), 2);
     assert!(store.events.is_empty());
     assert!(store.acquired.is_empty());
     assert_eq!(SECOND_MAP_CALLS.get(), 0);
@@ -2264,13 +2235,11 @@ fn existing_target_support_is_not_mapped_again_when_support_grows() {
     let left = archive(1, 1);
     let right = archive(2, 2);
     publish_root(&mut store, root, &left, 31);
-    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer())
-        .unwrap();
+    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer()).unwrap();
 
     reset_mapping_calls();
     publish_root(&mut store, root, &right, 31);
-    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer())
-        .unwrap();
+    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer()).unwrap();
     assert_eq!(FIRST_MAP_CALLS.get(), 1);
 }
 
@@ -2282,12 +2251,14 @@ fn resident_source_upper_is_mapped_instead_of_its_finer_children() {
     for blob in [&left, &right] {
         publish_root(&mut store, root, blob, 31);
     }
-    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer())
-        .unwrap();
+    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer()).unwrap();
 
     let snapshot = store.snapshot().unwrap();
     let attached = snapshot.collection(first).unwrap();
-    let (_, first_cover) = (attached.support().unwrap().clone(), attached.cover().clone());
+    let (_, first_cover) = (
+        attached.support().unwrap().clone(),
+        attached.cover().clone(),
+    );
     let mut children = first_cover.members().map(|handle| {
         snapshot
             .get::<Blob<FirstEncoding>, FirstEncoding>(handle)
@@ -2301,23 +2272,25 @@ fn resident_source_upper_is_mapped_instead_of_its_finer_children() {
     let upper = join_first(&low, &high).unwrap();
     store.put::<FirstEncoding, _>(upper.clone()).unwrap();
     store
-        .insert(CollectionRecord::Merge(CollectionMerge::sign(
-            &equation_signer(),
-            first.handle(),
-            low_witness,
-            high_witness,
-            data(&upper),
-        )))
+        .insert(CollectionRecord::Merge(
+            CollectionMerge::sign(
+                &equation_signer(),
+                first.handle(),
+                [low_witness, high_witness],
+                data(&upper),
+            )
+            .unwrap(),
+        ))
         .unwrap();
 
     reset_mapping_calls();
-    ensure_resident::<_, SecondEncoding>(&mut store, second, &equation_signer())
-        .unwrap();
+    ensure_resident::<_, SecondEncoding>(&mut store, second, &equation_signer()).unwrap();
     assert_eq!(SECOND_MAP_CALLS.get(), 1);
     assert!(records(&mut store).iter().any(|record| matches!(
         record,
         CollectionRecord::Derive(derive)
-            if derive.collection() == second.handle() && derive.input() == data(&upper)
+            if derive.collection() == second.handle()
+                && derive.input() == crate::collection::SourceLocator::of(data(&upper).raw)
     )));
 }
 
@@ -2330,16 +2303,17 @@ fn optional_target_dependency_keeps_the_finer_cover() {
         publish_root(&mut store, root, blob, 31);
     }
 
-    maintain_resident::<_, FirstEncoding>(&mut store, first, &equation_signer())
-        .unwrap();
+    maintain_resident::<_, FirstEncoding>(&mut store, first, &equation_signer()).unwrap();
     let snapshot = store.snapshot().unwrap();
     let attached = snapshot.collection(first).unwrap();
-    let (_, cover) = (attached.support().unwrap().clone(), attached.cover().clone());
+    let (_, cover) = (
+        attached.support().unwrap().clone(),
+        attached.cover().clone(),
+    );
     assert_eq!(cover.len(), 2);
     drop(snapshot);
     let first_result = store.snapshot().unwrap();
-    maintain_resident::<_, FirstEncoding>(&mut store, first, &equation_signer())
-        .unwrap();
+    maintain_resident::<_, FirstEncoding>(&mut store, first, &equation_signer()).unwrap();
     assert!(store
         .snapshot()
         .unwrap()
@@ -2358,8 +2332,7 @@ fn source_guidance_maps_only_the_resident_coarsest_upper_and_repeats_without_wor
     for member in &members {
         publish_root(&mut inner, root, member, 31);
     }
-    ensure_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer())
-        .unwrap();
+    ensure_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer()).unwrap();
     let mut store = GuardStore::new(inner);
 
     reset_mapping_calls();
@@ -2390,25 +2363,20 @@ fn source_guidance_maps_only_the_resident_coarsest_upper_and_repeats_without_wor
         drop(before);
         store
             .inner
-            .insert(CollectionRecord::Merge(CollectionMerge::sign(
-                &equation_signer(),
-                root.handle(),
-                low_witness,
-                high_witness,
-                data(result),
-            )))
+            .insert(CollectionRecord::Merge(
+                CollectionMerge::sign(
+                    &equation_signer(),
+                    root.handle(),
+                    [low_witness, high_witness],
+                    data(result),
+                )
+                .unwrap(),
+            ))
             .unwrap();
     }
 
     let after = block_on(store.maintain(first, &equation_signer())).unwrap();
-    assert_eq!(
-        after
-            .collection(first)
-            .unwrap()
-            .cover()
-            .len(),
-        1
-    );
+    assert_eq!(after.collection(first).unwrap().cover().len(), 1);
     drop(after);
     assert_eq!(
         FIRST_MAP_CALLS.get(),
@@ -2418,11 +2386,16 @@ fn source_guidance_maps_only_the_resident_coarsest_upper_and_repeats_without_wor
     // One target blob and one target DERIVE; then the three images the new
     // one covers are consumed, each by a MERGE whose result is the new
     // image, so they leave the frontier for good. No join runs for that.
-    assert_eq!(store.events.len(), 5, "one blob, one DERIVE, three consuming MERGEs");
+    assert_eq!(
+        store.events.len(),
+        5,
+        "one blob, one DERIVE, three consuming MERGEs"
+    );
     assert!(matches!(store.events[0], WriteEvent::Put(_)));
     assert!(
         matches!(store.events[1], WriteEvent::Insert(CollectionRecord::Derive(derive))
-        if derive.collection() == first.handle() && derive.input() == data(&upper))
+        if derive.collection() == first.handle()
+            && derive.input() == crate::collection::SourceLocator::of(data(&upper).raw))
     );
     let image = match store.events[1] {
         WriteEvent::Insert(CollectionRecord::Derive(derive)) => derive.output(),
@@ -2454,14 +2427,15 @@ fn target_maintenance_publishes_only_horizontal_target_merges() {
     for blob in [&left, &right] {
         publish_root(&mut store, root, blob, 31);
     }
-    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer())
-        .unwrap();
-    maintain_resident::<_, SecondEncoding>(&mut store, second, &equation_signer())
-        .unwrap();
+    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer()).unwrap();
+    maintain_resident::<_, SecondEncoding>(&mut store, second, &equation_signer()).unwrap();
 
     let snapshot = store.snapshot().unwrap();
     let attached = snapshot.collection(second).unwrap();
-    let (_, cover) = (attached.support().unwrap().clone(), attached.cover().clone());
+    let (_, cover) = (
+        attached.support().unwrap().clone(),
+        attached.cover().clone(),
+    );
     assert_eq!(cover.len(), 1);
     let all = records(&mut store);
     assert!(all.iter().any(|record| matches!(
@@ -2484,13 +2458,7 @@ fn target_maintenance_reendorses_a_resident_upper_without_joining_again() {
     let _a_commit = publish_root(&mut inner, root, &a, 31);
     let _b_commit = publish_root(&mut inner, root, &b, 31);
     let _c_commit = publish_root(&mut inner, root, &c, 31);
-    let ab = CollectionMerge::sign(
-        &signer,
-        root.handle(),
-        data(&a),
-        data(&b),
-        data(&b),
-    );
+    let ab = CollectionMerge::sign(&signer, root.handle(), [data(&a), data(&b)], data(&b)).unwrap();
     inner.insert(CollectionRecord::Merge(ab)).unwrap();
     let snapshot = inner.snapshot().unwrap();
     let first_b = FirstEncoding::map(&(), &b, &snapshot).unwrap();
@@ -2501,19 +2469,19 @@ fn target_maintenance_reendorses_a_resident_upper_without_joining_again() {
     let first_b_record = CollectionDerive::sign(
         &signer,
         first.handle(),
-        data(&b),
+        crate::collection::SourceLocator::of(data(&b).raw),
         data(&first_b),
     );
     let first_ab_record = CollectionDerive::sign(
         &signer,
         first.handle(),
-        data(&b),
+        crate::collection::SourceLocator::of(data(&b).raw),
         data(&first_b),
     );
     let first_c_record = CollectionDerive::sign(
         &signer,
         first.handle(),
-        data(&c),
+        crate::collection::SourceLocator::of(data(&c).raw),
         data(&first_c),
     );
     for record in [first_b_record, first_ab_record, first_c_record] {
@@ -2530,31 +2498,26 @@ fn target_maintenance_reendorses_a_resident_upper_without_joining_again() {
     let x_b = CollectionDerive::sign(
         &signer,
         second.handle(),
-        data(&first_b),
+        crate::collection::SourceLocator::of(data(&first_b).raw),
         data(&x),
     );
     let x_ab = CollectionDerive::sign(
         &signer,
         second.handle(),
-        data(&first_b),
+        crate::collection::SourceLocator::of(data(&first_b).raw),
         data(&x),
     );
     let y_c = CollectionDerive::sign(
         &signer,
         second.handle(),
-        data(&first_c),
+        crate::collection::SourceLocator::of(data(&first_c).raw),
         data(&y),
     );
     for record in [x_b, x_ab, y_c] {
         inner.insert(CollectionRecord::Derive(record)).unwrap();
     }
-    let z_bc = CollectionMerge::sign(
-        &signer,
-        second.handle(),
-        data(&x),
-        data(&y),
-        data(&z),
-    );
+    let z_bc =
+        CollectionMerge::sign(&signer, second.handle(), [data(&x), data(&y)], data(&z)).unwrap();
     inner.insert(CollectionRecord::Merge(z_bc)).unwrap();
     // x's row is {a, b}, y's is {c}, and z = join(x, y) carries {a, b, c}
     // outright. Under cited routes z certified only {b, c} and x had to stay
@@ -2617,14 +2580,11 @@ fn target_maintenance_is_deterministic_and_repeatedly_idempotent() {
     for blob in [&left, &right] {
         publish_root(&mut store, root, blob, 31);
     }
-    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer())
-        .unwrap();
-    maintain_resident::<_, SecondEncoding>(&mut store, second, &equation_signer())
-        .unwrap();
+    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer()).unwrap();
+    maintain_resident::<_, SecondEncoding>(&mut store, second, &equation_signer()).unwrap();
     let first_result = store.snapshot().unwrap();
 
-    maintain_resident::<_, SecondEncoding>(&mut store, second, &equation_signer())
-        .unwrap();
+    maintain_resident::<_, SecondEncoding>(&mut store, second, &equation_signer()).unwrap();
     let second_result = store.snapshot().unwrap();
     assert!(second_result.changes_since(&first_result).is_empty());
 }
@@ -2662,13 +2622,15 @@ fn redundant_support_fixture() -> (
         .map(|blob| publish_root(&mut store, collection, blob, 31));
     for (low, high, output) in [(0, 3, b), (1, 2, z)] {
         store
-            .insert(CollectionRecord::Merge(CollectionMerge::sign(
-                &equation_signer(),
-                collection.handle(),
-                commits[low].data(),
-                commits[high].data(),
-                data(output),
-            )))
+            .insert(CollectionRecord::Merge(
+                CollectionMerge::sign(
+                    &equation_signer(),
+                    collection.handle(),
+                    [commits[low].data(), commits[high].data()],
+                    data(output),
+                )
+                .unwrap(),
+            ))
             .unwrap();
     }
     let retained = store
@@ -2736,11 +2698,7 @@ fn target_maintenance_does_not_repeat_a_support_redundant_carry() {
     store.events.clear();
     let after = block_on(store.maintain(collection, &equation_signer())).unwrap();
     assert_eq!(
-        after
-            .collection(collection)
-            .unwrap()
-            .support()
-            .unwrap(),
+        after.collection(collection).unwrap().support().unwrap(),
         &requested
     );
     assert!(
@@ -2764,11 +2722,7 @@ fn equal_payload_commit_does_not_restart_completed_target_maintenance() {
     let mut store = GuardStore::new(store);
     let after = block_on(store.maintain(collection, &equation_signer())).unwrap();
     assert_eq!(
-        after
-            .collection(collection)
-            .unwrap()
-            .support()
-            .unwrap(),
+        after.collection(collection).unwrap().support().unwrap(),
         &requested
     );
     assert!(store.events.is_empty());

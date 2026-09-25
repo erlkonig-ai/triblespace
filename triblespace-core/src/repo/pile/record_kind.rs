@@ -123,6 +123,32 @@ pub const KIND_COLLECTION_MERGE_SIGNED_V2: RawInline =
 pub const KIND_COLLECTION_DERIVE_SIGNED_V2: RawInline =
     hex_literal::hex!("B2EE8382C70161379E387D692B822946A60B602A909EED66B7D6DA2A62F36232");
 
+/// RETIRED pile kind v8: the signed binary MERGE, live from 2026-09-18 until
+/// lattice v2 (2026-09-25). Replay decodes it into an inert
+/// [`RetiredCollectionEquation`](crate::collection::RetiredCollectionEquation)
+/// that keeps every field; rewrites carry the frame byte for byte. Its dense
+/// fields were collection, low, high, result, author, R, S (224 bytes),
+/// followed by zero padding to two 256-byte blocks.
+pub const KIND_COLLECTION_MERGE_V8: RawInline =
+    hex_literal::hex!("424E7CF62C69A76E6829DF9F71CDFCB42B2B4795143AC6CC5CFF57F410E287CA");
+
+/// Tombstone of the 16-byte anchor [`KIND_COLLECTION_MERGE_V8`]'s description
+/// is rooted at. Minted with `trible genid` on 2026-09-18; never reuse.
+#[allow(dead_code)] // A tombstone: kept so the anchor is never minted again.
+pub const KIND_ID_COLLECTION_MERGE_V8: Id = id_hex!("8EE2A3F5C3469990F32DC9A91D2ABB28");
+
+/// RETIRED pile kind v9: the signed handle DERIVE, live from 2026-09-18 until
+/// lattice v2 (2026-09-25). Handled like [`KIND_COLLECTION_MERGE_V8`]. Its
+/// dense fields were target, input handle, output, author, R, S (192 bytes),
+/// filling one 256-byte block exactly.
+pub const KIND_COLLECTION_DERIVE_V9: RawInline =
+    hex_literal::hex!("5839C091F53DFDDCC32BB1909471989E3C40F934A64E4A2F7729E610ACF0494F");
+
+/// Tombstone of the 16-byte anchor [`KIND_COLLECTION_DERIVE_V9`]'s description
+/// is rooted at. Minted with `trible genid` on 2026-09-18; never reuse.
+#[allow(dead_code)] // A tombstone: kept so the anchor is never minted again.
+pub const KIND_ID_COLLECTION_DERIVE_V9: Id = id_hex!("22919B84195046DF981C19D5B43F6DF3");
+
 /// Archive one description fragment and take its content identity.
 ///
 /// Only the fragment's facts are archived, exactly as a collection descriptor
@@ -209,17 +235,19 @@ record_kinds! {
         "pile-collection-commit-v4",
         "A signed COMMIT(collection, data, metadata) assertion. Envelope bytes 64..96 hold the collection descriptor handle, 96..128 the data digest, 128..160 the metadata archive handle, 160..192 the author Ed25519 public key, 192..224 the signature R component, and 224..256 the signature S component. This is the tightest record the pile writes: it fills the block exactly and reserves nothing. The signature covers a domain-separated transcript, not these bytes, so a commit survives reframing unchanged.";
 
-    /// A witness-free MERGE endorsement. Anchor minted with `trible genid` on 2026-09-18.
-    CollectionMergeRecordV8 = KIND_ID_COLLECTION_MERGE "8EE2A3F5C3469990F32DC9A91D2ABB28",
-        KIND_COLLECTION_MERGE hex_literal::hex!("424E7CF62C69A76E6829DF9F71CDFCB42B2B4795143AC6CC5CFF57F410E287CA"),
-        "pile-collection-merge-v8",
-        "A signed MERGE(collection, low, high, result) endorsement. Envelope bytes 64..96 hold the collection descriptor handle, 96..128 the low input digest, 128..160 the high input digest, 160..192 the result digest, 192..224 the author Ed25519 public key, 224..256 the signature R component, 256..288 the signature S component, and 288..512 zeros. The record spans exactly two 256-byte blocks. Input payloads are sorted lexicographically by digest. The record names no input RECORD: which records produce those payloads is a relation content addressing already holds, so storing it again on the endorsement was redundant. A record fingerprint is the full BLAKE3 digest of its semantic kind followed by its canonical dense payload, not a blob handle. The signature covers a domain-separated transcript containing the semantic kind, author, collection, ordered payload inputs, and result, not the pile framing. An authorized producer endorses that those two payloads join to that result; storing an endorsement does not itself establish WRITE admission or input availability.";
+    /// A signed n-ary MERGE. Anchor minted with `trible genid` on
+    /// 2026-09-25 for lattice v2.
+    CollectionMergeRecordV10 = KIND_ID_COLLECTION_MERGE "E3DC1829F876D861395386CD92CC428A",
+        KIND_COLLECTION_MERGE hex_literal::hex!("3C1B4C0D0A71AB17D079AC528576B6BD2E6A514E461E7F0C3D1EA4C8F0BC019E"),
+        "pile-collection-merge-v10",
+        "A signed n-ary MERGE(collection; inputs -> result) endorsement. Envelope bytes 64..96 hold the collection descriptor handle, 96..128 the result digest, 128..160 the author Ed25519 public key, 160..192 the signature R component, 192..224 the signature S component, and 224..256 the input count k as an unsigned big-endian 32-bit integer in bytes 252..256 with bytes 224..252 zero. Bytes 256..256+32k hold the k input digests, 32 bytes each, strictly increasing by raw bytes, with 2 <= k <= 16. The result may equal one of the inputs. The record spans ceil((256 + 32k) / 256) blocks, two for k <= 8 and three for 9 <= k <= 16, and every byte after the last input is zero. The bytes from envelope byte 64 through the last input are the record's canonical dense form. A record fingerprint is the full BLAKE3 digest of the 16-byte semantic kind D0D98881093C0A6F318E1E1525521F80 followed by that dense form, not a blob handle. The signature covers a transcript, not the pile framing: the 32-byte domain B75F4382781F565972D759D69C72703B2A2E525B9D3B13A249590235C7BE8C40, the semantic kind, the author key, the collection, k as a big-endian 32-bit integer, the inputs in order, and the result. The record names no input RECORD. An authorized producer endorses that those payloads join to that result; storing an endorsement does not itself establish WRITE admission or input availability.";
 
-    /// A witness-free DERIVE endorsement. Anchor minted with `trible genid` on 2026-09-18.
-    CollectionDeriveRecordV9 = KIND_ID_COLLECTION_DERIVE "22919B84195046DF981C19D5B43F6DF3",
-        KIND_COLLECTION_DERIVE hex_literal::hex!("5839C091F53DFDDCC32BB1909471989E3C40F934A64E4A2F7729E610ACF0494F"),
-        "pile-collection-derive-v9",
-        "A signed DERIVE(target, input, output) endorsement. Envelope bytes 64..96 hold the target collection descriptor handle, 96..128 the input digest, 128..160 the output digest, 160..192 the author Ed25519 public key, 192..224 the signature R component, and 224..256 the signature S component. Like a commit, it fills one 256-byte block exactly and reserves nothing. The record names no input RECORD: which records produce that input payload is a relation content addressing already holds. A record fingerprint is the full BLAKE3 digest of its semantic kind followed by its canonical dense payload, not a blob handle. The signature covers a domain-separated transcript containing the semantic kind, author, target, input, and output, not the pile framing. The target descriptor names the source and mapping. An authorized producer endorses that the mapping takes that input to that output; storing an endorsement does not itself establish WRITE admission or input availability.";
+    /// A signed locator DERIVE, the leaf of a derived collection. Anchor
+    /// minted with `trible genid` on 2026-09-25 for lattice v2.
+    CollectionDeriveRecordV11 = KIND_ID_COLLECTION_DERIVE "0EB3BCDAC8AAD655FEFB489D8E5B4410",
+        KIND_COLLECTION_DERIVE hex_literal::hex!("F1AC0F8FD22F38D2D549107059035CDF8F6C9BA087960311F1C9223F5A17EE9C"),
+        "pile-collection-derive-v11",
+        "A signed locator DERIVE(target, L -> output) endorsement: one foundation of a derived collection. Envelope bytes 64..96 hold the target collection descriptor handle, 96..128 the source locator L, 128..160 the output digest, 160..192 the author Ed25519 public key, 192..224 the signature R component, and 224..256 the signature S component. It fills one 256-byte block exactly and reserves nothing. L is BLAKE3 of the 32-byte locator context 224DFBA2A0DE0FEC0A2073D78B8DCFEE91A037BC7749639A0D5E83DF307BA93A followed by the 32-byte handle of one foundation of the target's source collection: a one-way image of that handle, not a blob handle, so the record owns its output only. The target descriptor names the source and the mapping. The bytes from envelope byte 64 are the record's canonical dense form. A record fingerprint is the full BLAKE3 digest of the 16-byte semantic kind 630BF5B294A3A1D85C0A7B185C9BC899 followed by that dense form, not a blob handle. The signature covers a transcript, not the pile framing: the 32-byte domain 3F33151333CCDE3566D792C723DF70A74ACCF357CD0B9A7E7E1C61913020D22F, the semantic kind, the author key, the target, the locator, and the output. An authorized producer endorses that the target's mapping takes the source foundation named by L to that output; storing an endorsement does not itself establish WRITE admission.";
 
     /// A self-contained prefix-signed capability proof.
     ///
@@ -300,5 +328,7 @@ mod tests {
         assert!(!writable.contains(&KIND_COLLECTION_DERIVE_SIGNED_V2));
         assert!(!writable.contains(&KIND_COLLECTION_MERGE_WITNESSED_V6));
         assert!(!writable.contains(&KIND_COLLECTION_DERIVE_WITNESSED_V7));
+        assert!(!writable.contains(&KIND_COLLECTION_MERGE_V8));
+        assert!(!writable.contains(&KIND_COLLECTION_DERIVE_V9));
     }
 }

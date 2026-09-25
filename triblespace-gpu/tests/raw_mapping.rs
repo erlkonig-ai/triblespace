@@ -209,12 +209,25 @@ where
         merges * 6,
         "every target carry uses the backend; no source merges exist"
     );
+    // A DERIVE names its source foundation by locator; find the committed
+    // payload it names among the source commits.
+    let sources: std::collections::BTreeMap<_, _> = records
+        .iter()
+        .filter_map(|record| match record {
+            CollectionRecord::Commit(commit) => Some((
+                triblespace_core::collection::SourceLocator::of(commit.data().raw),
+                commit.data(),
+            )),
+            _ => None,
+        })
+        .collect();
     for record in &records {
         record.verify_strict().unwrap();
         let (expected, output) = match record {
             CollectionRecord::Derive(record) => {
+                let source = sources[&record.input()];
                 let input: Blob<SimpleArchive> = compact
-                    .get(Handle::<SimpleArchive>::from_hash(record.input()))
+                    .get(Handle::<SimpleArchive>::from_hash(source))
                     .unwrap();
                 (
                     SuccinctArchiveBlob::build_from_simple_archive(&input).unwrap(),
@@ -222,15 +235,17 @@ where
                 )
             }
             CollectionRecord::Merge(record) => {
-                let (low, high) = record.inputs();
-                let low: Blob<SuccinctArchiveBlob> = compact
-                    .get(Handle::<SuccinctArchiveBlob>::from_hash(low))
-                    .unwrap();
-                let high: Blob<SuccinctArchiveBlob> = compact
-                    .get(Handle::<SuccinctArchiveBlob>::from_hash(high))
-                    .unwrap();
+                let inputs: Vec<Blob<SuccinctArchiveBlob>> = record
+                    .inputs()
+                    .iter()
+                    .map(|input| {
+                        compact
+                            .get(Handle::<SuccinctArchiveBlob>::from_hash(*input))
+                            .unwrap()
+                    })
+                    .collect();
                 (
-                    SuccinctArchiveBlob::merge(&[low, high]).unwrap(),
+                    SuccinctArchiveBlob::merge(&inputs).unwrap(),
                     record.result(),
                 )
             }

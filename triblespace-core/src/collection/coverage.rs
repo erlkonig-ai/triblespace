@@ -1,35 +1,47 @@
-//! Downward coverage: which foundation commits a lattice node stands for.
+//! Downward coverage: which foundations of its own collection a lattice node
+//! stands for.
 //!
 //! A COMMIT, MERGE, or DERIVE is an attestation about the relationship between
 //! payloads, not an object worth reifying. What every consumer actually asks is
-//! the *denotational* question — given this node of the lattice, which
-//! foundation commits does it cover? — and that answer is a set, not a walk.
+//! the *denotational* question — given this node of a collection's lattice,
+//! which of that collection's foundations does it cover? — and that answer is
+//! a set, not a walk.
 //!
-//! This module folds records into exactly that answer. Each admitted record
-//! contributes one monotone union:
+//! Every collection is a lattice of foundations joined by MERGEs. This module
+//! folds records into exactly that answer. Each admitted record contributes
+//! one monotone union:
 //!
-//! - `COMMIT(_, data)` — `coverage(data) ∪= {data}`; a commit is its own
-//!   foundation.
-//! - `MERGE(_, low, high, result)` — `coverage(result) ∪= coverage(low) ∪
-//!   coverage(high)`; a merge is compaction inside the lattice.
-//! - `DERIVE(_, input, output)` — `coverage(output) ∪= coverage(input)`; a
-//!   derive is projection across lattices, and it carries the support through
-//!   unchanged because the derived image denotes the same logical value.
+//! - `COMMIT(root, data)` — `coverage(data) ∪= {data}`; a commit is a
+//!   foundation of a root collection.
+//! - `DERIVE(target, L -> output)` — `coverage(output) ∪= {output}`; a derive
+//!   is a foundation (a leaf) of a derived collection. It reads no row: its
+//!   input is the locator of a source foundation, not a node of this lattice.
+//! - `MERGE(c; a1..ak -> result)` — `coverage(result) ∪= coverage(a1) ∪ … ∪
+//!   coverage(ak)`, all or nothing; a merge is compaction inside one lattice.
+//!
+//! Coverage is collection-local. Every row is keyed by its own collection and
+//! every support is a set of that collection's own foundations: commit
+//! payloads in a root, leaf images in a derived collection. No attestation
+//! reads a row of another collection; the only link between a derived
+//! collection and its source is the locator in each DERIVE, which the fold
+//! publishes in [`Coverage::leaf_outputs`] and nowhere follows. Whether a
+//! collection is a root or derived is still resolved, for one reason: a
+//! COMMIT into a derived collection and a DERIVE into a root attest nothing.
 //!
 //! The representation is a doubly nested PATCH: the outer trie maps a result
-//! payload handle to an inner trie of foundation commit handles. Nesting, not a
-//! flat `result ‖ commit` key, is what preserves structural sharing — two nodes
-//! covering the same commits share one inner root, and set operations between
-//! nodes are then PATCH union and intersection over shared subtries rather than
-//! per-member work.
+//! payload handle to an inner trie of foundation handles. Nesting, not a flat
+//! `result ‖ foundation` key, is what preserves structural sharing — two nodes
+//! covering the same foundations share one inner root, and set operations
+//! between nodes are then PATCH union and intersection over shared subtries
+//! rather than per-member work.
 //!
 //! Beside the supports the fold keeps each collection's *frontier*: the nodes
 //! whose support no driven MERGE of that collection has consumed. A MERGE takes
-//! its inputs off and puts its result on; a DERIVE puts its output on the
-//! target's frontier; a COMMIT puts itself on its root's. That is the set a
-//! reader attaches, and it makes a read a lookup: the frontier, one support
-//! per frontier node, and their union. Without it every read re-derived from
-//! the records which nodes are maximal and what they stand for.
+//! every input that is not its result off and puts its result on; a COMMIT or
+//! a DERIVE puts its own node on. That is the set a reader attaches, and it
+//! makes a read a lookup: the frontier, one support per frontier node, and
+//! their union. It also keeps, per node, who produced it ([`Coverage::owners`])
+//! and, per derived collection, which source locators have a leaf.
 //!
 //! Nothing here is persisted. The index is rebuilt by replaying the records a
 //! store already holds, which is affordable precisely because the fold is a
@@ -38,19 +50,19 @@
 //! # A record is reduced the moment it arrives
 //!
 //! [`CoverageIndex::apply`] keeps no record. It reduces one to the
-//! [`Attestation`] it makes — one to three payload handles — and drops the
-//! signature, the witnesses, and the metadata. Those exist to decide whether an
-//! attestation may be believed; once that is decided, nothing downstream has a
-//! use for them. Holding records here would be the reified-record habit wearing
-//! an index for a costume.
+//! [`Attestation`] it makes and its signer, and drops the signature and the
+//! metadata. Those exist to decide whether an attestation may be believed;
+//! once that is decided, nothing downstream has a use for them. Holding
+//! records here would be the reified-record habit wearing an index for a
+//! costume.
 //!
 //! # Attestations that cannot be applied yet
 //!
 //! Two things can be missing when a record arrives: the evidence that its
-//! signer may write its collection, and the coverage rows of its inputs. Both
-//! are open-world absences — a proof or an input can still arrive later — so an
-//! attestation that cannot be applied is parked rather than rejected, indexed
-//! by what it waits on, and retried when that arrives.
+//! signer may write its collection, and the coverage rows of a merge's inputs.
+//! Both are open-world absences — a proof or an input can still arrive later —
+//! so an attestation that cannot be applied is parked or blocked rather than
+//! rejected, and retried when what it waits on arrives.
 //!
 //! # Validate once, then walk
 //!
@@ -59,8 +71,8 @@
 //! authorized: that decision is already baked into which unions happened.
 
 use std::cell::RefCell;
-use std::collections::BTreeSet;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use ed25519_dalek::VerifyingKey;
 
@@ -70,11 +82,14 @@ use crate::patch::{Blake3Merkle, Entry, IdentitySchema, PATCH};
 use crate::repo::{BlobStoreGet, CapabilityProofRead};
 
 use super::api::AdmissionEvidence;
-use crate::capability::QuorumOutcome;
+use super::records::{
+    CollectionData, CollectionHandle, CollectionRecord, MergeInputs, SourceLocator,
+};
 use super::store::CollectionRead;
-use super::records::{CollectionData, CollectionHandle, CollectionRecord};
+use crate::capability::QuorumOutcome;
 
-/// The foundation commits one lattice node covers.
+/// The foundations of its own collection one lattice node covers: commit
+/// payloads in a root, leaf outputs in a derived collection.
 ///
 /// Set algebra over these is PATCH algebra: union, intersection, and difference
 /// share subtries instead of copying members.
@@ -87,12 +102,25 @@ pub type CoverageSet = PATCH<32, IdentitySchema, (), Blake3Merkle>;
 /// digest, and a frontier changes on every believed record.
 pub type FrontierSet = PATCH<32, IdentitySchema, ()>;
 
+/// Three 32-byte segments, so a prefix of one or two segments enumerates the
+/// third.
+mod triple_key {
+    crate::key_segmentation!(Segments, 96, [32, 32, 32]);
+    crate::key_schema!(Schema, Segments, 96, [0, 1, 2]);
+}
+
+/// `collection || node || signer`: who produced each believed node.
+type OwnerSet = PATCH<96, triple_key::Schema, ()>;
+/// `collection || locator || output`: every believed leaf of a derived
+/// collection, keyed by the locator of the source foundation it maps.
+type LeafSet = PATCH<96, triple_key::Schema, ()>;
+
 /// One immutable observation of downward coverage.
 ///
-/// This is the half of [`CoverageIndex`] a reader needs, and it is two
-/// persistent PATCH roots, so publishing it into a snapshot is a constant-time
-/// clone rather than a copy of the fold's bookkeeping. The builder's consumer
-/// map and backlog exist to keep the index growing incrementally; nothing that
+/// This is the half of [`CoverageIndex`] a reader needs, and it is persistent
+/// PATCH roots, so publishing it into a snapshot is a constant-time clone
+/// rather than a copy of the fold's bookkeeping. The builder's consumer map
+/// and backlog exist to keep the index growing incrementally; nothing that
 /// only asks questions has any use for them.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Coverage {
@@ -102,25 +130,31 @@ pub struct Coverage {
     /// supports by the same fold, so a read is a lookup and not a walk over
     /// the records that produced the lattice.
     frontiers: PATCH<32, IdentitySchema, FrontierSet>,
-    /// Per collection, the results of believed attestations that could not be
-    /// driven yet because an input has no support: a record that arrived
-    /// ahead of its input. While a collection has any, its frontier can move
-    /// on a record landing in an ancestor; otherwise only its own records
-    /// move it, which is what a reader tracking its observation needs to
-    /// know.
+    /// Per collection, the results of believed merges that could not be
+    /// driven yet because an input of the same collection has no support: a
+    /// record that arrived ahead of its input. Only that collection's own
+    /// records can unblock them.
     blocked: PATCH<32, IdentitySchema, FrontierSet>,
+    /// `collection || node || signer` for every believed attestation: the
+    /// signer of each record that produced the node. "You own what you
+    /// signed."
+    owners: OwnerSet,
+    /// `collection || locator || output` for every believed leaf. Answers
+    /// "has the source foundation with this locator been derived into this
+    /// collection, and to what?" by the DERIVE relation's own key.
+    leaves: LeafSet,
 }
 
 /// One row's key: the collection a node belongs to, then the node itself.
 ///
 /// A payload handle is not a lattice coordinate on its own. Content
 /// addressing makes the same bytes the same handle everywhere, but the
-/// commits underneath a node belong to one collection, and commits from two
-/// collections are not comparable — so scoping the row by its collection is
-/// what keeps an unrelated lattice from putting its members in this one. It
-/// costs nothing in sharing, because the commit set is a separate nested trie
-/// either way, and two nodes that genuinely cover the same commits still
-/// share one inner root.
+/// foundations underneath a node belong to one collection, and foundations
+/// from two collections are not comparable — so scoping the row by its
+/// collection is what keeps an unrelated lattice from putting its members in
+/// this one. It costs nothing in sharing, because the foundation set is a
+/// separate nested trie either way, and two nodes that genuinely cover the
+/// same foundations still share one inner root.
 fn row_key(collection: CollectionHandle, node: CollectionData) -> [u8; 64] {
     let mut key = [0u8; 64];
     key[..32].copy_from_slice(&collection.raw);
@@ -128,8 +162,16 @@ fn row_key(collection: CollectionHandle, node: CollectionData) -> [u8; 64] {
     key
 }
 
+fn triple(first: [u8; 32], second: [u8; 32], third: [u8; 32]) -> [u8; 96] {
+    let mut key = [0u8; 96];
+    key[..32].copy_from_slice(&first);
+    key[32..64].copy_from_slice(&second);
+    key[64..].copy_from_slice(&third);
+    key
+}
+
 impl Coverage {
-    /// The foundation commits this node covers within that collection, if any
+    /// The foundations this node covers within that collection, if any
     /// admitted record has attested it.
     ///
     /// An absent row and an empty row are different answers: absent means no
@@ -138,15 +180,15 @@ impl Coverage {
         self.rows.get(&row_key(collection, node))
     }
 
-    /// Whether this node is known to cover that foundation commit.
+    /// Whether this node is known to cover that foundation of its collection.
     pub fn covers(
         &self,
         collection: CollectionHandle,
         node: CollectionData,
-        commit: CollectionData,
+        foundation: CollectionData,
     ) -> bool {
         self.of(collection, node)
-            .is_some_and(|coverage| coverage.get(&commit.raw).is_some())
+            .is_some_and(|coverage| coverage.get(&foundation.raw).is_some())
     }
 
     /// The union of what every one of these nodes covers, within one collection.
@@ -174,14 +216,14 @@ impl Coverage {
     /// The frontier of one collection: every node with a support that no
     /// driven MERGE of that collection has consumed, in ascending byte order.
     ///
-    /// These are the nodes a reader attaches. A MERGE takes its two inputs
-    /// off the frontier and puts its result on; a DERIVE puts its output on
-    /// the target's frontier; a COMMIT puts itself on its root's. Records may
-    /// arrive in any order, so a node is only put on when no MERGE that has
-    /// already been driven consumes it. An image of a source node that a
-    /// coarser image also covers stays on the frontier until a MERGE in the
-    /// target consumes it: the frontier is about consumption, and a reader
-    /// that wants the narrowest cover compares supports.
+    /// These are the nodes a reader attaches. A MERGE takes every input that
+    /// is not its own result off the frontier and puts its result on; a
+    /// COMMIT or a DERIVE puts its own node on. Records may arrive in any
+    /// order, so a node is only put on when no MERGE that has already been
+    /// driven consumes it. A node whose support another frontier node also
+    /// covers stays until a MERGE consumes it: the frontier is about
+    /// consumption, and a reader that wants the narrowest cover compares
+    /// supports.
     pub fn frontier(
         &self,
         collection: CollectionHandle,
@@ -199,21 +241,97 @@ impl Coverage {
     }
 
     /// The union of what the frontier of one collection covers: the support
-    /// a reader attaching that frontier stands on. Frontier nodes without a
-    /// support cannot exist, so the reported list is always empty; it is
-    /// kept for symmetry with [`Self::union_over`].
-    pub fn frontier_support(&self, collection: CollectionHandle) -> (CoverageSet, Vec<CollectionData>) {
+    /// a reader attaching that frontier stands on, a set of that collection's
+    /// own foundations. Frontier nodes without a support cannot exist, so the
+    /// reported list is always empty; it is kept for symmetry with
+    /// [`Self::union_over`].
+    pub fn frontier_support(
+        &self,
+        collection: CollectionHandle,
+    ) -> (CoverageSet, Vec<CollectionData>) {
         let nodes: Vec<_> = self.frontier(collection).collect();
         self.union_over(collection, nodes)
     }
 
-    /// Whether any believed attestation of this collection is still waiting
-    /// for an input's support: a record ahead of its input. Only then can a
-    /// record landing in an ancestor move this collection's frontier.
+    /// Whether any believed merge of this collection is still waiting for an
+    /// input's support: a record ahead of its input. Only this collection's
+    /// own records can move it.
     pub fn has_blocked(&self, collection: CollectionHandle) -> bool {
         self.blocked
             .get(&collection.raw)
             .is_some_and(|blocked| !blocked.is_empty())
+    }
+
+    /// Every signer of a believed record that produced this node, ascending.
+    pub fn owners(
+        &self,
+        collection: CollectionHandle,
+        node: CollectionData,
+    ) -> Vec<Inline<ED25519PublicKey>> {
+        let mut prefix = [0u8; 64];
+        prefix[..32].copy_from_slice(&collection.raw);
+        prefix[32..].copy_from_slice(&node.raw);
+        let mut owners = Vec::new();
+        self.owners.infixes(&prefix, |signer: &[u8; 32]| {
+            owners.push(Inline::new(*signer));
+        });
+        owners.sort_unstable_by(|left, right| left.raw.cmp(&right.raw));
+        owners
+    }
+
+    /// Whether `signer` signed a believed record that produced this node.
+    pub fn owned_by(
+        &self,
+        collection: CollectionHandle,
+        node: CollectionData,
+        signer: Inline<ED25519PublicKey>,
+    ) -> bool {
+        self.owners
+            .get(&triple(collection.raw, node.raw, signer.raw))
+            .is_some()
+    }
+
+    /// Whether a believed leaf of `collection` maps the source foundation
+    /// with this locator.
+    pub fn has_leaf(&self, collection: CollectionHandle, locator: SourceLocator) -> bool {
+        let mut prefix = [0u8; 64];
+        prefix[..32].copy_from_slice(&collection.raw);
+        prefix[32..].copy_from_slice(locator.as_bytes());
+        self.leaves.has_prefix(&prefix)
+    }
+
+    /// The outputs believed leaves of `collection` give the source foundation
+    /// with this locator, ascending. One, unless writers disagree.
+    pub fn leaf_outputs(
+        &self,
+        collection: CollectionHandle,
+        locator: SourceLocator,
+    ) -> Vec<CollectionData> {
+        let mut prefix = [0u8; 64];
+        prefix[..32].copy_from_slice(&collection.raw);
+        prefix[32..].copy_from_slice(locator.as_bytes());
+        let mut outputs = Vec::new();
+        self.leaves.infixes(&prefix, |output: &[u8; 32]| {
+            outputs.push(Inline::new(*output));
+        });
+        outputs.sort_unstable_by(|left, right| left.raw.cmp(&right.raw));
+        outputs
+    }
+
+    /// Every believed leaf of `collection` as `(locator, output)`, ascending.
+    pub fn leaves(&self, collection: CollectionHandle) -> Vec<(SourceLocator, CollectionData)> {
+        let mut locators = Vec::new();
+        self.leaves.infixes(&collection.raw, |locator: &[u8; 32]| {
+            locators.push(SourceLocator::from_raw(*locator));
+        });
+        locators.sort_unstable();
+        let mut leaves = Vec::new();
+        for locator in locators {
+            for output in self.leaf_outputs(collection, locator) {
+                leaves.push((locator, output));
+            }
+        }
+        leaves
     }
 
     /// Number of lattice nodes with a coverage row.
@@ -250,18 +368,20 @@ enum Driven {
 /// carries exists to decide whether this statement may be believed.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Attestation {
-    /// This payload is a member of the collection on its own authority.
+    /// This payload is a foundation of a root collection, on its own
+    /// authority: a COMMIT.
     Foundation { data: CollectionData },
-    /// This result is the join of two payloads in the same lattice.
-    Join {
-        low: CollectionData,
-        high: CollectionData,
-        result: CollectionData,
-    },
-    /// This output is the image of an input under a collection's mapping.
-    Image {
-        input: CollectionData,
+    /// This output is a foundation of a derived collection: the image of the
+    /// source foundation named by `locator`. A DERIVE.
+    Leaf {
+        locator: SourceLocator,
         output: CollectionData,
+    },
+    /// This result is the join of these distinct nodes of the same lattice:
+    /// a MERGE. The result may be one of the inputs.
+    Join {
+        inputs: MergeInputs,
+        result: CollectionData,
     },
 }
 
@@ -280,16 +400,12 @@ impl Attestation {
             CollectionRecord::Commit(commit) => Self::Foundation {
                 data: commit.data(),
             },
-            CollectionRecord::Merge(merge) => {
-                let (low, high) = merge.inputs();
-                Self::Join {
-                    low,
-                    high,
-                    result: merge.result(),
-                }
-            }
-            CollectionRecord::Derive(derive) => Self::Image {
-                input: derive.input(),
+            CollectionRecord::Merge(merge) => Self::Join {
+                inputs: merge.merge_inputs(),
+                result: merge.result(),
+            },
+            CollectionRecord::Derive(derive) => Self::Leaf {
+                locator: derive.input(),
                 output: derive.output(),
             },
         }
@@ -299,19 +415,18 @@ impl Attestation {
     pub fn result(&self) -> CollectionData {
         match self {
             Self::Foundation { data } => *data,
+            Self::Leaf { output, .. } => *output,
             Self::Join { result, .. } => *result,
-            Self::Image { output, .. } => *output,
         }
     }
 
-    /// The nodes whose coverage this attestation reads.
-    fn inputs(&self) -> impl Iterator<Item = CollectionData> {
-        let (first, second) = match self {
-            Self::Foundation { .. } => (None, None),
-            Self::Join { low, high, .. } => (Some(*low), Some(*high)),
-            Self::Image { input, .. } => (Some(*input), None),
-        };
-        first.into_iter().chain(second)
+    /// The nodes of its own collection whose coverage this attestation reads:
+    /// a join's inputs, and nothing for a foundation or a leaf.
+    fn inputs(&self) -> &[CollectionData] {
+        match self {
+            Self::Join { inputs, .. } => inputs.as_slice(),
+            Self::Foundation { .. } | Self::Leaf { .. } => &[],
+        }
     }
 }
 
@@ -341,17 +456,17 @@ pub enum Admittance {
 }
 
 /// What the fold must know about a collection before it can believe an
-/// attestation naming it: which lineage the attestation belongs to, and
-/// whether this signer may make it.
+/// attestation naming it: whether it is a root or derived, and whether this
+/// signer may make it.
 ///
 /// Implementors do the descriptor and capability work; this module only asks,
 /// and only once per attestation.
 pub trait RecordAdmission {
     /// The collection this one derives from, if any.
     ///
-    /// Only a `DERIVE` needs this, and only one hop of it: the record names
-    /// its target, while its input is a node in the target's source. A commit
-    /// and a merge stay entirely inside the collection they name.
+    /// The fold reads only the kind from this: a COMMIT into a derived
+    /// collection and a DERIVE into a root attest nothing. No row of the
+    /// source is ever read.
     ///
     /// Naming the *missing* descriptor rather than just failing is what lets a
     /// parked attestation be keyed on the exact blob whose arrival would
@@ -365,7 +480,7 @@ pub trait RecordAdmission {
 /// What a collection's descriptor says about where it derives from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SourceResolution {
-    /// The descriptor names no source: this collection is a lineage root.
+    /// The descriptor names no source: this collection is a root.
     Root,
     /// The collection this one derives from.
     Derived(CollectionHandle),
@@ -374,11 +489,11 @@ pub enum SourceResolution {
     Missing(CollectionHandle),
 }
 
-/// Admits every signer and treats every collection as its own foundation.
+/// Admits every signer and treats every collection as a root.
 ///
 /// For stores that carry no admission evidence, and for exercising the fold
-/// on its own — where each test collection is the root of its own lineage,
-/// which is exactly what makes cross-lineage aliasing visible.
+/// on its own — where each test collection is a root of its own, which is
+/// exactly what makes cross-collection aliasing visible.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AdmitEveryRecord;
 
@@ -414,26 +529,21 @@ struct Parked {
 /// no end of the run to defer to, only an endless sequence of appends.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum Awaiting {
-    /// The descriptor chain from this collection to its foundation is not
-    /// fully resident. Retry when this blob lands.
+    /// A blob this decision reads is not resident: the collection's own
+    /// descriptor, or a policy definition it names. Retry when it lands.
     Lineage(CollectionHandle),
     /// No capability proof admits this signer to write yet. Retry when a
     /// proof arrives.
     Proof(Inline<ED25519PublicKey>),
 }
 
-/// What arrived since the last settle that could change an earlier decision.
-///
-
-/// One consumer edge: the collection it writes to, the one it reads from,
-/// and the attestation itself.
-type ConsumerEdge = (CollectionHandle, CollectionHandle, Attestation);
-/// The edges that read one input, one entry per edge, keyed by
-/// [`edge_key`]. Recording the k-th edge of a node costs one path, not a
-/// copy of the other k-1; a node read by many records is the common case in
-/// a lattice and used to make the fold quadratic in it.
-type Edges = PATCH<96, IdentitySchema, ConsumerEdge>;
-/// Collection-scoped input handle to the edges that read it.
+/// The joins that read one input, one entry per distinct join, keyed by
+/// [`edge_key`]. Every edge is collection-local: the consumer map's own key
+/// names the collection. Recording the k-th edge of a node costs one path,
+/// not a copy of the other k-1; a node read by many records is the common
+/// case in a lattice and used to make the fold quadratic in it.
+type Edges = PATCH<64, IdentitySchema, Attestation>;
+/// Collection-scoped input handle to the joins that read it.
 type Consumers = PATCH<64, IdentitySchema, Edges>;
 /// The attestations held under one awaited thing, one entry each, keyed by
 /// [`parked_key`]; the same shape as [`Edges`], for the same reason.
@@ -441,39 +551,46 @@ type Held = PATCH<160, IdentitySchema, Parked>;
 /// Attestations held until one named thing arrives, keyed by that thing.
 type Waiters = PATCH<32, IdentitySchema, Held>;
 
-/// What identifies a consumer edge under one of its inputs: where it writes,
-/// what it produces, and the other input it reads -- zero for an image, which
-/// reads one.
-fn edge_key(
-    writes_to: CollectionHandle,
-    attestation: Attestation,
-    input: CollectionData,
-) -> [u8; 96] {
-    let mut key = [0u8; 96];
-    key[..32].copy_from_slice(&writes_to.raw);
-    key[32..64].copy_from_slice(&attestation.result().raw);
-    if let Attestation::Join { low, high, .. } = attestation {
-        let other = if input == low { high } else { low };
-        key[64..].copy_from_slice(&other.raw);
+/// A fixed-width name for one join's input set: BLAKE3 over the inputs in
+/// order. Only an index key, so two joins with the same result and different
+/// inputs stay two entries; never a lookup target.
+fn join_digest(inputs: &MergeInputs) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    for input in inputs.iter() {
+        hasher.update(&input.raw);
+    }
+    *hasher.finalize().as_bytes()
+}
+
+/// What identifies a join under one of its inputs: its result and its input
+/// set.
+fn edge_key(attestation: &Attestation) -> [u8; 64] {
+    let mut key = [0u8; 64];
+    key[..32].copy_from_slice(&attestation.result().raw);
+    if let Attestation::Join { inputs, .. } = attestation {
+        key[32..].copy_from_slice(&join_digest(inputs));
     }
     key
 }
 
 /// What identifies a parked attestation: the collection and signer that
-/// would believe it, and the attestation itself.
+/// would believe it, its result, its kind, and what distinguishes it among
+/// attestations of that kind with the same result -- a leaf's locator or a
+/// join's input set.
 fn parked_key(entry: &Parked) -> [u8; 160] {
     let mut key = [0u8; 160];
     key[..32].copy_from_slice(&entry.collection.raw);
     key[32..64].copy_from_slice(&entry.signer.raw);
     key[64..96].copy_from_slice(&entry.attestation.result().raw);
-    match entry.attestation {
-        Attestation::Foundation { .. } => {}
-        Attestation::Join { low, high, .. } => {
-            key[96..128].copy_from_slice(&low.raw);
-            key[128..].copy_from_slice(&high.raw);
+    match &entry.attestation {
+        Attestation::Foundation { .. } => key[96] = 1,
+        Attestation::Leaf { locator, .. } => {
+            key[96] = 2;
+            key[128..].copy_from_slice(locator.as_bytes());
         }
-        Attestation::Image { input, .. } => {
-            key[96..128].copy_from_slice(&input.raw);
+        Attestation::Join { inputs, .. } => {
+            key[96] = 3;
+            key[128..].copy_from_slice(&join_digest(inputs));
         }
     }
     key
@@ -490,16 +607,14 @@ fn held(held: &Held) -> impl Iterator<Item = Parked> + '_ {
 /// only its published half -- is a constant-time clone. That is what lets a
 /// snapshot carry the index rather than a copy of the rows, and what lets a
 /// reader compose on top of one: clone it, park a few more records, settle.
-/// Only `fresh` is a plain vector, and it is empty whenever the index is
-/// settled, which is the only time one is handed out.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CoverageIndex {
-    /// The half a reader sees: result payload handle to the commits it covers.
+    /// The half a reader sees: rows, frontiers, owners and leaves.
     published: Coverage,
-    /// Which attestations read each input, so a row that grows can re-drive
-    /// its consumers instead of forcing a full replay.
+    /// Which joins read each input, so a row that grows can re-drive its
+    /// consumers instead of forcing a full replay.
     consumers: Consumers,
-    /// Waiting on a descriptor blob, keyed by that blob's handle.
+    /// Waiting on a descriptor or definition blob, keyed by that blob's handle.
     awaiting_lineage: Waiters,
     /// Waiting on a proof admitting their signer, keyed by the signer.
     awaiting_proof: Waiters,
@@ -551,8 +666,8 @@ impl CoverageIndex {
         Self::default()
     }
 
-    /// The foundation commits this node covers, if any admitted record has
-    /// attested it.
+    /// The foundations this node covers, if any admitted record has attested
+    /// it.
     ///
     /// An absent row and an empty row are different answers: absent means no
     /// admitted attestation names this payload as a result at all.
@@ -564,19 +679,19 @@ impl CoverageIndex {
         self.published.of(collection, node)
     }
 
-    /// Whether this node is known to cover that foundation commit.
+    /// Whether this node is known to cover that foundation.
     pub fn covers(
         &self,
         collection: CollectionHandle,
         node: CollectionData,
-        commit: CollectionData,
+        foundation: CollectionData,
     ) -> bool {
-        self.published.covers(collection, node, commit)
+        self.published.covers(collection, node, foundation)
     }
 
     /// The immutable observation to hand a reader.
     ///
-    /// A constant-time clone: one persistent PATCH root, none of the fold's
+    /// A constant-time clone: persistent PATCH roots, none of the fold's
     /// bookkeeping.
     pub fn published(&self) -> &Coverage {
         &self.published
@@ -597,7 +712,9 @@ impl CoverageIndex {
     /// A store can skip building a reader entirely when this is false, which is
     /// the steady state once a pile has been replayed once.
     pub fn has_parked(&self) -> bool {
-        !self.awaiting_lineage.is_empty() || !self.awaiting_proof.is_empty() || !self.fresh.is_empty()
+        !self.awaiting_lineage.is_empty()
+            || !self.awaiting_proof.is_empty()
+            || !self.fresh.is_empty()
     }
 
     /// Whether any attestation has never been offered a decision.
@@ -653,18 +770,18 @@ impl CoverageIndex {
             .collect()
     }
 
-    /// The same, for attestations waiting on a descriptor chain to land
-    /// instead of on a proof.
+    /// The same, for attestations waiting on a descriptor or definition blob
+    /// to land instead of on a proof.
     ///
     /// Kept apart from [`Self::unadmitted_in`] because the two absences have
     /// different remedies and different owners: a missing proof is a grant
-    /// somebody must issue, a missing lineage is bytes that have not
+    /// somebody must issue, a missing descriptor is bytes that have not
     /// replicated yet and may simply arrive.
     pub fn awaiting_lineage_in(&self, collection: CollectionHandle) -> usize {
         parked_in(&self.awaiting_lineage, collection).count()
     }
 
-    /// Number waiting specifically on a descriptor chain becoming resident.
+    /// Number waiting specifically on a descriptor or definition blob.
     pub fn parked_on_lineages(&self) -> usize {
         waiting(&self.awaiting_lineage)
     }
@@ -672,8 +789,8 @@ impl CoverageIndex {
     /// Fold one record into the index, keeping only what it attests.
     ///
     /// Applying is idempotent: the same record folded twice unions the same
-    /// members. Records may arrive in any order — one whose inputs have no row
-    /// yet contributes nothing now and is retried the moment they do.
+    /// members. Records may arrive in any order — a merge whose inputs have no
+    /// row yet contributes nothing now and is retried the moment they do.
     pub fn apply<A: RecordAdmission>(&mut self, record: &CollectionRecord, admission: &A) {
         self.attest(
             record.collection(),
@@ -703,36 +820,34 @@ impl CoverageIndex {
 
     /// Believe one attestation, or file it under the evidence it still needs.
     fn decide<A: RecordAdmission>(&mut self, entry: Parked, admission: &A) {
-        // A projection is the one attestation whose inputs live somewhere
-        // else: the record names its target, the input is a node in the
-        // target's source. One descriptor hop answers that; a commit and a
-        // merge need no hop at all.
-        let reads_from = match entry.attestation {
-            Attestation::Image { .. } => match admission.source(entry.collection) {
-                SourceResolution::Derived(source) => source,
+        // Only the collection's kind is resolved here, never a row of another
+        // collection: a foundation of a root is a COMMIT, a foundation of a
+        // derived collection is a DERIVE, and the other pairing attests
+        // nothing. A merge stays inside its own collection whatever it is.
+        match entry.attestation {
+            Attestation::Leaf { .. } => match admission.source(entry.collection) {
+                SourceResolution::Derived(_) => {}
                 SourceResolution::Missing(descriptor) => {
+                    // The kind is unknown until the collection's OWN
+                    // descriptor lands; nothing about its source is read.
                     self.hold(Awaiting::Lineage(descriptor), entry);
                     return;
                 }
                 SourceResolution::Root => {
-                    // A derive into a collection that derives from nothing has
-                    // no source lattice to read, so it attests nothing.
+                    // A derive into a root names no foundation of it.
                     return;
                 }
             },
             Attestation::Foundation { .. } => {
-                // A commit is a foundation attestation, which only a root can
-                // make: a derived collection's members are images of its
-                // source's, so a commit written straight into one names no
-                // foundation and attests nothing. A missing descriptor is
-                // decided below, where admission parks it on that blob.
+                // A commit written straight into a derived collection names no
+                // foundation of it. A missing descriptor is decided below,
+                // where admission parks it on that blob.
                 if let SourceResolution::Derived(_) = admission.source(entry.collection) {
                     return;
                 }
-                entry.collection
             }
-            Attestation::Join { .. } => entry.collection,
-        };
+            Attestation::Join { .. } => {}
+        }
         match admission.admits(entry.collection, entry.signer) {
             Admittance::Admitted => {}
             Admittance::Pending => {
@@ -751,7 +866,7 @@ impl CoverageIndex {
                 return;
             }
         }
-        self.believe(entry.collection, reads_from, entry.attestation);
+        self.believe(entry.collection, entry.attestation, entry.signer);
     }
 
     fn hold(&mut self, awaiting: Awaiting, entry: Parked) {
@@ -789,10 +904,11 @@ impl CoverageIndex {
             signer,
         };
         // Keyed by the collection it names, so a reader can decide one
-        // lineage's records and leave every other lineage's parked.
+        // collection's records and leave every other collection's parked.
         let mut held = self.fresh.get(&collection.raw).cloned().unwrap_or_default();
         held.insert(&Entry::with_value(&parked_key(&entry), entry));
-        self.fresh.replace(&Entry::with_value(&collection.raw, held));
+        self.fresh
+            .replace(&Entry::with_value(&collection.raw, held));
     }
 
     /// Reduce one record to what it attests and park it.
@@ -880,10 +996,10 @@ impl CoverageIndex {
     }
 
     /// Decide every fresh attestation naming one of `collections`, and only
-    /// those. A reader asks for exactly the lineage it reads -- foundation,
-    /// sources, target -- which is closed under "reads from", so settling it
-    /// alone publishes the same rows a full settle would for those
-    /// collections; every other lineage's records stay parked, unpaid for.
+    /// those. Every collection is closed under "reads from" on its own, since
+    /// no attestation reads another collection's rows, so settling a set of
+    /// collections publishes the same rows a full settle would for them;
+    /// every other collection's records stay parked, unpaid for.
     pub fn settle_collections<A: RecordAdmission>(
         &mut self,
         admission: &A,
@@ -920,43 +1036,61 @@ impl CoverageIndex {
     /// admitted.
     fn believe(
         &mut self,
-        writes_to: CollectionHandle,
-        reads_from: CollectionHandle,
+        collection: CollectionHandle,
         attestation: Attestation,
+        signer: Inline<ED25519PublicKey>,
     ) {
+        // Who produced the node, and for a leaf which source foundation it
+        // maps: both are facts about the believed record, recorded whether or
+        // not a join can be driven yet.
+        self.published.owners.insert(&Entry::new(&triple(
+            collection.raw,
+            attestation.result().raw,
+            signer.raw,
+        )));
+        if let Attestation::Leaf { locator, output } = attestation {
+            self.published.leaves.insert(&Entry::new(&triple(
+                collection.raw,
+                locator.raw(),
+                output.raw,
+            )));
+        }
         for input in attestation.inputs() {
-            let key = row_key(reads_from, input);
+            let key = row_key(collection, *input);
             let mut edges = self.consumers.get(&key).cloned().unwrap_or_default();
-            edges.insert(&Entry::with_value(
-                &edge_key(writes_to, attestation, input),
-                (writes_to, reads_from, attestation),
-            ));
+            edges.insert(&Entry::with_value(&edge_key(&attestation), attestation));
             self.consumers.replace(&Entry::with_value(&key, edges));
         }
         let mut grown = Vec::new();
-        if self.drive(writes_to, reads_from, attestation) == Driven::Grew {
-            grown.push((writes_to, attestation.result()));
+        if self.drive(collection, attestation) == Driven::Grew {
+            grown.push(attestation.result());
         }
-        // A row that grew may unblock or widen the attestations that read it,
-        // and those may widen their own consumers in turn. Growth is bounded by
-        // the finite set of foundation commits, so the worklist drains.
-        while let Some((collection, node)) = grown.pop() {
+        // A row that grew may unblock or widen the joins that read it, and
+        // those may widen their own consumers in turn. Everything stays in
+        // this collection. Growth is bounded by the finite set of its
+        // foundations, so the worklist drains.
+        while let Some(node) = grown.pop() {
             let Some(edges) = self.consumers.get(&row_key(collection, node)).cloned() else {
                 continue;
             };
             for key in edges.iter_ordered() {
-                let Some(&(writes_to, reads_from, consumer)) = edges.get(key) else {
+                let Some(&consumer) = edges.get(key) else {
                     continue;
                 };
-                if self.drive(writes_to, reads_from, consumer) == Driven::Grew {
-                    grown.push((writes_to, consumer.result()));
+                if self.drive(collection, consumer) == Driven::Grew {
+                    grown.push(consumer.result());
                 }
             }
         }
     }
 
     /// Note whether an attestation's result is still waiting for an input.
-    fn mark_blocked(&mut self, collection: CollectionHandle, result: CollectionData, blocked: bool) {
+    fn mark_blocked(
+        &mut self,
+        collection: CollectionHandle,
+        result: CollectionData,
+        blocked: bool,
+    ) {
         let mut set = self
             .published
             .blocked
@@ -980,44 +1114,30 @@ impl CoverageIndex {
     /// Says whether the row grew, which is the termination condition for the
     /// propagation worklist, or whether the attestation is still blocked on
     /// an input without a support.
-    fn drive(
-        &mut self,
-        writes_to: CollectionHandle,
-        reads_from: CollectionHandle,
-        attestation: Attestation,
-    ) -> Driven {
+    fn drive(&mut self, collection: CollectionHandle, attestation: Attestation) -> Driven {
         let contribution = match attestation {
             Attestation::Foundation { data } => CoverageSet::from_keys(std::iter::once(data.raw)),
-            Attestation::Join { low, high, .. } => {
-                let (Some(low), Some(high)) = (
-                    self.published.rows.get(&row_key(reads_from, low)),
-                    self.published.rows.get(&row_key(reads_from, high)),
-                ) else {
-                    // All or nothing: a join that only saw one side would
-                    // otherwise publish a support it never attested.
-                    self.mark_blocked(writes_to, attestation.result(), true);
-                    return Driven::Blocked;
-                };
-                let mut union = low.clone();
-                union.union(high.clone());
+            // A leaf is a foundation of this collection: it stands for its
+            // own output, and reads nothing.
+            Attestation::Leaf { output, .. } => CoverageSet::from_keys(std::iter::once(output.raw)),
+            Attestation::Join { inputs, .. } => {
+                // All or nothing: a join that saw only some of its inputs
+                // would otherwise publish a support it never attested.
+                let mut union = CoverageSet::new();
+                for input in inputs.iter() {
+                    let Some(row) = self.published.rows.get(&row_key(collection, input)) else {
+                        self.mark_blocked(collection, attestation.result(), true);
+                        return Driven::Blocked;
+                    };
+                    union.union(row.clone());
+                }
                 union
             }
-            Attestation::Image { input, .. } => {
-                // The input is a node in the source collection; the output
-                // becomes a node in this one. The commit set travels across
-                // unchanged, which is what makes the derived image denote the
-                // same logical value.
-                let Some(input) = self.published.rows.get(&row_key(reads_from, input)) else {
-                    self.mark_blocked(writes_to, attestation.result(), true);
-                    return Driven::Blocked;
-                };
-                input.clone()
-            }
         };
-        self.mark_blocked(writes_to, attestation.result(), false);
+        self.mark_blocked(collection, attestation.result(), false);
         // Union first, then ask whether anything changed: a PATCH compares
         // by its root hash, so that question costs nothing after the union.
-        let key = row_key(writes_to, attestation.result());
+        let key = row_key(collection, attestation.result());
         let (support, grew) = match self.published.rows.get(&key) {
             Some(existing) => {
                 let mut merged = existing.clone();
@@ -1035,7 +1155,7 @@ impl CoverageIndex {
         // The frontier moves whenever the attestation is driven, grown or
         // not: a second route to a result that already has its support still
         // consumes that route's inputs.
-        self.advance_frontier(writes_to, attestation);
+        self.advance_frontier(collection, attestation);
         if grew {
             Driven::Grew
         } else {
@@ -1044,9 +1164,10 @@ impl CoverageIndex {
     }
 
     /// Move one collection's frontier for an attestation that has just been
-    /// driven: a join takes its inputs off and puts its result on, a
-    /// foundation or an image puts its node on. Idempotent, because a driven
-    /// attestation is driven again whenever one of its inputs grows.
+    /// driven: a join takes every input that is not its result off and puts
+    /// its result on, a foundation or a leaf puts its node on. Idempotent,
+    /// because a driven attestation is driven again whenever one of its
+    /// inputs grows.
     fn advance_frontier(&mut self, collection: CollectionHandle, attestation: Attestation) {
         let mut frontier = self
             .published
@@ -1055,10 +1176,9 @@ impl CoverageIndex {
             .cloned()
             .unwrap_or_default();
         let result = attestation.result();
-        if let Attestation::Join { low, high, .. } = attestation {
-            // `MERGE(x, x) -> x` is legal and appears in practice; it must not
-            // take its own result off.
-            for input in [low, high] {
+        if let Attestation::Join { inputs, .. } = attestation {
+            // `MERGE(a, c) -> c` is legal: it must not take its own result off.
+            for input in inputs.iter() {
                 if input != result {
                     frontier.remove(&input.raw);
                 }
@@ -1073,9 +1193,10 @@ impl CoverageIndex {
     }
 
     /// Whether a driven join of this collection reads this node: one whose
-    /// result and other input both have supports. A join that was only
-    /// registered, its other input still absent, has not consumed anything
-    /// yet; it takes the node off the frontier when it is driven.
+    /// result is not the node, and whose result and every other input have
+    /// supports. A join that was only registered, an input still absent, has
+    /// not consumed anything yet; it takes the node off the frontier when it
+    /// is driven.
     fn consumed(&self, collection: CollectionHandle, node: CollectionData) -> bool {
         let Some(edges) = self.consumers.get(&row_key(collection, node)) else {
             return false;
@@ -1083,19 +1204,25 @@ impl CoverageIndex {
         edges
             .iter_ordered()
             .filter_map(|key| edges.get(key))
-            .any(|&(writes_to, _, consumer)| {
-                let Attestation::Join { low, high, result } = consumer else {
+            .any(|consumer| {
+                let Attestation::Join { inputs, result } = consumer else {
                     return false;
                 };
-                let other = if node == low { high } else { low };
-                writes_to == collection
-                    && result != node
-                    && self.published.rows.get(&row_key(collection, result)).is_some()
-                    && self.published.rows.get(&row_key(collection, other)).is_some()
+                *result != node
+                    && self
+                        .published
+                        .rows
+                        .get(&row_key(collection, *result))
+                        .is_some()
+                    && inputs.iter().filter(|input| *input != node).all(|input| {
+                        self.published
+                            .rows
+                            .get(&row_key(collection, input))
+                            .is_some()
+                    })
             })
     }
 }
-
 
 /// Admission decided from one immutable store observation.
 ///
@@ -1120,8 +1247,9 @@ pub(crate) struct StoreWriters<'a, R> {
     reader: &'a R,
     /// Per collection: the evidence its resident policy definitions give,
     /// and the definitions that are not resident yet.
-    evidence:
-        RefCell<BTreeMap<CollectionHandle, Result<(AdmissionEvidence, Vec<CollectionHandle>), Absent>>>,
+    evidence: RefCell<
+        BTreeMap<CollectionHandle, Result<(AdmissionEvidence, Vec<CollectionHandle>), Absent>>,
+    >,
     sources: RefCell<BTreeMap<CollectionHandle, SourceResolution>>,
     /// One answer per (collection, signer) for the life of this reader. A
     /// fold asks once per record and a lattice holds thousands of records per
@@ -1141,10 +1269,8 @@ impl<'a, R: BlobStoreGet + CapabilityProofRead> StoreWriters<'a, R> {
         }
     }
 
-    /// Read one descriptor to see which collection this one derives from.
-    ///
-    /// One hop, not a walk: the fold only ever needs the collection an input
-    /// node lives in, and that is the immediate source.
+    /// Read one descriptor to see whether this collection is a root or
+    /// derived. The fold only needs that kind; it never reads the source.
     fn read_source(&self, collection: CollectionHandle) -> SourceResolution {
         let Ok(descriptor) = super::api::load_collection_descriptor(self.reader, collection) else {
             return SourceResolution::Missing(collection);
@@ -1163,8 +1289,7 @@ impl<'a, R: BlobStoreGet + CapabilityProofRead> StoreWriters<'a, R> {
     fn write_evidence(&self, collection: CollectionHandle) -> Result<(), Absent> {
         let mut cache = self.evidence.borrow_mut();
         let entry = cache.entry(collection).or_insert_with(|| {
-            let descriptor = match super::api::load_collection_descriptor(self.reader, collection)
-            {
+            let descriptor = match super::api::load_collection_descriptor(self.reader, collection) {
                 Ok(descriptor) => descriptor,
                 Err(super::api::CollectionDescriptorError::Get { .. }) => {
                     return Err(Absent::Descriptor)

@@ -285,7 +285,8 @@ fn reframe(pile_path: &PathBuf, destination: &PathBuf) -> Result<()> {
             .map_err(|e| anyhow!("reframe: {e}"))?;
         println!(
             "Reframed into {}:\n  blobs: {}\n  pin updates: {}\n  wants: {}\n  \
-             retired WANT records projected: {}\n  capability proofs: {}\n  collection records: {}\n  dropped inert records: {}",
+             retired WANT records projected: {}\n  capability proofs: {}\n  collection records: {}\n  \
+             retired v8/v9 equations carried: {}\n  dropped inert records: {}",
             destination.display(),
             stats.blobs,
             stats.pin_updates,
@@ -293,6 +294,7 @@ fn reframe(pile_path: &PathBuf, destination: &PathBuf) -> Result<()> {
             stats.retired_want_records,
             stats.capability_proofs,
             stats.collection_records,
+            stats.retired_equations,
             stats.dropped_inert,
         );
 

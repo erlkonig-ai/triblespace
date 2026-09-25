@@ -973,10 +973,10 @@ mod tests {
         let merge = CollectionMerge::sign(
             &old_key,
             old.handle(),
-            commits[0].data(),
-            commits[1].data(),
+            [commits[0].data(), commits[1].data()],
             crate::inline::Inline::new([0xEE; 32]),
-        );
+        )
+        .unwrap();
         store.insert(CollectionRecord::Merge(merge)).unwrap();
 
         let snapshot = store.snapshot().unwrap();

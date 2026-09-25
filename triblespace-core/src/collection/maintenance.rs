@@ -42,7 +42,7 @@ use super::operation_snapshot::{OperationFrontier, OperationSnapshot};
 use super::{
     Collection, CollectionData, CollectionDerive, CollectionEncoding, CollectionHandle,
     CollectionMapping, CollectionMerge, CollectionOperationError, CollectionRecord,
-    CollectionRecordSelector,
+    CollectionRecordSelector, SourceLocator,
 };
 
 /// One lattice node and what it stands for.
@@ -178,8 +178,7 @@ where
             let CollectionRecord::Merge(merge) = record else {
                 continue;
             };
-            let (low, high) = merge.inputs();
-            for input in [low, high] {
+            for &input in merge.inputs() {
                 if input == node || !visited.insert(input) {
                     continue;
                 }
@@ -260,6 +259,19 @@ fn publish<S: Store>(
         .map_err(|error| CollectionRealizationError::storage(operation, error))?;
     frontier.include_record(record);
     Ok(())
+}
+
+/// Sign one MERGE the maintenance planner chose. Its inputs are distinct
+/// frontier nodes, so an arity refusal is a planning bug, reported as such.
+fn sign_merge<const N: usize>(
+    signing_key: &SigningKey,
+    collection: CollectionHandle,
+    inputs: [CollectionData; N],
+    result: CollectionData,
+) -> Result<CollectionMerge, CollectionRealizationError> {
+    CollectionMerge::sign(signing_key, collection, inputs, result).map_err(|error| {
+        CollectionRealizationError::Resolution(format!("plan an invalid MERGE: {error}"))
+    })
 }
 
 fn ordered(left: CollectionData, right: CollectionData) -> (CollectionData, CollectionData) {
@@ -496,8 +508,8 @@ where
             let input: Blob<M::Source> = snapshot
                 .get(Handle::<M::Source>::from_hash(input_data))
                 .map_err(|error| {
-                    CollectionRealizationError::storage("load source member for mapping", error)
-                })?;
+                CollectionRealizationError::storage("load source member for mapping", error)
+            })?;
             let output = bound.mapping.map(&input, &snapshot);
             drop(snapshot);
             let output = match output {
@@ -521,13 +533,19 @@ where
             store.put::<M::Target, _>(output).map_err(|error| {
                 CollectionRealizationError::storage("store derived target member", error)
             })?;
+            // A2: under lattice v2 a DERIVE is a leaf naming one source
+            // FOUNDATION by its locator, and only the maintaining key's own
+            // foundations are derived. This still maps whatever source
+            // frontier node the cross-collection support difference selects,
+            // merged uppers included, and the new coverage no longer carries
+            // source supports into the target, so this planning is stale.
             publish(
                 store,
                 frontier,
                 CollectionRecord::Derive(CollectionDerive::sign(
                     signing_key,
                     target.handle(),
-                    input_data,
+                    SourceLocator::of(input_data.raw),
                     output_data,
                 )),
                 "publish target DERIVE",
@@ -569,7 +587,11 @@ where
         // The source's frontier from the index, widest first, bytes or not.
         let mut sources: Vec<Node> = coverage
             .frontier(bound.source)
-            .filter_map(|node| coverage.of(bound.source, node).map(|support| (node, support.clone())))
+            .filter_map(|node| {
+                coverage
+                    .of(bound.source, node)
+                    .map(|support| (node, support.clone()))
+            })
             .collect();
         sources.sort_by(|left, right| {
             right
@@ -581,10 +603,7 @@ where
         let candidate = sources.into_iter().find(|(node, support)| {
             !attempted.contains(node)
                 && support <= &targets.covered
-                && !targets
-                    .cover
-                    .iter()
-                    .any(|(_, image)| support <= image)
+                && !targets.cover.iter().any(|(_, image)| support <= image)
         });
         let Some((input_data, support)) = candidate else {
             return Ok(());
@@ -607,8 +626,8 @@ where
                 let low_blob: Blob<M::Target> = snapshot
                     .get(Handle::<M::Target>::from_hash(low))
                     .map_err(|error| {
-                        CollectionRealizationError::storage("load lower image to join", error)
-                    })?;
+                    CollectionRealizationError::storage("load lower image to join", error)
+                })?;
                 let high_blob: Blob<M::Target> = snapshot
                     .get(Handle::<M::Target>::from_hash(high))
                     .map_err(|error| {
@@ -667,23 +686,24 @@ where
             publish(
                 store,
                 frontier,
-                CollectionRecord::Merge(CollectionMerge::sign(
+                CollectionRecord::Merge(sign_merge(
                     signing_key,
                     target.handle(),
-                    low,
-                    high,
+                    [low, high],
                     output_data,
-                )),
+                )?),
                 "publish mirrored target MERGE",
             )?;
         }
+        // A2: a DERIVE of a merged source node is not a leaf under lattice
+        // v2; aligned merges replace this whole mirror.
         publish(
             store,
             frontier,
             CollectionRecord::Derive(CollectionDerive::sign(
                 signing_key,
                 target.handle(),
-                input_data,
+                SourceLocator::of(input_data.raw),
                 output_data,
             )),
             "publish mirrored target DERIVE",
@@ -828,16 +848,17 @@ where
             }
             drop(snapshot);
             for ((low, high), result) in merges {
+                // A2: the carry is still binary; lattice v2 carries eight own
+                // nodes per tier in one n-ary MERGE.
                 publish(
                     store,
                     frontier,
-                    CollectionRecord::Merge(CollectionMerge::sign(
+                    CollectionRecord::Merge(sign_merge(
                         signing_key,
                         target.handle(),
-                        low,
-                        high,
+                        [low, high],
                         result,
-                    )),
+                    )?),
                     "publish target MERGE",
                 )?;
             }
@@ -924,13 +945,12 @@ where
                     publish(
                         store,
                         frontier,
-                        CollectionRecord::Merge(CollectionMerge::sign(
+                        CollectionRecord::Merge(sign_merge(
                             signing_key,
                             target.handle(),
-                            low_data,
-                            high_data,
+                            [low_data, high_data],
                             result,
-                        )),
+                        )?),
                         "publish target MERGE",
                     )?;
                     published = true;

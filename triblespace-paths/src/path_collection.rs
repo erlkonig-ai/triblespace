@@ -335,13 +335,15 @@ fn resident_source_merge_is_lowered_once() {
     store.put::<SimpleArchive, _>(joined.clone()).unwrap();
     let joined_data = Handle::<SimpleArchive>::to_hash(joined.get_handle());
     store
-        .insert(CollectionRecord::Merge(CollectionMerge::sign(
-            &authority_key(),
-            source.handle(),
-            first.data(),
-            second.data(),
-            joined_data,
-        )))
+        .insert(CollectionRecord::Merge(
+            CollectionMerge::sign(
+                &authority_key(),
+                source.handle(),
+                [first.data(), second.data()],
+                joined_data,
+            )
+            .unwrap(),
+        ))
         .unwrap();
     let support = support(&mut store, source, [first, second]);
 
@@ -358,7 +360,12 @@ fn resident_source_merge_is_lowered_once() {
             _ => None,
         })
         .collect();
-    assert_eq!(inputs, vec![joined_data]);
+    assert_eq!(
+        inputs,
+        vec![triblespace_core::collection::SourceLocator::of(
+            joined_data.raw
+        )]
+    );
 }
 
 #[test]
@@ -379,7 +386,7 @@ fn existing_target_merge_is_selected_as_one_physical_member() {
         let record = CollectionDerive::sign(
             &authority_key(),
             target.handle(),
-            input.data(),
+            triblespace_core::collection::SourceLocator::of(input.data().raw),
             Handle::<PathSummaryBlob>::to_hash(output.get_handle()),
         );
         store.insert(CollectionRecord::Derive(record)).unwrap();
@@ -389,13 +396,15 @@ fn existing_target_merge_is_selected_as_one_physical_member() {
     store.put::<PathSummaryBlob, _>(joined.clone()).unwrap();
     let joined_data = Handle::<PathSummaryBlob>::to_hash(joined.get_handle());
     store
-        .insert(CollectionRecord::Merge(CollectionMerge::sign(
-            &authority_key(),
-            target.handle(),
-            derives[0].output(),
-            derives[1].output(),
-            joined_data,
-        )))
+        .insert(CollectionRecord::Merge(
+            CollectionMerge::sign(
+                &authority_key(),
+                target.handle(),
+                [derives[0].output(), derives[1].output()],
+                joined_data,
+            )
+            .unwrap(),
+        ))
         .unwrap();
     let support = support(&mut store, source, [first, second]);
     let snapshot = store.snapshot().unwrap();

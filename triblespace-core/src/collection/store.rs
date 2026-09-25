@@ -76,11 +76,9 @@ pub(crate) fn selectors_match_record(
         CollectionRecord::Commit(commit) => selectors.contains(
             &CollectionRecordSelector::CommitMember(commit.collection(), commit.data()),
         ),
-        CollectionRecord::Merge(merge) => {
-            selectors.contains(&CollectionRecordSelector::MergeCollection(
-                merge.collection(),
-            ))
-        }
+        CollectionRecord::Merge(merge) => selectors.contains(
+            &CollectionRecordSelector::MergeCollection(merge.collection()),
+        ),
         CollectionRecord::Derive(derive) => {
             selectors.contains(&CollectionRecordSelector::DeriveTarget(derive.collection()))
         }
@@ -381,42 +379,46 @@ mod tests {
                 data(4),
                 empty_metadata_handle(),
             )),
-            CollectionRecord::Merge(CollectionMerge::sign(
-                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                source,
-                data(4),
-                data(5),
-                data(6),
-            )),
-            CollectionRecord::Merge(CollectionMerge::sign(
-                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                other,
-                data(4),
-                data(5),
-                data(7),
-            )),
+            CollectionRecord::Merge(
+                CollectionMerge::sign(
+                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                    source,
+                    [data(4), data(5)],
+                    data(6),
+                )
+                .unwrap(),
+            ),
+            CollectionRecord::Merge(
+                CollectionMerge::sign(
+                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                    other,
+                    [data(4), data(5)],
+                    data(7),
+                )
+                .unwrap(),
+            ),
             CollectionRecord::Derive(CollectionDerive::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 target,
-                input,
+                crate::collection::SourceLocator::of(input.raw),
                 data(11),
             )),
             CollectionRecord::Derive(CollectionDerive::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 target,
-                input,
+                crate::collection::SourceLocator::of(input.raw),
                 data(12),
             )),
             CollectionRecord::Derive(CollectionDerive::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 target,
-                data(13),
+                crate::collection::SourceLocator::of(data(13).raw),
                 data(14),
             )),
             CollectionRecord::Derive(CollectionDerive::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 other,
-                input,
+                crate::collection::SourceLocator::of(input.raw),
                 data(15),
             )),
         ];
@@ -557,17 +559,19 @@ mod tests {
                 data(1),
                 empty_metadata_handle(),
             )),
-            CollectionRecord::Merge(CollectionMerge::sign(
-                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                expected,
-                data(1),
-                data(2),
-                data(3),
-            )),
+            CollectionRecord::Merge(
+                CollectionMerge::sign(
+                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                    expected,
+                    [data(1), data(2)],
+                    data(3),
+                )
+                .unwrap(),
+            ),
             CollectionRecord::Derive(CollectionDerive::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 expected,
-                data(3),
+                crate::collection::SourceLocator::of(data(3).raw),
                 data(4),
             )),
             CollectionRecord::Commit(CollectionCommit::sign(
@@ -576,17 +580,19 @@ mod tests {
                 data(1),
                 empty_metadata_handle(),
             )),
-            CollectionRecord::Merge(CollectionMerge::sign(
-                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                other,
-                data(1),
-                data(2),
-                data(3),
-            )),
+            CollectionRecord::Merge(
+                CollectionMerge::sign(
+                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                    other,
+                    [data(1), data(2)],
+                    data(3),
+                )
+                .unwrap(),
+            ),
             CollectionRecord::Derive(CollectionDerive::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 other,
-                data(3),
+                crate::collection::SourceLocator::of(data(3).raw),
                 data(4),
             )),
         ];

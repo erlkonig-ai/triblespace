@@ -1112,11 +1112,9 @@ mod tests {
         reconciler.observe_missing(&wanted, &roots);
         let last_attempt = reconciler.states[&root].last_attempt;
         reconciler.next_service = ServiceTurn::Wants;
-        assert!(
-            reconciler
-                .next_work(&wanted, &roots, crate::clock::mono_now())
-                .is_none()
-        );
+        assert!(reconciler
+            .next_work(&wanted, &roots, crate::clock::mono_now())
+            .is_none());
         assert_eq!(reconciler.states[&root].last_attempt, last_attempt);
         assert_eq!(reconciler.states[&root].backoff, Duration::from_secs(60));
         assert!(reconciler.states[&root].first_root_attempt);
@@ -1150,17 +1148,19 @@ mod tests {
                 Inline::new([2; 32]),
                 Inline::new([3; 32]),
             )),
-            CollectionRecord::Merge(CollectionMerge::sign(
-                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                collection,
-                Inline::new([4; 32]),
-                Inline::new([5; 32]),
-                Inline::new([6; 32]),
-            )),
+            CollectionRecord::Merge(
+                CollectionMerge::sign(
+                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                    collection,
+                    [Inline::new([4; 32]), Inline::new([5; 32])],
+                    Inline::new([6; 32]),
+                )
+                .unwrap(),
+            ),
             CollectionRecord::Derive(CollectionDerive::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 collection,
-                Inline::new([6; 32]),
+                triblespace_core::collection::SourceLocator::of([6; 32]),
                 Inline::new([7; 32]),
             )),
             CollectionRecord::Commit(CollectionCommit::sign(
@@ -1178,11 +1178,9 @@ mod tests {
             direct_roots(&snapshot, &selectors).unwrap(),
             (1..=7).map(|byte| [byte; 32]).collect(),
         );
-        assert!(
-            direct_roots(&snapshot, &BTreeSet::new())
-                .unwrap()
-                .is_empty()
-        );
+        assert!(direct_roots(&snapshot, &BTreeSet::new())
+            .unwrap()
+            .is_empty());
         assert!(direct_roots(&FailingCollectionRead, &selectors).is_err());
     }
 
@@ -1335,11 +1333,9 @@ mod tests {
         );
         reconciler.observe_blob_hint(collection, low);
         assert!(reconciler.blob_hints[&collection].has_prefix(&low));
-        assert!(
-            reconciler.hint_rounds[&collection][&TEST_BLOB_HINT_SOURCE]
-                .unattempted
-                .has_prefix(&low)
-        );
+        assert!(reconciler.hint_rounds[&collection][&TEST_BLOB_HINT_SOURCE]
+            .unattempted
+            .has_prefix(&low));
     }
 
     #[test]
@@ -1369,11 +1365,9 @@ mod tests {
         worker.merge_blob_hints_from(&owner);
         assert!(owner.blob_hints[&collection].has_prefix(&later));
         assert!(worker.blob_hints[&collection].has_prefix(&later));
-        assert!(
-            worker.hint_rounds[&collection][&TEST_BLOB_HINT_SOURCE]
-                .unattempted
-                .has_prefix(&later)
-        );
+        assert!(worker.hint_rounds[&collection][&TEST_BLOB_HINT_SOURCE]
+            .unattempted
+            .has_prefix(&later));
     }
 
     #[test]
@@ -1448,16 +1442,12 @@ mod tests {
             reconciler.blob_hints[&collection].get(&handle),
             Some(&source_a)
         );
-        assert!(
-            reconciler.hint_rounds[&collection][&source_a]
-                .unattempted
-                .has_prefix(&handle)
-        );
-        assert!(
-            reconciler.hint_rounds[&collection][&source_b]
-                .unattempted
-                .is_empty()
-        );
+        assert!(reconciler.hint_rounds[&collection][&source_a]
+            .unattempted
+            .has_prefix(&handle));
+        assert!(reconciler.hint_rounds[&collection][&source_b]
+            .unattempted
+            .is_empty());
         reconciler.observe_missing(&BTreeSet::new(), &BTreeSet::from([handle]));
         reconciler.begin_attempt(ServiceTurn::FreshRoots, handle);
         reconciler.finish_blob_inventory_pass(collection, source_b);
@@ -1552,11 +1542,9 @@ mod tests {
             worker.hint_rounds[&collection][&source].completed_passes,
             owner.hint_rounds[&collection][&source].completed_passes
         );
-        assert!(
-            worker.hint_rounds[&collection][&source]
-                .unattempted
-                .has_prefix(&next)
-        );
+        assert!(worker.hint_rounds[&collection][&source]
+            .unattempted
+            .has_prefix(&next));
     }
 
     #[test]
@@ -2496,11 +2484,9 @@ mod tests {
         peer.activate_collection(collection);
         let before = peer.snapshot().unwrap();
         let previous_serving = observer.current_snapshot().unwrap();
-        assert!(
-            previous_serving
-                .collections()
-                .any(|c| c.collection() == collection)
-        );
+        assert!(previous_serving
+            .collections()
+            .any(|c| c.collection() == collection));
         let frontier = || {
             observer
                 .health()
@@ -2513,11 +2499,9 @@ mod tests {
         let initial_overlay = collection_repair_overlay(&before, collection).unwrap();
         assert!(initial_overlay.records().is_empty());
         assert!(initial_overlay.authorization_evidence().is_empty());
-        assert!(
-            !initial_overlay
-                .authorization_evidence()
-                .reader_is_admitted_by(reader, &[])
-        );
+        assert!(!initial_overlay
+            .authorization_evidence()
+            .reader_is_admitted_by(reader, &[]));
         let initial_frontier = frontier().unwrap();
         assert_eq!(initial_frontier.records, manifest(&initial_overlay).records);
         assert_eq!(
@@ -2591,11 +2575,9 @@ mod tests {
             expected.authorization_evidence().get(proof.id()),
             Some(&proof)
         );
-        assert!(
-            expected
-                .authorization_evidence()
-                .reader_is_admitted_by(reader, std::slice::from_ref(&proof))
-        );
+        assert!(expected
+            .authorization_evidence()
+            .reader_is_admitted_by(reader, std::slice::from_ref(&proof)));
         // Health commits to the actual serving inventory as well as the
         // complete semantic record and AUTH PATCHes.
         let published = frontier_after_refresh.unwrap();
@@ -2612,13 +2594,11 @@ mod tests {
             manifest(&initial_overlay).wake_root,
             manifest(&expected).wake_root
         );
-        assert!(
-            observer
-                .current_snapshot()
-                .unwrap()
-                .collections()
-                .any(|c| c.collection() == collection)
-        );
+        assert!(observer
+            .current_snapshot()
+            .unwrap()
+            .collections()
+            .any(|c| c.collection() == collection));
         assert!(!Arc::ptr_eq(
             &previous_serving,
             &observer.current_snapshot().unwrap()

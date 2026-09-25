@@ -61,7 +61,8 @@ fn census(path: &Path) -> Result<RecordCensus> {
             | PileRecordContent::RetiredArtifactOfferV1 => census.retired_team_records += 1,
             PileRecordContent::Opaque { .. } => {
                 census.opaque += 1;
-                census.opaque_bytes += u64::try_from(record.len).context("frame length exceeds u64")?;
+                census.opaque_bytes +=
+                    u64::try_from(record.len).context("frame length exceeds u64")?;
             }
             _ => {}
         }
@@ -256,6 +257,10 @@ pub(super) fn run(
     println!(
         "  frames left behind with drained generations: {}",
         stats.drained_frames
+    );
+    println!(
+        "  retired v8/v9 equations carried for the clean-pile migration: {}",
+        stats.retired_equations
     );
     Ok(())
 }

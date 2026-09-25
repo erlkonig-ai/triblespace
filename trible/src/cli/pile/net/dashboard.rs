@@ -12,20 +12,20 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace_core::blob::encodings::utf8string::UTF8String;
+use triblespace_core::blob::encodings::UnknownBlob;
+use triblespace_core::blob::Blob;
+use triblespace_core::collection::descriptor;
 use triblespace_core::collection::{
     AdmissionPolicy, Collection, CollectionHandle, CollectionPolicy, CollectionSnapshot,
     CollectionSnapshotExt, CollectionStoreExt, TryFromCoverError,
 };
+use triblespace_core::inline::encodings::hash::Handle;
+use triblespace_core::inline::Inline;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::pile::{Pile, PileSnapshot};
 use triblespace_core::repo::SnapshotSource;
 use triblespace_core::trible::TribleSet;
-use triblespace_core::blob::encodings::utf8string::UTF8String;
-use triblespace_core::blob::Blob;
-use triblespace_core::blob::encodings::UnknownBlob;
-use triblespace_core::collection::descriptor;
-use triblespace_core::inline::encodings::hash::Handle;
-use triblespace_core::inline::Inline;
 use triblespace_net::dashboard::{self, CountMetric, Freshness, ObserverReport};
 use triblespace_net::health_record;
 use triblespace_net::telemetry::{self, Metric, WorkerReport};
@@ -335,13 +335,15 @@ impl Reader {
         // An indexed per-collection lookup, so this costs the selected
         // collection's own records rather than the store's.
         let members = match (self.lattice, self.focus) {
-            (true, Some(collection)) => match observe_members(&snapshot, collection, MEMBER_LIMIT) {
-                Ok(members) => Some(members),
-                Err(error) => {
-                    warnings.push(format!("Collection members unreadable: {error}"));
-                    None
+            (true, Some(collection)) => {
+                match observe_members(&snapshot, collection, MEMBER_LIMIT) {
+                    Ok(members) => Some(members),
+                    Err(error) => {
+                        warnings.push(format!("Collection members unreadable: {error}"));
+                        None
+                    }
                 }
-            },
+            }
             _ => None,
         };
         let frame = Frame {
@@ -555,8 +557,11 @@ fn observe_lattice<R: triblespace_core::repo::StoreRead>(
     // handle. The drawing places nodes by rank and then by this order, so a
     // fixed order is what stops the picture jumping between observations.
     out.sort_by(|left, right| {
-        (left.name.is_none(), &left.name, left.handle)
-            .cmp(&(right.name.is_none(), &right.name, right.handle))
+        (left.name.is_none(), &left.name, left.handle).cmp(&(
+            right.name.is_none(),
+            &right.name,
+            right.handle,
+        ))
     });
     Ok(out)
 }
@@ -699,9 +704,9 @@ fn observe_members<R: triblespace_core::repo::StoreRead>(
     use triblespace_core::collection::records::{CollectionData, CollectionRecord};
     use triblespace_core::collection::CollectionRecordSelector;
 
-    let selectors = BTreeSet::from([CollectionRecordSelector::Collection(
-        CollectionHandle::new(collection),
-    )]);
+    let selectors = BTreeSet::from([CollectionRecordSelector::Collection(CollectionHandle::new(
+        collection,
+    ))]);
     let records = snapshot
         .select_records(&selectors)
         .map_err(|_| ReadFailure::RefreshPile)?;
@@ -718,13 +723,12 @@ fn observe_members<R: triblespace_core::repo::StoreRead>(
                 handles.insert(data);
             }
             CollectionRecord::Merge(merge) => {
-                let (low, high) = merge.inputs();
                 let result = merge.result().raw;
                 produced.insert(result);
                 handles.insert(result);
-                for input in [low.raw, high.raw] {
-                    handles.insert(input);
-                    raw_joins.push((input, result));
+                for input in merge.inputs() {
+                    handles.insert(input.raw);
+                    raw_joins.push((input.raw, result));
                 }
             }
             CollectionRecord::Derive(derive) => {
@@ -1517,8 +1521,7 @@ mod tests {
         use triblespace_core::blob::encodings::succinctarchive::SuccinctArchiveBlob;
         let mut store = MemoryRepo::default();
         let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
-        let source: Collection<SimpleArchive> =
-            store.collection("facts", policy.clone()).unwrap();
+        let source: Collection<SimpleArchive> = store.collection("facts", policy.clone()).unwrap();
         let signer = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
         store
             .commit(source, &signer, entity! { metadata::name: "first" })
@@ -1545,7 +1548,10 @@ mod tests {
             .iter()
             .find(|collection| collection.handle == source.raw)
             .expect("the source collection is projected");
-        assert_eq!(root.source, None, "a root has no source; that is not a failure");
+        assert_eq!(
+            root.source, None,
+            "a root has no source; that is not a failure"
+        );
         assert_eq!(root.name.as_deref(), Some("facts"));
         assert_eq!(root.commits, 1);
     }
@@ -1623,8 +1629,7 @@ mod tests {
         use triblespace_core::collection::CollectionStore;
         let mut store = MemoryRepo::default();
         let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
-        let collection: Collection<SimpleArchive> =
-            store.collection("members", policy).unwrap();
+        let collection: Collection<SimpleArchive> = store.collection("members", policy).unwrap();
         let signer = ed25519_dalek::SigningKey::from_bytes(&[13; 32]);
         let first = store
             .commit(collection, &signer, entity! { metadata::name: "a" })
@@ -1637,12 +1642,12 @@ mod tests {
         // exactly the case the drawing must not show as complete.
         let result = Inline::new([0x77; 32]);
         let merge = CollectionMerge::sign(
-    &signer,
-    collection.handle(),
-    first.data(),
-    second.data(),
-    result,
-);
+            &signer,
+            collection.handle(),
+            [first.data(), second.data()],
+            result,
+        )
+        .unwrap();
         store.insert(CollectionRecord::Merge(merge)).unwrap();
         (
             store,
@@ -1714,8 +1719,12 @@ mod tests {
                 empty_metadata_handle(),
             )))
             .unwrap();
-        let derive =
-            CollectionDerive::sign(&signer, CollectionHandle::new(target.raw), input, output);
+        let derive = CollectionDerive::sign(
+            &signer,
+            CollectionHandle::new(target.raw),
+            triblespace_core::collection::SourceLocator::of(input.raw),
+            output,
+        );
         store.insert(CollectionRecord::Derive(derive)).unwrap();
         let snapshot = store.snapshot().unwrap();
         let members = observe_members(&snapshot, target.raw, MEMBER_LIMIT).unwrap();
@@ -1846,10 +1855,10 @@ mod tests {
         let merge = CollectionMerge::sign(
             &signer,
             CollectionHandle::new(collection),
-            Inline::new(result),
-            orphan,
+            [Inline::new(result), orphan],
             Inline::new([0x55; 32]),
-        );
+        )
+        .unwrap();
         store.insert(CollectionRecord::Merge(merge)).unwrap();
         let snapshot = store.snapshot().unwrap();
         let members = observe_members(&snapshot, collection, MEMBER_LIMIT).unwrap();
@@ -1884,7 +1893,6 @@ mod tests {
         assert!(rendered.contains("references no collections"));
         assert!(!rendered.contains("not sampled"));
     }
-
 
     fn worker() -> WorkerReport {
         let id = Id::new([1; 16]).unwrap();

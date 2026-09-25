@@ -23,17 +23,19 @@ fn signed_records() -> [CollectionRecord; 3] {
             Inline::new([2; 32]),
             Inline::new([3; 32]),
         )),
-        CollectionRecord::Merge(CollectionMerge::sign(
-            &key,
-            Inline::new([1; 32]),
-            Inline::new([2; 32]),
-            Inline::new([3; 32]),
-            Inline::new([4; 32]),
-        )),
+        CollectionRecord::Merge(
+            CollectionMerge::sign(
+                &key,
+                Inline::new([1; 32]),
+                [Inline::new([2; 32]), Inline::new([3; 32])],
+                Inline::new([4; 32]),
+            )
+            .unwrap(),
+        ),
         CollectionRecord::Derive(CollectionDerive::sign(
             &key,
             Inline::new([1; 32]),
-            Inline::new([2; 32]),
+            triblespace_core::collection::SourceLocator::of([2; 32]),
             Inline::new([3; 32]),
         )),
     ]

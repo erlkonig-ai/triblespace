@@ -9,13 +9,10 @@
 //! available batches into the next immutable observation without a disk flush.
 //! Explicit close (or an application-chosen flush) owns persistence.
 
-use triblespace_core::blob::Blob;
 use triblespace_core::blob::encodings::UnknownBlob;
+use triblespace_core::blob::Blob;
 use triblespace_core::capability::CapabilityProof;
-use triblespace_core::collection::{
-    COLLECTION_COMMIT_BYTES_LEN, COLLECTION_DERIVE_BYTES_LEN, COLLECTION_MERGE_BYTES_LEN,
-    CollectionHandle, CollectionRecord,
-};
+use triblespace_core::collection::{CollectionHandle, CollectionRecord};
 
 /// Authenticated, structurally canonical collection items returned by repair.
 ///
@@ -47,9 +44,9 @@ impl NetEvent {
     fn admission_bytes(&self) -> usize {
         match self {
             Self::Blob(blob) => blob.bytes.len(),
-            Self::CollectionRecord(CollectionRecord::Commit(_)) => 1 + COLLECTION_COMMIT_BYTES_LEN,
-            Self::CollectionRecord(CollectionRecord::Merge(_)) => 1 + COLLECTION_MERGE_BYTES_LEN,
-            Self::CollectionRecord(CollectionRecord::Derive(_)) => 1 + COLLECTION_DERIVE_BYTES_LEN,
+            // One tag byte and the dense form; a MERGE's length follows its
+            // arity.
+            Self::CollectionRecord(record) => 1 + record.dense_len(),
             Self::CapabilityProof(proof) => proof.as_bytes().len(),
             Self::BlobHint { .. } => 96,
             Self::BlobInventoryPassCompleted { .. } => 64,
@@ -152,7 +149,7 @@ impl NetEventBatch {
 mod tests {
     use ed25519_dalek::SigningKey;
     use triblespace_core::collection::{
-        CollectionCommit, CollectionData, CollectionRecord, empty_metadata_handle,
+        empty_metadata_handle, CollectionCommit, CollectionData, CollectionRecord,
     };
 
     use super::*;

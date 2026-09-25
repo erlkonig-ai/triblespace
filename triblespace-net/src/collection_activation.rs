@@ -22,9 +22,9 @@ use triblespace_core::capability::{
     CapabilityResource,
 };
 use triblespace_core::collection::{
-    ACTION_READ, ACTION_WRITE, AdmissionPolicy, CollectionDescriptorError, CollectionHandle,
-    CollectionPolicy, CollectionRead, CollectionReadAudience, RecordDecodeError,
     collection_read_audience_by_policy, collection_reader_is_admitted_by_policy, descriptor,
+    AdmissionPolicy, CollectionDescriptorError, CollectionHandle, CollectionPolicy, CollectionRead,
+    CollectionReadAudience, RecordDecodeError, ACTION_READ, ACTION_WRITE,
 };
 use triblespace_core::id::Id;
 use triblespace_core::patch::{Blake3Merkle, Entry as PatchEntry, IdentitySchema, PATCH};
@@ -33,7 +33,7 @@ use triblespace_core::repo::{BlobStoreGet, CapabilityProofRead};
 use triblespace_core::trible::TribleSet;
 
 use crate::collection_delta::{
-    CollectionRecordPatch, CollectionRecordPatchError, collection_record_patch,
+    collection_record_patch, CollectionRecordPatch, CollectionRecordPatchError,
 };
 use crate::host::ResidentBlobReader;
 use crate::patch_repair::PatchSummary;
@@ -862,13 +862,13 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use triblespace_core::capability::policy::{capability_handle, resource_policy};
     use triblespace_core::capability::{
-        CapabilityRequest, capability_action, capability_delegate_action,
-        capability_quorum_authorizes,
+        capability_action, capability_delegate_action, capability_quorum_authorizes,
+        CapabilityRequest,
     };
     use triblespace_core::collection::{
-        CollectionCommit, CollectionData, CollectionDerive, CollectionMerge, CollectionPolicy,
-        CollectionRecord, CollectionStore, CollectionStoreExt, KIND_COLLECTION_DESCRIPTOR,
-        empty_metadata_handle, read_capability, write_capability,
+        empty_metadata_handle, read_capability, write_capability, CollectionCommit, CollectionData,
+        CollectionDerive, CollectionMerge, CollectionPolicy, CollectionRecord, CollectionStore,
+        CollectionStoreExt, KIND_COLLECTION_DESCRIPTOR,
     };
     use triblespace_core::inline::Inline;
     use triblespace_core::metadata;
@@ -1280,11 +1280,9 @@ mod tests {
             let overlay = collection_repair_overlay(&snapshot, collection).unwrap();
             let evidence = overlay.authorization_evidence();
             assert_eq!(evidence.read_policies().count(), 0);
-            assert!(
-                evidence
-                    .write_policies()
-                    .any(|policy| matches!(policy, AdmissionPolicy::Open))
-            );
+            assert!(evidence
+                .write_policies()
+                .any(|policy| matches!(policy, AdmissionPolicy::Open)));
             assert!(!evidence.reader_is_admitted_by(key(44).verifying_key(), &[]));
             assert_eq!(
                 evidence.authorized_readers(),
@@ -1326,11 +1324,14 @@ mod tests {
         assert_eq!(evidence.write_policies().count(), 0);
         assert!(evidence.reader_is_admitted_by(key(44).verifying_key(), &[]));
         assert_eq!(evidence.authorized_readers(), CollectionReadAudience::Open);
-        assert!(
-            collection_read_bootstrap_proofs(&snapshot, collection, key(44).verifying_key(), 0)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(collection_read_bootstrap_proofs(
+            &snapshot,
+            collection,
+            key(44).verifying_key(),
+            0
+        )
+        .unwrap()
+        .is_empty());
     }
 
     #[test]
@@ -1358,20 +1359,16 @@ mod tests {
 
         let before_snapshot = store.snapshot().unwrap();
         let before = collection_repair_overlay(&before_snapshot, collection.handle()).unwrap();
-        assert!(
-            !collection
-                .writer_is_admitted(&before_snapshot, writer.verifying_key())
-                .unwrap()
-        );
+        assert!(!collection
+            .writer_is_admitted(&before_snapshot, writer.verifying_key())
+            .unwrap());
         let atom = write_scope(collection.handle());
         store_proof(&mut store, root_proof(&root, &writer, atom));
         let after_snapshot = store.snapshot().unwrap();
         let after = collection_repair_overlay(&after_snapshot, collection.handle()).unwrap();
-        assert!(
-            collection
-                .writer_is_admitted(&after_snapshot, writer.verifying_key())
-                .unwrap()
-        );
+        assert!(collection
+            .writer_is_admitted(&after_snapshot, writer.verifying_key())
+            .unwrap());
 
         assert_eq!(before.records().summary().leaf_count(), 1);
         assert_eq!(after.records().summary().leaf_count(), 1);
@@ -1489,19 +1486,16 @@ mod tests {
         let before = collection_repair_overlay(&before_snapshot, collection.handle()).unwrap();
 
         store
-            .insert(CollectionRecord::Merge(CollectionMerge::sign(
-                &writer,
-                collection.handle(),
-                data(31),
-                data(32),
-                data(33),
-            )))
+            .insert(CollectionRecord::Merge(
+                CollectionMerge::sign(&writer, collection.handle(), [data(31), data(32)], data(33))
+                    .unwrap(),
+            ))
             .unwrap();
         store
             .insert(CollectionRecord::Derive(CollectionDerive::sign(
                 &writer,
                 collection.handle(),
-                data(33),
+                triblespace_core::collection::SourceLocator::of(data(33).raw),
                 data(34),
             )))
             .unwrap();
@@ -1582,26 +1576,20 @@ mod tests {
             before.authorization_evidence().get(proof.id()),
             Some(&proof)
         );
-        assert!(
-            !before
-                .authorization_evidence()
-                .reader_is_admitted_by(reader.verifying_key(), &[proof.clone()])
-        );
+        assert!(!before
+            .authorization_evidence()
+            .reader_is_admitted_by(reader.verifying_key(), &[proof.clone()]));
         store
             .put::<SimpleArchive, _>(entity! { capability_action: ACTION_READ }.facts().clone())
             .unwrap();
         let after = collection_repair_overlay(&store.snapshot().unwrap(), collection).unwrap();
         assert_eq!(before.wake_root(), after.wake_root());
-        assert!(
-            after
-                .authorization_evidence()
-                .reader_is_admitted_by(reader.verifying_key(), &[proof.clone()])
-        );
-        assert!(
-            !before
-                .authorization_evidence()
-                .reader_is_admitted_by(reader.verifying_key(), &[proof])
-        );
+        assert!(after
+            .authorization_evidence()
+            .reader_is_admitted_by(reader.verifying_key(), &[proof.clone()]));
+        assert!(!before
+            .authorization_evidence()
+            .reader_is_admitted_by(reader.verifying_key(), &[proof]));
     }
 
     #[test]
@@ -1753,16 +1741,14 @@ mod tests {
             candidates, expected,
             "only routed R evidence contributes; wrong roots, other audiences, split routes and missing R descriptors do not"
         );
-        assert!(
-            collection_read_bootstrap_proofs(
-                &snapshot,
-                collection.handle(),
-                reader.verifying_key(),
-                16
-            )
-            .unwrap()
-            .is_empty()
-        );
+        assert!(collection_read_bootstrap_proofs(
+            &snapshot,
+            collection.handle(),
+            reader.verifying_key(),
+            16
+        )
+        .unwrap()
+        .is_empty());
     }
 
     #[test]
@@ -2018,11 +2004,9 @@ mod tests {
         .unwrap();
         assert_eq!(selected, [relevant.clone()]);
         let overlay = collection_repair_overlay(&snapshot, collection.handle()).unwrap();
-        assert!(
-            overlay
-                .authorization_evidence()
-                .reader_is_admitted_by(reader.verifying_key(), &[relevant])
-        );
+        assert!(overlay
+            .authorization_evidence()
+            .reader_is_admitted_by(reader.verifying_key(), &[relevant]));
         assert!(matches!(
             collection_read_bootstrap_proofs(
                 &snapshot,
@@ -2097,16 +2081,12 @@ mod tests {
             assert_eq!(witness.capabilities().collect::<Vec<_>>(), [delegating]);
         }
         let overlay = collection_repair_overlay(&snapshot, collection.handle()).unwrap();
-        assert!(
-            overlay
-                .authorization_evidence()
-                .reader_is_admitted_by(reader.verifying_key(), &selected)
-        );
-        assert!(
-            !overlay
-                .authorization_evidence()
-                .reader_is_admitted_by(reader.verifying_key(), &selected[..1])
-        );
+        assert!(overlay
+            .authorization_evidence()
+            .reader_is_admitted_by(reader.verifying_key(), &selected));
+        assert!(!overlay
+            .authorization_evidence()
+            .reader_is_admitted_by(reader.verifying_key(), &selected[..1]));
         assert!(matches!(
             collection_read_bootstrap_proofs(
                 &snapshot,
@@ -2198,11 +2178,9 @@ mod tests {
         )
         .unwrap();
         assert!(selected.is_empty());
-        assert!(
-            collection_repair_overlay(&snapshot, collection.handle())
-                .unwrap()
-                .authorization_evidence()
-                .reader_is_admitted_by(key(27).verifying_key(), &[])
-        );
+        assert!(collection_repair_overlay(&snapshot, collection.handle())
+            .unwrap()
+            .authorization_evidence()
+            .reader_is_admitted_by(key(27).verifying_key(), &[]));
     }
 }

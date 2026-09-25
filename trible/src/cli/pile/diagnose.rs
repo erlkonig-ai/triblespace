@@ -535,7 +535,7 @@ fn record_at(pile_path: &Path, offset: usize) -> Result<()> {
 }
 
 fn print_record(bytes: &[u8], file_len: usize, record: triblespace_core::repo::pile::PileRecord) {
-    use triblespace_core::collection::CollectionRecord;
+    use triblespace_core::collection::{CollectionRecord, RetiredCollectionEquation};
     use triblespace_core::repo::pile::{LegacyCollectionRecordKindV3, PileRecordContent};
     fn print_want_request(request: WantRequest) {
         match request {
@@ -614,24 +614,56 @@ fn print_record(bytes: &[u8], file_len: usize, record: triblespace_core::repo::p
                 println!("  author: {}", hex::encode_upper(commit.public_key().raw));
             }
             CollectionRecord::Merge(merge) => {
-                let (low, high) = merge.inputs();
                 println!("  classification: collection-merge");
                 println!(
                     "  collection: {}",
                     hex::encode_upper(merge.collection().raw)
                 );
-                println!("  low: {}", hex::encode_upper(low.raw));
-                println!("  high: {}", hex::encode_upper(high.raw));
+                for (index, input) in merge.inputs().iter().enumerate() {
+                    println!("  input[{index}]: {}", hex::encode_upper(input.raw));
+                }
                 println!("  result: {}", hex::encode_upper(merge.result().raw));
                 println!("  author: {}", hex::encode_upper(merge.public_key().raw));
             }
             CollectionRecord::Derive(derive) => {
-                let (input, output) = (derive.input(), derive.output());
                 println!("  classification: collection-derive");
                 println!("  target: {}", hex::encode_upper(derive.collection().raw));
+                println!(
+                    "  source_locator: {}",
+                    hex::encode_upper(derive.input().raw())
+                );
+                println!("  output: {}", hex::encode_upper(derive.output().raw));
+                println!("  author: {}", hex::encode_upper(derive.public_key().raw));
+            }
+        },
+        PileRecordContent::RetiredCollectionEquation { equation } => match equation {
+            RetiredCollectionEquation::MergeV8 {
+                collection,
+                low,
+                high,
+                result,
+                public_key,
+                ..
+            } => {
+                println!("  classification: retired-v8-collection-merge (inert)");
+                println!("  collection: {}", hex::encode_upper(collection.raw));
+                println!("  low: {}", hex::encode_upper(low.raw));
+                println!("  high: {}", hex::encode_upper(high.raw));
+                println!("  result: {}", hex::encode_upper(result.raw));
+                println!("  author: {}", hex::encode_upper(public_key.raw));
+            }
+            RetiredCollectionEquation::DeriveV9 {
+                target,
+                input,
+                output,
+                public_key,
+                ..
+            } => {
+                println!("  classification: retired-v9-collection-derive (inert)");
+                println!("  target: {}", hex::encode_upper(target.raw));
                 println!("  input: {}", hex::encode_upper(input.raw));
                 println!("  output: {}", hex::encode_upper(output.raw));
-                println!("  author: {}", hex::encode_upper(derive.public_key().raw));
+                println!("  author: {}", hex::encode_upper(public_key.raw));
             }
         },
         PileRecordContent::LegacyCollectionV3 { kind } => {
@@ -846,6 +878,9 @@ fn census(path: &Path) -> Result<()> {
         let (kind, is_opaque) = match &record.content {
             PileRecordContent::Blob { .. } => ("BLOB", None),
             PileRecordContent::Collection { .. } => ("COLLECTION", None),
+            PileRecordContent::RetiredCollectionEquation { .. } => {
+                ("retired COLLECTION_EQUATION_V8_V9", None)
+            }
             PileRecordContent::LegacyUnsignedCollectionEquation { .. } => {
                 ("legacy UNSIGNED_COLLECTION_EQUATION", None)
             }
@@ -921,17 +956,16 @@ fn census(path: &Path) -> Result<()> {
 }
 
 /// One input set of an equation, as a key: the collection it names and the
-/// node or nodes it reads.
+/// nodes a merge joins, or the source locator a derive maps.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum EquationInputs {
     Merge {
         collection: [u8; 32],
-        low: [u8; 32],
-        high: [u8; 32],
+        inputs: Vec<[u8; 32]>,
     },
     Derive {
         target: [u8; 32],
-        input: [u8; 32],
+        locator: [u8; 32],
     },
 }
 
@@ -950,22 +984,20 @@ fn conflicts(path: &Path) -> Result<()> {
         BTreeMap::new();
     let mut merges = 0usize;
     let mut derives = 0usize;
-    for record in snapshot
-        .records()
-        .map_err(|error| anyhow::anyhow!("read collection records of {}: {error}", path.display()))?
-    {
-        let record = record
-            .map_err(|error| anyhow::anyhow!("read collection records of {}: {error}", path.display()))?;
+    for record in snapshot.records().map_err(|error| {
+        anyhow::anyhow!("read collection records of {}: {error}", path.display())
+    })? {
+        let record = record.map_err(|error| {
+            anyhow::anyhow!("read collection records of {}: {error}", path.display())
+        })?;
         let (inputs, output, signer) = match record {
             CollectionRecord::Commit(_) => continue,
             CollectionRecord::Merge(merge) => {
                 merges += 1;
-                let (low, high) = merge.inputs();
                 (
                     EquationInputs::Merge {
                         collection: merge.collection().raw,
-                        low: low.raw,
-                        high: high.raw,
+                        inputs: merge.inputs().iter().map(|input| input.raw).collect(),
                     },
                     merge.result().raw,
                     merge.public_key().raw,
@@ -976,7 +1008,7 @@ fn conflicts(path: &Path) -> Result<()> {
                 (
                     EquationInputs::Derive {
                         target: derive.collection().raw,
-                        input: derive.input().raw,
+                        locator: derive.input().raw(),
                     },
                     derive.output().raw,
                     derive.public_key().raw,
@@ -1024,25 +1056,25 @@ fn conflicts(path: &Path) -> Result<()> {
     println!();
     for (inputs, outputs) in &disagreeing {
         match inputs {
-            EquationInputs::Merge {
-                collection,
-                low,
-                high,
-            } => println!(
-                "MERGE in {}\n  low  {}\n  high {}",
-                hex::encode(collection),
-                hex::encode(low),
-                hex::encode(high)
-            ),
-            EquationInputs::Derive { target, input } => println!(
-                "DERIVE into {}\n  input {}",
+            EquationInputs::Merge { collection, inputs } => {
+                println!("MERGE in {}", hex::encode(collection));
+                for input in inputs {
+                    println!("  input {}", hex::encode(input));
+                }
+            }
+            EquationInputs::Derive { target, locator } => println!(
+                "DERIVE into {}\n  locator {}",
                 hex::encode(target),
-                hex::encode(input)
+                hex::encode(locator)
             ),
         }
         for (output, signers) in outputs.iter() {
             let signers: Vec<String> = signers.iter().map(hex::encode).collect();
-            println!("  -> {}  signed by {}", hex::encode(output), signers.join(", "));
+            println!(
+                "  -> {}  signed by {}",
+                hex::encode(output),
+                signers.join(", ")
+            );
         }
     }
     anyhow::bail!(
@@ -1084,7 +1116,7 @@ mod conflict_tests {
             CollectionRecord::Derive(CollectionDerive::sign(
                 &one,
                 collection,
-                input,
+                triblespace_core::collection::SourceLocator::of(input.raw),
                 Inline::new([20; 32]),
             )),
             // A second signer naming the same output agrees, and is one more
@@ -1092,16 +1124,13 @@ mod conflict_tests {
             CollectionRecord::Derive(CollectionDerive::sign(
                 &two,
                 collection,
-                input,
+                triblespace_core::collection::SourceLocator::of(input.raw),
                 Inline::new([20; 32]),
             )),
-            CollectionRecord::Merge(CollectionMerge::sign(
-                &one,
-                collection,
-                input,
-                other,
-                Inline::new([30; 32]),
-            )),
+            CollectionRecord::Merge(
+                CollectionMerge::sign(&one, collection, [input, other], Inline::new([30; 32]))
+                    .unwrap(),
+            ),
         ]);
         conflicts(&agreed.path().join("equations.pile")).unwrap();
 
@@ -1109,30 +1138,24 @@ mod conflict_tests {
             CollectionRecord::Derive(CollectionDerive::sign(
                 &one,
                 collection,
-                input,
+                triblespace_core::collection::SourceLocator::of(input.raw),
                 Inline::new([20; 32]),
             )),
             CollectionRecord::Derive(CollectionDerive::sign(
                 &two,
                 collection,
-                input,
+                triblespace_core::collection::SourceLocator::of(input.raw),
                 Inline::new([21; 32]),
             )),
             // The same join named in either order is one input set.
-            CollectionRecord::Merge(CollectionMerge::sign(
-                &one,
-                collection,
-                input,
-                other,
-                Inline::new([30; 32]),
-            )),
-            CollectionRecord::Merge(CollectionMerge::sign(
-                &one,
-                collection,
-                other,
-                input,
-                Inline::new([31; 32]),
-            )),
+            CollectionRecord::Merge(
+                CollectionMerge::sign(&one, collection, [input, other], Inline::new([30; 32]))
+                    .unwrap(),
+            ),
+            CollectionRecord::Merge(
+                CollectionMerge::sign(&one, collection, [other, input], Inline::new([31; 32]))
+                    .unwrap(),
+            ),
         ]);
         let error = conflicts(&disagreeing.path().join("equations.pile")).unwrap_err();
         assert!(
