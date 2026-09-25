@@ -12,12 +12,18 @@
 //!
 //! Each proof is keyed by one TLS-authenticated endpoint identity and names
 //! the other, so it binds both and is exactly one 64-byte BLAKE3 block. `H`
-//! sits on opposite sides of the two messages, so the two roles never produce
-//! the same value: not on one connection, where equality would let a requester
-//! that knows only `L` echo the provider's proof back, and not across a
-//! swapped pair of roles. They are deterministic because replay by the same
-//! requester to the same provider merely repeats an authorized read of
-//! immutable content; replay under any other endpoint identity fails.
+//! sits on opposite sides of the two messages. While `H` is secret, which is
+//! the premise of the whole exchange, the two roles therefore never produce the
+//! same value: not on one connection, where equality would let a requester that
+//! knows only `L` echo the provider's proof back, and not across a swapped pair
+//! of roles. The separation is conditional, not algebraic: if `H` equals an
+//! endpoint identity, `provider_proof(H, R, P)` equals
+//! `requester_proof(H, P, R)` (both are `keyed(P; R || R)` when `H = R`). That
+//! is no bypass, because such an `H` is already public.
+//!
+//! The proofs are deterministic because replay by the same requester to the
+//! same provider merely repeats an authorized read of immutable content; replay
+//! under any other endpoint identity fails.
 
 use anyhow::Result;
 use triblespace_core::patch::{Entry as PatchEntry, IdentitySchema, PATCH};
