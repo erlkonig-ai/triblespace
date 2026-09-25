@@ -1327,11 +1327,12 @@ fn adopt_payloads_rescues_exactly_the_listed_payloads() {
     assert_eq!(find(&report["retired"], fixture.other)["absent_resident"], 0);
     assert_eq!(find(&report["roots"], fixture.root)["adopted_payloads"], 3);
 
-    // Listing a payload the root already holds adopts nothing again.
+    // Listing a payload the root already holds under another key (B owns
+    // P2) adopts nothing: one owner per payload.
     let again = fixture.path("again.txt");
     std::fs::write(
         &again,
-        format!("{} {}\n", hex::encode(fixture.p1.raw), handle_line(fixture.root.raw)),
+        format!("{} {}\n", hex::encode(fixture.p2.raw), handle_line(fixture.root.raw)),
     )
     .unwrap();
     let dst = fixture.path("present.pile");
@@ -1344,6 +1345,31 @@ fn adopt_payloads_rescues_exactly_the_listed_payloads() {
     let report = fixture.report(&dst);
     assert_eq!(report["payload_adoption"]["adopted"], 0);
     assert_eq!(report["payload_adoption"]["already_present"], 1);
+    assert_eq!(report["payload_adoption"]["variants_added"], 0);
+
+    // Adopted by name first, which carries only its owner A's metadata, then
+    // listed for rescue: the rescue adds B's variant, still signed by A.
+    let q1_only = fixture.path("q1.txt");
+    std::fs::write(
+        &q1_only,
+        format!("{} {}\n", hex::encode(fixture.q1.raw), handle_line(fixture.root.raw)),
+    )
+    .unwrap();
+    let dst = fixture.path("both.pile");
+    assert_success(&fixture.clean(
+        &fixture.src,
+        &dst,
+        &["--adopt-by-name", "--adopt-payloads", q1_only.to_str().unwrap()],
+        &[&fixture.key_a, &fixture.key_b],
+    ));
+    let a = fixture.a.verifying_key().to_bytes();
+    assert_eq!(
+        commits_of(&records(&dst), fixture.q1),
+        BTreeSet::from([(a, fixture.q1_metadata), (a, fixture.p1_metadata[1])])
+    );
+    let report = fixture.report(&dst);
+    assert_eq!(report["payload_adoption"]["already_present"], 1);
+    assert_eq!(report["payload_adoption"]["variants_added"], 1);
 }
 
 #[test]

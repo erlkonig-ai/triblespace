@@ -1441,6 +1441,9 @@ struct Roots {
     /// payload listed for payload adoption, from any collection.
     payload_metadata: HashMap<Raw, BTreeSet<Raw>>,
     payload_adoption: PayloadAdoptionStats,
+    /// `(root, payload, metadata)` of every commit the destination holds, kept
+    /// or adopted, so payload rescue adds only variants it does not hold yet.
+    written: HashSet<(usize, Raw, Raw)>,
 }
 
 /// What dropping one retired root would drop.
@@ -1457,6 +1460,9 @@ struct Unkept {
 struct PayloadAdoptionStats {
     adopted: u64,
     already_present: u64,
+    /// Metadata variants added to a payload the adopter already carried in
+    /// this run through collection adoption.
+    variants_added: u64,
 }
 
 impl Roots {
@@ -1886,6 +1892,7 @@ impl Run {
             retired_payloads: BTreeMap::new(),
             payload_metadata: HashMap::new(),
             payload_adoption: PayloadAdoptionStats::default(),
+            written: HashSet::new(),
         };
         let mut run: Option<((usize, Raw), Option<u32>)> = None;
         // The same owner rule per `(retired collection, data)`: only the
@@ -1953,6 +1960,7 @@ impl Run {
                     continue;
                 }
                 stats.kept_commits += 1;
+                roots.written.insert((root, data, commit.metadata().raw));
                 out.record(record, "commit")?;
             } else if let Some((_, mapped)) = plan.retired.get(&collection) {
                 roots
@@ -2025,6 +2033,7 @@ impl Run {
                 Inline::new(*metadata),
             );
             out.record(CollectionRecord::Commit(commit), "adopted_commit")?;
+            roots.written.insert((*root, *data, *metadata));
             stats.adopted_commits += 1;
             roots.stats[*root].adopted_commits += 1;
             if adopted.insert((*root, *data)) {
@@ -2056,8 +2065,28 @@ impl Run {
     ) -> Result<()> {
         let adopter_signer = signers.intern(adopter.verifying_key().to_bytes());
         for (payload, root) in &self.plan.adopted_payloads {
-            if roots.owners.contains_key(&(*root as u32, *payload)) {
+            if let Some(owner) = roots.owners.get(&(*root as u32, *payload)).copied() {
                 roots.payload_adoption.already_present += 1;
+                // Carried by collection adoption, which takes one signer's
+                // metadata: add the variants it left out. A payload another
+                // key owns stays that key's alone (one owner per payload).
+                if owner == adopter_signer {
+                    let variants = roots.payload_metadata.get(payload).cloned().unwrap_or_default();
+                    for metadata in variants {
+                        if !roots.written.insert((*root, *payload, metadata)) {
+                            continue;
+                        }
+                        let commit = CollectionCommit::sign(
+                            adopter,
+                            Inline::new(self.plan.roots[*root]),
+                            Inline::new(*payload),
+                            Inline::new(metadata),
+                        );
+                        out.record(CollectionRecord::Commit(commit), "adopted_payload_commit")?;
+                        roots.stats[*root].adopted_commits += 1;
+                        roots.payload_adoption.variants_added += 1;
+                    }
+                }
                 continue;
             }
             let Some(variants) = roots.payload_metadata.get(payload).cloned() else {
@@ -2077,6 +2106,7 @@ impl Run {
                     Inline::new(*metadata),
                 );
                 out.record(CollectionRecord::Commit(commit), "adopted_payload_commit")?;
+                roots.written.insert((*root, *payload, *metadata));
             }
             roots.owners.insert((*root as u32, *payload), adopter_signer);
             let stats = &mut roots.stats[*root];
@@ -2521,6 +2551,7 @@ impl Run {
                 "listed": plan.adopted_payloads.len(),
                 "adopted": payload_adoption.adopted,
                 "already_present": payload_adoption.already_present,
+                "variants_added": payload_adoption.variants_added,
             },
             "unkept_guard": {
                 "not_retired": unkept
