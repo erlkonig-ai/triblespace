@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Replace the string-context hashes of the bearer and DHT layer with one-block
+  constructions over random 32-byte context keys (generated from the OS random
+  source): locator `BLAKE3(LOCATOR_CONTEXT || H)`, directory token
+  `keyed(provider; H || TOKEN_CONTEXT)`, exact-GET proofs
+  `keyed(provider; H || requester)` and `keyed(requester; provider || H)`, and
+  wake topic `BLAKE3(WAKE_TOPIC_CONTEXT || C)`. Each is one BLAKE3 compression,
+  against two for a locator, four for a token and five for a proof before.
+  The token and proofs no longer hash L, which is a function of H. H sits on
+  opposite sides of the two proofs so the roles never produce equal values,
+  and an exchange whose two endpoints share an identity is refused. This is a
+  wire change: the transport generation becomes `/triblespace/pile-sync/27`,
+  generation-26 peers and installed `Leech` readers cannot connect, and the
+  generation-26 compatibility test is removed. The reference-summary mapping,
+  which stores locators in its Bloom bits, moves to
+  `REFERENCE_SUMMARY_MAPPING_V2` (`C0F7F9B5A68660407FDBFD8CF4D6E1AD`, minted
+  with `trible genid`); no populated version 1 collection existed.
+
 - Apply selected native record-index differences to retained collection Merkle
   PATCHes instead of rebuilding a changed collection's complete history on each
   peer refresh. Preserve the last successful blob-inventory traversal checkpoint

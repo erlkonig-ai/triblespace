@@ -28,7 +28,10 @@ mod patch_directory;
 pub(crate) type ProviderKey = [u8; 32];
 pub(crate) type ProviderToken = [u8; 32];
 type ProviderIdentity = [u8; 32];
-const PROVIDER_TOKEN_CONTEXT: &[u8] = b"triblespace.net/provider-token/v1\0";
+/// Random 32-byte context key that fills the second half of a directory
+/// token's block. Generated from the OS random source on 2026-09-24.
+const PROVIDER_TOKEN_CONTEXT: [u8; 32] =
+    hex_literal::hex!("536FCCF3AEE4B931A16B2E5CBA3FB6999A26967D4E0ED23BFE8C13FC59FAFA27");
 
 /// Receiver-chosen lifetime of one exact provider lease.
 pub(crate) const PROVIDER_LEASE_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
@@ -46,31 +49,25 @@ const MAX_PROVIDER_MEMBERSHIPS: usize = 1 << 24;
 /// Bound opportunistic expiry reclamation performed by one RPC.
 const MAX_EXPIRED_PROVIDER_MEMBERSHIPS_PER_CALL: usize = 64;
 
-/// Endpoint-bound directory proof for one opaque rendezvous key.
+/// Derive the endpoint-bound directory token for one exact bearer identity:
+/// `keyed(provider; H || PROVIDER_TOKEN_CONTEXT)`, one 64-byte BLAKE3 block.
 ///
-/// `identity` is H for an exact blob lease. Keying by H makes the token a proof
-/// of bearer-handle knowledge, bound to the domain-separated rendezvous key and
-/// the provider endpoint without storing a second per-H token trie.
-pub(crate) fn provider_lease_token(
-    identity: [u8; 32],
-    key: ProviderKey,
-    provider: PeerId,
-) -> ProviderToken {
-    let mut hasher = blake3::Hasher::new_keyed(&identity);
-    hasher.update(PROVIDER_TOKEN_CONTEXT);
-    hasher.update(&key);
-    hasher.update(&provider);
-    *hasher.finalize().as_bytes()
-}
-
-/// Derive the expected endpoint-bound directory token for one exact blob.
-///
-/// A reader who knows the bearer handle can compare this value with a
+/// `identity` is H for a blob lease or the collection handle for a collection
+/// lease. A reader who knows H can compare this value with a
 /// `protocol::op_provider_get` reply without fetching the blob or sending the
-/// handle. A matching token proves knowledge of the handle, not current
-/// provider reachability or residency. Never log the input handle.
-pub fn blob_provider_token(identity: [u8; 32], provider: PeerId) -> [u8; 32] {
-    provider_lease_token(identity, blob_locator(identity), provider)
+/// handle; directory nodes, which see only the locator, can neither check nor
+/// forge it. The token need not name the locator: a token copied under another
+/// locator fails the requester's check, which uses its own H. It cannot equal
+/// a provider proof, `keyed(provider; H || requester)`, unless some requester
+/// authenticates as the endpoint whose key is the random context.
+///
+/// A matching token proves knowledge of the handle, not current provider
+/// reachability or residency. Never log the input handle.
+pub fn blob_provider_token(identity: [u8; 32], provider: PeerId) -> ProviderToken {
+    let mut block = [0; 64];
+    block[..32].copy_from_slice(&identity);
+    block[32..].copy_from_slice(&PROVIDER_TOKEN_CONTEXT);
+    *blake3::keyed_hash(&provider, &block).as_bytes()
 }
 
 /// Canonical exact publication set for one serving snapshot. Values retain the
@@ -893,25 +890,22 @@ mod tests {
     }
 
     #[test]
-    fn blob_lease_tokens_are_handle_key_and_endpoint_bound() {
-        let handle = [44; 32];
-        let key = blob_locator(handle);
-        let provider = [45; 32];
+    fn blob_lease_tokens_are_handle_and_endpoint_bound() {
+        // Computed independently with the reference blake3 crate. The bytes
+        // are wire format: a provider and a reader must agree on them.
         assert_eq!(
-            provider_lease_token(handle, key, provider),
-            blob_provider_token(handle, provider)
+            blob_provider_token([1; 32], [3; 32]),
+            hex_literal::hex!("0AFA56985BFAA12F85DD66ECFC0CBE82B7901B607C3C5EABD8F751ADBEC39F19")
+        );
+        let handle = [44; 32];
+        let provider = [45; 32];
+        assert_ne!(
+            blob_provider_token(handle, provider),
+            blob_provider_token(handle, [46; 32])
         );
         assert_ne!(
-            provider_lease_token(handle, key, provider),
-            provider_lease_token(handle, key, [46; 32])
-        );
-        assert_ne!(
-            provider_lease_token(handle, key, provider),
-            provider_lease_token([47; 32], key, provider)
-        );
-        assert_ne!(
-            provider_lease_token(handle, key, provider),
-            provider_lease_token(handle, [48; 32], provider)
+            blob_provider_token(handle, provider),
+            blob_provider_token([47; 32], provider)
         );
     }
 

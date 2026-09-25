@@ -23,7 +23,10 @@ use crate::transport::PeerId;
 
 /// Shared bearer/DHT transport generation. Collection repair versions its own
 /// operation byte so unchanged exact-H clients need not replace their endpoint.
-pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/26";
+/// Generation 27 replaced the string-context locator, directory token and
+/// exact-GET proofs with one-block constructions; a generation-26 peer derives
+/// different DHT keys and proofs, so it must not connect at all.
+pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/27";
 
 // Operation types — first byte on each stream.
 // 0x01 was branch-list; 0x03 was blob-children; 0x04 was branch-head;
@@ -223,6 +226,9 @@ where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
+    if requester == provider {
+        return Err(anyhow!("refusing a bearer exchange with our own endpoint"));
+    }
     send_hash(send, &blob_locator(*hash)).await?;
     let proof = match recv_u8(recv).await? {
         BLOB_UNAVAILABLE => {
@@ -268,6 +274,9 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    if requester == provider {
+        return Err(anyhow!("refusing a bearer exchange with our own endpoint"));
+    }
     let locator = recv_hash(recv).await?;
     let Some(handle) = resolve(locator) else {
         send_u8(send, BLOB_UNAVAILABLE).await?;
@@ -957,6 +966,42 @@ mod tests {
         assert_eq!(storage_units(), 0);
         pile.close().unwrap();
         assert_eq!(reread.as_ref(), content);
+    }
+
+    #[tokio::test]
+    async fn exact_get_refuses_an_exchange_with_our_own_endpoint() {
+        // With one identity on both sides the two proofs coincide, so the
+        // exchange is refused before either side writes a byte.
+        let me = [9; 32];
+        let content_handle = handle(b"self-addressed");
+        let (client, server) = duplex(4096);
+        let (mut client_recv, mut client_send) = split(client);
+        let (mut server_recv, mut server_send) = split(server);
+        assert!(
+            fetch_get_blob_stream(&mut client_send, &mut client_recv, me, me, &content_handle)
+                .await
+                .is_err()
+        );
+        assert!(
+            serve_get_blob(
+                &mut server_recv,
+                &mut server_send,
+                me,
+                me,
+                |_| Some(content_handle),
+                |_| Some(Bytes::from_source(b"self-addressed".to_vec())),
+            )
+            .await
+            .is_err()
+        );
+        // A split duplex end closes only when both of its halves are gone, so
+        // signal end-of-stream explicitly before reading to it.
+        client_send.shutdown().await.unwrap();
+        server_send.shutdown().await.unwrap();
+        let mut written = Vec::new();
+        client_recv.read_to_end(&mut written).await.unwrap();
+        server_recv.read_to_end(&mut written).await.unwrap();
+        assert!(written.is_empty());
     }
 
     #[tokio::test]

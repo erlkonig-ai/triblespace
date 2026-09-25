@@ -21,6 +21,11 @@ use iroh_gossip::proto::DeliveryScope;
 use iroh_gossip::{Gossip, TopicId};
 use triblespace_core::collection::CollectionHandle;
 
+/// Random 32-byte context key that separates wake topics from every other
+/// BLAKE3 input. Generated from the OS random source on 2026-09-24.
+const WAKE_TOPIC_CONTEXT: [u8; 32] =
+    hex_literal::hex!("6EB6D184D149FCE2A07E0726537FBE61B7E2B068F1B55D1D25CBCCF8FD853394");
+
 /// Domain prefix for the signed wake transcript.
 pub const COLLECTION_WAKE_TRANSCRIPT_DOMAIN: &[u8] = b"triblespace.collection.wake";
 
@@ -325,11 +330,13 @@ impl CollectionWakePlane {
     ///
     /// This namespace isolates neighbor-only application relaying from the
     /// former v1 topic's automatic Swarm forwarding and duplicate pruning.
+    ///
+    /// `topic = BLAKE3(WAKE_TOPIC_CONTEXT || collection)`, one 64-byte block.
     pub fn topic_id(collection: CollectionHandle) -> TopicId {
-        TopicId::from_bytes(blake3::derive_key(
-            "triblespace/collection-wake-topic/v2",
-            &collection.raw,
-        ))
+        let mut block = [0; 64];
+        block[..32].copy_from_slice(&WAKE_TOPIC_CONTEXT);
+        block[32..].copy_from_slice(&collection.raw);
+        TopicId::from_bytes(*blake3::hash(&block).as_bytes())
     }
 
     /// Join the collection mesh through zero or more stock gossip peers.
@@ -663,11 +670,13 @@ mod tests {
         assert_eq!(topic, CollectionWakePlane::topic_id(handle));
         assert_ne!(topic.as_bytes(), &handle.raw);
         assert_ne!(topic, CollectionWakePlane::topic_id(collection(0x53)));
-        let legacy_swarm_topic = TopicId::from_bytes(blake3::derive_key(
-            "triblespace/collection-wake-topic/v1",
-            &handle.raw,
-        ));
-        assert_ne!(topic, legacy_swarm_topic);
+        // Computed independently with the reference blake3 crate as
+        // blake3::hash(WAKE_TOPIC_CONTEXT || [4; 32]). Every peer must join
+        // the same gossip topic for a collection.
+        assert_eq!(
+            *CollectionWakePlane::topic_id(CollectionHandle::new([4; 32])).as_bytes(),
+            hex_literal::hex!("42AC50568A0980829A6DCD108863DF61BA1C2CA2BAFCA03896C36381251AC44A")
+        );
     }
 
     #[test]

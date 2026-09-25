@@ -54,7 +54,7 @@ use crate::protocol::{
 };
 use crate::provider::{
     ProviderDirectory, ProviderKey, ProviderObservation, ProviderPublication, ProviderPublisher,
-    ProviderPutResult, ProviderToken, PublicationResult, blob_provider_token, provider_lease_token,
+    ProviderPutResult, ProviderToken, PublicationResult, blob_provider_token,
 };
 use crate::routing::{ALPHA, IterativeLookup, K, RoutingKey, RoutingTable};
 use crate::transport::{Conn, Harness, PeerId, Transport};
@@ -2196,7 +2196,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
             }
             let client = provider_client.clone();
             let publication_tx = publication_tx.clone();
-            let token = provider_lease_token(work.identity, key, my_id);
+            let token = blob_provider_token(work.identity, my_id);
             tokio::spawn(async move {
                 let result = client.announce_key(key, token).await;
                 let _ = publication_tx.send(PublicationOutcome {

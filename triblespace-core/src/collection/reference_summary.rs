@@ -154,20 +154,23 @@ impl MetaDescribe for ReferenceSummaryBlob {
     }
 }
 
-/// Complete-producer recursive-reference mapping, version 1.
+/// Complete-producer recursive-reference mapping, version 2.
 ///
-/// Minted with installed `trible genid` for this encoding.
-pub const REFERENCE_SUMMARY_MAPPING_V1: Id = id_hex!("A8C939AA55A7EC07C12FFCDA1FAA5785");
+/// Minted with installed `trible genid` on 2026-09-24, when the blob locator
+/// changed from a `derive_key` string context to a 32-byte context key.
+/// Version 1 (`A8C939AA55A7EC07C12FFCDA1FAA5785`) set the same Bloom bits
+/// from the old locators; no populated version 1 collection existed.
+pub const REFERENCE_SUMMARY_MAPPING_V2: Id = id_hex!("C0F7F9B5A68660407FDBFD8CF4D6E1AD");
 
 /// Self-description of the complete-producer reference projection.
-pub struct ReferenceSummaryMappingV1;
+pub struct ReferenceSummaryMappingV2;
 
-impl MetaDescribe for ReferenceSummaryMappingV1 {
+impl MetaDescribe for ReferenceSummaryMappingV2 {
     fn describe() -> Fragment {
-        let id = REFERENCE_SUMMARY_MAPPING_V1;
+        let id = REFERENCE_SUMMARY_MAPPING_V2;
         entity! { ExclusiveId::force_ref(&id) @
-            metadata::name: "reference-summary-mapping-v1",
-            metadata::description: "Producer-only projection from canonical SimpleArchive over its complete immutable referenced-blob closure. Scan aligned 32-byte candidates, follow only resident blobs, and insert their opaque triblespace.net/blob-locator/v1 locators into descriptor-fixed odd-step Bloom positions. Never seed the source artifact handle, enumerate ambient inventory, fetch missing bytes, or derive from an incomplete replica. Completeness is a producer obligation, not established by this untyped scan.",
+            metadata::name: "reference-summary-mapping-v2",
+            metadata::description: "Producer-only projection from canonical SimpleArchive over its complete immutable referenced-blob closure. Scan aligned 32-byte candidates, follow only resident blobs, and insert their opaque blob locators, BLAKE3 of the 32-byte locator context key followed by the handle, into descriptor-fixed odd-step Bloom positions. Never seed the source artifact handle, enumerate ambient inventory, fetch missing bytes, or derive from an incomplete replica. Completeness is a producer obligation, not established by this untyped scan.",
             metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
         }
     }
@@ -640,7 +643,7 @@ fn descriptor_layout(
 ) -> Result<ReferenceSummaryLayout, CollectionOperationError> {
     let actual = super::descriptor::mapping_algorithm(descriptor.facts())
         .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?;
-    if actual != Some(REFERENCE_SUMMARY_MAPPING_V1) {
+    if actual != Some(REFERENCE_SUMMARY_MAPPING_V2) {
         return Err(CollectionOperationError::Fatal(
             "unexpected reference-summary mapping algorithm".to_owned(),
         ));
@@ -719,7 +722,7 @@ impl CollectionDerivation for ReferenceSummaryBlob {
     fn fragment(layout: &ReferenceSummaryLayout) -> Fragment {
         entity! { _ @
             metadata::tag: KIND_COLLECTION_MAPPING,
-            mapping_algorithm*: ReferenceSummaryMappingV1::describe(),
+            mapping_algorithm*: ReferenceSummaryMappingV2::describe(),
             reference_summary_log2_bits: layout.log2_bits,
             reference_summary_probes: layout.probes,
         }
@@ -1231,7 +1234,7 @@ mod tests {
             metadata::tag: KIND_COLLECTION_MAPPING,
             metadata::tag: metadata::KIND_MULTI,
             metadata::name: "an extrinsic mapping with harmless annotations",
-            mapping_algorithm*: ReferenceSummaryMappingV1::describe(),
+            mapping_algorithm*: ReferenceSummaryMappingV2::describe(),
             reference_summary_log2_bits: layout.log2_bits,
             reference_summary_probes: layout.probes,
         };

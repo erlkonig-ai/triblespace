@@ -100,10 +100,11 @@ share the raw record's byte ownership. This is a validated membership projection
 not validation during Pile replay and not a shared global host index. Summaries
 and repair nodes expose only C's fixed prefix; hashes bind the full keys while
 wire keys and compressed paths omit that prefix. The three-component manifest
-uses repair opcode `0x0E` on `/triblespace/pile-sync/26`; old repair opcode
-`0x0D` is rejected before decoding. Exact-blob and DHT frames are unchanged,
-so already-installed `Leech` readers remain compatible without joining the
-new collection topic. No AUTH or collection-repair operation transfers
+uses repair opcode `0x0E` on `/triblespace/pile-sync/27`; old repair opcode
+`0x0D` is rejected before decoding. Generation 27 changed the blob locator,
+directory token and exact-GET proofs to one-block constructions, so
+generation-26 peers and installed `Leech` readers cannot connect and all
+nodes switch together. No AUTH or collection-repair operation transfers
 blob bodies or creates WANT; exact H remains the blob read capability.
 
 DHT provider-directory operations use the ordinary blob-locator namespace,

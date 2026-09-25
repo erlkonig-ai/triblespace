@@ -137,10 +137,11 @@ participate in repair is not permission to endorse an equation. Signature
 verification happens when decoding foreign record bytes, not when rebuilding
 the local repair PATCH or observing the local store again.
 
-The three-component repair epoch uses opcode `0x0E` on
-`/triblespace/pile-sync/26`; the retired `0x0D` repair grammar is rejected
-before decoding. Unchanged bearer and DHT operations remain compatible with
-installed `Leech` readers, which never join collection repair. Dense
+The three-component repair epoch uses opcode `0x0E`; the retired `0x0D`
+repair grammar is rejected before decoding. The current transport generation
+is `/triblespace/pile-sync/27`: generation 27 changed the bearer locator,
+directory token and exact-GET proofs (see below), so a generation-26 peer or
+installed `Leech` reader derives different DHT keys and must not connect. Dense
 record tag 6 carries a 288-byte MERGE body and tag 7 a 224-byte DERIVE body;
 each wire value has one additional tag byte. MERGE signs two input-record
 fingerprints paired with its payloads; DERIVE signs one. Unsigned tags 2/3 and
@@ -180,8 +181,8 @@ admission bridge into the store. It does not discard records or turn a dropped
 notification into a lost update; later root announcements and Merkle repair
 derive the outstanding work from current state.
 
-The `iroh-gossip` topic ID uses the version-isolated
-`triblespace/collection-wake-topic/v2` domain over the collection handle.
+The `iroh-gossip` topic ID is `BLAKE3(WAKE_TOPIC_CONTEXT || C)`, where the
+context is a random 32-byte constant, so a topic costs one 64-byte block.
 Anyone who knows C can derive and join that topic, while generic gossip
 routers do not learn raw C. There is no authorization handshake merely to hear
 that something changed. The application payload is fixed width (145 bytes):
@@ -366,11 +367,16 @@ matter to that computation.
 
 Knowledge of a full content hash H is the read capability for those exact
 bytes and the secret needed to discover them. Publication and lookup derive a
-full-width opaque locator under a dedicated domain:
+full-width opaque locator under a random 32-byte context key:
 
 ```text
-L = BLAKE3-KDF("triblespace.net/blob-locator/v1", H)
+L = BLAKE3(LOCATOR_CONTEXT || H)
 ```
+
+The input is exactly one 64-byte BLAKE3 block, so a locator costs one
+compression. Until generation 27 it was a `derive_key` over a context string,
+which cost two; the locator is computed for every resident blob on every
+index build, so the difference is paid many times.
 
 This is not encryption or protection against guessing the exact blob content.
 Someone who can guess those bytes can compute both H and L and confirm a
@@ -379,10 +385,20 @@ the additional locator hash prevents disclosure of H from a copied L, not
 reconstruction of H from already-known or guessed bytes.
 
 Every served resident blob may renew a soft lease at L on nearby XOR-DHT
-nodes. The lease contains an independently domain-separated token bound to H
-and the provider's authenticated endpoint ID. A requester who knows H rejects
+nodes. The lease carries the token `keyed(provider; H || TOKEN_CONTEXT)`: keyed
+by the provider's authenticated endpoint ID, over H and a random 32-byte
+context, one block. A requester who knows H rejects
 forged candidate entries before dialing; the directory learns neither H nor
 collection membership.
+
+An exact GET sends only L. The provider first proves knowledge of H with
+`keyed(provider; H || requester)`; only then does the requester answer with
+`keyed(requester; provider || H)`, and only then do bytes flow, checked
+against H on arrival. Each proof is one block and binds both authenticated
+endpoints. H sits on opposite sides of the two messages, so a requester that
+knows only L cannot echo the provider's proof back, and the proof a provider
+hands out is never the requester proof of the reversed connection. An exchange
+whose two endpoints are the same identity is refused.
 
 For an ordinary `PROVIDER_GET(L)`, the selected DHT node also consults its
 already-installed, snapshot-coherent L→H index. If L is resident there, it
@@ -838,7 +854,7 @@ guarantee.
 
 ## Wire surface
 
-The `/triblespace/pile-sync/26` ALPN keeps the direct operation set narrow;
+The `/triblespace/pile-sync/27` ALPN keeps the direct operation set narrow;
 collection repair has its own new opcode rather than changing unchanged
 bearer/DHT framing:
 

@@ -4,14 +4,20 @@
 //! those exact immutable bytes. The raw handle never crosses the provider
 //! directory or the exact-GET stream:
 //!
-//! - `L = KDF(H)` is the opaque locator sent to a candidate;
-//! - the candidate proves knowledge of `H` first; and
-//! - only then does the requester prove knowledge of `H`.
+//! - `L = blob_locator(H)` is the opaque locator sent to a candidate;
+//! - the candidate proves knowledge of `H` first with
+//!   `keyed(provider; H || requester)`; and
+//! - only then does the requester prove knowledge of `H` with
+//!   `keyed(requester; provider || H)`.
 //!
-//! Both proofs bind the TLS-authenticated endpoint identities. They are
-//! deterministic because replay by the same requester to the same provider
-//! merely repeats an authorized read of immutable content; replay under any
-//! other endpoint identity fails.
+//! Each proof is keyed by one TLS-authenticated endpoint identity and names
+//! the other, so it binds both and is exactly one 64-byte BLAKE3 block. `H`
+//! sits on opposite sides of the two messages, so the two roles never produce
+//! the same value: not on one connection, where equality would let a requester
+//! that knows only `L` echo the provider's proof back, and not across a
+//! swapped pair of roles. They are deterministic because replay by the same
+//! requester to the same provider merely repeats an authorized read of
+//! immutable content; replay under any other endpoint identity fails.
 
 use anyhow::Result;
 use triblespace_core::patch::{Entry as PatchEntry, IdentitySchema, PATCH};
@@ -19,9 +25,6 @@ use triblespace_core::repo::BlobStoreList;
 
 use crate::protocol::RawHash;
 use crate::transport::PeerId;
-
-const PROVIDER_PROOF_CONTEXT: &[u8] = b"triblespace.net/blob-provider-proof/v1\0";
-const REQUESTER_PROOF_CONTEXT: &[u8] = b"triblespace.net/blob-requester-proof/v1\0";
 
 /// Snapshot-coherent reverse index from opaque locator to resident handle.
 ///
@@ -31,23 +34,21 @@ pub(crate) type BearerLocatorIndex = PATCH<32, IdentitySchema, RawHash>;
 
 pub use triblespace_core::blob::locator::blob_locator;
 
-/// Provider-first proof of knowledge, bound to both TLS endpoint identities.
+/// Provider-first proof of knowledge: `keyed(provider; H || requester)`.
 pub(crate) fn provider_proof(handle: RawHash, requester: PeerId, provider: PeerId) -> RawHash {
-    proof(handle, PROVIDER_PROOF_CONTEXT, requester, provider)
+    keyed_block(&provider, &handle, &requester)
 }
 
-/// Requester-second proof of knowledge, bound to both TLS endpoint identities.
+/// Requester-second proof of knowledge: `keyed(requester; provider || H)`.
 pub(crate) fn requester_proof(handle: RawHash, requester: PeerId, provider: PeerId) -> RawHash {
-    proof(handle, REQUESTER_PROOF_CONTEXT, requester, provider)
+    keyed_block(&requester, &provider, &handle)
 }
 
-fn proof(handle: RawHash, domain: &[u8], requester: PeerId, provider: PeerId) -> RawHash {
-    let mut hasher = blake3::Hasher::new_keyed(&handle);
-    hasher.update(domain);
-    hasher.update(&requester);
-    hasher.update(&provider);
-    hasher.update(&blob_locator(handle));
-    *hasher.finalize().as_bytes()
+fn keyed_block(key: &[u8; 32], first: &[u8; 32], second: &[u8; 32]) -> RawHash {
+    let mut block = [0; 64];
+    block[..32].copy_from_slice(first);
+    block[32..].copy_from_slice(second);
+    *blake3::keyed_hash(key, &block).as_bytes()
 }
 
 /// Compare fixed-width key-confirmation values without an early mismatch exit.
@@ -121,6 +122,42 @@ mod tests {
     use triblespace_core::repo::{BlobInfo, BlobStorePut, SnapshotSource};
 
     use super::*;
+
+    #[test]
+    fn proofs_match_their_known_answers() {
+        // Computed independently with the reference blake3 crate. These bytes
+        // are wire format: a provider and a requester must agree on them.
+        let (handle, requester, provider) = ([1; 32], [2; 32], [3; 32]);
+        assert_eq!(
+            provider_proof(handle, requester, provider),
+            hex_literal::hex!("0319B3498D8C22E3F8E2BB46556AE3ED205335DA0C5D6A6CF3C3DC42740CBA28")
+        );
+        assert_eq!(
+            requester_proof(handle, requester, provider),
+            hex_literal::hex!("8D30D403E89833D30A2ADD3EC09038019C4F59B3DFA2DADE2B3315989575A9F8")
+        );
+    }
+
+    #[test]
+    fn a_provider_proof_never_serves_as_a_requester_proof() {
+        let (handle, requester, provider) = ([21; 32], [22; 32], [23; 32]);
+        // Echo: a requester that knows only the locator receives the
+        // provider's proof and returns it on the same connection.
+        assert_ne!(
+            provider_proof(handle, requester, provider),
+            requester_proof(handle, requester, provider)
+        );
+        // Swap: the proof a provider hands out must not be the requester
+        // proof of the connection with the roles reversed.
+        assert_ne!(
+            provider_proof(handle, requester, provider),
+            requester_proof(handle, provider, requester)
+        );
+        assert_ne!(
+            requester_proof(handle, requester, provider),
+            provider_proof(handle, provider, requester)
+        );
+    }
 
     #[derive(Clone)]
     struct ListSnapshot(Vec<BlobInfo>);

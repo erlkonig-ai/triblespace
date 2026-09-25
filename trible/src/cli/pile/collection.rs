@@ -42,7 +42,7 @@ use triblespace_core::blob::IntoBlob;
 use triblespace_core::blob::TryFromBlob;
 use triblespace_core::collection::records::{CollectionHandle, CollectionRecord};
 use triblespace_core::collection::reference_summary::{
-    ReferenceSummaryBlob, ReferenceSummaryLayout, REFERENCE_SUMMARY_MAPPING_V1,
+    ReferenceSummaryBlob, ReferenceSummaryLayout, REFERENCE_SUMMARY_MAPPING_V2,
 };
 use triblespace_core::collection::CollectionRead;
 use triblespace_core::collection::{
@@ -756,8 +756,8 @@ fn mapping_algorithm_name(id: Id) -> Option<&'static str> {
 
     if id == SIMPLE_TO_SUCCINCT_MAPPING_V1 {
         Some("SIMPLE_TO_SUCCINCT_MAPPING_V1")
-    } else if id == REFERENCE_SUMMARY_MAPPING_V1 {
-        Some("REFERENCE_SUMMARY_MAPPING_V1")
+    } else if id == REFERENCE_SUMMARY_MAPPING_V2 {
+        Some("REFERENCE_SUMMARY_MAPPING_V2")
     } else if id == RAW_TO_RANK9_ACCELERATED_MAPPING_V1_32_LE {
         Some("RAW_TO_RANK9_ACCELERATED_MAPPING_V1_32_LE")
     } else if id == RAW_TO_RANK9_ACCELERATED_MAPPING_V1_32_BE {
