@@ -1236,7 +1236,7 @@ fn the_guard_refuses_to_drop_what_exists_nowhere_else() {
     let output = fixture.clean_unguarded(&fixture.src, &dst, &["--adopt-by-name"], &keys);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("refusing to drop 2 retired root(s)"), "{stderr}");
+    assert!(stderr.contains("refusing to drop 2 collection(s)"), "{stderr}");
     assert!(stderr.contains(&hex::encode(fixture.retired.raw)), "{stderr}");
     assert!(stderr.contains(&hex::encode(fixture.other.raw)), "{stderr}");
     assert!(!dst.exists());
@@ -1282,17 +1282,17 @@ fn the_guard_refuses_to_drop_what_exists_nowhere_else() {
 fn adopt_payloads_rescues_exactly_the_listed_payloads() {
     let fixture = Fixture::new();
     // Q3's author was never admitted and U's collection is retired: neither
-    // can be adopted as a collection, both can be rescued one by one. With
-    // them and Q1 carried, nothing is left for the guard to refuse.
+    // can be adopted as a collection, both can be rescued one by one, and so
+    // can Q1. With the three carried, nothing is left for the guard.
     let list = fixture.path("rescue.txt");
     std::fs::write(
         &list,
         format!(
-            "# rescued\n{} {}\n{} {}\n",
+            "# rescued\n{} {r}\n{} {r}\n{} {r}\n",
             hex::encode(fixture.q3.raw),
-            handle_line(fixture.root.raw),
             hex::encode(fixture.unrelated.raw),
-            handle_line(fixture.root.raw)
+            hex::encode(fixture.q1.raw),
+            r = handle_line(fixture.root.raw)
         ),
     )
     .unwrap();
@@ -1300,7 +1300,7 @@ fn adopt_payloads_rescues_exactly_the_listed_payloads() {
     assert_success(&fixture.clean_unguarded(
         &fixture.src,
         &dst,
-        &["--adopt-by-name", "--adopt-payloads", list.to_str().unwrap()],
+        &["--adopt-payloads", list.to_str().unwrap()],
         &[&fixture.key_a, &fixture.key_b],
     ));
     let written = records(&dst);
@@ -1313,9 +1313,15 @@ fn adopt_payloads_rescues_exactly_the_listed_payloads() {
     );
     assert_eq!(commits_of(&written, fixture.unrelated).len(), 1);
     assert_eq!(commits_of(&written, fixture.unrelated).first().unwrap().0, a);
+    // Q1 was committed by A and by B with different metadata: no variant can
+    // claim to be the original, so both travel.
+    assert_eq!(
+        commits_of(&written, fixture.q1),
+        BTreeSet::from([(a, fixture.q1_metadata), (a, fixture.p1_metadata[1])])
+    );
     let report = fixture.report(&dst);
-    assert_eq!(report["payload_adoption"]["listed"], 2);
-    assert_eq!(report["payload_adoption"]["adopted"], 2);
+    assert_eq!(report["payload_adoption"]["listed"], 3);
+    assert_eq!(report["payload_adoption"]["adopted"], 3);
     assert_eq!(report["unkept_guard"]["would_refuse"], json!([]));
     assert_eq!(find(&report["retired"], fixture.retired)["absent_resident"], 0);
     assert_eq!(find(&report["retired"], fixture.other)["absent_resident"], 0);
@@ -1338,4 +1344,63 @@ fn adopt_payloads_rescues_exactly_the_listed_payloads() {
     let report = fixture.report(&dst);
     assert_eq!(report["payload_adoption"]["adopted"], 0);
     assert_eq!(report["payload_adoption"]["already_present"], 1);
+}
+
+#[test]
+fn the_guard_counts_commits_into_collections_without_a_descriptor() {
+    let fixture = Fixture::new();
+    // A signed commit into a collection whose descriptor never reached this
+    // pile: neither a root nor retired, so it would drop with its payload
+    // unless someone decides it may.
+    let orphan: CollectionHandle = Inline::new([0x5A; 32]);
+    let mut pile = Pile::open(&fixture.src).unwrap();
+    let data = put_raw(&mut pile, b"orphan payload");
+    let metadata = put_raw(&mut pile, b"orphan metadata");
+    pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
+        &fixture.a,
+        orphan,
+        data,
+        Inline::new(metadata.raw),
+    )))
+    .unwrap();
+    pile.close().unwrap();
+
+    let keys = [&*fixture.key_a, &*fixture.key_b];
+    let dst = fixture.path("orphan.pile");
+    let output = fixture.clean(&fixture.src, &dst, &["--adopt-by-name"], &keys);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(&hex::encode(orphan.raw)), "{stderr}");
+    assert!(stderr.contains("not a root"), "{stderr}");
+    assert!(!dst.exists());
+
+    // Discarded along with the fixture's own decision, the run goes ahead
+    // and the report says what went.
+    let discard = fixture.path("discard-orphan.txt");
+    std::fs::write(
+        &discard,
+        format!(
+            "{}{} # its descriptor never arrived\n",
+            std::fs::read_to_string(&fixture.discard_file).unwrap(),
+            handle_line(orphan.raw)
+        ),
+    )
+    .unwrap();
+    assert_success(&fixture.clean_unguarded(
+        &fixture.src,
+        &dst,
+        &["--adopt-by-name", "--discard", discard.to_str().unwrap()],
+        &keys,
+    ));
+    let report = fixture.report(&dst);
+    let entry = report["unkept_guard"]["not_retired"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["handle"] == hex::encode(orphan.raw).as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(entry["payloads"], 1);
+    assert_eq!(entry["absent_resident"], 1);
+    assert_eq!(entry["discarded"], true);
 }

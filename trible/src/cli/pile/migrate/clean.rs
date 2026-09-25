@@ -110,16 +110,20 @@ pub struct CleanArgs {
     pub adopt_by_name: bool,
     /// Payload adoption: `PAYLOAD_HANDLE CURRENT_HANDLE` per line. Exactly
     /// that payload is re-signed into that current root with the first
-    /// `--key`, carrying the metadata of its earliest strictly verifying
-    /// commit anywhere in the source, whether or not the collection it was
-    /// committed to is admitted or even readable. For rescuing single
-    /// payloads without adopting a whole retired collection.
+    /// `--key`, once per distinct metadata of its strictly verifying commits
+    /// anywhere in the source, whether or not the collection it was committed
+    /// to is admitted or even readable. For rescuing single payloads without
+    /// adopting a whole retired collection.
     #[arg(long)]
     pub adopt_payloads: Option<PathBuf>,
-    /// Retired roots whose payloads may be dropped although no kept root
-    /// holds them: one handle per line, `#` starts the reason. Without it a
-    /// real run refuses to drop any resident payload that exists nowhere
-    /// else in the destination; a dry run reports them.
+    /// Collections that are not kept roots (retired roots, descriptor-less
+    /// collections, derived collections carrying commits) whose payloads may
+    /// be dropped although no kept root holds them: one handle per line, `#`
+    /// starts the reason. Without it a real run refuses to drop any resident
+    /// payload that exists nowhere else in the destination; a dry run
+    /// reports them. The guard proves bytes survive somewhere, not that a
+    /// faculty will see them where it looks: that is what --adopt and
+    /// --adopt-payloads decide.
     #[arg(long)]
     pub discard: Option<PathBuf>,
     /// Signing key file (64 hex characters) this run may sign with; repeat
@@ -816,9 +820,13 @@ fn plan(
         if root_index.contains_key(handle) {
             bail!("--discard names blake3:{}, one of the --roots", hex(handle));
         }
-        if !retired.contains_key(handle) {
+        if !retired.contains_key(handle)
+            && !dropped.contains_key(handle)
+            && !chains.contains_key(handle)
+            && !chains.values().any(|chain| chain.contains(handle))
+        {
             eprintln!(
-                "clean: --discard names blake3:{}, not a retired root of this source; ignored",
+                "clean: --discard names blake3:{}, not a collection of this source; ignored",
                 hex(handle)
             );
             unused_discards.push(*handle);
@@ -1425,12 +1433,13 @@ struct Roots {
     retired: BTreeMap<Raw, RetiredStats>,
     owners: HashMap<(u32, Raw), u32>,
     adoptable: BTreeMap<(usize, Raw, Raw), Raw>,
-    /// Every payload any commit of a retired root names, whatever its
-    /// signature or admission: what dropping that root would drop.
+    /// Every payload any commit of a collection other than a kept root
+    /// names (retired roots, descriptor-less or derived collections),
+    /// whatever its signature or admission: what dropping it would drop.
     retired_payloads: BTreeMap<Raw, BTreeSet<Raw>>,
-    /// Metadata of the earliest strictly verifying commit of each payload
-    /// listed for payload adoption, from any collection.
-    payload_metadata: HashMap<Raw, Raw>,
+    /// Every distinct metadata of a strictly verifying commit of each
+    /// payload listed for payload adoption, from any collection.
+    payload_metadata: HashMap<Raw, BTreeSet<Raw>>,
     payload_adoption: PayloadAdoptionStats,
 }
 
@@ -1674,7 +1683,30 @@ impl Run {
                 "written",
                 format_args!("{} closed and synced", partial.display()),
             );
-            let installed = audit_destination(&partial).and_then(|audit| {
+            let installed = audit_destination(&partial).and_then(|(mut audit, unresolved)| {
+                // An unresolved reference is expected when the source never
+                // held valid bytes for it either. One the source holds intact
+                // was lost by the copy, and the destination is refused.
+                let (mut lost, mut absent, mut corrupt) = (Vec::new(), 0u64, 0u64);
+                for handle in &unresolved {
+                    match snapshot.get::<Blob<UnknownBlob>, UnknownBlob>(Inline::new(*handle)) {
+                        Ok(_) => lost.push(*handle),
+                        Err(GetBlobError::BlobNotFound(_)) => absent += 1,
+                        Err(GetBlobError::ValidationError(_)) => corrupt += 1,
+                        Err(error) => bail!("inspect source blob {}: {error}", hex(handle)),
+                    }
+                }
+                if !lost.is_empty() {
+                    bail!(
+                        "the destination leaves {} reference(s) unresolved whose valid bytes \
+                         the source holds, e.g. blake3:{}; refusing to install a lossy copy",
+                        lost.len(),
+                        hex(&lost[0])
+                    );
+                }
+                let object = audit.as_object_mut().expect("the audit is an object");
+                object.insert("unresolved_absent_in_source".into(), json!(absent));
+                object.insert("unresolved_corrupt_in_source".into(), json!(corrupt));
                 let bytes = std::fs::metadata(&partial)
                     .with_context(|| format!("stat {}", partial.display()))?
                     .len();
@@ -1894,7 +1926,8 @@ impl Run {
                 roots
                     .payload_metadata
                     .entry(data)
-                    .or_insert(commit.metadata().raw);
+                    .or_default()
+                    .insert(commit.metadata().raw);
             }
             if let Some(&root) = plan.root_index.get(&collection) {
                 if run.map(|(key, _)| key) != Some((root, data)) {
@@ -1950,6 +1983,16 @@ impl Run {
                     .adoptable
                     .entry((*root, data, commit.metadata().raw))
                     .or_insert(collection);
+            } else {
+                // A commit into a collection that is neither a kept nor a
+                // retired root: its descriptor is missing or unreadable, or
+                // it names a derived collection. Its payload is counted all
+                // the same, so the guard sees what dropping it would drop.
+                roots
+                    .retired_payloads
+                    .entry(collection)
+                    .or_default()
+                    .insert(data);
             }
         }
         roots.close_run(run.take());
@@ -2000,8 +2043,10 @@ impl Run {
     }
 
     /// Exactly the listed payloads, re-signed into their current root by the
-    /// first key with the metadata of their earliest strictly verifying
-    /// commit. A payload the root already holds is left as it is.
+    /// first key, once per distinct metadata of their strictly verifying
+    /// commits anywhere in the source. The new signature is a fresh
+    /// endorsement, not the original authorship. A payload the root already
+    /// holds is left as it is.
     fn adopt_payloads(
         &self,
         out: &mut Writing,
@@ -2015,23 +2060,27 @@ impl Run {
                 roots.payload_adoption.already_present += 1;
                 continue;
             }
-            let Some(metadata) = roots.payload_metadata.get(payload) else {
+            let Some(variants) = roots.payload_metadata.get(payload).cloned() else {
                 bail!(
                     "--adopt-payloads lists blake3:{}, but no commit of it in the source \
                      verifies strictly; there is no metadata to carry",
                     hex(payload)
                 );
             };
-            let commit = CollectionCommit::sign(
-                adopter,
-                Inline::new(self.plan.roots[*root]),
-                Inline::new(*payload),
-                Inline::new(*metadata),
-            );
-            out.record(CollectionRecord::Commit(commit), "adopted_payload_commit")?;
+            // One commit per distinct metadata: pile order is not authorship
+            // order, so no single variant can claim to be the original.
+            for metadata in &variants {
+                let commit = CollectionCommit::sign(
+                    adopter,
+                    Inline::new(self.plan.roots[*root]),
+                    Inline::new(*payload),
+                    Inline::new(*metadata),
+                );
+                out.record(CollectionRecord::Commit(commit), "adopted_payload_commit")?;
+            }
             roots.owners.insert((*root as u32, *payload), adopter_signer);
             let stats = &mut roots.stats[*root];
-            stats.adopted_commits += 1;
+            stats.adopted_commits += variants.len() as u64;
             stats.adopted_payloads += 1;
             *stats.foundations.entry(adopter_signer).or_default() += 1;
             roots.payload_adoption.adopted += 1;
@@ -2080,12 +2129,13 @@ impl Run {
                 entry.absent_resident > 0 && !self.plan.discard.contains(*collection)
             })
             .map(|(collection, entry)| {
-                let name = self
-                    .plan
-                    .retired
-                    .get(collection)
-                    .and_then(|(name, _)| name.clone())
-                    .unwrap_or_else(|| "(unnamed)".to_owned());
+                let name = match self.plan.retired.get(collection) {
+                    Some((name, _)) => name.clone().unwrap_or_else(|| "(unnamed)".to_owned()),
+                    None => self.plan.dropped.get(collection).map_or_else(
+                        || "(commits into a derived collection)".to_owned(),
+                        |reason| format!("(not a root: {reason})"),
+                    ),
+                };
                 format!(
                     "  blake3:{} {name}: {} of {} payload(s) exist nowhere else",
                     hex(collection),
@@ -2096,9 +2146,9 @@ impl Run {
             .collect();
         if !refused.is_empty() {
             bail!(
-                "refusing to drop {} retired root(s) holding resident payloads that no kept \
+                "refusing to drop {} collection(s) holding resident payloads that no kept \
                  root holds:\n{}\nKeep them with --roots, carry payloads with --adopt or \
-                 --adopt-payloads, or list the root in --discard after deciding it may go",
+                 --adopt-payloads, or list the collection in --discard after deciding it may go",
                 refused.len(),
                 refused.join("\n")
             );
@@ -2262,7 +2312,9 @@ impl Run {
                         // The image's references normally travel with the
                         // foundation's archive. Without that foundation in
                         // the destination, the image is walked itself.
-                        if !out.retainer.copied.contains(&foundation) {
+                        if !out.retainer.copied.contains(&foundation)
+                            || out.retainer.corrupt.contains(&foundation)
+                        {
                             out.retainer.keep_strides(out.sink, chosen.output)?;
                         }
                         match outcome {
@@ -2471,6 +2523,19 @@ impl Run {
                 "already_present": payload_adoption.already_present,
             },
             "unkept_guard": {
+                "not_retired": unkept
+                    .iter()
+                    .filter(|(handle, _)| !plan.retired.contains_key(*handle))
+                    .map(|(handle, entry)| json!({
+                        "handle": hex(handle),
+                        "reason": plan.dropped.get(handle).cloned()
+                            .unwrap_or_else(|| "commits into a derived collection".to_owned()),
+                        "payloads": entry.payloads,
+                        "absent_resident": entry.absent_resident,
+                        "absent_elsewhere": entry.absent_elsewhere,
+                        "discarded": plan.discard.contains(handle),
+                    }))
+                    .collect::<Vec<_>>(),
                 "discarded_roots": plan.discard.len() - plan.unused_discards.len(),
                 "unused_discards": plan.unused_discards.iter().map(hex).collect::<Vec<_>>(),
                 "would_refuse": refused,
@@ -2532,14 +2597,15 @@ impl Run {
 
 /// Re-read the written pile: every record verifies strictly, and every blob
 /// a record or proof names directly is resident unless the source lacked it.
-fn audit_destination(path: &Path) -> Result<Value> {
+fn audit_destination(path: &Path) -> Result<(Value, BTreeSet<Raw>)> {
     let mut pile = PileFile::open_read_only(path)
         .map_err(|error| super::super::pile_read_error(path, error))?;
     let result = (|| {
         let snapshot = pile
             .snapshot()
             .map_err(|error| super::super::pile_read_error(path, error))?;
-        let (mut records, mut invalid, mut unresolved) = (0u64, 0u64, 0u64);
+        let (mut records, mut invalid) = (0u64, 0u64);
+        let mut unresolved: BTreeSet<Raw> = BTreeSet::new();
         let resident =
             |handle: Inline<Handle<UnknownBlob>>| snapshot.contains_blob(handle).unwrap_or(false);
         let all = snapshot
@@ -2556,10 +2622,12 @@ fn audit_destination(path: &Path) -> Result<Value> {
             if !verified {
                 invalid += 1;
             }
-            unresolved += record
-                .blob_references()
-                .filter(|handle| !resident(*handle))
-                .count() as u64;
+            unresolved.extend(
+                record
+                    .blob_references()
+                    .filter(|handle| !resident(*handle))
+                    .map(|handle| handle.raw),
+            );
         }
         let mut proofs = 0u64;
         for proof in snapshot
@@ -2568,19 +2636,24 @@ fn audit_destination(path: &Path) -> Result<Value> {
         {
             let proof = proof.map_err(|error| anyhow!("read proof: {error}"))?;
             proofs += 1;
-            unresolved += proof
-                .blob_references()
-                .filter(|handle| !resident(*handle))
-                .count() as u64;
+            unresolved.extend(
+                proof
+                    .blob_references()
+                    .filter(|handle| !resident(*handle))
+                    .map(|handle| handle.raw),
+            );
         }
         if invalid > 0 {
             bail!("{invalid} written record(s) fail strict verification");
         }
-        Ok(json!({
-            "records": records,
-            "proofs": proofs,
-            "unresolved_references": unresolved,
-        }))
+        Ok((
+            json!({
+                "records": records,
+                "proofs": proofs,
+                "unresolved_references": unresolved.len(),
+            }),
+            unresolved,
+        ))
     })();
     let closed = pile
         .close()
