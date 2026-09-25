@@ -395,10 +395,13 @@ An exact GET sends only L. The provider first proves knowledge of H with
 `keyed(provider; H || requester)`; only then does the requester answer with
 `keyed(requester; provider || H)`, and only then do bytes flow, checked
 against H on arrival. Each proof is one block and binds both authenticated
-endpoints. H sits on opposite sides of the two messages, so a requester that
-knows only L cannot echo the provider's proof back, and the proof a provider
-hands out is never the requester proof of the reversed connection. An exchange
-whose two endpoints are the same identity is refused.
+endpoints. H sits on opposite sides of the two messages, so while H is secret a
+requester that knows only L cannot echo the provider's proof back, and the proof
+a provider hands out is not the requester proof of the reversed connection. The
+separation rests on H being secret, not on algebra: an H equal to an endpoint
+identity would make the swapped pair coincide, but such an H is public anyway.
+An exchange whose two endpoints are the same identity authenticates nothing and
+is refused.
 
 For an ordinary `PROVIDER_GET(L)`, the selected DHT node also consults its
 already-installed, snapshot-coherent L→H index. If L is resident there, it

@@ -970,8 +970,10 @@ mod tests {
 
     #[tokio::test]
     async fn exact_get_refuses_an_exchange_with_our_own_endpoint() {
-        // With one identity on both sides the two proofs coincide, so the
-        // exchange is refused before either side writes a byte.
+        // An exchange with our own endpoint authenticates nothing, so it is
+        // refused before either side writes a byte. (The two proofs do not
+        // coincide here: keyed(me; H || me) differs from keyed(me; me || H)
+        // unless H equals our own endpoint id.)
         let me = [9; 32];
         let content_handle = handle(b"self-addressed");
         let (client, server) = duplex(4096);

@@ -15,8 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wake topic `BLAKE3(WAKE_TOPIC_CONTEXT || C)`. Each is one BLAKE3 compression,
   against two for a locator, four for a token and five for a proof before.
   The token and proofs no longer hash L, which is a function of H. H sits on
-  opposite sides of the two proofs so the roles never produce equal values,
-  and an exchange whose two endpoints share an identity is refused. This is a
+  opposite sides of the two proofs so, while H is secret, the roles never
+  produce equal values (an H equal to an endpoint id would make a swapped pair
+  coincide, but such an H is public), and an exchange whose two endpoints share
+  an identity is refused. This is a
   wire change: the transport generation becomes `/triblespace/pile-sync/27`,
   generation-26 peers and installed `Leech` readers cannot connect, and the
   generation-26 compatibility test is removed. The reference-summary mapping,
