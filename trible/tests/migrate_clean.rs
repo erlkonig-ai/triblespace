@@ -5,8 +5,9 @@
 //! unadmitted and an invalidly signed commit, a retired generation with a
 //! payload to adopt, an unmapped retired root, current and retired MERGEs,
 //! first-hop and chained v9 DERIVEs (Succinct over the root, Rank9 over
-//! Succinct), a conflicting DERIVE, DERIVEs of merged nodes, WRITE grants,
-//! and a WANT. Retired v8/v9 frames are written byte for byte, because no
+//! Succinct), a conflicting DERIVE, an earlier claim by a signer the target
+//! does not admit, DERIVEs of merged nodes, WRITE grants, a second admitted
+//! signer of a retired payload, and a WANT. Retired v8/v9 frames are written byte for byte, because no
 //! current writer can produce them any more.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -248,7 +249,12 @@ impl Fixture {
             .unwrap();
         let other = pile.collection("other", current.clone()).unwrap();
         let mut proofs = Vec::new();
-        for collection in [root.handle(), succinct.handle(), rank9.handle()] {
+        for collection in [
+            root.handle(),
+            succinct.handle(),
+            rank9.handle(),
+            retired.handle(),
+        ] {
             proofs.push(
                 grant_collection_write(&mut pile, collection, &a, b.verifying_key()).unwrap(),
             );
@@ -311,7 +317,9 @@ impl Fixture {
         .unwrap();
 
         // The retired generation: Q1 is new, P1 is already current, Q3's
-        // author was never admitted there.
+        // author was never admitted there. B, admitted later than A, commits
+        // Q1 again with other metadata: A owns Q1 there, so only A's
+        // metadata is adopted.
         let adopted = pile
             .commit(
                 retired,
@@ -320,6 +328,13 @@ impl Fixture {
             )
             .unwrap();
         let q1 = adopted.data();
+        pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
+            &b,
+            retired.handle(),
+            q1,
+            second_metadata,
+        )))
+        .unwrap();
         pile.commit(retired, &a, entity! { metadata::description: "first fact" })
             .unwrap();
         pile.commit(retired, &c, entity! { metadata::description: "stray fact" })
@@ -343,6 +358,7 @@ impl Fixture {
         let s1 = image(&mut pile, "succinct p1");
         let s1x = image(&mut pile, "succinct p1 (disputed)");
         let s2 = image(&mut pile, "succinct p2");
+        let s2x = image(&mut pile, "succinct p2 (unadmitted)");
         let s12 = image(&mut pile, "succinct p1 p2");
         let s3 = image(&mut pile, "succinct p3");
         let s5 = image(&mut pile, "succinct p5");
@@ -362,6 +378,9 @@ impl Fixture {
             // B's disputed image of P1 comes first; the owner's still wins.
             derive_v9(&b, succinct, p1, s1x),
             derive_v9(&a, succinct, p1, s1),
+            // C, whom Succinct does not admit, claims P2 first: never
+            // believed, so it neither wins nor conflicts.
+            derive_v9(&c, succinct, p2, s2x),
             derive_v9(&a, succinct, p2, s2),
             derive_v9(&a, succinct, r12, s12),
             merge_v8(&a, succinct, s1, s2, s12),
@@ -417,7 +436,7 @@ impl Fixture {
                 _ => {}
             }
         }
-        assert_eq!(retired_frames, 14);
+        assert_eq!(retired_frames, 15);
         assert_eq!(invalid_commits, 1);
 
         let roots_file = dir.path().join("roots.txt");
@@ -496,6 +515,18 @@ fn records(path: &Path) -> Vec<CollectionRecord> {
     drop(snapshot);
     pile.close().unwrap();
     records
+}
+
+fn blob_set(path: &Path) -> BTreeSet<Raw> {
+    let mut pile = PileFile::open_read_only(path).unwrap();
+    let snapshot = pile.snapshot().unwrap();
+    let blobs = snapshot
+        .blobs()
+        .map(|info| info.unwrap().handle.raw)
+        .collect();
+    drop(snapshot);
+    pile.close().unwrap();
+    blobs
 }
 
 fn commits_of(records: &[CollectionRecord], data: CollectionData) -> BTreeSet<(Raw, Raw)> {
@@ -715,6 +746,10 @@ fn clean_keeps_one_owner_adopts_and_reemits_leaves() {
     assert_eq!(retired["adopted_payloads"], 1);
     assert_eq!(retired["already_present"], 1);
     assert_eq!(retired["unadmitted"], 1);
+    assert_eq!(
+        retired["duplicate_owner"], 1,
+        "B's later metadata for Q1 is not adopted"
+    );
     let other = find(&report["retired"], fixture.other);
     assert!(other["adopted_into"].is_null());
     assert_eq!(other["records"], 1);
@@ -733,6 +768,7 @@ fn clean_keeps_one_owner_adopts_and_reemits_leaves() {
     let frames = &succinct["derive_frames"];
     assert_eq!(frames["reemitted"], 3);
     assert_eq!(frames["conflicting_output"], 1);
+    assert_eq!(frames["unadmitted_claim"], 1);
     assert_eq!(frames["merged_input"], 1);
     assert_eq!(frames["unmatched_input"], 1);
     let rank9 = find(&report["derived"], fixture.rank9);
@@ -750,10 +786,10 @@ fn clean_keeps_one_owner_adopts_and_reemits_leaves() {
     assert_eq!(report["records_written"]["commit"], 4);
     assert_eq!(report["records_written"]["adopted_commit"], 1);
     assert_eq!(report["records_written"]["derive"], 5);
-    assert_eq!(report["records_written"]["capability_proof"], 3);
+    assert_eq!(report["records_written"]["capability_proof"], 4);
     assert_eq!(report["dropped_frames"]["merge_v10"], 1);
     assert_eq!(report["dropped_frames"]["merge_v8"], 3);
-    assert_eq!(report["dropped_frames"]["derive_v9"], 11);
+    assert_eq!(report["dropped_frames"]["derive_v9"], 12);
     assert_eq!(report["dropped_frames"]["want"], 1);
     assert_eq!(report["destination_audit"]["unresolved_references"], 0);
     assert_eq!(
@@ -765,6 +801,17 @@ fn clean_keeps_one_owner_adopts_and_reemits_leaves() {
         std::fs::metadata(&fixture.src).unwrap().len()
     );
     assert!(report["elapsed_seconds"].as_f64().is_some());
+    // Every distinct source blob is either in the destination or counted
+    // as dropped; no image here stands over an absent payload.
+    let (source_blobs, clean_blobs) = (blob_set(&fixture.src), blob_set(&dst));
+    let blobs = &report["blobs"];
+    assert_eq!(blobs["source_distinct"], source_blobs.len());
+    assert_eq!(
+        blobs["dropped"],
+        source_blobs.difference(&clean_blobs).count()
+    );
+    assert!(blobs["dropped"].as_u64().unwrap() > 0);
+    assert_eq!(blobs["leaf_images_walked_conservatively"], 0);
 
     // Cleaning a clean pile changes nothing.
     let again = fixture.path("again.pile");
@@ -897,6 +944,41 @@ fn dry_run_writes_nothing_and_counts_what_a_run_writes() {
 fn refusals_leave_no_destination() {
     let fixture = Fixture::new();
 
+    // The report is a separate new file: it never names the source or the
+    // destination, and never replaces an existing file. Refused up front.
+    let before = sha256(&fixture.src);
+    let roots_text = std::fs::read_to_string(&fixture.roots_file).unwrap();
+    let fresh = fixture.path("fresh.pile");
+    for report in [
+        fixture.src.clone(),
+        fresh.clone(),
+        fixture.path("fresh.pile.partial"),
+        fixture.roots_file.clone(),
+    ] {
+        let output = trible()
+            .args(["pile", "migrate"])
+            .arg(&fixture.src)
+            .args(["clean", "--into"])
+            .arg(&fresh)
+            .arg("--roots")
+            .arg(&fixture.roots_file)
+            .arg("--report")
+            .arg(&report)
+            .arg("--key")
+            .arg(&fixture.key_a)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "--report {report:?} accepted");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("--report"));
+        assert!(!fresh.exists());
+        assert!(!fixture.path("fresh.pile.partial").exists());
+    }
+    assert_eq!(sha256(&fixture.src), before, "the source is untouched");
+    assert_eq!(
+        std::fs::read_to_string(&fixture.roots_file).unwrap(),
+        roots_text
+    );
+
     // The first key adopts, so it must be admitted to the current root.
     let dst = fixture.path("inadmissible.pile");
     let output = fixture.clean(&fixture.src, &dst, &["--adopt-by-name"], &[&fixture.key_c]);
@@ -933,6 +1015,116 @@ fn refusals_leave_no_destination() {
     let output = fixture.clean(&fixture.src, &dst, &["--drop-unknown"], &[&fixture.key_a]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("already exists"));
+}
+
+#[test]
+fn an_owners_current_leaf_is_kept_over_its_own_earlier_claim() {
+    // Concatenation is the merge: the source's retired claims come first,
+    // the clean pile's current leaves after them. Every leaf is already
+    // signed by its owner, so a run without any key keeps all of them.
+    let fixture = Fixture::new();
+    let keys = [fixture.key_a.as_path(), fixture.key_b.as_path()];
+    let dst = fixture.path("clean.pile");
+    assert_success(&fixture.clean(&fixture.src, &dst, &["--adopt-by-name"], &keys));
+    let merged = fixture.path("merged.pile");
+    let mut bytes = std::fs::read(&fixture.src).unwrap();
+    bytes.extend(std::fs::read(&dst).unwrap());
+    std::fs::write(&merged, bytes).unwrap();
+
+    let again = fixture.path("again.pile");
+    assert_success(&fixture.clean(&merged, &again, &[], &[]));
+    assert_eq!(derives(&records(&again)), derives(&records(&dst)));
+    let report = fixture.report(&again);
+    for (target, kept) in [(fixture.succinct, 3), (fixture.rank9, 2)] {
+        let frames = &find(&report["derived"], target)["derive_frames"];
+        assert_eq!(frames["kept_current"], kept);
+        assert_eq!(frames["reemitted"], 0);
+        assert!(owners(&frames["no_key_by_owner"]).is_empty());
+    }
+    let root = find(&report["roots"], fixture.root);
+    assert_eq!(
+        root["kept_commits"], 5,
+        "P1 twice, P2, P5 and the adopted Q1"
+    );
+    assert_eq!(report["records_written"]["commit"], 5);
+    assert_eq!(
+        report["destination_bytes"],
+        report["destination_bytes_projected"]
+    );
+}
+
+#[test]
+fn a_leaf_over_an_absent_payload_keeps_what_its_image_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("source.pile");
+    std::fs::File::create(&src).unwrap();
+    let key_path = dir.path().join("a.key");
+    let a = triblespace_core::signing_key_file::init(&key_path).unwrap();
+    let mut pile = Pile::open(&src).unwrap();
+    let root = pile.collection("facts", policy(&a)).unwrap();
+    let succinct = pile
+        .derive::<SuccinctArchiveBlob>(root, (), policy(&a))
+        .unwrap();
+    // This replica holds the commit and the image, never the payload.
+    let payload = data(b"a payload this replica never held");
+    let metadata = pile
+        .put::<SimpleArchive, _>(
+            entity! { metadata::tag: metadata::KIND_BLOB_ENCODING }
+                .facts()
+                .clone(),
+        )
+        .unwrap();
+    pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
+        &a,
+        root.handle(),
+        payload,
+        metadata,
+    )))
+    .unwrap();
+    // A blob only the image names, at a 32-byte-aligned offset of an image
+    // that is not an archive (96 bytes: no whole 64-byte rows).
+    let child = put_raw(&mut pile, b"named only by the image");
+    let mut image_bytes = vec![0x11; 32];
+    image_bytes.extend_from_slice(&child.raw);
+    image_bytes.extend_from_slice(&[0x22; 32]);
+    let image = put_raw(&mut pile, &image_bytes);
+    pile.close().unwrap();
+    append(&src, &derive_v9(&a, succinct.handle(), payload, image));
+
+    let roots_file = dir.path().join("roots.txt");
+    std::fs::write(&roots_file, handle_line(root.handle().raw)).unwrap();
+    let dst = dir.path().join("clean.pile");
+    let report_path = dir.path().join("clean.json");
+    let output = trible()
+        .args(["pile", "migrate"])
+        .arg(&src)
+        .args(["clean", "--into"])
+        .arg(&dst)
+        .arg("--roots")
+        .arg(&roots_file)
+        .arg("--report")
+        .arg(&report_path)
+        .arg("--key")
+        .arg(&key_path)
+        .output()
+        .unwrap();
+    assert_success(&output);
+
+    assert_eq!(
+        derives(&records(&dst)),
+        BTreeSet::from([leaf(succinct.handle(), payload, image, &a)])
+    );
+    let clean_blobs = blob_set(&dst);
+    assert!(clean_blobs.contains(&image.raw));
+    assert!(
+        clean_blobs.contains(&child.raw),
+        "what the image names travels without its payload"
+    );
+    let report: Value =
+        serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+    assert_eq!(report["blobs"]["leaf_images_walked_conservatively"], 1);
+    assert_eq!(report["blobs"]["kept_by_conservative_walk"], 1);
+    assert_eq!(report["blobs"]["references_not_resident"], 1);
 }
 
 #[test]

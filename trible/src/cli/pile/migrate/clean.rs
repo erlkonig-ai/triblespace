@@ -18,11 +18,12 @@
 //! escalated to an exclusive lock only for a re-check when replay meets a
 //! record torn by an in-flight append. Nothing is locked afterwards: every
 //! later read comes from the immutable mapped prefix that replay validated,
-//! and the raw census walks that same prefix through [`PileRecords`], which
-//! takes no lock at all (as `verify` and `diagnose` do). Blob appends up to
-//! 1 GiB share the lock and are never blocked; appends that take the
-//! exclusive lock (collection records, proofs, larger blobs) wait at most for
-//! the replay.
+//! and the raw census walks exactly that prefix through the snapshot's own
+//! mapping ([`PileFileSnapshot::raw_records`]): no lock, no reopen by path,
+//! and nothing appended after replay (an append still in flight included) is
+//! ever decoded. Blob appends up to 1 GiB share the lock and are never
+//! blocked; appends that take the exclusive lock (collection records, proofs,
+//! larger blobs) wait at most for the replay.
 //!
 //! **Ownership.** Per `(current root, data)`, among COMMITs whose signature
 //! verifies strictly and whose signer the root admits as a writer, the owner
@@ -40,10 +41,13 @@
 //! That is exact for this data model, where a handle lives in an archive's
 //! value column; derived images (Succinct, Rank9, views) are
 //! functions of source archives the pile keeps, so their references are
-//! already retained through those. The conservative walk would instead probe
-//! every 32-byte stride of every kept blob, large non-archive payloads
-//! included, and the default `BlobChildren` hashes every candidate it hits.
-//! Each kept blob is read once, validated once and written once.
+//! already retained through those. The one exception is a kept leaf whose
+//! foundation is not in the destination (the source never held its payload):
+//! its image is walked conservatively, every 32-byte-aligned stride probed
+//! for residency, so the blobs it names still travel. A walk of every kept
+//! blob that way would probe every stride of large non-archive payloads too,
+//! and the default `BlobChildren` hashes every candidate it hits. Each kept
+//! blob is read once, validated once and written once.
 //!
 //! **Streaming.** Nothing proportional to payload bytes is held in memory:
 //! blobs are mmap-backed views of the source prefix, copied one at a time.
@@ -73,7 +77,7 @@ use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::Inline;
 use triblespace_core::repo::pile::{
     description_blobs, GetBlobError, PileFile, PileFileSnapshot, PileRecord, PileRecordContent,
-    PileRecords, ReadError,
+    ReadError,
 };
 use triblespace_core::repo::{
     BlobStoreGet, BlobStoreList, BlobStorePut, CapabilityProofRead, CapabilityProofStore,
@@ -109,7 +113,8 @@ pub struct CleanArgs {
     /// foundations it owns. No key is used implicitly.
     #[arg(long = "key", value_name = "PATH")]
     pub keys: Vec<PathBuf>,
-    /// Write the full JSON report here.
+    /// Write the full JSON report to this NEW file. It must not exist, and
+    /// must not name the source or the destination.
     #[arg(long)]
     pub report: Option<PathBuf>,
     /// Plan and count only; no destination is created.
@@ -122,13 +127,15 @@ pub struct CleanArgs {
 
 const LOCK_DESCRIPTION: &str = "source opened read-only; one shared flock held only while replay \
     builds the index (escalated to an exclusive re-check only if replay meets a record torn by an \
-    in-flight append), as `collection list` does; no lock afterwards; the raw census walks the \
-    same validated prefix without a lock, as `verify` does";
+    in-flight append), as `collection list` does; no lock afterwards; the raw census walks exactly \
+    the replayed prefix through the snapshot's own mapping, never reopening the path or decoding \
+    anything appended after replay";
 
 const RETENTION_DESCRIPTION: &str = "direct references of kept records, descriptors and proofs \
     are copied; a copied blob is walked only when it is a canonical SimpleArchive, probing its \
     value column against the in-memory blob index, one lookup per row until a value is accepted; \
-    every other blob is a leaf and is never scanned";
+    every other blob is a leaf and is not scanned, except a kept leaf image whose foundation the \
+    destination does not hold, whose every 32-byte-aligned stride is probed";
 
 pub fn run(source: PathBuf, args: CleanArgs) -> Result<()> {
     let started = Instant::now();
@@ -150,6 +157,9 @@ pub fn run(source: PathBuf, args: CleanArgs) -> Result<()> {
             "destination {} already exists; clean writes a fresh pile",
             args.into.display()
         );
+    }
+    if let Some(report) = &args.report {
+        check_report_path(report, &source, &args.into)?;
     }
 
     let mut src = PileFile::open_read_only(&source)
@@ -176,8 +186,54 @@ pub fn run(source: PathBuf, args: CleanArgs) -> Result<()> {
     print_summary(&report);
     if let Some(path) = &args.report {
         let text = serde_json::to_string_pretty(&report).context("render report")?;
-        std::fs::write(path, text + "\n")
+        // A new file only: never truncate one that appeared meanwhile.
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .with_context(|| format!("create report {}", path.display()))?;
+        std::io::Write::write_all(&mut file, (text + "\n").as_bytes())
             .with_context(|| format!("write report {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// A path's identity for comparison before either file exists: absolute,
+/// with its directory resolved through symlinks when that directory exists.
+fn path_identity(path: &Path) -> PathBuf {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    match (absolute.parent(), absolute.file_name()) {
+        (Some(parent), Some(name)) => parent
+            .canonicalize()
+            .map(|parent| parent.join(name))
+            .unwrap_or(absolute),
+        _ => absolute,
+    }
+}
+
+/// The report is written to a NEW file (created exclusively, so neither an
+/// existing file nor a symlink is ever followed and truncated), and it must
+/// not name the source, the destination or the destination's partial file.
+/// Checked before any work, so a bad `--report` costs nothing.
+fn check_report_path(report: &Path, source: &Path, into: &Path) -> Result<()> {
+    let report_identity = path_identity(report);
+    for (what, path) in [
+        ("the source pile", source.to_path_buf()),
+        ("the destination (--into)", into.to_path_buf()),
+        ("the partial destination", partial_path(into)),
+    ] {
+        if report_identity == path_identity(&path) {
+            bail!(
+                "--report {} names {what}; the report must be a separate new file",
+                report.display()
+            );
+        }
+    }
+    if std::fs::symlink_metadata(report).is_ok() {
+        bail!(
+            "--report {} already exists; the report is only ever written to a new file",
+            report.display()
+        );
     }
     Ok(())
 }
@@ -280,25 +336,40 @@ fn describe(snapshot: &PileFileSnapshot, handle: Raw) -> Described {
 }
 
 /// Who may WRITE a collection, decided from its own descriptor policy and the
-/// source's proofs, as the coverage fold decides it. Cached per collection and
-/// per `(collection, signer)`.
+/// proofs the destination keeps, as the coverage fold decides it. Cached per
+/// collection and per `(collection, signer)`.
 struct WriteAdmission<'a> {
     reader: &'a PileFileSnapshot,
+    /// Every source proof whose signatures all verify: exactly the proofs
+    /// the destination keeps (a pile accepts no other). Admission is decided
+    /// from these alone, so a record judged admitted here is admitted by the
+    /// destination's own evidence, never by the valid prefix of a proof the
+    /// destination cannot hold.
     proofs: Vec<CapabilityProof>,
+    /// Source proofs dropped because some signature fails.
+    invalid_proofs: u64,
     policies: HashMap<Raw, Option<Vec<AdmissionPolicy>>>,
     decided: HashMap<(Raw, Raw), bool>,
 }
 
 impl<'a> WriteAdmission<'a> {
     fn new(reader: &'a PileFileSnapshot) -> Result<Self> {
-        let proofs = reader
+        let (mut proofs, mut invalid_proofs) = (Vec::new(), 0u64);
+        for proof in reader
             .proofs()
             .map_err(|error| anyhow!("list proofs: {error}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| anyhow!("read proof: {error}"))?;
+        {
+            let proof = proof.map_err(|error| anyhow!("read proof: {error}"))?;
+            if proof.verify_signatures().is_ok() {
+                proofs.push(proof);
+            } else {
+                invalid_proofs += 1;
+            }
+        }
         Ok(Self {
             reader,
             proofs,
+            invalid_proofs,
             policies: HashMap::new(),
             decided: HashMap::new(),
         })
@@ -399,6 +470,9 @@ struct RetiredStats {
     valid_admitted: u64,
     invalid_signature: u64,
     unadmitted: u64,
+    /// Admitted commits of a payload by other than its earliest admitted
+    /// signer there, whose metadata is not adopted.
+    duplicate_owner: u64,
     adopted_payloads: u64,
     adopted_commits: u64,
     already_present: u64,
@@ -414,6 +488,8 @@ struct DerivedStats {
     upstream_pending: BTreeMap<u32, u64>,
     superseded: u64,
     conflicting: u64,
+    /// Claims whose signer the target does not admit to WRITE.
+    unadmitted_claim: u64,
     merged_input: u64,
     unmatched_input: u64,
     invalid_signature: u64,
@@ -859,20 +935,14 @@ struct RawPass {
     merge_results: HashSet<(Raw, Raw)>,
 }
 
-fn raw_pass(path: &Path, prefix_len: usize, plan: &Plan, signers: &mut Signers) -> Result<RawPass> {
-    let records =
-        PileRecords::open(path).map_err(|error| super::super::pile_read_error(path, error))?;
-    // Frames at or past the prefix were appended after replay; this run
-    // does not see them.
-    let within = records.take_while(|record| {
-        record
-            .as_ref()
-            .map_or(true, |record| record.offset < prefix_len)
-    });
+/// Every frame of the snapshot's replayed prefix, read from its own mapping:
+/// frames appended after replay, a torn in-flight append among them, are
+/// never decoded, and a re-pointed path cannot substitute another file.
+fn raw_pass(snapshot: &PileFileSnapshot, plan: &Plan, signers: &mut Signers) -> Result<RawPass> {
     // Only a claim that could become a leaf of a kept derived collection
     // is worth a signature check.
     let checked = Checked::new(
-        within,
+        snapshot.raw_records(),
         |record: &Result<PileRecord, ReadError>| match record {
             Ok(PileRecord {
                 content:
@@ -906,7 +976,11 @@ fn raw_pass(path: &Path, prefix_len: usize, plan: &Plan, signers: &mut Signers) 
         merge_results: HashSet::new(),
     };
     for (record, verified) in checked {
-        let record = record.map_err(|error| super::super::pile_read_error(path, error))?;
+        // Replay accepted every frame of this prefix; failing to decode one
+        // now means bytes below it changed, never a torn tail.
+        let record = record.map_err(|error| {
+            anyhow!("census: a frame below the replayed prefix no longer decodes: {error}")
+        })?;
         let census = &mut pass.census;
         census.frames += 1;
         let offset = record.offset as u64;
@@ -1072,14 +1146,28 @@ struct BlobStats {
     kept_payload_bytes: u64,
     archives_walked: u64,
     values_probed: u64,
+    /// Leaf images walked conservatively because their foundation is not
+    /// in the destination, and the blobs that walk added.
+    stride_walks: u64,
+    stride_children: u64,
     corrupt_skipped: u64,
     references_not_resident: u64,
+    /// Distinct resident source blobs, and those the destination does not
+    /// hold (never reached, or no occurrence validates), with payload bytes
+    /// as the source's record headers state them.
+    source_distinct: u64,
+    source_payload_bytes: u64,
+    dropped: u64,
+    dropped_payload_bytes: u64,
 }
 
 /// Copies blobs out of the frozen source prefix, each once.
 struct Retainer<'a> {
     src: &'a PileFileSnapshot,
+    /// Every handle decided: copied, or found with no valid occurrence.
     copied: HashSet<Raw>,
+    /// Handles decided but not copied, because no occurrence validates.
+    corrupt: HashSet<Raw>,
     stats: BlobStats,
     projected_bytes: u64,
 }
@@ -1089,9 +1177,28 @@ impl<'a> Retainer<'a> {
         Self {
             src,
             copied: HashSet::new(),
+            corrupt: HashSet::new(),
             stats: BlobStats::default(),
             projected_bytes: 0,
         }
+    }
+
+    /// Count the source's distinct blobs and those the destination will not
+    /// hold. One pass over the in-memory blob index, reading record headers
+    /// only (no payload is hashed).
+    fn count_dropped(&mut self) -> Result<()> {
+        let src = self.src;
+        for info in src.blobs() {
+            let info = info.map_err(|error| anyhow!("list source blobs: {error}"))?;
+            let handle = info.handle.raw;
+            self.stats.source_distinct += 1;
+            self.stats.source_payload_bytes += info.length;
+            if !self.copied.contains(&handle) || self.corrupt.contains(&handle) {
+                self.stats.dropped += 1;
+                self.stats.dropped_payload_bytes += info.length;
+            }
+        }
+        Ok(())
     }
 
     fn resident(&self, handle: Raw) -> bool {
@@ -1124,6 +1231,7 @@ impl<'a> Retainer<'a> {
                     // No resident occurrence hashes to its handle; nothing
                     // can be copied, and the reference stays dangling.
                     self.stats.corrupt_skipped += 1;
+                    self.corrupt.insert(handle);
                     continue;
                 }
                 Err(error) => bail!("read blob {}: {error}", hex(&handle)),
@@ -1147,6 +1255,34 @@ impl<'a> Retainer<'a> {
             self.stats.kept_payload_bytes += len as u64;
             self.projected_bytes += blob_frame_len(len);
             sink.put(blob)?;
+        }
+        Ok(())
+    }
+
+    /// The conservative walk, for a kept leaf image whose foundation is not
+    /// in the destination to carry its references: keep every resident blob
+    /// a 32-byte-aligned stride of the image names, each with its archive
+    /// closure. Probes are residency lookups; the image is not re-hashed.
+    fn keep_strides(&mut self, sink: &mut Sink, handle: Raw) -> Result<()> {
+        if !self.resident(handle) {
+            return Ok(());
+        }
+        let blob: Blob<UnknownBlob> = match self
+            .src
+            .get::<Blob<UnknownBlob>, UnknownBlob>(Inline::new(handle))
+        {
+            Ok(blob) => blob,
+            // Counted when the image itself was kept.
+            Err(GetBlobError::ValidationError(_)) => return Ok(()),
+            Err(error) => bail!("read blob {}: {error}", hex(&handle)),
+        };
+        self.stats.stride_walks += 1;
+        for stride in blob.bytes.chunks_exact(32) {
+            let value = <Raw>::try_from(stride).expect("a stride is 32 bytes");
+            if !self.copied.contains(&value) && self.resident(value) {
+                self.stats.stride_children += 1;
+                self.keep(sink, value)?;
+            }
         }
         Ok(())
     }
@@ -1318,7 +1454,7 @@ impl Run {
             plan.derived.len(),
             plan.retired.len(),
         );
-        let pass = raw_pass(source, snapshot.prefix_len(), plan, &mut signers)?;
+        let pass = raw_pass(snapshot, plan, &mut signers)?;
         if pass.census.opaque > 0 && !args.drop_unknown {
             bail!(
                 "the source holds {} frame(s) ({} bytes) of kinds this binary does not know; \
@@ -1479,7 +1615,8 @@ impl Run {
             sink,
             records_written: BTreeMap::new(),
         };
-        let (proofs_kept, proofs_invalid) = self.keep_descriptors_and_proofs(&mut out, snapshot)?;
+        let proofs_kept = self.keep_descriptors_and_proofs(&mut out, admission)?;
+        let proofs_invalid = admission.invalid_proofs;
         let mut roots = self.keep_roots(&mut out, snapshot, signers, admission)?;
         self.mark(
             "roots",
@@ -1512,6 +1649,7 @@ impl Run {
                 descriptions += 1;
             }
         }
+        out.retainer.count_dropped()?;
 
         Ok(self.report(
             pass,
@@ -1526,12 +1664,13 @@ impl Run {
     }
 
     /// Descriptors first, then the proofs that admit writers, so every
-    /// record lands after what it needs to be decided.
+    /// record lands after what it needs to be decided. The proofs are the
+    /// signature-valid ones admission was decided from.
     fn keep_descriptors_and_proofs(
         &self,
         out: &mut Writing,
-        snapshot: &PileFileSnapshot,
-    ) -> Result<(u64, u64)> {
+        admission: &WriteAdmission,
+    ) -> Result<u64> {
         let plan = &self.plan;
         for handle in plan
             .roots
@@ -1540,16 +1679,8 @@ impl Run {
         {
             out.keep(*handle)?;
         }
-        let (mut kept, mut invalid) = (0u64, 0u64);
-        for proof in snapshot
-            .proofs()
-            .map_err(|error| anyhow!("list proofs: {error}"))?
-        {
-            let proof = proof.map_err(|error| anyhow!("read proof: {error}"))?;
-            if proof.verify_signatures().is_err() {
-                invalid += 1;
-                continue;
-            }
+        let mut kept = 0u64;
+        for proof in admission.proofs.iter().cloned() {
             for definition in proof.blob_references() {
                 out.keep(definition.raw)?;
             }
@@ -1564,7 +1695,7 @@ impl Run {
             out.sink.insert_proof(proof)?;
             kept += 1;
         }
-        Ok((kept, invalid))
+        Ok(kept)
     }
 
     /// Roots: one streaming walk of the record index. Each payload's commits
@@ -1586,6 +1717,9 @@ impl Run {
             adoptable: BTreeMap::new(),
         };
         let mut run: Option<((usize, Raw), Option<u32>)> = None;
+        // The same owner rule per `(retired collection, data)`: only the
+        // earliest admitted signer's metadata is carried into adoption.
+        let mut retired_run: Option<((Raw, Raw), Option<Raw>)> = None;
         let records = snapshot
             .records()
             .map_err(|error| anyhow!("read collection records: {error}"))?;
@@ -1643,18 +1777,28 @@ impl Run {
                 out.record(record, "commit")?;
             } else if let Some((_, mapped)) = plan.retired.get(&collection) {
                 let Some(root) = mapped else { continue };
+                if retired_run.map(|(key, _)| key) != Some((collection, data)) {
+                    retired_run = Some(((collection, data), None));
+                }
                 let stats = roots.retired.entry(collection).or_default();
                 if !verified {
                     stats.invalid_signature += 1;
-                } else if !admission.admits(collection, signer) {
-                    stats.unadmitted += 1;
-                } else {
-                    stats.valid_admitted += 1;
-                    roots
-                        .adoptable
-                        .entry((*root, data, commit.metadata().raw))
-                        .or_insert(collection);
+                    continue;
                 }
+                if !admission.admits(collection, signer) {
+                    stats.unadmitted += 1;
+                    continue;
+                }
+                stats.valid_admitted += 1;
+                let owner = &mut retired_run.as_mut().expect("a run is open").1;
+                if *owner.get_or_insert(signer) != signer {
+                    stats.duplicate_owner += 1;
+                    continue;
+                }
+                roots
+                    .adoptable
+                    .entry((*root, data, commit.metadata().raw))
+                    .or_insert(collection);
             }
         }
         roots.close_run(run.take());
@@ -1663,6 +1807,8 @@ impl Run {
 
     /// Admitted payloads of a mapped retired collection that the current
     /// root lacks, re-signed into it by the first key, which then owns them.
+    /// Only the metadata of the payload's owner in the retired collection
+    /// (its earliest admitted signer) is carried, as for a current root.
     fn adopt(
         &self,
         out: &mut Writing,
@@ -1776,25 +1922,39 @@ impl Run {
                     None => Some(candidate.input),
                     Some(_) => locators.get(&candidate.input).copied(),
                 };
-                match foundation.filter(|foundation| foundation_of(foundation).is_some()) {
-                    Some(foundation) => groups.entry(foundation).or_default().push(*candidate),
-                    None if candidate.current.is_none()
+                let Some(foundation) =
+                    foundation.filter(|foundation| foundation_of(foundation).is_some())
+                else {
+                    if candidate.current.is_none()
                         && pass
                             .merge_results
-                            .contains(&(derived.source_handle, candidate.input)) =>
+                            .contains(&(derived.source_handle, candidate.input))
                     {
-                        stats.merged_input += 1
+                        stats.merged_input += 1;
+                    } else {
+                        stats.unmatched_input += 1;
                     }
-                    None => stats.unmatched_input += 1,
+                    continue;
+                };
+                // A claim whose signer the target's WRITE policy does not
+                // admit was never believed in the source: it neither competes
+                // for the leaf nor counts as a conflict.
+                if !admission.admits(derived.handle, signers.keys[candidate.signer as usize]) {
+                    stats.unadmitted_claim += 1;
+                    continue;
                 }
+                groups.entry(foundation).or_default().push(*candidate);
             }
             for (foundation, mut group) in groups {
                 group.sort_by_key(|candidate| candidate.offset);
                 let source = foundation_of(&foundation).expect("grouped foundations are known");
                 let owner = source.owner;
+                // The owner's current record, kept as is without a key; else
+                // the owner's earliest claim; else the earliest admitted one.
                 let chosen = *group
                     .iter()
-                    .find(|candidate| candidate.signer == owner)
+                    .find(|candidate| candidate.signer == owner && candidate.current.is_some())
+                    .or_else(|| group.iter().find(|candidate| candidate.signer == owner))
                     .unwrap_or(&group[0]);
                 for candidate in &group {
                     if candidate.offset == chosen.offset {
@@ -1841,6 +2001,12 @@ impl Run {
                 let written = match decision {
                     Decision::Write(derive, outcome) => {
                         out.record(CollectionRecord::Derive(derive), "derive")?;
+                        // The image's references normally travel with the
+                        // foundation's archive. Without that foundation in
+                        // the destination, the image is walked itself.
+                        if !out.retainer.copied.contains(&foundation) {
+                            out.retainer.keep_strides(out.sink, chosen.output)?;
+                        }
                         match outcome {
                             Outcome::KeptCurrent => stats.kept_current += 1,
                             Outcome::Reemitted => stats.reemitted += 1,
@@ -1952,6 +2118,7 @@ impl Run {
                     "admitted_commits": stats.map_or(0, |s| s.valid_admitted),
                     "invalid_signature": stats.map_or(0, |s| s.invalid_signature),
                     "unadmitted": stats.map_or(0, |s| s.unadmitted),
+                    "duplicate_owner": stats.map_or(0, |s| s.duplicate_owner),
                     "adopted_payloads": stats.map_or(0, |s| s.adopted_payloads),
                     "adopted_commits": stats.map_or(0, |s| s.adopted_commits),
                     "already_present": stats.map_or(0, |s| s.already_present),
@@ -1988,6 +2155,7 @@ impl Run {
                         "source_leaf_not_written_by_owner": by_owner(&stats.upstream_pending),
                         "superseded": stats.superseded,
                         "conflicting_output": stats.conflicting,
+                        "unadmitted_claim": stats.unadmitted_claim,
                         "merged_input": stats.merged_input,
                         "unmatched_input": stats.unmatched_input,
                         "invalid_signature": stats.invalid_signature,
@@ -2068,6 +2236,12 @@ impl Run {
                 "archive_values_probed": stats.values_probed,
                 "corrupt_skipped": stats.corrupt_skipped,
                 "references_not_resident": stats.references_not_resident,
+                "leaf_images_walked_conservatively": stats.stride_walks,
+                "kept_by_conservative_walk": stats.stride_children,
+                "source_distinct": stats.source_distinct,
+                "source_payload_bytes": stats.source_payload_bytes,
+                "dropped": stats.dropped,
+                "dropped_payload_bytes": stats.dropped_payload_bytes,
                 "retention": RETENTION_DESCRIPTION,
             },
             "destination_bytes_projected": retainer.projected_bytes,
@@ -2179,12 +2353,16 @@ fn print_summary(report: &Value) {
         get(&["blobs", "record_kind_descriptions_added"]),
     );
     println!(
-        "  dropped: {} MERGE v10, {} MERGE v8, {} DERIVE v9 frame(s), {} WANT(s), {} pin record(s)",
+        "  dropped: {} MERGE v10, {} MERGE v8, {} DERIVE v9 frame(s), {} WANT(s), {} pin record(s), \
+         {} of {} distinct source blob(s) ({} payload bytes)",
         get(&["dropped_frames", "merge_v10"]),
         get(&["dropped_frames", "merge_v8"]),
         get(&["dropped_frames", "derive_v9"]),
         get(&["dropped_frames", "want"]),
         get(&["dropped_frames", "pin"]),
+        get(&["blobs", "dropped"]),
+        get(&["blobs", "source_distinct"]),
+        get(&["blobs", "dropped_payload_bytes"]),
     );
     for root in get(&["roots"]).as_array().into_iter().flatten() {
         println!(
@@ -2294,6 +2472,101 @@ mod tests {
         for (index, (item, answer)) in checked.into_iter().enumerate() {
             assert_eq!(item, index as u32);
             assert_eq!(answer, item % 3 == 0);
+        }
+    }
+
+    #[test]
+    fn census_walks_exactly_the_replayed_prefix() {
+        use triblespace_core::repo::pile::PileRecords;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.pile");
+        let other = dir.path().join("other.pile");
+        for (file, payloads) in [(&path, vec!["first"]), (&other, vec!["first", "second"])] {
+            std::fs::File::create(file).unwrap();
+            let mut pile = PileFile::open(file).unwrap();
+            for payload in payloads {
+                pile.put::<UnknownBlob, _>(Blob::<UnknownBlob>::new(anybytes::Bytes::from_source(
+                    payload.as_bytes().to_vec(),
+                )))
+                .unwrap();
+            }
+            pile.close().unwrap();
+        }
+        let plan = Plan {
+            roots: Vec::new(),
+            root_names: Vec::new(),
+            root_index: HashMap::new(),
+            derived: Vec::new(),
+            derived_index: HashMap::new(),
+            retired: BTreeMap::new(),
+            dropped: BTreeMap::new(),
+        };
+        let census = |snapshot: &PileFileSnapshot| {
+            let pass = raw_pass(snapshot, &plan, &mut Signers::default()).unwrap();
+            (pass.census.frames, pass.census.blob_frames)
+        };
+
+        let mut source = PileFile::open_read_only(&path).unwrap();
+        let snapshot = source.snapshot().unwrap();
+        let replayed = census(&snapshot);
+        assert_eq!(replayed.1, 1);
+
+        // A peer's append still in flight at the replayed boundary: the
+        // file now ends in a torn frame, which a walk of the path meets.
+        let torn = &std::fs::read(&other).unwrap()[..300];
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut file, torn).unwrap();
+        drop(file);
+        assert!(
+            PileRecords::open(&path)
+                .unwrap()
+                .any(|record| record.is_err()),
+            "the file's tail is torn"
+        );
+        assert_eq!(
+            census(&snapshot),
+            replayed,
+            "the torn tail is never decoded"
+        );
+
+        // Re-pointing the path at another pile changes nothing either.
+        std::fs::rename(&other, &path).unwrap();
+        assert_eq!(
+            census(&snapshot),
+            replayed,
+            "the census reads the replayed file"
+        );
+        drop(snapshot);
+        source.close().unwrap();
+    }
+
+    #[test]
+    fn report_path_must_be_a_separate_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.pile");
+        std::fs::write(&source, b"").unwrap();
+        let into = dir.path().join("clean.pile");
+        let report = dir.path().join("report.json");
+        assert!(check_report_path(&report, &source, &into).is_ok());
+        for named in [
+            source.clone(),
+            into.clone(),
+            partial_path(&into),
+            dir.path().join(".").join("clean.pile"),
+        ] {
+            let error = check_report_path(&named, &source, &into).unwrap_err();
+            assert!(error.to_string().contains("names"), "{error}");
+        }
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link.json");
+            std::os::unix::fs::symlink(&source, &link).unwrap();
+            let error = check_report_path(&link, &source, &into).unwrap_err();
+            assert!(error.to_string().contains("already exists"), "{error}");
         }
     }
 

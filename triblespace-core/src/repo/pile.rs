@@ -3059,12 +3059,45 @@ impl PileFileSnapshot {
 
     /// Length in bytes of the validated file prefix this snapshot observes.
     ///
-    /// Every record this snapshot indexes starts below it, and a
-    /// [`PileRecords`] walk of the same file that stops here meets exactly
-    /// those records, so a raw pass and indexed reads can share one frozen
-    /// observation while writers keep appending.
+    /// Every record this snapshot indexes starts below it; see
+    /// [`Self::raw_records`] for a raw walk of exactly that prefix.
     pub const fn prefix_len(&self) -> usize {
         self.covered_len
+    }
+
+    /// The raw records of exactly this snapshot's validated prefix, in log
+    /// order, read from the snapshot's own mapping.
+    ///
+    /// Nothing is reopened, locked or re-measured, so a raw pass and indexed
+    /// reads share one frozen observation while writers keep appending:
+    /// bytes appended after replay, including an append still in flight,
+    /// lie at or past [`Self::prefix_len`] and are never decoded, and the
+    /// walk reads the file this snapshot replayed even if its path has since
+    /// been re-pointed. Every record it yields was accepted by replay, so an
+    /// error means bytes below the accepted prefix changed.
+    pub fn raw_records(&self) -> PileRecords {
+        let bytes = if self.covered_len == 0 {
+            Bytes::empty()
+        } else {
+            assert!(
+                self.covered_len <= self.mmap.len(),
+                "accepted pile prefix lies outside its mapping"
+            );
+            // SAFETY: the pile is append-only by contract, so the accepted
+            // prefix is never mutated, and the mapping stays alive as the
+            // owner of the returned bytes.
+            unsafe {
+                let slice = slice_from_raw_parts(self.mmap.as_ptr(), self.covered_len)
+                    .as_ref()
+                    .unwrap();
+                Bytes::from_raw_parts(slice, self.mmap.clone())
+            }
+        };
+        PileRecords {
+            bytes,
+            offset: 0,
+            failed: false,
+        }
     }
 
     /// Number of unknown generic-envelope records in this exact observation.
