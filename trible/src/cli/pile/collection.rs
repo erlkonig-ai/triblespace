@@ -2035,13 +2035,18 @@ mod tests {
         let root = SigningKey::from_bytes(&[62; 32]);
         let signer = SigningKey::from_bytes(&[63; 32]);
         let policy = direct_policy(root.verifying_key());
-        let source = pile.collection("delegated source", policy.clone()).unwrap();
+        // The signer writes the source member itself, so its leaf in the
+        // target is the signer's to derive -- through a delegated grant whose
+        // definition is not here yet.
+        let source = pile
+            .collection("delegated source", direct_policy(signer.verifying_key()))
+            .unwrap();
         let target = pile
             .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
             .unwrap();
         pile.commit(
             source,
-            &root,
+            &signer,
             entity! { metadata::description: "delegated member" },
         )
         .unwrap();

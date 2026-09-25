@@ -267,7 +267,7 @@ fn equation_admission_uses_frozen_proof_evidence() {
 }
 
 #[test]
-fn target_stands_for_nothing_until_its_source_input_is_admitted() {
+fn target_stands_on_its_own_writers_whatever_its_source_admits() {
     let source_owner = SigningKey::from_bytes(&[41; 32]);
     let source_writer = SigningKey::from_bytes(&[42; 32]);
     let target_owner = SigningKey::from_bytes(&[43; 32]);
@@ -320,17 +320,26 @@ fn target_stands_for_nothing_until_its_source_input_is_admitted() {
         .writer_is_admitted(&snapshot, source_writer.verifying_key())
         .unwrap());
     assert!(source.admitted(&snapshot).unwrap().is_empty());
-    // An admitted producer named an input nothing admitted here stands
-    // behind. The fold has no row for that input, so the image is blocked
-    // and the target stands for nothing -- an empty cover and an empty
-    // support -- rather than for a foundation this store cannot vouch for.
-    // No record is walked to certify it from what the producer named.
+    // The deliberate lattice-v2 trust model: the leaf is admitted by the
+    // target's own WRITE policy, and nothing checks its locator against the
+    // source. The image stands on its admitted writer although nothing the
+    // source admits stands behind the input it names, and no record is
+    // walked to certify it either way.
     let unadmitted = snapshot.collection(target).unwrap();
-    assert!(unadmitted.cover().is_empty());
-    assert!(unadmitted.support().unwrap().is_empty());
+    assert_eq!(
+        unadmitted.cover().members().collect::<Vec<_>>(),
+        vec![output]
+    );
+    assert_eq!(
+        unadmitted.support().unwrap().members().collect::<Vec<_>>(),
+        vec![output]
+    );
+    // What the view stands for in its source is read through its leaves by
+    // locator: nothing yet.
+    assert!(crate::collection::test_support::stood_for(&unadmitted).is_empty());
 
     // A commit written straight into the derived target, even by its own
-    // admitted writer, names no foundation and is not evidence either.
+    // admitted writer, names no foundation and attests nothing.
     store
         .insert(CollectionRecord::Commit(CollectionCommit::sign(
             &target_owner,
@@ -340,8 +349,11 @@ fn target_stands_for_nothing_until_its_source_input_is_admitted() {
         )))
         .unwrap();
     let mismatched = store.snapshot().unwrap().collection(target).unwrap();
-    assert!(mismatched.cover().is_empty());
-    assert!(mismatched.support().unwrap().is_empty());
+    assert_eq!(
+        mismatched.cover().members().collect::<Vec<_>>(),
+        vec![output]
+    );
+    assert_eq!(mismatched.support().unwrap().len(), 1);
 
     grant_collection_write(
         &mut store,
@@ -354,6 +366,8 @@ fn target_stands_for_nothing_until_its_source_input_is_admitted() {
     assert!(!snapshot.contains_blob(input.get_handle()).unwrap());
     let requested = source.cover([input.get_handle()]);
     assert_eq!(source.admitted(&snapshot).unwrap(), requested);
+    // Once the source admits the input, the leaf's locator names one of its
+    // foundations: the view reads the same image and now stands for it.
     let attached = snapshot.collection(target).unwrap();
     assert_eq!(attached.cover().members().collect::<Vec<_>>(), vec![output]);
     assert_eq!(

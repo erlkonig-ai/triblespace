@@ -77,11 +77,15 @@ fn reference_summary_cli_registers_maintains_and_reuses_ordinary_derived_records
             let target =
                 Collection::<ReferenceSummaryBlob>::open(&snapshot, Inline::new(raw)).unwrap();
             let observed = snapshot.collection(target).unwrap();
+            // The view stands on its one leaf, and the leaf is the commit's:
+            // freshness against the source finds nothing missing.
             assert_eq!(observed.support().unwrap().len(), 1);
-            assert!(observed
+            let source_snapshot = snapshot.collection(source).unwrap();
+            assert!(source_snapshot
                 .support()
                 .unwrap()
                 .contains(Inline::new(commit.data().raw)));
+            assert!(observed.missing_from(&source_snapshot).unwrap().is_empty());
             let view = observed.view::<ReferenceSummaryView>().unwrap();
             assert_eq!(
                 view.layout(),
@@ -113,6 +117,7 @@ fn reference_summary_cli_registers_maintains_and_reuses_ordinary_derived_records
             } else {
                 first_records = Some(records);
             }
+            drop(source_snapshot);
             drop(observed);
             drop(snapshot);
             pile.close().unwrap();

@@ -10,13 +10,13 @@ use triblespace_core::blob::encodings::succinctarchive::{
 };
 use triblespace_core::collection::{
     derived_from, ensure_downstream, maintain_downstream, AdmissionPolicy, Collection,
-    CollectionPolicy, CollectionRead, CollectionRecord, CollectionSnapshotExt,
-    CollectionStoreExt, CoreRealizer, Derived, RealizeDerived, Realized, Upkeep,
+    CollectionPolicy, CollectionRead, CollectionRecord, CollectionSnapshotExt, CollectionStoreExt,
+    CoreRealizer, Derived, RealizeDerived, Realized, Upkeep, MERGE_FAN_IN,
 };
 use triblespace_core::metadata;
 use triblespace_core::prelude::entity;
-use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::async_store::AsyncBlobStoreAcquire;
+use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{SnapshotSource, Store};
 use triblespace_core::trible::Fragment;
 
@@ -111,15 +111,11 @@ fn ensure_derived_makes_a_commit_readable_through_every_view_and_publishes_no_me
     let chain = chain(&mut store, "ensured", &owner);
     // The first commit and the registration-time realization put the chain
     // into the listing; every later write finds it there.
-    store
-        .commit(chain.source, &owner, fragment("one"))
-        .unwrap();
+    store.commit(chain.source, &owner, fragment("one")).unwrap();
     block_on(store.ensure(chain.succinct, &owner)).unwrap();
     block_on(store.ensure(chain.rank9, &owner)).unwrap();
 
-    store
-        .commit(chain.source, &owner, fragment("two"))
-        .unwrap();
+    store.commit(chain.source, &owner, fragment("two")).unwrap();
     let report = block_on(ensure_downstream(
         &mut store,
         chain.source.handle(),
@@ -144,7 +140,9 @@ fn ensure_derived_makes_a_commit_readable_through_every_view_and_publishes_no_me
     assert_eq!((commits, merges), (2, 0));
     assert_eq!(derives, 4, "each commit's image in each lattice");
 
-    // Maintenance carries what ensure left as leaves.
+    // A derived collection has no carry of its own: maintaining the views
+    // mirrors their source's merges, and two commits sit below the root's
+    // fan-in, so there is none.
     let report = block_on(maintain_downstream(
         &mut store,
         chain.source.handle(),
@@ -156,13 +154,39 @@ fn ensure_derived_makes_a_commit_readable_through_every_view_and_publishes_no_me
         report.realized,
         [chain.succinct.handle(), chain.rank9.handle()]
     );
-    let (_, merges, _) = record_kinds(&mut store);
-    assert!(merges > 0, "maintenance merged the two leaves");
+    assert_eq!(record_kinds(&mut store), (2, 0, 4));
+
+    // Once the root carries a full tier into one MERGE, maintenance mirrors
+    // it in every view, upstream first, over the leaves' images.
+    let more = ["three", "four", "five", "six", "seven", "eight"];
+    assert_eq!(2 + more.len(), MERGE_FAN_IN);
+    for name in more {
+        store.commit(chain.source, &owner, fragment(name)).unwrap();
+    }
+    drop(block_on(store.maintain(chain.source, &owner)).unwrap());
+    let report = block_on(maintain_downstream(
+        &mut store,
+        chain.source.handle(),
+        &owner,
+        &mut CoreRealizer,
+    ))
+    .unwrap();
+    assert_eq!(
+        report.realized,
+        [chain.succinct.handle(), chain.rank9.handle()]
+    );
+    assert_eq!(
+        record_kinds(&mut store),
+        (MERGE_FAN_IN, 3, 2 * MERGE_FAN_IN),
+        "one root carry and its two mirrors; a leaf per commit per view"
+    );
     let snapshot = store.snapshot().unwrap();
     let observed = snapshot.collection(chain.rank9).unwrap();
-    assert_eq!(observed.support().unwrap().len(), 2);
+    assert_eq!(observed.support().unwrap().len(), MERGE_FAN_IN);
     let view: UnionArchive<OrderedUniverse> = observed.view().unwrap();
     assert_eq!(view.segment_count(), 1);
+    let source = snapshot.collection(chain.succinct).unwrap();
+    assert!(observed.missing_from(&source).unwrap().is_empty());
 }
 
 #[test]

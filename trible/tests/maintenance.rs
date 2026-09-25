@@ -446,7 +446,13 @@ fn entity_id_set_cli_uses_the_existing_attribute_argument_conventions() {
         Some(GenId::encode(attribute).raw)
     );
     let observed = snapshot.collection(target).unwrap();
-    assert_eq!(observed.support().unwrap().len(), 2);
+    // Both source commits have their leaf, and both leaves are the same
+    // empty image: the view's own support is that one image.
+    assert!(observed
+        .missing_from(&snapshot.collection(fixture.source).unwrap())
+        .unwrap()
+        .is_empty());
+    assert_eq!(observed.support().unwrap().len(), 1);
     assert!(observed.view::<EntityIdSet>().unwrap().is_empty());
     drop(observed);
     drop(snapshot);
@@ -582,7 +588,7 @@ fn maintain_deduplicates_targets_without_scheduling_their_dependencies() {
 }
 
 #[test]
-fn maintain_all_follows_dependencies_without_merging_the_unselected_root() {
+fn maintain_all_follows_dependencies_and_leaves_the_unrelated_root_alone() {
     let fixture = Fixture::new();
     let before = records(&fixture.path);
     assert_success(&fixture.run("maintain-all", &[fixture.rank9.handle()]));
@@ -595,6 +601,8 @@ fn maintain_all_follows_dependencies_without_merging_the_unselected_root() {
             fixture.signer.verifying_key().to_bytes()
         );
         assert_ne!(record.collection(), fixture.unrelated.handle());
+        // The reached root is maintained too, by its own carry, but its two
+        // commits sit below the fan-in: nothing is merged there.
         if record.collection() == fixture.source.handle() {
             assert!(matches!(record, CollectionRecord::Commit(_)));
         }
@@ -604,11 +612,13 @@ fn maintain_all_follows_dependencies_without_merging_the_unselected_root() {
     let mut pile = Pile::open(&fixture.path).unwrap();
     let snapshot = pile.snapshot().unwrap();
     let support = fixture.source.admitted(&snapshot).unwrap();
+    // A derived collection has no carry of its own, and its source has no
+    // merge to mirror: each view holds one leaf per commit.
     for len in [
         snapshot.collection(fixture.succinct).unwrap().cover().len(),
         snapshot.collection(fixture.rank9).unwrap().cover().len(),
     ] {
-        assert_eq!(len, 1, "the equal-size inputs should be rolled up");
+        assert_eq!(len, 2, "one leaf per commit, nothing merged");
     }
     let observed = snapshot.collection(fixture.rank9).unwrap();
     assert_eq!(stood_for(&observed), support);
@@ -690,23 +700,65 @@ fn maintain_all_schedules_a_shared_upstream_once() {
 }
 
 #[test]
-fn maintain_all_merges_a_root_when_it_is_explicitly_selected() {
+fn maintain_all_carries_a_reached_root_once_before_its_views() {
     let fixture = Fixture::new();
-    // Selecting the root after its descendant must still apply the explicit
-    // choice before the traversal first visits it as an upstream dependency.
+    // Six more own commits fill the root's first tier.
+    let mut pile = Pile::open(&fixture.path).unwrap();
+    let mut expected = fixture.expected.clone();
+    for text in ["third", "fourth", "fifth", "sixth", "seventh", "eighth"] {
+        let fragment = entity! { metadata::description: text };
+        expected += fragment.facts().clone();
+        pile.commit(fixture.source, &fixture.signer, fragment)
+            .unwrap();
+    }
+    pile.close().unwrap();
+    // Every root the pass reaches is carried, whether it is selected or only
+    // reached; selecting it after its descendant schedules it once, first.
     let output = fixture.run(
         "maintain-all",
         &[fixture.rank9.handle(), fixture.source.handle()],
     );
     assert_success(&output);
-    assert!(records(&fixture.path).iter().any(|record| matches!(
-        record,
-        CollectionRecord::Merge(record) if record.collection() == fixture.source.handle()
-    )));
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let root = handle_text(fixture.source.handle());
-    assert_eq!(stdout.matches(&format!("maintained {root} ")).count(), 1);
-    assert!(!stdout.contains(&format!("ensured {root} ")));
+    assert_eq!(
+        scheduled_handles(&output),
+        [
+            fixture.source.handle(),
+            fixture.succinct.handle(),
+            fixture.rank9.handle(),
+        ]
+        .map(handle_text)
+    );
+    let after = records(&fixture.path);
+    for collection in [
+        fixture.source.handle(),
+        fixture.succinct.handle(),
+        fixture.rank9.handle(),
+    ] {
+        assert_eq!(
+            after
+                .iter()
+                .filter(|record| matches!(
+                    record,
+                    CollectionRecord::Merge(record) if record.collection() == collection
+                ))
+                .count(),
+            1,
+            "the root's one carry, and its mirror in each view"
+        );
+    }
+    let mut pile = Pile::open(&fixture.path).unwrap();
+    let snapshot = pile.snapshot().unwrap();
+    let observed = snapshot.collection(fixture.rank9).unwrap();
+    assert_eq!(observed.cover().len(), 1);
+    assert_eq!(
+        stood_for(&observed),
+        fixture.source.admitted(&snapshot).unwrap()
+    );
+    let facts = observed.view::<UnionArchive<OrderedUniverse>>().unwrap();
+    assert_eq!(facts.iter().collect::<TribleSet>(), expected);
+    drop(observed);
+    drop(snapshot);
+    pile.close().unwrap();
 }
 
 #[test]
@@ -727,11 +779,15 @@ fn one_failed_target_does_not_prevent_independent_targets_from_advancing() {
                     .unwrap()
             } else {
                 let other = SigningKey::from_bytes(&[81; 32]);
-                let source = pile.collection("foreign", policy(&other)).unwrap();
+                // The command's key writes this source, so the target's leaf
+                // for its commit is the key's to derive.
+                let source = pile
+                    .collection("own source, foreign target", policy(&fixture.signer))
+                    .unwrap();
                 pile.commit(
                     source,
-                    &other,
-                    entity! { metadata::description: "foreign fact" },
+                    &fixture.signer,
+                    entity! { metadata::description: "own fact" },
                 )
                 .unwrap();
                 // The command's key can READ this target, but cannot sign new
@@ -773,9 +829,13 @@ fn one_failed_target_does_not_prevent_independent_targets_from_advancing() {
 
 #[test]
 fn failed_upstream_upkeep_does_not_suppress_available_downstream_work() {
+    use triblespace_core::blob::IntoBlob;
+    use triblespace_core::collection::records::CollectionCommit;
+    use triblespace_core::collection::{empty_metadata_handle, CollectionStore};
+    use triblespace_core::inline::encodings::hash::Handle;
+
     let fixture = Fixture::new();
     let mut pile = Pile::open(&fixture.path).unwrap();
-    let other = SigningKey::from_bytes(&[82; 32]);
     // A source of our own, so the upstream can be seeded on its first commit
     // and then left behind by a second one.
     let source = pile.collection("staged", policy(&fixture.signer)).unwrap();
@@ -786,14 +846,7 @@ fn failed_upstream_upkeep_does_not_suppress_available_downstream_work() {
     )
     .unwrap();
     let succinct = pile
-        .derive::<SuccinctArchiveBlob>(
-            source,
-            (),
-            CollectionPolicy::new(
-                AdmissionPolicy::direct(fixture.signer.verifying_key()),
-                AdmissionPolicy::direct(other.verifying_key()),
-            ),
-        )
+        .derive::<SuccinctArchiveBlob>(source, (), policy(&fixture.signer))
         .unwrap();
     let rank9 = pile
         .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy(&fixture.signer))
@@ -801,7 +854,7 @@ fn failed_upstream_upkeep_does_not_suppress_available_downstream_work() {
     let seeded = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap()
-        .block_on(pile.ensure(succinct, &other))
+        .block_on(pile.ensure(succinct, &fixture.signer))
         .unwrap();
     let first = source.admitted(&seeded).unwrap();
     assert_eq!(first.len(), 1);
@@ -818,13 +871,20 @@ fn failed_upstream_upkeep_does_not_suppress_available_downstream_work() {
         .support()
         .unwrap()
         .is_empty());
-    // The second commit leaves the upstream behind. Carrying it needs a DERIVE
-    // signed under `other`'s WRITE authority, which the command's key lacks.
-    pile.commit(
-        source,
+    // The second commit leaves the upstream behind: it is the key's own, so
+    // its leaf is the key's to derive, but its payload is not here and
+    // nothing can hand it over. Deriving it fails; nothing else has to.
+    let cold: triblespace_core::blob::Blob<SimpleArchive> =
+        entity! { metadata::description: "a fact whose payload never arrives" }
+            .facts()
+            .clone()
+            .to_blob();
+    pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
         &fixture.signer,
-        entity! { metadata::description: "other fact" },
-    )
+        source.handle(),
+        Handle::<SimpleArchive>::to_hash(cold.get_handle()),
+        empty_metadata_handle(),
+    )))
     .unwrap();
     let snapshot = pile.snapshot().unwrap();
     let all = source.admitted(&snapshot).unwrap();
@@ -838,11 +898,13 @@ fn failed_upstream_upkeep_does_not_suppress_available_downstream_work() {
     let output = fixture.run("maintain-all", &[rank9.handle()]);
     assert!(
         !output.status.success(),
-        "the denied upstream work is reported"
+        "the failed upstream work is reported\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("requires an admitted WRITE producer"),
+        stderr.contains("have no leaf the mapping can represent"),
         "{stderr}"
     );
     let after = records(&fixture.path);
@@ -853,7 +915,7 @@ fn failed_upstream_upkeep_does_not_suppress_available_downstream_work() {
             .filter(|record| record.collection() == succinct.handle())
             .collect::<Vec<_>>(),
         upstream_before,
-        "the local signer must not publish unauthorized upstream work",
+        "the upstream publishes nothing it cannot derive",
     );
     let downstream = after
         .iter()
@@ -875,6 +937,10 @@ fn failed_upstream_upkeep_does_not_suppress_available_downstream_work() {
     assert_eq!(stood_for(&snapshot.collection(succinct).unwrap()), first);
     let available = snapshot.collection(rank9).unwrap();
     assert_eq!(stood_for(&available), first);
+    assert!(available
+        .missing_from(&snapshot.collection(succinct).unwrap())
+        .unwrap()
+        .is_empty());
     let facts = available.view::<UnionArchive<OrderedUniverse>>().unwrap();
     assert_eq!(facts.iter().collect::<TribleSet>(), expected);
     pile.close().unwrap();

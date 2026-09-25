@@ -350,47 +350,55 @@ fn scoped_same_value_keeps_new_support_and_skips_other_chain() {
 #[test]
 fn upstream_publication_rechecks_downstream_in_the_same_pass() {
     let mut fixture = Fixture::new();
-    fixture
-        .writer
-        .commit(
-            fixture.sources[0],
-            &fixture.signer,
-            receipt(Id::new([2; 16]).unwrap(), "second root member"),
-        )
-        .unwrap();
     let mut state = State::default();
     let mut references = warm(&mut fixture, &mut state);
     let source = fixture.sources[0].handle();
     let target = fixture.targets[0].handle();
+    // Seven more own members fill the root's first tier: this pass's own
+    // carry of the root publishes a MERGE, and the target must be checked
+    // after that publication -- even when target ordering puts its chain
+    // first -- or it could not mirror it. Repeated references do not change
+    // the selected set or the upstream-first walk.
+    let values: Vec<Id> = (2..=triblespace_core::collection::MERGE_FAN_IN as u8)
+        .map(|byte| Id::new([byte; 16]).unwrap())
+        .collect();
+    for value in &values {
+        fixture
+            .writer
+            .commit(
+                fixture.sources[0],
+                &fixture.signer,
+                receipt(*value, "root member"),
+            )
+            .unwrap();
+    }
     let before = fixture.pile.snapshot().unwrap();
     assert!(selected_records(&before, source)
         .iter()
         .all(|record| matches!(record, CollectionRecord::Commit(_))));
-    assert!(!maintenance_changed(
-        &state.hops[&target].before.inner,
-        &before,
-        &state.hops[&target].interests
-    ));
-    // Explicitly maintaining the previously ensure-only root publishes a
-    // coarsening. Target eligibility must be checked after that publication,
-    // even when target ordering puts its chain first. Repeated references do
-    // not change the selected set or upstream-first walk.
     references.extend([handle_hex(source), handle_hex(target)]);
     let (failures, counts) = pass(&mut fixture, &references, true, &mut state, None);
     assert_eq!(failures, 0);
-    assert!(counts.insertions[&source][1] > 0);
+    assert!(counts.insertions[&source][1] > 0, "the root carried");
+    assert!(
+        counts.insertions[&target][1] > 0,
+        "the target mirrored the carry in the same pass"
+    );
     assert!(counts.selected_calls[&target] >= 2);
     assert_skipped(&counts, &fixture, 1);
     let snapshot = fixture.pile.snapshot().unwrap();
     let observed = snapshot.collection(fixture.targets[0]).unwrap();
+    let mut expected = vec![fixture.first_value];
+    expected.extend(values);
     assert_eq!(
         observed
             .view::<EntityIdSet>()
             .unwrap()
             .iter()
             .collect::<Vec<_>>(),
-        [fixture.first_value, Id::new([2; 16]).unwrap()]
+        expected
     );
+    assert_eq!(observed.cover().len(), 1);
     assert_eq!(
         stood_for(&observed),
         fixture.sources[0].admitted(&snapshot).unwrap()

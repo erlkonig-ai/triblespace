@@ -61,6 +61,14 @@ where
     Handle::<E>::to_hash(blob.get_handle())
 }
 
+/// The identity of `source`'s image in the first view, computed without
+/// calling (and counting) the mapping: its bytes followed by `0xA5`.
+fn first_image(source: &Blob<SimpleArchive>) -> CollectionData {
+    let mut bytes = source.bytes.as_ref().to_vec();
+    bytes.push(0xA5);
+    data(&Blob::<FirstEncoding>::new(bytes.into()))
+}
+
 fn append_adversarial_proof_edge(
     proof: CapabilityProof,
     issuer: &SigningKey,
@@ -814,12 +822,13 @@ fn ordinary_attachment_reports_only_support_realized_in_its_snapshot() {
     let (mut store, root, first, _second) = collections();
     let left = archive(1, 1);
     let right = archive(2, 2);
-    publish_root(&mut store, root, &left, 1);
+    // The maintaining key wrote the commit, so the leaf is its to derive.
+    publish_root(&mut store, root, &left, 31);
     let left_support = support(root, std::slice::from_ref(&left));
     ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer()).unwrap();
     // The source grows after the target was realized: an attachment reports
     // what the target stands on in its snapshot, not what the source admits.
-    publish_root(&mut store, root, &right, 2);
+    publish_root(&mut store, root, &right, 31);
 
     let snapshot = store.snapshot().unwrap();
     let observed = super::super::observation::attach(&snapshot, first).unwrap();
@@ -828,6 +837,12 @@ fn ordinary_attachment_reports_only_support_realized_in_its_snapshot() {
         left_support
     );
     assert_eq!(observed.cover().len(), 1);
+    // The gap is the view's freshness, asked of its source explicitly.
+    let source = snapshot.collection(root).unwrap();
+    assert_eq!(
+        observed.missing_from(&source).unwrap(),
+        support(root, std::slice::from_ref(&right))
+    );
 }
 
 #[test]
@@ -914,6 +929,9 @@ fn ordinary_derived_ensure_leaves_cold_source_records_for_explicit_root_acquisit
         metadata,
     )));
 
+    // Neither commit is the maintaining key's: a view derives what its
+    // maintainer wrote, so this ensure owes nothing and reads nobody else's
+    // payload, cold or not.
     let snapshot = block_on(store.ensure(first, &equation_signer())).unwrap();
 
     assert!(store.acquired.is_empty());
@@ -924,13 +942,16 @@ fn ordinary_derived_ensure_leaves_cold_source_records_for_explicit_root_acquisit
     drop(observed);
     drop(snapshot);
 
-    // Acquisition belongs to the root. The subsequent downstream operation
-    // observes its own immediate-source snapshot, including the concurrently
-    // published member now that both inputs are resident and admitted.
+    // Acquisition belongs to the root. Each writer's subsequent downstream
+    // operation observes its own immediate-source snapshot, including the
+    // concurrently published member now that both inputs are resident and
+    // admitted, and derives what that writer wrote.
     drop(block_on(store.ensure(root, &equation_signer())).unwrap());
     assert_eq!(store.acquired, vec![data(&source)]);
     assert!(store.inject_record_on_acquire.is_none());
-    let snapshot = block_on(store.ensure(first, &equation_signer())).unwrap();
+    drop(block_on(store.ensure(first, &SigningKey::from_bytes(&[42; 32]))).unwrap());
+    let snapshot = block_on(store.ensure(first, &SigningKey::from_bytes(&[43; 32]))).unwrap();
+    assert_eq!(store.acquired, vec![data(&source)]);
     let observed = snapshot.collection(first).unwrap();
     assert_eq!(
         crate::collection::test_support::stood_for(&observed),
@@ -1005,34 +1026,41 @@ fn ensure_reuses_a_resident_image_without_mapping() {
         data(&output),
     );
     inner.insert(CollectionRecord::Derive(previous)).unwrap();
-    // The resident image was endorsed with certificate {a, b}, which is
-    // everything the root stands on, so the target is already current: there
-    // is no "different support" to re-endorse under. That concept only
-    // existed while endorsements named routes.
-    let requested = support(root, &[a, b.clone()]);
+    // A leaf is the image of one foundation. b's image stands for b alone,
+    // whatever the root's absorption MERGE(a, b) -> b says about b's node:
+    // a is a foundation of its own, still owed its own leaf.
     let before = inner.snapshot().unwrap();
+    let view = before.collection(first).unwrap();
     assert_eq!(
-        crate::collection::test_support::stood_for(&before.collection(first).unwrap()),
-        requested,
+        crate::collection::test_support::stood_for(&view),
+        support(root, std::slice::from_ref(&b)),
     );
+    assert_eq!(
+        view.missing_from(&before.collection(root).unwrap())
+            .unwrap(),
+        support(root, std::slice::from_ref(&a)),
+    );
+    drop(view);
     drop(before);
 
     let mut store = GuardStore::new(inner);
     reset_mapping_calls();
     let after = block_on(store.ensure(first, &signer)).unwrap();
 
-    assert_eq!(FIRST_MAP_CALLS.get(), 0);
+    // Only a is mapped; b's resident image is reused as it stands.
+    assert_eq!(FIRST_MAP_CALLS.get(), 1);
     assert_eq!(SECOND_MAP_CALLS.get(), 0);
     assert_eq!(SECOND_JOIN_CALLS.get(), 0);
     assert!(store.acquired.is_empty());
+    let a_image = first_image(&a);
     let selected = after.collection(first).unwrap();
     assert_eq!(
         crate::collection::test_support::stood_for(&selected),
-        requested
+        support(root, &[a.clone(), b.clone()])
     );
     assert_eq!(
-        selected.cover().data_members().collect::<Vec<_>>(),
-        vec![data(&output)],
+        selected.cover().data_members().collect::<BTreeSet<_>>(),
+        BTreeSet::from([data(&output), a_image]),
     );
     let published: Vec<_> = store
         .events
@@ -1042,7 +1070,16 @@ fn ensure_reuses_a_resident_image_without_mapping() {
             WriteEvent::Put(_) => None,
         })
         .collect();
-    assert!(published.is_empty(), "nothing to re-endorse: {published:?}");
+    assert_eq!(
+        published,
+        vec![CollectionRecord::Derive(CollectionDerive::sign(
+            &signer,
+            first.handle(),
+            crate::collection::SourceLocator::of(data(&a).raw),
+            a_image,
+        ))],
+        "only a's leaf is new",
+    );
     assert!(after
         .select_records(&BTreeSet::from([CollectionRecordSelector::ProducedMember(
             first.handle(),
@@ -1364,10 +1401,11 @@ fn root_ensure_reuses_a_signed_union_without_fetching_ancestor_bytes() {
 #[test]
 fn root_maintenance_only_merges_and_warm_ensure_is_write_free() {
     let (mut inner, root, _, _) = collections();
-    let left = archive(36, 36);
-    let right = archive(37, 37);
-    publish_root(&mut inner, root, &left, 31);
-    publish_root(&mut inner, root, &right, 31);
+    // One tier's worth of the maintaining key's own commits: the root carry
+    // joins them into one MERGE.
+    for member in 0..crate::collection::MERGE_FAN_IN as u8 {
+        publish_root(&mut inner, root, &archive(36 + member, 36 + member), 31);
+    }
     let mut store = GuardStore::new(inner);
 
     let maintained = block_on(store.maintain(root, &equation_signer())).unwrap();
@@ -1390,7 +1428,7 @@ fn root_maintenance_only_merges_and_warm_ensure_is_write_free() {
             .view::<TribleSet>()
             .unwrap()
             .len(),
-        2
+        crate::collection::MERGE_FAN_IN
     );
     assert!(store.events.is_empty());
     assert!(store.acquired.is_empty());
@@ -1675,16 +1713,35 @@ fn snapshot_read_audience_defers_later_proofs_after_descriptor_acquisition() {
     );
 }
 
+/// `members` commits of the maintaining key, carried in the root, derived and
+/// mirrored in the first view, and derived as leaves in the second: all a
+/// maintenance of the second view has left to do is mirror the first's
+/// merges.
+fn carried_chain(
+    store: &mut MemoryRepo,
+    root: Collection<SimpleArchive>,
+    first: Collection<FirstEncoding>,
+    second: Collection<SecondEncoding>,
+    members: u8,
+) {
+    for member in 1..=members {
+        publish_root(store, root, &archive(member, member), 31);
+    }
+    drop(block_on(store.maintain(root, &equation_signer())).unwrap());
+    maintain_resident::<_, FirstEncoding>(store, first, &equation_signer()).unwrap();
+    ensure_resident::<_, SecondEncoding>(store, second, &equation_signer()).unwrap();
+}
+
 #[test]
 fn maintenance_drops_every_residency_snapshot_and_stores_the_blob_before_merge() {
     let (mut inner, root, first, second) = collections();
-    let left = archive(1, 1);
-    let right = archive(2, 2);
-    for blob in [&left, &right] {
-        publish_root(&mut inner, root, blob, 31);
-    }
-    ensure_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer()).unwrap();
-    ensure_resident::<_, SecondEncoding>(&mut inner, second, &equation_signer()).unwrap();
+    carried_chain(
+        &mut inner,
+        root,
+        first,
+        second,
+        crate::collection::MERGE_FAN_IN as u8,
+    );
     let mut store = GuardStore::new(inner);
 
     maintain_resident::<_, SecondEncoding>(&mut store, second, &equation_signer()).unwrap();
@@ -1714,17 +1771,14 @@ fn maintenance_drops_every_residency_snapshot_and_stores_the_blob_before_merge()
 
 #[test]
 fn target_maintenance_never_enumerates_records() {
-    const MEMBERS: usize = 8;
-
     let (mut inner, root, first, second) = collections();
-    let members: Vec<_> = (0..MEMBERS)
-        .map(|member| archive(member as u8 + 1, member as u8 + 1))
-        .collect();
-    for member in &members {
-        publish_root(&mut inner, root, member, 31);
-    }
-    ensure_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer()).unwrap();
-    ensure_resident::<_, SecondEncoding>(&mut inner, second, &equation_signer()).unwrap();
+    carried_chain(
+        &mut inner,
+        root,
+        first,
+        second,
+        crate::collection::MERGE_FAN_IN as u8,
+    );
 
     let mut store = GuardStore::new(inner);
     maintain_resident::<_, SecondEncoding>(&mut store, second, &equation_signer()).unwrap();
@@ -1734,7 +1788,7 @@ fn target_maintenance_never_enumerates_records() {
         .iter()
         .filter(|event| matches!(event, WriteEvent::Insert(CollectionRecord::Merge(_))))
         .count();
-    assert_eq!(merges, MEMBERS - 1);
+    assert_eq!(merges, 1, "the first view's one merge, mirrored");
     assert_eq!(
         store.semantic_probes.load(Ordering::SeqCst),
         0,
@@ -1754,12 +1808,16 @@ fn target_maintenance_never_enumerates_records() {
 fn failed_target_batch_preserves_every_published_prefix_carry() {
     for fail_insert in [false, true] {
         let (mut inner, root, first, second) = collections();
-        let members: Vec<_> = (1..=4).map(|member| archive(member, member)).collect();
-        for member in &members {
-            publish_root(&mut inner, root, member, 31);
-        }
-        ensure_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer()).unwrap();
-        ensure_resident::<_, SecondEncoding>(&mut inner, second, &equation_signer()).unwrap();
+        // Two groups of eight: the root carries two MERGEs, so maintaining
+        // the second view mirrors two, one blob and one MERGE each, and the
+        // second write of either kind fails.
+        carried_chain(
+            &mut inner,
+            root,
+            first,
+            second,
+            2 * crate::collection::MERGE_FAN_IN as u8,
+        );
 
         let mut store = GuardStore::new(inner);
         if fail_insert {
@@ -1779,7 +1837,7 @@ fn failed_target_batch_preserves_every_published_prefix_carry() {
                 matches!(record, CollectionRecord::Merge(merge) if merge.collection() == second.handle())
             })
             .count();
-        assert_eq!(merges, 1, "the first target carry remains visible");
+        assert_eq!(merges, 1, "the first mirror remains visible");
     }
 }
 
@@ -1859,12 +1917,15 @@ fn capacity_blocked_source_upper_falls_back_to_its_resident_children() {
     reset_mapping_calls();
     FIRST_MAP_CAPACITY.replace(Some(data(&joined)));
 
-    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer()).unwrap();
+    // The two leaves are mapped, then the mirror of the root's MERGE maps
+    // the joined node from its own bytes, and the mapping declines it.
+    maintain_resident::<_, FirstEncoding>(&mut store, first, &equation_signer()).unwrap();
     FIRST_MAP_CAPACITY.replace(None);
 
     assert_eq!(FIRST_MAP_CALLS.get(), 3);
-    let inputs: std::collections::BTreeSet<_> = records(&mut store)
-        .into_iter()
+    let all = records(&mut store);
+    let inputs: std::collections::BTreeSet<_> = all
+        .iter()
         .filter_map(|record| match record {
             CollectionRecord::Derive(derive) if derive.collection() == first.handle() => {
                 Some(derive.input())
@@ -1878,6 +1939,21 @@ fn capacity_blocked_source_upper_falls_back_to_its_resident_children() {
             crate::collection::SourceLocator::of(data(&left).raw),
             crate::collection::SourceLocator::of(data(&right).raw),
         ])
+    );
+    // Nothing is mirrored, so the view stands on the two leaves beneath.
+    assert!(!all.iter().any(|record| matches!(
+        record,
+        CollectionRecord::Merge(merge) if merge.collection() == first.handle()
+    )));
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!(
+        snapshot
+            .collection(first)
+            .unwrap()
+            .cover()
+            .data_members()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([first_image(&left), first_image(&right)])
     );
 }
 
@@ -1896,11 +1972,15 @@ fn warm_exact_ensure_is_a_zero_write_zero_algebra_observation() {
     assert_eq!(FIRST_MAP_CALLS.get(), 0);
 }
 
-/// Produce a genuine first-hop endorsement, then replicate only what exists
-/// at the boundary before the target's own work: the root writer's proof and
-/// the first-hop grant remain in the replica, but the grant's definition and
-/// the root payload do not, so the first-hop producer is not admitted -- and
-/// the source has no rows -- until the definition arrives.
+/// Produce a genuine first-hop leaf, then replicate only what exists at the
+/// boundary before the target's own work: the writer's root proof and its
+/// first-hop grant remain in the replica, but the grant's definition and the
+/// root payload do not, so the first-hop leaf is not admitted -- and the
+/// source has no rows -- until the definition arrives.
+///
+/// One key writes every hop, because a view derives what its maintainer
+/// wrote: the target's leaf is owed by whoever owns the first-hop leaf,
+/// which is whoever wrote the root commit beneath it.
 fn cold_source_authority_fixture() -> (
     GuardStore,
     Collection<SecondEncoding>,
@@ -1908,9 +1988,9 @@ fn cold_source_authority_fixture() -> (
     Blob<SimpleArchive>,
 ) {
     let authority = SigningKey::from_bytes(&[90; 32]);
-    let root_writer = SigningKey::from_bytes(&[91; 32]);
-    let first_writer = SigningKey::from_bytes(&[92; 32]);
     let owner = equation_signer();
+    let root_writer = owner.clone();
+    let first_writer = owner.clone();
     let source_policy = CollectionPolicy::new(
         AdmissionPolicy::Open,
         AdmissionPolicy::direct(authority.verifying_key()),
@@ -1955,7 +2035,11 @@ fn cold_source_authority_fixture() -> (
     );
     staging.insert_proof(first_proof.clone()).unwrap();
     let source = archive(44, 44);
-    let commit = publish_root(&mut staging, root, &source, 91);
+    let commit = publish_root(&mut staging, root, &source, 31);
+    assert_eq!(
+        commit.public_key().raw,
+        root_writer.verifying_key().to_bytes()
+    );
     let selected = support(root, std::slice::from_ref(&source));
     drop(block_on(staging.ensure(first, &first_writer)).unwrap());
     let realized = staging.snapshot().unwrap();
@@ -2156,7 +2240,9 @@ fn missing_realization_requires_write_before_computation_or_publication() {
         )
         .unwrap();
     let source = archive(1, 1);
-    publish_root(&mut inner, root, &source, 31);
+    // The reader wrote this commit, so its leaf is the reader's to derive;
+    // the target's WRITE admits only the owner.
+    publish_root(&mut inner, root, &source, 32);
     let mut store = GuardStore::new(inner);
     reset_mapping_calls();
 
@@ -2253,7 +2339,7 @@ fn existing_target_support_is_not_mapped_again_when_support_grows() {
 }
 
 #[test]
-fn resident_source_upper_is_mapped_instead_of_its_finer_children() {
+fn a_source_upper_is_mirrored_from_its_own_bytes_without_a_join() {
     let (mut store, root, first, second) = collections();
     let left = archive(1, 1);
     let right = archive(2, 2);
@@ -2293,14 +2379,59 @@ fn resident_source_upper_is_mapped_instead_of_its_finer_children() {
         .unwrap();
 
     reset_mapping_calls();
-    ensure_resident::<_, SecondEncoding>(&mut store, second, &equation_signer()).unwrap();
-    assert_eq!(SECOND_MAP_CALLS.get(), 1);
-    assert!(records(&mut store).iter().any(|record| matches!(
-        record,
-        CollectionRecord::Derive(derive)
-            if derive.collection() == second.handle()
-                && derive.input() == crate::collection::SourceLocator::of(data(&upper).raw)
-    )));
+    maintain_resident::<_, SecondEncoding>(&mut store, second, &equation_signer()).unwrap();
+    // Each leaf is mapped from its foundation, and the upper -- the first
+    // view's own MERGE, not a foundation -- is mapped once from its own
+    // bytes to mirror that MERGE. Nothing in the second view is joined.
+    assert_eq!(SECOND_MAP_CALLS.get(), 3);
+    assert_eq!(SECOND_JOIN_CALLS.get(), 0);
+    let second_image = |blob: &Blob<FirstEncoding>| {
+        let mut bytes = blob.bytes.as_ref().to_vec();
+        bytes.push(0xB6);
+        data(&Blob::<SecondEncoding>::new(bytes.into()))
+    };
+    let all = records(&mut store);
+    let leaves: BTreeSet<_> = all
+        .iter()
+        .filter_map(|record| match record {
+            CollectionRecord::Derive(derive) if derive.collection() == second.handle() => {
+                Some(derive.input())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        leaves,
+        BTreeSet::from([
+            crate::collection::SourceLocator::of(low_witness.raw),
+            crate::collection::SourceLocator::of(high_witness.raw),
+        ]),
+        "no leaf names the upper",
+    );
+    let mirrors: Vec<_> = all
+        .iter()
+        .filter_map(|record| match record {
+            CollectionRecord::Merge(merge) if merge.collection() == second.handle() => Some(*merge),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(mirrors.len(), 1);
+    assert_eq!(
+        mirrors[0].inputs().iter().copied().collect::<BTreeSet<_>>(),
+        BTreeSet::from([second_image(&low), second_image(&high)])
+    );
+    assert_eq!(mirrors[0].result(), second_image(&upper));
+    assert_eq!(
+        store
+            .snapshot()
+            .unwrap()
+            .collection(second)
+            .unwrap()
+            .cover()
+            .data_members()
+            .collect::<Vec<_>>(),
+        vec![second_image(&upper)]
+    );
 }
 
 #[test]
@@ -2335,7 +2466,7 @@ fn optional_target_dependency_keeps_the_finer_cover() {
 }
 
 #[test]
-fn source_guidance_maps_only_the_resident_coarsest_upper_and_repeats_without_work() {
+fn own_source_merges_are_mirrored_bottom_up_and_repeat_without_work() {
     let (mut inner, root, first, _second) = collections();
     let members = [archive(1, 1), archive(2, 2), archive(3, 3)];
     for member in &members {
@@ -2344,16 +2475,12 @@ fn source_guidance_maps_only_the_resident_coarsest_upper_and_repeats_without_wor
     ensure_resident::<_, FirstEncoding>(&mut inner, first, &equation_signer()).unwrap();
     let mut store = GuardStore::new(inner);
 
+    // Three leaves and no source merge: a derived collection has no carry
+    // of its own, so there is nothing to mirror and nothing to fetch.
     reset_mapping_calls();
     block_on(store.maintain(first, &equation_signer())).unwrap();
-    assert!(
-        store.events.is_empty(),
-        "missing source unions stay missing"
-    );
-    assert!(
-        store.acquired.is_empty(),
-        "optional source coarsening never fetches"
-    );
+    assert!(store.events.is_empty(), "no source merge, no target merge");
+    assert!(store.acquired.is_empty(), "maintenance fetched nothing");
     assert_eq!(FIRST_MAP_CALLS.get(), 0);
 
     let intermediate =
@@ -2387,34 +2514,31 @@ fn source_guidance_maps_only_the_resident_coarsest_upper_and_repeats_without_wor
     let after = block_on(store.maintain(first, &equation_signer())).unwrap();
     assert_eq!(after.collection(first).unwrap().cover().len(), 1);
     drop(after);
-    assert_eq!(
-        FIRST_MAP_CALLS.get(),
-        1,
-        "skip the historical intermediate image"
-    );
-    // One target blob and one target DERIVE; then the three images the new
-    // one covers are consumed, each by a MERGE whose result is the new
-    // image, so they leave the frontier for good. No join runs for that.
-    assert_eq!(
-        store.events.len(),
-        5,
-        "one blob, one DERIVE, three consuming MERGEs"
-    );
-    assert!(matches!(store.events[0], WriteEvent::Put(_)));
-    assert!(
-        matches!(store.events[1], WriteEvent::Insert(CollectionRecord::Derive(derive))
-        if derive.collection() == first.handle()
-            && derive.input() == crate::collection::SourceLocator::of(data(&upper).raw))
-    );
-    let image = match store.events[1] {
-        WriteEvent::Insert(CollectionRecord::Derive(derive)) => derive.output(),
-        _ => unreachable!(),
+    // Aligned merges, bottom-up: the intermediate is mirrored first, then
+    // the upper over the intermediate's image and the third leaf. Each is
+    // mapped once from its own bytes, and no image is joined for it.
+    assert_eq!(FIRST_MAP_CALLS.get(), 2, "one mapping per source merge");
+    let mirror = |inputs: [&Blob<SimpleArchive>; 2], result: &Blob<SimpleArchive>| {
+        WriteEvent::Insert(CollectionRecord::Merge(
+            CollectionMerge::sign(
+                &equation_signer(),
+                first.handle(),
+                inputs.map(first_image),
+                first_image(result),
+            )
+            .unwrap(),
+        ))
     };
-    assert!(store.events[2..].iter().all(|event| matches!(
-        event,
-        WriteEvent::Insert(CollectionRecord::Merge(merge))
-            if merge.collection() == first.handle() && merge.result() == image
-    )));
+    assert_eq!(
+        store.events,
+        vec![
+            WriteEvent::Put(first_image(&intermediate)),
+            mirror([&members[0], &members[1]], &intermediate),
+            WriteEvent::Put(first_image(&upper)),
+            mirror([&intermediate, &members[2]], &upper),
+        ],
+        "each image is stored before the MERGE that names it"
+    );
     assert!(store.acquired.is_empty());
 
     store.events.clear();
@@ -2424,19 +2548,21 @@ fn source_guidance_maps_only_the_resident_coarsest_upper_and_repeats_without_wor
     assert_eq!(
         FIRST_MAP_CALLS.get(),
         0,
-        "the already resident upper image is reused"
+        "a mirror already published is found, not mapped again"
     );
 }
 
 #[test]
 fn target_maintenance_publishes_only_horizontal_target_merges() {
     let (mut store, root, first, second) = collections();
-    let left = archive(1, 1);
-    let right = archive(2, 2);
-    for blob in [&left, &right] {
-        publish_root(&mut store, root, blob, 31);
-    }
-    ensure_resident::<_, FirstEncoding>(&mut store, first, &equation_signer()).unwrap();
+    carried_chain(
+        &mut store,
+        root,
+        first,
+        second,
+        crate::collection::MERGE_FAN_IN as u8,
+    );
+    let before = records(&mut store);
     maintain_resident::<_, SecondEncoding>(&mut store, second, &equation_signer()).unwrap();
 
     let snapshot = store.snapshot().unwrap();
@@ -2446,15 +2572,19 @@ fn target_maintenance_publishes_only_horizontal_target_merges() {
         attached.cover().clone(),
     );
     assert_eq!(cover.len(), 1);
-    let all = records(&mut store);
-    assert!(all.iter().any(|record| matches!(
+    // Mirroring the first view's merge publishes into the second view only:
+    // nothing is written into the source or the root on the way.
+    let published: Vec<_> = records(&mut store)
+        .into_iter()
+        .filter(|record| !before.contains(record))
+        .collect();
+    assert!(published.iter().any(|record| matches!(
         record,
         CollectionRecord::Merge(merge) if merge.collection() == second.handle()
     )));
-    assert!(!all.iter().any(|record| matches!(
-        record,
-        CollectionRecord::Merge(merge) if merge.collection() == root.handle()
-    )));
+    assert!(published
+        .iter()
+        .all(|record| record.collection() == second.handle()));
 }
 
 #[test]
@@ -2528,20 +2658,29 @@ fn target_maintenance_reendorses_a_resident_upper_without_joining_again() {
     let z_bc =
         CollectionMerge::sign(&signer, second.handle(), [data(&x), data(&y)], data(&z)).unwrap();
     inner.insert(CollectionRecord::Merge(z_bc)).unwrap();
-    // x's row is {a, b}, y's is {c}, and z = join(x, y) carries {a, b, c}
-    // outright. Under cited routes z certified only {b, c} and x had to stay
-    // selected beside it until a second MERGE widened z; a row is the union
-    // over every producer, so z alone is the requested point.
-    let requested = support(root, &[a, b, c]);
+    // x is b's image and y is c's, one leaf each, and z = join(x, y) is the
+    // second view's own MERGE over them, so z alone is the view's point. a
+    // is a root foundation the first view has no leaf for: a leaf stands for
+    // its one foundation, so b's image never inherits a through the root's
+    // absorption MERGE(a, b) -> b, and nothing above stands for a.
+    let requested = support(root, &[b.clone(), c.clone()]);
     assert_eq!(x.bytes.len().ilog2(), z.bytes.len().ilog2());
     let before = inner.snapshot().unwrap();
+    assert_eq!(
+        before
+            .collection(first)
+            .unwrap()
+            .missing_from(&before.collection(root).unwrap())
+            .unwrap(),
+        support(root, std::slice::from_ref(&a)),
+    );
     let selected = before.collection(second).unwrap();
     assert_eq!(
         crate::collection::test_support::stood_for(&selected),
         requested
     );
-    // z = join(x, y) covers {a, b, c} outright, so x is already beneath it
-    // and nothing needs a second endorsement to say so.
+    // z = join(x, y) stands for both leaves, so x and y are beneath it and
+    // nothing needs a second endorsement to say so.
     assert_eq!(
         selected.cover().data_members().collect::<BTreeSet<_>>(),
         BTreeSet::from([data(&z)]),
@@ -2574,9 +2713,10 @@ fn target_maintenance_reendorses_a_resident_upper_without_joining_again() {
             WriteEvent::Put(_) => None,
         })
         .collect();
-    // Nothing to endorse: z is already exact for the request. The witness-era
-    // maintenance published join(x, z) = z here to certify z at the wider
-    // support, because its cited route carried only {b, c}.
+    // Nothing to endorse: both own leaves exist and are resident, and the
+    // first view has no merge of its own to mirror. The second view's own
+    // MERGE is not re-joined, and a is left to whoever derives it into the
+    // first view.
     assert!(published.is_empty(), "nothing to endorse: {published:?}");
     assert!(after
         .select_records(&BTreeSet::from([CollectionRecordSelector::ProducedMember(
@@ -2855,12 +2995,6 @@ mod lattice_v2 {
         merge.inputs().iter().copied().collect()
     }
 
-    fn first_image(source: &Blob<SimpleArchive>) -> CollectionData {
-        let mut bytes = source.bytes.as_ref().to_vec();
-        bytes.push(0xA5);
-        data(&Blob::<FirstEncoding>::new(bytes.into()))
-    }
-
     #[test]
     fn seven_own_nodes_stay_and_the_eighth_makes_one_eight_input_merge() {
         let (mut store, root, _, _) = collections();
@@ -3114,6 +3248,63 @@ mod lattice_v2 {
                 .collect::<Vec<_>>(),
             [id(1)]
         );
+    }
+
+    #[test]
+    fn an_own_commit_whose_payload_is_nowhere_is_reported_after_the_rest() {
+        let (mut store, root, first, _) = collections();
+        let owner = key(41);
+        let resident = own_commit(&mut store, root, 41, 0);
+        // The key's own COMMIT arrived, its payload did not, and nothing can
+        // hand it over: nothing upstream of a root can restore it.
+        let cold = foreign_commit(&mut store, root, 41, 1);
+        let result = block_on(store.ensure(first, &owner));
+        assert!(
+            matches!(
+                &result,
+                Err(CollectionRealizationError::Unmappable { blocked })
+                    if blocked.iter().map(|(member, _)| *member).collect::<Vec<_>>() == [cold]
+            ),
+            "{:?}",
+            result.err()
+        );
+        let leaves = derives_in(&mut store, first.handle());
+        assert_eq!(leaves.len(), 1, "the resident commit was derived anyway");
+        assert_eq!(leaves[0].input(), SourceLocator::of(resident.raw));
+    }
+
+    #[test]
+    fn an_own_image_of_a_derived_source_that_is_nowhere_is_that_sources_lag() {
+        let (mut store, root, first, second) = collections();
+        let owner = key(41);
+        own_commit(&mut store, root, 41, 0);
+        block_on(store.ensure(first, &owner)).unwrap();
+        // The key's own leaf in the first view arrived ahead of its image,
+        // and nothing can hand the image over. Maintaining the first view
+        // would map it again; deriving the second one neither requires nor
+        // repairs it.
+        let elsewhere = payload(41, 1);
+        store
+            .insert(CollectionRecord::Derive(CollectionDerive::sign(
+                &owner,
+                first.handle(),
+                SourceLocator::of(data(&elsewhere).raw),
+                first_image(&elsewhere),
+            )))
+            .unwrap();
+        let before = records(&mut store);
+        let snapshot = block_on(store.maintain(second, &owner)).unwrap();
+        assert_eq!(snapshot.collection(second).unwrap().cover().len(), 1);
+        drop(snapshot);
+        let published: Vec<_> = records(&mut store)
+            .into_iter()
+            .filter(|record| !before.contains(record))
+            .collect();
+        assert_eq!(published.len(), 1);
+        assert!(matches!(
+            published[0],
+            CollectionRecord::Derive(derive) if derive.collection() == second.handle()
+        ));
     }
 
     #[test]

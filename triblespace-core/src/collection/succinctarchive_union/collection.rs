@@ -546,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_observation_accepts_a_multihop_support_equivalent_union_image() {
+    fn exact_observation_accepts_a_multihop_mirrored_union_image() {
         let mut store = MemoryRepo::default();
         let (source_collection, raw_collection, accelerated_collection) = collections(&mut store);
         let source_a = simple([row(1, 2, 3)]);
@@ -559,57 +559,54 @@ mod tests {
         let a_data = Handle::<SuccinctArchiveBlob>::to_hash(a.get_handle());
         let b_data = Handle::<SuccinctArchiveBlob>::to_hash(b.get_handle());
         let c_data = Handle::<SuccinctArchiveBlob>::to_hash(c.get_handle());
-        let fc = accelerated(&c);
-        let fc_data = Handle::<Rank9AcceleratedSuccinctArchiveBlob>::to_hash(fc.get_handle());
+        let [fa, fb, fc] = [&a, &b, &c].map(accelerated);
+        let [fa_data, fb_data, fc_data] = [&fa, &fb, &fc]
+            .map(|blob| Handle::<Rank9AcceleratedSuccinctArchiveBlob>::to_hash(blob.get_handle()));
 
         for member in [source_a, source_b] {
             store.put::<SimpleArchive, _>(member).unwrap();
         }
         store.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
-        let source_records = [source_a_data, source_b_data]
-            .map(|data| input_record(source_collection.handle(), data));
-        for record in source_records {
-            store.insert(record).unwrap();
+        for data in [source_a_data, source_b_data] {
+            store
+                .insert(input_record(source_collection.handle(), data))
+                .unwrap();
         }
         for member in [a, b, c] {
             store.put::<SuccinctArchiveBlob, _>(member).unwrap();
         }
-        store
-            .put::<Rank9AcceleratedSuccinctArchiveBlob, _>(fc)
-            .unwrap();
-        let raw_records = [(source_a_data, a_data), (source_b_data, b_data)]
-            .into_iter()
-            .zip(source_records)
-            .map(|((input, output), _source)| {
-                CollectionRecord::Derive(CollectionDerive::sign(
-                    &SigningKey::from_bytes(&[7; 32]),
-                    raw_collection.handle(),
-                    crate::collection::SourceLocator::of(input.raw),
-                    output,
-                ))
-            })
-            .collect::<Vec<_>>();
-        for record in &raw_records {
-            store.insert(*record).unwrap();
+        for member in [fa, fb, fc] {
+            store
+                .put::<Rank9AcceleratedSuccinctArchiveBlob, _>(member)
+                .unwrap();
         }
-        let merged = CollectionRecord::Merge(
-            CollectionMerge::sign(
-                &SigningKey::from_bytes(&[7; 32]),
-                raw_collection.handle(),
-                [a_data, b_data],
-                c_data,
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let leaf = |collection: CollectionHandle, input: [u8; 32], output| {
+            CollectionRecord::Derive(CollectionDerive::sign(
+                &key,
+                collection,
+                crate::collection::SourceLocator::of(input),
+                output,
+            ))
+        };
+        let merge = |collection: CollectionHandle, inputs: [CollectionData; 2], result| {
+            CollectionRecord::Merge(
+                CollectionMerge::sign(&key, collection, inputs, result).unwrap(),
             )
-            .unwrap(),
-        );
-        store.insert(merged).unwrap();
-        store
-            .insert(CollectionRecord::Derive(CollectionDerive::sign(
-                &SigningKey::from_bytes(&[7; 32]),
-                accelerated_collection.handle(),
-                crate::collection::SourceLocator::of(c_data.raw),
-                fc_data,
-            )))
-            .unwrap();
+        };
+        // Each hop holds one leaf per foundation of its source, and the raw
+        // union c = join(a, b) is mirrored one level up: the accelerated
+        // image of c's own bytes, as the MERGE over the leaves' images.
+        for record in [
+            leaf(raw_collection.handle(), source_a_data.raw, a_data),
+            leaf(raw_collection.handle(), source_b_data.raw, b_data),
+            merge(raw_collection.handle(), [a_data, b_data], c_data),
+            leaf(accelerated_collection.handle(), a_data.raw, fa_data),
+            leaf(accelerated_collection.handle(), b_data.raw, fb_data),
+            merge(accelerated_collection.handle(), [fa_data, fb_data], fc_data),
+        ] {
+            store.insert(record).unwrap();
+        }
 
         let support = Support::from_data(source_collection, [source_a_data, source_b_data]);
         let snapshot = store.snapshot().unwrap();
@@ -622,6 +619,14 @@ mod tests {
         assert_eq!(
             attached.cover().data_members().collect::<Vec<_>>(),
             vec![fc_data],
+        );
+        assert_eq!(
+            attached
+                .support()
+                .unwrap()
+                .data_members()
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([fa_data, fb_data]),
         );
         let view: UnionArchive<OrderedUniverse> = attached.view().unwrap();
         assert_eq!(view.iter().count(), 2);

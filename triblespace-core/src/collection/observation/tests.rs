@@ -14,9 +14,8 @@ use crate::capability::{CapabilityProof, CapabilityProofId};
 use crate::collection::{
     descriptor, read_capability, succinctarchive_union, write_capability, AdmissionPolicy,
     Collection, CollectionCommit, CollectionData, CollectionDerivation, CollectionDerive,
-    CollectionMerge, CollectionPolicy, CollectionRead, CollectionRealizationError,
-    CollectionRecord, CollectionRecordSelector, CollectionSnapshotExt, CollectionStore,
-    CollectionStoreExt,
+    CollectionMerge, CollectionPolicy, CollectionRead, CollectionRecord, CollectionRecordSelector,
+    CollectionSnapshotExt, CollectionStore, CollectionStoreExt,
 };
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
@@ -293,45 +292,47 @@ impl WantRead for CountingSnapshot {
 }
 
 #[test]
-fn target_stands_for_nothing_until_its_input_is_admitted_then_reads_from_the_index() {
+fn target_reads_its_own_leaf_from_the_index_whatever_its_source_holds() {
     let mut fixture = one_hop();
     fixture.store.insert(fixture.equation).unwrap();
-    // Without the source descriptor the lineage beneath the target is not
-    // known, so a read cannot say which foundation the target stands on.
-    let before = fixture.store.snapshot().unwrap();
-    assert!(!before.contains_blob(fixture.source.handle()).unwrap());
-    assert!(matches!(
-        before.collection(fixture.target),
-        Err(CollectionRealizationError::MissingDependency { member })
-            if member == Handle::<SimpleArchive>::to_hash(fixture.source.handle())
-    ));
+    // Coverage is collection-local: the target's leaf is admitted by the
+    // target's own WRITE policy and reads no row of its source. With the
+    // source unknown here altogether -- not even its descriptor -- the
+    // target still reads its own image, from the index, and nothing
+    // beneath it.
+    let before = CountingSnapshot::new(fixture.store.snapshot().unwrap());
+    assert!(!before.inner.contains_blob(fixture.source.handle()).unwrap());
+    let observed = before.collection(fixture.target).unwrap();
+    assert_eq!(
+        observed.cover().members().collect::<Vec<_>>(),
+        [fixture.output.get_handle()]
+    );
+    assert_eq!(
+        observed.support().unwrap().members().collect::<Vec<_>>(),
+        [fixture.output.get_handle()]
+    );
+    let view: UnionArchive<OrderedUniverse> = observed.view().unwrap();
+    assert_eq!(view.iter().collect::<TribleSet>(), facts(1, 21));
+    before.assert_no_record_enumeration();
+    before.assert_not_loaded(data(&fixture.source_blob));
+    before.assert_not_loaded(data(&fixture.metadata));
 
+    // What the leaf's locator names is a question about the source, asked
+    // through the leaves by locator. Known but without the input's COMMIT,
+    // the source has no foundation the view stands for.
     descriptor::put_closure(&mut fixture.store, &fixture.source_descriptor).unwrap();
-    let without_commit = CountingSnapshot::new(fixture.store.snapshot().unwrap());
+    let without_commit = fixture.store.snapshot().unwrap();
     assert!(without_commit
-        .inner
         .select_records(&BTreeSet::from([CollectionRecordSelector::ProducedMember(
             fixture.source.handle(),
             fixture.commit.data(),
         )]))
         .unwrap()
         .is_empty());
-    // The producer's image names an input no admitted record stands behind.
-    // The fold has no row for it, so the target stands for nothing: an empty
-    // cover and an empty support, and no record walked to certify more from
-    // what the producer named.
-    let observed = without_commit.collection(fixture.target).unwrap();
-    assert!(observed.cover().is_empty());
-    assert!(observed.support().unwrap().is_empty());
-    assert!(observed
-        .view::<UnionArchive<OrderedUniverse>>()
-        .unwrap()
-        .iter()
-        .next()
-        .is_none());
-    without_commit.assert_no_record_enumeration();
-    without_commit.assert_not_loaded(data(&fixture.source_blob));
-    without_commit.assert_not_loaded(data(&fixture.metadata));
+    assert!(crate::collection::test_support::stood_for(
+        &without_commit.collection(fixture.target).unwrap()
+    )
+    .is_empty());
 
     fixture
         .store
@@ -350,8 +351,7 @@ fn target_stands_for_nothing_until_its_input_is_admitted_then_reads_from_the_ind
     assert_eq!(support.len(), 1);
     assert!(support.contains(fixture.source_blob.get_handle()));
     // The source payload and metadata are neither resident nor asked for:
-    // support is a lookup in the index, and reading the target loads only
-    // its own output.
+    // reading the target loads only its own output.
     assert!(!after
         .inner
         .contains_blob(fixture.source_blob.get_handle())
@@ -359,9 +359,11 @@ fn target_stands_for_nothing_until_its_input_is_admitted_then_reads_from_the_ind
     after.assert_no_record_enumeration();
     after.assert_not_loaded(data(&fixture.source_blob));
     after.assert_not_loaded(data(&fixture.metadata));
-    // The earlier observation keeps standing for nothing.
-    assert!(observed.cover().is_empty());
-    assert!(observed.support().unwrap().is_empty());
+    // The earlier observation read the same leaf and keeps it.
+    assert_eq!(
+        observed.cover().members().collect::<Vec<_>>(),
+        [fixture.output.get_handle()]
+    );
 }
 
 #[test]
@@ -629,24 +631,29 @@ fn multihop_read_takes_cover_and_support_from_the_index_without_payload_reads() 
     snapshot.assert_no_record_enumeration();
     snapshot.assert_not_loaded(data(&fixture.source_blob));
     snapshot.assert_not_loaded(data(&fixture.metadata));
-    let support = &crate::collection::test_support::stood_for(&observed);
-    assert_eq!(support.collection(), fixture.source);
-    assert!(support.contains(fixture.source_blob.get_handle()));
-    assert_eq!(support.len(), 1);
-    // Support is the row the index already holds. Asking for it charges the
-    // lineage to the observation and reads nothing else: no record is
-    // selected, no payload loaded, no proof asked for.
+    // Following the leaves of every hop down to the root, the final image
+    // stands for the one root commit.
+    let stood = &crate::collection::test_support::stood_for(&observed);
+    assert_eq!(stood.collection(), fixture.source);
+    assert!(stood.contains(fixture.source_blob.get_handle()));
+    assert_eq!(stood.len(), 1);
     snapshot.assert_no_record_enumeration();
     snapshot.assert_not_loaded(data(&fixture.source_blob));
     snapshot.assert_not_loaded(data(&fixture.metadata));
+    // The observation's own support is the row the index already held when
+    // it attached: its own leaf image. Asking for it, of the observation or
+    // of a clone, reads nothing at all: no record is selected, no blob
+    // loaded, no proof asked for.
     let selections = snapshot.counts.selections.lock().unwrap().len();
     let blob_reads = snapshot.counts.gets.lock().unwrap().len();
     let proof_queries = snapshot.counts.proof_queries.load(Ordering::SeqCst);
-    let cloned = observed.clone();
+    let support = observed.support().unwrap().clone();
     assert_eq!(
-        &crate::collection::test_support::stood_for(&cloned),
-        support
+        support.members().collect::<Vec<_>>(),
+        [accelerated.get_handle()]
     );
+    let cloned = observed.clone();
+    assert_eq!(cloned.support().unwrap(), &support);
     assert_eq!(snapshot.counts.selections.lock().unwrap().len(), selections);
     assert_eq!(snapshot.counts.gets.lock().unwrap().len(), blob_reads);
     assert_eq!(
@@ -656,12 +663,12 @@ fn multihop_read_takes_cover_and_support_from_the_index_without_payload_reads() 
 }
 
 #[test]
-fn multihop_read_stands_for_nothing_beneath_an_unadmitted_ancestor() {
+fn multihop_read_stands_on_its_own_writer_above_an_unadmitted_ancestor() {
     let mut fixture = one_hop();
     descriptor::put_closure(&mut fixture.store, &fixture.source_descriptor).unwrap();
     // The historical source commit and the target's image of it are signed
     // by a key nothing here admits. The final producer is admitted, and its
-    // record is believed, but the image it names has no row to stand on.
+    // record is believed.
     let historical = SigningKey::from_bytes(&[41; 32]);
     fixture
         .store
@@ -684,20 +691,33 @@ fn multihop_read_stands_for_nothing_beneath_an_unadmitted_ancestor() {
     let final_owner = SigningKey::from_bytes(&[42; 32]);
     let (final_target, accelerated) = second_hop(&mut fixture, &final_owner);
     let snapshot = CountingSnapshot::new(fixture.store.snapshot().unwrap());
+    // The final image stands on its own admitted writer: its leaf reads no
+    // row beneath it, whoever signed the records there.
     let observed = snapshot.collection(final_target).unwrap();
-    assert!(observed.cover().is_empty());
-    assert!(observed.support().unwrap().is_empty());
-    assert!(observed
-        .view::<UnionArchive<OrderedUniverse>>()
-        .unwrap()
-        .iter()
-        .next()
-        .is_none());
-    // Nothing walked the chain to certify the final image from what its
-    // producer named: no enumeration, no ancestor payload.
+    assert_eq!(
+        observed.cover().members().collect::<Vec<_>>(),
+        [accelerated.get_handle()]
+    );
+    assert_eq!(
+        observed.support().unwrap().members().collect::<Vec<_>>(),
+        [accelerated.get_handle()]
+    );
+    assert_eq!(
+        observed
+            .view::<UnionArchive<OrderedUniverse>>()
+            .unwrap()
+            .iter()
+            .collect::<TribleSet>(),
+        facts(1, 21)
+    );
+    // Nothing walked the chain to read it: no enumeration, no root payload.
     snapshot.assert_no_record_enumeration();
     snapshot.assert_not_loaded(data(&fixture.source_blob));
-    snapshot.assert_not_loaded(data(&fixture.output));
+    snapshot.assert_not_loaded(data(&fixture.metadata));
+    // Followed through the believed leaves of every hop, though, it stands
+    // for nothing its root admits: neither the source commit nor the middle
+    // image beneath it is believed.
+    assert!(crate::collection::test_support::stood_for(&observed).is_empty());
 
     // Admitted records for the same payloads make the chain stand.
     fixture
@@ -719,7 +739,11 @@ fn multihop_read_stands_for_nothing_beneath_an_unadmitted_ancestor() {
         crate::collection::test_support::stood_for(&admitted),
         fixture.source.cover([fixture.source_blob.get_handle()])
     );
-    assert!(observed.cover().is_empty());
+    // The earlier observation read the same image and keeps it.
+    assert_eq!(
+        observed.cover().members().collect::<Vec<_>>(),
+        [accelerated.get_handle()]
+    );
 }
 
 fn empty_pile(dir: &tempfile::TempDir) -> Pile {
@@ -743,12 +767,15 @@ fn pile_observation_tracks_only_consulted_lineage_and_target_changes() {
         .unwrap();
     pile.insert(fixture.equation).unwrap();
     let before = pile.snapshot().unwrap();
-    // The image is ahead of its input: the target holds a blocked record,
-    // so a record landing anywhere in the lineage can move its frontier and
-    // the whole lineage is what this read depends on.
-    let blocked = before.collection(fixture.target).unwrap();
-    assert!(blocked.cover().is_empty());
-    assert!(blocked.is_current(&before));
+    // The image is ahead of its input, and that no longer blocks anything:
+    // the target's leaf reads no source row, so the read stands on the
+    // target's own records and evidence, and those are all it depends on.
+    let observed = before.collection(fixture.target).unwrap();
+    assert_eq!(
+        observed.cover().members().collect::<Vec<_>>(),
+        [fixture.output.get_handle()]
+    );
+    assert!(observed.is_current(&before));
 
     let unrelated_descriptor = descriptor::naming::<SimpleArchive>(
         "unrelated-observation-source",
@@ -766,24 +793,21 @@ fn pile_observation_tracks_only_consulted_lineage_and_target_changes() {
     )))
     .unwrap();
     let after_unrelated = pile.snapshot().unwrap();
-    assert!(blocked.is_current(&after_unrelated));
+    assert!(observed.is_current(&after_unrelated));
 
+    // The input's COMMIT landing in the source is not something the target
+    // read: the observation stays current, and a new one reads the same.
     pile.insert(CollectionRecord::Commit(fixture.commit))
         .unwrap();
     let after_commit = pile.snapshot().unwrap();
-    assert!(!blocked.is_current(&after_commit));
-    assert!(blocked.is_current(&before));
-    assert!(blocked.cover().is_empty());
+    assert!(observed.is_current(&after_commit));
     let complete = after_commit.collection(fixture.target).unwrap();
-    assert_eq!(
-        complete.cover().members().collect::<Vec<_>>(),
-        [fixture.output.get_handle()]
-    );
+    assert_eq!(complete.cover(), observed.cover());
     assert!(complete.is_current(&after_commit));
 
-    // With nothing blocked, the cover depends on the target's own records
-    // only. A second source commit leaves it current until its support is
-    // asked for, which is what charges the lineage.
+    // Nor does a second source commit, even once what the view stands for
+    // in its source is asked: that is read through the leaves by locator
+    // from the store, and its own support charges nothing beyond its rows.
     let second_blob: Blob<SimpleArchive> = facts(8, 28).to_blob();
     pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
         &fixture.source_owner,
@@ -794,6 +818,7 @@ fn pile_observation_tracks_only_consulted_lineage_and_target_changes() {
     .unwrap();
     let after_second = pile.snapshot().unwrap();
     assert!(complete.is_current(&after_second));
+    assert_eq!(complete.support().unwrap().len(), 1);
     let support = &crate::collection::test_support::stood_for(&complete);
     assert_eq!(support.collection(), fixture.source);
     assert_eq!(support.len(), 1);
@@ -801,7 +826,7 @@ fn pile_observation_tracks_only_consulted_lineage_and_target_changes() {
     assert!(!after_second
         .contains_blob(fixture.source_blob.get_handle())
         .unwrap());
-    assert!(!complete.is_current(&after_second));
+    assert!(complete.is_current(&after_second));
     assert!(complete.is_current(&after_commit));
 
     // A new target equation with the same visible bytes invalidates the

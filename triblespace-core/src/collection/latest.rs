@@ -1069,7 +1069,20 @@ mod tests {
                 .len(),
             3
         );
-        assert!(caught_up.records().unwrap().any(|record| matches!(record.unwrap(), super::super::CollectionRecord::Merge(merge) if merge.collection() == target.handle())));
+        // Maintaining a derived collection derives its leaves and mirrors its
+        // source's merges. Three commits sit below the root's fan-in, so the
+        // source has no merge and the target none of its own: one leaf per
+        // commit, and the frozen observations above were read across them.
+        let target_records: Vec<_> = caught_up
+            .records()
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|record| record.collection() == target.handle())
+            .collect();
+        assert_eq!(target_records.len(), 3);
+        assert!(target_records
+            .iter()
+            .all(|record| matches!(record, super::super::CollectionRecord::Derive(_))));
     }
 
     #[test]
