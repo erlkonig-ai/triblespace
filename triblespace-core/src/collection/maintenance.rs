@@ -1,10 +1,12 @@
 //! Maintenance planned from the coverage index, per owner.
 //!
 //! Every collection is a lattice of its own foundations joined by MERGEs,
-//! and a maintainer merges or derives only what it owns
+//! and a maintainer merges only what it owns
 //! ([`owns`](super::ownership::owns),
-//! [`owns_merge`](super::ownership::owns_merge)). There are two kinds of
-//! work, and neither compares supports across collections:
+//! [`owns_merge`](super::ownership::owns_merge)): a merge is a choice. A
+//! derive is a function, so it derives what it owns first and then what an
+//! absent owner has left underived. There are two kinds of work, and
+//! neither compares supports across collections:
 //!
 //! - A root carries its maintainer's own frontier nodes. A node whose support
 //!   lies inside another own node's is absorbed by it, `MERGE(node, wider) ->
@@ -14,11 +16,14 @@
 //!   so nobody else's absence can stall it.
 //! - A derived collection derives what its maintainer wrote. Every source
 //!   foundation it owns whose locator has no leaf in the target yet is mapped
-//!   and published as `DERIVE(target, L(F), f(F))`, empty images included.
-//!   Every believed source MERGE it signed is mirrored, bottom-up, as a
-//!   target MERGE over the images of its inputs, the result computed by
-//!   mapping the merged source node's own bytes. A derived collection has no
-//!   carry of its own: its merges are its source's merges, one level down.
+//!   and published as `DERIVE(target, L(F), f(F))`, empty images included;
+//!   then, when the view admits the maintainer, every foundation another key
+//!   owns that has no leaf at all, so a reader never waits on an owner who
+//!   is offline. Every believed source MERGE it signed is mirrored,
+//!   bottom-up, as a target MERGE over the images of its inputs, the result
+//!   computed by mapping the merged source node's own bytes. A derived
+//!   collection has no carry of its own: its merges are its source's merges,
+//!   one level down.
 //!
 //! Records are selected only to descend: the MERGEs that produced a merged
 //! source node come from the produced-member index, and are kept only when
@@ -650,6 +655,15 @@ where
 /// is fetched too; when it cannot be, the foundation is mapped again to
 /// restore the bytes, and a leaf is published only if the image differs.
 ///
+/// Maintenance also derives, after its own, every foundation another key
+/// owns that has no leaf at all. A merge is a choice and has one owner; a
+/// derive is a function anyone can compute, and a reader of the view must
+/// not lag behind an owner who is absent (a machine that is offline, or not
+/// yet on this version). Two keys deriving the same foundation publish the
+/// same output, so a race costs a duplicate record, never a divergent view.
+/// A foreign foundation whose payload cannot be had here is that owner's lag
+/// and is skipped quietly.
+///
 /// An own source foundation owed a leaf whose bytes are not here is fetched.
 /// When nobody can hand them over, a root commit's payload is reported,
 /// because nothing upstream can restore it. A derived source's leaf image is
@@ -677,18 +691,23 @@ where
     let coverage = coverage_of(&snapshot, &scope)?;
     let (foundations, _) = coverage.frontier_support(bound.source);
     // Each own foundation, its locator, and the images its existing leaves
-    // name: none for a foundation still owed a leaf.
+    // name: none for a foundation still owed a leaf. Foreign foundations
+    // without any leaf follow the own ones, in maintenance only.
     let mut owed = Vec::new();
+    let mut foreign = Vec::new();
     let mut derived = Vec::new();
     for raw in foundations.iter_ordered() {
         let foundation: CollectionData = Inline::new(*raw);
+        let locator = SourceLocator::of(foundation.raw);
         if !owns(&coverage, bound.source, foundation, &key) {
+            if restore && !coverage.has_leaf(target.handle(), locator) {
+                foreign.push((foundation, locator, Vec::new(), false));
+            }
             continue;
         }
-        let locator = SourceLocator::of(foundation.raw);
         let outputs = coverage.leaf_outputs(target.handle(), locator);
         if outputs.is_empty() {
-            owed.push((foundation, locator, outputs));
+            owed.push((foundation, locator, outputs, true));
         } else if restore {
             derived.push((foundation, locator, outputs));
         }
@@ -715,10 +734,10 @@ where
                 return Err(CollectionRealizationError::MissingDependency { member: *member });
             }
             // Nobody could hand the image over: map the own foundation again.
-            owed.push((foundation, locator, outputs));
+            owed.push((foundation, locator, outputs, true));
         }
     }
-    if owed.is_empty() {
+    if owed.is_empty() && foreign.is_empty() {
         return Ok(Vec::new());
     }
     let admitted = producer_is_admitted(&snapshot, target, signing_key)?;
@@ -727,10 +746,18 @@ where
             collection: target.handle(),
         });
     }
+    // Foreign work is offered, never owed: a key the view does not admit
+    // leaves it to the keys it does.
+    if admitted {
+        owed.extend(foreign);
+    }
+    if owed.is_empty() {
+        return Ok(Vec::new());
+    }
     drop(snapshot);
 
     let mut blocked = Vec::new();
-    for (foundation, locator, existing) in owed {
+    for (foundation, locator, existing, own) in owed {
         let snapshot = open(store, frontier, "open leaf mapping snapshot")?;
         let handle = Handle::<M::Source>::from_hash(foundation);
         let resident = snapshot
@@ -741,7 +768,8 @@ where
             .is_some();
         if !resident {
             if unavailable.contains(&foundation) {
-                if bound.source_is_root {
+                // A foreign payload nobody could hand over is its owner's lag.
+                if own && bound.source_is_root {
                     blocked.push((
                         foundation,
                         "the source commit's payload is not resident and could not be acquired"

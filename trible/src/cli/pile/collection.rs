@@ -350,8 +350,10 @@ pub enum Command {
     ///
     /// Shared dependencies run once per pass. Every root reached runs the
     /// key's own carry; every derived collection reached gets the key's own
-    /// leaves and a mirror of the key's own source merges, after its source.
-    /// Nobody else's nodes are merged or derived. This is scheduling over
+    /// leaves, a leaf for every foundation another key has left without one
+    /// (a derive is a function; a reader must not wait on an absent owner),
+    /// and a mirror of the key's own source merges, after its source.
+    /// Nobody else's nodes are merged. This is scheduling over
     /// ordinary one-edge operations; mappings and joins do not acquire
     /// recursive construction side effects. Only the requested targets and
     /// their descriptor source chains are selected, not historical indexes.

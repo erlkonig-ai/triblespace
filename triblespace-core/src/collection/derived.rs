@@ -16,7 +16,8 @@
 //! the collection has none for yet, and publishes no merge; a write that
 //! calls it after its commit leaves the commit readable through every view,
 //! at the cost of one locator per own foundation and that commit's own
-//! images. [`maintain_downstream`] also mirrors the signer's own source
+//! images. [`maintain_downstream`] also derives the foundations other
+//! owners have left without a leaf, and mirrors the signer's own source
 //! merges into each of them, as the daemon does; a derived collection has no
 //! carry of its own. Both visit a collection after its source, which is what
 //! makes a source's mirrored merge result resident before the collection

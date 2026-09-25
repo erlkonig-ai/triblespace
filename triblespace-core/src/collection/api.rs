@@ -1386,8 +1386,9 @@ pub trait CollectionRealization: CollectionEncoding {
         S: Store + AsyncBlobStoreAcquire + Send;
 
     /// A root carries the key's own nodes to their LSM fixed point; a
-    /// derived collection gets the key's leaves and a mirror of every source
-    /// merge the key owns.
+    /// derived collection gets the key's leaves, a leaf for every foundation
+    /// another key owns that has none yet (a derive is a function anyone may
+    /// compute), and a mirror of every source merge the key owns.
     fn maintain<'a, S>(
         store: &'a mut S,
         target: Collection<Self>,
@@ -1566,7 +1567,8 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
     /// collection gets a leaf, `DERIVE(target, L(F), f(F))`, for every
     /// foundation `F` of its immediate source the key owns whose locator it
     /// has no leaf for yet; empty images are published too. Other owners'
-    /// foundations are theirs to derive. Each publishing operation runs
+    /// foundations are theirs to derive here; `maintain` derives those an
+    /// owner has left without a leaf. Each publishing operation runs
     /// against one frozen control snapshot; when it names a missing image or
     /// descriptor, acquisition ends the operation and the retry starts from a
     /// fresh snapshot that sees everything that arrived, records and proofs

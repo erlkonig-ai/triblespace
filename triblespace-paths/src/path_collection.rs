@@ -364,7 +364,7 @@ fn missing_then_maintain_closes_cross_fragment_path() {
 }
 
 #[test]
-fn another_writers_fragment_is_its_writers_to_derive() {
+fn another_writers_fragment_waits_for_ensure_but_not_for_maintenance() {
     let mut store = CollectionOnly::default();
     let (source, target) = test_paths(&mut store, "paths", plus());
     let left = put_data(&mut store, &edge(1, 2));
@@ -375,13 +375,13 @@ fn another_writers_fragment_is_its_writers_to_derive() {
     publish(&mut store, second);
     support(&mut store, source, [first, second]);
 
-    // The maintaining key derives what it wrote; the other writer's
+    // A write's ensure derives what its key wrote; the other writer's
     // fragment is that writer's lag, and freshness names exactly it.
-    let after = block_on(store.maintain(target, &authority_key())).unwrap();
-    let observed = after.collection(target).unwrap();
+    let ensured = block_on(store.ensure(target, &authority_key())).unwrap();
+    let observed = ensured.collection(target).unwrap();
     assert_eq!(stood_for(&observed).len(), 1);
     let missing = observed
-        .missing_from(&after.collection(source).unwrap())
+        .missing_from(&ensured.collection(source).unwrap())
         .unwrap();
     assert_eq!(
         missing.members().collect::<Vec<_>>(),
@@ -389,6 +389,16 @@ fn another_writers_fragment_is_its_writers_to_derive() {
     );
     let index: Arc<PathIndex> = observed.view().unwrap();
     assert!(!index.contains(&RawInline::from(id(1)), &RawInline::from(id(3))));
+
+    // Maintenance derives it anyway: a derive is a function, so a reader
+    // never waits on a writer who is absent.
+    let after = block_on(store.maintain(target, &authority_key())).unwrap();
+    let observed = after.collection(target).unwrap();
+    assert_eq!(stood_for(&observed).len(), 2);
+    let missing = observed
+        .missing_from(&after.collection(source).unwrap())
+        .unwrap();
+    assert_eq!(missing.members().count(), 0);
 }
 
 #[test]

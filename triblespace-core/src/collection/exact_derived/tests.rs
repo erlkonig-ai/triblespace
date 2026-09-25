@@ -3225,7 +3225,7 @@ mod lattice_v2 {
     }
 
     #[test]
-    fn a_view_derives_only_its_maintainers_own_leaves_and_freshness_names_the_rest() {
+    fn ensure_derives_only_its_keys_own_leaves_and_freshness_names_the_rest() {
         let (mut store, root, first, _) = collections();
         let a1 = own_commit(&mut store, root, 41, 1);
         let a2 = own_commit(&mut store, root, 41, 2);
@@ -3800,5 +3800,117 @@ mod lattice_v2 {
             .missing_from(&snapshot.collection(root).unwrap())
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn maintenance_derives_an_absent_owners_foundations_and_ensure_does_not() {
+        // JP, 2026-09-25: merge is a choice, derive is a function. A view
+        // must not lag behind an owner who is offline or on an older build.
+        let (mut store, root, first, _) = collections();
+        let a1 = own_commit(&mut store, root, 41, 1);
+        let b1 = own_commit(&mut store, root, 42, 1);
+        let missing = |store: &mut MemoryRepo| -> BTreeSet<CollectionData> {
+            let snapshot = store.snapshot().unwrap();
+            let view = snapshot.collection(first).unwrap();
+            let source = snapshot.collection(root).unwrap();
+            view.missing_from(&source).unwrap().data_members().collect()
+        };
+
+        // The per-write ensure derives only what 41 wrote.
+        block_on(store.ensure(first, &key(41))).unwrap();
+        assert_eq!(missing(&mut store), BTreeSet::from([b1]));
+
+        // Maintenance by 41 derives 42's foundation too, with 42 absent.
+        block_on(store.maintain(first, &key(41))).unwrap();
+        assert!(missing(&mut store).is_empty());
+        let leaves = derives_in(&mut store, first.handle());
+        assert_eq!(leaves.len(), 2);
+        assert!(leaves.iter().all(|leaf| leaf.public_key() == public(41)));
+        assert!(leaves
+            .iter()
+            .any(|leaf| leaf.input() == SourceLocator::of(b1.raw)
+                && leaf.output() == first_image(&payload(42, 1))));
+        let _ = a1;
+
+        // When 42 comes back, its own pass converges on the same image and
+        // publishes nothing: the foundation already has a leaf.
+        let before = records(&mut store).len();
+        block_on(store.maintain(first, &key(42))).unwrap();
+        assert_eq!(records(&mut store).len(), before);
+    }
+
+    #[test]
+    fn maintainers_racing_on_an_absent_owners_foundations_converge_and_leave_its_merges() {
+        // A bounded race: 41 and 42 each maintain their own replica of one
+        // state while 43 is away, then the replicas are united, as `cat` does.
+        // 43 holds eight nodes in one tier, so a merge is on offer to steal.
+        let replica = || {
+            let (mut store, root, first, _) = collections();
+            own_commit(&mut store, root, 41, 0);
+            own_commit(&mut store, root, 42, 0);
+            for entity in 0..8 {
+                own_commit(&mut store, root, 43, entity);
+            }
+            (store, root, first)
+        };
+        let (mut left, root, first) = replica();
+        let (mut right, right_root, right_first) = replica();
+        assert_eq!(
+            (right_root.handle(), right_first.handle()),
+            (root.handle(), first.handle())
+        );
+        for (store, racer) in [(&mut left, 41), (&mut right, 42)] {
+            block_on(store.maintain(root, &key(racer))).unwrap();
+            block_on(store.maintain(first, &key(racer))).unwrap();
+            // A merge is a choice: neither racer merged 43's nodes, in the
+            // root or as a mirror in the view.
+            assert!(merges_in(store, root.handle()).is_empty());
+            assert!(merges_in(store, first.handle()).is_empty());
+        }
+        let alone = frontier(&mut left, first.handle());
+        assert_eq!(alone.len(), 10);
+
+        for record in records(&mut right) {
+            left.insert(record).unwrap();
+        }
+
+        // Every foundation now has a leaf from each racer, and both leaves
+        // name the same image: a derive is a function.
+        let leaves = derives_in(&mut left, first.handle());
+        assert_eq!(leaves.len(), 20);
+        let mut outputs = std::collections::BTreeMap::<_, BTreeSet<_>>::new();
+        for leaf in &leaves {
+            outputs.entry(leaf.input()).or_default().insert(leaf.output());
+        }
+        assert_eq!(outputs.len(), 10);
+        assert!(outputs.values().all(|images| images.len() == 1));
+        assert_eq!(frontier(&mut left, first.handle()), alone);
+        let snapshot = left.snapshot().unwrap();
+        assert!(snapshot
+            .collection(first)
+            .unwrap()
+            .missing_from(&snapshot.collection(root).unwrap())
+            .unwrap()
+            .is_empty());
+        drop(snapshot);
+
+        // Converged: another pass by either racer publishes nothing.
+        let before = records(&mut left).len();
+        block_on(left.maintain(first, &key(41))).unwrap();
+        block_on(left.maintain(first, &key(42))).unwrap();
+        assert_eq!(records(&mut left).len(), before);
+
+        // When 43 returns, it makes its own merge and mirrors it over the
+        // racers' leaves, and nobody else's merge appears.
+        block_on(left.maintain(root, &key(43))).unwrap();
+        block_on(left.maintain(first, &key(43))).unwrap();
+        let merges = merges_in(&mut left, root.handle());
+        assert_eq!(merges.len(), 1);
+        let mirrors = merges_in(&mut left, first.handle());
+        assert_eq!(mirrors.len(), 1);
+        assert!(merges
+            .iter()
+            .chain(&mirrors)
+            .all(|merge| merge.public_key() == public(43)));
     }
 }
