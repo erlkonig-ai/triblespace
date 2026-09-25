@@ -70,7 +70,7 @@ fn census(path: &Path) -> Result<RecordCensus> {
     Ok(census)
 }
 
-fn create_fresh_destination(path: &Path) -> std::io::Result<std::fs::File> {
+pub(super) fn create_fresh_destination(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -81,7 +81,7 @@ fn create_fresh_destination(path: &Path) -> std::io::Result<std::fs::File> {
     options.open(path)
 }
 
-fn cleanup_incomplete_destination(path: &Path, primary: anyhow::Error) -> anyhow::Error {
+pub(super) fn cleanup_incomplete_destination(path: &Path, primary: anyhow::Error) -> anyhow::Error {
     match std::fs::remove_file(path) {
         Ok(()) => primary,
         Err(cleanup) => primary.context(format!(

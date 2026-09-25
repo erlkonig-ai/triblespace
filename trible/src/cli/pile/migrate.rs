@@ -7,6 +7,7 @@ use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::{BlobStoreGet, SnapshotSource};
 
 mod branch_to_collection;
+mod clean;
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Migration {
@@ -31,6 +32,25 @@ pub enum Command {
         #[arg(long = "into")]
         into: PathBuf,
     },
+    /// Write a clean lattice v2 pile: one owner per payload, adopted
+    /// generations, leaf DERIVEs re-emitted by locator, no MERGEs.
+    ///
+    /// LOSSY by design, unlike `compact`. Per current root and payload, the
+    /// owner is the signer of the earliest COMMIT that verifies strictly and
+    /// that the root admits as a writer; every COMMIT of that owner is kept
+    /// and other signers' COMMITs of the payload are dropped. Payloads an
+    /// adopted retired collection admitted and the current root lacks are
+    /// re-signed into it with the first `--key`. Retired (v9) DERIVEs whose
+    /// input is a kept foundation of their target's source are re-emitted as
+    /// locator DERIVEs signed by that foundation's owner, derived collections
+    /// upstream first; without the owner's key they are counted, and the owner
+    /// derives them after the cutover. Signature-valid capability proofs,
+    /// kept collections' descriptors, the record-kind descriptions and every
+    /// blob those reach are kept. Every MERGE, retired kind, WANT, pin,
+    /// COMMIT of a retired collection and duplicate-owner COMMIT is dropped
+    /// and counted; maintenance rebuilds merges. The source is only read,
+    /// through a read-only descriptor, and locked only while it is replayed.
+    Clean(clean::CleanArgs),
     /// Re-sign one verified legacy branch as native collection commits.
     ///
     /// This is deliberately a same-pile migration: one frozen pin observation
@@ -71,6 +91,7 @@ pub fn run(pile_path: PathBuf, cmd: Command) -> Result<()> {
     match cmd {
         Command::List => list_migrations(&pile_path),
         Command::Reframe { into } => reframe(&pile_path, &into),
+        Command::Clean(args) => clean::run(pile_path, args),
         Command::BranchToCollection {
             branch,
             collection_name,

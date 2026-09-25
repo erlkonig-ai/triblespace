@@ -3057,6 +3057,16 @@ impl PileFileSnapshot {
         }
     }
 
+    /// Length in bytes of the validated file prefix this snapshot observes.
+    ///
+    /// Every record this snapshot indexes starts below it, and a
+    /// [`PileRecords`] walk of the same file that stops here meets exactly
+    /// those records, so a raw pass and indexed reads can share one frozen
+    /// observation while writers keep appending.
+    pub const fn prefix_len(&self) -> usize {
+        self.covered_len
+    }
+
     /// Number of unknown generic-envelope records in this exact observation.
     pub(crate) const fn opaque_record_count(&self) -> usize {
         self.opaque_records
@@ -3672,7 +3682,23 @@ impl PileFile {
     /// Complete opaque envelopes are crossed; unknown unenveloped markers are
     /// refused without truncation.
     pub fn open(path: &Path) -> Result<Self, ReadError> {
-        let file = OpenOptions::new().read(true).append(true).open(path)?;
+        Self::from_file(OpenOptions::new().read(true).append(true).open(path)?)
+    }
+
+    /// Opens an existing pile file for reading only.
+    ///
+    /// The descriptor carries no write access, so nothing written through
+    /// this handle can reach the file: an append fails with the operating
+    /// system's permission error instead. Replay ([`Self::refresh`]) and
+    /// snapshots behave exactly as after [`Self::open`], including the shared
+    /// file lock a replay holds while it reads. For tools that must never
+    /// mutate the pile they read, such as the clean-pile migration; the file
+    /// itself may be read-only.
+    pub fn open_read_only(path: &Path) -> Result<Self, ReadError> {
+        Self::from_file(OpenOptions::new().read(true).open(path)?)
+    }
+
+    fn from_file(file: File) -> Result<Self, ReadError> {
         let length_u64 = file.metadata()?.len();
         let length = usize::try_from(length_u64)
             .map_err(|_| ReadError::FileTooLarge { length: usize::MAX })?;
