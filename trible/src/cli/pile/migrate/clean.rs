@@ -68,7 +68,9 @@ use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::Blob;
 use triblespace_core::capability::CapabilityProof;
-use triblespace_core::collection::records::{CollectionCommit, CollectionDerive, SourceLocator};
+use triblespace_core::collection::records::{
+    CollectionCommit, CollectionDerive, LegacyUnsignedCollectionEquation, SourceLocator,
+};
 use triblespace_core::collection::{
     collection_writer_is_admitted_by_policy, descriptor, AdmissionPolicy, CollectionRead,
     CollectionRecord, CollectionStore, RetiredCollectionEquation, ACTION_WRITE,
@@ -1038,6 +1040,10 @@ struct RawPass {
     invalid_candidates: Vec<u64>,
     /// `(collection, result)` of every MERGE (v8 and v10) of a kept collection.
     merge_results: HashSet<(Raw, Raw)>,
+    /// Every decodable equation whose output names a blob: `(kind, collection,
+    /// output, inputs)`. The clean pile drops them all; an output whose inputs
+    /// are not all valid here would be the only copy of those facts.
+    equations: Vec<(&'static str, Raw, Raw, Vec<Raw>)>,
 }
 
 /// Every frame of the snapshot's replayed prefix, read from its own mapping:
@@ -1079,6 +1085,7 @@ fn raw_pass(snapshot: &PileFileSnapshot, plan: &Plan, signers: &mut Signers) -> 
         current: Vec::new(),
         invalid_candidates: vec![0; plan.derived.len()],
         merge_results: HashSet::new(),
+        equations: Vec::new(),
     };
     for (record, verified) in checked {
         // Replay accepted every frame of this prefix; failing to decode one
@@ -1105,6 +1112,12 @@ fn raw_pass(snapshot: &PileFileSnapshot, plan: &Plan, signers: &mut Signers) -> 
                     CollectionRecord::Merge(merge) => {
                         census.merges_v10 += 1;
                         counts.merges_v10 += 1;
+                        pass.equations.push((
+                            "merge_v10",
+                            collection,
+                            merge.result().raw,
+                            merge.inputs().iter().map(|input| input.raw).collect(),
+                        ));
                         if plan.kept(&collection) {
                             pass.merge_results.insert((collection, merge.result().raw));
                         }
@@ -1135,9 +1148,17 @@ fn raw_pass(snapshot: &PileFileSnapshot, plan: &Plan, signers: &mut Signers) -> 
                 let collection = equation.collection().raw;
                 let counts = pass.per_collection.entry(collection).or_default();
                 match equation {
-                    RetiredCollectionEquation::MergeV8 { result, .. } => {
+                    RetiredCollectionEquation::MergeV8 {
+                        low, high, result, ..
+                    } => {
                         census.merges_v8 += 1;
                         counts.merges_v8 += 1;
+                        pass.equations.push((
+                            "merge_v8",
+                            collection,
+                            result.raw,
+                            vec![low.raw, high.raw],
+                        ));
                         if plan.kept(&collection) {
                             pass.merge_results.insert((collection, result.raw));
                         }
@@ -1150,6 +1171,7 @@ fn raw_pass(snapshot: &PileFileSnapshot, plan: &Plan, signers: &mut Signers) -> 
                     } => {
                         census.derives_v9 += 1;
                         counts.derives_v9 += 1;
+                        pass.equations.push(("derive_v9", collection, output.raw, vec![input.raw]));
                         if let Some(&target) = plan.derived_index.get(&collection) {
                             if !verified {
                                 pass.invalid_candidates[target] += 1;
@@ -1174,8 +1196,31 @@ fn raw_pass(snapshot: &PileFileSnapshot, plan: &Plan, signers: &mut Signers) -> 
             PileRecordContent::Branch { .. } => census.pins += 1,
             PileRecordContent::BranchTombstone { .. } => census.pin_tombstones += 1,
             PileRecordContent::LegacyCollectionV3 { .. } => census.legacy_v3 += 1,
-            PileRecordContent::LegacyUnsignedCollectionEquation { .. } => {
-                census.legacy_unsigned_equations += 1
+            PileRecordContent::LegacyUnsignedCollectionEquation { equation } => {
+                census.legacy_unsigned_equations += 1;
+                match equation {
+                    LegacyUnsignedCollectionEquation::Merge {
+                        collection,
+                        low,
+                        high,
+                        result,
+                    } => pass.equations.push((
+                        "legacy_merge",
+                        collection.raw,
+                        result.raw,
+                        vec![low.raw, high.raw],
+                    )),
+                    LegacyUnsignedCollectionEquation::Derive {
+                        collection,
+                        input,
+                        output,
+                    } => pass.equations.push((
+                        "legacy_derive",
+                        collection.raw,
+                        output.raw,
+                        vec![input.raw],
+                    )),
+                }
             }
             PileRecordContent::RetiredCollectionDeriveV4 => census.retired_derive_v4 += 1,
             PileRecordContent::RetiredPeerEvidenceV1 | PileRecordContent::RetiredStoreScopeV1 => {
@@ -1191,6 +1236,73 @@ fn raw_pass(snapshot: &PileFileSnapshot, plan: &Plan, signers: &mut Signers) -> 
         }
     }
     Ok(pass)
+}
+
+/// Equations whose output has valid bytes here while one of their inputs does
+/// not: the output is then the only copy of those facts. The clean pile drops
+/// every equation record, so such an output is lost unless the destination
+/// keeps its bytes anyway (a kept leaf image, for one).
+#[derive(Default)]
+struct SoleRepresentations {
+    checked: u64,
+    candidates: Vec<(&'static str, Raw, Raw)>,
+}
+
+fn sole_representations(snapshot: &PileFileSnapshot, pass: &RawPass) -> Result<SoleRepresentations> {
+    // Valid means resident AND hashing to its handle: a corrupt occurrence
+    // regenerates nothing. Each blob is read and hashed at most once.
+    let mut valid: HashMap<Raw, bool> = HashMap::new();
+    let mut is_valid = |handle: Raw| -> Result<bool> {
+        if let Some(known) = valid.get(&handle) {
+            return Ok(*known);
+        }
+        let answer = match snapshot.get::<Blob<UnknownBlob>, UnknownBlob>(Inline::new(handle)) {
+            Ok(_) => true,
+            Err(GetBlobError::BlobNotFound(_)) | Err(GetBlobError::ValidationError(_)) => false,
+            Err(error) => bail!("inspect blob {}: {error}", hex(&handle)),
+        };
+        valid.insert(handle, answer);
+        Ok(answer)
+    };
+    let mut sole = SoleRepresentations::default();
+    for (kind, collection, output, inputs) in &pass.equations {
+        sole.checked += 1;
+        if !is_valid(*output)? {
+            continue;
+        }
+        let mut regenerable = true;
+        for input in inputs {
+            if !is_valid(*input)? {
+                regenerable = false;
+                break;
+            }
+        }
+        if !regenerable {
+            sole.candidates.push((*kind, *collection, *output));
+        }
+    }
+    Ok(sole)
+}
+
+/// The report, given which sole copies the destination did not keep.
+fn sole_json(sole: &SoleRepresentations, lost: &[(&'static str, Raw, Raw)]) -> Value {
+    let mut by: BTreeMap<(&'static str, Raw), u64> = BTreeMap::new();
+    for (kind, collection, _) in lost {
+        *by.entry((*kind, *collection)).or_default() += 1;
+    }
+    json!({
+        "equations_checked": sole.checked,
+        "sole_copies": sole.candidates.len(),
+        "kept_in_destination": sole.candidates.len() - lost.len(),
+        "found": lost.len(),
+        "by_kind_and_collection": by.iter().map(|((kind, collection), count)| json!({
+            "kind": kind, "collection": hex(collection), "count": count,
+        })).collect::<Vec<_>>(),
+        "examples": lost.iter().take(10).map(|(kind, collection, output)| json!({
+            "kind": kind, "collection": hex(collection), "output": hex(output),
+        })).collect::<Vec<_>>(),
+        "not_decodable": "frames of unknown kinds (census unknown_kind) are dropped only with --drop-unknown",
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1619,6 +1731,15 @@ impl Run {
                 pass.candidates.iter().map(Vec::len).sum::<usize>()
             ),
         );
+        let sole = sole_representations(snapshot, &pass)?;
+        self.mark(
+            "sole_representations",
+            format_args!(
+                "{} equation(s) checked, {} output(s) are the only valid copy of their facts",
+                sole.checked,
+                sole.candidates.len()
+            ),
+        );
 
         // The destination is written under a `.partial` name, created only
         // now, after every refusal that needs no writing, and installed under
@@ -1661,6 +1782,7 @@ impl Run {
         let written = self.write(
             snapshot,
             &pass,
+            &sole,
             &mut signers,
             &mut admission,
             adopter,
@@ -1775,6 +1897,7 @@ impl Run {
         &self,
         snapshot: &PileFileSnapshot,
         pass: &RawPass,
+        sole: &SoleRepresentations,
         signers: &mut Signers,
         admission: &mut WriteAdmission,
         adopter: Option<&SigningKey>,
@@ -1824,7 +1947,26 @@ impl Run {
         }
         out.retainer.count_dropped()?;
 
-        Ok(self.report(
+        // A sole copy the destination keeps anyway (a kept leaf image, say)
+        // is preserved; one it does not keep is refused in a real run.
+        let lost: Vec<(&'static str, Raw, Raw)> = sole
+            .candidates
+            .iter()
+            .filter(|(_, _, output)| !out.retainer.copied.contains(output))
+            .copied()
+            .collect();
+        if !lost.is_empty() && !self.dry_run {
+            bail!(
+                "refusing to drop {} equation output(s) that are the only valid copy of their \
+                 facts (an input is missing or corrupt here), e.g. {} blake3:{}; see a dry run's \
+                 sole_representations",
+                lost.len(),
+                lost[0].0,
+                hex(&lost[0].2)
+            );
+        }
+
+        let mut report = self.report(
             pass,
             signers,
             &out,
@@ -1834,7 +1976,12 @@ impl Run {
             proofs_kept,
             proofs_invalid,
             descriptions,
-        ))
+        );
+        report
+            .as_object_mut()
+            .expect("the report is an object")
+            .insert("sole_representations".into(), sole_json(sole, &lost));
+        Ok(report)
     }
 
     /// Descriptors first, then the proofs that admit writers, so every

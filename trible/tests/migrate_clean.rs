@@ -1430,3 +1430,41 @@ fn the_guard_counts_commits_into_collections_without_a_descriptor() {
     assert_eq!(entry["absent_resident"], 1);
     assert_eq!(entry["discarded"], true);
 }
+
+#[test]
+fn an_equation_output_whose_input_is_gone_is_not_dropped_silently() {
+    let fixture = Fixture::new();
+    // An old MERGE whose result bytes are here while one input's bytes never
+    // arrived: the result is the only copy of that input's facts, and the
+    // clean pile drops every equation record.
+    let mut pile = Pile::open(&fixture.src).unwrap();
+    let result = put_raw(&mut pile, b"merged facts whose input is gone");
+    pile.close().unwrap();
+    let gone = data(b"an input that never arrived");
+    append(
+        &fixture.src,
+        &merge_v8(&fixture.a, fixture.retired, gone, fixture.q1, result),
+    );
+
+    let keys = [&*fixture.key_a, &*fixture.key_b];
+    let dst = fixture.path("sole.pile");
+    let output = fixture.clean(&fixture.src, &dst, &["--adopt-by-name"], &keys);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("only valid copy"), "{stderr}");
+    assert!(!dst.exists());
+    assert!(!fixture.path("sole.pile.partial").exists());
+
+    // A dry run names it; every regenerable equation of the fixture is not.
+    let dry = fixture.path("sole-dry.pile");
+    assert_success(&fixture.clean(
+        &fixture.src,
+        &dry,
+        &["--adopt-by-name", "--dry-run"],
+        &keys,
+    ));
+    let sole = fixture.report(&dry)["sole_representations"].clone();
+    assert_eq!(sole["found"], 1);
+    assert_eq!(sole["examples"][0]["kind"], "merge_v8");
+    assert_eq!(sole["examples"][0]["output"], hex::encode(result.raw).as_str());
+}
