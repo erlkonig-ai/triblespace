@@ -9,8 +9,8 @@
 //! available batches into the next immutable observation without a disk flush.
 //! Explicit close (or an application-chosen flush) owns persistence.
 
-use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::Blob;
+use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::capability::CapabilityProof;
 use triblespace_core::collection::{CollectionHandle, CollectionRecord};
 
@@ -149,7 +149,7 @@ impl NetEventBatch {
 mod tests {
     use ed25519_dalek::SigningKey;
     use triblespace_core::collection::{
-        empty_metadata_handle, CollectionCommit, CollectionData, CollectionRecord,
+        CollectionCommit, CollectionData, CollectionRecord, empty_metadata_handle,
     };
 
     use super::*;

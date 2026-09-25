@@ -263,8 +263,8 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
     use triblespace_core::collection::{
-        empty_metadata_handle, CollectionCommit, CollectionData, CollectionDerive, CollectionMerge,
-        COLLECTION_RECORD_KIND_MERGE_V4,
+        COLLECTION_RECORD_KIND_MERGE_V4, CollectionCommit, CollectionData, CollectionDerive,
+        CollectionMerge, empty_metadata_handle,
     };
     use triblespace_core::inline::Inline;
 
@@ -492,9 +492,11 @@ mod tests {
         let overlay = collection_record_patch(&store, expected).unwrap();
 
         assert_eq!(overlay.len(), selected.len() as u64);
-        assert!(selected
-            .iter()
-            .all(|record| { overlay.get(record.fingerprint()) == Some(*record) }));
+        assert!(
+            selected
+                .iter()
+                .all(|record| { overlay.get(record.fingerprint()) == Some(*record) })
+        );
         assert_eq!(store.selections.get(), 1);
         assert_eq!(store.global_enumerations.get(), 0);
     }
