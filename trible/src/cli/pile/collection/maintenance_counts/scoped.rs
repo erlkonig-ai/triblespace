@@ -148,8 +148,8 @@ fn changed_chain_skips_other_chain_without_losing_its_wake_interest() {
         [fixture.first_value, Id::new([3; 16]).unwrap()]
     );
     assert_eq!(
-        observed.support().unwrap(),
-        &fixture.sources[1].admitted(&snapshot).unwrap()
+        stood_for(&observed),
+        fixture.sources[1].admitted(&snapshot).unwrap()
     );
     fixture.close();
 }
@@ -348,26 +348,6 @@ fn scoped_same_value_keeps_new_support_and_skips_other_chain() {
 }
 
 #[test]
-fn implicit_root_retries_when_explicitly_selected() {
-    let mut fixture = Fixture::new();
-    let mut state = State::default();
-    let mut references = warm(&mut fixture, &mut state);
-    let root = fixture.sources[0].handle();
-    assert!(state.hops[&root].dependency_only);
-    references.push(handle_hex(root));
-    let (failures, counts) = pass(&mut fixture, &references, true, &mut state, None);
-    assert_eq!(failures, 0);
-    assert!(!state.hops[&root].dependency_only);
-    assert!(counts.selected_calls[&root] >= 2);
-    assert_eq!(
-        counts.selected_calls.get(&fixture.targets[0].handle()),
-        None
-    );
-    assert_skipped(&counts, &fixture, 1);
-    fixture.close();
-}
-
-#[test]
 fn upstream_publication_rechecks_downstream_in_the_same_pass() {
     let mut fixture = Fixture::new();
     fixture
@@ -412,8 +392,8 @@ fn upstream_publication_rechecks_downstream_in_the_same_pass() {
         [fixture.first_value, Id::new([2; 16]).unwrap()]
     );
     assert_eq!(
-        observed.support().unwrap(),
-        &fixture.sources[0].admitted(&snapshot).unwrap()
+        stood_for(&observed),
+        fixture.sources[0].admitted(&snapshot).unwrap()
     );
     fixture.close();
 }

@@ -45,8 +45,8 @@ use triblespace::core::collection::{
     CollectionStoreExt,
 };
 use triblespace::core::examples::literature;
-use triblespace::core::repo::BlobStoreGet;
 use triblespace::core::repo::memoryrepo::MemoryRepoSnapshot;
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::*;
 
 type Entity = Inline<inlineencodings::GenId>;
@@ -286,13 +286,23 @@ impl IncrementalState {
             self.raw,
             self.accelerated,
         );
-        // What the target newly stands on is the delta. It is a set of source
-        // payloads, so read it from the source through the same snapshot; the
-        // Succinct target answers the full side of the query.
-        let changed_support = next
+        // The delta is the source payloads added since the previous step,
+        // read from the root through the same two snapshots: supports are
+        // collection-local, and the Succinct target answers the full side of
+        // the query.
+        let root_now = next
+            .snapshot()
+            .collection(self.collection)
+            .expect("observe the source now");
+        let root_before = self
+            .snapshot
+            .snapshot()
+            .collection(self.collection)
+            .expect("observe the source before");
+        let changed_support = root_now
             .support()
             .expect("resolve incremental support")
-            .additions_since(self.snapshot.support().expect("resolve previous support"))
+            .additions_since(root_before.support().expect("resolve previous support"))
             .expect("benchmark support grows monotonically");
         assert_eq!(changed_support.len(), 1, "one payload is observed per step");
         let mut changed_view = TribleSet::new();

@@ -72,6 +72,17 @@ impl CollectionEncoding for SimpleArchive {
     {
         join(low, high).map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
+
+    fn join_many<R>(
+        _descriptor: &Fragment,
+        members: &[Blob<Self>],
+        _reader: &R,
+    ) -> Result<Blob<Self>, CollectionOperationError>
+    where
+        R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
+    {
+        join_all(members).map_err(|source| CollectionOperationError::Fatal(source.to_string()))
+    }
 }
 
 /// The collection endpoint involved in a validation failure.
@@ -354,6 +365,55 @@ pub fn join(
     let left_rows = canonical_rows(left)?;
     let right_rows = canonical_rows(right)?;
     Ok(join_canonical_rows(left, right, &left_rows, &right_rows))
+}
+
+/// Compute the exact canonical union of one or more `SimpleArchive` elements:
+/// the k-way join an n-ary MERGE states.
+///
+/// Every input is validated first. One lexicographic k-way merge then emits
+/// each distinct row once, so the result is the same canonical archive a
+/// fold of [`join`] would produce, without its intermediate archives.
+pub fn join_all(members: &[Blob<SimpleArchive>]) -> Result<Blob<SimpleArchive>, UnarchiveError> {
+    let rows = members
+        .iter()
+        .map(canonical_rows)
+        .collect::<Result<Vec<_>, _>>()?;
+    let nonempty: Vec<usize> = (0..members.len())
+        .filter(|&index| !rows[index].is_empty())
+        .collect();
+    match nonempty[..] {
+        [] => {
+            return Ok(members.first().map_or_else(
+                || Blob::new(Bytes::from(Vec::<u8>::new())),
+                |member| Blob::new(member.bytes.clone()),
+            ))
+        }
+        [only] => return Ok(Blob::new(members[only].bytes.clone())),
+        _ => {}
+    }
+    let mut cursors = vec![0usize; rows.len()];
+    let total: usize = rows.iter().map(|rows| rows.len()).sum();
+    let mut out: Vec<[u8; TRIBLE_LEN]> = Vec::with_capacity(total);
+    loop {
+        let mut least: Option<&[u8; TRIBLE_LEN]> = None;
+        for (index, rows) in rows.iter().enumerate() {
+            if let Some(row) = rows.get(cursors[index]) {
+                if least.is_none_or(|least| row < least) {
+                    least = Some(row);
+                }
+            }
+        }
+        let Some(least) = least.copied() else {
+            break;
+        };
+        for (index, rows) in rows.iter().enumerate() {
+            if rows.get(cursors[index]) == Some(&least) {
+                cursors[index] += 1;
+            }
+        }
+        out.push(least);
+    }
+    Ok(Blob::new(Bytes::from(out)))
 }
 
 /// Validate a discovered commit as one canonical root of this collection.

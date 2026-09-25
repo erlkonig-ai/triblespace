@@ -790,10 +790,23 @@ fn main() {
             if recording {
                 samples.push(t.elapsed().as_secs_f64() * 1000.0);
             }
-            assert_eq!(
-                attached.support().expect("resolve accelerated support"),
-                &support,
-                "the maintained target stands for the source's frontier",
+            // Supports are collection-local: freshness is asked hop by hop,
+            // as the view's leaves against its source's foundations.
+            let raw_view = snapshot
+                .collection(raw)
+                .expect("observe raw Succinct cover");
+            let source_view = snapshot.collection(source).expect("observe source");
+            assert_eq!(source_view.support().expect("source support"), &support);
+            assert!(
+                raw_view
+                    .missing_from(&source_view)
+                    .expect("raw freshness")
+                    .is_empty()
+                    && attached
+                        .missing_from(&raw_view)
+                        .expect("accelerated freshness")
+                        .is_empty(),
+                "the maintained chain has a leaf for every source foundation",
             );
 
             // Inspect the resident raw physical cover outside the timer. This

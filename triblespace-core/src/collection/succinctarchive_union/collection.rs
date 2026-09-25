@@ -484,14 +484,20 @@ mod tests {
             .unwrap();
         let full_support = Support::from_data(source_collection, [first.data(), second.data()]);
         let observed = snapshot.collection(accelerated_collection).unwrap();
-        assert_eq!(observed.support().unwrap(), &first_support);
+        assert_eq!(
+            crate::collection::test_support::stood_for(&observed),
+            first_support
+        );
 
         block_on(store.ensure(raw_collection, &SigningKey::from_bytes(&[7; 32]))).unwrap();
         let snapshot =
             block_on(store.ensure(accelerated_collection, &SigningKey::from_bytes(&[7; 32])))
                 .unwrap();
         let observed = snapshot.collection(accelerated_collection).unwrap();
-        assert_eq!(observed.support().unwrap(), &full_support);
+        assert_eq!(
+            crate::collection::test_support::stood_for(&observed),
+            full_support
+        );
         let view: UnionArchive<OrderedUniverse> = observed.view().unwrap();
         assert_eq!(view.iter().count(), 2);
     }
@@ -609,7 +615,10 @@ mod tests {
         let snapshot = store.snapshot().unwrap();
         let attached = snapshot.collection(accelerated_collection).unwrap();
 
-        assert_eq!(attached.support().unwrap(), &support);
+        assert_eq!(
+            crate::collection::test_support::stood_for(&attached),
+            support
+        );
         assert_eq!(
             attached.cover().data_members().collect::<Vec<_>>(),
             vec![fc_data],

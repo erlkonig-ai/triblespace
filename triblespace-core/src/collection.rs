@@ -41,7 +41,8 @@ pub fn write_capability() -> CapabilityHandle {
 
 /// Narrow write facade for a scoped fact collection.
 pub mod api;
-/// Downward coverage: which foundation commits a lattice node covers.
+/// Downward coverage: which of its own collection's foundations a lattice
+/// node covers.
 pub mod coverage;
 pub mod covered;
 /// Reading one collection descriptor's facts.
@@ -50,21 +51,23 @@ pub mod descriptor;
 pub mod discovery;
 /// Canonical collection encodings and join-preserving mappings.
 pub mod encoding;
-/// Exact realization over invariant foundational support.
+/// Realization operations and their acquisition loop.
 mod exact_derived;
-/// Deterministic size-tiered maintenance behind exact derived collections.
-mod maintenance;
 /// Same-named collection generations, and the records they strand.
 pub mod generation;
 /// Maintained positive latest states and historical supersession evidence.
 pub mod latest;
 /// Maintained stated last-write-wins registers over exact source covers.
 pub mod lww_register;
+/// Per-owner maintenance: root carries, leaves and aligned merges.
+mod maintenance;
 /// Carrying content between collections, and proving it arrived.
 pub mod migration;
 mod observation;
 pub mod observed_store;
 mod operation_snapshot;
+/// Who may merge or derive a node: "you own what you signed".
+pub mod ownership;
 /// Immutable collection-local READ and WRITE authorization ceilings.
 pub mod policy;
 pub mod records;
@@ -92,6 +95,7 @@ pub use discovery::*;
 pub use encoding::*;
 pub use exact_derived::CollectionRealizationError;
 pub use generation::*;
+pub use maintenance::MERGE_FAN_IN;
 pub use policy::*;
 pub use records::*;
 pub use simplearchive_union::{PreparedCollectionCommit, StagedCollectionCommit};
@@ -103,3 +107,6 @@ mod oracle;
 
 #[cfg(test)]
 mod equation_admission_tests;
+
+#[cfg(test)]
+pub(crate) mod test_support;

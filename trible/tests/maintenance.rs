@@ -26,6 +26,59 @@ use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::{BlobStorePut, SnapshotSource};
 use triblespace_core::trible::TribleSet;
 
+/// The root commits a view stands for, following each root foundation up
+/// the view's descriptor chain through the leaves of every hop. Lattice v2
+/// supports are collection-local, so this is the only way a test can still
+/// say "this view stands for these commits".
+fn stood_for<R, E>(
+    view: &triblespace_core::collection::CollectionSnapshot<R, E>,
+) -> triblespace_core::collection::Support
+where
+    R: triblespace_core::repo::StoreRead,
+    E: triblespace_core::collection::CollectionEncoding,
+{
+    use triblespace_core::collection::{descriptor, Collection, SourceLocator};
+    use triblespace_core::inline::encodings::hash::Handle;
+    let snapshot = view.snapshot();
+    let mut chain = vec![view.cover().collection().handle()];
+    loop {
+        let facts: triblespace_core::trible::TribleSet =
+            snapshot.get(*chain.last().unwrap()).unwrap();
+        match descriptor::source(&facts).unwrap() {
+            Some(source) => chain.push(source),
+            None => break,
+        }
+    }
+    let root: Collection<triblespace_core::blob::encodings::simplearchive::SimpleArchive> =
+        Collection::open(snapshot, *chain.last().unwrap()).unwrap();
+    let scope: std::collections::BTreeSet<_> = chain.iter().copied().collect();
+    let coverage = snapshot.coverage(&scope).unwrap();
+    let top: std::collections::BTreeSet<[u8; 32]> = view
+        .support()
+        .unwrap()
+        .members()
+        .map(|member| member.raw)
+        .collect();
+    let (foundations, _) = coverage.frontier_support(root.handle());
+    root.cover(
+        foundations
+            .iter_ordered()
+            .filter(|raw| {
+                let mut images = std::collections::BTreeSet::from([**raw]);
+                for hop in chain.iter().rev().skip(1) {
+                    images = images
+                        .iter()
+                        .flat_map(|image| coverage.leaf_outputs(*hop, SourceLocator::of(*image)))
+                        .map(|output| output.raw)
+                        .collect();
+                }
+                images.iter().any(|image| top.contains(image))
+            })
+            .map(|raw| Handle::from_hash(triblespace_core::inline::Inline::new(*raw)))
+            .collect::<Vec<_>>(),
+    )
+}
+
 struct Fixture {
     _directory: TempDir,
     path: PathBuf,
@@ -502,8 +555,8 @@ fn maintain_is_one_edge_and_accepts_descriptor_only_targets() {
     let snapshot = pile.snapshot().unwrap();
     let observed = snapshot.collection(fixture.rank9).unwrap();
     assert_eq!(
-        observed.support().unwrap(),
-        &fixture.source.admitted(&snapshot).unwrap()
+        stood_for(&observed),
+        fixture.source.admitted(&snapshot).unwrap()
     );
     let facts = observed.view::<UnionArchive<OrderedUniverse>>().unwrap();
     assert_eq!(facts.iter().collect::<TribleSet>(), fixture.expected);
@@ -558,7 +611,7 @@ fn maintain_all_follows_dependencies_without_merging_the_unselected_root() {
         assert_eq!(len, 1, "the equal-size inputs should be rolled up");
     }
     let observed = snapshot.collection(fixture.rank9).unwrap();
-    assert_eq!(observed.support().unwrap(), &support);
+    assert_eq!(stood_for(&observed), support);
     assert_eq!(support.len(), 2);
     let facts = observed.view::<UnionArchive<OrderedUniverse>>().unwrap();
     assert_eq!(facts.iter().collect::<TribleSet>(), fixture.expected);
@@ -629,7 +682,7 @@ fn maintain_all_schedules_a_shared_upstream_once() {
     let support = fixture.source.admitted(&snapshot).unwrap();
     for target in [fixture.rank9, second] {
         let observed = snapshot.collection(target).unwrap();
-        assert_eq!(observed.support().unwrap(), &support);
+        assert_eq!(stood_for(&observed), support);
         let facts = observed.view::<UnionArchive<OrderedUniverse>>().unwrap();
         assert_eq!(facts.iter().collect::<TribleSet>(), fixture.expected);
     }
@@ -753,7 +806,7 @@ fn failed_upstream_upkeep_does_not_suppress_available_downstream_work() {
     let first = source.admitted(&seeded).unwrap();
     assert_eq!(first.len(), 1);
     let available = seeded.collection(succinct).unwrap();
-    assert_eq!(available.support().unwrap(), &first);
+    assert_eq!(stood_for(&available), first);
     let expected = available
         .view::<UnionArchive<OrderedUniverse>>()
         .unwrap()
@@ -819,12 +872,9 @@ fn failed_upstream_upkeep_does_not_suppress_available_downstream_work() {
     assert_eq!(source.admitted(&snapshot).unwrap(), all);
     // The upstream still stands on what it had; the downstream now stands on
     // everything its source realized, which is that same first commit.
-    assert_eq!(
-        snapshot.collection(succinct).unwrap().support().unwrap(),
-        &first
-    );
+    assert_eq!(stood_for(&snapshot.collection(succinct).unwrap()), first);
     let available = snapshot.collection(rank9).unwrap();
-    assert_eq!(available.support().unwrap(), &first);
+    assert_eq!(stood_for(&available), first);
     let facts = available.view::<UnionArchive<OrderedUniverse>>().unwrap();
     assert_eq!(facts.iter().collect::<TribleSet>(), expected);
     pile.close().unwrap();

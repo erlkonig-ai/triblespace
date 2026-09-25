@@ -70,7 +70,7 @@ fn only_believed_alternative_equations_change_an_endorsed_results_support() {
             .support()
             .unwrap()
             .members()
-            .map(Handle::<SimpleArchive>::to_hash)
+            .map(Handle::<SuccinctArchiveBlob>::to_hash)
             .collect::<BTreeSet<_>>()
     };
 

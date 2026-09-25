@@ -1,10 +1,11 @@
-//! Exact collection realization from invariant foundational support.
+//! Realization operations and their acquisition loop.
 //!
-//! A [`Support`] is always a cover of the ultimate `SimpleArchive` root.
-//! Stored `MERGE` and `DERIVE` equations close the complete descriptor lineage
-//! from those roots. Crossing one mapping publishes only `DERIVE`; horizontal
-//! LSM carries are the separate `maintain` operation. Neither operation ever
-//! manufactures an upstream dependency as a side effect of downstream work.
+//! A collection's support is a cover of its own foundations: commit payloads
+//! in a root, leaf images in a derived collection. `ensure` on a derived
+//! collection derives the maintaining key's own missing leaves; `maintain`
+//! also mirrors its own source merges; `maintain` on a root carries the
+//! key's own nodes. None of them manufactures an upstream dependency as a
+//! side effect of downstream work, and none reads another owner's payload.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -22,8 +23,7 @@ use crate::trible::Fragment;
 
 use super::operation_snapshot::OperationFrontier;
 use super::{
-    descriptor, Collection, CollectionData, CollectionEncoding, CollectionHandle,
-    CollectionMapping,
+    descriptor, Collection, CollectionData, CollectionEncoding, CollectionHandle, CollectionMapping,
 };
 #[cfg(test)]
 use super::{CanonicalDerivation, CollectionDerivation};
@@ -65,12 +65,10 @@ pub enum CollectionRealizationError {
         /// Concrete construction failure.
         reason: String,
     },
-    /// The target encoding could not join one deterministic LSM pair.
+    /// The target encoding could not join one group of own nodes.
     Merge {
-        /// Canonically lower input identity.
-        low: CollectionData,
-        /// Canonically higher input identity.
-        high: CollectionData,
+        /// The inputs of the join, ascending.
+        inputs: Vec<CollectionData>,
         /// Concrete construction failure.
         reason: String,
     },
@@ -80,13 +78,12 @@ pub enum CollectionRealizationError {
         /// Exact missing content identity.
         member: CollectionData,
     },
-    /// No resident physical source cover remains after deterministic capacity
-    /// failures exclude members which cannot be represented downstream.
-    UnrepresentableCover {
-        /// Capacity-terminal source members and their reasons.
+    /// Own source foundations the mapping cannot represent as leaves: its
+    /// capacity refused them, or their bytes or a dependency could not be
+    /// acquired. Everything else was derived and mirrored.
+    Unmappable {
+        /// Each foundation left without a leaf, and why.
         blocked: Vec<(CollectionData, String)>,
-        /// Foundational obligations left uncovered by usable source members.
-        missing: Vec<CollectionData>,
     },
     /// Publication made no observable progress.
     Stalled {
@@ -159,28 +156,26 @@ impl fmt::Display for CollectionRealizationError {
                 "derive source element {}: {reason}",
                 hex::encode_upper(input.raw),
             ),
-            Self::Merge { low, high, reason } => write!(
+            Self::Merge { inputs, reason } => write!(
                 formatter,
-                "merge target elements {} and {}: {reason}",
-                hex::encode_upper(low.raw),
-                hex::encode_upper(high.raw),
+                "join {} collection element(s) {}: {reason}",
+                inputs.len(),
+                name_some(inputs.iter().map(|m| hex::encode_upper(m.raw))),
             ),
             Self::MissingDependency { member } => write!(
                 formatter,
                 "mapping requires resident blob {}",
                 hex::encode_upper(member.raw),
             ),
-            Self::UnrepresentableCover { blocked, missing } => write!(
+            Self::Unmappable { blocked } => write!(
                 formatter,
-                "source support is unrepresentable ({} capacity-terminal member(s): {}; {} uncovered foundational member(s): {})",
+                "{} own source foundation(s) have no leaf the mapping can represent: {}",
                 blocked.len(),
                 name_some(
                     blocked
                         .iter()
                         .map(|(member, reason)| format!("{} ({reason})", hex::encode_upper(member.raw))),
                 ),
-                missing.len(),
-                name_some(missing.iter().map(|m| hex::encode_upper(m.raw))),
             ),
             Self::Stalled { cover } => write!(
                 formatter,
@@ -216,8 +211,9 @@ where
         })
 }
 
-/// Runtime descriptor ancestry from one `SimpleArchive` foundation to a
-/// typed target.
+/// Runtime descriptor ancestry from one `SimpleArchive` root to a typed
+/// target. Maintenance binds a mapping through it; nothing reads another
+/// collection's coverage through it.
 pub(super) struct Lineage {
     pub(super) foundation: Collection<SimpleArchive>,
     pub(super) descriptors: BTreeMap<CollectionHandle, Fragment>,
@@ -332,12 +328,8 @@ where
     Ok(load_lineage(snapshot, target)?.foundation)
 }
 
-/// Ensure one immediate mapping for invariant foundational support.
-///
-/// Existing equations throughout the ancestry are reused, but new work only
-/// maps resident immediate-source members and publishes target `DERIVE`
-/// records. A missing immediate-source cover is an error: downstream ensure
-/// never constructs upstream blobs.
+/// Derive the key's own missing leaves through one mapping, in one frozen
+/// operation, without acquisition.
 #[cfg(test)]
 fn ensure_resident_with<S, M>(
     store: &mut S,
@@ -348,9 +340,9 @@ where
     S: Store,
     M: CollectionMapping,
 {
-    let snapshot = store.snapshot().map_err(|error| {
-        CollectionRealizationError::storage("freeze mapping frontier", error)
-    })?;
+    let snapshot = store
+        .snapshot()
+        .map_err(|error| CollectionRealizationError::storage("freeze mapping frontier", error))?;
     let mut frontier = OperationFrontier::new(snapshot);
     ensure_resident_in_frontier_with::<S, M>(
         store,
@@ -385,11 +377,18 @@ where
     S: Store,
     M: CollectionMapping,
 {
-    super::maintenance::realize_images::<S, M>(store, target, signing_key, unavailable, frontier)
+    super::maintenance::maintain_derived::<S, M>(
+        store,
+        target,
+        signing_key,
+        unavailable,
+        frontier,
+        false,
+    )
 }
 
-/// Ensure one mapping and then carry its target lattice to the deterministic
-/// LSM fixed point.
+/// Derive the key's own missing leaves and mirror its own source merges
+/// through one mapping, in one frozen operation, without acquisition.
 #[cfg(test)]
 fn maintain_resident_with<S, M>(
     store: &mut S,
@@ -437,7 +436,14 @@ where
     S: Store,
     M: CollectionMapping,
 {
-    super::maintenance::maintain_images::<S, M>(store, target, signing_key, unavailable, frontier)
+    super::maintenance::maintain_derived::<S, M>(
+        store,
+        target,
+        signing_key,
+        unavailable,
+        frontier,
+        true,
+    )
 }
 
 pub(crate) async fn acquire_missing<S>(
@@ -533,9 +539,11 @@ where
     }
 }
 
-/// Make a root stand on every admitted commit, acquiring what is missing.
-/// This publishes nothing, so it needs no operation: every look is a fresh
-/// snapshot, and a commit admitted while it runs is simply seen.
+/// Make a root readable on every admitted commit, whoever wrote it,
+/// acquiring what is missing: what `ensure` on a root does. This publishes
+/// nothing, so it needs no operation: every look is a fresh snapshot, and a
+/// commit admitted while it runs is simply seen. Maintenance never waits on
+/// it: a root's carry reads only its maintainer's own nodes.
 pub(crate) async fn ensure_root<S>(
     store: &mut S,
     target: Collection<SimpleArchive>,
@@ -567,35 +575,6 @@ where
             return super::maintenance::root_incomplete(&snapshot, target);
         }
     }
-}
-
-/// A current target is reused as it is. Binding still checks the encoding
-/// and the mapping, but no immediate-source producer or capability
-/// definition is needed until new work remains.
-async fn prepare_mapping<S, M>(
-    store: &mut S,
-    target: Collection<M::Target>,
-) -> Result<bool, CollectionRealizationError>
-where
-    S: Store + AsyncBlobStoreAcquire,
-    M: CollectionMapping,
-{
-    let current = {
-        let snapshot = store.snapshot().map_err(|error| {
-            CollectionRealizationError::storage("observe target before acquisition", error)
-        })?;
-        match super::maintenance::images_current::<_, M>(&snapshot, target) {
-            Ok(current) => current,
-            // A missing descriptor can still be acquired through the ordinary
-            // active path. Semantic/type/mapping errors must not become misses.
-            Err(CollectionRealizationError::MissingDependency { .. }) => false,
-            Err(error) => return Err(error),
-        }
-    };
-    if !current {
-        acquire_authority(store, target).await?;
-    }
-    Ok(current)
 }
 
 /// Run one operation against a fresh control snapshot, acquiring what it
@@ -645,9 +624,6 @@ where
     S: Store + AsyncBlobStoreAcquire,
     M: CollectionMapping,
 {
-    if prepare_mapping::<S, M>(store, target).await? {
-        return Ok(());
-    }
     acquiring(store, |store, unavailable, frontier| {
         ensure_resident_in_frontier_with::<S, M>(store, target, signing_key, unavailable, frontier)
     })
@@ -663,11 +639,31 @@ where
     S: Store + AsyncBlobStoreAcquire,
     M: CollectionMapping,
 {
-    // Warm maintenance may still coarsen the target, but source-guided
-    // opportunities are optional and must use only already resident evidence.
-    prepare_mapping::<S, M>(store, target).await?;
     acquiring(store, |store, unavailable, frontier| {
-        maintain_resident_in_frontier_with::<S, M>(store, target, signing_key, unavailable, frontier)
+        maintain_resident_in_frontier_with::<S, M>(
+            store,
+            target,
+            signing_key,
+            unavailable,
+            frontier,
+        )
+    })
+    .await
+}
+
+/// Carry the key's own nodes of one root, acquiring an own node whose bytes
+/// are elsewhere. Nobody else's payload is asked for.
+pub(crate) async fn maintain_root_acquiring<S, E>(
+    store: &mut S,
+    target: Collection<E>,
+    signing_key: &SigningKey,
+) -> Result<(), CollectionRealizationError>
+where
+    S: Store + AsyncBlobStoreAcquire,
+    E: CollectionEncoding,
+{
+    acquiring(store, |store, unavailable, frontier| {
+        super::maintenance::carry_root(store, target, signing_key, unavailable, frontier)
     })
     .await
 }

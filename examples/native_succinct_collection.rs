@@ -72,7 +72,21 @@ fn main() {
     let archive = snapshot
         .collection(accelerated)
         .expect("observe Rank9-accelerated collection");
-    assert_eq!(archive.support().expect("resolve support"), &support);
+    // Supports are collection-local. Whether each view has caught up is asked
+    // hop by hop: every source foundation has a leaf in the view above it.
+    let source_view = snapshot.collection(collection).expect("observe source");
+    let raw_view = snapshot
+        .collection(raw)
+        .expect("observe raw Succinct collection");
+    assert_eq!(source_view.support().expect("resolve support"), &support);
+    assert!(raw_view
+        .missing_from(&source_view)
+        .expect("raw freshness")
+        .is_empty());
+    assert!(archive
+        .missing_from(&raw_view)
+        .expect("accelerated freshness")
+        .is_empty());
     let view: UnionArchive<OrderedUniverse> = archive.view().expect("reconstruct Succinct view");
     let mut names: Vec<String> = find!(
         name: Inline<_>,

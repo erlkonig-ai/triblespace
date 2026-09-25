@@ -11,12 +11,17 @@
 //! derived collection realizes it once, then, when the source has something
 //! to image; from then on every write's [`ensure_downstream`] finds it.
 //!
-//! [`ensure_downstream`] realizes every derived collection's missing images and
-//! publishes no merge; a write that calls it after its commit leaves the
-//! commit readable through every view, at the cost of that commit's own
-//! images. [`maintain_downstream`] carries each of them to its LSM fixed point
-//! as the daemon does. Neither decides what is cheap: the first call on a
-//! cold store may take as long as the backlog is, and says so by taking it.
+//! Maintenance is "derive what you wrote". [`ensure_downstream`] gives every
+//! derived collection a leaf for each source foundation the signer owns and
+//! the collection has none for yet, and publishes no merge; a write that
+//! calls it after its commit leaves the commit readable through every view,
+//! at the cost of one locator per own foundation and that commit's own
+//! images. [`maintain_downstream`] also mirrors the signer's own source
+//! merges into each of them, as the daemon does; a derived collection has no
+//! carry of its own. Both visit a collection after its source, which is what
+//! makes a source's mirrored merge result resident before the collection
+//! above it maps it. Neither decides what is cheap: the first call on a cold
+//! store may take as long as the backlog is, and says so by taking it.
 //! A representation this binary cannot map, or a descriptor naming a mapping
 //! other than the representation's canonical one, is named in the report
 //! rather than guessed at; a signer the target's policy does not admit is
@@ -42,10 +47,10 @@ use crate::trible::TribleSet;
 use super::api::{load_collection_descriptor, CollectionStoreExt};
 use super::encoding::CollectionDerivation;
 use super::exact_derived::CollectionRealizationError;
-use super::Collection;
 use super::latest::LatestBlob;
 use super::lww_register::LwwRegisterBlob;
 use super::reference_summary::ReferenceSummaryBlob;
+use super::Collection;
 use super::{descriptor, CollectionHandle};
 
 /// One collection derived, directly or through other derived collections,
@@ -119,10 +124,9 @@ where
 /// How far to take a derived collection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Upkeep {
-    /// Realize the images the target is missing for its source's resident
-    /// frontier; publish no merge.
+    /// Derive the signer's own missing leaves; publish no merge.
     Ensure,
-    /// Ensure, then carry the target to its LSM fixed point.
+    /// Ensure, then mirror the signer's own source merges.
     Maintain,
 }
 
@@ -175,9 +179,9 @@ where
     T: CollectionDerivation + MetaDescribe,
     Handle<T>: InlineEncoding,
 {
-    let snapshot = store
-        .snapshot()
-        .map_err(|error| CollectionRealizationError::storage("observe derived collection", error))?;
+    let snapshot = store.snapshot().map_err(|error| {
+        CollectionRealizationError::storage("observe derived collection", error)
+    })?;
     let collection: Collection<T> = Collection::open(&snapshot, derived.handle)
         .map_err(|error| CollectionRealizationError::storage("open derived descriptor", error))?;
     let target = load_collection_descriptor(&snapshot, derived.handle)
@@ -263,9 +267,9 @@ where
     S: Store + AsyncBlobStoreAcquire + Send,
     R: RealizeDerived<S>,
 {
-    let snapshot = store
-        .snapshot()
-        .map_err(|error| CollectionRealizationError::storage("observe derived collections", error))?;
+    let snapshot = store.snapshot().map_err(|error| {
+        CollectionRealizationError::storage("observe derived collections", error)
+    })?;
     let derived = derived_from(&snapshot, source)
         .map_err(|error| CollectionRealizationError::storage("list derived collections", error))?;
     drop(snapshot);
@@ -280,9 +284,10 @@ where
     Ok(report)
 }
 
-/// Realize the missing images of every collection derived from `source`, so
-/// that what `source` stands on is readable through each of them; publish no
-/// merge. A write calls this after its commit.
+/// Derive the signer's own missing leaves into every collection derived from
+/// `source`, each after its own source, so that what the signer wrote is
+/// readable through each of them; publish no merge. A write calls this after
+/// its commit.
 pub async fn ensure_downstream<S, R>(
     store: &mut S,
     source: CollectionHandle,
@@ -296,8 +301,9 @@ where
     upkeep_downstream(store, source, signer, Upkeep::Ensure, realizer).await
 }
 
-/// Carry every collection derived from `source` to its LSM fixed point, each
-/// after its own source. What the daemon does for its configured sources.
+/// Derive the signer's own leaves into every collection derived from
+/// `source` and mirror its own source merges there, each after its own
+/// source. What the daemon does for its configured sources.
 pub async fn maintain_downstream<S, R>(
     store: &mut S,
     source: CollectionHandle,

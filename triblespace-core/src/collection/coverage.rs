@@ -544,23 +544,32 @@ enum Awaiting {
     Proof(Inline<ED25519PublicKey>),
 }
 
-/// The joins that read one input, one entry per distinct join, keyed by
-/// [`edge_key`]. Every edge is collection-local: the consumer map's own key
-/// names the collection. Recording the k-th edge of a node costs one path,
-/// not a copy of the other k-1; a node read by many records is the common
-/// case in a lattice and used to make the fold quadratic in it.
-type Edges = PATCH<64, IdentitySchema, Attestation>;
+/// The joins that read one input, one key per distinct join: [`edge_key`],
+/// the join's result and the digest of its input set. Every edge is
+/// collection-local: the consumer map's own key names the collection. The
+/// join's inputs are not copied here; they live once in the index's joins
+/// table under `collection || edge key`. Recording the k-th edge of a node
+/// costs one path, not a copy of the other k-1, and not a copy of the join.
+type Edges = PATCH<64, IdentitySchema, ()>;
 /// Collection-scoped input handle to the joins that read it.
 type Consumers = PATCH<64, IdentitySchema, Edges>;
-/// The attestations held under one awaited thing, one entry each, keyed by
-/// [`parked_key`]; the same shape as [`Edges`], for the same reason.
-type Held = PATCH<160, IdentitySchema, Parked>;
+/// The attestations held under one awaited thing, one key each: a
+/// [`parked_key`] names the collection, the signer, the result, the kind and
+/// the locator or join digest, which is the whole attestation but a join's
+/// inputs, and those are in the joins table. The same shape as [`Edges`], for
+/// the same reason.
+type Held = PATCH<160, IdentitySchema, ()>;
 /// Attestations held until one named thing arrives, keyed by that thing.
 type Waiters = PATCH<32, IdentitySchema, Held>;
+/// `collection || result || join digest -> inputs`: every join the index has
+/// been handed, believed or parked, stored once. A MERGE carries a fixed
+/// 16-slot input array; copying it into every consumer edge and every
+/// parked entry made a k-input join cost k+1 copies of it.
+type Joins = PATCH<96, IdentitySchema, MergeInputs>;
 
 /// A fixed-width name for one join's input set: BLAKE3 over the inputs in
 /// order. Only an index key, so two joins with the same result and different
-/// inputs stay two entries; never a lookup target.
+/// inputs stay two entries; never a lookup target computed from outside.
 fn join_digest(inputs: &MergeInputs) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     for input in inputs.iter() {
@@ -580,32 +589,62 @@ fn edge_key(attestation: &Attestation) -> [u8; 64] {
     key
 }
 
+/// Where one join's inputs are kept: its collection, then its [`edge_key`].
+fn join_key(collection: CollectionHandle, edge: &[u8; 64]) -> [u8; 96] {
+    let mut key = [0u8; 96];
+    key[..32].copy_from_slice(&collection.raw);
+    key[32..].copy_from_slice(edge);
+    key
+}
+
+/// The kind byte of a [`parked_key`].
+const PARKED_FOUNDATION: u8 = 1;
+const PARKED_LEAF: u8 = 2;
+const PARKED_JOIN: u8 = 3;
+
 /// What identifies a parked attestation: the collection and signer that
 /// would believe it, its result, its kind, and what distinguishes it among
 /// attestations of that kind with the same result -- a leaf's locator or a
-/// join's input set.
+/// join's input set. Together with the joins table this is the whole entry,
+/// which is why a held entry is a key and nothing else.
 fn parked_key(entry: &Parked) -> [u8; 160] {
     let mut key = [0u8; 160];
     key[..32].copy_from_slice(&entry.collection.raw);
     key[32..64].copy_from_slice(&entry.signer.raw);
     key[64..96].copy_from_slice(&entry.attestation.result().raw);
     match &entry.attestation {
-        Attestation::Foundation { .. } => key[96] = 1,
+        Attestation::Foundation { .. } => key[96] = PARKED_FOUNDATION,
         Attestation::Leaf { locator, .. } => {
-            key[96] = 2;
+            key[96] = PARKED_LEAF;
             key[128..].copy_from_slice(locator.as_bytes());
         }
         Attestation::Join { inputs, .. } => {
-            key[96] = 3;
+            key[96] = PARKED_JOIN;
             key[128..].copy_from_slice(&join_digest(inputs));
         }
     }
     key
 }
 
-/// Every attestation held in one waiter map.
-fn held(held: &Held) -> impl Iterator<Item = Parked> + '_ {
-    held.iter_ordered().filter_map(|key| held.get(key).copied())
+fn segment(key: &[u8], at: usize) -> [u8; 32] {
+    key[at..at + 32]
+        .try_into()
+        .expect("a key segment is 32 bytes")
+}
+
+/// The collection a [`parked_key`] names.
+fn parked_collection(key: &[u8; 160]) -> CollectionHandle {
+    Inline::new(segment(key, 0))
+}
+
+/// The result a [`parked_key`] names.
+fn parked_result(key: &[u8; 160]) -> CollectionData {
+    Inline::new(segment(key, 64))
+}
+
+/// Every key held in one waiter map.
+fn held_keys(held: &Held) -> impl Iterator<Item = [u8; 160]> + '_ {
+    held.iter_ordered().copied()
 }
 
 /// Downward coverage for every lattice node a store has admitted.
@@ -633,24 +672,30 @@ pub struct CoverageIndex {
     /// distinct from `pending`, whose entries have already been decided
     /// against and are waiting on a *named* arrival.
     fresh: Waiters,
+    /// Every join handed to the index, believed or parked, once: what an
+    /// edge or a held key names by its result and input digest.
+    joins: Joins,
 }
 
-/// How many attestations a waiter map holds.
-/// Count the parked attestations of one collection in a waiter map.
+/// The keys of one collection's parked attestations in a waiter map.
 ///
 /// The map is keyed by the awaited evidence rather than by collection, because
 /// that is what lets a drain cost the events that happened rather than the size
 /// of the backlog. So a per-collection question is a scan of the backlog, which
 /// is the right trade for a view: the backlog is small in the steady state, and
 /// re-keying it to make this cheaper would make the drain expensive instead.
-fn parked_in(waiters: &Waiters, collection: CollectionHandle) -> impl Iterator<Item = Parked> + '_ {
+fn parked_in(
+    waiters: &Waiters,
+    collection: CollectionHandle,
+) -> impl Iterator<Item = [u8; 160]> + '_ {
     waiters
         .iter_ordered()
         .filter_map(|key| waiters.get(key))
-        .flat_map(held)
-        .filter(move |parked| parked.collection == collection)
+        .flat_map(held_keys)
+        .filter(move |key| parked_collection(key) == collection)
 }
 
+/// How many attestations a waiter map holds.
 fn waiting(waiters: &Waiters) -> usize {
     waiters
         .iter_ordered()
@@ -658,11 +703,11 @@ fn waiting(waiters: &Waiters) -> usize {
         .sum()
 }
 
-/// Move every attestation out of a waiter map.
-fn drain(waiters: Waiters, into: &mut Vec<Parked>) {
+/// Move every held key out of a waiter map.
+fn drain(waiters: Waiters, into: &mut Vec<[u8; 160]>) {
     for key in waiters.iter_ordered() {
         if let Some(entries) = waiters.get(key) {
-            into.extend(held(entries));
+            into.extend(held_keys(entries));
         }
     }
 }
@@ -671,6 +716,89 @@ impl CoverageIndex {
     /// An index covering nothing.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Keep a join's inputs, once, where its edges and parked keys find
+    /// them. Idempotent: `insert` keeps an existing entry.
+    fn remember_join(&mut self, collection: CollectionHandle, attestation: &Attestation) {
+        if let Attestation::Join { inputs, .. } = attestation {
+            self.joins.insert(&Entry::with_value(
+                &join_key(collection, &edge_key(attestation)),
+                *inputs,
+            ));
+        }
+    }
+
+    /// The join one edge of `collection` names, read back from the joins
+    /// table.
+    fn edge_join(&self, collection: CollectionHandle, edge: &[u8; 64]) -> Option<Attestation> {
+        let inputs = *self.joins.get(&join_key(collection, edge))?;
+        Some(Attestation::Join {
+            inputs,
+            result: Inline::new(segment(edge, 0)),
+        })
+    }
+
+    /// The whole parked entry a held key stands for.
+    fn parked_entry(&self, key: &[u8; 160]) -> Option<Parked> {
+        let collection = parked_collection(key);
+        let result = parked_result(key);
+        let attestation = match key[96] {
+            PARKED_FOUNDATION => Attestation::Foundation { data: result },
+            PARKED_LEAF => Attestation::Leaf {
+                locator: SourceLocator::from_raw(segment(key, 128)),
+                output: result,
+            },
+            PARKED_JOIN => {
+                let mut edge = [0u8; 64];
+                edge[..32].copy_from_slice(&result.raw);
+                edge[32..].copy_from_slice(&key[128..]);
+                self.edge_join(collection, &edge)?
+            }
+            _ => return None,
+        };
+        Some(Parked {
+            collection,
+            attestation,
+            signer: Inline::new(segment(key, 32)),
+        })
+    }
+
+    /// The whole parked entries a list of held keys stands for.
+    fn parked_entries(&self, keys: Vec<[u8; 160]>) -> Vec<Parked> {
+        keys.iter()
+            .filter_map(|key| self.parked_entry(key))
+            .collect()
+    }
+
+    /// The believed joins of `collection` that read `node`, each as its
+    /// input set and result, ascending by result.
+    ///
+    /// This is the consumer side of the MERGE relation, read by its own key:
+    /// what a maintainer asks to find whether a join of exactly these nodes
+    /// is already believed, without computing anything to look it up.
+    pub fn joins_reading(
+        &self,
+        collection: CollectionHandle,
+        node: CollectionData,
+    ) -> Vec<(MergeInputs, CollectionData)> {
+        let Some(edges) = self.consumers.get(&row_key(collection, node)) else {
+            return Vec::new();
+        };
+        edges
+            .iter_ordered()
+            .filter_map(|edge| match self.edge_join(collection, edge)? {
+                Attestation::Join { inputs, result } => Some((inputs, result)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// How many distinct joins the index keeps inputs for, believed or
+    /// parked: one entry per join, whatever its arity or the number of its
+    /// edges and parked copies.
+    pub fn stored_joins(&self) -> usize {
+        self.joins.len().min(usize::MAX as u64) as usize
     }
 
     /// The foundations this node covers, if any admitted record has attested
@@ -773,7 +901,7 @@ impl CoverageIndex {
     /// counts waiting attestations, the other names waiting members.
     pub fn unadmitted_nodes_in(&self, collection: CollectionHandle) -> BTreeSet<CollectionData> {
         parked_in(&self.awaiting_proof, collection)
-            .map(|parked| parked.attestation.result())
+            .map(|key| parked_result(&key))
             .collect()
     }
 
@@ -815,6 +943,7 @@ impl CoverageIndex {
         signer: Inline<ED25519PublicKey>,
         admission: &A,
     ) {
+        self.remember_join(collection, &attestation);
         self.decide(
             Parked {
                 collection,
@@ -884,9 +1013,11 @@ impl CoverageIndex {
         // The inner map is a persistent root: cloning it is constant time,
         // and `insert` keeps an existing entry, so the same attestation parked
         // twice is held once. `replace` on the outer map, because `insert`
-        // would keep the old inner map.
+        // would keep the old inner map. A join's inputs are already in the
+        // joins table: every attestation reaches here through `attest` or
+        // `park`, which put them there.
         let mut entries = waiters.get(&key).cloned().unwrap_or_default();
-        entries.insert(&Entry::with_value(&parked_key(&entry), entry));
+        entries.insert(&Entry::new(&parked_key(&entry)));
         waiters.replace(&Entry::with_value(&key, entries));
     }
 
@@ -910,10 +1041,11 @@ impl CoverageIndex {
             attestation,
             signer,
         };
+        self.remember_join(collection, &attestation);
         // Keyed by the collection it names, so a reader can decide one
         // collection's records and leave every other collection's parked.
         let mut held = self.fresh.get(&collection.raw).cloned().unwrap_or_default();
-        held.insert(&Entry::with_value(&parked_key(&entry), entry));
+        held.insert(&Entry::new(&parked_key(&entry)));
         self.fresh
             .replace(&Entry::with_value(&collection.raw, held));
     }
@@ -962,18 +1094,18 @@ impl CoverageIndex {
         arrivals: impl IntoIterator<Item = CollectionHandle>,
         proofs_arrived: bool,
     ) {
-        let mut woken: Vec<Parked> = Vec::new();
+        let mut woken = Vec::new();
         drain(std::mem::take(&mut self.fresh), &mut woken);
         for handle in arrivals {
             if let Some(entries) = self.awaiting_lineage.get(&handle.raw).cloned() {
                 self.awaiting_lineage.remove(&handle.raw);
-                woken.extend(held(&entries));
+                woken.extend(held_keys(&entries));
             }
         }
         if proofs_arrived {
             drain(std::mem::take(&mut self.awaiting_proof), &mut woken);
         }
-        for entry in woken {
+        for entry in self.parked_entries(woken) {
             self.decide(entry, admission);
         }
     }
@@ -986,7 +1118,7 @@ impl CoverageIndex {
             return;
         };
         self.awaiting_lineage.remove(&descriptor.raw);
-        for entry in held(&entries) {
+        for entry in self.parked_entries(held_keys(&entries).collect()) {
             self.park(entry.collection, entry.attestation, entry.signer);
         }
     }
@@ -997,7 +1129,7 @@ impl CoverageIndex {
     pub fn wake_proofs(&mut self) {
         let mut woken = Vec::new();
         drain(std::mem::take(&mut self.awaiting_proof), &mut woken);
-        for entry in woken {
+        for entry in self.parked_entries(woken) {
             self.park(entry.collection, entry.attestation, entry.signer);
         }
     }
@@ -1016,10 +1148,10 @@ impl CoverageIndex {
         for collection in collections {
             if let Some(entries) = self.fresh.get(&collection.raw).cloned() {
                 self.fresh.remove(&collection.raw);
-                woken.extend(held(&entries));
+                woken.extend(held_keys(&entries));
             }
         }
-        for entry in woken {
+        for entry in self.parked_entries(woken) {
             self.decide(entry, admission);
         }
     }
@@ -1030,11 +1162,11 @@ impl CoverageIndex {
     /// arrived. Correct but coarse: prefer [`Self::settle`] where the arrivals
     /// are observable.
     pub fn resolve<A: RecordAdmission>(&mut self, admission: &A) {
-        let mut woken: Vec<Parked> = Vec::new();
+        let mut woken = Vec::new();
         drain(std::mem::take(&mut self.fresh), &mut woken);
         drain(std::mem::take(&mut self.awaiting_lineage), &mut woken);
         drain(std::mem::take(&mut self.awaiting_proof), &mut woken);
-        for entry in woken {
+        for entry in self.parked_entries(woken) {
             self.decide(entry, admission);
         }
     }
@@ -1065,7 +1197,7 @@ impl CoverageIndex {
         for input in attestation.inputs() {
             let key = row_key(collection, *input);
             let mut edges = self.consumers.get(&key).cloned().unwrap_or_default();
-            edges.insert(&Entry::with_value(&edge_key(&attestation), attestation));
+            edges.insert(&Entry::new(&edge_key(&attestation)));
             self.consumers.replace(&Entry::with_value(&key, edges));
         }
         let mut grown = Vec::new();
@@ -1080,8 +1212,8 @@ impl CoverageIndex {
             let Some(edges) = self.consumers.get(&row_key(collection, node)).cloned() else {
                 continue;
             };
-            for key in edges.iter_ordered() {
-                let Some(&consumer) = edges.get(key) else {
+            for edge in edges.iter_ordered() {
+                let Some(consumer) = self.edge_join(collection, edge) else {
                     continue;
                 };
                 if self.drive(collection, consumer) == Driven::Grew {
@@ -1224,16 +1356,16 @@ impl CoverageIndex {
         };
         edges
             .iter_ordered()
-            .filter_map(|key| edges.get(key))
+            .filter_map(|edge| self.edge_join(collection, edge))
             .any(|consumer| {
                 let Attestation::Join { inputs, result } = consumer else {
                     return false;
                 };
-                *result != node
+                result != node
                     && self
                         .published
                         .rows
-                        .get(&row_key(collection, *result))
+                        .get(&row_key(collection, result))
                         .is_some()
                     && inputs.iter().filter(|input| *input != node).all(|input| {
                         self.published

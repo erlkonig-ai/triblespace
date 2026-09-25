@@ -785,7 +785,7 @@ fn two_hops_reuse_one_invariant_foundational_support() {
     let snapshot = store.snapshot().unwrap();
     let attached = snapshot.collection(second).unwrap();
     let (observed_support, cover) = (
-        attached.support().unwrap().clone(),
+        crate::collection::test_support::stood_for(&attached),
         attached.cover().clone(),
     );
 
@@ -823,7 +823,10 @@ fn ordinary_attachment_reports_only_support_realized_in_its_snapshot() {
 
     let snapshot = store.snapshot().unwrap();
     let observed = super::super::observation::attach(&snapshot, first).unwrap();
-    assert_eq!(*observed.support().unwrap(), left_support);
+    assert_eq!(
+        crate::collection::test_support::stood_for(&observed),
+        left_support
+    );
     assert_eq!(observed.cover().len(), 1);
 }
 
@@ -930,8 +933,8 @@ fn ordinary_derived_ensure_leaves_cold_source_records_for_explicit_root_acquisit
     let snapshot = block_on(store.ensure(first, &equation_signer())).unwrap();
     let observed = snapshot.collection(first).unwrap();
     assert_eq!(
-        observed.support().unwrap(),
-        &support(root, &[source, concurrent])
+        crate::collection::test_support::stood_for(&observed),
+        support(root, &[source, concurrent])
     );
     assert_eq!(observed.cover().len(), 2);
     assert_eq!(snapshot.wants().unwrap().count(), 0);
@@ -967,7 +970,10 @@ fn exact_ensure_fetches_a_known_derive_output_without_recomputing() {
     );
     assert_eq!(snapshot.wants().unwrap().count(), 0);
     let observed = snapshot.collection(first).unwrap();
-    assert_eq!(observed.support().unwrap(), &support);
+    assert_eq!(
+        crate::collection::test_support::stood_for(&observed),
+        support
+    );
     assert_eq!(
         observed.cover().data_members().collect::<Vec<_>>(),
         vec![output_data],
@@ -1006,8 +1012,8 @@ fn ensure_reuses_a_resident_image_without_mapping() {
     let requested = support(root, &[a, b.clone()]);
     let before = inner.snapshot().unwrap();
     assert_eq!(
-        before.collection(first).unwrap().support().unwrap(),
-        &requested,
+        crate::collection::test_support::stood_for(&before.collection(first).unwrap()),
+        requested,
     );
     drop(before);
 
@@ -1020,7 +1026,10 @@ fn ensure_reuses_a_resident_image_without_mapping() {
     assert_eq!(SECOND_JOIN_CALLS.get(), 0);
     assert!(store.acquired.is_empty());
     let selected = after.collection(first).unwrap();
-    assert_eq!(selected.support().unwrap(), &requested);
+    assert_eq!(
+        crate::collection::test_support::stood_for(&selected),
+        requested
+    );
     assert_eq!(
         selected.cover().data_members().collect::<Vec<_>>(),
         vec![data(&output)],
@@ -1106,7 +1115,7 @@ fn exact_maintenance_recovers_a_pending_derive_with_a_missing_output() {
         .is_some());
     let attached = snapshot.collection(first).unwrap();
     let (observed, cover) = (
-        attached.support().unwrap().clone(),
+        crate::collection::test_support::stood_for(&attached),
         attached.cover().clone(),
     );
     assert_eq!(observed, support);
@@ -2008,8 +2017,8 @@ fn new_work_still_requires_the_immediate_source_grant_definition() {
         if available_definition {
             let after = result.unwrap();
             assert_eq!(
-                after.collection(target).unwrap().support().unwrap(),
-                &selected
+                crate::collection::test_support::stood_for(&after.collection(target).unwrap()),
+                selected
             );
             assert_eq!(SECOND_MAP_CALLS.get(), 1);
         } else {
@@ -2527,7 +2536,10 @@ fn target_maintenance_reendorses_a_resident_upper_without_joining_again() {
     assert_eq!(x.bytes.len().ilog2(), z.bytes.len().ilog2());
     let before = inner.snapshot().unwrap();
     let selected = before.collection(second).unwrap();
-    assert_eq!(selected.support().unwrap(), &requested);
+    assert_eq!(
+        crate::collection::test_support::stood_for(&selected),
+        requested
+    );
     // z = join(x, y) covers {a, b, c} outright, so x is already beneath it
     // and nothing needs a second endorsement to say so.
     assert_eq!(
@@ -2546,7 +2558,10 @@ fn target_maintenance_reendorses_a_resident_upper_without_joining_again() {
     assert_eq!(SECOND_JOIN_CALLS.get(), 0);
     assert!(store.acquired.is_empty());
     let selected = after.collection(second).unwrap();
-    assert_eq!(selected.support().unwrap(), &requested);
+    assert_eq!(
+        crate::collection::test_support::stood_for(&selected),
+        requested
+    );
     assert_eq!(
         selected.cover().data_members().collect::<Vec<_>>(),
         vec![data(&z)],
@@ -2745,3 +2760,517 @@ fn equal_payload_commit_does_not_restart_completed_target_maintenance() {
 //   "another lineage must not answer from the previous lineage's memo"
 //       -> cannot arise: nothing memoizes support to become stale, and
 //          coverage rows are keyed by collection rather than by a walk.
+
+/// Lattice v2: per-owner root carries, "derive what you wrote", aligned
+/// merges and freshness.
+mod lattice_v2 {
+    use super::*;
+
+    use crate::blob::encodings::entity_id_set::{EntityIdSet, EntityIdSetBlob};
+    use crate::blob::encodings::succinctarchive::{
+        OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
+    };
+    use crate::collection::{
+        maintain_downstream, simplearchive_union, CollectionHandle, CoreRealizer, CoverageRead,
+        SourceLocator, MERGE_FAN_IN,
+    };
+
+    fn key(byte: u8) -> SigningKey {
+        SigningKey::from_bytes(&[byte; 32])
+    }
+
+    fn public(byte: u8) -> Inline<crate::inline::encodings::ed25519::ED25519PublicKey> {
+        Inline::new(key(byte).verifying_key().to_bytes())
+    }
+
+    /// The payload `signer` commits as its `entity`-th member: distinct per
+    /// signer and entity.
+    fn payload(signer: u8, entity: u8) -> Blob<SimpleArchive> {
+        // Entity byte zero would be the nil id.
+        archive(entity + 1, signer)
+    }
+
+    /// Commit a resident payload into `root`, signed by `signer`.
+    fn own_commit(
+        store: &mut MemoryRepo,
+        root: Collection<SimpleArchive>,
+        signer: u8,
+        entity: u8,
+    ) -> CollectionData {
+        publish_root(store, root, &payload(signer, entity), signer).data()
+    }
+
+    /// Only the signed record of `signer`'s commit arrives; its payload stays
+    /// elsewhere.
+    fn foreign_commit(
+        store: &mut MemoryRepo,
+        root: Collection<SimpleArchive>,
+        signer: u8,
+        entity: u8,
+    ) -> CollectionData {
+        let metadata = store
+            .put::<SimpleArchive, _>(TribleSet::new().to_blob())
+            .unwrap();
+        let data = data(&payload(signer, entity));
+        store
+            .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                &key(signer),
+                root.handle(),
+                data,
+                metadata,
+            )))
+            .unwrap();
+        data
+    }
+
+    fn merges_in(store: &mut MemoryRepo, collection: CollectionHandle) -> Vec<CollectionMerge> {
+        records(store)
+            .into_iter()
+            .filter_map(|record| match record {
+                CollectionRecord::Merge(merge) if merge.collection() == collection => Some(merge),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn derives_in(store: &mut MemoryRepo, collection: CollectionHandle) -> Vec<CollectionDerive> {
+        records(store)
+            .into_iter()
+            .filter_map(|record| match record {
+                CollectionRecord::Derive(derive) if derive.collection() == collection => {
+                    Some(derive)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn frontier(store: &mut MemoryRepo, collection: CollectionHandle) -> BTreeSet<CollectionData> {
+        let snapshot = store.snapshot().unwrap();
+        let coverage = CoverageRead::coverage(&snapshot, &BTreeSet::from([collection])).unwrap();
+        coverage.frontier(collection).collect()
+    }
+
+    fn inputs(merge: &CollectionMerge) -> BTreeSet<CollectionData> {
+        merge.inputs().iter().copied().collect()
+    }
+
+    fn first_image(source: &Blob<SimpleArchive>) -> CollectionData {
+        let mut bytes = source.bytes.as_ref().to_vec();
+        bytes.push(0xA5);
+        data(&Blob::<FirstEncoding>::new(bytes.into()))
+    }
+
+    #[test]
+    fn seven_own_nodes_stay_and_the_eighth_makes_one_eight_input_merge() {
+        let (mut store, root, _, _) = collections();
+        let owner = key(41);
+        for entity in 0..7 {
+            own_commit(&mut store, root, 41, entity);
+        }
+        block_on(store.maintain(root, &owner)).unwrap();
+        assert!(merges_in(&mut store, root.handle()).is_empty());
+        assert_eq!(frontier(&mut store, root.handle()).len(), 7);
+
+        own_commit(&mut store, root, 41, 7);
+        block_on(store.maintain(root, &owner)).unwrap();
+        let merges = merges_in(&mut store, root.handle());
+        assert_eq!(merges.len(), 1);
+        assert_eq!(merges[0].inputs().len(), MERGE_FAN_IN);
+        let payloads: Vec<_> = (0..8).map(|entity| payload(41, entity)).collect();
+        assert_eq!(inputs(&merges[0]), payloads.iter().map(data).collect());
+        let union = simplearchive_union::join_all(&payloads).unwrap();
+        assert_eq!(merges[0].result(), data(&union));
+        let snapshot = store.snapshot().unwrap();
+        assert!(snapshot
+            .metadata(Handle::<SimpleArchive>::from_hash(merges[0].result()))
+            .unwrap()
+            .is_some());
+        drop(snapshot);
+        assert_eq!(
+            frontier(&mut store, root.handle()),
+            BTreeSet::from([merges[0].result()])
+        );
+
+        let before = records(&mut store).len();
+        block_on(store.maintain(root, &owner)).unwrap();
+        assert_eq!(records(&mut store).len(), before);
+    }
+
+    #[test]
+    fn two_owners_carry_two_trees_that_never_merge_each_others_nodes() {
+        let (mut store, root, _, _) = collections();
+        let a = key(41);
+        let b = key(42);
+        let mut own_a: BTreeSet<_> = (0..4)
+            .map(|entity| own_commit(&mut store, root, 41, entity))
+            .collect();
+        // B's payloads are elsewhere: A's carry neither reads nor waits
+        // for them.
+        let mut own_b: BTreeSet<_> = (0..4)
+            .map(|entity| foreign_commit(&mut store, root, 42, entity))
+            .collect();
+        // Eight nodes share tier 0, but neither owner holds eight.
+        block_on(store.maintain(root, &a)).unwrap();
+        assert!(merges_in(&mut store, root.handle()).is_empty());
+
+        own_a.extend((4..8).map(|entity| own_commit(&mut store, root, 41, entity)));
+        block_on(store.maintain(root, &a)).unwrap();
+        let merges = merges_in(&mut store, root.handle());
+        assert_eq!(merges.len(), 1);
+        assert_eq!(merges[0].public_key(), public(41));
+        assert_eq!(inputs(&merges[0]), own_a);
+        let tree_a = merges[0].result();
+        assert_eq!(
+            frontier(&mut store, root.handle()),
+            own_b.iter().copied().chain([tree_a]).collect()
+        );
+
+        // B's payloads land and B writes four more: B's own carry takes
+        // exactly B's eight, and A's tree stays A's.
+        for entity in 0..4 {
+            store.put::<SimpleArchive, _>(payload(42, entity)).unwrap();
+        }
+        own_b.extend((4..8).map(|entity| own_commit(&mut store, root, 42, entity)));
+        block_on(store.maintain(root, &b)).unwrap();
+        let merges = merges_in(&mut store, root.handle());
+        assert_eq!(merges.len(), 2);
+        let tree_b = merges
+            .iter()
+            .find(|merge| merge.public_key() == public(42))
+            .expect("B carried its own nodes");
+        assert_eq!(inputs(tree_b), own_b);
+        assert_eq!(
+            frontier(&mut store, root.handle()),
+            BTreeSet::from([tree_a, tree_b.result()])
+        );
+
+        // Two tier-1 nodes, one per owner: neither maintainer touches the
+        // other's.
+        let before = records(&mut store).len();
+        block_on(store.maintain(root, &a)).unwrap();
+        block_on(store.maintain(root, &b)).unwrap();
+        assert_eq!(records(&mut store).len(), before);
+    }
+
+    #[test]
+    fn an_own_node_inside_another_own_node_is_absorbed_and_a_foreign_one_is_not() {
+        let (mut store, root, _, _) = collections();
+        let owner = key(41);
+        let commits: Vec<_> = (0..8)
+            .map(|entity| own_commit(&mut store, root, 41, entity))
+            .collect();
+        block_on(store.maintain(root, &owner)).unwrap();
+        let wide = merges_in(&mut store, root.handle())[0].result();
+
+        // The same key grouped two members again elsewhere: an own node
+        // inside the wide one.
+        let narrow = simplearchive_union::join(&payload(41, 0), &payload(41, 1)).unwrap();
+        let narrow =
+            Handle::<SimpleArchive>::to_hash(store.put::<SimpleArchive, _>(narrow).unwrap());
+        store
+            .insert(CollectionRecord::Merge(
+                CollectionMerge::sign(&owner, root.handle(), [commits[0], commits[1]], narrow)
+                    .unwrap(),
+            ))
+            .unwrap();
+        // Someone else's node inside it too.
+        let foreign = simplearchive_union::join(&payload(41, 2), &payload(41, 3)).unwrap();
+        let foreign =
+            Handle::<SimpleArchive>::to_hash(store.put::<SimpleArchive, _>(foreign).unwrap());
+        store
+            .insert(CollectionRecord::Merge(
+                CollectionMerge::sign(&key(42), root.handle(), [commits[2], commits[3]], foreign)
+                    .unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(
+            frontier(&mut store, root.handle()),
+            BTreeSet::from([wide, narrow, foreign])
+        );
+
+        block_on(store.maintain(root, &owner)).unwrap();
+        let merges = merges_in(&mut store, root.handle());
+        let absorbed: Vec<_> = merges
+            .iter()
+            .filter(|merge| merge.public_key() == public(41) && merge.result() == wide)
+            .filter(|merge| merge.inputs().len() == 2)
+            .collect();
+        assert_eq!(absorbed.len(), 1);
+        assert_eq!(inputs(absorbed[0]), BTreeSet::from([narrow, wide]));
+        assert!(merges
+            .iter()
+            .all(|merge| merge.public_key() != public(41) || !merge.inputs().contains(&foreign)));
+        assert_eq!(
+            frontier(&mut store, root.handle()),
+            BTreeSet::from([wide, foreign])
+        );
+    }
+
+    #[test]
+    fn a_view_derives_only_its_maintainers_own_leaves_and_freshness_names_the_rest() {
+        let (mut store, root, first, _) = collections();
+        let a1 = own_commit(&mut store, root, 41, 1);
+        let a2 = own_commit(&mut store, root, 41, 2);
+        let b1 = own_commit(&mut store, root, 42, 1);
+        let missing = |store: &mut MemoryRepo| -> BTreeSet<CollectionData> {
+            let snapshot = store.snapshot().unwrap();
+            let view = snapshot.collection(first).unwrap();
+            let source = snapshot.collection(root).unwrap();
+            view.missing_from(&source).unwrap().data_members().collect()
+        };
+        assert_eq!(missing(&mut store), BTreeSet::from([a1, a2, b1]));
+
+        block_on(store.ensure(first, &key(41))).unwrap();
+        let leaves = derives_in(&mut store, first.handle());
+        assert_eq!(leaves.len(), 2);
+        assert!(leaves.iter().all(|leaf| leaf.public_key() == public(41)));
+        assert_eq!(
+            leaves
+                .iter()
+                .map(|leaf| leaf.input())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([SourceLocator::of(a1.raw), SourceLocator::of(a2.raw)])
+        );
+        assert!(leaves
+            .iter()
+            .any(|leaf| leaf.output() == first_image(&payload(41, 1))));
+        assert_eq!(missing(&mut store), BTreeSet::from([b1]));
+        // A second pass has nothing left of its own to derive.
+        let before = records(&mut store).len();
+        block_on(store.ensure(first, &key(41))).unwrap();
+        assert_eq!(records(&mut store).len(), before);
+
+        block_on(store.ensure(first, &key(42))).unwrap();
+        assert!(missing(&mut store).is_empty());
+        let leaves = derives_in(&mut store, first.handle());
+        assert_eq!(leaves.len(), 3);
+        assert!(leaves.iter().any(
+            |leaf| leaf.public_key() == public(42) && leaf.input() == SourceLocator::of(b1.raw)
+        ));
+
+        // Freshness is asked of the view's own source, nothing else.
+        let other = store.collection("unrelated", policy()).unwrap();
+        publish_root(&mut store, other, &archive(9, 9), 41);
+        let snapshot = store.snapshot().unwrap();
+        let view = snapshot.collection(first).unwrap();
+        let unrelated = snapshot.collection(other).unwrap();
+        assert!(matches!(
+            view.missing_from(&unrelated),
+            Err(CollectionRealizationError::InvalidCover(_))
+        ));
+    }
+
+    #[test]
+    fn a_view_publishes_an_empty_image_as_a_leaf() {
+        let id = |byte: u8| Id::new([byte; 16]).unwrap();
+        let owner = key(41);
+        let mut store = MemoryRepo::default();
+        let root = store.collection("receipts", policy()).unwrap();
+        let ids = store
+            .derive::<EntityIdSetBlob>(root, crate::metadata::supersedes.id(), policy())
+            .unwrap();
+        let receipt = id(31);
+        store
+            .commit(
+                root,
+                &owner,
+                crate::macros::entity! { ExclusiveId::force_ref(&receipt) @
+                    crate::metadata::supersedes: id(1),
+                },
+            )
+            .unwrap();
+        let unrelated = store
+            .commit(
+                root,
+                &owner,
+                crate::macros::entity! { crate::metadata::name: "nothing superseded" },
+            )
+            .unwrap();
+        block_on(store.ensure(ids, &owner)).unwrap();
+
+        let leaves = derives_in(&mut store, ids.handle());
+        assert_eq!(leaves.len(), 2);
+        let snapshot = store.snapshot().unwrap();
+        let empty = <EntityIdSetBlob as CollectionDerivation>::map(
+            &crate::metadata::supersedes.id(),
+            &TribleSet::new().to_blob(),
+            &snapshot,
+        )
+        .unwrap();
+        let leaf = leaves
+            .iter()
+            .find(|leaf| leaf.input() == SourceLocator::of(unrelated.data().raw))
+            .expect("the unrelated commit has its leaf");
+        assert_eq!(leaf.output(), data(&empty));
+        let view = snapshot.collection(ids).unwrap();
+        let source = snapshot.collection(root).unwrap();
+        assert!(view.missing_from(&source).unwrap().is_empty());
+        assert_eq!(view.support().unwrap().len(), 2);
+        assert_eq!(
+            view.view::<EntityIdSet>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            [id(1)]
+        );
+    }
+
+    #[test]
+    fn an_own_source_merge_is_mirrored_exactly_once_across_passes() {
+        reset_mapping_calls();
+        let (mut store, root, first, _) = collections();
+        let owner = key(41);
+        for entity in 0..8 {
+            own_commit(&mut store, root, 41, entity);
+        }
+        block_on(store.maintain(root, &owner)).unwrap();
+        let merged = merges_in(&mut store, root.handle())[0].result();
+
+        block_on(store.maintain(first, &owner)).unwrap();
+        let leaves = derives_in(&mut store, first.handle());
+        assert_eq!(leaves.len(), 8);
+        let mirrors = merges_in(&mut store, first.handle());
+        assert_eq!(mirrors.len(), 1);
+        assert_eq!(
+            inputs(&mirrors[0]),
+            leaves.iter().map(|leaf| leaf.output()).collect()
+        );
+        // f(R) is R's own bytes mapped, not a join of the images.
+        let snapshot = store.snapshot().unwrap();
+        let merged_blob: Blob<SimpleArchive> = snapshot
+            .get(Handle::<SimpleArchive>::from_hash(merged))
+            .unwrap();
+        drop(snapshot);
+        assert_eq!(mirrors[0].result(), first_image(&merged_blob));
+        assert_eq!(FIRST_MAP_CALLS.get(), 9);
+        assert_eq!(
+            frontier(&mut store, first.handle()),
+            BTreeSet::from([mirrors[0].result()])
+        );
+
+        reset_mapping_calls();
+        let before = records(&mut store).len();
+        block_on(store.maintain(first, &owner)).unwrap();
+        assert_eq!(records(&mut store).len(), before);
+        assert_eq!(FIRST_MAP_CALLS.get(), 0);
+    }
+
+    #[test]
+    fn a_merge_the_mapping_declines_is_not_mirrored_nor_is_anything_above_it() {
+        reset_mapping_calls();
+        let (mut store, root, first, _) = collections();
+        let owner = key(41);
+        for entity in 0..64 {
+            own_commit(&mut store, root, 41, entity);
+        }
+        // 64 own nodes carry through two tiers: eight merges of eight, then
+        // one merge of those eight.
+        block_on(store.maintain(root, &owner)).unwrap();
+        let root_merges = merges_in(&mut store, root.handle());
+        assert_eq!(root_merges.len(), 9);
+        let top = root_merges
+            .iter()
+            .find(|merge| {
+                merge.inputs().len() == MERGE_FAN_IN && {
+                    let snapshot = store.snapshot().unwrap();
+                    let coverage =
+                        CoverageRead::coverage(&snapshot, &BTreeSet::from([root.handle()]))
+                            .unwrap();
+                    coverage.of(root.handle(), merge.result()).unwrap().len() == 64
+                }
+            })
+            .expect("one merge stands for all 64")
+            .result();
+        assert_eq!(frontier(&mut store, root.handle()), BTreeSet::from([top]));
+        let declined = root_merges
+            .iter()
+            .filter(|merge| merge.result() != top)
+            .map(|merge| merge.result())
+            .min()
+            .unwrap();
+        FIRST_MAP_CAPACITY.replace(Some(declined));
+
+        block_on(store.maintain(first, &owner)).unwrap();
+        assert_eq!(derives_in(&mut store, first.handle()).len(), 64);
+        // The seven other tier-1 merges are mirrored; the declined one and
+        // the top merge that needs it are not, and the declined node's eight
+        // children stay on the target frontier.
+        assert_eq!(merges_in(&mut store, first.handle()).len(), 7);
+        assert_eq!(frontier(&mut store, first.handle()).len(), 8 + 7);
+
+        reset_mapping_calls();
+        block_on(store.maintain(first, &owner)).unwrap();
+        assert_eq!(merges_in(&mut store, first.handle()).len(), 9);
+        // Only the declined node and the top were mapped this time.
+        assert_eq!(FIRST_MAP_CALLS.get(), 2);
+        assert_eq!(frontier(&mut store, first.handle()).len(), 1);
+    }
+
+    #[test]
+    fn a_chain_is_maintained_upstream_first_in_one_pass() {
+        let owner = key(41);
+        let mut store = MemoryRepo::default();
+        let root = store.collection("facts", policy()).unwrap();
+        let raw = store
+            .derive::<SuccinctArchiveBlob>(root, (), policy())
+            .unwrap();
+        let accelerated = store
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(raw, (), policy())
+            .unwrap();
+        // Whoever registers a view realizes it once; from then on the
+        // store lists it.
+        own_commit(&mut store, root, 41, 0);
+        block_on(store.ensure(raw, &owner)).unwrap();
+        block_on(store.ensure(accelerated, &owner)).unwrap();
+
+        for entity in 1..8 {
+            own_commit(&mut store, root, 41, entity);
+        }
+        block_on(store.maintain(root, &owner)).unwrap();
+        let report = block_on(maintain_downstream(
+            &mut store,
+            root.handle(),
+            &owner,
+            &mut CoreRealizer,
+        ))
+        .unwrap();
+        assert_eq!(report.realized, vec![raw.handle(), accelerated.handle()]);
+
+        // Rank9's leaves name Succinct's own foundations, and its one merge
+        // mirrors Succinct's, which had to exist first.
+        let raw_leaves = derives_in(&mut store, raw.handle());
+        assert_eq!(raw_leaves.len(), 8);
+        let raw_images: BTreeSet<_> = raw_leaves
+            .iter()
+            .map(|leaf| SourceLocator::of(leaf.output().raw))
+            .collect();
+        let accelerated_leaves = derives_in(&mut store, accelerated.handle());
+        assert_eq!(accelerated_leaves.len(), 8);
+        assert_eq!(
+            accelerated_leaves
+                .iter()
+                .map(|leaf| leaf.input())
+                .collect::<BTreeSet<_>>(),
+            raw_images
+        );
+        let raw_mirrors = merges_in(&mut store, raw.handle());
+        let accelerated_mirrors = merges_in(&mut store, accelerated.handle());
+        assert_eq!(raw_mirrors.len(), 1);
+        assert_eq!(accelerated_mirrors.len(), 1);
+        assert_eq!(
+            frontier(&mut store, accelerated.handle()),
+            BTreeSet::from([accelerated_mirrors[0].result()])
+        );
+
+        let snapshot = store.snapshot().unwrap();
+        let view = snapshot.collection(accelerated).unwrap();
+        let facts: UnionArchive<OrderedUniverse> = view.view().unwrap();
+        let expected: TribleSet = (0..8).map(|entity| row(entity + 1, 41)).collect();
+        assert_eq!(facts.iter().collect::<TribleSet>(), expected);
+        let raw_view = snapshot.collection(raw).unwrap();
+        let source = snapshot.collection(root).unwrap();
+        assert!(raw_view.missing_from(&source).unwrap().is_empty());
+        assert!(view.missing_from(&raw_view).unwrap().is_empty());
+    }
+}

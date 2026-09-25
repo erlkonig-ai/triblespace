@@ -188,11 +188,7 @@ fn derive_before_write_proof_is_inert_then_admitted_without_reinsertion() {
         vec![output]
     );
     assert_eq!(
-        after
-            .collection(target)
-            .unwrap()
-            .support()
-            .unwrap()
+        crate::collection::test_support::stood_for(&after.collection(target).unwrap())
             .members()
             .collect::<Vec<_>>(),
         vec![a.get_handle()]
@@ -360,7 +356,10 @@ fn target_stands_for_nothing_until_its_source_input_is_admitted() {
     assert_eq!(source.admitted(&snapshot).unwrap(), requested);
     let attached = snapshot.collection(target).unwrap();
     assert_eq!(attached.cover().members().collect::<Vec<_>>(), vec![output]);
-    assert_eq!(attached.support().unwrap(), &requested);
+    assert_eq!(
+        crate::collection::test_support::stood_for(&attached),
+        requested
+    );
     assert_eq!(
         attached
             .view::<UnionArchive<OrderedUniverse>>()

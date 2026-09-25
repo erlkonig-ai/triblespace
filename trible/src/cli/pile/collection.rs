@@ -348,11 +348,13 @@ pub enum Command {
     },
     /// Maintain selected targets and their source dependencies, upstream first.
     ///
-    /// Shared dependencies run once per pass. Root fact collections are only
-    /// ensured, unless explicitly selected as targets themselves. This is
-    /// scheduling over ordinary one-edge operations; mappings and joins do not
-    /// acquire recursive construction side effects. Only the requested targets
-    /// and their descriptor source chains are selected, not historical indexes.
+    /// Shared dependencies run once per pass. Every root reached runs the
+    /// key's own carry; every derived collection reached gets the key's own
+    /// leaves and a mirror of the key's own source merges, after its source.
+    /// Nobody else's nodes are merged or derived. This is scheduling over
+    /// ordinary one-edge operations; mappings and joins do not acquire
+    /// recursive construction side effects. Only the requested targets and
+    /// their descriptor source chains are selected, not historical indexes.
     /// The author's public key biases which selected chain runs first; each
     /// chain still runs upstream first, independently of argument order.
     MaintainAll {
@@ -2668,9 +2670,6 @@ fn maintenance_order<R: BlobStoreGet>(
 struct MaintenanceHop<R> {
     before: R,
     interests: StoreDependencies,
-    // An implicitly selected root is ensured, whereas an explicit root is
-    // maintained. Derived hops conservatively retry on this mode change too.
-    dependency_only: bool,
     // Preserve the old retry opportunity whenever any selected input wakes
     // this worker. An Err is not a valid cached answer, especially when its
     // cause is runtime/provider state outside the stored dependency model.
@@ -2718,14 +2717,11 @@ impl<R: StoreSnapshot> MaintenanceState<R> {
         }
     }
 
-    fn needs_work(&mut self, handle: CollectionHandle, dependency_only: bool, current: &R) -> bool {
+    fn needs_work(&mut self, handle: CollectionHandle, current: &R) -> bool {
         let Some(hop) = self.hops.get_mut(&handle) else {
             return true;
         };
-        if hop.retry_on_pass
-            || hop.dependency_only != dependency_only
-            || maintenance_changed(&hop.before, current, &hop.interests)
-        {
+        if hop.retry_on_pass || maintenance_changed(&hop.before, current, &hop.interests) {
             return true;
         }
         // Rebase only after proving this hop unchanged, releasing older shared
@@ -2783,37 +2779,6 @@ async fn maintenance_pass_observed<S: Store + AsyncBlobStoreAcquire + Send>(
         telemetry.emit_due(pile);
     }
     result
-}
-
-async fn maintenance_hop<S: Store + AsyncBlobStoreAcquire + Send>(
-    store: &mut S,
-    snapshot: &S::Snapshot,
-    handle: CollectionHandle,
-    representation: Id,
-    algorithm: Option<Id>,
-    signer: &SigningKey,
-    succinct_backend: SuccinctBackend,
-    ensure_only: bool,
-) -> Result<S::Snapshot> {
-    if ensure_only {
-        let root: Collection<SimpleArchive> = Collection::open(snapshot, handle)
-            .map_err(|error| anyhow!("open foundational collection: {error}"))?;
-        store
-            .ensure(root, signer)
-            .await
-            .map_err(|error| anyhow!("ensure foundational collection: {error}"))
-    } else {
-        maintain_by_representation(
-            store,
-            snapshot,
-            handle,
-            representation,
-            algorithm,
-            signer,
-            succinct_backend,
-        )
-        .await
-    }
 }
 
 async fn maintenance_pass_inner<S: Store + AsyncBlobStoreAcquire + Send>(
@@ -2899,8 +2864,7 @@ async fn maintenance_pass_inner<S: Store + AsyncBlobStoreAcquire + Send>(
                     continue;
                 }
             };
-            let dependency_only = dependencies && !selected.contains(&handle);
-            if !state.needs_work(handle, dependency_only, &before) {
+            if !state.needs_work(handle, &before) {
                 continue;
             }
             let hop_started = telemetry.as_deref_mut().map(|telemetry| {
@@ -2918,8 +2882,6 @@ async fn maintenance_pass_inner<S: Store + AsyncBlobStoreAcquire + Send>(
                     .map_err(|error| anyhow!("read collection descriptor: {error}"))?;
                 let representation = descriptor::representation(&facts)?;
                 let algorithm = descriptor::mapping_algorithm(&facts)?;
-                let source = descriptor::source(&facts)?;
-                let ensure_only = dependency_only && source.is_none();
                 let before = cover_census(&snapshot, handle)?;
                 let started = Instant::now();
                 let after = if let Some(telemetry) = telemetry.as_deref_mut() {
@@ -2927,7 +2889,7 @@ async fn maintenance_pass_inner<S: Store + AsyncBlobStoreAcquire + Send>(
                         inner: &mut observed,
                         counts: &mut telemetry.publications,
                     };
-                    maintenance_hop(
+                    maintain_by_representation(
                         &mut counted,
                         &snapshot,
                         handle,
@@ -2935,11 +2897,10 @@ async fn maintenance_pass_inner<S: Store + AsyncBlobStoreAcquire + Send>(
                         algorithm,
                         signer,
                         succinct_backend,
-                        ensure_only,
                     )
                     .await?
                 } else {
-                    maintenance_hop(
+                    maintain_by_representation(
                         &mut observed,
                         &snapshot,
                         handle,
@@ -2947,14 +2908,12 @@ async fn maintenance_pass_inner<S: Store + AsyncBlobStoreAcquire + Send>(
                         algorithm,
                         signer,
                         succinct_backend,
-                        ensure_only,
                     )
                     .await?
                 };
                 let after = cover_census(&after, handle)?;
                 println!(
-                    "{} blake3:{} in {:.1} s: commits {} -> {}, merges {} -> {}, derives {} -> {}",
-                    if ensure_only { "ensured" } else { "maintained" },
+                    "maintained blake3:{} in {:.1} s: commits {} -> {}, merges {} -> {}, derives {} -> {}",
                     handle_hex(handle),
                     started.elapsed().as_secs_f64(),
                     before.0,
@@ -2982,7 +2941,6 @@ async fn maintenance_pass_inner<S: Store + AsyncBlobStoreAcquire + Send>(
                 MaintenanceHop {
                     before,
                     interests,
-                    dependency_only,
                     retry_on_pass: result.is_err(),
                 },
             );

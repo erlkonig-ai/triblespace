@@ -3,8 +3,10 @@
 //!
 //! A [`CollectionSnapshot`] owns the store observation against which its
 //! realized target cover is valid. Its support comes with it, read from the
-//! coverage index by the same selection. Logical values remain caller-chosen
-//! projections reconstructed through [`TryFromCover`].
+//! coverage index by the same selection: a cover of the collection's own
+//! foundations. Whether a derived collection has caught up with its source
+//! is [`CollectionSnapshot::missing_from`]. Logical values remain
+//! caller-chosen projections reconstructed through [`TryFromCover`].
 
 use std::collections::BTreeSet;
 use std::convert::Infallible;
@@ -17,28 +19,24 @@ use crate::trible::Fragment;
 use super::observed_store::{DependencyTracker, ObservedStore};
 use super::{
     CollectionData, CollectionDescriptorError, CollectionEncoding, CollectionHandle,
-    CollectionRealizationError, Cover, CoverageRead, RecordDecodeError, Support,
+    CollectionRealizationError, Cover, CoverageRead, RecordDecodeError, SourceLocator, Support,
 };
 
 /// One immutable collection observation and what it stands on.
 ///
 /// The cover is the target's resident frontier, selected from the coverage
 /// index; the support is the union of what those nodes stand for, taken from
-/// the same index in the same selection. Reading the value does not require
-/// the historical inputs to be present. Logical views are reconstructed on
-/// demand with [`Self::view`].
+/// the same index in the same selection: the target's own foundations.
+/// Reading the value does not require the historical inputs to be present.
+/// Logical views are reconstructed on demand with [`Self::view`].
 pub struct CollectionSnapshot<R, E>
 where
     R: StoreSnapshot,
     E: CollectionEncoding,
 {
     snapshot: R,
-    support: Support,
+    support: Support<E>,
     cover: Cover<E>,
-    /// The lineage the support stands on. Charged to the read-set when the
-    /// support is asked for, not when the cover is attached: the cover moves
-    /// on the target's records, the support on the whole lineage's.
-    support_lineage: BTreeSet<CollectionHandle>,
     dependencies: DependencyTracker,
 }
 
@@ -52,7 +50,6 @@ where
             snapshot: self.snapshot.clone(),
             support: self.support.clone(),
             cover: self.cover.clone(),
-            support_lineage: self.support_lineage.clone(),
             dependencies: self.dependencies.clone(),
         }
     }
@@ -64,20 +61,18 @@ where
     E: CollectionEncoding,
 {
     /// Pair one store observation with a cover and support taken from the
-    /// coverage index's frontier. The cover's read-set is already in
-    /// `dependencies`; the support's lineage is charged when it is asked for.
+    /// coverage index's frontier. Both are read from the target's own rows,
+    /// whose read-set is already in `dependencies`.
     pub(crate) fn from_frontier(
         snapshot: R,
-        support: Support,
+        support: Support<E>,
         cover: Cover<E>,
-        lineage: BTreeSet<CollectionHandle>,
         dependencies: DependencyTracker,
     ) -> Self {
         Self {
             snapshot,
             support,
             cover,
-            support_lineage: lineage,
             dependencies,
         }
     }
@@ -102,22 +97,64 @@ where
         snapshot.changes_for(&self.snapshot, &dependencies) == StoreChanges::NONE
     }
 
-    /// The foundational support this observation stands on.
+    /// What this observation stands on: a cover of the collection's own
+    /// foundations -- commit payloads for a root, leaf images for a derived
+    /// collection.
     ///
-    /// The support stands on the whole lineage's records, so asking for it is
-    /// what makes them a dependency of this observation; the cover alone
-    /// depends only on the target's own. The one storage read this performs
-    /// is that charge.
-    pub fn support(&self) -> Result<&Support, CollectionRealizationError>
+    /// It is read from the target's own rows, the same ones the cover came
+    /// from, so it adds nothing to the read-set. Two collections' supports
+    /// are never comparable; ask [`Self::missing_from`] whether a derived
+    /// collection has caught up with its source.
+    pub fn support(&self) -> Result<&Support<E>, CollectionRealizationError>
     where
         R: StoreRead,
     {
+        Ok(&self.support)
+    }
+
+    /// The foundations of `source` this derived collection has no leaf for
+    /// yet: the freshness of a view against a source observation.
+    ///
+    /// Each source foundation `F` is looked up by its locator `L(F)` in this
+    /// collection's leaves, the DERIVE relation read by its own key. Nothing
+    /// is compared between the two collections' supports, and whoever owns a
+    /// missing foundation is the one expected to derive it. `source` must be
+    /// the collection this one's descriptor names as its source; the two
+    /// observations may be of different store snapshots, and the answer is
+    /// then this view's leaves against that source's foundations.
+    pub fn missing_from<RS, S>(
+        &self,
+        source: &CollectionSnapshot<RS, S>,
+    ) -> Result<Cover<S>, CollectionRealizationError>
+    where
+        R: StoreRead,
+        RS: StoreRead,
+        S: CollectionEncoding,
+    {
+        let target = self.cover.collection().handle();
         let observed =
             ObservedStore::with_tracker(self.snapshot.clone(), self.dependencies.clone());
-        observed
-            .coverage(&self.support_lineage)
-            .map_err(|error| CollectionRealizationError::storage("charge support lineage", error))?;
-        Ok(&self.support)
+        let descriptor = super::api::load_collection_descriptor(&observed, target)
+            .map_err(|error| CollectionRealizationError::storage("read view descriptor", error))?;
+        let named = super::descriptor::source(descriptor.fragment.facts()).map_err(|error| {
+            CollectionRealizationError::Resolution(format!("read view source: {error}"))
+        })?;
+        let source_collection = source.cover().collection();
+        if named != Some(source_collection.handle()) {
+            return Err(CollectionRealizationError::InvalidCover(format!(
+                "collection {} does not derive from {}",
+                hex::encode_upper(target.raw),
+                hex::encode_upper(source_collection.handle().raw),
+            )));
+        }
+        let coverage = observed
+            .coverage(&BTreeSet::from([target]))
+            .map_err(|error| CollectionRealizationError::storage("read view leaves", error))?;
+        let missing = source
+            .support()?
+            .data_members()
+            .filter(|foundation| !coverage.has_leaf(target, SourceLocator::of(foundation.raw)));
+        Ok(Cover::from_data(source_collection, missing))
     }
 
     /// Resident target cover selected from the coverage index.
@@ -139,12 +176,12 @@ where
         V::try_from_cover(&self.cover, &descriptor.fragment, &observed)
     }
 
-    /// Consume this snapshot into its store observation and exact covers.
-    pub fn into_parts(self) -> Result<(R, Support, Cover<E>), CollectionRealizationError>
+    /// Consume this snapshot into its store observation, its support and its
+    /// cover.
+    pub fn into_parts(self) -> Result<(R, Support<E>, Cover<E>), CollectionRealizationError>
     where
         R: StoreRead,
     {
-        self.support()?;
         Ok((self.snapshot, self.support, self.cover))
     }
 }
@@ -261,9 +298,6 @@ pub trait TryFromCover<L: CollectionEncoding>: Sized {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
-    use crate::blob::encodings::simplearchive::SimpleArchive;
     use crate::blob::encodings::succinctarchive::SuccinctArchiveBlob;
     use crate::collection::observed_store::ObservedStore;
     use crate::collection::{Collection, CollectionData, CollectionHandle};
@@ -273,10 +307,10 @@ mod tests {
     use super::{CollectionSnapshot, Cover, Support};
 
     #[test]
-    fn snapshot_keeps_foundational_support_separate_from_target_cover() {
-        let foundation = Collection::<SimpleArchive>::from_handle(CollectionHandle::new([1; 32]));
+    fn snapshot_keeps_its_own_support_beside_its_cover() {
         let target = Collection::<SuccinctArchiveBlob>::from_handle(CollectionHandle::new([2; 32]));
-        let support = Support::from_data(foundation, [CollectionData::new([3; 32])]);
+        let support: Support<SuccinctArchiveBlob> =
+            Support::from_data(target, [CollectionData::new([3; 32])]);
         let cover = Cover::from_data(target, [CollectionData::new([4; 32])]);
         let mut store = MemoryRepo::default();
         let store_snapshot = store.snapshot().unwrap();
@@ -285,7 +319,6 @@ mod tests {
             store_snapshot.clone(),
             support.clone(),
             cover.clone(),
-            BTreeSet::new(),
             ObservedStore::new(store_snapshot.clone()).tracker(),
         );
         assert!(snapshot.snapshot() == &store_snapshot);

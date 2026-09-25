@@ -345,7 +345,7 @@ fn target_stands_for_nothing_until_its_input_is_admitted_then_reads_from_the_ind
     );
     let view: UnionArchive<OrderedUniverse> = complete.view().unwrap();
     assert_eq!(view.iter().collect::<TribleSet>(), facts(1, 21));
-    let support = complete.support().unwrap();
+    let support = &crate::collection::test_support::stood_for(&complete);
     assert_eq!(support.collection(), fixture.source);
     assert_eq!(support.len(), 1);
     assert!(support.contains(fixture.source_blob.get_handle()));
@@ -477,7 +477,7 @@ fn absent_target_parent_is_read_through_its_resident_merge_inputs() {
     assert_eq!(before.cover().len(), 2);
     assert!(before.cover().contains(fixture.output.get_handle()));
     assert!(before.cover().contains(other_output.get_handle()));
-    assert_eq!(before.support().unwrap(), &both);
+    assert_eq!(crate::collection::test_support::stood_for(&before), both);
     assert_eq!(
         before
             .view::<UnionArchive<OrderedUniverse>>()
@@ -501,7 +501,7 @@ fn absent_target_parent_is_read_through_its_resident_merge_inputs() {
         after.cover().members().collect::<Vec<_>>(),
         [union_blob.get_handle()]
     );
-    assert_eq!(after.support().unwrap(), &both);
+    assert_eq!(crate::collection::test_support::stood_for(&after), both);
     assert_eq!(
         after
             .view::<UnionArchive<OrderedUniverse>>()
@@ -629,7 +629,7 @@ fn multihop_read_takes_cover_and_support_from_the_index_without_payload_reads() 
     snapshot.assert_no_record_enumeration();
     snapshot.assert_not_loaded(data(&fixture.source_blob));
     snapshot.assert_not_loaded(data(&fixture.metadata));
-    let support = observed.support().unwrap();
+    let support = &crate::collection::test_support::stood_for(&observed);
     assert_eq!(support.collection(), fixture.source);
     assert!(support.contains(fixture.source_blob.get_handle()));
     assert_eq!(support.len(), 1);
@@ -643,7 +643,10 @@ fn multihop_read_takes_cover_and_support_from_the_index_without_payload_reads() 
     let blob_reads = snapshot.counts.gets.lock().unwrap().len();
     let proof_queries = snapshot.counts.proof_queries.load(Ordering::SeqCst);
     let cloned = observed.clone();
-    assert_eq!(cloned.support().unwrap(), support);
+    assert_eq!(
+        &crate::collection::test_support::stood_for(&cloned),
+        support
+    );
     assert_eq!(snapshot.counts.selections.lock().unwrap().len(), selections);
     assert_eq!(snapshot.counts.gets.lock().unwrap().len(), blob_reads);
     assert_eq!(
@@ -713,8 +716,8 @@ fn multihop_read_stands_for_nothing_beneath_an_unadmitted_ancestor() {
         [accelerated.get_handle()]
     );
     assert_eq!(
-        admitted.support().unwrap(),
-        &fixture.source.cover([fixture.source_blob.get_handle()])
+        crate::collection::test_support::stood_for(&admitted),
+        fixture.source.cover([fixture.source_blob.get_handle()])
     );
     assert!(observed.cover().is_empty());
 }
@@ -791,7 +794,7 @@ fn pile_observation_tracks_only_consulted_lineage_and_target_changes() {
     .unwrap();
     let after_second = pile.snapshot().unwrap();
     assert!(complete.is_current(&after_second));
-    let support = complete.support().unwrap();
+    let support = &crate::collection::test_support::stood_for(&complete);
     assert_eq!(support.collection(), fixture.source);
     assert_eq!(support.len(), 1);
     assert!(support.contains(fixture.source_blob.get_handle()));

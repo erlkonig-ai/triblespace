@@ -9,6 +9,7 @@ use std::io;
 use ed25519_dalek::SigningKey;
 use futures::executor::block_on;
 use rand::rngs::OsRng;
+use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
     OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
 };
@@ -67,6 +68,7 @@ fn changes(
 fn observe(
     store: &mut MemoryRepo,
     signing_key: &SigningKey,
+    source: Collection<SimpleArchive>,
     raw: Collection<SuccinctArchiveBlob>,
     accelerated: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
     checkpoint: &mut Option<
@@ -75,8 +77,9 @@ fn observe(
     mut consume: impl FnMut(&str) -> Result<(), Box<dyn Error>>,
 ) -> Result<Vec<String>, Box<dyn Error>> {
     // Carry each mapping edge to its source's frontier, then read the target
-    // from the snapshot that observes all of that work. What it stands on is
-    // the continuation token.
+    // from the snapshot that observes all of that work. What the source stood
+    // on in that snapshot is the continuation token: supports are
+    // collection-local, and the payloads are the source's.
     block_on(store.maintain(raw, signing_key))?;
     let snapshot = block_on(store.maintain(accelerated, signing_key))?;
     let next = snapshot.collection(accelerated)?;
@@ -85,8 +88,10 @@ fn observe(
     // the same snapshot; the Succinct target answers the full side.
     let changed = match checkpoint.as_ref() {
         Some(previous) => {
-            let previous_support = previous.support()?;
-            let current_support = next.support()?;
+            let previous_source = previous.snapshot().collection(source)?;
+            let current_source = snapshot.collection(source)?;
+            let previous_support = previous_source.support()?;
+            let current_support = current_source.support()?;
             if previous_support == current_support {
                 return Ok(Vec::new());
             }
@@ -153,6 +158,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let first = observe(
         &mut store,
         &signing_key,
+        collection,
         raw,
         accelerated,
         &mut checkpoint,
@@ -176,6 +182,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let failed = observe(
         &mut store,
         &signing_key,
+        collection,
         raw,
         accelerated,
         &mut checkpoint,
@@ -193,6 +200,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let retry = observe(
         &mut store,
         &signing_key,
+        collection,
         raw,
         accelerated,
         &mut checkpoint,
@@ -203,6 +211,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let unchanged = observe(
         &mut store,
         &signing_key,
+        collection,
         raw,
         accelerated,
         &mut checkpoint,

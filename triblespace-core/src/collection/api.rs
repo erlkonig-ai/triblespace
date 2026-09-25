@@ -37,12 +37,11 @@ use crate::repo::{CapabilityProofStore, SnapshotSource, Store, StoreRead, StoreS
 use crate::trible::{Fragment, TribleSet};
 
 use super::exact_derived::CollectionRealizationError;
-use super::operation_snapshot::OperationFrontier;
 use super::simplearchive_union::PreparedCollectionCommit;
 use super::{
     descriptor, read_capability, write_capability, Collection, CollectionCommit, CollectionData,
-    CollectionEncoding, CollectionHandle, CollectionSnapshot, CollectionStore,
-    CollectionTypeError, RecordDecodeError, TryFromCover, TryFromCoverError,
+    CollectionEncoding, CollectionHandle, CollectionSnapshot, CollectionStore, CollectionTypeError,
+    RecordDecodeError, TryFromCover, TryFromCoverError,
 };
 use super::{
     AdmissionPolicy, CanonicalDerivation, CollectionDerivation, CollectionMapping, CollectionPolicy,
@@ -545,13 +544,18 @@ impl<L: CollectionEncoding> PartialEq for Cover<L> {
 
 impl<L: CollectionEncoding> Eq for Cover<L> {}
 
-/// Denotational support shared by every representation of one logical value.
+/// What a collection stands on: a cover of its OWN foundations.
 ///
-/// Support is the set of distinct admitted `COMMIT.data` handles in the
-/// foundational [`SimpleArchive`] collection. `MERGE` and `DERIVE` change the
-/// physical cover, never this value. Several authorized commits may attest the
-/// same payload without creating multiple support members.
-pub type Support = Cover<SimpleArchive>;
+/// A root's foundations are its distinct admitted `COMMIT.data` payloads; a
+/// derived collection's are the images its believed leaves (`DERIVE`s) name.
+/// `MERGE` changes the physical cover, never this value, and several
+/// authorized records attesting one payload are one member. Supports of two
+/// collections are never compared: whether a view has caught up with its
+/// source is [`CollectionSnapshot::missing_from`], which asks the view's
+/// leaves for each source foundation's locator.
+///
+/// The parameter is the collection's own encoding; it defaults to a root's.
+pub type Support<E = SimpleArchive> = Cover<E>;
 
 /// Failure to combine covers from distinct collection lattices.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1295,12 +1299,12 @@ impl<L: CollectionEncoding> Collection<L> {
     }
 
     /// What this collection stands for in this snapshot, from the coverage
-    /// index.
+    /// index: its own foundations, resident or not.
     ///
-    /// For a root these are its admitted COMMIT payloads, resident or not.
-    /// For a derived collection they are what its frontier stands for, the
-    /// same question one lattice up. Nothing is enumerated: the index is
-    /// settled for this one handle and its frontier's supports are unioned.
+    /// For a root these are its admitted COMMIT payloads. For a derived
+    /// collection they are the images its believed leaves name. Nothing is
+    /// enumerated: the index is settled for this one handle and its
+    /// frontier's supports are unioned.
     pub fn admitted<S>(self, snapshot: &S) -> Result<Cover<L>, S::RecordsError>
     where
         S: StoreRead,
@@ -1333,9 +1337,9 @@ impl<L: CollectionEncoding> Collection<L> {
 /// Immutable collection observations implemented by every complete store snapshot.
 ///
 /// A snapshot is the temporal boundary. The returned [`CollectionSnapshot`]
-/// therefore owns this exact store observation and the physical target cover
-/// selected inside it. Foundational [`Support`] is available separately through
-/// the observation's fallible provenance query.
+/// therefore owns this exact store observation, the physical target cover
+/// selected inside it, and the [`Support`] that cover stands on: a cover of
+/// the collection's own foundations.
 pub trait CollectionSnapshotExt: StoreRead + Sized {
     /// Observe what one collection contains in this immutable snapshot.
     ///
@@ -1360,18 +1364,19 @@ impl<R> CollectionSnapshotExt for R where R: StoreRead {}
 
 /// An encoding whose collection can be made resident and maintained by storage.
 ///
-/// Root `SimpleArchive` collections acquire their signed support. Encodings
-/// with a canonical [`CollectionDerivation`] additionally compute missing
-/// images. This operational capability is separate from the pure encoding and
-/// mapping laws; no fictitious self-derivation is needed for a root collection.
-/// The explicit key signs only records published by realization; pure mapping
-/// and snapshot observation need no signer.
+/// Root `SimpleArchive` collections acquire their signed support and carry
+/// their maintainer's own nodes. Encodings with a canonical
+/// [`CollectionDerivation`] derive their maintainer's own leaves and mirror
+/// its own source merges. This operational capability is separate from the
+/// pure encoding and mapping laws; no fictitious self-derivation is needed for
+/// a root collection. The explicit key is the maintainer: it decides what is
+/// owned, and signs only records published by realization; pure mapping and
+/// snapshot observation need no signer.
 /// Use the four [`CollectionStoreExt`] methods at call sites. Explicit foreign
 /// mappings remain available through their `*_with` counterparts.
 pub trait CollectionRealization: CollectionEncoding {
-    /// Make the target stand for everything it can: a root acquires its
-    /// admitted commits, a derived collection publishes the images its
-    /// source's frontier is owed.
+    /// A root acquires its admitted commits, whoever wrote them; a derived
+    /// collection gets a leaf for every source foundation the key owns.
     fn ensure<'a, S>(
         store: &'a mut S,
         target: Collection<Self>,
@@ -1380,7 +1385,9 @@ pub trait CollectionRealization: CollectionEncoding {
     where
         S: Store + AsyncBlobStoreAcquire + Send;
 
-    /// Ensure, then carry the target to its deterministic LSM fixed point.
+    /// A root carries the key's own nodes to their LSM fixed point; a
+    /// derived collection gets the key's leaves and a mirror of every source
+    /// merge the key owns.
     fn maintain<'a, S>(
         store: &'a mut S,
         target: Collection<Self>,
@@ -1452,22 +1459,12 @@ where
     S: Store + AsyncBlobStoreAcquire,
 {
     super::exact_derived::acquire_authority(store, target).await?;
-    super::exact_derived::ensure_root(store, target).await?;
     if compact {
-        let before = store.snapshot().map_err(|error| {
-            CollectionRealizationError::storage("freeze root collection frontier", error)
-        })?;
-        let mut frontier = OperationFrontier::new(before);
-        super::maintenance::carry_target(
-            store,
-            target,
-            signing_key,
-            &BTreeSet::from([target.handle()]),
-            &mut frontier,
-            |descriptor, low, high, reader| {
-                SimpleArchive::join_members(descriptor, low, high, reader).map(Some)
-            },
-        )?;
+        // The carry reads the key's own nodes only; nobody else's absent
+        // payload is waited for or fetched.
+        super::exact_derived::maintain_root_acquiring(store, target, signing_key).await?;
+    } else {
+        super::exact_derived::ensure_root(store, target).await?;
     }
     store.snapshot().map_err(|error| {
         CollectionRealizationError::storage("freeze realized root snapshot", error)
@@ -1563,20 +1560,21 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
         Ok(Collection::from_handle(handle))
     }
 
-    /// Ensure the currently available input of one collection.
+    /// Ensure one collection for the key: "derive what you wrote".
     ///
-    /// A root acquires its admitted commits. A derived collection makes its
-    /// frontier stand on what its immediate source's resident frontier stands
-    /// on, publishing the missing `DERIVE` work; a source node whose bytes are
-    /// elsewhere is the root's to fetch, not a downstream obligation. Each
-    /// publishing operation runs against one frozen control snapshot; when it
-    /// names a missing image or descriptor, acquisition ends the operation
-    /// and the retry starts from a fresh snapshot that sees everything that
-    /// arrived, records and proofs included. No acquisition emits a durable
-    /// WANT. Newly published equations are signed by `signing_key`; reusing a
-    /// current realization does not require that key to hold WRITE authority.
-    /// The returned store snapshot observes everything published by this work
-    /// and by any concurrent writer before that final observation.
+    /// A root acquires its admitted commits, whoever wrote them. A derived
+    /// collection gets a leaf, `DERIVE(target, L(F), f(F))`, for every
+    /// foundation `F` of its immediate source the key owns whose locator it
+    /// has no leaf for yet; empty images are published too. Other owners'
+    /// foundations are theirs to derive. Each publishing operation runs
+    /// against one frozen control snapshot; when it names a missing image or
+    /// descriptor, acquisition ends the operation and the retry starts from a
+    /// fresh snapshot that sees everything that arrived, records and proofs
+    /// included. No acquisition emits a durable WANT. Newly published
+    /// equations are signed by `signing_key`; a target with nothing owed does
+    /// not require that key to hold WRITE authority. The returned store
+    /// snapshot observes everything published by this work and by any
+    /// concurrent writer before that final observation.
     fn ensure<'a, T>(
         &'a mut self,
         target: Collection<T>,
@@ -1590,7 +1588,8 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
         T::ensure(self, target, signing_key)
     }
 
-    /// Ensure resident, admitted immediate-source support through one mapping.
+    /// Ensure one derived collection for the key through one explicit
+    /// mapping.
     fn ensure_with<'a, M>(
         &'a mut self,
         target: Collection<M::Target>,
@@ -1611,19 +1610,20 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
         }
     }
 
-    /// Ensure and maintain the currently available input of one collection.
+    /// Maintain one collection for the key.
     ///
-    /// A derived target selects the admitted support already realized by its
-    /// immediate source; a root acquires its own admitted support. The chosen
-    /// support is frozen once before work begins. Derived maintenance first
-    /// reuses coarsening already resident in that source, without constructing
-    /// upstream members. Then deterministic target size-tier carries run to
-    /// their feasible LSM fixed point. There is no caller-visible budget or
-    /// tuning knob; every useful result is published independently. The live
-    /// store may acquire exact dependencies while doing so.
-    /// The supplied key signs each newly published `MERGE` or `DERIVE`.
-    /// Without target WRITE authority, an already complete fine cover is the
-    /// permission-limited feasible fixed point: optional coarsening is skipped.
+    /// A root carries the key's own frontier nodes: a node inside another
+    /// own node's support is absorbed, and every tier (`floor(log_8
+    /// |support|)`) holding eight own nodes is joined by one n-ary `MERGE`,
+    /// until none does. Other owners' nodes are neither merged nor read. A
+    /// derived collection is ensured, then every source `MERGE` producing a
+    /// node the key owns is mirrored, bottom-up, as a target `MERGE` over its
+    /// inputs' images, the result mapped from the merged source node's bytes.
+    /// A derived collection has no carry of its own. There is no
+    /// caller-visible budget or tuning knob; every useful result is published
+    /// independently. The live store may acquire exact dependencies while
+    /// doing so. The supplied key signs each newly published `MERGE` or
+    /// `DERIVE`. Without target WRITE authority, optional merging is skipped.
     fn maintain<'a, T>(
         &'a mut self,
         target: Collection<T>,
@@ -1637,7 +1637,8 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
         T::maintain(self, target, signing_key)
     }
 
-    /// Maintain resident, admitted immediate-source support through one mapping.
+    /// Maintain one derived collection for the key through one explicit
+    /// mapping.
     fn maintain_with<'a, M>(
         &'a mut self,
         target: Collection<M::Target>,

@@ -974,3 +974,98 @@ fn a_commit_written_into_a_derived_collection_attests_nothing() {
     assert!(index.published().owners(target, data(9)).is_empty());
     assert_eq!(index.parked(), 0);
 }
+
+/// Admits one signer and holds every other on a proof.
+struct AdmitOnly(Inline<ED25519PublicKey>);
+
+impl RecordAdmission for AdmitOnly {
+    fn source(&self, _collection: CollectionHandle) -> SourceResolution {
+        SourceResolution::Root
+    }
+
+    fn admits(
+        &self,
+        _collection: CollectionHandle,
+        signer: Inline<ED25519PublicKey>,
+    ) -> Admittance {
+        if signer == self.0 {
+            Admittance::Admitted
+        } else {
+            Admittance::Pending
+        }
+    }
+}
+
+#[test]
+fn a_join_keeps_its_inputs_once_however_many_edges_and_parked_copies_name_it() {
+    let c = collection(1);
+    let inputs: Vec<CollectionData> = (10..18).map(data).collect();
+    let result = data(40);
+    let admission = AdmitOnly(public(7));
+    let mut index = CoverageIndex::new();
+    for input in &inputs {
+        index.apply(&commit(7, c, *input), &admission);
+    }
+    // One eight-input join, believed: eight consumer edges name it.
+    let join = merge(7, c, &inputs, result);
+    index.apply(&join, &admission);
+    index.apply(&join, &admission);
+    assert_eq!(index.stored_joins(), 1);
+    for input in &inputs {
+        let reading = index.joins_reading(c, *input);
+        assert_eq!(reading.len(), 1);
+        assert_eq!(reading[0].0.as_slice(), inputs.as_slice());
+        assert_eq!(reading[0].1, result);
+    }
+    // The same join signed by an unadmitted key is parked, not copied: it is
+    // one more parked key naming the join already kept.
+    index.apply(&merge(9, c, &inputs, result), &admission);
+    assert_eq!(index.parked_on_signers(), 1);
+    assert_eq!(index.stored_joins(), 1);
+    // A different join is a second entry, parked and believed alike.
+    let other = data(41);
+    index.apply(&merge(9, c, &inputs[..4], other), &admission);
+    assert_eq!(index.stored_joins(), 2);
+    assert_eq!(index.parked_on_signers(), 2);
+    assert!(index.coverage(c, other).is_none());
+    // A parked join rebuilt from its key and the joins table drives exactly
+    // as the record would have: admit the signer and settle.
+    index.resolve(&AdmitEveryRecord);
+    assert_eq!(index.parked(), 0);
+    assert_eq!(
+        members(&index, c, other),
+        inputs[..4]
+            .iter()
+            .map(|input| input.raw)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(index.stored_joins(), 2);
+}
+
+#[test]
+fn a_parked_leaf_and_a_parked_join_come_back_whole() {
+    let root = collection(1);
+    let view = collection(2);
+    let lineages = Lineages([(view, root)].into_iter().collect());
+    let mut index = CoverageIndex::new();
+    // Replay parks everything first; the batch's settle decides it.
+    index.park_record(&derive(5, view, data(10), data(20)));
+    index.park_record(&derive(5, view, data(11), data(21)));
+    index.park_record(&merge(5, view, &[data(20), data(21)], data(22)));
+    assert_eq!(index.stored_joins(), 1);
+    index.settle(&lineages, std::iter::empty(), false);
+    assert_eq!(members(&index, view, data(22)), vec![[20; 32], [21; 32]]);
+    assert!(index
+        .published()
+        .has_leaf(view, SourceLocator::of(data(10).raw)));
+    assert_eq!(
+        index
+            .published()
+            .leaf_outputs(view, SourceLocator::of(data(11).raw)),
+        vec![data(21)]
+    );
+    assert_eq!(
+        index.published().frontier(view).collect::<Vec<_>>(),
+        vec![data(22)]
+    );
+}

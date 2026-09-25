@@ -148,6 +148,30 @@ pub trait CollectionEncoding: BlobEncoding + MetaDescribe + Sized + 'static {
     ) -> Result<Blob<Self>, CollectionOperationError>
     where
         R: BlobStoreGet + BlobStoreMeta;
+
+    /// Compute the exact canonical join of one or more members: the k-way
+    /// join an n-ary MERGE states.
+    ///
+    /// The default folds [`Self::join_members`] left to right, which is the
+    /// same canonical result by associativity; an encoding with a cheaper
+    /// k-way join overrides it. The same availability rules apply.
+    fn join_many<R>(
+        descriptor: &Fragment,
+        members: &[Blob<Self>],
+        reader: &R,
+    ) -> Result<Blob<Self>, CollectionOperationError>
+    where
+        R: BlobStoreGet + BlobStoreMeta,
+    {
+        let (first, rest) = members.split_first().ok_or_else(|| {
+            CollectionOperationError::Fatal("a join needs at least one member".to_owned())
+        })?;
+        let mut joined = first.clone();
+        for member in rest {
+            joined = Self::join_members(descriptor, &joined, member, reader)?;
+        }
+        Ok(joined)
+    }
 }
 
 /// The canonical incoming derivation owned by one target encoding.

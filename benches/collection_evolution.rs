@@ -251,6 +251,34 @@ struct RunContext<'a> {
     collections: &'a Collections,
 }
 
+/// What the source stood on in the store snapshot a target observation was
+/// taken from. Supports are collection-local, so the accounting cover of
+/// source payloads is read from the source itself.
+fn source_support<E: triblespace_core::collection::CollectionEncoding>(
+    observed: &CollectionSnapshot<MemoryRepoSnapshot, E>,
+    collections: &Collections,
+) -> Support {
+    observed
+        .snapshot()
+        .collection(collections.source)
+        .expect("observe the source")
+        .support()
+        .expect("resolve source support")
+        .clone()
+}
+
+/// The collection a raw target derives from, read from its descriptor.
+fn collections_source(
+    snapshot: &MemoryRepoSnapshot,
+    raw: Collection<SuccinctArchiveBlob>,
+) -> Collection<SimpleArchive> {
+    let facts: TribleSet = snapshot.get(raw.handle()).expect("raw descriptor");
+    let source = triblespace_core::collection::descriptor::source(&facts)
+        .expect("raw descriptor source")
+        .expect("a raw target derives from a source");
+    Collection::open(snapshot, source).expect("open the raw target's source")
+}
+
 fn maintain_succinct(
     store: &mut MemoryRepo,
     collections: &Collections,
@@ -275,7 +303,7 @@ fn time_ensure(
     let attached = maintain_succinct(store, collections, signing_key);
     let elapsed = start.elapsed();
     assert_eq!(
-        attached.support().expect("resolve accelerated support"),
+        &source_support(&attached, collections),
         cover,
         "the maintained target stands for the accounting cover",
     );
@@ -298,9 +326,16 @@ fn observe_raw_cover(
     let raw_cover = diagnostic_before
         .collection(raw)
         .expect("observe resident raw cover");
-    assert_eq!(
-        raw_cover.support().expect("resolve raw support"),
-        cover,
+    assert!(
+        raw_cover
+            .missing_from(
+                &diagnostic_before
+                    .collection(collections_source(&diagnostic_before, raw))
+                    .expect("observe the raw target's source"),
+            )
+            .expect("raw freshness")
+            .is_empty()
+            && raw_cover.support().expect("resolve raw support").len() == cover.len(),
         "the raw target stands for the accounting cover",
     );
     let diagnostic_after = store
@@ -450,7 +485,7 @@ fn time_snapshot(
             cover.len(),
             0,
         ),
-        Some(previous) if cover == previous.support().unwrap() => {
+        Some(previous) if cover == &source_support(previous, collections) => {
             let elapsed = start.elapsed();
             let union: UnionArchive<OrderedUniverse> = previous
                 .view()
@@ -465,7 +500,7 @@ fn time_snapshot(
                 },
             );
         }
-        Some(previous) => match cover.additions_since(previous.support().unwrap()) {
+        Some(previous) => match cover.additions_since(&source_support(previous, collections)) {
             Ok(additions) => {
                 let next = maintain_succinct(store, collections, signing_key);
                 // The delta is a set of source payloads: read them from the
@@ -480,7 +515,11 @@ fn time_snapshot(
                     changed.union(payload);
                 }
                 black_box(changed.len());
-                (next, additions.len(), previous.support().unwrap().len())
+                (
+                    next,
+                    additions.len(),
+                    source_support(previous, collections).len(),
+                )
             }
             Err(CoverAdvanceError::ResetRequired { .. }) => (
                 maintain_succinct(store, collections, signing_key),
