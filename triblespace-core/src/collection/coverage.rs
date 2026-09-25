@@ -109,6 +109,11 @@ mod triple_key {
     crate::key_schema!(Schema, Segments, 96, [0, 1, 2]);
 }
 
+/// The believed joins of one collection that cannot be driven yet, keyed by
+/// [`edge_key`] (result, then the digest of the input set), so two joins
+/// naming one result are tracked apart.
+type BlockedJoins = PATCH<64, IdentitySchema, ()>;
+
 /// `collection || node || signer`: who produced each believed node.
 type OwnerSet = PATCH<96, triple_key::Schema, ()>;
 /// `collection || locator || output`: every believed leaf of a derived
@@ -130,11 +135,13 @@ pub struct Coverage {
     /// supports by the same fold, so a read is a lookup and not a walk over
     /// the records that produced the lattice.
     frontiers: PATCH<32, IdentitySchema, FrontierSet>,
-    /// Per collection, the results of believed merges that could not be
-    /// driven yet because an input of the same collection has no support: a
-    /// record that arrived ahead of its input. Only that collection's own
-    /// records can unblock them.
-    blocked: PATCH<32, IdentitySchema, FrontierSet>,
+    /// Per collection, the believed merges that could not be driven yet
+    /// because an input of the same collection has no support: a record that
+    /// arrived ahead of its input. Keyed per join, not per result, so the
+    /// set depends only on which records are believed, never on the order
+    /// they arrived in; a collection with none has no entry at all. Only
+    /// that collection's own records can unblock them.
+    blocked: PATCH<32, IdentitySchema, BlockedJoins>,
     /// `collection || node || signer` for every believed attestation: the
     /// signer of each record that produced the node. "You own what you
     /// signed."
@@ -1084,13 +1091,20 @@ impl CoverageIndex {
         }
     }
 
-    /// Note whether an attestation's result is still waiting for an input.
+    /// Note whether one join is still waiting for an input.
+    ///
+    /// Keyed by the join itself ([`edge_key`]), so another route to the same
+    /// result -- a foundation, a leaf, or a second join -- never clears a
+    /// join that is still blocked. A join, once driven, stays drivable: rows
+    /// only grow. An emptied set drops its collection's entry, so a history
+    /// that blocked for a while equals one that never did.
     fn mark_blocked(
         &mut self,
         collection: CollectionHandle,
-        result: CollectionData,
+        attestation: &Attestation,
         blocked: bool,
     ) {
+        let key = edge_key(attestation);
         let mut set = self
             .published
             .blocked
@@ -1098,15 +1112,22 @@ impl CoverageIndex {
             .cloned()
             .unwrap_or_default();
         if blocked {
-            set.insert(&Entry::new(&result.raw));
-        } else if set.get(&result.raw).is_some() {
-            set.remove(&result.raw);
+            if set.get(&key).is_some() {
+                return;
+            }
+            set.insert(&Entry::new(&key));
+        } else if set.get(&key).is_some() {
+            set.remove(&key);
         } else {
             return;
         }
-        self.published
-            .blocked
-            .replace(&Entry::with_value(&collection.raw, set));
+        if set.is_empty() {
+            self.published.blocked.remove(&collection.raw);
+        } else {
+            self.published
+                .blocked
+                .replace(&Entry::with_value(&collection.raw, set));
+        }
     }
 
     /// Union one attestation's contribution into its result row.
@@ -1126,15 +1147,15 @@ impl CoverageIndex {
                 let mut union = CoverageSet::new();
                 for input in inputs.iter() {
                     let Some(row) = self.published.rows.get(&row_key(collection, input)) else {
-                        self.mark_blocked(collection, attestation.result(), true);
+                        self.mark_blocked(collection, &attestation, true);
                         return Driven::Blocked;
                     };
                     union.union(row.clone());
                 }
+                self.mark_blocked(collection, &attestation, false);
                 union
             }
         };
-        self.mark_blocked(collection, attestation.result(), false);
         // Union first, then ask whether anything changed: a PATCH compares
         // by its root hash, so that question costs nothing after the union.
         let key = row_key(collection, attestation.result());

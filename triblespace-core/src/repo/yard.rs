@@ -2230,6 +2230,75 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    /// A derived collection holds only DERIVEs and MERGEs. Those records must
+    /// keep its descriptor on their own: without it no record of the
+    /// collection can be decided, so the whole view would stand for nothing.
+    #[test]
+    fn derived_collection_records_alone_keep_its_descriptor_through_reclaim() {
+        let (_dir, mut yard) = yard_with(1, YardConfig::default());
+        publish_record_kind_descriptions(&mut yard);
+        let descriptor = named_for_tests("derived", pin_id(48));
+        let derived = yard
+            .put::<SimpleArchive, _>(crate::blob::IntoBlob::<SimpleArchive>::to_blob(
+                descriptor.into_facts(),
+            ))
+            .unwrap();
+        let unrelated = yard
+            .put::<RawBytes, _>(raw_blob(b"owned by nothing"))
+            .unwrap();
+        let key = SigningKey::from_bytes(&[49; 32]);
+        // Outputs, inputs and the merge result are all absent: the
+        // descriptor is the only resident blob any of these records names.
+        let records = vec![
+            CollectionRecord::Derive(CollectionDerive::sign(
+                &key,
+                derived,
+                crate::collection::SourceLocator::of([50; 32]),
+                Inline::new([51; 32]),
+            )),
+            CollectionRecord::Derive(CollectionDerive::sign(
+                &key,
+                derived,
+                crate::collection::SourceLocator::of([52; 32]),
+                Inline::new([53; 32]),
+            )),
+            CollectionRecord::Merge(
+                CollectionMerge::sign(
+                    &key,
+                    derived,
+                    [Inline::new([51; 32]), Inline::new([53; 32])],
+                    Inline::new([54; 32]),
+                )
+                .unwrap(),
+            ),
+        ];
+        for record in records.iter().copied() {
+            yard.insert(record).unwrap();
+        }
+
+        yard.collect(&RetentionRoots::new()).unwrap();
+        let reader = yard.snapshot().unwrap();
+        assert!(reader.contains_blob(derived).unwrap());
+        assert!(!reader.contains_blob(unrelated).unwrap());
+        drop(reader);
+
+        yard.reclaim().unwrap();
+        let snapshot = yard.snapshot().unwrap();
+        assert!(snapshot
+            .get::<Blob<SimpleArchive>, SimpleArchive>(derived)
+            .is_ok());
+        assert!(!snapshot.contains_blob(unrelated).unwrap());
+        let mut actual = snapshot
+            .records()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        actual.sort_by_key(CollectionRecord::fingerprint);
+        let mut expected = records;
+        expected.sort_by_key(CollectionRecord::fingerprint);
+        assert_eq!(actual, expected);
+    }
+
     #[test]
     fn valid_dangling_native_commit_survives_yard_collection_and_reclaim() {
         let (dir, mut yard) = yard_with(1, YardConfig::default());

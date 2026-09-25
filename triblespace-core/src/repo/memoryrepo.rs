@@ -803,6 +803,9 @@ mod tests {
         let descriptor = repo
             .put::<UnknownBlob, _>(Bytes::from_source(b"descriptor".to_vec()))
             .unwrap();
+        let derived_descriptor = repo
+            .put::<UnknownBlob, _>(Bytes::from_source(b"derived descriptor".to_vec()))
+            .unwrap();
         let wanted_input = repo
             .put::<UnknownBlob, _>(Bytes::from_source(b"wanted input".to_vec()))
             .unwrap();
@@ -820,17 +823,30 @@ mod tests {
             .unwrap(),
         ))
         .unwrap();
+        // A derived collection holds no COMMIT; its DERIVE alone must keep
+        // its descriptor, while its locator names nothing to keep.
+        repo.insert(CollectionRecord::Derive(CollectionDerive::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+            derived_descriptor.transmute(),
+            crate::collection::SourceLocator::of(orphan.raw),
+            Inline::new([0xfe; 32]),
+        )))
+        .unwrap();
         repo.want(WantRequest::blob(wanted_input)).unwrap();
 
         repo.keep(std::iter::empty::<Inline<Handle<UnknownBlob>>>());
 
         let reader = repo.snapshot().unwrap();
-        for retained in [child, merge_input, merge_output, wanted_input] {
+        for retained in [
+            child,
+            merge_input,
+            merge_output,
+            descriptor,
+            derived_descriptor,
+            wanted_input,
+        ] {
             assert!(reader.get::<Blob<UnknownBlob>, _>(retained).is_ok());
         }
-        // A lattice-v2 MERGE owns its result and inputs, not its collection's
-        // descriptor.
-        assert!(reader.get::<Blob<UnknownBlob>, _>(descriptor).is_err());
         assert!(reader.get::<Blob<UnknownBlob>, _>(orphan).is_err());
     }
 

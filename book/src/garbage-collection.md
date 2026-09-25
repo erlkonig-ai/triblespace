@@ -69,9 +69,14 @@ incorrect.
 
 There is no collection-specific retention planner. In particular, admission
 results do not select lifetime roots and `MERGE` or `DERIVE` records
-are not treated as weaker cache hints. A retained equation owns its resident
-inputs, output, and descriptor exactly as a retained commit owns its resident
-descriptor, data, and metadata.
+are not treated as weaker cache hints. A retained MERGE owns its resident
+descriptor, result, and inputs, and a retained DERIVE its resident target
+descriptor and output, exactly as a retained commit owns its resident
+descriptor, data, and metadata. A DERIVE's source locator is a one-way image
+of a handle, not a handle, so it owns nothing. Naming the descriptor matters
+most for a derived collection: it holds no COMMIT, so its MERGEs and DERIVEs
+are the only records that keep the descriptor every one of its records needs
+to be decided.
 
 This ownership rule is deliberately stronger than read-time dependency
 selection. An authorized witness-bound output can be read without historical

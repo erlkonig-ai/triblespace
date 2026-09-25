@@ -806,6 +806,7 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
             }
             PileRecordContent::Collection { .. }
             | PileRecordContent::LegacyUnsignedCollectionEquation { .. }
+            | PileRecordContent::RetiredCollectionEquation { .. }
             | PileRecordContent::LegacyCollectionV3 { .. }
             | PileRecordContent::RetiredCollectionDeriveV4 => {
                 let raw = &bytes[record.offset..record.offset + record.len];

@@ -682,9 +682,13 @@ impl SourceLocator {
         Self(crate::blob::locator::blob_locator(handle_raw))
     }
 
-    /// Reinterpret raw locator bytes read from a record. This does not hash:
-    /// the bytes already are a locator.
-    pub const fn from_raw(raw: [u8; 32]) -> Self {
+    /// Reinterpret raw locator bytes read from a record or an index. This
+    /// does not hash: the bytes must already be a locator.
+    ///
+    /// Crate-private on purpose. Outside the decoders a locator is only ever
+    /// built from a handle with [`Self::of`]; wrapping a raw handle here would
+    /// publish a leaf no freshness query can find.
+    pub(crate) const fn from_raw(raw: [u8; 32]) -> Self {
         Self(raw)
     }
 
@@ -869,10 +873,17 @@ impl CollectionMerge {
         self.result
     }
 
-    /// Blob handles named directly by this record: the result, then every
-    /// input. Residency of each handle is independent.
+    /// Blob handles named directly by this record: the collection descriptor,
+    /// the result, then every input. Residency of each handle is independent.
+    ///
+    /// The descriptor is owned like a COMMIT owns its descriptor. A derived
+    /// collection holds only MERGEs and DERIVEs, so if these did not name it,
+    /// nothing would keep a derived collection's descriptor through
+    /// record-rooted garbage collection, and without it none of the
+    /// collection's records can be decided.
     pub fn blob_references(&self) -> impl ExactSizeIterator<Item = Inline<Handle<UnknownBlob>>> {
-        let mut references = arrayvec::ArrayVec::<_, { MAX_MERGE_INPUTS + 1 }>::new();
+        let mut references = arrayvec::ArrayVec::<_, { MAX_MERGE_INPUTS + 2 }>::new();
+        references.push(self.collection.transmute());
         references.push(Handle::<UnknownBlob>::from_hash(self.result));
         references.extend(self.inputs.iter().map(Handle::<UnknownBlob>::from_hash));
         references.into_iter()
@@ -1030,10 +1041,16 @@ impl CollectionDerive {
         self.output
     }
 
-    /// Blob handles named directly by this record: the output only. The
-    /// locator is not fetchable.
-    pub fn blob_references(&self) -> [Inline<Handle<UnknownBlob>>; 1] {
-        [Handle::<UnknownBlob>::from_hash(self.output)]
+    /// Blob handles named directly by this record: the target descriptor and
+    /// the output. Never the locator, which is not fetchable.
+    ///
+    /// The target descriptor is owned for the reason a MERGE owns its
+    /// collection's: a derived collection holds no COMMIT to keep it.
+    pub fn blob_references(&self) -> [Inline<Handle<UnknownBlob>>; 2] {
+        [
+            self.target.transmute(),
+            Handle::<UnknownBlob>::from_hash(self.output),
+        ]
     }
 
     /// Encode into the exact dense 192-byte layout: `target | locator |
@@ -1507,14 +1524,15 @@ impl CollectionRecord {
 
     /// Blob handles named directly by this native record.
     ///
-    /// A commit names its descriptor, data and metadata; a merge its result
-    /// and every input; a derive only its output, because its input is a
-    /// locator, not a fetchable handle. The returned handles express physical
-    /// ownership only. Callers must not filter them through signature
-    /// validity, collection admission, or algebraic usefulness before
-    /// applying retention.
+    /// Every record names its collection's descriptor. Beyond that, a commit
+    /// names its data and metadata; a merge its result and every input; a
+    /// derive its output only, because its input is a locator, not a
+    /// fetchable handle. The returned handles express physical ownership
+    /// only. Callers must not filter them through signature validity,
+    /// collection admission, or algebraic usefulness before applying
+    /// retention.
     pub fn blob_references(&self) -> impl ExactSizeIterator<Item = Inline<Handle<UnknownBlob>>> {
-        let mut references = arrayvec::ArrayVec::<_, { MAX_MERGE_INPUTS + 1 }>::new();
+        let mut references = arrayvec::ArrayVec::<_, { MAX_MERGE_INPUTS + 2 }>::new();
         match self {
             Self::Commit(record) => references.extend(record.blob_references()),
             Self::Merge(record) => references.extend(record.blob_references()),
@@ -2051,7 +2069,7 @@ mod tests {
         assert_eq!(widest.to_bytes().len(), COLLECTION_MERGE_MAX_BYTES_LEN);
         assert_eq!(
             CollectionRecord::Merge(widest).blob_references().len(),
-            MAX_MERGE_INPUTS + 1
+            MAX_MERGE_INPUTS + 2
         );
         assert_eq!(
             CollectionMerge::from_bytes(&widest.to_bytes()).unwrap(),
@@ -2220,21 +2238,22 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![[1; 32], [2; 32], [3; 32]],
         );
-        // The result, then every input; never the collection.
+        // The descriptor, the result, then every input.
         assert_eq!(
             CollectionRecord::Merge(merge)
                 .blob_references()
                 .map(|handle| handle.raw)
                 .collect::<Vec<_>>(),
-            vec![[7; 32], [5; 32], [6; 32], [8; 32]],
+            vec![[4; 32], [7; 32], [5; 32], [6; 32], [8; 32]],
         );
-        // The output only: a locator is not fetchable.
+        // The target descriptor and the output; never the locator, which is
+        // not fetchable.
         assert_eq!(
             CollectionRecord::Derive(derive)
                 .blob_references()
                 .map(|handle| handle.raw)
                 .collect::<Vec<_>>(),
-            vec![[10; 32]],
+            vec![[8; 32], [10; 32]],
         );
     }
 

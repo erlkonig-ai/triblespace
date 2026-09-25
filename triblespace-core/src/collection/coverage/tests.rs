@@ -820,6 +820,43 @@ fn a_merge_arriving_before_its_inputs_settles_on_the_same_frontier() {
     assert!(!index.published().has_blocked(c));
 }
 
+/// Whether a collection still holds a blocked join depends only on which
+/// records are believed. A second route to the same result -- here a driven
+/// join -- must not clear a join that still lacks an input, whichever came
+/// first; and a join that blocked for a while leaves no trace once driven.
+#[test]
+fn blocked_joins_do_not_depend_on_arrival_order() {
+    let c = collection(0);
+    let driven = merge(1, c, &[data(1), data(2)], data(20));
+    let stuck = merge(1, c, &[data(3), data(9)], data(20));
+    let foundations = [
+        commit(1, c, data(1)),
+        commit(1, c, data(2)),
+        commit(1, c, data(3)),
+    ];
+    let fold = |records: &[&CollectionRecord]| {
+        let mut index = CoverageIndex::new();
+        for record in records {
+            index.apply(record, &AdmitEveryRecord);
+        }
+        index
+    };
+    let [a, b, d] = &foundations;
+    let driven_first = fold(&[a, b, d, &driven, &stuck]);
+    let stuck_first = fold(&[a, b, d, &stuck, &driven]);
+    assert!(driven_first.published().has_blocked(c));
+    assert!(stuck_first.published().has_blocked(c));
+    assert_eq!(driven_first.published(), stuck_first.published());
+
+    // A join that arrives ahead of its inputs and is then driven publishes
+    // exactly what the in-order history does.
+    let in_order = fold(&[a, b, &driven]);
+    let reversed = fold(&[&driven, b, a]);
+    assert!(!in_order.published().has_blocked(c));
+    assert!(!reversed.published().has_blocked(c));
+    assert_eq!(in_order.published(), reversed.published());
+}
+
 #[test]
 fn a_commit_arriving_after_the_merge_that_consumes_it_is_not_put_back() {
     let mut index = CoverageIndex::new();
