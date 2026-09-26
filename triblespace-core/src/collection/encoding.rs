@@ -186,6 +186,14 @@ pub trait CollectionEncoding: BlobEncoding + MetaDescribe + Sized + 'static {
 pub trait CollectionDerivation: CollectionEncoding {
     /// Canonical source encoding.
     type Source: CollectionEncoding;
+
+    /// Whether this mapping's image of a source member is the same on every
+    /// host that can compute it: a function of the member and the blobs it
+    /// names, never of which of them a host happens to hold. Maintenance
+    /// derives another owner's foundations only through such a mapping; one
+    /// that is correct only on its producer's complete replica leaves each
+    /// foundation to its owner.
+    const REPLICA_INDEPENDENT: bool = true;
     /// Runtime argument which distinguishes concrete mappings of this
     /// canonical source-to-target relation.
     type Argument;
@@ -251,6 +259,14 @@ pub trait CollectionDerivation: CollectionEncoding {
 pub trait CollectionMapping: Sized {
     /// Canonical source encoding.
     type Source: CollectionEncoding;
+
+    /// Whether this mapping's image of a source member is the same on every
+    /// host that can compute it: a function of the member and the blobs it
+    /// names, never of which of them a host happens to hold. Maintenance
+    /// derives another owner's foundations only through such a mapping; one
+    /// that is correct only on its producer's complete replica leaves each
+    /// foundation to its owner.
+    const REPLICA_INDEPENDENT: bool = true;
     /// Canonical target encoding.
     type Target: CollectionEncoding;
 
@@ -309,6 +325,8 @@ impl<T: CollectionDerivation> CanonicalDerivation<T> {
 impl<T: CollectionDerivation> CollectionMapping for CanonicalDerivation<T> {
     type Source = T::Source;
     type Target = T;
+
+    const REPLICA_INDEPENDENT: bool = T::REPLICA_INDEPENDENT;
 
     fn fragment(&self) -> Fragment {
         T::fragment(&self.argument)

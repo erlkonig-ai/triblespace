@@ -569,6 +569,11 @@ where
     View<[f32]>: TryFromBlob<E>,
     <View<[f32]> as TryFromBlob<E>>::Error: std::fmt::Display + Send + Sync + 'static,
 {
+    /// Model inference, not asserted bit-identical across hosts: each
+    /// foundation's owner computes its image and others receive it by
+    /// replication, as the compute-class refusal below says.
+    const REPLICA_INDEPENDENT: bool = false;
+
     type Source = SimpleArchive;
     type Target = NvFp4CosineSet<E>;
 

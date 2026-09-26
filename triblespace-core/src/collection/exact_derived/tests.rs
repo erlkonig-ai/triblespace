@@ -260,6 +260,7 @@ thread_local! {
     static SECOND_JOIN_CALLS: Cell<usize> = const { Cell::new(0) };
     static FIRST_MAP_MISSING: Cell<bool> = const { Cell::new(false) };
     static FIRST_MAP_CAPACITY: RefCell<Option<CollectionData>> = const { RefCell::new(None) };
+    static FIRST_MAP_FATAL: RefCell<Option<CollectionData>> = const { RefCell::new(None) };
 }
 
 fn reset_mapping_calls() {
@@ -268,6 +269,7 @@ fn reset_mapping_calls() {
     SECOND_JOIN_CALLS.set(0);
     FIRST_MAP_MISSING.set(false);
     FIRST_MAP_CAPACITY.replace(None);
+    FIRST_MAP_FATAL.replace(None);
 }
 
 impl CollectionDerivation for FirstEncoding {
@@ -306,6 +308,11 @@ impl CollectionDerivation for FirstEncoding {
         if FIRST_MAP_CAPACITY.with_borrow(|blocked| *blocked == Some(data(source))) {
             return Err(CollectionOperationError::Capacity(
                 "injected source capacity".to_owned(),
+            ));
+        }
+        if FIRST_MAP_FATAL.with_borrow(|refused| *refused == Some(data(source))) {
+            return Err(CollectionOperationError::Fatal(
+                "injected source refusal".to_owned(),
             ));
         }
         let mut bytes = source.bytes.as_ref().to_vec();
@@ -3912,5 +3919,83 @@ mod lattice_v2 {
             .iter()
             .chain(&mirrors)
             .all(|merge| merge.public_key() == public(43)));
+    }
+    #[test]
+    fn a_foreign_foundation_the_mapping_refuses_is_its_owners_lag_not_this_keys_failure() {
+        // Review finding, 2026-09-26: a Fatal or capacity refusal on another
+        // owner's foundation must not fail this key's pass or stop its own
+        // mirroring, nor be reported as this key's lag.
+        reset_mapping_calls();
+        let (mut store, root, first, _) = collections();
+        for entity in 0..8 {
+            own_commit(&mut store, root, 41, entity);
+        }
+        let refused = own_commit(&mut store, root, 42, 1);
+        let too_big = own_commit(&mut store, root, 42, 2);
+        let fine = own_commit(&mut store, root, 42, 3);
+        FIRST_MAP_FATAL.replace(Some(refused));
+        FIRST_MAP_CAPACITY.replace(Some(too_big));
+
+        block_on(store.maintain(root, &key(41))).unwrap();
+        block_on(store.maintain(first, &key(41))).unwrap();
+
+        // 41's own merge is mirrored, and every foundation but the two the
+        // mapping refused has a leaf.
+        let mirrors = merges_in(&mut store, first.handle());
+        assert_eq!(mirrors.len(), 1);
+        assert!(mirrors.iter().all(|mirror| mirror.public_key() == public(41)));
+        let snapshot = store.snapshot().unwrap();
+        let missing: BTreeSet<CollectionData> = snapshot
+            .collection(first)
+            .unwrap()
+            .missing_from(&snapshot.collection(root).unwrap())
+            .unwrap()
+            .data_members()
+            .collect();
+        drop(snapshot);
+        assert_eq!(missing, BTreeSet::from([refused, too_big]));
+        assert!(derives_in(&mut store, first.handle())
+            .iter()
+            .any(|leaf| leaf.input() == SourceLocator::of(fine.raw)));
+
+        // Another pass is quiet and still succeeds.
+        let before = records(&mut store).len();
+        block_on(store.maintain(first, &key(41))).unwrap();
+        assert_eq!(records(&mut store).len(), before);
+    }
+
+    #[test]
+    fn maintenance_never_fetches_another_owners_payload() {
+        // Review finding, 2026-09-26: foreign work is derived only from
+        // payloads already here; an absent owner's missing payload costs no
+        // acquisition, on this pass or any later one.
+        let (mut inner, root, first, _) = collections();
+        let own = own_commit(&mut inner, root, 41, 1);
+        let absent = foreign_commit(&mut inner, root, 42, 1);
+        let mut store = GuardStore::new(inner);
+
+        block_on(store.maintain(first, &key(41))).unwrap();
+        block_on(store.maintain(first, &key(41))).unwrap();
+        assert!(store.acquired.is_empty(), "{:?}", store.acquired);
+
+        // The own foundation has its leaf; the absent payload's foundation
+        // has none. (Freshness does not name it: a source stands only for
+        // payloads it holds.)
+        let leaves: BTreeSet<SourceLocator> = derives_in(&mut store.inner, first.handle())
+            .iter()
+            .map(|leaf| leaf.input())
+            .collect();
+        assert_eq!(leaves, BTreeSet::from([SourceLocator::of(own.raw)]));
+        assert!(!leaves.contains(&SourceLocator::of(absent.raw)));
+    }
+
+    #[test]
+    fn a_mapping_bound_to_its_producers_replica_is_left_to_each_owner() {
+        use crate::collection::encoding::CanonicalDerivation;
+        use crate::collection::reference_summary::ReferenceSummaryBlob;
+        assert!(<CanonicalDerivation<FirstEncoding> as CollectionMapping>::REPLICA_INDEPENDENT);
+        assert!(
+            !<CanonicalDerivation<ReferenceSummaryBlob> as CollectionMapping>::REPLICA_INDEPENDENT
+        );
     }
 }

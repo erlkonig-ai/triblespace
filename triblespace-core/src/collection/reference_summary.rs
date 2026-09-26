@@ -716,6 +716,10 @@ impl CollectionEncoding for ReferenceSummaryBlob {
 }
 
 impl CollectionDerivation for ReferenceSummaryBlob {
+    /// The summary follows only the referenced blobs a host holds, so a
+    /// partial replica would publish a smaller summary than the producer's.
+    const REPLICA_INDEPENDENT: bool = false;
+
     type Source = SimpleArchive;
     type Argument = ReferenceSummaryLayout;
 

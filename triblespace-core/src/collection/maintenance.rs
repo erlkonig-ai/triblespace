@@ -17,9 +17,11 @@
 //! - A derived collection derives what its maintainer wrote. Every source
 //!   foundation it owns whose locator has no leaf in the target yet is mapped
 //!   and published as `DERIVE(target, L(F), f(F))`, empty images included;
-//!   then, when the view admits the maintainer, every foundation another key
-//!   owns that has no leaf at all, so a reader never waits on an owner who
-//!   is offline. Every believed source MERGE it signed is mirrored,
+//!   then, when the view admits the maintainer and the mapping does not
+//!   depend on what a host holds, every foundation another key owns that has
+//!   no leaf at all and whose payload is already here, so a reader never
+//!   waits on an owner who is offline; what that mapping cannot do with such
+//!   a foundation stays the owner's lag. Every believed source MERGE it signed is mirrored,
 //!   bottom-up, as a target MERGE over the images of its inputs, the result
 //!   computed by mapping the merged source node's own bytes. A derived
 //!   collection has no carry of its own: its merges are its source's merges,
@@ -661,8 +663,13 @@ where
 /// not lag behind an owner who is absent (a machine that is offline, or not
 /// yet on this version). Two keys deriving the same foundation publish the
 /// same output, so a race costs a duplicate record, never a divergent view.
-/// A foreign foundation whose payload cannot be had here is that owner's lag
-/// and is skipped quietly.
+/// That holds only for a mapping whose image does not depend on which blobs
+/// a host holds ([`CollectionMapping::REPLICA_INDEPENDENT`]); any other is
+/// left to each foundation's owner. Foreign work is offered, never owed:
+/// only a key the view admits takes it, only for payloads already here
+/// (nothing is fetched for another owner), and whatever the mapping cannot
+/// do with one -- a refusal, a capacity limit, a dependency not here -- is
+/// that owner's lag, skipped quietly rather than failing this key's pass.
 ///
 /// An own source foundation owed a leaf whose bytes are not here is fetched.
 /// When nobody can hand them over, a root commit's payload is reported,
@@ -700,8 +707,8 @@ where
         let foundation: CollectionData = Inline::new(*raw);
         let locator = SourceLocator::of(foundation.raw);
         if !owns(&coverage, bound.source, foundation, &key) {
-            if restore && !coverage.has_leaf(target.handle(), locator) {
-                foreign.push((foundation, locator, Vec::new(), false));
+            if restore && M::REPLICA_INDEPENDENT && !coverage.has_leaf(target.handle(), locator) {
+                foreign.push((foundation, locator));
             }
             continue;
         }
@@ -747,9 +754,22 @@ where
         });
     }
     // Foreign work is offered, never owed: a key the view does not admit
-    // leaves it to the keys it does.
-    if admitted {
-        owed.extend(foreign);
+    // leaves it to the keys it does, and another owner's payload that is not
+    // already here is not fetched.
+    if admitted && !foreign.is_empty() {
+        let mut payloads = FrontierSet::new();
+        for (foundation, _) in &foreign {
+            payloads.insert(&Entry::new(&foundation.raw));
+        }
+        let resident = snapshot.resident(&payloads).map_err(|error| {
+            CollectionRealizationError::storage("intersect foreign payloads with residency", error)
+        })?;
+        owed.extend(
+            foreign
+                .into_iter()
+                .filter(|(foundation, _)| resident.get(&foundation.raw).is_some())
+                .map(|(foundation, locator)| (foundation, locator, Vec::new(), false)),
+        );
     }
     if owed.is_empty() {
         return Ok(Vec::new());
@@ -767,9 +787,12 @@ where
             })?
             .is_some();
         if !resident {
+            if !own {
+                // Resident when selected; nothing is fetched for another owner.
+                continue;
+            }
             if unavailable.contains(&foundation) {
-                // A foreign payload nobody could hand over is its owner's lag.
-                if own && bound.source_is_root {
+                if bound.source_is_root {
                     blocked.push((
                         foundation,
                         "the source commit's payload is not resident and could not be acquired"
@@ -807,6 +830,9 @@ where
                     "publish leaf DERIVE",
                 )?;
             }
+            // Whatever the mapping cannot do with another owner's foundation
+            // is that owner's lag, not this key's failure.
+            Err(_) if !own => continue,
             Err(CollectionOperationError::Capacity(reason)) => blocked.push((foundation, reason)),
             Err(CollectionOperationError::MissingDependency(member))
                 if unavailable.contains(&member) =>
