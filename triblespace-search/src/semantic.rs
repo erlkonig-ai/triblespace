@@ -1,52 +1,61 @@
 //! The semantic index: an NVFP4 cosine set derived straight from source
-//! facts through the nomic models that live in the same pile.
+//! facts through a nomic model that lives in the same pile.
 //!
 //! [`SemanticIndex`] is a [`CollectionMapping`] from one `SimpleArchive`
 //! source (the Files collection, say) to [`NvFp4CosineSet`]. Its descriptor
-//! names what to embed (one content attribute whose values are handles to
-//! raw bytes, classified by the bytes themselves: a raster image goes
-//! through the vision model, a PDF's own text layer and any valid UTF-8 go
-//! through the text model's document side; plus any number of attributes
-//! whose values are handles to UTF-8 text), the model and tokenizer roots to
-//! embed with and their containing collection handle, the compute class the
-//! index is canonical on, and the row dimension. The selected references are
-//! identity; unrelated observations and the collection's physical member
-//! archives are not. A new selection is a new descriptor and the old index
-//! stays readable.
+//! names what to embed (any number of attributes whose values are handles to
+//! content bytes), the one model that embeds them ([`SemanticModel`]: a
+//! vision root, or a text root with its tokenizer root) in a named model
+//! collection, the compute class the index is canonical on, and the row
+//! dimension. The selected references are identity; unrelated observations
+//! and the collection's physical member archives are not. A new selection is
+//! a new descriptor and the old index stays readable.
 //!
-//! A row is keyed by what embedded it and the entity it belongs to, 32
-//! bytes: a content row by the root of the model its bytes went through,
-//! `[model root id | entity id]` (the vision root for an image, the text
-//! root for a text or a PDF), a text-attribute row by its attribute,
-//! `[attribute id | entity id]`. So a hit names the entity without any
-//! stored per-entity vector (the vectors a writer may have stored under a
-//! per-file attribute are not the index any more), and a reader tells an
-//! image row from a text row by the key alone, which it must: text-to-text
-//! cosines in this space sit near 0.7 and text-to-image near 0.07, so the
-//! two kinds rank apart. JP, 2026-09-13, on this shape: "it's the right
-//! shape let's build it".
+//! A row is keyed by the content handle it embeds: the 32-byte value `V` of
+//! a selected `(entity, attribute, V)` fact. The index therefore asserts
+//! nothing about how many values an entity has. A multi-valued attribute is
+//! more values, one blob held by several entities is one row, and the
+//! mapping of a union is the union of the mappings, which is exactly the
+//! NVFP4 carrier's join. A reader reaches the entities through the source
+//! on the same value: the rows of an index constrain `v`, and
+//! `pattern(e, a, v)` over the source (with `a` bound to an attribute, or
+//! left free for "any attached content") names who holds it. See
+//! [`crate::nvfp4::ReconstructedCosines`].
 //!
-//! Images go through nomic-embed-vision-v1.5 and texts through the document
-//! side of nomic-embed-text-v1.5, the two halves of one aligned space, so a
-//! text query finds an image by cosine alone. JP, 2026-09-13, on the text
-//! side: "just point to the file blob itself as a UTF8String if it is one";
-//! a scanned PDF has no text layer and waits for an OCR model in the pile.
+//! One index is one model. Images go through nomic-embed-vision-v1.5 and
+//! texts through the document side of nomic-embed-text-v1.5, the two halves
+//! of one aligned space, so a text query finds an image by cosine alone. But
+//! text-to-text cosines in this space sit near 0.7 and text-to-image near
+//! 0.07, so the two kinds cannot share a floor or a ranking. The kind of a
+//! row is the index it lives in: a vision index holds a row for every value
+//! whose bytes the image decoder recognises, a text index for every value
+//! whose bytes are a PDF with a text layer or UTF-8 text (HTML reduced to
+//! its text). The two sets are disjoint by construction, because the bytes
+//! alone decide ([`classify`]). A reader who wants both queries both, each
+//! with its own floor, and unions them with `or!`.
+//!
 //! The text model reads the first 2,048 tokens of a document; chunk rows for
-//! long documents are the follow-up. Rows are the two-stage NVFP4
-//! form JP settled for the index side on 2026-09-11 (97.6 % recall\@10
-//! against f32 on our own prose); [`NvFp4CosineIndex::reconstructed_top_k`]
-//! answers a query from the rows alone.
+//! long documents are the follow-up. A scanned PDF has no text layer and
+//! waits for an OCR model in the pile. Rows are the two-stage NVFP4 form
+//! settled for the index side on 2026-09-11 (97.6 % recall\@10 against f32
+//! on our own prose). No exact vector is stored per row, so this index is
+//! read through its reconstructions
+//! ([`crate::nvfp4::NvFp4CosineIndex::reconstructed_cosines`]); the exact
+//! reranking reads of `top_k`, `above` and `similar_to` do not apply to it.
 //!
-//! The mapping is a function of the source bytes and the selected model roots
-//! on the compute class it names. A GPU is not bit-deterministic across
+//! The mapping is a function of the content bytes and the selected model
+//! roots on the compute class it names. A GPU is not bit-deterministic across
 //! hardware, so the descriptor carries the class it was computed on and
 //! [`SemanticIndex::map`] refuses to compute on another: there the DERIVE
-//! results arrive by replication (JP, 2026-09-10: the Sparks are canonical,
-//! customers buy appliances). A golden vector checked before publishing is
-//! the follow-up that makes a driver update visible.
+//! results arrive by replication. Within the class the join requires the
+//! same bytes to embed to the same row every time: a blob that two source
+//! members both hold is embedded by both, and the carrier refuses two
+//! different rows under one handle rather than choosing one. A golden vector
+//! checked before publishing is the follow-up that makes a driver update
+//! visible.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
@@ -57,14 +66,13 @@ use mary::selection::{
 };
 use triblespace_core::blob::encodings::rawbytes::RawBytes;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::{Blob, BlobEncoding, TryFromBlob};
 use triblespace_core::collection::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
 use triblespace_core::collection::{
     Collection, CollectionHandle, CollectionMapping, CollectionOperationError,
     CollectionSnapshotExt, Cover,
 };
-use triblespace_core::id::{id_hex, ExclusiveId, Id, RawId};
+use triblespace_core::id::{id_hex, ExclusiveId, Id};
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::encodings::shortstring::ShortString;
@@ -72,46 +80,46 @@ use triblespace_core::inline::{Inline, IntoInline};
 use triblespace_core::macros::{attributes, entity, find};
 use triblespace_core::metadata::{self, MetaDescribe};
 use triblespace_core::query::TriblePattern;
-use triblespace_core::repo::StoreRead;
+use triblespace_core::repo::{BlobStoreGet, StoreRead};
 use triblespace_core::trible::{Fragment, TribleSet, TRIBLE_LEN};
 
 use crate::nvfp4::{encode_rows, nvfp4_dimension, NvFp4CosineSet, StoredRow, HANDLE_LEN};
 
-/// The mapping algorithm: selected attributes of a `SimpleArchive` source,
-/// embedded through the nomic v1.5 text and vision models pinned by the
-/// descriptor, to two-stage NVFP4 rows keyed by model root (content rows)
-/// or attribute (text-attribute rows) and entity. The content attribute's
-/// bytes are classified (image, PDF text layer, UTF-8).
+/// The mapping algorithm: the values of the selected attributes of a
+/// `SimpleArchive` source, each a handle to content bytes, embedded through
+/// the one nomic v1.5 model the descriptor pins (vision for images, the text
+/// model's document side for PDF text layers and UTF-8), to two-stage NVFP4
+/// rows keyed by the content handle.
 ///
-/// Minted with `trible genid` on 2026-09-14:
-/// `2B69128192930EE0782CCA03B97677F5`. Models and the tokenizer are explicit
-/// root references in one named collection, not member-archive handles. The
-/// previous archive-pinning algorithm was `021EE2F74220BDAE30CC35FB08FC9427`;
-/// its descriptors and results are not rewritten or implicitly rebound.
-/// That algorithm replaced
-/// `4704CB1C2A54CDBF96F54BFFC53A0733` of the same day, which keyed content
-/// rows by the content attribute and so could not tell an image row from a
-/// text row, and `B94732E5DA22EFE9A4961BE906F5C500`, the image-only mapping
-/// of the night before; neither left sky. A mapping that computes something
+/// Minted with `trible genid` on 2026-09-27:
+/// `523C31F03F049CA26A0E847CAAFC08F7`. It replaces
+/// `2B69128192930EE0782CCA03B97677F5` of 2026-09-14, whose rows were keyed
+/// `[model root | entity]` and `[attribute | entity]`: that key claimed one
+/// value per entity, so a second value under one key could not join, and its
+/// row named an entity rather than a value the source could be joined on. Its
+/// descriptors and results are not rewritten or implicitly rebound. Earlier
+/// ids: `021EE2F74220BDAE30CC35FB08FC9427` (archive-pinning),
+/// `4704CB1C2A54CDBF96F54BFFC53A0733` and
+/// `B94732E5DA22EFE9A4961BE906F5C500`. A mapping that computes something
 /// else is a different function and gets a different id.
-pub const NOMIC_ATTRIBUTES_TO_NVFP4: Id = id_hex!("2B69128192930EE0782CCA03B97677F5");
+pub const NOMIC_ATTRIBUTES_TO_NVFP4: Id = id_hex!("523C31F03F049CA26A0E847CAAFC08F7");
 
 attributes! {
-    /// The one attribute whose values are handles to raw content bytes; every
-    /// entity carrying it gets a row when the bytes are an image, a PDF with
-    /// a text layer, or UTF-8 text. Minted 2026-09-13.
+    /// An attribute whose values are handles to content bytes; repeatable.
+    /// Every distinct value under any selected attribute gets at most one
+    /// row, when the index's model has something to read in its bytes.
+    /// Minted 2026-09-13.
     "13E4B93C65EA173282139D7DEBC1CC9B" as pub semantic_content_attribute: GenId;
-    /// An attribute whose values are handles to UTF-8 text; repeatable, one
-    /// text row per (attribute, entity). Minted 2026-09-13.
-    "02C9C79EA911BE8AAF9070A83B26CD10" as pub semantic_text_attribute: GenId;
     /// Historical archive-pinning argument, retained with its original id.
     /// A member archive of the pile's model collection carrying the roots
     /// named below and their tokenizer; repeatable. These pin the exact
     /// model bytes. Minted 2026-09-13.
     "FC76F2B04ACC2CE2F74BDC3CBEDBF37B" as pub semantic_model_archive: Handle<SimpleArchive>;
-    /// The vision model root in the named collection. Minted 2026-09-13.
+    /// The vision model root in the named collection, for a vision index.
+    /// Minted 2026-09-13.
     "4ADAD28EE2152E087625A04BB7CA449B" as pub semantic_vision_root: GenId;
-    /// The text model root in the named collection. Minted 2026-09-13.
+    /// The text model root in the named collection, for a text index.
+    /// Minted 2026-09-13.
     "9273B441A9D0EEC0778A5B5488EB6851" as pub semantic_text_root: GenId;
     /// The text tokenizer root in the named collection. Minted with
     /// `trible genid` 2026-09-14: `E6A241C22B0457CD24AE65C1FC6AC177`.
@@ -147,29 +155,41 @@ impl MetaDescribe for NomicAttributesToNvFp4Recipe {
         let id = NOMIC_ATTRIBUTES_TO_NVFP4;
         entity! { ExclusiveId::force_ref(&id) @
             metadata::name: "nomic-content-to-nvfp4",
-            metadata::description: "Selected attributes of a SimpleArchive source embedded through the nomic-embed v1.5 vision and text models pinned by the descriptor, as two-stage NVFP4 cosine rows keyed by attribute and entity; the content attribute's bytes are classified as image, PDF text layer or UTF-8 text.",
+            metadata::description: "The values of selected attributes of a SimpleArchive source, each a handle to content bytes, embedded through the one nomic-embed v1.5 model the descriptor pins (vision for images, the text model's document side for PDF text layers and UTF-8 text), as two-stage NVFP4 cosine rows keyed by the content handle. The bytes alone decide whether the model has anything to read in a value.",
             metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
         }
     }
 }
 
-/// One concrete semantic index: what to embed, with which model references,
-/// on which compute, into rows of which dimension.
+/// The one model a semantic index embeds with, which is also the kind of
+/// every row it holds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SemanticModel {
+    /// Raster images through a vision model root.
+    Vision {
+        /// The vision model root in the named collection.
+        root: Id,
+    },
+    /// PDF text layers and UTF-8 text through a text model root's document
+    /// side.
+    Text {
+        /// The text model root in the named collection.
+        root: Id,
+        /// Its tokenizer root in the same collection.
+        tokenizer: Id,
+    },
+}
+
+/// One concrete semantic index: what to embed, with which model, on which
+/// compute, into rows of which dimension.
 pub struct SemanticIndex<E: BlobEncoding> {
-    /// Attribute whose values are handles to raw content bytes (image, PDF or
-    /// UTF-8 text), if content is indexed.
-    pub content_attribute: Option<Id>,
-    /// Attributes whose values are handles to UTF-8 text.
-    pub text_attributes: BTreeSet<Id>,
-    /// The collection containing the selected roots and text tokenizer.
+    /// Attributes whose values are handles to content bytes.
+    pub content_attributes: BTreeSet<Id>,
+    /// The collection containing the selected model roots.
     /// Its physical support does not participate in this index's identity.
     pub model_collection: CollectionHandle,
-    /// The vision root used for image content, when images are indexed.
-    pub vision_root: Option<Id>,
-    /// The text root; required when `text_attributes` is not empty.
-    pub text_root: Option<Id>,
-    /// The tokenizer root; required whenever a text root is named.
-    pub tokenizer_root: Option<Id>,
+    /// The model that embeds every row, and so the kind of every row.
+    pub model: SemanticModel,
     /// The compute class the index is canonical on.
     pub compute: String,
     /// Row dimension (768 for the nomic v1.5 pair).
@@ -181,12 +201,9 @@ pub struct SemanticIndex<E: BlobEncoding> {
 impl<E: BlobEncoding> Clone for SemanticIndex<E> {
     fn clone(&self) -> Self {
         Self {
-            content_attribute: self.content_attribute,
-            text_attributes: self.text_attributes.clone(),
+            content_attributes: self.content_attributes.clone(),
             model_collection: self.model_collection,
-            vision_root: self.vision_root,
-            text_root: self.text_root,
-            tokenizer_root: self.tokenizer_root,
+            model: self.model,
             compute: self.compute.clone(),
             dimension: self.dimension,
             encoding: PhantomData,
@@ -196,12 +213,9 @@ impl<E: BlobEncoding> Clone for SemanticIndex<E> {
 
 impl<E: BlobEncoding> PartialEq for SemanticIndex<E> {
     fn eq(&self, other: &Self) -> bool {
-        self.content_attribute == other.content_attribute
-            && self.text_attributes == other.text_attributes
+        self.content_attributes == other.content_attributes
             && self.model_collection == other.model_collection
-            && self.vision_root == other.vision_root
-            && self.text_root == other.text_root
-            && self.tokenizer_root == other.tokenizer_root
+            && self.model == other.model
             && self.compute == other.compute
             && self.dimension == other.dimension
     }
@@ -213,38 +227,37 @@ impl<E: BlobEncoding> std::fmt::Debug for SemanticIndex<E> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("SemanticIndex")
-            .field("content_attribute", &self.content_attribute)
-            .field("text_attributes", &self.text_attributes)
+            .field("content_attributes", &self.content_attributes)
             .field("model_collection", &self.model_collection)
-            .field("vision_root", &self.vision_root)
-            .field("text_root", &self.text_root)
-            .field("tokenizer_root", &self.tokenizer_root)
+            .field("model", &self.model)
             .field("compute", &self.compute)
             .field("dimension", &self.dimension)
             .finish()
     }
 }
 
+/// What an index's model reads from one content blob.
+enum Input<'a> {
+    /// Image bytes for the vision model.
+    Image(&'a [u8]),
+    /// A document's text for the text model's document side.
+    Document(String),
+}
+
 impl<E: BlobEncoding> SemanticIndex<E> {
     /// A new index description. `dimension` must be positive and at least
-    /// one of the two model roots must be named with its attributes.
+    /// one content attribute must be selected.
     pub fn new(
-        content_attribute: Option<Id>,
-        text_attributes: impl IntoIterator<Item = Id>,
+        content_attributes: impl IntoIterator<Item = Id>,
         model_collection: CollectionHandle,
-        vision_root: Option<Id>,
-        text_root: Option<Id>,
-        tokenizer_root: Option<Id>,
+        model: SemanticModel,
         compute: impl Into<String>,
         dimension: usize,
     ) -> Result<Self, CollectionOperationError> {
         let index = Self {
-            content_attribute,
-            text_attributes: text_attributes.into_iter().collect(),
+            content_attributes: content_attributes.into_iter().collect(),
             model_collection,
-            vision_root,
-            text_root,
-            tokenizer_root,
+            model,
             compute: compute.into(),
             dimension,
             encoding: PhantomData,
@@ -257,26 +270,8 @@ impl<E: BlobEncoding> SemanticIndex<E> {
         if self.dimension == 0 {
             return Err(fatal("semantic index dimension must be positive"));
         }
-        if self.content_attribute.is_some()
-            && self.vision_root.is_none()
-            && self.text_root.is_none()
-        {
-            return Err(fatal(
-                "semantic index embeds content but names neither a vision nor a text root",
-            ));
-        }
-        if !self.text_attributes.is_empty() && self.text_root.is_none() {
-            return Err(fatal("semantic index embeds text but names no text root"));
-        }
-        if self.text_root.is_some() && self.tokenizer_root.is_none() {
-            return Err(fatal(
-                "semantic index names a text root but no tokenizer root",
-            ));
-        }
-        if self.content_attribute.is_none() && self.text_attributes.is_empty() {
-            return Err(fatal(
-                "semantic index embeds nothing: no content or text attribute",
-            ));
+        if self.content_attributes.is_empty() {
+            return Err(fatal("semantic index embeds nothing: no content attribute"));
         }
         if self.compute.is_empty() {
             return Err(fatal("semantic index names no compute class"));
@@ -284,29 +279,84 @@ impl<E: BlobEncoding> SemanticIndex<E> {
         Ok(())
     }
 
-    /// The row key of one (attribute, entity) pair: attribute id in the high
-    /// sixteen bytes, entity id in the low sixteen. A content row's
-    /// "attribute" is the root of the model that embedded it.
-    pub fn row_key(attribute: Id, entity: RawId) -> [u8; HANDLE_LEN] {
-        let mut key = [0u8; HANDLE_LEN];
-        key[..16].copy_from_slice(&attribute[..]);
-        key[16..].copy_from_slice(&entity);
-        key
+    /// Every distinct value under a selected attribute in `source`: the
+    /// candidate row keys. A set, because a repeated fact is one fact and a
+    /// value held twice is one value.
+    fn values(&self, source: &Blob<SimpleArchive>) -> BTreeSet<[u8; HANDLE_LEN]> {
+        source
+            .bytes
+            .as_ref()
+            .chunks_exact(TRIBLE_LEN)
+            .filter(|raw| {
+                self.content_attributes
+                    .iter()
+                    .any(|attribute| raw[16..32] == attribute[..])
+            })
+            .map(|raw| raw[32..].try_into().expect("32-byte trible value"))
+            .collect()
     }
 
-    /// The (attribute, entity) pair a row key names, or `None` for a key
-    /// that is not one of ours; for a content row the first id is the model
-    /// root, the descriptor's `vision_root` or `text_root`.
-    pub fn row_entity(key: &[u8; HANDLE_LEN]) -> Option<(Id, Id)> {
-        let attribute = Id::new(key[..16].try_into().expect("16 bytes"))?;
-        let entity = Id::new(key[16..].try_into().expect("16 bytes"))?;
-        Some((attribute, entity))
+    /// What this index's model reads in `bytes`, decided by the bytes alone,
+    /// or `None` when it has nothing to read there (the value then has no
+    /// row, the same answer every time).
+    fn model_input<'a>(&self, bytes: &'a [u8]) -> Option<Input<'a>> {
+        match self.model {
+            SemanticModel::Vision { .. } => image::guess_format(bytes)
+                .is_ok()
+                .then_some(Input::Image(bytes)),
+            SemanticModel::Text { .. } => match classify(bytes) {
+                Content::Pdf(text) | Content::Text(text) if !text.trim().is_empty() => {
+                    Some(Input::Document(text))
+                }
+                _ => None,
+            },
+        }
     }
 
-    /// The embedders this index computes with, loaded from
-    /// the explicitly named collection through `reader`, the same frozen
-    /// records and authorization boundary the source came from.
-    fn models<R>(&self, reader: &R) -> Result<Rc<Models>, CollectionOperationError>
+    /// The rows for `values`, each embedded by `embed` from what the model
+    /// reads in its bytes and keyed by the value itself. `embed` answers
+    /// `None` for input it cannot embed (an image the decoder rejects), which
+    /// is a classification of the bytes and gets no row.
+    fn embed_values<R, F>(
+        &self,
+        values: &BTreeSet<[u8; HANDLE_LEN]>,
+        reader: &R,
+        mut embed: F,
+    ) -> Result<Blob<NvFp4CosineSet<E>>, CollectionOperationError>
+    where
+        R: BlobStoreGet,
+        F: FnMut(Input<'_>) -> Result<Option<Vec<f32>>, CollectionOperationError>,
+    {
+        let mut rows = Vec::with_capacity(values.len());
+        for raw in values {
+            let bytes: Bytes = reader
+                .get(Inline::<Handle<RawBytes>>::new(*raw))
+                .map_err(|source| fatal(source.to_string()))?;
+            let Some(input) = self.model_input(bytes.as_ref()) else {
+                continue;
+            };
+            let Some(vector) = embed(input)? else {
+                continue;
+            };
+            if vector.len() != self.dimension {
+                return Err(fatal(format!(
+                    "model produced {} dimensions, index has {}",
+                    vector.len(),
+                    self.dimension
+                )));
+            }
+            rows.push(
+                StoredRow::quantize(*raw, &vector, self.dimension)
+                    .map_err(|source| fatal(source.to_string()))?,
+            );
+        }
+        encode_rows::<E>(self.dimension, rows).map_err(|source| fatal(source.to_string()))
+    }
+
+    /// The embedder this index computes with, loaded from the explicitly
+    /// named collection through `reader`, the same frozen records and
+    /// authorization boundary the source came from.
+    fn load_model<R>(&self, reader: &R) -> Result<Rc<Model>, CollectionOperationError>
     where
         R: StoreRead,
     {
@@ -323,88 +373,89 @@ impl<E: BlobEncoding> SemanticIndex<E> {
         let snapshot = reader
             .collection(collection)
             .map_err(|source| fatal(format!("semantic index model collection: {source:#}")))?;
-        let references = (
-            self.model_collection,
-            self.vision_root,
-            self.text_root,
-            self.tokenizer_root,
-        );
+        let references = (self.model_collection, self.model);
         // Operational reuse after admission, not model identity: the cheap
         // cover equality guards one thread's last inference observation before
         // materializing its graph. Changed packaging or annotations may reload
         // the runtime once, but cannot rekey the descriptor or derived rows.
         // No graph digest is minted and reuse never skips frozen admission.
-        if let Some(models) = MODELS.with(|cache| {
+        if let Some(model) = MODEL.with(|cache| {
             cache
                 .borrow()
                 .as_ref()
-                .and_then(|(selected, observed, models)| {
-                    (*selected == references && observed == snapshot.cover())
-                        .then(|| models.clone())
+                .and_then(|(selected, observed, model)| {
+                    (*selected == references && observed == snapshot.cover()).then(|| model.clone())
                 })
         }) {
-            return Ok(models);
+            return Ok(model);
         }
         let facts = snapshot
             .view::<TribleSet>()
             .map_err(|source| fatal(format!("semantic index model facts: {source:#}")))?;
         let device = mary::embed::default_device();
-        let vision = match self.vision_root {
-            Some(root) => {
+        let model = match self.model {
+            SemanticModel::Vision { root } => {
                 let keymap = load_keymap_from_graph(&facts, reader, ModelSelector::Root(root))
                     .map_err(|source| {
                         fatal(format!("semantic index vision root {root:X}: {source:#}"))
                     })?;
-                Some(
-                    mary::embed::load_nomic_vision_from_keymap(keymap, device.clone()).map_err(
+                Model::Vision(
+                    mary::embed::load_nomic_vision_from_keymap(keymap, device).map_err(
                         |source| fatal(format!("semantic index vision model: {source:#}")),
                     )?,
                 )
             }
-            None => None,
-        };
-        let text = match self.text_root {
-            Some(root) => {
+            SemanticModel::Text { root, tokenizer } => {
                 let keymap = load_keymap_from_graph(&facts, reader, ModelSelector::Root(root))
                     .map_err(|source| {
                         fatal(format!("semantic index text root {root:X}: {source:#}"))
                     })?;
-                let tokenizer_root = self
-                    .tokenizer_root
-                    .ok_or_else(|| fatal("semantic index names no text tokenizer root"))?;
-                let tokenizer = load_tokenizer_from_graph(
-                    &facts,
-                    reader,
-                    TokenizerSelector::Root(tokenizer_root),
-                )
-                .map_err(|source| fatal(format!("semantic index text tokenizer: {source:#}")))?;
-                Some(
+                let tokenizer =
+                    load_tokenizer_from_graph(&facts, reader, TokenizerSelector::Root(tokenizer))
+                        .map_err(|source| {
+                        fatal(format!("semantic index text tokenizer: {source:#}"))
+                    })?;
+                Model::Text(
                     mary::embed::nomic_text_from_parts(keymap, tokenizer, device).map_err(
                         |source| fatal(format!("semantic index text model: {source:#}")),
                     )?,
                 )
             }
-            None => None,
         };
-        let models = Rc::new(Models { vision, text });
-        MODELS.with(|cache| {
-            *cache.borrow_mut() = Some((references, snapshot.cover().clone(), models.clone()));
+        let model = Rc::new(model);
+        MODEL.with(|cache| {
+            *cache.borrow_mut() = Some((references, snapshot.cover().clone(), model.clone()));
         });
-        Ok(models)
+        Ok(model)
     }
 }
 
 type Backend = mary::nn::backend::B;
 
-struct Models {
-    vision: Option<mary::embed::NomicVisionEmbedder<Backend>>,
-    text: Option<mary::embed::NomicTextEmbedder<Backend>>,
+enum Model {
+    Vision(mary::embed::NomicVisionEmbedder<Backend>),
+    Text(mary::embed::NomicTextEmbedder<Backend>),
 }
 
-type ModelReferences = (CollectionHandle, Option<Id>, Option<Id>, Option<Id>);
+impl Model {
+    /// Embed what the index's model reads. A rejected image is a
+    /// classification of its bytes (no row); a text model failure is an error.
+    fn embed(&self, input: Input<'_>) -> Result<Option<Vec<f32>>, CollectionOperationError> {
+        match (self, input) {
+            (Model::Vision(vision), Input::Image(bytes)) => Ok(vision.embed_image(bytes).ok()),
+            (Model::Text(text), Input::Document(document)) => text
+                .embed_document(&document)
+                .map(Some)
+                .map_err(|source| fatal(format!("text model: {source:#}"))),
+            _ => Err(fatal("semantic index model does not read this input")),
+        }
+    }
+}
+
+type ModelReferences = (CollectionHandle, SemanticModel);
 
 thread_local! {
-    static MODELS: RefCell<Option<(ModelReferences, Cover<SimpleArchive>, Rc<Models>)>> = const { RefCell::new(None) };
+    static MODEL: RefCell<Option<(ModelReferences, Cover<SimpleArchive>, Rc<Model>)>> = const { RefCell::new(None) };
 }
 
 fn fatal(message: impl Into<String>) -> CollectionOperationError {
@@ -578,18 +629,23 @@ where
     type Target = NvFp4CosineSet<E>;
 
     fn fragment(&self) -> Fragment {
-        let image: Option<Inline<GenId>> = self.content_attribute.map(|id| id.to_inline());
-        let vision: Option<Inline<GenId>> = self.vision_root.map(|id| id.to_inline());
-        let text: Option<Inline<GenId>> = self.text_root.map(|id| id.to_inline());
-        let tokenizer: Option<Inline<GenId>> = self.tokenizer_root.map(|id| id.to_inline());
+        let (vision, text, tokenizer): (
+            Option<Inline<GenId>>,
+            Option<Inline<GenId>>,
+            Option<Inline<GenId>>,
+        ) = match self.model {
+            SemanticModel::Vision { root } => (Some(root.to_inline()), None, None),
+            SemanticModel::Text { root, tokenizer } => {
+                (None, Some(root.to_inline()), Some(tokenizer.to_inline()))
+            }
+        };
         entity! { _ @
             metadata::tag: KIND_COLLECTION_MAPPING,
             mapping_algorithm*: <NomicAttributesToNvFp4Recipe as MetaDescribe>::describe(),
             metadata::blob_encoding*: E::describe(),
             nvfp4_dimension: self.dimension as u64,
             semantic_compute: self.compute.as_str(),
-            semantic_content_attribute?: image,
-            semantic_text_attribute*: self.text_attributes.iter(),
+            semantic_content_attribute*: self.content_attributes.iter(),
             semantic_model_collection: self.model_collection,
             semantic_vision_root?: vision,
             semantic_text_root?: text,
@@ -626,13 +682,24 @@ where
         )
         .map_err(|source| fatal(source.to_string()))?
         .ok_or_else(|| fatal("semantic index names no model collection"))?;
-        Self::new(
-            scalar_id(facts, semantic_content_attribute.id())?,
-            repeated_ids(facts, mapping, semantic_text_attribute.id()),
-            Inline::new(model_collection),
+        let model = match (
             scalar_id(facts, semantic_vision_root.id())?,
             scalar_id(facts, semantic_text_root.id())?,
             scalar_id(facts, semantic_tokenizer_root.id())?,
+        ) {
+            (Some(root), None, None) => SemanticModel::Vision { root },
+            (None, Some(root), Some(tokenizer)) => SemanticModel::Text { root, tokenizer },
+            _ => {
+                return Err(fatal(
+                    "semantic index names neither one vision root nor one text root with its \
+                     tokenizer root: one index is one model's rows",
+                ))
+            }
+        };
+        Self::new(
+            repeated_ids(facts, mapping, semantic_content_attribute.id()),
+            Inline::new(model_collection),
+            model,
             compute_class,
             dimension,
         )
@@ -649,30 +716,8 @@ where
         triblespace_core::collection::simplearchive_union::validate_element(source)
             .map_err(|source| fatal(source.to_string()))?;
 
-        // What this member asks to embed: per (attribute, entity), the set of
-        // handles under it. A set, because a repeated fact is one fact; the
-        // canonically lowest handle is the one embedded when there are
-        // several, so the row is a function of the facts and never of their
-        // order.
-        let mut images: BTreeMap<RawId, BTreeSet<[u8; 32]>> = BTreeMap::new();
-        let mut texts: BTreeMap<(Id, RawId), BTreeSet<[u8; 32]>> = BTreeMap::new();
-        for raw in source.bytes.as_ref().chunks_exact(TRIBLE_LEN) {
-            let entity: RawId = raw[..16].try_into().expect("16-byte entity");
-            let value: [u8; 32] = raw[32..].try_into().expect("32-byte trible value");
-            if self
-                .content_attribute
-                .is_some_and(|attribute| raw[16..32] == attribute[..])
-            {
-                images.entry(entity).or_default().insert(value);
-                continue;
-            }
-            for attribute in &self.text_attributes {
-                if raw[16..32] == attribute[..] {
-                    texts.entry((*attribute, entity)).or_default().insert(value);
-                }
-            }
-        }
-        if images.is_empty() && texts.is_empty() {
+        let values = self.values(source);
+        if values.is_empty() {
             return encode_rows::<E>(self.dimension, Vec::new())
                 .map_err(|source| fatal(source.to_string()));
         }
@@ -680,8 +725,8 @@ where
         // Every dependency must be here before any model is loaded: a missing
         // blob is the one error the caller can act on (fetch it), so it must
         // not hide behind a model failure.
-        for handles in images.values() {
-            let handle = Inline::<Handle<RawBytes>>::new(*handles.first().expect("non-empty set"));
+        for raw in &values {
+            let handle = Inline::<Handle<RawBytes>>::new(*raw);
             if reader
                 .metadata(handle)
                 .map_err(|source| fatal(source.to_string()))?
@@ -689,21 +734,6 @@ where
             {
                 return Err(CollectionOperationError::MissingDependency(Handle::<
                     RawBytes,
-                >::to_hash(
-                    handle
-                )));
-            }
-        }
-        for handles in texts.values() {
-            let handle =
-                Inline::<Handle<UTF8String>>::new(*handles.first().expect("non-empty set"));
-            if reader
-                .metadata(handle)
-                .map_err(|source| fatal(source.to_string()))?
-                .is_none()
-            {
-                return Err(CollectionOperationError::MissingDependency(Handle::<
-                    UTF8String,
                 >::to_hash(
                     handle
                 )));
@@ -717,140 +747,108 @@ where
                 local_compute()
             )));
         }
-        let models = self.models(reader)?;
+        let model = self.load_model(reader)?;
         // SEMANTIC_TRACE=1 prints one line per source member on stderr: what
         // it held and what it cost, the only progress an index build shows.
         let trace = std::env::var_os("SEMANTIC_TRACE").is_some();
         let started = std::time::Instant::now();
-        let (mut n_image, mut n_text, mut n_pdf, mut n_other) = (0usize, 0usize, 0usize, 0usize);
-
-        let mut rows = Vec::with_capacity(images.len() + texts.len());
-        if self.content_attribute.is_some() {
-            for (entity, handles) in &images {
-                let raw = *handles.first().expect("non-empty set");
-                let bytes: Bytes = reader
-                    .get(Inline::<Handle<RawBytes>>::new(raw))
-                    .map_err(|source| fatal(source.to_string()))?;
-                // The bytes say what they are; a kind this index has no
-                // model for gets no row, the same answer every time.
-                let kind = classify(bytes.as_ref());
-                match &kind {
-                    Content::Image => n_image += 1,
-                    Content::Pdf(_) => n_pdf += 1,
-                    Content::Text(_) => n_text += 1,
-                    Content::Other => n_other += 1,
-                }
-                // The row is keyed by the root of the model it went through.
-                let (vector, root) = match kind {
-                    Content::Image => match (models.vision.as_ref(), self.vision_root) {
-                        (Some(vision), Some(root)) => match vision.embed_image(bytes.as_ref()) {
-                            Ok(vector) => (vector, root),
-                            Err(_) => continue,
-                        },
-                        _ => continue,
-                    },
-                    Content::Pdf(text) | Content::Text(text) => {
-                        if text.trim().is_empty() {
-                            continue;
-                        }
-                        match (models.text.as_ref(), self.text_root) {
-                            (Some(text_model), Some(root)) => (
-                                text_model
-                                    .embed_document(&text)
-                                    .map_err(|source| fatal(format!("text model: {source:#}")))?,
-                                root,
-                            ),
-                            _ => continue,
-                        }
-                    }
-                    Content::Other => continue,
-                };
-                if vector.len() != self.dimension {
-                    return Err(fatal(format!(
-                        "model produced {} dimensions, index has {}",
-                        vector.len(),
-                        self.dimension
-                    )));
-                }
-                rows.push(
-                    StoredRow::quantize(Self::row_key(root, *entity), &vector, self.dimension)
-                        .map_err(|source| fatal(source.to_string()))?,
-                );
-            }
-        }
-        if let Some(text_model) = models.text.as_ref() {
-            for ((attribute, entity), handles) in &texts {
-                let raw = *handles.first().expect("non-empty set");
-                let text: View<str> = reader
-                    .get(Inline::<Handle<UTF8String>>::new(raw))
-                    .map_err(|source| fatal(source.to_string()))?;
-                let vector = text_model
-                    .embed_document(&text)
-                    .map_err(|source| fatal(format!("text model: {source:#}")))?;
-                if vector.len() != self.dimension {
-                    return Err(fatal(format!(
-                        "text model produced {} dimensions, index has {}",
-                        vector.len(),
-                        self.dimension
-                    )));
-                }
-                rows.push(
-                    StoredRow::quantize(
-                        Self::row_key(*attribute, *entity),
-                        &vector,
-                        self.dimension,
-                    )
-                    .map_err(|source| fatal(source.to_string()))?,
-                );
-            }
-        }
+        let mut embedded = 0usize;
+        let rows = self.embed_values(&values, reader, |input| {
+            let vector = model.embed(input)?;
+            embedded += usize::from(vector.is_some());
+            Ok(vector)
+        })?;
         if trace {
             eprintln!(
-                "semantic index: member with {} content value(s) ({n_image} image, {n_text} text, {n_pdf} pdf, {n_other} other) and {} text fact(s): {} row(s) in {:.1} s",
-                images.len(),
-                texts.len(),
-                rows.len(),
+                "semantic index: member with {} content value(s): {embedded} row(s) in {:.1} s",
+                values.len(),
                 started.elapsed().as_secs_f64()
             );
         }
-        encode_rows::<E>(self.dimension, rows).map_err(|source| fatal(source.to_string()))
+        Ok(rows)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nvfp4::NvFp4CosineIndex;
     use crate::schemas::Embedding;
+    use triblespace_core::blob::IntoBlob;
+    use triblespace_core::collection::TryFromCover;
+    use triblespace_core::repo::memoryrepo::MemoryRepo;
+    use triblespace_core::repo::{BlobStorePut, SnapshotSource};
+    use triblespace_core::trible::Trible;
+
+    const DIMENSION: usize = 8;
 
     fn collection(byte: u8) -> CollectionHandle {
         Inline::new([byte; 32])
     }
 
-    #[test]
-    fn descriptor_round_trips_every_argument() {
+    fn text_model() -> SemanticModel {
+        SemanticModel::Text {
+            root: Id::new([5; 16]).unwrap(),
+            tokenizer: Id::new([6; 16]).unwrap(),
+        }
+    }
+
+    fn vision_model() -> SemanticModel {
+        SemanticModel::Vision {
+            root: Id::new([4; 16]).unwrap(),
+        }
+    }
+
+    /// A stand-in model: a function of what it reads, so the rows it makes
+    /// are a function of the bytes, as the real model's are on one compute.
+    fn fake_embed(input: Input<'_>) -> Result<Option<Vec<f32>>, CollectionOperationError> {
+        let digest = match input {
+            Input::Image(bytes) => blake3::hash(bytes),
+            Input::Document(text) => blake3::hash(text.as_bytes()),
+        };
+        Ok(Some(
+            digest.as_bytes()[..DIMENSION]
+                .iter()
+                .map(|byte| f32::from(*byte) - 127.5)
+                .collect(),
+        ))
+    }
+
+    fn map_with_fake<R: BlobStoreGet>(
+        index: &SemanticIndex<Embedding>,
+        facts: &TribleSet,
+        reader: &R,
+    ) -> Blob<NvFp4CosineSet<Embedding>> {
+        let values = index.values(&facts.to_blob());
+        index.embed_values(&values, reader, fake_embed).unwrap()
+    }
+
+    fn fact(entity: u8, attribute: Id, value: Inline<Handle<RawBytes>>) -> Trible {
+        Trible::force(&Id::new([entity; 16]).unwrap(), &attribute, &value)
+    }
+
+    fn row_keys(member: &Blob<NvFp4CosineSet<Embedding>>) -> Vec<[u8; HANDLE_LEN]> {
+        let rows = u64::from_le_bytes(
+            member.bytes.as_ref()[member.bytes.len() - 16..][..8]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        member.bytes.as_ref()[..rows * HANDLE_LEN]
+            .chunks_exact(HANDLE_LEN)
+            .map(|key| key.try_into().unwrap())
+            .collect()
+    }
+
+    /// A store holding `index` derived from an empty source: its target
+    /// collection and the descriptor the store wrote for it.
+    fn derived(
+        index: &SemanticIndex<Embedding>,
+    ) -> (
+        (MemoryRepo, Collection<NvFp4CosineSet<Embedding>>),
+        Fragment,
+    ) {
         use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
-        use triblespace_core::repo::memoryrepo::MemoryRepo;
-        use triblespace_core::repo::{BlobStoreGet, SnapshotSource};
 
-        let image = Id::new([1; 16]).unwrap();
-        let title = Id::new([2; 16]).unwrap();
-        let body = Id::new([3; 16]).unwrap();
-        let vision = Id::new([4; 16]).unwrap();
-        let text = Id::new([5; 16]).unwrap();
-        let tokenizer = Id::new([6; 16]).unwrap();
-        let index = SemanticIndex::<Embedding>::new(
-            Some(image),
-            [title, body],
-            collection(7),
-            Some(vision),
-            Some(text),
-            Some(tokenizer),
-            "gb10",
-            768,
-        )
-        .unwrap();
-
-        // The descriptor a store writes is the one bind reads back.
         let mut store = MemoryRepo::default();
         let root = ed25519_dalek::SigningKey::from_bytes(&[7; 32]).verifying_key();
         let policy =
@@ -860,38 +858,91 @@ mod tests {
         let snapshot = store.snapshot().unwrap();
         let descriptor: Blob<SimpleArchive> = snapshot.get(target.handle()).unwrap();
         let descriptor = Fragment::from(TribleSet::try_from_blob(descriptor).unwrap());
-        let bound = SemanticIndex::<Embedding>::bind(&Fragment::empty(), &descriptor).unwrap();
-        assert_eq!(bound, index);
-        assert!(!descriptor
-            .facts()
-            .iter()
-            .any(|fact| fact.a() == &semantic_model_archive.id()));
-        assert_eq!(
-            semantic_model_collection.id(),
-            mary::format::attrs::model_collection.id()
-        );
+        ((store, target), descriptor)
+    }
 
-        let mut changed = index.clone();
-        changed.model_collection = collection(8);
-        assert_ne!(changed.fragment(), index.fragment());
-        changed = index.clone();
-        changed.vision_root = Some(Id::new([9; 16]).unwrap());
-        assert_ne!(changed.fragment(), index.fragment());
-        changed = index.clone();
-        changed.text_root = Some(Id::new([9; 16]).unwrap());
-        assert_ne!(changed.fragment(), index.fragment());
-        changed = index.clone();
-        changed.tokenizer_root = Some(Id::new([9; 16]).unwrap());
-        assert_ne!(changed.fragment(), index.fragment());
-        changed = index.clone();
-        changed.text_attributes.remove(&body);
-        assert_ne!(changed.fragment(), index.fragment());
+    #[test]
+    fn descriptor_round_trips_every_argument() {
+        let content = Id::new([1; 16]).unwrap();
+        let body = Id::new([3; 16]).unwrap();
+        for model in [text_model(), vision_model()] {
+            let index =
+                SemanticIndex::<Embedding>::new([content, body], collection(7), model, "gb10", 768)
+                    .unwrap();
+
+            // The descriptor a store writes is the one bind reads back.
+            let (_, descriptor) = derived(&index);
+            let bound = SemanticIndex::<Embedding>::bind(&Fragment::empty(), &descriptor).unwrap();
+            assert_eq!(bound, index);
+            assert!(!descriptor
+                .facts()
+                .iter()
+                .any(|fact| fact.a() == &semantic_model_archive.id()));
+            assert_eq!(
+                semantic_model_collection.id(),
+                mary::format::attrs::model_collection.id()
+            );
+
+            let mut changed = index.clone();
+            changed.model_collection = collection(8);
+            assert_ne!(changed.fragment(), index.fragment());
+            changed = index.clone();
+            changed.content_attributes.remove(&body);
+            assert_ne!(changed.fragment(), index.fragment());
+            changed = index.clone();
+            changed.compute = "apple".to_owned();
+            assert_ne!(changed.fragment(), index.fragment());
+        }
+
+        // The model is identity, and so is its kind.
+        let text =
+            SemanticIndex::<Embedding>::new([content], collection(7), text_model(), "gb10", 768)
+                .unwrap();
+        let vision =
+            SemanticIndex::<Embedding>::new([content], collection(7), vision_model(), "gb10", 768)
+                .unwrap();
+        assert_ne!(text.fragment(), vision.fragment());
+        let mut other_tokenizer = text.clone();
+        other_tokenizer.model = SemanticModel::Text {
+            root: Id::new([5; 16]).unwrap(),
+            tokenizer: Id::new([9; 16]).unwrap(),
+        };
+        assert_ne!(other_tokenizer.fragment(), text.fragment());
+    }
+
+    #[test]
+    fn a_descriptor_naming_two_models_is_refused() {
+        let vision = SemanticIndex::<Embedding>::new(
+            [Id::new([1; 16]).unwrap()],
+            collection(7),
+            vision_model(),
+            "gb10",
+            768,
+        )
+        .unwrap();
+        let (_, descriptor) = derived(&vision);
+        let mapping = triblespace_core::collection::descriptor::mapping(descriptor.facts())
+            .unwrap()
+            .unwrap();
+        // Both roots on one mapping entity would be rows of two kinds in one
+        // set, told apart by nothing.
+        let text_root = Id::new([5; 16]).unwrap();
+        let tokenizer_root = Id::new([6; 16]).unwrap();
+        let mut both = descriptor.clone();
+        both += entity! { ExclusiveId::force_ref(&mapping) @
+            semantic_text_root: &text_root,
+            semantic_tokenizer_root: &tokenizer_root,
+        };
+        let error = SemanticIndex::<Embedding>::bind(&Fragment::empty(), &both).unwrap_err();
+        assert!(
+            error.to_string().contains("one index is one model"),
+            "{error}"
+        );
     }
 
     #[test]
     fn a_named_model_collection_is_not_replaced_by_ambient_discovery() {
         use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
-        use triblespace_core::repo::{memoryrepo::MemoryRepo, SnapshotSource};
 
         let mut store = MemoryRepo::default();
         let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
@@ -911,48 +962,227 @@ mod tests {
         let snapshot = store.snapshot().unwrap();
         let named = collection(11);
         let index = SemanticIndex::<Embedding>::new(
-            Some(Id::new([1; 16]).unwrap()),
-            [],
+            [Id::new([1; 16]).unwrap()],
             named,
-            Some(Id::new([2; 16]).unwrap()),
-            None,
-            None,
+            vision_model(),
             local_compute(),
             768,
         )
         .unwrap();
         assert!(matches!(
-            index.models(&snapshot),
+            index.load_model(&snapshot),
             Err(CollectionOperationError::MissingDependency(handle)) if handle.raw == named.raw
         ));
     }
 
+    /// Rows are keyed by the value: two values under one attribute of one
+    /// entity are two rows, one value under two entities or two attributes is
+    /// one row, and the key is the content handle itself.
     #[test]
-    fn a_text_model_requires_an_explicit_tokenizer_root() {
-        let error = SemanticIndex::<Embedding>::new(
-            Some(Id::new([1; 16]).unwrap()),
-            [],
+    fn rows_are_keyed_by_content_handle() {
+        let content = Id::new([1; 16]).unwrap();
+        let attachment = Id::new([2; 16]).unwrap();
+        let unselected = Id::new([3; 16]).unwrap();
+        let mut store = MemoryRepo::default();
+        let first = store
+            .put::<RawBytes, _>(Bytes::from_source(b"the first document".to_vec()))
+            .unwrap();
+        let second = store
+            .put::<RawBytes, _>(Bytes::from_source(b"the second document".to_vec()))
+            .unwrap();
+        let ignored = store
+            .put::<RawBytes, _>(Bytes::from_source(b"an unselected attribute".to_vec()))
+            .unwrap();
+        let reader = store.snapshot().unwrap();
+
+        let mut facts = TribleSet::new();
+        // One entity, one attribute, two values.
+        facts.insert(&fact(1, content, first));
+        facts.insert(&fact(1, content, second));
+        // The same value held by another entity, and under another
+        // selected attribute.
+        facts.insert(&fact(2, content, first));
+        facts.insert(&fact(3, attachment, second));
+        facts.insert(&fact(4, unselected, ignored));
+
+        let index = SemanticIndex::<Embedding>::new(
+            [content, attachment],
             collection(7),
-            None,
-            Some(Id::new([2; 16]).unwrap()),
-            None,
+            text_model(),
             "gb10",
-            768,
+            DIMENSION,
         )
-        .unwrap_err();
-        assert!(error.to_string().contains("no tokenizer root"), "{error}");
+        .unwrap();
+        let member = map_with_fake(&index, &facts, &reader);
+        let mut expected = vec![first.raw, second.raw];
+        expected.sort_unstable();
+        assert_eq!(row_keys(&member), expected);
     }
 
+    /// The mapping of a union is the join of the mappings, byte for byte,
+    /// including a value both sides hold and the empty member: the carrier's
+    /// join is a plain union by content handle.
     #[test]
-    fn row_key_names_attribute_and_entity() {
-        let attribute = Id::new([0xAB; 16]).unwrap();
-        let entity = [0xCD; 16];
-        let key = SemanticIndex::<Embedding>::row_key(attribute, entity);
-        assert_eq!(&key[..16], &attribute[..]);
-        assert_eq!(&key[16..], &entity);
-        let (a, e) = SemanticIndex::<Embedding>::row_entity(&key).unwrap();
-        assert_eq!(a, attribute);
-        assert_eq!(&e[..], &entity);
+    fn mapping_is_a_join_homomorphism() {
+        let content = Id::new([1; 16]).unwrap();
+        let mut store = MemoryRepo::default();
+        let mut blob = |bytes: &[u8]| {
+            store
+                .put::<RawBytes, _>(Bytes::from_source(bytes.to_vec()))
+                .unwrap()
+        };
+        let shared = blob(b"a document both sides hold");
+        let left_only = blob(b"only on the left");
+        let right_only = blob(b"<html><body><p>only on the right</p></body></html>");
+        let binary = blob(&[0xff, 0xfe, 0x00, 0x01]);
+        let reader = store.snapshot().unwrap();
+
+        let mut left = TribleSet::new();
+        left.insert(&fact(1, content, shared));
+        left.insert(&fact(2, content, left_only));
+        left.insert(&fact(2, content, binary));
+        let mut right = TribleSet::new();
+        // The shared value under a different entity: one row, both sides.
+        right.insert(&fact(3, content, shared));
+        right.insert(&fact(3, content, right_only));
+        let mut union = left.clone();
+        union += right.clone();
+
+        let index = SemanticIndex::<Embedding>::new(
+            [content],
+            collection(7),
+            text_model(),
+            "gb10",
+            DIMENSION,
+        )
+        .unwrap();
+        let mapped_left = map_with_fake(&index, &left, &reader);
+        let mapped_right = map_with_fake(&index, &right, &reader);
+        let mapped_union = map_with_fake(&index, &union, &reader);
+        let joined = crate::nvfp4::join_members(&mapped_left, &mapped_right, DIMENSION).unwrap();
+        assert_eq!(mapped_union.bytes.as_ref(), joined.bytes.as_ref());
+        let reversed = crate::nvfp4::join_members(&mapped_right, &mapped_left, DIMENSION).unwrap();
+        assert_eq!(reversed.bytes.as_ref(), joined.bytes.as_ref());
+        // Bytes the text model cannot read get no row on either side.
+        assert_eq!(row_keys(&mapped_union).len(), 3);
+
+        let empty = map_with_fake(&index, &TribleSet::new(), &reader);
+        let with_empty = crate::nvfp4::join_members(&mapped_left, &empty, DIMENSION).unwrap();
+        assert_eq!(with_empty.bytes.as_ref(), mapped_left.bytes.as_ref());
+    }
+
+    /// An image and a text never share an index: the bytes decide which
+    /// model reads them, so a vision index and a text index over the same
+    /// source hold disjoint rows, and the kind of a row is its index.
+    #[test]
+    fn a_vision_and_a_text_index_split_the_values_by_their_bytes() {
+        let content = Id::new([1; 16]).unwrap();
+        let mut store = MemoryRepo::default();
+        let png = store
+            .put::<RawBytes, _>(Bytes::from_source(
+                b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec(),
+            ))
+            .unwrap();
+        let text = store
+            .put::<RawBytes, _>(Bytes::from_source(b"a caption".to_vec()))
+            .unwrap();
+        let scanned = store
+            .put::<RawBytes, _>(Bytes::from_source(b"%PDF-1.7 no text layer".to_vec()))
+            .unwrap();
+        let reader = store.snapshot().unwrap();
+        let mut facts = TribleSet::new();
+        facts.insert(&fact(1, content, png));
+        facts.insert(&fact(1, content, text));
+        facts.insert(&fact(2, content, scanned));
+
+        let vision = SemanticIndex::<Embedding>::new(
+            [content],
+            collection(7),
+            vision_model(),
+            "gb10",
+            DIMENSION,
+        )
+        .unwrap();
+        let texts = SemanticIndex::<Embedding>::new(
+            [content],
+            collection(7),
+            text_model(),
+            "gb10",
+            DIMENSION,
+        )
+        .unwrap();
+        assert_eq!(
+            row_keys(&map_with_fake(&vision, &facts, &reader)),
+            vec![png.raw]
+        );
+        assert_eq!(
+            row_keys(&map_with_fake(&texts, &facts, &reader)),
+            vec![text.raw]
+        );
+    }
+
+    /// The rows join the source on the content handle: a threshold over the
+    /// reconstructions constrains `v`, and the source pattern with a free
+    /// attribute names every entity holding a similar value.
+    #[test]
+    fn rows_join_the_source_on_the_content_handle() {
+        let content = Id::new([1; 16]).unwrap();
+        let mut store = MemoryRepo::default();
+        let shared = store
+            .put::<RawBytes, _>(Bytes::from_source(b"one attachment saved twice".to_vec()))
+            .unwrap();
+        let other = store
+            .put::<RawBytes, _>(Bytes::from_source(b"something else".to_vec()))
+            .unwrap();
+        let mut facts = TribleSet::new();
+        facts.insert(&fact(1, content, shared));
+        facts.insert(&fact(2, content, shared));
+        facts.insert(&fact(3, content, other));
+
+        let index = SemanticIndex::<Embedding>::new(
+            [content],
+            collection(7),
+            text_model(),
+            "gb10",
+            DIMENSION,
+        )
+        .unwrap();
+        let reader = store.snapshot().unwrap();
+        let member = map_with_fake(&index, &facts, &reader);
+        let ((mut target_store, target), descriptor) = derived(&index);
+        let member_handle = target_store
+            .put::<NvFp4CosineSet<Embedding>, _>(member)
+            .unwrap();
+        let cover = target.cover([member_handle]);
+        let view = NvFp4CosineIndex::<Embedding>::try_from_cover(
+            &cover,
+            &descriptor,
+            &target_store.snapshot().unwrap(),
+        )
+        .unwrap();
+
+        // The query is the shared document's own embedding.
+        let query = fake_embed(Input::Document("one attachment saved twice".to_owned()))
+            .unwrap()
+            .unwrap();
+        let cosines = view.reconstructed_cosines(&query).unwrap();
+        let holders: BTreeSet<Id> = find!(
+            holder: Id,
+            triblespace_core::temp!(
+                (attribute, value),
+                triblespace_core::and!(
+                    cosines.similar_to::<Handle<RawBytes>>(value, 0.99),
+                    facts.pattern(holder, attribute, value),
+                )
+            )
+        )
+        .collect();
+        assert_eq!(
+            holders,
+            BTreeSet::from([Id::new([1; 16]).unwrap(), Id::new([2; 16]).unwrap()])
+        );
+        assert!(cosines.cosine(&shared).unwrap() > 0.99);
+        assert!(cosines.cosine(&other).unwrap() < 0.99);
     }
 
     #[test]
@@ -985,9 +1215,8 @@ mod tests {
 
     #[test]
     fn an_index_that_embeds_nothing_is_refused() {
-        let error =
-            SemanticIndex::<Embedding>::new(None, [], collection(1), None, None, None, "gb10", 768)
-                .unwrap_err();
+        let error = SemanticIndex::<Embedding>::new([], collection(1), vision_model(), "gb10", 768)
+            .unwrap_err();
         assert!(error.to_string().contains("embeds nothing"), "{error}");
     }
 }

@@ -34,6 +34,24 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### The semantic index (`semantic`, feature `semantic`)
 
+- Rows are keyed by the content handle they embed, the value `V` of a
+  selected `(entity, attribute, V)` fact, instead of `[model root | entity]`
+  and `[attribute | entity]`. That key claimed one value per entity: a second
+  value under one key made the carrier refuse the join, a union kept only the
+  smallest value, and a row named an entity no query could join the source
+  on. Now a multi-valued attribute is more values, a blob several entities
+  hold is one row, the mapping of a union is the join of the mappings, and a
+  reader joins the source on the value (`pattern(e, a, v)`, with `a` free for
+  any attached content). One index is one model (`SemanticModel::Vision` or
+  `SemanticModel::Text` with its tokenizer), so the kind of a row is the
+  index it lives in and each kind gets its own floor; the bytes decide which
+  model reads a value, so a vision and a text index over one source are
+  disjoint. `semantic_content_attribute` is repeatable and the
+  `semantic_text_attribute` argument is gone (text attributes are content
+  attributes whose values are text). `row_key` and `row_entity` are gone.
+  Minted the mapping id `523C31F03F049CA26A0E847CAAFC08F7`, replacing
+  `2B69128192930EE0782CCA03B97677F5`; existing indexes must be derived again.
+
 - Added `SemanticIndex`, a `CollectionMapping` from a `SimpleArchive` source
   to `NvFp4CosineSet` whose rows are embedded straight from the source facts:
   one attribute of image bytes through nomic-embed-vision-v1.5, any number of
