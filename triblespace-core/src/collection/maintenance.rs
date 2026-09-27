@@ -1,19 +1,23 @@
-//! Maintenance planned from the coverage index, per owner.
+//! Maintenance planned from the coverage index.
 //!
-//! Every collection is a lattice of its own foundations joined by MERGEs,
-//! and a maintainer merges only what it owns
-//! ([`owns`](super::ownership::owns),
-//! [`owns_merge`](super::ownership::owns_merge)): a merge is a choice. A
-//! derive is a function, so it derives what it owns first and then what an
-//! absent owner has left underived. There are two kinds of work, and
-//! neither compares supports across collections:
+//! Every collection is a set of foundations, and each host joins what it
+//! holds of that set into a lattice of its own: join is associative,
+//! commutative and idempotent, so two hosts' different trees over the same
+//! foundations stand for the same set. The store's fold believes only the
+//! host's own MERGEs, so the carry signs with the host's key and merges
+//! every held node, whoever signed the foundations beneath it. A merge needs
+//! no WRITE: it adds no foundation. A derive is a function, so it derives
+//! what its maintainer owns first and then what an absent owner has left
+//! underived. There are two kinds of work, and neither compares supports
+//! across collections:
 //!
-//! - A root carries its maintainer's own frontier nodes. A node whose support
-//!   lies inside another own node's is absorbed by it, `MERGE(node, wider) ->
-//!   wider`. Whenever one tier -- `floor(log_8 |support|)` -- holds
-//!   [`MERGE_FAN_IN`] own nodes, the eight lowest handles are joined by one
-//!   n-ary MERGE, until no tier holds eight. Nobody else's payload is read,
-//!   so nobody else's absence can stall it.
+//! - A root carries every frontier node whose bytes are here. A node whose
+//!   support lies inside another held node's is absorbed by it,
+//!   `MERGE(node, wider) -> wider`. Whenever one tier -- `floor(log_8
+//!   |support|)` -- holds [`MERGE_FAN_IN`] held nodes, the eight lowest
+//!   handles are joined by one n-ary MERGE, until no tier holds eight. A
+//!   frontier node whose bytes are not here sits out: nothing is fetched for
+//!   it, so an absent payload never stalls or restarts the carry.
 //! - A derived collection derives what its maintainer wrote. Every source
 //!   foundation it owns whose locator has no leaf in the target yet is mapped
 //!   and published as `DERIVE(target, L(F), f(F))`, empty images included;
@@ -27,12 +31,15 @@
 //!   collection has no carry of its own: its merges are its source's merges,
 //!   one level down.
 //!
-//! Records are selected only to descend: the MERGEs that produced a merged
-//! source node come from the produced-member index, and are kept only when
-//! the key signed them and the source's coverage believes them. A mirror
-//! already published is found through the target's consumer edges, the
-//! MERGE relation read by its own key. The only link between a view and its
-//! source is the locator each leaf carries.
+//! A reader descends from a frontier node to the finer nodes beneath it
+//! through the host's driven joins, read from the index by the node's own
+//! key ([`Coverage::producers`]); no record is selected for it. The mirror
+//! still selects the MERGE records that produced a merged source node from
+//! the produced-member index, and keeps only those the key signed and the
+//! source's coverage believes. A mirror already published is found through
+//! the target's consumer edges, the MERGE relation read by its own key. The
+//! only link between a view and its source is the locator each leaf
+//! carries.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
@@ -106,9 +113,12 @@ fn members(set: &CoverageSet) -> Vec<CollectionData> {
 ///
 /// The frontier is the starting point, widest node first. A node inside
 /// nothing chosen before it is taken when its bytes are here and complete.
-/// Any other node -- absent or incomplete -- is descended: the MERGEs that
-/// produced it name the finer nodes beneath. A node inside what is already
-/// covered adds nothing and is neither taken nor descended.
+/// Any other node -- absent or incomplete -- is descended: the host's driven
+/// joins that produced it name the finer nodes beneath, read from the index
+/// by the node's own key. A MERGE another key signed is never folded, so it
+/// is never descended. A node inside what is already covered adds nothing
+/// and is neither taken nor descended; a join's own result among its inputs
+/// (an absorption) and a node already met are skipped, so a cycle ends.
 pub(super) fn select<R, E>(
     snapshot: &R,
     coverage: &Coverage,
@@ -169,10 +179,10 @@ where
         } else {
             selection.absent.push((node, support.clone()));
         }
-        // Descend: the MERGEs that produced this node name the finer nodes
-        // beneath it, one indexed lookup.
-        for merge in producers(snapshot, handle, node)? {
-            for &input in merge.inputs() {
+        // Descend: the host's driven joins that produced this node name the
+        // finer nodes beneath it, one prefix scan of the index.
+        for inputs in coverage.producers(handle, node) {
+            for input in inputs.iter() {
                 if input == node || !visited.insert(input) {
                     continue;
                 }
@@ -185,8 +195,11 @@ where
     Ok(selection)
 }
 
-/// The MERGEs of `collection` that produce `node`, in the store's
-/// deterministic order: one produced-member lookup.
+/// The MERGE records of `collection` that produce `node`, whoever signed
+/// them, in the store's deterministic order: one produced-member lookup.
+///
+/// Only the mirror still reads records this way, and filters them by signer
+/// and belief itself; a reader descends through [`Coverage::producers`].
 fn producers<R>(
     snapshot: &R,
     collection: CollectionHandle,
@@ -298,6 +311,14 @@ where
 
 /// What a root still has to acquire before a reader stands on every
 /// admitted commit, whoever wrote it: `None` when it does.
+///
+/// The gap is the believed foundations the reader's selection does not
+/// reach. Only the host's own merges are folded, so an absent node met on
+/// the way down is a foundation or a host merge result whose bytes are
+/// gone. A host merge over the needed payloads is asked for first, since
+/// one fetch then stands for many; commits whose payloads no host merge
+/// covers -- every commit, on a store without a host -- are fetched one by
+/// one. Another key's merge is never a shortcut: it is not believed here.
 pub(super) fn root_acquisitions<R>(
     snapshot: &R,
     target: Collection<SimpleArchive>,
@@ -309,8 +330,8 @@ where
     if gap.needed.is_empty() {
         return Ok(None);
     }
-    // A merge that stands for a needed payload before the payload itself:
-    // one fetch instead of many. Then the payloads.
+    // A host merge that stands for a needed payload before the payload
+    // itself: one fetch instead of many. Then the payloads.
     let mut acquisitions = gap.selection.missing(&gap.needed);
     acquisitions.extend(gap.selection.dependencies.iter().copied());
     acquisitions.extend(members(&gap.needed));
@@ -342,16 +363,18 @@ impl Lineage {
     }
 }
 
-/// The maintaining key's own frontier nodes of one collection, widest first.
+/// Every frontier node of one collection whose bytes are here, widest
+/// first.
 ///
-/// An own node whose bytes are not here is asked for; one that could not be
-/// acquired sits out. Nobody else's node is looked at, resident or not.
-fn own_frontier<R>(
+/// The frontier is every believed foundation, whoever signed it, and the
+/// host's own merge results. A node whose bytes are not here sits out of
+/// this carry: it is not asked for, so a host holding another key's commit
+/// records without their payloads neither fetches them nor restarts the
+/// carry once per payload. It rejoins the carry when its bytes arrive.
+fn held_frontier<R>(
     snapshot: &R,
     coverage: &Coverage,
     collection: CollectionHandle,
-    key: &VerifyingKey,
-    unavailable: &BTreeSet<CollectionData>,
 ) -> Result<Vec<Node>, CollectionRealizationError>
 where
     R: StoreRead,
@@ -359,24 +382,15 @@ where
     let Some(frontier) = coverage.frontier_set(collection) else {
         return Ok(Vec::new());
     };
-    let mut own = FrontierSet::new();
-    for raw in frontier.iter_ordered() {
-        if owns(coverage, collection, Inline::new(*raw), key) {
-            own.insert(&Entry::new(raw));
-        }
-    }
-    let resident = snapshot.resident(&own).map_err(|error| {
-        CollectionRealizationError::storage("intersect own frontier with residency", error)
+    let resident = snapshot.resident(frontier).map_err(|error| {
+        CollectionRealizationError::storage("intersect frontier with residency", error)
     })?;
     let mut nodes = Vec::new();
-    for raw in own.iter_ordered() {
-        let node: CollectionData = Inline::new(*raw);
+    for raw in frontier.iter_ordered() {
         if resident.get(raw).is_none() {
-            if unavailable.contains(&node) {
-                continue;
-            }
-            return Err(CollectionRealizationError::MissingDependency { member: node });
+            continue;
         }
+        let node: CollectionData = Inline::new(*raw);
         if let Some(support) = coverage.of(collection, node) {
             nodes.push((node, support.clone()));
         }
@@ -391,17 +405,40 @@ where
     Ok(nodes)
 }
 
-/// Carry the maintaining key's own nodes of one root to their LSM fixed
-/// point.
+/// Refuse to publish a MERGE the store would not fold.
 ///
-/// Each round reads the own frontier from the index. A node whose support
-/// lies inside another own node's is consumed first, by `MERGE(node, wider)
-/// -> wider`: no bytes move. Then every tier holding [`MERGE_FAN_IN`] own
-/// nodes is carried, the lowest such tier first, eight lowest handles per
-/// MERGE, joined by the encoding's k-way join, before the frontier is read
-/// again. Each result is stored and published at once, so a later failure
-/// keeps the complete successful prefix. Without WRITE authority nothing is
-/// published; the own finer cover is then the fixed point.
+/// The fold believes only its host's MERGEs. A carry signing with any other
+/// key -- or into a store with no host -- would publish merges nothing here
+/// believes: the frontier would not move and the carry would report a
+/// stall, or publish the same merges again on every pass. So a mismatch is
+/// an error that names both keys, raised where a merge is about to be
+/// published; a carry with nothing to merge needs no host.
+fn require_host(
+    index: &CoverageIndex,
+    signing_key: &SigningKey,
+) -> Result<(), CollectionRealizationError> {
+    let signer = Inline::new(signing_key.verifying_key().to_bytes());
+    let host = index.host();
+    if host == Some(signer) {
+        Ok(())
+    } else {
+        Err(CollectionRealizationError::HostMismatch { host, signer })
+    }
+}
+
+/// Carry every held node of one root to its LSM fixed point.
+///
+/// Each round reads the held frontier from the index: every frontier node
+/// whose bytes are here, whoever signed the foundations beneath it. A node
+/// whose support lies inside another held node's is consumed first, by
+/// `MERGE(node, wider) -> wider`: no bytes move. Then every tier holding
+/// [`MERGE_FAN_IN`] held nodes is carried, the lowest such tier first, eight
+/// lowest handles per MERGE, joined by the encoding's k-way join, before the
+/// frontier is read again. Each result is stored and published at once, so a
+/// later failure keeps the complete successful prefix. A merge needs no
+/// WRITE authority, only the store's host key: publishing with any other key
+/// is an error ([`CollectionRealizationError::HostMismatch`]). A frontier
+/// node whose bytes are not here sits out; nothing is fetched for it.
 ///
 /// Only a root carries. A derived collection whose encoding happens to be a
 /// root's is refused: its merges are its source's, mirrored through its
@@ -410,14 +447,12 @@ pub(super) fn carry_root<S, E>(
     store: &mut S,
     target: Collection<E>,
     signing_key: &SigningKey,
-    unavailable: &BTreeSet<CollectionData>,
     frontier: &mut OperationFrontier<S::Snapshot>,
 ) -> Result<(), CollectionRealizationError>
 where
     S: Store,
     E: CollectionEncoding,
 {
-    let key = signing_key.verifying_key();
     let scope = BTreeSet::from([target.handle()]);
     let lineage = load_lineage(&open(store, frontier, "open root-carry snapshot")?, target)?;
     if lineage.foundation.handle() != target.handle() {
@@ -431,8 +466,8 @@ where
     let mut progressed = true;
     loop {
         let snapshot = open(store, frontier, "open root-carry snapshot")?;
-        let coverage = coverage_of(&snapshot, &scope)?;
-        let nodes = own_frontier(&snapshot, &coverage, target.handle(), &key, unavailable)?;
+        let index = index_of(&snapshot, &scope)?;
+        let nodes = held_frontier(&snapshot, index.published(), target.handle())?;
         let identity: Vec<CollectionData> = nodes.iter().map(|(node, _)| *node).collect();
         if progressed && !seen.insert(identity.clone()) {
             return Err(CollectionRealizationError::Stalled { cover: identity });
@@ -440,14 +475,14 @@ where
         if nodes.len() < 2 {
             return Ok(());
         }
-        // A node inside another own node's support is consumed by its widest
-        // such node. Two nodes with one support keep the lower handle, which
-        // is also the one a reader keeps. Only a strictly wider node can hold
-        // a node properly, and `nodes` is widest first, so each node tests
-        // inclusion against the nodes before its own width alone; an equal
-        // support is found by its Merkle root. Fresh commits -- pairwise
-        // disjoint singletons, all of one width -- then cost no inclusion
-        // test at all, however many of them a root holds.
+        // A node inside another held node's support is consumed by its
+        // widest such node. Two nodes with one support keep the lower
+        // handle, which is also the one a reader keeps. Only a strictly
+        // wider node can hold a node properly, and `nodes` is widest first,
+        // so each node tests inclusion against the nodes before its own
+        // width alone; an equal support is found by its Merkle root. Fresh
+        // commits -- pairwise disjoint singletons, all of one width -- then
+        // cost no inclusion test at all, however many of them a root holds.
         let mut keepers = BTreeMap::<[u8; 32], CollectionData>::new();
         for (node, support) in &nodes {
             if let Some(root) = support.merkle_root() {
@@ -472,9 +507,7 @@ where
             })
             .collect();
         if !absorbed.is_empty() {
-            if !producer_is_admitted(&snapshot, target, signing_key)? {
-                return Ok(());
-            }
+            require_host(&index, signing_key)?;
             drop(snapshot);
             for (node, wider) in absorbed {
                 publish(
@@ -513,9 +546,7 @@ where
         if round.is_empty() {
             return Ok(());
         }
-        if !producer_is_admitted(&snapshot, target, signing_key)? {
-            return Ok(());
-        }
+        require_host(&index, signing_key)?;
         drop(snapshot);
         progressed = false;
         for group in round {
@@ -525,7 +556,7 @@ where
                 .map(|node| snapshot.get::<Blob<E>, E>(Handle::<E>::from_hash(*node)))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| {
-                    CollectionRealizationError::storage("load an own node to carry", error)
+                    CollectionRealizationError::storage("load a held node to carry", error)
                 })?;
             let joined = E::join_many(&descriptor, &blobs, &snapshot);
             drop(snapshot);

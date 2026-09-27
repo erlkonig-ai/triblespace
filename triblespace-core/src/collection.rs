@@ -59,14 +59,14 @@ pub mod generation;
 pub mod latest;
 /// Maintained stated last-write-wins registers over exact source covers.
 pub mod lww_register;
-/// Per-owner maintenance: root carries, leaves and aligned merges.
+/// Maintenance: root carries into the host's merges, leaves and aligned merges.
 mod maintenance;
 /// Carrying content between collections, and proving it arrived.
 pub mod migration;
 mod observation;
 pub mod observed_store;
 mod operation_snapshot;
-/// Who may merge or derive a node: "you own what you signed".
+/// Who produced a foundation: "you own what you signed".
 pub mod ownership;
 /// Immutable collection-local READ and WRITE authorization ceilings.
 pub mod policy;

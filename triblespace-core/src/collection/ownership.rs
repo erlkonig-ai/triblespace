@@ -1,19 +1,20 @@
-//! Who may merge or derive a node: "you own what you signed".
+//! Who produced a foundation: "you own what you signed".
 //!
-//! Maintenance never merges or derives a node it does not own. A root's
-//! carry takes only its own frontier nodes; a derived collection derives the
-//! source foundations its maintainer owns and mirrors the source merges its
-//! maintainer owns. Every one of those decisions asks [`owns`] or
-//! [`owns_merge`], and nothing else, so a later notion of ownership (claims,
-//! transfer) replaces these two functions rather than a scatter of signer
-//! comparisons.
+//! Ownership decides derivation, not merging. A root's carry merges every
+//! node the store holds, whoever signed the foundations beneath it, into the
+//! host's own merges: join is associative, commutative and idempotent, so
+//! whose tree covers a foundation does not matter. A derived collection
+//! still derives the source foundations its maintainer owns first, and
+//! mirrors the source merges its maintainer signed; those decisions ask
+//! [`owns`] or [`owns_merge`], and nothing else, so a later notion of
+//! ownership (claims, transfer) replaces these two functions rather than a
+//! scatter of signer comparisons.
 //!
-//! For now ownership of a node is read from the coverage index's `owners`
-//! relation: the signers of the believed records that produced the node. A
-//! node two signers produced -- the same payload committed by both, or one
-//! join both happened to sign -- is owned by both, and either may build on
-//! it. Ownership of a MERGE record is the same rule one level down: its
-//! signer owns it.
+//! Ownership of a node is read from the coverage index's `owners` relation:
+//! the signers of the believed COMMITs and DERIVEs that produced it. A node
+//! two signers produced -- the same payload committed by both -- is owned by
+//! both. A join records no owner: every join the index believes is the
+//! host's. Ownership of a MERGE record is its signer.
 
 use ed25519_dalek::VerifyingKey;
 

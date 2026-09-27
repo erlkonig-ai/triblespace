@@ -3,9 +3,10 @@
 //! A collection's support is a cover of its own foundations: commit payloads
 //! in a root, leaf images in a derived collection. `ensure` on a derived
 //! collection derives the maintaining key's own missing leaves; `maintain`
-//! also mirrors its own source merges; `maintain` on a root carries the
-//! key's own nodes. None of them manufactures an upstream dependency as a
-//! side effect of downstream work, and none reads another owner's payload.
+//! also mirrors its own source merges; `maintain` on a root carries every
+//! node the store holds, whoever signed the foundations beneath it, into the
+//! host's own merges. None of them manufactures an upstream dependency as a
+//! side effect of downstream work, and none fetches another owner's payload.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -16,7 +17,9 @@ use ed25519_dalek::SigningKey;
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::Blob;
+use crate::inline::encodings::ed25519::ED25519PublicKey;
 use crate::inline::encodings::hash::Handle;
+use crate::inline::Inline;
 use crate::repo::async_store::AsyncBlobStoreAcquire;
 use crate::repo::{BlobStoreGet, BlobStoreList, Store, StoreRead};
 use crate::trible::Fragment;
@@ -90,6 +93,15 @@ pub enum CollectionRealizationError {
     Stalled {
         /// Repeated target cover in canonical content order.
         cover: Vec<CollectionData>,
+    },
+    /// A MERGE was about to be signed with a key whose MERGEs the store
+    /// does not fold: the store was opened with another host, or with none.
+    /// Open it as the maintaining key.
+    HostMismatch {
+        /// The key whose MERGEs the store folds, if any.
+        host: Option<Inline<ED25519PublicKey>>,
+        /// The key maintenance signs with.
+        signer: Inline<ED25519PublicKey>,
     },
 }
 
@@ -182,6 +194,12 @@ impl fmt::Display for CollectionRealizationError {
                 formatter,
                 "collection operation repeated an unchanged {}-member cover",
                 cover.len(),
+            ),
+            Self::HostMismatch { host, signer } => write!(
+                formatter,
+                "maintenance signs with {} but the store folds the MERGEs of {}; open the store as the signing key",
+                hex::encode_upper(signer.raw),
+                host.map_or_else(|| "no key".to_owned(), |host| hex::encode_upper(host.raw)),
             ),
         }
     }
@@ -543,8 +561,11 @@ where
 /// Make a root readable on every admitted commit, whoever wrote it,
 /// acquiring what is missing: what `ensure` on a root does. This publishes
 /// nothing, so it needs no operation: every look is a fresh snapshot, and a
-/// commit admitted while it runs is simply seen. Maintenance never waits on
-/// it: a root's carry reads only its maintainer's own nodes.
+/// commit admitted while it runs is simply seen. A host merge standing for
+/// several missing payloads is fetched before them; another key's merge is
+/// not believed here, so commits no host merge covers are fetched one by
+/// one. Maintenance never waits on it: a root's carry merges what is held
+/// and fetches nothing.
 pub(crate) async fn ensure_root<S>(
     store: &mut S,
     target: Collection<SimpleArchive>,
@@ -652,8 +673,10 @@ where
     .await
 }
 
-/// Carry the key's own nodes of one root, acquiring an own node whose bytes
-/// are elsewhere. Nobody else's payload is asked for.
+/// Carry every held node of one root into the host's merges. No frontier
+/// node is fetched: one whose bytes are not here sits out, so the loop
+/// acquires only what the root's lineage names (its descriptor) and never
+/// restarts for a payload.
 pub(crate) async fn maintain_root_acquiring<S, E>(
     store: &mut S,
     target: Collection<E>,
@@ -663,8 +686,8 @@ where
     S: Store + AsyncBlobStoreAcquire,
     E: CollectionEncoding,
 {
-    acquiring(store, |store, unavailable, frontier| {
-        super::maintenance::carry_root(store, target, signing_key, unavailable, frontier)
+    acquiring(store, |store, _unavailable, frontier| {
+        super::maintenance::carry_root(store, target, signing_key, frontier)
     })
     .await
 }

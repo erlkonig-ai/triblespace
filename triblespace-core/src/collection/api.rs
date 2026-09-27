@@ -1365,13 +1365,15 @@ impl<R> CollectionSnapshotExt for R where R: StoreRead {}
 /// An encoding whose collection can be made resident and maintained by storage.
 ///
 /// Root `SimpleArchive` collections acquire their signed support and carry
-/// their maintainer's own nodes. Encodings with a canonical
-/// [`CollectionDerivation`] derive their maintainer's own leaves and mirror
-/// its own source merges. This operational capability is separate from the
-/// pure encoding and mapping laws; no fictitious self-derivation is needed for
-/// a root collection. The explicit key is the maintainer: it decides what is
-/// owned, and signs only records published by realization; pure mapping and
-/// snapshot observation need no signer.
+/// every node the store holds into the host's own merges. Encodings with a
+/// canonical [`CollectionDerivation`] derive their maintainer's own leaves and
+/// mirror its own source merges. This operational capability is separate from
+/// the pure encoding and mapping laws; no fictitious self-derivation is needed
+/// for a root collection. The explicit key is the maintainer: it decides what
+/// is owned, and signs only records published by realization; pure mapping and
+/// snapshot observation need no signer. A root carry publishes MERGEs, which
+/// the store folds only for its host, so the store must be opened as this
+/// key (for example [`crate::repo::pile::Pile::open_as`]).
 /// Use the four [`CollectionStoreExt`] methods at call sites. Explicit foreign
 /// mappings remain available through their `*_with` counterparts.
 pub trait CollectionRealization: CollectionEncoding {
@@ -1385,10 +1387,10 @@ pub trait CollectionRealization: CollectionEncoding {
     where
         S: Store + AsyncBlobStoreAcquire + Send;
 
-    /// A root carries the key's own nodes to their LSM fixed point; a
-    /// derived collection gets the key's leaves, a leaf for every foundation
-    /// another key owns that has none yet (a derive is a function anyone may
-    /// compute), and a mirror of every source merge the key owns.
+    /// A root carries every held node to its LSM fixed point in the host's
+    /// merges; a derived collection gets the key's leaves, a leaf for every
+    /// foundation another key owns that has none yet (a derive is a function
+    /// anyone may compute), and a mirror of every source merge the key owns.
     fn maintain<'a, S>(
         store: &'a mut S,
         target: Collection<Self>,
@@ -1461,8 +1463,8 @@ where
 {
     super::exact_derived::acquire_authority(store, target).await?;
     if compact {
-        // The carry reads the key's own nodes only; nobody else's absent
-        // payload is waited for or fetched.
+        // The carry merges every node the store holds, whoever signed the
+        // foundations beneath it; no absent payload is waited for or fetched.
         super::exact_derived::maintain_root_acquiring(store, target, signing_key).await?;
     } else {
         super::exact_derived::ensure_root(store, target).await?;
@@ -1614,10 +1616,14 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
 
     /// Maintain one collection for the key.
     ///
-    /// A root carries the key's own frontier nodes: a node inside another
-    /// own node's support is absorbed, and every tier (`floor(log_8
-    /// |support|)`) holding eight own nodes is joined by one n-ary `MERGE`,
-    /// until none does. Other owners' nodes are neither merged nor read. A
+    /// A root carries every frontier node whose bytes are here, whoever
+    /// signed the foundations beneath it: a node inside another held node's
+    /// support is absorbed, and every tier (`floor(log_8 |support|)`) holding
+    /// eight held nodes is joined by one n-ary `MERGE`, until none does. A
+    /// frontier node whose bytes are not here sits out and is not fetched. A
+    /// root's merges need no WRITE authority, only a store opened as the key
+    /// (its host); signing with another key is
+    /// [`CollectionRealizationError::HostMismatch`]. A
     /// derived collection is ensured, an own leaf whose image is absent is
     /// fetched or mapped again, and every believed source `MERGE` the key
     /// signed is mirrored, bottom-up, as a target `MERGE` over its inputs'
@@ -1627,7 +1633,8 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
     /// caller-visible budget or tuning knob; every useful result is published
     /// independently. The live store may acquire exact dependencies while
     /// doing so. The supplied key signs each newly published `MERGE` or
-    /// `DERIVE`. Without target WRITE authority, optional merging is skipped.
+    /// `DERIVE`. Without target WRITE authority, a derived collection's
+    /// optional mirroring is skipped.
     fn maintain<'a, T>(
         &'a mut self,
         target: Collection<T>,

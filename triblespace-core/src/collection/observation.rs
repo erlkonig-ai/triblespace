@@ -18,10 +18,11 @@ use super::{
 /// The coverage index says which nodes of the target are its frontier and
 /// what each stands for. The read is the same selection maintenance makes:
 /// the frontier, widest node first, taking a node whose bytes are here and
-/// complete, descending through the MERGE that produced a node whose bytes
-/// are not, with one produced-member lookup. No record is enumerated and no
-/// support is re-derived; a target the fold has nothing for stands for
-/// nothing, honestly, until its records are admitted.
+/// complete, descending through the host's driven joins that produced a
+/// node whose bytes are not, read from the index by the node's own key. No
+/// record is selected or enumerated and no support is re-derived; a target
+/// the fold has nothing for stands for nothing, honestly, until its records
+/// are admitted.
 ///
 /// Coverage is collection-local: no attestation of the target reads another
 /// collection's rows, so the read-set charged is the target's own coverage
