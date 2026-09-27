@@ -24,7 +24,11 @@
 //! Approximation is confined to candidate discovery.  [`NvFp4CosineIndex`]
 //! uses conservative error bounds and fetches original embedding blobs for
 //! exact reranking, so [`NvFp4CosineIndex::top_k`] and
-//! [`NvFp4CosineIndex::above`] retain exact cosine semantics.
+//! [`NvFp4CosineIndex::above`] retain exact cosine semantics. An index that
+//! holds no exact vector per row (the semantic index keys its rows by the
+//! content they embed) is read through its reconstructions instead:
+//! [`NvFp4CosineIndex::reconstructed_cosines`] scores every row once, and its
+//! [`ReconstructedCosines::similar_to`] is the threshold as a query constraint.
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeSet, BinaryHeap};
@@ -49,7 +53,7 @@ use triblespace_core::id::{id_hex, ExclusiveId, Id};
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::encodings::iu256::U256BE;
-use triblespace_core::inline::{Inline, IntoInline, TryFromInline};
+use triblespace_core::inline::{Inline, InlineEncoding, IntoInline, TryFromInline};
 use triblespace_core::macros::{attributes, entity};
 use triblespace_core::metadata::{self, MetaDescribe};
 use triblespace_core::query::Variable;
@@ -514,7 +518,7 @@ fn rows_equal(
             == right_bytes[right_error..right_error + FLOAT_LEN]
 }
 
-fn join_members<E: BlobEncoding>(
+pub(crate) fn join_members<E: BlobEncoding>(
     low: &Blob<NvFp4CosineSet<E>>,
     high: &Blob<NvFp4CosineSet<E>>,
     dimension: usize,
@@ -1028,9 +1032,9 @@ where
     ///
     /// The probe need not be a member of this index. Fetch and decoding errors
     /// remain visible to the caller; an unavailable probe is not an empty
-    /// mathematical neighbourhood. Candidate discovery and exact membership
-    /// are delegated to [`Self::above`], so the resulting constraint contains
-    /// every and only indexed handle whose exact cosine clears `floor`.
+    /// mathematical neighbourhood. The fetched vector goes to
+    /// [`Self::similar_to_query`], so the resulting constraint contains every
+    /// and only indexed handle whose exact cosine clears `floor`.
     pub fn similar_to<R, S>(
         &self,
         snapshot: &R,
@@ -1038,7 +1042,7 @@ where
         variable: Variable<Handle<E>>,
         floor: f64,
         scanner: &S,
-    ) -> Result<crate::constraint::SimilarTo<E>, NvFp4Error>
+    ) -> Result<crate::constraint::SimilarTo<Handle<E>>, NvFp4Error>
     where
         R: BlobStoreGet,
         S: UpperScanner,
@@ -1055,8 +1059,31 @@ where
                 uppercase_hex(&probe.raw),
             ))
         })?;
+        self.similar_to_query(snapshot, query.as_ref(), variable, floor, scanner)
+    }
+
+    /// Freeze the exact above-threshold support for one query vector as a
+    /// query constraint.
+    ///
+    /// The query vector is a parameter of the question, like the terms of a
+    /// BM25 query: a free-text query embedded at query time has no blob and
+    /// needs none. Candidate discovery and exact membership are delegated to
+    /// [`Self::above`], so the constraint contains every and only indexed
+    /// handle whose exact cosine clears `floor`.
+    pub fn similar_to_query<R, S>(
+        &self,
+        snapshot: &R,
+        query: &[f32],
+        variable: Variable<Handle<E>>,
+        floor: f64,
+        scanner: &S,
+    ) -> Result<crate::constraint::SimilarTo<Handle<E>>, NvFp4Error>
+    where
+        R: BlobStoreGet,
+        S: UpperScanner,
+    {
         let candidates = self
-            .above(snapshot, query.as_ref(), floor, scanner)?
+            .above(snapshot, query, floor, scanner)?
             .into_iter()
             .map(|hit| hit.embedding.raw)
             .collect();
@@ -1065,27 +1092,27 @@ where
         ))
     }
 
-    /// The `k` best rows by the cosine between `query` and each row's own
-    /// two-stage NVFP4 reconstruction, ranked by score then handle, without
-    /// fetching any source embedding.
+    /// The cosine between `query` and every row's own two-stage NVFP4
+    /// reconstruction, from one scan that fetches no source blob.
     ///
-    /// The whole answer for an index whose rows are not blob handles (the
-    /// semantic index keys rows by attribute and entity); an approximation
-    /// for one whose rows are, since [`Self::top_k`] then reranks exactly.
+    /// The whole answer for an index that holds no exact vector per row (the
+    /// semantic index keys its rows by the value it embedded, not by an
+    /// embedding blob); an approximation for one whose rows are embedding
+    /// handles, since [`Self::top_k`] and [`Self::above`] then rerank exactly.
     /// A two-stage row's reconstruction cosine sits within about 1e-4 of the
-    /// exact cosine (measured 2026-09-11 on 17,744 of our own texts).
-    pub fn reconstructed_top_k(
-        &self,
-        query: &[f32],
-        k: usize,
-    ) -> Result<Vec<([u8; HANDLE_LEN], f64)>, NvFp4Error> {
-        if k == 0 || self.is_empty() {
-            return Ok(Vec::new());
+    /// exact cosine (measured 2026-09-11 on 17,744 texts).
+    ///
+    /// The result is a query-scoped table: [`ReconstructedCosines::similar_to`]
+    /// turns a floor into a constraint for `find!`, and
+    /// [`ReconstructedCosines::cosine`] ranks what the query returned.
+    pub fn reconstructed_cosines(&self, query: &[f32]) -> Result<ReconstructedCosines, NvFp4Error> {
+        if self.is_empty() {
+            return Ok(ReconstructedCosines { scores: Vec::new() });
         }
         let prepared = PreparedQuery::new(query, self.dimension)?;
         let coordinates = prepared.scan_coordinates();
         let segments = self.scan_segments();
-        let mut scored = Vec::new();
+        let mut scores = Vec::new();
         self.for_each_unique_row(|handle, member_index, _member, row| {
             let segment = segments[member_index];
             let norm = segment.row_certificate(row)?.reconstruction_norm();
@@ -1099,17 +1126,13 @@ where
                     "NVFP4 reconstruction produced a nonfinite score",
                 ));
             }
-            scored.push((handle, score.clamp(-1.0, 1.0)));
+            scores.push((handle, score.clamp(-1.0, 1.0)));
             Ok(())
         })?;
-        scored.sort_unstable_by(|left, right| {
-            right
-                .1
-                .total_cmp(&left.1)
-                .then_with(|| left.0.cmp(&right.0))
-        });
-        scored.truncate(k);
-        Ok(scored)
+        // `for_each_unique_row` visits handles in ascending order, which is
+        // the order `cosine` searches.
+        debug_assert!(scores.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        Ok(ReconstructedCosines { scores })
     }
 
     fn above_candidates<R>(
@@ -1264,6 +1287,59 @@ where
             }
         }
         Ok(())
+    }
+}
+
+/// The reconstruction cosine of every row of an [`NvFp4CosineIndex`] against
+/// one query vector, from [`NvFp4CosineIndex::reconstructed_cosines`].
+///
+/// A threshold is a set, so it is a constraint: [`Self::similar_to`] binds a
+/// variable to every row key whose cosine clears the floor and composes with
+/// `pattern!`, `and!` and `or!` inside `find!`. A ranking is presentation of
+/// what the query returned, so it stays outside: [`Self::cosine`] scores a
+/// returned value. Row keys are raw 32-byte values; the variable's encoding
+/// says how to read them, which is what lets an index keyed by a source value
+/// join that source's pattern on the same variable.
+#[derive(Clone, Debug, Default)]
+pub struct ReconstructedCosines {
+    /// Every row key with its cosine, in ascending key order.
+    scores: Vec<([u8; HANDLE_LEN], f64)>,
+}
+
+impl ReconstructedCosines {
+    /// Bind `variable` to every row key whose reconstruction cosine is at
+    /// least `floor`. A NaN floor admits nothing.
+    pub fn similar_to<V: InlineEncoding>(
+        &self,
+        variable: Variable<V>,
+        floor: f64,
+    ) -> crate::constraint::SimilarTo<V> {
+        let candidates = self
+            .scores
+            .iter()
+            .filter(|(_, score)| *score >= floor)
+            .map(|(key, _)| *key)
+            .collect();
+        crate::constraint::SimilarTo::from_candidates(variable, candidates)
+    }
+
+    /// The reconstruction cosine of the row keyed by `value`, or `None` when
+    /// the index holds no such row.
+    pub fn cosine<V: InlineEncoding>(&self, value: &Inline<V>) -> Option<f64> {
+        self.scores
+            .binary_search_by(|(key, _)| key.cmp(&value.raw))
+            .ok()
+            .map(|at| self.scores[at].1)
+    }
+
+    /// Number of distinct rows scored.
+    pub fn len(&self) -> usize {
+        self.scores.len()
+    }
+
+    /// Whether the index had no rows.
+    pub fn is_empty(&self) -> bool {
+        self.scores.is_empty()
     }
 }
 
@@ -1681,7 +1757,7 @@ mod tests {
             dimension: 2,
             _encoding: PhantomData,
         };
-        assert!(index.reconstructed_top_k(&[1.0, 0.0], 1).is_err());
+        assert!(index.reconstructed_cosines(&[1.0, 0.0]).is_err());
     }
 
     #[test]

@@ -20,8 +20,9 @@
 //!   like `InlineRange` in the core engine, it estimates
 //!   `usize::MAX` and proposes nothing.
 //! * [`SimilarTo`] — a unary set constraint over the result of one
-//!   fixed-probe backend search. Flat and NVFP4 retrieval are complete;
-//!   HNSW and succinct HNSW retrieval are approximate.
+//!   fixed-probe backend search, over a variable of any inline encoding.
+//!   Flat and NVFP4 retrieval are complete; HNSW and succinct HNSW
+//!   retrieval are approximate.
 //!
 //! All three speak the engine's cooperative protocol directly:
 //! `estimate` guides join ordering, `propose` appends candidate values
@@ -36,7 +37,7 @@ use std::collections::HashSet;
 use triblespace_core::blob::BlobEncoding;
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::hash::Handle;
-use triblespace_core::inline::{Inline, RawInline};
+use triblespace_core::inline::{Inline, InlineEncoding, RawInline};
 use triblespace_core::query::{
     Binding, Candidates, Constraint, Frontier, ProposalBuffer, Variable, VariableId, VariableSet,
 };
@@ -687,8 +688,14 @@ where
 /// denotes the raw [`RawInline`] support set, exactly the rows a query
 /// head can distinguish.
 ///
-/// Produced by the `similar_to` method on an [`crate::nvfp4::NvFp4CosineIndex`]
-/// or an
+/// The variable may have any inline encoding: the set holds raw values and
+/// the variable says how to read them. An exact index binds embedding
+/// handles; a reconstruction query over rows keyed by some other value (see
+/// [`crate::nvfp4::ReconstructedCosines`]) binds that value, so the
+/// constraint joins the source's own `pattern!` on it.
+///
+/// Produced by the `similar_to` method on an [`crate::nvfp4::NvFp4CosineIndex`],
+/// a [`crate::nvfp4::ReconstructedCosines`], or an
 /// [`crate::hnsw::AttachedHNSWIndex`] /
 /// [`crate::hnsw::AttachedFlatIndex`] /
 /// [`crate::succinct::AttachedSuccinctHNSWIndex`].
@@ -732,8 +739,8 @@ where
 /// assert!(got.contains(&handles[1]));
 /// assert!(!got.contains(&handles[2])); // below floor
 /// ```
-pub struct SimilarTo<E: BlobEncoding> {
-    var: Variable<Handle<E>>,
+pub struct SimilarTo<V: InlineEncoding> {
+    var: Variable<V>,
     /// Backend result list from the one walk at construction,
     /// deduplicated in first-occurrence order.
     candidates: Vec<RawInline>,
@@ -741,7 +748,7 @@ pub struct SimilarTo<E: BlobEncoding> {
     membership: HashSet<RawInline>,
 }
 
-impl<E: BlobEncoding> SimilarTo<E> {
+impl<V: InlineEncoding> SimilarTo<V> {
     /// Build from a pre-computed candidate list. Usually invoked
     /// through the `similar_to` method on an attached index
     /// rather than directly. Duplicate occurrences collapse at
@@ -757,7 +764,7 @@ impl<E: BlobEncoding> SimilarTo<E> {
     /// backends and hands the repeat straight through. Nothing downstream
     /// would collapse it — the engine has no head-claiming layer, so a repeated
     /// proposal is a repeated row.
-    pub fn from_candidates(var: Variable<Handle<E>>, candidates: Vec<RawInline>) -> Self {
+    pub fn from_candidates(var: Variable<V>, candidates: Vec<RawInline>) -> Self {
         let mut membership = HashSet::with_capacity(candidates.len());
         let mut unique = Vec::with_capacity(candidates.len());
         for candidate in candidates {
@@ -777,7 +784,7 @@ impl<E: BlobEncoding> SimilarTo<E> {
     }
 }
 
-impl<'a, E: BlobEncoding> Constraint<'a> for SimilarTo<E> {
+impl<'a, V: InlineEncoding> Constraint<'a> for SimilarTo<V> {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.var.index)
     }

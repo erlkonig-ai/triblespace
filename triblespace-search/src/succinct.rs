@@ -1003,7 +1003,7 @@ where
         probe: Inline<EmbHandle>,
         var: Variable<EmbHandle>,
         score_floor: f32,
-    ) -> crate::constraint::SimilarTo<Embedding> {
+    ) -> crate::constraint::SimilarTo<EmbHandle> {
         let candidates = self
             .candidates_above(probe, score_floor)
             .map(|v| v.into_iter().map(|h| h.raw).collect())

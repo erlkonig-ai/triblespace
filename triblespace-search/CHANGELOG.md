@@ -12,6 +12,21 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   document union and pointwise-maximum TF without serializing a merged carrier;
   canonical table validation is an explicit audit. Existing bytes are unchanged.
 
+- `SimilarTo` is generic over the variable's inline encoding rather than
+  over an embedding blob encoding: `SimilarTo<Handle<E>>` where it was
+  `SimilarTo<E>`. The set holds raw values, so the same constraint binds an
+  embedding handle for an exact index and a source value for an index keyed by
+  what it embedded, and then joins that source's pattern on one variable.
+- Added `NvFp4CosineIndex::reconstructed_cosines`, one scan scoring every row
+  against its own reconstruction, returning `ReconstructedCosines`: its
+  `similar_to(variable, floor)` is the threshold as a `find!` constraint and
+  its `cosine(value)` ranks what the query returned. It replaces
+  `reconstructed_top_k`, which ranked every row in Rust before any predicate
+  could narrow them.
+- Added `NvFp4CosineIndex::similar_to_query`, the exact threshold constraint
+  for a query vector that is not a blob (a free-text query embedded at query
+  time). `similar_to` fetches its probe and delegates to it.
+
 - NVFP4 index attachment checks plane geometry without scanning every stored
   value. Canonical row checks remain in the explicit `validate_member` audit;
   source embeddings are never requantized to read an existing member. The
