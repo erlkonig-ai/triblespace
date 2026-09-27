@@ -2889,9 +2889,19 @@ pub type PileSnapshot = crate::collection::covered::CoveredSnapshot<PileFileSnap
 
 impl Pile {
     /// Open the pile at `path` and replay it, with the coverage index fed at
-    /// the first snapshot.
+    /// the first snapshot. The fold has no host, so it believes no MERGE and
+    /// every believed foundation is its own frontier node: correct for any
+    /// reader, only wider. A process that maintains the pile opens it with
+    /// [`Pile::open_as`] instead.
     pub fn open(path: &Path) -> Result<Self, ReadError> {
         PileFile::open(path).map(Self::new)
+    }
+
+    /// Open the pile at `path` as `host`: the fold believes the MERGEs
+    /// `host` signed and no other key's. Maintenance signing with a key
+    /// needs the pile opened as that key's verifying key.
+    pub fn open_as(path: &Path, host: VerifyingKey) -> Result<Self, ReadError> {
+        PileFile::open(path).map(|file| Self::with_host(file, Some(host)))
     }
 }
 
@@ -6832,7 +6842,7 @@ mod tests {
         let snapshot = pile.snapshot().unwrap();
         // The eager form: every lineage decided, which is what a fold does.
         let maintained = snapshot.coverage_index().published().clone();
-        let folded = coverage_of(&snapshot).unwrap().published().clone();
+        let folded = coverage_of(&snapshot, None).unwrap().published().clone();
         assert_eq!(maintained, folded);
         assert!(!maintained.is_empty());
         drop(snapshot);

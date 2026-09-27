@@ -35,6 +35,10 @@ type CapabilityProofIndex = PATCH<INLINE_LEN, IdentitySchema, CapabilityProof, X
 /// required.
 /// The store every consumer uses: a [`MemoryStore`] with its coverage index
 /// maintained by snapshot difference.
+///
+/// `MemoryRepo::default()` has no host and believes no MERGE;
+/// `MemoryRepo::for_host(key)` believes the MERGEs `key` signed, which is
+/// what maintaining it with that key's signing half needs.
 pub type MemoryRepo = crate::collection::covered::Covered<MemoryStore>;
 /// One immutable observation of a [`MemoryRepo`]: the store snapshot and the
 /// index settled for exactly that prefix.

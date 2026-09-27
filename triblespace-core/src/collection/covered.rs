@@ -15,9 +15,17 @@
 //! parked in this pass is decided against the snapshot it came from, where its
 //! descriptor is already resident if it arrived in the same pass; the arrivals
 //! list only wakes records an *earlier* pass parked.
+//!
+//! A store is opened as a host or without one ([`Covered::with_host`]). The
+//! host is the one key whose MERGEs the fold believes; it is fixed for the
+//! store's life because every snapshot and reader shares the index it seeds.
+//! A store without a host believes no MERGE, which is always correct and only
+//! wider: every believed foundation is its own frontier node.
 
 use std::collections::BTreeSet;
 use std::ops::{Deref, DerefMut};
+
+use ed25519_dalek::VerifyingKey;
 
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::{BlobEncoding, IntoBlob, TryFromBlob};
@@ -56,6 +64,11 @@ pub trait RecordDelta {
 /// taken.
 pub struct Covered<S: SnapshotSource> {
     inner: S,
+    /// The key whose MERGEs this store's fold believes, constant for the
+    /// store's life. It seeds the first memo's index, and every later memo
+    /// and every operation clones that index, so the key rides along
+    /// without anyone passing it again. `None` believes no MERGE.
+    host: Option<VerifyingKey>,
     /// The last snapshot handed out and the memo it settles into, so the
     /// next snapshot starts from what readers have already decided and pays
     /// only for what arrived since, and only for lineages someone reads.
@@ -73,12 +86,38 @@ struct Memo {
 }
 
 impl<S: SnapshotSource> Covered<S> {
+    /// A store whose fold believes no MERGE: every believed foundation stays
+    /// on its collection's frontier. Right for inspection and for anything
+    /// that never merges; a maintainer opens with its key instead.
     pub fn new(inner: S) -> Self {
-        Self { inner, last: None }
+        Self::with_host(inner, None)
+    }
+
+    /// A store whose fold believes the MERGEs `host` signed, and no other
+    /// key's. Maintenance with a signing key needs `host` to be that key's
+    /// verifying key.
+    pub fn with_host(inner: S, host: Option<VerifyingKey>) -> Self {
+        Self {
+            inner,
+            host,
+            last: None,
+        }
+    }
+
+    /// The key whose MERGEs this store's fold believes, if any.
+    pub fn host(&self) -> Option<VerifyingKey> {
+        self.host
     }
 
     pub fn into_inner(self) -> S {
         self.inner
+    }
+}
+
+impl<S: SnapshotSource + Default> Covered<S> {
+    /// An empty store whose fold believes `host`'s MERGEs.
+    pub fn for_host(host: VerifyingKey) -> Self {
+        Self::with_host(S::default(), Some(host))
     }
 }
 
@@ -96,6 +135,7 @@ where
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
+            host: self.host,
             last: self.last.clone(),
         }
     }
@@ -105,6 +145,7 @@ impl<S: SnapshotSource + std::fmt::Debug> std::fmt::Debug for Covered<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Covered")
             .field("inner", &self.inner)
+            .field("host", &self.host)
             .field("last", &self.last.is_some())
             .finish()
     }
@@ -139,7 +180,10 @@ where
     /// exactly replay.
     fn carry_forward(&mut self, now: &S::Snapshot) -> std::sync::Arc<std::sync::Mutex<Memo>> {
         let Some((fed, last)) = &self.last else {
-            return std::sync::Arc::default();
+            return std::sync::Arc::new(std::sync::Mutex::new(Memo {
+                index: CoverageIndex::with_host(self.host.map(|host| Inline::new(host.to_bytes()))),
+                settled: BTreeSet::new(),
+            }));
         };
         let mut memo = last.lock().expect("coverage memo is not poisoned").clone();
         // A blob matters only as the descriptor some parked record is waiting

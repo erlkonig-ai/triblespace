@@ -655,6 +655,14 @@ fn held_keys(held: &Held) -> impl Iterator<Item = [u8; 160]> + '_ {
 /// reader compose on top of one: clone it, park a few more records, settle.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CoverageIndex {
+    /// The key whose MERGEs this index believes, constant for its life.
+    ///
+    /// It lives here rather than in [`RecordAdmission`] for two reasons:
+    /// replay parks records before any admission exists, and one index is
+    /// shared by every snapshot and reader of a store, so the key is one
+    /// value per store. `None` believes no MERGE: the lattice is its
+    /// foundations and the frontier is all of them.
+    host: Option<Inline<ED25519PublicKey>>,
     /// The half a reader sees: rows, frontiers, owners and leaves.
     published: Coverage,
     /// Which joins read each input, so a row that grows can re-drive its
@@ -713,9 +721,29 @@ fn drain(waiters: Waiters, into: &mut Vec<[u8; 160]>) {
 }
 
 impl CoverageIndex {
-    /// An index covering nothing.
+    /// An index covering nothing, with no host: it believes no MERGE, so
+    /// every believed foundation stays on its collection's frontier.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An index covering nothing that believes the MERGEs `host` signed,
+    /// and no other key's.
+    pub fn for_host(host: Inline<ED25519PublicKey>) -> Self {
+        Self::with_host(Some(host))
+    }
+
+    /// An index covering nothing, with or without a host.
+    pub fn with_host(host: Option<Inline<ED25519PublicKey>>) -> Self {
+        Self {
+            host,
+            ..Self::default()
+        }
+    }
+
+    /// The key whose MERGEs this index believes, if any.
+    pub fn host(&self) -> Option<Inline<ED25519PublicKey>> {
+        self.host
     }
 
     /// Keep a join's inputs, once, where its edges and parked keys find
@@ -1566,11 +1594,16 @@ impl<R: BlobStoreGet + CapabilityProofRead> RecordAdmission for StoreWriters<'_,
 /// — a pile does, during replay — should hand out its own instead of folding
 /// again; this is what everything else uses, and what an equivalence check
 /// compares that maintained index against.
-pub(crate) fn coverage_of<R>(reader: &R) -> Result<CoverageIndex, R::RecordsError>
+///
+/// `host` is the key whose MERGEs the fold believes; `None` believes none.
+pub(crate) fn coverage_of<R>(
+    reader: &R,
+    host: Option<Inline<ED25519PublicKey>>,
+) -> Result<CoverageIndex, R::RecordsError>
 where
     R: CollectionRead + BlobStoreGet + CapabilityProofRead,
 {
-    let mut index = CoverageIndex::new();
+    let mut index = CoverageIndex::with_host(host);
     for record in reader.records()? {
         index.park_record(&record?);
     }
