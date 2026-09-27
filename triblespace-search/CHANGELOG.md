@@ -52,7 +52,7 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   Minted the mapping id `523C31F03F049CA26A0E847CAAFC08F7`, replacing
   `2B69128192930EE0782CCA03B97677F5`; existing indexes must be derived again.
 
-- Added `SemanticIndex`, a `CollectionMapping` from a `SimpleArchive` source
+- Added `SemanticIndex`, a `DeriveMapping` from a `SimpleArchive` source
   to `NvFp4CosineSet` whose rows are embedded straight from the source facts:
   one attribute of image bytes through nomic-embed-vision-v1.5, any number of
   text attributes through the document side of nomic-embed-text-v1.5, both

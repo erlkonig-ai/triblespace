@@ -26,7 +26,7 @@ use crate::trible::Fragment;
 
 use super::operation_snapshot::OperationFrontier;
 use super::{
-    descriptor, Collection, CollectionData, CollectionEncoding, CollectionHandle, CollectionMapping,
+    descriptor, Collection, CollectionData, CollectionEncoding, CollectionHandle, DeriveMapping,
 };
 #[cfg(test)]
 use super::{CanonicalDerivation, CollectionDerivation};
@@ -357,7 +357,7 @@ fn ensure_resident_with<S, M>(
 ) -> Result<(), CollectionRealizationError>
 where
     S: Store,
-    M: CollectionMapping,
+    M: DeriveMapping,
 {
     let snapshot = store
         .snapshot()
@@ -394,7 +394,7 @@ fn ensure_resident_in_frontier_with<S, M>(
 ) -> Result<(), CollectionRealizationError>
 where
     S: Store,
-    M: CollectionMapping,
+    M: DeriveMapping,
 {
     super::maintenance::maintain_derived::<S, M>(
         store,
@@ -416,7 +416,7 @@ fn maintain_resident_with<S, M>(
 ) -> Result<(), CollectionRealizationError>
 where
     S: Store,
-    M: CollectionMapping,
+    M: DeriveMapping,
 {
     let snapshot = store.snapshot().map_err(|error| {
         CollectionRealizationError::storage("freeze maintenance frontier", error)
@@ -453,7 +453,7 @@ fn maintain_resident_in_frontier_with<S, M>(
 ) -> Result<(), CollectionRealizationError>
 where
     S: Store,
-    M: CollectionMapping,
+    M: DeriveMapping,
 {
     super::maintenance::maintain_derived::<S, M>(
         store,
@@ -644,7 +644,7 @@ pub(crate) async fn ensure_acquiring_with<S, M>(
 ) -> Result<(), CollectionRealizationError>
 where
     S: Store + AsyncBlobStoreAcquire,
-    M: CollectionMapping,
+    M: DeriveMapping,
 {
     acquiring(store, |store, unavailable, frontier| {
         ensure_resident_in_frontier_with::<S, M>(store, target, signing_key, unavailable, frontier)
@@ -659,7 +659,7 @@ pub(crate) async fn maintain_acquiring_with<S, M>(
 ) -> Result<(), CollectionRealizationError>
 where
     S: Store + AsyncBlobStoreAcquire,
-    M: CollectionMapping,
+    M: DeriveMapping,
 {
     acquiring(store, |store, unavailable, frontier| {
         maintain_resident_in_frontier_with::<S, M>(

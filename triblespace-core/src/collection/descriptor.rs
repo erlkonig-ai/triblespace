@@ -50,7 +50,7 @@ use super::records::{
     mapping_algorithm as mapping_algorithm_attribute, CollectionHandle, RecordDecodeError,
     KIND_COLLECTION_DESCRIPTOR, KIND_COLLECTION_MAPPING,
 };
-use super::{read_capability, write_capability, CollectionEncoding, CollectionMapping};
+use super::{read_capability, write_capability, CollectionEncoding, DeriveMapping};
 
 /// Store one descriptor archive and every blob carried by its self-contained
 /// Fragment, returning the canonical descriptor handle.
@@ -181,7 +181,7 @@ pub(crate) fn deriving_with<M>(
     policy: CollectionPolicy,
 ) -> Fragment
 where
-    M: CollectionMapping,
+    M: DeriveMapping,
 {
     entity! {
         metadata::tag: KIND_COLLECTION_DESCRIPTOR,

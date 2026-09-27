@@ -129,7 +129,7 @@ ordinary target blobs. The mathematical contract is a join homomorphism over
 their logical values:
 `f(a ⊔ b) = f(a) ⊔ f(b)`.
 
-When neither encoding crate can own that implementation, `CollectionMapping`
+When neither encoding crate can own that implementation, `DeriveMapping`
 is the coherence-safe explicit extension seam. The `derive_with`,
 `ensure_with`, and `maintain_with` operations select such a mapping value or
 type; both surfaces execute the same derivation engine and persist the same

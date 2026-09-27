@@ -8,6 +8,9 @@
 //!   within one collection;
 //! - a [`CollectionDerivation`] lets one target encoding own its canonical,
 //!   parameterized, join-preserving conversion from one source encoding;
+//! - a [`DeriveMapping`] is an explicit mapping whose images are derived into
+//!   a collection of their own, and [`MapMapping`] states the contract of a
+//!   mapping attached to another collection's nodes instead;
 //! - [`Collection`] binds an encoding to one exact, content-addressed
 //!   descriptor.
 //!
@@ -187,13 +190,6 @@ pub trait CollectionDerivation: CollectionEncoding {
     /// Canonical source encoding.
     type Source: CollectionEncoding;
 
-    /// Whether this mapping's image of a source member is the same on every
-    /// host that can compute it: a function of the member and the blobs it
-    /// names, never of which of them a host happens to hold. Maintenance
-    /// derives another owner's foundations only through such a mapping; one
-    /// that is correct only on its producer's complete replica leaves each
-    /// foundation to its owner.
-    const REPLICA_INDEPENDENT: bool = true;
     /// Runtime argument which distinguishes concrete mappings of this
     /// canonical source-to-target relation.
     type Argument;
@@ -247,7 +243,12 @@ pub trait CollectionDerivation: CollectionEncoding {
     }
 }
 
-/// One explicit parameterized mapping between collection encodings.
+/// One explicit parameterized mapping between collection encodings, whose
+/// images are derived into a collection of their own.
+///
+/// Its images are published as `DERIVE` leaves of the derived collection and
+/// replicate with it. An index that every reader of a node can compute for
+/// itself is a [`MapMapping`] instead.
 ///
 /// This is the coherence-safe extension point for mappings whose source and
 /// target encodings are both owned elsewhere. Prefer [`CollectionDerivation`]
@@ -256,17 +257,25 @@ pub trait CollectionDerivation: CollectionEncoding {
 /// Implementations must be a join homomorphism:
 ///
 /// `map(a join b) = map(a) join map(b)`.
-pub trait CollectionMapping: Sized {
+pub trait DeriveMapping: Sized {
     /// Canonical source encoding.
     type Source: CollectionEncoding;
 
-    /// Whether this mapping's image of a source member is the same on every
-    /// host that can compute it: a function of the member and the blobs it
-    /// names, never of which of them a host happens to hold. Maintenance
-    /// derives another owner's foundations only through such a mapping; one
-    /// that is correct only on its producer's complete replica leaves each
-    /// foundation to its owner.
-    const REPLICA_INDEPENDENT: bool = true;
+    /// Whether maintenance derives a source foundation another key owns.
+    ///
+    /// `maintain` derives, after the maintaining key's own foundations, every
+    /// foundation of another owner that has no leaf at all, when the view
+    /// admits the maintaining key and the payload is already here; `ensure`
+    /// never does. `false` leaves each foundation to its owner, for a mapping
+    /// whose image is only trusted where its owner computed it, such as model
+    /// inference on one compute class whose results other hosts receive by
+    /// replication.
+    ///
+    /// Temporary: it stands in until derivation is scheduled by leaf rather
+    /// than by owner (a foundation with any admitted leaf is done, whoever
+    /// signed it). A mapping only some hosts can compute then says so through
+    /// a hook of its own, and this constant goes.
+    const FOREIGN_DERIVABLE: bool = true;
     /// Canonical target encoding.
     type Target: CollectionEncoding;
 
@@ -322,11 +331,9 @@ impl<T: CollectionDerivation> CanonicalDerivation<T> {
     }
 }
 
-impl<T: CollectionDerivation> CollectionMapping for CanonicalDerivation<T> {
+impl<T: CollectionDerivation> DeriveMapping for CanonicalDerivation<T> {
     type Source = T::Source;
     type Target = T;
-
-    const REPLICA_INDEPENDENT: bool = T::REPLICA_INDEPENDENT;
 
     fn fragment(&self) -> Fragment {
         T::fragment(&self.argument)
@@ -360,6 +367,39 @@ impl<T: CollectionDerivation> CollectionMapping for CanonicalDerivation<T> {
         T::join_images(&self.argument, target_descriptor, low, high, reader)
     }
 }
+
+/// A mapping attached to another collection's nodes: an index of each node,
+/// not a collection of its own.
+///
+/// This trait declares no items yet; attached collections fill it in. It
+/// states the contract an implementor takes on:
+///
+/// - It maps any node of the collection it indexes, a merge result as well
+///   as a foundation.
+/// - It is deterministic. Its inputs are the node, immutable dependencies the
+///   node or the mapping names, and optionally other attachments of the same
+///   node. A dependency that is not resident is reported as
+///   [`CollectionOperationError::MissingDependency`], never read as absent.
+/// - Every host that can read the node can compute it: it is not pinned to a
+///   model, an accelerator class or any other property of a host. A mapping
+///   that is pinned cannot implement this trait, so it cannot be attached by
+///   mistake; it stays a [`DeriveMapping`].
+/// - Its images need no join. Building a node's image from its children's
+///   images is an optional shortcut, and it must equal mapping the node.
+///
+/// Its law is cover-query equivalence. A reader answers a query over a cover
+/// of attachments at mixed granularity -- one node's image beside the images
+/// of finer nodes, possibly overlapping -- and the answer must equal the
+/// query over the image of the union the cover stands for:
+///
+/// `view(cover { map(a_1), ..., map(a_n) }) = view(map(a_1 join ... join a_n))`.
+///
+/// Because the `a_i` may overlap, a view combines its per-node answers
+/// idempotently: a last-writer-wins register pairs partial rows across the
+/// cover, a text index takes each entity's maximum score, and a count or any
+/// other non-idempotent aggregate is never summed over overlapping supports.
+/// Every implementor is tested against this law over random covers.
+pub trait MapMapping {}
 
 /// A descriptor does not denote the encoding requested by its Rust type.
 #[derive(Clone, Debug, Eq, PartialEq)]

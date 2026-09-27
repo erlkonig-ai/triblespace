@@ -247,13 +247,13 @@ fn a_signer_the_target_does_not_admit_and_an_unknown_representation_are_named_no
 #[test]
 fn a_descriptor_naming_another_mapping_is_left_to_whoever_registered_it() {
     use triblespace_core::blob::Blob;
-    use triblespace_core::collection::{CollectionMapping, CollectionOperationError};
+    use triblespace_core::collection::{CollectionOperationError, DeriveMapping};
     use triblespace_core::repo::StoreRead;
 
     /// Succinct images built by a mapping that is not the canonical one: same
     /// target encoding, another algorithm in the descriptor.
     struct OtherWay;
-    impl CollectionMapping for OtherWay {
+    impl DeriveMapping for OtherWay {
         type Source = SimpleArchive;
         type Target = SuccinctArchiveBlob;
         fn fragment(&self) -> Fragment {

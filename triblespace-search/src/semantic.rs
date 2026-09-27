@@ -1,7 +1,7 @@
 //! The semantic index: an NVFP4 cosine set derived straight from source
 //! facts through a nomic model that lives in the same pile.
 //!
-//! [`SemanticIndex`] is a [`CollectionMapping`] from one `SimpleArchive`
+//! [`SemanticIndex`] is a [`DeriveMapping`] from one `SimpleArchive`
 //! source (the Files collection, say) to [`NvFp4CosineSet`]. Its descriptor
 //! names what to embed (any number of attributes whose values are handles to
 //! content bytes), the one model that embeds them ([`SemanticModel`]: a
@@ -69,8 +69,8 @@ use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{Blob, BlobEncoding, TryFromBlob};
 use triblespace_core::collection::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
 use triblespace_core::collection::{
-    Collection, CollectionHandle, CollectionMapping, CollectionOperationError,
-    CollectionSnapshotExt, Cover,
+    Collection, CollectionHandle, CollectionOperationError, CollectionSnapshotExt, Cover,
+    DeriveMapping,
 };
 use triblespace_core::id::{id_hex, ExclusiveId, Id};
 use triblespace_core::inline::encodings::genid::GenId;
@@ -614,7 +614,7 @@ fn pdf_text(bytes: &[u8]) -> String {
         .unwrap_or_default()
 }
 
-impl<E> CollectionMapping for SemanticIndex<E>
+impl<E> DeriveMapping for SemanticIndex<E>
 where
     E: BlobEncoding,
     View<[f32]>: TryFromBlob<E>,
@@ -623,7 +623,7 @@ where
     /// Model inference, not asserted bit-identical across hosts: each
     /// foundation's owner computes its image and others receive it by
     /// replication, as the compute-class refusal below says.
-    const REPLICA_INDEPENDENT: bool = false;
+    const FOREIGN_DERIVABLE: bool = false;
 
     type Source = SimpleArchive;
     type Target = NvFp4CosineSet<E>;

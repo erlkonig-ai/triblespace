@@ -44,7 +44,7 @@ use super::{
     RecordDecodeError, TryFromCover, TryFromCoverError,
 };
 use super::{
-    AdmissionPolicy, CanonicalDerivation, CollectionDerivation, CollectionMapping, CollectionPolicy,
+    AdmissionPolicy, CanonicalDerivation, CollectionDerivation, CollectionPolicy, DeriveMapping,
 };
 
 /// Failure to discover the resident capability evidence used for collection
@@ -1550,7 +1550,7 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
         policy: CollectionPolicy,
     ) -> Result<Collection<M::Target>, CollectionRegistrationError<<Self as BlobStorePut>::PutError>>
     where
-        M: CollectionMapping,
+        M: DeriveMapping,
     {
         let descriptor = descriptor::deriving_with(source.handle(), &mapping, policy);
         // The constructor already supplies the target encoding and both
@@ -1600,7 +1600,7 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
         signing_key: &'a SigningKey,
     ) -> impl Future<Output = Result<Self::Snapshot, CollectionRealizationError>> + Send + 'a
     where
-        M: CollectionMapping,
+        M: DeriveMapping,
         Self: Store + AsyncBlobStoreAcquire + Send,
         Handle<M::Target>: InlineEncoding,
     {
@@ -1656,7 +1656,7 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
         signing_key: &'a SigningKey,
     ) -> impl Future<Output = Result<Self::Snapshot, CollectionRealizationError>> + Send + 'a
     where
-        M: CollectionMapping,
+        M: DeriveMapping,
         Self: Store + AsyncBlobStoreAcquire + Send,
         Handle<M::Target>: InlineEncoding,
     {

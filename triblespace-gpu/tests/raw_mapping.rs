@@ -11,8 +11,8 @@ use triblespace_core::blob::encodings::succinctarchive::{
 };
 use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::collection::{
-    AdmissionPolicy, CollectionDerivation, CollectionMapping, CollectionPolicy, CollectionRead,
-    CollectionRecord, CollectionSnapshotExt, CollectionStoreExt,
+    AdmissionPolicy, CollectionDerivation, CollectionPolicy, CollectionRead, CollectionRecord,
+    CollectionSnapshotExt, CollectionStoreExt, DeriveMapping,
 };
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::memoryrepo::MemoryRepo;

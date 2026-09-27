@@ -8,7 +8,7 @@ use triblespace_core::blob::encodings::succinctarchive::{
 };
 use triblespace_core::blob::Blob;
 use triblespace_core::collection::{
-    CollectionDerivation, CollectionEncoding, CollectionMapping, CollectionOperationError,
+    CollectionDerivation, CollectionEncoding, CollectionOperationError, DeriveMapping,
 };
 use triblespace_core::repo::{BlobStoreGet, BlobStoreMeta, StoreRead};
 use triblespace_core::trible::Fragment;
@@ -37,7 +37,7 @@ impl<B> BackendSuccinctMapping<B> {
     }
 }
 
-impl<B> CollectionMapping for BackendSuccinctMapping<B>
+impl<B> DeriveMapping for BackendSuccinctMapping<B>
 where
     B: WaveletMatrixFreezeBackend + Default,
     B::Error: std::fmt::Display,

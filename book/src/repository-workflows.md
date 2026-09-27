@@ -449,7 +449,7 @@ Suppose `f` is a canonical join homomorphism. Its target encoding implements
 
 If a downstream crate owns neither the source nor target encoding, Rust's
 orphan rule prevents that target-owned implementation. It can instead provide
-an explicit `CollectionMapping` and select the same engine through
+an explicit `DeriveMapping` and select the same engine through
 `derive_with`, `ensure_with`, and `maintain_with`.
 
 ```text

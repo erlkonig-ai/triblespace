@@ -636,7 +636,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CollectionDerivation`. `derive::<Target>(source, argument, policy)` still
   returns an ordinary `Collection<Target>`, while `ensure` and `maintain` now
   infer the derivation directly from that target and require no public mapping
-  witness type. Preserve `CollectionMapping` and the explicit `derive_with`,
+  witness type. Preserve `DeriveMapping` and the explicit `derive_with`,
   `ensure_with`, and `maintain_with` seam for downstream mappings between two
   foreign encoding types that Rust's orphan rule prevents either crate from
   attaching to the target.
@@ -895,7 +895,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CollectionEncoding` validates that blob and defines one canonical join;
   `Cover<E>` keeps the logical join total when one member hits a deterministic
   capacity boundary, so every source and derived collection is a full lattice.
-  `CollectionMapping` maps blobs to blobs as a join homomorphism, while storage
+  `DeriveMapping` maps blobs to blobs as a join homomorphism, while storage
   owns deterministic merge/derive sequencing and immutable dependencies.
 
 - Add a typed collection API above the representation-neutral wire records.
@@ -907,7 +907,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   encodings. Each `CollectionEncoding` owns canonical validation and one direct
   physical join operation, while covers retain finer equivalent shapes across
   deterministic capacity boundaries and exact derivations bind one parameterized
-  `CollectionMapping<Source, Target>` whose ordinary trible fragment is
+  `DeriveMapping<Source, Target>` whose ordinary trible fragment is
   embedded in the target descriptor.
 
 - Add an exact maintained last-write-wins register collection. Its canonical
@@ -1433,7 +1433,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the observed attribute, register coordinate attributes, or complete path
   automaton remain queryable while also participating in mapping and target
   identity. The target embeds the encoding and mapping-algorithm descriptions,
-  and `CollectionMapping<Source, Target>` validates the declared algorithm and
+  and `DeriveMapping<Source, Target>` validates the declared algorithm and
   parameters before computing any member. These descriptor identities never
   shipped, so the old recipe shape and compatibility aliases are removed
   outright.

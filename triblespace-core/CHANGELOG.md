@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `CollectionMapping` is now `DeriveMapping`, named for what its images
+  become: `DERIVE` leaves of a derived collection. A new, still empty
+  `MapMapping` trait states the contract of a mapping attached to another
+  collection's nodes instead (deterministic, computable by every host that
+  can read the node, no join required) and its law, cover-query equivalence.
+  `REPLICA_INDEPENDENT` is gone from `DeriveMapping` and
+  `CollectionDerivation`. The one thing it decided, whether `maintain`
+  derives a leafless foundation another key owns, is
+  `DeriveMapping::FOREIGN_DERIVABLE` until derivation is scheduled by leaf
+  rather than by owner.
+
 - `ensure_derived`, `maintain_derived` and `upkeep_derived` are now
   `ensure_downstream`, `maintain_downstream` and `upkeep_downstream`.
   `derived` names what a collection *is*; `downstream` names where it sits
@@ -61,7 +72,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A derived collection joins the listing with its first record, so whoever
   creates one ensures it right then, for the commits already there.
 
-- `join_images` on `CollectionDerivation` and `CollectionMapping` no longer
+- `join_images` on `CollectionDerivation` and `DeriveMapping` no longer
   takes a source union; it is the mapping's own route for joining two
   images, defaulting to the encoding's `join_members`. The Rank9 route that
   reused the raw union's bytes is gone, with the `source_union` parameter of
@@ -303,7 +314,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add store-owned collection construction:
   `collection(name, policy)`, `derive(source, mapping, policy)`, and the raw
-  `register_collection::<E>(descriptor)` boundary. `CollectionMapping` now
+  `register_collection::<E>(descriptor)` boundary. `DeriveMapping` now
   carries associated `Source` and `Target` encodings plus its concrete mapping
   fragment. Store snapshots expose immutable typed collection observations;
   mutating ensure/maintain operations take only the target and mapping type,
@@ -325,7 +336,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CollectionEncoding` validates that blob and defines one canonical join;
   `Cover<E>` keeps the logical join total when one member hits a deterministic
   capacity boundary, so every source and derived collection is a full lattice.
-  `CollectionMapping` maps blobs to blobs as a join homomorphism, while storage
+  `DeriveMapping` maps blobs to blobs as a join homomorphism, while storage
   owns deterministic merge/derive sequencing and immutable dependencies.
 
 - Add direct typed collection encodings, covers, and logical cover
@@ -336,7 +347,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   typed materialization works for non-`SimpleArchive` collections. Derived
   descriptors link a concrete mapping entity carrying its algorithm and
   concrete parameters, while exact derived lifecycles bind one
-  `CollectionMapping<Source, Target>` whose law is a join homomorphism.
+  `DeriveMapping<Source, Target>` whose law is a join homomorphism.
 
 - Add top-level `capability`, a direct authorization kernel. One canonical
   proof encodes `magic32 | resource32 | root32 |`

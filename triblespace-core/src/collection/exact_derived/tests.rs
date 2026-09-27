@@ -2166,7 +2166,7 @@ fn new_work_still_requires_the_immediate_source_grant_definition() {
 fn warm_reuse_keeps_representation_and_mapping_checks() {
     struct WrongSecondMapping;
 
-    impl CollectionMapping for WrongSecondMapping {
+    impl DeriveMapping for WrongSecondMapping {
         type Source = FirstEncoding;
         type Target = SecondEncoding;
 
@@ -3626,7 +3626,7 @@ mod lattice_v2 {
     fn a_derived_collection_in_a_roots_encoding_has_no_carry() {
         struct Identity;
 
-        impl CollectionMapping for Identity {
+        impl DeriveMapping for Identity {
             type Source = SimpleArchive;
             type Target = SimpleArchive;
 

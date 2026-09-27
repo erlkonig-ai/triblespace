@@ -61,8 +61,8 @@ use super::operation_snapshot::{OperationFrontier, OperationSnapshot};
 use super::ownership::{owns, owns_merge};
 use super::{
     Collection, CollectionData, CollectionDerive, CollectionEncoding, CollectionHandle,
-    CollectionMapping, CollectionMerge, CollectionOperationError, CollectionRecord,
-    CollectionRecordSelector, MergeInputs, SourceLocator,
+    CollectionMerge, CollectionOperationError, CollectionRecord, CollectionRecordSelector,
+    DeriveMapping, MergeInputs, SourceLocator,
 };
 
 /// How many own nodes of one tier a root carry joins into one MERGE, and the
@@ -610,7 +610,7 @@ fn bind<R, M>(
 ) -> Result<Bound<M>, CollectionRealizationError>
 where
     R: StoreRead,
-    M: CollectionMapping,
+    M: DeriveMapping,
 {
     let lineage = load_lineage(snapshot, target)?;
     let source = lineage
@@ -657,7 +657,7 @@ pub(super) fn maintain_derived<S, M>(
 ) -> Result<(), CollectionRealizationError>
 where
     S: Store,
-    M: CollectionMapping,
+    M: DeriveMapping,
 {
     let bound: Bound<M> = bind(&open(store, frontier, "open mapping snapshot")?, target)?;
     let blocked = derive_leaves(
@@ -694,9 +694,9 @@ where
 /// not lag behind an owner who is absent (a machine that is offline, or not
 /// yet on this version). Two keys deriving the same foundation publish the
 /// same output, so a race costs a duplicate record, never a divergent view.
-/// That holds only for a mapping whose image does not depend on which blobs
-/// a host holds ([`CollectionMapping::REPLICA_INDEPENDENT`]); any other is
-/// left to each foundation's owner. Foreign work is offered, never owed:
+/// That holds only for a mapping every such key computes alike; one that
+/// declares [`DeriveMapping::FOREIGN_DERIVABLE`] false leaves each
+/// foundation to its owner. Foreign work is offered, never owed:
 /// only a key the view admits takes it, only for payloads already here
 /// (nothing is fetched for another owner), and whatever the mapping cannot
 /// do with one -- a refusal, a capacity limit, a dependency not here -- is
@@ -721,7 +721,7 @@ fn derive_leaves<S, M>(
 ) -> Result<Vec<(CollectionData, String)>, CollectionRealizationError>
 where
     S: Store,
-    M: CollectionMapping,
+    M: DeriveMapping,
 {
     let key = signing_key.verifying_key();
     let scope = BTreeSet::from([bound.source, target.handle()]);
@@ -738,7 +738,7 @@ where
         let foundation: CollectionData = Inline::new(*raw);
         let locator = SourceLocator::of(foundation.raw);
         if !owns(&coverage, bound.source, foundation, &key) {
-            if restore && M::REPLICA_INDEPENDENT && !coverage.has_leaf(target.handle(), locator) {
+            if restore && M::FOREIGN_DERIVABLE && !coverage.has_leaf(target.handle(), locator) {
                 foreign.push((foundation, locator));
             }
             continue;
@@ -924,7 +924,7 @@ fn mirror_merges<S, M>(
 ) -> Result<(), CollectionRealizationError>
 where
     S: Store,
-    M: CollectionMapping,
+    M: DeriveMapping,
 {
     let key = signing_key.verifying_key();
     let source = bound.source;
@@ -1010,7 +1010,7 @@ fn produced_by_key(
 struct Mirror<'a, S, M>
 where
     S: Store,
-    M: CollectionMapping,
+    M: DeriveMapping,
 {
     store: &'a mut S,
     frontier: &'a mut OperationFrontier<S::Snapshot>,
@@ -1036,7 +1036,7 @@ where
 impl<S, M> Mirror<'_, S, M>
 where
     S: Store,
-    M: CollectionMapping,
+    M: DeriveMapping,
 {
     /// The image of one source node in the target, publishing the mirror
     /// that makes it one when the key owns the node.
