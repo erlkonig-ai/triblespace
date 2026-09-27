@@ -567,13 +567,13 @@ trusted-source boundary; structural open alone is not an import verifier.
 
 An authorized equation producer endorses the mathematical result. What a
 result stands for is the coverage index's answer: the monotone union of
-everything believed beneath it, foundation COMMITs reached through admitted
-MERGE and DERIVE equations. Attachment applies WRITE to the target's candidate
-producers and reads their rows; it needs the descriptor lineage and the
-producing records to be available, and a payload no admitted record produces
-is reported rather than taken for empty support. A later admitted equation
-about the same payload extends that answer; an unauthorized one changes
-nothing. Only the selected output and its encoding-required blob dependencies
+everything believed beneath it, foundation COMMITs and admitted DERIVE leaves
+reached through the MERGEs the store's own host key signed. Attachment applies
+WRITE to the target's candidate foundations and reads their rows; it needs the
+descriptor lineage and the producing records to be available, and a payload no
+believed record produces is reported rather than taken for empty support. A
+later admitted foundation or host MERGE about the same payload extends that
+answer; another key's MERGE, or an unadmitted record, changes nothing. Only the selected output and its encoding-required blob dependencies
 need be resident for materialization; historical inputs may have been
 evicted. This is producer trust, not proof of mathematical correctness: an
 authorized dishonest producer can still endorse a wrong result.

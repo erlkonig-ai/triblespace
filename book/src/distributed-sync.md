@@ -26,7 +26,7 @@ The boundaries are deliberately small:
 know C           -> join C's wake topic and learn (origin, opaque state root)
 prove READ(C)    -> receive C's records, scoped proofs and resident-blob handles
 know H           -> derive its opaque locator, discover providers, and authorize H
-satisfy WRITE(C) -> make a signed COMMIT, MERGE, or DERIVE active in C
+satisfy WRITE(C) -> make a signed COMMIT or DERIVE active in C
 ```
 
 `C` is the exact 32-byte collection descriptor handle. `H` is an exact blob
@@ -47,6 +47,9 @@ Local stores remain permissive grow-only ledgers. They may contain a COMMIT
 whose signer does not currently satisfy WRITE(C), or a proof irrelevant to any
 resident collection. Admission is applied when a snapshot is observed. Later
 proof evidence may activate an old commit without rewriting or retracting it.
+WRITE never activates a MERGE: each store believes only the MERGEs its own
+host key signed, so another host's MERGEs stay in the ledger and fold into
+nothing.
 
 ## The collection repair product
 

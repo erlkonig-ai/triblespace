@@ -173,9 +173,11 @@ READ(C)  = request(resource C, ACTION_READ)
 WRITE(C) = request(resource C, ACTION_WRITE)
 ```
 
-WRITE admission decides which signed COMMITs contribute membership and which
-signed MERGE/DERIVE endorsements may be reused. An equation needs WRITE on its
-target; source WRITE alone is insufficient. It signs both the computation's
+WRITE admission decides which signed COMMITs and DERIVEs contribute
+membership. A DERIVE needs WRITE on its target; source WRITE alone is
+insufficient. A MERGE needs no WRITE: a store believes only the MERGEs its own
+host key signed, and any other key's MERGE folds into nothing, whatever that
+key may write. It signs both the computation's
 payload handles and fingerprints of the exact input records whose support the
 producer validated. Readers admit target producers, then follow those native
 witnesses without repeating ancestor authorization or loading ancestral data,

@@ -905,12 +905,9 @@ where
     let planning = open(store, frontier, "open merge-mirror snapshot")?;
     let index = index_of(&planning, &scope)?;
     let coverage = index.published();
-    let tops: Vec<CollectionData> = coverage
-        .frontier(source)
-        .filter(|node| owns(coverage, source, *node, &key))
-        .collect();
-    let mut produced = BTreeMap::new();
-    let mut pending = tops.clone();
+    let everything: Vec<CollectionData> = coverage.frontier(source).collect();
+    let mut produced: BTreeMap<CollectionData, Vec<MergeInputs>> = BTreeMap::new();
+    let mut pending = everything.clone();
     let mut seen = BTreeSet::new();
     while let Some(node) = pending.pop() {
         if !seen.insert(node) {
@@ -937,6 +934,14 @@ where
         pending.extend(merges.iter().flat_map(|inputs| inputs.iter()));
         produced.insert(node, merges);
     }
+    // The key's own source frontier: the foundations it committed and the
+    // nodes its own believed merges produced. A join records no owner, and
+    // only the host's merges are believed, so the second half is empty
+    // unless the key is the store's host.
+    let tops: Vec<CollectionData> = everything
+        .into_iter()
+        .filter(|node| owns(coverage, source, *node, &key) || produced_by_key(&produced, *node))
+        .collect();
     let admitted = producer_is_admitted(&planning, target, signing_key)?;
     drop(planning);
 
@@ -959,6 +964,14 @@ where
         mirror.image(node)?;
     }
     Ok(())
+}
+
+/// Whether one of the key's own believed source merges produces `node`.
+fn produced_by_key(
+    produced: &BTreeMap<CollectionData, Vec<MergeInputs>>,
+    node: CollectionData,
+) -> bool {
+    produced.get(&node).is_some_and(|merges| !merges.is_empty())
 }
 
 /// One pass of aligned mirroring: what it read at the start, and what it has
@@ -1021,7 +1034,10 @@ where
         let target = self.target.handle();
         let coverage = self.index.published();
         let foundation = coverage.covers(source, node, node);
-        let owned = owns(coverage, source, node, &self.key);
+        // The key's node: a foundation it committed, or a node one of its own
+        // believed merges produced (a join records no owner of its own).
+        let owned =
+            owns(coverage, source, node, &self.key) || produced_by_key(&self.produced, node);
         let leaf = foundation
             .then(|| {
                 coverage

@@ -7,9 +7,9 @@
 //! which of that collection's foundations does it cover? — and that answer is
 //! a set, not a walk.
 //!
-//! Every collection is a lattice of foundations joined by MERGEs. This module
-//! folds records into exactly that answer. Each admitted record contributes
-//! one monotone union:
+//! Every collection is a set of foundations, and each host joins that set
+//! into a lattice of its own with MERGEs. This module folds records into
+//! exactly that answer. Each believed record contributes one monotone union:
 //!
 //! - `COMMIT(root, data)` — `coverage(data) ∪= {data}`; a commit is a
 //!   foundation of a root collection.
@@ -18,6 +18,19 @@
 //!   input is the locator of a source foundation, not a node of this lattice.
 //! - `MERGE(c; a1..ak -> result)` — `coverage(result) ∪= coverage(a1) ∪ … ∪
 //!   coverage(ak)`, all or nothing; a merge is compaction inside one lattice.
+//!
+//! Foundations and merges are believed on different grounds. A COMMIT or a
+//! DERIVE is believed when its signer may WRITE its collection; that is what
+//! [`RecordAdmission`] decides, and nothing else asks it. A MERGE is believed
+//! only when the index's host signed it ([`CoverageIndex::for_host`]): join is
+//! associative, commutative and idempotent, so every host's own tree over the
+//! same foundations stands for the same set, and nobody needs anybody else's.
+//! A MERGE another key signed stays in the store and is never folded: it adds
+//! no support, no consumer edge, no owner, and moves no frontier, so it cannot
+//! widen what a node stands for. That closes support injection by other keys;
+//! it says nothing about a bug in the host's own computation, whose merges are
+//! believed as signed. An index without a host believes no MERGE at all, and
+//! its frontier is every believed foundation.
 //!
 //! Coverage is collection-local. Every row is keyed by its own collection and
 //! every support is a set of that collection's own foundations: commit
@@ -40,8 +53,10 @@
 //! every input that is not its result off and puts its result on; a COMMIT or
 //! a DERIVE puts its own node on. That is the set a reader attaches, and it
 //! makes a read a lookup: the frontier, one support per frontier node, and
-//! their union. It also keeps, per node, who produced it ([`Coverage::owners`])
-//! and, per derived collection, which source locators have a leaf.
+//! their union. It also keeps, per foundation, who produced it
+//! ([`Coverage::owners`]), per derived collection which source locators have a
+//! leaf, and the host's joins, so a reader finds the producers of a node by
+//! its own key ([`Coverage::producers`]).
 //!
 //! Nothing here is persisted. The index is rebuilt by replaying the records a
 //! store already holds, which is affordable precisely because the fold is a
@@ -58,11 +73,13 @@
 //!
 //! # Attestations that cannot be applied yet
 //!
-//! Two things can be missing when a record arrives: the evidence that its
-//! signer may write its collection, and the coverage rows of a merge's inputs.
-//! Both are open-world absences — a proof or an input can still arrive later —
-//! so an attestation that cannot be applied is parked or blocked rather than
-//! rejected, and retried when what it waits on arrives.
+//! Two things can be missing when a record arrives: the evidence that a
+//! foundation's signer may write its collection, and the coverage rows of a
+//! merge's inputs. Both are open-world absences — a proof or an input can
+//! still arrive later — so a foundation that cannot be admitted is parked, a
+//! host merge whose input has no support yet is blocked, and each is retried
+//! when what it waits on arrives. The admission backlog therefore holds only
+//! foundations; a host merge waits on its inputs alone.
 //!
 //! # Validate once, then walk
 //!
@@ -142,14 +159,20 @@ pub struct Coverage {
     /// they arrived in; a collection with none has no entry at all. Only
     /// that collection's own records can unblock them.
     blocked: PATCH<32, IdentitySchema, BlockedJoins>,
-    /// `collection || node || signer` for every believed attestation: the
-    /// signer of each record that produced the node. "You own what you
-    /// signed."
+    /// `collection || node || signer` for every believed foundation and
+    /// leaf: the signer of each COMMIT or DERIVE that produced the node. A
+    /// join records no owner: every join the index believes is the host's.
     owners: OwnerSet,
     /// `collection || locator || output` for every believed leaf. Answers
     /// "has the source foundation with this locator been derived into this
     /// collection, and to what?" by the DERIVE relation's own key.
     leaves: LeafSet,
+    /// `collection || result || join digest -> inputs`: every join of the
+    /// host's the index has been handed, stored once. A join another key
+    /// signed never reaches it. For a collection a reader has settled these
+    /// are exactly the believed joins, and [`Self::producers`] reads the
+    /// ones that are driven by their result, the MERGE relation's own key.
+    joins: Joins,
 }
 
 /// One row's key: the collection a node belongs to, then the node itself.
@@ -269,7 +292,46 @@ impl Coverage {
             .is_some_and(|blocked| !blocked.is_empty())
     }
 
-    /// Every signer of a believed record that produced this node, ascending.
+    /// The input sets of the host's driven joins of `collection` that
+    /// produce `node`, in ascending order of their input digest.
+    ///
+    /// One prefix scan of the joins table on `collection || node`: the MERGE
+    /// relation read by its own key, no record selected and nothing
+    /// computed to look it up. A join still waiting for an input's support
+    /// is skipped, so every input set named here has a support for each of
+    /// its inputs. Only the host's joins are ever stored, so a MERGE another
+    /// key signed is never a producer. An absorption `MERGE(a, node) -> node`
+    /// names `node` among its own inputs; a caller descending through
+    /// producers skips it there.
+    pub fn producers(
+        &self,
+        collection: CollectionHandle,
+        node: CollectionData,
+    ) -> Vec<MergeInputs> {
+        let prefix = row_key(collection, node);
+        let mut digests = Vec::new();
+        self.joins.infixes(&prefix, |digest: &[u8; 32]| {
+            digests.push(*digest);
+        });
+        let blocked = self.blocked.get(&collection.raw);
+        digests
+            .into_iter()
+            .filter(|digest| {
+                let mut edge = [0u8; 64];
+                edge[..32].copy_from_slice(&node.raw);
+                edge[32..].copy_from_slice(digest);
+                blocked.map_or(true, |blocked| blocked.get(&edge).is_none())
+            })
+            .filter_map(|digest| {
+                self.joins
+                    .get(&triple(collection.raw, node.raw, digest))
+                    .copied()
+            })
+            .collect()
+    }
+
+    /// Every signer of a believed COMMIT or DERIVE that produced this node,
+    /// ascending. A node only a join produced has none.
     pub fn owners(
         &self,
         collection: CollectionHandle,
@@ -462,12 +524,15 @@ pub enum Admittance {
     Undefined(Vec<CollectionHandle>),
 }
 
-/// What the fold must know about a collection before it can believe an
-/// attestation naming it: whether it is a root or derived, and whether this
-/// signer may make it.
+/// What the fold must know about a collection before it can believe a
+/// foundation naming it: whether it is a root or derived, and whether this
+/// signer may write it.
 ///
-/// Implementors do the descriptor and capability work; this module only asks,
-/// and only once per attestation.
+/// Asked only for COMMIT and DERIVE. A MERGE is believed on the index's host
+/// key alone, with no WRITE check and no descriptor read: a merge adds no
+/// foundation, and whether its inputs are believed is the fold's own
+/// question. Implementors do the descriptor and capability work; this module
+/// only asks, and only once per foundation.
 pub trait RecordAdmission {
     /// The collection this one derives from, if any.
     ///
@@ -561,11 +626,12 @@ type Consumers = PATCH<64, IdentitySchema, Edges>;
 type Held = PATCH<160, IdentitySchema, ()>;
 /// Attestations held until one named thing arrives, keyed by that thing.
 type Waiters = PATCH<32, IdentitySchema, Held>;
-/// `collection || result || join digest -> inputs`: every join the index has
-/// been handed, believed or parked, stored once. A MERGE carries a fixed
-/// 16-slot input array; copying it into every consumer edge and every
-/// parked entry made a k-input join cost k+1 copies of it.
-type Joins = PATCH<96, IdentitySchema, MergeInputs>;
+/// `collection || result || join digest -> inputs`: every host join the
+/// index has been handed, stored once. A MERGE carries a fixed 16-slot input
+/// array; copying it into every consumer edge and every parked entry made a
+/// k-input join cost k+1 copies of it. Three segments, so the joins
+/// producing one node are a prefix scan on `collection || result`.
+type Joins = PATCH<96, triple_key::Schema, MergeInputs>;
 
 /// A fixed-width name for one join's input set: BLAKE3 over the inputs in
 /// order. Only an index key, so two joins with the same result and different
@@ -663,7 +729,8 @@ pub struct CoverageIndex {
     /// value per store. `None` believes no MERGE: the lattice is its
     /// foundations and the frontier is all of them.
     host: Option<Inline<ED25519PublicKey>>,
-    /// The half a reader sees: rows, frontiers, owners and leaves.
+    /// The half a reader sees: rows, frontiers, owners, leaves and the
+    /// host's joins.
     published: Coverage,
     /// Which joins read each input, so a row that grows can re-drive its
     /// consumers instead of forcing a full replay.
@@ -680,9 +747,6 @@ pub struct CoverageIndex {
     /// distinct from `pending`, whose entries have already been decided
     /// against and are waiting on a *named* arrival.
     fresh: Waiters,
-    /// Every join handed to the index, believed or parked, once: what an
-    /// edge or a held key names by its result and input digest.
-    joins: Joins,
 }
 
 /// The keys of one collection's parked attestations in a waiter map.
@@ -746,11 +810,23 @@ impl CoverageIndex {
         self.host
     }
 
-    /// Keep a join's inputs, once, where its edges and parked keys find
-    /// them. Idempotent: `insert` keeps an existing entry.
+    /// Whether this index folds an attestation at all: a foundation or a
+    /// leaf always (admission decides it later), a join only when the host
+    /// signed it. Anything else is dropped before it touches any table, so
+    /// another key's MERGE never reaches joins, the backlog, consumer edges,
+    /// owners, blocked joins, rows or a frontier.
+    fn folds(&self, attestation: &Attestation, signer: Inline<ED25519PublicKey>) -> bool {
+        match attestation {
+            Attestation::Join { .. } => self.host == Some(signer),
+            Attestation::Foundation { .. } | Attestation::Leaf { .. } => true,
+        }
+    }
+
+    /// Keep a join's inputs, once, where its edges, parked keys and readers
+    /// find them. Idempotent: `insert` keeps an existing entry.
     fn remember_join(&mut self, collection: CollectionHandle, attestation: &Attestation) {
         if let Attestation::Join { inputs, .. } = attestation {
-            self.joins.insert(&Entry::with_value(
+            self.published.joins.insert(&Entry::with_value(
                 &join_key(collection, &edge_key(attestation)),
                 *inputs,
             ));
@@ -760,7 +836,7 @@ impl CoverageIndex {
     /// The join one edge of `collection` names, read back from the joins
     /// table.
     fn edge_join(&self, collection: CollectionHandle, edge: &[u8; 64]) -> Option<Attestation> {
-        let inputs = *self.joins.get(&join_key(collection, edge))?;
+        let inputs = *self.published.joins.get(&join_key(collection, edge))?;
         Some(Attestation::Join {
             inputs,
             result: Inline::new(segment(edge, 0)),
@@ -800,11 +876,13 @@ impl CoverageIndex {
     }
 
     /// The believed joins of `collection` that read `node`, each as its
-    /// input set and result, ascending by result.
+    /// input set and result, ascending by result. A join still waiting for
+    /// another input's support is included: it is believed, not driven.
     ///
     /// This is the consumer side of the MERGE relation, read by its own key:
     /// what a maintainer asks to find whether a join of exactly these nodes
-    /// is already believed, without computing anything to look it up.
+    /// is already believed, without computing anything to look it up. Every
+    /// join here is the host's.
     pub fn joins_reading(
         &self,
         collection: CollectionHandle,
@@ -823,12 +901,14 @@ impl CoverageIndex {
     }
 
     /// Whether the index believes the join of exactly `inputs` into
-    /// `result` in `collection`.
+    /// `result` in `collection` and has driven it: every input has a
+    /// support, so the join stands for their union.
     ///
-    /// A raw MERGE is not a belief: a store keeps records whose signer no
-    /// policy admits. Only believed joins have consumer edges, so this reads
-    /// the edges of the join's first input, the MERGE relation by its own
-    /// key, and looks for this one among them.
+    /// A raw MERGE is not a belief: a store keeps MERGEs other keys signed,
+    /// and those never reach the index. Only believed joins have consumer
+    /// edges, so this reads the edges of the join's first input, the MERGE
+    /// relation by its own key, looks for this one among them, and asks
+    /// whether that edge is still blocked on an input.
     pub fn believes_join(
         &self,
         collection: CollectionHandle,
@@ -838,16 +918,24 @@ impl CoverageIndex {
         let Some(first) = inputs.iter().next() else {
             return false;
         };
-        self.joins_reading(collection, first)
-            .iter()
-            .any(|(read, produced)| read == inputs && *produced == result)
+        let Some(edges) = self.consumers.get(&row_key(collection, first)) else {
+            return false;
+        };
+        let blocked = self.published.blocked.get(&collection.raw);
+        edges.iter_ordered().any(|edge| {
+            matches!(
+                self.edge_join(collection, edge),
+                Some(Attestation::Join { inputs: read, result: produced })
+                    if read == *inputs && produced == result
+            ) && blocked.map_or(true, |blocked| blocked.get(edge).is_none())
+        })
     }
 
     /// How many distinct joins the index keeps inputs for, believed or
-    /// parked: one entry per join, whatever its arity or the number of its
-    /// edges and parked copies.
+    /// still fresh: one entry per join, whatever its arity or the number of
+    /// its edges and parked copies. Only the host's joins are ever kept.
     pub fn stored_joins(&self) -> usize {
-        self.joins.len().min(usize::MAX as u64) as usize
+        self.published.joins.len().min(usize::MAX as u64) as usize
     }
 
     /// The foundations this node covers, if any admitted record has attested
@@ -984,7 +1072,8 @@ impl CoverageIndex {
         );
     }
 
-    /// Fold one stripped attestation, subject to its signer's admission.
+    /// Fold one stripped attestation: a foundation subject to its signer's
+    /// admission, a join only when the host signed it.
     pub fn attest<A: RecordAdmission>(
         &mut self,
         collection: CollectionHandle,
@@ -992,6 +1081,9 @@ impl CoverageIndex {
         signer: Inline<ED25519PublicKey>,
         admission: &A,
     ) {
+        if !self.folds(&attestation, signer) {
+            return;
+        }
         self.remember_join(collection, &attestation);
         self.decide(
             Parked {
@@ -1008,8 +1100,21 @@ impl CoverageIndex {
         // Only the collection's kind is resolved here, never a row of another
         // collection: a foundation of a root is a COMMIT, a foundation of a
         // derived collection is a DERIVE, and the other pairing attests
-        // nothing. A merge stays inside its own collection whatever it is.
+        // nothing.
         match entry.attestation {
+            Attestation::Join { .. } => {
+                // A host's own join is believed on its key alone: no WRITE
+                // check and no descriptor. It stays inside its collection
+                // whatever that is, adds no foundation, and stands for
+                // nothing until every input has a support, which `drive`
+                // enforces all or nothing and the inputs' consumer edges
+                // retry. Another key's join never gets here; the check is
+                // the same one `attest` and `park` made.
+                if self.folds(&entry.attestation, entry.signer) {
+                    self.believe(entry.collection, entry.attestation, entry.signer);
+                }
+                return;
+            }
             Attestation::Leaf { .. } => match admission.source(entry.collection) {
                 SourceResolution::Derived(_) => {}
                 SourceResolution::Missing(descriptor) => {
@@ -1031,7 +1136,6 @@ impl CoverageIndex {
                     return;
                 }
             }
-            Attestation::Join { .. } => {}
         }
         match admission.admits(entry.collection, entry.signer) {
             Admittance::Admitted => {}
@@ -1062,9 +1166,8 @@ impl CoverageIndex {
         // The inner map is a persistent root: cloning it is constant time,
         // and `insert` keeps an existing entry, so the same attestation parked
         // twice is held once. `replace` on the outer map, because `insert`
-        // would keep the old inner map. A join's inputs are already in the
-        // joins table: every attestation reaches here through `attest` or
-        // `park`, which put them there.
+        // would keep the old inner map. Only a foundation or a leaf is ever
+        // held here: a host join is believed as soon as it is decided.
         let mut entries = waiters.get(&key).cloned().unwrap_or_default();
         entries.insert(&Entry::new(&parked_key(&entry)));
         waiters.replace(&Entry::with_value(&key, entries));
@@ -1079,12 +1182,18 @@ impl CoverageIndex {
     /// each parked attestation its first decision once the batch has been
     /// applied. Nothing here defers a *re-*decision to a batch boundary —
     /// those are keyed on the arrival that would change the answer.
+    ///
+    /// A join another key signed is dropped here, before it is stored: the
+    /// host is known without any admission, so nothing waits to decide it.
     pub fn park(
         &mut self,
         collection: CollectionHandle,
         attestation: Attestation,
         signer: Inline<ED25519PublicKey>,
     ) {
+        if !self.folds(&attestation, signer) {
+            return;
+        }
         let entry = Parked {
             collection,
             attestation,
@@ -1220,22 +1329,26 @@ impl CoverageIndex {
         }
     }
 
-    /// Fold an attestation whose collection resolves and whose signer is
-    /// admitted.
+    /// Fold a foundation whose collection resolves and whose signer is
+    /// admitted, or a join the host signed.
     fn believe(
         &mut self,
         collection: CollectionHandle,
         attestation: Attestation,
         signer: Inline<ED25519PublicKey>,
     ) {
-        // Who produced the node, and for a leaf which source foundation it
-        // maps: both are facts about the believed record, recorded whether or
-        // not a join can be driven yet.
-        self.published.owners.insert(&Entry::new(&triple(
-            collection.raw,
-            attestation.result().raw,
-            signer.raw,
-        )));
+        // Who produced a foundation, and for a leaf which source foundation
+        // it maps: both are facts about the believed record. A join has no
+        // owner to record: it is always the host's, and recording it would
+        // make a foundation that is also an absorption result read as the
+        // host's own foundation.
+        if !matches!(attestation, Attestation::Join { .. }) {
+            self.published.owners.insert(&Entry::new(&triple(
+                collection.raw,
+                attestation.result().raw,
+                signer.raw,
+            )));
+        }
         if let Attestation::Leaf { locator, output } = attestation {
             self.published.leaves.insert(&Entry::new(&triple(
                 collection.raw,
@@ -1369,7 +1482,8 @@ impl CoverageIndex {
     /// driven: a join takes every input that is not its result off and puts
     /// its result on, a foundation or a leaf puts its node on. Idempotent,
     /// because a driven attestation is driven again whenever one of its
-    /// inputs grows.
+    /// inputs grows. Every join driven here is the host's, so only the
+    /// host's own merges ever consume a node.
     fn advance_frontier(&mut self, collection: CollectionHandle, attestation: Attestation) {
         let mut frontier = self
             .published
