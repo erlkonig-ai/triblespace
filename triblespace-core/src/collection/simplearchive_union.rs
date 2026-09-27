@@ -1381,12 +1381,16 @@ mod tests {
                 let actual = join(&left, &right).unwrap();
 
                 prop_assert_eq!(&actual, &expected);
-                let collection = root("first");
-                let claim = CollectionMerge::sign(&ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                    identity_for_tests(&collection), [data(&left), data(&right)],
-                    data(&actual),).unwrap();
-                let (low, high) = ordered_inputs(&left, &right);
-                prop_assert!(validate_merge(&collection, &claim, low, high, &actual).is_ok());
+                // A MERGE names two to sixteen distinct inputs, so two equal
+                // sides -- both empty, say -- have no claim to check.
+                if data(&left) != data(&right) {
+                    let collection = root("first");
+                    let claim = CollectionMerge::sign(&ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                        identity_for_tests(&collection), [data(&left), data(&right)],
+                        data(&actual),).unwrap();
+                    let (low, high) = ordered_inputs(&left, &right);
+                    prop_assert!(validate_merge(&collection, &claim, low, high, &actual).is_ok());
+                }
                 prop_assert_eq!(actual, join(&right, &left).unwrap());
             }
 
