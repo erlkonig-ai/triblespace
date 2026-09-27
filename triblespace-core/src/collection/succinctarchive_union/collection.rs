@@ -547,7 +547,9 @@ mod tests {
 
     #[test]
     fn exact_observation_accepts_a_multihop_mirrored_union_image() {
-        let mut store = MemoryRepo::default();
+        let key = SigningKey::from_bytes(&[7; 32]);
+        // The key signs the merges below, so it is the store's host.
+        let mut store = MemoryRepo::for_host(key.verifying_key());
         let (source_collection, raw_collection, accelerated_collection) = collections(&mut store);
         let source_a = simple([row(1, 2, 3)]);
         let source_b = simple([row(4, 5, 6)]);
@@ -580,7 +582,6 @@ mod tests {
                 .put::<Rank9AcceleratedSuccinctArchiveBlob, _>(member)
                 .unwrap();
         }
-        let key = SigningKey::from_bytes(&[7; 32]);
         let leaf = |collection: CollectionHandle, input: [u8; 32], output| {
             CollectionRecord::Derive(CollectionDerive::sign(
                 &key,

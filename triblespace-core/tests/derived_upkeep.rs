@@ -107,7 +107,8 @@ fn chain_named_unrelated(store: &mut MemoryRepo, owner: &SigningKey) -> Collecti
 #[test]
 fn ensure_derived_makes_a_commit_readable_through_every_view_and_publishes_no_merge() {
     let owner = key(2);
-    let mut store = MemoryRepo::default();
+    // The owner carries the root, so the store is its host.
+    let mut store = MemoryRepo::for_host(owner.verifying_key());
     let chain = chain(&mut store, "ensured", &owner);
     // The first commit and the registration-time realization put the chain
     // into the listing; every later write finds it there.

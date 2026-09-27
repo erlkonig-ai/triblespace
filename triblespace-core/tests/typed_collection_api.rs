@@ -248,7 +248,8 @@ fn maintenance_follows_a_resident_source_union_across_target_size_tiers() {
         large.insert(&Trible::force_raw(row).unwrap());
     }
     let expected = small.clone() + large.clone();
-    let mut store = MemoryRepo::default();
+    // The authority signs the source union below, so it is the store's host.
+    let mut store = MemoryRepo::for_host(authority.verifying_key());
     let source = store
         .collection("source-guided-unequal-tiers", policy.clone())
         .unwrap();

@@ -381,13 +381,28 @@ fn require_mapping(target: &Fragment, expected: Id) -> Result<(), CollectionOper
     }
 }
 
+/// A root and two chained views in a store hosted by [`equation_signer`],
+/// the key these tests maintain with: its merges are the ones the store
+/// believes.
 fn collections() -> (
     MemoryRepo,
     Collection<SimpleArchive>,
     Collection<FirstEncoding>,
     Collection<SecondEncoding>,
 ) {
-    let mut store = MemoryRepo::default();
+    collections_as(&equation_signer())
+}
+
+/// The same fixture in a store hosted by `host`.
+fn collections_as(
+    host: &SigningKey,
+) -> (
+    MemoryRepo,
+    Collection<SimpleArchive>,
+    Collection<FirstEncoding>,
+    Collection<SecondEncoding>,
+) {
+    let mut store = MemoryRepo::for_host(host.verifying_key());
     let root = store.collection("root", policy()).unwrap();
     let first = store.derive::<FirstEncoding>(root, (), policy()).unwrap();
     let second = store.derive::<SecondEncoding>(first, (), policy()).unwrap();
@@ -2305,7 +2320,8 @@ fn optional_maintenance_without_write_keeps_the_fine_cover_without_algebra() {
         AdmissionPolicy::Open,
         AdmissionPolicy::direct(owner.verifying_key()),
     );
-    let mut inner = MemoryRepo::default();
+    // The reader is this store's host: its merges are the ones believed.
+    let mut inner = MemoryRepo::for_host(reader.verifying_key());
     let root = inner.collection("read-only-maintenance", policy()).unwrap();
     let first = inner
         .derive::<FirstEncoding>(root, (), private_write.clone())
@@ -2325,20 +2341,19 @@ fn optional_maintenance_without_write_keeps_the_fine_cover_without_algebra() {
     block_on(inner.ensure(second, &owner)).unwrap();
     let upper = crate::collection::simplearchive_union::join(&left, &right).unwrap();
     inner.put::<SimpleArchive, _>(upper.clone()).unwrap();
-    let root_merge = |key: &SigningKey| {
-        CollectionRecord::Merge(
+    // The reader's own root MERGE is owed a mirror in `first`, which the
+    // reader may not write.
+    inner
+        .insert(CollectionRecord::Merge(
             CollectionMerge::sign(
-                key,
+                &reader,
                 root.handle(),
                 [data(&left), data(&right)],
                 data(&upper),
             )
             .unwrap(),
-        )
-    };
-    // The reader's own root MERGE is owed a mirror in `first`, which the
-    // reader may not write.
-    inner.insert(root_merge(&reader)).unwrap();
+        ))
+        .unwrap();
     let mut store = GuardStore::new(inner);
     reset_mapping_calls();
 
@@ -2353,50 +2368,29 @@ fn optional_maintenance_without_write_keeps_the_fine_cover_without_algebra() {
         "no image is computed for a mirror that cannot be published"
     );
 
-    // The owner signs the same MERGE and pays for its image in `first`.
-    // Then the reader gains WRITE on `first` and co-signs everything there,
-    // so it owns `first`'s nodes too -- and still may not write `second`.
-    store.inner.insert(root_merge(&owner)).unwrap();
-    drop(block_on(store.maintain(first, &owner)).unwrap());
-    store
-        .inner
-        .insert_proof(CapabilityProof::new(
-            CapabilityResource::from(first.handle()),
+    // WRITE on `first` is the only thing that held it back: granted, the
+    // reader pays for its merge's image there -- and still may not write
+    // `second`.
+    let grant = |collection: CollectionHandle| {
+        CapabilityProof::new(
+            CapabilityResource::from(collection),
             &owner,
             write_capability(),
             reader.verifying_key(),
-        ))
-        .unwrap();
-    let mut mirrored = 0;
-    for record in records(&mut store.inner) {
-        let copy = match record {
-            CollectionRecord::Derive(derive) if derive.collection() == first.handle() => {
-                CollectionRecord::Derive(CollectionDerive::sign(
-                    &reader,
-                    first.handle(),
-                    derive.input(),
-                    derive.output(),
-                ))
-            }
-            CollectionRecord::Merge(merge) if merge.collection() == first.handle() => {
-                mirrored += 1;
-                CollectionRecord::Merge(
-                    CollectionMerge::sign(
-                        &reader,
-                        first.handle(),
-                        merge.inputs().iter().copied(),
-                        merge.result(),
-                    )
-                    .unwrap(),
-                )
-            }
-            _ => continue,
-        };
-        store.inner.insert(copy).unwrap();
-    }
+        )
+    };
+    store.inner.insert_proof(grant(first.handle())).unwrap();
+    drop(block_on(store.maintain(first, &reader)).unwrap());
+    assert_eq!(FIRST_MAP_CALLS.get(), 1);
+    let mirrored = records(&mut store.inner)
+        .into_iter()
+        .filter(|record| {
+            matches!(record, CollectionRecord::Merge(merge) if merge.collection() == first.handle())
+        })
+        .count();
     assert_eq!(
         mirrored, 1,
-        "the owner mirrored its root MERGE into `first`"
+        "the reader mirrored its root MERGE into `first`"
     );
     store.events.clear();
     reset_mapping_calls();
@@ -2408,8 +2402,9 @@ fn optional_maintenance_without_write_keeps_the_fine_cover_without_algebra() {
     assert_eq!(SECOND_MAP_CALLS.get(), 0);
     assert_eq!(SECOND_JOIN_CALLS.get(), 0);
 
-    // WRITE is the only thing that held it back: the owner mirrors it.
-    let snapshot = block_on(store.maintain(second, &owner)).unwrap();
+    // And WRITE on `second` is the only thing that holds that one back.
+    store.inner.insert_proof(grant(second.handle())).unwrap();
+    let snapshot = block_on(store.maintain(second, &reader)).unwrap();
     assert_eq!(snapshot.collection(second).unwrap().cover().len(), 1);
     assert_eq!(SECOND_MAP_CALLS.get(), 1);
 }
@@ -2860,7 +2855,7 @@ fn redundant_support_fixture() -> (
     let [a, b, z, d] = &blobs;
     assert_eq!(a.bytes.len().ilog2(), b.bytes.len().ilog2());
     assert_eq!(b.bytes.len().ilog2(), z.bytes.len().ilog2());
-    let mut store = MemoryRepo::default();
+    let mut store = MemoryRepo::for_host(equation_signer().verifying_key());
     let collection = store.collection("compaction-progress", policy()).unwrap();
     let commits = blobs
         .each_ref()
@@ -3009,6 +3004,17 @@ mod lattice_v2 {
         SigningKey::from_bytes(&[byte; 32])
     }
 
+    /// The parent fixture hosted by key 41, the maintainer most of these
+    /// tests carry with.
+    fn collections() -> (
+        MemoryRepo,
+        Collection<SimpleArchive>,
+        Collection<FirstEncoding>,
+        Collection<SecondEncoding>,
+    ) {
+        collections_as(&key(41))
+    }
+
     fn public(byte: u8) -> Inline<crate::inline::encodings::ed25519::ED25519PublicKey> {
         Inline::new(key(byte).verifying_key().to_bytes())
     }
@@ -3122,63 +3128,63 @@ mod lattice_v2 {
     }
 
     #[test]
-    fn two_owners_carry_two_trees_that_never_merge_each_others_nodes() {
+    fn one_host_merges_every_held_commit_and_absent_payloads_sit_out() {
         let (mut store, root, _, _) = collections();
-        let a = key(41);
-        let b = key(42);
-        let mut own_a: BTreeSet<_> = (0..4)
+        let host = key(41);
+        let mut own: BTreeSet<_> = (0..4)
             .map(|entity| own_commit(&mut store, root, 41, entity))
             .collect();
-        // B's payloads are elsewhere: A's carry neither reads nor waits
-        // for them.
-        let mut own_b: BTreeSet<_> = (0..4)
+        // 42's payloads are elsewhere: the carry neither reads nor waits for
+        // them.
+        let mut absent: BTreeSet<_> = (0..4)
             .map(|entity| foreign_commit(&mut store, root, 42, entity))
             .collect();
-        // Eight nodes share tier 0, but neither owner holds eight.
-        block_on(store.maintain(root, &a)).unwrap();
+        // Eight nodes share tier 0, but only four are held.
+        block_on(store.maintain(root, &host)).unwrap();
         assert!(merges_in(&mut store, root.handle()).is_empty());
 
-        own_a.extend((4..8).map(|entity| own_commit(&mut store, root, 41, entity)));
-        block_on(store.maintain(root, &a)).unwrap();
+        own.extend((4..8).map(|entity| own_commit(&mut store, root, 41, entity)));
+        block_on(store.maintain(root, &host)).unwrap();
         let merges = merges_in(&mut store, root.handle());
         assert_eq!(merges.len(), 1);
         assert_eq!(merges[0].public_key(), public(41));
-        assert_eq!(inputs(&merges[0]), own_a);
-        let tree_a = merges[0].result();
+        assert_eq!(inputs(&merges[0]), own);
+        let first_tree = merges[0].result();
         assert_eq!(
             frontier(&mut store, root.handle()),
-            own_b.iter().copied().chain([tree_a]).collect()
+            absent.iter().copied().chain([first_tree]).collect()
         );
 
-        // B's payloads land and B writes four more: B's own carry takes
-        // exactly B's eight, and A's tree stays A's.
+        // 42's payloads land and 42 writes four more: the host merges 42's
+        // eight held commits as readily as its own, into its own tree.
         for entity in 0..4 {
             store.put::<SimpleArchive, _>(payload(42, entity)).unwrap();
         }
-        own_b.extend((4..8).map(|entity| own_commit(&mut store, root, 42, entity)));
-        block_on(store.maintain(root, &b)).unwrap();
+        absent.extend((4..8).map(|entity| own_commit(&mut store, root, 42, entity)));
+        block_on(store.maintain(root, &host)).unwrap();
         let merges = merges_in(&mut store, root.handle());
         assert_eq!(merges.len(), 2);
-        let tree_b = merges
+        assert!(merges.iter().all(|merge| merge.public_key() == public(41)));
+        let second_tree = merges
             .iter()
-            .find(|merge| merge.public_key() == public(42))
-            .expect("B carried its own nodes");
-        assert_eq!(inputs(tree_b), own_b);
+            .find(|merge| merge.result() != first_tree)
+            .expect("the host carried 42's commits");
+        assert_eq!(inputs(second_tree), absent);
         assert_eq!(
             frontier(&mut store, root.handle()),
-            BTreeSet::from([tree_a, tree_b.result()])
+            BTreeSet::from([first_tree, second_tree.result()])
         );
 
-        // Two tier-1 nodes, one per owner: neither maintainer touches the
-        // other's.
+        // Two tier-1 nodes: a fixed point, and a key that is not the host
+        // has nothing to publish here either.
         let before = records(&mut store).len();
-        block_on(store.maintain(root, &a)).unwrap();
-        block_on(store.maintain(root, &b)).unwrap();
+        block_on(store.maintain(root, &host)).unwrap();
+        block_on(store.maintain(root, &key(42))).unwrap();
         assert_eq!(records(&mut store).len(), before);
     }
 
     #[test]
-    fn an_own_node_inside_another_own_node_is_absorbed_and_a_foreign_one_is_not() {
+    fn a_held_node_inside_another_is_absorbed_and_a_foreign_merge_is_no_node() {
         let (mut store, root, _, _) = collections();
         let owner = key(41);
         let commits: Vec<_> = (0..8)
@@ -3187,8 +3193,8 @@ mod lattice_v2 {
         block_on(store.maintain(root, &owner)).unwrap();
         let wide = merges_in(&mut store, root.handle())[0].result();
 
-        // The same key grouped two members again elsewhere: an own node
-        // inside the wide one.
+        // The host grouped two members again elsewhere: a node inside the
+        // wide one.
         let narrow = simplearchive_union::join(&payload(41, 0), &payload(41, 1)).unwrap();
         let narrow =
             Handle::<SimpleArchive>::to_hash(store.put::<SimpleArchive, _>(narrow).unwrap());
@@ -3198,7 +3204,8 @@ mod lattice_v2 {
                     .unwrap(),
             ))
             .unwrap();
-        // Someone else's node inside it too.
+        // Another key's merge of two more members, its bytes resident: not
+        // folded, so it is on nobody's frontier and nothing absorbs it.
         let foreign = simplearchive_union::join(&payload(41, 2), &payload(41, 3)).unwrap();
         let foreign =
             Handle::<SimpleArchive>::to_hash(store.put::<SimpleArchive, _>(foreign).unwrap());
@@ -3210,7 +3217,7 @@ mod lattice_v2 {
             .unwrap();
         assert_eq!(
             frontier(&mut store, root.handle()),
-            BTreeSet::from([wide, narrow, foreign])
+            BTreeSet::from([wide, narrow])
         );
 
         block_on(store.maintain(root, &owner)).unwrap();
@@ -3225,10 +3232,7 @@ mod lattice_v2 {
         assert!(merges
             .iter()
             .all(|merge| merge.public_key() != public(41) || !merge.inputs().contains(&foreign)));
-        assert_eq!(
-            frontier(&mut store, root.handle()),
-            BTreeSet::from([wide, foreign])
-        );
+        assert_eq!(frontier(&mut store, root.handle()), BTreeSet::from([wide]));
     }
 
     #[test]
@@ -3289,7 +3293,7 @@ mod lattice_v2 {
     fn a_view_publishes_an_empty_image_as_a_leaf() {
         let id = |byte: u8| Id::new([byte; 16]).unwrap();
         let owner = key(41);
-        let mut store = MemoryRepo::default();
+        let mut store = MemoryRepo::for_host(owner.verifying_key());
         let root = store.collection("receipts", policy()).unwrap();
         let ids = store
             .derive::<EntityIdSetBlob>(root, crate::metadata::supersedes.id(), policy())
@@ -3491,7 +3495,7 @@ mod lattice_v2 {
     #[test]
     fn a_chain_is_maintained_upstream_first_in_one_pass() {
         let owner = key(41);
-        let mut store = MemoryRepo::default();
+        let mut store = MemoryRepo::for_host(owner.verifying_key());
         let root = store.collection("facts", policy()).unwrap();
         let raw = store
             .derive::<SuccinctArchiveBlob>(root, (), policy())
@@ -3558,7 +3562,7 @@ mod lattice_v2 {
     #[test]
     fn a_view_mirrors_only_merges_its_maintainer_signed() {
         let owner = key(41);
-        let mut store = MemoryRepo::default();
+        let mut store = MemoryRepo::for_host(owner.verifying_key());
         // The owner roots the root's WRITE and grants it to 42; 43 is
         // admitted nowhere.
         let root = store
@@ -3847,12 +3851,14 @@ mod lattice_v2 {
     }
 
     #[test]
-    fn maintainers_racing_on_an_absent_owners_foundations_converge_and_leave_its_merges() {
+    fn two_hosts_racing_on_an_absent_owners_foundations_converge_on_one_support() {
         // A bounded race: 41 and 42 each maintain their own replica of one
-        // state while 43 is away, then the replicas are united, as `cat` does.
-        // 43 holds eight nodes in one tier, so a merge is on offer to steal.
-        let replica = || {
-            let (mut store, root, first, _) = collections();
+        // state while 43 is away, then the replicas are united, as `cat`
+        // does. 43 holds eight nodes, so each host merges them into its own
+        // tree: join is idempotent, commutative and associative, so the two
+        // trees stand for the same set and neither needs the other's.
+        let replica = |host: u8| {
+            let (mut store, root, first, _) = collections_as(&key(host));
             own_commit(&mut store, root, 41, 0);
             own_commit(&mut store, root, 42, 0);
             for entity in 0..8 {
@@ -3860,8 +3866,8 @@ mod lattice_v2 {
             }
             (store, root, first)
         };
-        let (mut left, root, first) = replica();
-        let (mut right, right_root, right_first) = replica();
+        let (mut left, root, first) = replica(41);
+        let (mut right, right_root, right_first) = replica(42);
         assert_eq!(
             (right_root.handle(), right_first.handle()),
             (root.handle(), first.handle())
@@ -3869,57 +3875,72 @@ mod lattice_v2 {
         for (store, racer) in [(&mut left, 41), (&mut right, 42)] {
             block_on(store.maintain(root, &key(racer))).unwrap();
             block_on(store.maintain(first, &key(racer))).unwrap();
-            // A merge is a choice: neither racer merged 43's nodes, in the
-            // root or as a mirror in the view.
-            assert!(merges_in(store, root.handle()).is_empty());
-            assert!(merges_in(store, first.handle()).is_empty());
+            // Each host merged eight of the ten held commits, 43's included,
+            // and mirrored its own merge in the view.
+            let merges = merges_in(store, root.handle());
+            assert_eq!(merges.len(), 1);
+            assert_eq!(merges[0].public_key(), public(racer));
+            assert_eq!(merges[0].inputs().len(), MERGE_FAN_IN);
+            let mirrors = merges_in(store, first.handle());
+            assert_eq!(mirrors.len(), 1);
+            assert_eq!(mirrors[0].public_key(), public(racer));
         }
-        let alone = frontier(&mut left, first.handle());
-        assert_eq!(alone.len(), 10);
+        let alone = frontier(&mut left, root.handle());
+        assert_eq!(alone.len(), 3);
+        // The same eight inputs join to the same bytes whoever signs.
+        assert_eq!(frontier(&mut right, root.handle()), alone);
+        let left_view = frontier(&mut left, first.handle());
 
-        for record in records(&mut right) {
+        let (from_left, from_right) = (records(&mut left), records(&mut right));
+        for record in from_right {
             left.insert(record).unwrap();
         }
+        for record in from_left {
+            right.insert(record).unwrap();
+        }
 
-        // Every foundation now has a leaf from each racer, and both leaves
-        // name the same image: a derive is a function.
+        // Each host still believes only its own merges: the other's are in
+        // the store and fold into nothing, so each frontier is its own.
+        assert_eq!(merges_in(&mut left, root.handle()).len(), 2);
+        assert_eq!(frontier(&mut left, root.handle()), alone);
+        assert_eq!(frontier(&mut right, root.handle()), alone);
+        assert_eq!(frontier(&mut left, first.handle()), left_view);
+        // Every foundation has a leaf from each racer, and both leaves name
+        // the same image: a derive is a function.
         let leaves = derives_in(&mut left, first.handle());
         assert_eq!(leaves.len(), 20);
         let mut outputs = std::collections::BTreeMap::<_, BTreeSet<_>>::new();
         for leaf in &leaves {
-            outputs.entry(leaf.input()).or_default().insert(leaf.output());
+            outputs
+                .entry(leaf.input())
+                .or_default()
+                .insert(leaf.output());
         }
         assert_eq!(outputs.len(), 10);
         assert!(outputs.values().all(|images| images.len() == 1));
-        assert_eq!(frontier(&mut left, first.handle()), alone);
-        let snapshot = left.snapshot().unwrap();
-        assert!(snapshot
-            .collection(first)
-            .unwrap()
-            .missing_from(&snapshot.collection(root).unwrap())
-            .unwrap()
-            .is_empty());
-        drop(snapshot);
+        for store in [&mut left, &mut right] {
+            let snapshot = store.snapshot().unwrap();
+            assert!(snapshot
+                .collection(first)
+                .unwrap()
+                .missing_from(&snapshot.collection(root).unwrap())
+                .unwrap()
+                .is_empty());
+        }
 
-        // Converged: another pass by either racer publishes nothing.
-        let before = records(&mut left).len();
-        block_on(left.maintain(first, &key(41))).unwrap();
-        block_on(left.maintain(first, &key(42))).unwrap();
-        assert_eq!(records(&mut left).len(), before);
-
-        // When 43 returns, it makes its own merge and mirrors it over the
-        // racers' leaves, and nobody else's merge appears.
-        block_on(left.maintain(root, &key(43))).unwrap();
-        block_on(left.maintain(first, &key(43))).unwrap();
-        let merges = merges_in(&mut left, root.handle());
-        assert_eq!(merges.len(), 1);
-        let mirrors = merges_in(&mut left, first.handle());
-        assert_eq!(mirrors.len(), 1);
-        assert!(merges
-            .iter()
-            .chain(&mirrors)
-            .all(|merge| merge.public_key() == public(43)));
+        // Converged: another pass by either host publishes nothing, and
+        // neither stalls on the other's merges.
+        let before = (records(&mut left).len(), records(&mut right).len());
+        for (store, racer) in [(&mut left, 41), (&mut right, 42)] {
+            block_on(store.maintain(root, &key(racer))).unwrap();
+            block_on(store.maintain(first, &key(racer))).unwrap();
+        }
+        assert_eq!(
+            (records(&mut left).len(), records(&mut right).len()),
+            before
+        );
     }
+
     #[test]
     fn a_foreign_foundation_the_mapping_refuses_is_its_owners_lag_not_this_keys_failure() {
         // Review finding, 2026-09-26: a Fatal or capacity refusal on another
@@ -3930,6 +3951,9 @@ mod lattice_v2 {
         for entity in 0..8 {
             own_commit(&mut store, root, 41, entity);
         }
+        // 41 carries its eight before 42's three arrive: three nodes stay
+        // below the fan-in, so the root merge is 41's commits alone.
+        block_on(store.maintain(root, &key(41))).unwrap();
         let refused = own_commit(&mut store, root, 42, 1);
         let too_big = own_commit(&mut store, root, 42, 2);
         let fine = own_commit(&mut store, root, 42, 3);
@@ -3987,5 +4011,166 @@ mod lattice_v2 {
             .collect();
         assert_eq!(leaves, BTreeSet::from([SourceLocator::of(own.raw)]));
         assert!(!leaves.contains(&SourceLocator::of(absent.raw)));
+    }
+
+    /// The host may not write the collection -- WRITE is 40's, granted to
+    /// 42 and 43 -- and still merges the eight held commits those three
+    /// keys signed into one MERGE of its own: a merge needs the host's key,
+    /// not WRITE. Two more commits whose payloads are elsewhere sit out at
+    /// no cost: nothing is acquired for them.
+    #[test]
+    fn the_carry_merges_eight_held_foundations_of_mixed_signers_into_one_merge() {
+        let host = key(41);
+        let mut inner = MemoryRepo::for_host(host.verifying_key());
+        let root = inner
+            .collection(
+                "mixed-signers",
+                CollectionPolicy::new(
+                    AdmissionPolicy::Open,
+                    AdmissionPolicy::direct(key(40).verifying_key()),
+                ),
+            )
+            .unwrap();
+        for grantee in [42, 43] {
+            inner
+                .insert_proof(CapabilityProof::new(
+                    CapabilityResource::from(root.handle()),
+                    &key(40),
+                    write_capability(),
+                    key(grantee).verifying_key(),
+                ))
+                .unwrap();
+        }
+        let held: BTreeSet<CollectionData> = [
+            (40, 0),
+            (40, 1),
+            (40, 2),
+            (42, 0),
+            (42, 1),
+            (42, 2),
+            (43, 0),
+            (43, 1),
+        ]
+        .into_iter()
+        .map(|(signer, entity)| own_commit(&mut inner, root, signer, entity))
+        .collect();
+        let absent: BTreeSet<CollectionData> = (3..5)
+            .map(|entity| foreign_commit(&mut inner, root, 43, entity))
+            .collect();
+        let snapshot = inner.snapshot().unwrap();
+        assert!(!root
+            .writer_is_admitted(&snapshot, host.verifying_key())
+            .unwrap());
+        drop(snapshot);
+        assert_eq!(frontier(&mut inner, root.handle()).len(), 10);
+
+        let mut store = GuardStore::new(inner);
+        drop(block_on(store.maintain(root, &host)).unwrap());
+        assert!(store.acquired.is_empty(), "{:?}", store.acquired);
+        let merges = merges_in(&mut store.inner, root.handle());
+        assert_eq!(merges.len(), 1);
+        assert_eq!(merges[0].public_key(), public(41));
+        assert_eq!(inputs(&merges[0]), held);
+        assert_eq!(
+            frontier(&mut store.inner, root.handle()),
+            absent.iter().copied().chain([merges[0].result()]).collect()
+        );
+        // The frontier still stands for every believed commit.
+        let snapshot = store.inner.snapshot().unwrap();
+        let coverage = CoverageRead::coverage(&snapshot, &BTreeSet::from([root.handle()])).unwrap();
+        let (support, _) = coverage.frontier_support(root.handle());
+        let support: BTreeSet<CollectionData> = support
+            .iter_ordered()
+            .map(|raw| Inline::new(*raw))
+            .collect();
+        assert_eq!(support, held.union(&absent).copied().collect());
+    }
+
+    /// A frontier node whose bytes are not here is skipped by the carry
+    /// itself: the operation finishes without naming it missing, which is
+    /// the only thing that would make the acquiring loop fetch and run the
+    /// operation again. So a host holding another key's commit records
+    /// without their payloads makes no acquisition and no restart.
+    #[test]
+    fn a_frontier_node_whose_bytes_are_elsewhere_costs_no_acquisition_and_no_restart() {
+        let host = key(41);
+        let (mut inner, root, _, _) = collections();
+        for entity in 0..8 {
+            own_commit(&mut inner, root, 41, entity);
+        }
+        let absent = foreign_commit(&mut inner, root, 42, 0);
+        let mut store = GuardStore::new(inner);
+
+        let result = {
+            let mut operation = OperationFrontier::new(store.snapshot().unwrap());
+            crate::collection::maintenance::carry_root(&mut store, root, &host, &mut operation)
+        };
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert!(store.acquired.is_empty(), "{:?}", store.acquired);
+        let merges = merges_in(&mut store.inner, root.handle());
+        assert_eq!(merges.len(), 1);
+        assert!(!merges[0].inputs().contains(&absent));
+
+        // Through the acquiring loop, on this pass and the next.
+        drop(block_on(store.maintain(root, &host)).unwrap());
+        drop(block_on(store.maintain(root, &host)).unwrap());
+        assert!(store.acquired.is_empty(), "{:?}", store.acquired);
+        assert_eq!(merges_in(&mut store.inner, root.handle()).len(), 1);
+        assert!(frontier(&mut store.inner, root.handle()).contains(&absent));
+    }
+
+    /// A carry signing with a key whose merges the store does not fold would
+    /// publish merges nothing believes, see the frontier unmoved, and report
+    /// a stall. It is refused, naming both keys, before anything is
+    /// published. With nothing to merge, the key does not matter.
+    #[test]
+    fn a_carry_signing_with_a_key_that_is_not_the_host_is_an_error_not_a_stall() {
+        let (mut inner, root, _, _) = collections();
+        for entity in 0..8 {
+            own_commit(&mut inner, root, 42, entity);
+        }
+        let mut store = GuardStore::new(inner);
+        let error = block_on(store.maintain(root, &key(42)))
+            .err()
+            .expect("another key's carry is refused");
+        assert!(
+            matches!(
+                error,
+                CollectionRealizationError::HostMismatch { host: Some(host), signer }
+                    if host == public(41) && signer == public(42)
+            ),
+            "{error}"
+        );
+        assert!(store.events.is_empty());
+        assert!(merges_in(&mut store.inner, root.handle()).is_empty());
+
+        // A store with no host believes no merge; carrying into it is the
+        // same error.
+        let mut keyless = MemoryRepo::default();
+        let root = keyless.collection("root", policy()).unwrap();
+        for entity in 0..8 {
+            own_commit(&mut keyless, root, 41, entity);
+        }
+        let error = block_on(keyless.maintain(root, &key(41)))
+            .err()
+            .expect("a carry into a store without a host is refused");
+        assert!(
+            matches!(
+                error,
+                CollectionRealizationError::HostMismatch { host: None, signer }
+                    if signer == public(41)
+            ),
+            "{error}"
+        );
+        assert!(merges_in(&mut keyless, root.handle()).is_empty());
+
+        // Seven held nodes: no merge to publish, so no host is needed.
+        let mut quiet = MemoryRepo::default();
+        let root = quiet.collection("root", policy()).unwrap();
+        for entity in 0..7 {
+            own_commit(&mut quiet, root, 41, entity);
+        }
+        drop(block_on(quiet.maintain(root, &key(41))).unwrap());
+        assert!(merges_in(&mut quiet, root.handle()).is_empty());
     }
 }

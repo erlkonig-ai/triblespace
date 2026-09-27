@@ -6617,9 +6617,10 @@ mod tests {
     fn replay_folds_admitted_records_into_downward_coverage() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "coverage-fold.pile");
-        let mut pile = Pile::open(&path).unwrap();
-        let collection = register_simplearchive_collection(&mut pile, "coverage-fold");
         let authority = SigningKey::from_bytes(&[0xAA; 32]);
+        // The merge is the authority's own, so the pile is opened as it.
+        let mut pile = Pile::open_as(&path, authority.verifying_key()).unwrap();
+        let collection = register_simplearchive_collection(&mut pile, "coverage-fold");
 
         let low = collection_test_hash(6);
         let high = collection_test_hash(7);
@@ -6684,7 +6685,7 @@ mod tests {
         let high = collection_test_hash(7);
         let result = collection_test_hash(8);
         let handle = {
-            let mut pile = Pile::open(&path).unwrap();
+            let mut pile = Pile::open_as(&path, authority.verifying_key()).unwrap();
             let collection = register_simplearchive_collection(&mut pile, "coverage-rebuild");
             for payload in [low, high] {
                 pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
@@ -6704,7 +6705,7 @@ mod tests {
             collection.handle()
         };
 
-        let mut reopened = Pile::open(&path).unwrap();
+        let mut reopened = Pile::open_as(&path, authority.verifying_key()).unwrap();
         reopened.refresh().unwrap();
         assert_eq!(
             reopened
@@ -6759,8 +6760,10 @@ mod tests {
         pile.close().unwrap();
     }
 
-    /// A record about a collection whose descriptor is not resident parks
-    /// instead of being believed: absence of evidence is not evidence.
+    /// A foundation about a collection whose descriptor is not resident
+    /// parks instead of being believed: absence of evidence is not evidence.
+    /// A merge is never parked: another key's is not folded at all, and the
+    /// host's own needs no descriptor, only supported inputs.
     #[test]
     fn a_record_naming_an_unresolvable_collection_parks() {
         let dir = tempfile::tempdir().unwrap();
@@ -6770,26 +6773,30 @@ mod tests {
             pile.insert(record).unwrap();
         }
         pile.refresh().unwrap();
-        assert!(pile.snapshot().unwrap().coverage_index().is_empty());
-        // Every record names a collection whose descriptor is absent, so
-        // nothing can say who may write it; all three wait on that descriptor,
-        // the one arrival that would change the answer.
-        assert_eq!(pile.snapshot().unwrap().coverage_index().parked(), 3);
-        assert_eq!(
-            pile.snapshot()
-                .unwrap()
-                .coverage_index()
-                .parked_on_signers(),
-            0
-        );
-        assert_eq!(
-            pile.snapshot()
-                .unwrap()
-                .coverage_index()
-                .parked_on_lineages(),
-            3
-        );
+        let index = pile.snapshot().unwrap().coverage_index();
+        assert!(index.is_empty());
+        // The commit and the derive name a collection whose descriptor is
+        // absent, so nothing can say who may write it; both wait on that
+        // descriptor, the one arrival that would change the answer. The
+        // merge was signed by a key that is not this pile's host: dropped,
+        // not kept anywhere.
+        assert_eq!(index.parked(), 2);
+        assert_eq!(index.parked_on_signers(), 0);
+        assert_eq!(index.parked_on_lineages(), 2);
+        assert_eq!(index.stored_joins(), 0);
         pile.close().unwrap();
+
+        // Opened as the merge's signer, the merge is believed at once with
+        // no descriptor, and waits, blocked, for its inputs' supports.
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let mut hosted = Pile::open_as(&path, signer.verifying_key()).unwrap();
+        let index = hosted.snapshot().unwrap().coverage_index();
+        assert!(index.is_empty());
+        assert_eq!(index.parked(), 2);
+        assert_eq!(index.parked_on_lineages(), 2);
+        assert_eq!(index.stored_joins(), 1);
+        assert!(index.published().has_blocked(collection_test_collection(1)));
+        hosted.close().unwrap();
     }
 
     /// The maintained index and a fold over the same records agree.
@@ -6805,10 +6812,10 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "coverage-agreement.pile");
-        let mut pile = Pile::open(&path).unwrap();
-        let collection = register_simplearchive_collection(&mut pile, "coverage-agreement");
         let authority = SigningKey::from_bytes(&[0xAA; 32]);
         let stranger = SigningKey::from_bytes(&[7; 32]);
+        let mut pile = Pile::open_as(&path, authority.verifying_key()).unwrap();
+        let collection = register_simplearchive_collection(&mut pile, "coverage-agreement");
 
         let low = collection_test_hash(6);
         let high = collection_test_hash(7);
@@ -6826,14 +6833,26 @@ mod tests {
             CollectionMerge::sign(&authority, collection.handle(), [low, high], result).unwrap(),
         ))
         .unwrap();
-        // A record nobody can admit, and one naming a collection with no
-        // descriptor: both routes through the backlog, both must agree.
+        // A record nobody can admit, one naming a collection with no
+        // descriptor, and a merge another key signed: the first two route
+        // through the backlog, the third is dropped, and both paths must
+        // agree on all of it.
         pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
             &stranger,
             collection.handle(),
             collection_test_hash(9),
             empty_metadata_handle(),
         )))
+        .unwrap();
+        pile.insert(CollectionRecord::Merge(
+            CollectionMerge::sign(
+                &stranger,
+                collection.handle(),
+                [low, high],
+                collection_test_hash(10),
+            )
+            .unwrap(),
+        ))
         .unwrap();
         for record in collection_test_records() {
             pile.insert(record).unwrap();
@@ -6842,9 +6861,15 @@ mod tests {
         let snapshot = pile.snapshot().unwrap();
         // The eager form: every lineage decided, which is what a fold does.
         let maintained = snapshot.coverage_index().published().clone();
-        let folded = coverage_of(&snapshot, None).unwrap().published().clone();
+        let host = Some(Inline::new(authority.verifying_key().to_bytes()));
+        let folded = coverage_of(&snapshot, host).unwrap().published().clone();
         assert_eq!(maintained, folded);
         assert!(!maintained.is_empty());
+        assert_eq!(
+            maintained.frontier(collection.handle()).collect::<Vec<_>>(),
+            vec![result],
+            "control: the host's merge folded, the stranger's did not"
+        );
         drop(snapshot);
         pile.close().unwrap();
     }
@@ -9438,7 +9463,7 @@ mod tests {
         let high = collection_test_hash(7);
         let result = collection_test_hash(8);
         let (lineage, records) = {
-            let mut pile = Pile::open(&single_path).unwrap();
+            let mut pile = Pile::open_as(&single_path, authority.verifying_key()).unwrap();
             let lineage = register_simplearchive_collection(&mut pile, "repeat").handle();
             let mut records: Vec<_> = [low, high]
                 .into_iter()
@@ -9465,8 +9490,8 @@ mod tests {
         doubled.extend_from_slice(&bytes);
         std::fs::write(&doubled_path, doubled).unwrap();
 
-        let mut single = Pile::open(&single_path).unwrap();
-        let mut repeated = Pile::open(&doubled_path).unwrap();
+        let mut single = Pile::open_as(&single_path, authority.verifying_key()).unwrap();
+        let mut repeated = Pile::open_as(&doubled_path, authority.verifying_key()).unwrap();
         let one = single.snapshot().unwrap();
         let two = repeated.snapshot().unwrap();
         // Control: the repeat really is indexed, once per frame.

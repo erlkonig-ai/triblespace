@@ -1,6 +1,9 @@
 //! A result's support is what the believed equations beneath it say, and only
-//! those: an unauthorized alternative cannot change it, while an authorized one
-//! is one more attestation and is believed like any other.
+//! those. A MERGE is believed only when the store's host signed it: another
+//! key's alternative cannot change a support whatever that key may write,
+//! while the host's own is one more attestation and is believed like any
+//! other. Trusting the host's own computation is what this buys; it is no
+//! protection against a bug in that computation.
 //!
 //! Support is collection-local, so the audit reads the result's own row in the
 //! collection that holds it. A derived collection's image never inherits a
@@ -12,26 +15,30 @@ use std::collections::BTreeSet;
 use ed25519_dalek::SigningKey;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::IntoBlob;
+use triblespace_core::capability::{CapabilityProof, CapabilityResource};
 use triblespace_core::collection::{
-    simplearchive_union, AdmissionPolicy, CollectionData, CollectionMerge, CollectionPolicy,
-    CollectionRecord, CollectionSnapshotExt, CollectionStore, CollectionStoreExt, CoverageRead,
+    simplearchive_union, write_capability, AdmissionPolicy, CollectionData, CollectionMerge,
+    CollectionPolicy, CollectionRecord, CollectionSnapshotExt, CollectionStore, CollectionStoreExt,
+    CoverageRead,
 };
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::Inline;
 use triblespace_core::metadata;
 use triblespace_core::prelude::entity;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
-use triblespace_core::repo::{BlobStorePut, SnapshotSource};
+use triblespace_core::repo::{BlobStorePut, CapabilityProofStore, SnapshotSource};
 
 #[test]
 fn only_believed_alternative_equations_change_a_results_support() {
     let owner = SigningKey::from_bytes(&[73; 32]);
     let unrelated = SigningKey::from_bytes(&[74; 32]);
+    let writer = SigningKey::from_bytes(&[75; 32]);
     let policy = CollectionPolicy::new(
         AdmissionPolicy::direct(owner.verifying_key()),
         AdmissionPolicy::direct(owner.verifying_key()),
     );
-    let mut store = MemoryRepo::default();
+    // The owner is this store's host: its merges are the ones believed.
+    let mut store = MemoryRepo::for_host(owner.verifying_key());
     let source = store.collection("support-audit", policy).unwrap();
     let a = entity! { metadata::name: "a" };
     let b = entity! { metadata::name: "b" };
@@ -76,8 +83,9 @@ fn only_believed_alternative_equations_change_a_results_support() {
     );
 
     // Different operation inputs mean no functional-output conflict. This
-    // absorption claims `c` already contains `z`. Signed by a key with no
-    // WRITE it is not believed, so nothing moves.
+    // absorption claims `c` already contains `z`. Signed by a key that is
+    // not the host it is not believed, so nothing moves -- whether that key
+    // has no rights at all or holds WRITE on the collection.
     let absorb = |signer: &SigningKey| {
         CollectionRecord::Merge(
             CollectionMerge::sign(signer, source.handle(), [c, cz.data()], c).unwrap(),
@@ -88,12 +96,24 @@ fn only_believed_alternative_equations_change_a_results_support() {
         observe(&mut store),
         (original.clone(), BTreeSet::from([c, cz.data()]))
     );
+    store
+        .insert_proof(CapabilityProof::new(
+            CapabilityResource::from(source.handle()),
+            &owner,
+            write_capability(),
+            writer.verifying_key(),
+        ))
+        .unwrap();
+    store.insert(absorb(&writer)).unwrap();
+    assert_eq!(
+        observe(&mut store),
+        (original.clone(), BTreeSet::from([c, cz.data()]))
+    );
 
-    // Signed by the owner it is one more believed attestation about `c`, and
+    // Signed by the host it is one more believed attestation about `c`, and
     // coverage is the monotone union of everything believed: `c` now stands
-    // for `z` as well, and a reader stands on `c` alone. A writer who lies
-    // about their own collection owns that lie; the index does not
-    // second-guess an admitted equation.
+    // for `z` as well, and a reader stands on `c` alone. The host's own
+    // computation is trusted as signed; the index does not second-guess it.
     store.insert(absorb(&owner)).unwrap();
     let mut extended = original;
     extended.insert(cz.data());

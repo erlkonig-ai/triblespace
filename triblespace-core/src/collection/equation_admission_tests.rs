@@ -1,4 +1,7 @@
-//! Signed equation producers are admitted by the target's frozen WRITE policy.
+//! Signed foundation producers are admitted by the target's frozen WRITE
+//! policy; a MERGE is believed on the store's host key alone.
+
+use std::collections::BTreeSet;
 
 use ed25519_dalek::SigningKey;
 
@@ -42,11 +45,16 @@ fn publish(
     commit
 }
 
+/// A MERGE is believed on the store's host key, never on rights: the
+/// collection's WRITE root and a key granted READ each sign a merge of the
+/// same two commits, and neither is folded, while the host, which may
+/// neither read nor write the collection, has its own merge believed.
 #[test]
-fn read_rights_do_not_admit_merges_or_inject_conflicts() {
+fn merges_are_believed_on_the_host_key_not_on_read_or_write_rights() {
     let root = SigningKey::from_bytes(&[11; 32]);
     let reader = SigningKey::from_bytes(&[12; 32]);
-    let mut store = MemoryRepo::default();
+    let host = SigningKey::from_bytes(&[13; 32]);
+    let mut store = MemoryRepo::for_host(host.verifying_key());
     let collection = store
         .collection(
             "signed-merge-admission",
@@ -75,27 +83,16 @@ fn read_rights_do_not_admit_merges_or_inject_conflicts() {
 
     let low = Handle::<SimpleArchive>::to_hash(a.get_handle());
     let high = Handle::<SimpleArchive>::to_hash(b.get_handle());
+    let merge = |signer: &SigningKey, result| {
+        CollectionRecord::Merge(
+            CollectionMerge::sign(signer, collection.handle(), [low, high], result).unwrap(),
+        )
+    };
     store
-        .insert(CollectionRecord::Merge(
-            CollectionMerge::sign(
-                &root,
-                collection.handle(),
-                [low, high],
-                Handle::<SimpleArchive>::to_hash(c_handle),
-            )
-            .unwrap(),
-        ))
+        .insert(merge(&root, Handle::<SimpleArchive>::to_hash(c_handle)))
         .unwrap();
     store
-        .insert(CollectionRecord::Merge(
-            CollectionMerge::sign(
-                &reader,
-                collection.handle(),
-                [low, high],
-                Handle::<SimpleArchive>::to_hash(wrong),
-            )
-            .unwrap(),
-        ))
+        .insert(merge(&reader, Handle::<SimpleArchive>::to_hash(wrong)))
         .unwrap();
 
     let snapshot = store.snapshot().unwrap();
@@ -105,6 +102,25 @@ fn read_rights_do_not_admit_merges_or_inject_conflicts() {
     assert!(!collection
         .writer_is_admitted(&snapshot, reader.verifying_key())
         .unwrap());
+    assert!(!collection
+        .writer_is_admitted(&snapshot, host.verifying_key())
+        .unwrap());
+    // Neither merge is the host's: the reader stands on both commits, and
+    // the reader's false result is nowhere.
+    let attached = snapshot.collection(collection).unwrap();
+    assert_eq!(
+        attached.cover().members().collect::<BTreeSet<_>>(),
+        BTreeSet::from([a.get_handle(), b.get_handle()])
+    );
+    assert_eq!(attached.view::<TribleSet>().unwrap().len(), 2);
+    drop(attached);
+    drop(snapshot);
+
+    // The host's own merge is believed without WRITE.
+    store
+        .insert(merge(&host, Handle::<SimpleArchive>::to_hash(c_handle)))
+        .unwrap();
+    let snapshot = store.snapshot().unwrap();
     let attached = snapshot.collection(collection).unwrap();
     assert_eq!(
         attached.cover().members().collect::<Vec<_>>(),
@@ -205,11 +221,15 @@ fn derive_before_write_proof_is_inert_then_admitted_without_reinsertion() {
     );
 }
 
+/// A foundation's admission is decided against the proofs its snapshot
+/// holds: a proof arriving later admits the commit in later snapshots and
+/// leaves the earlier snapshot's answer as it was. A merge needs no proof
+/// at all, so the host's merge over the commits is believed throughout.
 #[test]
 fn equation_admission_uses_frozen_proof_evidence() {
     let root = SigningKey::from_bytes(&[31; 32]);
     let producer = SigningKey::from_bytes(&[32; 32]);
-    let mut store = MemoryRepo::default();
+    let mut store = MemoryRepo::for_host(producer.verifying_key());
     let collection = store
         .collection(
             "timeless-equation-authority",
@@ -221,6 +241,7 @@ fn equation_admission_uses_frozen_proof_evidence() {
         .unwrap();
     let a = archive(5);
     let b = archive(6);
+    let x = archive(7);
     let ca = publish(&mut store, collection, &root, a.clone());
     let cb = publish(&mut store, collection, &root, b.clone());
     let joined = store
@@ -237,6 +258,8 @@ fn equation_admission_uses_frozen_proof_evidence() {
             .unwrap(),
         ))
         .unwrap();
+    // The producer's own commit waits for a WRITE proof.
+    let cx = publish(&mut store, collection, &producer, x.clone());
     let before = store.snapshot().unwrap();
     store
         .insert_proof(CapabilityProof::new(
@@ -248,9 +271,8 @@ fn equation_admission_uses_frozen_proof_evidence() {
         .unwrap();
     let admitted = store.snapshot().unwrap();
     let later = store.snapshot().unwrap();
-    assert_eq!(before.collection(collection).unwrap().cover().len(), 2);
     assert_eq!(
-        admitted
+        before
             .collection(collection)
             .unwrap()
             .cover()
@@ -258,8 +280,22 @@ fn equation_admission_uses_frozen_proof_evidence() {
             .collect::<Vec<_>>(),
         vec![joined]
     );
-    assert_eq!(later.collection(collection).unwrap().cover().len(), 1);
-    assert_eq!(admitted.collection(collection).unwrap().cover().len(), 1);
+    assert_eq!(
+        admitted
+            .collection(collection)
+            .unwrap()
+            .cover()
+            .members()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([joined, x.get_handle()])
+    );
+    assert!(admitted
+        .collection(collection)
+        .unwrap()
+        .cover()
+        .contains(Handle::<SimpleArchive>::from_hash(cx.data())));
+    assert_eq!(later.collection(collection).unwrap().cover().len(), 2);
+    assert_eq!(before.collection(collection).unwrap().cover().len(), 1);
     assert_eq!(
         later.records().unwrap().count(),
         before.records().unwrap().count()

@@ -72,7 +72,8 @@ fn one_hop() -> OneHop {
     let source_descriptor =
         descriptor::naming::<SimpleArchive>("passive-observation-source", policy(&source_owner));
     let source = Collection::from_handle(source_descriptor.facts().clone().to_blob().get_handle());
-    let mut store = MemoryRepo::default();
+    // The producer maintains the view, so its merges are the ones believed.
+    let mut store = MemoryRepo::for_host(producer.verifying_key());
     let target = store
         .derive::<SuccinctArchiveBlob>(source, (), policy(&producer))
         .unwrap();
@@ -399,7 +400,8 @@ fn unauthorized_target_producers_neither_admit_outputs_nor_hide_authorized_input
             CollectionMerge::sign(
                 &outsider,
                 fixture.target.handle(),
-                // An unauthorized absorption of the authorized output.
+                // Another key's absorption of the authorized output: not
+                // the store's host, so never folded.
                 [data(&fixture.output), data(&wrong)],
                 data(&wrong),
             )
