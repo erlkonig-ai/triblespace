@@ -172,7 +172,6 @@ includes the current Nomic semantic mapping; execution still obeys its compute
 class and target WRITE policy. Application-specific mappings need their own
 linked implementation. The local pile must have the required blobs; a separate
 sync/custody process may bring them in, after which a watched pass can retry.
-Reference-summary maintenance requires the producer's complete blob closure.
 
 Readers can independently attach the resident rollup through
 `snapshot.collection(target)?.view()`. They see the support already realized

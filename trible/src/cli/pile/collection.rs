@@ -41,9 +41,6 @@ use triblespace_core::blob::Blob;
 use triblespace_core::blob::IntoBlob;
 use triblespace_core::blob::TryFromBlob;
 use triblespace_core::collection::records::{CollectionHandle, CollectionRecord};
-use triblespace_core::collection::reference_summary::{
-    ReferenceSummaryBlob, ReferenceSummaryLayout, REFERENCE_SUMMARY_MAPPING_V2,
-};
 use triblespace_core::collection::CollectionRead;
 use triblespace_core::collection::{
     descriptor, grant_collection_read, grant_collection_write, AdmissionPolicy, Collection,
@@ -248,8 +245,7 @@ pub enum Command {
         source: String,
         /// What to derive. succinct and rank9 take no arguments; entity-id-set
         /// takes --attribute; latest takes --observes; lww takes --identity and
-        /// --orders; nvfp4 takes --attribute and --dimension. reference-summary
-        /// takes --log2-bits and --probes (defaults: 32 and 4); bm25 takes --text
+        /// --orders; nvfp4 takes --attribute and --dimension; bm25 takes --text
         /// and --tokenizer; path takes --expr.
         #[arg(value_enum)]
         kind: DeriveKind,
@@ -269,12 +265,6 @@ pub enum Command {
         /// nvfp4: the embedding dimension
         #[arg(long)]
         dimension: Option<usize>,
-        /// reference-summary: fixed bit universe, expressed as its base-two log
-        #[arg(long)]
-        log2_bits: Option<u8>,
-        /// reference-summary: fixed number of Bloom probes per locator
-        #[arg(long)]
-        probes: Option<u8>,
         /// bm25: the attribute carrying UTF8String text blobs
         #[arg(long)]
         text: Option<String>,
@@ -324,7 +314,6 @@ pub enum Command {
     /// one pile open and retries after content or authorization changes.
     /// Target priority is stable for the author's public key, spreading first
     /// attempts across independent authors without changing the merge plan.
-    /// Reference summaries require the complete producer-side blob closure.
     Maintain {
         /// Path to the pile file to modify
         pile: PathBuf,
@@ -433,8 +422,6 @@ pub enum DeriveKind {
     Lww,
     /// NvFp4CosineSet over f32 embeddings in a SimpleArchive source
     Nvfp4,
-    /// Recursive blob-reference Bloom summary; maintain only with complete producer closure
-    ReferenceSummary,
     /// PortableBM25Blob over UTF8String texts in a SimpleArchive source
     Bm25,
     /// PathSummaryBlob over a SimpleArchive source, for the regular path
@@ -480,8 +467,6 @@ pub fn run(cmd: Command) -> Result<()> {
             orders,
             attribute,
             dimension,
-            log2_bits,
-            probes,
             text,
             tokenizer,
             expr,
@@ -496,8 +481,6 @@ pub fn run(cmd: Command) -> Result<()> {
                 orders,
                 attribute,
                 dimension,
-                log2_bits,
-                probes,
                 text,
                 tokenizer,
                 expr,
@@ -682,8 +665,6 @@ fn representation_name(id: Id) -> Option<&'static str> {
         == <triblespace_core::collection::lww_register::LwwRegisterBlob as MetaDescribe>::id()
     {
         Some("LwwRegisterBlob")
-    } else if id == <ReferenceSummaryBlob as MetaDescribe>::id() {
-        Some("ReferenceSummaryBlob")
     } else if id == <triblespace_paths::PathSummaryBlob as MetaDescribe>::id() {
         Some("PathSummaryBlob")
     } else if nvfp4_embedding_set_id().is_some_and(|nvfp4| id == nvfp4) {
@@ -760,8 +741,6 @@ fn mapping_algorithm_name(id: Id) -> Option<&'static str> {
 
     if id == SIMPLE_TO_SUCCINCT_MAPPING_V1 {
         Some("SIMPLE_TO_SUCCINCT_MAPPING_V1")
-    } else if id == REFERENCE_SUMMARY_MAPPING_V2 {
-        Some("REFERENCE_SUMMARY_MAPPING_V2")
     } else if id == RAW_TO_RANK9_ACCELERATED_MAPPING_V1_32_LE {
         Some("RAW_TO_RANK9_ACCELERATED_MAPPING_V1_32_LE")
     } else if id == RAW_TO_RANK9_ACCELERATED_MAPPING_V1_32_BE {
@@ -2548,9 +2527,6 @@ async fn maintain_by_representation<S: Store + AsyncBlobStoreAcquire + Send>(
         go::<S, LatestBlob>(pile, snapshot, handle, signer).await
     } else if representation == <LwwRegisterBlob as MetaDescribe>::id() {
         go::<S, LwwRegisterBlob>(pile, snapshot, handle, signer).await
-    } else if representation == <ReferenceSummaryBlob as MetaDescribe>::id() {
-        eprintln!("reference summary: assuming complete producer-side blob closure");
-        go::<S, ReferenceSummaryBlob>(pile, snapshot, handle, signer).await
     } else if representation == <triblespace_paths::PathSummaryBlob as MetaDescribe>::id() {
         go::<S, triblespace_paths::PathSummaryBlob>(pile, snapshot, handle, signer).await
     } else if nvfp4_embedding_set_id().is_some_and(|nvfp4| representation == nvfp4) {
@@ -3163,8 +3139,6 @@ struct DeriveArguments {
     orders: Option<String>,
     attribute: Option<String>,
     dimension: Option<usize>,
-    log2_bits: Option<u8>,
-    probes: Option<u8>,
     text: Option<String>,
     tokenizer: String,
     expr: Option<String>,
@@ -3257,16 +3231,6 @@ fn run_derive(
                 .handle()
             }
             DeriveKind::Nvfp4 => derive_nvfp4(&mut pile, source_handle, &arguments, policy)?,
-            DeriveKind::ReferenceSummary => {
-                let layout = ReferenceSummaryLayout::new(
-                    arguments.log2_bits.unwrap_or(32),
-                    arguments.probes.unwrap_or(4),
-                )?;
-                let source: Collection<SimpleArchive> = open_source(&mut pile, source_handle)?;
-                pile.derive::<ReferenceSummaryBlob>(source, layout, policy)
-                    .map_err(registered)?
-                    .handle()
-            }
             DeriveKind::Bm25 => derive_bm25(&mut pile, source_handle, &arguments, policy)?,
             DeriveKind::Path => {
                 let text = arguments

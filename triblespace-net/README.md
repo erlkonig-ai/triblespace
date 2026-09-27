@@ -217,7 +217,7 @@ A completed inventory pass permits wrapping to earlier keys only for its own
 supplying peer; unrelated completions cannot reset that cursor. Hints are bounded,
 partial and fallible. An empty hint backlog is not
 proof of full recursive residency. The former speculative aligned-word network
-scan and reference-summary filtering are not part of this acquisition path.
+scan is not part of this acquisition path.
 
 ## Exact content
 

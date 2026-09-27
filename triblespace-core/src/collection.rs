@@ -71,8 +71,6 @@ pub mod ownership;
 /// Immutable collection-local READ and WRITE authorization ceilings.
 pub mod policy;
 pub mod records;
-/// Unionable summaries of complete producer-side referenced-blob closures.
-pub mod reference_summary;
 /// Canonical `SimpleArchive` set-union collection kind.
 pub mod simplearchive_union;
 /// Native grow-only storage for collection-calculus records.

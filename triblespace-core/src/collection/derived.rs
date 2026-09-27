@@ -50,7 +50,6 @@ use super::encoding::CollectionDerivation;
 use super::exact_derived::CollectionRealizationError;
 use super::latest::LatestBlob;
 use super::lww_register::LwwRegisterBlob;
-use super::reference_summary::ReferenceSummaryBlob;
 use super::Collection;
 use super::{descriptor, CollectionHandle};
 
@@ -207,8 +206,7 @@ where
 }
 
 /// The realizer for this crate's own derived encodings: Succinct and Rank9
-/// archives, entity-id sets, latest indexes, last-writer-wins registers and
-/// reference summaries.
+/// archives, entity-id sets, latest indexes and last-writer-wins registers.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CoreRealizer;
 
@@ -235,8 +233,6 @@ where
             realize_as::<S, LatestBlob>(store, derived, signer, upkeep).await
         } else if representation == <LwwRegisterBlob as MetaDescribe>::id() {
             realize_as::<S, LwwRegisterBlob>(store, derived, signer, upkeep).await
-        } else if representation == <ReferenceSummaryBlob as MetaDescribe>::id() {
-            realize_as::<S, ReferenceSummaryBlob>(store, derived, signer, upkeep).await
         } else {
             Ok(Realized::Unknown)
         }

@@ -203,9 +203,9 @@ retain typed views of the persisted bytes and perform the framing, bounds and
 alignment checks needed for safe access. Canonical ordering checks, count
 reproofs and reconstruction comparisons belong to explicit audits. Nor should
 a reader serialize and hash a new member just to interpret a multi-member cover.
-Query work remains query work: for example, a sparse reference summary needs
-its gap stream decoded into query scratch for repeated binary-search probes.
-Its `query()` method makes that preparation explicit; attaching the summary
+Query work remains query work: for example, a portable BM25 index stores no
+document lengths, so scoring needs one pass over its postings to derive them.
+Its `query()` method makes that preparation explicit; attaching the index
 itself only retains the original bytes. No wire-format or collection identity
 change is needed to keep these operations separate.
 

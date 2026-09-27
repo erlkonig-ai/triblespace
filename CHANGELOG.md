@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Remove the reference-summary collection encoding (`ReferenceSummaryBlob`,
+  `REFERENCE_SUMMARY_MAPPING_V2`), its derived-collection realizer branch and
+  the `trible pile collection derive reference-summary` kind. Sync routes blobs
+  by each collection's held-blob inventory, which answers the question the
+  Bloom summary was built for without requiring a producer's complete closure.
+  Existing reference-summary collections are no longer maintained: upkeep
+  reports them as unknown, and `collection maintain` refuses them as an
+  unimplemented representation.
+
 - Replace the string-context hashes of the bearer and DHT layer with one-block
   constructions over random 32-byte context keys (generated from the OS random
   source): locator `BLAKE3(LOCATOR_CONTEXT || H)`, directory token

@@ -3988,14 +3988,4 @@ mod lattice_v2 {
         assert_eq!(leaves, BTreeSet::from([SourceLocator::of(own.raw)]));
         assert!(!leaves.contains(&SourceLocator::of(absent.raw)));
     }
-
-    #[test]
-    fn a_mapping_bound_to_its_producers_replica_is_left_to_each_owner() {
-        use crate::collection::encoding::CanonicalDerivation;
-        use crate::collection::reference_summary::ReferenceSummaryBlob;
-        assert!(<CanonicalDerivation<FirstEncoding> as CollectionMapping>::REPLICA_INDEPENDENT);
-        assert!(
-            !<CanonicalDerivation<ReferenceSummaryBlob> as CollectionMapping>::REPLICA_INDEPENDENT
-        );
-    }
 }

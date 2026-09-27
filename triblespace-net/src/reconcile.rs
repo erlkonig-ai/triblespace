@@ -57,7 +57,7 @@ pub struct ReplicationStats {
     pub inventory_pending: usize,
     /// Compatibility counter; speculative scanning was removed and this stays zero.
     pub candidates: usize,
-    /// Compatibility counter; reference-summary filtering was removed and this stays zero.
+    /// Compatibility counter; candidate filtering was removed and this stays zero.
     pub filtered: usize,
     /// Compatibility counter; no speculative network requests are made.
     pub speculative_attempted: usize,

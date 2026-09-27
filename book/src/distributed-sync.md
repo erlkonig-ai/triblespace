@@ -817,9 +817,9 @@ of activation and authority:
 Selecting a collection does not grant READ or WRITE and does not activate it.
 Structurally valid but WRITE-inert records can name direct roots; acquiring
 their bytes does not admit those records. Full mode no longer sends arbitrary
-aligned payload words to the DHT or uses reference-summary Bloom filters to
-choose speculative requests. Local aligned-word scanning constructs positive
-serving inventory only; remote hydration consumes the resulting known H keys.
+aligned payload words to the DHT to choose speculative requests. Local
+aligned-word scanning constructs positive serving inventory only; remote
+hydration consumes the resulting known H keys.
 
 The reconciler retains a bounded positive window per selected collection
 (currently 4,096 handles), pruning locally readable entries as bodies arrive.
