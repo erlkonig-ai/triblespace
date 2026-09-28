@@ -84,7 +84,7 @@ fn build_fixture(commits: usize, books_per_commit: usize) -> Fixture {
         AdmissionPolicy::direct(authority),
         AdmissionPolicy::direct(authority),
     );
-    let mut store = MemoryRepo::default();
+    let mut store = MemoryRepo::for_host(authority);
     let collection = store
         .collection(name, policy.clone())
         .expect("register benchmark collection");

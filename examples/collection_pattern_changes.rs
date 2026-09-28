@@ -158,7 +158,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         AdmissionPolicy::direct(authority),
         AdmissionPolicy::direct(authority),
     );
-    let mut store = MemoryRepo::default();
+    // Opened as the maintaining key, so its fold believes the merges it signs.
+    let mut store = MemoryRepo::for_host(authority);
     let collection = store.collection(name, policy.clone())?;
 
     let author = entity! {
