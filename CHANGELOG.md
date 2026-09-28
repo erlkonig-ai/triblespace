@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Sync exports foundations only and advertises held-blob sets: transport
+  generation `/triblespace/pile-sync/28`, wake version 5. MERGE records never
+  cross the wire. Each synced collection's held blobs are kept by the store
+  (`triblespace_core::collection::held`), scanned once with a periodic full
+  walk as backstop; `trible pile net sync` runs that walk on its own threads
+  (`--held-walk-interval`, default 1800 s; `--held-walk-threads`, default 4).
+  See the `triblespace-core` and `triblespace-net` changelogs.
+
 - Remove the reference-summary collection encoding (`ReferenceSummaryBlob`,
   `REFERENCE_SUMMARY_MAPPING_V2`), its derived-collection realizer branch and
   the `trible pile collection derive reference-summary` kind. Sync routes blobs

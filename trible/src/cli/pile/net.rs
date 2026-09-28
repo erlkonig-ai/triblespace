@@ -11,10 +11,10 @@ use ed25519_dalek::SigningKey;
 use iroh_base::{EndpointAddr, EndpointId};
 use iroh_tickets::endpoint::EndpointTicket;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace_core::collection::CollectionHandle;
 use triblespace_core::collection::{
     AdmissionPolicy, Collection, CollectionPolicy, CollectionStoreExt,
 };
+use triblespace_core::collection::{CollectionHandle, HeldWalkConfig};
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::SnapshotSource;
 use triblespace_net::health_record::{self, Recorder, DEFAULT_MAX_AGE, REPORT_EVERY};
@@ -215,6 +215,26 @@ pub enum Command {
         /// Stop after N seconds with no admitted repair or fulfilled WANT.
         #[arg(long, value_name = "SECS")]
         quiescent_for: Option<u64>,
+        /// Seconds from one full walk of the synced collections' held-blob
+        /// sets to the next. Each blob is scanned once, when first reached; a
+        /// child that becomes resident after its parent was scanned, and that
+        /// no peer reports, is found by the next walk: the delay is bounded by
+        /// this interval plus one walk's duration.
+        #[arg(
+            long,
+            value_name = "SECS",
+            default_value_t = 1800,
+            value_parser = clap::value_parser!(u64).range(1..)
+        )]
+        held_walk_interval: u64,
+        /// Threads that read blobs during one held-set walk.
+        #[arg(
+            long,
+            value_name = "THREADS",
+            default_value_t = 4,
+            value_parser = clap::value_parser!(u64).range(1..=64)
+        )]
+        held_walk_threads: u64,
     },
 }
 
@@ -263,6 +283,8 @@ pub fn run(command: Command) -> Result<()> {
             telemetry,
             duration,
             quiescent_for,
+            held_walk_interval,
+            held_walk_threads,
         } => run_sync(
             pile,
             peers,
@@ -278,6 +300,10 @@ pub fn run(command: Command) -> Result<()> {
             telemetry,
             duration,
             quiescent_for,
+            HeldWalkConfig {
+                interval: std::time::Duration::from_secs(held_walk_interval),
+                threads: held_walk_threads as usize,
+            },
         ),
     }
 }
@@ -307,6 +333,7 @@ fn run_sync(
     telemetry_options: telemetry::Options,
     duration: Option<u64>,
     quiescent_for: Option<u64>,
+    held_walk: HeldWalkConfig,
 ) -> Result<()> {
     let key = load_existing_key(key_path, &pile_path)?;
     let peers = parse_peers(&peer_values)?;
@@ -370,6 +397,10 @@ fn run_sync(
     } else {
         None
     };
+    // The start-up walk of each activated collection's held set and the
+    // periodic backstop walk run on this sync process's own threads, for as
+    // long as it runs; short-lived readers of the same pile start none.
+    let held_walker = pile.start_held_walker(held_walk);
     let mut peer = Peer::new(
         pile,
         key.clone(),
@@ -507,6 +538,7 @@ fn run_sync(
         }
     });
     eprintln!("wants: {wants_fulfilled_total} fulfilled this run; {wants_pending} still pending");
+    drop(held_walker);
     let close = peer
         .into_store()
         .close()
