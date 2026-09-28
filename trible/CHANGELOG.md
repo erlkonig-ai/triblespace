@@ -20,11 +20,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
-- `pile collection search --key <path>` names the key whose merges the read
-  believes; a named key that does not load is an error. Without it the default
-  key (`TRIBLESPACE_KEY`, else `self.key` beside the pile) is used when it
-  loads; with no key the read believes no MERGE and attaches every member
-  separately, which finds the same hits.
+- `pile collection search --key <path>` names the key whose merges and
+  attachments the read believes; a named key that does not load is an error.
+  Without it the default key (`TRIBLESPACE_KEY`, else `self.key` beside the
+  pile) is used when it loads. With no key, or a key that did not maintain
+  the pile, the read believes no attachment and searches nothing; it says
+  which of the two it is and asks for `--key` naming the maintaining key,
+  instead of asking for maintenance.
 - `pile migrate SRC lattice-v3 --into DST [--dry-run] [--allow-absent]
   [--attached-mapping ID]`: the lattice v3 cutover filter. It keeps every
   COMMIT of every generation, proofs, WANTs, pins and unknown frames; leaves
