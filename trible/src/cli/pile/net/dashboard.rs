@@ -76,6 +76,7 @@ enum ReadFailure {
     MemberUnavailable,
     InvalidFacts,
     HealthDescriptor,
+    SigningKey,
     SamplerPanicked,
 }
 
@@ -96,6 +97,10 @@ impl ReadFailure {
             Self::MemberUnavailable => "selected member unavailable",
             Self::InvalidFacts => "selected member cannot form a fact view",
             Self::HealthDescriptor => "cannot prepare health descriptor",
+            Self::SigningKey => {
+                "the signing key named by --key cannot be read -- omit --key to use the \
+                 default key when it loads, or to observe with no key"
+            }
             Self::SamplerPanicked => "dashboard sampler panicked",
         }
     }
@@ -172,7 +177,29 @@ struct Reader {
 }
 
 impl Reader {
+    /// Open as the key `--key` names, else as the default key when it loads,
+    /// else as no key ([`crate::cli::pile::reading_host`]). A named key that
+    /// does not load is refused rather than observed around: a mistyped key
+    /// would otherwise draw every member lattice without a join, which reads
+    /// as "nothing carried".
     fn open(options: &Options) -> ReadResult<Self> {
+        Self::open_with(options, |options| {
+            crate::cli::pile::reading_host(options.key.as_deref(), &options.pile)
+                .map_err(|_| ReadFailure::SigningKey)
+        })
+    }
+
+    /// Open as `host` without resolving a key: a fixture's way to observe as
+    /// no key, or as one, without depending on the ambient environment.
+    #[cfg(test)]
+    fn open_as(options: &Options, host: Option<ed25519_dalek::VerifyingKey>) -> ReadResult<Self> {
+        Self::open_with(options, |_| Ok(host))
+    }
+
+    fn open_with(
+        options: &Options,
+        host: impl FnOnce(&Options) -> ReadResult<Option<ed25519_dalek::VerifyingKey>>,
+    ) -> ReadResult<Self> {
         // Say WHICH of the three this is. The path is deliberately not named:
         // a pile filename can itself be a hex capability handle, which is what
         // `reader_open_failure_does_not_retain_a_sensitive_path` guards. An
@@ -192,11 +219,9 @@ impl Reader {
         // draws: opened as it, the fold believes that key's MERGEs and no
         // other's. Without one it believes none, and every believed
         // foundation stays on its collection's frontier.
-        let mut host = None;
-        let health = match super::load_existing_key(options.key.clone(), &options.pile) {
-            Ok(signer) => {
-                let authority = signer.verifying_key();
-                host = Some(authority);
+        let host = host(options)?;
+        let health = match host {
+            Some(authority) => {
                 let mut descriptors = MemoryRepo::default();
                 let collection: Collection<SimpleArchive> = descriptors
                     .collection(
@@ -209,8 +234,12 @@ impl Reader {
                     .map_err(|_| ReadFailure::HealthDescriptor)?;
                 Some(SelectedSource::new(collection.handle()))
             }
-            Err(_) => {
-                setup_warnings.push("Health fallback unavailable: cannot read signing key".into());
+            None => {
+                setup_warnings.push(
+                    "No signing key loads: no health fallback, and no MERGE is believed, so a \
+                     member lattice draws every member unjoined"
+                        .into(),
+                );
                 None
             }
         };
@@ -416,17 +445,23 @@ struct LatticeCollection {
     commits: u64,
     merges: u64,
     derives: u64,
-    /// Records naming it whose member, join result or mapping output blob is
-    /// actually here. The shortfall against the three counts above is the
-    /// concrete "what is missing": endorsed work whose bytes this store does
-    /// not hold.
-    result_resident: u64,
+    /// COMMITs and DERIVEs naming it whose payload or mapping output is
+    /// actually here. The shortfall against [`Self::foundations`] is the
+    /// concrete "what is missing": foundations replication has not delivered
+    /// yet.
+    ///
+    /// MERGEs are counted above and deliberately left out of this ratio: a
+    /// MERGE never replicates. The host's own are its private computation over
+    /// the foundations, and another key's are never believed, so a result of
+    /// either that is not here is nothing any peer will send. Counting them
+    /// would draw a store holding every foundation as permanently behind.
+    foundations_resident: u64,
     /// Attestations of this collection that no capability proof admits yet.
     /// Only COMMITs and DERIVEs wait on a grant: a MERGE needs none, since the
     /// host's own are believed as they stand and another key's never are.
     ///
-    /// A different absence from `result_resident`, and the reason it is worth
-    /// its own field: missing bytes arrive on their own once replication
+    /// A different absence from `foundations_resident`, and the reason it is
+    /// worth its own field: missing bytes arrive on their own once replication
     /// catches up, while an unadmitted signer waits on a grant somebody has to
     /// issue. One is weather, the other is work, and a view that showed only
     /// the first would report a collection as merely behind when it is
@@ -435,10 +470,9 @@ struct LatticeCollection {
 }
 
 impl LatticeCollection {
-    fn stored(&self) -> u64 {
-        self.commits
-            .saturating_add(self.merges)
-            .saturating_add(self.derives)
+    /// The records that replicate: COMMITs and DERIVEs.
+    fn foundations(&self) -> u64 {
+        self.commits.saturating_add(self.derives)
     }
 }
 
@@ -514,7 +548,7 @@ fn observe_lattice<R: triblespace_core::repo::StoreRead>(
         if let Some(source) = source {
             pending.push(source);
         }
-        let (commits, merges, derives, result_resident) = match evidence.get(&raw) {
+        let (commits, merges, derives, foundations_resident) = match evidence.get(&raw) {
             Some(found) => (
                 found.commits.stored,
                 found.merges.stored,
@@ -522,7 +556,6 @@ fn observe_lattice<R: triblespace_core::repo::StoreRead>(
                 found
                     .commits
                     .result_resident
-                    .saturating_add(found.merges.result_resident)
                     .saturating_add(found.derives.result_resident),
             ),
             None => (0, 0, 0, 0),
@@ -535,7 +568,7 @@ fn observe_lattice<R: triblespace_core::repo::StoreRead>(
             commits,
             merges,
             derives,
-            result_resident,
+            foundations_resident,
             // Filled below: admission is a question about the whole lattice at
             // once, not about one collection as it is discovered.
             unadmitted: 0,
@@ -633,15 +666,14 @@ struct Member {
     committed: bool,
     /// The member's bytes are here.
     resident: bool,
-    /// A record *in this collection* produced it: the result of a `MERGE` the
-    /// fold believes, or a `DERIVE` output.
+    /// A record *in this collection* produced it: the result of one of the
+    /// host's `MERGE`s, driven or waiting, or a `DERIVE` output.
     ///
     /// `false` with `committed` also false is a member reached only as an
-    /// input of a believed join — real, resident, and made by a record this
-    /// observation cannot see. It was already counted here and printed as a
-    /// number beside the picture, which is the one absence in the whole view a
-    /// reader could not point at. It is now carried per member so the mark can
-    /// carry it too.
+    /// input of a waiting join — real, and made by a record this observation
+    /// cannot see. It was already counted here and printed as a number beside
+    /// the picture, which is the one absence in the whole view a reader could
+    /// not point at. It is now carried per member so the mark can carry it too.
     produced: bool,
     /// Whether an admitted record put it here.
     ///
@@ -668,7 +700,7 @@ enum Admission {
     /// yet. Waiting on a grant somebody must issue.
     Unadmitted,
     /// Neither. Nothing here attests it — it was reached only as an input of
-    /// a believed join — or its lineage has not replicated, or it is the
+    /// a waiting join — or its lineage has not replicated, or it is the
     /// result of a join of the host's still waiting for an input's support.
     /// Those wait on bytes or on other records rather than on a grant, and
     /// belong to nobody in particular. Another key's MERGE never lands here:
@@ -689,10 +721,18 @@ struct MemberLattice {
     /// The collection these members belong to.
     collection: [u8; 32],
     members: Vec<Member>,
-    /// `(from, to)` indices into `members`: an input of a join, and its result.
+    /// `(from, to)` indices into `members`: an input of a driven join, and its
+    /// result. A driven join is one of the host's whose every input has a
+    /// support, so it stands for their union and a reader descends it.
     joins: Vec<(usize, usize)>,
-    /// Members this collection's records reach that no record here produces —
-    /// a join input whose own commit or merge lives somewhere else.
+    /// The same, for the host's joins still waiting for an input's support:
+    /// the host signed them, but no reader descends them and their inputs stay
+    /// on the frontier. Drawn apart from `joins`, as the one kind of edge that
+    /// is declared and not yet performed.
+    waiting: Vec<(usize, usize)>,
+    /// Members this collection's records reach that no record here produces:
+    /// an input of a waiting join whose own commit or merge lives somewhere
+    /// else. A driven join's inputs all have a support, so they never count.
     unproduced: usize,
     /// The lattice was too large to draw honestly, so it was not built.
     /// A truncated graph is a false picture, not a partial one.
@@ -710,11 +750,14 @@ struct MemberLattice {
 /// a member of the *source* collection and has no place in this order; drawing
 /// it here would put two different collections' members in one lattice.
 ///
-/// A `MERGE` contributes only when the fold believes it: the host's own join,
-/// the host being the key the store was opened as. Another key's MERGE stays
-/// in the store and is never folded into a support, a consumer edge or a
-/// frontier, so its edges and its result are not part of this lattice at all;
-/// drawing them would draw a lattice no reader here attaches.
+/// A `MERGE` contributes only when it is the host's own, the host being the key
+/// the store was opened as. A driven one -- every input has a support -- is a
+/// join a reader descends and draws in `joins`; one still waiting for an
+/// input's support draws in `waiting`, because a reader here never descends
+/// it. Another key's MERGE stays in the store and is never folded into a
+/// support, a consumer edge or a frontier, so its edges and its result are not
+/// part of this lattice at all; drawing them would draw a lattice no reader
+/// here attaches.
 fn observe_members<R: triblespace_core::repo::StoreRead>(
     snapshot: &R,
     collection: [u8; 32],
@@ -744,6 +787,7 @@ fn observe_members<R: triblespace_core::repo::StoreRead>(
     let mut committed = BTreeSet::new();
     let mut produced = BTreeSet::new();
     let mut raw_joins = Vec::new();
+    let mut raw_waiting = Vec::new();
     let mut handles = BTreeSet::new();
     for record in records {
         match record {
@@ -753,26 +797,28 @@ fn observe_members<R: triblespace_core::repo::StoreRead>(
                 handles.insert(data);
             }
             CollectionRecord::Merge(merge) => {
-                // The consumer side of the MERGE relation, read by its own
-                // key: a believed join has an edge from each of its inputs,
-                // and only the host's joins are ever believed.
-                let believed = merge.inputs().first().is_some_and(|first| {
-                    coverage
-                        .joins_reading(target, *first)
-                        .iter()
-                        .any(|(inputs, result)| {
-                            *inputs == merge.merge_inputs() && *result == merge.result()
-                        })
-                });
-                if !believed {
+                // Only the host's MERGEs are ever folded; another key's is
+                // not part of this lattice.
+                if coverage.host() != Some(merge.public_key()) {
                     continue;
                 }
+                // The MERGE relation read by its own key, the result: the
+                // host's driven joins producing it, blocked ones skipped.
+                let driven = coverage
+                    .published()
+                    .producers(target, merge.result())
+                    .contains(&merge.merge_inputs());
                 let result = merge.result().raw;
                 produced.insert(result);
                 handles.insert(result);
+                let edges = if driven {
+                    &mut raw_joins
+                } else {
+                    &mut raw_waiting
+                };
                 for input in merge.inputs() {
                     handles.insert(input.raw);
-                    raw_joins.push((input.raw, result));
+                    edges.push((input.raw, result));
                 }
             }
             CollectionRecord::Derive(derive) => {
@@ -792,6 +838,7 @@ fn observe_members<R: triblespace_core::repo::StoreRead>(
             collection,
             members: Vec::new(),
             joins: Vec::new(),
+            waiting: Vec::new(),
             unproduced,
             too_large: Some(handles.len()),
         });
@@ -824,18 +871,24 @@ fn observe_members<R: triblespace_core::repo::StoreRead>(
         })
         .collect();
     let index = |handle: &[u8; 32]| order.binary_search(handle).ok();
-    let mut joins: Vec<(usize, usize)> = raw_joins
-        .iter()
-        .filter_map(|(from, to)| Some((index(from)?, index(to)?)))
-        .filter(|(from, to)| from != to)
-        .collect();
-    joins.sort_unstable();
-    joins.dedup();
+    let edges = |raw: &[([u8; 32], [u8; 32])]| {
+        let mut edges: Vec<(usize, usize)> = raw
+            .iter()
+            .filter_map(|(from, to)| Some((index(from)?, index(to)?)))
+            .filter(|(from, to)| from != to)
+            .collect();
+        edges.sort_unstable();
+        edges.dedup();
+        edges
+    };
+    let joins = edges(&raw_joins);
+    let waiting = edges(&raw_waiting);
 
     Ok(MemberLattice {
         collection,
         members,
         joins,
+        waiting,
         unproduced,
         too_large: None,
     })
@@ -1347,17 +1400,17 @@ fn render_terminal(frame: &Frame) -> String {
                 for collection in rows.iter().take(12) {
                     let _ = writeln!(
                         out,
-                        "  {} {} · {} commit / {} merge / {} derive · {} of {} results resident{}",
+                        "  {} {} · {} commit / {} derive · {} of {} resident · {} merge stored{}",
                         if collection.descriptor_resident { "+" } else { "?" },
                         collection
                             .name
                             .clone()
                             .unwrap_or_else(|| short(&collection.handle)),
                         collection.commits,
-                        collection.merges,
                         collection.derives,
-                        collection.result_resident,
-                        collection.stored(),
+                        collection.foundations_resident,
+                        collection.foundations(),
+                        collection.merges,
                         match collection.source {
                             Some(source) => format!(" · derives from {}", short(&source)),
                             None => String::new(),
@@ -1606,9 +1659,44 @@ mod tests {
             .iter()
             .find(|collection| collection.handle == target.raw)
             .expect("a seeded handle is projected");
-        assert_eq!(derived.stored(), 0, "nothing has been derived yet");
+        assert_eq!(derived.foundations(), 0, "nothing has been derived yet");
         assert_eq!(derived.derives, 0);
         assert!(derived.descriptor_resident, "its descriptor is right here");
+    }
+
+    #[test]
+    fn a_merge_whose_result_never_arrives_does_not_count_as_missing() {
+        // A MERGE never replicates: the host's own are its private computation
+        // and another key's are never believed, so an absent result of either
+        // is nothing any peer will send. The resident ratio is over the
+        // foundations, which do replicate, and a store holding every one of
+        // them reads as complete however many merges it also stores.
+        use triblespace_core::collection::CollectionStore;
+        let (mut store, source, _target) = lattice_fixture();
+        let stranger = ed25519_dalek::SigningKey::from_bytes(&[29; 32]);
+        store
+            .insert(CollectionRecord::Merge(
+                CollectionMerge::sign(
+                    &stranger,
+                    CollectionHandle::new(source.raw),
+                    [Inline::new([0x61; 32]), Inline::new([0x62; 32])],
+                    Inline::new([0x63; 32]),
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let lattice = observe_lattice(&snapshot, []).unwrap();
+        let root = lattice
+            .iter()
+            .find(|collection| collection.handle == source.raw)
+            .expect("the source collection is projected");
+        assert_eq!(root.merges, 1, "the stored MERGE is still counted");
+        assert_eq!(root.foundations(), 1);
+        assert_eq!(
+            root.foundations_resident, 1,
+            "the one commit is here, so nothing replicable is missing"
+        );
     }
 
     #[test]
@@ -1637,7 +1725,7 @@ mod tests {
         assert!(!hole.descriptor_resident);
         assert_eq!(hole.source, None);
         assert_eq!(hole.name, None);
-        assert_eq!(hole.stored(), 0);
+        assert_eq!(hole.foundations(), 0);
     }
 
     #[test]
@@ -1887,9 +1975,10 @@ mod tests {
     #[test]
     fn a_member_known_only_as_a_join_input_is_counted_not_hidden() {
         use triblespace_core::collection::CollectionStore;
-        let (mut store, collection, first, _second, result) = member_fixture();
-        // The host's own join, so the fold believes it; it stays blocked on
-        // the orphan, which has no support, and is still an edge here.
+        let (mut store, collection, first, second, result) = member_fixture();
+        // The host's own join, so it is part of this lattice; it waits on the
+        // orphan, which has no support, so no reader descends it and it is
+        // drawn apart from the driven join below it.
         let signer = member_host();
         // Join the earlier result with a member nothing here produces.
         // Deliberately NOT committed anywhere: `unproduced` counts handles
@@ -1917,6 +2006,34 @@ mod tests {
             "and it is still drawn"
         );
         assert!(members.members.iter().any(|m| m.handle == first));
+
+        let at = |handle: [u8; 32]| {
+            members
+                .members
+                .iter()
+                .position(|member| member.handle == handle)
+                .expect("member projected")
+        };
+        let waiting_result = [0x55; 32];
+        let mut driven = vec![(at(first), at(result)), (at(second), at(result))];
+        driven.sort_unstable();
+        assert_eq!(members.joins, driven, "the driven join is solid");
+        let mut waiting = vec![
+            (at(result), at(waiting_result)),
+            (at(orphan.raw), at(waiting_result)),
+        ];
+        waiting.sort_unstable();
+        assert_eq!(
+            members.waiting, waiting,
+            "the join waiting on the orphan is drawn apart, never as a driven one"
+        );
+        let waiting_member = &members.members[at(waiting_result)];
+        assert!(waiting_member.produced, "a record here made it");
+        assert_eq!(
+            waiting_member.admission,
+            Admission::Unknown,
+            "but nothing supports it until the orphan has a support"
+        );
     }
 
     #[test]
@@ -1949,6 +2066,10 @@ mod tests {
         let handles: BTreeSet<[u8; 32]> = members.members.iter().map(|m| m.handle).collect();
         assert_eq!(handles, BTreeSet::from([first, second, result]));
         assert_eq!(members.joins.len(), 2, "only the host's join is drawn");
+        assert!(
+            members.waiting.is_empty(),
+            "another key's join is not drawn as waiting either"
+        );
         assert_eq!(members.unproduced, 0);
 
         // Opened as no key, the same records believe no MERGE at all: the
@@ -1961,6 +2082,7 @@ mod tests {
         assert_eq!(handles, BTreeSet::from([first, second]));
         assert!(!handles.contains(&result));
         assert!(members.joins.is_empty());
+        assert!(members.waiting.is_empty());
         assert!(members
             .members
             .iter()
@@ -2293,7 +2415,7 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
         let options = Options {
             pile: path.clone(),
-            key: Some(directory.path().join("absent.key")),
+            key: None,
             telemetry: vec![collection.handle()],
             max_age: Duration::from_secs(180),
             interval: Duration::from_secs(1),
@@ -2301,7 +2423,9 @@ mod tests {
             gui: false,
             lattice: false,
         };
-        let mut reader = Reader::open(&options).unwrap();
+        // Observed as no key; the refusal of a named key that does not load
+        // is `disposable_reader_does_not_append_or_create_a_pile`'s.
+        let mut reader = Reader::open_as(&options, None).unwrap();
         // Exercise the health warning arm over the same disposable bad member.
         reader.health = Some(SelectedSource::new(collection.handle()));
         let frame = reader.sample().unwrap();
@@ -2442,7 +2566,7 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
         let options = Options {
             pile: path.clone(),
-            key: Some(directory.path().join("absent.key")),
+            key: None,
             telemetry: vec![collection.handle(), collection.handle()],
             max_age: Duration::from_secs(180),
             interval: Duration::from_secs(1),
@@ -2450,7 +2574,9 @@ mod tests {
             gui: false,
             lattice: false,
         };
-        let mut reader = Reader::open(&options).unwrap();
+        // Observed as no key; the refusal of a named key that does not load
+        // is `disposable_reader_does_not_append_or_create_a_pile`'s.
+        let mut reader = Reader::open_as(&options, None).unwrap();
         for _ in 0..2 {
             let frame = reader.sample().unwrap();
             assert_eq!((frame.selected_sources, frame.readable_sources), (1, 1));
@@ -2547,7 +2673,7 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
         let options = Options {
             pile: path.clone(),
-            key: Some(directory.path().join("absent.key")),
+            key: None,
             telemetry: vec![collection.handle()],
             max_age: Duration::from_secs(30),
             interval: Duration::from_secs(1),
@@ -2555,7 +2681,9 @@ mod tests {
             gui: false,
             lattice: false,
         };
-        let mut reader = Reader::open(&options).unwrap();
+        // Observed as no key; the refusal of a named key that does not load
+        // is `disposable_reader_does_not_append_or_create_a_pile`'s.
+        let mut reader = Reader::open_as(&options, None).unwrap();
         reader.health = Some(SelectedSource::new(collection.handle()));
         // Cross Future -> Fresh, prior expiry, current expiry, then return
         // within the original valid interval and finally before its origin.
@@ -2627,7 +2755,7 @@ mod tests {
         writer.close().unwrap();
         let options = Options {
             pile: path.clone(),
-            key: Some(directory.path().join("absent.key")),
+            key: None,
             telemetry: vec![reports.handle()],
             max_age: Duration::from_secs(30),
             interval: Duration::from_secs(1),
@@ -2635,7 +2763,9 @@ mod tests {
             gui: false,
             lattice: false,
         };
-        let mut reader = Reader::open(&options).unwrap();
+        // Observed as no key; the refusal of a named key that does not load
+        // is `disposable_reader_does_not_append_or_create_a_pile`'s.
+        let mut reader = Reader::open_as(&options, None).unwrap();
         // A missing key means health=None and does not block the fast path.
         reader.sample_at(100_000_000_000).unwrap();
         reader.sample_at(101_000_000_000).unwrap();
@@ -2708,16 +2838,68 @@ mod tests {
             lattice: false,
         };
         let before = std::fs::read(&path).unwrap();
-        let mut reader = Reader::open(&options).unwrap();
+        // A key named on the command line must load: a mistyped one is
+        // refused, not observed around as no key. Refusing creates nothing.
+        assert!(matches!(
+            Reader::open(&options),
+            Err(ReadFailure::SigningKey)
+        ));
+        assert!(!options.key.as_ref().unwrap().exists());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        // Observed as no key, the reader still samples, and says what it lacks.
+        let mut reader = Reader::open_as(&options, None).unwrap();
         let first = reader.sample().unwrap();
         let second = reader.sample().unwrap();
         assert!(first.workers.is_empty() && second.workers.is_empty());
-        assert!(!first.warnings.is_empty());
+        assert!(first
+            .warnings
+            .iter()
+            .any(|warning| warning.starts_with("No signing key loads")));
         reader.close().unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert!(!options.key.as_ref().unwrap().exists());
         options.pile = directory.path().join("typo.pile");
-        assert!(Reader::open(&options).is_err());
+        assert!(matches!(
+            Reader::open(&options),
+            Err(ReadFailure::PileMissing)
+        ));
         assert!(!options.pile.exists());
+    }
+
+    #[test]
+    fn a_reader_opens_as_the_key_it_resolves_so_it_draws_that_keys_merges() {
+        use std::collections::BTreeSet;
+        use triblespace_core::collection::CoverageRead;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("dashboard.pile");
+        std::fs::File::create(&path).unwrap();
+        let key = directory.path().join("dashboard.key");
+        let signer = triblespace_core::signing_key_file::init(&key).unwrap();
+        let options = Options {
+            pile: path.clone(),
+            key: Some(key),
+            telemetry: vec![],
+            max_age: Duration::from_secs(180),
+            interval: Duration::from_secs(1),
+            once: true,
+            gui: false,
+            lattice: false,
+        };
+        let mut reader = Reader::open(&options).unwrap();
+        let host = reader
+            .pile
+            .snapshot()
+            .unwrap()
+            .index(&BTreeSet::new())
+            .unwrap()
+            .host();
+        assert_eq!(
+            host.map(|host| host.raw),
+            Some(signer.verifying_key().to_bytes()),
+            "the store folds as the named key, so the member lattice draws its merges"
+        );
+        assert!(reader.health.is_some(), "and that key's health is selected");
+        assert!(reader.setup_warnings.is_empty());
+        reader.close().unwrap();
     }
 }
