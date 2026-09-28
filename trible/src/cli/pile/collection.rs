@@ -332,8 +332,9 @@ pub enum Command {
     /// Maintain selected collections, without maintaining their dependencies.
     ///
     /// Root collections roll up every admitted commit held here, whoever
-    /// signed it; derived collections fill missing images of available
-    /// source members and roll up results. Readers opened as the same key
+    /// signed it; derived collections derive every available source member
+    /// with no usable image yet and roll up their own images, never their
+    /// source's merges. Readers opened as the same key
     /// can then use those merged members. Deterministic and idempotent: run
     /// again, it publishes nothing new. New equations are signed by the
     /// supplied durable key, and the pile is opened as that key so its fold
@@ -370,10 +371,11 @@ pub enum Command {
     /// Shared dependencies run once per pass. Every root reached runs the
     /// carry, which merges every held node into the key's own merges,
     /// whoever signed the foundations beneath it; every derived collection
-    /// reached gets the key's own leaves, a leaf for every foundation
-    /// another key has left without one (a reader must not wait on an
-    /// absent owner), and a mirror of the key's own source merges, after its
-    /// source. Another key's merges are never believed. This is scheduling over
+    /// reached, after its source, gets a leaf for every foundation that has
+    /// no usable one, whoever owns it (a reader must not wait on an absent
+    /// owner; any leaf whose image is here or can be fetched suffices), and
+    /// carries its own leaves the same way. Another key's merges are never
+    /// believed. This is scheduling over
     /// ordinary one-edge operations; mappings and joins do not acquire
     /// recursive construction side effects. Only the requested targets and
     /// their descriptor source chains are selected, not historical indexes.
@@ -399,6 +401,30 @@ pub enum Command {
         succinct_backend: SuccinctBackend,
         #[command(flatten)]
         telemetry: maintenance_telemetry::Options,
+    },
+    /// Derive named source members of a derived collection again, beside
+    /// the leaves they have: the supplement to a leaf known to be bad.
+    ///
+    /// Maintenance derives a source member only when none of its leaves has
+    /// an image that is here or can be fetched, whoever derived that leaf,
+    /// and it never replaces one. This maps each named member of the
+    /// collection's immediate source again and publishes the result as
+    /// another leaf unless a leaf already names those bytes; the collection
+    /// joins both. The key must be one the collection's WRITE admits, on a
+    /// host that can compute the mapping; the pile is opened as it. Nothing
+    /// is carried: maintenance joins the new leaves.
+    Rederive {
+        /// Path to the pile file to modify
+        pile: PathBuf,
+        /// Derived collection: name, or descriptor handle
+        collection: String,
+        /// Members of the collection's immediate source to derive again,
+        /// as `blake3:HEX` or bare hex content handles
+        #[arg(required = true, num_args = 1..)]
+        members: Vec<String>,
+        /// Existing durable signing-key file (default: beside the pile)
+        #[arg(long)]
+        key: Option<PathBuf>,
     },
     /// Grant one endpoint unbounded READ access to an existing collection.
     ///
@@ -572,6 +598,12 @@ pub fn run(cmd: Command) -> Result<()> {
             succinct_backend,
             telemetry,
         ),
+        Command::Rederive {
+            pile,
+            collection,
+            members,
+            key,
+        } => run_rederive(pile, collection, members, key),
         Command::GrantRead {
             pile,
             collection,
@@ -3287,6 +3319,122 @@ async fn maintain_nvfp4_embedding_set<S: Store + AsyncBlobStoreAcquire + Send>(
     _snapshot: &S::Snapshot,
     _handle: CollectionHandle,
     _algorithm: Option<Id>,
+    _signer: &SigningKey,
+) -> Result<S::Snapshot> {
+    unreachable!("the NVFP4 representation is only recognised with the search feature")
+}
+
+fn run_rederive(
+    path: PathBuf,
+    collection: String,
+    members: Vec<String>,
+    key: Option<PathBuf>,
+) -> Result<()> {
+    let key_path = triblespace_core::signing_key_file::resolve_path(key.as_deref(), &path);
+    let signer = triblespace_core::signing_key_file::load_existing(&key_path)
+        .map_err(|error| anyhow!("load signing key {}: {error}", key_path.display()))?;
+    let members = members
+        .iter()
+        .map(|member| parse_collection_handle(member))
+        .collect::<Result<Vec<_>>>()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| anyhow!("start the runtime: {error}"))?;
+    let mut pile = open_refreshed_as(&path, signer.verifying_key())?;
+    let res = (|| -> Result<(CollectionHandle, usize)> {
+        let snapshot = pile
+            .snapshot()
+            .map_err(|error| anyhow!("pile snapshot: {error:?}"))?;
+        let rows = enumerate(&snapshot)?;
+        let handle = resolve(&rows, &collection)?;
+        let facts: TribleSet = snapshot
+            .get(handle)
+            .map_err(|error| anyhow!("read collection descriptor: {error}"))?;
+        let representation = descriptor::representation(&facts)?;
+        let algorithm = descriptor::mapping_algorithm(&facts)?;
+        let source = descriptor::source(&facts)?.ok_or_else(|| {
+            anyhow!(
+                "blake3:{} is not a derived collection: its descriptor names no source",
+                handle_hex(handle)
+            )
+        })?;
+        let source: Collection<SimpleArchive> = Collection::open(&snapshot, source)
+            .map_err(|error| anyhow!("open the source descriptor: {error}"))?;
+        let named = source.cover(members);
+        let leaves = |snapshot: &PileSnapshot| -> Result<usize> {
+            Ok(snapshot
+                .select_records(&BTreeSet::from([CollectionRecordSelector::DeriveTarget(
+                    handle,
+                )]))
+                .map_err(|error| anyhow!("select the collection's leaves: {error:?}"))?
+                .len())
+        };
+        let before = leaves(&snapshot)?;
+        if !nvfp4_embedding_set_id().is_some_and(|nvfp4| representation == nvfp4) {
+            bail!(
+                "representation {representation:X} has no derivation this binary implements; \
+                 nothing here can derive it again"
+            );
+        }
+        let after = runtime.block_on(rederive_nvfp4_embedding_set(
+            &mut pile, &snapshot, handle, algorithm, &named, &signer,
+        ))?;
+        Ok((handle, leaves(&after)? - before))
+    })();
+    let close_res = pile
+        .close()
+        .map_err(|error| anyhow!("pile close: {error:?}"));
+    let (handle, added) = res.and_then(|done| close_res.map(|()| done))?;
+    println!(
+        "rederived blake3:{}: {added} new leaf(s)",
+        handle_hex(handle)
+    );
+    Ok(())
+}
+
+#[cfg(feature = "search")]
+async fn rederive_nvfp4_embedding_set<S: Store + AsyncBlobStoreAcquire + Send>(
+    pile: &mut S,
+    snapshot: &S::Snapshot,
+    handle: CollectionHandle,
+    algorithm: Option<Id>,
+    named: &triblespace_core::collection::Cover<SimpleArchive>,
+    signer: &SigningKey,
+) -> Result<S::Snapshot> {
+    use triblespace_search::nvfp4::EMBEDDING_ATTRIBUTE_TO_NVFP4;
+    use triblespace_search::schemas::Embedding;
+    use triblespace_search::semantic::{SemanticIndex, NOMIC_ATTRIBUTES_TO_NVFP4};
+    let collection: Collection<
+        triblespace_search::nvfp4::NvFp4CosineSet<triblespace_search::schemas::Embedding>,
+    > = Collection::open(snapshot, handle)
+        .map_err(|error| anyhow!("open collection descriptor: {error}"))?;
+    if algorithm == Some(EMBEDDING_ATTRIBUTE_TO_NVFP4) {
+        pile.rederive(collection, named, signer)
+            .await
+            .map_err(|error| anyhow!("derive NVFP4 embedding members again: {error}"))
+    } else if algorithm == Some(NOMIC_ATTRIBUTES_TO_NVFP4) {
+        pile.rederive_with::<SemanticIndex<Embedding>>(collection, named, signer)
+            .await
+            .map_err(|error| anyhow!("derive semantic index members again: {error}"))
+    } else {
+        Err(anyhow!(
+            "NVFP4 mapping algorithm {} is not implemented by this binary; \
+             historical or unknown mappings are not rebound to another algorithm",
+            algorithm
+                .map(|id| format!("{id:X}"))
+                .unwrap_or_else(|| "<absent>".to_owned())
+        ))
+    }
+}
+
+#[cfg(not(feature = "search"))]
+async fn rederive_nvfp4_embedding_set<S: Store + AsyncBlobStoreAcquire + Send>(
+    _pile: &mut S,
+    _snapshot: &S::Snapshot,
+    _handle: CollectionHandle,
+    _algorithm: Option<Id>,
+    _named: &triblespace_core::collection::Cover<SimpleArchive>,
     _signer: &SigningKey,
 ) -> Result<S::Snapshot> {
     unreachable!("the NVFP4 representation is only recognised with the search feature")
