@@ -481,9 +481,14 @@ output cannot be obtained does not count, and a fetch that fails means the
 output is unavailable now, not lost: if the original output arrives after
 the foundation was derived again, both leaves stand, both are joined, and
 nothing further is derived. Outputs that are not here are asked for after the
-rest of the pass -- deriving what needs no fetch, and the carry -- each once,
-and a pass stops asking after eight fetches have failed; the rest wait for
-the next pass. Only a store that can reach other holders asks at all: a
+rest of the pass -- deriving what needs no fetch, and the carry -- each once.
+The outputs of one foundation's leaves are asked for until one arrives or all
+have failed, and a pass starts no further foundation once eight fetches have
+failed. Each pass starts the foundations in an order of its own, drawn
+afresh, so foundations whose fetches always fail cannot keep the same others
+waiting pass after pass. A leaf counts only when its output reads: damaged
+bytes a pile still lists are no usable leaf, and the carry joins only nodes
+whose bytes read. Only a store that can reach other holders asks at all: a
 plain pile answers from its own blobs, so a miss there says nothing about
 elsewhere, and the foundation waits for its output instead of being derived
 again. Each key derives in an order of its own, and a foundation whose leaf
@@ -633,8 +638,9 @@ no support argument to pass along, and none to request narrower.
   leaf -- the key's own, fetching their payloads, and another owner's whose
   payload is already here -- then carries the target's own leaves the way a
   root carries its commits. A foundation the mapping refuses holds back
-  neither the rest nor the carry; it is reported afterwards. It also returns
-  a fresh store snapshot.
+  neither the rest, nor the carry, nor the fetches the rest is waiting for;
+  it is reported afterwards, after a failure of the carry itself. It also
+  returns a fresh store snapshot.
 
 A derived operation never constructs an upstream member as a side effect, and
 the carry reads nothing outside the target's own lattice. If a target join

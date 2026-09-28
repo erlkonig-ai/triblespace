@@ -21,11 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-write `ensure` still answers `UnauthorizedProducer` for a key that owes
   leaves for foundations of its own. `realize_as` follows: a signer without
   WRITE answers `Realized::Unadmitted` and, under `Upkeep::Maintain`, carries
-  the collection. What deriving could not do holds back neither the rest nor
-  the carry: a refused own foundation (`Derive`), a blob an own foundation
-  needs (`MissingDependency`, fetched before the operation runs again) and
-  `Unmappable` are all reported after the carry; only a storage failure ends
-  the operation first. A derived collection stored in a root's
+  the collection. What deriving could not do holds back neither the rest, nor
+  the carry, nor the fetches of outputs the rest is waiting for: a blob an
+  own foundation needs (`MissingDependency`) is fetched and everything runs
+  again, and what is reported -- the carry's own failure first, then a
+  refused own foundation (`Derive`), then `Unmappable` -- is returned only
+  after the outputs the call went on without were asked for; only a storage
+  failure ends the operation first. A fetch that fails outright (the store
+  cannot reach other holders, or cannot keep what it got) is that blob's
+  unavailability for the call, like any failed fetch, and is reported once
+  the work is done, ahead of the rest. A derived collection stored in a root's
   encoding carries only through its mapping (`maintain_with`); `maintain`
   still refuses it.
 - Derivation is scheduled by leaf, and any admitted leaf suffices: a source
@@ -38,8 +43,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing further is derived. Outputs that are not here are named by the
   operation and asked for together after its work -- deriving what needs no
   fetch, and the carry -- rather than one restart each before anything is
-  mapped, and one call stops asking after eight failed fetches; the rest wait
-  for the next call. A foundation whose leaf another writer publishes while
+  mapped. The outputs of one foundation's leaves are asked for as a group
+  until one arrives or all have failed, and one call starts no further
+  foundation once eight fetches have failed. Each call starts the
+  foundations in an order drawn afresh, so foundations whose fetches always
+  fail cannot keep the same others waiting call after call: of `n`
+  foundations waiting, a given one is reached in a call with probability at
+  least `1/n`, and at least `min(8, n)/n` when each has one leaf. A leaf
+  counts only when its output reads: an output a store lists but cannot read
+  (damaged bytes in a pile) makes its foundation owed at once, and a mapping
+  that reproduces restores the bytes. The carry holds only frontier nodes
+  whose bytes read, so a damaged node sits out like an absent one instead of
+  failing every carry. A foundation whose leaf another writer publishes while
   the pass runs is left to that leaf (read from a fresh observation, used
   only to skip work), and each key derives its own foundations first and
   then the rest, each in an order hashed from the key and the foundation, so
@@ -177,9 +192,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`SourceResolution::Attached`). `attached_to` and `realize_attached_as` find
   and maintain every collection attached to a root, siblings first, in
   `ensure_downstream` and `maintain_downstream`, whose report names attached
-  representations it does not know in `unknown_attached` and attached
-  collections whose upkeep failed in `failed_attached`; one failing does not
-  stop the pass, a signer that is not the host does. `attached_to` lists only
+  representations it does not know in `unknown_attached`, attached
+  collections whose upkeep failed in `failed_attached`, and derived
+  collections whose upkeep failed in `failed`; one failing does not stop the
+  pass, a signer that is not the host does. `attached_to` lists only
   descriptors naming the root as their one parent, the only kind an attached
   read serves. New ids, minted with
   `trible genid`: `KIND_COLLECTION_MAP` `329669AA662709605053C123671DF1D2`,
