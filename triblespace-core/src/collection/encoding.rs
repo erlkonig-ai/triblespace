@@ -261,20 +261,24 @@ pub trait DeriveMapping: Sized {
     /// Canonical source encoding.
     type Source: CollectionEncoding;
 
-    /// Whether maintenance derives a source foundation another key owns.
+    /// Whether maintenance maps source foundations another key owns.
     ///
-    /// `maintain` derives, after the maintaining key's own foundations, every
-    /// foundation of another owner that has no leaf at all, when the view
-    /// admits the maintaining key and the payload is already here; `ensure`
-    /// never does. `false` leaves each foundation to its owner, for a mapping
-    /// whose image is only trusted where its owner computed it, such as model
-    /// inference on one compute class whose results other hosts receive by
-    /// replication.
+    /// It decides two things, both in `maintain` only. With `true`, after the
+    /// maintaining key's own foundations it derives every foundation of
+    /// another owner that has no leaf at all, when the view admits the
+    /// maintaining key and the payload is already here; and it mirrors a
+    /// source merge of its own by mapping the merged node's bytes, whoever
+    /// signed the foundations inside it. With `false` it does neither: each
+    /// such foundation waits for a leaf from its owner, and a source merge
+    /// holding one is not mirrored, so the view keeps the finer images
+    /// beneath it. `ensure` never derives another owner's foundation.
     ///
     /// Temporary: it stands in until derivation is scheduled by leaf rather
     /// than by owner (a foundation with any admitted leaf is done, whoever
-    /// signed it). A mapping only some hosts can compute then says so through
-    /// a hook of its own, and this constant goes.
+    /// signed it) and derived collections carry their own leaf images rather
+    /// than mirroring their source's merges. A mapping only some hosts can
+    /// compute then says so through a hook of its own, and this constant
+    /// goes.
     const FOREIGN_DERIVABLE: bool = true;
     /// Canonical target encoding.
     type Target: CollectionEncoding;

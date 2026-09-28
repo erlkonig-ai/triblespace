@@ -68,7 +68,7 @@ pub enum CollectionRealizationError {
         /// Concrete construction failure.
         reason: String,
     },
-    /// The target encoding could not join one group of own nodes.
+    /// The target encoding could not join one group of held nodes.
     Merge {
         /// The inputs of the join, ascending.
         inputs: Vec<CollectionData>,

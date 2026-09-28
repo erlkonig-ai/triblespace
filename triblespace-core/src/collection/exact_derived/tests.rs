@@ -3590,10 +3590,17 @@ mod lattice_v2 {
         let merged = merges_in(&mut store, root.handle())[0].result();
         let theirs = own_commit(&mut store, root, 42, 0);
         block_on(store.ensure(first, &key(42))).unwrap();
+        // A maintainer that is not the store's host mirrors nothing, even
+        // where the view admits it: the only source merges the store drives
+        // are the host's, which are not its own to mirror, and a target
+        // MERGE it signed would fold into nothing here, on every pass.
+        block_on(store.maintain(first, &key(42))).unwrap();
+        assert!(merges_in(&mut store, first.handle()).is_empty());
         // Claims about the owner's node the owner never made: that it
         // absorbed the other writer's commit, and that it is the join of two
-        // of its own commits. 43's are unbelieved; 42's are believed, and
-        // still not the owner's to mirror.
+        // of its own commits. Neither key is the store's host, so none of
+        // them is folded, whatever the key may write -- 42 may write the
+        // root, 43 may not -- and none is mirrored.
         for signer in [43, 42] {
             for inputs in [[theirs, merged], [own[0], own[1]]] {
                 store
@@ -3951,8 +3958,66 @@ mod lattice_v2 {
         for entity in 0..8 {
             own_commit(&mut store, root, 41, entity);
         }
-        // 41 carries its eight before 42's three arrive: three nodes stay
-        // below the fan-in, so the root merge is 41's commits alone.
+        let refused = own_commit(&mut store, root, 42, 1);
+        let too_big = own_commit(&mut store, root, 42, 2);
+        let fine = own_commit(&mut store, root, 42, 3);
+        FIRST_MAP_FATAL.replace(Some(refused));
+        FIRST_MAP_CAPACITY.replace(Some(too_big));
+
+        block_on(store.maintain(root, &key(41))).unwrap();
+        block_on(store.maintain(first, &key(41))).unwrap();
+
+        // The pass succeeds, and every foundation but the two the mapping
+        // refused has a leaf: the refusals are 42's lag, not 41's failure.
+        let snapshot = store.snapshot().unwrap();
+        let missing: BTreeSet<CollectionData> = snapshot
+            .collection(first)
+            .unwrap()
+            .missing_from(&snapshot.collection(root).unwrap())
+            .unwrap()
+            .data_members()
+            .collect();
+        drop(snapshot);
+        assert_eq!(missing, BTreeSet::from([refused, too_big]));
+        assert!(derives_in(&mut store, first.handle())
+            .iter()
+            .any(|leaf| leaf.input() == SourceLocator::of(fine.raw)));
+
+        // Known gap until derived collections carry their own leaf images:
+        // the host merges every held commit, so its one merge of eight holds
+        // a foundation the mapping refused. That merge has an input without
+        // an image, the mirror cannot mirror it, and 41's own images stay on
+        // the view's frontier unjoined. Before the host merged other keys'
+        // commits, its merge held 41's alone and was mirrored. The view is
+        // wider, not wrong.
+        let merges = merges_in(&mut store, root.handle());
+        assert_eq!(merges.len(), 1);
+        let merged = inputs(&merges[0]);
+        assert!(merged.contains(&refused) || merged.contains(&too_big));
+        assert!(merges_in(&mut store, first.handle()).is_empty());
+        let leaves: BTreeSet<CollectionData> = (0..8)
+            .map(|entity| first_image(&payload(41, entity)))
+            .chain([first_image(&payload(42, 3))])
+            .collect();
+        assert_eq!(frontier(&mut store, first.handle()), leaves);
+
+        // Another pass is quiet and still succeeds.
+        let before = records(&mut store).len();
+        block_on(store.maintain(first, &key(41))).unwrap();
+        assert_eq!(records(&mut store).len(), before);
+    }
+
+    /// The same refusals, with 41's eight commits merged before 42's three
+    /// arrive: three nodes stay below the fan-in, so the host's one merge
+    /// holds 41's commits alone and is mirrored. A refused foundation beside
+    /// a merge, rather than inside one, stops nothing.
+    #[test]
+    fn a_refused_foreign_foundation_beside_a_host_merge_does_not_stop_its_mirror() {
+        reset_mapping_calls();
+        let (mut store, root, first, _) = collections();
+        for entity in 0..8 {
+            own_commit(&mut store, root, 41, entity);
+        }
         block_on(store.maintain(root, &key(41))).unwrap();
         let refused = own_commit(&mut store, root, 42, 1);
         let too_big = own_commit(&mut store, root, 42, 2);
@@ -3967,7 +4032,9 @@ mod lattice_v2 {
         // mapping refused has a leaf.
         let mirrors = merges_in(&mut store, first.handle());
         assert_eq!(mirrors.len(), 1);
-        assert!(mirrors.iter().all(|mirror| mirror.public_key() == public(41)));
+        assert!(mirrors
+            .iter()
+            .all(|mirror| mirror.public_key() == public(41)));
         let snapshot = store.snapshot().unwrap();
         let missing: BTreeSet<CollectionData> = snapshot
             .collection(first)
@@ -4089,8 +4156,9 @@ mod lattice_v2 {
     /// A frontier node whose bytes are not here is skipped by the carry
     /// itself: the operation finishes without naming it missing, which is
     /// the only thing that would make the acquiring loop fetch and run the
-    /// operation again. So a host holding another key's commit records
-    /// without their payloads makes no acquisition and no restart.
+    /// operation again. So a host holding commit records without their
+    /// payloads -- another key's, or its own whose payload is elsewhere --
+    /// makes no acquisition and no restart.
     #[test]
     fn a_frontier_node_whose_bytes_are_elsewhere_costs_no_acquisition_and_no_restart() {
         let host = key(41);
@@ -4099,6 +4167,9 @@ mod lattice_v2 {
             own_commit(&mut inner, root, 41, entity);
         }
         let absent = foreign_commit(&mut inner, root, 42, 0);
+        // The host's own commit, its payload elsewhere: the carry used to ask
+        // for exactly this one.
+        let own_absent = foreign_commit(&mut inner, root, 41, 9);
         let mut store = GuardStore::new(inner);
 
         let result = {
@@ -4110,13 +4181,16 @@ mod lattice_v2 {
         let merges = merges_in(&mut store.inner, root.handle());
         assert_eq!(merges.len(), 1);
         assert!(!merges[0].inputs().contains(&absent));
+        assert!(!merges[0].inputs().contains(&own_absent));
 
         // Through the acquiring loop, on this pass and the next.
         drop(block_on(store.maintain(root, &host)).unwrap());
         drop(block_on(store.maintain(root, &host)).unwrap());
         assert!(store.acquired.is_empty(), "{:?}", store.acquired);
         assert_eq!(merges_in(&mut store.inner, root.handle()).len(), 1);
-        assert!(frontier(&mut store.inner, root.handle()).contains(&absent));
+        let after = frontier(&mut store.inner, root.handle());
+        assert!(after.contains(&absent));
+        assert!(after.contains(&own_absent));
     }
 
     /// A carry signing with a key whose merges the store does not fold would
@@ -4172,5 +4246,153 @@ mod lattice_v2 {
         }
         drop(block_on(quiet.maintain(root, &key(41))).unwrap());
         assert!(merges_in(&mut quiet, root.handle()).is_empty());
+    }
+
+    /// A host merge result whose bytes are gone -- here, bytes this store
+    /// never held -- is never joined and never fetched. Its inputs are
+    /// consumed, so it stays on the frontier, and a reader descends it to
+    /// those inputs. A held node with the same support absorbs it without
+    /// reading its bytes, and the frontier narrows to the held node.
+    #[test]
+    fn a_host_merge_result_whose_bytes_are_gone_is_descended_until_a_held_node_absorbs_it() {
+        let host = key(41);
+        let (mut inner, root, _, _) = collections();
+        let commits: Vec<CollectionData> = (0..8)
+            .map(|entity| own_commit(&mut inner, root, 41, entity))
+            .collect();
+        let gone = data(&archive(200, 41));
+        inner
+            .insert(CollectionRecord::Merge(
+                CollectionMerge::sign(&host, root.handle(), commits.iter().copied(), gone).unwrap(),
+            ))
+            .unwrap();
+        let mut store = GuardStore::new(inner);
+        assert_eq!(
+            frontier(&mut store.inner, root.handle()),
+            BTreeSet::from([gone])
+        );
+
+        drop(block_on(store.maintain(root, &host)).unwrap());
+        assert!(store.acquired.is_empty(), "{:?}", store.acquired);
+        assert!(store.events.is_empty());
+        assert_eq!(
+            frontier(&mut store.inner, root.handle()),
+            BTreeSet::from([gone])
+        );
+        let snapshot = store.inner.snapshot().unwrap();
+        let attached = snapshot.collection(root).unwrap();
+        assert_eq!(attached.cover().len(), MERGE_FAN_IN);
+        assert_eq!(attached.view::<TribleSet>().unwrap().len(), MERGE_FAN_IN);
+        drop(attached);
+        drop(snapshot);
+
+        // The same eight joined again, with the joined bytes here: two
+        // frontier nodes with one support, one of them held.
+        let payloads: Vec<_> = (0..8).map(|entity| payload(41, entity)).collect();
+        let union = simplearchive_union::join_all(&payloads).unwrap();
+        let held = data(&union);
+        store.inner.put::<SimpleArchive, _>(union).unwrap();
+        store
+            .inner
+            .insert(CollectionRecord::Merge(
+                CollectionMerge::sign(&host, root.handle(), commits.iter().copied(), held).unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(
+            frontier(&mut store.inner, root.handle()),
+            BTreeSet::from([gone, held])
+        );
+
+        drop(block_on(store.maintain(root, &host)).unwrap());
+        assert!(store.acquired.is_empty(), "{:?}", store.acquired);
+        let absorptions: Vec<_> = merges_in(&mut store.inner, root.handle())
+            .into_iter()
+            .filter(|merge| merge.result() == held && merge.inputs().len() == 2)
+            .collect();
+        assert_eq!(absorptions.len(), 1);
+        assert_eq!(inputs(&absorptions[0]), BTreeSet::from([gone, held]));
+        assert_eq!(
+            frontier(&mut store.inner, root.handle()),
+            BTreeSet::from([held])
+        );
+    }
+
+    /// The first view's mapping, declaring that another owner's foundations
+    /// are left to that owner.
+    struct OwnersOnlyFirst(CanonicalDerivation<FirstEncoding>);
+
+    impl DeriveMapping for OwnersOnlyFirst {
+        const FOREIGN_DERIVABLE: bool = false;
+        type Source = SimpleArchive;
+        type Target = FirstEncoding;
+
+        fn fragment(&self) -> Fragment {
+            self.0.fragment()
+        }
+
+        fn bind(source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
+            CanonicalDerivation::<FirstEncoding>::bind(source, target).map(Self)
+        }
+
+        fn map<R>(
+            &self,
+            source: &Blob<Self::Source>,
+            reader: &R,
+        ) -> Result<Blob<Self::Target>, CollectionOperationError>
+        where
+            R: StoreRead,
+        {
+            self.0.map(source, reader)
+        }
+    }
+
+    /// The host merges every held commit, so its merge can hold another
+    /// owner's foundations. A mapping that leaves those to their owner does
+    /// not map them inside the merge either: the merge is not mirrored and
+    /// the view keeps its leaves. A mapping any key may compute mirrors the
+    /// same merge from its bytes.
+    #[test]
+    fn a_host_merge_holding_another_owners_foundations_is_mapped_only_by_a_foreign_derivable_mapping(
+    ) {
+        reset_mapping_calls();
+        let host = key(41);
+        let (mut store, root, first, _) = collections();
+        let mut commits = BTreeSet::new();
+        for signer in [41, 42] {
+            for entity in 0..4 {
+                commits.insert(own_commit(&mut store, root, signer, entity));
+            }
+        }
+        block_on(store.maintain(root, &host)).unwrap();
+        let merges = merges_in(&mut store, root.handle());
+        assert_eq!(merges.len(), 1);
+        assert_eq!(inputs(&merges[0]), commits);
+
+        // 42 derives its own four leaves; 41 maintains the view.
+        block_on(store.ensure_with::<OwnersOnlyFirst>(first, &key(42))).unwrap();
+        reset_mapping_calls();
+        block_on(store.maintain_with::<OwnersOnlyFirst>(first, &host)).unwrap();
+        // Four calls, 41's own four foundations: the merge was not mapped.
+        assert_eq!(FIRST_MAP_CALLS.get(), 4);
+        assert!(merges_in(&mut store, first.handle()).is_empty());
+        let leaves: BTreeSet<CollectionData> = [41, 42]
+            .into_iter()
+            .flat_map(|signer| (0..4).map(move |entity| first_image(&payload(signer, entity))))
+            .collect();
+        assert_eq!(frontier(&mut store, first.handle()), leaves);
+        reset_mapping_calls();
+        let before = records(&mut store).len();
+        block_on(store.maintain_with::<OwnersOnlyFirst>(first, &host)).unwrap();
+        assert_eq!(FIRST_MAP_CALLS.get(), 0);
+        assert_eq!(records(&mut store).len(), before);
+
+        // The canonical mapping may map anybody's foundations, so it maps
+        // the merged node once and mirrors the merge.
+        block_on(store.maintain(first, &host)).unwrap();
+        assert_eq!(FIRST_MAP_CALLS.get(), 1);
+        let mirrors = merges_in(&mut store, first.handle());
+        assert_eq!(mirrors.len(), 1);
+        assert_eq!(mirrors[0].public_key(), public(41));
+        assert_eq!(inputs(&mirrors[0]), leaves);
     }
 }

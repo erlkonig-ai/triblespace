@@ -620,9 +620,10 @@ where
     View<[f32]>: TryFromBlob<E>,
     <View<[f32]> as TryFromBlob<E>>::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    /// Model inference, not asserted bit-identical across hosts: each
-    /// foundation's owner computes its image and others receive it by
-    /// replication, as the compute-class refusal below says.
+    /// Model inference: each foundation's owner derives its image and other
+    /// hosts receive it by replication, and a source merge holding another
+    /// owner's foundation is not mirrored. The compute-class refusal below
+    /// is a separate check.
     const FOREIGN_DERIVABLE: bool = false;
 
     type Source = SimpleArchive;
