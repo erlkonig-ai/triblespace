@@ -3,11 +3,11 @@
 //! This benchmark compares the two public maintenance paths on
 //! geometrically growing source frontiers:
 //!
-//! - `maintain`: deterministic size-tiered raw-target maintenance followed by
-//!   the Rank9-accelerated derivation.
-//! - functional snapshot advancement: maintain the Succinct chain, read the
-//!   payloads the target newly stands on from the source as the delta, and
-//!   return immutable candidates to the caller.
+//! - `maintain_attached`: the source's carry, then the Succinct attachment
+//!   of each frontier node and the Rank9 accelerator of each.
+//! - functional snapshot advancement: maintain both attachments, read the
+//!   payloads the attached cover newly stands on from the source as the
+//!   delta, and return immutable candidates to the caller.
 //!
 //! Stateless `maintain` gets an independent warm store, a source-identical cold
 //! store with no derived evidence, and an immediate unchanged warm no-op. The
@@ -46,9 +46,8 @@ use triblespace_core::blob::encodings::succinctarchive::{
 };
 use triblespace_core::blob::Blob;
 use triblespace_core::collection::{
-    AdmissionPolicy, Collection, CollectionPolicy, CollectionRead, CollectionRecord,
-    CollectionSnapshot, CollectionSnapshotExt, CollectionStoreExt, Cover, CoverAdvanceError,
-    Support,
+    AdmissionPolicy, AttachedSnapshot, Collection, CollectionPolicy, CollectionRead,
+    CollectionRecord, CollectionSnapshotExt, CollectionStoreExt, Cover, CoverAdvanceError, Support,
 };
 use triblespace_core::inline::Encodes;
 use triblespace_core::prelude::*;
@@ -61,9 +60,8 @@ struct StoreShape {
     blob_bytes: u64,
     commits: u64,
     source_merges: u64,
-    raw_derives: u64,
-    raw_merges: u64,
-    accelerated_records: u64,
+    raw_maps: u64,
+    accelerated_maps: u64,
     other_records: u64,
 }
 
@@ -74,9 +72,8 @@ impl StoreShape {
             blob_bytes: self.blob_bytes + other.blob_bytes,
             commits: self.commits + other.commits,
             source_merges: self.source_merges + other.source_merges,
-            raw_derives: self.raw_derives + other.raw_derives,
-            raw_merges: self.raw_merges + other.raw_merges,
-            accelerated_records: self.accelerated_records + other.accelerated_records,
+            raw_maps: self.raw_maps + other.raw_maps,
+            accelerated_maps: self.accelerated_maps + other.accelerated_maps,
             other_records: self.other_records + other.other_records,
         }
     }
@@ -87,9 +84,8 @@ impl StoreShape {
             blob_bytes: self.blob_bytes - before.blob_bytes,
             commits: self.commits - before.commits,
             source_merges: self.source_merges - before.source_merges,
-            raw_derives: self.raw_derives - before.raw_derives,
-            raw_merges: self.raw_merges - before.raw_merges,
-            accelerated_records: self.accelerated_records - before.accelerated_records,
+            raw_maps: self.raw_maps - before.raw_maps,
+            accelerated_maps: self.accelerated_maps - before.accelerated_maps,
             other_records: self.other_records - before.other_records,
         }
     }
@@ -115,21 +111,11 @@ fn store_shape(store: &mut MemoryRepo, collections: &Collections) -> StoreShape 
             CollectionRecord::Merge(merge) if merge.collection() == collections.source.handle() => {
                 shape.source_merges += 1;
             }
-            CollectionRecord::Derive(derive) if derive.collection() == collections.raw.handle() => {
-                shape.raw_derives += 1;
+            CollectionRecord::Map(map) if map.collection() == collections.raw.handle() => {
+                shape.raw_maps += 1;
             }
-            CollectionRecord::Merge(merge) if merge.collection() == collections.raw.handle() => {
-                shape.raw_merges += 1;
-            }
-            CollectionRecord::Derive(derive)
-                if derive.collection() == collections.accelerated.handle() =>
-            {
-                shape.accelerated_records += 1;
-            }
-            CollectionRecord::Merge(merge)
-                if merge.collection() == collections.accelerated.handle() =>
-            {
-                shape.accelerated_records += 1;
+            CollectionRecord::Map(map) if map.collection() == collections.accelerated.handle() => {
+                shape.accelerated_maps += 1;
             }
             _ => shape.other_records += 1,
         }
@@ -251,46 +237,26 @@ struct RunContext<'a> {
     collections: &'a Collections,
 }
 
-/// What the source stood on in the store snapshot a target observation was
-/// taken from. Supports are collection-local, so the accounting cover of
-/// source payloads is read from the source itself.
-fn source_support<E: triblespace_core::collection::CollectionEncoding>(
-    observed: &CollectionSnapshot<MemoryRepoSnapshot, E>,
-    collections: &Collections,
+/// What the attached cover stands for: its parent's foundations.
+fn source_support(
+    observed: &AttachedSnapshot<MemoryRepoSnapshot, Rank9AcceleratedSuccinctArchiveBlob>,
+    _collections: &Collections,
 ) -> Support {
-    observed
-        .snapshot()
-        .collection(collections.source)
-        .expect("observe the source")
-        .support()
-        .expect("resolve source support")
-        .clone()
-}
-
-/// The collection a raw target derives from, read from its descriptor.
-fn collections_source(
-    snapshot: &MemoryRepoSnapshot,
-    raw: Collection<SuccinctArchiveBlob>,
-) -> Collection<SimpleArchive> {
-    let facts: TribleSet = snapshot.get(raw.handle()).expect("raw descriptor");
-    let source = triblespace_core::collection::descriptor::source(&facts)
-        .expect("raw descriptor source")
-        .expect("a raw target derives from a source");
-    Collection::open(snapshot, source).expect("open the raw target's source")
+    observed.support().clone()
 }
 
 fn maintain_succinct(
     store: &mut MemoryRepo,
     collections: &Collections,
     signing_key: &SigningKey,
-) -> CollectionSnapshot<MemoryRepoSnapshot, Rank9AcceleratedSuccinctArchiveBlob> {
-    block_on(store.maintain(collections.raw, signing_key))
-        .expect("maintain raw Succinct collection");
-    let snapshot = block_on(store.maintain(collections.accelerated, signing_key))
-        .expect("maintain accelerated Succinct collection");
+) -> AttachedSnapshot<MemoryRepoSnapshot, Rank9AcceleratedSuccinctArchiveBlob> {
+    block_on(store.maintain_attached(collections.raw, signing_key))
+        .expect("maintain Succinct attachments");
+    let snapshot = block_on(store.maintain_attached(collections.accelerated, signing_key))
+        .expect("maintain Rank9 attachments");
     snapshot
-        .collection(collections.accelerated)
-        .expect("observe accelerated Succinct collection")
+        .attached(collections.accelerated)
+        .expect("observe the Rank9 attachments")
 }
 
 fn time_ensure(
@@ -302,28 +268,13 @@ fn time_ensure(
     let start = Instant::now();
     let attached = maintain_succinct(store, collections, signing_key);
     let elapsed = start.elapsed();
-    // Supports are collection-local: the source stands on the accounting
-    // cover, and each hop's leaves answer for every foundation of its source.
+    // The attached cover stands on the accounting cover, with no residual.
     assert_eq!(
         &source_support(&attached, collections),
         cover,
-        "the source stands on the accounting cover",
+        "the attached cover stands on the accounting cover",
     );
-    let snapshot = attached.snapshot();
-    let source = snapshot
-        .collection(collections.source)
-        .expect("observe the source");
-    let raw = snapshot
-        .collection(collections.raw)
-        .expect("observe the raw Succinct collection");
-    assert!(
-        raw.missing_from(&source).expect("raw freshness").is_empty()
-            && attached
-                .missing_from(&raw)
-                .expect("accelerated freshness")
-                .is_empty(),
-        "the maintained target stands for the accounting cover",
-    );
+    assert!(attached.residual().is_empty());
     let union: UnionArchive<OrderedUniverse> = attached.view().expect("materialize Succinct view");
     black_box(union.segment_count());
     TimedOperation { elapsed, union }
@@ -335,29 +286,18 @@ fn observe_raw_cover(
     raw: Collection<SuccinctArchiveBlob>,
 ) -> CoverIdentity {
     // This is outside the timer and must be a zero-write, zero-algebra lookup.
-    // The public accelerated phase remains represented by timing and its
-    // ordinary DERIVE/MERGE/blob delta.
     let diagnostic_before = store
         .snapshot()
         .expect("freeze pre-diagnostic store snapshot");
     let raw_cover = diagnostic_before
-        .collection(raw)
-        .expect("observe resident raw cover");
-    let source = diagnostic_before
-        .collection(collections_source(&diagnostic_before, raw))
-        .expect("observe the raw target's source");
+        .attached(raw)
+        .expect("observe the Succinct attachments");
     assert_eq!(
-        source.support().expect("resolve source support"),
+        raw_cover.support(),
         cover,
-        "the raw target's source stands on the accounting cover",
+        "the Succinct attachments stand on the accounting cover",
     );
-    assert!(
-        raw_cover
-            .missing_from(&source)
-            .expect("raw freshness")
-            .is_empty(),
-        "the raw target has a leaf for every accounting payload",
-    );
+    assert!(raw_cover.residual().is_empty());
     let diagnostic_after = store
         .snapshot()
         .expect("freeze post-diagnostic store snapshot");
@@ -492,7 +432,7 @@ fn run_ensure_family(
 }
 
 fn time_snapshot(
-    state: &mut Option<CollectionSnapshot<MemoryRepoSnapshot, Rank9AcceleratedSuccinctArchiveBlob>>,
+    state: &mut Option<AttachedSnapshot<MemoryRepoSnapshot, Rank9AcceleratedSuccinctArchiveBlob>>,
     store: &mut MemoryRepo,
     cover: &Support,
     collections: &Collections,
@@ -568,7 +508,7 @@ fn time_snapshot(
 }
 
 fn run_snapshot_pair(
-    state: &mut Option<CollectionSnapshot<MemoryRepoSnapshot, Rank9AcceleratedSuccinctArchiveBlob>>,
+    state: &mut Option<AttachedSnapshot<MemoryRepoSnapshot, Rank9AcceleratedSuccinctArchiveBlob>>,
     store: &mut MemoryRepo,
     context: &RunContext<'_>,
     before: StoreShape,
@@ -685,16 +625,15 @@ fn benchmark_policy() -> CollectionPolicy {
 }
 
 fn register_collections(store: &mut MemoryRepo) -> Collections {
-    let policy = benchmark_policy();
     let source = store
-        .collection(benchmark_name(), policy.clone())
+        .collection(benchmark_name(), benchmark_policy())
         .expect("register benchmark source collection");
     let raw = store
-        .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-        .expect("register raw Succinct projection");
+        .attach::<SuccinctArchiveBlob>(source, ())
+        .expect("attach the Succinct index");
     let accelerated = store
-        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(raw, (), policy)
-        .expect("register accelerated Succinct projection");
+        .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, raw)
+        .expect("attach the Rank9 accelerator");
     Collections {
         source,
         raw,
@@ -702,9 +641,8 @@ fn register_collections(store: &mut MemoryRepo) -> Collections {
     }
 }
 
-/// A store opened as the key the run maintains with.
-fn new_source_store(expected: &Collections, host: &SigningKey) -> MemoryRepo {
-    let mut store = MemoryRepo::for_host(host.verifying_key());
+fn new_source_store(expected: &Collections) -> MemoryRepo {
+    let mut store = MemoryRepo::for_host(benchmark_authority());
     assert_eq!(&register_collections(&mut store), expected);
     store
 }
@@ -741,10 +679,10 @@ fn run_iteration(
     let mut maintained_snapshot = None;
     let source = collections.source;
     let signing_key = SigningKey::from_bytes(&[0x71; 32]);
-    let mut source_accounting = new_source_store(collections, &signing_key);
-    let mut cold_ensure_source = new_source_store(collections, &signing_key);
-    let mut warm_ensure = new_source_store(collections, &signing_key);
-    let mut snapshot_source = new_source_store(collections, &signing_key);
+    let mut source_accounting = new_source_store(collections);
+    let mut cold_ensure_source = new_source_store(collections);
+    let mut warm_ensure = new_source_store(collections);
+    let mut snapshot_source = new_source_store(collections);
 
     let mut published = 0usize;
     let mut previous_rows = 0u64;
@@ -1003,7 +941,7 @@ fn main() {
     );
     println!(
         "{:>7} {:>16} {:>4} {:>10} {:>4} {:>4} {:>4} {:>15}",
-        "commits", "arm", "+B", "+bytes", "+D", "+M", "+A", "support",
+        "commits", "arm", "+B", "+bytes", "+M", "+Ms", "+Ma", "support",
     );
     for &checkpoint in &checkpoints {
         for arm in arms {
@@ -1021,16 +959,12 @@ fn main() {
                 arm.label(),
                 work.blobs,
                 work.blob_bytes,
-                work.raw_derives,
-                work.raw_merges,
-                work.accelerated_records,
+                work.source_merges,
+                work.raw_maps,
+                work.accelerated_maps,
                 support,
             );
             assert_eq!(work.commits, 0, "measured operation wrote a COMMIT");
-            assert_eq!(
-                work.source_merges, 0,
-                "measured operation published a source MERGE",
-            );
             assert_eq!(work.other_records, 0, "unclassified record write");
         }
     }

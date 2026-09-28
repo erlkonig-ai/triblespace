@@ -174,26 +174,24 @@ let source_policy = CollectionPolicy::new(
     AdmissionPolicy::direct(source_reader),
     AdmissionPolicy::direct(source_writer),
 );
-let index_policy = CollectionPolicy::new(
-    AdmissionPolicy::direct(index_reader),
-    AdmissionPolicy::direct(index_writer),
-);
 let source = store.collection("social", source_policy)?;
-let paths = store.derive::<PathSummaryBlob>(source, friend_automaton, index_policy)?;
+// Attached to the root: no policy of its own, built by the store's host.
+let paths = store.attach::<PathSummaryBlob>(source, friend_automaton)?;
 
-let after = store.maintain(paths, &writer).await?;
-let observed = after.collection(paths)?;
-let support = observed.support()?;
+let after = store.maintain_attached(paths, &host).await?;
+let observed = after.attached(paths)?;
+let support = observed.support();
 let index: Arc<PathIndex> = observed.view()?;
 ```
 
 The foundational support replaces ambient heads, commit-chain traversal,
 manifests, registered hooks, and range planning.
 
-The derivation selects a target `Cover<PathSummaryBlob>` whose support is the
-same `Cover<SimpleArchive>` at the root. The path mapping permits any stored
-combination of source merges, target merges, and derivations with that support,
-so route choice is not encoded as a cover mode.
+The attached read selects a `Cover<PathSummaryBlob>` of attachments whose
+support is a `Cover<SimpleArchive>` of the root's foundations. Any mixture of
+attachments at merged and unmerged nodes with that support answers the same
+paths, because summaries are joined before closure, so route choice is not
+encoded as a cover mode.
 
 The opaque cover is the value boundary. It must name the canonical
 policy-bearing `SimpleArchive` source descriptor, and every member names one
@@ -264,15 +262,11 @@ would miss such paths. Merge order remains irrelevant because closure is
 derived only after the canonical semilattice join.
 
 The low-level `path_summary_union` module exposes the concrete law directly.
-`store.derive::<PathSummaryBlob>(source, automaton, policy)` identifies
-one target lattice by the handle of the collection it summarises, the
-`PathSummaryBlob` representation, the canonical automaton fingerprint, and its
-independent policy.
-`derive_element` lowers one canonical `SimpleArchive` into direct product arcs,
-`join` unions two summaries, and `validate_derive` / `validate_merge` bind all
-supplied blobs to the record's exact identities and recompute the claimed
-equations byte for byte. Those explicit validators are producer, ingress, or
-offline-audit tools; warm attachment does not invoke them:
+`store.attach::<PathSummaryBlob>(source, automaton)` identifies one attached
+collection by the handle of the root it summarises, the `PathSummaryBlob`
+representation and the canonical automaton fingerprint; it carries no policy.
+`derive_element` lowers one canonical `SimpleArchive` into direct product
+arcs, and the encoding's join unions two summaries:
 
 ```text
 paths(∅) = ⊥
@@ -280,7 +274,7 @@ paths(a ∪ b) = paths(a) ⊔ paths(b)
 ```
 
 The same derivation is available from the command line without writing Rust.
-`trible pile collection derive <pile> <source> path --expr '<expression>'`
+`trible pile collection attach <pile> <source> path --expr '<expression>'`
 registers the path summary collection; the expression names attributes by
 their 32-hex-digit ids, juxtaposition is sequence, `|` alternation, `*`, `+`
 and `?` the usual repetitions, `^` before an atom or group follows those edges

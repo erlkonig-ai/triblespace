@@ -1,12 +1,13 @@
+mod common;
+
 use std::collections::{BTreeMap, BTreeSet};
+
+use common::{Image, ImageFacts, IMAGE_MAPPING};
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use futures::executor::block_on;
 
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace_core::blob::encodings::succinctarchive::{
-    OrderedUniverse, SuccinctArchiveBlob, UnionArchive,
-};
 use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::{BlobEncoding, IntoBlob};
 use triblespace_core::capability::policy::{capability_handle, resource_policy};
@@ -20,7 +21,6 @@ use triblespace_core::collection::records::{
     collection_representation, collection_source, mapping_algorithm, KIND_COLLECTION_DESCRIPTOR,
     KIND_COLLECTION_MAPPING,
 };
-use triblespace_core::collection::succinctarchive_union::SIMPLE_TO_SUCCINCT_MAPPING_V1;
 use triblespace_core::collection::{
     collection_action_audience, collection_read_audience, grant_collection_capability,
     grant_collection_read, grant_collection_write, read_capability, write_capability,
@@ -191,7 +191,7 @@ fn typed_collection_reads_its_descriptor_local_policy() {
     let mut store = MemoryRepo::default();
     let source = store.collection("policy-source", source_policy).unwrap();
     let target = store
-        .derive::<SuccinctArchiveBlob>(source, (), target_policy.clone())
+        .derive::<Image>(source, (), target_policy.clone())
         .unwrap();
 
     let snapshot = store.snapshot().unwrap();
@@ -207,7 +207,7 @@ fn typed_collection_open_rejects_the_wrong_encoding() {
         .collection("source", policy(root.verifying_key()))
         .unwrap();
     let registered = store
-        .derive::<SuccinctArchiveBlob>(source, (), policy(root.verifying_key()))
+        .derive::<Image>(source, (), policy(root.verifying_key()))
         .unwrap();
 
     let snapshot = store.snapshot().unwrap();
@@ -313,17 +313,17 @@ fn annotations_and_opaque_ids_preserve_ordinary_maintenance() {
     let target_subject = rngid();
     let mapping_subject = rngid();
     let target = store
-        .register_collection::<SuccinctArchiveBlob>(entity! { &target_subject @
+        .register_collection::<Image>(entity! { &target_subject @
             metadata::tag: KIND_COLLECTION_DESCRIPTOR,
             collection_source: source.handle(),
             // A name annotates this derivation; it does not turn it into a root.
             collection_name: "annotated-derivation",
-            collection_representation: SuccinctArchiveBlob::id(),
+            collection_representation: <Image as triblespace_core::metadata::MetaDescribe>::id(),
             resource_policy*: expected_policy.read().binding(read_capability()),
             resource_policy*: expected_policy.write().binding(write_capability()),
             collection_mapping*: entity! { &mapping_subject @
                 metadata::tag: KIND_COLLECTION_MAPPING,
-                mapping_algorithm: SIMPLE_TO_SUCCINCT_MAPPING_V1,
+                mapping_algorithm: IMAGE_MAPPING,
                 metadata::name: "opaque mapping entity",
             },
         })
@@ -343,19 +343,12 @@ fn annotations_and_opaque_ids_preserve_ordinary_maintenance() {
         source
     );
     assert_eq!(
-        Collection::<SuccinctArchiveBlob>::open(&maintained, target.handle()).unwrap(),
+        Collection::<Image>::open(&maintained, target.handle()).unwrap(),
         target
     );
     let observed = maintained.collection(target).unwrap();
     assert_eq!(observed.support().unwrap().len(), 2);
-    assert_eq!(
-        observed
-            .view::<UnionArchive<OrderedUniverse>>()
-            .unwrap()
-            .iter()
-            .collect::<TribleSet>(),
-        expected,
-    );
+    assert_eq!(observed.view::<ImageFacts>().unwrap().0, expected,);
     let before = maintained
         .records()
         .unwrap()
@@ -634,9 +627,7 @@ fn custom_capability_grants_and_audiences_do_not_borrow_read_or_write_authority(
     // Explicit policy inspection/derivation retains the custom binding; the
     // source proof still cannot authorize the distinct derived resource.
     let copied_policy = source.policy(&after).unwrap();
-    let derived = store
-        .derive::<SuccinctArchiveBlob>(source, (), copied_policy)
-        .unwrap();
+    let derived = store.derive::<Image>(source, (), copied_policy).unwrap();
     let derived_snapshot = store.snapshot().unwrap();
     assert_eq!(
         collection_action_audience(&derived_snapshot, derived.handle(), delivery_action.id)

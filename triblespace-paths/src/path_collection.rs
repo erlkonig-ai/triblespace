@@ -1,152 +1,37 @@
-//! Direct collection lifecycle tests for regular-path summaries.
+//! Attached-collection lifecycle tests for regular-path summaries.
 
 #![cfg(test)]
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use futures::executor::block_on;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace_core::blob::encodings::UnknownBlob;
-use triblespace_core::blob::{Blob, BlobEncoding, Bytes, IntoBlob, TryFromBlob};
-use triblespace_core::capability::{CapabilityProof, CapabilityResource};
+use triblespace_core::blob::{Blob, IntoBlob, TryFromBlob};
 use triblespace_core::collection::simplearchive_union;
 use triblespace_core::collection::{
-    write_capability, Collection, CollectionCommit, CollectionDerive, CollectionEncoding,
-    CollectionMerge, CollectionPolicy, CollectionRead, CollectionRecord, CollectionSnapshotExt,
-    CollectionStore, CollectionStoreExt, Support,
+    Collection, CollectionAttachment, CollectionData, CollectionMap, CollectionMerge,
+    CollectionPolicy, CollectionRead, CollectionRecord, CollectionSnapshotExt, CollectionStore,
+    CollectionStoreExt, TryFromCover,
 };
 use triblespace_core::id::ExclusiveId;
 use triblespace_core::inline::encodings::hash::Handle;
-use triblespace_core::inline::{InlineEncoding, RawInline};
+use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::metadata;
 use triblespace_core::prelude::entity;
-use triblespace_core::repo::async_store::AsyncBlobStoreAcquire;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
-use triblespace_core::repo::{BlobStoreGet, BlobStorePut, CapabilityProofStore, SnapshotSource};
+use triblespace_core::repo::{BlobStoreGet, BlobStorePut, SnapshotSource};
 use triblespace_core::trible::{Fragment, TribleSet};
 
-use crate::path_summary_union;
 use crate::{Automaton, PathIndex, PathSummaryBlob, Step, Transition};
-
-/// The root commits a view stands for, following each root foundation up
-/// the view's descriptor chain through the leaves of every hop. Lattice v2
-/// supports are collection-local, so this is the only way a test can still
-/// say "this view stands for these commits".
-fn stood_for<R, E>(
-    view: &triblespace_core::collection::CollectionSnapshot<R, E>,
-) -> triblespace_core::collection::Support
-where
-    R: triblespace_core::repo::StoreRead,
-    E: triblespace_core::collection::CollectionEncoding,
-{
-    use triblespace_core::collection::{descriptor, Collection, SourceLocator};
-    use triblespace_core::inline::encodings::hash::Handle;
-    let snapshot = view.snapshot();
-    let mut chain = vec![view.cover().collection().handle()];
-    loop {
-        let facts: triblespace_core::trible::TribleSet =
-            snapshot.get(*chain.last().unwrap()).unwrap();
-        match descriptor::source(&facts).unwrap() {
-            Some(source) => chain.push(source),
-            None => break,
-        }
-    }
-    let root: Collection<triblespace_core::blob::encodings::simplearchive::SimpleArchive> =
-        Collection::open(snapshot, *chain.last().unwrap()).unwrap();
-    let scope: std::collections::BTreeSet<_> = chain.iter().copied().collect();
-    let coverage = snapshot.coverage(&scope).unwrap();
-    let top: std::collections::BTreeSet<[u8; 32]> = view
-        .support()
-        .unwrap()
-        .members()
-        .map(|member| member.raw)
-        .collect();
-    let (foundations, _) = coverage.frontier_support(root.handle());
-    root.cover(
-        foundations
-            .iter_ordered()
-            .filter(|raw| {
-                let mut images = std::collections::BTreeSet::from([**raw]);
-                for hop in chain.iter().rev().skip(1) {
-                    images = images
-                        .iter()
-                        .flat_map(|image| coverage.leaf_outputs(*hop, SourceLocator::of(*image)))
-                        .map(|output| output.raw)
-                        .collect();
-                }
-                images.iter().any(|image| top.contains(image))
-            })
-            .map(|raw| Handle::from_hash(triblespace_core::inline::Inline::new(*raw)))
-            .collect::<Vec<_>>(),
-    )
-}
-
-#[derive(Default)]
-struct CollectionOnly(MemoryRepo);
-
-impl BlobStorePut for CollectionOnly {
-    type PutError = <MemoryRepo as BlobStorePut>::PutError;
-
-    fn put<E, T>(
-        &mut self,
-        item: T,
-    ) -> Result<triblespace_core::inline::Inline<Handle<E>>, Self::PutError>
-    where
-        E: BlobEncoding + 'static,
-        T: triblespace_core::blob::IntoBlob<E>,
-        Handle<E>: InlineEncoding,
-    {
-        self.0.put(item)
-    }
-}
-
-impl SnapshotSource for CollectionOnly {
-    type Snapshot = <MemoryRepo as SnapshotSource>::Snapshot;
-    type SnapshotError = <MemoryRepo as SnapshotSource>::SnapshotError;
-
-    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
-        self.0.snapshot()
-    }
-}
-
-impl AsyncBlobStoreAcquire for CollectionOnly {
-    type AcquireError = <MemoryRepo as AsyncBlobStoreAcquire>::AcquireError;
-
-    fn acquire(
-        &mut self,
-        handle: triblespace_core::inline::Inline<Handle<UnknownBlob>>,
-    ) -> impl std::future::Future<Output = Result<Option<Bytes>, Self::AcquireError>> + Send {
-        self.0.acquire(handle)
-    }
-}
-
-impl CollectionStore for CollectionOnly {
-    type InsertError = <MemoryRepo as CollectionStore>::InsertError;
-
-    fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
-        self.0.insert(record)
-    }
-}
-
-impl CapabilityProofStore for CollectionOnly {
-    type InsertError = <MemoryRepo as CapabilityProofStore>::InsertError;
-
-    fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
-        self.0.insert_proof(proof)
-    }
-}
 
 fn id(byte: u8) -> triblespace_core::id::Id {
     triblespace_core::id::Id::new([byte; 16]).unwrap()
 }
 
-fn authority_key() -> SigningKey {
+fn host_key() -> SigningKey {
     SigningKey::from_bytes(&[1; 32])
-}
-
-fn authority() -> VerifyingKey {
-    authority_key().verifying_key()
 }
 
 fn policy(authority: VerifyingKey) -> CollectionPolicy {
@@ -154,18 +39,6 @@ fn policy(authority: VerifyingKey) -> CollectionPolicy {
         triblespace_core::collection::AdmissionPolicy::direct(authority),
         triblespace_core::collection::AdmissionPolicy::direct(authority),
     )
-}
-
-fn test_paths(
-    store: &mut CollectionOnly,
-    name: &str,
-    automaton: Automaton,
-) -> (Collection<SimpleArchive>, Collection<PathSummaryBlob>) {
-    let source = store.collection(name, policy(authority())).unwrap();
-    let target = store
-        .derive::<PathSummaryBlob>(source, automaton, policy(authority()))
-        .unwrap();
-    (source, target)
 }
 
 fn plus() -> Automaton {
@@ -186,115 +59,77 @@ fn edge(source: u8, target: u8) -> TribleSet {
     entity! { ExclusiveId::force_ref(&source) @ metadata::tag: id(target) }.into_facts()
 }
 
-fn put_data(store: &mut CollectionOnly, facts: &TribleSet) -> Blob<SimpleArchive> {
-    let blob = facts.to_blob();
-    store.put::<SimpleArchive, _>(blob.clone()).unwrap();
-    blob
+/// A store hosted by the maintaining key, a root and its path summary.
+fn attached_paths(
+    name: &str,
+) -> (
+    MemoryRepo,
+    Collection<SimpleArchive>,
+    Collection<PathSummaryBlob>,
+) {
+    let key = host_key();
+    let mut store = MemoryRepo::for_host(key.verifying_key());
+    let root = store.collection(name, policy(key.verifying_key())).unwrap();
+    let target = store.attach::<PathSummaryBlob>(root, plus()).unwrap();
+    (store, root, target)
 }
 
-fn signed_commit(
-    store: &mut CollectionOnly,
-    collection: Collection<SimpleArchive>,
-    key: u8,
-    data: &Blob<SimpleArchive>,
-) -> CollectionCommit {
-    let metadata = store
-        .put::<SimpleArchive, _>(TribleSet::new().to_blob())
-        .unwrap();
-    CollectionCommit::sign(
-        &SigningKey::from_bytes(&[key; 32]),
-        collection.handle(),
-        Handle::<SimpleArchive>::to_hash(data.get_handle()),
-        metadata,
-    )
-}
-
-fn publish(store: &mut CollectionOnly, commit: CollectionCommit) {
-    store.insert(CollectionRecord::Commit(commit)).unwrap();
-}
-
-fn support(
-    store: &mut CollectionOnly,
-    collection: Collection<SimpleArchive>,
-    commits: impl IntoIterator<Item = CollectionCommit>,
-) -> Support {
-    let root = authority_key();
-    let mut writers: Vec<_> = commits
-        .into_iter()
-        .map(|commit| VerifyingKey::from_bytes(&commit.public_key().raw).unwrap())
-        .filter(|writer| *writer != root.verifying_key())
-        .collect();
-    writers.sort_unstable_by_key(VerifyingKey::to_bytes);
-    writers.dedup();
-    for writer in writers {
-        let proof = CapabilityProof::new(
-            CapabilityResource::from(collection.handle()),
-            &root,
-            write_capability(),
-            writer,
-        );
-        store.insert_proof(proof).unwrap();
-    }
-    collection.admitted(&store.snapshot().unwrap()).unwrap()
-}
-
-fn records(store: &mut CollectionOnly) -> Vec<CollectionRecord> {
-    store
-        .snapshot()
-        .unwrap()
-        .records()
-        .unwrap()
-        .map(Result::unwrap)
-        .collect()
-}
-
-fn descriptor_for<L>(store: &mut CollectionOnly, collection: Collection<L>) -> Fragment
+fn descriptor_for<L>(store: &mut MemoryRepo, collection: Collection<L>) -> Fragment
 where
-    L: CollectionEncoding,
+    L: triblespace_core::collection::CollectionEncoding,
 {
     let snapshot = store.snapshot().unwrap();
     let blob: Blob<SimpleArchive> = snapshot.get(collection.handle()).unwrap();
     Fragment::from(TribleSet::try_from_blob(blob).unwrap())
 }
 
-fn assert_cross_fragment_path(index: &PathIndex) {
-    assert!(index.contains(&RawInline::from(id(1)), &RawInline::from(id(3))));
+fn maps(store: &mut MemoryRepo, collection: Collection<PathSummaryBlob>) -> usize {
+    store
+        .snapshot()
+        .unwrap()
+        .records()
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|record| {
+            matches!(record, CollectionRecord::Map(map) if map.collection() == collection.handle())
+        })
+        .count()
 }
 
 #[test]
-fn source_and_target_policies_are_independent() {
-    let mut store = CollectionOnly::default();
-    let source = store.collection("paths", policy(authority())).unwrap();
-    let target = store
-        .derive::<PathSummaryBlob>(
-            source,
-            plus(),
-            policy(SigningKey::from_bytes(&[2; 32]).verifying_key()),
-        )
-        .unwrap();
-    let other_source = store
-        .collection(
-            "paths",
-            policy(SigningKey::from_bytes(&[3; 32]).verifying_key()),
-        )
-        .unwrap();
-    let other_target = store
-        .derive::<PathSummaryBlob>(
-            other_source,
-            plus(),
-            policy(SigningKey::from_bytes(&[2; 32]).verifying_key()),
-        )
-        .unwrap();
-
-    assert_ne!(source, other_source);
-    assert_ne!(target, other_target);
+fn an_attached_summary_names_its_parent_and_carries_no_policy() {
+    let (mut store, root, target) = attached_paths("edges");
+    let descriptor = descriptor_for(&mut store, target);
+    assert_eq!(
+        triblespace_core::collection::descriptor::parents(descriptor.facts()),
+        Ok(vec![root.handle()])
+    );
+    assert_eq!(
+        triblespace_core::collection::descriptor::capability_policies(descriptor.facts(), None)
+            .count(),
+        0
+    );
+    let root_descriptor = descriptor_for(&mut store, root);
+    assert_eq!(
+        <PathSummaryBlob as CollectionAttachment>::bind(&root_descriptor, &descriptor).unwrap(),
+        plus()
+    );
 }
 
+/// A persisted summary whose fixed representation claims more rows than its
+/// automaton can have is malformed, whatever it is attached to: validating
+/// it is fatal, not a capacity limit a finer cover could get around.
 #[test]
 fn malformed_fixed_representation_capacity_is_fatal() {
     let automaton = Automaton::new(u32::MAX, [0], [0], []).unwrap();
-    let mut store = CollectionOnly::default();
-    let (_, target) = test_paths(&mut store, "paths", automaton.clone());
+    let key = host_key();
+    let mut store = MemoryRepo::for_host(key.verifying_key());
+    let root = store
+        .collection("paths", policy(key.verifying_key()))
+        .unwrap();
+    let target = store
+        .attach::<PathSummaryBlob>(root, automaton.clone())
+        .unwrap();
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&crate::automaton_fingerprint(&automaton).raw);
     bytes.extend_from_slice(&automaton.state_count().to_le_bytes());
@@ -306,288 +141,240 @@ fn malformed_fixed_representation_capacity_is_fatal() {
     let descriptor = descriptor_for(&mut store, target);
     let reader = store.snapshot().unwrap();
     assert!(matches!(
-        <PathSummaryBlob as CollectionEncoding>::validate_member(&descriptor, &persisted, &reader,),
+        <PathSummaryBlob as triblespace_core::collection::CollectionEncoding>::validate_member(
+            &descriptor,
+            &persisted,
+            &reader,
+        ),
         Err(triblespace_core::collection::CollectionOperationError::Fatal(_))
     ));
 }
 
 #[test]
-fn empty_support_is_local_bottom_and_writes_nothing() {
-    let mut store = CollectionOnly::default();
-    let (source, target) = test_paths(&mut store, "paths", plus());
-    let blobs = store.0.blobs.len();
-    let record_count = records(&mut store).len();
-    let support = support(&mut store, source, []);
-    assert!(support.is_empty());
-    let snapshot = block_on(store.maintain(target, &authority_key())).unwrap();
-    let observed = snapshot.collection(target).unwrap();
-    assert_eq!(stood_for(&observed), support);
-    let index: Arc<PathIndex> = observed.view().unwrap();
+fn an_empty_parent_is_bottom_and_maintenance_writes_nothing() {
+    let (mut store, _root, target) = attached_paths("empty-edges");
+    let snapshot = block_on(store.maintain_attached(target, &host_key())).unwrap();
+    assert_eq!(maps(&mut store, target), 0);
+    let attached = snapshot.attached(target).unwrap();
+    assert!(attached.cover().is_empty());
+    assert!(attached.residual().is_empty());
+    let index: Arc<PathIndex> = attached.view().unwrap();
     assert_eq!(index.accepted_pair_count(), 0);
-    assert_eq!(store.0.blobs.len(), blobs);
-    assert_eq!(records(&mut store).len(), record_count);
 }
 
 #[test]
-fn missing_then_maintain_closes_cross_fragment_path() {
-    let mut store = CollectionOnly::default();
-    let (source, target) = test_paths(&mut store, "paths", plus());
-    let left = put_data(&mut store, &edge(1, 2));
-    let right = put_data(&mut store, &edge(2, 3));
-    // The maintaining key wrote both fragments, so both are its to derive.
-    let first = signed_commit(&mut store, source, 1, &left);
-    let second = signed_commit(&mut store, source, 1, &right);
-    publish(&mut store, first);
-    publish(&mut store, second);
-    let support = support(&mut store, source, [first, second]);
-    // Admitted but not yet derived data is absent from a read: until it is
-    // maintained, the target stands on nothing.
-    let before = store.snapshot().unwrap();
-    let unrealized = before.collection(target).unwrap();
-    assert!(unrealized.cover().is_empty());
-    assert!(unrealized.support().unwrap().is_empty());
-    assert_eq!(
-        unrealized
-            .missing_from(&before.collection(source).unwrap())
-            .unwrap(),
-        support
-    );
-
-    let after = block_on(store.maintain(target, &authority_key())).unwrap();
-    let observed = after.collection(target).unwrap();
-    assert_eq!(stood_for(&observed), support);
-    assert!(observed
-        .missing_from(&after.collection(source).unwrap())
-        .unwrap()
-        .is_empty());
-    assert_cross_fragment_path(&observed.view::<Arc<PathIndex>>().unwrap());
+fn a_path_across_two_nodes_closes_over_the_attached_cover() {
+    let (mut store, root, target) = attached_paths("split-edges");
+    let key = host_key();
+    for (source, target_vertex) in [(1, 2), (2, 3)] {
+        store
+            .commit(root, &key, Fragment::from(edge(source, target_vertex)))
+            .unwrap();
+    }
+    let snapshot = block_on(store.ensure_attached(target, &key)).unwrap();
+    assert_eq!(maps(&mut store, target), 2);
+    let attached = snapshot.attached(target).unwrap();
+    assert_eq!(attached.cover().len(), 2);
+    let index: Arc<PathIndex> = attached.view().unwrap();
+    assert!(index.contains(&RawInline::from(id(1)), &RawInline::from(id(3))));
+    // A second pass has nothing to attach.
+    block_on(store.ensure_attached(target, &key)).unwrap();
+    assert_eq!(maps(&mut store, target), 2);
 }
 
 #[test]
-fn another_writers_fragment_waits_for_ensure_but_not_for_maintenance() {
-    let mut store = CollectionOnly::default();
-    let (source, target) = test_paths(&mut store, "paths", plus());
-    let left = put_data(&mut store, &edge(1, 2));
-    let right = put_data(&mut store, &edge(2, 3));
-    let first = signed_commit(&mut store, source, 1, &left);
-    let second = signed_commit(&mut store, source, 2, &right);
-    publish(&mut store, first);
-    publish(&mut store, second);
-    support(&mut store, source, [first, second]);
-
-    // A write's ensure derives what its key wrote; the other writer's
-    // fragment is that writer's lag, and freshness names exactly it.
-    let ensured = block_on(store.ensure(target, &authority_key())).unwrap();
-    let observed = ensured.collection(target).unwrap();
-    assert_eq!(stood_for(&observed).len(), 1);
-    let missing = observed
-        .missing_from(&ensured.collection(source).unwrap())
-        .unwrap();
-    assert_eq!(
-        missing.members().collect::<Vec<_>>(),
-        vec![right.get_handle()]
-    );
-    let index: Arc<PathIndex> = observed.view().unwrap();
-    assert!(!index.contains(&RawInline::from(id(1)), &RawInline::from(id(3))));
-
-    // Maintenance derives it anyway: a derive is a function, so a reader
-    // never waits on a writer who is absent.
-    let after = block_on(store.maintain(target, &authority_key())).unwrap();
-    let observed = after.collection(target).unwrap();
-    assert_eq!(stood_for(&observed).len(), 2);
-    let missing = observed
-        .missing_from(&after.collection(source).unwrap())
-        .unwrap();
-    assert_eq!(missing.members().count(), 0);
+fn a_merged_node_is_attached_once_after_the_carry() {
+    let (mut store, root, target) = attached_paths("chain-edges");
+    let key = host_key();
+    for step in 1..=8u8 {
+        store
+            .commit(root, &key, Fragment::from(edge(step, step + 1)))
+            .unwrap();
+    }
+    // One pass: the eight commits are carried into one merge, and only that
+    // node is attached.
+    let snapshot = block_on(store.maintain_attached(target, &key)).unwrap();
+    assert_eq!(maps(&mut store, target), 1);
+    let attached = snapshot.attached(target).unwrap();
+    assert_eq!(attached.cover().len(), 1);
+    assert_eq!(attached.support().len(), 8);
+    let index: Arc<PathIndex> = attached.view().unwrap();
+    assert!(index.contains(&RawInline::from(id(1)), &RawInline::from(id(9))));
 }
 
-#[test]
-fn duplicate_payload_provenance_shares_one_derive() {
-    let mut store = CollectionOnly::default();
-    let (source, target) = test_paths(&mut store, "paths", plus());
-    let data = put_data(&mut store, &edge(1, 2));
-    let first = signed_commit(&mut store, source, 1, &data);
-    let second = signed_commit(&mut store, source, 2, &data);
-    publish(&mut store, first);
-    publish(&mut store, second);
-    let support = support(&mut store, source, [first, first, second]);
-    assert_eq!(support.len(), 1);
-    block_on(store.ensure(target, &authority_key())).unwrap();
-    let derives = records(&mut store)
-        .into_iter()
-        .filter(|record| {
-            matches!(record, CollectionRecord::Derive(claim)
-                if claim.collection() == target.handle())
-        })
-        .count();
-    assert_eq!(derives, 1);
+/// splitmix64: a deterministic stream for the property test.
+struct Stream(u64);
+
+impl Stream {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn below(&mut self, bound: u64) -> u64 {
+        self.next() % bound
+    }
 }
 
-#[test]
-fn resident_source_merge_is_lowered_once() {
-    let mut store = CollectionOnly::default();
-    let automaton = plus();
-    let (source, target) = test_paths(&mut store, "paths", automaton.clone());
-    let left = put_data(&mut store, &edge(1, 2));
-    let right = put_data(&mut store, &edge(2, 3));
-    let first = signed_commit(&mut store, source, 1, &left);
-    let second = signed_commit(&mut store, source, 1, &right);
-    publish(&mut store, first);
-    publish(&mut store, second);
-    let joined = simplearchive_union::join(&left, &right).unwrap();
-    store.put::<SimpleArchive, _>(joined.clone()).unwrap();
-    let joined_data = Handle::<SimpleArchive>::to_hash(joined.get_handle());
-    store
-        .insert(CollectionRecord::Merge(
-            CollectionMerge::sign(
-                &authority_key(),
-                source.handle(),
-                [first.data(), second.data()],
-                joined_data,
-            )
-            .unwrap(),
-        ))
-        .unwrap();
-    let support = support(&mut store, source, [first, second]);
+/// Every believed node of `root`'s lattice: the frontier and everything the
+/// host's joins name beneath it.
+fn lattice_nodes<R: triblespace_core::repo::StoreRead>(
+    snapshot: &R,
+    root: Collection<SimpleArchive>,
+) -> Vec<CollectionData> {
+    let coverage = snapshot.coverage(&BTreeSet::from([root.handle()])).unwrap();
+    let mut seen = BTreeSet::new();
+    let mut pending: Vec<CollectionData> = coverage.frontier(root.handle()).collect();
+    while let Some(node) = pending.pop() {
+        if !seen.insert(node) {
+            continue;
+        }
+        for inputs in coverage.producers(root.handle(), node) {
+            pending.extend(inputs.iter());
+        }
+    }
+    seen.into_iter().collect()
+}
 
-    let snapshot = block_on(store.maintain(target, &authority_key())).unwrap();
-    let observed = snapshot.collection(target).unwrap();
-    assert_eq!(stood_for(&observed), support);
-    assert_cross_fragment_path(&observed.view::<Arc<PathIndex>>().unwrap());
-    // One leaf per source foundation, never one for the merged node, and
-    // the source MERGE lowered once: a target MERGE of the two leaf images
-    // whose result is the merged node's own bytes mapped.
-    let published = records(&mut store);
-    let mut leaves: Vec<_> = published
-        .iter()
-        .filter_map(|record| match record {
-            CollectionRecord::Derive(claim) if claim.collection() == target.handle() => {
-                Some(claim.input())
+/// Cover-query equivalence: over random lattices (commits, the host's carry,
+/// extra host merges with overlapping inputs, absorptions) and random
+/// attachment presence, the paths the attached cover closes -- with the
+/// residual built in memory -- are exactly the paths of the summary of the
+/// union of every foundation.
+#[test]
+fn attached_covers_answer_like_the_summary_of_the_union() {
+    for seed in 0..24u64 {
+        let mut random = Stream(seed.wrapping_mul(0x51D7_348D_A7C9_2E11) + 7);
+        let (mut store, root, target) = attached_paths(&format!("random-{seed}"));
+        let key = host_key();
+        let automaton = plus();
+        let commits = 2 + random.below(18) as usize;
+        let mut union = TribleSet::new();
+        for _ in 0..commits {
+            let mut facts = TribleSet::new();
+            for _ in 0..1 + random.below(3) {
+                facts += edge(1 + random.below(6) as u8, 1 + random.below(6) as u8);
             }
-            _ => None,
-        })
-        .collect();
-    leaves.sort();
-    let mut expected = vec![
-        triblespace_core::collection::SourceLocator::of(first.data().raw),
-        triblespace_core::collection::SourceLocator::of(second.data().raw),
-    ];
-    expected.sort();
-    assert_eq!(leaves, expected);
-    let mirrors: Vec<_> = published
-        .iter()
-        .filter_map(|record| match record {
-            CollectionRecord::Merge(merge) if merge.collection() == target.handle() => Some(*merge),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(mirrors.len(), 1);
-    let image = |blob: &Blob<SimpleArchive>| {
-        Handle::<PathSummaryBlob>::to_hash(
-            path_summary_union::derive_element(blob, &automaton)
-                .unwrap()
-                .get_handle(),
+            union += facts.clone();
+            store.commit(root, &key, Fragment::from(facts)).unwrap();
+        }
+        if random.below(2) == 0 {
+            block_on(store.maintain(root, &key)).unwrap();
+        }
+        // Host merges over random, possibly overlapping, nodes, and
+        // absorptions of a node into one that already covers it.
+        for _ in 0..random.below(4) {
+            let snapshot = store.snapshot().unwrap();
+            let nodes = lattice_nodes(&snapshot, root);
+            if nodes.len() < 2 {
+                break;
+            }
+            let picked: BTreeSet<CollectionData> = (0..2 + random.below(2))
+                .map(|_| nodes[random.below(nodes.len() as u64) as usize])
+                .collect();
+            if picked.len() < 2 {
+                continue;
+            }
+            let blobs: Vec<Blob<SimpleArchive>> = picked
+                .iter()
+                .map(|node| {
+                    snapshot
+                        .get(Handle::<SimpleArchive>::from_hash(*node))
+                        .unwrap()
+                })
+                .collect();
+            drop(snapshot);
+            let joined = blobs.iter().skip(1).fold(blobs[0].clone(), |joined, blob| {
+                simplearchive_union::join(&joined, blob).unwrap()
+            });
+            let result = store.put::<SimpleArchive, _>(joined).unwrap();
+            store
+                .insert(CollectionRecord::Merge(
+                    CollectionMerge::sign(
+                        &key,
+                        root.handle(),
+                        picked.iter().copied(),
+                        Handle::<SimpleArchive>::to_hash(result),
+                    )
+                    .unwrap(),
+                ))
+                .unwrap();
+        }
+        // Random attachment presence, at any node.
+        let snapshot = store.snapshot().unwrap();
+        for node in lattice_nodes(&snapshot, root) {
+            if random.below(2) == 0 {
+                continue;
+            }
+            let bytes: Blob<SimpleArchive> = snapshot
+                .get(Handle::<SimpleArchive>::from_hash(node))
+                .unwrap();
+            let image =
+                <PathSummaryBlob as CollectionAttachment>::map(&automaton, &bytes, &[], &snapshot)
+                    .unwrap();
+            let attachment = store.put::<PathSummaryBlob, _>(image).unwrap();
+            store
+                .insert(CollectionRecord::Map(CollectionMap::sign(
+                    &key,
+                    target.handle(),
+                    node,
+                    Handle::<PathSummaryBlob>::to_hash(attachment),
+                )))
+                .unwrap();
+        }
+        drop(snapshot);
+
+        let snapshot = store.snapshot().unwrap();
+        let attached = snapshot.attached(target).unwrap();
+        let mut members: Vec<Inline<Handle<PathSummaryBlob>>> =
+            attached.cover().members().collect();
+        // The residual, built in memory from the parent's own nodes.
+        let residual: Vec<_> = attached.residual().members().collect();
+        drop(attached);
+        drop(snapshot);
+        for foundation in residual {
+            let snapshot = store.snapshot().unwrap();
+            let bytes: Blob<SimpleArchive> = snapshot.get(foundation).unwrap();
+            let image =
+                <PathSummaryBlob as CollectionAttachment>::map(&automaton, &bytes, &[], &snapshot)
+                    .unwrap();
+            drop(snapshot);
+            members.push(store.put::<PathSummaryBlob, _>(image).unwrap());
+        }
+        let expected_image = <PathSummaryBlob as CollectionAttachment>::map(
+            &automaton,
+            &union.to_blob(),
+            &[],
+            &store.snapshot().unwrap(),
         )
-    };
-    let mut images = vec![image(&left), image(&right)];
-    images.sort_by(|a, b| a.raw.cmp(&b.raw));
-    assert_eq!(mirrors[0].inputs(), images.as_slice());
-    assert_eq!(mirrors[0].result(), image(&joined));
-    assert_eq!(observed.cover().len(), 1);
+        .unwrap();
+        let expected_member = store.put::<PathSummaryBlob, _>(expected_image).unwrap();
 
-    // Lowered once: a second pass publishes nothing.
-    drop(observed);
-    drop(snapshot);
-    block_on(store.maintain(target, &authority_key())).unwrap();
-    assert_eq!(records(&mut store), published);
-}
-
-#[test]
-fn existing_target_merge_is_selected_as_one_physical_member() {
-    let mut store = CollectionOnly::default();
-    let automaton = plus();
-    let (source, target) = test_paths(&mut store, "paths", automaton.clone());
-    let left = put_data(&mut store, &edge(1, 2));
-    let right = put_data(&mut store, &edge(2, 3));
-    let first = signed_commit(&mut store, source, 1, &left);
-    let second = signed_commit(&mut store, source, 2, &right);
-    publish(&mut store, first);
-    publish(&mut store, second);
-    let left_summary = path_summary_union::derive_element(&left, &automaton).unwrap();
-    let right_summary = path_summary_union::derive_element(&right, &automaton).unwrap();
-    let derives = [(first, &left_summary), (second, &right_summary)].map(|(input, output)| {
-        store.put::<PathSummaryBlob, _>(output.clone()).unwrap();
-        let record = CollectionDerive::sign(
-            &authority_key(),
-            target.handle(),
-            triblespace_core::collection::SourceLocator::of(input.data().raw),
-            Handle::<PathSummaryBlob>::to_hash(output.get_handle()),
+        let descriptor = descriptor_for(&mut store, target);
+        let snapshot = store.snapshot().unwrap();
+        let through_cover: Arc<PathIndex> =
+            TryFromCover::try_from_cover(&target.cover(members), &descriptor, &snapshot).unwrap();
+        let through_union: Arc<PathIndex> =
+            TryFromCover::try_from_cover(&target.cover([expected_member]), &descriptor, &snapshot)
+                .unwrap();
+        let pairs = |index: &PathIndex| {
+            let mut pairs = BTreeSet::new();
+            for source in 1..=6u8 {
+                for sink in 1..=6u8 {
+                    if index.contains(&RawInline::from(id(source)), &RawInline::from(id(sink))) {
+                        pairs.insert((source, sink));
+                    }
+                }
+            }
+            pairs
+        };
+        assert_eq!(
+            pairs(&through_cover),
+            pairs(&through_union),
+            "seed {seed}: a cover of attachments must answer like the union"
         );
-        store.insert(CollectionRecord::Derive(record)).unwrap();
-        record
-    });
-    let joined = PathSummaryBlob::join(&left_summary, &right_summary, &automaton).unwrap();
-    store.put::<PathSummaryBlob, _>(joined.clone()).unwrap();
-    let joined_data = Handle::<PathSummaryBlob>::to_hash(joined.get_handle());
-    store
-        .insert(CollectionRecord::Merge(
-            CollectionMerge::sign(
-                &authority_key(),
-                target.handle(),
-                [derives[0].output(), derives[1].output()],
-                joined_data,
-            )
-            .unwrap(),
-        ))
-        .unwrap();
-    let support = support(&mut store, source, [first, second]);
-    let snapshot = store.snapshot().unwrap();
-    let observation = snapshot.collection(target).unwrap();
-    assert_eq!(observation.cover().len(), 1);
-    assert_eq!(
-        observation.cover().members().next().unwrap(),
-        joined.get_handle()
-    );
-    assert_eq!(stood_for(&observation), support);
-    assert_cross_fragment_path(&observation.view::<Arc<PathIndex>>().unwrap());
-}
-
-#[test]
-fn absent_source_bytes_delay_residency_but_not_record_admission() {
-    let mut store = CollectionOnly::default();
-    let (source, target) = test_paths(&mut store, "paths", plus());
-    let absent = edge(1, 2).to_blob();
-    let metadata = store
-        .put::<SimpleArchive, _>(TribleSet::new().to_blob())
-        .unwrap();
-    let commit = CollectionCommit::sign(
-        &SigningKey::from_bytes(&[5; 32]),
-        source.handle(),
-        Handle::<SimpleArchive>::to_hash(absent.get_handle()),
-        metadata,
-    );
-    publish(&mut store, commit);
-    let support = support(&mut store, source, [commit]);
-    assert_eq!(support.len(), 1);
-    assert!(support.contains(absent.get_handle()));
-    let before_records = records(&mut store);
-    let before = store.snapshot().unwrap();
-    // The commit is admitted, but its bytes are not here: neither the source
-    // nor the target has a resident member to stand on.
-    assert!(before.collection(source).unwrap().cover().is_empty());
-    assert!(before.collection(target).unwrap().cover().is_empty());
-
-    store.put::<SimpleArchive, _>(absent.clone()).unwrap();
-    let after = store.snapshot().unwrap();
-    assert_eq!(source.admitted(&after).unwrap(), support);
-    let source_view = after.collection(source).unwrap();
-    assert_eq!(source_view.support().unwrap(), &support);
-    assert_eq!(source_view.view::<TribleSet>().unwrap(), edge(1, 2));
-    assert_eq!(records(&mut store), before_records);
-    assert!(before.collection(source).unwrap().cover().is_empty());
-    // Arriving source bytes need no new COMMIT, but do not manufacture a
-    // target DERIVE: the target still stands on nothing.
-    let target_view = after.collection(target).unwrap();
-    assert!(target_view.cover().is_empty());
-    assert!(target_view.support().unwrap().is_empty());
+    }
 }

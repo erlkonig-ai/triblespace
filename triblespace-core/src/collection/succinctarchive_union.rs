@@ -1,47 +1,43 @@
-//! Canonical raw SuccinctArchive set union and its derivation from
-//! [`SimpleArchive`](crate::blob::encodings::simplearchive::SimpleArchive).
+//! Canonical raw SuccinctArchive set union, and the Succinct and Rank9
+//! indexes attached to a [`SimpleArchive`](crate::blob::encodings::simplearchive::SimpleArchive)
+//! root.
 //!
 //! SimpleArchive and raw SuccinctArchive each own canonical set union for
-//! their bytes. The target-owned derivation witnesses that the canonical
-//! conversion preserves those joins:
+//! their bytes, and the canonical conversion preserves it:
 //!
 //! ```text
 //! succinct(a ∪ b) = succinct(a) ∪ succinct(b)
 //! ```
 //!
-//! This module can explicitly validate those `DERIVE` and `MERGE` equations at
-//! producer, ingress, or offline-audit boundaries. Warm collection resolution
-//! does not replay them. It does not authorize commits, select semantic roots,
-//! retain artifacts, or assign authority to construction records. Storage
-//! believes a signed `DERIVE` when its signer may write the target, and a
-//! signed `MERGE` only when the store's own host key signed it.
+//! Both indexes are attached collections: a Succinct archive of a node is
+//! mapped from the node's own bytes, a merged node's from the merged
+//! `SimpleArchive`, and a Rank9 accelerator from the same node's Succinct
+//! attachment, which its attached descriptor names. Neither has merges of
+//! its own, and a host believes only the MAPs it signed.
 
 use super::descriptor as descriptor_facts;
-use super::records::{mapping_algorithm, RecordDecodeError, KIND_COLLECTION_MAPPING};
-#[cfg(test)]
-use super::CollectionPolicy;
+use super::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
 use crate::id::ExclusiveId;
 use crate::metadata;
 use crate::prelude::entity;
 use crate::trible::Fragment;
-use std::error::Error;
-use std::fmt;
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::succinctarchive::{
     merge_ordered_archives, OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchive,
     SuccinctArchiveBlob, SuccinctArchiveRawBuildError, SuccinctArchiveRawMergeError,
 };
-use crate::blob::{Blob, BlobEncoding};
+use crate::blob::Blob;
 use crate::id::Id;
 use crate::id_hex;
 use crate::inline::encodings::hash::Handle;
 use crate::metadata::MetaDescribe;
 use crate::repo::{BlobStoreGet, BlobStoreMeta};
 
+use super::records::mapping_reads_attached;
 use super::{
-    CollectionData, CollectionDerivation, CollectionDerive, CollectionEncoding, CollectionHandle,
-    CollectionMerge, CollectionOperationError, SourceLocator,
+    Collection, CollectionAttachment, CollectionData, CollectionEncoding, CollectionHandle,
+    CollectionOperationError,
 };
 
 mod collection;
@@ -268,8 +264,7 @@ fn mapping_fragment() -> Fragment {
     }
 }
 
-impl CollectionDerivation for SuccinctArchiveBlob {
-    type Source = SimpleArchive;
+impl CollectionAttachment for SuccinctArchiveBlob {
     type Argument = ();
 
     fn fragment(_argument: &Self::Argument) -> Fragment {
@@ -277,10 +272,10 @@ impl CollectionDerivation for SuccinctArchiveBlob {
     }
 
     fn bind(
-        _source: &Fragment,
-        target: &Fragment,
+        _parent: &Fragment,
+        attached: &Fragment,
     ) -> Result<Self::Argument, CollectionOperationError> {
-        let actual = descriptor_facts::mapping_algorithm(target.facts())
+        let actual = descriptor_facts::mapping_algorithm(attached.facts())
             .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?;
         let expected = Some(SIMPLE_TO_SUCCINCT_MAPPING_V1);
         if actual != expected {
@@ -293,15 +288,18 @@ impl CollectionDerivation for SuccinctArchiveBlob {
         Ok(())
     }
 
+    /// A node's Succinct archive, from the node's own bytes: a merged node's
+    /// from the merged `SimpleArchive`, never from its children's archives.
     fn map<R>(
         _argument: &Self::Argument,
-        source: &Blob<SimpleArchive>,
+        node: &Blob<SimpleArchive>,
+        _siblings: &[CollectionData],
         _reader: &R,
     ) -> Result<Blob<SuccinctArchiveBlob>, CollectionOperationError>
     where
-        R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
+        R: crate::repo::StoreRead,
     {
-        derive_element(source).map_err(|source| match source {
+        derive_element(node).map_err(|source| match source {
             SuccinctArchiveRawBuildError::TooManyRows(_)
             | SuccinctArchiveRawBuildError::DomainTooWide(_) => {
                 CollectionOperationError::Capacity(source.to_string())
@@ -344,7 +342,7 @@ impl MetaDescribe for RawToRank9AcceleratedMappingV1 {
         entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::name: "raw-to-rank9-accelerated-succinctarchive-v1",
-                metadata::description: "Canonical join-homomorphic mapping from one portable SuccinctArchive member to its ABI-qualified Rank9-accelerated encoding. Raw and accelerated collections are full lattices. Each mapping hop is explicit over invariant foundational support; accelerated maintenance may consume an already-resident raw-union dependency but never creates upstream raw state.",
+                metadata::description: "Canonical mapping from one portable SuccinctArchive to its ABI-qualified Rank9-accelerated encoding, whose header names that archive. Attached to a SimpleArchive root, it maps each node's attachment in the Succinct attached collection its mapping names; the accelerator is usable only where that archive is resident.",
                 metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
         }
     }
@@ -364,26 +362,31 @@ pub const fn current_rank9_accelerated_mapping_algorithm() -> Id {
     CURRENT_RANK9_ACCELERATED_MAPPING
 }
 
-fn rank9_accelerated_mapping_fragment() -> Fragment {
+fn rank9_accelerated_mapping_fragment(succinct: Collection<SuccinctArchiveBlob>) -> Fragment {
     entity! {
         metadata::tag: KIND_COLLECTION_MAPPING,
         mapping_algorithm*: <RawToRank9AcceleratedMappingV1 as MetaDescribe>::describe(),
+        mapping_reads_attached: succinct.handle(),
     }
 }
 
-impl CollectionDerivation for Rank9AcceleratedSuccinctArchiveBlob {
-    type Source = SuccinctArchiveBlob;
-    type Argument = ();
+/// A node's Rank9 accelerator, built from the same node's attachment in the
+/// Succinct attached collection its descriptor names. The accelerator's
+/// header names that raw archive, so it is usable only where the archive is
+/// resident too.
+impl CollectionAttachment for Rank9AcceleratedSuccinctArchiveBlob {
+    /// The Succinct attached collection of the same parent this reads.
+    type Argument = Collection<SuccinctArchiveBlob>;
 
-    fn fragment(_argument: &Self::Argument) -> Fragment {
-        rank9_accelerated_mapping_fragment()
+    fn fragment(succinct: &Self::Argument) -> Fragment {
+        rank9_accelerated_mapping_fragment(*succinct)
     }
 
     fn bind(
-        _source: &Fragment,
-        target: &Fragment,
+        _parent: &Fragment,
+        attached: &Fragment,
     ) -> Result<Self::Argument, CollectionOperationError> {
-        let actual = descriptor_facts::mapping_algorithm(target.facts())
+        let actual = descriptor_facts::mapping_algorithm(attached.facts())
             .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?;
         let expected = Some(current_rank9_accelerated_mapping_algorithm());
         if actual != expected {
@@ -393,236 +396,40 @@ impl CollectionDerivation for Rank9AcceleratedSuccinctArchiveBlob {
                 format!("{:X}", expected.expect("mapping algorithm")),
             )));
         }
-        Ok(())
+        match descriptor_facts::reads_attached(attached.facts())
+            .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?
+            .as_slice()
+        {
+            [succinct] => Ok(Collection::from_handle(*succinct)),
+            siblings => Err(CollectionOperationError::Fatal(format!(
+                "a Rank9 attachment reads exactly one Succinct attached collection; its mapping names {}",
+                siblings.len(),
+            ))),
+        }
+    }
+
+    fn siblings(succinct: &Self::Argument) -> Vec<CollectionHandle> {
+        vec![succinct.handle()]
     }
 
     fn map<R>(
         _argument: &Self::Argument,
-        source: &Blob<SuccinctArchiveBlob>,
-        _reader: &R,
+        _node: &Blob<SimpleArchive>,
+        siblings: &[CollectionData],
+        reader: &R,
     ) -> Result<Blob<Rank9AcceleratedSuccinctArchiveBlob>, CollectionOperationError>
     where
-        R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
+        R: crate::repo::StoreRead,
     {
-        SuccinctArchive::<OrderedUniverse>::build_accelerated_root(source.clone())
+        let [raw] = siblings else {
+            return Err(CollectionOperationError::Fatal(
+                "a Rank9 attachment needs the node's Succinct attachment".to_owned(),
+            ));
+        };
+        let raw = resident_raw(Handle::<SuccinctArchiveBlob>::from_hash(*raw), reader)?;
+        SuccinctArchive::<OrderedUniverse>::build_accelerated_root(raw)
             .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
-}
-
-/// A collection descriptor participating in a validation failure.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DescriptorRole {
-    /// Canonical SimpleArchive source of a derivation.
-    Source,
-    /// Canonical raw SuccinctArchive target or merge collection.
-    Target,
-}
-
-impl fmt::Display for DescriptorRole {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Source => formatter.write_str("source"),
-            Self::Target => formatter.write_str("target"),
-        }
-    }
-}
-
-/// A collection element participating in a validation failure.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ElementRole {
-    /// SimpleArchive input of a derivation.
-    DeriveInput,
-    /// Raw SuccinctArchive output of a derivation.
-    DeriveOutput,
-    /// Canonically lower raw SuccinctArchive merge input.
-    MergeLow,
-    /// Canonically higher raw SuccinctArchive merge input.
-    MergeHigh,
-    /// Claimed raw SuccinctArchive merge output.
-    MergeResult,
-}
-
-impl fmt::Display for ElementRole {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::DeriveInput => formatter.write_str("derive input"),
-            Self::DeriveOutput => formatter.write_str("derive output"),
-            Self::MergeLow => formatter.write_str("merge low input"),
-            Self::MergeHigh => formatter.write_str("merge high input"),
-            Self::MergeResult => formatter.write_str("merge result"),
-        }
-    }
-}
-
-/// Failure to validate the canonical raw SuccinctArchive collection law.
-#[derive(Debug)]
-pub enum SuccinctArchiveUnionValidationError {
-    /// The target does not derive from the source it was checked against.
-    WrongSource {
-        /// The source descriptor's handle.
-        expected: CollectionHandle,
-        /// What the target actually names, if anything.
-        actual: Option<CollectionHandle>,
-    },
-    /// The descriptor does not carry a field this check needs.
-    Malformed(RecordDecodeError),
-    /// A descriptor names another blob representation.
-    WrongRepresentation {
-        /// Descriptor being checked.
-        role: DescriptorRole,
-        /// Required representation descriptor.
-        expected: Id,
-        /// Representation found in the descriptor.
-        actual: Id,
-    },
-    /// A derived descriptor names another mapping algorithm.
-    WrongMapping {
-        /// Descriptor being checked.
-        role: DescriptorRole,
-        /// Required mapping algorithm.
-        expected: Id,
-        /// Mapping algorithm found in the descriptor.
-        actual: Option<Id>,
-    },
-    /// A record names another collection descriptor.
-    WrongCollection {
-        /// Record endpoint being checked.
-        role: DescriptorRole,
-        /// Descriptor required at this endpoint.
-        expected: CollectionHandle,
-        /// Descriptor named by the record.
-        actual: CollectionHandle,
-    },
-    /// The supplied blob's trusted cached identity differs from the record.
-    EndpointMismatch {
-        /// Endpoint being checked.
-        role: ElementRole,
-        /// Identity named by the record.
-        expected: CollectionData,
-        /// Cached identity carried by the supplied blob.
-        actual: CollectionData,
-    },
-    /// The SimpleArchive source could not be canonically converted.
-    SourceBuild(SuccinctArchiveRawBuildError),
-    /// Raw merge-input validation or canonical union construction failed.
-    RawMerge(SuccinctArchiveRawMergeError),
-    /// The claimed derivation is not the canonical conversion of its source.
-    WrongDeriveOutput,
-    /// The claimed merge result is not the canonical union of its inputs.
-    WrongMergeResult,
-    /// The supplied source's locator is not the one the DERIVE names.
-    WrongDeriveLocator {
-        /// Locator named by the record.
-        expected: SourceLocator,
-        /// Locator of the supplied source blob's handle.
-        actual: SourceLocator,
-    },
-    /// This validator checks two-input joins; the claim names this many
-    /// inputs.
-    UnsupportedMergeArity(usize),
-}
-
-impl fmt::Display for SuccinctArchiveUnionValidationError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::WrongSource { expected, actual } => match actual {
-                Some(actual) => write!(
-                    formatter,
-                    "collection derives from {actual:?}, not {expected:?}"
-                ),
-                None => write!(
-                    formatter,
-                    "collection is a root, expected a derivation of {expected:?}"
-                ),
-            },
-            Self::Malformed(error) => {
-                write!(formatter, "malformed collection descriptor: {error}")
-            }
-            Self::WrongRepresentation {
-                role,
-                expected,
-                actual,
-            } => write!(
-                formatter,
-                "{role} collection representation {actual:X} does not match {expected:X}"
-            ),
-            Self::WrongMapping {
-                role,
-                expected,
-                actual,
-            } => write!(
-                formatter,
-                "{role} collection mapping algorithm {:?} does not match {}",
-                actual.map(|id| format!("{id:X}")),
-                format!("{expected:X}"),
-            ),
-            Self::WrongCollection {
-                role,
-                expected,
-                actual,
-            } => write!(
-                formatter,
-                "record {role} collection {} does not match descriptor {}",
-                hex::encode_upper(actual.raw),
-                hex::encode_upper(expected.raw),
-            ),
-            Self::EndpointMismatch {
-                role,
-                expected,
-                actual,
-            } => write!(
-                formatter,
-                "{role} handle {} does not match claimed {}",
-                hex::encode_upper(actual.raw),
-                hex::encode_upper(expected.raw),
-            ),
-            Self::SourceBuild(source) => {
-                write!(formatter, "cannot derive raw SuccinctArchive: {source}")
-            }
-            Self::RawMerge(source) => {
-                write!(
-                    formatter,
-                    "cannot validate and merge raw SuccinctArchives: {source}"
-                )
-            }
-            Self::WrongDeriveOutput => formatter
-                .write_str("derive output is not the canonical raw SuccinctArchive of its input"),
-            Self::WrongMergeResult => formatter.write_str(
-                "merge result is not the exact canonical union of its raw SuccinctArchive inputs",
-            ),
-            Self::WrongDeriveLocator { expected, actual } => write!(
-                formatter,
-                "derive source locator {actual} does not match claimed {expected}"
-            ),
-            Self::UnsupportedMergeArity(inputs) => write!(
-                formatter,
-                "cannot validate a merge of {inputs} inputs; expected two"
-            ),
-        }
-    }
-}
-
-impl Error for SuccinctArchiveUnionValidationError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::SourceBuild(source) => Some(source),
-            Self::RawMerge(source) => Some(source),
-            _ => None,
-        }
-    }
-}
-
-/// Describe the raw SuccinctArchive collection derived from one source.
-///
-/// A derivation is anchored by the collection it is computed from, so this
-/// takes that source's handle and carries no name of its own. Authority is
-/// mandatory and local: the target names its own trust root rather than
-/// inheriting one from the source.
-///
-#[cfg(test)]
-pub(crate) fn descriptor(source: CollectionHandle, policy: CollectionPolicy) -> Fragment {
-    let mapping = crate::collection::CanonicalDerivation::<SuccinctArchiveBlob>::new(());
-    descriptor_facts::deriving_with(source, &mapping, policy)
 }
 
 /// Return the canonical empty raw SuccinctArchive artifact.
@@ -646,207 +453,36 @@ pub fn join(
     SuccinctArchiveBlob::merge(&[left.clone(), right.clone()])
 }
 
-/// Validate an exact canonical `SimpleArchive -> SuccinctArchiveBlob` mapping.
-///
-/// This checks both descriptors, requires the target to name this exact source
-/// by handle, binds the record and supplied endpoint bytes in both directions,
-/// validates the target's portable format, and compares it byte-for-byte with a
-/// fresh direct construction from the source.
-pub fn validate_derive(
-    source_descriptor: &Fragment,
-    target_descriptor: &Fragment,
-    claim: &CollectionDerive,
-    input: &Blob<SimpleArchive>,
-    output: &Blob<SuccinctArchiveBlob>,
-) -> Result<(), SuccinctArchiveUnionValidationError> {
-    validate_source_descriptor(source_descriptor)?;
-    validate_descriptor(target_descriptor)?;
-    let source_collection: CollectionHandle =
-        crate::blob::IntoBlob::<SimpleArchive>::to_blob(source_descriptor.facts().clone())
-            .get_handle();
-    let target_collection: CollectionHandle =
-        crate::blob::IntoBlob::<SimpleArchive>::to_blob(target_descriptor.facts().clone())
-            .get_handle();
-    // The target names its source by handle, so this checks the lineage
-    // itself rather than a label both sides could independently claim.
-    let actual_source = descriptor_facts::source(target_descriptor.facts())?;
-    match actual_source {
-        Some(source) if source == source_collection => {}
-        _ => {
-            return Err(SuccinctArchiveUnionValidationError::WrongSource {
-                expected: source_collection,
-                actual: actual_source,
-            });
-        }
-    }
-    validate_collection(
-        DescriptorRole::Target,
-        target_collection,
-        claim.collection(),
-    )?;
-
-    // The record names its source foundation by locator; bind the supplied
-    // source bytes to it through their handle.
-    let actual_locator =
-        SourceLocator::of(Handle::<SimpleArchive>::to_hash(input.get_handle()).raw);
-    if actual_locator != claim.input() {
-        return Err(SuccinctArchiveUnionValidationError::WrongDeriveLocator {
-            expected: claim.input(),
-            actual: actual_locator,
-        });
-    }
-    validate_endpoint(ElementRole::DeriveOutput, claim.output(), output)?;
-    let expected =
-        derive_element(input).map_err(SuccinctArchiveUnionValidationError::SourceBuild)?;
-    if output.bytes != expected.bytes {
-        return Err(SuccinctArchiveUnionValidationError::WrongDeriveOutput);
-    }
-    Ok(())
-}
-
-/// Validate an exact canonical raw SuccinctArchive union equation.
-///
-/// All three endpoint identities are checked through their trusted cached
-/// handles. The raw merge structurally validates both inputs while constructing
-/// their canonical union;
-/// byte-for-byte equality with that union proves the claimed result canonical.
-pub fn validate_merge(
-    descriptor: &Fragment,
-    claim: &CollectionMerge,
-    low: &Blob<SuccinctArchiveBlob>,
-    high: &Blob<SuccinctArchiveBlob>,
-    result: &Blob<SuccinctArchiveBlob>,
-) -> Result<(), SuccinctArchiveUnionValidationError> {
-    validate_descriptor(descriptor)?;
-    let collection: CollectionHandle =
-        crate::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone()).get_handle();
-    validate_collection(DescriptorRole::Target, collection, claim.collection())?;
-
-    // A2: n-ary validation. This still checks two-input joins only.
-    let &[expected_low, expected_high] = claim.inputs() else {
-        return Err(SuccinctArchiveUnionValidationError::UnsupportedMergeArity(
-            claim.inputs().len(),
-        ));
-    };
-    validate_endpoint(ElementRole::MergeLow, expected_low, low)?;
-    validate_endpoint(ElementRole::MergeHigh, expected_high, high)?;
-    validate_endpoint(ElementRole::MergeResult, claim.result(), result)?;
-
-    let expected = join(low, high).map_err(SuccinctArchiveUnionValidationError::RawMerge)?;
-    if result.bytes != expected.bytes {
-        return Err(SuccinctArchiveUnionValidationError::WrongMergeResult);
-    }
-    Ok(())
-}
-
-fn validate_source_descriptor(
-    descriptor: &Fragment,
-) -> Result<(), SuccinctArchiveUnionValidationError> {
-    validate_descriptor_parts(
-        DescriptorRole::Source,
-        descriptor,
-        <SimpleArchive as MetaDescribe>::id(),
-        None,
-    )
-}
-
-fn validate_descriptor(descriptor: &Fragment) -> Result<(), SuccinctArchiveUnionValidationError> {
-    validate_descriptor_parts(
-        DescriptorRole::Target,
-        descriptor,
-        <SuccinctArchiveBlob as MetaDescribe>::id(),
-        Some(SIMPLE_TO_SUCCINCT_MAPPING_V1),
-    )
-}
-
-fn validate_descriptor_parts(
-    role: DescriptorRole,
-    descriptor: &Fragment,
-    expected_representation: Id,
-    expected_mapping: Option<Id>,
-) -> Result<(), SuccinctArchiveUnionValidationError> {
-    let representation = descriptor_facts::representation(descriptor.facts())?;
-    if representation != expected_representation {
-        return Err(SuccinctArchiveUnionValidationError::WrongRepresentation {
-            role,
-            expected: expected_representation,
-            actual: representation,
-        });
-    }
-    let actual_mapping = descriptor_facts::mapping_algorithm(descriptor.facts())?;
-    if actual_mapping != expected_mapping {
-        return Err(SuccinctArchiveUnionValidationError::WrongMapping {
-            role,
-            expected: expected_mapping.unwrap_or(SIMPLE_TO_SUCCINCT_MAPPING_V1),
-            actual: actual_mapping,
-        });
-    }
-    Ok(())
-}
-
-fn validate_collection(
-    role: DescriptorRole,
-    expected: CollectionHandle,
-    actual: CollectionHandle,
-) -> Result<(), SuccinctArchiveUnionValidationError> {
-    if actual != expected {
-        return Err(SuccinctArchiveUnionValidationError::WrongCollection {
-            role,
-            expected,
-            actual,
-        });
-    }
-    Ok(())
-}
-
-fn validate_endpoint<S: BlobEncoding>(
-    role: ElementRole,
-    expected: CollectionData,
-    blob: &Blob<S>,
-) -> Result<(), SuccinctArchiveUnionValidationError> {
-    let actual = Handle::<S>::to_hash(blob.get_handle());
-    if actual != expected {
-        return Err(SuccinctArchiveUnionValidationError::EndpointMismatch {
-            role,
-            expected,
-            actual,
-        });
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use anybytes::Bytes;
-
-    use ed25519_dalek::SigningKey;
-
     use crate::blob::IntoBlob;
     use crate::collection::descriptor::identity_for_tests;
     use crate::collection::simplearchive_union;
+    use crate::collection::{CanonicalAttachment, CollectionPolicy};
     use crate::trible::{Trible, TribleSet, TRIBLE_LEN};
 
-    fn authority() -> ed25519_dalek::VerifyingKey {
-        SigningKey::from_bytes(&[1; 32]).verifying_key()
-    }
-
     fn direct_policy() -> CollectionPolicy {
+        let authority = ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key();
         CollectionPolicy::new(
-            crate::collection::AdmissionPolicy::direct(authority()),
-            crate::collection::AdmissionPolicy::direct(authority()),
+            crate::collection::AdmissionPolicy::direct(authority),
+            crate::collection::AdmissionPolicy::direct(authority),
         )
     }
 
-    /// The named `SimpleArchive` root these tests derive from.
+    /// The named `SimpleArchive` root these tests attach to.
     fn raw_root(name: &str) -> Fragment {
         simplearchive_union::descriptor(name, direct_policy())
     }
 
-    /// A merge or derive names its input PAYLOAD. This used to wrap it
-    /// beside a fingerprint citing a record that produced it; nothing
-    /// cites anything now, so it is just the payload.
+    fn attached(parent: &Fragment) -> Fragment {
+        descriptor_facts::attaching_with(
+            identity_for_tests(parent),
+            &CanonicalAttachment::<SuccinctArchiveBlob>::new(()),
+        )
+    }
+
     fn row(entity: u8, attribute: u8, value: u8) -> [u8; TRIBLE_LEN] {
         let mut row = [value; TRIBLE_LEN];
         row[..16].fill(entity);
@@ -862,242 +498,94 @@ mod tests {
         facts.to_blob()
     }
 
-    fn data_identity<S: BlobEncoding>(blob: &Blob<S>) -> CollectionData {
-        Handle::<S>::to_hash(blob.get_handle())
-    }
-
-    fn ordered<'a, S: BlobEncoding>(
-        left: &'a Blob<S>,
-        right: &'a Blob<S>,
-    ) -> (&'a Blob<S>, &'a Blob<S>) {
-        if data_identity(left) <= data_identity(right) {
-            (left, right)
-        } else {
-            (right, left)
-        }
-    }
-
-    /// The indexed collection is the raw one's derivation: a different
-    /// encoding connected by one explicit, concrete mapping.
+    /// The index is attached to its parent through one explicit mapping: it
+    /// names the parent, not a source, and carries no policy and no name.
     #[test]
-    fn the_index_derives_from_the_raw_collection_through_its_mapping() {
-        let source = raw_root("first");
-        let target = descriptor(identity_for_tests(&source), direct_policy());
-
-        // The target points at exactly this source, and carries no anchor of
-        // its own: what it derives from is what anchors it.
+    fn the_index_attaches_to_its_parent_through_its_mapping() {
+        let parent = raw_root("first");
+        let index = attached(&parent);
         assert_eq!(
-            crate::collection::descriptor::source(target.facts()),
-            Ok(Some(identity_for_tests(&source)))
+            descriptor_facts::parents(index.facts()),
+            Ok(vec![identity_for_tests(&parent)])
         );
-        assert!(
-            crate::collection::descriptor::name(target.facts())
-                .unwrap()
-                .is_none(),
-            "a derivation needs no anchor"
+        assert_eq!(descriptor_facts::source(index.facts()), Ok(None));
+        assert_eq!(descriptor_facts::name(index.facts()), Ok(None));
+        assert_eq!(
+            descriptor_facts::capability_policies(index.facts(), None).count(),
+            0,
+            "an attached collection has no policy of its own"
         );
-        assert!(
-            crate::collection::descriptor::source(source.facts())
-                .unwrap()
-                .is_none(),
-            "the raw collection is a root"
-        );
-        // A derivation of the same shape over different data is a different
-        // collection, because its source is.
+        // The same mapping over another parent is another collection.
         assert_ne!(
-            identity_for_tests(&target),
-            identity_for_tests(&descriptor(
-                identity_for_tests(&raw_root("second")),
-                direct_policy(),
-            ))
-        );
-
-        assert_eq!(
-            crate::collection::descriptor::mapping(source.facts()),
-            Ok(None)
+            identity_for_tests(&index),
+            identity_for_tests(&attached(&raw_root("second")))
         );
         assert_eq!(
-            crate::collection::descriptor::mapping_algorithm(target.facts()),
+            descriptor_facts::mapping_algorithm(index.facts()),
             Ok(Some(SIMPLE_TO_SUCCINCT_MAPPING_V1))
         );
         assert_eq!(
-            crate::collection::descriptor::representation(source.facts()).unwrap(),
-            <SimpleArchive as MetaDescribe>::id()
-        );
-        assert_eq!(
-            crate::collection::descriptor::representation(target.facts()).unwrap(),
+            descriptor_facts::representation(index.facts()).unwrap(),
             <SuccinctArchiveBlob as MetaDescribe>::id()
         );
-        assert_ne!(identity_for_tests(&source), identity_for_tests(&target));
+        assert!(<SuccinctArchiveBlob as CollectionAttachment>::bind(&parent, &index).is_ok());
+
+        // A Rank9 index names the Succinct attached collection it reads.
+        let succinct = Collection::<SuccinctArchiveBlob>::from_handle(identity_for_tests(&index));
+        let rank9 = descriptor_facts::attaching_with(
+            identity_for_tests(&parent),
+            &CanonicalAttachment::<Rank9AcceleratedSuccinctArchiveBlob>::new(succinct),
+        );
+        assert_eq!(
+            descriptor_facts::reads_attached(rank9.facts()),
+            Ok(vec![succinct.handle()])
+        );
+        assert_eq!(
+            <Rank9AcceleratedSuccinctArchiveBlob as CollectionAttachment>::bind(&parent, &rank9),
+            Ok(succinct)
+        );
     }
 
     #[test]
-    fn canonical_empty_is_the_derived_bottom_and_merge_identity() {
-        let source_descriptor = raw_root("first");
-        let target_descriptor = descriptor(identity_for_tests(&raw_root("first")), direct_policy());
+    fn canonical_empty_is_the_bottom_and_the_join_identity() {
         let source_empty: Blob<SimpleArchive> = TribleSet::new().to_blob();
         let derived_empty = derive_element(&source_empty).unwrap();
         let canonical_empty = empty();
-
         assert_eq!(derived_empty.bytes, canonical_empty.bytes);
-        assert_eq!(derived_empty.get_handle(), canonical_empty.get_handle());
 
-        let derive = CollectionDerive::sign(
-            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-            identity_for_tests(&target_descriptor),
-            crate::collection::SourceLocator::of(data_identity(&source_empty).raw),
-            data_identity(&canonical_empty),
-        );
-        validate_derive(
-            &source_descriptor,
-            &target_descriptor,
-            &derive,
-            &source_empty,
-            &canonical_empty,
-        )
-        .unwrap();
-
-        let element_source = archive([row(1, 9, 3)]);
-        let element = derive_element(&element_source).unwrap();
+        let element = derive_element(&archive([row(1, 9, 3)])).unwrap();
         let joined = join(&canonical_empty, &element).unwrap();
         assert_eq!(joined.bytes, element.bytes);
         assert_eq!(joined.get_handle(), element.get_handle());
-
-        let (low, high) = ordered(&canonical_empty, &element);
-        let merge = CollectionMerge::sign(
-            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-            identity_for_tests(&target_descriptor),
-            [data_identity(low), data_identity(high)],
-            data_identity(&joined),
-        )
-        .unwrap();
-        validate_merge(&target_descriptor, &merge, low, high, &joined).unwrap();
     }
 
+    /// A merged node's Succinct attachment is mapped from the merged
+    /// `SimpleArchive`, and that is byte for byte the structural join of its
+    /// children's attachments: the join shortcut is never needed for
+    /// correctness.
     #[test]
-    fn derive_and_merge_commute_to_identical_canonical_bytes() {
-        let source_descriptor = raw_root("first");
-        let target_descriptor = descriptor(identity_for_tests(&raw_root("first")), direct_policy());
+    fn a_merged_nodes_attachment_from_its_bytes_is_the_structural_join_of_its_childrens() {
         let shared = row(3, 10, 40);
-        let left = archive([row(2, 10, 60), shared]);
-        let right = archive([row(1, 10, 20), shared]);
-
-        let source_union = simplearchive_union::join(&left, &right).unwrap();
-        let derive_after_merge = derive_element(&source_union).unwrap();
-        let derived_left = derive_element(&left).unwrap();
-        let derived_right = derive_element(&right).unwrap();
-        let merge_after_derive = join(&derived_left, &derived_right).unwrap();
-
-        assert_eq!(derive_after_merge.bytes, merge_after_derive.bytes);
-        assert_eq!(
-            derive_after_merge.get_handle(),
-            merge_after_derive.get_handle()
-        );
-
-        for (input, output) in [
-            (&left, &derived_left),
-            (&right, &derived_right),
-            (&source_union, &derive_after_merge),
-        ] {
-            let claim = CollectionDerive::sign(
-                &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                identity_for_tests(&target_descriptor),
-                crate::collection::SourceLocator::of(data_identity(input).raw),
-                data_identity(output),
-            );
-            validate_derive(
-                &source_descriptor,
-                &target_descriptor,
-                &claim,
-                input,
-                output,
-            )
-            .unwrap();
-        }
-
-        let (low, high) = ordered(&derived_left, &derived_right);
-        let merge = CollectionMerge::sign(
-            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-            identity_for_tests(&target_descriptor),
-            [data_identity(low), data_identity(high)],
-            data_identity(&merge_after_derive),
+        let children = [
+            archive([row(2, 10, 60), shared]),
+            archive([row(1, 10, 20), shared]),
+            archive([row(4, 11, 20), row(4, 12, 21)]),
+        ];
+        let merged = children
+            .iter()
+            .skip(1)
+            .fold(children[0].clone(), |merged, child| {
+                simplearchive_union::join(&merged, child).unwrap()
+            });
+        let from_bytes = derive_element(&merged).unwrap();
+        let structural = SuccinctArchiveBlob::merge(
+            &children
+                .iter()
+                .map(|child| derive_element(child).unwrap())
+                .collect::<Vec<_>>(),
         )
         .unwrap();
-        validate_merge(&target_descriptor, &merge, low, high, &merge_after_derive).unwrap();
-    }
-
-    #[test]
-    fn validators_reject_valid_but_wrong_canonical_outputs() {
-        let source_descriptor = raw_root("first");
-        let target_descriptor = descriptor(identity_for_tests(&raw_root("first")), direct_policy());
-        let input = archive([row(1, 9, 3)]);
-        let wrong_source = archive([row(2, 9, 4)]);
-        let wrong_output = derive_element(&wrong_source).unwrap();
-        let claim = CollectionDerive::sign(
-            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-            identity_for_tests(&target_descriptor),
-            crate::collection::SourceLocator::of(data_identity(&input).raw),
-            data_identity(&wrong_output),
-        );
-
-        assert!(matches!(
-            validate_derive(
-                &source_descriptor,
-                &target_descriptor,
-                &claim,
-                &input,
-                &wrong_output,
-            ),
-            Err(SuccinctArchiveUnionValidationError::WrongDeriveOutput)
-        ));
-
-        let left = derive_element(&input).unwrap();
-        let right = derive_element(&wrong_source).unwrap();
-        let correct = join(&left, &right).unwrap();
-        let wrong = empty();
-        let (low, high) = ordered(&left, &right);
-        let merge = CollectionMerge::sign(
-            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-            identity_for_tests(&target_descriptor),
-            [data_identity(low), data_identity(high)],
-            data_identity(&wrong),
-        )
-        .unwrap();
-        assert_ne!(correct.bytes, wrong.bytes);
-        assert!(matches!(
-            validate_merge(&target_descriptor, &merge, low, high, &wrong),
-            Err(SuccinctArchiveUnionValidationError::WrongMergeResult)
-        ));
-    }
-
-    #[test]
-    fn malformed_target_is_rejected_before_equation_admission() {
-        let source_descriptor = raw_root("first");
-        let target_descriptor = descriptor(identity_for_tests(&raw_root("first")), direct_policy());
-        let input = archive([row(1, 9, 3)]);
-        let malformed = Blob::<SuccinctArchiveBlob>::new(Bytes::from(vec![0xAA; 17]));
-        let claim = CollectionDerive::sign(
-            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-            identity_for_tests(&target_descriptor),
-            crate::collection::SourceLocator::of(data_identity(&input).raw),
-            data_identity(&malformed),
-        );
-
-        assert!(matches!(
-            validate_derive(
-                &source_descriptor,
-                &target_descriptor,
-                &claim,
-                &input,
-                &malformed,
-            ),
-            Err(SuccinctArchiveUnionValidationError::WrongDeriveOutput)
-        ));
-    }
-}
-
-impl From<RecordDecodeError> for SuccinctArchiveUnionValidationError {
-    fn from(error: RecordDecodeError) -> Self {
-        Self::Malformed(error)
+        assert_eq!(from_bytes.bytes, structural.bytes);
+        assert_eq!(from_bytes.get_handle(), structural.get_handle());
     }
 }

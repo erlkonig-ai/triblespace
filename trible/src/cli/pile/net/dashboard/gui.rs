@@ -560,11 +560,12 @@ fn render_lattice(ui: &mut egui::Ui, frame: &Frame, selected: &mut Option<[u8; 3
             Some(LatticeEdge {
                 from,
                 to,
-                // The descriptor declares the derivation; a DERIVE record is
-                // what performs it. Declared but never performed is exactly
-                // the missing step this view exists to show, so it draws as a
-                // dashed edge rather than as an ordinary one.
-                endorsed: collection.derives > 0,
+                // The descriptor declares the derivation or attachment; a
+                // DERIVE or MAP record is what performs it. Declared but never
+                // performed is exactly the missing step this view exists to
+                // show, so it draws as a dashed edge rather than as an
+                // ordinary one.
+                endorsed: collection.derives > 0 || collection.maps > 0,
             })
         })
         .collect();
@@ -652,13 +653,14 @@ fn render_lattice(ui: &mut egui::Ui, frame: &Frame, selected: &mut Option<[u8; 3
             chain.reverse();
             let focus = &collections[index];
             ui.small(format!(
-                "{} · {} commit / {} derive · {} of {} resident · {} merge stored{}",
+                "{} · {} commit / {} derive · {} of {} resident · {} merge / {} map stored{}",
                 label(focus),
                 focus.commits,
                 focus.derives,
                 focus.foundations_resident,
                 focus.foundations(),
                 focus.merges,
+                focus.maps,
                 match focus.descriptor_resident {
                     true => "",
                     false => " · descriptor not resident here",

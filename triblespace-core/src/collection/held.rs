@@ -346,8 +346,9 @@ impl<T> HeldIndex<T> {
     }
 }
 
-/// The blobs a replicated record names; `None` for a MERGE, which never
-/// replicates.
+/// The blobs a replicated record names; `None` for a MERGE or a MAP, which
+/// never replicate: a merge result or an attachment is the signing host's own
+/// computation, never a seed.
 fn seeds_of(record: &CollectionRecord) -> Option<Vec<Raw>> {
     match record {
         CollectionRecord::Commit(commit) => Some(
@@ -364,7 +365,7 @@ fn seeds_of(record: &CollectionRecord) -> Option<Vec<Raw>> {
                 .map(|handle| handle.raw)
                 .collect(),
         ),
-        CollectionRecord::Merge(_) => None,
+        CollectionRecord::Merge(_) | CollectionRecord::Map(_) => None,
     }
 }
 
@@ -1088,7 +1089,8 @@ mod tests {
     use crate::capability::{CapabilityProof, CapabilityProofId, CapabilityResource};
     use crate::collection::covered::Covered;
     use crate::collection::{
-        CollectionCommit, CollectionDerive, CollectionMerge, CollectionStore, SourceLocator,
+        CollectionCommit, CollectionDerive, CollectionMap, CollectionMerge, CollectionStore,
+        SourceLocator,
     };
     use crate::inline::InlineEncoding;
     use crate::prelude::entity;
@@ -1535,6 +1537,58 @@ mod tests {
             held_set(&snapshot, derived),
             BTreeSet::from([derived.raw, output, output_child]),
             "a DERIVE holds its output, never its source node"
+        );
+    }
+
+    #[test]
+    fn map_attachments_are_never_held_even_in_a_tracked_attached_collection() {
+        // A MAP is the signing host's own attachment of one node and never
+        // replicates. Neither the parent's held set nor the attached
+        // collection's own, should an operator list it, holds an attachment,
+        // whether the MAP was there when tracking began or arrived later.
+        let mut store = Store::default();
+        let parent = collection(&mut store, "parent");
+        let data = blob(&mut store, b"foundation");
+        let metadata = blob(&mut store, b"metadata");
+        commit(&mut store, parent, data, metadata);
+        let attached = collection(&mut store, "attached");
+        let under = blob(&mut store, b"only an attachment reaches this");
+        let attachment = blob_naming(&mut store, b"attachment", &[under]);
+        for target in [attached, parent] {
+            store
+                .insert(CollectionRecord::Map(CollectionMap::sign(
+                    &key(),
+                    target,
+                    Inline::new(data),
+                    Inline::new(attachment),
+                )))
+                .unwrap();
+        }
+        store.track_held([parent, attached]);
+        let snapshot = store.snapshot().unwrap();
+        assert_eq!(
+            held_set(&snapshot, parent),
+            BTreeSet::from([parent.raw, data, metadata])
+        );
+        assert_eq!(
+            held_set(&snapshot, attached),
+            BTreeSet::from([attached.raw])
+        );
+
+        let later = blob_naming(&mut store, b"a later attachment", &[under]);
+        store
+            .insert(CollectionRecord::Map(CollectionMap::sign(
+                &key(),
+                attached,
+                Inline::new(data),
+                Inline::new(later),
+            )))
+            .unwrap();
+        let after = store.snapshot().unwrap();
+        assert_eq!(held_set(&after, attached), BTreeSet::from([attached.raw]));
+        assert_eq!(
+            held_set(&after, parent),
+            BTreeSet::from([parent.raw, data, metadata])
         );
     }
 
@@ -2193,7 +2247,14 @@ mod tests {
             SourceLocator::of([6; 32]),
             Inline::new([7; 32]),
         ));
-        for record in [commit, merge, derive] {
+        // A MAP is a host's attachment of one node; it never replicates.
+        let map = CollectionRecord::Map(CollectionMap::sign(
+            &key(),
+            c,
+            Inline::new([2; 32]),
+            Inline::new([8; 32]),
+        ));
+        for record in [commit, merge, derive, map] {
             store.insert(record).unwrap();
         }
         let selected: BTreeSet<_> = store

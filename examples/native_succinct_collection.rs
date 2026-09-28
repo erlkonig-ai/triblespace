@@ -20,16 +20,15 @@ fn main() {
     let path = tmp.path().join("native-succinct.pile");
     std::fs::File::create(&path).expect("create pile file");
 
-    // The pile is opened as the key that maintains it: its fold believes the
-    // merges that key signs and no other key's.
-    let signing_key = SigningKey::generate(&mut OsRng);
-    let authority = signing_key.verifying_key();
-    let mut pile = Pile::open_as(&path, authority).expect("open pile");
-    pile.refresh().expect("load pile");
-
     // A root collection is the handle of a self-contained descriptor. Its
     // independent READ and WRITE policies participate in that content identity.
     let name = "literature";
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let authority = signing_key.verifying_key();
+    // The pile is opened as the key that maintains it: only its own MERGEs
+    // and MAPs are believed.
+    let mut pile = Pile::open_as(&path, authority).expect("open pile");
+    pile.refresh().expect("load pile");
     let policy = CollectionPolicy::new(
         AdmissionPolicy::direct(authority),
         AdmissionPolicy::direct(authority),
@@ -58,37 +57,26 @@ fn main() {
     assert_eq!(support.len(), 3);
     drop(snapshot);
 
-    // Carry each mapping edge to its source's frontier: the raw Succinct
-    // shards first, then their Rank9 fibers. The snapshot returned by the last
-    // step observes all of that work, so the target read from it stands for
-    // exactly the support admitted above.
+    // Attach the Succinct index and the Rank9 accelerator that reads it to the
+    // collection's own nodes. Maintaining them carries the collection and
+    // attaches what the carry leaves, the Succinct index first. The snapshot
+    // returned by the last step observes all of that work.
     let raw = pile
-        .derive::<SuccinctArchiveBlob>(collection, (), policy.clone())
-        .expect("register raw Succinct projection");
+        .attach::<SuccinctArchiveBlob>(collection, ())
+        .expect("attach the Succinct index");
     let accelerated = pile
-        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(raw, (), policy)
-        .expect("register Rank9-accelerated projection");
-    block_on(pile.maintain(raw, &signing_key)).expect("maintain raw Succinct collection");
-    let snapshot = block_on(pile.maintain(accelerated, &signing_key))
-        .expect("maintain Rank9-accelerated collection");
+        .attach::<Rank9AcceleratedSuccinctArchiveBlob>(collection, raw)
+        .expect("attach the Rank9 accelerator");
+    block_on(pile.maintain_attached(raw, &signing_key)).expect("maintain Succinct attachments");
+    let snapshot = block_on(pile.maintain_attached(accelerated, &signing_key))
+        .expect("maintain Rank9 attachments");
     let archive = snapshot
-        .collection(accelerated)
-        .expect("observe Rank9-accelerated collection");
-    // Supports are collection-local. Whether each view has caught up is asked
-    // hop by hop: every source foundation has a leaf in the view above it.
-    let source_view = snapshot.collection(collection).expect("observe source");
-    let raw_view = snapshot
-        .collection(raw)
-        .expect("observe raw Succinct collection");
-    assert_eq!(source_view.support().expect("resolve support"), &support);
-    assert!(raw_view
-        .missing_from(&source_view)
-        .expect("raw freshness")
-        .is_empty());
-    assert!(archive
-        .missing_from(&raw_view)
-        .expect("accelerated freshness")
-        .is_empty());
+        .attached(accelerated)
+        .expect("observe the Rank9 attachments");
+    // An attached collection stands for its parent's foundations; what no
+    // attachment reaches yet is the residual.
+    assert_eq!(archive.support(), &support);
+    assert!(archive.residual().is_empty());
     let view: UnionArchive<OrderedUniverse> = archive.view().expect("reconstruct Succinct view");
     let mut names: Vec<String> = find!(
         name: Inline<_>,

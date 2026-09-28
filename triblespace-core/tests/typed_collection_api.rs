@@ -1,15 +1,13 @@
+mod common;
+
+use common::{Image, ImageFacts, ImageTwo};
 use ed25519_dalek::SigningKey;
 use futures::executor::block_on;
 use std::collections::BTreeSet;
 
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace_core::blob::encodings::succinctarchive::{
-    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchive, SuccinctArchiveBlob,
-    UnionArchive,
-};
 use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::capability::{CapabilityProof, CapabilityResource};
-use triblespace_core::collection::succinctarchive_union;
 use triblespace_core::collection::{
     write_capability, AdmissionPolicy, CollectionCommit, CollectionDerive, CollectionMerge,
     CollectionPolicy, CollectionRead, CollectionRecord, CollectionSnapshotExt, CollectionStore,
@@ -116,11 +114,11 @@ fn simplearchive_collection_round_trips_typed_views() {
 }
 
 #[test]
-fn succinct_cover_materializes_as_a_typed_union_archive() {
+fn a_derived_cover_materializes_as_a_typed_view() {
     let authority = SigningKey::from_bytes(&[42; 32]);
     let expected = one_fact(11);
     let source_blob: Blob<SimpleArchive> = expected.clone().to_blob();
-    let raw = succinctarchive_union::derive_element(&source_blob).unwrap();
+    let raw = Image::image(&source_blob);
     let raw_handle = raw.get_handle();
     let mut store = MemoryRepo::default();
 
@@ -130,9 +128,7 @@ fn succinct_cover_materializes_as_a_typed_union_archive() {
     );
     let target_policy = source_policy.clone();
     let source = store.collection("typed-api-source", source_policy).unwrap();
-    let target = store
-        .derive::<SuccinctArchiveBlob>(source, (), target_policy)
-        .unwrap();
+    let target = store.derive::<Image>(source, (), target_policy).unwrap();
 
     store
         .commit(source, &authority, Fragment::from(expected.clone()))
@@ -146,9 +142,9 @@ fn succinct_cover_materializes_as_a_typed_union_archive() {
     assert_eq!(cover.collection(), target);
     assert_eq!(cover.members().collect::<Vec<_>>(), vec![raw_handle]);
 
-    let materialized = collection.view::<UnionArchive<OrderedUniverse>>().unwrap();
-    assert_eq!(materialized.segment_count(), 1);
-    assert_eq!(materialized.iter().collect::<TribleSet>(), expected);
+    let materialized = collection.view::<ImageFacts>().unwrap();
+    assert_eq!(collection.cover().len(), 1);
+    assert_eq!(materialized.0, expected);
 
     // Ensure and maintenance share the same immutable snapshot result shape,
     // and a warm target is a fixed point of both.
@@ -186,12 +182,8 @@ fn derived_apis_accept_a_derived_source_encoding() {
     let source = store
         .collection("typed-api-exact-source", policy.clone())
         .unwrap();
-    let raw = store
-        .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-        .unwrap();
-    let accelerated = store
-        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(raw, (), policy)
-        .unwrap();
+    let raw = store.derive::<Image>(source, (), policy.clone()).unwrap();
+    let accelerated = store.derive::<ImageTwo>(raw, (), policy).unwrap();
     store
         .commit(source, &authority, Fragment::from(expected.clone()))
         .unwrap();
@@ -227,9 +219,9 @@ fn derived_apis_accept_a_derived_source_encoding() {
     let materialized = maintained
         .collection(accelerated)
         .unwrap()
-        .view::<UnionArchive<OrderedUniverse>>()
+        .view::<ImageFacts>()
         .unwrap();
-    assert_eq!(materialized.iter().collect::<TribleSet>(), expected);
+    assert_eq!(materialized.0, expected);
 }
 
 #[test]
@@ -253,12 +245,8 @@ fn maintenance_follows_a_resident_source_union_across_target_size_tiers() {
     let source = store
         .collection("source-guided-unequal-tiers", policy.clone())
         .unwrap();
-    let raw = store
-        .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-        .unwrap();
-    let accelerated = store
-        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(raw, (), policy)
-        .unwrap();
+    let raw = store.derive::<Image>(source, (), policy.clone()).unwrap();
+    let accelerated = store.derive::<ImageTwo>(raw, (), policy).unwrap();
     for facts in [small, large] {
         store
             .commit(source, &authority, Fragment::from(facts))
@@ -271,11 +259,7 @@ fn maintenance_follows_a_resident_source_union_across_target_size_tiers() {
     let inputs = raw_cover
         .cover()
         .members()
-        .map(|handle| {
-            children
-                .get::<Blob<SuccinctArchiveBlob>, _>(handle)
-                .unwrap()
-        })
+        .map(|handle| children.get::<Blob<Image>, _>(handle).unwrap())
         .collect::<Vec<_>>();
     assert_eq!(inputs.len(), 2);
     let accelerated_children = children.collection(accelerated).unwrap();
@@ -292,14 +276,13 @@ fn maintenance_follows_a_resident_source_union_across_target_size_tiers() {
 
     // An independent producer has already compacted the immediate source.
     // Target maintenance must consume this fact, not create upstream artifacts.
-    let union = SuccinctArchiveBlob::merge(&inputs).unwrap();
-    let expected_root =
-        SuccinctArchive::<OrderedUniverse>::build_accelerated_root(union.clone()).unwrap();
+    let union = Image::join(&inputs);
+    let expected_root = ImageTwo::image(&union);
     let union_handle = store.put(union).unwrap();
     let input_records = inputs
         .iter()
         .map(|input| {
-            let data = Handle::<SuccinctArchiveBlob>::to_hash(input.get_handle());
+            let data = Handle::<Image>::to_hash(input.get_handle());
             let _record = children
                 .records()
                 .unwrap()
@@ -318,7 +301,7 @@ fn maintenance_follows_a_resident_source_union_across_target_size_tiers() {
                 &authority,
                 raw.handle(),
                 [input_records[0], input_records[1]],
-                Handle::<SuccinctArchiveBlob>::to_hash(union_handle),
+                Handle::<Image>::to_hash(union_handle),
             )
             .unwrap(),
         ))
@@ -363,14 +346,7 @@ fn maintenance_follows_a_resident_source_union_across_target_size_tiers() {
         observed.cover().members().collect::<Vec<_>>(),
         vec![expected_root.get_handle()]
     );
-    assert_eq!(
-        observed
-            .view::<UnionArchive<OrderedUniverse>>()
-            .unwrap()
-            .iter()
-            .collect::<TribleSet>(),
-        expected
-    );
+    assert_eq!(observed.view::<ImageFacts>().unwrap().0, expected);
     let blobs_after = after
         .blobs()
         .map(|info| info.unwrap().handle)
@@ -397,6 +373,7 @@ fn maintenance_follows_a_resident_source_union_across_target_size_tiers() {
             CollectionRecord::Derive(record) => record.collection(),
             CollectionRecord::Merge(record) => record.collection(),
             CollectionRecord::Commit(_) => panic!("maintenance must not author roots"),
+            CollectionRecord::Map(_) => panic!("nothing here is attached"),
         };
         assert_eq!(
             collection,
@@ -439,9 +416,7 @@ fn ordinary_derived_operations_use_only_resident_immediate_source_support() {
         let second = one_fact(22);
         let third = one_fact(23);
         let third_blob: Blob<SimpleArchive> = third.clone().to_blob();
-        let raw_third = succinctarchive_union::derive_element(&third_blob)
-            .unwrap()
-            .get_handle();
+        let raw_third = Image::image(&third_blob).get_handle();
         let expected_initial: TribleSet = first.iter().chain(second.iter()).copied().collect();
         let expected_final: TribleSet = expected_initial
             .iter()
@@ -452,12 +427,8 @@ fn ordinary_derived_operations_use_only_resident_immediate_source_support() {
         let source = store
             .collection("typed-api-immediate-source", policy.clone())
             .unwrap();
-        let raw = store
-            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-            .unwrap();
-        let accelerated = store
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(raw, (), policy)
-            .unwrap();
+        let raw = store.derive::<Image>(source, (), policy.clone()).unwrap();
+        let accelerated = store.derive::<ImageTwo>(raw, (), policy).unwrap();
         for facts in [first, second] {
             store
                 .commit(source, &authority, Fragment::from(facts))
@@ -490,14 +461,7 @@ fn ordinary_derived_operations_use_only_resident_immediate_source_support() {
         .expect("ordinary Rank9 work must stop at the resident raw-source frontier");
         let observed = after.collection(accelerated).unwrap();
         assert_eq!(stood_for(&observed), initial_support);
-        assert_eq!(
-            observed
-                .view::<UnionArchive<OrderedUniverse>>()
-                .unwrap()
-                .iter()
-                .collect::<TribleSet>(),
-            expected_initial
-        );
+        assert_eq!(observed.view::<ImageFacts>().unwrap().0, expected_initial);
         assert_eq!(stood_for(&after.collection(raw).unwrap()), initial_support);
         assert!(!after.contains_blob(raw_third).unwrap());
         assert_eq!(after.wants().unwrap().count(), 0);
@@ -512,6 +476,7 @@ fn ordinary_derived_operations_use_only_resident_immediate_source_support() {
                 CollectionRecord::Derive(record) => record.collection(),
                 CollectionRecord::Merge(record) => record.collection(),
                 CollectionRecord::Commit(_) => panic!("downstream work must not author roots"),
+                CollectionRecord::Map(_) => panic!("nothing here is attached"),
             };
             assert_eq!(
                 collection,
@@ -525,14 +490,7 @@ fn ordinary_derived_operations_use_only_resident_immediate_source_support() {
         let caught_up = block_on(store.maintain(accelerated, &authority)).unwrap();
         let observed = caught_up.collection(accelerated).unwrap();
         assert_eq!(stood_for(&observed), full_support);
-        assert_eq!(
-            observed
-                .view::<UnionArchive<OrderedUniverse>>()
-                .unwrap()
-                .iter()
-                .collect::<TribleSet>(),
-            expected_final
-        );
+        assert_eq!(observed.view::<ImageFacts>().unwrap().0, expected_final);
         assert_eq!(stood_for(&warmed.collection(raw).unwrap()), initial_support);
     }
 }
@@ -547,19 +505,13 @@ fn ordinary_derived_operations_ignore_pending_immediate_source_output() {
     let first = one_fact(24);
     let later = one_fact(25);
     let later_blob: Blob<SimpleArchive> = later.clone().to_blob();
-    let missing_raw = succinctarchive_union::derive_element(&later_blob)
-        .unwrap()
-        .get_handle();
+    let missing_raw = Image::image(&later_blob).get_handle();
     let mut store = MemoryRepo::default();
     let source = store
         .collection("typed-api-pending-immediate-source", policy.clone())
         .unwrap();
-    let raw = store
-        .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-        .unwrap();
-    let accelerated = store
-        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(raw, (), policy)
-        .unwrap();
+    let raw = store.derive::<Image>(source, (), policy.clone()).unwrap();
+    let accelerated = store.derive::<ImageTwo>(raw, (), policy).unwrap();
     store
         .commit(source, &authority, Fragment::from(first.clone()))
         .unwrap();
@@ -572,7 +524,7 @@ fn ordinary_derived_operations_ignore_pending_immediate_source_output() {
         &authority,
         raw.handle(),
         triblespace_core::collection::SourceLocator::of(later_commit.data().raw),
-        Handle::<SuccinctArchiveBlob>::to_hash(missing_raw),
+        Handle::<Image>::to_hash(missing_raw),
     );
     store.insert(CollectionRecord::Derive(pending)).unwrap();
     let before = store.snapshot().unwrap();
@@ -595,14 +547,7 @@ fn ordinary_derived_operations_ignore_pending_immediate_source_output() {
         .expect("a dangling raw output is not a required Rank9 input");
         let observed = after.collection(accelerated).unwrap();
         assert_eq!(stood_for(&observed), initial_support);
-        assert_eq!(
-            observed
-                .view::<UnionArchive<OrderedUniverse>>()
-                .unwrap()
-                .iter()
-                .collect::<TribleSet>(),
-            first
-        );
+        assert_eq!(observed.view::<ImageFacts>().unwrap().0, first);
         assert_eq!(stood_for(&after.collection(raw).unwrap()), initial_support);
         assert!(!after.contains_blob(missing_raw).unwrap());
         let records_after = after
@@ -616,6 +561,7 @@ fn ordinary_derived_operations_ignore_pending_immediate_source_output() {
                 CollectionRecord::Derive(record) => record.collection(),
                 CollectionRecord::Merge(record) => record.collection(),
                 CollectionRecord::Commit(_) => panic!("downstream work must not author roots"),
+                CollectionRecord::Map(_) => panic!("nothing here is attached"),
             };
             assert_eq!(
                 collection,
@@ -638,18 +584,14 @@ fn ordinary_derived_operations_exclude_unauthorized_immediate_source_equations()
     let admitted = one_fact(26);
     let denied = one_fact(27);
     let denied_blob: Blob<SimpleArchive> = denied.clone().to_blob();
-    let denied_raw_blob = succinctarchive_union::derive_element(&denied_blob).unwrap();
+    let denied_raw_blob = Image::image(&denied_blob);
     let denied_raw = denied_raw_blob.get_handle();
     let mut store = MemoryRepo::default();
     let source = store
         .collection("typed-api-unauthorized-immediate-source", policy.clone())
         .unwrap();
-    let raw = store
-        .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-        .unwrap();
-    let accelerated = store
-        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(raw, (), policy)
-        .unwrap();
+    let raw = store.derive::<Image>(source, (), policy.clone()).unwrap();
+    let accelerated = store.derive::<ImageTwo>(raw, (), policy).unwrap();
     store
         .commit(source, &authority, Fragment::from(admitted.clone()))
         .unwrap();
@@ -661,15 +603,13 @@ fn ordinary_derived_operations_exclude_unauthorized_immediate_source_equations()
     let denied_commit = store
         .commit(source, &unauthorized, Fragment::from(denied))
         .unwrap();
-    store
-        .put::<SuccinctArchiveBlob, _>(denied_raw_blob)
-        .unwrap();
+    store.put::<Image, _>(denied_raw_blob).unwrap();
     store
         .insert(CollectionRecord::Derive(CollectionDerive::sign(
             &unauthorized,
             raw.handle(),
             triblespace_core::collection::SourceLocator::of(denied_commit.data().raw),
-            Handle::<SuccinctArchiveBlob>::to_hash(denied_raw),
+            Handle::<Image>::to_hash(denied_raw),
         )))
         .unwrap();
     let before = store.snapshot().unwrap();
@@ -689,21 +629,14 @@ fn ordinary_derived_operations_exclude_unauthorized_immediate_source_equations()
         .unwrap();
         let observed = after.collection(accelerated).unwrap();
         assert_eq!(stood_for(&observed), admitted_support);
-        assert_eq!(
-            observed
-                .view::<UnionArchive<OrderedUniverse>>()
-                .unwrap()
-                .iter()
-                .collect::<TribleSet>(),
-            admitted
-        );
+        assert_eq!(observed.view::<ImageFacts>().unwrap().0, admitted);
         assert!(!after.records().unwrap().any(|record| matches!(
             record.unwrap(),
             CollectionRecord::Derive(record)
                 if record.collection() == accelerated.handle()
                     && record.input()
                         == triblespace_core::collection::SourceLocator::of(
-                            Handle::<SuccinctArchiveBlob>::to_hash(denied_raw).raw
+                            Handle::<Image>::to_hash(denied_raw).raw
                         )
         )));
     }
@@ -789,9 +722,7 @@ fn collection_returns_the_maximal_resident_partial_realization() {
     let source = store
         .collection("typed-api-partial-source", policy.clone())
         .unwrap();
-    let target = store
-        .derive::<SuccinctArchiveBlob>(source, (), policy)
-        .unwrap();
+    let target = store.derive::<Image>(source, (), policy).unwrap();
 
     store
         .commit(source, &authority, Fragment::from(first.clone()))
@@ -812,14 +743,7 @@ fn collection_returns_the_maximal_resident_partial_realization() {
     let observed = snapshot.collection(target).unwrap();
     assert_eq!(stood_for(&observed), first_support);
     assert_eq!(observed.cover().len(), 1);
-    assert_eq!(
-        observed
-            .view::<UnionArchive<OrderedUniverse>>()
-            .unwrap()
-            .iter()
-            .collect::<TribleSet>(),
-        first
-    );
+    assert_eq!(observed.view::<ImageFacts>().unwrap().0, first);
 }
 
 #[test]

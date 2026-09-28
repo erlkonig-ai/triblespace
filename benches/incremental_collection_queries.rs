@@ -41,7 +41,7 @@ use triblespace::core::blob::encodings::succinctarchive::{
     OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
 };
 use triblespace::core::collection::{
-    AdmissionPolicy, Collection, CollectionPolicy, CollectionSnapshot, CollectionSnapshotExt,
+    AdmissionPolicy, AttachedSnapshot, Collection, CollectionPolicy, CollectionSnapshotExt,
     CollectionStoreExt,
 };
 use triblespace::core::examples::literature;
@@ -86,7 +86,7 @@ fn build_fixture(commits: usize, books_per_commit: usize) -> Fixture {
     );
     let mut store = MemoryRepo::for_host(authority);
     let collection = store
-        .collection(name, policy.clone())
+        .collection(name, policy)
         .expect("register benchmark collection");
 
     let author = entity! {
@@ -134,11 +134,11 @@ fn build_fixture(commits: usize, books_per_commit: usize) -> Fixture {
     }
 
     let raw = store
-        .derive::<SuccinctArchiveBlob>(collection, (), policy.clone())
-        .expect("register raw Succinct projection");
+        .attach::<SuccinctArchiveBlob>(collection, ())
+        .expect("attach the Succinct index");
     let accelerated = store
-        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(raw, (), policy)
-        .expect("register accelerated Succinct projection");
+        .attach::<Rank9AcceleratedSuccinctArchiveBlob>(collection, raw)
+        .expect("attach the Rank9 accelerator");
     Fixture {
         store,
         signing_key,
@@ -150,27 +150,27 @@ fn build_fixture(commits: usize, books_per_commit: usize) -> Fixture {
     }
 }
 
-/// Carry both mapping edges to the source's frontier and attach the
-/// accelerated target from the snapshot which observes that work.
+/// Maintain both attachments and read the accelerated cover from the
+/// snapshot which observes that work.
 fn maintain_succinct(
     store: &mut MemoryRepo,
     signing_key: &SigningKey,
     raw: Collection<SuccinctArchiveBlob>,
     accelerated: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
-) -> CollectionSnapshot<MemoryRepoSnapshot, Rank9AcceleratedSuccinctArchiveBlob> {
-    block_on(store.maintain(raw, signing_key)).expect("maintain raw Succinct cover");
-    let snapshot = block_on(store.maintain(accelerated, signing_key))
-        .expect("maintain accelerated Succinct cover");
+) -> AttachedSnapshot<MemoryRepoSnapshot, Rank9AcceleratedSuccinctArchiveBlob> {
+    block_on(store.maintain_attached(raw, signing_key)).expect("maintain Succinct attachments");
+    let snapshot = block_on(store.maintain_attached(accelerated, signing_key))
+        .expect("maintain Rank9 attachments");
     snapshot
-        .collection(accelerated)
-        .expect("observe accelerated Succinct cover")
+        .attached(accelerated)
+        .expect("observe the Rank9 attachments")
 }
 
 fn seed_view(
     fixture: &Fixture,
 ) -> (
     MemoryRepo,
-    CollectionSnapshot<MemoryRepoSnapshot, Rank9AcceleratedSuccinctArchiveBlob>,
+    AttachedSnapshot<MemoryRepoSnapshot, Rank9AcceleratedSuccinctArchiveBlob>,
 ) {
     let mut store = fixture.store.clone();
     let seed = maintain_succinct(
@@ -180,7 +180,7 @@ fn seed_view(
         fixture.accelerated,
     );
     assert_eq!(
-        seed.support().expect("resolve seed support").len(),
+        seed.support().len(),
         1,
         "the seed stands on the author commit alone"
     );
@@ -257,7 +257,7 @@ struct IncrementalState {
     collection: Collection<SimpleArchive>,
     raw: Collection<SuccinctArchiveBlob>,
     accelerated: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
-    snapshot: CollectionSnapshot<MemoryRepoSnapshot, Rank9AcceleratedSuccinctArchiveBlob>,
+    snapshot: AttachedSnapshot<MemoryRepoSnapshot, Rank9AcceleratedSuccinctArchiveBlob>,
     results: BTreeSet<Row>,
 }
 
@@ -286,40 +286,16 @@ impl IncrementalState {
             self.raw,
             self.accelerated,
         );
-        // The delta is the source payloads added since the previous step,
-        // read from the root through the same two snapshots: supports are
-        // collection-local, and the Succinct target answers the full side of
-        // the query. The root's support is a valid token only because this
-        // single writer's chain has absorbed all of it, which each hop's
-        // freshness confirms.
-        let root_now = next
-            .snapshot()
-            .collection(self.collection)
-            .expect("observe the source now");
-        let raw_now = next
-            .snapshot()
-            .collection(self.raw)
-            .expect("observe the raw view now");
+        // The delta is the source payloads added since the previous step: the
+        // attached cover stands for its parent's foundations, and with no
+        // residual it answers the full side of the query for all of them.
         assert!(
-            raw_now
-                .missing_from(&root_now)
-                .expect("raw freshness")
-                .is_empty()
-                && next
-                    .missing_from(&raw_now)
-                    .expect("accelerated freshness")
-                    .is_empty(),
-            "the view chain has absorbed every source payload"
+            next.residual().is_empty(),
+            "the attached cover reaches every source payload"
         );
-        let root_before = self
-            .snapshot
-            .snapshot()
-            .collection(self.collection)
-            .expect("observe the source before");
-        let changed_support = root_now
+        let changed_support = next
             .support()
-            .expect("resolve incremental support")
-            .additions_since(root_before.support().expect("resolve previous support"))
+            .additions_since(self.snapshot.support())
             .expect("benchmark support grows monotonically");
         assert_eq!(changed_support.len(), 1, "one payload is observed per step");
         let mut changed_view = TribleSet::new();
@@ -443,10 +419,7 @@ fn run_incremental(fixture: &Fixture, checkpoints: &BTreeSet<usize>) -> Run {
         let commits = index + 1;
         // The seed author plus every commit so far: the retained snapshot
         // stands on the whole source frontier.
-        assert_eq!(
-            state.snapshot.support().expect("resolve support").len(),
-            commits + 1
-        );
+        assert_eq!(state.snapshot.support().len(), commits + 1);
         if checkpoints.contains(&commits) {
             samples.push(Sample {
                 arm: Arm::Incremental,

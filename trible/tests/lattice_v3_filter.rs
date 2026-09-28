@@ -1,12 +1,15 @@
 //! `trible pile migrate SRC lattice-v3` over synthetic piles.
 //!
-//! The fixture registers one root and, through the CLI, one derived
-//! collection of every kind the CLI can register, so the filter classifies
-//! real descriptors: Succinct, Rank9, EntityIdSet, latest states, the LWW
-//! register, BM25 and PathSummary become attached, and the stored-vector
-//! NVFP4 set stays derived. Beside them sit hand-built descriptors the CLI
-//! cannot register any more or never could: ReferenceSummary (deleted, known
-//! only by its literal ids), a retired semantic-index id, an unrecognised
+//! The fixture registers one root and one derived collection of every kind
+//! the pre-v3 lattice derived: Succinct, Rank9, EntityIdSet, latest states,
+//! the LWW register, BM25 and PathSummary become attached, and the
+//! stored-vector NVFP4 set stays derived. The NVFP4 set is registered
+//! through the CLI. The kinds that become attached are built by hand as the
+//! derived descriptors earlier binaries wrote (a source and a mapping
+//! algorithm), because this binary registers them only as attached
+//! collections. Beside them sit hand-built descriptors the CLI cannot
+//! register any more or never could: ReferenceSummary (deleted, known only
+//! by its literal ids), a retired semantic-index id, an unrecognised
 //! algorithm, a plural descriptor, one naming a mapping entity without a
 //! tagged algorithm, and a blob that does not decode as a descriptor.
 //! Records: commits, an own and a foreign MERGE, one DERIVE per derived
@@ -261,7 +264,6 @@ fn derive(
 }
 
 const ATTRIBUTE: &str = "A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A1";
-const ORDERS: &str = "A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A2";
 
 struct Fixture {
     dir: TempDir,
@@ -306,29 +308,32 @@ impl Fixture {
         let empty = pile.collection("empty", policy(&key)).unwrap().handle();
         pile.close().unwrap();
 
-        let succinct = derive(&src, &key_path, root, "succinct", &[]);
-        let rank9 = derive(&src, &key_path, succinct, "rank9", &[]);
-        let attached = [
-            succinct,
-            rank9,
-            derive(
-                &src,
-                &key_path,
-                root,
-                "entity-id-set",
-                &["--attribute", ATTRIBUTE],
-            ),
-            derive(&src, &key_path, root, "latest", &["--observes", ATTRIBUTE]),
-            derive(
-                &src,
-                &key_path,
-                root,
-                "lww",
-                &["--identity", ATTRIBUTE, "--orders", ORDERS],
-            ),
-            derive(&src, &key_path, root, "bm25", &["--text", ATTRIBUTE]),
-            derive(&src, &key_path, root, "path", &["--expr", ATTRIBUTE]),
-        ];
+        // The derived descriptors the pre-v3 lattice registered for the
+        // mappings that become attached; this binary attaches them instead.
+        let (succinct, attached) = {
+            use triblespace_core::collection::succinctarchive_union::{
+                RAW_TO_RANK9_ACCELERATED_MAPPING_V1_64_LE, SIMPLE_TO_SUCCINCT_MAPPING_V1,
+            };
+            let mut pile = Pile::open(&src).unwrap();
+            let succinct = hand_descriptor(&mut pile, root, &[SIMPLE_TO_SUCCINCT_MAPPING_V1]);
+            let rank9 = hand_descriptor(
+                &mut pile,
+                succinct,
+                &[RAW_TO_RANK9_ACCELERATED_MAPPING_V1_64_LE],
+            );
+            let mut attached = vec![succinct, rank9];
+            for algorithm in [
+                triblespace_core::blob::encodings::entity_id_set::GENID_ATTRIBUTE_VALUES_MAPPING_V1,
+                triblespace_core::collection::latest::LATEST_STATES_MAPPING_V1,
+                triblespace_core::collection::lww_register::REGISTER_COORDINATES_MAPPING_V1,
+                triblespace_search::text_bm25::TEXT_ATTRIBUTE_TO_BM25,
+                triblespace_paths::REGULAR_PATH_MAPPING_V1,
+            ] {
+                attached.push(hand_descriptor(&mut pile, root, &[algorithm]));
+            }
+            pile.close().unwrap();
+            (succinct, attached)
+        };
         let nvfp4 = derive(
             &src,
             &key_path,

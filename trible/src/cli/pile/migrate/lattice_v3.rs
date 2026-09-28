@@ -11,6 +11,9 @@
 //! - every MERGE of every encoding and every signer (current v10, retired v8,
 //!   retired v2 and v6, legacy unsigned, legacy V3) is left behind: a host
 //!   folds only merges its own key signed, and rebuilds them;
+//! - every MAP (a host's attachment of one node in an attached collection)
+//!   is left behind for the same reason: attachments are rebuilt by the
+//!   host's maintenance over the rebuilt lattice;
 //! - a DERIVE of any encoding is left behind when its target's resident
 //!   descriptor names only mapping algorithms that become attached or are
 //!   deleted ([`v3_mappings`](super::super::collection::v3_mappings)), and is
@@ -303,7 +306,9 @@ impl CollectionFrameFilter for V3Filter<'_> {
         }
         let census = &mut self.census;
         let carried = match (frame.role, collection) {
-            (CollectionFrameRole::Merge, _) => false,
+            // Both are the host's private computation over the foundations:
+            // the v3 lattice and its attachments are rebuilt, never carried.
+            (CollectionFrameRole::Merge, _) | (CollectionFrameRole::Map, _) => false,
             (CollectionFrameRole::Derive, Some(collection)) => {
                 !census.classes[&collection].leaves_derives_behind(&census.attached)
             }
@@ -333,6 +338,7 @@ fn role_label(role: CollectionFrameRole) -> &'static str {
         CollectionFrameRole::Merge => "MERGE",
         CollectionFrameRole::Derive => "DERIVE",
         CollectionFrameRole::Definition => "DEFINITION",
+        CollectionFrameRole::Map => "MAP",
     }
 }
 

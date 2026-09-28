@@ -434,27 +434,31 @@ struct LatticeCollection {
     handle: [u8; 32],
     /// The name a root descriptor carries, when its bytes are here.
     name: Option<String>,
-    /// The collection this one derives from. `None` is what being a root
-    /// means; it is not a failure to read one.
+    /// The collection this one derives from, or the parent it is attached
+    /// to. `None` is what being a root means; it is not a failure to read one.
     source: Option<[u8; 32]>,
     /// Whether this collection's descriptor archive is resident and decodable
     /// in this observation.
     descriptor_resident: bool,
     /// Signed records naming this collection, by kind: every one stored, so
-    /// `merges` counts other keys' MERGEs too, which the fold never believes.
+    /// `merges` and `maps` count other keys' MERGEs and MAPs too, which the
+    /// fold never believes.
     commits: u64,
     merges: u64,
     derives: u64,
+    /// MAP records naming it: an attached collection's attachments.
+    maps: u64,
     /// COMMITs and DERIVEs naming it whose payload or mapping output is
     /// actually here. The shortfall against [`Self::foundations`] is the
     /// concrete "what is missing": foundations replication has not delivered
     /// yet.
     ///
-    /// MERGEs are counted above and deliberately left out of this ratio: a
-    /// MERGE never replicates. The host's own are its private computation over
-    /// the foundations, and another key's are never believed, so a result of
-    /// either that is not here is nothing any peer will send. Counting them
-    /// would draw a store holding every foundation as permanently behind.
+    /// MERGEs and MAPs are counted above and deliberately left out of this
+    /// ratio: neither ever replicates. The host's own are its private
+    /// computation over the foundations, and another key's are never
+    /// believed, so a result or attachment of either that is not here is
+    /// nothing any peer will send. Counting them would draw a store holding
+    /// every foundation as permanently behind.
     foundations_resident: u64,
     /// Attestations of this collection that no capability proof admits yet.
     /// Only COMMITs and DERIVEs wait on a grant: a MERGE needs none, since the
@@ -538,7 +542,13 @@ fn observe_lattice<R: triblespace_core::repo::StoreRead>(
         let facts: Option<TribleSet> = snapshot.get(handle).ok();
         let source = facts
             .as_ref()
-            .and_then(|facts| descriptor::source(facts).ok().flatten())
+            .and_then(|facts| {
+                descriptor::source(facts).ok().flatten().or_else(|| {
+                    descriptor::parents(facts)
+                        .ok()
+                        .and_then(|parents| parents.first().copied())
+                })
+            })
             .map(|source| source.raw);
         let name = facts.as_ref().and_then(|facts| {
             let named = descriptor::name(facts).ok().flatten()?;
@@ -548,17 +558,18 @@ fn observe_lattice<R: triblespace_core::repo::StoreRead>(
         if let Some(source) = source {
             pending.push(source);
         }
-        let (commits, merges, derives, foundations_resident) = match evidence.get(&raw) {
+        let (commits, merges, derives, maps, foundations_resident) = match evidence.get(&raw) {
             Some(found) => (
                 found.commits.stored,
                 found.merges.stored,
                 found.derives.stored,
+                found.maps.stored,
                 found
                     .commits
                     .result_resident
                     .saturating_add(found.derives.result_resident),
             ),
-            None => (0, 0, 0, 0),
+            None => (0, 0, 0, 0, 0),
         };
         out.push(LatticeCollection {
             handle: raw,
@@ -568,6 +579,7 @@ fn observe_lattice<R: triblespace_core::repo::StoreRead>(
             commits,
             merges,
             derives,
+            maps,
             foundations_resident,
             // Filled below: admission is a question about the whole lattice at
             // once, not about one collection as it is discovered.
@@ -826,6 +838,8 @@ fn observe_members<R: triblespace_core::repo::StoreRead>(
                 produced.insert(output);
                 handles.insert(output);
             }
+            // An attachment is no node of this collection's lattice.
+            CollectionRecord::Map(_) => {}
         }
     }
 
@@ -1389,7 +1403,7 @@ fn render_terminal(frame: &Frame) -> String {
                 collections.len()
             );
             out.push_str(
-                "  Resident is result blobs actually here over records naming the collection, per collection.\n",
+                "  Resident is COMMIT payloads and DERIVE outputs here over the COMMITs and DERIVEs naming the collection; MERGEs and MAPs never replicate and are counted beside it.\n",
             );
             // Derived descriptors carry no name of their own, so they sort
             // last; a flat cut then hides every derivation behind the roots,
@@ -1400,7 +1414,7 @@ fn render_terminal(frame: &Frame) -> String {
                 for collection in rows.iter().take(12) {
                     let _ = writeln!(
                         out,
-                        "  {} {} · {} commit / {} derive · {} of {} resident · {} merge stored{}",
+                        "  {} {} · {} commit / {} derive · {} of {} resident · {} merge / {} map stored{}",
                         if collection.descriptor_resident { "+" } else { "?" },
                         collection
                             .name
@@ -1411,6 +1425,7 @@ fn render_terminal(frame: &Frame) -> String {
                         collection.foundations_resident,
                         collection.foundations(),
                         collection.merges,
+                        collection.maps,
                         match collection.source {
                             Some(source) => format!(" · derives from {}", short(&source)),
                             None => String::new(),
@@ -1600,20 +1615,18 @@ mod tests {
     use triblespace_core::prelude::*;
     use triblespace_net::telemetry::MetricValue;
 
-    /// A root collection with one commit, plus a derivation registered over it
-    /// that has never been maintained.
+    /// A root collection with one commit, plus an index attached to it that
+    /// has never been maintained.
     fn lattice_fixture() -> (MemoryRepo, CollectionHandle, CollectionHandle) {
         use triblespace_core::blob::encodings::succinctarchive::SuccinctArchiveBlob;
         let mut store = MemoryRepo::default();
         let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
-        let source: Collection<SimpleArchive> = store.collection("facts", policy.clone()).unwrap();
+        let source: Collection<SimpleArchive> = store.collection("facts", policy).unwrap();
         let signer = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
         store
             .commit(source, &signer, entity! { metadata::name: "first" })
             .unwrap();
-        let target = store
-            .derive::<SuccinctArchiveBlob>(source, (), policy)
-            .unwrap();
+        let target = store.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
         (store, source.handle(), target.handle())
     }
 
@@ -1661,6 +1674,7 @@ mod tests {
             .expect("a seeded handle is projected");
         assert_eq!(derived.foundations(), 0, "nothing has been derived yet");
         assert_eq!(derived.derives, 0);
+        assert_eq!(derived.maps, 0, "nothing has been attached yet");
         assert!(derived.descriptor_resident, "its descriptor is right here");
     }
 

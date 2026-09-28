@@ -52,7 +52,7 @@ use crate::trible::{Fragment, Trible, A_START, E_START, TRIBLE_LEN};
 
 use super::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
 use super::{
-    CollectionDerivation, CollectionEncoding, CollectionOperationError, TryFromCover,
+    CollectionAttachment, CollectionEncoding, CollectionOperationError, TryFromCover,
     TryFromCoverError,
 };
 
@@ -348,8 +348,7 @@ impl CollectionEncoding for LatestBlob {
     }
 }
 
-impl CollectionDerivation for LatestBlob {
-    type Source = SimpleArchive;
+impl CollectionAttachment for LatestBlob {
     type Argument = Id;
 
     fn fragment(observes: &Id) -> Fragment {
@@ -360,7 +359,7 @@ impl CollectionDerivation for LatestBlob {
         }
     }
 
-    fn bind(_source: &Fragment, target: &Fragment) -> Result<Id, CollectionOperationError> {
+    fn bind(_parent: &Fragment, target: &Fragment) -> Result<Id, CollectionOperationError> {
         let raw = super::descriptor::mapping_argument(target.facts(), register_observes.id())
             .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?
             .ok_or_else(|| {
@@ -385,13 +384,14 @@ impl CollectionDerivation for LatestBlob {
 
     fn map<R>(
         observes: &Id,
-        source: &Blob<SimpleArchive>,
+        node: &Blob<SimpleArchive>,
+        _siblings: &[super::CollectionData],
         _reader: &R,
     ) -> Result<Blob<Self>, CollectionOperationError>
     where
-        R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
+        R: crate::repo::StoreRead,
     {
-        derive_element(source, *observes)
+        derive_element(node, *observes)
             .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
 }
@@ -655,11 +655,7 @@ mod tests {
             .collection("latest-row-view", policy(key.verifying_key()))
             .unwrap();
         let target = store
-            .derive::<LatestBlob>(
-                source,
-                metadata::supersedes.id(),
-                policy(key.verifying_key()),
-            )
+            .attach::<LatestBlob>(source, metadata::supersedes.id())
             .unwrap();
         let handles = members
             .iter()
@@ -964,16 +960,16 @@ mod tests {
 
     #[test]
     fn configured_edge_is_part_of_mapping_identity_and_does_not_limit_subjects() {
-        use super::super::{descriptor, CanonicalDerivation};
+        use super::super::{descriptor, CanonicalAttachment};
         let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
         let mut store = MemoryRepo::default();
         let source = store
             .collection("latest-identity", policy(key.verifying_key()))
             .unwrap();
-        let a = CanonicalDerivation::<LatestBlob>::new(metadata::supersedes.id());
-        let b = CanonicalDerivation::<LatestBlob>::new(metadata::tag.id());
-        let first = descriptor::deriving_with(source.handle(), &a, policy(key.verifying_key()));
-        let second = descriptor::deriving_with(source.handle(), &b, policy(key.verifying_key()));
+        let a = CanonicalAttachment::<LatestBlob>::new(metadata::supersedes.id());
+        let b = CanonicalAttachment::<LatestBlob>::new(metadata::tag.id());
+        let first = descriptor::attaching_with(source.handle(), &a);
+        let second = descriptor::attaching_with(source.handle(), &b);
         assert_ne!(first, second);
         assert_eq!(
             descriptor::mapping_algorithm(first.facts()),
@@ -993,18 +989,14 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_collection_maintenance_keeps_frozen_latest_views_and_historical_targets() {
+    fn attached_maintenance_keeps_frozen_latest_views_and_historical_targets() {
         let key = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
-        let mut store = MemoryRepo::default();
+        let mut store = MemoryRepo::for_host(key.verifying_key());
         let source = store
             .collection("maintained-latest", policy(key.verifying_key()))
             .unwrap();
         let target = store
-            .derive::<LatestBlob>(
-                source,
-                metadata::supersedes.id(),
-                policy(key.verifying_key()),
-            )
+            .attach::<LatestBlob>(source, metadata::supersedes.id())
             .unwrap();
         let a = ufoid();
         let b = ufoid();
@@ -1012,9 +1004,9 @@ mod tests {
         store
             .commit(source, &key, Fragment::from(edge(&b, &a)))
             .unwrap();
-        let early = block_on(store.maintain(target, &key))
+        let early = block_on(store.maintain_attached(target, &key))
             .unwrap()
-            .collection(target)
+            .attached(target)
             .unwrap();
         assert_eq!(
             early
@@ -1027,8 +1019,8 @@ mod tests {
         store
             .commit(source, &key, Fragment::from(edge(&c, &b)))
             .unwrap();
-        let after = block_on(store.maintain(target, &key)).unwrap();
-        let frozen = after.collection(target).unwrap();
+        let after = block_on(store.maintain_attached(target, &key)).unwrap();
+        let frozen = after.attached(target).unwrap();
         assert_eq!(
             frozen
                 .view::<LatestIndex>()
@@ -1040,8 +1032,8 @@ mod tests {
         store
             .commit(source, &key, Fragment::from(state(&a)))
             .unwrap();
-        let caught_up = block_on(store.maintain(target, &key)).unwrap();
-        let live: LatestIndex = caught_up.collection(target).unwrap().view().unwrap();
+        let caught_up = block_on(store.maintain_attached(target, &key)).unwrap();
+        let live: LatestIndex = caught_up.attached(target).unwrap().view().unwrap();
         assert_eq!(live.states().collect::<Vec<_>>(), [*c]);
         assert_eq!(
             early
@@ -1051,28 +1043,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             [*b]
         );
-        assert_eq!(
-            frozen
-                .view::<LatestIndex>()
-                .unwrap()
-                .states()
-                .collect::<Vec<_>>(),
-            [*c]
-        );
-        assert_eq!(frozen.support().unwrap().len(), 2);
-        assert_eq!(
-            caught_up
-                .collection(target)
-                .unwrap()
-                .support()
-                .unwrap()
-                .len(),
-            3
-        );
-        // Maintaining a derived collection derives its leaves and mirrors its
-        // source's merges. Three commits sit below the root's fan-in, so the
-        // source has no merge and the target none of its own: one leaf per
-        // commit, and the frozen observations above were read across them.
+        assert_eq!(frozen.support().len(), 2);
+        assert_eq!(caught_up.attached(target).unwrap().support().len(), 3);
+        // Three commits sit below the root's fan-in, so the parent has no
+        // merge: one MAP per commit, and the reads above were across them.
         let target_records: Vec<_> = caught_up
             .records()
             .unwrap()
@@ -1082,7 +1056,7 @@ mod tests {
         assert_eq!(target_records.len(), 3);
         assert!(target_records
             .iter()
-            .all(|record| matches!(record, super::super::CollectionRecord::Derive(_))));
+            .all(|record| matches!(record, super::super::CollectionRecord::Map(_))));
     }
 
     #[test]

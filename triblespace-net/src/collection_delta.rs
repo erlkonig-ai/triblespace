@@ -351,6 +351,34 @@ mod tests {
     }
 
     #[test]
+    fn map_records_are_never_encoded_decoded_or_patched() {
+        use triblespace_core::collection::CollectionMap;
+        let expected = collection(1);
+        let map = CollectionRecord::Map(CollectionMap::sign(
+            &SigningKey::from_bytes(&[7; 32]),
+            expected,
+            data(1),
+            data(6),
+        ));
+        // The bytes decode as a MAP: the refusal is the replication rule,
+        // not a decoding failure.
+        assert_eq!(CollectionRecord::from_bytes(&map.to_bytes()).unwrap(), map);
+        assert_eq!(
+            encode_record(expected, map),
+            Err(CollectionDeltaError::NotReplicated)
+        );
+        assert_eq!(
+            decode_record(expected, &map.to_bytes()),
+            Err(CollectionDeltaError::NotReplicated)
+        );
+        let [commit, derive] = foundations(expected);
+        assert!(matches!(
+            canonical_records(expected, [commit, map, derive]),
+            Err(CollectionDeltaError::NotReplicated)
+        ));
+    }
+
+    #[test]
     fn framing_collection_and_signatures_fail_before_admission() {
         let expected = collection(1);
         let commit = records(expected)[0];

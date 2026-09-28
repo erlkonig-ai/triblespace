@@ -9,10 +9,13 @@
 //!
 //! A root carries [`collection_name`] while a derived collection carries
 //! [`collection_source`] and one concrete [`collection_mapping`]
-//! instance instead. Mapping parameters hang from that mapping entity, not
-//! from the collection descriptor, so the conversion remains independently
-//! identifiable and queryable. Both kinds carry independent, self-contained
-//! capability policy bindings. Each capability is either open or governed by
+//! instance instead. An attached collection carries [`collection_parent`]
+//! and one concrete mapping, and no policy at all: its records are believed
+//! on the host's own key alone, and nowhere else. Mapping parameters hang
+//! from that mapping entity, not from the collection descriptor, so the
+//! conversion remains independently identifiable and queryable. Roots and
+//! derived collections carry independent, self-contained capability policy
+//! bindings. Each capability is either open or governed by
 //! a quorum over its own canonical root set; there is no privileged collection
 //! owner or shared anchor. Policy is never inferred by walking the source
 //! chain. Readers query the facts they need; unrelated fields and retired
@@ -46,11 +49,11 @@ use super::policy::{
 };
 use super::records::{
     admission_delegate_threshold, admission_invoke_threshold, admission_policy_root,
-    collection_mapping, collection_name, collection_representation, collection_source,
-    mapping_algorithm as mapping_algorithm_attribute, CollectionHandle, RecordDecodeError,
-    KIND_COLLECTION_DESCRIPTOR, KIND_COLLECTION_MAPPING,
+    collection_mapping, collection_name, collection_parent, collection_representation,
+    collection_source, mapping_algorithm as mapping_algorithm_attribute, mapping_reads_attached,
+    CollectionHandle, RecordDecodeError, KIND_COLLECTION_DESCRIPTOR, KIND_COLLECTION_MAPPING,
 };
-use super::{read_capability, write_capability, CollectionEncoding, DeriveMapping};
+use super::{read_capability, write_capability, CollectionEncoding, DeriveMapping, MapMapping};
 
 /// Store one descriptor archive and every blob carried by its self-contained
 /// Fragment, returning the canonical descriptor handle.
@@ -192,6 +195,26 @@ where
     }
 }
 
+/// Build an attached descriptor around one explicit mapping value: the
+/// parent's handle, the attachment encoding and the mapping, and nothing
+/// else.
+///
+/// There is no policy. A MAP is believed only when the host's own key signed
+/// it, so no other store's belief depends on it and no WRITE or READ
+/// audience is there to state; the handle is then the same on every host
+/// that holds the parent, though nothing depends on that.
+pub(crate) fn attaching_with<M>(parent: CollectionHandle, mapping: &M) -> Fragment
+where
+    M: MapMapping,
+{
+    entity! {
+        metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+        collection_parent: parent,
+        collection_representation*: <M::Target as MetaDescribe>::describe(),
+        collection_mapping*: mapping.fragment(),
+    }
+}
+
 /// The entity the descriptor's own attributes hang off.
 ///
 /// A descriptor archive holds more than one entity: the descriptor, plus the
@@ -282,6 +305,44 @@ pub fn source(facts: &TribleSet) -> Result<Option<CollectionHandle>, RecordDecod
         .map(|(v,)| v),
         "collection_source",
     )
+}
+
+/// The collections whose nodes this attached collection indexes, ascending:
+/// empty for a root or a derived collection.
+///
+/// Attaching names exactly one parent, but nothing here counts them: a
+/// descriptor naming two is still an attached collection, whose records the
+/// fold drops like any other attached collection's. A reader that walks one
+/// parent's lattice asks for one, and leaves a descriptor it cannot read
+/// that way alone.
+pub fn parents(facts: &TribleSet) -> Result<Vec<CollectionHandle>, RecordDecodeError> {
+    let descriptor = entity(facts)?;
+    let mut parents: Vec<CollectionHandle> = find!(
+        (v: CollectionHandle),
+        pattern!(facts, [{ descriptor @ collection_parent: ?v }])
+    )
+    .map(|(v,)| v)
+    .collect();
+    parents.sort_unstable_by(|left, right| left.raw.cmp(&right.raw));
+    parents.dedup();
+    Ok(parents)
+}
+
+/// The sibling attached collections this attached collection's mapping
+/// reads, as its mapping entity names them, ascending.
+pub fn reads_attached(facts: &TribleSet) -> Result<Vec<CollectionHandle>, RecordDecodeError> {
+    let Some(mapping) = mapping(facts)? else {
+        return Ok(Vec::new());
+    };
+    let mut siblings: Vec<CollectionHandle> = find!(
+        (v: CollectionHandle),
+        pattern!(facts, [{ mapping @ mapping_reads_attached: ?v }])
+    )
+    .map(|(v,)| v)
+    .collect();
+    siblings.sort_unstable_by(|left, right| left.raw.cmp(&right.raw));
+    siblings.dedup();
+    Ok(siblings)
 }
 
 /// Handle of the UTF-8 name carried by a root collection.

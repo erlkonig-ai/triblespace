@@ -1,7 +1,9 @@
-//! Canonical path-summary union and its derivation from `SimpleArchive`.
+//! Canonical path-summary union, attached to a `SimpleArchive` root.
 //!
-//! One collection is fixed by an extrinsic dataset scope and one canonical
-//! path automaton. Its elements retain only the graph domain and direct
+//! One collection is fixed by its parent collection and one canonical path
+//! automaton. It is an attached collection: every host that holds a node
+//! computes that node's summary, so each host keeps its own, as `MAP`s of its
+//! own nodes, and none replicate. Its elements retain only the graph domain and direct
 //! product arcs required by that automaton; their join is exact set union.
 //! Lowering graph facts into those direct arcs is therefore a join
 //! homomorphism:
@@ -13,6 +15,9 @@
 //! Transitive closure is deliberately absent from the collection law. It is
 //! performed once when a [`PathIndex`](crate::PathIndex) is materialized, so
 //! paths whose edges live in different source fragments remain discoverable.
+//! That is also what makes a reader's cover of attachments answer alike at
+//! any granularity: the members' arcs are unioned before closure, whether
+//! one node's summary holds a path or two nodes' summaries each hold half.
 //!
 //! Reading is split in three steps with different trust. Attaching a
 //! [`PathSummaryView`] is typed and structural: it keeps the resident members
@@ -38,7 +43,7 @@ use triblespace_core::collection::descriptor;
 use triblespace_core::collection::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
 use triblespace_core::collection::simplearchive_union;
 use triblespace_core::collection::{
-    CollectionData, CollectionDerivation, CollectionEncoding, CollectionOperationError, Cover,
+    CollectionAttachment, CollectionData, CollectionEncoding, CollectionOperationError, Cover,
     TryFromCover, TryFromCoverError,
 };
 use triblespace_core::id::{ExclusiveId, Id};
@@ -219,11 +224,11 @@ where
 /// immutable automaton child.
 impl CollectionEncoding for PathSummaryBlob {
     fn validate_descriptor(descriptor: &Fragment) -> Result<(), CollectionOperationError> {
-        let source = descriptor::source(descriptor.facts())
+        let parents = descriptor::parents(descriptor.facts())
             .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?;
-        if source.is_none() {
+        if parents.is_empty() {
             return Err(CollectionOperationError::Fatal(
-                "path-summary descriptor is missing its source collection".to_owned(),
+                "path-summary descriptor is missing its parent collection".to_owned(),
             ));
         }
         automaton_from_descriptor(descriptor).map(|_| ())
@@ -288,8 +293,7 @@ impl CollectionEncoding for PathSummaryBlob {
     }
 }
 
-impl CollectionDerivation for PathSummaryBlob {
-    type Source = SimpleArchive;
+impl CollectionAttachment for PathSummaryBlob {
     type Argument = Automaton;
 
     fn fragment(automaton: &Self::Argument) -> Fragment {
@@ -297,7 +301,7 @@ impl CollectionDerivation for PathSummaryBlob {
     }
 
     fn bind(
-        _source: &Fragment,
+        _parent: &Fragment,
         target: &Fragment,
     ) -> Result<Self::Argument, CollectionOperationError> {
         require_regular_path_mapping(target)?;
@@ -307,10 +311,11 @@ impl CollectionDerivation for PathSummaryBlob {
     fn map<R>(
         automaton: &Self::Argument,
         source: &Blob<SimpleArchive>,
+        _siblings: &[CollectionData],
         reader: &R,
     ) -> Result<Blob<Self>, CollectionOperationError>
     where
-        R: triblespace_core::repo::BlobStoreGet + triblespace_core::repo::BlobStoreMeta,
+        R: triblespace_core::repo::StoreRead,
     {
         let automaton_handle = PathAutomatonBlob::encode(automaton).get_handle();
         let resident = reader
@@ -722,7 +727,7 @@ mod tests {
     use triblespace_core::blob::IntoBlob;
     use triblespace_core::capability::policy::resource_policy;
     use triblespace_core::collection::records::{
-        collection_mapping, collection_name, collection_representation, collection_source,
+        collection_mapping, collection_name, collection_parent, collection_representation,
         CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
     };
     use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy};
@@ -772,27 +777,23 @@ mod tests {
         }
     }
 
-    fn summary_descriptor(source: CollectionHandle, automaton: &Automaton) -> Fragment {
-        let policy = policy();
+    fn summary_descriptor(parent: CollectionHandle, automaton: &Automaton) -> Fragment {
         entity! { _ @
             metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-            collection_source: source,
-            resource_policy*: policy.fragment(),
+            collection_parent: parent,
             collection_representation*: <PathSummaryBlob as MetaDescribe>::describe(),
             collection_mapping*: mapping_fragment(automaton),
         }
     }
 
     fn summary_descriptor_with_fingerprint(
-        source: CollectionHandle,
+        parent: CollectionHandle,
         automaton: &Automaton,
         fingerprint: Inline<Hash<Blake3>>,
     ) -> Fragment {
-        let policy = policy();
         entity! { _ @
             metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-            collection_source: source,
-            resource_policy*: policy.fragment(),
+            collection_parent: parent,
             collection_representation*: <PathSummaryBlob as MetaDescribe>::describe(),
             collection_mapping*: mapping_fragment_with_fingerprint(automaton, fingerprint),
         }
@@ -826,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_identity_includes_source_representation_and_automaton() {
+    fn descriptor_identity_includes_parent_representation_and_automaton() {
         let first_automaton = plus(label(7));
         let second_automaton = plus(label(8));
         let source = source_collection();
@@ -835,22 +836,23 @@ mod tests {
         let second = summary_descriptor(collection_of(&source), &second_automaton);
 
         assert_eq!(first, repeated);
-        // A summary names the collection it summarises, and carries no anchor
-        // of its own.
+        // A summary names the collection whose nodes it indexes, and carries
+        // no anchor and no policy of its own.
         assert_eq!(
-            descriptor::source(first.facts()),
-            Ok(Some(collection_of(&source)))
+            descriptor::parents(first.facts()),
+            Ok(vec![collection_of(&source)])
         );
+        assert_eq!(descriptor::source(first.facts()), Ok(None));
         assert!(
             descriptor::name(first.facts()).unwrap().is_none(),
-            "a derivation needs no anchor"
+            "an attachment needs no anchor"
         );
-        assert_eq!(descriptor::policy(first.facts()), Ok(policy()));
+        assert!(descriptor::policy(first.facts()).is_err());
         let other_source = summary_descriptor(
             collection_of(&source_descriptor("other-edges", policy())),
             &first_automaton,
         );
-        // Source scope changes the collection but not the reusable mapping.
+        // The parent changes the collection but not the reusable mapping.
         assert_ne!(collection_of(&first), collection_of(&other_source));
         assert_eq!(
             descriptor::mapping(first.facts()),
@@ -906,7 +908,7 @@ mod tests {
         let expected_handle = expected_automaton.get_handle();
         let historical_mapping =
             mapping_fragment_with_fingerprint(&automaton, Inline::new(expected_handle.raw));
-        let attached_mapping = <PathSummaryBlob as CollectionDerivation>::fragment(&automaton);
+        let attached_mapping = <PathSummaryBlob as CollectionAttachment>::fragment(&automaton);
         assert_eq!(attached_mapping.facts(), historical_mapping.facts());
         assert_eq!(attached_mapping.root(), historical_mapping.root());
 
@@ -926,7 +928,7 @@ mod tests {
         let mut annotated = descriptor.clone();
         let mapping = descriptor::mapping(annotated.facts())
             .unwrap()
-            .expect("derived descriptor has a mapping");
+            .expect("attached descriptor has a mapping");
         let predecessor: Inline<GenId> =
             triblespace_core::inline::IntoInline::to_inline(REGULAR_PATH_MAPPING_V1);
         annotated.facts_mut().insert(&Trible::force(

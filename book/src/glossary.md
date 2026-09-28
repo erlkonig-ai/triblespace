@@ -135,8 +135,25 @@ is the coherence-safe explicit extension seam. The `derive_with`,
 type; both surfaces execute the same derivation engine and persist the same
 descriptor facts.
 
+### Attached Collection
+An index attached to a root collection: its descriptor names the parent root
+and a mapping, and carries no policy. It has no lattice of its own. A `MAP`
+record, signed by the store's host, names the attachment built from one node of
+the parent's lattice; a store believes only its own host's `MAP`s, so one that
+reaches another store stays inert. A read takes, for each frontier node widest
+first, its usable attachment -- bytes and dependencies resident -- and
+otherwise descends through the host's merges; the foundations no attachment
+reaches are the read's residual. Succinct, Rank9, id-set, latest-state,
+last-writer-wins, BM25 and path-summary indexes are attached.
+
+### MAP
+The signed native record `MAP(attached, node, attachment)`: the host's claim
+that `attachment` is the attached collection's mapping of the parent node
+`node`. It carries no witness and is believed only when signed by the store's
+host.
+
 ### Collection Store
-A grow-only set of native `COMMIT`, `MERGE`, and `DERIVE` records. Insertion is
+A grow-only set of native `COMMIT`, `MERGE`, `DERIVE`, and `MAP` records. Insertion is
 idempotent by exact canonical record value; combining two stores is set union.
 Physical fixed-width indexes may key that value by its full-width fingerprint.
 

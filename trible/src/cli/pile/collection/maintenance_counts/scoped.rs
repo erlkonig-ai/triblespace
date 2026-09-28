@@ -7,6 +7,45 @@ use triblespace_core::repo::memoryrepo::MemoryRepo;
 
 type State = MaintenanceState<Counted<PileSnapshot>>;
 
+/// A derived id-set descriptor of an older generation, which this binary
+/// does not maintain.
+struct LegacyIdSet;
+
+impl triblespace_core::collection::DeriveMapping for LegacyIdSet {
+    type Source = SimpleArchive;
+    type Target = EntityIdSetBlob;
+
+    fn fragment(&self) -> Fragment {
+        use triblespace_core::collection::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
+        entity! {
+            metadata::tag: KIND_COLLECTION_MAPPING,
+            mapping_algorithm*: entity! {
+                metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
+                metadata::name: "an older derived id set",
+            },
+        }
+    }
+
+    fn bind(
+        _: &Fragment,
+        _: &Fragment,
+    ) -> Result<Self, triblespace_core::collection::CollectionOperationError> {
+        Ok(Self)
+    }
+
+    fn map<R: StoreRead>(
+        &self,
+        _: &Blob<SimpleArchive>,
+        _: &R,
+    ) -> Result<Blob<EntityIdSetBlob>, triblespace_core::collection::CollectionOperationError> {
+        Err(
+            triblespace_core::collection::CollectionOperationError::Fatal(
+                "an older derived id set is not maintained here".to_owned(),
+            ),
+        )
+    }
+}
+
 fn pass(
     fixture: &mut Fixture,
     references: &[String],
@@ -138,7 +177,7 @@ fn changed_chain_skips_other_chain_without_losing_its_wake_interest() {
     assert_skipped(&formerly_quiet, &fixture, 0);
     assert!(formerly_quiet.insertions[&fixture.targets[1].handle()][2] > 0);
     let snapshot = fixture.pile.snapshot().unwrap();
-    let observed = snapshot.collection(fixture.targets[1]).unwrap();
+    let observed = snapshot.attached(fixture.targets[1]).unwrap();
     assert_eq!(
         observed
             .view::<EntityIdSet>()
@@ -148,8 +187,8 @@ fn changed_chain_skips_other_chain_without_losing_its_wake_interest() {
         [fixture.first_value, Id::new([3; 16]).unwrap()]
     );
     assert_eq!(
-        stood_for(&observed),
-        fixture.sources[1].admitted(&snapshot).unwrap()
+        observed.support(),
+        &fixture.sources[1].admitted(&snapshot).unwrap()
     );
     fixture.close();
 }
@@ -182,11 +221,13 @@ fn failed_hop_keeps_its_retry_opportunity_when_another_chain_wakes() {
     let mut fixture = Fixture::new();
     let mut state = State::default();
     let mut references = warm(&mut fixture, &mut state);
+    // An old-generation derived id set: this binary maintains the attached
+    // one, so every pass fails this hop.
     let inaccessible = fixture
         .pile
-        .derive::<EntityIdSetBlob>(
+        .derive_with(
             fixture.sources[0],
-            metadata::tag.id(),
+            LegacyIdSet,
             CollectionPolicy::new(
                 AdmissionPolicy::direct(fixture.signer.verifying_key()),
                 AdmissionPolicy::direct(SigningKey::from_bytes(&[74; 32]).verifying_key()),
@@ -348,16 +389,16 @@ fn scoped_same_value_keeps_new_support_and_skips_other_chain() {
 }
 
 #[test]
-fn upstream_publication_rechecks_downstream_in_the_same_pass() {
+fn an_attached_target_carries_its_parent_before_attaching_in_the_same_pass() {
     let mut fixture = Fixture::new();
     let mut state = State::default();
-    let mut references = warm(&mut fixture, &mut state);
+    warm(&mut fixture, &mut state);
     let source = fixture.sources[0].handle();
     let target = fixture.targets[0].handle();
     // Seven more own members fill the root's first tier. A pass over the
-    // target alone, without its dependencies, derives their leaves and
-    // leaves the root uncarried, so the target starts the next pass with
-    // nothing to do.
+    // attached target alone carries its parent first, then attaches the
+    // frontier the carry left: one MERGE into the root and one MAP of the
+    // merged node, in the same pass.
     let values: Vec<Id> = (2..=triblespace_core::collection::MERGE_FAN_IN as u8)
         .map(|byte| Id::new([byte; 16]).unwrap())
         .collect();
@@ -371,49 +412,22 @@ fn upstream_publication_rechecks_downstream_in_the_same_pass() {
             )
             .unwrap();
     }
-    let (failures, leaves) = pass(&mut fixture, &[handle_hex(target)], false, &mut state, None);
-    assert_eq!(failures, 0);
-    assert!(
-        leaves.insertions[&target][2] > 0,
-        "the target derived its leaves"
-    );
-    assert!(
-        !leaves.insertions.contains_key(&source),
-        "the root was not reached"
-    );
-    // Its own writes ask for one catch-up, which finds nothing to do.
-    let (_, catch_up) = pass(&mut fixture, &[handle_hex(target)], false, &mut state, None);
-    assert!(catch_up.insertions.is_empty());
-    let before = fixture.pile.snapshot().unwrap();
-    assert!(selected_records(&before, source)
-        .iter()
-        .all(|record| matches!(record, CollectionRecord::Commit(_))));
-    assert!(!maintenance_changed(
-        &state.hops[&target].before.inner,
-        &before,
-        &state.hops[&target].interests
-    ));
-    // A pass with dependencies reaches the root and carries it, and only
-    // that publication gives the target work: the target must be checked
-    // after the root's carry -- even when target ordering puts its chain
-    // first -- or it could not mirror it. Repeated references do not change
-    // the selected set or the upstream-first walk.
-    references.extend([handle_hex(source), handle_hex(target)]);
-    let (failures, counts) = pass(&mut fixture, &references, true, &mut state, None);
+    let (failures, counts) = pass(&mut fixture, &[handle_hex(target)], false, &mut state, None);
     assert_eq!(failures, 0);
     assert!(counts.insertions[&source][1] > 0, "the root carried");
     assert!(
-        counts.insertions[&target][1] > 0,
-        "the target mirrored the carry in the same pass"
+        counts.insertions[&target][2] > 0,
+        "the target attached the merged node in the same pass"
     );
-    assert!(counts.selected_calls[&target] >= 2);
-    // The target-only passes above never reached the other chain, so this
-    // pass visits it afresh; it has nothing to publish.
+    // The target-only pass never reached the other chain.
     for handle in [fixture.sources[1].handle(), fixture.targets[1].handle()] {
         assert_eq!(counts.insertions.get(&handle), None);
     }
+    // Its own writes ask for one catch-up, which finds nothing to do.
+    let (_, catch_up) = pass(&mut fixture, &[handle_hex(target)], false, &mut state, None);
+    assert!(catch_up.insertions.is_empty());
     let snapshot = fixture.pile.snapshot().unwrap();
-    let observed = snapshot.collection(fixture.targets[0]).unwrap();
+    let observed = snapshot.attached(fixture.targets[0]).unwrap();
     let mut expected = vec![fixture.first_value];
     expected.extend(values);
     assert_eq!(
@@ -426,8 +440,8 @@ fn upstream_publication_rechecks_downstream_in_the_same_pass() {
     );
     assert_eq!(observed.cover().len(), 1);
     assert_eq!(
-        stood_for(&observed),
-        fixture.sources[0].admitted(&snapshot).unwrap()
+        observed.support(),
+        &fixture.sources[0].admitted(&snapshot).unwrap()
     );
     fixture.close();
 }
@@ -578,12 +592,7 @@ fn append_during_frozen_hop_is_not_absorbed_by_end_baseline() {
     );
     let after = fixture.pile.snapshot().unwrap();
     assert_eq!(
-        after
-            .collection(fixture.targets[0])
-            .unwrap()
-            .support()
-            .unwrap()
-            .len(),
+        after.attached(fixture.targets[0]).unwrap().support().len(),
         1
     );
     assert!(maintenance_changed(

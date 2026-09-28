@@ -5,9 +5,9 @@
 //!   collection_maintain_probe steady PILE REPS
 //!
 //! `build` creates a fresh pile holding one root `SimpleArchive` collection
-//! with N signed COMMITs, derives the SuccinctArchive and Rank9 hops the
-//! faculties fact chain uses, and maintains both to convergence. `steady`
-//! reopens that converged pile and runs the no-op maintain of both hops REPS
+//! with N signed COMMITs, attaches the Succinct and Rank9 indexes the
+//! faculties fact pair uses, and maintains both to convergence. `steady`
+//! reopens that converged pile and runs the no-op maintenance of both REPS
 //! times, reporting wall and CPU seconds. Nothing is published in `steady`.
 
 use std::path::Path;
@@ -54,17 +54,17 @@ fn main() {
     if !Path::new(path).exists() {
         std::fs::File::create(path).expect("create pile");
     }
-    let mut pile = Pile::open(Path::new(path)).expect("open pile");
+    let mut pile = Pile::open_as(Path::new(path), key.verifying_key()).expect("open pile");
     pile.refresh().expect("refresh pile");
     let source = pile
         .collection("probe-facts", policy(&key))
         .expect("root collection");
     let succinct = pile
-        .derive::<SuccinctArchiveBlob>(source, (), policy(&key))
-        .expect("succinct hop");
+        .attach::<SuccinctArchiveBlob>(source, ())
+        .expect("succinct attachment");
     let rank9 = pile
-        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy(&key))
-        .expect("rank9 hop");
+        .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
+        .expect("rank9 attachment");
 
     match mode {
         "build" => {
@@ -77,11 +77,27 @@ fn main() {
             }
             futures::executor::block_on(async {
                 drop(pile.ensure(source, &key).await.expect("ensure source"));
-                drop(pile.maintain(succinct, &key).await.expect("maintain succinct"));
-                drop(pile.maintain(rank9, &key).await.expect("maintain rank9"));
+                drop(
+                    pile.maintain_attached(succinct, &key)
+                        .await
+                        .expect("maintain succinct"),
+                );
+                drop(
+                    pile.maintain_attached(rank9, &key)
+                        .await
+                        .expect("maintain rank9"),
+                );
                 // Second pass so the recorded pile is already at the fixed point.
-                drop(pile.maintain(succinct, &key).await.expect("maintain succinct"));
-                drop(pile.maintain(rank9, &key).await.expect("maintain rank9"));
+                drop(
+                    pile.maintain_attached(succinct, &key)
+                        .await
+                        .expect("maintain succinct"),
+                );
+                drop(
+                    pile.maintain_attached(rank9, &key)
+                        .await
+                        .expect("maintain rank9"),
+                );
             });
             pile.flush().expect("flush");
             println!("built records={count}");
@@ -91,8 +107,16 @@ fn main() {
                 let wall = Instant::now();
                 let cpu = cpu_seconds();
                 futures::executor::block_on(async {
-                    drop(pile.maintain(succinct, &key).await.expect("maintain succinct"));
-                    drop(pile.maintain(rank9, &key).await.expect("maintain rank9"));
+                    drop(
+                        pile.maintain_attached(succinct, &key)
+                            .await
+                            .expect("maintain succinct"),
+                    );
+                    drop(
+                        pile.maintain_attached(rank9, &key)
+                            .await
+                            .expect("maintain rank9"),
+                    );
                 });
                 println!(
                     "rep={rep} wall_s={:.3} cpu_s={:.3}",

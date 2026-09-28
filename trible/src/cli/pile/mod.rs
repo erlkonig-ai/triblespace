@@ -161,18 +161,18 @@ pub(crate) fn pile_read_error(path: &Path, err: ReadError) -> anyhow::Error {
 /// genuine corruption stays a separate, boundary-confirmed
 /// `trible pile amputate <path> --truncate-to <byte-offset>` step.
 ///
-/// The fold has no host, so it believes no MERGE and every believed
+/// The fold has no host, so it believes no MERGE or MAP and every believed
 /// foundation is its own frontier node.
 ///
 /// The rule for every command: open as a host, the key it signs with,
 /// through [`open_refreshed_as`] or [`open_refreshed_with`], exactly when
-/// what the command does depends on which MERGEs the fold believes, because
-/// it publishes merges (a carry, or a derived view's upkeep) or reads through
-/// them (an attached read such as `collection search`, or the dashboard's
-/// member lattice). Every other command opens here, with no host, including
-/// one that signs records: a COMMIT, DERIVE, grant or descriptor is admitted
-/// by WRITE, never by the host, and a record scan or copy never asks the
-/// fold.
+/// what the command does depends on which MERGEs and MAPs the fold believes,
+/// because it publishes them (a carry, a derived view's upkeep, or attaching)
+/// or reads through them (an attached read such as `collection search`, or
+/// the dashboard's member lattice). Every other command opens here, with no
+/// host, including one that signs records: a COMMIT, DERIVE, grant or
+/// descriptor is admitted by WRITE, never by the host, and a record scan or
+/// copy never asks the fold.
 pub(crate) fn open_refreshed(path: &Path) -> Result<Pile> {
     open_refreshed_with(path, None)
 }
@@ -191,8 +191,8 @@ pub(crate) fn open_refreshed_as(path: &Path, host: VerifyingKey) -> Result<Pile>
 /// An explicit key must load, so a mistyped `--key` is an error rather than
 /// a quietly keyless read. Without one, the default (`TRIBLESPACE_KEY`, else
 /// `self.key` beside the pile) is used when it loads, and with no loadable
-/// key the read believes no MERGE: correct, only wider, since it attaches
-/// every believed foundation instead of the host's merges over them.
+/// key the read believes no MERGE and no MAP: every believed foundation is
+/// its own frontier node and nothing is attached.
 pub(crate) fn reading_host(explicit: Option<&Path>, pile: &Path) -> Result<Option<VerifyingKey>> {
     let path = triblespace_core::signing_key_file::resolve_path(explicit, pile);
     match triblespace_core::signing_key_file::load_existing(&path) {

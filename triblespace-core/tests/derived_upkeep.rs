@@ -1,6 +1,6 @@
-//! The collections derived from a source are found from their descriptors
-//! and taken up as a group: ensured after a write so the write is readable
-//! through every view, maintained by a daemon to their fixed points.
+//! The collections attached to a root are found from their descriptors and
+//! taken up as a group: ensured after a write so the write is readable
+//! through every attachment, maintained by a daemon after the root's carry.
 
 use ed25519_dalek::SigningKey;
 use futures::executor::block_on;
@@ -9,9 +9,10 @@ use triblespace_core::blob::encodings::succinctarchive::{
     OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
 };
 use triblespace_core::collection::{
-    derived_from, ensure_downstream, maintain_downstream, AdmissionPolicy, Collection,
-    CollectionPolicy, CollectionRead, CollectionRecord, CollectionSnapshotExt, CollectionStoreExt,
-    CoreRealizer, Derived, RealizeDerived, Realized, Upkeep, MERGE_FAN_IN,
+    attached_to, ensure_downstream, maintain_downstream, AdmissionPolicy, Attached, Collection,
+    CollectionPolicy, CollectionRead, CollectionRealizationError, CollectionRecord,
+    CollectionSnapshotExt, CollectionStoreExt, CoreRealizer, Derived, RealizeDerived, Realized,
+    Upkeep, MERGE_FAN_IN,
 };
 use triblespace_core::metadata;
 use triblespace_core::prelude::entity;
@@ -35,185 +36,179 @@ fn fragment(name: &'static str) -> Fragment {
     entity! { metadata::name: name }
 }
 
-struct Chain {
+struct Pair {
     source: Collection<SimpleArchive>,
     succinct: Collection<SuccinctArchiveBlob>,
     rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
 }
 
-fn chain(store: &mut MemoryRepo, name: &str, owner: &SigningKey) -> Chain {
-    let policy = open_for(owner);
-    let source = store.collection(name, policy.clone()).unwrap();
-    let succinct = store
-        .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-        .unwrap();
+fn pair(store: &mut MemoryRepo, name: &str, owner: &SigningKey) -> Pair {
+    let source = store.collection(name, open_for(owner)).unwrap();
+    let succinct = store.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
     let rank9 = store
-        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+        .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
         .unwrap();
-    Chain {
+    Pair {
         source,
         succinct,
         rank9,
     }
 }
 
-fn record_kinds(store: &mut MemoryRepo) -> (usize, usize, usize) {
+/// Commits, merges, derives and maps in the store.
+fn record_kinds(store: &mut MemoryRepo) -> (usize, usize, usize, usize) {
     let snapshot = store.snapshot().unwrap();
-    let mut counts = (0, 0, 0);
+    let mut counts = (0, 0, 0, 0);
     for record in snapshot.records().unwrap() {
         match record.unwrap() {
             CollectionRecord::Commit(_) => counts.0 += 1,
             CollectionRecord::Merge(_) => counts.1 += 1,
             CollectionRecord::Derive(_) => counts.2 += 1,
+            CollectionRecord::Map(_) => counts.3 += 1,
         }
     }
     counts
 }
 
+/// Registering the pair and attaching it once puts it into the listing.
+fn seed(store: &mut MemoryRepo, pair: &Pair, owner: &SigningKey) {
+    block_on(store.ensure_attached(pair.succinct, owner)).unwrap();
+    block_on(store.ensure_attached(pair.rank9, owner)).unwrap();
+}
+
 #[test]
-fn derived_collections_are_found_from_their_descriptors_in_dependency_order() {
+fn attached_collections_are_found_from_their_descriptors_siblings_first() {
     let owner = key(1);
-    let mut store = MemoryRepo::default();
-    let chain = chain(&mut store, "found", &owner);
-    let other = chain_named_unrelated(&mut store, &owner);
-    // A derived collection joins the listing with its first record, which
-    // realizing it once, as registration does, leaves behind.
+    let mut store = MemoryRepo::for_host(owner.verifying_key());
+    let pair = pair(&mut store, "found", &owner);
+    let other = store.collection("unrelated", open_for(&owner)).unwrap();
     store
-        .commit(chain.source, &owner, fragment("first"))
+        .commit(pair.source, &owner, fragment("first"))
         .unwrap();
     store.commit(other, &owner, fragment("elsewhere")).unwrap();
-    block_on(store.ensure(chain.succinct, &owner)).unwrap();
-    block_on(store.ensure(chain.rank9, &owner)).unwrap();
+    seed(&mut store, &pair, &owner);
     let snapshot = store.snapshot().unwrap();
-    let derived: Vec<_> = derived_from(&snapshot, chain.source.handle())
+    let attached: Vec<_> = attached_to(&snapshot, pair.source.handle())
         .unwrap()
         .into_iter()
-        .map(|derived| (derived.handle, derived.source))
+        .map(|attached| (attached.handle, attached.parent, attached.siblings))
         .collect();
     assert_eq!(
-        derived,
+        attached,
         [
-            (chain.succinct.handle(), chain.source.handle()),
-            (chain.rank9.handle(), chain.succinct.handle()),
+            (pair.succinct.handle(), pair.source.handle(), vec![]),
+            (
+                pair.rank9.handle(),
+                pair.source.handle(),
+                vec![pair.succinct.handle()]
+            ),
         ]
     );
-    assert!(derived_from(&snapshot, other.handle()).unwrap().is_empty());
-}
-
-fn chain_named_unrelated(store: &mut MemoryRepo, owner: &SigningKey) -> Collection<SimpleArchive> {
-    store.collection("unrelated", open_for(owner)).unwrap()
+    assert!(attached_to(&snapshot, other.handle()).unwrap().is_empty());
 }
 
 #[test]
-fn ensure_derived_makes_a_commit_readable_through_every_view_and_publishes_no_merge() {
+fn ensure_downstream_makes_a_commit_readable_through_every_attachment_and_publishes_no_merge() {
     let owner = key(2);
-    // The owner carries the root, so the store is its host.
+    // The owner carries the root and signs the MAPs, so the store is its host.
     let mut store = MemoryRepo::for_host(owner.verifying_key());
-    let chain = chain(&mut store, "ensured", &owner);
-    // The first commit and the registration-time realization put the chain
-    // into the listing; every later write finds it there.
-    store.commit(chain.source, &owner, fragment("one")).unwrap();
-    block_on(store.ensure(chain.succinct, &owner)).unwrap();
-    block_on(store.ensure(chain.rank9, &owner)).unwrap();
+    let pair = pair(&mut store, "ensured", &owner);
+    store.commit(pair.source, &owner, fragment("one")).unwrap();
+    seed(&mut store, &pair, &owner);
 
-    store.commit(chain.source, &owner, fragment("two")).unwrap();
+    store.commit(pair.source, &owner, fragment("two")).unwrap();
     let report = block_on(ensure_downstream(
         &mut store,
-        chain.source.handle(),
+        pair.source.handle(),
         &owner,
         &mut CoreRealizer,
     ))
     .unwrap();
     assert_eq!(
         report.realized,
-        [chain.succinct.handle(), chain.rank9.handle()]
+        [pair.succinct.handle(), pair.rank9.handle()]
     );
     assert!(report.unadmitted.is_empty());
-    assert!(report.unknown.is_empty());
+    assert!(report.unknown_attached.is_empty());
 
     let snapshot = store.snapshot().unwrap();
-    let observed = snapshot.collection(chain.rank9).unwrap();
-    assert_eq!(observed.support().unwrap().len(), 2);
+    let observed = snapshot.attached(pair.rank9).unwrap();
+    assert_eq!(observed.support().len(), 2);
+    assert!(observed.residual().is_empty());
     let view: UnionArchive<OrderedUniverse> = observed.view().unwrap();
-    assert_eq!(view.segment_count(), 2, "two leaf images, nothing merged");
+    assert_eq!(view.segment_count(), 2, "two commits, nothing merged");
     drop(snapshot);
-    let (commits, merges, derives) = record_kinds(&mut store);
-    assert_eq!((commits, merges), (2, 0));
-    assert_eq!(derives, 4, "each commit's image in each lattice");
+    assert_eq!(
+        record_kinds(&mut store),
+        (2, 0, 0, 4),
+        "each commit attached in each collection, and no merge"
+    );
 
-    // A derived collection has no carry of its own: maintaining the views
-    // mirrors their source's merges, and two commits sit below the root's
-    // fan-in, so there is none.
-    let report = block_on(maintain_downstream(
+    // Maintenance carries the root and attaches what the carry leaves: two
+    // commits sit below the fan-in, so there is nothing to carry.
+    block_on(maintain_downstream(
         &mut store,
-        chain.source.handle(),
+        pair.source.handle(),
         &owner,
         &mut CoreRealizer,
     ))
     .unwrap();
-    assert_eq!(
-        report.realized,
-        [chain.succinct.handle(), chain.rank9.handle()]
-    );
-    assert_eq!(record_kinds(&mut store), (2, 0, 4));
+    assert_eq!(record_kinds(&mut store), (2, 0, 0, 4));
 
-    // Once the root carries a full tier into one MERGE, maintenance mirrors
-    // it in every view, upstream first, over the leaves' images.
+    // A full tier is carried into one MERGE, and only the merged node is
+    // attached, in each collection.
     let more = ["three", "four", "five", "six", "seven", "eight"];
     assert_eq!(2 + more.len(), MERGE_FAN_IN);
     for name in more {
-        store.commit(chain.source, &owner, fragment(name)).unwrap();
+        store.commit(pair.source, &owner, fragment(name)).unwrap();
     }
-    drop(block_on(store.maintain(chain.source, &owner)).unwrap());
     let report = block_on(maintain_downstream(
         &mut store,
-        chain.source.handle(),
+        pair.source.handle(),
         &owner,
         &mut CoreRealizer,
     ))
     .unwrap();
     assert_eq!(
         report.realized,
-        [chain.succinct.handle(), chain.rank9.handle()]
+        [pair.succinct.handle(), pair.rank9.handle()]
     );
     assert_eq!(
         record_kinds(&mut store),
-        (MERGE_FAN_IN, 3, 2 * MERGE_FAN_IN),
-        "one root carry and its two mirrors; a leaf per commit per view"
+        (MERGE_FAN_IN, 1, 0, 6),
+        "one carry, and the merged node attached in both collections"
     );
     let snapshot = store.snapshot().unwrap();
-    let observed = snapshot.collection(chain.rank9).unwrap();
-    assert_eq!(observed.support().unwrap().len(), MERGE_FAN_IN);
+    let observed = snapshot.attached(pair.rank9).unwrap();
+    assert_eq!(observed.support().len(), MERGE_FAN_IN);
     let view: UnionArchive<OrderedUniverse> = observed.view().unwrap();
     assert_eq!(view.segment_count(), 1);
-    let source = snapshot.collection(chain.succinct).unwrap();
-    assert!(observed.missing_from(&source).unwrap().is_empty());
 }
 
 #[test]
-fn a_signer_the_target_does_not_admit_and_an_unknown_representation_are_named_not_guessed() {
+fn a_key_that_is_not_the_host_fails_and_an_unknown_representation_is_named_not_guessed() {
     let owner = key(3);
     let stranger = key(4);
-    let mut store = MemoryRepo::default();
-    let chain = chain(&mut store, "guarded", &owner);
+    let mut store = MemoryRepo::for_host(owner.verifying_key());
+    let pair = pair(&mut store, "guarded", &owner);
     store
-        .commit(chain.source, &owner, fragment("guarded"))
+        .commit(pair.source, &owner, fragment("guarded"))
         .unwrap();
-    block_on(store.ensure(chain.succinct, &owner)).unwrap();
-    block_on(store.ensure(chain.rank9, &owner)).unwrap();
+    seed(&mut store, &pair, &owner);
+    store
+        .commit(pair.source, &owner, fragment("guarded again"))
+        .unwrap();
 
-    let report = block_on(ensure_downstream(
-        &mut store,
-        chain.source.handle(),
-        &stranger,
-        &mut CoreRealizer,
-    ))
-    .unwrap();
-    assert!(report.realized.is_empty());
-    assert_eq!(
-        report.unadmitted,
-        [chain.succinct.handle(), chain.rank9.handle()]
-    );
+    // Only the host's MAPs are believed: another key has nothing to sign.
+    assert!(matches!(
+        block_on(ensure_downstream(
+            &mut store,
+            pair.source.handle(),
+            &stranger,
+            &mut CoreRealizer,
+        )),
+        Err(CollectionRealizationError::HostMismatch { .. })
+    ));
 
     struct KnowsNothing;
     impl<S: Store + AsyncBlobStoreAcquire + Send> RealizeDerived<S> for KnowsNothing {
@@ -223,38 +218,49 @@ fn a_signer_the_target_does_not_admit_and_an_unknown_representation_are_named_no
             _derived: &Derived,
             _signer: &SigningKey,
             _upkeep: Upkeep,
-        ) -> Result<Realized, triblespace_core::collection::CollectionRealizationError> {
+        ) -> Result<Realized, CollectionRealizationError> {
+            Ok(Realized::Unknown)
+        }
+
+        async fn realize_attached(
+            &mut self,
+            _store: &mut S,
+            _attached: &Attached,
+            _signer: &SigningKey,
+            _upkeep: Upkeep,
+        ) -> Result<Realized, CollectionRealizationError> {
             Ok(Realized::Unknown)
         }
     }
     let report = block_on(ensure_downstream(
         &mut store,
-        chain.source.handle(),
+        pair.source.handle(),
         &owner,
         &mut KnowsNothing,
     ))
     .unwrap();
     assert_eq!(
         report
-            .unknown
+            .unknown_attached
             .iter()
-            .map(|derived| derived.handle)
+            .map(|attached| attached.handle)
             .collect::<Vec<_>>(),
-        [chain.succinct.handle(), chain.rank9.handle()]
+        [pair.succinct.handle(), pair.rank9.handle()]
     );
 }
 
 #[test]
 fn a_descriptor_naming_another_mapping_is_left_to_whoever_registered_it() {
     use triblespace_core::blob::Blob;
-    use triblespace_core::collection::{CollectionOperationError, DeriveMapping};
+    use triblespace_core::collection::{
+        CollectionAttachment, CollectionData, CollectionOperationError, MapMapping,
+    };
     use triblespace_core::repo::StoreRead;
 
-    /// Succinct images built by a mapping that is not the canonical one: same
-    /// target encoding, another algorithm in the descriptor.
+    /// Succinct attachments built by a mapping that is not the canonical
+    /// one: same encoding, another algorithm in the descriptor.
     struct OtherWay;
-    impl DeriveMapping for OtherWay {
-        type Source = SimpleArchive;
+    impl MapMapping for OtherWay {
         type Target = SuccinctArchiveBlob;
         fn fragment(&self) -> Fragment {
             use triblespace_core::collection::{mapping_algorithm, KIND_COLLECTION_MAPPING};
@@ -273,24 +279,20 @@ fn a_descriptor_naming_another_mapping_is_left_to_whoever_registered_it() {
         }
         fn map<R: StoreRead>(
             &self,
-            source: &Blob<SimpleArchive>,
+            node: &Blob<SimpleArchive>,
+            siblings: &[CollectionData],
             reader: &R,
         ) -> Result<Blob<SuccinctArchiveBlob>, CollectionOperationError> {
-            <SuccinctArchiveBlob as triblespace_core::collection::CollectionDerivation>::map(
-                &(),
-                source,
-                reader,
-            )
+            <SuccinctArchiveBlob as CollectionAttachment>::map(&(), node, siblings, reader)
         }
     }
 
     let owner = key(5);
-    let mut store = MemoryRepo::default();
-    let policy = open_for(&owner);
-    let source = store.collection("mapped", policy.clone()).unwrap();
-    let other = store.derive_with(source, OtherWay, policy).unwrap();
+    let mut store = MemoryRepo::for_host(owner.verifying_key());
+    let source = store.collection("mapped", open_for(&owner)).unwrap();
+    let other = store.attach_with(source, OtherWay).unwrap();
     store.commit(source, &owner, fragment("mapped")).unwrap();
-    block_on(store.ensure_with::<OtherWay>(other, &owner)).unwrap();
+    block_on(store.ensure_attached_with::<OtherWay>(other, &owner)).unwrap();
 
     let report = block_on(ensure_downstream(
         &mut store,
@@ -302,9 +304,9 @@ fn a_descriptor_naming_another_mapping_is_left_to_whoever_registered_it() {
     assert!(report.realized.is_empty());
     assert_eq!(
         report
-            .unknown
+            .unknown_attached
             .iter()
-            .map(|derived| derived.handle)
+            .map(|attached| attached.handle)
             .collect::<Vec<_>>(),
         [other.handle()],
         "the canonical realizer names it instead of mapping it its own way"

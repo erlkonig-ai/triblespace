@@ -27,59 +27,6 @@ use triblespace_core::repo::{
     StoreChanges, WantRead, WantRequest, WantStore,
 };
 
-/// The root commits a view stands for, following each root foundation up
-/// the view's descriptor chain through the leaves of every hop. Lattice v2
-/// supports are collection-local, so this is the only way a test can still
-/// say "this view stands for these commits".
-fn stood_for<R, E>(
-    view: &triblespace_core::collection::CollectionSnapshot<R, E>,
-) -> triblespace_core::collection::Support
-where
-    R: triblespace_core::repo::StoreRead,
-    E: triblespace_core::collection::CollectionEncoding,
-{
-    use triblespace_core::collection::{descriptor, Collection, SourceLocator};
-    use triblespace_core::inline::encodings::hash::Handle;
-    let snapshot = view.snapshot();
-    let mut chain = vec![view.cover().collection().handle()];
-    loop {
-        let facts: triblespace_core::trible::TribleSet =
-            snapshot.get(*chain.last().unwrap()).unwrap();
-        match descriptor::source(&facts).unwrap() {
-            Some(source) => chain.push(source),
-            None => break,
-        }
-    }
-    let root: Collection<triblespace_core::blob::encodings::simplearchive::SimpleArchive> =
-        Collection::open(snapshot, *chain.last().unwrap()).unwrap();
-    let scope: std::collections::BTreeSet<_> = chain.iter().copied().collect();
-    let coverage = snapshot.coverage(&scope).unwrap();
-    let top: std::collections::BTreeSet<[u8; 32]> = view
-        .support()
-        .unwrap()
-        .members()
-        .map(|member| member.raw)
-        .collect();
-    let (foundations, _) = coverage.frontier_support(root.handle());
-    root.cover(
-        foundations
-            .iter_ordered()
-            .filter(|raw| {
-                let mut images = std::collections::BTreeSet::from([**raw]);
-                for hop in chain.iter().rev().skip(1) {
-                    images = images
-                        .iter()
-                        .flat_map(|image| coverage.leaf_outputs(*hop, SourceLocator::of(*image)))
-                        .map(|output| output.raw)
-                        .collect();
-                }
-                images.iter().any(|image| top.contains(image))
-            })
-            .map(|raw| Handle::from_hash(triblespace_core::inline::Inline::new(*raw)))
-            .collect::<Vec<_>>(),
-    )
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Counts {
     snapshots: usize,
@@ -92,7 +39,8 @@ struct Counts {
     proof_lookups: usize,
     blob_puts: usize,
     id_set_puts: usize,
-    // COMMIT, MERGE, DERIVE attempts, independently of whether already stored.
+    // COMMIT, MERGE, DERIVE or MAP attempts, independently of whether already
+    // stored.
     insertions: BTreeMap<CollectionHandle, [usize; 3]>,
 }
 
@@ -199,7 +147,7 @@ impl<S: CollectionStore> CollectionStore for Counted<S> {
             let kind = match record {
                 CollectionRecord::Commit(_) => 0,
                 CollectionRecord::Merge(_) => 1,
-                CollectionRecord::Derive(_) => 2,
+                CollectionRecord::Derive(_) | CollectionRecord::Map(_) => 2,
             };
             counts.insertions.entry(record.collection()).or_default()[kind] += 1;
         });
@@ -457,6 +405,7 @@ fn output_handles(snapshot: &PileSnapshot, collection: CollectionHandle) -> BTre
             CollectionRecord::Commit(commit) => commit.data().raw,
             CollectionRecord::Merge(merge) => merge.result().raw,
             CollectionRecord::Derive(derive) => derive.output().raw,
+            CollectionRecord::Map(map) => map.attachment().raw,
         })
         .collect()
 }
@@ -496,7 +445,7 @@ impl Fixture {
         let sources = ["hot receipt source", "quiet receipt source"]
             .map(|name| pile.collection(name, policy.clone()).unwrap());
         let targets = sources.map(|source| {
-            pile.derive::<EntityIdSetBlob>(source, metadata::supersedes.id(), policy.clone())
+            pile.attach::<EntityIdSetBlob>(source, metadata::supersedes.id())
                 .unwrap()
         });
         let other = pile.collection("unselected source", policy).unwrap();
@@ -549,7 +498,7 @@ impl Fixture {
 
     fn assert_value_and_support(&mut self, values: &[Id], expected_members: usize) {
         let snapshot = self.pile.snapshot().unwrap();
-        let observed = snapshot.collection(self.targets[0]).unwrap();
+        let observed = snapshot.attached(self.targets[0]).unwrap();
         assert_eq!(
             observed
                 .view::<EntityIdSet>()
@@ -560,7 +509,7 @@ impl Fixture {
         );
         let expected = self.sources[0].admitted(&snapshot).unwrap();
         assert_eq!(expected.len(), expected_members);
-        assert_eq!(stood_for(&observed), expected);
+        assert_eq!(observed.support(), &expected);
         assert!(selected_records(&snapshot, self.sources[0].handle())
             .iter()
             .all(|record| matches!(record, CollectionRecord::Commit(_))));
@@ -719,7 +668,7 @@ fn repeated_projected_value_adds_support_without_a_new_output_handle() {
     let outputs = output_handles(&settled, target);
     let original_records = selected_records(&settled, target);
     let quiet_records = selected_records(&settled, fixture.targets[1].handle());
-    let old_observation = settled.collection(fixture.targets[0]).unwrap();
+    let old_observation = settled.attached(fixture.targets[0]).unwrap();
 
     // Same projected value, genuinely different ordinary source payload. A new
     // annotation is not permission to erase its independent COMMIT support.
@@ -744,7 +693,7 @@ fn repeated_projected_value_adds_support_without_a_new_output_handle() {
     );
     assert!(repeated_counts.insertions[&target][2] > 0);
     fixture.assert_value_and_support(&[fixture.first_value], 2);
-    assert_eq!(old_observation.support().unwrap().len(), 1);
+    assert_eq!(old_observation.support().len(), 1);
     assert_eq!(
         old_observation
             .view::<EntityIdSet>()

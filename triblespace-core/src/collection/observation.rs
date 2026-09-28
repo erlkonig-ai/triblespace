@@ -10,7 +10,8 @@ use crate::repo::StoreRead;
 use super::observed_store::ObservedStore;
 use super::store::CoverageRead;
 use super::{
-    Collection, CollectionEncoding, CollectionRealizationError, CollectionSnapshot, Cover, Support,
+    AttachedSnapshot, Collection, CollectionEncoding, CollectionRealizationError,
+    CollectionSnapshot, Cover, Support,
 };
 
 /// Attach what the target stands on.
@@ -42,6 +43,15 @@ where
     super::encoding::validate_descriptor_type::<E>(&loaded.fragment)
         .map_err(|error| CollectionRealizationError::Resolution(error.to_string()))?;
     let handle = target.handle();
+    if !super::descriptor::parents(loaded.fragment.facts())
+        .map_err(|error| CollectionRealizationError::Resolution(error.to_string()))?
+        .is_empty()
+    {
+        return Err(CollectionRealizationError::InvalidCover(format!(
+            "collection {} is an attached collection; read it through `attached`",
+            hex::encode_upper(handle.raw),
+        )));
+    }
     let charged = BTreeSet::from([handle]);
     let coverage = observed
         .coverage(&charged)
@@ -71,6 +81,77 @@ where
         observed.inner().clone(),
         support,
         cover,
+        observed.tracker(),
+    ))
+}
+
+/// Attach what an attached collection holds for its parent: the attached
+/// cover, from one observation.
+///
+/// The read-set charged is the attached collection's records (its MAPs) and
+/// the parent's (its lattice), the parent's admission evidence, which
+/// decides which of its foundations are believed, and the residency of
+/// every attachment and dependency the selection looked at.
+pub(super) fn attach_attached<R, E>(
+    snapshot: &R,
+    attached: Collection<E>,
+) -> Result<AttachedSnapshot<R, E>, CollectionRealizationError>
+where
+    R: StoreRead,
+    E: CollectionEncoding,
+{
+    let observed = ObservedStore::new(snapshot.clone());
+    let (parent, _, parent_descriptor) = super::maintenance::attached_lineage(&observed, attached)
+        .map_err(|error| match error {
+            CollectionRealizationError::MissingDependency { member } => {
+                CollectionRealizationError::Resolution(format!(
+                    "attached lineage descriptor {} is not resident",
+                    hex::encode_upper(member.raw),
+                ))
+            }
+            other => other,
+        })?;
+    let charged = BTreeSet::from([attached.handle(), parent.handle()]);
+    let coverage = observed
+        .coverage(&charged)
+        .map_err(|error| CollectionRealizationError::storage("read coverage", error))?;
+    let (policies, _) = super::descriptor::admission_policies_with_missing(
+        &observed,
+        parent_descriptor.facts(),
+        super::ACTION_WRITE,
+        None,
+    );
+    super::api::discover_admission_evidence(
+        &observed,
+        policies.into_iter(),
+        super::ACTION_WRITE,
+        parent.handle(),
+    )
+    .map_err(|error| CollectionRealizationError::storage("read parent WRITE evidence", error))?;
+    let selection =
+        super::maintenance::select_attached(&observed, &coverage, parent.handle(), attached)?;
+    // A reader may read the residual from its own bytes, so their arrival is
+    // a change this observation depends on.
+    for key in selection.residual.iter_ordered() {
+        crate::repo::BlobStoreMeta::metadata(
+            &observed,
+            crate::inline::Inline::<
+                crate::inline::encodings::hash::Handle<
+                    crate::blob::encodings::simplearchive::SimpleArchive,
+                >,
+            >::new(*key),
+        )
+        .map_err(|error| CollectionRealizationError::storage("read residual residency", error))?;
+    }
+    let cover = Cover::from_data(
+        attached,
+        selection.cover.iter().map(|(_, attachment)| *attachment),
+    );
+    Ok(AttachedSnapshot::new(
+        observed.inner().clone(),
+        cover,
+        Support::from_patch(parent, selection.covered),
+        Support::from_patch(parent, selection.residual),
         observed.tracker(),
     ))
 }

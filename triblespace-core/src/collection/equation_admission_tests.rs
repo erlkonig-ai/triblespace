@@ -7,11 +7,9 @@ use ed25519_dalek::SigningKey;
 
 use super::*;
 use crate::blob::encodings::simplearchive::SimpleArchive;
-use crate::blob::encodings::succinctarchive::{
-    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
-};
 use crate::blob::{Blob, IntoBlob};
 use crate::capability::{CapabilityProof, CapabilityResource};
+use crate::collection::test_support::{TestImage, TestImageTwo};
 use crate::inline::encodings::hash::Handle;
 use crate::repo::memoryrepo::MemoryRepo;
 use crate::repo::{BlobStoreList, BlobStorePut, CapabilityProofStore, SnapshotSource};
@@ -145,7 +143,7 @@ fn derive_before_write_proof_is_inert_then_admitted_without_reinsertion() {
         )
         .unwrap();
     let target = store
-        .derive::<SuccinctArchiveBlob>(
+        .derive::<TestImage>(
             source,
             (),
             CollectionPolicy::new(
@@ -156,14 +154,12 @@ fn derive_before_write_proof_is_inert_then_admitted_without_reinsertion() {
         .unwrap();
     let a = archive(4);
     let ca = publish(&mut store, source, &source_owner, a.clone());
-    let output = store
-        .put::<SuccinctArchiveBlob, _>(succinctarchive_union::derive_element(&a).unwrap())
-        .unwrap();
+    let output = store.put::<TestImage, _>(TestImage::image(&a)).unwrap();
     let equation = CollectionRecord::Derive(CollectionDerive::sign(
         &producer,
         target.handle(),
         crate::collection::SourceLocator::of(ca.data().raw),
-        Handle::<SuccinctArchiveBlob>::to_hash(output),
+        Handle::<TestImage>::to_hash(output),
     ));
     store.insert(equation).unwrap();
     let before = store.snapshot().unwrap();
@@ -176,7 +172,7 @@ fn derive_before_write_proof_is_inert_then_admitted_without_reinsertion() {
             &source_owner,
             target.handle(),
             crate::collection::SourceLocator::of(ca.data().raw),
-            Handle::<SuccinctArchiveBlob>::to_hash(output),
+            Handle::<TestImage>::to_hash(output),
         )))
         .unwrap();
     assert!(store
@@ -318,7 +314,7 @@ fn target_stands_on_its_own_writers_whatever_its_source_admits() {
         )
         .unwrap();
     let target = store
-        .derive::<SuccinctArchiveBlob>(
+        .derive::<TestImage>(
             source,
             (),
             CollectionPolicy::new(
@@ -329,9 +325,7 @@ fn target_stands_on_its_own_writers_whatever_its_source_admits() {
         .unwrap();
     let input = archive(7);
     let input_data = Handle::<SimpleArchive>::to_hash(input.get_handle());
-    let output = store
-        .put::<SuccinctArchiveBlob, _>(succinctarchive_union::derive_element(&input).unwrap())
-        .unwrap();
+    let output = store.put::<TestImage, _>(TestImage::image(&input)).unwrap();
     // The producing node validated this input. This receiving store has the
     // signed records but neither the input's payload nor the source writer's
     // grant.
@@ -348,7 +342,7 @@ fn target_stands_on_its_own_writers_whatever_its_source_admits() {
             &target_owner,
             target.handle(),
             crate::collection::SourceLocator::of(input_data.raw),
-            Handle::<SuccinctArchiveBlob>::to_hash(output),
+            Handle::<TestImage>::to_hash(output),
         )))
         .unwrap();
     let snapshot = store.snapshot().unwrap();
@@ -410,14 +404,7 @@ fn target_stands_on_its_own_writers_whatever_its_source_admits() {
         crate::collection::test_support::stood_for(&attached),
         requested
     );
-    assert_eq!(
-        attached
-            .view::<UnionArchive<OrderedUniverse>>()
-            .unwrap()
-            .iter()
-            .count(),
-        1
-    );
+    assert_eq!(attached.view::<TribleSet>().unwrap().len(), 1);
 }
 
 #[test]
@@ -434,17 +421,13 @@ fn indexed_reads_do_not_replace_absent_target_outputs_with_source_members() {
     );
     let source = store.collection("residual-source", policy.clone()).unwrap();
     let succinct = store
-        .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+        .derive::<TestImage>(source, (), policy.clone())
         .unwrap();
-    let rank9 = store
-        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
-        .unwrap();
+    let rank9 = store.derive::<TestImageTwo>(succinct, (), policy).unwrap();
     let a = archive(4);
     let ca = publish(&mut store, source, &owner, a.clone());
-    let b = store
-        .put::<SuccinctArchiveBlob, _>(succinctarchive_union::derive_element(&a).unwrap())
-        .unwrap();
-    let b_data = Handle::<SuccinctArchiveBlob>::to_hash(b);
+    let b = store.put::<TestImage, _>(TestImage::image(&a)).unwrap();
+    let b_data = Handle::<TestImage>::to_hash(b);
     let b_record = CollectionRecord::Derive(CollectionDerive::sign(
         &owner,
         succinct.handle(),
@@ -453,9 +436,8 @@ fn indexed_reads_do_not_replace_absent_target_outputs_with_source_members() {
     ));
     store.insert(b_record).unwrap();
     // R: a signed output whose bytes never arrive.
-    let r_data = Handle::<Rank9AcceleratedSuccinctArchiveBlob>::to_hash(
-        Blob::<Rank9AcceleratedSuccinctArchiveBlob>::new(anybytes::Bytes::from(vec![7u8; 64]))
-            .get_handle(),
+    let r_data = Handle::<TestImageTwo>::to_hash(
+        Blob::<TestImageTwo>::new(anybytes::Bytes::from(vec![7u8; 64])).get_handle(),
     );
     store
         .insert(CollectionRecord::Derive(CollectionDerive::sign(

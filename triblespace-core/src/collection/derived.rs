@@ -1,5 +1,10 @@
-//! The collections derived from a source, found from their descriptors, and
-//! kept up as a group.
+//! The collections derived from a source or attached to it, found from
+//! their descriptors, and kept up as a group.
+//!
+//! An attached collection names its parent instead of a source; every write's
+//! [`ensure_downstream`] attaches the parent's current frontier into it, and
+//! [`maintain_downstream`] carries the parent first and attaches what the
+//! carry left. The prose below is about derived collections.
 //!
 //! Every derived collection's descriptor names its immediate source, and every
 //! store can list the collections its records name. So "what derives from
@@ -46,7 +51,7 @@ use crate::repo::{Store, StoreRead};
 use crate::trible::TribleSet;
 
 use super::api::{load_collection_descriptor, CollectionStoreExt};
-use super::encoding::CollectionDerivation;
+use super::encoding::{CollectionAttachment, CollectionDerivation};
 use super::exact_derived::CollectionRealizationError;
 use super::latest::LatestBlob;
 use super::lww_register::LwwRegisterBlob;
@@ -121,16 +126,103 @@ where
     Ok(ordered)
 }
 
-/// How far to take a derived collection.
+/// One collection attached to the parent asked about.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Attached {
+    /// The attached collection.
+    pub handle: CollectionHandle,
+    /// The collection whose nodes it indexes.
+    pub parent: CollectionHandle,
+    /// The blob representation its descriptor names.
+    pub representation: Id,
+    /// The mapping algorithm its descriptor names, if any.
+    pub algorithm: Option<Id>,
+    /// The sibling attached collections its mapping reads, each earlier in
+    /// the same list when it is attached to the same parent.
+    pub siblings: Vec<CollectionHandle>,
+}
+
+/// Every collection attached to `parent`, each after the siblings its
+/// mapping reads.
+///
+/// Read from the store's collection listing and each candidate's
+/// descriptor, like [`derived_from`]; an attached collection is listed once
+/// it holds a MAP. A sibling cycle, which no mapping should name, is broken
+/// by listing what remains in handle order.
+pub fn attached_to<S>(
+    snapshot: &S,
+    parent: CollectionHandle,
+) -> Result<Vec<Attached>, S::RecordsError>
+where
+    S: StoreRead,
+{
+    let mut pending: BTreeMap<CollectionHandle, Attached> = BTreeMap::new();
+    for collection in snapshot.collections()? {
+        let Ok(facts) = snapshot.get::<TribleSet, _>(collection) else {
+            continue;
+        };
+        let (Ok(named), Ok(representation), Ok(algorithm), Ok(siblings)) = (
+            descriptor::parents(&facts),
+            descriptor::representation(&facts),
+            descriptor::mapping_algorithm(&facts),
+            descriptor::reads_attached(&facts),
+        ) else {
+            continue;
+        };
+        if !named.contains(&parent) {
+            continue;
+        }
+        pending.insert(
+            collection,
+            Attached {
+                handle: collection,
+                parent,
+                representation,
+                algorithm,
+                siblings,
+            },
+        );
+    }
+    let mut ordered = Vec::new();
+    while !pending.is_empty() {
+        let ready: Vec<CollectionHandle> = pending
+            .values()
+            .filter(|attached| {
+                attached
+                    .siblings
+                    .iter()
+                    .all(|sibling| !pending.contains_key(sibling))
+            })
+            .map(|attached| attached.handle)
+            .collect();
+        let next = if ready.is_empty() {
+            vec![*pending.keys().next().expect("pending is not empty")]
+        } else {
+            ready
+        };
+        for handle in next {
+            ordered.push(
+                pending
+                    .remove(&handle)
+                    .expect("a pending attached collection"),
+            );
+        }
+    }
+    Ok(ordered)
+}
+
+/// How far to take a derived or attached collection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Upkeep {
-    /// Derive the signer's own missing leaves; publish no merge.
+    /// Derive the signer's own missing leaves, or attach the parent's
+    /// current frontier; publish no merge.
     Ensure,
-    /// Ensure, then mirror the signer's own source merges.
+    /// Ensure, then mirror the signer's own source merges; for an attached
+    /// collection, carry its parent first and attach the frontier after.
     Maintain,
 }
 
-/// What one realizer did with one derived collection.
+/// What one realizer did with one derived or attached collection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Realized {
     /// The target was taken as far as asked.
@@ -142,9 +234,9 @@ pub enum Realized {
     Unknown,
 }
 
-/// Takes one derived collection as far as asked, for the representations it
-/// knows. [`CoreRealizer`] knows this crate's; a binary that carries more
-/// encodings wraps it and answers for those first.
+/// Takes one derived or attached collection as far as asked, for the
+/// representations it knows. [`CoreRealizer`] knows this crate's; a binary
+/// that carries more encodings wraps it and answers for those first.
 pub trait RealizeDerived<S>
 where
     S: Store + AsyncBlobStoreAcquire + Send,
@@ -155,6 +247,17 @@ where
         &mut self,
         store: &mut S,
         derived: &Derived,
+        signer: &SigningKey,
+        upkeep: Upkeep,
+    ) -> impl Future<Output = Result<Realized, CollectionRealizationError>> + Send;
+
+    /// Realize one attached collection under `upkeep`, signing its MAPs with
+    /// `signer`, which must be the store's host, or say that this realizer
+    /// does not know it.
+    fn realize_attached(
+        &mut self,
+        store: &mut S,
+        attached: &Attached,
         signer: &SigningKey,
         upkeep: Upkeep,
     ) -> impl Future<Output = Result<Realized, CollectionRealizationError>> + Send;
@@ -205,8 +308,45 @@ where
     Ok(Realized::Done)
 }
 
-/// The realizer for this crate's own derived encodings: Succinct and Rank9
-/// archives, entity-id sets, latest indexes and last-writer-wins registers.
+/// Take one attached collection of a known encoding as far as asked through
+/// its canonical mapping, or answer [`Realized::Unknown`] when its
+/// descriptor names another mapping. There is no WRITE check: an attached
+/// collection has no policy, and its MAPs are believed on the host's key.
+pub async fn realize_attached_as<S, T>(
+    store: &mut S,
+    attached: &Attached,
+    signer: &SigningKey,
+    upkeep: Upkeep,
+) -> Result<Realized, CollectionRealizationError>
+where
+    S: Store + AsyncBlobStoreAcquire + Send,
+    T: CollectionAttachment + MetaDescribe,
+    Handle<T>: InlineEncoding,
+{
+    let snapshot = store.snapshot().map_err(|error| {
+        CollectionRealizationError::storage("observe attached collection", error)
+    })?;
+    let collection: Collection<T> = Collection::open(&snapshot, attached.handle)
+        .map_err(|error| CollectionRealizationError::storage("open attached descriptor", error))?;
+    let descriptor = load_collection_descriptor(&snapshot, attached.handle)
+        .map_err(|error| CollectionRealizationError::storage("read attached descriptor", error))?;
+    let parent = load_collection_descriptor(&snapshot, attached.parent)
+        .map_err(|error| CollectionRealizationError::storage("read parent descriptor", error))?;
+    drop(snapshot);
+    if T::bind(&parent.fragment, &descriptor.fragment).is_err() {
+        return Ok(Realized::Unknown);
+    }
+    match upkeep {
+        Upkeep::Ensure => drop(store.ensure_attached(collection, signer).await?),
+        Upkeep::Maintain => drop(store.maintain_attached(collection, signer).await?),
+    }
+    Ok(Realized::Done)
+}
+
+/// The realizer for this crate's own encodings. It knows no derived
+/// collection: every index this crate defines -- Succinct and Rank9
+/// archives, entity-id sets, latest indexes and last-writer-wins registers --
+/// is attached to its parent instead.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CoreRealizer;
 
@@ -216,43 +356,60 @@ where
 {
     async fn realize(
         &mut self,
+        _store: &mut S,
+        _derived: &Derived,
+        _signer: &SigningKey,
+        _upkeep: Upkeep,
+    ) -> Result<Realized, CollectionRealizationError> {
+        Ok(Realized::Unknown)
+    }
+
+    async fn realize_attached(
+        &mut self,
         store: &mut S,
-        derived: &Derived,
+        attached: &Attached,
         signer: &SigningKey,
         upkeep: Upkeep,
     ) -> Result<Realized, CollectionRealizationError> {
-        let representation = derived.representation;
+        let representation = attached.representation;
         if representation == <SuccinctArchiveBlob as MetaDescribe>::id() {
-            realize_as::<S, SuccinctArchiveBlob>(store, derived, signer, upkeep).await
+            realize_attached_as::<S, SuccinctArchiveBlob>(store, attached, signer, upkeep).await
         } else if representation == <Rank9AcceleratedSuccinctArchiveBlob as MetaDescribe>::id() {
-            realize_as::<S, Rank9AcceleratedSuccinctArchiveBlob>(store, derived, signer, upkeep)
-                .await
+            realize_attached_as::<S, Rank9AcceleratedSuccinctArchiveBlob>(
+                store, attached, signer, upkeep,
+            )
+            .await
         } else if representation == <EntityIdSetBlob as MetaDescribe>::id() {
-            realize_as::<S, EntityIdSetBlob>(store, derived, signer, upkeep).await
+            realize_attached_as::<S, EntityIdSetBlob>(store, attached, signer, upkeep).await
         } else if representation == <LatestBlob as MetaDescribe>::id() {
-            realize_as::<S, LatestBlob>(store, derived, signer, upkeep).await
+            realize_attached_as::<S, LatestBlob>(store, attached, signer, upkeep).await
         } else if representation == <LwwRegisterBlob as MetaDescribe>::id() {
-            realize_as::<S, LwwRegisterBlob>(store, derived, signer, upkeep).await
+            realize_attached_as::<S, LwwRegisterBlob>(store, attached, signer, upkeep).await
         } else {
             Ok(Realized::Unknown)
         }
     }
 }
 
-/// What a pass over a source's derived collections did.
+/// What a pass over a source's derived and attached collections did.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct UpkeepReport {
-    /// Taken as far as asked, in the order they were visited.
+    /// Taken as far as asked, in the order they were visited: derived
+    /// collections first, then attached ones.
     pub realized: Vec<CollectionHandle>,
     /// Left alone because the signer may not write them.
     pub unadmitted: Vec<CollectionHandle>,
-    /// Left alone because no realizer knows their representation or the
-    /// mapping their descriptor names; each carries both.
+    /// Derived collections left alone because no realizer knows their
+    /// representation or the mapping their descriptor names; each carries
+    /// both.
     pub unknown: Vec<Derived>,
+    /// Attached collections left alone for the same reason.
+    pub unknown_attached: Vec<Attached>,
 }
 
 /// Visit every collection derived from `source`, each after its own source,
-/// and take it as far as `upkeep` asks with `realizer`.
+/// then every collection attached to `source`, each after the siblings it
+/// reads, and take each as far as `upkeep` asks with `realizer`.
 pub async fn upkeep_downstream<S, R>(
     store: &mut S,
     source: CollectionHandle,
@@ -269,6 +426,8 @@ where
     })?;
     let derived = derived_from(&snapshot, source)
         .map_err(|error| CollectionRealizationError::storage("list derived collections", error))?;
+    let attached = attached_to(&snapshot, source)
+        .map_err(|error| CollectionRealizationError::storage("list attached collections", error))?;
     drop(snapshot);
     let mut report = UpkeepReport::default();
     for target in derived {
@@ -278,13 +437,24 @@ where
             Realized::Unknown => report.unknown.push(target),
         }
     }
+    for target in attached {
+        match realizer
+            .realize_attached(store, &target, signer, upkeep)
+            .await?
+        {
+            Realized::Done => report.realized.push(target.handle),
+            Realized::Unadmitted => report.unadmitted.push(target.handle),
+            Realized::Unknown => report.unknown_attached.push(target),
+        }
+    }
     Ok(report)
 }
 
 /// Derive the signer's own missing leaves into every collection derived from
-/// `source`, each after its own source, so that what the signer wrote is
-/// readable through each of them; publish no merge. A write calls this after
-/// its commit.
+/// `source`, each after its own source, and attach `source`'s current
+/// frontier into every collection attached to it, so that what the signer
+/// wrote is readable through each of them; publish no merge. A write calls
+/// this after its commit.
 pub async fn ensure_downstream<S, R>(
     store: &mut S,
     source: CollectionHandle,
@@ -300,7 +470,9 @@ where
 
 /// Derive the signer's own leaves into every collection derived from
 /// `source` and mirror its own source merges there, each after its own
-/// source. What the daemon does for its configured sources.
+/// source; then carry `source` and attach its new frontier into every
+/// collection attached to it. What the daemon does for its configured
+/// sources.
 pub async fn maintain_downstream<S, R>(
     store: &mut S,
     source: CollectionHandle,

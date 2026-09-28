@@ -31,6 +31,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`--held-walk-interval`, default 1800 s; `--held-walk-threads`, default 4).
   See the `triblespace-core` and `triblespace-net` changelogs.
 
+- Attached collections and the `MAP` record. An index that only restates a
+  root in another representation -- Succinct, Rank9, the entity id set, the
+  latest-state and last-writer-wins registers, BM25 and path summaries -- is
+  now attached to its root instead of derived: its descriptor is the parent's
+  handle and a mapping, with no policy, and a host-signed `MAP(attached, node,
+  attachment)` names the attachment of one node of the parent's lattice. A
+  store believes only its own host's `MAP`s, so one that reaches another store
+  stays inert; attached collections have no carry and no policy of their own.
+  A read takes each frontier node's usable attachment or descends through the
+  host's merges; the foundations nothing reaches are its residual, which
+  `AttachedSnapshot::read` builds in memory and `read_attached` reads raw, each
+  naming what it cannot read. Maintenance carries the root first and attaches
+  the frontier the carry leaves. `trible pile collection attach`
+  registers them. See the `triblespace-core`, `triblespace-search` and
+  `trible` changelogs.
+
 - Remove the reference-summary collection encoding (`ReferenceSummaryBlob`,
   `REFERENCE_SUMMARY_MAPPING_V2`), its derived-collection realizer branch and
   the `trible pile collection derive reference-summary` kind. Sync routes blobs

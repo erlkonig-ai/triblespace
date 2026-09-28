@@ -49,6 +49,7 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
+use crate::blob::encodings::UnknownBlob;
 use crate::blob::Blob;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
@@ -63,8 +64,8 @@ use super::operation_snapshot::{OperationFrontier, OperationSnapshot};
 use super::ownership::{owns, owns_merge};
 use super::{
     Collection, CollectionData, CollectionDerive, CollectionEncoding, CollectionHandle,
-    CollectionMerge, CollectionOperationError, CollectionRecord, CollectionRecordSelector,
-    DeriveMapping, MergeInputs, SourceLocator,
+    CollectionMap, CollectionMerge, CollectionOperationError, CollectionRecord,
+    CollectionRecordSelector, DeriveMapping, MapMapping, MergeInputs, SourceLocator,
 };
 
 /// How many held nodes of one tier a root carry joins into one MERGE, and the
@@ -111,16 +112,72 @@ fn members(set: &CoverageSet) -> Vec<CollectionData> {
     set.iter_ordered().map(|raw| Inline::new(*raw)).collect()
 }
 
+/// Walk one collection's lattice from its frontier, widest node first,
+/// taking every node `take` accepts and descending from every other one.
+///
+/// A node inside what is already covered adds nothing and is neither taken
+/// nor descended. A node `take` refuses is descended: the host's driven
+/// joins that produced it name the finer nodes beneath, read from the index
+/// by the node's own key ([`Coverage::producers`]). A MERGE another key
+/// signed is never folded, so it is never descended; a join's own result
+/// among its inputs (an absorption) and a node already met are skipped, so
+/// a cycle ends. Returns the union of the supports of the nodes taken.
+///
+/// This is the one walk every cover is chosen by: a reader's resident cover
+/// ([`select`]), an attached collection's cover of usable attachments
+/// ([`select_attached`]), and the attachments maintenance builds
+/// ([`attach_frontier`]) differ only in what they take.
+fn walk<F>(
+    coverage: &Coverage,
+    collection: CollectionHandle,
+    mut take: F,
+) -> Result<CoverageSet, CollectionRealizationError>
+where
+    F: FnMut(CollectionData, &CoverageSet) -> Result<bool, CollectionRealizationError>,
+{
+    let mut covered = CoverageSet::new();
+    let Some(frontier) = coverage.frontier_set(collection) else {
+        return Ok(covered);
+    };
+    let mut pending = BinaryHeap::new();
+    let mut visited = BTreeSet::new();
+    for raw in frontier.iter_ordered() {
+        let node: CollectionData = Inline::new(*raw);
+        if let Some(support) = coverage.of(collection, node) {
+            visited.insert(node);
+            pending.push((support.len(), Reverse(node.raw), node));
+        }
+    }
+    while let Some((_, _, node)) = pending.pop() {
+        let support = coverage
+            .of(collection, node)
+            .expect("a pending node was pushed with its row");
+        if support <= &covered {
+            continue;
+        }
+        if take(node, support)? {
+            covered.union(support.clone());
+            continue;
+        }
+        for inputs in coverage.producers(collection, node) {
+            for input in inputs.iter() {
+                if input == node || !visited.insert(input) {
+                    continue;
+                }
+                if let Some(support) = coverage.of(collection, input) {
+                    pending.push((support.len(), Reverse(input.raw), input));
+                }
+            }
+        }
+    }
+    Ok(covered)
+}
+
 /// What `collection` stands on, from the index: the reader's selection.
 ///
 /// The frontier is the starting point, widest node first. A node inside
 /// nothing chosen before it is taken when its bytes are here and complete.
-/// Any other node -- absent or incomplete -- is descended: the host's driven
-/// joins that produced it name the finer nodes beneath, read from the index
-/// by the node's own key. A MERGE another key signed is never folded, so it
-/// is never descended. A node inside what is already covered adds nothing
-/// and is neither taken nor descended; a join's own result among its inputs
-/// (an absorption) and a node already met are skipped, so a cycle ends.
+/// Any other node -- absent or incomplete -- is descended ([`walk`]).
 pub(super) fn select<R, E>(
     snapshot: &R,
     coverage: &Coverage,
@@ -131,35 +188,18 @@ where
     E: CollectionEncoding,
 {
     let handle = collection.handle();
-    let mut selection = Selection {
-        cover: Vec::new(),
-        covered: CoverageSet::new(),
-        absent: Vec::new(),
-        dependencies: Vec::new(),
+    let mut cover = Vec::new();
+    let mut absent = Vec::new();
+    let mut dependencies = Vec::new();
+    let resident = match coverage.frontier_set(handle) {
+        Some(frontier) => snapshot.resident(frontier).map_err(|error| {
+            CollectionRealizationError::storage("intersect frontier with residency", error)
+        })?,
+        None => FrontierSet::new(),
     };
-    let Some(frontier) = coverage.frontier_set(handle) else {
-        return Ok(selection);
-    };
-    let resident = snapshot.resident(frontier).map_err(|error| {
-        CollectionRealizationError::storage("intersect frontier with residency", error)
-    })?;
-    let mut pending = BinaryHeap::new();
-    let mut visited = BTreeSet::new();
-    for raw in frontier.iter_ordered() {
-        let node: CollectionData = Inline::new(*raw);
-        if let Some(support) = coverage.of(handle, node) {
-            visited.insert(node);
-            pending.push((support.len(), Reverse(node.raw), node));
-        }
-    }
-    while let Some((_, _, node)) = pending.pop() {
-        let support = coverage
-            .of(handle, node)
-            .expect("a pending node was pushed with its row");
-        if support <= &selection.covered {
-            continue;
-        }
-        let is_resident = if frontier.get(&node.raw).is_some() {
+    let frontier = coverage.frontier_set(handle);
+    let covered = walk(coverage, handle, |node, support| {
+        let is_resident = if frontier.is_some_and(|frontier| frontier.get(&node.raw).is_some()) {
             resident.get(&node.raw).is_some()
         } else {
             snapshot
@@ -169,32 +209,134 @@ where
                 })?
                 .is_some()
         };
-        if is_resident {
-            let missing = E::missing_representation_dependencies(node, snapshot)
-                .map_err(|error| CollectionRealizationError::Resolution(error.to_string()))?;
-            if missing.is_empty() {
-                selection.covered.union(support.clone());
-                selection.cover.push((node, support.clone()));
-                continue;
-            }
-            selection.dependencies.extend(missing);
-        } else {
-            selection.absent.push((node, support.clone()));
+        if !is_resident {
+            absent.push((node, support.clone()));
+            return Ok(false);
         }
-        // Descend: the host's driven joins that produced this node name the
-        // finer nodes beneath it, one prefix scan of the index.
-        for inputs in coverage.producers(handle, node) {
-            for input in inputs.iter() {
-                if input == node || !visited.insert(input) {
-                    continue;
-                }
-                if let Some(support) = coverage.of(handle, input) {
-                    pending.push((support.len(), Reverse(input.raw), input));
-                }
-            }
+        let missing = E::missing_representation_dependencies(node, snapshot)
+            .map_err(|error| CollectionRealizationError::Resolution(error.to_string()))?;
+        if missing.is_empty() {
+            cover.push((node, support.clone()));
+            return Ok(true);
+        }
+        dependencies.extend(missing);
+        Ok(false)
+    })?;
+    Ok(Selection {
+        cover,
+        covered,
+        absent,
+        dependencies,
+    })
+}
+
+/// What an attached collection stands on right now: usable attachments of
+/// its parent's nodes, and what they do not reach.
+pub(super) struct AttachedSelection {
+    /// `(parent node, attachment)` for every attachment taken, widest node
+    /// first.
+    pub(super) cover: Vec<(CollectionData, CollectionData)>,
+    /// The parent foundations the taken attachments stand for.
+    pub(super) covered: CoverageSet,
+    /// The parent foundations no taken attachment reaches: read the raw
+    /// node, build its attachment, or report it as a gap.
+    pub(super) residual: CoverageSet,
+}
+
+/// An attachment of `node` in `attached` a reader can use: a believed MAP
+/// whose attachment is resident with every representation dependency it
+/// names (a Rank9 attachment's raw Succinct child, say).
+fn usable_attachment<R, E>(
+    snapshot: &R,
+    coverage: &Coverage,
+    attached: CollectionHandle,
+    node: CollectionData,
+) -> Result<Option<CollectionData>, CollectionRealizationError>
+where
+    R: StoreRead,
+    E: CollectionEncoding,
+{
+    for attachment in coverage.attachments(attached, node) {
+        let resident = snapshot
+            .metadata(Handle::<E>::from_hash(attachment))
+            .map_err(|error| {
+                CollectionRealizationError::storage("inspect attachment residency", error)
+            })?
+            .is_some();
+        if !resident {
+            continue;
+        }
+        let missing = E::missing_representation_dependencies(attachment, snapshot)
+            .map_err(|error| CollectionRealizationError::Resolution(error.to_string()))?;
+        if missing.is_empty() {
+            return Ok(Some(attachment));
         }
     }
-    Ok(selection)
+    Ok(None)
+}
+
+/// An attachment of `node` in a sibling attached collection whose bytes are
+/// here. A sibling's own representation dependencies are the sibling's
+/// business; a mapping reading it names what else it needs.
+fn resident_attachment<R>(
+    snapshot: &R,
+    coverage: &Coverage,
+    attached: CollectionHandle,
+    node: CollectionData,
+) -> Result<Option<CollectionData>, CollectionRealizationError>
+where
+    R: StoreRead,
+{
+    for attachment in coverage.attachments(attached, node) {
+        if snapshot
+            .metadata(Handle::<UnknownBlob>::from_hash(attachment))
+            .map_err(|error| {
+                CollectionRealizationError::storage("inspect sibling attachment residency", error)
+            })?
+            .is_some()
+        {
+            return Ok(Some(attachment));
+        }
+    }
+    Ok(None)
+}
+
+/// The attached cover: for each node of the parent's frontier, widest
+/// first, its usable attachment; failing that, the attachments of the
+/// highest nodes beneath it that have one ([`walk`]). What no taken
+/// attachment reaches is the residual, a set of parent foundations.
+///
+/// Only attachments of nodes the walk reaches are read, so a MAP whose node
+/// the parent's lattice does not reach -- a node only a foreign merge
+/// produced, or one of a join still blocked -- is never used, and only the
+/// host's MAPs are believed in the first place.
+pub(super) fn select_attached<R, E>(
+    snapshot: &R,
+    coverage: &Coverage,
+    parent: CollectionHandle,
+    attached: Collection<E>,
+) -> Result<AttachedSelection, CollectionRealizationError>
+where
+    R: StoreRead,
+    E: CollectionEncoding,
+{
+    let mut cover = Vec::new();
+    let covered = walk(coverage, parent, |node, _| {
+        match usable_attachment::<R, E>(snapshot, coverage, attached.handle(), node)? {
+            Some(attachment) => {
+                cover.push((node, attachment));
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    })?;
+    let (believed, _) = coverage.frontier_support(parent);
+    let residual = believed.difference(&covered);
+    Ok(AttachedSelection {
+        cover,
+        covered,
+        residual,
+    })
 }
 
 /// The MERGE records of `collection` that produce `node`, whoever signed
@@ -604,6 +746,244 @@ where
             }
         }
     }
+}
+
+/// One attached collection's mapping, bound to its descriptor and parent.
+pub(super) struct BoundAttachment<M> {
+    pub(super) parent: Collection<SimpleArchive>,
+    pub(super) mapping: M,
+    pub(super) siblings: Vec<CollectionHandle>,
+}
+
+/// Read an attached collection's descriptor and its parent's, and bind the
+/// mapping the descriptor names.
+///
+/// The parent must be a root: an attached collection indexes the nodes of a
+/// lattice of `SimpleArchive`s. Whether a derived collection may be a parent
+/// is left open; one is refused here rather than half served.
+pub(super) fn bind_attached<R, M>(
+    snapshot: &R,
+    attached: Collection<M::Target>,
+) -> Result<BoundAttachment<M>, CollectionRealizationError>
+where
+    R: StoreRead,
+    M: MapMapping,
+{
+    let (parent, attached_descriptor, parent_descriptor) = attached_lineage(snapshot, attached)?;
+    let mapping = M::bind(&parent_descriptor, &attached_descriptor).map_err(|error| {
+        CollectionRealizationError::Resolution(format!(
+            "attached descriptor does not bind the requested mapping: {error}"
+        ))
+    })?;
+    let siblings = mapping.siblings();
+    Ok(BoundAttachment {
+        parent,
+        mapping,
+        siblings,
+    })
+}
+
+/// An attached collection's parent and both descriptors, or the descriptor
+/// that is not resident as a [`CollectionRealizationError::MissingDependency`].
+pub(super) fn attached_lineage<R, E>(
+    snapshot: &R,
+    attached: Collection<E>,
+) -> Result<
+    (
+        Collection<SimpleArchive>,
+        crate::trible::Fragment,
+        crate::trible::Fragment,
+    ),
+    CollectionRealizationError,
+>
+where
+    R: StoreRead,
+    E: CollectionEncoding,
+{
+    let load = |collection: CollectionHandle| {
+        if !snapshot.contains_blob(collection).map_err(|error| {
+            CollectionRealizationError::storage("inspect collection descriptor residency", error)
+        })? {
+            return Err(CollectionRealizationError::MissingDependency {
+                member: Handle::<SimpleArchive>::to_hash(collection),
+            });
+        }
+        super::api::load_collection_descriptor(snapshot, collection)
+            .map(|loaded| loaded.fragment)
+            .map_err(|error| {
+                CollectionRealizationError::Resolution(format!(
+                    "load collection descriptor {}: {error}",
+                    hex::encode_upper(collection.raw),
+                ))
+            })
+    };
+    let attached_descriptor = load(attached.handle())?;
+    super::encoding::validate_descriptor_type::<E>(&attached_descriptor).map_err(|error| {
+        CollectionRealizationError::Resolution(format!(
+            "attached descriptor has the wrong representation: {error}"
+        ))
+    })?;
+    let parents = super::descriptor::parents(attached_descriptor.facts()).map_err(|error| {
+        CollectionRealizationError::Resolution(format!("decode attached parent: {error}"))
+    })?;
+    // An attached read walks one parent's lattice. A descriptor naming
+    // several parents is one this reader does not read; attaching never
+    // writes one.
+    let parent = match parents.as_slice() {
+        [parent] => *parent,
+        [] => {
+            return Err(CollectionRealizationError::InvalidCover(format!(
+                "collection {} is not an attached collection",
+                hex::encode_upper(attached.handle().raw),
+            )))
+        }
+        _ => {
+            return Err(CollectionRealizationError::InvalidCover(format!(
+                "attached collection {} names {} parents; an attached read walks one parent's \
+                 lattice",
+                hex::encode_upper(attached.handle().raw),
+                parents.len(),
+            )))
+        }
+    };
+    let parent_descriptor = load(parent)?;
+    let parent_is_root = super::descriptor::source(parent_descriptor.facts())
+        .map_err(|error| {
+            CollectionRealizationError::Resolution(format!("decode parent source: {error}"))
+        })?
+        .is_none()
+        && super::descriptor::parents(parent_descriptor.facts())
+            .map_err(|error| {
+                CollectionRealizationError::Resolution(format!("decode parent kind: {error}"))
+            })?
+            .is_empty();
+    if !parent_is_root {
+        return Err(CollectionRealizationError::InvalidCover(
+            "an attached collection's parent must be a root collection".to_owned(),
+        ));
+    }
+    super::encoding::validate_descriptor_type::<SimpleArchive>(&parent_descriptor).map_err(
+        |error| {
+            CollectionRealizationError::Resolution(format!(
+                "attached parent is not a SimpleArchive root: {error}"
+            ))
+        },
+    )?;
+    Ok((
+        Collection::from_handle(parent),
+        attached_descriptor,
+        parent_descriptor,
+    ))
+}
+
+/// Give every node of the parent's frontier whose attachment is missing one,
+/// signed by the host.
+///
+/// The same walk a reader makes ([`walk`]), taking a node that already has a
+/// usable attachment, and otherwise building one: the node's own bytes, and
+/// a usable attachment of the node in each sibling the mapping reads, are
+/// mapped, the image stored and `MAP(attached; node -> image)` published. A
+/// node whose bytes or siblings are not here, or whose attachment the
+/// mapping cannot represent (`Capacity`), is descended, so its finer nodes
+/// get attachments instead: frontier nodes first, finer ones only where a
+/// frontier node cannot have one. A dependency the mapping names is
+/// acquired, and the operation runs again; one that cannot be acquired
+/// leaves that node to its finer ones, and what no node covers is a reader's
+/// residual. Only frontier nodes are maintained: an interior node a merge
+/// has consumed needs no attachment, and one a MAP gave before its merge
+/// stays in the store until a compaction collects it.
+pub(super) fn attach_frontier<S, M>(
+    store: &mut S,
+    attached: Collection<M::Target>,
+    signing_key: &SigningKey,
+    unavailable: &BTreeSet<CollectionData>,
+    frontier: &mut OperationFrontier<S::Snapshot>,
+) -> Result<(), CollectionRealizationError>
+where
+    S: Store,
+    M: MapMapping,
+{
+    let planning = open(store, frontier, "open attachment planning snapshot")?;
+    let bound: BoundAttachment<M> = bind_attached(&planning, attached)?;
+    let parent = bound.parent.handle();
+    let mut scope = BTreeSet::from([parent, attached.handle()]);
+    scope.extend(bound.siblings.iter().copied());
+    let index = index_of(&planning, &scope)?;
+    let coverage = index.published().clone();
+    let signer = Inline::new(signing_key.verifying_key().to_bytes());
+    let host = index.host();
+    walk(&coverage, parent, |node, _| {
+        if usable_attachment::<_, M::Target>(&planning, &coverage, attached.handle(), node)?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        // A MAP another key signed is believed nowhere: building one here
+        // would be work nothing reads. Refused before anything is mapped or
+        // fetched; a pass with nothing to attach needs no host.
+        if host != Some(signer) {
+            return Err(CollectionRealizationError::HostMismatch { host, signer });
+        }
+        let mut siblings = Vec::with_capacity(bound.siblings.len());
+        for sibling in &bound.siblings {
+            match resident_attachment(&planning, &coverage, *sibling, node)? {
+                Some(attachment) => siblings.push(attachment),
+                None => return Ok(false),
+            }
+        }
+        let snapshot = open(store, frontier, "open attachment mapping snapshot")?;
+        let handle = Handle::<SimpleArchive>::from_hash(node);
+        let held = snapshot
+            .metadata(handle)
+            .map_err(|error| {
+                CollectionRealizationError::storage("inspect a parent node's residency", error)
+            })?
+            .is_some();
+        if !held {
+            return Ok(false);
+        }
+        let input: Blob<SimpleArchive> = snapshot.get(handle).map_err(|error| {
+            CollectionRealizationError::storage("load a parent node to attach", error)
+        })?;
+        let output = bound.mapping.map(&input, &siblings, &snapshot);
+        drop(snapshot);
+        match output {
+            Ok(output) => {
+                let attachment = data_identity::<M::Target>(&output);
+                store.put::<M::Target, _>(output).map_err(|error| {
+                    CollectionRealizationError::storage("store an attachment", error)
+                })?;
+                publish(
+                    store,
+                    frontier,
+                    CollectionRecord::Map(CollectionMap::sign(
+                        signing_key,
+                        attached.handle(),
+                        node,
+                        attachment,
+                    )),
+                    "publish attachment MAP",
+                )?;
+                Ok(true)
+            }
+            Err(CollectionOperationError::Capacity(_)) => Ok(false),
+            Err(CollectionOperationError::MissingDependency(member))
+                if unavailable.contains(&member) =>
+            {
+                Ok(false)
+            }
+            Err(CollectionOperationError::MissingDependency(member)) => {
+                Err(CollectionRealizationError::MissingDependency { member })
+            }
+            Err(CollectionOperationError::Fatal(reason)) => {
+                Err(CollectionRealizationError::Derive {
+                    input: node,
+                    reason,
+                })
+            }
+        }
+    })?;
+    Ok(())
 }
 
 /// One mapping bound to its target and its immediate source.

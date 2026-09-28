@@ -1142,6 +1142,9 @@ fn raw_pass(snapshot: &PileFileSnapshot, plan: &Plan, signers: &mut Signers) -> 
                             }
                         }
                     }
+                    // No MAP predates this migration; a later one is carried
+                    // by the rewrite like any other record it does not plan.
+                    CollectionRecord::Map(_) => {}
                 }
             }
             PileRecordContent::RetiredCollectionEquation { equation } => {

@@ -635,6 +635,13 @@ fn print_record(bytes: &[u8], file_len: usize, record: triblespace_core::repo::p
                 println!("  output: {}", hex::encode_upper(derive.output().raw));
                 println!("  author: {}", hex::encode_upper(derive.public_key().raw));
             }
+            CollectionRecord::Map(map) => {
+                println!("  classification: collection-map");
+                println!("  attached: {}", hex::encode_upper(map.collection().raw));
+                println!("  node: {}", hex::encode_upper(map.node().raw));
+                println!("  attachment: {}", hex::encode_upper(map.attachment().raw));
+                println!("  author: {}", hex::encode_upper(map.public_key().raw));
+            }
         },
         PileRecordContent::RetiredCollectionEquation { equation } => match equation {
             RetiredCollectionEquation::MergeV8 {
@@ -988,7 +995,9 @@ impl ConflictTally {
     fn add(&mut self, record: &triblespace_core::collection::CollectionRecord) {
         use triblespace_core::collection::CollectionRecord;
         match record {
-            CollectionRecord::Commit(_) => {}
+            // A MAP is a host's private attachment of one node; it asserts
+            // no equation between collection states, so it cannot conflict.
+            CollectionRecord::Commit(_) | CollectionRecord::Map(_) => {}
             CollectionRecord::Merge(merge) => {
                 self.merge_records += 1;
                 self.merges

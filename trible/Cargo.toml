@@ -38,7 +38,10 @@ triblespace-core = { version = "0.47.0", path = "../triblespace-core", default-f
 triblespace-gpu = { version = "0.47.0", path = "../triblespace-gpu", default-features = false, optional = true }
 triblespace-paths = { path = "../triblespace-paths" }
 anybytes = "0.20"
-triblespace-search = { path = "../triblespace-search", optional = true }
+# BM25 and the other plain-CPU search encodings are attached to their parent
+# by every host that reads it, so every build carries them. The model-bearing
+# part stays behind the `search` feature.
+triblespace-search = { path = "../triblespace-search", default-features = false }
 file_type = "0.8"
 chrono = "0.4"
 hifitime = "4.1.2"
@@ -72,10 +75,11 @@ default = ["search", "dashboard-gui"]
 # Lean custody builds may omit this with --no-default-features.
 dashboard-gui = ["dep:GORBIE", "dep:egui"]
 # Maintain both stored-vector and model-derived semantic indexes. On by default
-# so the CLI can dispatch the concrete mapping named by a search descriptor;
-# the price is that the search crate brings the model crate with it. Build with
-# --no-default-features for a lean daemon.
-search = ["dep:triblespace-search", "triblespace-search/semantic"]
+# so the CLI can dispatch the concrete mapping named by a derived search
+# descriptor; the price is that the search crate brings the model crate with
+# it. Build with --no-default-features for a lean daemon, which still
+# maintains and searches BM25 attachments.
+search = ["triblespace-search/semantic"]
 # Explicit execution choice for bounded, externally reserved CUDA maintenance.
 # CPU remains the command default, including when this feature is compiled.
 succinct-cuda = ["dep:triblespace-gpu", "triblespace-gpu/cuda"]

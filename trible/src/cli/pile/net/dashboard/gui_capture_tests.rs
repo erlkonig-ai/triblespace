@@ -45,10 +45,10 @@ fn generated_frame(directory: &Path) -> Result<(Frame, i128)> {
         writer.collection("generated-dashboard-telemetry", policy.clone())?;
     let health: Collection<SimpleArchive> =
         writer.collection(health_record::COLLECTION_NAME, policy.clone())?;
-    // A registered derivation that is never maintained. It has no records at
+    // A registered attachment that is never maintained. It has no records at
     // all, so it is exactly the case a record-seeded walk would omit: the
-    // lattice must show the declared-but-unperformed derivation as a hole.
-    let derived = writer.derive::<SuccinctArchiveBlob>(collection, (), policy)?;
+    // lattice must show the declared-but-unperformed index as a hole.
+    let derived = writer.attach::<SuccinctArchiveBlob>(collection, ())?;
     // These are disposable, public fixture endpoint labels, not any node's key.
     let nodes = [11, 12, 13, 14, 15]
         .map(|seed| ed25519_dalek::SigningKey::from_bytes(&[seed; 32]).verifying_key());

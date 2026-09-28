@@ -27,6 +27,7 @@ use crate::trible::Fragment;
 use super::operation_snapshot::OperationFrontier;
 use super::{
     descriptor, Collection, CollectionData, CollectionEncoding, CollectionHandle, DeriveMapping,
+    MapMapping,
 };
 #[cfg(test)]
 use super::{CanonicalDerivation, CollectionDerivation};
@@ -300,6 +301,22 @@ where
                 hex::encode_upper(cursor.raw),
             ))
         })?;
+        // An attached collection is no lattice: it has no carry, no leaves
+        // and no merges of its own, and nothing derives from it.
+        if !descriptor::parents(loaded.fragment.facts())
+            .map_err(|error| {
+                CollectionRealizationError::Resolution(format!(
+                    "decode collection parent for {}: {error}",
+                    hex::encode_upper(cursor.raw),
+                ))
+            })?
+            .is_empty()
+        {
+            return Err(CollectionRealizationError::InvalidCover(format!(
+                "collection {} is an attached collection; maintain it through its mapping",
+                hex::encode_upper(cursor.raw),
+            )));
+        }
         let source = descriptor::source(loaded.fragment.facts()).map_err(|error| {
             CollectionRealizationError::Resolution(format!(
                 "decode collection source for {}: {error}",
@@ -688,6 +705,60 @@ where
 {
     acquiring(store, |store, _unavailable, frontier| {
         super::maintenance::carry_root(store, target, signing_key, frontier)
+    })
+    .await
+}
+
+/// Acquire an attached collection's descriptor and its parent's: all an
+/// attachment needs to be bound. Neither carries a policy the attachment
+/// answers to, so nothing else is fetched.
+pub(crate) async fn acquire_attached_lineage<S, E>(
+    store: &mut S,
+    attached: Collection<E>,
+) -> Result<(), CollectionRealizationError>
+where
+    S: Store + AsyncBlobStoreAcquire,
+    E: CollectionEncoding,
+{
+    let mut attempted = BTreeSet::new();
+    loop {
+        let snapshot = store.snapshot().map_err(|error| {
+            CollectionRealizationError::storage("observe attached lineage", error)
+        })?;
+        let result = super::maintenance::attached_lineage(&snapshot, attached);
+        drop(snapshot);
+        match result {
+            Ok(_) => return Ok(()),
+            Err(CollectionRealizationError::MissingDependency { member }) => {
+                if acquire_missing(store, &mut attempted, member).await? {
+                    continue;
+                }
+                return Err(CollectionRealizationError::MissingDependency { member });
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Give the parent's frontier nodes their missing attachments through one
+/// mapping, acquiring what the mapping names as missing and running again.
+pub(crate) async fn attach_acquiring_with<S, M>(
+    store: &mut S,
+    attached: Collection<M::Target>,
+    signing_key: &SigningKey,
+) -> Result<(), CollectionRealizationError>
+where
+    S: Store + AsyncBlobStoreAcquire,
+    M: MapMapping,
+{
+    acquiring(store, |store, unavailable, frontier| {
+        super::maintenance::attach_frontier::<S, M>(
+            store,
+            attached,
+            signing_key,
+            unavailable,
+            frontier,
+        )
     })
     .await
 }

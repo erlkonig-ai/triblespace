@@ -4,8 +4,8 @@
 //! so it resnapshots the backing store as it goes. It must not admit
 //! collection records or capability proofs which arrived while it ran: the
 //! initial snapshot remains the exact control-plane observation, a later
-//! snapshot contributes only newly resident blob bytes, and the `MERGE` and
-//! `DERIVE` records the operation authored are the sole overlay. Anything
+//! snapshot contributes only newly resident blob bytes, and the `MERGE`,
+//! `DERIVE` and `MAP` records the operation authored are the sole overlay. Anything
 //! that has to be acquired from elsewhere ends the operation; the retry is
 //! a new operation on a fresh control snapshot, which is how an acquired
 //! descriptor or definition comes to count.
@@ -46,7 +46,7 @@ impl<C> OperationFrontier<C> {
     pub(crate) fn include_record(&mut self, record: CollectionRecord) {
         assert!(
             !matches!(record, CollectionRecord::Commit(_)),
-            "an active realization may author only MERGE or DERIVE equations",
+            "an active realization may author only MERGE, DERIVE or MAP records",
         );
         self.authored
             .insert(&Entry::with_value(&record.fingerprint().raw(), record));

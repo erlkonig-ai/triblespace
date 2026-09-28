@@ -56,8 +56,9 @@ pub use crate::collection::LegacyUnsignedCollectionEquation;
 pub use crate::collection::RetiredCollectionEquation;
 use crate::collection::{
     collection_merge_bytes_len, CollectionCommit, CollectionData, CollectionDerive,
-    CollectionHandle, CollectionMerge, CollectionRecord, CollectionRecordSelector, CollectionStore,
-    SourceLocator, COLLECTION_MERGE_FIXED_BYTES_LEN, MAX_MERGE_INPUTS, MIN_MERGE_INPUTS,
+    CollectionHandle, CollectionMap, CollectionMerge, CollectionRecord, CollectionRecordSelector,
+    CollectionStore, SourceLocator, COLLECTION_MERGE_FIXED_BYTES_LEN, MAX_MERGE_INPUTS,
+    MIN_MERGE_INPUTS,
 };
 use crate::id::Id;
 use crate::id::RawId;
@@ -91,6 +92,7 @@ pub(crate) fn collection_record_kind(record: CollectionRecord) -> RecordKind {
         CollectionRecord::Commit(_) => record_kind::KIND_COLLECTION_COMMIT,
         CollectionRecord::Merge(_) => record_kind::KIND_COLLECTION_MERGE,
         CollectionRecord::Derive(_) => record_kind::KIND_COLLECTION_DERIVE,
+        CollectionRecord::Map(_) => record_kind::KIND_COLLECTION_MAP,
     })
 }
 
@@ -496,12 +498,13 @@ type CapabilityProofIndex = PATCH<32, IdentitySchema, CapabilityProof, XorSip128
 type LegacyCollectionHeaderIndex = PATCH<V3_HEADER_LEN, IdentitySchema>;
 
 /// The member a record produces: a commit's data, a merge's result, a
-/// derive's output (a derived collection's leaf).
+/// derive's output (a derived collection's leaf), a map's attachment.
 fn collection_record_output(record: &CollectionRecord) -> CollectionData {
     match record {
         CollectionRecord::Commit(commit) => commit.data(),
         CollectionRecord::Merge(merge) => merge.result(),
         CollectionRecord::Derive(derive) => derive.output(),
+        CollectionRecord::Map(map) => map.attachment(),
     }
 }
 
@@ -1432,6 +1435,39 @@ impl CollectionDeriveRecordHeader {
     }
 }
 
+/// Signed attachment. Its six fields fill one block exactly, like a
+/// DERIVE's.
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
+struct CollectionMapRecordHeader {
+    magic: [u8; FRAME_MAGIC_LEN],
+    span_blocks: [u8; 4],
+    record_kind: RawInline,
+    attached: RawInline,
+    node: RawInline,
+    attachment: RawInline,
+    public_key: RawInline,
+    signature_r: RawInline,
+    signature_s: RawInline,
+}
+
+impl CollectionMapRecordHeader {
+    fn new(record: &CollectionMap) -> Self {
+        let (signature_r, signature_s) = record.signature();
+        Self {
+            magic: FRAME_MAGIC,
+            span_blocks: 1u32.to_le_bytes(),
+            record_kind: record_kind::KIND_COLLECTION_MAP,
+            attached: record.attached().raw,
+            node: record.node().raw,
+            attachment: record.attachment().raw,
+            public_key: record.public_key().raw,
+            signature_r: signature_r.raw,
+            signature_s: signature_s.raw,
+        }
+    }
+}
+
 /// Reassemble a canonical [`WantRequest`] from a header's tag and three
 /// fields. Shared by both envelope generations: only the field offsets moved.
 /// The exact historical key of a retired typed-WANT log entry: its kind byte
@@ -1478,6 +1514,7 @@ fn collection_record_header(record: &CollectionRecord) -> Vec<u8> {
         CollectionRecord::Derive(record) => CollectionDeriveRecordHeader::new(record)
             .as_bytes()
             .to_vec(),
+        CollectionRecord::Map(record) => CollectionMapRecordHeader::new(record).as_bytes().to_vec(),
     }
 }
 
@@ -1520,6 +1557,7 @@ const _: () = {
     assert!(std::mem::size_of::<LegacyCollectionDeriveRecordHeader>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<RetiredCollectionMergeV8RecordHeader>() == 2 * ENVELOPE_BLOCK_LEN);
     assert!(std::mem::size_of::<CollectionDeriveRecordHeader>() == ENVELOPE_HEADER_LEN);
+    assert!(std::mem::size_of::<CollectionMapRecordHeader>() == ENVELOPE_HEADER_LEN);
 };
 
 /// A single record decoded from a pile file.
@@ -2051,6 +2089,25 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
                         Inline::new(header.target),
                         SourceLocator::from_raw(header.input),
                         Inline::new(header.output),
+                        Inline::new(header.public_key),
+                        Inline::new(header.signature_r),
+                        Inline::new(header.signature_s),
+                    )),
+                },
+            })
+        }
+        record_kind::KIND_COLLECTION_MAP => {
+            fixed_header()?;
+            let (header, _) =
+                CollectionMapRecordHeader::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+            Ok(PileRecord {
+                offset,
+                len,
+                content: PileRecordContent::Collection {
+                    record: CollectionRecord::Map(CollectionMap::from_parts(
+                        Inline::new(header.attached),
+                        Inline::new(header.node),
+                        Inline::new(header.attachment),
                         Inline::new(header.public_key),
                         Inline::new(header.signature_r),
                         Inline::new(header.signature_s),
@@ -5660,7 +5717,9 @@ fn record_equation_key(record: &CollectionRecord) -> Option<EquationKey> {
             )),
             _ => None,
         },
-        CollectionRecord::Derive(_) | CollectionRecord::Commit(_) => None,
+        CollectionRecord::Derive(_) | CollectionRecord::Commit(_) | CollectionRecord::Map(_) => {
+            None
+        }
     }
 }
 
@@ -5820,6 +5879,9 @@ pub enum CollectionFrameRole {
     Derive,
     /// A legacy V3 collection definition.
     Definition,
+    /// A host's attachment of one node of its parent's lattice, in an
+    /// attached collection.
+    Map,
 }
 
 /// One collection-algebra frame a retained rewrite considers carrying: what
@@ -6803,6 +6865,7 @@ impl PileFile {
                 CollectionRecord::Commit(_) => CollectionFrameRole::Commit,
                 CollectionRecord::Merge(_) => CollectionFrameRole::Merge,
                 CollectionRecord::Derive(_) => CollectionFrameRole::Derive,
+                CollectionRecord::Map(_) => CollectionFrameRole::Map,
             };
             let stated = CollectionFrame {
                 generation: CollectionFrameGeneration::Current,
@@ -8145,6 +8208,65 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn a_map_frame_is_one_block_naming_its_node_and_replays() {
+        let key = SigningKey::from_bytes(&[93; 32]);
+        let map = CollectionMap::sign(
+            &key,
+            collection_test_collection(97),
+            collection_test_hash(98),
+            collection_test_hash(99),
+        );
+        let frame = collection_record_header(&CollectionRecord::Map(map));
+        assert_eq!(frame.len(), ENVELOPE_BLOCK_LEN);
+        assert_eq!(
+            &frame[FRAME_BODY_OFFSET - 32..FRAME_BODY_OFFSET],
+            record_kind::KIND_COLLECTION_MAP.as_slice()
+        );
+        assert_eq!(&frame[FRAME_BODY_OFFSET..], map.to_bytes().as_slice());
+        assert!(matches!(
+            decode_record(&frame, 0).unwrap().content,
+            PileRecordContent::Collection {
+                record: CollectionRecord::Map(decoded)
+            } if decoded == map
+        ));
+
+        // Written, closed and replayed, it is selected by its collection and
+        // by the member it produces, the attachment.
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "map.pile");
+        let mut pile = Pile::open(&path).unwrap();
+        pile.insert(CollectionRecord::Map(map)).unwrap();
+        pile.insert(CollectionRecord::Map(map)).unwrap();
+        pile.close().unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            ENVELOPE_BLOCK_LEN as u64
+        );
+        let mut pile = Pile::open(&path).unwrap();
+        let snapshot = pile.snapshot().unwrap();
+        for selector in [
+            CollectionRecordSelector::Collection(map.attached()),
+            CollectionRecordSelector::ProducedMember(map.attached(), map.attachment()),
+        ] {
+            assert_eq!(
+                snapshot
+                    .select_records(&BTreeSet::from([selector]))
+                    .unwrap(),
+                vec![CollectionRecord::Map(map)]
+            );
+        }
+        assert!(snapshot
+            .select_records(&BTreeSet::from([CollectionRecordSelector::ProducedMember(
+                map.attached(),
+                map.node(),
+            )]))
+            .unwrap()
+            .is_empty());
+        drop(snapshot);
+        pile.close().unwrap();
+    }
+
     /// The binary MERGE (v8) and handle DERIVE (v9) that lattice v2 retired
     /// decode with every field, are not current records and not opaque, and
     /// every rewrite carries their exact frames.
@@ -8286,9 +8408,18 @@ mod tests {
             // A derive's six fields fill one block exactly, just as a commit's
             // do.
             (record_kind::KIND_COLLECTION_DERIVE, 1, None),
+            // So do a map's.
+            (record_kind::KIND_COLLECTION_MAP, 1, None),
         ];
+        let map = CollectionRecord::Map(CollectionMap::sign(
+            &SigningKey::from_bytes(&[7; 32]),
+            collection_test_collection(3),
+            collection_test_hash(8),
+            collection_test_hash(10),
+        ));
+        let records = records.into_iter().chain([map]);
 
-        for (record, (kind, blocks, reserved_start)) in records.into_iter().zip(expected) {
+        for (record, (kind, blocks, reserved_start)) in records.zip(expected) {
             let header = collection_record_header(&record);
             assert_eq!(header.len(), blocks as usize * ENVELOPE_BLOCK_LEN);
             assert_eq!(&header[..FRAME_MAGIC_LEN], FRAME_MAGIC.as_slice());
@@ -8886,6 +9017,7 @@ mod tests {
                         .as_bytes(),
                     );
                 }
+                CollectionRecord::Map(_) => unreachable!("the fixture holds no MAP"),
             }
 
             let original = header;
@@ -8915,6 +9047,7 @@ mod tests {
                     decoded.content,
                     PileRecordContent::Collection { record: decoded } if decoded == record
                 )),
+                CollectionRecord::Map(_) => unreachable!("the fixture holds no MAP"),
             }
             assert_eq!(header, original);
         }
@@ -13215,7 +13348,6 @@ mod tests {
     /// successor lacks refuses the rewrite instead.
     #[test]
     fn a_drained_generation_and_its_derivations_are_left_behind_by_rewrite() {
-        use crate::blob::encodings::succinctarchive::SuccinctArchiveBlob;
         use crate::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
 
         let dir = tempfile::tempdir().unwrap();
@@ -13233,7 +13365,7 @@ mod tests {
         let new = source.collection("gen", policy(&other)).unwrap();
         assert_ne!(old.handle(), new.handle());
         let derived = source
-            .derive::<SuccinctArchiveBlob>(old, (), policy(&key))
+            .derive::<crate::collection::test_support::TestImage>(old, (), policy(&key))
             .unwrap();
         let data = [collection_test_hash(1), collection_test_hash(2)];
         for member in data {
@@ -13365,7 +13497,7 @@ mod tests {
             fn carries(&mut self, frame: &CollectionFrame) -> bool {
                 self.asked.push(*frame);
                 match frame.role {
-                    CollectionFrameRole::Merge => false,
+                    CollectionFrameRole::Merge | CollectionFrameRole::Map => false,
                     CollectionFrameRole::Derive => frame.collection != Some(self.target),
                     CollectionFrameRole::Commit | CollectionFrameRole::Definition => true,
                 }
@@ -13677,7 +13809,7 @@ mod tests {
         impl CollectionFrameFilter for DropMergesAndDerivesInto {
             fn carries(&mut self, frame: &CollectionFrame) -> bool {
                 match frame.role {
-                    CollectionFrameRole::Merge => false,
+                    CollectionFrameRole::Merge | CollectionFrameRole::Map => false,
                     CollectionFrameRole::Derive => frame.collection != Some(self.0),
                     CollectionFrameRole::Commit | CollectionFrameRole::Definition => true,
                 }

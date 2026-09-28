@@ -90,7 +90,7 @@ use super::simplearchive_union;
 #[cfg(test)]
 use super::CollectionPolicy;
 use super::{
-    CollectionDerivation, CollectionEncoding, CollectionOperationError, TryFromCover,
+    CollectionAttachment, CollectionEncoding, CollectionOperationError, TryFromCover,
     TryFromCoverError,
 };
 
@@ -413,20 +413,12 @@ pub fn join(
         .encode())
 }
 
-/// Construct the maintained LWW register descriptor for one source collection.
-///
-/// The target's independent READ and WRITE policies are explicit rather than
-/// inherited from its source.
+/// Construct the attached LWW register descriptor for one parent collection.
 #[cfg(test)]
-pub(crate) fn descriptor(
-    source: CollectionHandle,
-    identity: Id,
-    orders: Id,
-    policy: CollectionPolicy,
-) -> Fragment {
+pub(crate) fn descriptor(parent: CollectionHandle, identity: Id, orders: Id) -> Fragment {
     let mapping =
-        crate::collection::CanonicalDerivation::<LwwRegisterBlob>::new((identity, orders));
-    crate::collection::descriptor::deriving_with(source, &mapping, policy)
+        crate::collection::CanonicalAttachment::<LwwRegisterBlob>::new((identity, orders));
+    crate::collection::descriptor::attaching_with(parent, &mapping)
 }
 
 /// Canonical stated-register coordinate projection algorithm, version 1.
@@ -506,8 +498,7 @@ impl CollectionEncoding for LwwRegisterBlob {
     }
 }
 
-impl CollectionDerivation for LwwRegisterBlob {
-    type Source = SimpleArchive;
+impl CollectionAttachment for LwwRegisterBlob {
     type Argument = (Id, Id);
 
     fn fragment(&(identity, orders): &Self::Argument) -> Fragment {
@@ -515,7 +506,7 @@ impl CollectionDerivation for LwwRegisterBlob {
     }
 
     fn bind(
-        _source: &Fragment,
+        _parent: &Fragment,
         target: &Fragment,
     ) -> Result<Self::Argument, CollectionOperationError> {
         let (identity, orders) = register_attributes(target)?;
@@ -532,13 +523,14 @@ impl CollectionDerivation for LwwRegisterBlob {
 
     fn map<R>(
         &(identity, orders): &Self::Argument,
-        source: &Blob<SimpleArchive>,
+        node: &Blob<SimpleArchive>,
+        _siblings: &[crate::collection::CollectionData],
         _reader: &R,
     ) -> Result<Blob<LwwRegisterBlob>, CollectionOperationError>
     where
-        R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
+        R: crate::repo::StoreRead,
     {
-        derive_element(source, identity, orders)
+        derive_element(node, identity, orders)
             .map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
 }
@@ -920,11 +912,7 @@ mod tests {
             .collection("lww-row-view", direct_policy(key.verifying_key()))
             .unwrap();
         let target = store
-            .derive::<LwwRegisterBlob>(
-                source,
-                (state_of.id(), written_at.id()),
-                direct_policy(key.verifying_key()),
-            )
+            .attach::<LwwRegisterBlob>(source, (state_of.id(), written_at.id()))
             .unwrap();
         let handles = members
             .iter()
@@ -1355,7 +1343,7 @@ mod tests {
             simplearchive_union::descriptor("source", policy()).into_facts(),
         )
         .get_handle();
-        let stated = descriptor(source, state_of.id(), written_at.id(), policy());
+        let stated = descriptor(source, state_of.id(), written_at.id());
         assert_eq!(
             descriptor_facts::mapping_argument(stated.facts(), register_identity.id()),
             Ok(Some(
@@ -1376,7 +1364,7 @@ mod tests {
         );
         assert_ne!(
             stated,
-            descriptor(source, metadata::tag.id(), written_at.id(), policy(),)
+            descriptor(source, metadata::tag.id(), written_at.id())
         );
         assert_eq!(
             descriptor_facts::mapping_algorithm(stated.facts()),
@@ -1385,40 +1373,27 @@ mod tests {
     }
 
     #[test]
-    fn source_and_derived_descriptors_carry_independent_policies() {
+    fn an_attached_register_carries_no_policy_of_its_own() {
         use crate::collection::descriptor as descriptor_facts;
 
-        let source_root = ed25519_dalek::SigningKey::from_bytes(&[8; 32]).verifying_key();
-        let target_root = ed25519_dalek::SigningKey::from_bytes(&[9; 32]).verifying_key();
-        let name = "lww-source".to_owned();
-        let source_policy = direct_policy(source_root);
-        let target_policy = direct_policy(target_root);
+        let root = ed25519_dalek::SigningKey::from_bytes(&[8; 32]).verifying_key();
         let mut store = MemoryRepo::default();
-        let source = store.collection(&name, source_policy.clone()).unwrap();
+        let source = store.collection("lww-source", direct_policy(root)).unwrap();
         let target = store
-            .derive::<LwwRegisterBlob>(
-                source,
-                (state_of.id(), written_at.id()),
-                target_policy.clone(),
-            )
+            .attach::<LwwRegisterBlob>(source, (state_of.id(), written_at.id()))
             .unwrap();
         let snapshot = store.snapshot().unwrap();
-        let source_descriptor =
-            crate::collection::api::load_collection_descriptor(&snapshot, source.handle())
-                .unwrap()
-                .fragment;
         let target_descriptor =
             crate::collection::api::load_collection_descriptor(&snapshot, target.handle())
                 .unwrap()
                 .fragment;
-
         assert_eq!(
-            descriptor_facts::policy(source_descriptor.facts()),
-            Ok(source_policy)
+            descriptor_facts::parents(target_descriptor.facts()),
+            Ok(vec![source.handle()])
         );
         assert_eq!(
-            descriptor_facts::policy(target_descriptor.facts()),
-            Ok(target_policy)
+            descriptor_facts::capability_policies(target_descriptor.facts(), None).count(),
+            0
         );
     }
 
@@ -1426,16 +1401,12 @@ mod tests {
     fn collection_lifecycle_joins_fact_halves_from_distinct_commits() {
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
         let team = signing_key.verifying_key();
-        let mut store = MemoryRepo::default();
+        let mut store = MemoryRepo::for_host(team);
         let source = store
             .collection("maintained-lww", direct_policy(team))
             .unwrap();
         let target = store
-            .derive::<LwwRegisterBlob>(
-                source,
-                (state_of.id(), written_at.id()),
-                direct_policy(team),
-            )
+            .attach::<LwwRegisterBlob>(source, (state_of.id(), written_at.id()))
             .unwrap();
         let register = ufoid();
         let state = ufoid();
@@ -1450,17 +1421,13 @@ mod tests {
             .commit(source, &signing_key, Fragment::from(order(&state, 42)))
             .unwrap();
 
-        let snapshot = block_on(store.maintain(target, &signing_key)).unwrap();
-        let ensured: LwwIndex = snapshot
-            .collection(target)
-            .unwrap()
-            .view()
-            .unwrap();
+        let snapshot = block_on(store.maintain_attached(target, &signing_key)).unwrap();
+        let ensured: LwwIndex = snapshot.attached(target).unwrap().view().unwrap();
         assert_eq!(ensured.query().unwrap().winner(*register), Some(*state));
         let attached: LwwIndex = store
             .snapshot()
             .unwrap()
-            .collection(target)
+            .attached(target)
             .unwrap()
             .view()
             .unwrap();

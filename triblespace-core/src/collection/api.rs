@@ -44,7 +44,8 @@ use super::{
     RecordDecodeError, TryFromCover, TryFromCoverError,
 };
 use super::{
-    AdmissionPolicy, CanonicalDerivation, CollectionDerivation, CollectionPolicy, DeriveMapping,
+    AdmissionPolicy, AttachedSnapshot, CanonicalAttachment, CanonicalDerivation,
+    CollectionAttachment, CollectionDerivation, CollectionPolicy, DeriveMapping, MapMapping,
 };
 
 /// Failure to discover the resident capability evidence used for collection
@@ -1358,6 +1359,28 @@ pub trait CollectionSnapshotExt: StoreRead + Sized {
     {
         super::observation::attach(self, target)
     }
+
+    /// Observe what one attached collection holds for its parent in this
+    /// immutable snapshot: the attached cover.
+    ///
+    /// For each node of the parent's frontier, widest first, its usable
+    /// attachment is taken -- a MAP the host signed, whose bytes and
+    /// representation dependencies are here -- and otherwise the
+    /// attachments of the highest nodes beneath it that have one, found
+    /// through the host's own merges. The parent foundations no taken
+    /// attachment reaches are the [`AttachedSnapshot::residual`]: read those
+    /// nodes raw, or report them. Supports and usability come from this one
+    /// observation.
+    fn attached<E>(
+        &self,
+        attached: Collection<E>,
+    ) -> Result<AttachedSnapshot<Self, E>, CollectionRealizationError>
+    where
+        E: CollectionEncoding,
+        Handle<E>: InlineEncoding,
+    {
+        super::observation::attach_attached(self, attached)
+    }
 }
 
 impl<R> CollectionSnapshotExt for R where R: StoreRead {}
@@ -1561,6 +1584,129 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
         let handle = descriptor::put_closure(self, &descriptor)
             .map_err(CollectionRegistrationError::DependencyPut)?;
         Ok(Collection::from_handle(handle))
+    }
+
+    /// Create and register one canonical attached collection: an index of
+    /// `parent`'s nodes through `T`'s own mapping.
+    ///
+    /// The descriptor is the parent's handle and the mapping, with no
+    /// policy; registering it publishes nothing else.
+    fn attach<T>(
+        &mut self,
+        parent: Collection<SimpleArchive>,
+        argument: T::Argument,
+    ) -> Result<Collection<T>, CollectionRegistrationError<<Self as BlobStorePut>::PutError>>
+    where
+        T: CollectionAttachment,
+    {
+        self.attach_with::<CanonicalAttachment<T>>(parent, CanonicalAttachment::new(argument))
+    }
+
+    /// Create and register one attached collection through an explicit
+    /// mapping value.
+    fn attach_with<M>(
+        &mut self,
+        parent: Collection<SimpleArchive>,
+        mapping: M,
+    ) -> Result<Collection<M::Target>, CollectionRegistrationError<<Self as BlobStorePut>::PutError>>
+    where
+        M: MapMapping,
+    {
+        let descriptor = descriptor::attaching_with(parent.handle(), &mapping);
+        M::Target::validate_descriptor(&descriptor).map_err(|source| {
+            CollectionRegistrationError::WrongType(CollectionTypeError::InvalidDescriptor(source))
+        })?;
+        let handle = descriptor::put_closure(self, &descriptor)
+            .map_err(CollectionRegistrationError::DependencyPut)?;
+        Ok(Collection::from_handle(handle))
+    }
+
+    /// Give the parent's current frontier nodes their missing attachments:
+    /// what a write calls after its commit, so the commit is readable
+    /// through the attached collection. No merge is published.
+    ///
+    /// Every MAP is signed by `signing_key`, which must be the store's host
+    /// ([`CollectionRealizationError::HostMismatch`] otherwise): only the
+    /// host's MAPs are believed. A mapping reading a sibling attached
+    /// collection finds that sibling's attachments here, so ensure the
+    /// sibling first.
+    fn ensure_attached<'a, T>(
+        &'a mut self,
+        attached: Collection<T>,
+        signing_key: &'a SigningKey,
+    ) -> impl Future<Output = Result<Self::Snapshot, CollectionRealizationError>> + Send + 'a
+    where
+        T: CollectionAttachment,
+        Self: Store + AsyncBlobStoreAcquire + Send,
+        Handle<T>: InlineEncoding,
+    {
+        self.ensure_attached_with::<CanonicalAttachment<T>>(attached, signing_key)
+    }
+
+    /// [`Self::ensure_attached`] through one explicit mapping.
+    fn ensure_attached_with<'a, M>(
+        &'a mut self,
+        attached: Collection<M::Target>,
+        signing_key: &'a SigningKey,
+    ) -> impl Future<Output = Result<Self::Snapshot, CollectionRealizationError>> + Send + 'a
+    where
+        M: MapMapping,
+        Self: Store + AsyncBlobStoreAcquire + Send,
+        Handle<M::Target>: InlineEncoding,
+    {
+        async move {
+            super::exact_derived::acquire_attached_lineage(self, attached).await?;
+            super::exact_derived::attach_acquiring_with::<Self, M>(self, attached, signing_key)
+                .await?;
+            self.snapshot().map_err(|error| {
+                CollectionRealizationError::storage("freeze post-attach snapshot", error)
+            })
+        }
+    }
+
+    /// Maintain one attached collection: carry its parent first, then give
+    /// every node of the parent's frontier after that carry its missing
+    /// attachment, so nothing is built for a node the carry is about to
+    /// consume. A merged node's attachment is mapped from the merged node's
+    /// own bytes.
+    fn maintain_attached<'a, T>(
+        &'a mut self,
+        attached: Collection<T>,
+        signing_key: &'a SigningKey,
+    ) -> impl Future<Output = Result<Self::Snapshot, CollectionRealizationError>> + Send + 'a
+    where
+        T: CollectionAttachment,
+        Self: Store + AsyncBlobStoreAcquire + Send,
+        Handle<T>: InlineEncoding,
+    {
+        self.maintain_attached_with::<CanonicalAttachment<T>>(attached, signing_key)
+    }
+
+    /// [`Self::maintain_attached`] through one explicit mapping.
+    fn maintain_attached_with<'a, M>(
+        &'a mut self,
+        attached: Collection<M::Target>,
+        signing_key: &'a SigningKey,
+    ) -> impl Future<Output = Result<Self::Snapshot, CollectionRealizationError>> + Send + 'a
+    where
+        M: MapMapping,
+        Self: Store + AsyncBlobStoreAcquire + Send,
+        Handle<M::Target>: InlineEncoding,
+    {
+        async move {
+            super::exact_derived::acquire_attached_lineage(self, attached).await?;
+            let snapshot = self.snapshot().map_err(|error| {
+                CollectionRealizationError::storage("observe attached parent", error)
+            })?;
+            let (parent, _, _) = super::maintenance::attached_lineage(&snapshot, attached)?;
+            drop(snapshot);
+            realize_root(self, parent, signing_key, true).await?;
+            super::exact_derived::attach_acquiring_with::<Self, M>(self, attached, signing_key)
+                .await?;
+            self.snapshot().map_err(|error| {
+                CollectionRealizationError::storage("freeze post-attach snapshot", error)
+            })
+        }
     }
 
     /// Ensure one collection for the key: "derive what you wrote".

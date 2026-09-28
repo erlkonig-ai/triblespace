@@ -11,8 +11,8 @@ use triblespace_core::blob::encodings::succinctarchive::{
 };
 use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::collection::{
-    AdmissionPolicy, CollectionDerivation, CollectionPolicy, CollectionRead, CollectionRecord,
-    CollectionSnapshotExt, CollectionStoreExt, DeriveMapping,
+    AdmissionPolicy, CollectionAttachment, CollectionPolicy, CollectionRead, CollectionRecord,
+    CollectionSnapshotExt, CollectionStoreExt, MapMapping,
 };
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
@@ -132,7 +132,7 @@ impl WaveletMatrixFreezeBackend for CountedReference {
     }
 }
 
-fn maintenance_uses_both_operations<B: Counted>()
+fn maintenance_uses_the_backend_for_every_attachment<B: Counted>()
 where
     B::Error: std::fmt::Display,
 {
@@ -141,14 +141,23 @@ where
         AdmissionPolicy::direct(signer.verifying_key()),
         AdmissionPolicy::direct(signer.verifying_key()),
     );
-    let mut store = MemoryRepo::default();
-    let source = store.collection("raw-backend", policy.clone()).unwrap();
+    let mut store = MemoryRepo::for_host(signer.verifying_key());
+    let source = store.collection("raw-backend", policy).unwrap();
     let target = store
-        .derive::<SuccinctArchiveBlob>(source, (), policy)
+        .attach_with(source, BackendSuccinctMapping::new(B::default()))
         .unwrap();
+    // The canonical attached descriptor is the backend's: one collection,
+    // whichever device builds it.
+    assert_eq!(
+        target.handle(),
+        store
+            .attach::<SuccinctArchiveBlob>(source, ())
+            .unwrap()
+            .handle()
+    );
     let mut expected = TribleSet::new();
-    for start in [0, 32, 64, 96] {
-        let part = varied_facts(start, 64);
+    for start in 0..8u32 {
+        let part = varied_facts(start * 64, 64);
         expected += part.clone();
         store.commit(source, &signer, Fragment::from(part)).unwrap();
     }
@@ -165,7 +174,7 @@ where
         .unwrap();
         assert_eq!(
             bound.fragment().facts(),
-            <SuccinctArchiveBlob as CollectionDerivation>::fragment(&()).facts()
+            <SuccinctArchiveBlob as CollectionAttachment>::fragment(&()).facts()
         );
     }
     assert_eq!(
@@ -173,91 +182,46 @@ where
         0,
         "descriptor binding must not initialize a device"
     );
-    let fine = block_on(store.ensure_with::<BackendSuccinctMapping<B>>(target, &signer)).unwrap();
+    // The parent is carried first, so the eight commits are one merged
+    // node, and that node alone is attached, mapped from its own bytes.
+    let compact =
+        block_on(store.maintain_attached_with::<BackendSuccinctMapping<B>>(target, &signer))
+            .unwrap();
     assert!(
         B::constructions().load(Ordering::Relaxed) > 0,
         "actual maps initialize the backend"
     );
     assert_eq!(
         B::counter().load(Ordering::Relaxed),
-        4 * 6,
-        "four raw derivations"
+        6,
+        "one raw build, of the merged node"
     );
-    let fine_records = fine
-        .records()
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    assert!(!fine_records
-        .iter()
-        .any(|record| matches!(record, CollectionRecord::Merge(_))));
-    B::counter().store(0, Ordering::Relaxed);
-    let compact =
-        block_on(store.maintain_with::<BackendSuccinctMapping<B>>(target, &signer)).unwrap();
     let records = compact
         .records()
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    let merges = records
-        .iter()
-        .filter(|record| matches!(record, CollectionRecord::Merge(_)))
-        .count();
-    assert!(merges > 0, "must exercise target MERGE, not just map");
-    assert_eq!(
-        B::counter().load(Ordering::Relaxed),
-        merges * 6,
-        "every target carry uses the backend; no source merges exist"
-    );
-    // A DERIVE names its source foundation by locator; find the committed
-    // payload it names among the source commits.
-    let sources: std::collections::BTreeMap<_, _> = records
+    let maps: Vec<_> = records
         .iter()
         .filter_map(|record| match record {
-            CollectionRecord::Commit(commit) => Some((
-                triblespace_core::collection::SourceLocator::of(commit.data().raw),
-                commit.data(),
-            )),
+            CollectionRecord::Map(map) => Some(*map),
             _ => None,
         })
         .collect();
-    for record in &records {
-        record.verify_strict().unwrap();
-        let (expected, output) = match record {
-            CollectionRecord::Derive(record) => {
-                let source = sources[&record.input()];
-                let input: Blob<SimpleArchive> = compact
-                    .get(Handle::<SimpleArchive>::from_hash(source))
-                    .unwrap();
-                (
-                    SuccinctArchiveBlob::build_from_simple_archive(&input).unwrap(),
-                    record.output(),
-                )
-            }
-            CollectionRecord::Merge(record) => {
-                let inputs: Vec<Blob<SuccinctArchiveBlob>> = record
-                    .inputs()
-                    .iter()
-                    .map(|input| {
-                        compact
-                            .get(Handle::<SuccinctArchiveBlob>::from_hash(*input))
-                            .unwrap()
-                    })
-                    .collect();
-                (
-                    SuccinctArchiveBlob::merge(&inputs).unwrap(),
-                    record.result(),
-                )
-            }
-            CollectionRecord::Commit(_) => continue,
-        };
+    assert_eq!(maps.len(), 1);
+    for map in &maps {
+        map.verify_strict().unwrap();
+        let node: Blob<SimpleArchive> = compact
+            .get(Handle::<SimpleArchive>::from_hash(map.node()))
+            .unwrap();
+        let expected = SuccinctArchiveBlob::build_from_simple_archive(&node).unwrap();
         let actual: Blob<SuccinctArchiveBlob> = compact
-            .get(Handle::<SuccinctArchiveBlob>::from_hash(output))
+            .get(Handle::<SuccinctArchiveBlob>::from_hash(map.attachment()))
             .unwrap();
         assert_eq!(actual.bytes.as_ref(), expected.bytes.as_ref());
-        assert_eq!(actual.get_handle(), expected.get_handle());
     }
-    let view = compact.collection(target).unwrap();
+    let view = compact.attached(target).unwrap();
+    assert!(view.residual().is_empty());
     assert_eq!(
         view.view::<UnionArchive<OrderedUniverse>>()
             .unwrap()
@@ -268,7 +232,8 @@ where
     let calls = B::counter().load(Ordering::Relaxed);
     let constructions = B::constructions().load(Ordering::Relaxed);
     let again =
-        block_on(store.maintain_with::<BackendSuccinctMapping<B>>(target, &signer)).unwrap();
+        block_on(store.maintain_attached_with::<BackendSuccinctMapping<B>>(target, &signer))
+            .unwrap();
     assert_eq!(
         B::counter().load(Ordering::Relaxed),
         calls,
@@ -283,13 +248,13 @@ where
 }
 
 #[test]
-fn canonical_mapping_uses_backend_for_derives_and_target_merges() {
+fn canonical_mapping_uses_backend_for_every_attachment() {
     let accelerated = BackendSuccinctMapping::new(Reference);
     assert_eq!(
         accelerated.fragment().facts(),
-        <SuccinctArchiveBlob as CollectionDerivation>::fragment(&()).facts()
+        <SuccinctArchiveBlob as CollectionAttachment>::fragment(&()).facts()
     );
-    maintenance_uses_both_operations::<CountedReference>();
+    maintenance_uses_the_backend_for_every_attachment::<CountedReference>();
     let source = singleton_domain_source();
     assert_eq!(
         SuccinctArchiveBlob::build_from_simple_archive_with_backend(&source, &Reference)
@@ -327,17 +292,9 @@ fn returned_backend_failures_use_canonical_cpu_without_partial_output() {
     let snapshot = store.snapshot().unwrap();
     let source: Blob<SimpleArchive> = facts(0, 65).to_blob();
     let cpu = SuccinctArchiveBlob::build_from_simple_archive(&source).unwrap();
-    let output = mapping.map(&source, &snapshot).unwrap();
+    let output = mapping.map(&source, &[], &snapshot).unwrap();
     assert_eq!(output.bytes.as_ref(), cpu.bytes.as_ref());
     assert_eq!(output.get_handle(), cpu.get_handle());
-    let other = SuccinctArchiveBlob::build_from_simple_archive(&facts(32, 65).to_blob()).unwrap();
-    let joined = mapping
-        .join_images(&Fragment::empty(), &output, &other, &snapshot)
-        .unwrap()
-        .unwrap();
-    let expected = SuccinctArchiveBlob::merge(&[cpu, other]).unwrap();
-    assert_eq!(joined.bytes.as_ref(), expected.bytes.as_ref());
-    assert_eq!(joined.get_handle(), expected.get_handle());
 }
 
 #[cfg(feature = "cuda")]
@@ -383,8 +340,8 @@ mod cuda {
 
     #[test]
     #[ignore = "requires an exclusively reserved CUDA device/shared-memory budget"]
-    fn cuda_collection_derives_and_target_merges_match_canonical_bytes() {
-        maintenance_uses_both_operations::<StrictCuda>();
+    fn cuda_collection_attachments_match_canonical_bytes() {
+        maintenance_uses_the_backend_for_every_attachment::<StrictCuda>();
     }
 
     #[test]
