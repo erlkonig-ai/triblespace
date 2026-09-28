@@ -968,35 +968,30 @@ struct SignedJoin {
     inputs: Vec<[u8; 32]>,
 }
 
-fn conflicts(path: &Path) -> Result<()> {
-    use std::collections::{BTreeMap, BTreeSet};
-    use triblespace_core::collection::{CollectionRead, CollectionRecord};
-    use triblespace_core::repo::pile::Pile;
-    use triblespace_core::repo::SnapshotSource;
+/// What `conflicts` counts in one record scan: every MERGE once per signer
+/// (inputs -> results) and every DERIVE once per locator (outputs). A
+/// display tally, dropped after printing; nothing reads it later.
+#[derive(Default)]
+struct ConflictTally {
+    merge_records: usize,
+    derive_records: usize,
+    /// Every MERGE once per signer: inputs -> results.
+    merges: std::collections::BTreeMap<SignedJoin, Named>,
+    /// Every DERIVE once: (target, locator) -> outputs.
+    derives: std::collections::BTreeMap<([u8; 32], [u8; 32]), Named>,
+}
 
-    // A record scan: nothing here asks the fold, so the pile is opened with
-    // no host and no MERGE is believed or needs to be.
-    let mut pile = Pile::open(path).map_err(|error| super::pile_read_error(path, error))?;
-    let snapshot = pile
-        .snapshot()
-        .map_err(|error| super::pile_read_error(path, error))?;
-    // Every MERGE once per signer: inputs -> results.
-    let mut merges: BTreeMap<SignedJoin, BTreeSet<[u8; 32]>> = BTreeMap::new();
-    // Every DERIVE once: (target, locator) -> outputs.
-    let mut derives: BTreeMap<([u8; 32], [u8; 32]), BTreeSet<[u8; 32]>> = BTreeMap::new();
-    let mut merge_records = 0usize;
-    let mut derive_records = 0usize;
-    for record in snapshot.records().map_err(|error| {
-        anyhow::anyhow!("read collection records of {}: {error}", path.display())
-    })? {
-        let record = record.map_err(|error| {
-            anyhow::anyhow!("read collection records of {}: {error}", path.display())
-        })?;
+/// The results or outputs named for one input set or locator.
+type Named = std::collections::BTreeSet<[u8; 32]>;
+
+impl ConflictTally {
+    fn add(&mut self, record: &triblespace_core::collection::CollectionRecord) {
+        use triblespace_core::collection::CollectionRecord;
         match record {
             CollectionRecord::Commit(_) => {}
             CollectionRecord::Merge(merge) => {
-                merge_records += 1;
-                merges
+                self.merge_records += 1;
+                self.merges
                     .entry(SignedJoin {
                         collection: merge.collection().raw,
                         signer: merge.public_key().raw,
@@ -1006,51 +1001,95 @@ fn conflicts(path: &Path) -> Result<()> {
                     .insert(merge.result().raw);
             }
             CollectionRecord::Derive(derive) => {
-                derive_records += 1;
-                derives
+                self.derive_records += 1;
+                self.derives
                     .entry((derive.collection().raw, derive.input().raw()))
                     .or_default()
                     .insert(derive.output().raw);
             }
         }
     }
+
+    /// DERIVE locators with several outputs. Legal: a DERIVE is a relation,
+    /// and every output is its own leaf of the derived collection.
+    fn several_outputs(&self) -> usize {
+        self.derives
+            .values()
+            .filter(|outputs| outputs.len() > 1)
+            .count()
+    }
+
+    /// Joins (collection and input set) on which different keys name
+    /// different results and no key contradicts itself. Legal: each host
+    /// believes only its own MERGEs, so neither side reaches the other. A join
+    /// some key does contradict itself on is one of [`Self::disagreeing`]'s,
+    /// and is reported there rather than counted twice.
+    fn across_keys(&self) -> usize {
+        use std::collections::{BTreeMap, BTreeSet};
+        let mut by_join: BTreeMap<([u8; 32], &[[u8; 32]]), (BTreeSet<[u8; 32]>, bool)> =
+            BTreeMap::new();
+        for (merge, results) in &self.merges {
+            let (named, contradicted) = by_join
+                .entry((merge.collection, merge.inputs.as_slice()))
+                .or_default();
+            named.extend(results.iter().copied());
+            *contradicted |= results.len() > 1;
+        }
+        by_join
+            .values()
+            .filter(|(named, contradicted)| named.len() > 1 && !contradicted)
+            .count()
+    }
+
+    /// The conflicts: one key naming two or more results for one input set.
+    fn disagreeing(&self) -> Vec<(&SignedJoin, &Named)> {
+        self.merges
+            .iter()
+            .filter(|(_, results)| results.len() > 1)
+            .collect()
+    }
+}
+
+fn conflicts(path: &Path) -> Result<()> {
+    use std::collections::BTreeMap;
+    use triblespace_core::collection::CollectionRead;
+    use triblespace_core::repo::pile::Pile;
+    use triblespace_core::repo::SnapshotSource;
+
+    // A record scan: nothing here asks the fold, so the pile is opened with
+    // no host and no MERGE is believed or needs to be.
+    let mut pile = Pile::open(path).map_err(|error| super::pile_read_error(path, error))?;
+    let snapshot = pile
+        .snapshot()
+        .map_err(|error| super::pile_read_error(path, error))?;
+    let mut tally = ConflictTally::default();
+    for record in snapshot.records().map_err(|error| {
+        anyhow::anyhow!("read collection records of {}: {error}", path.display())
+    })? {
+        let record = record.map_err(|error| {
+            anyhow::anyhow!("read collection records of {}: {error}", path.display())
+        })?;
+        tally.add(&record);
+    }
     println!(
         "{} MERGE record(s) over {} signed input set(s) and {} DERIVE record(s) over {} \
          locator(s) in {}",
-        merge_records,
-        merges.len(),
-        derive_records,
-        derives.len(),
+        tally.merge_records,
+        tally.merges.len(),
+        tally.derive_records,
+        tally.derives.len(),
         path.display()
     );
 
-    // Several outputs for one locator are legal: a DERIVE is a relation, and
-    // every output is its own leaf of the derived collection. They are
-    // counted so a reader can see them, never failed on.
-    let several = derives.values().filter(|outputs| outputs.len() > 1).count();
+    // Counted so a reader can see them, never failed on.
+    let several = tally.several_outputs();
     if several > 0 {
         println!(
             "{several} DERIVE locator(s) carry several outputs; each output is its own leaf, \
              which is not a conflict"
         );
     }
-    // Keys disagreeing only with each other about one join are counted too:
-    // each host believes only its own MERGEs, so neither side reaches the
-    // other. Per join: every result any key names, and whether some key
-    // names two by itself.
-    let mut by_join: BTreeMap<([u8; 32], &[[u8; 32]]), (BTreeSet<[u8; 32]>, bool)> =
-        BTreeMap::new();
-    for (merge, results) in &merges {
-        let (named, contradicted) = by_join
-            .entry((merge.collection, merge.inputs.as_slice()))
-            .or_default();
-        named.extend(results.iter().copied());
-        *contradicted |= results.len() > 1;
-    }
-    let across_keys = by_join
-        .values()
-        .filter(|(named, contradicted)| named.len() > 1 && !contradicted)
-        .count();
+    let across_keys = tally.across_keys();
     if across_keys > 0 {
         println!(
             "{across_keys} MERGE input set(s) carry different results from different keys; \
@@ -1058,10 +1097,7 @@ fn conflicts(path: &Path) -> Result<()> {
         );
     }
 
-    let disagreeing: Vec<_> = merges
-        .iter()
-        .filter(|(_, results)| results.len() > 1)
-        .collect();
+    let disagreeing = tally.disagreeing();
     if disagreeing.is_empty() {
         println!("No key names two results for one MERGE input set");
         return Ok(());
@@ -1100,7 +1136,7 @@ fn conflicts(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod conflict_tests {
-    use super::conflicts;
+    use super::{conflicts, ConflictTally};
     use ed25519_dalek::SigningKey;
     use triblespace_core::collection::{
         CollectionDerive, CollectionMerge, CollectionRecord, CollectionStore,
@@ -1214,5 +1250,63 @@ mod conflict_tests {
             ),
         ]);
         conflicts(&legal.path().join("equations.pile")).unwrap();
+    }
+
+    #[test]
+    fn the_tally_counts_disagreement_across_keys_apart_from_one_key_contradicting_itself() {
+        let one = SigningKey::from_bytes(&[1; 32]);
+        let two = SigningKey::from_bytes(&[2; 32]);
+        let collection = Inline::new([7; 32]);
+        let input = Inline::new([10; 32]);
+        let other = Inline::new([11; 32]);
+        let third = Inline::new([12; 32]);
+        let merge = |key: &SigningKey,
+                     inputs: [triblespace_core::collection::CollectionData; 2],
+                     result: u8| {
+            CollectionRecord::Merge(
+                CollectionMerge::sign(key, collection, inputs, Inline::new([result; 32])).unwrap(),
+            )
+        };
+        let mut tally = ConflictTally::default();
+        // One join two keys disagree on, each consistent with itself: counted
+        // across keys, and no conflict.
+        tally.add(&merge(&one, [input, other], 30));
+        tally.add(&merge(&two, [input, other], 31));
+        // Another join, on which key one contradicts itself while key two
+        // names a third result: a conflict of key one's, reported once among
+        // the conflicts and not counted again across keys.
+        tally.add(&merge(&one, [input, third], 40));
+        tally.add(&merge(&one, [third, input], 41));
+        tally.add(&merge(&two, [input, third], 42));
+        // A key repeating itself is one result, not two.
+        tally.add(&merge(&two, [input, other], 31));
+        // Two outputs for one locator are two leaves.
+        tally.add(&CollectionRecord::Derive(CollectionDerive::sign(
+            &one,
+            collection,
+            triblespace_core::collection::SourceLocator::of(input.raw),
+            Inline::new([20; 32]),
+        )));
+        tally.add(&CollectionRecord::Derive(CollectionDerive::sign(
+            &two,
+            collection,
+            triblespace_core::collection::SourceLocator::of(input.raw),
+            Inline::new([21; 32]),
+        )));
+
+        assert_eq!(tally.merge_records, 6);
+        assert_eq!(tally.merges.len(), 4, "signed input sets");
+        assert_eq!(tally.derive_records, 2);
+        assert_eq!(tally.several_outputs(), 1);
+        assert_eq!(tally.across_keys(), 1);
+        let disagreeing = tally.disagreeing();
+        assert_eq!(disagreeing.len(), 1);
+        let (join, results) = disagreeing[0];
+        assert_eq!(join.signer, one.verifying_key().to_bytes());
+        assert_eq!(join.inputs, vec![input.raw, third.raw]);
+        assert_eq!(
+            results.iter().copied().collect::<Vec<_>>(),
+            vec![[40; 32], [41; 32]]
+        );
     }
 }
