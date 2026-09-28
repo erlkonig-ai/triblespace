@@ -47,12 +47,15 @@
 //! roots on the compute class it names. A GPU is not bit-deterministic across
 //! hardware, so the descriptor carries the class it was computed on and
 //! [`SemanticIndex::map`] refuses to compute on another: there the DERIVE
-//! results arrive by replication. Within the class the join requires the
-//! same bytes to embed to the same row every time: a blob that two source
-//! members both hold is embedded by both, and the carrier refuses two
-//! different rows under one handle rather than choosing one. A golden vector
-//! checked before publishing is the follow-up that makes a driver update
-//! visible.
+//! results arrive by replication. Within the class two embeddings of one
+//! content need not agree bit for bit. A blob that two source members both
+//! hold is embedded by both, and when the two rows differ the carrier keeps
+//! both under the one content handle: its rows are a set, so the join stays
+//! total. A reader binds each content handle once and scores it by the best
+//! of its rows ([`crate::nvfp4::ReconstructedCosines`]). Bit-reproducible
+//! embedding is therefore an optimisation (identical rows collapse into one),
+//! not a condition of the join. A golden vector checked before publishing is
+//! the follow-up that makes a driver update visible.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -1184,6 +1187,101 @@ mod tests {
         );
         assert!(cosines.cosine(&shared).unwrap() > 0.99);
         assert!(cosines.cosine(&other).unwrap() < 0.99);
+    }
+
+    /// Two embeddings of one content that disagree (another run, another
+    /// kernel) are two rows under the one content handle. The leaves join,
+    /// and a reader binds the handle once, scored by the better of its rows:
+    /// each run's own query finds it, through the two-leaf cover and through
+    /// the join alike, and each holder is named once.
+    #[test]
+    fn disagreeing_embeddings_of_one_content_join_and_read_once() {
+        let content = Id::new([1; 16]).unwrap();
+        let mut store = MemoryRepo::default();
+        let shared = store
+            .put::<RawBytes, _>(Bytes::from_source(b"one attachment saved twice".to_vec()))
+            .unwrap();
+        let other = store
+            .put::<RawBytes, _>(Bytes::from_source(b"something else".to_vec()))
+            .unwrap();
+        let reader = store.snapshot().unwrap();
+        let mut left = TribleSet::new();
+        left.insert(&fact(1, content, shared));
+        let mut right = TribleSet::new();
+        right.insert(&fact(2, content, shared));
+        right.insert(&fact(3, content, other));
+        let mut facts = left.clone();
+        facts += right.clone();
+
+        let index = SemanticIndex::<Embedding>::new(
+            [content],
+            collection(7),
+            text_model(),
+            "gb10",
+            DIMENSION,
+        )
+        .unwrap();
+        // The second leaf's run disagrees with the first on every value.
+        let drifted = |input: Input<'_>| {
+            fake_embed(input).map(|vector| {
+                vector.map(|mut vector| {
+                    vector.reverse();
+                    vector
+                })
+            })
+        };
+        let left_leaf = map_with_fake(&index, &left, &reader);
+        let right_leaf = index
+            .embed_values(&index.values(&right.to_blob()), &reader, drifted)
+            .unwrap();
+        let joined = crate::nvfp4::join_members(&left_leaf, &right_leaf, DIMENSION).unwrap();
+        let keys = row_keys(&joined);
+        assert_eq!(keys.len(), 3);
+        assert_eq!(keys.iter().filter(|key| **key == shared.raw).count(), 2);
+
+        let ((mut target_store, target), descriptor) = derived(&index);
+        let [left_handle, right_handle, joined_handle] =
+            [left_leaf, right_leaf, joined].map(|leaf| {
+                target_store
+                    .put::<NvFp4CosineSet<Embedding>, _>(leaf)
+                    .unwrap()
+            });
+        let snapshot = target_store.snapshot().unwrap();
+        let document = || Input::Document("one attachment saved twice".to_owned());
+        let queries = [
+            fake_embed(document()).unwrap().unwrap(),
+            drifted(document()).unwrap().unwrap(),
+        ];
+        for cover in [
+            target.cover([left_handle, right_handle]),
+            target.cover([joined_handle]),
+        ] {
+            let view =
+                NvFp4CosineIndex::<Embedding>::try_from_cover(&cover, &descriptor, &snapshot)
+                    .unwrap();
+            for query in &queries {
+                let cosines = view.reconstructed_cosines(query).unwrap();
+                assert_eq!(cosines.len(), 2, "one entry per content handle");
+                assert!(cosines.cosine(&shared).unwrap() > 0.99);
+                assert!(cosines.cosine(&other).unwrap() < 0.99);
+                let mut holders: Vec<Id> = find!(
+                    holder: Id,
+                    triblespace_core::temp!(
+                        (attribute, value),
+                        triblespace_core::and!(
+                            cosines.similar_to::<Handle<RawBytes>>(value, 0.99),
+                            facts.pattern(holder, attribute, value),
+                        )
+                    )
+                )
+                .collect();
+                holders.sort();
+                assert_eq!(
+                    holders,
+                    vec![Id::new([1; 16]).unwrap(), Id::new([2; 16]).unwrap()]
+                );
+            }
+        }
     }
 
     #[test]
