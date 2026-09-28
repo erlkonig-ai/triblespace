@@ -5511,4 +5511,55 @@ mod lattice_v2 {
             assert!(report.failed_attached.is_empty());
         }
     }
+
+    /// The carry binds a derived collection's mapping, which reads the
+    /// descriptors of its whole source chain. They are in the derived
+    /// collection's held set -- its descriptor names its source's, and so on
+    /// to the root -- so a host that receives that set and the collection's
+    /// leaves carries it, with none of its sources' records or payloads.
+    #[test]
+    fn a_derived_collections_held_set_holds_the_descriptors_its_carry_binds() {
+        use crate::collection::{HeldRead, HeldStore};
+
+        reset_mapping_calls();
+        let (mut store, root, first, second) = collections();
+        for entity in 0..8 {
+            own_commit(&mut store, root, 41, entity);
+        }
+        block_on(store.ensure(first, &key(41))).unwrap();
+        block_on(store.ensure(second, &key(41))).unwrap();
+        store.track_held([second.handle()]);
+        let snapshot = store.snapshot().unwrap();
+        let held: BTreeSet<[u8; 32]> = snapshot
+            .held(second.handle())
+            .unwrap()
+            .iter_ordered()
+            .copied()
+            .collect();
+        for descriptor in [second.handle(), first.handle(), root.handle()] {
+            assert!(held.contains(&descriptor.raw));
+        }
+
+        let mut carrier = MemoryRepo::for_host(key(43).verifying_key());
+        for blob in &held {
+            let bytes: Bytes = snapshot
+                .get::<Bytes, UnknownBlob>(Inline::new(*blob))
+                .unwrap();
+            carrier.put::<UnknownBlob, _>(bytes).unwrap();
+        }
+        drop(snapshot);
+        for leaf in derives_in(&mut store, second.handle()) {
+            carrier.insert(CollectionRecord::Derive(leaf)).unwrap();
+        }
+        let mapped = (FIRST_MAP_CALLS.get(), SECOND_MAP_CALLS.get());
+        drop(block_on(carrier.maintain(second, &key(43))).unwrap());
+        let carried = merges_in(&mut carrier, second.handle());
+        assert_eq!(carried.len(), 1);
+        assert_eq!(inputs(&carried[0]).len(), 8);
+        assert_eq!(
+            (FIRST_MAP_CALLS.get(), SECOND_MAP_CALLS.get()),
+            mapped,
+            "the carrier maps nothing"
+        );
+    }
 }
