@@ -13838,6 +13838,7 @@ mod tests {
         let merged_v8 = put(&mut source, b"named only by a retired merge".to_vec());
         let unrelated = put(&mut source, b"named by nothing".to_vec());
         let named_by_unknown = put(&mut source, b"named by an unknown frame".to_vec());
+        let attachment = put(&mut source, b"named only by a map".to_vec());
         // A resident descriptor for the kept derived collection.
         let kept = source
             .put::<SimpleArchive, _>(TribleSet::new().to_blob())
@@ -13870,6 +13871,14 @@ mod tests {
                 kept,
                 SourceLocator::of(data.raw),
                 Inline::new(image_kept.raw),
+            )),
+            // A host's attachment of the committed node, in an attached
+            // collection: a MAP frame the filter is asked about.
+            CollectionRecord::Map(crate::collection::CollectionMap::sign(
+                &key,
+                dropped,
+                data,
+                Inline::new(attachment.raw),
             )),
         ] {
             source.insert(record).unwrap();
@@ -13911,7 +13920,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stats.retained_blobs, plan.retained_blobs);
-        assert_eq!(stats.filtered_frames, 3);
+        assert_eq!(
+            stats.filtered_frames, 4,
+            "the MERGE, the DERIVE, the MAP, the v8 MERGE"
+        );
         let reader = destination.snapshot().unwrap();
         for handle in [
             payload,
@@ -13925,9 +13937,16 @@ mod tests {
                 "{handle:?} is reached"
             );
         }
-        for handle in [image_dropped, joined, merged_v8, unrelated] {
+        for handle in [image_dropped, joined, merged_v8, unrelated, attachment] {
             assert!(!reader.contains_blob(handle).unwrap(), "{handle:?} is not");
         }
+        assert!(
+            reader
+                .records()
+                .unwrap()
+                .all(|record| !matches!(record.unwrap(), CollectionRecord::Map(_))),
+            "the MAP is left behind"
+        );
         let mut bytes = 0u64;
         let mut count = 0usize;
         for info in reader.blobs() {
@@ -13948,6 +13967,12 @@ mod tests {
         let reader = plain.snapshot().unwrap();
         assert!(reader.contains_blob(unrelated).unwrap());
         assert!(reader.contains_blob(joined).unwrap());
+        // The plain rewrite asks no filter: the MAP and its attachment travel.
+        assert!(reader.contains_blob(attachment).unwrap());
+        assert!(reader
+            .records()
+            .unwrap()
+            .any(|record| matches!(record.unwrap(), CollectionRecord::Map(_))));
         drop(reader);
         plain.close().unwrap();
         source.close().unwrap();

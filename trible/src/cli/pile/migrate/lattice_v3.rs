@@ -1125,3 +1125,138 @@ fn filter_into(source_path: &Path, destination_path: &Path, options: &Options) -
     }
     Ok(())
 }
+
+#[cfg(all(test, feature = "search"))]
+mod tests {
+    use super::*;
+    use triblespace_core::blob::encodings::entity_id_set::EntityIdSetBlob;
+    use triblespace_core::blob::encodings::succinctarchive::{
+        Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+    };
+    use triblespace_core::collection::latest::LatestBlob;
+    use triblespace_core::collection::lww_register::LwwRegisterBlob;
+    use triblespace_core::collection::{
+        AdmissionPolicy, Collection, CollectionPolicy, CollectionStoreExt,
+    };
+    use triblespace_search::nvfp4::{NvFp4CosineSet, NvFp4EmbeddingAttribute, NVFP4_COSINE_SET};
+    use triblespace_search::portable_bm25::PortableBM25Blob;
+    use triblespace_search::schemas::Embedding;
+    use triblespace_search::text_bm25::{Bm25Tokenizer, TextAttributeToBm25};
+
+    /// The classification table against the implementations it was frozen
+    /// ahead of: every attached collection this binary registers names only
+    /// mapping algorithms whose DERIVEs the filter leaves behind, and the
+    /// derived collection it registers, the stored-vector NVFP4 set under
+    /// the set-row recipe `NVFP4_COSINE_SET`, keeps its DERIVEs. A mapping
+    /// that moved between the attached and the derived path, or changed its
+    /// id, fails here rather than in a cutover.
+    #[test]
+    fn every_collection_this_binary_registers_classifies_as_its_kind() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("kinds.pile");
+        std::fs::File::create(&path).unwrap();
+        let mut pile = Pile::open(&path).unwrap();
+        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+        let root: Collection<SimpleArchive> = pile.collection("root", policy.clone()).unwrap();
+        let attribute = Id::from_hex("7A77D4CF7DF3D0CCC1371212DD15FBE3").unwrap();
+        let orders = Id::from_hex("5F6556534C64842EB8450D5C120187C8").unwrap();
+        let automaton = super::super::super::path_text::parse("7A77D4CF7DF3D0CCC1371212DD15FBE3")
+            .unwrap()
+            .compile();
+        let succinct = pile.attach::<SuccinctArchiveBlob>(root, ()).unwrap();
+        let attached = [
+            ("succinct", succinct.handle()),
+            (
+                "rank9",
+                pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(root, succinct)
+                    .unwrap()
+                    .handle(),
+            ),
+            (
+                "entity id set",
+                pile.attach::<EntityIdSetBlob>(root, attribute)
+                    .unwrap()
+                    .handle(),
+            ),
+            (
+                "latest",
+                pile.attach::<LatestBlob>(root, attribute).unwrap().handle(),
+            ),
+            (
+                "lww",
+                pile.attach::<LwwRegisterBlob>(root, (attribute, orders))
+                    .unwrap()
+                    .handle(),
+            ),
+            (
+                "bm25",
+                pile.attach::<PortableBM25Blob>(
+                    root,
+                    TextAttributeToBm25 {
+                        attribute,
+                        tokenizer: Bm25Tokenizer::Word,
+                    },
+                )
+                .unwrap()
+                .handle(),
+            ),
+            (
+                "path",
+                pile.attach::<triblespace_paths::PathSummaryBlob>(root, automaton)
+                    .unwrap()
+                    .handle(),
+            ),
+        ];
+        let nvfp4 = pile
+            .derive::<NvFp4CosineSet<Embedding>>(
+                root,
+                NvFp4EmbeddingAttribute::new(attribute, 4).unwrap(),
+                policy,
+            )
+            .unwrap()
+            .handle();
+        pile.close().unwrap();
+
+        let mut source = open_source(&path).unwrap();
+        let reader = source.snapshot().unwrap();
+        let none = BTreeSet::new();
+        for (kind, handle) in attached {
+            let class = classify(&reader, handle.raw);
+            assert!(
+                matches!(&class, Class::Mapped { algorithms, unresolved: 0 } if !algorithms.is_empty()),
+                "{kind}: {class:?}"
+            );
+            assert!(
+                class.leaves_derives_behind(&none),
+                "{kind}: {}",
+                class.label(&none)
+            );
+        }
+        let class = classify(&reader, nvfp4.raw);
+        assert!(
+            matches!(&class, Class::Mapped { algorithms, unresolved: 0 } if !algorithms.is_empty()),
+            "nvfp4: {class:?}"
+        );
+        assert!(
+            !class.leaves_derives_behind(&none),
+            "{}",
+            class.label(&none)
+        );
+        // The descriptor carries the set-row recipe, so this is the NVFP4
+        // collection the merged binary registers, not an earlier one.
+        let facts: TribleSet = reader
+            .get::<TribleSet, SimpleArchive>(Inline::new(nvfp4.raw))
+            .unwrap();
+        assert!(
+            find!(
+                entity: Id,
+                pattern!(&facts, [{ ?entity @ metadata::tag: NVFP4_COSINE_SET }])
+            )
+            .next()
+            .is_some(),
+            "the NVFP4 descriptor names the set-row recipe"
+        );
+        drop(reader);
+        source.close().unwrap();
+    }
+}

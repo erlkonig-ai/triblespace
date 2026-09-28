@@ -12,10 +12,13 @@
 //!
 //! Every id below is either the crate constant itself or a literal copied
 //! from the source that defines it, never typed. A literal is used where the
-//! constant is out of reach: the search crate is an optional dependency, the
-//! archive-block BM25 mapping lives in the faculties repository, and the
-//! ReferenceSummary module is deleted. `literals_match_their_definitions`
-//! pins every literal whose definition this build can reach.
+//! constant is out of reach in some build: the NVFP4 mappings sit behind the
+//! search feature, the archive-block BM25 mapping lives in the faculties
+//! repository, and the ReferenceSummary module is deleted. Text BM25 is a
+//! literal too, though every build now carries it. The literal tests pin
+//! every literal whose definition this build can reach, and the migration
+//! filter's tests check the table against every collection this binary
+//! registers.
 
 use triblespace_core::blob::encodings::entity_id_set::GENID_ATTRIBUTE_VALUES_MAPPING_V1;
 use triblespace_core::collection::latest::LATEST_STATES_MAPPING_V1;
@@ -103,9 +106,9 @@ const EMBEDDING_ATTRIBUTE_TO_NVFP4_BEFORE_A1927BD0: Id =
 /// LWW register, latest states, EntityIdSet, both BM25 mappings and
 /// PathSummary. ReferenceSummary is deleted. The semantic index and the
 /// stored-vector NVFP4 set stay derived: they need a model, or a vector
-/// source not every reader has. The table is frozen against this list of the
-/// lattice v3 design, not against the attached implementations themselves,
-/// which land separately.
+/// source not every reader has. The table follows this list of the lattice
+/// v3 design; the migration filter's tests check it against the attached and
+/// derived collections this binary registers.
 pub(crate) const V3_MAPPINGS: &[V3Mapping] = &[
     V3Mapping {
         id: SIMPLE_TO_SUCCINCT_MAPPING_V1,
@@ -244,10 +247,11 @@ mod tests {
     #[test]
     fn every_algorithm_the_listing_names_is_classified() {
         let known = super::super::known_mapping_algorithms();
-        // Nine core and paths mappings, plus the three search mappings when
-        // this build has the search feature.
-        let search = if cfg!(feature = "search") { 3 } else { 0 };
-        assert_eq!(known.len(), 9 + search);
+        // Nine core and paths mappings and text BM25, which every build
+        // carries, plus the two NVFP4 mappings when this build has the search
+        // feature.
+        let search = if cfg!(feature = "search") { 2 } else { 0 };
+        assert_eq!(known.len(), 10 + search);
         for (id, name) in known {
             let mapping =
                 v3_mapping(id).unwrap_or_else(|| panic!("{name} ({id:X}) is not classified"));
@@ -291,14 +295,19 @@ mod tests {
     }
 
     /// The literals equal the constants they were copied from, wherever this
-    /// build can reach the constant.
-    #[cfg(feature = "search")]
+    /// build can reach the constant: text BM25 in every build, the NVFP4
+    /// mappings with the search feature.
     #[test]
-    fn literals_match_their_definitions() {
+    fn the_bm25_literal_matches_its_definition() {
         assert_eq!(
             TEXT_ATTRIBUTE_TO_BM25,
             triblespace_search::text_bm25::TEXT_ATTRIBUTE_TO_BM25
         );
+    }
+
+    #[cfg(feature = "search")]
+    #[test]
+    fn literals_match_their_definitions() {
         assert_eq!(
             NOMIC_ATTRIBUTES_TO_NVFP4,
             triblespace_search::semantic::NOMIC_ATTRIBUTES_TO_NVFP4
