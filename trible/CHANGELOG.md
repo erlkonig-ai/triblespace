@@ -12,7 +12,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   and prints `bound: <ip:port>[ <ip:port>...]` on stderr at startup;
   `pile net identity --bind <ip:port>` also prints `ticket: <ticket>` for a
   daemon bound there, so two daemons can be given each other's tickets before
-  either starts. After each pass `pile net sync` prints one plain stderr line
+  either starts; it refuses port 0 and the unspecified addresses, which name
+  no socket the daemon will have. After each pass `pile net sync` prints one plain stderr line
   per peer it completed collection repair with: `reconciled with peer
   <endpoint id hex>: <n> collections`.
 - `pile net sync --health-collection <handle>` (with `--health-key`) and
