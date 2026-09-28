@@ -338,7 +338,7 @@ fn compact_preserves_current_delegated_capability_proof_and_admission() {
         .arg(&destination_path)
         .assert()
         .success()
-        .stdout(predicate::str::contains("capability proofs: 2 -> 1"));
+        .stdout(predicate::str::contains("\n  capability proofs: 2 -> 1\n"));
     assert_eq!(std::fs::read(&source_path).unwrap(), source_before);
 
     let mut records = PileRecords::open(&destination_path).unwrap();
@@ -568,6 +568,58 @@ fn compact_copies_source_permissions_after_rewrite() {
             & 0o777,
         0o640
     );
+}
+
+/// One retired v1 capability-proof frame (kind AUTH_PROOF_V1): a 96-byte
+/// prefix and a 160-byte body of a root key and one edge closed by a
+/// delegate key.
+fn retired_proof_v1(seed: u8) -> Vec<u8> {
+    let mut frame = vec![0u8; 256];
+    frame[..28].copy_from_slice(
+        &hex::decode("0371B249F0626B2ABDDB80E23EA969059D9656A5EA5A497320351F3B").unwrap(),
+    );
+    frame[28..32].copy_from_slice(&1u32.to_le_bytes());
+    frame[32..64].copy_from_slice(
+        &hex::decode("29AC46C61788022D62BE6E2388DA4A164419BA648377D48B2E6DB092EE0A8053").unwrap(),
+    );
+    frame[64..72].copy_from_slice(&160u64.to_le_bytes());
+    frame[96..128].copy_from_slice(
+        &SigningKey::from_bytes(&[seed; 32])
+            .verifying_key()
+            .to_bytes(),
+    );
+    frame[128..224].fill(seed);
+    frame[224..256].copy_from_slice(
+        &SigningKey::from_bytes(&[seed.wrapping_add(1); 32])
+            .verifying_key()
+            .to_bytes(),
+    );
+    frame
+}
+
+#[test]
+fn compact_carries_retired_capability_proofs_and_says_so() {
+    let dir = tempdir().unwrap();
+    let source_path = dir.path().join("retired-proof-source.pile");
+    let destination_path = dir.path().join("carried.pile");
+    let proof = retired_proof_v1(0x44);
+    let source_bytes = [proof.as_slice(), proof.as_slice()].concat();
+    std::fs::write(&source_path, &source_bytes).unwrap();
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "compact"])
+        .arg(&source_path)
+        .arg("--into")
+        .arg(&destination_path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\n  capability proofs: 0 -> 0\n  retired capability proofs: 2 -> 1 (carried exactly)\n",
+        ));
+
+    assert_eq!(std::fs::read(&source_path).unwrap(), source_bytes);
+    assert_eq!(std::fs::read(&destination_path).unwrap(), proof);
 }
 
 #[test]

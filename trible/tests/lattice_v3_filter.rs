@@ -772,7 +772,7 @@ fn the_filter_keeps_commits_and_derived_mappings_and_leaves_merges_and_attached_
         "  DERIVE (legacy V3): 1 / 0",
         "  DEFINITION (legacy V3): 1 / 0",
         "rewrite: 19 left behind by the filter, 0 superseded, 0 drained, 0 repeated frames counted once; carried 1 frames of unknown kind and 1 retired v8/v9 equations",
-        "roots: 0 named, 0 resident and kept with what they reach, 0 not resident in the source",
+        "roots: 0 named, 0 resident and kept with what they reach, 0 resident only as corrupt bytes, 0 not resident in the source",
         "  9C8CFEB097B0A336E09D506E8DD361C2 SIMPLE_TO_SUCCINCT_MAPPING_V1 [attached]: 0 / 4 in 1",
         "  C0F7F9B5A68660407FDBFD8CF4D6E1AD REFERENCE_SUMMARY_MAPPING_V2 [deleted]: 0 / 1 in 1",
         "  A8C939AA55A7EC07C12FFCDA1FAA5785 REFERENCE_SUMMARY_MAPPING_V1 [deleted]: 0 / 1 in 1",
@@ -787,7 +787,7 @@ fn the_filter_keeps_commits_and_derived_mappings_and_leaves_merges_and_attached_
         "  (legacy V3 definition ids): 1 / 0 in 1",
         "  (no resident descriptor): 1 / 0 in 1",
         "descriptors left behind: 9 (resident; only collections a frame names are examined, keep others with --root)",
-        "readability (keyless fold): 2 kept collections with believed foundations, 3 foundations, 0 not resident",
+        "readability (keyless fold): 2 kept collections with believed foundations, 3 foundations, 0 not resident, 0 corrupt",
     ] {
         assert!(
             text.lines().any(|candidate| candidate == line),
@@ -1006,7 +1006,7 @@ fn absent_foundation_payloads_are_listed_and_refused_unless_allowed() {
     let text = stdout(&dry);
     assert!(text.lines().any(|line| line == absent), "{text}");
     assert!(text.lines().any(|line| line
-        == "readability (keyless fold): 2 kept collections with believed foundations, 4 foundations, 1 not resident"));
+        == "readability (keyless fold): 2 kept collections with believed foundations, 4 foundations, 1 not resident, 0 corrupt"));
 
     let (destination, output) = fixture.filter_into("refused.pile", &[]);
     assert!(!output.status.success());
@@ -1057,7 +1057,7 @@ fn a_collection_only_a_root_names_keeps_its_descriptor() {
     assert!(resident(&destination, fixture.empty.raw));
     let text = stdout(&output);
     for line in [
-        "roots: 2 named, 1 resident and kept with what they reach, 1 not resident in the source"
+        "roots: 2 named, 1 resident and kept with what they reach, 0 resident only as corrupt bytes, 1 not resident in the source"
             .to_owned(),
         format!("  not resident blake3:{}", hex::encode_upper(absent)),
     ] {
@@ -1128,6 +1128,8 @@ fn a_pile_concatenated_with_itself_filters_to_the_same_pile() {
 
 /// The retired capability-proof kind v1, copied from triblespace-core.
 const KIND_AUTH_PROOF_V1: &str = "29AC46C61788022D62BE6E2388DA4A164419BA648377D48B2E6DB092EE0A8053";
+/// The blob record kind, copied from triblespace-core.
+const KIND_BLOB: &str = "01148F301FE56E346D16596A8480532E8B4420C4EFD00C8DFF437D0DF9810ED0";
 
 /// One retired v1 capability-proof frame: a 96-byte prefix (frame, kind,
 /// body length, zero pad) and a 160-byte body of a root key and one edge
@@ -1207,53 +1209,182 @@ fn damage_blob_payload(path: &Path, raw: Raw) {
     file.sync_all().unwrap();
 }
 
-/// A kept COMMIT whose payload is resident only as corrupt bytes: both runs
-/// name it as corrupt, count it as not resident in the readability check
-/// and refuse without `--allow-absent`; with it, both runs complete and
-/// print the same report.
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// The report body of a run: every line after the first, which names the
+/// mode.
+fn body(text: &str) -> Vec<&str> {
+    text.lines().skip(1).collect()
+}
+
+/// A kept COMMIT whose payload is resident only as corrupt bytes. Both runs
+/// refuse by default, and `--allow-absent`, which accepts payloads that are
+/// not resident, does not accept corrupt ones: the real run writes nothing.
+/// With `--allow-corrupt` both runs set the blob aside, name it, count the
+/// foundation as corrupt rather than absent, and print the same report.
 #[test]
-fn a_corrupt_payload_is_named_by_both_runs_and_refused_unless_allowed() {
+fn a_corrupt_payload_is_refused_by_both_runs_unless_allowed_as_corrupt() {
     let fixture = Fixture::new(false);
     let CollectionRecord::Commit(commit) = fixture.commits[0] else {
         unreachable!()
     };
     let payload = commit.data().raw;
     damage_blob_payload(&fixture.src, payload);
-    let named = format!("  corrupt blake3:{}", hex::encode_upper(payload));
-    let counted = "corrupt blobs: 1 reached with no occurrence matching its hash, not copied";
-    let readability = "readability (keyless fold): 2 kept collections with believed foundations, 3 foundations, 1 not resident";
+    let named = format!("corrupt blake3:{}", hex::encode_upper(payload));
 
-    let dry = fixture.run(&fixture.src, &["--dry-run"]);
-    assert!(!dry.status.success(), "{}", stdout(&dry));
-    let (destination, real) = fixture.filter_into("refused.pile", &[]);
-    assert!(!real.status.success());
-    assert!(!destination.exists(), "a refused result is removed");
-    for output in [&dry, &real] {
-        let text = stdout(output);
-        for line in [counted, named.as_str(), readability] {
+    let mut refused = Vec::new();
+    for extra in [&[][..], &["--allow-absent"][..]] {
+        let mut args = vec!["--dry-run"];
+        args.extend_from_slice(extra);
+        let dry = fixture.run(&fixture.src, &args);
+        let (destination, real) = fixture.filter_into("refused.pile", extra);
+        assert!(
+            !dry.status.success() && !real.status.success(),
+            "corruption is refused with {extra:?}\n{}",
+            stdout(&dry)
+        );
+        assert!(!destination.exists(), "a refused run leaves nothing");
+        refused.push((dry, real));
+    }
+    for (dry, real) in &refused {
+        let text = stdout(dry);
+        for line in [
+            "corrupt blobs: 1 reached with no occurrence matching its hash, not copied".to_owned(),
+            format!("  {named}"),
+            "readability (keyless fold): 2 kept collections with believed foundations, 3 foundations, 0 not resident, 1 corrupt".to_owned(),
+        ] {
             assert!(
                 text.lines().any(|candidate| candidate == line),
                 "{line:?} in\n{text}"
             );
         }
-        assert!(String::from_utf8_lossy(&output.stderr).contains("--allow-absent"));
+        for output in [dry, real] {
+            let error = stderr(output);
+            assert!(error.contains("--allow-corrupt"), "{error}");
+            assert!(!error.contains("--allow-absent"), "{error}");
+        }
+        assert!(stderr(real).contains(&named), "{}", stderr(real));
     }
 
-    let dry = fixture.run(&fixture.src, &["--dry-run", "--allow-absent"]);
+    let dry = fixture.run(&fixture.src, &["--dry-run", "--allow-corrupt"]);
     assert_success(&dry);
-    let (destination, real) = fixture.filter_into("accepted.pile", &["--allow-absent"]);
+    let (destination, real) = fixture.filter_into("accepted.pile", &["--allow-corrupt"]);
     assert_success(&real);
     let dry = stdout(&dry);
     let real = stdout(&real);
-    let dry_body: Vec<_> = dry.lines().skip(1).collect();
-    let real_body: Vec<_> = real.lines().skip(1).collect();
+    let (dry_body, real_body) = (body(&dry), body(&real));
     assert_eq!(&real_body[..dry_body.len()], &dry_body[..]);
-    assert!(real_body.iter().any(|line| *line == named));
+    assert!(real_body.iter().any(|line| line.trim() == named));
     let mut pile = Pile::open(&destination).unwrap();
     let snapshot = pile.snapshot().unwrap();
     assert!(!snapshot
         .contains_blob(Inline::<Handle<UnknownBlob>>::new(payload))
         .unwrap());
+    drop(snapshot);
+    pile.close().unwrap();
+}
+
+/// A corrupt blob a `--root` names directly is refused like any other, and
+/// with `--allow-corrupt` the roots line counts it as corrupt, not as
+/// resident and kept.
+#[test]
+fn a_corrupt_root_is_refused_and_not_counted_as_kept() {
+    let fixture = Fixture::new(false);
+    damage_blob_payload(&fixture.src, fixture.empty.raw);
+    let root = format!("blake3:{}", hex::encode(fixture.empty.raw));
+    let dry = fixture.run(&fixture.src, &["--dry-run", "--root", &root]);
+    assert!(
+        !dry.status.success(),
+        "a corrupt root is refused\n{}",
+        stdout(&dry)
+    );
+    let (destination, real) = fixture.filter_into("refused.pile", &["--root", &root]);
+    assert!(!real.status.success());
+    assert!(!destination.exists());
+
+    let line = "roots: 1 named, 0 resident and kept with what they reach, 1 resident only as corrupt bytes, 0 not resident in the source";
+    let (destination, real) =
+        fixture.filter_into("accepted.pile", &["--root", &root, "--allow-corrupt"]);
+    assert_success(&real);
+    for text in [stdout(&dry), stdout(&real)] {
+        assert!(text.lines().any(|candidate| candidate == line), "{text}");
+        let named = format!("  corrupt blake3:{}", hex::encode_upper(fixture.empty.raw));
+        assert!(text.lines().any(|candidate| candidate == named), "{text}");
+    }
+    let mut pile = Pile::open(&destination).unwrap();
+    let snapshot = pile.snapshot().unwrap();
+    assert!(!snapshot
+        .contains_blob(Inline::<Handle<UnknownBlob>>::new(fixture.empty.raw))
+        .unwrap());
+    drop(snapshot);
+    pile.close().unwrap();
+}
+
+/// The resident descriptor of a kept collection whose bytes are corrupt is
+/// labelled as corrupt, and listed among the descriptors left behind for
+/// that reason, not as one no kept record reaches: a `--root` would not
+/// keep it either.
+#[test]
+fn a_corrupt_descriptor_is_reported_as_corrupt() {
+    let fixture = Fixture::new(false);
+    damage_blob_payload(&fixture.src, fixture.nvfp4.raw);
+    let dry = fixture.run(&fixture.src, &["--dry-run"]);
+    assert!(!dry.status.success());
+    let (_, real) = fixture.filter_into("accepted.pile", &["--allow-corrupt"]);
+    assert_success(&real);
+    let line = format!(
+        "  blake3:{} (corrupt descriptor): resident only as corrupt bytes (see corrupt blobs)",
+        hex::encode_upper(fixture.nvfp4.raw)
+    );
+    for text in [stdout(&dry), stdout(&real)] {
+        assert!(text.lines().any(|candidate| candidate == line), "{text}");
+    }
+}
+
+/// A blob whose first occurrence is corrupt and whose second is valid is
+/// copied from the valid one. The dry run counts that occurrence's bytes, as
+/// the real run's destination holds them, so both print the same report.
+#[test]
+fn both_runs_count_the_bytes_of_the_occurrence_the_copy_takes() {
+    let fixture = Fixture::new(false);
+    let payload = vec![0x5C; 1024];
+    let hash = *blake3::hash(&payload).as_bytes();
+    // A one-byte blob record claiming the 1024-byte payload's hash: a header
+    // block and one payload block.
+    let mut forged = vec![0u8; 512];
+    forged[..28].copy_from_slice(&hex::decode(FRAME_MAGIC).unwrap());
+    forged[28..32].copy_from_slice(&2u32.to_le_bytes());
+    forged[32..64].copy_from_slice(&hex::decode(KIND_BLOB).unwrap());
+    forged[72..80].copy_from_slice(&1u64.to_le_bytes());
+    forged[96..128].copy_from_slice(&hash);
+    forged[256] = 0x5C;
+    append(&fixture.src, &forged);
+    let mut pile = Pile::open(&fixture.src).unwrap();
+    let valid = put_raw(&mut pile, &payload);
+    assert_eq!(valid.raw, hash);
+    pile.want(WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(hash)))
+        .unwrap();
+    pile.close().unwrap();
+
+    let dry = fixture.run(&fixture.src, &["--dry-run"]);
+    assert_success(&dry);
+    let (destination, real) = fixture.filter_into("filtered.pile", &[]);
+    assert_success(&real);
+    let dry = stdout(&dry);
+    let real = stdout(&real);
+    let (dry_body, real_body) = (body(&dry), body(&real));
+    assert_eq!(&real_body[..dry_body.len()], &dry_body[..]);
+    let mut pile = Pile::open(&destination).unwrap();
+    let snapshot = pile.snapshot().unwrap();
+    let length = snapshot
+        .blobs()
+        .map(|info| info.unwrap())
+        .find(|info| info.handle.raw == hash)
+        .unwrap()
+        .length;
+    assert_eq!(length, 1024);
     drop(snapshot);
     pile.close().unwrap();
 }
