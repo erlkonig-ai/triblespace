@@ -1193,7 +1193,14 @@ impl CoverageIndex {
                 // retry. Another key's join never gets here; the check is
                 // the same one `attest` and `park` made. An attached
                 // collection has no lattice: a join into one attests
-                // nothing, when its descriptor says so.
+                // nothing, when its descriptor says so. A join decided before
+                // its collection's descriptor is here is believed, like any
+                // host join, and is not decided again when the descriptor
+                // lands: into an attached collection it then stays stored
+                // and blocked, because no input of it ever gains a support
+                // there. That is bookkeeping only (a known limit): nothing
+                // reads an attached collection's joins, and its readers walk
+                // the parent's lattice.
                 if matches!(
                     admission.source(entry.collection),
                     SourceResolution::Attached

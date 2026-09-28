@@ -756,6 +756,93 @@ fn a_commit_derive_or_merge_aimed_at_an_attached_handle_is_not_parked() {
     assert_eq!(index.published().frontier(attached.handle()).count(), 0);
 }
 
+/// Known limit (review finding, 2026-09-28): the fold believes a host
+/// MERGE without its collection's descriptor, so one aimed at an attached
+/// collection whose descriptor is not here yet is believed, and stays
+/// stored and blocked after the descriptor arrives: an attached collection
+/// never gives its inputs a support. It is bookkeeping and nothing more. The
+/// attached collection gains no row or frontier node from it, nothing
+/// reads an attached collection's joins, and the root's own join, decided
+/// the same way, is carried as usual.
+#[test]
+fn a_host_merge_into_an_attached_handle_before_its_descriptor_stays_inert() {
+    // The descriptors, and the policy definitions they name, are made
+    // elsewhere; this store holds them only later.
+    use crate::blob::encodings::UnknownBlob;
+    use crate::repo::BlobStoreList;
+    let (mut elsewhere, root, attached) = succinct_root("late-descriptor");
+    let snapshot = elsewhere.snapshot().unwrap();
+    let descriptors: Vec<Blob<UnknownBlob>> = snapshot
+        .blobs()
+        .map(|info| snapshot.get(info.unwrap().handle).unwrap())
+        .collect();
+    drop(snapshot);
+
+    let mut store = MemoryRepo::for_host(host().verifying_key());
+    let mut nodes = Vec::new();
+    for byte in 1..=8u8 {
+        let payload: Blob<SimpleArchive> = row(byte, 2, 3).to_blob();
+        nodes.push(data(&payload));
+        store.put::<SimpleArchive, _>(payload).unwrap();
+        store
+            .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                &host(),
+                root.handle(),
+                *nodes.last().unwrap(),
+                empty_metadata_handle(),
+            )))
+            .unwrap();
+    }
+    let result: CollectionData = Inline::new([0x77; 32]);
+    store
+        .insert(CollectionRecord::Merge(
+            CollectionMerge::sign(&host(), root.handle(), nodes.iter().copied(), result).unwrap(),
+        ))
+        .unwrap();
+    store
+        .insert(CollectionRecord::Merge(
+            CollectionMerge::sign(
+                &host(),
+                attached.handle(),
+                [nodes[0], Inline::new([0x42; 32])],
+                nodes[0],
+            )
+            .unwrap(),
+        ))
+        .unwrap();
+    // Both joins are decided while neither descriptor is here.
+    let lineage = BTreeSet::from([root.handle(), attached.handle()]);
+    drop(store.snapshot().unwrap().index(&lineage).unwrap());
+
+    for descriptor in descriptors {
+        store.put::<UnknownBlob, _>(descriptor).unwrap();
+    }
+    let snapshot = store.snapshot().unwrap();
+    let index = snapshot.index(&lineage).unwrap();
+    assert_eq!(index.parked(), 0);
+    assert_eq!(
+        index
+            .published()
+            .frontier(root.handle())
+            .collect::<Vec<_>>(),
+        vec![result]
+    );
+    // The limit: the attached collection's join is kept and blocked...
+    assert_eq!(index.stored_joins(), 2);
+    assert!(index.published().has_blocked(attached.handle()));
+    // ...and nothing else sees it.
+    assert_eq!(index.published().frontier(attached.handle()).count(), 0);
+    assert!(index.coverage(attached.handle(), nodes[0]).is_none());
+    // An attached read walks the parent's lattice: no attachment yet, so
+    // every foundation of the root is residual, as without that join.
+    let read = snapshot.attached(attached).unwrap();
+    assert!(read.cover().members().next().is_none());
+    assert_eq!(
+        read.residual().data_members().collect::<BTreeSet<_>>(),
+        nodes.iter().copied().collect()
+    );
+}
+
 /// A descriptor naming two parents is still attached: a COMMIT aimed at it
 /// is dropped like one aimed at any attached collection, never parked
 /// waiting for a descriptor that is already here. How many parents it names
