@@ -873,11 +873,13 @@ struct Refs {
     derives_from: usize,
     /// Derives naming this collection as their target.
     derives_into: usize,
+    /// Maps attaching into this collection.
+    maps: usize,
 }
 
 impl Refs {
     fn total(&self) -> usize {
-        self.commits + self.merges + self.derives_from + self.derives_into
+        self.commits + self.merges + self.derives_from + self.derives_into + self.maps
     }
 }
 
@@ -900,6 +902,9 @@ fn referenced_collections(snapshot: &PileSnapshot) -> Result<BTreeMap<Collection
             }
             CollectionRecord::Derive(derive) => {
                 refs.entry(derive.collection()).or_default().derives_into += 1;
+            }
+            CollectionRecord::Map(map) => {
+                refs.entry(map.collection()).or_default().maps += 1;
             }
         }
     }
@@ -1588,12 +1593,13 @@ fn run_show(path: PathBuf, reference: String) -> Result<()> {
             .map(|row| row.refs)
             .unwrap_or_default();
         println!(
-            "records:        {} (commits={} merges={} derives-from={} derives-into={})",
+            "records:        {} (commits={} merges={} derives-from={} derives-into={} maps={})",
             counts.total(),
             counts.commits,
             counts.merges,
             counts.derives_from,
             counts.derives_into,
+            counts.maps,
         );
         Ok(())
     })();
@@ -1607,11 +1613,7 @@ fn run_show(path: PathBuf, reference: String) -> Result<()> {
 /// collection it produces. This is the same question `referenced_collections`
 /// tallies, asked one record at a time.
 fn names_collection(record: &CollectionRecord, collection: CollectionHandle) -> bool {
-    match record {
-        CollectionRecord::Commit(commit) => commit.collection() == collection,
-        CollectionRecord::Merge(merge) => merge.collection() == collection,
-        CollectionRecord::Derive(derive) => derive.collection() == collection,
-    }
+    record.collection() == collection
 }
 
 fn run_log(path: PathBuf, reference: String, limit: usize, long: bool) -> Result<()> {
@@ -1640,12 +1642,13 @@ fn run_log(path: PathBuf, reference: String, limit: usize, long: bool) -> Result
         }
         println!();
         println!(
-            "records: {} (commits={} merges={} derives-from={} derives-into={})",
+            "records: {} (commits={} merges={} derives-from={} derives-into={} maps={})",
             row.refs.total(),
             row.refs.commits,
             row.refs.merges,
             row.refs.derives_from,
             row.refs.derives_into,
+            row.refs.maps,
         );
         println!();
 
@@ -1701,6 +1704,14 @@ fn run_log(path: PathBuf, reference: String, limit: usize, long: bool) -> Result
                         short(derive.output().raw),
                     );
                 }
+                CollectionRecord::Map(map) => {
+                    println!(
+                        "map     {:X}  node={}  attachment={}  signer={signer}  signature={signature}",
+                        fingerprint,
+                        short(map.node().raw),
+                        short(map.attachment().raw),
+                    );
+                }
             }
         }
         if skipped > 0 {
@@ -1719,17 +1730,7 @@ fn run_log(path: PathBuf, reference: String, limit: usize, long: bool) -> Result
 fn referenced_ids(records: &[CollectionRecord]) -> std::collections::BTreeSet<CollectionHandle> {
     let mut out = std::collections::BTreeSet::new();
     for record in records {
-        match record {
-            CollectionRecord::Commit(commit) => {
-                out.insert(commit.collection());
-            }
-            CollectionRecord::Merge(merge) => {
-                out.insert(merge.collection());
-            }
-            CollectionRecord::Derive(derive) => {
-                out.insert(derive.collection());
-            }
-        }
+        out.insert(record.collection());
     }
     out
 }
@@ -2440,10 +2441,11 @@ mod tests {
 fn cover_census<R: CollectionRead>(
     snapshot: &R,
     collection: CollectionHandle,
-) -> Result<(usize, usize, usize)> {
+) -> Result<(usize, usize, usize, usize)> {
     let mut commits = 0usize;
     let mut merges = 0usize;
     let mut derives = 0usize;
+    let mut maps = 0usize;
     let records = snapshot
         .select_records(&BTreeSet::from([CollectionRecordSelector::Collection(
             collection,
@@ -2454,9 +2456,10 @@ fn cover_census<R: CollectionRead>(
             CollectionRecord::Commit(_) => commits += 1,
             CollectionRecord::Merge(_) => merges += 1,
             CollectionRecord::Derive(_) => derives += 1,
+            CollectionRecord::Map(_) => maps += 1,
         }
     }
-    Ok((commits, merges, derives))
+    Ok((commits, merges, derives, maps))
 }
 
 /// Maintain `handle` under whichever encoding its descriptor names.
@@ -2577,11 +2580,7 @@ fn resolve_maintenance_target<R: StoreRead>(
         .map_err(|error| anyhow!("enumerate collection names: {error:?}"))?
     {
         let record = record.map_err(|error| anyhow!("read collection record: {error:?}"))?;
-        candidates.insert(match record {
-            CollectionRecord::Commit(commit) => commit.collection(),
-            CollectionRecord::Merge(merge) => merge.collection(),
-            CollectionRecord::Derive(derive) => derive.collection(),
-        });
+        candidates.insert(record.collection());
     }
     let mut matches = BTreeSet::new();
     for handle in candidates {
@@ -2896,7 +2895,7 @@ async fn maintenance_pass_inner<S: Store + AsyncBlobStoreAcquire + Send>(
                 };
                 let after = cover_census(&after, handle)?;
                 println!(
-                    "maintained blake3:{} in {:.1} s: commits {} -> {}, merges {} -> {}, derives {} -> {}",
+                    "maintained blake3:{} in {:.1} s: commits {} -> {}, merges {} -> {}, derives {} -> {}, maps {} -> {}",
                     handle_hex(handle),
                     started.elapsed().as_secs_f64(),
                     before.0,
@@ -2905,6 +2904,8 @@ async fn maintenance_pass_inner<S: Store + AsyncBlobStoreAcquire + Send>(
                     after.1,
                     before.2,
                     after.2,
+                    before.3,
+                    after.3,
                 );
                 Ok::<(), anyhow::Error>(())
             }

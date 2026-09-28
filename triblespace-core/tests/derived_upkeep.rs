@@ -65,6 +65,7 @@ fn record_kinds(store: &mut MemoryRepo) -> (usize, usize, usize) {
             CollectionRecord::Commit(_) => counts.0 += 1,
             CollectionRecord::Merge(_) => counts.1 += 1,
             CollectionRecord::Derive(_) => counts.2 += 1,
+            CollectionRecord::Map(_) => {}
         }
     }
     counts

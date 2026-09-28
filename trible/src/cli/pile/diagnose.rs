@@ -635,6 +635,13 @@ fn print_record(bytes: &[u8], file_len: usize, record: triblespace_core::repo::p
                 println!("  output: {}", hex::encode_upper(derive.output().raw));
                 println!("  author: {}", hex::encode_upper(derive.public_key().raw));
             }
+            CollectionRecord::Map(map) => {
+                println!("  classification: collection-map");
+                println!("  attached: {}", hex::encode_upper(map.collection().raw));
+                println!("  node: {}", hex::encode_upper(map.node().raw));
+                println!("  attachment: {}", hex::encode_upper(map.attachment().raw));
+                println!("  author: {}", hex::encode_upper(map.public_key().raw));
+            }
         },
         PileRecordContent::RetiredCollectionEquation { equation } => match equation {
             RetiredCollectionEquation::MergeV8 {
@@ -992,7 +999,7 @@ fn conflicts(path: &Path) -> Result<()> {
             anyhow::anyhow!("read collection records of {}: {error}", path.display())
         })?;
         let (inputs, output, signer) = match record {
-            CollectionRecord::Commit(_) => continue,
+            CollectionRecord::Commit(_) | CollectionRecord::Map(_) => continue,
             CollectionRecord::Merge(merge) => {
                 merges += 1;
                 (

@@ -1,10 +1,13 @@
 //! Dense typed records for the top-level collection calculus.
 //!
-//! [`CollectionCommit`], [`CollectionMerge`], and [`CollectionDerive`] are
-//! native algebra records, not graph data. Their canonical representations are
-//! the 32-byte-aligned dense byte layouts exposed by their
-//! `to_bytes`/`from_bytes` methods; a MERGE's length varies with its arity. A collection *descriptor* is not a record at all: it is an
-//! ordinary [`TribleSet`] stored as a self-describing [`SimpleArchive`], and
+//! [`CollectionCommit`], [`CollectionMerge`], [`CollectionDerive`] and
+//! [`CollectionMap`] are native algebra records, not graph data. Their
+//! canonical representations are the 32-byte-aligned dense byte layouts
+//! exposed by their `to_bytes`/`from_bytes` methods; a MERGE's length varies
+//! with its arity. COMMIT and DERIVE add foundations and replicate; MERGE and
+//! MAP are a host's own choices over what it holds and stay local. A
+//! collection *descriptor* is not a record at all: it is an ordinary
+//! [`TribleSet`] stored as a self-describing [`SimpleArchive`], and
 //! that blob's handle is the collection identity. See
 //! [`descriptor`](crate::collection::descriptor) for reading one.
 //!
@@ -75,6 +78,13 @@ pub const KIND_COLLECTION_MERGE: Id = id_hex!("D0D98881093C0A6F318E1E1525521F80"
 /// [`COLLECTION_RECORD_KIND_DERIVE_V4`] and pile kind
 /// `pile-collection-derive-v11`.
 pub const KIND_COLLECTION_DERIVE: Id = id_hex!("630BF5B294A3A1D85C0A7B185C9BC899");
+/// Stable semantic kind of a signed `MAP(attached; node -> attachment)`: one
+/// node of a collection's lattice indexed into an attached collection.
+///
+/// Minted with `trible genid` on 2026-09-28. It names the [`CollectionMap`]
+/// transcript and fingerprint, dense tag [`COLLECTION_RECORD_KIND_MAP_V1`]
+/// and pile kind `pile-collection-map-v1`.
+pub const KIND_COLLECTION_MAP: Id = id_hex!("329669AA662709605053C123671DF1D2");
 /// RETIRED tombstone: the witness-bound MERGE (pile kind v6, dense tag 6).
 ///
 /// Minted with `trible genid` on 2026-09-14 and retired without ever being
@@ -153,6 +163,9 @@ pub const COLLECTION_MERGE_FIXED_BYTES_LEN: usize = 6 * 32;
 pub const COLLECTION_MERGE_MAX_BYTES_LEN: usize = collection_merge_bytes_len(MAX_MERGE_INPUTS);
 /// Byte length of a dense locator derive.
 pub const COLLECTION_DERIVE_BYTES_LEN: usize = 6 * 32;
+/// Byte length of a dense MAP: attached collection, node, attachment,
+/// author, R, S.
+pub const COLLECTION_MAP_BYTES_LEN: usize = 6 * 32;
 /// Byte length of a dense retired binary MERGE (dense tag 4): collection,
 /// low, high, result, author, R, S.
 pub const RETIRED_MERGE_BINARY_BYTES_LEN: usize = 7 * 32;
@@ -296,6 +309,13 @@ pub const MERGE_TRANSCRIPT_DOMAIN: [u8; 32] =
 /// [`MERGE_TRANSCRIPT_DOMAIN`].
 pub const DERIVE_TRANSCRIPT_DOMAIN: [u8; 32] =
     hex_literal::hex!("3F33151333CCDE3566D792C723DF70A74ACCF357CD0B9A7E7E1C61913020D22F");
+/// Signature domain of the MAP transcript.
+///
+/// 32 random bytes, the concatenation of two ids minted with `trible genid`
+/// on 2026-09-28 (`4A5191C36898D0B453FEFF99ED0E3852`,
+/// `4AADD87ED8EB8620BD39623B5221B5BE`). See [`MERGE_TRANSCRIPT_DOMAIN`].
+pub const MAP_TRANSCRIPT_DOMAIN: [u8; 32] =
+    hex_literal::hex!("4A5191C36898D0B453FEFF99ED0E38524AADD87ED8EB8620BD39623B5221B5BE");
 /// RETIRED signature domain of the witness-bound MERGE. Reserved: never reuse.
 pub const MERGE_WITNESSED_TRANSCRIPT_DOMAIN_RETIRED: &[u8] =
     b"triblespace.collection.merge.endorsement";
@@ -1067,6 +1087,161 @@ impl CollectionDerive {
     }
 }
 
+/// Signed attachment: the attached collection's mapping takes this node of
+/// its parent collection's lattice to `attachment`.
+///
+/// A MAP is a host's own index of one of its own nodes. It adds no
+/// foundation and never replicates: a reader believes it only when the
+/// store's host signed it, and only for a node the reader reaches in the
+/// parent's lattice. The node is named by its handle directly: an attached
+/// collection indexes nodes, not source foundations, so there is no locator.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CollectionMap {
+    attached: CollectionHandle,
+    node: CollectionData,
+    attachment: CollectionData,
+    public_key: Inline<ED25519PublicKey>,
+    signature_r: Inline<ED25519RComponent>,
+    signature_s: Inline<ED25519SComponent>,
+}
+
+impl CollectionMap {
+    /// Canonical persisted record identity.
+    pub fn fingerprint(&self) -> CollectionRecordFingerprint {
+        CollectionRecord::Map(*self).fingerprint()
+    }
+
+    /// Sign `MAP(attached; node -> attachment)`.
+    ///
+    /// The attached collection's descriptor names its parent and its
+    /// mapping, so the record only says which parent node maps to which
+    /// attachment.
+    pub fn sign(
+        signing_key: &SigningKey,
+        attached: CollectionHandle,
+        node: CollectionData,
+        attachment: CollectionData,
+    ) -> Self {
+        let public_key = Inline::new(signing_key.verifying_key().to_bytes());
+        let transcript = map_transcript(public_key, attached, node, attachment);
+        let signature: Signature = signing_key.sign(&transcript);
+        Self::from_parts(
+            attached,
+            node,
+            attachment,
+            public_key,
+            Inline::new(*signature.r_bytes()),
+            Inline::new(*signature.s_bytes()),
+        )
+    }
+
+    pub(crate) fn from_parts(
+        attached: CollectionHandle,
+        node: CollectionData,
+        attachment: CollectionData,
+        public_key: Inline<ED25519PublicKey>,
+        signature_r: Inline<ED25519RComponent>,
+        signature_s: Inline<ED25519SComponent>,
+    ) -> Self {
+        Self {
+            attached,
+            node,
+            attachment,
+            public_key,
+            signature_r,
+            signature_s,
+        }
+    }
+
+    /// Decode foreign dense bytes and strictly verify their signature.
+    pub fn from_bytes(bytes: [u8; COLLECTION_MAP_BYTES_LEN]) -> Result<Self, RecordDecodeError> {
+        let record = Self::from_bytes_trusted(bytes);
+        record.verify_strict()?;
+        Ok(record)
+    }
+
+    /// Structural decoding for explicitly trusted persisted bytes and audits.
+    pub(crate) fn from_bytes_trusted(bytes: [u8; COLLECTION_MAP_BYTES_LEN]) -> Self {
+        Self::from_parts(
+            Inline::new(field(&bytes, 0)),
+            Inline::new(field(&bytes, 1)),
+            Inline::new(field(&bytes, 2)),
+            Inline::new(field(&bytes, 3)),
+            Inline::new(field(&bytes, 4)),
+            Inline::new(field(&bytes, 5)),
+        )
+    }
+
+    /// Prove authorship only. Belief is the store's host key, not WRITE.
+    pub fn verify_strict(&self) -> Result<(), RecordVerificationError> {
+        verify_record_signature(
+            self.public_key,
+            self.signature(),
+            &self.signing_transcript(),
+        )
+    }
+
+    /// Exact domain-separated bytes signed by the author:
+    /// `domain || kind || author || attached || node || attachment`.
+    pub fn signing_transcript(&self) -> Vec<u8> {
+        map_transcript(self.public_key, self.attached, self.node, self.attachment)
+    }
+
+    /// Author's public key.
+    pub fn public_key(&self) -> Inline<ED25519PublicKey> {
+        self.public_key
+    }
+
+    /// Exact signature components.
+    pub fn signature(&self) -> (Inline<ED25519RComponent>, Inline<ED25519SComponent>) {
+        (self.signature_r, self.signature_s)
+    }
+
+    /// The attached collection, which holds the attachment.
+    pub fn collection(&self) -> CollectionHandle {
+        self.attached
+    }
+
+    /// The attached collection. Same as [`Self::collection`].
+    pub fn attached(&self) -> CollectionHandle {
+        self.attached
+    }
+
+    /// The node of the parent collection's lattice this attachment indexes.
+    pub fn node(&self) -> CollectionData {
+        self.node
+    }
+
+    /// The attachment the mapping gives the node.
+    pub fn attachment(&self) -> CollectionData {
+        self.attachment
+    }
+
+    /// Blob handles named directly by this record: the attached descriptor
+    /// and the attachment. Never the node: a MAP must not keep a consumed
+    /// interior node of the parent resident, and the parent's own records
+    /// name its nodes.
+    pub fn blob_references(&self) -> [Inline<Handle<UnknownBlob>>; 2] {
+        [
+            self.attached.transmute(),
+            Handle::<UnknownBlob>::from_hash(self.attachment),
+        ]
+    }
+
+    /// Encode into the exact dense 192-byte layout: `attached | node |
+    /// attachment | author | R | S`.
+    pub fn to_bytes(&self) -> [u8; COLLECTION_MAP_BYTES_LEN] {
+        concat_fields([
+            self.attached.raw,
+            self.node.raw,
+            self.attachment.raw,
+            self.public_key.raw,
+            self.signature_r.raw,
+            self.signature_s.raw,
+        ])
+    }
+}
+
 /// A signed equation under one of the two kinds lattice v2 retired.
 ///
 /// Until 2026-09-25 these were the live MERGE and DERIVE: the binary MERGE
@@ -1492,15 +1667,20 @@ pub enum CollectionRecord {
     Merge(CollectionMerge),
     /// Signed locator leaf: a foundation of a derived collection.
     Derive(CollectionDerive),
+    /// Signed attachment of one parent node: a host's own index, never a
+    /// foundation.
+    Map(CollectionMap),
 }
 
 impl CollectionRecord {
-    /// The exact collection named by this record (the target for a DERIVE).
+    /// The exact collection named by this record (the target for a DERIVE,
+    /// the attached collection for a MAP).
     pub fn collection(&self) -> CollectionHandle {
         match self {
             Self::Commit(record) => record.collection(),
             Self::Merge(record) => record.collection(),
             Self::Derive(record) => record.collection(),
+            Self::Map(record) => record.collection(),
         }
     }
 
@@ -1510,6 +1690,7 @@ impl CollectionRecord {
             Self::Commit(record) => record.public_key(),
             Self::Merge(record) => record.public_key(),
             Self::Derive(record) => record.public_key(),
+            Self::Map(record) => record.public_key(),
         }
     }
 
@@ -1519,6 +1700,7 @@ impl CollectionRecord {
             Self::Commit(record) => record.verify_strict(),
             Self::Merge(record) => record.verify_strict(),
             Self::Derive(record) => record.verify_strict(),
+            Self::Map(record) => record.verify_strict(),
         }
     }
 
@@ -1527,7 +1709,8 @@ impl CollectionRecord {
     /// Every record names its collection's descriptor. Beyond that, a commit
     /// names its data and metadata; a merge its result and every input; a
     /// derive its output only, because its input is a locator, not a
-    /// fetchable handle. The returned handles express physical ownership
+    /// fetchable handle; a map its attachment only, never the node it
+    /// indexes. The returned handles express physical ownership
     /// only. Callers must not filter them through signature validity,
     /// collection admission, or algebraic usefulness before applying
     /// retention.
@@ -1537,6 +1720,7 @@ impl CollectionRecord {
             Self::Commit(record) => references.extend(record.blob_references()),
             Self::Merge(record) => references.extend(record.blob_references()),
             Self::Derive(record) => references.extend(record.blob_references()),
+            Self::Map(record) => references.extend(record.blob_references()),
         }
         references.into_iter()
     }
@@ -1547,6 +1731,7 @@ impl CollectionRecord {
             Self::Commit(_) => COLLECTION_COMMIT_BYTES_LEN,
             Self::Merge(record) => record.dense_len(),
             Self::Derive(_) => COLLECTION_DERIVE_BYTES_LEN,
+            Self::Map(_) => COLLECTION_MAP_BYTES_LEN,
         }
     }
 
@@ -1586,6 +1771,10 @@ impl CollectionRecord {
                 let bytes = exact_array::<COLLECTION_DERIVE_BYTES_LEN>(payload)?;
                 Ok(Self::Derive(CollectionDerive::from_bytes_trusted(bytes)))
             }
+            COLLECTION_RECORD_KIND_MAP_V1 => {
+                let bytes = exact_array::<COLLECTION_MAP_BYTES_LEN>(payload)?;
+                Ok(Self::Map(CollectionMap::from_bytes_trusted(bytes)))
+            }
             COLLECTION_RECORD_KIND_MERGE_V2 | COLLECTION_RECORD_KIND_DERIVE_V2 => {
                 Err(RecordDecodeError::RetiredKind(kind))
             }
@@ -1608,6 +1797,9 @@ impl CollectionRecord {
             Self::Derive(record) => {
                 collection_record_fingerprint(KIND_COLLECTION_DERIVE, &record.to_bytes())
             }
+            Self::Map(record) => {
+                collection_record_fingerprint(KIND_COLLECTION_MAP, &record.to_bytes())
+            }
         }
     }
 
@@ -1623,6 +1815,7 @@ impl CollectionRecord {
             Self::Derive(record) => {
                 tagged_bytes(COLLECTION_RECORD_KIND_DERIVE_V4, &record.to_bytes())
             }
+            Self::Map(record) => tagged_bytes(COLLECTION_RECORD_KIND_MAP_V1, &record.to_bytes()),
         }
     }
 }
@@ -1652,6 +1845,8 @@ pub const COLLECTION_RECORD_KIND_DERIVE_V3: u8 = 7;
 pub const COLLECTION_RECORD_KIND_MERGE_V4: u8 = 8;
 /// Dense generic-store tag of the locator [`CollectionDerive`] (lattice v2).
 pub const COLLECTION_RECORD_KIND_DERIVE_V4: u8 = 9;
+/// Dense generic-store tag of the [`CollectionMap`] attachment record.
+pub const COLLECTION_RECORD_KIND_MAP_V1: u8 = 10;
 
 fn commit_bytes(
     collection: CollectionHandle,
@@ -1839,6 +2034,24 @@ fn derive_transcript(
     transcript.extend_from_slice(&target.raw);
     transcript.extend_from_slice(&input.raw());
     transcript.extend_from_slice(&output.raw);
+    transcript
+}
+
+/// `domain || kind || author || attached || node || attachment`: the MAP
+/// transcript.
+fn map_transcript(
+    public_key: Inline<ED25519PublicKey>,
+    attached: CollectionHandle,
+    node: CollectionData,
+    attachment: CollectionData,
+) -> Vec<u8> {
+    let mut transcript = Vec::with_capacity(32 + 16 + 32 * 4);
+    transcript.extend_from_slice(&MAP_TRANSCRIPT_DOMAIN);
+    transcript.extend_from_slice(&KIND_COLLECTION_MAP.raw());
+    transcript.extend_from_slice(&public_key.raw);
+    transcript.extend_from_slice(&attached.raw);
+    transcript.extend_from_slice(&node.raw);
+    transcript.extend_from_slice(&attachment.raw);
     transcript
 }
 
@@ -2183,6 +2396,46 @@ mod tests {
     }
 
     #[test]
+    fn map_roundtrips_and_names_its_node_by_handle() {
+        let record = CollectionMap::sign(&fixture_key(), collection(2), hash(3), hash(4));
+        assert_eq!(
+            CollectionMap::from_bytes(record.to_bytes()).unwrap(),
+            record
+        );
+        assert_eq!(record.attached(), collection(2));
+        assert_eq!(record.collection(), collection(2));
+        // The node is its handle, not a locator: an attached collection
+        // indexes the parent's own nodes.
+        assert_eq!(record.node(), hash(3));
+        assert_eq!(&record.to_bytes()[32..64], &[3; 32]);
+        assert_eq!(record.attachment(), hash(4));
+        // domain || kind || author || attached || node || attachment
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&MAP_TRANSCRIPT_DOMAIN);
+        expected.extend_from_slice(&KIND_COLLECTION_MAP.raw());
+        expected.extend_from_slice(&record.public_key().raw);
+        expected.extend_from_slice(&[2; 32]);
+        expected.extend_from_slice(&[3; 32]);
+        expected.extend_from_slice(&[4; 32]);
+        assert_eq!(record.signing_transcript(), expected);
+        assert_eq!(record.signing_transcript().len(), 176);
+        // A MAP and a DERIVE over the same bytes are different statements.
+        let derive = CollectionDerive::from_parts(
+            collection(2),
+            SourceLocator::from_raw([3; 32]),
+            hash(4),
+            record.public_key(),
+            record.signature().0,
+            record.signature().1,
+        );
+        assert!(derive.verify_strict().is_err());
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&KIND_COLLECTION_MAP.raw());
+        hasher.update(&record.to_bytes());
+        assert_eq!(record.fingerprint().raw(), *hasher.finalize().as_bytes());
+    }
+
+    #[test]
     fn generic_codec_tags_each_variant() {
         let commit = CollectionCommit::sign(
             &fixture_key(),
@@ -2191,6 +2444,7 @@ mod tests {
             empty_metadata_handle(),
         );
         let derive = CollectionDerive::sign(&fixture_key(), collection(2), locator(3), hash(4));
+        let map = CollectionMap::sign(&fixture_key(), collection(5), hash(6), hash(7));
         for (record, tag) in [
             (
                 CollectionRecord::Commit(commit),
@@ -2204,6 +2458,7 @@ mod tests {
                 CollectionRecord::Derive(derive),
                 COLLECTION_RECORD_KIND_DERIVE_V4,
             ),
+            (CollectionRecord::Map(map), COLLECTION_RECORD_KIND_MAP_V1),
         ] {
             let bytes = record.to_bytes();
             assert_eq!(bytes[0], tag);
@@ -2212,6 +2467,7 @@ mod tests {
         }
         assert_eq!(COLLECTION_RECORD_KIND_MERGE_V4, 8);
         assert_eq!(COLLECTION_RECORD_KIND_DERIVE_V4, 9);
+        assert_eq!(COLLECTION_RECORD_KIND_MAP_V1, 10);
         assert_eq!(
             CollectionRecord::from_bytes(&[99]),
             Err(RecordDecodeError::UnknownKind(99))
@@ -2255,6 +2511,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![[8; 32], [10; 32]],
         );
+        // The attached descriptor and the attachment; never the node, which
+        // the parent's own records keep.
+        let map = CollectionMap::sign(&fixture_key(), collection(11), hash(12), hash(13));
+        assert_eq!(
+            CollectionRecord::Map(map)
+                .blob_references()
+                .map(|handle| handle.raw)
+                .collect::<Vec<_>>(),
+            vec![[11; 32], [13; 32]],
+        );
     }
 
     #[test]
@@ -2280,6 +2546,13 @@ mod tests {
                 actual: 0,
             })
         );
+        assert_eq!(
+            CollectionRecord::from_bytes(&[COLLECTION_RECORD_KIND_MAP_V1]),
+            Err(RecordDecodeError::InvalidLength {
+                expected: COLLECTION_MAP_BYTES_LEN,
+                actual: 0,
+            })
+        );
     }
 
     #[test]
@@ -2291,6 +2564,12 @@ mod tests {
                 collection(2),
                 locator(3),
                 hash(4),
+            )),
+            CollectionRecord::Map(CollectionMap::sign(
+                &fixture_key(),
+                collection(5),
+                hash(6),
+                hash(7),
             )),
         ];
         for record in records {
@@ -2312,7 +2591,7 @@ mod tests {
             }
             let key_start = match record {
                 CollectionRecord::Merge(_) => 1 + 2 * 32,
-                CollectionRecord::Derive(_) => 1 + 3 * 32,
+                CollectionRecord::Derive(_) | CollectionRecord::Map(_) => 1 + 3 * 32,
                 CollectionRecord::Commit(_) => unreachable!(),
             };
             let mut weak = encoded;

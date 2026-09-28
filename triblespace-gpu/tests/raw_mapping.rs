@@ -250,6 +250,7 @@ where
                 )
             }
             CollectionRecord::Commit(_) => continue,
+            CollectionRecord::Map(_) => continue,
         };
         let actual: Blob<SuccinctArchiveBlob> = compact
             .get(Handle::<SuccinctArchiveBlob>::from_hash(output))

@@ -409,6 +409,8 @@ struct LatticeCollection {
     commits: u64,
     merges: u64,
     derives: u64,
+    /// MAP records naming it: an attached collection's attachments.
+    maps: u64,
     /// Records naming it whose member, join result or mapping output blob is
     /// actually here. The shortfall against the three counts above is the
     /// concrete "what is missing": endorsed work whose bytes this store does
@@ -430,6 +432,7 @@ impl LatticeCollection {
         self.commits
             .saturating_add(self.merges)
             .saturating_add(self.derives)
+            .saturating_add(self.maps)
     }
 }
 
@@ -505,18 +508,20 @@ fn observe_lattice<R: triblespace_core::repo::StoreRead>(
         if let Some(source) = source {
             pending.push(source);
         }
-        let (commits, merges, derives, result_resident) = match evidence.get(&raw) {
+        let (commits, merges, derives, maps, result_resident) = match evidence.get(&raw) {
             Some(found) => (
                 found.commits.stored,
                 found.merges.stored,
                 found.derives.stored,
+                found.maps.stored,
                 found
                     .commits
                     .result_resident
                     .saturating_add(found.merges.result_resident)
-                    .saturating_add(found.derives.result_resident),
+                    .saturating_add(found.derives.result_resident)
+                    .saturating_add(found.maps.result_resident),
             ),
-            None => (0, 0, 0, 0),
+            None => (0, 0, 0, 0, 0),
         };
         out.push(LatticeCollection {
             handle: raw,
@@ -526,6 +531,7 @@ fn observe_lattice<R: triblespace_core::repo::StoreRead>(
             commits,
             merges,
             derives,
+            maps,
             result_resident,
             // Filled below: admission is a question about the whole lattice at
             // once, not about one collection as it is discovered.
@@ -736,6 +742,8 @@ fn observe_members<R: triblespace_core::repo::StoreRead>(
                 produced.insert(output);
                 handles.insert(output);
             }
+            // An attachment is no node of this collection's lattice.
+            CollectionRecord::Map(_) => {}
         }
     }
 
@@ -1315,7 +1323,7 @@ fn render_terminal(frame: &Frame) -> String {
                 for collection in rows.iter().take(12) {
                     let _ = writeln!(
                         out,
-                        "  {} {} · {} commit / {} merge / {} derive · {} of {} results resident{}",
+                        "  {} {} · {} commit / {} merge / {} derive / {} map · {} of {} results resident{}",
                         if collection.descriptor_resident { "+" } else { "?" },
                         collection
                             .name
@@ -1324,6 +1332,7 @@ fn render_terminal(frame: &Frame) -> String {
                         collection.commits,
                         collection.merges,
                         collection.derives,
+                        collection.maps,
                         collection.result_resident,
                         collection.stored(),
                         match collection.source {

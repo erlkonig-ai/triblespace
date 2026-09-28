@@ -24,8 +24,8 @@ pub enum CollectionRecordSelector {
     /// Select every record whose intrinsic collection is exactly `C`.
     ///
     /// This is the canonical construction route for one collection's sparse
-    /// overlay inventory. It includes signed `COMMIT`, `MERGE`,
-    /// and `DERIVE` equations without exposing or enumerating unrelated
+    /// overlay inventory. It includes signed `COMMIT`, `MERGE`, `DERIVE`
+    /// and `MAP` records without exposing or enumerating unrelated
     /// collections.
     Collection(CollectionHandle),
     /// Select every signed membership claim for one exact collection element.
@@ -35,9 +35,10 @@ pub enum CollectionRecordSelector {
     CommitMember(CollectionHandle, CollectionData),
     /// Select every raw record producing one exact collection member.
     ///
-    /// This matches `COMMIT.data`, `MERGE.result`, and `DERIVE.output` at
-    /// exactly `(C, H)`. Distinct producers and input witnesses remain distinct
-    /// records; neither authority nor witness closure is evaluated here.
+    /// This matches `COMMIT.data`, `MERGE.result`, `DERIVE.output` and
+    /// `MAP.attachment` at exactly `(C, H)`. Distinct producers and input
+    /// witnesses remain distinct records; neither authority nor witness
+    /// closure is evaluated here.
     ProducedMember(CollectionHandle, CollectionData),
     /// Select every `MERGE` asserted for one collection descriptor.
     MergeCollection(CollectionHandle),
@@ -52,11 +53,7 @@ pub(crate) fn selectors_match_record(
     selectors: &BTreeSet<CollectionRecordSelector>,
     record: CollectionRecord,
 ) -> bool {
-    let collection = match record {
-        CollectionRecord::Commit(commit) => commit.collection(),
-        CollectionRecord::Merge(merge) => merge.collection(),
-        CollectionRecord::Derive(derive) => derive.collection(),
-    };
+    let collection = record.collection();
     if selectors.contains(&CollectionRecordSelector::Collection(collection)) {
         return true;
     }
@@ -64,6 +61,7 @@ pub(crate) fn selectors_match_record(
         CollectionRecord::Commit(commit) => commit.data(),
         CollectionRecord::Merge(merge) => merge.result(),
         CollectionRecord::Derive(derive) => derive.output(),
+        CollectionRecord::Map(map) => map.attachment(),
     };
     if selectors.contains(&CollectionRecordSelector::ProducedMember(
         collection, output,
@@ -80,6 +78,8 @@ pub(crate) fn selectors_match_record(
         CollectionRecord::Derive(derive) => {
             selectors.contains(&CollectionRecordSelector::DeriveTarget(derive.collection()))
         }
+        // A MAP is selected by its collection or by its attachment only.
+        CollectionRecord::Map(_) => false,
     };
     matches_fields
 }
@@ -494,6 +494,7 @@ mod tests {
                 CollectionRecord::Derive(derive) => {
                     derive.collection() == collection(2) && derive.output() == data(11)
                 }
+                CollectionRecord::Map(_) => false,
             })
             .collect();
         assert_eq!(selected, expected);
@@ -591,11 +592,9 @@ mod tests {
         assert!(selected
             .iter()
             .any(|record| matches!(record, CollectionRecord::Derive(_))));
-        assert!(selected.iter().all(|record| match record {
-            CollectionRecord::Commit(record) => record.collection() == expected,
-            CollectionRecord::Merge(record) => record.collection() == expected,
-            CollectionRecord::Derive(record) => record.collection() == expected,
-        }));
+        assert!(selected
+            .iter()
+            .all(|record| record.collection() == expected));
         assert_eq!(store.enumerations.get(), 1);
     }
 

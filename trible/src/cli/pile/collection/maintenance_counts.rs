@@ -92,7 +92,8 @@ struct Counts {
     proof_lookups: usize,
     blob_puts: usize,
     id_set_puts: usize,
-    // COMMIT, MERGE, DERIVE attempts, independently of whether already stored.
+    // COMMIT, MERGE, DERIVE or MAP attempts, independently of whether already
+    // stored.
     insertions: BTreeMap<CollectionHandle, [usize; 3]>,
 }
 
@@ -199,7 +200,7 @@ impl<S: CollectionStore> CollectionStore for Counted<S> {
             let kind = match record {
                 CollectionRecord::Commit(_) => 0,
                 CollectionRecord::Merge(_) => 1,
-                CollectionRecord::Derive(_) => 2,
+                CollectionRecord::Derive(_) | CollectionRecord::Map(_) => 2,
             };
             counts.insertions.entry(record.collection()).or_default()[kind] += 1;
         });
@@ -456,6 +457,7 @@ fn output_handles(snapshot: &PileSnapshot, collection: CollectionHandle) -> BTre
             CollectionRecord::Commit(commit) => commit.data().raw,
             CollectionRecord::Merge(merge) => merge.result().raw,
             CollectionRecord::Derive(derive) => derive.output().raw,
+            CollectionRecord::Map(map) => map.attachment().raw,
         })
         .collect()
 }

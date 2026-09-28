@@ -43,6 +43,7 @@ pub enum NativeKind {
     Commit,
     Merge,
     Derive,
+    Map,
 }
 
 impl NativeKind {
@@ -51,6 +52,7 @@ impl NativeKind {
             Self::Commit => "commit",
             Self::Merge => "merge",
             Self::Derive => "derive",
+            Self::Map => "map",
         }
     }
 }
@@ -83,6 +85,7 @@ pub struct CollectionEvidence {
     pub commits: NativeSummary,
     pub merges: NativeSummary,
     pub derives: NativeSummary,
+    pub maps: NativeSummary,
 }
 
 /// Durable request counts, with answered requests separated from pending work.
@@ -104,6 +107,7 @@ pub struct LocalReport {
     pub commits: NativeSummary,
     pub merges: NativeSummary,
     pub derives: NativeSummary,
+    pub maps: NativeSummary,
     pub collections: Vec<CollectionEvidence>,
     pub missing_reference_sample: Vec<MissingReference>,
     pub missing_reference_sample_truncated: bool,
@@ -198,6 +202,7 @@ struct MutableCollectionEvidence {
     commits: NativeSummary,
     merges: NativeSummary,
     derives: NativeSummary,
+    maps: NativeSummary,
 }
 
 /// Inspect one immutable store observation without fetching, maintaining, or
@@ -231,6 +236,7 @@ where
     let mut commits = NativeSummary::default();
     let mut merges = NativeSummary::default();
     let mut derives = NativeSummary::default();
+    let mut maps = NativeSummary::default();
     let mut collections = BTreeMap::<[u8; 32], MutableCollectionEvidence>::new();
     let mut missing_references = BTreeSet::new();
     let mut missing_reference_count = 0_u64;
@@ -250,6 +256,7 @@ where
             CollectionRecord::Commit(commit) => (NativeKind::Commit, commit.data().raw),
             CollectionRecord::Merge(merge) => (NativeKind::Merge, merge.result().raw),
             CollectionRecord::Derive(derive) => (NativeKind::Derive, derive.output().raw),
+            CollectionRecord::Map(map) => (NativeKind::Map, map.attachment().raw),
         };
         let mut missing = Vec::new();
         for handle in record.blob_references() {
@@ -268,7 +275,7 @@ where
         )?;
 
         update_native_summary(
-            summary_mut(kind, &mut commits, &mut merges, &mut derives),
+            summary_mut(kind, &mut commits, &mut merges, &mut derives, &mut maps),
             &missing,
             result_resident,
         );
@@ -279,6 +286,7 @@ where
                 &mut collection_summary.commits,
                 &mut collection_summary.merges,
                 &mut collection_summary.derives,
+                &mut collection_summary.maps,
             ),
             &missing,
             result_resident,
@@ -328,6 +336,7 @@ where
         commits,
         merges,
         derives,
+        maps,
         collections: collections
             .into_iter()
             .map(|(collection, evidence)| CollectionEvidence {
@@ -335,6 +344,7 @@ where
                 commits: evidence.commits,
                 merges: evidence.merges,
                 derives: evidence.derives,
+                maps: evidence.maps,
             })
             .collect(),
         missing_reference_sample: missing_references.into_iter().collect(),
@@ -629,11 +639,13 @@ fn summary_mut<'a>(
     commits: &'a mut NativeSummary,
     merges: &'a mut NativeSummary,
     derives: &'a mut NativeSummary,
+    maps: &'a mut NativeSummary,
 ) -> &'a mut NativeSummary {
     match kind {
         NativeKind::Commit => commits,
         NativeKind::Merge => merges,
         NativeKind::Derive => derives,
+        NativeKind::Map => maps,
     }
 }
 

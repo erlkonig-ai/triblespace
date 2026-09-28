@@ -18,6 +18,9 @@
 //!   input is the locator of a source foundation, not a node of this lattice.
 //! - `MERGE(c; a1..ak -> result)` — `coverage(result) ∪= coverage(a1) ∪ … ∪
 //!   coverage(ak)`, all or nothing; a merge is compaction inside one lattice.
+//! - `MAP(attached; node -> attachment)` — no row at all: the attachment is
+//!   recorded against the node in [`Coverage::attachments`], and its support
+//!   is the node's support in the parent, looked up there.
 //!
 //! Foundations and merges are believed on different grounds. A COMMIT or a
 //! DERIVE is believed when its signer may WRITE its collection; that is what
@@ -144,6 +147,9 @@ type OwnerSet = PATCH<96, triple_key::Schema, ()>;
 /// `collection || locator || output`: every believed leaf of a derived
 /// collection, keyed by the locator of the source foundation it maps.
 type LeafSet = PATCH<96, triple_key::Schema, ()>;
+/// `attached || node || attachment`: every believed MAP, keyed by the parent
+/// node it indexes.
+type AttachmentSet = PATCH<96, triple_key::Schema, ()>;
 
 /// One immutable observation of downward coverage.
 ///
@@ -181,6 +187,10 @@ pub struct Coverage {
     /// apart until it is, so [`Self::producers`] reads exactly the driven
     /// ones by their result, the MERGE relation's own key.
     joins: Joins,
+    /// `attached || node || attachment` for every believed MAP: the host's
+    /// own attachments, keyed by the node they index. No support is kept:
+    /// an attachment stands for its node's support in the parent.
+    attachments: AttachmentSet,
 }
 
 /// One row's key: the collection a node belongs to, then the node itself.
@@ -414,6 +424,24 @@ impl Coverage {
         leaves
     }
 
+    /// The attachments the host's believed MAPs give `node` in `attached`,
+    /// ascending. One, unless the host mapped the node twice to different
+    /// bytes. Whether the node itself is believed is not asked here: a
+    /// reader reaches it in the parent's lattice first.
+    pub fn attachments(
+        &self,
+        attached: CollectionHandle,
+        node: CollectionData,
+    ) -> Vec<CollectionData> {
+        let prefix = row_key(attached, node);
+        let mut attachments = Vec::new();
+        self.attachments.infixes(&prefix, |attachment: &[u8; 32]| {
+            attachments.push(Inline::new(*attachment));
+        });
+        attachments.sort_unstable_by(|left, right| left.raw.cmp(&right.raw));
+        attachments
+    }
+
     /// Number of lattice nodes with a coverage row.
     pub fn len(&self) -> usize {
         self.rows.len().min(usize::MAX as u64) as usize
@@ -463,6 +491,12 @@ pub enum Attestation {
         inputs: MergeInputs,
         result: CollectionData,
     },
+    /// This attachment indexes this node of the attached collection's
+    /// parent: a MAP. It is no node of any lattice and widens no support.
+    Attachment {
+        node: CollectionData,
+        attachment: CollectionData,
+    },
 }
 
 /// The `(collection, payload)` a record produces: its attestation's result.
@@ -488,24 +522,31 @@ impl Attestation {
                 locator: derive.input(),
                 output: derive.output(),
             },
+            CollectionRecord::Map(map) => Self::Attachment {
+                node: map.node(),
+                attachment: map.attachment(),
+            },
         }
     }
 
-    /// The node whose coverage this attestation widens.
+    /// The node whose coverage this attestation widens, or for an
+    /// attachment the blob it produces, which widens nothing.
     pub fn result(&self) -> CollectionData {
         match self {
             Self::Foundation { data } => *data,
             Self::Leaf { output, .. } => *output,
             Self::Join { result, .. } => *result,
+            Self::Attachment { attachment, .. } => *attachment,
         }
     }
 
     /// The nodes of its own collection whose coverage this attestation reads:
-    /// a join's inputs, and nothing for a foundation or a leaf.
+    /// a join's inputs, and nothing for a foundation, a leaf or an
+    /// attachment.
     fn inputs(&self) -> &[CollectionData] {
         match self {
             Self::Join { inputs, .. } => inputs.as_slice(),
-            Self::Foundation { .. } | Self::Leaf { .. } => &[],
+            Self::Foundation { .. } | Self::Leaf { .. } | Self::Attachment { .. } => &[],
         }
     }
 }
@@ -678,12 +719,14 @@ fn join_key(collection: CollectionHandle, edge: &[u8; 64]) -> [u8; 96] {
 const PARKED_FOUNDATION: u8 = 1;
 const PARKED_LEAF: u8 = 2;
 const PARKED_JOIN: u8 = 3;
+const PARKED_ATTACHMENT: u8 = 4;
 
 /// What identifies a parked attestation: the collection and signer that
 /// would believe it, its result, its kind, and what distinguishes it among
-/// attestations of that kind with the same result -- a leaf's locator or a
-/// join's input set. Together with the joins table this is the whole entry,
-/// which is why a held entry is a key and nothing else.
+/// attestations of that kind with the same result -- a leaf's locator, a
+/// join's input set or an attachment's node. Together with the joins table
+/// this is the whole entry, which is why a held entry is a key and nothing
+/// else.
 fn parked_key(entry: &Parked) -> [u8; 160] {
     let mut key = [0u8; 160];
     key[..32].copy_from_slice(&entry.collection.raw);
@@ -698,6 +741,10 @@ fn parked_key(entry: &Parked) -> [u8; 160] {
         Attestation::Join { inputs, .. } => {
             key[96] = PARKED_JOIN;
             key[128..].copy_from_slice(&join_digest(inputs));
+        }
+        Attestation::Attachment { node, .. } => {
+            key[96] = PARKED_ATTACHMENT;
+            key[128..].copy_from_slice(&node.raw);
         }
     }
     key
@@ -826,14 +873,16 @@ impl CoverageIndex {
     }
 
     /// Whether this index folds an attestation at all: a foundation or a
-    /// leaf always (admission decides it later), a join only when the host
-    /// signed it. Anything else is dropped before it touches any table, so
-    /// another key's MERGE never reaches joins, the backlog, consumer edges,
-    /// owners, blocked joins, rows or a frontier.
+    /// leaf always (admission decides it later), a join or an attachment
+    /// only when the host signed it. Anything else is dropped before it
+    /// touches any table, so another key's MERGE never reaches joins, the
+    /// backlog, consumer edges, owners, blocked joins, rows or a frontier.
     fn folds(&self, attestation: &Attestation, signer: Inline<ED25519PublicKey>) -> bool {
         match attestation {
             Attestation::Join { .. } => self.host == Some(signer),
             Attestation::Foundation { .. } | Attestation::Leaf { .. } => true,
+            // An attachment is the host's own index, like its merges.
+            Attestation::Attachment { .. } => self.host == Some(signer),
         }
     }
 
@@ -897,6 +946,10 @@ impl CoverageIndex {
                     .or_else(|| self.published.joins.get(&key))?;
                 Attestation::Join { inputs, result }
             }
+            PARKED_ATTACHMENT => Attestation::Attachment {
+                node: Inline::new(segment(key, 128)),
+                attachment: result,
+            },
             _ => return None,
         };
         Some(Parked {
@@ -1142,6 +1195,16 @@ impl CoverageIndex {
         // derived collection is a DERIVE, and the other pairing attests
         // nothing.
         match entry.attestation {
+            Attestation::Attachment { .. } => {
+                // A host's own attachment is believed on its key alone, like
+                // its joins: no WRITE check and no descriptor. It reads no
+                // row; whether its node is believed is the reader's
+                // question, answered by reaching the node in the parent.
+                if self.folds(&entry.attestation, entry.signer) {
+                    self.believe(entry.collection, entry.attestation, entry.signer);
+                }
+                return;
+            }
             Attestation::Join { .. } => {
                 // A host's own join is believed on its key alone: no WRITE
                 // check and no descriptor. It stays inside its collection
@@ -1374,13 +1437,23 @@ impl CoverageIndex {
     }
 
     /// Fold a foundation whose collection resolves and whose signer is
-    /// admitted, or a join the host signed.
+    /// admitted, or a join or an attachment the host signed.
     fn believe(
         &mut self,
         collection: CollectionHandle,
         attestation: Attestation,
         signer: Inline<ED25519PublicKey>,
     ) {
+        // An attachment is recorded against its node and touches nothing
+        // else: no row, no frontier, no owner, no consumer edge.
+        if let Attestation::Attachment { node, attachment } = attestation {
+            self.published.attachments.insert(&Entry::new(&triple(
+                collection.raw,
+                node.raw,
+                attachment.raw,
+            )));
+            return;
+        }
         // Who produced a foundation, and for a leaf which source foundation
         // it maps: both are facts about the believed record. A join has no
         // owner to record: it is always the host's, and recording it would
@@ -1481,6 +1554,8 @@ impl CoverageIndex {
             // A leaf is a foundation of this collection: it stands for its
             // own output, and reads nothing.
             Attestation::Leaf { output, .. } => CoverageSet::from_keys(std::iter::once(output.raw)),
+            // An attachment is no node of a lattice: it is never driven.
+            Attestation::Attachment { .. } => return Driven::Unchanged,
             Attestation::Join { inputs, .. } => {
                 // All or nothing: a join that saw only some of its inputs
                 // would otherwise publish a support it never attested.

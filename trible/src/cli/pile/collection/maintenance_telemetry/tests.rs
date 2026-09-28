@@ -139,7 +139,8 @@ fn publication_counter_counts_successful_calls_including_idempotent_insertions()
         counts,
         Publications {
             merges: 2,
-            derives: 1
+            derives: 1,
+            maps: 0,
         }
     );
     assert_eq!(store.snapshot().unwrap().records().unwrap().count(), 3);
@@ -174,7 +175,8 @@ fn failed_insert_does_not_count_or_erase_a_prior_success() {
         counts,
         Publications {
             merges: 1,
-            derives: 0
+            derives: 0,
+            maps: 0,
         }
     );
 }

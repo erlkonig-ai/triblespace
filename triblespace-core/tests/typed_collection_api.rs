@@ -397,6 +397,7 @@ fn maintenance_follows_a_resident_source_union_across_target_size_tiers() {
             CollectionRecord::Derive(record) => record.collection(),
             CollectionRecord::Merge(record) => record.collection(),
             CollectionRecord::Commit(_) => panic!("maintenance must not author roots"),
+            CollectionRecord::Map(_) => panic!("nothing here is attached"),
         };
         assert_eq!(
             collection,
@@ -512,6 +513,7 @@ fn ordinary_derived_operations_use_only_resident_immediate_source_support() {
                 CollectionRecord::Derive(record) => record.collection(),
                 CollectionRecord::Merge(record) => record.collection(),
                 CollectionRecord::Commit(_) => panic!("downstream work must not author roots"),
+                CollectionRecord::Map(_) => panic!("nothing here is attached"),
             };
             assert_eq!(
                 collection,
@@ -616,6 +618,7 @@ fn ordinary_derived_operations_ignore_pending_immediate_source_output() {
                 CollectionRecord::Derive(record) => record.collection(),
                 CollectionRecord::Merge(record) => record.collection(),
                 CollectionRecord::Commit(_) => panic!("downstream work must not author roots"),
+                CollectionRecord::Map(_) => panic!("nothing here is attached"),
             };
             assert_eq!(
                 collection,

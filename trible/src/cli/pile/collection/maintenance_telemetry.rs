@@ -98,6 +98,9 @@ impl Options {
 pub(super) struct Publications {
     pub merges: u128,
     pub derives: u128,
+    /// MAPs this worker published: the attached counterpart of a DERIVE, one
+    /// node mapped. Emitted with the DERIVEs as completed mapping work.
+    pub maps: u128,
 }
 
 /// Only the mutating surface is wrapped; the exact underlying snapshot type,
@@ -140,6 +143,9 @@ impl<S: CollectionStore> CollectionStore for CountedStore<'_, S> {
             }
             CollectionRecord::Derive(_) => {
                 self.counts.derives = self.counts.derives.saturating_add(1);
+            }
+            CollectionRecord::Map(_) => {
+                self.counts.maps = self.counts.maps.saturating_add(1);
             }
             CollectionRecord::Commit(_) => {}
         }
@@ -378,7 +384,10 @@ impl Telemetry {
                     telemetry::attrs::parallelism: 1_u128,
                     telemetry::attrs::parallel_compiled: triblespace_core::PARALLEL_COMPILED,
                     telemetry::attrs::completed_merges: self.publications.merges,
-                    telemetry::attrs::completed_derives: self.publications.derives,
+                    // A MAP is a mapped node like a DERIVE; the schema has
+                    // one attribute for both.
+                    telemetry::attrs::completed_derives:
+                        self.publications.derives.saturating_add(self.publications.maps),
                 };
             }
         }

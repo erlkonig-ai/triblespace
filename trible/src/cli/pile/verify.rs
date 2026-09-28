@@ -13,7 +13,7 @@ pub(super) fn run(path: &Path) -> Result<()> {
     // duplicates must each be audited, even if ordinary replay collapses them.
     let mut records =
         PileRecords::open(path).map_err(|error| super::pile_read_error(path, error))?;
-    let mut checked = [0usize; 4];
+    let mut checked = [0usize; 5];
     let mut invalid = 0usize;
     let mut unsigned = 0usize;
     let mut opaque = 0usize;
@@ -27,6 +27,7 @@ pub(super) fn run(path: &Path) -> Result<()> {
                     CollectionRecord::Commit(_) => ("COMMIT", 0),
                     CollectionRecord::Merge(_) => ("MERGE", 1),
                     CollectionRecord::Derive(_) => ("DERIVE", 2),
+                    CollectionRecord::Map(_) => ("MAP", 4),
                 };
                 checked[index] += 1;
                 (kind, record.verify_strict().map_err(anyhow::Error::from))
@@ -78,8 +79,8 @@ pub(super) fn run(path: &Path) -> Result<()> {
         }
     }
     println!(
-        "Native record audit: COMMIT={}, MERGE={}, DERIVE={}, AUTH={}",
-        checked[0], checked[1], checked[2], checked[3]
+        "Native record audit: COMMIT={}, MERGE={}, DERIVE={}, AUTH={}, MAP={}",
+        checked[0], checked[1], checked[2], checked[3], checked[4]
     );
     println!("Retired signed equations checked (pile kinds v8/v9): {retired}");
     println!("Invalid native records: {invalid}");
