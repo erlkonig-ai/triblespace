@@ -410,6 +410,25 @@ impl<T: CollectionDerivation> DeriveMapping for CanonicalDerivation<T> {
 /// cover, a text index takes each entity's maximum score, and a count or any
 /// other non-idempotent aggregate is never summed over overlapping supports.
 /// Every implementor is tested against this law over random covers.
+///
+/// The law holds for every cover when an image is built from single facts,
+/// as every implementor in this crate's is. A mapping whose image aggregates
+/// facts of several entities cannot tell from one node that an entity has
+/// more facts elsewhere, and then no combination of per-node images is
+/// exact once a cover splits that entity. Such an implementor states its
+/// law with that precondition. The one known is the Archive block BM25
+/// mapping in faculties (`ArchiveBlockTextBm25Mapping`), whose document is a
+/// block and whose term frequency sums over the block's parts: it answers
+/// like the union for every cover whose nodes hold whole source units (a
+/// block with all its parts and their facts), and a node holding part of a
+/// block scores that block from the part it holds, so a cover that splits a
+/// block undercounts it. Faculties' Archive writer commits whole source
+/// units, so every cover built from its own writes keeps blocks whole. The
+/// ignored faculties tests `a_block_whose_parts_sit_in_two_nodes_scores_like_their_union`,
+/// `a_block_extended_by_a_node_without_its_tag_scores_like_their_union` and
+/// `archive_block_covers_answer_like_the_union_when_parts_spread_over_nodes`
+/// are the acceptance tests of the structural fix: a per-fact text index
+/// over the content fact's payload, with blocks ranked at query time.
 pub trait MapMapping: Sized {
     /// Encoding of the attachments.
     type Target: CollectionEncoding;
