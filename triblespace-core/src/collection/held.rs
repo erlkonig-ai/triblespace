@@ -338,6 +338,9 @@ struct State<T> {
     /// Proof seeds are recomputed at the next observation: reading the proofs
     /// failed, or a descriptor arrived.
     proofs_stale: bool,
+    /// A descriptor the proofs were judged against was resident but could not
+    /// be read: the next completed walk makes the proofs stale.
+    proofs_retry: bool,
     /// `collection || blob`: peer reports since the last observation.
     candidates: Pairs,
     /// The last observation fed in.
@@ -378,6 +381,7 @@ impl<T> Default for HeldIndex<T> {
                 ready: Pairs::new(),
                 unrouted: Handles::new(),
                 proofs_stale: false,
+                proofs_retry: false,
                 candidates: Pairs::new(),
                 fed: None,
                 generation: 0,
@@ -465,6 +469,9 @@ struct ProofSeeds {
     /// Collection and resource descriptors that are not resident: their
     /// arrival may let a proof be judged for one of the collections.
     unrouted: Vec<Raw>,
+    /// A descriptor was resident but could not be read: nothing will arrive,
+    /// so the proofs are judged again after the next walk.
+    retry: bool,
 }
 
 /// Capability definitions named by the proofs each of `collections` keeps as
@@ -477,6 +484,7 @@ fn proof_seeds<T: HeldSource>(
     let mut found = ProofSeeds {
         seeds: Vec::new(),
         unrouted: Vec::new(),
+        retry: false,
     };
     if collections.is_empty() {
         return Ok(found);
@@ -504,14 +512,20 @@ fn proof_seeds<T: HeldSource>(
                     candidates.insert(collection);
                 }
             }
-        } else if !snapshot.contains_blob(resource).unwrap_or(false) {
+        } else if snapshot.contains_blob(resource).unwrap_or(false) {
+            found.retry = true;
+        } else {
             found.unrouted.push(resource.raw);
         }
         for collection in candidates {
             let descriptor = descriptors.entry(collection).or_insert_with(|| {
                 let facts = snapshot.get::<TribleSet, SimpleArchive>(collection).ok();
-                if facts.is_none() && !snapshot.contains_blob(collection).unwrap_or(false) {
-                    found.unrouted.push(collection.raw);
+                if facts.is_none() {
+                    if snapshot.contains_blob(collection).unwrap_or(false) {
+                        found.retry = true;
+                    } else {
+                        found.unrouted.push(collection.raw);
+                    }
                 }
                 facts
             });
@@ -594,6 +608,14 @@ impl<T> State<T> {
                 (Inline::new(*collection), roots)
             })
             .collect()
+    }
+
+    /// A walk completed: judge the proofs again if a descriptor could not be
+    /// read when they were last judged.
+    fn walked(&mut self) {
+        if std::mem::take(&mut self.proofs_retry) {
+            self.proofs_stale = true;
+        }
     }
 
     /// Record one scan: the blob, and an edge to each resident child.
@@ -793,6 +815,7 @@ impl<T: HeldSource> HeldIndex<T> {
                 match proof_seeds(now, &settled) {
                     Ok(found) => {
                         state.proofs_stale = false;
+                        state.proofs_retry = found.retry;
                         state.add_proof_seeds(found, &mut roots);
                     }
                     // Retried at the next observation.
@@ -833,6 +856,7 @@ impl<T: HeldSource> HeldIndex<T> {
                 for descriptor in proofs.unrouted {
                     state.unrouted.insert(&Entry::new(&descriptor));
                 }
+                state.proofs_retry |= proofs.retry;
                 for (collection, seed) in proofs.seeds {
                     seeds.get_mut(&collection).expect("fresh").push(seed);
                 }
@@ -1072,6 +1096,7 @@ impl<T: HeldSource> HeldIndex<T> {
                     }
                     self.wake.notify_all();
                 }
+                state.walked();
                 return;
             }
             let mut reports = Vec::new();
@@ -1111,6 +1136,7 @@ impl<T: HeldSource> HeldIndex<T> {
                 for collection in &covered {
                     state.warming.remove(&collection.raw);
                 }
+                state.walked();
                 return;
             }
             // Reported blobs were resident when their reports were taken,
@@ -2996,6 +3022,36 @@ mod tests {
             let walked = store.snapshot().unwrap();
             assert!(held_set(&walked, c).is_superset(&BTreeSet::from([data, z])));
         }
+    }
+
+    /// Proofs judged while C's own descriptor was resident but unreadable are
+    /// judged again after the next walk, although nothing arrives.
+    #[test]
+    fn proofs_judged_against_an_unreadable_descriptor_are_judged_again() {
+        let mut store = Store::default();
+        let root = SigningKey::from_bytes(&[48; 32]);
+        let c = governed(&mut store, "descriptor unreadable", &root);
+        let definition: Inline<Handle<SimpleArchive>> =
+            Inline::new(blob(&mut store, b"definition behind a bad read"));
+        store
+            .insert_proof(CapabilityProof::new(
+                CapabilityResource::from(c),
+                &root,
+                definition,
+                SigningKey::from_bytes(&[49; 32]).verifying_key(),
+            ))
+            .unwrap();
+        store.faults.unreadable.lock().unwrap().insert(c.raw);
+        store.track_held([c]);
+        let first = store.snapshot().unwrap();
+        assert!(!held_set(&first, c).contains(&definition.raw));
+        store.faults.unreadable.lock().unwrap().remove(&c.raw);
+        store.walk_held(1).unwrap();
+        let walked = store.snapshot().unwrap();
+        assert!(
+            held_set(&walked, c).contains(&definition.raw),
+            "a proof judged against an unreadable descriptor was never judged again"
+        );
     }
 
     #[test]
