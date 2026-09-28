@@ -526,6 +526,7 @@ these algebra records.
 | Commit | `A1322BB3F5214287C314D42AFCC1A97CB264FACD9A22B4938838BE78DB31AA59` (`CBF2CF97D52A3486E16C12D70D397C66`) | `64..96` descriptor handle, `96..128` data digest, `128..160` metadata handle, `160..192` Ed25519 public key, `192..224` signature R, `224..256` signature S — no reserved bytes |
 | Merge | `4D2087B6C4944A404E1D0BCF4898819267E00FCAE49B146F5955522CBE935909` (`3AB7D3C2BAB53C85CCA6108A30BB8930`) | `64..96` descriptor handle, `96..128` low input digest, `128..160` high input digest, `160..192` result digest, `192..224` low input-record fingerprint, `224..256` high input-record fingerprint, `256..288` Ed25519 public key, `288..320` signature R, `320..352` signature S, `352..512` reserved zeros |
 | Derive | `DBF641F31E772F6CE715087D954375AA44860BF411C0DE849C207B542ABDC583` (`D933002B5656620792BFD250AB5061AD`) | `64..96` target descriptor handle, `96..128` input digest, `128..160` output digest, `160..192` input-record fingerprint, `192..224` Ed25519 public key, `224..256` signature R, `256..288` signature S, `288..512` reserved zeros |
+| Map | `32E0D7333FD2AD1F567AE9A030814F95CA8F7F4A87C0DEAA275FB9DD8FC5F408` (`ED7B98CD20AD9A4D172F037A08CC47F1`) | `64..96` attached collection descriptor handle, `96..128` node digest, `128..160` attachment digest, `160..192` Ed25519 public key, `192..224` signature R, `224..256` signature S — one block, no reserved bytes |
 
 The new MERGE and DERIVE description anchors above were minted with installed
 `trible genid` on 2026-09-14. Their signed semantic kind IDs, independently
@@ -543,6 +544,7 @@ same ordered 32-byte body fields, without native framing or reserved padding:
 | COMMIT | 1 | 192 | 193 |
 | witness-bound MERGE | 6 | 288 | 289 |
 | witness-bound DERIVE | 7 | 224 | 225 |
+| MAP | 10 | 192 | 193 |
 
 Tags 2/3 are retired unsigned layouts; tags 4/5 are retired signed payload-only
 layouts. None is an alias for a witness-bound endorsement. The combined
@@ -582,19 +584,24 @@ evicted. This is producer trust, not proof of mathematical correctness: an
 authorized dishonest producer, or a bug in the host's own merge, can still
 endorse a wrong result.
 
-These are the complete native collection-record family: there is no
-accelerator-specific fourth variant. A Rank9-accelerated member is an ordinary
-blob root plus its portable raw child, related to the raw collection by an
-ordinary `DERIVE`. Raw Succinct and Rank9-accelerated collections both own
-canonical joins and use the same `MERGE` record kind. The accelerated root's
-first 32 bytes name the raw child, so
-generic blob traversal can follow the dependency without a special pile index.
-An accelerated join may consume the exact raw union when that immutable blob is
-already resident, but it never creates the upstream raw blob or `MERGE` record.
-Without that dependency, target maintenance retains a finer accelerated cover.
-Collection resolution treats a member as physically
-available only when its root and required representation closure are resident;
-an incomplete compacted root is skipped in favor of a finer exact cover. Typed
+`MAP(attached; node -> attachment)` is the fourth native record: a host's
+own index of one node of a parent collection's lattice, its attachment
+mapped from the node's own bytes. The MAP kind was minted with `trible
+genid` on 2026-09-28: semantic kind `329669AA662709605053C123671DF1D2`,
+pile description anchor `ED7B98CD20AD9A4D172F037A08CC47F1` (description
+`pile-collection-map-v1`, handle above pinned by the description-recomputation
+test), signed over the domain `4A5191C36898D0B453FEFF99ED0E3852` ||
+`4AADD87ED8EB8620BD39623B5221B5BE`. It carries no witness, adds no foundation
+and is never replicated: a store believes a MAP only when its own host key
+signed it, keeps it as the attachment of its node, and a reader uses it only
+for a node it reaches in the parent's lattice. A Rank9-accelerated member is
+an ordinary blob root plus its portable raw child, attached to the same node
+as that child's Succinct attachment; neither attached collection has
+`MERGE` records of its own. The accelerated root's first 32 bytes name the
+raw child, so generic blob traversal can follow the dependency without a
+special pile index. An attached read treats an attachment as usable only when
+its root and required representation closure are resident; otherwise it
+descends to the attachments of the nodes beneath. Typed
 materialization then defensively validates the selected raw/index pair.
 The unpublished mapping-evidence record kind was clean-cutover removed after a
 scan found no live records requiring migration.

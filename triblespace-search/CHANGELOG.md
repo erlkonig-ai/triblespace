@@ -6,6 +6,11 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## Unreleased
 
+- `PortableBM25Blob` is attached to its root through `TextAttributeToBm25`
+  (`CollectionAttachment`) instead of derived. `mary` is an optional
+  dependency behind the new `nvfp4` feature, which `semantic` and
+  `nvfp4-cuda` enable: BM25 is an ordinary dependency with default features.
+
 - Portable BM25 attachment retains its encoded members and checks framing only.
   `index.query()` / `view.query()` explicitly prepare the global scoring
   statistics omitted by the wire format. Overlapping covers query a logical

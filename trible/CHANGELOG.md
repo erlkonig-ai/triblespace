@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- `pile collection attach <pile> <parent> <kind>` registers an attached
+  collection (`succinct`, `rank9`, `entity-id-set`, `latest`, `lww`, `bm25`,
+  `path`); `derive` keeps only `nvfp4`. `maintain` and `maintain-all` open the
+  pile as the signing key, carry an attached collection's parent and attach
+  what the carry leaves; the maintenance order follows a parent and a named
+  sibling as it follows a source. `search` reads the attached cover as the
+  `--key` it is given and reports the source foundations it does not reach.
+  The listing, `show` and `log` name attached collections and their MAPs, and
+  `pile verify` and `pile diagnose` count MAP records.
+
 ### Added
 
 - `pile net sync --health-collection <handle>` (with `--health-key`) and

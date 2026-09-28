@@ -467,12 +467,27 @@ equations. Canonical joins, mappings, and logical cover views receive one
 frozen store snapshot and may resolve immutable dependencies named by their
 inputs; unrelated resident blobs are never ambient semantic input.
 
-Succinct storage applies this model as two ordinary derivations:
+### Attached collections
+
+An index that only restates its root in another representation has no
+lattice of its own to keep. It is *attached*: its descriptor is the root's
+handle and the mapping, with no policy, and a `MAP` record signed by the store's
+host names, for one node of the root's lattice, the attachment built from that
+node's own bytes:
 
 ```text
-SimpleArchive --DERIVE--> SuccinctArchiveBlob --DERIVE-->
-    Rank9AcceleratedSuccinctArchiveBlob
+SimpleArchive node --MAP--> SuccinctArchiveBlob
+                   --MAP--> Rank9AcceleratedSuccinctArchiveBlob
 ```
+
+An attached collection has no carry, no `COMMIT`, `DERIVE` or `MERGE` of its
+own, and is never replicated: every host builds its own attachments, and a
+store believes only the `MAP`s its own host signed. Maintenance carries the
+root first and then attaches the frontier the carry leaves, so a merged node's
+attachment is mapped from the merged node's bytes and nothing is built for a
+node the carry is about to consume. A mapping that reads another attached
+collection names it in its descriptor: Rank9 is built from the same node's
+Succinct attachment.
 
 ```rust,ignore
 use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
@@ -481,28 +496,28 @@ use triblespace::core::blob::encodings::succinctarchive::{
     UnionArchive,
 };
 
+// The store is opened as the host: only its MAPs and MERGEs are believed.
 let source = storage.collection("models", source_policy)?;
-let raw = storage.derive::<SuccinctArchiveBlob>(source, (), raw_policy)?;
-let accelerated = storage.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
-    raw,
-    (),
-    accelerated_policy,
-)?;
+let raw = storage.attach::<SuccinctArchiveBlob>(source, ())?;
+let accelerated = storage.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, raw)?;
 
-storage.ensure(source, &writer).await?;
-storage.maintain(raw, &writer).await?;
-let after = storage.maintain(accelerated, &writer).await?;
+storage.maintain_attached(raw, &host).await?;
+let after = storage.maintain_attached(accelerated, &host).await?;
 
-let observed = after.collection(accelerated)?;
+let observed = after.attached(accelerated)?;
 let facts: UnionArchive<OrderedUniverse> = observed.view()?;
+let unattached = observed.residual();
 ```
 
-Each ordinary mapping call selects only the admitted support already realized
-by its immediate source in the call's initial snapshot. If a new commit arrives
-after raw maintenance, accelerated maintenance processes the raw members which
-exist; it does not demand an unbuilt raw image of that new commit. A later pass
-advances the two lattices again. Source support is still expressed in the same
-foundational coordinates; only the selection of currently usable input changes.
+A read walks the root's frontier widest first and takes a node's attachment
+when it is usable: a `MAP` the host signed whose bytes, and the bytes of every
+attachment it depends on, are here. Otherwise it descends through the host's
+merges to the nodes that produced it. A foundation no usable attachment
+reaches is the read's *residual*: read it from its own bytes
+(`succinctarchive_union::read_attached` does this for Succinct and Rank9),
+build its attachment, or report it. Attachments combine idempotently, so a
+cover of attachments answers every query as the attachment of the union of
+its nodes would.
 
 For a command-line maintenance owner, `trible pile collection maintain-all`
 discovers this source order from explicitly selected descriptor handles and

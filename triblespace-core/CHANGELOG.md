@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Attached collections. `CollectionRecord::Map` is a fourth native record,
+  `CollectionMap` (`attached`, `node`, `attachment`, signed), framed in a pile
+  as one 256-byte block under record kind `KIND_ID_COLLECTION_MAP`, with
+  semantic kind `KIND_COLLECTION_MAP` and transcript domain
+  `MAP_TRANSCRIPT_DOMAIN`. An attached descriptor names its parent through
+  `collection_parent`; a mapping that reads another attached collection names
+  it through `mapping_reads_attached` (Rank9 names its Succinct collection).
+  `MapMapping` states the contract of an attached mapping and its law,
+  cover-query equivalence: a cover of attachments answers every query as the
+  attachment of the union of their nodes. `CollectionAttachment` is the
+  target-owned canonical form, implemented by `SuccinctArchiveBlob`,
+  `Rank9AcceleratedSuccinctArchiveBlob`, `EntityIdSetBlob`, `LatestBlob` and
+  `LwwRegisterBlob`, which are no longer `CollectionDerivation`s.
+  `CollectionStoreExt::attach`, `attach_with`, `ensure_attached` and
+  `maintain_attached` register and maintain them; `CollectionSnapshotExt::attached`
+  reads an `AttachedSnapshot` (cover, support, residual, currency), and
+  `succinctarchive_union::read_attached` reads a Succinct or Rank9 one with its
+  residual built from the bytes that are here. The fold believes a `MAP` only
+  from the host, keeps it as the attachment of a node of the parent, and drops
+  a `COMMIT`, `DERIVE` or `MERGE` aimed at an attached handle
+  (`SourceResolution::Attached`). `attached_to` and `realize_attached_as` find
+  and maintain every collection attached to a root, siblings first, in
+  `ensure_downstream` and `maintain_downstream`, whose report names attached
+  representations it does not know in `unknown_attached`. New ids, minted with
+  `trible genid`: `KIND_COLLECTION_MAP` `329669AA662709605053C123671DF1D2`,
+  pile kind anchor `ED7B98CD20AD9A4D172F037A08CC47F1`,
+  `MAP_TRANSCRIPT_DOMAIN` `4A5191C36898D0B453FEFF99ED0E3852` +
+  `4AADD87ED8EB8620BD39623B5221B5BE`, `collection_parent`
+  `9B20AA2BE739DB1B4911186620368262`, `mapping_reads_attached`
+  `7A852B1D4097983EA823D04C8CD1A53A`.
+
 - `CollectionMapping` is now `DeriveMapping`, named for what its images
   become: `DERIVE` leaves of a derived collection. A new, still empty
   `MapMapping` trait states the contract of a mapping attached to another
