@@ -618,7 +618,8 @@ impl<T: HeldSource> State<T> {
     /// A blob joins only after every resident child it has joined, so a held
     /// blob's whole closure is held and a later closure stops at it. With a
     /// snapshot, a blob never scanned is read now. Without one it is unknown:
-    /// it and everything above it wait for the walk that will scan it.
+    /// it and everything above it wait for the walk that will scan it. A
+    /// blob that cannot be read is unknown on both paths, resident or not.
     fn reach(
         &mut self,
         snapshot: Option<&T>,
@@ -660,6 +661,10 @@ impl<T: HeldSource> State<T> {
                             self.pending
                                 .insert(&Entry::new(&pair(&handle, &collection.raw)));
                         }
+                        // Not readable: absent, or resident and failing to
+                        // read. Either way nothing above it joins, on this
+                        // path as on the walk's; the periodic walk tries again.
+                        unknown.insert(handle);
                         continue;
                     }
                 }
@@ -911,12 +916,18 @@ impl<T: HeldSource> HeldIndex<T> {
                 }
                 continue;
             }
-            if state.reach(Some(now), collection, [handle]) {
-                state
-                    .routes
-                    .insert(&Entry::new(&pair(&collection.raw, &handle)));
-                changed = true;
+            if !now
+                .contains_blob(Inline::<Handle<UnknownBlob>>::new(handle))
+                .unwrap_or(false)
+            {
+                continue;
             }
+            // A route even if something under it cannot be read yet: the
+            // periodic walk tries it again.
+            state
+                .routes
+                .insert(&Entry::new(&pair(&collection.raw, &handle)));
+            changed |= state.reach(Some(now), collection, [handle]);
         }
         state.fed = Some(now.clone());
         if changed {
@@ -1515,6 +1526,9 @@ mod tests {
     struct Faults {
         select: AtomicBool,
         proofs: AtomicBool,
+        /// Resident blobs whose reads fail (an indexed blob every copy of
+        /// which fails validation).
+        unreadable: Mutex<std::collections::HashSet<Raw>>,
     }
 
     #[derive(Debug)]
@@ -1616,6 +1630,9 @@ mod tests {
             Handle<S>: InlineEncoding,
         {
             self.gate.pass(&handle.raw);
+            if self.faults.unreadable.lock().unwrap().contains(&handle.raw) {
+                return Err(crate::blob::MemoryStoreGetError::NotFound());
+            }
             *self.reads.lock().unwrap().entry(handle.raw).or_default() += 1;
             if std::thread::current().name() != Some("held-blob-walk") {
                 *self
@@ -2941,6 +2958,44 @@ mod tests {
         closed(&index);
         let held = view.held(c).unwrap();
         assert!(held.has_prefix(&b) && held.has_prefix(&p));
+    }
+
+    /// A resident blob that cannot be read holds back everything above it
+    /// on both paths, so no held set lacks a resident child; the walk after
+    /// it becomes readable holds them.
+    #[test]
+    fn an_unreadable_resident_child_holds_back_its_parent_on_both_paths() {
+        let _guard = walker_guard();
+        for with_walker in [false, true] {
+            let mut store = Store::default();
+            let c = collection(&mut store, "unreadable child");
+            let metadata = blob(&mut store, b"metadata");
+            let z = blob(&mut store, b"indexed, every copy invalid");
+            let data = blob_naming(&mut store, b"names Z", &[z]);
+            commit(&mut store, c, data, metadata);
+            store.faults.unreadable.lock().unwrap().insert(z);
+            let walker = with_walker
+                .then(|| store.start_held_walker(walker_config(Duration::from_secs(3600))));
+            store.track_held([c]);
+            let settled = until(&mut store, "the collection to settle", |snapshot| {
+                snapshot.held(c).is_some()
+                    && held_set(snapshot, c).is_superset(&BTreeSet::from([c.raw, metadata]))
+            });
+            // Let a walker finish its start-up walk.
+            std::thread::sleep(Duration::from_millis(100));
+            let settled = if with_walker {
+                store.snapshot().unwrap()
+            } else {
+                settled
+            };
+            assert_closed(&settled, c);
+            assert!(!held_set(&settled, c).contains(&data));
+            drop(walker);
+            store.faults.unreadable.lock().unwrap().remove(&z);
+            store.walk_held(1).unwrap();
+            let walked = store.snapshot().unwrap();
+            assert!(held_set(&walked, c).is_superset(&BTreeSet::from([data, z])));
+        }
     }
 
     #[test]
