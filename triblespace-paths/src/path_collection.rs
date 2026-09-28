@@ -116,6 +116,40 @@ fn an_attached_summary_names_its_parent_and_carries_no_policy() {
     );
 }
 
+/// A persisted summary whose fixed representation claims more rows than its
+/// automaton can have is malformed, whatever it is attached to: validating
+/// it is fatal, not a capacity limit a finer cover could get around.
+#[test]
+fn malformed_fixed_representation_capacity_is_fatal() {
+    let automaton = Automaton::new(u32::MAX, [0], [0], []).unwrap();
+    let key = host_key();
+    let mut store = MemoryRepo::for_host(key.verifying_key());
+    let root = store
+        .collection("paths", policy(key.verifying_key()))
+        .unwrap();
+    let target = store
+        .attach::<PathSummaryBlob>(root, automaton.clone())
+        .unwrap();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&crate::automaton_fingerprint(&automaton).raw);
+    bytes.extend_from_slice(&automaton.state_count().to_le_bytes());
+    bytes.extend_from_slice(&2u32.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.extend_from_slice(&[1; 32]);
+    bytes.extend_from_slice(&[2; 32]);
+    let persisted = Blob::<PathSummaryBlob>::new(bytes.into());
+    let descriptor = descriptor_for(&mut store, target);
+    let reader = store.snapshot().unwrap();
+    assert!(matches!(
+        <PathSummaryBlob as triblespace_core::collection::CollectionEncoding>::validate_member(
+            &descriptor,
+            &persisted,
+            &reader,
+        ),
+        Err(triblespace_core::collection::CollectionOperationError::Fatal(_))
+    ));
+}
+
 #[test]
 fn an_empty_parent_is_bottom_and_maintenance_writes_nothing() {
     let (mut store, _root, target) = attached_paths("empty-edges");

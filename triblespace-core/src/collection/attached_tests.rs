@@ -329,31 +329,45 @@ fn a_map_for_a_node_the_lattice_does_not_reach_is_never_used() {
     assert_eq!(residual(&read), BTreeSet::from([a, b]));
 }
 
-/// A host join still waiting for an input's support is no producer: the
-/// attachment of its unsupported input is never taken.
+/// A host join still waiting for an input's support is no producer, and it
+/// changes nothing a reader sees: the attached read of a store holding it is
+/// the read of the same store without it.
+///
+/// The join claims `z` is `a + b + y`, where `a` and `b` are attached
+/// commits and `y` has no support, so it stays blocked and consumes nothing.
+/// That is the whole observable contract. Whether a reader would descend a
+/// blocked join cannot be seen through the read at all: every node with a
+/// row is reachable through driven joins anyway, and a node without one is
+/// never taken, so the walk's own filter is pinned by `producers` alone.
 #[test]
-fn a_blocked_own_join_is_never_used() {
-    let (mut store, root, attached) = succinct_root("blocked");
-    let a = commit(&mut store, root, row(1, 2, 3));
-    let z = commit(&mut store, root, row(7, 8, 9));
-    let y_bytes: Blob<SimpleArchive> = row(4, 5, 6).to_blob();
-    let y = data(&y_bytes);
-    store.put::<SimpleArchive, _>(y_bytes).unwrap();
-    store
-        .insert(CollectionRecord::Merge(
-            CollectionMerge::sign(&host(), root.handle(), [a, y], z).unwrap(),
-        ))
-        .unwrap();
-    let a_attachment = map_succinct(&mut store, attached, a, &host());
-    let y_attachment = map_succinct(&mut store, attached, y, &host());
-    let snapshot = store.snapshot().unwrap();
-    let coverage = CoverageRead::coverage(&snapshot, &BTreeSet::from([root.handle()])).unwrap();
-    assert!(coverage.has_blocked(root.handle()));
-    assert!(coverage.producers(root.handle(), z).is_empty());
-    let read = snapshot.attached(attached).unwrap();
-    assert_eq!(members(read.cover()), BTreeSet::from([a_attachment]));
-    assert!(!members(read.cover()).contains(&y_attachment));
-    assert_eq!(residual(&read), BTreeSet::from([z]));
+fn a_blocked_own_join_changes_nothing_a_reader_sees() {
+    fn read_with_join(blocked: bool) -> (BTreeSet<CollectionData>, BTreeSet<CollectionData>) {
+        let (mut store, root, attached) = succinct_root("blocked");
+        let a = commit(&mut store, root, row(1, 2, 3));
+        let b = commit(&mut store, root, row(4, 5, 6));
+        let z = commit(&mut store, root, row(7, 8, 9));
+        let y: CollectionData = Inline::new([0x31; 32]);
+        if blocked {
+            store
+                .insert(CollectionRecord::Merge(
+                    CollectionMerge::sign(&host(), root.handle(), [a, b, y], z).unwrap(),
+                ))
+                .unwrap();
+        }
+        map_succinct(&mut store, attached, a, &host());
+        map_succinct(&mut store, attached, b, &host());
+        let snapshot = store.snapshot().unwrap();
+        let coverage = CoverageRead::coverage(&snapshot, &BTreeSet::from([root.handle()])).unwrap();
+        assert_eq!(coverage.has_blocked(root.handle()), blocked);
+        assert!(
+            coverage.producers(root.handle(), z).is_empty(),
+            "a blocked join names no producer of its result"
+        );
+        let read = snapshot.attached(attached).unwrap();
+        assert_eq!(residual(&read), BTreeSet::from([z]));
+        (members(read.cover()), residual(&read))
+    }
+    assert_eq!(read_with_join(true), read_with_join(false));
 }
 
 /// An absorption `MERGE(c, m) -> m` names its own result among its inputs:
