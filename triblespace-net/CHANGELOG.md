@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `PeerConfig::bind`: bind the production endpoint to exactly one local
   socket (`None` keeps iroh's default sockets). The host thread hands back
   `HostStarted { wake_plane, bound }` and `Peer::bound_sockets` reports the
-  sockets bound.
+  sockets bound. The reconciler's selected collections are a PATCH set.
 
 - Transport generation `/triblespace/pile-sync/28` and wake version 5: sync
   exports foundations only. The record PATCH, its summary, served nodes,
