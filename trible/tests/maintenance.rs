@@ -1117,6 +1117,7 @@ fn search_reads_existing_bm25_support_and_snippets_after_source_growth() {
 #[cfg(feature = "search")]
 #[test]
 fn a_search_that_believes_no_attachment_names_the_key_not_maintenance() {
+    use triblespace_core::collection::CollectionStore;
     use triblespace_search::portable_bm25::PortableBM25Blob;
     use triblespace_search::text_bm25::{Bm25Tokenizer, TextAttributeToBm25};
 
@@ -1180,16 +1181,46 @@ fn a_search_that_believes_no_attachment_names_the_key_not_maintenance() {
     // A key that did not maintain this pile believes none of the maintaining
     // key's attachments: the message names the key it read as.
     let (stdout, stderr) = search(Some(&stranger));
-    assert!(
-        stdout.contains(&format!(
-            "nothing searched: no attachment here is signed by key {}",
-            hex::encode_upper(stranger_key.verifying_key().to_bytes())
-        )),
-        "{stdout}"
+    let unusable = format!(
+        "nothing searched: no usable attachment here for key {} (none is signed by it, or \
+         their bytes are not here)",
+        hex::encode_upper(stranger_key.verifying_key().to_bytes())
     );
+    assert!(stdout.contains(&unusable), "{stdout}");
     assert!(stdout.contains("pass --key"), "{stdout}");
     assert!(!stdout.contains("hit(s)"), "{stdout}");
     assert!(!stderr.contains("have no attachment yet"), "{stderr}");
+
+    // Review finding, 2026-09-28: the message said no attachment was signed
+    // by the key even when the key's MAPs are here and only their bytes are
+    // not. Now the key has a MAP for every node, naming bytes nowhere: the
+    // cover is empty again, and the message names both causes.
+    let nodes: Vec<_> = records(&fixture.path)
+        .into_iter()
+        .filter_map(|record| match record {
+            CollectionRecord::Commit(commit) if commit.collection() == fixture.source.handle() => {
+                Some(commit.data())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(nodes.len(), 2);
+    let mut pile = Pile::open(&fixture.path).unwrap();
+    for node in nodes {
+        pile.insert(CollectionRecord::Map(
+            triblespace_core::collection::CollectionMap::sign(
+                &stranger_key,
+                index.handle(),
+                node,
+                triblespace_core::inline::Inline::new([0x5A; 32]),
+            ),
+        ))
+        .unwrap();
+    }
+    pile.close().unwrap();
+    let (stdout, _) = search(Some(&stranger));
+    assert!(stdout.contains(&unusable), "{stdout}");
+    assert!(stdout.contains("2 foundation(s)"), "{stdout}");
 }
 
 #[test]

@@ -34,10 +34,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - `pile collection search --key <path>` names the key whose merges and
   attachments the read believes; a named key that does not load is an error.
   Without it the default key (`TRIBLESPACE_KEY`, else `self.key` beside the
-  pile) is used when it loads. With no key, or a key that did not maintain
-  the pile, the read believes no attachment and searches nothing; it says
-  which of the two it is and asks for `--key` naming the maintaining key,
-  instead of asking for maintenance.
+  pile) is used when it loads. With no key the read believes no attachment
+  and searches nothing, and says so; with a key that has no usable
+  attachment here -- none is signed by it, or their bytes are not here -- it
+  says that, naming both causes, and asks for `--key` naming the maintaining
+  key or for maintenance with this one.
 - `pile migrate SRC lattice-v3 --into DST [--dry-run] [--allow-absent]
   [--attached-mapping ID]`: the lattice v3 cutover filter. It keeps every
   COMMIT of every generation, proofs, WANTs, pins and unknown frames; leaves
@@ -78,8 +79,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   `pile net health --collection <handle>` report into and read from an
   explicit existing health generation instead of the reporting key's own
   `swarm-health` generation, whose identity is a function of that key. The
-  derived health chains take the source's policy, so every reader of a shared
-  generation derives the same chain handles.
+  health views are attached to the generation (a Succinct archive and an LWW
+  register) and have no policy of their own, so every reader of a shared
+  generation attaches the same handles.
 - `pile collection init --root <key> --root <key> --threshold N` mints a root
   collection whose READ and WRITE policy is a quorum over the listed public
   keys; no signing key is needed, because a descriptor is content, and root

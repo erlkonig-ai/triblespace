@@ -307,8 +307,9 @@ pub enum Command {
     /// (entities of the source collection) with their BM25 scores. With
     /// --snippet, also prints the start of each hit's text, read from the
     /// source collection through the attribute the descriptor names. When
-    /// the read believes no attachment at all, it says whether the key is
-    /// the reason (no key loads, or no attachment here is signed by it).
+    /// the read uses no attachment at all, it says why (no key loads, or no
+    /// usable attachment here for it: none signed by it, or their bytes are
+    /// not here).
     Search {
         /// Path to the pile file to read
         pile: PathBuf,
@@ -334,7 +335,9 @@ pub enum Command {
     /// Root collections roll up every admitted commit held here, whoever
     /// signed it; derived collections derive every available source member
     /// with no usable image yet and roll up their own images, never their
-    /// source's merges. Readers opened as the same key
+    /// source's merges. An image is usable when it is here and reads; one
+    /// whose leaf is here but whose bytes are not is waited for, because
+    /// the pile cannot fetch it. Readers opened as the same key
     /// can then use those merged members. Deterministic and idempotent: run
     /// again, it publishes nothing new. New equations are signed by the
     /// supplied durable key, and the pile is opened as that key so its fold
@@ -373,9 +376,12 @@ pub enum Command {
     /// whoever signed the foundations beneath it; every derived collection
     /// reached, after its source, gets a leaf for every foundation that has
     /// no usable one, whoever owns it (a reader must not wait on an absent
-    /// owner; any leaf whose image is here or can be fetched suffices), and
-    /// carries its own leaves the same way. Another key's merges are never
-    /// believed. This is scheduling over
+    /// owner), and carries its own leaves the same way. A leaf whose image
+    /// is here and reads suffices, whoever derived it. This command opens
+    /// the pile itself, which cannot fetch from other holders, so a leaf
+    /// whose image is not here is waited for rather than derived again;
+    /// 'collection rederive' supplements a leaf known to be bad. Another
+    /// key's merges are never believed. This is scheduling over
     /// ordinary one-edge operations; mappings and joins do not acquire
     /// recursive construction side effects. Only the requested targets and
     /// their descriptor source chains are selected, not historical indexes.
@@ -3636,7 +3642,10 @@ fn derive_nvfp4(
 /// Only the host's MAPs are believed, so an empty cover over a parent that
 /// has foundations says as much about the key the read opened as about
 /// maintenance: with no key nothing is ever attached, and a key that did not
-/// maintain this pile sees none of the maintaining key's attachments.
+/// maintain this pile sees none of the maintaining key's attachments. With a
+/// key, the cover is also empty when that key's MAPs are here but none of
+/// their attachments' bytes is, so the message names both causes;
+/// maintaining with the key repairs either.
 fn unsearched(host: Option<VerifyingKey>, residual: usize) -> String {
     match (host, residual) {
         (_, 0) => "the parent collection holds no foundations yet; nothing to search".to_owned(),
@@ -3647,9 +3656,10 @@ fn unsearched(host: Option<VerifyingKey>, residual: usize) -> String {
              that maintains this pile"
         ),
         (Some(host), _) => format!(
-            "nothing searched: no attachment here is signed by key {}, so none of the \
-             parent's {residual} foundation(s) is searched; pass --key naming the key that \
-             maintains this pile, or run 'collection maintain' with this key",
+            "nothing searched: no usable attachment here for key {} (none is signed by it, \
+             or their bytes are not here), so none of the parent's {residual} foundation(s) \
+             is searched; pass --key naming the key that maintains this pile, or run \
+             'collection maintain' with this key",
             hex::encode_upper(host.to_bytes())
         ),
     }
