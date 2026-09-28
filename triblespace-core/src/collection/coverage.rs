@@ -39,7 +39,14 @@
 //! put there by `cat` or by anyone who can write the bucket, is believed. It
 //! also says nothing about a bug in the host's own computation, whose merges
 //! are believed as signed. An index without a host believes no MERGE at all,
-//! and its frontier is every believed foundation.
+//! and its frontier is every believed foundation. A MAP is believed on the
+//! same ground as a MERGE, the host's key alone: an attachment adds no data.
+//! Whether its node is believed is the reader's question, answered by
+//! reaching the node in the parent's lattice; the fold stays collection-local.
+//!
+//! An attached collection has no foundations and no lattice of its own. A
+//! COMMIT, DERIVE or MERGE aimed at one attests nothing and is dropped, not
+//! parked: its descriptor names no policy, so nothing could ever admit it.
 //!
 //! Coverage is collection-local. Every row is keyed by its own collection and
 //! every support is a set of that collection's own foundations: commit
@@ -577,14 +584,15 @@ pub enum Admittance {
 }
 
 /// What the fold must know about a collection before it can believe a
-/// foundation naming it: whether it is a root or derived, and whether this
-/// signer may write it.
+/// foundation naming it: whether it is a root, derived or attached, and
+/// whether this signer may write it.
 ///
-/// Asked only for COMMIT and DERIVE. A MERGE is believed on the index's host
-/// key alone, with no WRITE check and no descriptor read: a merge adds no
-/// foundation, and whether its inputs are believed is the fold's own
-/// question. Implementors do the descriptor and capability work; this module
-/// only asks, and only once per foundation.
+/// Admission is asked only for COMMIT and DERIVE. A MERGE or a MAP is
+/// believed on the index's host key alone, with no WRITE check: neither adds
+/// a foundation, and whether a merge's inputs are believed is the fold's own
+/// question. A MERGE still asks [`Self::source`], so that one aimed at an
+/// attached collection is dropped. Implementors do the descriptor and
+/// capability work; this module only asks, and only once per foundation.
 pub trait RecordAdmission {
     /// The collection this one derives from, if any.
     ///
@@ -608,6 +616,9 @@ pub enum SourceResolution {
     Root,
     /// The collection this one derives from.
     Derived(CollectionHandle),
+    /// The collection whose nodes this attached collection indexes. It holds
+    /// no foundations and no merges; only a MAP attests anything about it.
+    Attached(CollectionHandle),
     /// This descriptor is not resident, so the question has no answer yet. An
     /// absence, not a refusal — the blob may still arrive.
     Missing(CollectionHandle),
@@ -1212,7 +1223,17 @@ impl CoverageIndex {
                 // nothing until every input has a support, which `drive`
                 // enforces all or nothing and the inputs' consumer edges
                 // retry. Another key's join never gets here; the check is
-                // the same one `attest` and `park` made.
+                // the same one `attest` and `park` made. An attached
+                // collection has no lattice: a join into one attests
+                // nothing, when its descriptor says so.
+                if matches!(
+                    admission.source(entry.collection),
+                    SourceResolution::Attached(_)
+                ) {
+                    self.fresh_joins
+                        .remove(&join_key(entry.collection, &edge_key(&entry.attestation)));
+                    return;
+                }
                 if self.folds(&entry.attestation, entry.signer) {
                     self.believe(entry.collection, entry.attestation, entry.signer);
                 }
@@ -1226,16 +1247,19 @@ impl CoverageIndex {
                     self.hold(Awaiting::Lineage(descriptor), entry);
                     return;
                 }
-                SourceResolution::Root => {
-                    // A derive into a root names no foundation of it.
+                SourceResolution::Root | SourceResolution::Attached(_) => {
+                    // A derive into a root or an attached collection names
+                    // no foundation of it.
                     return;
                 }
             },
             Attestation::Foundation { .. } => {
-                // A commit written straight into a derived collection names no
-                // foundation of it. A missing descriptor is decided below,
-                // where admission parks it on that blob.
-                if let SourceResolution::Derived(_) = admission.source(entry.collection) {
+                // A commit written straight into a derived or an attached
+                // collection names no foundation of it. A missing descriptor
+                // is decided below, where admission parks it on that blob.
+                if let SourceResolution::Derived(_) | SourceResolution::Attached(_) =
+                    admission.source(entry.collection)
+                {
                     return;
                 }
             }
@@ -1706,13 +1730,20 @@ impl<'a, R: BlobStoreGet + CapabilityProofRead> StoreWriters<'a, R> {
         }
     }
 
-    /// Read one descriptor to see whether this collection is a root or
-    /// derived. The fold only needs that kind; it never reads the source.
+    /// Read one descriptor to see whether this collection is a root, derived
+    /// or attached. The fold only needs that kind; it never reads the source
+    /// or the parent.
     fn read_source(&self, collection: CollectionHandle) -> SourceResolution {
         let Ok(descriptor) = super::api::load_collection_descriptor(self.reader, collection) else {
             return SourceResolution::Missing(collection);
         };
-        match super::descriptor::source(descriptor.fragment.facts()) {
+        let facts = descriptor.fragment.facts();
+        match super::descriptor::parent(facts) {
+            Ok(Some(parent)) => return SourceResolution::Attached(parent),
+            Ok(None) => {}
+            Err(_) => return SourceResolution::Missing(collection),
+        }
+        match super::descriptor::source(facts) {
             Ok(Some(source)) => SourceResolution::Derived(source),
             Ok(None) => SourceResolution::Root,
             Err(_) => SourceResolution::Missing(collection),

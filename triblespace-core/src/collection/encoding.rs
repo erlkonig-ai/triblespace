@@ -9,8 +9,9 @@
 //! - a [`CollectionDerivation`] lets one target encoding own its canonical,
 //!   parameterized, join-preserving conversion from one source encoding;
 //! - a [`DeriveMapping`] is an explicit mapping whose images are derived into
-//!   a collection of their own, and [`MapMapping`] states the contract of a
-//!   mapping attached to another collection's nodes instead;
+//!   a collection of their own, and a [`MapMapping`] (or the target-owned
+//!   [`CollectionAttachment`]) indexes another collection's nodes instead,
+//!   into an attached collection;
 //! - [`Collection`] binds an encoding to one exact, content-addressed
 //!   descriptor.
 //!
@@ -26,6 +27,7 @@ use std::error::Error;
 use std::fmt;
 use std::marker::PhantomData;
 
+use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::{Blob, BlobEncoding};
 use crate::metadata::{self, MetaDescribe};
 use crate::prelude::{exists, pattern};
@@ -375,21 +377,25 @@ impl<T: CollectionDerivation> DeriveMapping for CanonicalDerivation<T> {
 /// A mapping attached to another collection's nodes: an index of each node,
 /// not a collection of its own.
 ///
-/// This trait declares no items yet; attached collections fill it in. It
-/// states the contract an implementor takes on:
+/// An attached collection's descriptor names its parent collection and one
+/// concrete mapping, and no policy: its records are `MAP(node ->
+/// attachment)` signed by the host, which no other host believes and which
+/// never replicate. The contract an implementor takes on:
 ///
-/// - It maps any node of the collection it indexes, a merge result as well
-///   as a foundation.
+/// - It maps any node of its parent's lattice, a merge result as well as a
+///   foundation. The parent is a root collection: its nodes are
+///   `SimpleArchive`s.
 /// - It is deterministic. Its inputs are the node, immutable dependencies the
-///   node or the mapping names, and optionally other attachments of the same
-///   node. A dependency that is not resident is reported as
+///   node or the mapping names, and optionally the attachments of the same
+///   node in other attached collections of the same parent, named by
+///   [`Self::siblings`]. A dependency that is not resident is reported as
 ///   [`CollectionOperationError::MissingDependency`], never read as absent.
 /// - Every host that can read the node can compute it: it is not pinned to a
 ///   model, an accelerator class or any other property of a host. A mapping
 ///   that is pinned cannot implement this trait, so it cannot be attached by
 ///   mistake; it stays a [`DeriveMapping`].
-/// - Its images need no join. Building a node's image from its children's
-///   images is an optional shortcut, and it must equal mapping the node.
+/// - Its images need no join. `Capacity` means this node's attachment cannot
+///   be represented; a reader then descends to finer nodes.
 ///
 /// Its law is cover-query equivalence. A reader answers a query over a cover
 /// of attachments at mixed granularity -- one node's image beside the images
@@ -403,7 +409,117 @@ impl<T: CollectionDerivation> DeriveMapping for CanonicalDerivation<T> {
 /// cover, a text index takes each entity's maximum score, and a count or any
 /// other non-idempotent aggregate is never summed over overlapping supports.
 /// Every implementor is tested against this law over random covers.
-pub trait MapMapping {}
+pub trait MapMapping: Sized {
+    /// Encoding of the attachments.
+    type Target: CollectionEncoding;
+
+    /// Canonical concrete mapping fragment embedded in an attached
+    /// descriptor.
+    fn fragment(&self) -> Fragment;
+
+    /// Bind and validate the concrete mapping an attached descriptor names.
+    fn bind(parent: &Fragment, attached: &Fragment) -> Result<Self, CollectionOperationError>;
+
+    /// The attached collections of the same parent whose attachment of a
+    /// node this mapping reads, in the order [`Self::map`] receives them.
+    /// Their handles are named by the mapping's own descriptor, never
+    /// recomputed.
+    fn siblings(&self) -> Vec<CollectionHandle> {
+        Vec::new()
+    }
+
+    /// Compute the attachment of one node.
+    ///
+    /// `siblings` holds one usable attachment of this node in each collection
+    /// [`Self::siblings`] names. `reader` resolves immutable dependencies
+    /// named by the node, the siblings or the mapping; nothing else in the
+    /// store is an input.
+    fn map<R>(
+        &self,
+        node: &Blob<SimpleArchive>,
+        siblings: &[CollectionData],
+        reader: &R,
+    ) -> Result<Blob<Self::Target>, CollectionOperationError>
+    where
+        R: StoreRead;
+}
+
+/// The canonical attachment owned by one target encoding: the
+/// [`MapMapping`] counterpart of [`CollectionDerivation`], with the same
+/// contract and law.
+///
+/// The target names the runtime argument its mapping fragment carries;
+/// attaching it is [`crate::collection::CollectionStoreExt::attach`].
+pub trait CollectionAttachment: CollectionEncoding {
+    /// Runtime argument which distinguishes concrete mappings of this
+    /// canonical relation.
+    type Argument;
+
+    /// Canonical concrete mapping fragment embedded in an attached
+    /// descriptor.
+    fn fragment(argument: &Self::Argument) -> Fragment;
+
+    /// Bind and validate the concrete mapping an attached descriptor names.
+    fn bind(
+        parent: &Fragment,
+        attached: &Fragment,
+    ) -> Result<Self::Argument, CollectionOperationError>;
+
+    /// See [`MapMapping::siblings`].
+    fn siblings(_argument: &Self::Argument) -> Vec<CollectionHandle> {
+        Vec::new()
+    }
+
+    /// See [`MapMapping::map`].
+    fn map<R>(
+        argument: &Self::Argument,
+        node: &Blob<SimpleArchive>,
+        siblings: &[CollectionData],
+        reader: &R,
+    ) -> Result<Blob<Self>, CollectionOperationError>
+    where
+        R: StoreRead;
+}
+
+/// Internal adapter from a target-owned attachment to the explicit mapping
+/// engine, the counterpart of [`CanonicalDerivation`].
+pub(crate) struct CanonicalAttachment<T: CollectionAttachment> {
+    argument: T::Argument,
+}
+
+impl<T: CollectionAttachment> CanonicalAttachment<T> {
+    pub(crate) fn new(argument: T::Argument) -> Self {
+        Self { argument }
+    }
+}
+
+impl<T: CollectionAttachment> MapMapping for CanonicalAttachment<T> {
+    type Target = T;
+
+    fn fragment(&self) -> Fragment {
+        T::fragment(&self.argument)
+    }
+
+    fn bind(parent: &Fragment, attached: &Fragment) -> Result<Self, CollectionOperationError> {
+        T::bind(parent, attached).map(Self::new)
+    }
+
+    fn siblings(&self) -> Vec<CollectionHandle> {
+        T::siblings(&self.argument)
+    }
+
+    fn map<R>(
+        &self,
+        node: &Blob<SimpleArchive>,
+        siblings: &[CollectionData],
+        reader: &R,
+    ) -> Result<Blob<Self::Target>, CollectionOperationError>
+    where
+        R: StoreRead,
+    {
+        T::map(&self.argument, node, siblings, reader)
+    }
+}
 
 /// A descriptor does not denote the encoding requested by its Rust type.
 #[derive(Clone, Debug, Eq, PartialEq)]

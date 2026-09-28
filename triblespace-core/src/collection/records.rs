@@ -198,6 +198,28 @@ attributes! {
     ///
     /// Minted with `trible genid` on 2026-08-19.
     "8D93B2A626CD32182C0A026BC8D5A014" unsafe as pub collection_source: Handle<SimpleArchive>;
+    /// The collection whose lattice nodes an attached collection indexes, by
+    /// descriptor handle.
+    ///
+    /// An attached collection carries this and its mapping and nothing else:
+    /// no policy and no source. Its records are MAPs, one per indexed node
+    /// of the parent, believed only on the host's own key. It is kept apart
+    /// from [`collection_source`] because a source makes a collection
+    /// derived, with foundations and a lattice of its own; a parent does not.
+    ///
+    /// Anchor minted with `trible genid` on 2026-09-28:
+    /// `9B20AA2BE739DB1B4911186620368262`.
+    "9B20AA2BE739DB1B4911186620368262" as pub collection_parent: Handle<SimpleArchive>;
+    /// An attached collection of the same parent whose attachment of a node
+    /// a mapping reads instead of the node itself, by descriptor handle.
+    ///
+    /// A parameter of one concrete mapping instance, carried on the mapping
+    /// entity. It names the sibling explicitly, so nothing recomputes a
+    /// sibling's handle from its parent and mapping.
+    ///
+    /// Anchor minted with `trible genid` on 2026-09-28:
+    /// `7A852B1D4097983EA823D04C8CD1A53A`.
+    "7A852B1D4097983EA823D04C8CD1A53A" as pub mapping_reads_attached: Handle<SimpleArchive>;
     /// Blob representation carried by the elements of this collection.
     /// Minted with `trible genid` on 2026-08-07.
     "620FA4F2B456357DCD1882E583B85CC3" unsafe as pub collection_representation: GenId;
