@@ -3379,49 +3379,6 @@ fn derive_bm25(
     ))
 }
 
-/// The host a reading command folds as: the key it would sign with.
-///
-/// An explicit key must load. Without one, the default (`TRIBLESPACE_KEY`,
-/// else `self.key` beside the pile) is used when it loads, and a read with no
-/// loadable key believes no MERGE: correct, only wider, since it attaches
-/// every believed foundation instead of the host's merges over them.
-#[cfg(feature = "search")]
-fn reading_host(
-    explicit: Option<&std::path::Path>,
-    pile: &std::path::Path,
-) -> Result<Option<VerifyingKey>> {
-    let path = triblespace_core::signing_key_file::resolve_path(explicit, pile);
-    match triblespace_core::signing_key_file::load_existing(&path) {
-        Ok(key) => Ok(Some(key.verifying_key())),
-        Err(error) if explicit.is_some() => {
-            Err(anyhow!("load signing key {}: {error}", path.display()))
-        }
-        Err(_) => Ok(None),
-    }
-}
-
-#[cfg(all(test, feature = "search"))]
-mod reading_host_tests {
-    use super::reading_host;
-
-    #[test]
-    fn an_explicit_key_is_the_host_and_must_load() {
-        let directory = tempfile::tempdir().unwrap();
-        let pile = directory.path().join("read.pile");
-        let key = directory.path().join("reader.key");
-        let signer = triblespace_core::signing_key_file::init(&key).unwrap();
-        assert_eq!(
-            reading_host(Some(&key), &pile).unwrap(),
-            Some(signer.verifying_key())
-        );
-        let missing = directory.path().join("missing.key");
-        assert!(
-            reading_host(Some(&missing), &pile).is_err(),
-            "a key named on the command line that does not load is an error, not a keyless read"
-        );
-    }
-}
-
 #[cfg(feature = "search")]
 fn run_search(
     path: PathBuf,
@@ -3445,7 +3402,7 @@ fn run_search(
 
     // A read, but one of merged carriers: opened as the host it attaches the
     // host's merges instead of every leaf.
-    use super::open_refreshed_with;
+    use super::{open_refreshed_with, reading_host};
     let host = reading_host(key.as_deref(), &path)?;
     let mut pile = open_refreshed_with(&path, host)?;
     let res = (|| -> Result<()> {

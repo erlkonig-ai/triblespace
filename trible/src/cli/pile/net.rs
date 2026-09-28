@@ -21,10 +21,10 @@ use triblespace_net::health_record::{self, Recorder, DEFAULT_MAX_AGE, REPORT_EVE
 use triblespace_net::peer::{Peer, PeerConfig, ReconcileDirection, ReconcileQos};
 use triblespace_net::reconcile::ReplicationMode;
 
-/// Open the pile as `host`, the key this process signs with: its fold then
-/// believes exactly the MERGEs every other process of this host believes.
-fn open_pile(path: &PathBuf, host: ed25519_dalek::VerifyingKey) -> Result<Pile> {
-    crate::cli::pile::open_refreshed_as(path, host)
+/// Open the pile, as `host` when the command publishes or reads MERGEs and
+/// with no host otherwise (the rule is on [`crate::cli::pile::open_refreshed`]).
+fn open_pile(path: &PathBuf, host: Option<ed25519_dalek::VerifyingKey>) -> Result<Pile> {
+    crate::cli::pile::open_refreshed_with(path, host)
 }
 
 fn parse_peers(values: &[String]) -> Result<Vec<EndpointAddr>> {
@@ -324,7 +324,9 @@ fn run_sync(
         let _entered = runtime.enter();
         crate::cli::util::shutdown_signal()?
     };
-    let mut pile = open_pile(&pile_path, key.verifying_key())?;
+    // Sync writes and serves records and never publishes or reads a MERGE,
+    // so it opens with no host, whichever key signs its telemetry.
+    let mut pile = open_pile(&pile_path, None)?;
     let mut telemetry = telemetry::Publisher::open(&mut pile, &key, telemetry_options)?;
     let mut recorder = Recorder::new(key.verifying_key());
     let health_collection = if health || health_collection_value.is_some() {
@@ -558,8 +560,10 @@ fn run_health(
 
     let signer = load_existing_key(key_path, &pile_path)?;
     let authority = signer.verifying_key();
-    // This command maintains: its carry signs with `signer`.
-    let mut pile = open_pile(&pile_path, authority)?;
+    // This command maintains the health views and reads through their
+    // merges: the merges their upkeep publishes are signed with `signer`, and
+    // only a store opened as that key believes them.
+    let mut pile = open_pile(&pile_path, Some(authority))?;
     let result = (|| -> Result<()> {
         let source = open_health_collection(&mut pile, authority, collection_value.as_deref())?;
         // Derived chains carry the source's policy, so an explicit shared
