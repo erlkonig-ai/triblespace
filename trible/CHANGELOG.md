@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
+- `pile collection search --key <path>` names the key whose merges the read
+  believes. Without it the default key (`TRIBLESPACE_KEY`, else `self.key`
+  beside the pile) is used when it loads; with no key the read believes no
+  MERGE and attaches every member separately, which finds the same hits.
 - `pile net sync --health-collection <handle>` (with `--health-key`) and
   `pile net health --collection <handle>` report into and read from an
   explicit existing health generation instead of the reporting key's own
@@ -21,6 +25,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   the signing key the single direct root.
 
 ### Changed
+
+- Every command that maintains opens the pile as the key it signs with:
+  `pile collection maintain` and `maintain-all` (with or without `--watch`),
+  `pile net health` and `pile net sync`. A store believes only its host's
+  MERGEs, so a carry on a store opened as no key, or as another key, fails
+  with `HostMismatch` instead of publishing merges nothing would believe.
+  `pile net dashboard` opens as the key it resolves and draws only the MERGEs
+  the fold believes; another key's MERGE draws no edge and no member. Commands
+  that only scan, copy or write records (`list`, `show`, `log`, `adopt`,
+  `adopted`, `init`, `derive`, the grants, `compact`, `migrate`, `diagnose`,
+  `verify`) keep opening with no host.
+
+- `pile diagnose conflicts` fails only when one key names two results for one
+  MERGE input set: a host believes only its own MERGEs, so that is its own
+  computation disagreeing with itself. Different keys naming different
+  results for one join are two private lattices, and a DERIVE locator with
+  several outputs is several leaves; both are counted and neither fails.
 
 - `pile net sync` uses Peer-owned hydration and latest-snapshot network
   publication. Ready payload downloads no longer trigger an intermediate
