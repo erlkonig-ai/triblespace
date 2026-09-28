@@ -142,13 +142,15 @@ pub struct Attached {
     pub siblings: Vec<CollectionHandle>,
 }
 
-/// Every collection attached to `parent`, each after the siblings its
+/// Every collection attached to `parent` alone, each after the siblings its
 /// mapping reads.
 ///
 /// Read from the store's collection listing and each candidate's
 /// descriptor, like [`derived_from`]; an attached collection is listed once
-/// it holds a MAP. A sibling cycle, which no mapping should name, is broken
-/// by listing what remains in handle order.
+/// a record names it. A descriptor naming a second parent is not listed:
+/// an attached read walks one parent's lattice, so nothing here serves it.
+/// A sibling cycle, which no mapping should name, is broken by listing what
+/// remains in handle order.
 pub fn attached_to<S>(
     snapshot: &S,
     parent: CollectionHandle,
@@ -169,7 +171,7 @@ where
         ) else {
             continue;
         };
-        if !named.contains(&parent) {
+        if named.as_slice() != [parent] {
             continue;
         }
         pending.insert(
@@ -405,11 +407,20 @@ pub struct UpkeepReport {
     pub unknown: Vec<Derived>,
     /// Attached collections left alone for the same reason.
     pub unknown_attached: Vec<Attached>,
+    /// Attached collections whose upkeep failed, each with why; the pass
+    /// went on to the rest. What one leaves unattached is its readers'
+    /// residual, read from its bytes or named unread.
+    pub failed_attached: Vec<(Attached, String)>,
 }
 
 /// Visit every collection derived from `source`, each after its own source,
 /// then every collection attached to `source`, each after the siblings it
 /// reads, and take each as far as `upkeep` asks with `realizer`.
+///
+/// One attached collection failing is that collection's lag, not the
+/// pass's: it is named in [`UpkeepReport::failed_attached`] and the rest
+/// are still taken up. Only a signer that is not the store's host stops the
+/// pass, because no attached collection believes its MAPs.
 pub async fn upkeep_downstream<S, R>(
     store: &mut S,
     source: CollectionHandle,
@@ -440,11 +451,13 @@ where
     for target in attached {
         match realizer
             .realize_attached(store, &target, signer, upkeep)
-            .await?
+            .await
         {
-            Realized::Done => report.realized.push(target.handle),
-            Realized::Unadmitted => report.unadmitted.push(target.handle),
-            Realized::Unknown => report.unknown_attached.push(target),
+            Ok(Realized::Done) => report.realized.push(target.handle),
+            Ok(Realized::Unadmitted) => report.unadmitted.push(target.handle),
+            Ok(Realized::Unknown) => report.unknown_attached.push(target),
+            Err(error @ CollectionRealizationError::HostMismatch { .. }) => return Err(error),
+            Err(error) => report.failed_attached.push((target, error.to_string())),
         }
     }
     Ok(report)

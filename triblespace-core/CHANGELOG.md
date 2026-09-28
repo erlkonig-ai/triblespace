@@ -38,7 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`SourceResolution::Attached`). `attached_to` and `realize_attached_as` find
   and maintain every collection attached to a root, siblings first, in
   `ensure_downstream` and `maintain_downstream`, whose report names attached
-  representations it does not know in `unknown_attached`. New ids, minted with
+  representations it does not know in `unknown_attached` and attached
+  collections whose upkeep failed in `failed_attached`; one failing does not
+  stop the pass, a signer that is not the host does. `attached_to` lists only
+  descriptors naming the root as their one parent, the only kind an attached
+  read serves. New ids, minted with
   `trible genid`: `KIND_COLLECTION_MAP` `329669AA662709605053C123671DF1D2`,
   pile kind anchor `ED7B98CD20AD9A4D172F037A08CC47F1`,
   `MAP_TRANSCRIPT_DOMAIN` `4A5191C36898D0B453FEFF99ED0E3852` +
