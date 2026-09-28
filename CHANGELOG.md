@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `trible pile migrate SRC lattice-v3 --into DST` writes the lattice v3 pile
+  from a frozen copy: every COMMIT of every generation, every capability proof,
+  WANT, legacy pin and frame of unknown kind; no MERGE of any encoding or
+  signer; DERIVEs only into collections whose mapping stays derived, is
+  unrecognised, or whose descriptor is not resident; and only the blobs that
+  kept state reaches by the conservative walk, so merge results and the
+  images of dropped DERIVEs are left behind. A source another process holds
+  open is refused. `--dry-run` decides the same frames and blobs without
+  writing and prints the same report: counts by record kind, by mapping and
+  by collection, blobs kept and left behind, and a readability check through
+  the fold opened without a host key, which lists every believed foundation
+  whose payload is not resident. The core half is
+  `PileFile::rewrite_retained_into_filtered` with a `CollectionFrameFilter`,
+  and `PileFile::plan_retained_rewrite`.
+
 - Remove the reference-summary collection encoding (`ReferenceSummaryBlob`,
   `REFERENCE_SUMMARY_MAPPING_V2`), its derived-collection realizer branch and
   the `trible pile collection derive reference-summary` kind. Sync routes blobs

@@ -8,6 +8,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
+- `pile migrate SRC lattice-v3 --into DST [--dry-run] [--allow-absent]
+  [--attached-mapping ID]`: the lattice v3 cutover filter. It keeps every
+  COMMIT of every generation, proofs, WANTs, pins and unknown frames; leaves
+  behind every MERGE and the DERIVEs of mappings that become attached
+  (Succinct, Rank9, EntityIdSet, latest, LWW register, both BM25 mappings,
+  PathSummary) or are deleted (ReferenceSummary, by its literal ids); keeps
+  DERIVEs of the semantic and stored-vector NVFP4 indexes, of unrecognised
+  mappings and of collections without a resident descriptor; and keeps only
+  the blobs the kept state reaches by the conservative walk. It refuses a
+  source another process holds open, reads it read-only, and checks the
+  result through the fold without a host key: a believed foundation whose
+  payload is not resident is listed and refused unless `--allow-absent`.
+  `--dry-run` prints the same report without writing.
 - `pile net sync --health-collection <handle>` (with `--health-key`) and
   `pile net health --collection <handle>` report into and read from an
   explicit existing health generation instead of the reporting key's own

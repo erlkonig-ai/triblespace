@@ -65,6 +65,7 @@ mod adopt;
 #[cfg(test)]
 mod maintenance_counts;
 mod maintenance_telemetry;
+pub(crate) mod v3_mappings;
 
 /// Hex characters shown for a handle or key when the full value is not asked
 /// for. Sixteen is far past the point where two collections in one pile
