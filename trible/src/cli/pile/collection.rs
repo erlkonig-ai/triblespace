@@ -676,29 +676,15 @@ fn representation_name(id: Id) -> Option<&'static str> {
     }
 }
 
-/// The representation id of the portable BM25 carrier, with the `search`
-/// feature; `None` otherwise.
+/// The representation id of the portable BM25 carrier. BM25 is plain CPU
+/// code every build carries, so this is always known.
 fn bm25_carrier_id() -> Option<Id> {
-    #[cfg(feature = "search")]
-    {
-        Some(<triblespace_search::portable_bm25::PortableBM25Blob as MetaDescribe>::id())
-    }
-    #[cfg(not(feature = "search"))]
-    {
-        None
-    }
+    Some(<triblespace_search::portable_bm25::PortableBM25Blob as MetaDescribe>::id())
 }
 
-/// The text-attribute-to-BM25 mapping id, under the same feature.
+/// The text-attribute-to-BM25 mapping id.
 fn bm25_mapping_id() -> Option<Id> {
-    #[cfg(feature = "search")]
-    {
-        Some(triblespace_search::text_bm25::TEXT_ATTRIBUTE_TO_BM25)
-    }
-    #[cfg(not(feature = "search"))]
-    {
-        None
-    }
+    Some(triblespace_search::text_bm25::TEXT_ATTRIBUTE_TO_BM25)
 }
 
 /// The representation id of the NVFP4 vector set over f32 embeddings, when
@@ -3297,7 +3283,6 @@ fn derive_nvfp4(
     ))
 }
 
-#[cfg(feature = "search")]
 async fn maintain_bm25<S: Store + AsyncBlobStoreAcquire + Send>(
     pile: &mut S,
     snapshot: &S::Snapshot,
@@ -3311,16 +3296,6 @@ async fn maintain_bm25<S: Store + AsyncBlobStoreAcquire + Send>(
     pile.maintain(collection, signer)
         .await
         .map_err(|error| anyhow!("maintain BM25 collection: {error}"))
-}
-
-#[cfg(not(feature = "search"))]
-async fn maintain_bm25<S: Store + AsyncBlobStoreAcquire + Send>(
-    _pile: &mut S,
-    _snapshot: &S::Snapshot,
-    _handle: CollectionHandle,
-    _signer: &SigningKey,
-) -> Result<S::Snapshot> {
-    unreachable!("the BM25 representation is only recognised with the search feature")
 }
 
 #[cfg(feature = "search")]
