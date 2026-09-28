@@ -1077,11 +1077,18 @@ impl<T: HeldSource> HeldIndex<T> {
     /// that waited for the walk and that it did not reach are walked last,
     /// against the latest observation, and become routes; the walk ends only
     /// when none is waiting, so none is left for a snapshot to read.
-    pub(crate) fn walk(&self, threads: usize, only: Option<&Handles>, stop: Option<&AtomicBool>) {
+    ///
+    /// `false` when the walk was abandoned before it finished.
+    pub(crate) fn walk(
+        &self,
+        threads: usize,
+        only: Option<&Handles>,
+        stop: Option<&AtomicBool>,
+    ) -> bool {
         let (first, mut queue, epoch) = {
             let state = self.lock();
             let Some(first) = state.fed.clone() else {
-                return;
+                return true;
             };
             (first, state.walk_roots(only), state.epoch)
         };
@@ -1102,12 +1109,12 @@ impl<T: HeldSource> HeldIndex<T> {
                 if !self.walk_batch(
                     snapshot, epoch, threads, &abandoned, batch, &mut known, &mut seen,
                 ) {
-                    return;
+                    return false;
                 }
             }
             let mut state = self.lock();
             if state.epoch != epoch || abandoned() {
-                return;
+                return false;
             }
             if rounds == MAX_REPORT_ROUNDS {
                 // Reports keep arriving: the collections still owing some
@@ -1133,7 +1140,7 @@ impl<T: HeldSource> HeldIndex<T> {
                     self.wake.notify_all();
                 }
                 state.walked();
-                return;
+                return true;
             }
             let mut reports = Vec::new();
             for collection in &covered {
@@ -1173,7 +1180,7 @@ impl<T: HeldSource> HeldIndex<T> {
                     state.warming.remove(&collection.raw);
                 }
                 state.walked();
-                return;
+                return true;
             }
             // Reported blobs were resident when their reports were taken,
             // possibly only after this walk's snapshot.
@@ -1446,22 +1453,39 @@ impl<T: HeldSource> HeldIndex<T> {
 
     fn run_walker(&self, config: HeldWalkConfig, stop: &AtomicBool) {
         let mut due = Instant::now() + config.interval;
+        // The start-up walks this walker took and has not finished.
+        let mut owed = Handles::new();
         loop {
             let only = {
                 let mut state = self.lock();
                 loop {
-                    let Some(walker) = &mut state.walker else {
-                        return;
-                    };
-                    let requested = !walker.requested.is_empty();
                     if stop.load(Ordering::Relaxed) {
+                        // Hand back what a cancelled walk took and left
+                        // warming, in the lock hold that records the stop.
+                        let back: Vec<Raw> = owed
+                            .iter()
+                            .filter(|collection| state.warming.get(collection).is_some())
+                            .copied()
+                            .collect();
+                        let Some(walker) = &mut state.walker else {
+                            return;
+                        };
+                        for collection in &back {
+                            walker.requested.insert(&Entry::new(collection));
+                        }
                         walker.threads -= 1;
                         if walker.threads == 0 {
                             state.walker = None;
                             state.release_warming();
+                        } else if !back.is_empty() {
+                            self.wake.notify_all();
                         }
                         return;
                     }
+                    let Some(walker) = &mut state.walker else {
+                        return;
+                    };
+                    let requested = !walker.requested.is_empty();
                     let now = Instant::now();
                     if requested || now >= due {
                         break;
@@ -1479,6 +1503,7 @@ impl<T: HeldSource> HeldIndex<T> {
                         .expect("the walker is attached")
                         .requested,
                 );
+                owed = requested.clone();
                 let only = if Instant::now() >= due {
                     // The periodic walk covers every collection, the
                     // requested ones too.
@@ -1489,7 +1514,9 @@ impl<T: HeldSource> HeldIndex<T> {
                 };
                 only
             };
-            self.walk(config.threads, only.as_ref(), Some(stop));
+            if self.walk(config.threads, only.as_ref(), Some(stop)) {
+                owed = Handles::new();
+            }
         }
     }
 }
@@ -3179,6 +3206,35 @@ mod tests {
             held_set(&store.snapshot().unwrap(), c).contains(&h),
             "an explicit walk after the walkers stopped did nothing"
         );
+    }
+
+    /// A walker stopped in the middle of a start-up walk hands that walk back:
+    /// another attached walker takes it at once, not at its periodic pass.
+    #[test]
+    fn a_stopped_walker_hands_back_the_start_up_walk_it_took() {
+        let _guard = walker_guard();
+        let mut store = Store::default();
+        let c = collection(&mut store, "handed back");
+        let metadata = blob(&mut store, b"metadata");
+        let leaf = blob(&mut store, b"leaf");
+        let data = blob_naming(&mut store, b"data", &[leaf]);
+        commit(&mut store, c, data, metadata);
+        let mut first = store.start_held_walker(walker_config(Duration::from_secs(3600)));
+        let opener = store.gate.hold();
+        store.track_held([c]);
+        store.snapshot().unwrap();
+        // The first walker took C's start-up walk and is inside its scan.
+        store.gate.await_walker();
+        let second = store.start_held_walker(walker_config(Duration::from_secs(3600)));
+        (first.stop.take().expect("the first walker is running"))();
+        drop(opener);
+        drop(first);
+        until(
+            &mut store,
+            "the second walker to take the start-up walk",
+            |snapshot| held_set(snapshot, c) == BTreeSet::from([c.raw, metadata, data, leaf]),
+        );
+        drop(second);
     }
 
     #[test]
