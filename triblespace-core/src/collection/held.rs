@@ -597,11 +597,18 @@ impl<T> State<T> {
     }
 
     /// Record one scan: the blob, and an edge to each resident child.
-    fn record_scan(&mut self, handle: Raw, children: &[Raw]) {
+    /// Returns the children the cache did not name yet.
+    fn record_scan(&mut self, handle: Raw, children: &[Raw]) -> Vec<Raw> {
         self.scanned.insert(&Entry::new(&handle));
+        let mut learned = Vec::new();
         for child in children {
-            self.edges.insert(&Entry::new(&pair(&handle, child)));
+            let key = pair(&handle, child);
+            if self.edges.get(&key).is_none() {
+                self.edges.insert(&Entry::new(&key));
+                learned.push(*child);
+            }
         }
+        learned
     }
 }
 
@@ -918,24 +925,11 @@ impl<T: HeldSource> HeldIndex<T> {
         state.view.clone()
     }
 
-    /// Publish one piece of a walk: its scanned edges, the blobs it reached
-    /// per collection, and the seeds it could not read.
-    fn publish(
-        &self,
-        epoch: u64,
-        scanned: Vec<(Raw, Option<Arc<[Raw]>>)>,
-        reached: Vec<(CollectionHandle, Vec<Raw>)>,
-        unreadable: Vec<(CollectionHandle, Raw)>,
-    ) {
+    /// Publish the seeds a walk could not read.
+    fn publish_unreadable(&self, epoch: u64, unreadable: Vec<(CollectionHandle, Raw)>) {
         let mut state = self.lock();
         if state.epoch != epoch {
             return;
-        }
-        for (handle, children) in scanned {
-            if let Some(children) = children {
-                // Edges only accumulate: a rescan adds late children.
-                state.record_scan(handle, &children);
-            }
         }
         for (collection, handle) in unreadable {
             let Some(held) = state.held.get(&collection.raw) else {
@@ -963,9 +957,41 @@ impl<T: HeldSource> HeldIndex<T> {
                     .insert(&Entry::new(&pair(&handle, &collection.raw)));
             }
         }
+    }
+
+    /// Publish one piece of a walk, children before parents: each blob's
+    /// edges, then its membership in the collections that reached it, then
+    /// the membership its newly learned children owe the collections that
+    /// already hold it. A held blob is thus never left with a cached child
+    /// that is not held.
+    fn publish_piece(&self, epoch: u64, piece: Vec<(Raw, Arc<[Raw]>, Vec<CollectionHandle>)>) {
+        let mut state = self.lock();
+        if state.epoch != epoch {
+            return;
+        }
         let mut changed = false;
-        for (collection, nodes) in reached {
-            changed |= state.reach(None, collection, nodes);
+        for (handle, children, reached) in piece {
+            let learned = state.record_scan(handle, &children);
+            for collection in reached {
+                changed |= state.reach(None, collection, [handle]);
+            }
+            if learned.is_empty() {
+                continue;
+            }
+            let holders: Vec<CollectionHandle> = state
+                .held
+                .iter()
+                .filter(|collection| {
+                    state
+                        .held
+                        .get(collection)
+                        .is_some_and(|held| held.has_prefix(&handle))
+                })
+                .map(|collection| Inline::new(*collection))
+                .collect();
+            for collection in holders {
+                changed |= state.reach(None, collection, learned.iter().copied());
+            }
         }
         if changed {
             state.publish_view();
@@ -977,10 +1003,12 @@ impl<T: HeldSource> HeldIndex<T> {
     /// reports, and refresh the edge cache. A walk that completes ends the
     /// start-up walks it covered.
     ///
-    /// The roots are walked in batches. Each batch publishes its edges level
-    /// by level and then its blobs deepest first, so a blob joins a held set
-    /// only once its whole resident closure has: a positive set published
-    /// incomplete, never one that holds a blob without its children. Reports
+    /// The roots are walked in batches. Each batch is read to the end and
+    /// then published children before parents -- each blob's edges with its
+    /// membership -- so a blob joins a held set only once its whole resident
+    /// closure has, and a held blob never has a cached child that is not
+    /// held: a positive set published incomplete, never one that is not
+    /// closed. Reports
     /// that waited for the walk and that it did not reach are walked last,
     /// against the latest observation, and become routes; the walk ends only
     /// when none is waiting, so none is left for a snapshot to read.
@@ -1093,9 +1121,10 @@ impl<T: HeldSource> HeldIndex<T> {
         }
     }
 
-    /// Walk one batch of roots to the end: scan level by level, publishing
-    /// edges and unreadable seeds as they come, then the reached blobs
-    /// deepest level first. `false` when the walk was abandoned.
+    /// Walk one batch of roots to the end, level by level, publishing the
+    /// unreadable seeds as they come; then publish what it read and reached,
+    /// children before parents, in bounded pieces. `false` when the walk was
+    /// abandoned.
     fn walk_batch(
         &self,
         snapshot: &T,
@@ -1106,7 +1135,9 @@ impl<T: HeldSource> HeldIndex<T> {
         seen: &mut BTreeMap<CollectionHandle, HashSet<Raw>>,
     ) -> bool {
         let abandoned = || self.abandoned(epoch);
-        let mut levels = Vec::new();
+        // Scratch for this batch: the collections that reached each readable
+        // blob.
+        let mut reached: HashMap<Raw, Vec<CollectionHandle>> = HashMap::new();
         while frontier.iter().any(|(_, nodes)| !nodes.is_empty()) {
             if abandoned() {
                 return false;
@@ -1124,15 +1155,13 @@ impl<T: HeldSource> HeldIndex<T> {
                 // A partial level is not published.
                 return false;
             }
-            for (handle, children) in &scanned {
-                known.insert(*handle, children.clone());
+            for (handle, children) in scanned {
+                known.insert(handle, children);
             }
-            let mut reached = Vec::with_capacity(frontier.len());
             let mut unreadable = Vec::new();
             let mut next = Vec::with_capacity(frontier.len());
             for (collection, nodes) in frontier {
                 let seen = seen.entry(collection).or_default();
-                let mut here = Vec::new();
                 let mut after = Vec::new();
                 for handle in nodes {
                     if !seen.insert(handle) {
@@ -1140,7 +1169,7 @@ impl<T: HeldSource> HeldIndex<T> {
                     }
                     match &known[&handle] {
                         Some(children) => {
-                            here.push(handle);
+                            reached.entry(handle).or_default().push(collection);
                             after.extend(
                                 children
                                     .iter()
@@ -1151,36 +1180,63 @@ impl<T: HeldSource> HeldIndex<T> {
                         None => unreadable.push((collection, handle)),
                     }
                 }
-                reached.push((collection, here));
                 next.push((collection, after));
             }
-            // Published in bounded pieces, so a snapshot taken meanwhile waits
-            // for one piece, never for a whole level of a large start-up walk.
-            let mut scanned = scanned.into_iter().peekable();
-            while scanned.peek().is_some() {
-                let piece: Vec<_> = scanned.by_ref().take(PUBLISH_PIECE).collect();
-                self.publish(epoch, piece, Vec::new(), Vec::new());
-            }
-            self.publish(epoch, Vec::new(), Vec::new(), unreadable);
-            levels.push(reached);
+            self.publish_unreadable(epoch, unreadable);
             frontier = next;
         }
-        // Every edge under the batch is published: deepest first, each blob
-        // joins with the closure below it already held.
-        for reached in levels.into_iter().rev() {
-            for (collection, nodes) in reached {
-                for piece in nodes.chunks(PUBLISH_PIECE) {
-                    self.publish(
-                        epoch,
-                        Vec::new(),
-                        vec![(collection, piece.to_vec())],
-                        Vec::new(),
-                    );
-                }
-            }
+        // Published in bounded pieces, so a snapshot taken meanwhile waits
+        // for one piece, never for a whole batch.
+        let order = children_first(reached.keys().copied(), known);
+        for piece in order.chunks(PUBLISH_PIECE) {
+            let piece = piece
+                .iter()
+                .map(|handle| {
+                    let children = known[handle].clone().expect("a reached blob was read");
+                    (
+                        *handle,
+                        children,
+                        reached.remove(handle).unwrap_or_default(),
+                    )
+                })
+                .collect();
+            self.publish_piece(epoch, piece);
         }
         true
     }
+}
+
+/// `nodes` ordered so that each comes after those of its children that are
+/// among them.
+fn children_first(
+    nodes: impl IntoIterator<Item = Raw>,
+    known: &HashMap<Raw, Option<Arc<[Raw]>>>,
+) -> Vec<Raw> {
+    let nodes: HashSet<Raw> = nodes.into_iter().collect();
+    let mut order = Vec::with_capacity(nodes.len());
+    let mut entered: HashSet<Raw> = HashSet::new();
+    for start in &nodes {
+        let mut stack = vec![(*start, false)];
+        while let Some((node, exit)) = stack.pop() {
+            if exit {
+                order.push(node);
+                continue;
+            }
+            if !entered.insert(node) {
+                continue;
+            }
+            stack.push((node, true));
+            if let Some(Some(children)) = known.get(&node) {
+                stack.extend(
+                    children
+                        .iter()
+                        .filter(|child| nodes.contains(*child) && !entered.contains(*child))
+                        .map(|child| (*child, false)),
+                );
+            }
+        }
+    }
+    order
 }
 
 /// Up to [`WALK_BATCH`] roots from the front of `queue`.
@@ -2831,6 +2887,60 @@ mod tests {
             held_set(snapshot, c2).contains(&r)
         });
         drop(walker);
+    }
+
+    /// A walk rescans a held blob A and learns a child B that arrived after
+    /// A was first scanned. No observation holds A while the edge cache
+    /// names a child of A that is not held: a closure stopping at A must not
+    /// miss a child the cache knows.
+    #[test]
+    fn a_held_blob_is_closed_under_the_edges_a_walk_learns() {
+        let _guard = walker_guard();
+        let mut store = Counting::default();
+        let c = collection(&mut store, "edge growth");
+        let metadata = blob(&mut store, b"metadata");
+        let b_bytes = unresident_naming(b"late child B", &[]);
+        let b = handle_of(&b_bytes);
+        let a = blob_naming(&mut store, b"A names B", &[b]);
+        let root = blob_naming(&mut store, b"root names A", &[a]);
+        commit(&mut store, c, root, metadata);
+        let index: Arc<HeldIndex<CountingSnapshot>> = Arc::new(HeldIndex::default());
+        index.track([c]);
+        index.observe(&store.snapshot().unwrap());
+        store.put::<UnknownBlob, _>(b_bytes).unwrap();
+        let now = store.snapshot().unwrap();
+        index.observe(&now);
+        let closed = |index: &HeldIndex<CountingSnapshot>| {
+            let state = index.lock();
+            let held = state.held.get(&c.raw).cloned().unwrap_or_default();
+            for parent in held.iter_ordered() {
+                for child in related(&state.edges, parent) {
+                    assert!(
+                        held.has_prefix(&child),
+                        "a held blob has a cached child that is not held"
+                    );
+                }
+            }
+        };
+        let _opener = store.gate.hold_at(b);
+        let walk = std::thread::Builder::new()
+            .name("held-blob-walk".into())
+            .spawn({
+                let index = Arc::clone(&index);
+                move || index.walk(&now, 1, None)
+            })
+            .unwrap();
+        store.gate.await_walker();
+        let p = blob_naming(&mut store, b"new foundation over A", &[a]);
+        commit(&mut store, c, p, metadata);
+        index.observe(&store.snapshot().unwrap());
+        closed(&index);
+        store.gate.open();
+        walk.join().unwrap();
+        let view = index.observe(&store.snapshot().unwrap());
+        closed(&index);
+        let held = view.held(c).unwrap();
+        assert!(held.has_prefix(&b) && held.has_prefix(&p));
     }
 
     #[test]
