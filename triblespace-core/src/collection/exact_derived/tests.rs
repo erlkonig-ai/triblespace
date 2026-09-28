@@ -5306,4 +5306,109 @@ mod lattice_v2 {
             ])
         );
     }
+
+    /// Review finding, 2026-09-28: whether a leaf was usable was asked of
+    /// the pile's index, which says a blob is present without reading it.
+    /// A leaf whose output bytes are damaged therefore counted: its
+    /// foundation was never derived again, and every carry that grouped it
+    /// failed to read it. A leaf now counts only when its output reads, as
+    /// the Files lag count already asked, and the carry joins only nodes
+    /// whose bytes read. A mapping that reproduces restores the bytes; one
+    /// that does not adds a leaf, and the damaged one sits out.
+    #[test]
+    fn a_leaf_whose_output_is_damaged_is_derived_again_and_the_carry_reads_around_it() {
+        use crate::repo::pile::Pile;
+
+        for reproduces in [true, false] {
+            reset_mapping_calls();
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let host = key(41);
+            let mut pile = Pile::open_as(file.path(), host.verifying_key()).unwrap();
+            let root = pile.collection("root", policy()).unwrap();
+            let first = pile.derive::<FirstEncoding>(root, (), policy()).unwrap();
+            let sources: Vec<_> = (0..8).map(|entity| payload(41, entity)).collect();
+            for source in &sources {
+                pile.put::<SimpleArchive, _>(source.clone()).unwrap();
+                let metadata = pile
+                    .put::<SimpleArchive, _>(TribleSet::new().to_blob())
+                    .unwrap();
+                pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
+                    &host,
+                    root.handle(),
+                    data(source),
+                    metadata,
+                )))
+                .unwrap();
+            }
+            drop(block_on(pile.ensure(first, &host)).unwrap());
+            pile.close().unwrap();
+
+            // Damage one byte of the first source's image in the file.
+            let image = salted_image(&sources[0], 0);
+            let damaged = data(&image);
+            let mut bytes = std::fs::read(file.path()).unwrap();
+            let at = bytes
+                .windows(image.bytes.len())
+                .rposition(|window| window == image.bytes.as_ref())
+                .unwrap();
+            bytes[at + 8] ^= 0x40;
+            std::fs::write(file.path(), &bytes).unwrap();
+
+            let mut pile = Pile::open_as(file.path(), host.verifying_key()).unwrap();
+            let snapshot = pile.snapshot().unwrap();
+            let handle = Handle::<FirstEncoding>::from_hash(damaged);
+            assert!(snapshot.contains_blob(handle).unwrap(), "present");
+            assert!(snapshot.metadata(handle).unwrap().is_none(), "unreadable");
+            drop(snapshot);
+
+            if !reproduces {
+                FIRST_SALT.set(9);
+            }
+            let mapped = FIRST_MAP_CALLS.get();
+            let result = block_on(pile.maintain(first, &host));
+            assert!(result.is_ok(), "{:?}", result.err());
+            assert_eq!(FIRST_MAP_CALLS.get() - mapped, 1, "derived again");
+            let records: Vec<CollectionRecord> = pile
+                .snapshot()
+                .unwrap()
+                .records()
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            let leaves: Vec<CollectionData> = records
+                .iter()
+                .filter_map(|record| match record {
+                    CollectionRecord::Derive(leaf) if leaf.collection() == first.handle() => {
+                        Some(leaf.output())
+                    }
+                    _ => None,
+                })
+                .collect();
+            let merges: Vec<CollectionMerge> = records
+                .iter()
+                .filter_map(|record| match record {
+                    CollectionRecord::Merge(merge) if merge.collection() == first.handle() => {
+                        Some(*merge)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(merges.len(), 1);
+            let mut carried: BTreeSet<CollectionData> = sources[1..]
+                .iter()
+                .map(|source| data(&salted_image(source, 0)))
+                .collect();
+            if reproduces {
+                assert_eq!(leaves.len(), 8, "the leaf's bytes are restored");
+                carried.insert(damaged);
+                let snapshot = pile.snapshot().unwrap();
+                assert!(snapshot.metadata(handle).unwrap().is_some(), "readable");
+            } else {
+                assert_eq!(leaves.len(), 9, "a second leaf");
+                carried.insert(data(&salted_image(&sources[0], 9)));
+            }
+            assert_eq!(inputs(&merges[0]), carried);
+            pile.close().unwrap();
+        }
+    }
 }

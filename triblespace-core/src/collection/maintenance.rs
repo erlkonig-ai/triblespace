@@ -484,7 +484,7 @@ impl Lineage {
 }
 
 /// Every frontier node of one collection, and those of them whose bytes are
-/// here, each widest first.
+/// here and read, each widest first.
 ///
 /// The frontier is every believed foundation, whoever signed it, and the
 /// host's own merge results. Only a held node is ever joined or absorbs
@@ -492,7 +492,10 @@ impl Lineage {
 /// holding another key's commit or leaf records without their payloads
 /// neither fetches them nor restarts the carry once per payload; it can
 /// still be absorbed by a held node that covers it, which reads no bytes,
-/// and it rejoins the carry proper when its bytes arrive.
+/// and it rejoins the carry proper when its bytes arrive. A node whose bytes
+/// are here but do not read -- a store's index may say a blob is present
+/// without reading it, as a pile's does -- sits out the same way, instead of
+/// failing every carry that would join it.
 fn frontier_nodes<R>(
     snapshot: &R,
     coverage: &Coverage,
@@ -512,7 +515,7 @@ where
     for raw in frontier.iter_ordered() {
         let node: CollectionData = Inline::new(*raw);
         if let Some(support) = coverage.of(collection, node) {
-            if resident.get(raw).is_some() {
+            if resident.get(raw).is_some() && reads(snapshot, node)? {
                 held.push((node, support.clone()));
             }
             every.push((node, support.clone()));
@@ -528,6 +531,18 @@ where
         });
     }
     Ok((every, held))
+}
+
+/// Whether a blob's bytes can be read here, which on a store whose index
+/// answers presence without reading (a pile's) is more than being resident.
+fn reads<R: StoreRead>(
+    snapshot: &R,
+    blob: CollectionData,
+) -> Result<bool, CollectionRealizationError> {
+    Ok(snapshot
+        .metadata(Handle::<UnknownBlob>::from_hash(blob))
+        .map_err(|error| CollectionRealizationError::storage("read a resident blob", error))?
+        .is_some())
 }
 
 /// Refuse to publish a MERGE the store would not fold.
@@ -1169,14 +1184,17 @@ fn derive_order(key: &VerifyingKey, foundation: CollectionData) -> [u8; 32] {
 /// fetched for another owner, and a reader of the target never waits on an
 /// owner who is offline.
 ///
-/// An output a believed leaf names that is not here is not waited for: the
-/// outputs of one foundation's leaves go into `wanted` together, as one
-/// group any one of which would do, and the acquiring loop asks for them
-/// once the rest of the work -- deriving what needs no fetch, and the carry
-/// -- is done ([`super::exact_derived`]). Until then its foundation is left
-/// alone. When none of a foundation's leaves' outputs could be had
-/// (`unavailable`), those leaves do not count and the foundation is mapped
-/// again. A failed
+/// A leaf counts only when its output reads: an output that is here but
+/// does not read -- damaged bytes a pile's index still lists -- is no more
+/// use than an absent one, and as it cannot be fetched either (it is here),
+/// it counts as unavailable at once. An output a believed leaf names that
+/// is not here is not waited for: the outputs of one foundation's leaves go
+/// into `wanted` together, as one group any one of which would do, and the
+/// acquiring loop asks for them once the rest of the work -- deriving what
+/// needs no fetch, and the carry -- is done ([`super::exact_derived`]).
+/// Until then its foundation is left alone. When none of a foundation's
+/// leaves' outputs could be had (`unavailable`, or damaged), those leaves do
+/// not count and the foundation is mapped again. A failed
 /// fetch is current unavailability, not loss: a result equal to an output a
 /// leaf already names restores those bytes and publishes nothing, and a
 /// different one is a second leaf beside the first. When the first output
@@ -1285,24 +1303,33 @@ where
             CollectionRealizationError::storage("intersect leaf outputs with residency", error)
         })?
     };
+    let mut readable = FrontierSet::new();
+    for raw in resident.iter_ordered() {
+        if reads(&snapshot, Inline::new(*raw))? {
+            readable.insert(&Entry::new(raw));
+        }
+    }
     drop(snapshot);
     own.sort_by_cached_key(|(foundation, _, _)| derive_order(&key, *foundation));
     foreign.sort_by_cached_key(|(foundation, _, _)| derive_order(&key, *foundation));
-    // A foundation with a leaf whose output is here is done, whoever signed
-    // the leaf. One whose leaves' outputs are not here waits for them to be
-    // asked for, and is owed a leaf only once none of them could be had.
+    // A foundation with a leaf whose output reads here is done, whoever
+    // signed the leaf. One whose leaves' outputs are not here waits for them
+    // to be asked for, and is owed a leaf only once none of them could be
+    // had; an output here that does not read cannot be had.
     let mut owed = Vec::new();
     for (entries, owned) in [(own, true), (foreign, false)] {
         for (foundation, locator, outputs) in entries {
             if outputs
                 .iter()
-                .any(|output| resident.get(&output.raw).is_some())
+                .any(|output| readable.get(&output.raw).is_some())
             {
                 continue;
             }
             let unasked = outputs
                 .iter()
-                .filter(|output| !unavailable.contains(*output))
+                .filter(|output| {
+                    !unavailable.contains(*output) && resident.get(&output.raw).is_none()
+                })
                 .copied()
                 .collect::<Vec<_>>();
             if unasked.is_empty() {
