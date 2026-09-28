@@ -419,6 +419,10 @@ pub struct UpkeepReport {
     pub unknown: Vec<Derived>,
     /// Attached collections left alone for the same reason.
     pub unknown_attached: Vec<Attached>,
+    /// Derived collections whose upkeep failed, each with why; the pass went
+    /// on to the rest. What one leaves underived or uncarried is its lag,
+    /// and what it did publish stands.
+    pub failed: Vec<(Derived, String)>,
     /// Attached collections whose upkeep failed, each with why; the pass
     /// went on to the rest. What one leaves unattached is its readers'
     /// residual, read from its bytes or named unread.
@@ -429,10 +433,12 @@ pub struct UpkeepReport {
 /// then every collection attached to `source`, each after the siblings it
 /// reads, and take each as far as `upkeep` asks with `realizer`.
 ///
-/// One attached collection failing is that collection's lag, not the
-/// pass's: it is named in [`UpkeepReport::failed_attached`] and the rest
-/// are still taken up. Only a signer that is not the store's host stops the
-/// pass, because no attached collection believes its MAPs.
+/// One derived or attached collection failing is that collection's lag, not
+/// the pass's: it is named in [`UpkeepReport::failed`] or
+/// [`UpkeepReport::failed_attached`], and the rest are still taken up, a
+/// collection derived from a failed one too, from what the failed one does
+/// hold. Only a signer that is not the store's host stops the pass, because
+/// no collection believes its MERGEs or MAPs.
 pub async fn upkeep_downstream<S, R>(
     store: &mut S,
     source: CollectionHandle,
@@ -454,10 +460,12 @@ where
     drop(snapshot);
     let mut report = UpkeepReport::default();
     for target in derived {
-        match realizer.realize(store, &target, signer, upkeep).await? {
-            Realized::Done => report.realized.push(target.handle),
-            Realized::Unadmitted => report.unadmitted.push(target.handle),
-            Realized::Unknown => report.unknown.push(target),
+        match realizer.realize(store, &target, signer, upkeep).await {
+            Ok(Realized::Done) => report.realized.push(target.handle),
+            Ok(Realized::Unadmitted) => report.unadmitted.push(target.handle),
+            Ok(Realized::Unknown) => report.unknown.push(target),
+            Err(error @ CollectionRealizationError::HostMismatch { .. }) => return Err(error),
+            Err(error) => report.failed.push((target, error.to_string())),
         }
     }
     for target in attached {

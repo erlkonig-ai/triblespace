@@ -5411,4 +5411,104 @@ mod lattice_v2 {
             pile.close().unwrap();
         }
     }
+
+    /// Review finding, 2026-09-28: one derived collection failing stopped
+    /// the pass at it, before every derived collection after it and every
+    /// attached one. It is now that collection's lag, named with why, like
+    /// a failing attached collection.
+    #[test]
+    fn one_derived_collection_failing_leaves_the_others_upkept() {
+        use crate::blob::encodings::succinctarchive::SuccinctArchiveBlob;
+        use crate::collection::{
+            derived_from, ensure_downstream, Attached, CoreRealizer, Derived, RealizeDerived,
+            Realized, Upkeep,
+        };
+
+        /// The test realizer, except that one derived collection fails.
+        struct FailsOne(CollectionHandle);
+        impl<S> RealizeDerived<S> for FailsOne
+        where
+            S: crate::repo::Store + crate::repo::async_store::AsyncBlobStoreAcquire + Send,
+        {
+            async fn realize(
+                &mut self,
+                store: &mut S,
+                derived: &Derived,
+                signer: &SigningKey,
+                upkeep: Upkeep,
+            ) -> Result<Realized, CollectionRealizationError> {
+                if derived.handle == self.0 {
+                    return Err(CollectionRealizationError::Resolution(
+                        "this one cannot be taken up".to_owned(),
+                    ));
+                }
+                if derived.representation == <FirstEncoding as MetaDescribe>::id() {
+                    return crate::collection::realize_as::<S, FirstEncoding>(
+                        store, derived, signer, upkeep,
+                    )
+                    .await;
+                }
+                TestRealizer.realize(store, derived, signer, upkeep).await
+            }
+
+            async fn realize_attached(
+                &mut self,
+                store: &mut S,
+                attached: &Attached,
+                signer: &SigningKey,
+                upkeep: Upkeep,
+            ) -> Result<Realized, CollectionRealizationError> {
+                CoreRealizer
+                    .realize_attached(store, attached, signer, upkeep)
+                    .await
+            }
+        }
+
+        let owner = key(41);
+        let mut store = MemoryRepo::for_host(owner.verifying_key());
+        let root = store.collection("facts", policy()).unwrap();
+        let raw = store.derive::<TestImage>(root, (), policy()).unwrap();
+        let first = store.derive::<FirstEncoding>(root, (), policy()).unwrap();
+        let succinct = store.attach::<SuccinctArchiveBlob>(root, ()).unwrap();
+        own_commit(&mut store, root, 41, 0);
+        block_on(store.ensure(raw, &owner)).unwrap();
+        block_on(store.ensure(first, &owner)).unwrap();
+        block_on(store.ensure_attached(succinct, &owner)).unwrap();
+        let listed: Vec<CollectionHandle> = derived_from(&store.snapshot().unwrap(), root.handle())
+            .unwrap()
+            .into_iter()
+            .map(|derived| derived.handle)
+            .collect();
+        assert_eq!(listed.len(), 2);
+        let (failing, other) = (listed[0], listed[1]);
+
+        for (entity, upkeep) in [(1, Upkeep::Ensure), (2, Upkeep::Maintain)] {
+            own_commit(&mut store, root, 41, entity);
+            let mut realizer = FailsOne(failing);
+            let report = block_on(async {
+                match upkeep {
+                    Upkeep::Ensure => {
+                        ensure_downstream(&mut store, root.handle(), &owner, &mut realizer).await
+                    }
+                    Upkeep::Maintain => {
+                        maintain_downstream(&mut store, root.handle(), &owner, &mut realizer).await
+                    }
+                }
+            })
+            .unwrap();
+            assert_eq!(report.realized, vec![other, succinct.handle()]);
+            assert_eq!(
+                report
+                    .failed
+                    .iter()
+                    .map(|(derived, reason)| (
+                        derived.handle,
+                        reason.contains("cannot be taken up")
+                    ))
+                    .collect::<Vec<_>>(),
+                vec![(failing, true)]
+            );
+            assert!(report.failed_attached.is_empty());
+        }
+    }
 }
