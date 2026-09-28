@@ -46,6 +46,13 @@ pub enum CollectionRecordSelector {
     /// The source is not part of the selector: a target has one source, named
     /// by its descriptor, so selecting the target selects the mapping.
     DeriveTarget(CollectionHandle),
+    /// Select the records that replicate for `C`: its `COMMIT`s and
+    /// `DERIVE`s.
+    ///
+    /// A collection is a set of foundations. A `MERGE` is the signing host's
+    /// own lattice node, never replicated, so it never matches. This is the
+    /// selection sync exports and hydrates.
+    Foundations(CollectionHandle),
 }
 
 pub(crate) fn selectors_match_record(
@@ -58,6 +65,11 @@ pub(crate) fn selectors_match_record(
         CollectionRecord::Derive(derive) => derive.collection(),
     };
     if selectors.contains(&CollectionRecordSelector::Collection(collection)) {
+        return true;
+    }
+    if !matches!(record, CollectionRecord::Merge(_))
+        && selectors.contains(&CollectionRecordSelector::Foundations(collection))
+    {
         return true;
     }
     let output = match record {
