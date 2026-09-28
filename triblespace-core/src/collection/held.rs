@@ -1051,6 +1051,17 @@ impl<T: HeldSource> HeldIndex<T> {
             // Reported blobs were resident when their reports were taken,
             // possibly only after this walk's snapshot.
             latest = state.fed.clone();
+            drop(state);
+            // A blob the walk could not read holds only for the snapshot it
+            // tried: forget it, so the round reads it again.
+            known.retain(|handle, children| {
+                if children.is_none() {
+                    for seen in seen.values_mut() {
+                        seen.remove(handle);
+                    }
+                }
+                children.is_some()
+            });
             queue = reports;
         }
     }
@@ -2755,6 +2766,39 @@ mod tests {
             "a snapshot read {} blobs of a report the walk owed",
             foreground.len()
         );
+        drop(walker);
+    }
+
+    /// One walk covers C1 and C2. It finds C1's payload R absent; R then
+    /// arrives and is reported for C2, where no record names it. The round
+    /// that walks C2's reports reads R against the newer observation instead
+    /// of reusing the older one's negative answer.
+    #[test]
+    fn a_report_round_rereads_a_blob_the_older_snapshot_lacked() {
+        let _guard = walker_guard();
+        let mut store = Store::default();
+        let c1 = collection(&mut store, "negative first");
+        let c2 = collection(&mut store, "reported second");
+        let metadata = blob(&mut store, b"metadata");
+        let r_bytes = unresident_naming(b"absent at the walk's start", &[]);
+        let r = handle_of(&r_bytes);
+        commit(&mut store, c1, r, metadata);
+        let leaf = blob(&mut store, b"second leaf");
+        let data = blob_naming(&mut store, b"second payload", &[leaf]);
+        commit(&mut store, c2, data, metadata);
+        let walker = store.start_held_walker(walker_config(Duration::from_secs(3600)));
+        let _opener = store.gate.hold_at(leaf);
+        store.track_held([c1, c2]);
+        store.snapshot().unwrap();
+        store.gate.await_walker();
+        store.put::<UnknownBlob, _>(r_bytes).unwrap();
+        store.snapshot().unwrap();
+        store.note_held(c2, Inline::new(r));
+        store.snapshot().unwrap();
+        store.gate.open();
+        until(&mut store, "C2 to hold the reported R", |snapshot| {
+            held_set(snapshot, c2).contains(&r)
+        });
         drop(walker);
     }
 
