@@ -32,6 +32,22 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   source embeddings are never requantized to read an existing member. The
   constructor also stops re-reading its own freshly encoded output.
 
+- `NvFp4CosineSet` holds a set of rows, not one row per handle. One handle may
+  carry several different rows (two derivations of one content that did not
+  reproduce bit for bit), and a row two members hold identically is one row.
+  Rows are ordered by a canonical key, the row's own byte planes in layout
+  order with the handle first, so every set of rows has one encoding. The join
+  is set union: total, associative, commutative and idempotent, where it
+  returned an error for two different rows under one handle. `validate_member`
+  audits strict ascent in that order. Readers bind each handle once:
+  `reconstructed_cosines` keeps the maximum over a handle's rows (`cosine`,
+  `similar_to` and `len` are per handle), and the exact `top_k`, `above` and
+  `similar_to` take one candidate per handle, bounded by the largest
+  certificate over its rows, so each handle is fetched and returned once.
+  Every member that was canonical before is unchanged and joins to the same
+  bytes, so `NVFP4_COSINE_SET` and the encoding descriptions, which derived
+  descriptors embed, are unchanged and no collection handle moves.
+
 ### The semantic index (`semantic`, feature `semantic`)
 
 - Rows are keyed by the content handle they embed, the value `V` of a
