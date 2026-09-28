@@ -77,19 +77,21 @@ const FLOAT_LEN: usize = FLOAT_BYTES;
 const FOOTER_LEN: usize = 16;
 
 // Stable marker for this exact byte and cosine recipe. Minted with
-// `trible genid` on 2026-09-01 after strengthening `error_f32` to cover the
-// prescribed explicit-f32 decode. It is embedded in the derived encoding's
-// identity together with E, so a recipe or exact embedding encoding change
-// necessarily produces another collection encoding.
+// `trible genid` on 2026-09-28, when a set of rows replaced one row per
+// handle. It is embedded in the derived encoding's identity together with E,
+// so a recipe or exact embedding encoding change necessarily produces another
+// collection encoding.
 //
-// Set rows (several rows under one handle) extend this value space without
-// changing it: every member that was canonical under the earlier
-// one-row-per-handle rule is canonical under the canonical row order, has the
-// same bytes, and joins to the same bytes; only joins the earlier rule refused
-// now have a result. The marker and both `describe()` texts are therefore
-// unchanged, because a derived descriptor embeds them and editing either
-// would give every existing NVFP4 collection a new handle.
-pub const NVFP4_COSINE_SET: Id = id_hex!("9F1A2851ADCA92BAB92688441B262DEA");
+// It replaces `9F1A2851ADCA92BAB92688441B262DEA` (minted 2026-09-01 after
+// strengthening `error_f32` to cover the prescribed explicit-f32 decode),
+// whose values hold at most one row per handle. Those values are canonical
+// here too, with the same bytes and the same joins, but the converse fails: a
+// reader of that recipe given several rows under one handle scores the handle
+// twice, or refuses the cover as conflicting. A wider value space is another
+// type, so a reader that does not know it finds no collection instead of
+// misreading one. Collections under the old marker are neither rewritten nor
+// rebound; they are derived again under this one.
+pub const NVFP4_COSINE_SET: Id = id_hex!("7442860EF495677853BE03EC0E5079AC");
 
 // Stable identity for the SimpleArchive attribute-selection mapping. Minted
 // with `trible genid` on 2026-09-01 for the strengthened row certificate. The
@@ -145,7 +147,7 @@ impl MetaDescribe for NvFp4CosineRecipe {
         let id = NVFP4_COSINE_SET;
         entity! { ExclusiveId::force_ref(&id) @
             metadata::name: "nvfp4-cosine-recipe",
-            metadata::description: "Canonical row-local two-stage residual NVFP4 cosine carrier. Rows are ordered by exact embedding handle and independently normalized, deterministically rotated, block-scaled, quantized twice, and conservatively error-bounded for both canonical f64 and prescribed explicit-f32 reconstruction. Join is set union by handle; exact source embeddings remain lazy reranking dependencies.",
+            metadata::description: "Canonical row-local two-stage residual NVFP4 cosine carrier. A value is a set of rows, and one handle may carry several different rows. Each row is independently normalized, deterministically rotated, block-scaled, quantized twice, and conservatively error-bounded for both canonical f64 and prescribed explicit-f32 reconstruction. Rows are ordered by handle, then by their own stored bytes in layout order, and identical rows are one row. Join is set union of rows. A reader binds each handle once, and its reconstruction score and candidate bound are the maximum over its rows; exact source embeddings remain lazy reranking dependencies.",
             metadata::tag: metadata::KIND_TAG,
         }
     }

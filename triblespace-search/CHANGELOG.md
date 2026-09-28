@@ -45,8 +45,13 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   `similar_to` take one candidate per handle, bounded by the largest
   certificate over its rows, so each handle is fetched and returned once.
   Every member that was canonical before is unchanged and joins to the same
-  bytes, so `NVFP4_COSINE_SET` and the encoding descriptions, which derived
-  descriptors embed, are unchanged and no collection handle moves.
+  bytes, but a reader of the old recipe would misread several rows under one
+  handle, so the recipe is a new type: `NVFP4_COSINE_SET` is
+  `7442860EF495677853BE03EC0E5079AC` (minted with `trible genid`), replacing
+  `9F1A2851ADCA92BAB92688441B262DEA`, and the recipe description states the
+  set rows. Derived descriptors embed both, so every `NvFp4CosineSet`
+  collection gets a new handle; collections under the old recipe are not
+  rebound and must be derived again.
 
 ### The semantic index (`semantic`, feature `semantic`)
 
