@@ -488,12 +488,14 @@ fn proof_seeds<T: HeldSource>(
     for proof in snapshot.proofs()? {
         let proof = proof?;
         let resource: CollectionHandle = Inline::new(proof.resource().into_bytes());
-        // Only the proof's own resource, or a collection its resource
-        // descriptor names, can keep it; the predicate decides.
+        // Only the proof's own resource, and the collections its resource
+        // descriptor names (whether or not the resource is itself tracked),
+        // can keep it; the predicate decides.
         let mut candidates = BTreeSet::new();
         if collections.contains(&resource) {
             candidates.insert(resource);
-        } else if let Ok(facts) = snapshot.get::<TribleSet, SimpleArchive>(resource) {
+        }
+        if let Ok(facts) = snapshot.get::<TribleSet, SimpleArchive>(resource) {
             for (collection,) in find!(
                 (collection: Inline<Handle<SimpleArchive>>),
                 pattern!(&facts, [{ _?resource @ resource_collection: ?collection }])
@@ -2552,8 +2554,17 @@ mod tests {
     /// itself from one of C's policy roots, or over a subordinate resource
     /// whose own descriptor entity both routes to C and declares the root.
     /// A valid proof irrelevant to C seeds nothing.
+    ///
+    /// Whether the resource R is itself tracked changes nothing: a proof over
+    /// R still counts for C when R's descriptor routes to C.
     #[test]
     fn only_proofs_the_collections_authorization_keeps_are_seeds() {
+        for track_resource in [false, true] {
+            proofs_the_authorization_keeps(track_resource);
+        }
+    }
+
+    fn proofs_the_authorization_keeps(track_resource: bool) {
         use crate::capability::policy::resource_policy;
         use crate::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
 
@@ -2611,10 +2622,17 @@ mod tests {
                 ))
                 .unwrap();
         }
-        store.track_held([c]);
+        if track_resource {
+            store.track_held([c, resource]);
+        } else {
+            store.track_held([c]);
+        }
         let held = held_set(&store.snapshot().unwrap(), c);
         assert!(held.contains(&exact.raw));
-        assert!(held.contains(&routed.raw));
+        assert!(
+            held.contains(&routed.raw),
+            "a routed proof seeds C (resource tracked: {track_resource})"
+        );
         for irrelevant in [wrong_root, split, foreign_root] {
             assert!(
                 !held.contains(&irrelevant.raw),
