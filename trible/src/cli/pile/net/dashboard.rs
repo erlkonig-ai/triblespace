@@ -188,9 +188,15 @@ impl Reader {
             Ok(_) => {}
         }
         let mut setup_warnings = Vec::new();
+        // The key this dashboard would sign with is the host whose merges it
+        // draws: opened as it, the fold believes that key's MERGEs and no
+        // other's. Without one it believes none, and every believed
+        // foundation stays on its collection's frontier.
+        let mut host = None;
         let health = match super::load_existing_key(options.key.clone(), &options.pile) {
             Ok(signer) => {
                 let authority = signer.verifying_key();
+                host = Some(authority);
                 let mut descriptors = MemoryRepo::default();
                 let collection: Collection<SimpleArchive> = descriptors
                     .collection(
@@ -212,8 +218,8 @@ impl Reader {
         handles.sort_unstable_by_key(|handle| handle.raw);
         handles.dedup();
         let sources = handles.into_iter().map(SelectedSource::new).collect();
-        let pile =
-            crate::cli::pile::open_refreshed(&options.pile).map_err(|_| ReadFailure::OpenPile)?;
+        let pile = crate::cli::pile::open_refreshed_with(&options.pile, host)
+            .map_err(|_| ReadFailure::OpenPile)?;
         Ok(Self {
             pile,
             sources,
@@ -405,7 +411,8 @@ struct LatticeCollection {
     /// Whether this collection's descriptor archive is resident and decodable
     /// in this observation.
     descriptor_resident: bool,
-    /// Signed records naming this collection, by kind.
+    /// Signed records naming this collection, by kind: every one stored, so
+    /// `merges` counts other keys' MERGEs too, which the fold never believes.
     commits: u64,
     merges: u64,
     derives: u64,
@@ -415,6 +422,8 @@ struct LatticeCollection {
     /// not hold.
     result_resident: u64,
     /// Attestations of this collection that no capability proof admits yet.
+    /// Only COMMITs and DERIVEs wait on a grant: a MERGE needs none, since the
+    /// host's own are believed as they stand and another key's never are.
     ///
     /// A different absence from `result_resident`, and the reason it is worth
     /// its own field: missing bytes arrive on their own once replication
@@ -624,11 +633,11 @@ struct Member {
     committed: bool,
     /// The member's bytes are here.
     resident: bool,
-    /// A record *in this collection* produced it: a `MERGE` result or a
-    /// `DERIVE` output.
+    /// A record *in this collection* produced it: the result of a `MERGE` the
+    /// fold believes, or a `DERIVE` output.
     ///
-    /// `false` with `committed` also false is a member reached only as
-    /// somebody else's join input — real, resident, and made by a record this
+    /// `false` with `committed` also false is a member reached only as an
+    /// input of a believed join — real, resident, and made by a record this
     /// observation cannot see. It was already counted here and printed as a
     /// number beside the picture, which is the one absence in the whole view a
     /// reader could not point at. It is now carried per member so the mark can
@@ -652,14 +661,18 @@ struct Member {
 /// it is here, by the route that was allowed.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum Admission {
-    /// An admitted record attested it.
+    /// A believed record attested it: an admitted COMMIT or DERIVE, or a join
+    /// of the host's whose every input has a support.
     Admitted,
     /// A record attests it and no capability proof admits that record's signer
     /// yet. Waiting on a grant somebody must issue.
     Unadmitted,
-    /// Neither. Either nothing here produced it — it was reached as somebody
-    /// else's join input — or its lineage has not replicated, which is waiting
-    /// on bytes rather than on a grant and belongs to nobody in particular.
+    /// Neither. Nothing here attests it — it was reached only as an input of
+    /// a believed join — or its lineage has not replicated, or it is the
+    /// result of a join of the host's still waiting for an input's support.
+    /// Those wait on bytes or on other records rather than on a grant, and
+    /// belong to nobody in particular. Another key's MERGE never lands here:
+    /// it is not believed, so it draws nothing at all.
     #[default]
     Unknown,
 }
@@ -670,7 +683,7 @@ enum Admission {
 /// *within* one, and it is the merge chain: `MERGE(C, low, high, result)`
 /// states `low ⊔ high = result` under C's join law, so its two inputs are
 /// literally the two edges below a join. Nothing is summarised — the edges are
-/// the equations.
+/// the equations the fold believes, which are the host's own.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct MemberLattice {
     /// The collection these members belong to.
@@ -696,6 +709,12 @@ struct MemberLattice {
 /// A `DERIVE` naming this collection contributes only its output. Its input is
 /// a member of the *source* collection and has no place in this order; drawing
 /// it here would put two different collections' members in one lattice.
+///
+/// A `MERGE` contributes only when the fold believes it: the host's own join,
+/// the host being the key the store was opened as. Another key's MERGE stays
+/// in the store and is never folded into a support, a consumer edge or a
+/// frontier, so its edges and its result are not part of this lattice at all;
+/// drawing them would draw a lattice no reader here attaches.
 fn observe_members<R: triblespace_core::repo::StoreRead>(
     snapshot: &R,
     collection: [u8; 32],
@@ -704,9 +723,20 @@ fn observe_members<R: triblespace_core::repo::StoreRead>(
     use triblespace_core::collection::records::{CollectionData, CollectionRecord};
     use triblespace_core::collection::CollectionRecordSelector;
 
-    let selectors = BTreeSet::from([CollectionRecordSelector::Collection(CollectionHandle::new(
-        collection,
-    ))]);
+    // Admission and belief are the facts the record scan cannot see, so they
+    // come from the fold rather than from the records. Settling this one
+    // collection is what makes its answers mean anything: an index never
+    // asked about a lineage holds no parked rows for it, so a per-collection
+    // question asked without settling first reports a clean zero for exactly
+    // the collections nobody has looked at. The snapshot memoises the fold,
+    // so asking again for a collection the lattice pass already settled costs
+    // the clone and nothing else.
+    let target = CollectionHandle::new(collection);
+    let coverage = snapshot
+        .index(&BTreeSet::from([target]))
+        .map_err(|_| ReadFailure::RefreshPile)?;
+
+    let selectors = BTreeSet::from([CollectionRecordSelector::Collection(target)]);
     let records = snapshot
         .select_records(&selectors)
         .map_err(|_| ReadFailure::RefreshPile)?;
@@ -723,6 +753,20 @@ fn observe_members<R: triblespace_core::repo::StoreRead>(
                 handles.insert(data);
             }
             CollectionRecord::Merge(merge) => {
+                // The consumer side of the MERGE relation, read by its own
+                // key: a believed join has an edge from each of its inputs,
+                // and only the host's joins are ever believed.
+                let believed = merge.inputs().first().is_some_and(|first| {
+                    coverage
+                        .joins_reading(target, *first)
+                        .iter()
+                        .any(|(inputs, result)| {
+                            *inputs == merge.merge_inputs() && *result == merge.result()
+                        })
+                });
+                if !believed {
+                    continue;
+                }
                 let result = merge.result().raw;
                 produced.insert(result);
                 handles.insert(result);
@@ -753,18 +797,6 @@ fn observe_members<R: triblespace_core::repo::StoreRead>(
         });
     }
 
-    // Admission is the one fact above the scan cannot see, so it comes from the
-    // fold rather than from the records. Settling this one collection is what
-    // makes its answers mean anything: an index never asked about a lineage
-    // holds no parked rows for it, so a per-collection question asked without
-    // settling first reports a clean zero for exactly the collections nobody
-    // has looked at. The snapshot memoises the fold, so asking again for a
-    // collection the lattice pass already settled costs the clone and nothing
-    // else.
-    let target = CollectionHandle::new(collection);
-    let coverage = snapshot
-        .index(&BTreeSet::from([target]))
-        .map_err(|_| ReadFailure::RefreshPile)?;
     let waiting = coverage.unadmitted_nodes_in(target);
 
     let order: Vec<[u8; 32]> = handles.into_iter().collect();
@@ -1624,13 +1656,25 @@ mod tests {
         assert_eq!(handles.len(), count, "each collection appears once");
     }
 
-    /// Two commits joined by one merge whose result bytes are not here.
+    /// The key [`member_fixture`]'s store is opened as, and signs with.
+    fn member_host() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[13; 32])
+    }
+
+    /// Two commits joined by one merge whose result bytes are not here, in a
+    /// store opened as the merge's signer, so the fold believes the merge.
     fn member_fixture() -> (MemoryRepo, [u8; 32], [u8; 32], [u8; 32], [u8; 32]) {
+        member_fixture_in(MemoryRepo::for_host(member_host().verifying_key()))
+    }
+
+    /// The same records in `store`, whatever key it was opened as.
+    fn member_fixture_in(
+        mut store: MemoryRepo,
+    ) -> (MemoryRepo, [u8; 32], [u8; 32], [u8; 32], [u8; 32]) {
         use triblespace_core::collection::CollectionStore;
-        let mut store = MemoryRepo::default();
+        let signer = member_host();
         let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
         let collection: Collection<SimpleArchive> = store.collection("members", policy).unwrap();
-        let signer = ed25519_dalek::SigningKey::from_bytes(&[13; 32]);
         let first = store
             .commit(collection, &signer, entity! { metadata::name: "a" })
             .unwrap();
@@ -1844,7 +1888,9 @@ mod tests {
     fn a_member_known_only_as_a_join_input_is_counted_not_hidden() {
         use triblespace_core::collection::CollectionStore;
         let (mut store, collection, first, _second, result) = member_fixture();
-        let signer = ed25519_dalek::SigningKey::from_bytes(&[19; 32]);
+        // The host's own join, so the fold believes it; it stays blocked on
+        // the orphan, which has no support, and is still an edge here.
+        let signer = member_host();
         // Join the earlier result with a member nothing here produces.
         // Deliberately NOT committed anywhere: `unproduced` counts handles
         // that are neither committed nor produced, so a commit for the orphan
@@ -1871,6 +1917,54 @@ mod tests {
             "and it is still drawn"
         );
         assert!(members.members.iter().any(|m| m.handle == first));
+    }
+
+    #[test]
+    fn another_keys_merge_draws_nothing_and_a_keyless_store_draws_no_merge() {
+        // The fold never believes a MERGE another key signed: it gives no
+        // support, no consumer edge and no frontier node. Its edges and its
+        // result are therefore not part of the lattice a reader here attaches,
+        // and drawing them would show merges nothing reads.
+        use triblespace_core::collection::CollectionStore;
+        let (mut store, collection, first, second, result) = member_fixture();
+        let stranger = ed25519_dalek::SigningKey::from_bytes(&[23; 32]);
+        let foreign = Inline::new([0x66; 32]);
+        store
+            .insert(CollectionRecord::Merge(
+                CollectionMerge::sign(
+                    &stranger,
+                    CollectionHandle::new(collection),
+                    [Inline::new(first), Inline::new(second)],
+                    foreign,
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let members = observe_members(&snapshot, collection, MEMBER_LIMIT).unwrap();
+        assert!(
+            members.members.iter().all(|m| m.handle != foreign.raw),
+            "another key's join result is not a member here"
+        );
+        let handles: BTreeSet<[u8; 32]> = members.members.iter().map(|m| m.handle).collect();
+        assert_eq!(handles, BTreeSet::from([first, second, result]));
+        assert_eq!(members.joins.len(), 2, "only the host's join is drawn");
+        assert_eq!(members.unproduced, 0);
+
+        // Opened as no key, the same records believe no MERGE at all: the
+        // commits are the whole lattice and nothing joins them.
+        let (mut keyless, collection, first, second, result) =
+            member_fixture_in(MemoryRepo::default());
+        let snapshot = keyless.snapshot().unwrap();
+        let members = observe_members(&snapshot, collection, MEMBER_LIMIT).unwrap();
+        let handles: BTreeSet<[u8; 32]> = members.members.iter().map(|m| m.handle).collect();
+        assert_eq!(handles, BTreeSet::from([first, second]));
+        assert!(!handles.contains(&result));
+        assert!(members.joins.is_empty());
+        assert!(members
+            .members
+            .iter()
+            .all(|member| member.admission == Admission::Admitted));
     }
 
     #[test]

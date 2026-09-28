@@ -738,7 +738,7 @@ fn render_members(ui: &mut egui::Ui, frame: &Frame, chosen: Option<[u8; 32]>) {
             },
             // A commit is produced by definition — an author asserted it. For
             // the rest, this is whether a record HERE made it. False is the
-            // member reached only as somebody else's join input, which until
+            // member reached only as an input of a believed join, which until
             // now was a count printed beside a mark that looked exactly like a
             // fully-produced one.
             produced: member.committed || member.produced,
@@ -751,8 +751,9 @@ fn render_members(ui: &mut egui::Ui, frame: &Frame, chosen: Option<[u8; 32]>) {
         .map(|(from, to)| LatticeEdge {
             from: *from,
             to: *to,
-            // Every edge here comes from a stored MERGE. Absence of a join is
-            // a member with nothing above it, not a dashed edge.
+            // Every edge here comes from a MERGE the fold believes, which is
+            // the host's own; another key's MERGE draws nothing. Absence of a
+            // join is a member with nothing above it, not a dashed edge.
             endorsed: true,
         })
         .collect();
@@ -797,10 +798,11 @@ fn render_members(ui: &mut egui::Ui, frame: &Frame, chosen: Option<[u8; 32]>) {
     ui.small(
         "Inside the selection: square is a commit, circle a join result or mapping \
          output, a circle with a gap at the bottom a member nothing here produced — \
-         it was reached as somebody else's join input and the record that made it is \
+         it was reached only as a join input and the record that made it is \
          elsewhere. A solid mark is vouched for, an outline is a member here that no \
          capability proof admits yet, and dashed is a member whose bytes are not here \
-         at all. Each join's two edges are its MERGE inputs.",
+         at all. Each join's edges are the inputs of one of this host's MERGEs; another \
+         key's MERGEs are not believed and are not drawn.",
     );
 }
 
