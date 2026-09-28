@@ -675,7 +675,11 @@ const OPTIONAL_FETCH_FAILURES: usize = 8;
 /// An operation that reports something after its work -- a foundation its
 /// mapping refused, a carry that failed -- has its `wanted` asked for, and
 /// runs again, before that report is returned: nothing it reports holds back
-/// a fetch. Only a storage error ends the call at once.
+/// a fetch. Only a storage error ends the call at once. A fetch that fails
+/// outright -- the store cannot reach other holders now, or cannot keep what
+/// it got -- makes that blob unavailable for this call like any failed
+/// fetch, and the first such error is reported once the work is done, in
+/// preference to what the operation reported.
 async fn acquiring<S, F>(store: &mut S, mut operation: F) -> Result<(), CollectionRealizationError>
 where
     S: Store + AsyncBlobStoreAcquire,
@@ -689,6 +693,7 @@ where
     let mut attempted = BTreeSet::new();
     let mut unavailable = BTreeSet::new();
     let mut failures = 0;
+    let mut broken = None;
     loop {
         let mut wanted = Vec::new();
         let result = {
@@ -705,7 +710,7 @@ where
             Err(CollectionRealizationError::MissingDependency { member })
                 if !attempted.contains(&member) =>
             {
-                if !acquire_missing(store, &mut attempted, member).await? {
+                if !ask(store, &mut attempted, &mut broken, member).await {
                     unavailable.insert(member);
                 }
                 continue;
@@ -724,7 +729,7 @@ where
                         continue;
                     }
                     asked = true;
-                    if acquire_missing(store, &mut attempted, member).await? {
+                    if ask(store, &mut attempted, &mut broken, member).await {
                         break;
                     }
                     unavailable.insert(member);
@@ -735,10 +740,32 @@ where
                 continue;
             }
         }
-        return match reported {
+        return match broken.or(reported) {
             Some(error) => Err(error),
             None => Ok(()),
         };
+    }
+}
+
+/// Ask for one blob this call has not asked for, and say whether it is here
+/// now. A fetch that fails outright is that blob being unavailable for this
+/// call, like one nobody hands over; the first such error is kept in
+/// `broken`, to be reported once the work is done.
+async fn ask<S>(
+    store: &mut S,
+    attempted: &mut BTreeSet<CollectionData>,
+    broken: &mut Option<CollectionRealizationError>,
+    member: CollectionData,
+) -> bool
+where
+    S: AsyncBlobStoreAcquire,
+{
+    match acquire_missing(store, attempted, member).await {
+        Ok(here) => here,
+        Err(error) => {
+            broken.get_or_insert(error);
+            false
+        }
     }
 }
 

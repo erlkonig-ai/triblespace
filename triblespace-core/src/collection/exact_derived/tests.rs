@@ -667,6 +667,9 @@ struct GuardStore {
     reject_put_at: Option<usize>,
     reject_insert_at: Option<usize>,
     acquirable: BTreeMap<CollectionData, Bytes>,
+    /// Blobs whose fetch fails outright, as a peer endpoint that cannot
+    /// start, or a fetched blob that cannot be kept, would.
+    acquire_fails: BTreeSet<CollectionData>,
     acquired: Vec<CollectionData>,
     /// How many writes `events` held when each acquisition was made.
     acquired_at: Vec<usize>,
@@ -691,6 +694,7 @@ impl GuardStore {
             reject_put_at: None,
             reject_insert_at: None,
             acquirable: BTreeMap::new(),
+            acquire_fails: BTreeSet::new(),
             acquired: Vec::new(),
             acquired_at: Vec::new(),
             inject_record_on_acquire: None,
@@ -737,6 +741,9 @@ impl AsyncBlobStoreAcquire for GuardStore {
         let member = Handle::<UnknownBlob>::to_hash(handle);
         self.acquired.push(member);
         self.acquired_at.push(self.events.len());
+        if self.acquire_fails.contains(&member) {
+            return std::future::ready(Err(GuardStoreError::Injected("acquire")));
+        }
         let result = match self.acquirable.get(&member).cloned() {
             Some(bytes) => self
                 .inner
@@ -5245,5 +5252,58 @@ mod lattice_v2 {
             result.err()
         );
         assert_eq!(leaves_by(&mut store.inner, first, 41).len(), 8);
+    }
+
+    /// Review finding, 2026-09-28: a fetch that failed outright -- a peer
+    /// endpoint that cannot start, or a fetched blob that cannot be kept --
+    /// ended the whole call at that output. It now means that blob is
+    /// unavailable for this call, like any failed fetch, whether a leaf's
+    /// output or an own payload: the rest is asked for, a foundation whose
+    /// output could not be had is derived again, and the failure is
+    /// reported once the work is done.
+    #[test]
+    fn a_fetch_that_fails_outright_is_unavailability_reported_after_the_work() {
+        reset_mapping_calls();
+        let (mut inner, root, first, _) = collections();
+        let fresh = own_commit(&mut inner, root, 41, 0);
+        // An own foundation whose payload is elsewhere, and cannot be had.
+        foreign_commit(&mut inner, root, 41, 3);
+        let unreachable = payload(41, 3);
+        let broken_source = payload(42, 1);
+        let fetched_source = payload(42, 2);
+        own_commit(&mut inner, root, 42, 1);
+        own_commit(&mut inner, root, 42, 2);
+        let (record, broken) = leaf_of(first, 42, &broken_source, 7);
+        inner.insert(record).unwrap();
+        let (record, obtainable) = leaf_of(first, 42, &fetched_source, 7);
+        inner.insert(record).unwrap();
+        let mut store = GuardStore::new(inner);
+        store.offer(&obtainable);
+        store.acquire_fails.insert(data(&broken));
+        store.acquire_fails.insert(data(&unreachable));
+
+        let result = block_on(store.maintain(first, &key(41)));
+        let reported = format!("{:?}", result.as_ref().err());
+        assert!(
+            matches!(result, Err(CollectionRealizationError::Storage { .. })),
+            "{reported}"
+        );
+        assert!(reported.contains(r#"Injected("acquire")"#), "{reported}");
+        assert_eq!(
+            store.acquired.iter().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from([data(&broken), data(&obtainable), data(&unreachable)])
+        );
+        assert_eq!(store.acquired.len(), 3, "each asked for once");
+        assert!(!FIRST_MAP_LOG.with_borrow(|log| log.contains(&data(&fetched_source))));
+        assert_eq!(
+            leaves_by(&mut store.inner, first, 41)
+                .iter()
+                .map(|leaf| leaf.input())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                SourceLocator::of(fresh.raw),
+                SourceLocator::of(data(&broken_source).raw)
+            ])
+        );
     }
 }
