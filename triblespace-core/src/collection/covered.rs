@@ -281,7 +281,7 @@ where
     pub fn walk_held(&mut self, threads: usize) -> Result<(), S::SnapshotError> {
         let now = self.inner.snapshot()?;
         self.held.observe(&now);
-        self.held.walk(&now, threads, None);
+        self.held.walk(threads, None);
         Ok(())
     }
 }

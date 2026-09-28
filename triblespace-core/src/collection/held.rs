@@ -374,6 +374,10 @@ pub(crate) struct HeldIndex<T> {
     halt: AtomicBool,
     /// The state's epoch, readable by a walk without taking the lock.
     epoch: AtomicU64,
+    /// Test hook: run once by the next walk after it has taken what it
+    /// walks, before it reads anything.
+    #[cfg(test)]
+    walk_taken: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl<T> Default for HeldIndex<T> {
@@ -403,6 +407,8 @@ impl<T> Default for HeldIndex<T> {
             wake: Condvar::new(),
             halt: AtomicBool::new(false),
             epoch: AtomicU64::new(0),
+            #[cfg(test)]
+            walk_taken: Mutex::new(None),
         }
     }
 }
@@ -420,6 +426,8 @@ impl<T: Clone> HeldIndex<T> {
             wake: Condvar::new(),
             halt: AtomicBool::new(false),
             epoch: AtomicU64::new(epoch),
+            #[cfg(test)]
+            walk_taken: Mutex::new(None),
         }
     }
 }
@@ -442,6 +450,14 @@ impl<T> HeldIndex<T> {
             state
                 .candidates
                 .insert(&Entry::new(&pair(&collection.raw, &handle)));
+        }
+    }
+
+    /// Run the test hook, if one is set.
+    fn walk_taken(&self) {
+        #[cfg(test)]
+        if let Some(hook) = self.walk_taken.lock().unwrap().take() {
+            hook();
         }
     }
 
@@ -1044,10 +1060,12 @@ impl<T: HeldSource> HeldIndex<T> {
         }
     }
 
-    /// One walk against `snapshot` over `only` (every tracked collection when
-    /// `None`): rescan every blob reachable from their seeds and peer
-    /// reports, and refresh the edge cache. A walk that completes ends the
-    /// start-up walks it covered.
+    /// One walk against the latest observation over `only` (every tracked
+    /// collection when `None`): rescan every blob reachable from their seeds
+    /// and peer reports, and refresh the edge cache. A walk that completes
+    /// ends the start-up walks it covered. The observation, the roots and the
+    /// epoch the results belong to are taken in one lock hold, so a reset
+    /// after it abandons the walk and a reset before it is already seen.
     ///
     /// The roots are walked in batches. Each batch is read to the end and
     /// then published children before parents -- each blob's edges with its
@@ -1058,11 +1076,15 @@ impl<T: HeldSource> HeldIndex<T> {
     /// that waited for the walk and that it did not reach are walked last,
     /// against the latest observation, and become routes; the walk ends only
     /// when none is waiting, so none is left for a snapshot to read.
-    pub(crate) fn walk(&self, snapshot: &T, threads: usize, only: Option<&Handles>) {
-        let (mut queue, epoch) = {
+    pub(crate) fn walk(&self, threads: usize, only: Option<&Handles>) {
+        let (first, mut queue, epoch) = {
             let state = self.lock();
-            (state.walk_roots(only), state.epoch)
+            let Some(first) = state.fed.clone() else {
+                return;
+            };
+            (first, state.walk_roots(only), state.epoch)
         };
+        self.walk_taken();
         let covered: Vec<CollectionHandle> =
             queue.iter().map(|(collection, _)| *collection).collect();
         let threads = threads.max(1);
@@ -1074,7 +1096,7 @@ impl<T: HeldSource> HeldIndex<T> {
         let mut latest: Option<T> = None;
         let mut rounds = 0;
         loop {
-            let snapshot = latest.as_ref().unwrap_or(snapshot);
+            let snapshot = latest.as_ref().unwrap_or(&first);
             while let Some(batch) = next_batch(&mut queue) {
                 if !self.walk_batch(snapshot, epoch, threads, batch, &mut known, &mut seen) {
                     return;
@@ -1417,7 +1439,7 @@ impl<T: HeldSource> HeldIndex<T> {
     fn run_walker(&self, config: HeldWalkConfig) {
         let mut due = Instant::now() + config.interval;
         loop {
-            let (snapshot, only) = {
+            let only = {
                 let mut state = self.lock();
                 loop {
                     let (stop, requested) = match &state.walker {
@@ -1454,11 +1476,9 @@ impl<T: HeldSource> HeldIndex<T> {
                 } else {
                     Some(requested)
                 };
-                (state.fed.clone(), only)
+                only
             };
-            if let Some(snapshot) = snapshot {
-                self.walk(&snapshot, config.threads, only.as_ref());
-            }
+            self.walk(config.threads, only.as_ref());
         }
     }
 }
@@ -2981,7 +3001,7 @@ mod tests {
             .name("held-blob-walk".into())
             .spawn({
                 let index = Arc::clone(&index);
-                move || index.walk(&now, 1, None)
+                move || index.walk(1, None)
             })
             .unwrap();
         store.gate.await_walker();
@@ -3063,6 +3083,60 @@ mod tests {
             held_set(&walked, c).contains(&definition.raw),
             "a proof judged against an unreadable descriptor was never judged again"
         );
+    }
+
+    /// A walk takes the observation it reads and the epoch its results
+    /// belong to together: a reset between the two cannot make it publish,
+    /// as current, a blob the store lost before the walk began.
+    #[test]
+    fn a_walk_never_publishes_a_blob_lost_before_it_began() {
+        let _guard = walker_guard();
+        let mut store = Counting::default();
+        let c = collection(&mut store, "lost before the walk");
+        let metadata = blob(&mut store, b"metadata");
+        let lost = blob(&mut store, b"forgotten by the store");
+        let data = blob_naming(&mut store, b"names the lost blob", &[lost]);
+        commit(&mut store, c, data, metadata);
+        let index: Arc<HeldIndex<CountingSnapshot>> = Arc::new(HeldIndex::default());
+        index.track([c]);
+        let before = store.snapshot().unwrap();
+        index.observe(&before);
+        let (arrived, taken) = std::sync::mpsc::channel();
+        let (go, resume) = std::sync::mpsc::channel::<()>();
+        *index.walk_taken.lock().unwrap() = Some(Box::new(move || {
+            arrived.send(()).unwrap();
+            resume.recv().unwrap();
+        }));
+        // The periodic walk is due at once.
+        let walker = index.start_walker(walker_config(Duration::from_millis(10)));
+        taken
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the walker took a walk");
+        let kept: Vec<_> = before
+            .blobs()
+            .map(|info| info.unwrap().handle)
+            .filter(|handle| handle.raw != lost)
+            .collect();
+        store.inner.blobs.keep(kept);
+        index.observe(&store.snapshot().unwrap());
+        go.send(()).unwrap();
+        let start = Instant::now();
+        loop {
+            let view = index.observe(&store.snapshot().unwrap());
+            if let Some(held) = view.held(c).filter(|held| held.has_prefix(&data)) {
+                assert!(
+                    !held.has_prefix(&lost),
+                    "a walk published a blob the store lost before it began"
+                );
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "no walk held the data"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        drop(walker);
     }
 
     #[test]
