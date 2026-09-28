@@ -19,7 +19,7 @@ use triblespace_core::capability::{
 use triblespace_core::collection::{
     ACTION_READ, AdmissionPolicy, Collection, CollectionCommit, CollectionHandle, CollectionPolicy,
     CollectionRead, CollectionRecord, CollectionRecordSelector, CollectionStore,
-    CollectionStoreExt, KIND_COLLECTION_DESCRIPTOR, read_capability,
+    CollectionStoreExt, HeldStore, KIND_COLLECTION_DESCRIPTOR, read_capability,
 };
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{Inline, InlineEncoding};
@@ -155,6 +155,21 @@ impl<R: triblespace_core::collection::CoverageRead> triblespace_core::collection
         lineage: &std::collections::BTreeSet<triblespace_core::collection::CollectionHandle>,
     ) -> Result<triblespace_core::collection::coverage::CoverageIndex, Self::RecordsError> {
         self.inner.index(lineage)
+    }
+}
+
+impl<R: triblespace_core::collection::HeldRead> triblespace_core::collection::HeldRead
+    for CountedSnapshot<R>
+{
+    fn held(
+        &self,
+        collection: CollectionHandle,
+    ) -> Option<triblespace_core::collection::HeldBlobs> {
+        self.inner.held(collection)
+    }
+
+    fn held_generation(&self) -> u64 {
+        self.inner.held_generation()
     }
 }
 
@@ -802,6 +817,8 @@ fn arriving_read_definition_refreshes_admission_with_same_wake_root_and_record_l
     let collection = store
         .put::<SimpleArchive, _>(descriptor.facts().clone())
         .unwrap();
+    // The definition the proof names is a seed of the held set.
+    store.track_held([collection]);
     let data = store
         .put::<SimpleArchive, _>(
             entity! { metadata::name: "record before definition" }
@@ -994,9 +1011,13 @@ impl ScopedFixture {
 }
 
 #[test]
-fn scoped_unrelated_blobs_reuse_proofs_bootstrap_and_records_with_bounded_inventory_reads() {
+fn scoped_unrelated_blobs_reuse_proofs_bootstrap_and_records_without_blob_reads() {
     let mut fixture = ScopedFixture::new();
     let selected = fixture.active();
+    // Tracked as a serving peer tracks them, so the inventory served is a
+    // real held set.
+    let handles = fixture.collections.map(|collection| collection.handle());
+    fixture.store.track_held(handles);
     let mut before = fixture.observe(&selected, None);
     let (records, proofs, _) = fixture.take_counts();
     assert_eq!(
@@ -1013,14 +1034,27 @@ fn scoped_unrelated_blobs_reuse_proofs_bootstrap_and_records_with_bounded_invent
         assert_eq!(after.0.changes_since(&before.0), StoreChanges::BLOBS);
         let (records, proofs, reads) = fixture.take_counts();
         assert_eq!((records, proofs), (0, 0));
-        // New local bytes can satisfy an earlier missing reference. Revisit
-        // the positive inventory, but do not rebuild semantic components.
-        assert!(reads <= 2 * (1024 + 64));
+        // An unrelated arrival rebuilds no semantic component, and publication
+        // reads no blob body through the snapshot it serves: held sets are
+        // the store's own, fixed by its snapshot. The held index's own reads
+        // happen inside the pile's snapshot, outside this count; core
+        // measures them (held::tests::unrelated_arrivals_read_nothing).
+        assert_eq!(reads, 0);
         for index in 0..2 {
             let collection = fixture.collections[index].handle();
             let old = before.1.collection(collection).unwrap();
             let new = after.1.collection(collection).unwrap();
             assert!(new.repair.blob_inventory().get(&arrived.raw).is_none());
+            let CollectionRecord::Commit(commit) = fixture.records[index] else {
+                unreachable!("the fixture commits");
+            };
+            assert!(
+                new.repair
+                    .blob_inventory()
+                    .get(&commit.data().raw)
+                    .is_some(),
+                "the served inventory is the held set"
+            );
             assert_same_record_leaves(&old, &new, &[fixture.records[index]]);
             assert!(Arc::ptr_eq(&old.read_bootstrap, &new.read_bootstrap));
             let id = fixture.proofs[index].id();
@@ -1185,6 +1219,8 @@ fn scoped_missing_definition_landing_changes_bootstrap_without_rebuilding_record
         metadata::tag: KIND_COLLECTION_DESCRIPTOR,
         resource_policy*: AdmissionPolicy::direct(fixture.root.verifying_key()).binding(capability),
     }.facts().clone()).unwrap();
+    // The delayed definition the proof names is a seed of the held set.
+    fixture.store.track_held([collection]);
     let proof = CapabilityProof::new(
         CapabilityResource::from(collection),
         &fixture.root,

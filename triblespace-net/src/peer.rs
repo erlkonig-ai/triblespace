@@ -17,7 +17,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use iroh_base::EndpointId;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::{Blob, BlobEncoding, IntoBlob};
-use triblespace_core::collection::{CollectionHandle, CollectionStore};
+use triblespace_core::collection::{CollectionHandle, CollectionStore, HeldRead, HeldStore};
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::InlineEncoding;
 use triblespace_core::inline::encodings::hash::Handle;
@@ -187,9 +187,10 @@ where
         + CapabilityProofStore
         + WantStore
         + StorageFlush
+        + HeldStore
         + Send
         + 'static,
-    S::Snapshot: StoreRead + BlobChildren,
+    S::Snapshot: StoreRead + BlobChildren + HeldRead,
 {
     store: Arc<Mutex<Option<S>>>,
     sender: NetSender,
@@ -216,9 +217,10 @@ where
         + CapabilityProofStore
         + WantStore
         + StorageFlush
+        + HeldStore
         + Send
         + 'static,
-    S::Snapshot: StoreRead + BlobChildren,
+    S::Snapshot: StoreRead + BlobChildren + HeldRead,
 {
     /// Spawn a production host. No team scope or connection proof exists.
     pub fn new(store: S, key: SigningKey, config: PeerConfig) -> Result<Self, PeerOpenError> {
@@ -408,6 +410,10 @@ where
             tracing::warn!(%error, "cannot activate collections on network host");
             return;
         }
+        let collections: Vec<_> = collections.into_iter().collect();
+        // Held sets are kept for every collection this peer serves, from the
+        // next snapshot on.
+        self.store().track_held(collections.iter().copied());
         for collection in collections {
             self.active_dirty |= self.active.get(&collection.raw).is_none();
             self.active.insert(&PatchEntry::new(&collection.raw));
@@ -520,6 +526,11 @@ where
                         source,
                         handle,
                     } => {
+                        // A peer holds H in C. If H is resident at the next
+                        // snapshot it is held in C here too, in every
+                        // replication mode and whether or not the hint
+                        // window below retains the hint for acquisition.
+                        store.note_held(collection, Inline::new(handle));
                         self.reconciler
                             .observe_blob_hint_from(collection, source, handle);
                     }
@@ -570,7 +581,14 @@ where
             );
         }
         let snapshot = store.snapshot().map_err(PeerSnapshotError::Store)?;
-        self.reconciler.prune_blob_hints(&snapshot);
+        // Hints resident by now, however they arrived, are held in their
+        // collection from the next snapshot on.
+        for (collection, handle) in self.reconciler.prune_blob_hints(&snapshot) {
+            store.note_held(collection, Inline::new(handle));
+        }
+        // Publication reads only the frozen snapshot; landing and reconcile
+        // need not wait for it.
+        drop(guard);
         self.sender.observe_store(|health| {
             health.last_snapshot_observed_at = Some(crate::clock::mono_now());
         });
@@ -584,13 +602,16 @@ where
                     snapshot.changes_since(previous)
                 })
         };
+        // A background walk changes held sets without changing the store.
+        let held_unchanged = self
+            .last_store_snapshot
+            .as_ref()
+            .is_some_and(|previous| previous.held_generation() == snapshot.held_generation());
         if received == 0
             && changes == StoreChanges::NONE
+            && held_unchanged
             && !self.active_dirty
             && previous_snapshot.is_some()
-            && !previous_snapshot
-                .as_ref()
-                .is_some_and(|snapshot| snapshot.inventory_pending())
         {
             self.last_store_snapshot = Some(snapshot);
             return Ok(());
@@ -688,9 +709,10 @@ where
         + CapabilityProofStore
         + WantStore
         + StorageFlush
+        + HeldStore
         + Send
         + 'static,
-    S::Snapshot: StoreRead + BlobChildren,
+    S::Snapshot: StoreRead + BlobChildren + HeldRead,
 {
     type AcquireError = PeerAcquireError;
 
@@ -709,9 +731,10 @@ where
         + CapabilityProofStore
         + WantStore
         + StorageFlush
+        + HeldStore
         + Send
         + 'static,
-    S::Snapshot: StoreRead + BlobChildren,
+    S::Snapshot: StoreRead + BlobChildren + HeldRead,
 {
     type InsertError = <S as CollectionStore>::InsertError;
 
@@ -730,9 +753,10 @@ where
         + CapabilityProofStore
         + WantStore
         + StorageFlush
+        + HeldStore
         + Send
         + 'static,
-    S::Snapshot: StoreRead + BlobChildren,
+    S::Snapshot: StoreRead + BlobChildren + HeldRead,
 {
     type InsertError = <S as CapabilityProofStore>::InsertError;
 
@@ -751,9 +775,10 @@ where
         + CapabilityProofStore
         + WantStore
         + StorageFlush
+        + HeldStore
         + Send
         + 'static,
-    S::Snapshot: StoreRead + BlobChildren,
+    S::Snapshot: StoreRead + BlobChildren + HeldRead,
 {
     type PutError = S::PutError;
 
@@ -774,9 +799,10 @@ where
         + CapabilityProofStore
         + WantStore
         + StorageFlush
+        + HeldStore
         + Send
         + 'static,
-    S::Snapshot: StoreRead + BlobChildren,
+    S::Snapshot: StoreRead + BlobChildren + HeldRead,
 {
     type Snapshot = PeerSnapshot<S>;
     type SnapshotError = PeerSnapshotError<S::SnapshotError>;
@@ -794,9 +820,10 @@ where
         + CapabilityProofStore
         + WantStore
         + StorageFlush
+        + HeldStore
         + Send
         + 'static,
-    S::Snapshot: StoreRead + BlobChildren,
+    S::Snapshot: StoreRead + BlobChildren + HeldRead,
 {
     type Error = <S as StorageFlush>::Error;
 
@@ -813,9 +840,10 @@ where
         + WantStore
         + StorageFlush
         + StorageClose
+        + HeldStore
         + Send
         + 'static,
-    S::Snapshot: StoreRead + BlobChildren,
+    S::Snapshot: StoreRead + BlobChildren + HeldRead,
 {
     type Error = <S as StorageClose>::Error;
 

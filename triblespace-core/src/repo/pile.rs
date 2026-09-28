@@ -3323,7 +3323,8 @@ impl super::StoreSnapshot for PileFileSnapshot {
                     }
                     CollectionRecordSelector::Collection(collection)
                     | CollectionRecordSelector::MergeCollection(collection)
-                    | CollectionRecordSelector::DeriveTarget(collection) => collection,
+                    | CollectionRecordSelector::DeriveTarget(collection)
+                    | CollectionRecordSelector::Foundations(collection) => collection,
                 };
                 // Kind selectors conservatively share the whole collection
                 // prefix; exact producer routes above are narrower.
@@ -4575,7 +4576,8 @@ impl PileFileSnapshot {
                 }
                 CollectionRecordSelector::Collection(collection)
                 | CollectionRecordSelector::MergeCollection(collection)
-                | CollectionRecordSelector::DeriveTarget(collection) => collection,
+                | CollectionRecordSelector::DeriveTarget(collection)
+                | CollectionRecordSelector::Foundations(collection) => collection,
             };
             // An infix is one segment: the members first, then each
             // member's frames.

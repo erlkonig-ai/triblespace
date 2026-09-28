@@ -15,7 +15,7 @@ use triblespace_core::clock::{self, VirtualClock};
 use triblespace_core::collection::{
     AdmissionPolicy, Collection, CollectionCommit, CollectionHandle, CollectionPolicy,
     CollectionRead, CollectionRecord, CollectionSnapshotExt, CollectionStore, CollectionStoreExt,
-    read_capability, write_capability,
+    HeldRead, read_capability, write_capability,
 };
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
@@ -30,6 +30,7 @@ use triblespace_net::host::{self, PeerConfig};
 use triblespace_net::inventory::{ReconcileDirection, ReconcileQos};
 use triblespace_net::peer::Peer;
 use triblespace_net::reconcile::{ReconcileStats, Reconciler, ReplicationMode};
+use triblespace_net::transport::Transport;
 use triblespace_net::transport::sim::{SimConfig, SimNet};
 
 fn key(byte: u8) -> SigningKey {
@@ -1366,8 +1367,12 @@ fn selection_fairness_case(resident_child: bool) {
     }));
 }
 
+/// A child put on the server after its parent was scanned is not advertised
+/// by its arrival: each blob is scanned once. The server's walk backstop finds
+/// it; the reader then fetches it through the positive inventory, and since a
+/// peer reported it in C, the reader holds it in C and advertises it in turn.
 #[test]
-fn full_replication_inventory_learns_a_blob_only_child_arrival_without_semantic_changes() {
+fn a_blob_only_child_is_advertised_after_the_walk_and_held_by_the_reader_through_its_route() {
     let _guard = test_guard();
     let clock = virtual_clock();
     clock.reset();
@@ -1468,6 +1473,31 @@ fn full_replication_inventory_learns_a_blob_only_child_arrival_without_semantic_
             child
         );
         server.refresh();
+        // Scan-once: the arrival alone is not advertised.
+        for _ in 0..5 {
+            advance(&clock, &mut [&mut server, &mut reader], 1).await;
+            let stats =
+                reconcile_once(&clock, &mut reconciler, &mut reader, &mut [&mut server]).await;
+            assert_eq!(stats.replication.inventory, 0);
+        }
+        assert!(reader.try_local(child).is_none());
+        let server_held = server
+            .snapshot()
+            .unwrap()
+            .held(collection.handle())
+            .unwrap();
+        assert!(!server_held.has_prefix(&child));
+
+        // The walk backstop finds it; the next refresh advertises it.
+        server.store().walk_held(1).unwrap();
+        server.refresh();
+        let server_held = server
+            .snapshot()
+            .unwrap()
+            .held(collection.handle())
+            .unwrap();
+        assert!(server_held.has_prefix(&child));
+        assert!(server_held.has_prefix(&leaf.raw));
         let mut offered = 0;
         for _ in 0..120 {
             advance(&clock, &mut [&mut server, &mut reader], 1).await;
@@ -1477,13 +1507,13 @@ fn full_replication_inventory_learns_a_blob_only_child_arrival_without_semantic_
             assert_eq!(stats.replication.speculative_misses, 0);
             assert_eq!(stats.replication.candidates, 0);
             offered += stats.replication.inventory;
-            if reader.try_local(leaf.raw).is_some() {
+            if reader.try_local(leaf.raw).is_some() && reader.try_local(child).is_some() {
                 break;
             }
         }
         assert!(
             reader.try_local(child).is_some(),
-            "a resident child arriving without record changes must be offered"
+            "the walked child must be offered"
         );
         assert!(
             reader.try_local(leaf.raw).is_some(),
@@ -1493,6 +1523,16 @@ fn full_replication_inventory_learns_a_blob_only_child_arrival_without_semantic_
             offered > 0,
             "the reader actually consumed positive inventory hints"
         );
+        // The reader fetched both through C's inventory, so it holds both in
+        // C and would advertise them to its own readers.
+        reader.refresh();
+        let reader_held = reader
+            .snapshot()
+            .unwrap()
+            .held(collection.handle())
+            .unwrap();
+        assert!(reader_held.has_prefix(&child));
+        assert!(reader_held.has_prefix(&leaf.raw));
         let after = triblespace_net::collection_activation::collection_repair_overlay(
             &server.snapshot().unwrap(),
             collection.handle(),
@@ -1513,5 +1553,62 @@ fn full_replication_inventory_learns_a_blob_only_child_arrival_without_semantic_
             [record]
         );
         assert_eq!(snapshot.wants().unwrap().count(), 0);
+    }));
+}
+
+/// Transport generation 28 exports foundations only. A peer still speaking
+/// generation 27 is refused at the handshake; the current generation is served.
+#[test]
+fn a_previous_generation_peer_is_refused() {
+    let _guard = test_guard();
+    let clock = virtual_clock();
+    clock.reset();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    runtime.block_on(local.run_until(async {
+        let net = SimNet::new(0xC011_EC8A, SimConfig::default());
+        let server_key = key(95);
+        let mut server = bring_up(
+            &net,
+            &server_key,
+            MemoryRepo::default(),
+            Vec::new(),
+            ReconcileDirection::Bidirectional,
+        );
+        advance(&clock, &mut [&mut server], 1).await;
+        let client = net.join(&key(96));
+        let server_id = server_key.verifying_key().to_bytes();
+        assert_eq!(
+            triblespace_net::protocol::PILE_SYNC_ALPN,
+            b"/triblespace/pile-sync/28"
+        );
+        let current = client
+            .transport
+            .dial(server_id, triblespace_net::protocol::PILE_SYNC_ALPN)
+            .await
+            .unwrap();
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            triblespace_net::protocol::op_find_node(&current, &[7; 32]),
+        )
+        .await
+        .expect("the current generation answers");
+        assert!(answer.is_ok(), "{answer:?}");
+        let previous = client
+            .transport
+            .dial(server_id, b"/triblespace/pile-sync/27")
+            .await
+            .unwrap();
+        let refused = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            triblespace_net::protocol::op_find_node(&previous, &[7; 32]),
+        )
+        .await
+        .expect("a refused connection fails promptly");
+        assert!(refused.is_err(), "generation 27 must not be served");
     }));
 }

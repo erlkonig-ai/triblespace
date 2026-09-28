@@ -354,7 +354,8 @@ impl<R: CollectionRead> CollectionRead for Counted<R> {
                 | CollectionRecordSelector::CommitMember(collection, _)
                 | CollectionRecordSelector::ProducedMember(collection, _)
                 | CollectionRecordSelector::MergeCollection(collection)
-                | CollectionRecordSelector::DeriveTarget(collection) => {
+                | CollectionRecordSelector::DeriveTarget(collection)
+                | CollectionRecordSelector::Foundations(collection) => {
                     *collection == hook.collection
                 }
             });

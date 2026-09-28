@@ -22,7 +22,6 @@
 pub(crate) mod bearer;
 mod channel;
 pub mod collection_activation;
-pub(crate) mod collection_blob_inventory;
 pub mod collection_delta;
 pub(crate) mod collection_session;
 pub(crate) mod collection_wire;

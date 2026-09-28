@@ -6,15 +6,15 @@ model:
 
 1. stock `iroh-gossip` membership carries neighbor-only opaque root offers,
    with application-controlled relaying;
-2. one READ(C)-authorized exchange walks collection records, scoped AUTH and
-   a positive resident-blob inventory; and
+2. one READ(C)-authorized exchange walks the collection's foundation records,
+   scoped AUTH and the collection's positive held-blob set; and
 3. exact blob handles fetch only the immutable bytes a resolver actually
    chooses through a collection-independent, mutually authenticated bearer
    protocol.
 
 No global team, mutable roster, durable OFFER/GOSSIP bit, or second replicated
-inventory is needed. Resident inventories are local observations, not durable
-claims merged into a collection. The descriptor already states independent
+inventory is needed. Held sets are local observations, not durable claims
+merged into a collection. The descriptor already states independent
 READ and WRITE policy, and iroh authenticates the endpoint key on each direct
 connection.
 
@@ -24,7 +24,7 @@ The boundaries are deliberately small:
 
 ```text
 know C           -> join C's wake topic and learn (origin, opaque state root)
-prove READ(C)    -> receive C's records, scoped proofs and resident-blob handles
+prove READ(C)    -> receive C's foundations, scoped proofs and held-blob handles
 know H           -> derive its opaque locator, discover providers, and authorize H
 satisfy WRITE(C) -> make a signed COMMIT or DERIVE active in C
 ```
@@ -55,16 +55,19 @@ nothing.
 
 For one collection, repair pins three independent PATCH components:
 
-- every structurally valid native collection record naming exact C: signed
-  `COMMIT`, `MERGE`, and `DERIVE` records independent of current WRITE(C)
-  admission;
+- every structurally valid foundation record naming exact C: signed `COMMIT`
+  and `DERIVE` records independent of current WRITE(C) admission. A collection
+  is a set of foundations; a `MERGE` is its signing host's own lattice node,
+  is never served, and a client refuses a `MERGE` leaf as a protocol
+  violation;
 - every signature-valid native proof scoped to exact resource C and beginning
   at a root named by C's supported policy bindings, without requiring its grant
   handles to match those bindings. Subordinate-resource transport
   also includes proofs for R whose immutable descriptor declares C as its repair
   audience, under R's own policy roots; and
-- a positive partial inventory of locally readable blob handles reached from
-  C's descriptor and direct record/proof references.
+- C's held-blob set: the resident blobs reachable from C's descriptor, its
+  foundations' direct references and its proofs' capability definitions (see
+  *Held blobs* below).
 
 Each set is represented by an immutable BLAKE3-Merkle PATCH. Collection
 records are keyed physically by the full 32-byte fingerprint of their exact
@@ -122,37 +125,27 @@ Native stores obtain the difference from persistent indexes; cold activation
 still constructs the initial full overlay. Blob arrival
 still refreshes the authorization observation: a newly resident capability or
 subordinate-resource descriptor can enable admission or proof routing without
-changing any record. Resident-inventory scanning advances in bounded passive
-quanta against the same frozen reader; inventory changes can change the wake
-root even when records and AUTH are unchanged.
+changing any record. The held set comes from the store's own index, fixed by
+the same snapshot; it can change the wake root even when records and AUTH are
+unchanged.
 
-Signed MERGE and DERIVE records are input-record-bound endorsements and
-first-class members of the exact-C record PATCH and ordinary collection
-repair. Once present in a record store, an equation is reusable materialized
-LSM work; warm readers do not execute its join or mapping again. A frozen
-semantic view admits target producers under WRITE and follows only the exact
-native records their witnesses name. That closure establishes foundational
-support without rechecking ancestral producer authority or loading ancestral
-payloads, metadata, or proof definitions. Materialization needs the selected
-output and its encoding-required dependencies, not every historical input.
-Missing or mismatched witnesses remain unknown support. READ permission to
-participate in repair is not permission to endorse an equation. Signature
-verification happens when decoding foreign record bytes, not when rebuilding
-the local repair PATCH or observing the local store again.
+A DERIVE is a foundation of its derived collection and repairs like a COMMIT.
+A MERGE never replicates: each host builds its own merge lattice over the
+foundations it holds, and believes only the MERGEs its own key signed.
+Another host's MERGE records may sit inert in a pile, but they are neither
+exported nor accepted, and their result blobs are never held for sync.
+Signature verification happens when decoding foreign record bytes, not when
+rebuilding the local repair PATCH or observing the local store again.
 
 The three-component repair epoch uses opcode `0x0E`; the retired `0x0D`
 repair grammar is rejected before decoding. The current transport generation
-is `/triblespace/pile-sync/27`: generation 27 changed the bearer locator,
-directory token and exact-GET proofs (see below), so a generation-26 peer or
-installed `Leech` reader derives different DHT keys and must not connect. Dense
-record tag 6 carries a 288-byte MERGE body and tag 7 a 224-byte DERIVE body;
-each wire value has one additional tag byte. MERGE signs two input-record
-fingerprints paired with its payloads; DERIVE signs one. Unsigned tags 2/3 and
-payload-only signed tags 4/5 are retired, not alternate encodings of the new
-endorsement. COMMIT's 192-byte body and signature transcript are unchanged.
-Native piles retain historical equations as inert or opaque evidence; an
-authorized producer must explicitly issue a witness-bound endorsement before
-that historical work participates in the current repair algebra.
+is `/triblespace/pile-sync/28`. Generation 27 changed the bearer locator,
+directory token and exact-GET proofs (see below); generation 28 exports
+foundations only and makes the blob component the held set, so a
+generation-27 peer, which would serve MERGE records and an inventory with
+another meaning, is refused at the handshake. Dense record tag 7 carries a
+224-byte DERIVE body; each wire value has one additional tag byte. COMMIT's
+192-byte body and signature transcript are unchanged.
 
 Repair still transfers only records naming exact C. A DERIVE's source witness
 does not authorize disclosing another collection's records to a READ(C)-only
@@ -203,9 +196,11 @@ A wake contains no record, proof, blob handle, leaf count, component root, or
 human-readable collection metadata. It is a latency hint, not durable evidence
 and not authorization. Its semantic identity is `(C, R)`, not the signed
 contact, signature or nonce. Contact annotations can change without becoming
-a fresh state event. The wire envelope remains nonce-v4; the separate topic
-namespace prevents old automatic Swarm forwarding from mixing with the new
-neighbor-only relay rule.
+a fresh state event. The wire envelope is version 5, the version that goes
+with transport generation 28: gossip has its own protocol name, so the wake
+version is what keeps generation-27 wakes out. The separate topic namespace
+prevents old automatic Swarm forwarding from mixing with the neighbor-only
+relay rule.
 
 Stock gossip maintains membership and delivers to direct neighbors. It does
 not automatically forward these neighbor-scope offers. The application
@@ -250,7 +245,7 @@ New topology advances forwarding. Repeated equal state suppresses retained
 relay only when every known direct neighbor has itself signed that same root.
 A forwarded origin's signature does not establish the last hop's state, and
 one upstream match does not establish downstream coverage. Equality includes
-the partial resident inventory, but is not proof of complete recursive payload
+the partial held set, but is not proof of complete recursive payload
 closure or permission to interpret/decrypt its blobs.
 
 Bootstrap contacts come from descriptor policy roots, roots/delegates in
@@ -289,10 +284,10 @@ resident-blob PATCH summaries plus the same opaque root. The client may then
 walk only differing prefixes and
 receive missing leaf bodies:
 
-- canonical signature-valid `COMMIT`, `MERGE`, and `DERIVE` records naming C,
-  whether active or inert;
+- canonical signature-valid `COMMIT` and `DERIVE` records naming C, whether
+  active or inert (a `MERGE` leaf fails the pull);
 - native proofs relevant to C's repair audience and their resource's policy roots;
-- exact H keys from the pinned positive resident inventory, without blob bodies.
+- exact H keys from the pinned held set, without blob bodies.
 
 Each proof leaf contains the complete signed path and the handles of its
 capability definitions, not those definitions' facts.
@@ -748,26 +743,22 @@ does not exist. Diagnostics do not log the bearer handle.
 ## Lattice-aware sparse replication
 
 The network does not force every replica to mirror every blob. Collection
-records expose the same lattice known to local maintenance:
+repair carries foundations only; each host joins them into its own lattice:
 
 ```text
-COMMIT(C, a)       COMMIT(C, b)
+COMMIT(C, a)       COMMIT(C, b)       replicated
        \             /
-        MERGE(C, a, b, c)
+        MERGE(C, a, b, c)             this host's own node, never replicated
 
-DERIVE(D, c, d)
+DERIVE(D, x, d)                       replicated: a foundation of D
 ```
 
-A node can repair the small semantic overlay and use its resident exact merge
-and derivation results while planning a cover. Missing derived results are
-computed by the ordinary live `ensure` path, which may acquire exact missing
-dependencies and publishes missing `DERIVE` work only. `maintain` additionally
-publishes deterministic size-tiered `MERGE` work. These operations take an
-explicit signing key. Newly required derivation work needs target WRITE;
-reuse needs no new authority, and optional maintenance without WRITE preserves
-the existing finer cover. The signed equations repair as reusable computation
-and input-validation endorsements, not new exogenous membership; their
-referenced artifact blobs remain separate exact-H content.
+A node repairs the small semantic overlay and plans covers over its own
+resident merge results. Missing derived results are computed by the ordinary
+live `ensure` path, which may acquire exact missing dependencies and publishes
+missing `DERIVE` work only. `maintain` additionally writes this host's
+size-tiered `MERGE` work, which stays local. These operations take an
+explicit signing key; newly required derivation work needs target WRITE.
 Evidence and computation still converge by union; no central scheduler or
 query planner is required.
 
@@ -783,30 +774,61 @@ direct blob references alive through the normal record-root GC rules. GC never
 fetches missing references merely to retain them; dropping WANT records is an
 explicit rewrite/retention-policy choice.
 
-### Local residency inventory and replication policy
+### Held blobs and replication policy
 
-Each active collection's serving snapshot includes a passive, positive
-resident-handle PATCH. Seeds are the collection descriptor and direct blob
-references from its structural records and scoped AUTH proofs. A local scan
-follows an aligned 32-byte word only when that exact H is readable through the
-same passive snapshot. It does not issue network requests, create WANTs, or
-remember arbitrary absent words as possible downloads.
+Each active collection's serving snapshot includes its held set: a positive
+PATCH of resident handles, kept by the store itself
+(`triblespace_core::collection::held`) for the collections a sync host
+tracks. Seeds are the blobs C's replicated records name -- the descriptor,
+each COMMIT's data and metadata archive, each DERIVE's output -- and the
+capability definitions named by C's proofs, whether a proof is over C itself
+or over a resource whose descriptor routes to C (a descriptor that arrives
+after its proof routes it on arrival). A MERGE result is never a seed,
+and neither is a blob no record names. Reachability is conservative: an
+aligned 32-byte word is a child when that exact H is resident. It issues no
+network request, creates no WANT and remembers no absent word.
 
-Scanning advances with bounded source/word quanta and retained offsets rather
-than restarting every payload walk on refresh. Each refresh divides a budget
-of 1,024 source reads and 16,384 aligned words across active collections, with
-per-collection caps of 64 sources and 1,024 words and at least one of each. Each
-source yields after at most 64 words. These bound operations, not the backend's
-cost of reading a large body. PATCH clones share structure; no body is pinned
-between calls. Additions preserve traversal progress; removed seeds or
-readable-membership removals reset the closure
-so disconnected descendants are not advertised indefinitely.
+Each blob is scanned once, when first reached, and its edges to the children
+resident at that moment enter one edge cache shared by every collection. A new
+seed, edge or membership then extends a held set without reading bytes again;
+an already scanned blob shared with another collection joins it for free. A
+seed whose bytes arrive after its record is scanned on arrival, including
+while a walk that could not read it is still running. The late
+child -- resident only after its parent was scanned -- is caught three ways:
 
-This inventory is partial and conservative. A readable aligned word is not a
+- it is itself a seed of some collection;
+- a peer reports it in C's held set: a resident H a peer advertises for C is
+  held in C here too, however it arrived. The report is recorded when the hint
+  arrives, before the acquisition window filters it, so it works in every
+  replication mode and with a full window. It is routing evidence kept in
+  memory: a reopened store forgets it unless one of C's records reaches H;
+- the periodic full walk rescans every blob reachable from the seeds and
+  refreshes the edge cache. A late child nobody reported joins only after a
+  walk that started after it arrived has finished: the delay is bounded by the
+  walk interval plus one walk's duration plus scheduling delay (the sync
+  daemon defaults to a 30-minute interval on 4 threads), and is only eventual
+  under CPU saturation.
+
+A serving snapshot is published with the closures of the records new in its
+store observation already computed against that observation. The start-up
+walk of a newly activated collection (that collection only) and the periodic
+walk of every collection run on the sync daemon's own threads, publish into
+later snapshots level by level, and never gate publication; a snapshot's held
+sets never change after it is taken. While a collection's start-up walk is
+owed, peer reports for it wait for that walk instead of being read while a
+snapshot is taken: after a restart peers report their whole held sets, and
+reading them there would repeat the start-up walk on the publication path.
+A collection whose records the store cannot select is left out of the held
+sets and selected again, never published short. Short-lived readers of the
+same pile track nothing and start no thread.
+
+Anti-entropy compares like with like: the inventory walk diffs the remote
+held set against the local held set under Merkle pruning.
+
+This set is partial and conservative. A readable aligned word is not a
 typed semantic reference; an absent word says nothing about global residency.
-Finishing the local scan does not prove that every intended dependency exists.
 For encrypted blobs, H identifies the stored ciphertext; neither READ(C), this
-inventory, nor the exact-H protocol supplies an application's decryption keys.
+set, nor the exact-H protocol supplies an application's decryption keys.
 
 `Peer::set_replication(mode, collections)` selects acquisition independently
 of activation and authority:
@@ -814,15 +836,15 @@ of activation and authority:
 | Mode | Blob acquisition |
 |---|---|
 | `Demand` (default) | Explicit WANTs only. |
-| `Shallow` | Also direct blob references of selected collection records. |
+| `Shallow` | Also direct blob references of the selected collections' foundations. |
 | `Full` | Also positive resident handles learned through selected collections' READ-authorized repair. |
 
 Selecting a collection does not grant READ or WRITE and does not activate it.
 Structurally valid but WRITE-inert records can name direct roots; acquiring
 their bytes does not admit those records. Full mode no longer sends arbitrary
 aligned payload words to the DHT to choose speculative requests. Local
-aligned-word scanning constructs positive serving inventory only; remote
-hydration consumes the resulting known H keys.
+aligned-word scanning constructs the positive held set only; remote hydration
+consumes the resulting known H keys.
 
 The reconciler retains a bounded positive window per selected collection
 (currently 4,096 handles), pruning locally readable entries as bodies arrive.
@@ -860,7 +882,7 @@ guarantee.
 
 ## Wire surface
 
-The `/triblespace/pile-sync/27` ALPN keeps the direct operation set narrow;
+The `/triblespace/pile-sync/28` ALPN keeps the direct operation set narrow;
 collection repair has its own new opcode rather than changing unchanged
 bearer/DHT framing:
 
@@ -870,7 +892,7 @@ bearer/DHT framing:
 | `PROVIDER_PUT` | `0x06` | renew this endpoint's opaque provider lease |
 | `PROVIDER_GET` | `0x07` | obtain bounded candidates for one opaque key |
 | `FIND_NODE` | `0x0C` | iterative XOR-DHT routing step |
-| `COLLECTION_REPAIR` | `0x0E` | READ-gated record, authorization-evidence and resident-blob PATCH walks |
+| `COLLECTION_REPAIR` | `0x0E` | READ-gated foundation-record, authorization-evidence and held-blob PATCH walks |
 
 Opcode `0x0D` is no longer served. Mixed-generation collection repair is not
 supported: deploy the new repair cohort together. Per-collection topic v2

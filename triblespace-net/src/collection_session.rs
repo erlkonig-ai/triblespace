@@ -1516,6 +1516,74 @@ pub(crate) mod tests {
         }
     }
 
+    /// A peer that serves a MERGE leaf in its record PATCH is violating the
+    /// protocol: foundations are the only records that replicate. The pull
+    /// fails on that leaf instead of admitting it.
+    #[tokio::test]
+    async fn merge_leaf_is_rejected_by_pull_record_patch() {
+        use triblespace_core::collection::CollectionMerge;
+
+        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+        let mut store = MemoryRepo::default();
+        let collection = store.collection("merge leaf", policy).unwrap().handle();
+        let local = collection_repair_overlay(&store.snapshot().unwrap(), collection).unwrap();
+        let merge = CollectionRecord::Merge(
+            CollectionMerge::sign(
+                &SigningKey::from_bytes(&[7; 32]),
+                collection,
+                [CollectionData::new([2; 32]), CollectionData::new([3; 32])],
+                CollectionData::new([4; 32]),
+            )
+            .unwrap(),
+        );
+        let mut served = PATCH::<32, IdentitySchema, CollectionRecord, Blake3Merkle>::new();
+        served.insert(&triblespace_core::patch::Entry::with_value(
+            &merge.fingerprint().raw(),
+            merge,
+        ));
+        let remote = PatchSummary::from_patch(&served);
+        let (server_io, client_io) = tokio::io::duplex(1 << 20);
+        let (mut server_recv, mut server_send) = tokio::io::split(server_io);
+        let (mut client_recv, mut client_send) = tokio::io::split(client_io);
+        // A dishonest server: it answers from a PATCH holding a MERGE and
+        // encodes the raw record, skipping the export filter.
+        let server = tokio::spawn(async move {
+            while let Ok(CollectionRepairCommand::Node {
+                component, prefix, ..
+            }) = recv_repair_command(&mut server_recv).await
+            {
+                let response =
+                    patch_node_response(&served, &[], &prefix, |_, record| Ok(record.to_bytes()))
+                        .unwrap();
+                if send_repair_node_response(&mut server_send, &response, component)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let mut remaining = MAX_SEMANTIC_REPAIR_NODE_REQUESTS;
+        let mut bytes = 0;
+        let error = pull_record_patch(
+            &mut client_send,
+            &mut client_recv,
+            &local,
+            remote,
+            &mut remaining,
+            &mut bytes,
+        )
+        .await
+        .expect_err("a MERGE leaf is a protocol violation");
+        assert!(
+            format!("{error:#}").contains("only COMMIT and DERIVE records replicate"),
+            "{error:#}"
+        );
+        drop(client_send);
+        drop(client_recv);
+        server.await.unwrap();
+    }
+
     #[tokio::test]
     async fn one_stream_repairs_records_without_global_inventory() {
         let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);

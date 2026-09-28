@@ -17,7 +17,8 @@ use anybytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::collection::{
-    CollectionHandle, CollectionRead, CollectionRecordSelector, CollectionStore,
+    CollectionHandle, CollectionRead, CollectionRecordSelector, CollectionStore, HeldRead,
+    HeldStore,
 };
 use triblespace_core::inline::Inline;
 use triblespace_core::patch::{Entry as PatchEntry, IdentitySchema, PATCH};
@@ -36,7 +37,8 @@ pub enum ReplicationMode {
     /// Repair records and service explicit WANTs, without implicit blob demand.
     #[default]
     Demand,
-    /// Obtain every direct reference of selected structural collection records.
+    /// Obtain every direct reference of the selected collections' foundations:
+    /// descriptor, COMMIT data and metadata, and DERIVE outputs.
     Shallow,
     /// Also obtain positive resident-blob hints received through selected READ repair.
     Full,
@@ -196,7 +198,7 @@ pub struct Reconciler {
     max_backoff: Duration,
     fetch_budget: Duration,
     mode: ReplicationMode,
-    collections: BTreeSet<CollectionRecordSelector>,
+    collections: BTreeSet<CollectionHandle>,
     observation_generation: u64,
     want_round: ExactRound,
     root_round: ExactRound,
@@ -261,10 +263,11 @@ impl Reconciler {
     /// Select collection hydration explicitly, independently of READ grants or
     /// Peer activation. This does not activate a collection or publish a WANT.
     ///
-    /// Signature-valid but WRITE-inert COMMITs and structural MERGE/DERIVE
-    /// equations all contribute direct references. Obtaining their bytes does
-    /// not admit their semantic claims. Changing this selection forgets only
-    /// process-local traversal state, never stored data or demand.
+    /// Signature-valid but WRITE-inert COMMITs and DERIVEs contribute direct
+    /// references; a MERGE never replicates and contributes none. Obtaining
+    /// their bytes does not admit their semantic claims. Changing this
+    /// selection forgets only process-local traversal state, never stored
+    /// data or demand.
     pub fn with_replication(
         mut self,
         mode: ReplicationMode,
@@ -280,21 +283,12 @@ impl Reconciler {
         collections: impl IntoIterator<Item = CollectionHandle>,
     ) {
         self.mode = mode;
-        self.collections = collections
-            .into_iter()
-            .map(CollectionRecordSelector::Collection)
-            .collect();
+        self.collections = collections.into_iter().collect();
         self.blob_hints.retain(|collection, _| {
-            mode == ReplicationMode::Full
-                && self
-                    .collections
-                    .contains(&CollectionRecordSelector::Collection(*collection))
+            mode == ReplicationMode::Full && self.collections.contains(collection)
         });
         self.hint_rounds.retain(|collection, _| {
-            mode == ReplicationMode::Full
-                && self
-                    .collections
-                    .contains(&CollectionRecordSelector::Collection(*collection))
+            mode == ReplicationMode::Full && self.collections.contains(collection)
         });
         self.root_round = ExactRound::default();
         self.next_service = ServiceTurn::default();
@@ -320,11 +314,7 @@ impl Reconciler {
         source: PeerId,
         handle: RawHash,
     ) {
-        if self.mode != ReplicationMode::Full
-            || !self
-                .collections
-                .contains(&CollectionRecordSelector::Collection(collection))
-        {
+        if self.mode != ReplicationMode::Full || !self.collections.contains(&collection) {
             return;
         }
         if !self.observe_hint_source(collection, source) {
@@ -416,11 +406,7 @@ impl Reconciler {
         collection: CollectionHandle,
         source: PeerId,
     ) {
-        if self.mode != ReplicationMode::Full
-            || !self
-                .collections
-                .contains(&CollectionRecordSelector::Collection(collection))
-        {
+        if self.mode != ReplicationMode::Full || !self.collections.contains(&collection) {
             return;
         }
         let Some(round) = self
@@ -510,11 +496,7 @@ impl Reconciler {
             }
         }
         for (collection, sources) in &other.hint_rounds {
-            if self.mode != ReplicationMode::Full
-                || !self
-                    .collections
-                    .contains(&CollectionRecordSelector::Collection(*collection))
-            {
+            if self.mode != ReplicationMode::Full || !self.collections.contains(collection) {
                 continue;
             }
             for (source, progress) in sources {
@@ -558,7 +540,12 @@ impl Reconciler {
 
     /// Forget hints already readable in one passive store observation. This is
     /// also used by peer refresh when an external reconciler owns acquisition.
-    pub(crate) fn prune_blob_hints<R: BlobStoreGet>(&mut self, snapshot: &R) {
+    /// Returns the forgotten hints: resident blobs a peer reported in their
+    /// collection, which the caller records as held there.
+    pub(crate) fn prune_blob_hints<R: BlobStoreGet>(
+        &mut self,
+        snapshot: &R,
+    ) -> Vec<(CollectionHandle, RawHash)> {
         let resident = self
             .blob_hints
             .values()
@@ -567,10 +554,14 @@ impl Reconciler {
                 BlobStoreGet::get::<Bytes, UnknownBlob>(snapshot, Inline::new(*handle)).is_ok()
             })
             .collect();
-        self.prune_resident_hints(&resident);
+        self.prune_resident_hints(&resident)
     }
 
-    fn prune_resident_hints(&mut self, resident: &HashSet<RawHash>) {
+    fn prune_resident_hints(
+        &mut self,
+        resident: &HashSet<RawHash>,
+    ) -> Vec<(CollectionHandle, RawHash)> {
+        let mut pruned = Vec::new();
         self.blob_hints.retain(|collection, hints| {
             let landed: Vec<_> = hints
                 .iter_ordered()
@@ -588,9 +579,11 @@ impl Reconciler {
                 round.serviced_through =
                     Some(round.serviced_through.map_or(handle, |old| old.max(handle)));
                 hints.remove(&handle);
+                pruned.push((*collection, handle));
             }
             !hints.is_empty()
         });
+        pruned
     }
 
     fn observe_missing(&mut self, wanted: &BTreeSet<RawHash>, roots: &BTreeSet<RawHash>) {
@@ -703,21 +696,14 @@ impl Reconciler {
             + CapabilityProofStore
             + WantStore
             + StorageFlush
+            + HeldStore
             + Send
             + 'static,
-        S::Snapshot: StoreRead + BlobChildren,
+        S::Snapshot: StoreRead + BlobChildren + HeldRead,
     {
         if peer.reconciler().mode != self.mode || peer.reconciler().collections != self.collections
         {
-            peer.set_replication(
-                self.mode,
-                self.collections
-                    .iter()
-                    .filter_map(|selector| match selector {
-                        CollectionRecordSelector::Collection(collection) => Some(*collection),
-                        _ => None,
-                    }),
-            );
+            peer.set_replication(self.mode, self.collections.iter().copied());
         }
         // This is also the explicit external-Pile reobservation and inventory
         // admission boundary.
@@ -742,8 +728,8 @@ impl Reconciler {
 
     pub(crate) async fn tick_snapshot<S>(&mut self, snapshot: PeerSnapshot<S>) -> ReconcileStats
     where
-        S: BlobStore + Send + 'static,
-        S::Snapshot: StoreRead + BlobChildren,
+        S: BlobStore + HeldStore + Send + 'static,
+        S::Snapshot: StoreRead + BlobChildren + HeldRead,
     {
         let mut stats = ReconcileStats::default();
         let requests: Vec<WantRequest> = match snapshot
@@ -771,7 +757,7 @@ impl Reconciler {
             let observed = self
                 .collections
                 .iter()
-                .map(|selector| direct_roots(&snapshot, &BTreeSet::from([*selector])))
+                .map(|collection| direct_roots(&snapshot, *collection))
                 .collect::<Result<Vec<_>, _>>();
             match observed {
                 Ok(roots) => roots,
@@ -824,7 +810,9 @@ impl Reconciler {
         self.states
             .retain(|handle, _| exact_handles.contains(handle) && !visible_blobs.contains(handle));
         self.observe_missing(&missing_wanted, &missing_roots);
-        self.prune_resident_hints(&visible_blobs);
+        // A hinted blob already resident: the peer's report makes it held in
+        // that collection, however it arrived.
+        snapshot.note_held(self.prune_resident_hints(&visible_blobs));
 
         let started = crate::clock::mono_now();
         let deadline = tokio::time::Instant::now() + self.fetch_budget;
@@ -923,7 +911,8 @@ impl Reconciler {
                 .count()
         });
 
-        self.prune_resident_hints(&visible_blobs);
+        // Hints landed by this tick are held in the collection that offered them.
+        snapshot.note_held(self.prune_resident_hints(&visible_blobs));
         stats
     }
 
@@ -944,15 +933,19 @@ impl Reconciler {
     }
 }
 
+/// The blobs one collection's foundations name directly: its descriptor,
+/// COMMIT data and metadata, and DERIVE outputs. A MERGE never replicates, so
+/// neither its inputs nor its result are roots.
 fn direct_roots<R>(
     snapshot: &R,
-    selectors: &BTreeSet<CollectionRecordSelector>,
+    collection: CollectionHandle,
 ) -> Result<BTreeSet<RawHash>, R::RecordsError>
 where
     R: CollectionRead,
 {
     let mut roots = BTreeSet::new();
-    for record in snapshot.select_records(selectors)? {
+    let selectors = BTreeSet::from([CollectionRecordSelector::Foundations(collection)]);
+    for record in snapshot.select_records(&selectors)? {
         // Records are trusted local evidence; foreign signatures were checked
         // at ingress. WRITE admission does not govern structural ownership.
         roots.extend(record.blob_references().map(|handle| handle.raw));
@@ -1137,8 +1130,11 @@ mod tests {
         }
     }
 
+    /// Hydration roots are the foundations' direct references: descriptor,
+    /// commit data and metadata, and derive outputs -- never a MERGE's inputs
+    /// or result.
     #[test]
-    fn hydration_roots_use_selected_structural_records_without_loading_descriptors() {
+    fn hydration_roots_are_foundation_references_without_loading_descriptors() {
         let key = SigningKey::from_bytes(&[7; 32]);
         let collection = Inline::new([1; 32]);
         let other = Inline::new([9; 32]);
@@ -1175,17 +1171,16 @@ mod tests {
             store.insert(record).unwrap();
         }
         let snapshot = store.snapshot().unwrap();
-        let selectors = BTreeSet::from([CollectionRecordSelector::Collection(collection)]);
         assert_eq!(
-            direct_roots(&snapshot, &selectors).unwrap(),
-            (1..=7).map(|byte| [byte; 32]).collect(),
+            direct_roots(&snapshot, collection).unwrap(),
+            [1, 2, 3, 7].map(|byte| [byte; 32]).into_iter().collect(),
         );
         assert!(
-            direct_roots(&snapshot, &BTreeSet::new())
+            direct_roots(&snapshot, Inline::new([12; 32]))
                 .unwrap()
                 .is_empty()
         );
-        assert!(direct_roots(&FailingCollectionRead, &selectors).is_err());
+        assert!(direct_roots(&FailingCollectionRead, collection).is_err());
     }
 
     #[test]
@@ -1668,6 +1663,16 @@ mod tests {
         }
     }
 
+    impl HeldStore for LandingStore {
+        fn track_held(&mut self, collections: impl IntoIterator<Item = CollectionHandle>) {
+            self.inner.track_held(collections)
+        }
+
+        fn note_held(&mut self, collection: CollectionHandle, handle: Inline<Handle<UnknownBlob>>) {
+            self.inner.note_held(collection, handle)
+        }
+    }
+
     impl CollectionStore for LandingStore {
         type InsertError = <MemoryRepo as CollectionStore>::InsertError;
 
@@ -1867,6 +1872,73 @@ mod tests {
             landings,
             roots,
             collection: Inline::new(collection),
+        }
+    }
+
+    /// Rule 3: a peer reporting H in C's held set makes a resident H held in
+    /// C here. The report is recorded when the hint arrives, before the
+    /// acquisition window filters it, so it holds in Demand mode and when a
+    /// full window drops the hint. A report of a blob that is not resident is
+    /// not kept.
+    #[tokio::test]
+    async fn a_resident_hint_is_held_in_demand_mode_and_with_a_full_hint_window() {
+        use crate::channel::{NetEvent, NetEventBatch};
+
+        for full_window in [false, true] {
+            let key = SigningKey::from_bytes(&[7; 32]);
+            let (sender, receiver, wiring) =
+                crate::host::wire(crate::identity::iroh_secret(&key).public().into());
+            let mut store = MemoryRepo::default();
+            let collection: CollectionHandle =
+                Inline::new(put(&mut store, b"reported collection".to_vec()));
+            let resident = put(&mut store, b"resident, named by no record".to_vec());
+            let mut peer = Peer::with_wiring(
+                store,
+                crate::inventory::ReconcileQos::default(),
+                sender,
+                receiver,
+            );
+            peer.activate_collection(collection);
+            if full_window {
+                peer.set_replication(ReplicationMode::Full, [collection]);
+                for index in 0..MAX_BLOB_HINTS_PER_COLLECTION as u32 {
+                    peer.reconciler_mut().observe_blob_hint_from(
+                        collection,
+                        TEST_BLOB_HINT_SOURCE,
+                        scheduled_handle(1, index),
+                    );
+                }
+                assert_eq!(
+                    peer.reconciler().blob_hints[&collection].len(),
+                    MAX_BLOB_HINTS_PER_COLLECTION
+                );
+            } else {
+                assert_eq!(peer.reconciler().mode, ReplicationMode::Demand);
+            }
+            let before = peer.snapshot().unwrap().held(collection).unwrap();
+            assert!(!before.has_prefix(&resident));
+            let mut batch = NetEventBatch::default();
+            for handle in [resident, [68; 32]] {
+                batch
+                    .try_push(NetEvent::BlobHint {
+                        collection,
+                        source: TEST_BLOB_HINT_SOURCE,
+                        handle,
+                    })
+                    .unwrap();
+            }
+            wiring.send_admission(batch).await;
+            peer.refresh();
+            let held = peer.snapshot().unwrap().held(collection).unwrap();
+            assert!(held.has_prefix(&resident), "full window: {full_window}");
+            assert!(!held.has_prefix(&[68; 32]));
+            assert!(
+                peer.reconciler()
+                    .blob_hints
+                    .get(&collection)
+                    .is_none_or(|hints| !hints.has_prefix(&resident)),
+                "the acquisition window did not carry the report"
+            );
         }
     }
 

@@ -30,7 +30,11 @@ const WAKE_TOPIC_CONTEXT: [u8; 32] =
 pub const COLLECTION_WAKE_TRANSCRIPT_DOMAIN: &[u8] = b"triblespace.collection.wake";
 
 /// Current dense wake-envelope and signature-transcript version.
-pub const COLLECTION_WAKE_VERSION: u8 = 4;
+///
+/// Version 5 goes with transport generation 28: its wake roots commit to
+/// foundations-only records and held sets. Gossip runs on its own protocol
+/// name, so this version, not the transport generation, keeps older wakes out.
+pub const COLLECTION_WAKE_VERSION: u8 = 5;
 
 /// Exact number of bytes in a collection wake.
 pub const COLLECTION_WAKE_WIRE_LEN: usize = 1 + 32 + 32 + 16 + 64;
@@ -606,6 +610,15 @@ mod tests {
             Err(CollectionWakeError::UnsupportedVersion(
                 COLLECTION_WAKE_VERSION + 1
             ))
+        );
+        // A wake from the previous generation, whose roots committed to
+        // MERGE records and another inventory, is refused.
+        let mut previous_generation = encoded;
+        previous_generation[0] = 4;
+        assert_eq!(COLLECTION_WAKE_VERSION, 5);
+        assert_eq!(
+            CollectionWake::decode_and_verify(expected, &previous_generation),
+            Err(CollectionWakeError::UnsupportedVersion(4))
         );
         assert_eq!(
             CollectionWake::decode_and_verify(expected, &encoded[..encoded.len() - 1]),

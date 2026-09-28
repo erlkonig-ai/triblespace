@@ -381,7 +381,7 @@ async fn inactive_descriptor_cache_is_discoverable_but_never_a_repair_participan
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn full_inventory_fetches_late_child_and_grandchild_without_semantic_changes() {
+async fn full_inventory_fetches_walked_late_child_and_grandchild_without_semantic_changes() {
     let network = TestNetwork::new();
     let directory_endpoint = endpoint(&network, &key(0xC1)).await;
     let directory_addr = directory_endpoint.addr();
@@ -514,6 +514,12 @@ async fn full_inventory_fetches_late_child_and_grandchild_without_semantic_chang
                 .raw,
             expected
         );
+        source.refresh();
+        // Each blob is scanned once: an arrival alone, named by no record and
+        // reported by no peer, changes nothing the source serves.
+        assert_eq!(frontier(&source).wake_root, last_root);
+        // The walk backstop finds it.
+        source.store().walk_held(1).unwrap();
         source.refresh();
         // Publication is a positive control, not inferred from a local put.
         // Neither endpoint gains a new record or AUTH proof during this stage.

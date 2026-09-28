@@ -21,12 +21,16 @@ use crate::bearer::{blob_locator, proof_matches, provider_proof, requester_proof
 use crate::transport::Conn;
 use crate::transport::PeerId;
 
-/// Shared bearer/DHT transport generation. Collection repair versions its own
-/// operation byte so unchanged exact-H clients need not replace their endpoint.
+/// Shared bearer/DHT transport generation.
+///
 /// Generation 27 replaced the string-context locator, directory token and
 /// exact-GET proofs with one-block constructions; a generation-26 peer derives
 /// different DHT keys and proofs, so it must not connect at all.
-pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/27";
+/// Generation 28 exports foundations only: collection repair carries COMMIT,
+/// DERIVE, capability and authorization records and never a MERGE, and the
+/// blob component is the held set. A generation-27 peer would serve MERGEs
+/// and an inventory with another meaning, so it is refused at the handshake.
+pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/28";
 
 // Operation types — first byte on each stream.
 // 0x01 was branch-list; 0x03 was blob-children; 0x04 was branch-head;

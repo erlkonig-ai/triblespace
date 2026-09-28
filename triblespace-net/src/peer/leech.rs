@@ -26,9 +26,10 @@ where
         + CapabilityProofStore
         + WantStore
         + StorageFlush
+        + HeldStore
         + Send
         + 'static,
-    S::Snapshot: StoreRead + BlobChildren,
+    S::Snapshot: StoreRead + BlobChildren + HeldRead,
 {
     // This field is visible only inside the parent peer module. Production
     // construction below always starts dormant, and no Leech method installs a
@@ -43,9 +44,10 @@ where
         + CapabilityProofStore
         + WantStore
         + StorageFlush
+        + HeldStore
         + Send
         + 'static,
-    S::Snapshot: StoreRead + BlobChildren,
+    S::Snapshot: StoreRead + BlobChildren + HeldRead,
 {
     /// Attach lazy exact acquisition without starting a host or serving the pile.
     pub fn lazy(store: S, key: SigningKey, config: PeerConfig) -> Self {
@@ -106,9 +108,10 @@ where
         + CapabilityProofStore
         + WantStore
         + StorageFlush
+        + HeldStore
         + Send
         + 'static,
-    S::Snapshot: StoreRead + BlobChildren,
+    S::Snapshot: StoreRead + BlobChildren + HeldRead,
 {
     type Snapshot = PeerSnapshot<S>;
     type SnapshotError = PeerSnapshotError<S::SnapshotError>;
@@ -125,9 +128,10 @@ where
         + CapabilityProofStore
         + WantStore
         + StorageFlush
+        + HeldStore
         + Send
         + 'static,
-    S::Snapshot: StoreRead + BlobChildren,
+    S::Snapshot: StoreRead + BlobChildren + HeldRead,
 {
     type AcquireError = PeerAcquireError;
 
@@ -146,9 +150,10 @@ where
         + CapabilityProofStore
         + WantStore
         + StorageFlush
+        + HeldStore
         + Send
         + 'static,
-    S::Snapshot: StoreRead + BlobChildren,
+    S::Snapshot: StoreRead + BlobChildren + HeldRead,
 {
     type PutError = S::PutError;
 
@@ -169,9 +174,10 @@ where
         + CapabilityProofStore
         + WantStore
         + StorageFlush
+        + HeldStore
         + Send
         + 'static,
-    S::Snapshot: StoreRead + BlobChildren,
+    S::Snapshot: StoreRead + BlobChildren + HeldRead,
 {
     type InsertError = <S as CollectionStore>::InsertError;
 
@@ -190,9 +196,10 @@ where
         + CapabilityProofStore
         + WantStore
         + StorageFlush
+        + HeldStore
         + Send
         + 'static,
-    S::Snapshot: StoreRead + BlobChildren,
+    S::Snapshot: StoreRead + BlobChildren + HeldRead,
 {
     type InsertError = <S as CapabilityProofStore>::InsertError;
 
@@ -211,9 +218,10 @@ where
         + CapabilityProofStore
         + WantStore
         + StorageFlush
+        + HeldStore
         + Send
         + 'static,
-    S::Snapshot: StoreRead + BlobChildren,
+    S::Snapshot: StoreRead + BlobChildren + HeldRead,
 {
     type Error = <S as StorageFlush>::Error;
 
@@ -230,9 +238,10 @@ where
         + WantStore
         + StorageFlush
         + StorageClose
+        + HeldStore
         + Send
         + 'static,
-    S::Snapshot: StoreRead + BlobChildren,
+    S::Snapshot: StoreRead + BlobChildren + HeldRead,
 {
     type Error = <S as StorageClose>::Error;
 

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Transport generation `/triblespace/pile-sync/28` and wake version 5: sync
+  exports foundations only. The record PATCH, its summary, served nodes,
+  incremental updates and hydration roots carry COMMIT and DERIVE records
+  (with capability and authorization records as before), never a MERGE; a
+  client refuses any leaf that is not a COMMIT or DERIVE. The blob component
+  of repair is the store's
+  held set, replacing the budgeted in-publication scan
+  (`collection_blob_inventory` is gone): no scan budget, no revisit of a
+  whole closure on blob arrival. A blob a peer reports in C's held set is
+  recorded when the hint arrives, before the acquisition window filters it, so
+  it is held in every replication mode. Generation-27 peers and version-4
+  wakes are refused.
+
 - Extend collection repair to records, scoped AUTH and a positive resident-blob
   PATCH through new opcode `0x0E` on ALPN `/triblespace/pile-sync/26`;
   retired repair opcode `0x0D` is rejected, while unchanged bearer/DHT clients
