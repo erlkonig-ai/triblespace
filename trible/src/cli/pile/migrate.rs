@@ -62,9 +62,12 @@ pub enum Command {
     /// target's descriptor names only mapping algorithms that become
     /// attached or are deleted, and kept when the mapping stays derived (the
     /// semantic index), is unrecognised, or the descriptor is not resident.
-    /// A blob is kept only when the kept state reaches it by the
-    /// conservative walk, so merge results and dropped images are left
-    /// behind: archive the source first. The source is only read, and a
+    /// A blob is kept only when the kept state or a `--root` reaches it by
+    /// the conservative walk, so merge results and dropped images are left
+    /// behind, and so is the descriptor of a collection no kept record names
+    /// unless a root keeps it: archive the source first, and name with
+    /// `--root` or `--roots-from` every handle something outside the pile
+    /// opens. The source is only read, and a
     /// source another process holds open is refused. Afterwards every kept
     /// collection is read through the fold without a host key, and each
     /// believed foundation's payload must be resident. `--dry-run` decides

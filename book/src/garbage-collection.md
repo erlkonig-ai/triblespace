@@ -153,9 +153,10 @@ exactly what the carried records, headers, proofs, WANTs and pins reach.
 `PileFile::plan_retained_rewrite` runs the same selection pass and retention
 walk without writing, so a dry run reports exactly what the rewrite will do.
 The lattice v3 cutover (`trible pile migrate SRC lattice-v3`) is this rewrite
-with no explicit roots: it drops every MERGE, since each host folds and
-rebuilds only its own, the DERIVEs of mappings that became attached indexes
-or were deleted, and every blob only those reached.
+with only the roots its operator names: it drops every MERGE, since each host
+folds and rebuilds only its own, the DERIVEs of mappings that became attached
+indexes or were deleted, and every blob only those reached, including the
+descriptor of a collection no kept record names unless a root keeps it.
 
 ## Conservative Reachability
 

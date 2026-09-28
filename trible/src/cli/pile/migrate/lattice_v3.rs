@@ -21,8 +21,14 @@
 //!   what every kept record names (commit data and metadata, DERIVE outputs,
 //!   descriptors), from proofs, WANTs and pins, from the aligned words of kept
 //!   frames of unknown kind, and from the record-kind descriptions this binary
-//!   writes. Merge results and the images of dropped DERIVEs no kept record
-//!   reaches are left behind. Archive the source before replacing it.
+//!   writes, and from every `--root`. Merge results and the images of
+//!   dropped DERIVEs no kept record reaches are left behind, and so is the
+//!   descriptor of a collection no kept record names (one that never held a
+//!   record, say): name such handles with `--root` or `--roots-from` when
+//!   something outside the pile (a sync or maintenance list, an exact-handle
+//!   override) still opens them. The report lists every resident descriptor
+//!   of a collection some frame names that is left behind. Archive the
+//!   source before replacing it.
 //!
 //! The source is read through a read-only descriptor, and the command refuses
 //! a source another process holds open: this rewrites a frozen copy, never a
@@ -35,6 +41,10 @@
 //! destination; the answers agree because every foundation of a kept
 //! collection is a kept record, and a kept record's payload is kept whenever
 //! it is resident.
+//!
+//! A real run ends with a digest of the destination's frames that leaves out
+//! blob insertion timestamps, which every rewrite stamps afresh: two runs
+//! over one source write the same digest, not the same bytes.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -57,17 +67,31 @@ use triblespace_core::macros::{find, pattern};
 use triblespace_core::metadata;
 use triblespace_core::repo::pile::{
     CollectionFrame, CollectionFrameFilter, CollectionFrameGeneration, CollectionFrameRole, Pile,
-    PileFile, PileFileSnapshot, WantRewritePolicy,
+    PileFile, PileFileSnapshot, PileRecordContent, PileRecords, WantRewritePolicy,
 };
 use triblespace_core::repo::{BlobStoreGet, BlobStoreList, RetentionRoots, SnapshotSource};
 use triblespace_core::trible::TribleSet;
 
+use super::super::collection::parse_collection_handle;
 use super::super::collection::v3_mappings::{v3_mapping, V3Fate, V3_MAPPINGS};
 use super::super::compact::{cleanup_incomplete_destination, create_fresh_destination};
 
 /// Rewrite a pile copy for lattice v3 (see the module docs).
 #[derive(clap::Args, Debug)]
 pub struct LatticeV3Args {
+    /// A blob to keep with everything it reaches, as `blake3:HEX` or bare
+    /// hex: typically a collection handle something outside the pile opens,
+    /// whose descriptor no kept record may name. Repeat for several; one
+    /// that is not resident in the source is reported, not refused.
+    #[arg(long = "root", value_name = "HANDLE")]
+    pub roots: Vec<String>,
+    /// A file of handles to keep as `--root` keeps them: one per line,
+    /// `blake3:HEX` or bare hex; blank lines and lines starting with `#` are
+    /// skipped, and a line `NAME=HANDLE` (optionally after `export `) is read
+    /// as its HANDLE, so a collection environment file serves as it is.
+    /// Repeat for several files.
+    #[arg(long = "roots-from", value_name = "FILE")]
+    pub roots_from: Vec<PathBuf>,
     /// Fresh destination pile, mode 0600 until written. Must not exist.
     #[arg(long = "into", required_unless_present = "dry_run")]
     pub into: Option<PathBuf>,
@@ -95,10 +119,14 @@ enum Class {
     Missing,
     /// The descriptor blob does not decode as a SimpleArchive.
     Undecodable,
-    /// A descriptor naming no mapping algorithm, with the names it carries.
+    /// A descriptor naming no mapping, with the names it carries.
     Unmapped { names: BTreeSet<String> },
-    /// A descriptor naming these mapping algorithms.
-    Mapped { algorithms: BTreeSet<Id> },
+    /// A descriptor naming mappings: the algorithms of those tagged as
+    /// mappings, and how many name no algorithm that way.
+    Mapped {
+        algorithms: BTreeSet<Id>,
+        unresolved: usize,
+    },
 }
 
 fn classify(reader: &PileFileSnapshot, collection: [u8; 32]) -> Class {
@@ -109,22 +137,34 @@ fn classify(reader: &PileFileSnapshot, collection: [u8; 32]) -> Class {
     let Ok(facts) = reader.get::<TribleSet, SimpleArchive>(handle) else {
         return Class::Undecodable;
     };
-    let algorithms: BTreeSet<Id> = find!(
-        algorithm: Id,
-        pattern!(&facts, [
-            { _?descriptor @
-                metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-                collection_mapping: _?mapping,
-            },
-            { _?mapping @
-                metadata::tag: KIND_COLLECTION_MAPPING,
-                mapping_algorithm: ?algorithm,
-            },
-        ])
+    let mappings: BTreeSet<Id> = find!(
+        mapping: Id,
+        pattern!(&facts, [{ _?descriptor @
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            collection_mapping: ?mapping,
+        }])
     )
     .collect();
-    if !algorithms.is_empty() {
-        return Class::Mapped { algorithms };
+    if !mappings.is_empty() {
+        let tagged: BTreeSet<(Id, Id)> = find!(
+            (mapping: Id, algorithm: Id),
+            pattern!(&facts, [
+                { _?descriptor @
+                    metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+                    collection_mapping: ?mapping,
+                },
+                { ?mapping @
+                    metadata::tag: KIND_COLLECTION_MAPPING,
+                    mapping_algorithm: ?algorithm,
+                },
+            ])
+        )
+        .collect();
+        let resolved: BTreeSet<Id> = tagged.iter().map(|(mapping, _)| *mapping).collect();
+        return Class::Mapped {
+            algorithms: tagged.into_iter().map(|(_, algorithm)| algorithm).collect(),
+            unresolved: mappings.difference(&resolved).count(),
+        };
     }
     let names = find!(
         name: Inline<Handle<UTF8String>>,
@@ -147,14 +187,22 @@ fn fate(id: Id, attached: &BTreeSet<Id>) -> Option<V3Fate> {
 }
 
 impl Class {
-    /// Whether DERIVEs into this collection are left behind: only when the
-    /// descriptor names mapping algorithms and every one is attached or
-    /// deleted.
+    /// Whether DERIVEs into this collection are left behind: only when every
+    /// mapping the descriptor names is tagged with an algorithm, and every
+    /// such algorithm is attached or deleted. A mapping this reader cannot
+    /// resolve keeps them, as an unrecognised algorithm does.
     fn leaves_derives_behind(&self, attached: &BTreeSet<Id>) -> bool {
         match self {
-            Class::Mapped { algorithms } => algorithms
-                .iter()
-                .all(|id| fate(*id, attached).is_some_and(V3Fate::leaves_derives_behind)),
+            Class::Mapped {
+                algorithms,
+                unresolved,
+            } => {
+                *unresolved == 0
+                    && !algorithms.is_empty()
+                    && algorithms
+                        .iter()
+                        .all(|id| fate(*id, attached).is_some_and(V3Fate::leaves_derives_behind))
+            }
             Class::Missing | Class::Undecodable | Class::Unmapped { .. } => false,
         }
     }
@@ -172,7 +220,10 @@ impl Class {
                     .collect::<Vec<_>>()
                     .join(" | ")
             ),
-            Class::Mapped { algorithms } => algorithms
+            Class::Mapped {
+                algorithms,
+                unresolved,
+            } => algorithms
                 .iter()
                 .map(|id| match v3_mapping(*id) {
                     Some(mapping) => {
@@ -183,6 +234,9 @@ impl Class {
                     }
                     None => format!("{id:X} [unrecognised]"),
                 })
+                .chain((*unresolved > 0).then(|| {
+                    format!("{unresolved} mapping(s) without a tagged algorithm [unrecognised]")
+                }))
                 .collect::<Vec<_>>()
                 .join(" + "),
         }
@@ -299,8 +353,71 @@ struct FrameAccounting {
     filtered: usize,
     superseded: usize,
     drained: usize,
+    repeated: usize,
     opaque_carried: usize,
     retired_carried: usize,
+}
+
+/// The handles `--root` and `--roots-from` name, split by residency in the
+/// source: the resident ones are kept with what they reach.
+#[derive(Clone, Debug, Default)]
+struct Roots {
+    resident: BTreeSet<[u8; 32]>,
+    absent: BTreeSet<[u8; 32]>,
+}
+
+impl Roots {
+    fn retention(&self) -> RetentionRoots {
+        let mut roots = RetentionRoots::new();
+        for handle in &self.resident {
+            roots.retain_recursive(Inline::<Handle<UnknownBlob>>::new(*handle));
+        }
+        roots
+    }
+}
+
+/// Read the handles `--root` and `--roots-from` name (see
+/// [`LatticeV3Args::roots_from`] for the file format).
+fn parse_roots(roots: &[String], files: &[PathBuf]) -> Result<BTreeSet<[u8; 32]>> {
+    let mut parsed = BTreeSet::new();
+    for text in roots {
+        parsed.insert(parse_collection_handle(text).context("--root")?.raw);
+    }
+    for file in files {
+        let text = std::fs::read_to_string(file)
+            .with_context(|| format!("read --roots-from {}", file.display()))?;
+        for (number, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let value = line
+                .rsplit_once('=')
+                .map_or(line, |(_, value)| value)
+                .trim()
+                .trim_matches(|quote| quote == '"' || quote == '\'');
+            let handle = parse_collection_handle(value)
+                .with_context(|| format!("{}:{}", file.display(), number + 1))?;
+            parsed.insert(handle.raw);
+        }
+    }
+    Ok(parsed)
+}
+
+/// Split the named roots by residency in `reader`.
+fn resolve_roots(reader: &PileFileSnapshot, named: &BTreeSet<[u8; 32]>) -> Result<Roots> {
+    let mut roots = Roots::default();
+    for handle in named {
+        let resident = reader
+            .contains_blob(Inline::<Handle<UnknownBlob>>::new(*handle))
+            .map_err(|error| anyhow!("residency lookup: {error:?}"))?;
+        if resident {
+            roots.resident.insert(*handle);
+        } else {
+            roots.absent.insert(*handle);
+        }
+    }
+    Ok(roots)
 }
 
 /// Resident blobs in the source, and the ones the rewrite keeps.
@@ -376,11 +493,31 @@ impl Census {
             .collect()
     }
 
+    /// Every resident descriptor of a collection some frame names that the
+    /// rewrite leaves behind, with whether its DERIVEs are left behind too.
+    /// `kept` answers for the destination (or the plan). Collections no
+    /// frame names are not examined: nothing in the pile says they exist.
+    fn left_descriptors(
+        &self,
+        mut kept: impl FnMut([u8; 32]) -> Result<bool>,
+    ) -> Result<Vec<([u8; 32], bool)>> {
+        let mut left = Vec::new();
+        for (collection, class) in &self.classes {
+            if *class == Class::Missing || kept(*collection)? {
+                continue;
+            }
+            left.push((*collection, class.leaves_derives_behind(&self.attached)));
+        }
+        Ok(left)
+    }
+
     /// The report both modes print, in full.
     fn report(
         &self,
         accounting: FrameAccounting,
         blobs: BlobAccounting,
+        roots: &Roots,
+        left_descriptors: &[([u8; 32], bool)],
         readability: &Readability,
     ) -> String {
         let mut out = String::new();
@@ -399,7 +536,10 @@ impl Census {
         for id in attached {
             let _ = writeln!(out, "  {id:X}: attached, from --attached-mapping");
         }
-        let _ = writeln!(out, "frames (carried / left behind):");
+        let _ = writeln!(
+            out,
+            "records (carried / left behind; one held in several frames counts once):"
+        );
         for ((generation, role), tally) in &self.by_kind {
             let _ = writeln!(
                 out,
@@ -412,13 +552,24 @@ impl Census {
         }
         let _ = writeln!(
             out,
-            "rewrite: {} left behind by the filter, {} superseded, {} drained; carried {} frames of unknown kind and {} retired v8/v9 equations",
+            "rewrite: {} left behind by the filter, {} superseded, {} drained, {} repeated frames counted once; carried {} frames of unknown kind and {} retired v8/v9 equations",
             accounting.filtered,
             accounting.superseded,
             accounting.drained,
+            accounting.repeated,
             accounting.opaque_carried,
             accounting.retired_carried,
         );
+        let _ = writeln!(
+            out,
+            "roots: {} named, {} resident and kept with what they reach, {} not resident in the source",
+            roots.resident.len() + roots.absent.len(),
+            roots.resident.len(),
+            roots.absent.len(),
+        );
+        for handle in &roots.absent {
+            let _ = writeln!(out, "  not resident blake3:{}", hex::encode_upper(handle));
+        }
         let _ = writeln!(
             out,
             "blobs: {} resident ({} bytes), {} kept ({} bytes), {} left behind ({} bytes)",
@@ -450,7 +601,7 @@ impl Census {
         }
         let _ = writeln!(
             out,
-            "DERIVE frames by mapping (carried / left behind, collections):"
+            "DERIVE records by mapping (carried / left behind, collections):"
         );
         for (label, (tally, collections)) in &by_mapping {
             let _ = writeln!(
@@ -460,7 +611,7 @@ impl Census {
             );
         }
 
-        let _ = writeln!(out, "frames by collection (carried / left behind):");
+        let _ = writeln!(out, "records by collection (carried / left behind):");
         for (collection, roles) in &self.by_collection {
             let (name, label) = match collection {
                 Some(collection) => (
@@ -483,6 +634,29 @@ impl Census {
                 .collect::<Vec<_>>()
                 .join(", ");
             let _ = writeln!(out, "  {name} {label}: {counts}");
+        }
+
+        let _ = writeln!(
+            out,
+            "descriptors left behind: {} (resident; only collections a frame names are examined, keep others with --root)",
+            left_descriptors.len()
+        );
+        for (collection, derives_left) in left_descriptors {
+            let label = self
+                .classes
+                .get(collection)
+                .map(|class| class.label(attached))
+                .unwrap_or_default();
+            let why = if *derives_left {
+                "its DERIVEs are left behind"
+            } else {
+                "no kept record or root reaches it"
+            };
+            let _ = writeln!(
+                out,
+                "  blake3:{} {label}: {why}",
+                hex::encode_upper(collection)
+            );
         }
 
         let foundations: usize = readability.values().map(|(count, _)| count).sum();
@@ -611,6 +785,33 @@ fn open_source(path: &Path) -> Result<PileFile> {
     Ok(source)
 }
 
+/// A digest of a pile's frames, in file order, that leaves out the one field
+/// every rewrite stamps afresh, a blob record's insertion timestamp: a blob
+/// record counts by its content hash and length, every other frame by its
+/// bytes. Two runs of the filter over one source write piles with the same
+/// digest, though not the same bytes.
+fn content_digest(path: &Path) -> Result<blake3::Hash> {
+    let mut records =
+        PileRecords::open(path).map_err(|error| anyhow!("walk {}: {error:?}", path.display()))?;
+    let mut hasher = blake3::Hasher::new();
+    while let Some(record) = records.next() {
+        let record = record.map_err(|error| anyhow!("walk {}: {error:?}", path.display()))?;
+        match record.content {
+            PileRecordContent::Blob { hash, data_len, .. } => {
+                hasher.update(b"blob");
+                hasher.update(&hash.raw);
+                hasher.update(&(data_len as u64).to_le_bytes());
+            }
+            _ => {
+                hasher.update(b"frame");
+                hasher.update(&(record.len as u64).to_le_bytes());
+                hasher.update(&records.bytes()[record.offset..record.offset + record.len]);
+            }
+        }
+    }
+    Ok(hasher.finalize())
+}
+
 fn refuse_absent(readability: &Readability, allow_absent: bool) -> Result<()> {
     let absent: usize = readability.values().map(|(_, absent)| absent.len()).sum();
     if absent > 0 && !allow_absent {
@@ -625,6 +826,7 @@ fn refuse_absent(readability: &Readability, allow_absent: bool) -> Result<()> {
 
 pub fn run(source_path: PathBuf, args: LatticeV3Args) -> Result<()> {
     let attached = parse_attached(&args.attached_mappings)?;
+    let named_roots = parse_roots(&args.roots, &args.roots_from)?;
     if !source_path.is_file() {
         bail!("source {} is not a pile file", source_path.display());
     }
@@ -641,19 +843,27 @@ pub fn run(source_path: PathBuf, args: LatticeV3Args) -> Result<()> {
         .with_context(|| format!("stat {}", source_path.display()))?
         .len();
 
+    let options = Options {
+        attached: &attached,
+        named_roots: &named_roots,
+        allow_absent: args.allow_absent,
+        stable_len,
+    };
     if args.dry_run {
-        return dry_run(&source_path, &attached, args.allow_absent, stable_len);
+        return dry_run(&source_path, &options);
     }
     let destination_path = args
         .into
         .ok_or_else(|| anyhow!("--into is required without --dry-run"))?;
-    filter_into(
-        &source_path,
-        &destination_path,
-        &attached,
-        args.allow_absent,
-        stable_len,
-    )
+    filter_into(&source_path, &destination_path, &options)
+}
+
+/// What both modes take from the command line.
+struct Options<'a> {
+    attached: &'a BTreeSet<Id>,
+    named_roots: &'a BTreeSet<[u8; 32]>,
+    allow_absent: bool,
+    stable_len: u64,
 }
 
 fn check_source_len(path: &Path, stable_len: u64) -> Result<()> {
@@ -670,22 +880,18 @@ fn check_source_len(path: &Path, stable_len: u64) -> Result<()> {
     Ok(())
 }
 
-fn dry_run(
-    source_path: &Path,
-    attached: &BTreeSet<Id>,
-    allow_absent: bool,
-    stable_len: u64,
-) -> Result<()> {
+fn dry_run(source_path: &Path, options: &Options) -> Result<()> {
     let mut source = open_source(source_path)?;
     let planned = (|| -> Result<(String, Readability)> {
         let reader = source
             .snapshot()
             .map_err(|error| anyhow!("snapshot source: {error:?}"))?;
         let (resident, resident_bytes) = blob_totals(&reader)?;
-        let mut filter = V3Filter::new(&reader, attached);
+        let roots = resolve_roots(&reader, options.named_roots)?;
+        let mut filter = V3Filter::new(&reader, options.attached);
         let plan = source
             .plan_retained_rewrite(
-                &RetentionRoots::new(),
+                &roots.retention(),
                 WantRewritePolicy::Preserve,
                 &[],
                 &mut filter,
@@ -697,24 +903,31 @@ fn dry_run(
             kept: plan.retained_blobs,
             kept_bytes: plan.retained_bytes,
         };
-        check_source_len(source_path, stable_len)?;
+        check_source_len(source_path, options.stable_len)?;
         let accounting = FrameAccounting {
             filtered: plan.filtered_frames,
             superseded: plan.superseded_equations,
             drained: plan.drained_frames,
+            repeated: plan.repeated_frames,
             opaque_carried: plan.opaque_frames,
             retired_carried: plan.retired_equations,
         };
+        let census = filter.census;
+        let left = census.left_descriptors(|collection| {
+            Ok(plan
+                .retained
+                .contains(&Inline::<Handle<UnknownBlob>>::new(collection)))
+        })?;
         let mut keyless = Pile::new(
             PileFile::open_read_only(source_path)
                 .map_err(|error| anyhow!("reopen source: {error:?}"))?,
         );
-        let read = readability(&mut keyless, &filter.census.kept_collections());
+        let read = readability(&mut keyless, &census.kept_collections());
         keyless
             .close()
             .map_err(|error| anyhow!("close source: {error:?}"))?;
         let read = read?;
-        Ok((filter.census.report(accounting, blobs, &read), read))
+        Ok((census.report(accounting, blobs, &roots, &left, &read), read))
     })();
     let closed = source
         .close()
@@ -726,16 +939,10 @@ fn dry_run(
         source_path.display()
     );
     print!("{report}");
-    refuse_absent(&read, allow_absent)
+    refuse_absent(&read, options.allow_absent)
 }
 
-fn filter_into(
-    source_path: &Path,
-    destination_path: &Path,
-    attached: &BTreeSet<Id>,
-    allow_absent: bool,
-    stable_len: u64,
-) -> Result<()> {
+fn filter_into(source_path: &Path, destination_path: &Path, options: &Options) -> Result<()> {
     let mut source = open_source(source_path)?;
     let source_permissions = match std::fs::metadata(source_path) {
         Ok(metadata) => metadata.permissions(),
@@ -776,32 +983,40 @@ fn filter_into(
         }
     };
 
-    let operation = (|| -> Result<(Census, FrameAccounting, (usize, u64), usize)> {
+    let operation = (|| -> Result<(Census, FrameAccounting, Roots, (usize, u64), usize)> {
         let reader = source
             .snapshot()
             .map_err(|error| anyhow!("snapshot source: {error:?}"))?;
         let resident = blob_totals(&reader)?;
-        let mut filter = V3Filter::new(&reader, attached);
-        // No explicit roots: a blob travels only when the carried state
-        // reaches it.
+        let roots = resolve_roots(&reader, options.named_roots)?;
+        let mut filter = V3Filter::new(&reader, options.attached);
+        // Only the named roots: every other blob travels only when the
+        // carried state reaches it.
         let stats = source
             .rewrite_retained_into_filtered(
                 &mut destination,
-                &RetentionRoots::new(),
+                &roots.retention(),
                 WantRewritePolicy::Preserve,
                 &[],
                 &mut filter,
             )
             .map_err(|error| anyhow!("lattice v3 filter: {error}"))?;
-        check_source_len(source_path, stable_len)?;
+        check_source_len(source_path, options.stable_len)?;
         let accounting = FrameAccounting {
             filtered: stats.filtered_frames,
             superseded: stats.superseded_equations,
             drained: stats.drained_frames,
+            repeated: stats.repeated_frames,
             opaque_carried: stats.opaque_frames,
             retired_carried: stats.retired_equations,
         };
-        Ok((filter.census, accounting, resident, stats.retained_blobs))
+        Ok((
+            filter.census,
+            accounting,
+            roots,
+            resident,
+            stats.retained_blobs,
+        ))
     })();
     let destination_close = destination
         .close()
@@ -809,7 +1024,7 @@ fn filter_into(
     let source_close = source
         .close()
         .map_err(|error| anyhow!("close source: {error:?}"));
-    let (census, accounting, (resident, resident_bytes), retained) =
+    let (census, accounting, roots, (resident, resident_bytes), retained) =
         match (operation, destination_close, source_close) {
             (Ok(result), Ok(()), Ok(())) => result,
             (Err(error), _, _) | (Ok(_), Err(error), _) | (Ok(_), Ok(()), Err(error)) => {
@@ -821,12 +1036,12 @@ fn filter_into(
     // Read the written pile back: it holds exactly the blobs the rewrite
     // kept, and the keyless fold of every kept collection names resident
     // payloads.
-    let checked = (|| -> Result<(Readability, BlobAccounting)> {
+    let checked = (|| -> Result<(Readability, BlobAccounting, Vec<([u8; 32], bool)>)> {
         let mut written = Pile::new(
             PileFile::open_read_only(destination_path)
                 .map_err(|error| anyhow!("reopen destination: {error:?}"))?,
         );
-        let result = (|| -> Result<(Readability, BlobAccounting)> {
+        let result = (|| -> Result<(Readability, BlobAccounting, Vec<([u8; 32], bool)>)> {
             let snapshot = written
                 .snapshot()
                 .map_err(|error| anyhow!("snapshot destination: {error:?}"))?;
@@ -834,6 +1049,11 @@ fn filter_into(
             if kept != retained {
                 bail!("the destination holds {kept} blobs, the rewrite kept {retained}");
             }
+            let left = census.left_descriptors(|collection| {
+                snapshot
+                    .contains_blob(Inline::<Handle<UnknownBlob>>::new(collection))
+                    .map_err(|error| anyhow!("residency lookup: {error:?}"))
+            })?;
             drop(snapshot);
             let blobs = BlobAccounting {
                 resident,
@@ -844,6 +1064,7 @@ fn filter_into(
             Ok((
                 readability(&mut written, &census.kept_collections())?,
                 blobs,
+                left,
             ))
         })();
         let closed = written
@@ -853,7 +1074,7 @@ fn filter_into(
         closed?;
         Ok(read)
     })();
-    let (read, blobs) = match checked {
+    let (read, blobs, left) = match checked {
         Ok(checked) => checked,
         Err(error) => {
             drop(destination_file);
@@ -872,14 +1093,25 @@ fn filter_into(
     let destination_len = std::fs::metadata(destination_path)
         .with_context(|| format!("stat {}", destination_path.display()))?
         .len();
+    let digest = match content_digest(destination_path) {
+        Ok(digest) => digest,
+        Err(error) => return Err(cleanup_incomplete_destination(destination_path, error)),
+    };
     println!(
         "lattice-v3 filter of {} into {}",
         source_path.display(),
         destination_path.display()
     );
-    print!("{}", census.report(accounting, blobs, &read));
-    println!("destination: {stable_len} -> {destination_len} bytes");
-    if let Err(error) = refuse_absent(&read, allow_absent) {
+    print!("{}", census.report(accounting, blobs, &roots, &left, &read));
+    println!(
+        "destination: {} -> {destination_len} bytes",
+        options.stable_len
+    );
+    println!(
+        "destination digest (blob insertion timestamps left out): blake3:{}",
+        hex::encode_upper(digest.as_bytes())
+    );
+    if let Err(error) = refuse_absent(&read, options.allow_absent) {
         return Err(cleanup_incomplete_destination(
             destination_path,
             error.context("the destination was removed"),

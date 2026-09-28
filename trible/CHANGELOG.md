@@ -20,7 +20,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   source another process holds open, reads it read-only, and checks the
   result through the fold without a host key: a believed foundation whose
   payload is not resident is listed and refused unless `--allow-absent`.
-  `--dry-run` prints the same report without writing.
+  `--dry-run` prints the same report without writing. `--root HANDLE` and
+  `--roots-from FILE` (a handle list or a collection environment file) keep
+  blobs something outside the pile opens, such as the descriptor of a
+  collection no kept record names; the report lists the roots not resident
+  in the source and every resident descriptor of a collection some frame
+  names that is left behind. Counts are of records: one held in several
+  frames counts once. A descriptor naming a mapping without a tagged
+  algorithm keeps its DERIVEs, as an unrecognised algorithm does.
 - `pile net sync --health-collection <handle>` (with `--health-key`) and
   `pile net health --collection <handle>` report into and read from an
   explicit existing health generation instead of the reporting key's own
