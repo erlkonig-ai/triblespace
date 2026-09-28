@@ -471,7 +471,7 @@ fn run_sync(
     }
     eprintln!("live collection repair active. (Ctrl-C to stop; also SIGTERM on Unix)\n");
     let node = *peer.id().as_bytes();
-    let mut rounds_seen = std::collections::BTreeMap::new();
+    let mut rounds_seen = RoundsSeen::new();
 
     let started = std::time::Instant::now();
     let duration_limit = duration.map(std::time::Duration::from_secs);
@@ -605,25 +605,31 @@ fn reconciled_line(peer: &[u8; 32], collections: usize) -> String {
     )
 }
 
+/// The last completed repair round per `peer || collection`, kept across the
+/// daemon's passes.
+type RoundsSeen<T> = triblespace_core::patch::PATCH<64, triblespace_core::patch::IdentitySchema, T>;
+
 /// Collection repair rounds with a peer that completed without failure since
 /// the last call, counted per peer. Each round is `(peer, collection,
 /// completed at, failed at)`; a round that failed has both times equal.
 /// `seen` keeps the last completion per peer and collection.
 fn completed_rounds<T: Copy + Ord>(
     rounds: impl IntoIterator<Item = ([u8; 32], [u8; 32], Option<T>, Option<T>)>,
-    seen: &mut std::collections::BTreeMap<([u8; 32], [u8; 32]), T>,
+    seen: &mut RoundsSeen<T>,
 ) -> std::collections::BTreeMap<[u8; 32], usize> {
+    // Scratch for this call: the count per peer.
     let mut completed = std::collections::BTreeMap::new();
     for (peer, collection, completed_at, failed_at) in rounds {
         let Some(at) = completed_at else {
             continue;
         };
-        if seen
-            .insert((peer, collection), at)
-            .is_some_and(|previous| previous >= at)
-        {
+        let mut key = [0u8; 64];
+        key[..32].copy_from_slice(&peer);
+        key[32..].copy_from_slice(&collection);
+        if seen.get(&key).is_some_and(|previous| *previous >= at) {
             continue;
         }
+        seen.replace(&triblespace_core::patch::Entry::with_value(&key, at));
         if failed_at != Some(at) {
             *completed.entry(peer).or_default() += 1;
         }
@@ -914,7 +920,7 @@ mod tests {
 
     #[test]
     fn a_reconciled_line_per_peer_for_new_successful_rounds_only() {
-        let mut seen = std::collections::BTreeMap::new();
+        let mut seen = super::RoundsSeen::new();
         let (first, second) = ([1; 32], [2; 32]);
         let (a, b) = ([10; 32], [11; 32]);
         let rounds = [
