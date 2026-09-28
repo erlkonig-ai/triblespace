@@ -21,6 +21,11 @@
 //! store's life because every snapshot and reader shares the index it seeds.
 //! A store without a host believes no MERGE, which is always correct and only
 //! wider: every believed foundation is its own frontier node.
+//!
+//! Beside the coverage index, and under its own lock, sits the held-blob
+//! index of the collections a sync host tracks ([`super::held`]). It is fed
+//! by the same snapshot difference, and a store that tracks nothing pays
+//! nothing for it.
 
 use std::collections::BTreeSet;
 use std::ops::{Deref, DerefMut};
@@ -42,6 +47,9 @@ use crate::repo::{
 };
 
 use super::coverage::{Coverage, CoverageIndex, StoreWriters};
+use super::held::{
+    HeldBlobs, HeldIndex, HeldRead, HeldSource, HeldStore, HeldView, HeldWalkConfig, HeldWalker,
+};
 use super::{
     CollectionHandle, CollectionRead, CollectionRecord,
     CollectionRecordSelector, CollectionStore, CoverageRead,
@@ -73,6 +81,9 @@ pub struct Covered<S: SnapshotSource> {
     /// next snapshot starts from what readers have already decided and pays
     /// only for what arrived since, and only for lineages someone reads.
     last: Option<(S::Snapshot, std::sync::Arc<std::sync::Mutex<Memo>>)>,
+    /// The held-blob index, outside the coverage memo and behind its own
+    /// lock, so a scan never stalls a coverage read.
+    held: std::sync::Arc<HeldIndex<S::Snapshot>>,
 }
 
 /// What a snapshot has decided so far: the index, and the collections whose
@@ -101,6 +112,7 @@ impl<S: SnapshotSource> Covered<S> {
             inner,
             host,
             last: None,
+            held: std::sync::Arc::default(),
         }
     }
 
@@ -137,6 +149,9 @@ where
             inner: self.inner.clone(),
             host: self.host,
             last: self.last.clone(),
+            // A clone diverges from here on: it keeps what was learned, and
+            // no walker.
+            held: std::sync::Arc::new(self.held.detached_clone()),
         }
     }
 }
@@ -216,7 +231,7 @@ where
 impl<S> SnapshotSource for Covered<S>
 where
     S: SnapshotSource,
-    S::Snapshot: RecordDelta + BlobStoreList + BlobStoreGet + CapabilityProofRead + Clone,
+    S::Snapshot: HeldSource,
 {
     type Snapshot = CoveredSnapshot<S::Snapshot>;
     type SnapshotError = S::SnapshotError;
@@ -224,8 +239,50 @@ where
     fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
         let now = self.inner.snapshot()?;
         let memo = self.carry_forward(&now);
+        // The publication barrier: the closures of what arrived since the
+        // last snapshot are computed against this one before it is handed
+        // out. Nothing is tracked, nothing is paid.
+        let held = self.held.observe(&now);
         self.last = Some((now.clone(), std::sync::Arc::clone(&memo)));
-        Ok(CoveredSnapshot { inner: now, memo })
+        Ok(CoveredSnapshot {
+            inner: now,
+            memo,
+            held,
+        })
+    }
+}
+
+impl<S: SnapshotSource> HeldStore for Covered<S> {
+    fn track_held(&mut self, collections: impl IntoIterator<Item = CollectionHandle>) {
+        self.held.track(collections);
+    }
+
+    fn note_held(&mut self, collection: CollectionHandle, handle: Inline<Handle<UnknownBlob>>) {
+        self.held.note(collection, handle.raw);
+    }
+}
+
+impl<S> Covered<S>
+where
+    S: SnapshotSource,
+    S::Snapshot: HeldSource,
+{
+    /// Start the background walker of this store's held sets: the start-up
+    /// walk of each newly tracked collection and the periodic full walk.
+    /// Only a long-running host starts one; the thread lives until the
+    /// returned handle is dropped.
+    pub fn start_held_walker(&self, config: HeldWalkConfig) -> HeldWalker {
+        self.held.start_walker(config)
+    }
+
+    /// Run one full walk now, on the calling thread and `threads` readers,
+    /// against a fresh observation: the backstop the walker runs
+    /// periodically. Its results enter the next snapshot.
+    pub fn walk_held(&mut self, threads: usize) -> Result<(), S::SnapshotError> {
+        let now = self.inner.snapshot()?;
+        self.held.observe(&now);
+        self.held.walk(&now, threads);
+        Ok(())
     }
 }
 
@@ -330,6 +387,8 @@ impl<S: SnapshotSource + StorageClose> Covered<S> {
 pub struct CoveredSnapshot<T> {
     inner: T,
     memo: std::sync::Arc<std::sync::Mutex<Memo>>,
+    /// The held sets fixed when this snapshot was taken.
+    held: std::sync::Arc<HeldView>,
 }
 
 impl<T: std::fmt::Debug> std::fmt::Debug for CoveredSnapshot<T> {
@@ -337,13 +396,14 @@ impl<T: std::fmt::Debug> std::fmt::Debug for CoveredSnapshot<T> {
         f.debug_struct("CoveredSnapshot")
             .field("inner", &self.inner)
             .field("memo", &*self.memo.lock().expect("coverage memo is not poisoned"))
+            .field("held", &self.held)
             .finish()
     }
 }
 
 impl<T: PartialEq> PartialEq for CoveredSnapshot<T> {
     fn eq(&self, other: &Self) -> bool {
-        if self.inner != other.inner {
+        if self.inner != other.inner || self.held != other.held {
             return false;
         }
         // Clones share the memo; locking it twice would wait on ourselves.
@@ -441,6 +501,16 @@ impl<T: CollectionRead + BlobStoreGet + CapabilityProofRead> CoverageRead for Co
         let mut memo = self.memo.lock().expect("coverage memo is not poisoned");
         self.settle_lineage(&mut memo, lineage)?;
         Ok(memo.index.clone())
+    }
+}
+
+impl<T> HeldRead for CoveredSnapshot<T> {
+    fn held(&self, collection: CollectionHandle) -> Option<HeldBlobs> {
+        self.held.held(collection)
+    }
+
+    fn held_generation(&self) -> u64 {
+        self.held.generation()
     }
 }
 

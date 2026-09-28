@@ -55,6 +55,8 @@ pub mod encoding;
 mod exact_derived;
 /// Same-named collection generations, and the records they strand.
 pub mod generation;
+/// Which resident blobs each synced collection holds.
+pub mod held;
 /// Maintained positive latest states and historical supersession evidence.
 pub mod latest;
 /// Maintained stated last-write-wins registers over exact source covers.
@@ -93,6 +95,7 @@ pub use discovery::*;
 pub use encoding::*;
 pub use exact_derived::CollectionRealizationError;
 pub use generation::*;
+pub use held::{HeldBlobs, HeldRead, HeldStore, HeldWalkConfig, HeldWalker};
 pub use maintenance::MERGE_FAN_IN;
 pub use policy::*;
 pub use records::*;

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- A held-blob index per tracked collection (`collection::held`), kept by
+  `Covered` beside the coverage index under its own lock and fed by the same
+  snapshot difference. `held(C)` is every resident blob reachable from the
+  blobs C's replicated records name (descriptor, COMMIT data and metadata,
+  DERIVE outputs, proof capability definitions), never a MERGE result, plus
+  the resident blobs peers reported in C (`HeldStore::note_held`, in memory
+  only). Each blob is scanned once and its edges cached for every collection;
+  a periodic full walk on a `HeldWalker` catches children that arrived after
+  their parent was scanned. Snapshots carry fixed held sets
+  (`HeldRead::held`); background walks only enter later ones. A store that
+  tracks nothing (`HeldStore::track_held`) pays nothing and starts no thread.
+  New selector `CollectionRecordSelector::Foundations(C)`: the COMMITs and
+  DERIVEs of C, never a MERGE.
+
 - `CollectionMapping` is now `DeriveMapping`, named for what its images
   become: `DERIVE` leaves of a derived collection. A new, still empty
   `MapMapping` trait states the contract of a mapping attached to another
