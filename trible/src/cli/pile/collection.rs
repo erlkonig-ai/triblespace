@@ -302,12 +302,13 @@ pub enum Command {
     },
     /// Search a maintained BM25 collection from the command line.
     ///
-    /// Reads the collection's resident cover, merges its carriers, cuts the query
-    /// with the tokenizer the descriptor names, and prints the best documents
+    /// Reads the attached cover the key believes, cuts the query with the
+    /// tokenizer the descriptor names, and prints the best documents
     /// (entities of the source collection) with their BM25 scores. With
     /// --snippet, also prints the start of each hit's text, read from the
-    /// source collection through the attribute the descriptor names. Needs
-    /// the search feature.
+    /// source collection through the attribute the descriptor names. When
+    /// the read believes no attachment at all, it says whether the key is
+    /// the reason (no key loads, or no attachment here is signed by it).
     Search {
         /// Path to the pile file to read
         pile: PathBuf,
@@ -3449,6 +3450,30 @@ fn derive_nvfp4(
     ))
 }
 
+/// Why a search read no attachment at all, and what would give it one.
+///
+/// Only the host's MAPs are believed, so an empty cover over a parent that
+/// has foundations says as much about the key the read opened as about
+/// maintenance: with no key nothing is ever attached, and a key that did not
+/// maintain this pile sees none of the maintaining key's attachments.
+fn unsearched(host: Option<VerifyingKey>, residual: usize) -> String {
+    match (host, residual) {
+        (_, 0) => "the parent collection holds no foundations yet; nothing to search".to_owned(),
+        (None, _) => format!(
+            "nothing searched: no signing key loads (--key, TRIBLESPACE_KEY, or self.key \
+             beside the pile), and a read without a key believes no attachment, so none of \
+             the parent's {residual} foundation(s) is searched; pass --key naming the key \
+             that maintains this pile"
+        ),
+        (Some(host), _) => format!(
+            "nothing searched: no attachment here is signed by key {}, so none of the \
+             parent's {residual} foundation(s) is searched; pass --key naming the key that \
+             maintains this pile, or run 'collection maintain' with this key",
+            hex::encode_upper(host.to_bytes())
+        ),
+    }
+}
+
 fn run_search(
     path: PathBuf,
     reference: String,
@@ -3500,15 +3525,15 @@ fn run_search(
         let source = view.support().collection().handle();
         let members: Vec<_> = view.cover().members().collect();
         let residual = view.residual().len();
+        if members.is_empty() {
+            println!("{}", unsearched(host, residual));
+            return Ok(());
+        }
         if residual > 0 {
             eprintln!(
                 "{residual} parent foundation(s) have no attachment yet and are not searched; \
                  run 'collection maintain'"
             );
-        }
-        if members.is_empty() {
-            println!("the collection has no members yet; run 'collection maintain' first");
-            return Ok(());
         }
         // Score under the tokenizer the descriptor names; the carrier bytes are
         // the same grammar whichever term space they hold. Interpreting a cover

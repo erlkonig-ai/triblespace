@@ -1065,6 +1065,84 @@ fn search_reads_existing_bm25_support_and_snippets_after_source_growth() {
     assert_eq!(std::fs::metadata(&fixture.path).unwrap().len(), bytes);
 }
 
+#[cfg(feature = "search")]
+#[test]
+fn a_search_that_believes_no_attachment_names_the_key_not_maintenance() {
+    use triblespace_search::portable_bm25::PortableBM25Blob;
+    use triblespace_search::text_bm25::{Bm25Tokenizer, TextAttributeToBm25};
+
+    // The index is maintained by the fixture's key, so every foundation of
+    // the parent has an attachment that key signed.
+    let fixture = Fixture::new();
+    let mut pile = Pile::open(&fixture.path).unwrap();
+    let index = pile
+        .attach::<PortableBM25Blob>(
+            fixture.source,
+            TextAttributeToBm25 {
+                attribute: metadata::description.id(),
+                tokenizer: Bm25Tokenizer::Word,
+            },
+        )
+        .unwrap();
+    pile.close().unwrap();
+    assert_success(&fixture.run("maintain", &[index.handle()]));
+    let stranger = fixture._directory.path().join("stranger.key");
+    let stranger_key = triblespace_core::signing_key_file::init(&stranger).unwrap();
+
+    let search = |key: Option<&Path>| {
+        let mut command = trible();
+        command
+            .args(["pile", "collection", "search"])
+            .arg(&fixture.path)
+            .arg(handle_text(index.handle()))
+            .arg("first");
+        if let Some(key) = key {
+            command.arg("--key").arg(key);
+        }
+        let output = Command::from_std(command)
+            .timeout(Duration::from_secs(30))
+            .output()
+            .unwrap();
+        assert_success(&output);
+        (
+            String::from_utf8(output.stdout).unwrap(),
+            String::from_utf8(output.stderr).unwrap(),
+        )
+    };
+
+    // The maintaining key reads its own attachments.
+    let (stdout, _) = search(Some(&fixture.key));
+    assert!(stdout.contains("1 hit(s)"), "{stdout}");
+
+    // No key loads (the fixture's key is not self.key, and the command runs
+    // without TRIBLESPACE_KEY): nothing is attached, and maintenance would
+    // not change that.
+    let (stdout, stderr) = search(None);
+    assert!(
+        stdout.contains("nothing searched: no signing key loads"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("2 foundation(s)"), "{stdout}");
+    assert!(stdout.contains("pass --key"), "{stdout}");
+    assert!(!stdout.contains("hit(s)"), "{stdout}");
+    assert!(!stdout.contains("maintain' first"), "{stdout}");
+    assert!(!stderr.contains("run 'collection maintain'"), "{stderr}");
+
+    // A key that did not maintain this pile believes none of the maintaining
+    // key's attachments: the message names the key it read as.
+    let (stdout, stderr) = search(Some(&stranger));
+    assert!(
+        stdout.contains(&format!(
+            "nothing searched: no attachment here is signed by key {}",
+            hex::encode_upper(stranger_key.verifying_key().to_bytes())
+        )),
+        "{stdout}"
+    );
+    assert!(stdout.contains("pass --key"), "{stdout}");
+    assert!(!stdout.contains("hit(s)"), "{stdout}");
+    assert!(!stderr.contains("have no attachment yet"), "{stderr}");
+}
+
 #[test]
 fn zero_interval_is_rejected_before_maintenance() {
     let fixture = Fixture::new();
