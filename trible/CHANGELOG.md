@@ -27,7 +27,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   `maintain` and `maintain-all` never do this on their own: a member with a
   leaf whose image is here or can be fetched is not derived again, whoever
   derived it, and a derived collection carries its own leaves instead of
-  mirroring its source's merges.
+  mirroring its source's merges. They open a plain pile, which cannot fetch,
+  so a member whose leaf's image has not arrived waits for it rather than
+  being derived again, and a key the derived collection does not admit
+  carries it and does not count as a failed selection.
 - `pile collection search --key <path>` names the key whose merges and
   attachments the read believes; a named key that does not load is an error.
   Without it the default key (`TRIBLESPACE_KEY`, else `self.key` beside the
