@@ -745,12 +745,13 @@ impl<T: HeldSource> HeldIndex<T> {
                     let Some(named) = seeds_of(record) else {
                         return;
                     };
+                    // Every seed of a new record is a root, known or not: the
+                    // record is published with its whole closure even when a
+                    // start-up walk still owes a seed another record named.
+                    // A held seed costs one lookup.
                     for seed in named {
-                        let key = pair(&collection.raw, &seed);
-                        if seeds.get(&key).is_none() {
-                            seeds.insert(&Entry::new(&key));
-                            roots.entry(collection).or_default().push(seed);
-                        }
+                        seeds.insert(&Entry::new(&pair(&collection.raw, &seed)));
+                        roots.entry(collection).or_default().push(seed);
                     }
                 });
             }
@@ -2658,6 +2659,40 @@ mod tests {
         };
         assert_eq!(view([2; 32]), view([2; 32]));
         assert_ne!(view([2; 32]), view([3; 32]));
+    }
+
+    /// While the start-up walk still owes A and M, a new COMMIT that repeats
+    /// A with new metadata M2 is published with A's closure too, not only
+    /// with M2's.
+    #[test]
+    fn a_new_commit_repeating_owed_seeds_publishes_their_closure() {
+        let _guard = walker_guard();
+        let mut store = Store::default();
+        let c = collection(&mut store, "repeated seeds");
+        let metadata = blob(&mut store, b"metadata");
+        let leaf = blob(&mut store, b"under A");
+        let a = blob_naming(&mut store, b"A", &[leaf]);
+        commit(&mut store, c, a, metadata);
+        let walker = store.start_held_walker(walker_config(Duration::from_secs(3600)));
+        let _opener = store.gate.hold();
+        store.track_held([c]);
+        store.snapshot().unwrap();
+        store.gate.await_walker();
+        let fresh_metadata = blob(&mut store, b"new metadata M2");
+        commit(&mut store, c, a, fresh_metadata);
+        let after = store.snapshot().unwrap();
+        let held = held_set(&after, c);
+        assert!(held.contains(&fresh_metadata));
+        assert!(
+            held.contains(&a) && held.contains(&leaf),
+            "a new COMMIT repeating A was published without A's closure"
+        );
+        assert_closed(&after, c);
+        store.gate.open();
+        until(&mut store, "the start-up walk", |snapshot| {
+            held_set(snapshot, c) == BTreeSet::from([c.raw, metadata, fresh_metadata, a, leaf])
+        });
+        drop(walker);
     }
 
     #[test]
