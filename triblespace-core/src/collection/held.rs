@@ -61,14 +61,17 @@
 //! handed out ahead of its new records' closures. Background walks only
 //! enter later snapshots; a changed [`HeldRead::held_generation`] says one did.
 //!
-//! A held set is *closed* under the edge cache: a blob joins only once every
-//! child the cache names for it has joined, and when a walk learns a new
-//! child of a held blob, the child joins with the edge. So every closure
-//! computed later stops at a held blob without missing anything the cache
-//! knows below it. A blob that cannot be read -- absent, or resident and
-//! failing to read -- is unknown on every path: nothing above it joins until
-//! a walk reads it, and the reports and seeds above it stay roots of the
-//! periodic walk, which tries again.
+//! A held set is *closed* under the edge cache for readable children: a blob
+//! joins only once every child the cache names for it has joined, and when
+//! a walk learns a new readable child of a held blob, the child joins with
+//! the edge. So every closure computed later stops at a held blob without
+//! missing anything readable the cache knows below it. A blob that cannot be
+//! read -- absent, or resident and failing to read -- is unknown on every
+//! path: nothing above it joins until a walk reads it, and the reports and
+//! seeds above it stay roots of the periodic walk, which tries again. The
+//! boundary: a blob already held whose newly learned child cannot be read
+//! stays held without that child until a periodic walk reads it (taking the
+//! blob out would mean taking out every held blob above it).
 //!
 //! When a collection is first tracked, its existing closure is computed
 //! synchronously if no walker is attached, and otherwise by a start-up walk
