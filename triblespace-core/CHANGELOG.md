@@ -16,7 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it through `mapping_reads_attached` (Rank9 names its Succinct collection).
   `MapMapping` states the contract of an attached mapping and its law,
   cover-query equivalence: a cover of attachments answers every query as the
-  attachment of the union of their nodes. `CollectionAttachment` is the
+  attachment of the union of their nodes; for a mapping that aggregates
+  facts of several entities this is a premise about its input, which the
+  implementor states. `CollectionAttachment` is the
   target-owned canonical form, implemented by `SuccinctArchiveBlob`,
   `Rank9AcceleratedSuccinctArchiveBlob`, `EntityIdSetBlob`, `LatestBlob` and
   `LwwRegisterBlob`, which are no longer `CollectionDerivation`s.

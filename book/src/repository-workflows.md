@@ -520,7 +520,11 @@ reaches is the read's *residual*: read it from its own bytes
 (`succinctarchive_union::read_attached` does this for Succinct and Rank9),
 build its attachment, or report it. Attachments combine idempotently, so a
 cover of attachments answers every query as the attachment of the union of
-its nodes would.
+its nodes would, for every mapping this crate defines, each built from single
+facts. A mapping whose image aggregates facts of several entities (a
+document's term frequency summed over its parts, say) answers so only for
+covers that never split such an entity; that is a premise about its input,
+nothing refuses a node that breaks it, and its documentation states it.
 
 For a command-line maintenance owner, `trible pile collection maintain-all`
 discovers this source order from explicitly selected descriptor handles and
