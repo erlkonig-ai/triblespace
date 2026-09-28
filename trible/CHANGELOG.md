@@ -9,9 +9,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ### Added
 
 - `pile collection search --key <path>` names the key whose merges the read
-  believes. Without it the default key (`TRIBLESPACE_KEY`, else `self.key`
-  beside the pile) is used when it loads; with no key the read believes no
-  MERGE and attaches every member separately, which finds the same hits.
+  believes; a named key that does not load is an error. Without it the default
+  key (`TRIBLESPACE_KEY`, else `self.key` beside the pile) is used when it
+  loads; with no key the read believes no MERGE and attaches every member
+  separately, which finds the same hits.
 - `pile net sync --health-collection <handle>` (with `--health-key`) and
   `pile net health --collection <handle>` report into and read from an
   explicit existing health generation instead of the reporting key's own
@@ -26,16 +27,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
-- Every command that maintains opens the pile as the key it signs with:
-  `pile collection maintain` and `maintain-all` (with or without `--watch`),
-  `pile net health` and `pile net sync`. A store believes only its host's
-  MERGEs, so a carry on a store opened as no key, or as another key, fails
-  with `HostMismatch` instead of publishing merges nothing would believe.
-  `pile net dashboard` opens as the key it resolves and draws only the MERGEs
-  the fold believes; another key's MERGE draws no edge and no member. Commands
-  that only scan, copy or write records (`list`, `show`, `log`, `adopt`,
-  `adopted`, `init`, `derive`, the grants, `compact`, `migrate`, `diagnose`,
-  `verify`) keep opening with no host.
+- A command opens the pile as a host, the key it signs with, exactly when
+  what it does depends on which MERGEs the fold believes: `pile collection
+  maintain` and `maintain-all` (with or without `--watch`) and `pile net
+  health` publish merges, and `pile collection search` and `pile net
+  dashboard` read through them. A store believes only its host's MERGEs. A
+  root carry on a store opened as no key, or as another key, fails with
+  `HostMismatch` instead of publishing merges nothing would believe; a derived
+  view's upkeep there publishes no mirrored MERGE, since it mirrors only the
+  host's own source merges and the store believes none. Every other command
+  opens with no host: those that sign records (`init`, `derive`, the grants,
+  `adopt`, `pile net sync`), because a COMMIT, DERIVE, grant or descriptor is
+  admitted by WRITE and never by the host, and those that only scan or copy
+  them (`list`, `show`, `log`, `adopted`, `compact`, `migrate`, `diagnose`,
+  `verify`).
+
+- `pile net dashboard` opens as the key `--key` names, else as the default key
+  when it loads, else as no key, which it names in a warning; a named key that
+  does not load is refused. It draws the host's driven joins as solid edges
+  and its joins still waiting for an input's support as dashed ones; another
+  key's MERGE draws no edge and no member. The resident arc and the
+  "resident" counts cover the COMMITs and DERIVEs naming a collection: MERGEs
+  are still counted, but they never replicate, so an absent merge result is
+  nothing missing.
 
 - `pile diagnose conflicts` fails only when one key names two results for one
   MERGE input set: a host believes only its own MERGEs, so that is its own
