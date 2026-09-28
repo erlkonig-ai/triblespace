@@ -918,6 +918,12 @@ where
         {
             return Ok(true);
         }
+        // A MAP another key signed is believed nowhere: building one here
+        // would be work nothing reads. Refused before anything is mapped or
+        // fetched; a pass with nothing to attach needs no host.
+        if host != Some(signer) {
+            return Err(CollectionRealizationError::HostMismatch { host, signer });
+        }
         let mut siblings = Vec::with_capacity(bound.siblings.len());
         for sibling in &bound.siblings {
             match resident_attachment(&planning, &coverage, *sibling, node)? {
@@ -943,11 +949,6 @@ where
         drop(snapshot);
         match output {
             Ok(output) => {
-                // A MAP another key signed is believed nowhere: publishing
-                // one here would be work nothing reads.
-                if host != Some(signer) {
-                    return Err(CollectionRealizationError::HostMismatch { host, signer });
-                }
                 let attachment = data_identity::<M::Target>(&output);
                 store.put::<M::Target, _>(output).map_err(|error| {
                     CollectionRealizationError::storage("store an attachment", error)

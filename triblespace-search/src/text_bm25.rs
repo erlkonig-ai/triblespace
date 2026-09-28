@@ -664,6 +664,54 @@ mod tests {
         }
     }
 
+    /// A key that is not the store's host is refused before anything is
+    /// mapped or fetched: with a text that is not here, the old order ran
+    /// the mapping, asked for the text, and returned success with nothing
+    /// attached.
+    #[test]
+    fn a_key_that_is_not_the_host_is_refused_before_mapping() {
+        use ed25519_dalek::SigningKey;
+        use futures::executor::block_on;
+        use triblespace_core::collection::{
+            AdmissionPolicy, CollectionPolicy, CollectionRealizationError, CollectionStoreExt,
+        };
+
+        let host_key = SigningKey::from_bytes(&[46; 32]);
+        let other = SigningKey::from_bytes(&[47; 32]);
+        let host = host_key.verifying_key();
+        let attribute = Attribute::<Handle<UTF8String>>::named("bm25-not-host");
+        let argument = TextAttributeToBm25 {
+            attribute: attribute.id(),
+            tokenizer: Bm25Tokenizer::Word,
+        };
+        let mut store = MemoryRepo::for_host(host);
+        let policy =
+            CollectionPolicy::new(AdmissionPolicy::direct(host), AdmissionPolicy::direct(host));
+        let root = store.collection("bm25-not-host", policy).unwrap();
+        let target = store.attach::<PortableBM25Blob>(root, argument).unwrap();
+        let absent: Inline<Handle<UTF8String>> = Inline::new([9u8; 32]);
+        store
+            .commit(
+                root,
+                &host_key,
+                Fragment::from(text_facts(attribute.id(), [(1, absent)])),
+            )
+            .unwrap();
+        assert!(matches!(
+            block_on(store.ensure_attached(target, &other)),
+            Err(CollectionRealizationError::HostMismatch { .. })
+        ));
+        // With nothing left to attach, a pass needs no host.
+        let empty = store
+            .collection(
+                "bm25-not-host-empty",
+                CollectionPolicy::new(AdmissionPolicy::direct(host), AdmissionPolicy::direct(host)),
+            )
+            .unwrap();
+        let empty_target = store.attach::<PortableBM25Blob>(empty, argument).unwrap();
+        assert!(block_on(store.ensure_attached(empty_target, &other)).is_ok());
+    }
+
     #[test]
     fn mapping_is_a_join_homomorphism_over_source_union() {
         let attribute = Attribute::<Handle<UTF8String>>::named("bm25-homomorphism");
