@@ -569,8 +569,13 @@ fn memory_repo_conservative_delta_is_counted_without_claiming_native_pile_cost()
 
 fn assert_leech_has_no_serving_inventory(leech: &Leech<Counted<Pile>>, counts: &Counts) {
     assert_eq!(counts.inventory(), [0, 0, 0, 0]);
-    // A faculty-style open tracks no held set and starts no walker thread.
-    assert_eq!(triblespace_core::collection::held::held_walker_threads(), 0);
+    // A faculty-style open tracks no held set and spawns no held-index
+    // thread, walker or scan. No test in this binary runs a multi-threaded
+    // walk or a walker, so the process-wide count stays zero.
+    assert_eq!(
+        triblespace_core::collection::held::held_threads_spawned(),
+        0
+    );
     assert!(leech.peer.last_store_snapshot.is_none());
     assert!(leech.peer.sender.current_snapshot().is_none());
     assert_eq!(leech.peer.serving_snapshot_rebuilds, 0);

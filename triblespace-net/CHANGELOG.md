@@ -11,7 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exports foundations only. The record PATCH, its summary, served nodes,
   incremental updates and hydration roots carry COMMIT and DERIVE records
   (with capability and authorization records as before), never a MERGE; a
-  client refuses a MERGE leaf. The blob component of repair is the store's
+  client refuses any leaf that is not a COMMIT or DERIVE. The blob component
+  of repair is the store's
   held set, replacing the budgeted in-publication scan
   (`collection_blob_inventory` is gone): no scan budget, no revisit of a
   whole closure on blob arrival. A blob a peer reports in C's held set is

@@ -1576,7 +1576,7 @@ pub(crate) mod tests {
         .await
         .expect_err("a MERGE leaf is a protocol violation");
         assert!(
-            format!("{error:#}").contains("MERGE records never replicate"),
+            format!("{error:#}").contains("only COMMIT and DERIVE records replicate"),
             "{error:#}"
         );
         drop(client_send);

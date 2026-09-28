@@ -102,7 +102,8 @@ where
 pub enum CollectionDeltaError {
     Decode(RecordDecodeError),
     WrongCollection,
-    /// A MERGE: the signing host's own lattice node, which never replicates.
+    /// Not a foundation (a MERGE is the signing host's own lattice node):
+    /// it never replicates.
     NotReplicated,
     FingerprintCollision(CollectionRecordFingerprint),
 }
@@ -112,7 +113,7 @@ impl fmt::Display for CollectionDeltaError {
         match self {
             Self::Decode(error) => write!(f, "decode collection record: {error}"),
             Self::WrongCollection => write!(f, "record names another collection"),
-            Self::NotReplicated => write!(f, "MERGE records never replicate"),
+            Self::NotReplicated => write!(f, "only COMMIT and DERIVE records replicate"),
             Self::FingerprintCollision(fingerprint) => {
                 write!(
                     f,
@@ -226,7 +227,12 @@ fn validate_record(
     if record.collection() != expected {
         return Err(CollectionDeltaError::WrongCollection);
     }
-    if matches!(record, CollectionRecord::Merge(_)) {
+    // Foundations are named positively, so a record kind added later is
+    // refused until it is listed here.
+    if !matches!(
+        record,
+        CollectionRecord::Commit(_) | CollectionRecord::Derive(_)
+    ) {
         return Err(CollectionDeltaError::NotReplicated);
     }
     Ok(())
