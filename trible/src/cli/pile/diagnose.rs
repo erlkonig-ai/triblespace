@@ -45,16 +45,16 @@ pub enum Command {
         /// Path to the pile file to inspect
         pile: PathBuf,
     },
-    /// List equations that disagree: one input with two results.
+    /// List MERGEs that disagree: one key naming two results for one input set.
     ///
-    /// A MERGE names the join of two nodes and a DERIVE the image of one; the
-    /// lattice takes every signed equation at its word and never recomputes a
-    /// result to check it. Two records over the same inputs naming different
-    /// outputs are therefore a producer disagreeing with itself or with
-    /// another producer, which no reader can settle. This lists them by
-    /// collection with the keys that signed each side, and exits non-zero
-    /// when any exist. Admission is not checked here: a disagreement between
-    /// an admitted and an unadmitted producer is still worth a look.
+    /// A MERGE names the join of its inputs, and the host that signed it
+    /// takes it at its word and never recomputes the result to check it. A
+    /// host believes only its own MERGEs, so one key naming two results for
+    /// the same inputs is that host's computation disagreeing with itself,
+    /// which this lists by collection and key and exits non-zero on.
+    /// Different keys naming different results are two private lattices, and
+    /// a DERIVE with several outputs for one locator is several leaves; both
+    /// are counted and neither fails. Admission is not checked here.
     Conflicts {
         /// Path to the pile file to inspect
         pile: PathBuf,
@@ -956,18 +956,16 @@ fn census(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// One input set of an equation, as a key: the collection it names and the
-/// nodes a merge joins, or the source locator a derive maps.
+/// One MERGE's input set as one key signed it: the collection, the signer and
+/// the nodes it joins. The signer is part of the key because another key's
+/// MERGE is never believed here: two keys naming different results for one
+/// input set are two private lattices, not a contradiction. One key naming
+/// two results is its own computation disagreeing with itself.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum EquationInputs {
-    Merge {
-        collection: [u8; 32],
-        inputs: Vec<[u8; 32]>,
-    },
-    Derive {
-        target: [u8; 32],
-        locator: [u8; 32],
-    },
+struct SignedJoin {
+    collection: [u8; 32],
+    signer: [u8; 32],
+    inputs: Vec<[u8; 32]>,
 }
 
 fn conflicts(path: &Path) -> Result<()> {
@@ -976,78 +974,104 @@ fn conflicts(path: &Path) -> Result<()> {
     use triblespace_core::repo::pile::Pile;
     use triblespace_core::repo::SnapshotSource;
 
+    // A record scan: nothing here asks the fold, so the pile is opened with
+    // no host and no MERGE is believed or needs to be.
     let mut pile = Pile::open(path).map_err(|error| super::pile_read_error(path, error))?;
     let snapshot = pile
         .snapshot()
         .map_err(|error| super::pile_read_error(path, error))?;
-    // Every equation once: inputs -> (output -> the keys that signed it).
-    let mut equations: BTreeMap<EquationInputs, BTreeMap<[u8; 32], BTreeSet<[u8; 32]>>> =
-        BTreeMap::new();
-    let mut merges = 0usize;
-    let mut derives = 0usize;
+    // Every MERGE once per signer: inputs -> results.
+    let mut merges: BTreeMap<SignedJoin, BTreeSet<[u8; 32]>> = BTreeMap::new();
+    // Every DERIVE once: (target, locator) -> outputs.
+    let mut derives: BTreeMap<([u8; 32], [u8; 32]), BTreeSet<[u8; 32]>> = BTreeMap::new();
+    let mut merge_records = 0usize;
+    let mut derive_records = 0usize;
     for record in snapshot.records().map_err(|error| {
         anyhow::anyhow!("read collection records of {}: {error}", path.display())
     })? {
         let record = record.map_err(|error| {
             anyhow::anyhow!("read collection records of {}: {error}", path.display())
         })?;
-        let (inputs, output, signer) = match record {
-            CollectionRecord::Commit(_) => continue,
+        match record {
+            CollectionRecord::Commit(_) => {}
             CollectionRecord::Merge(merge) => {
-                merges += 1;
-                (
-                    EquationInputs::Merge {
+                merge_records += 1;
+                merges
+                    .entry(SignedJoin {
                         collection: merge.collection().raw,
+                        signer: merge.public_key().raw,
                         inputs: merge.inputs().iter().map(|input| input.raw).collect(),
-                    },
-                    merge.result().raw,
-                    merge.public_key().raw,
-                )
+                    })
+                    .or_default()
+                    .insert(merge.result().raw);
             }
             CollectionRecord::Derive(derive) => {
-                derives += 1;
-                (
-                    EquationInputs::Derive {
-                        target: derive.collection().raw,
-                        locator: derive.input().raw(),
-                    },
-                    derive.output().raw,
-                    derive.public_key().raw,
-                )
+                derive_records += 1;
+                derives
+                    .entry((derive.collection().raw, derive.input().raw()))
+                    .or_default()
+                    .insert(derive.output().raw);
             }
-        };
-        equations
-            .entry(inputs)
-            .or_default()
-            .entry(output)
-            .or_default()
-            .insert(signer);
+        }
     }
-    let disagreeing: Vec<_> = equations
-        .iter()
-        .filter(|(_, outputs)| outputs.len() > 1)
-        .collect();
     println!(
-        "{} MERGE and {} DERIVE record(s) over {} distinct input set(s) in {}",
-        merges,
-        derives,
-        equations.len(),
+        "{} MERGE record(s) over {} signed input set(s) and {} DERIVE record(s) over {} \
+         locator(s) in {}",
+        merge_records,
+        merges.len(),
+        derive_records,
+        derives.len(),
         path.display()
     );
+
+    // Several outputs for one locator are legal: a DERIVE is a relation, and
+    // every output is its own leaf of the derived collection. They are
+    // counted so a reader can see them, never failed on.
+    let several = derives.values().filter(|outputs| outputs.len() > 1).count();
+    if several > 0 {
+        println!(
+            "{several} DERIVE locator(s) carry several outputs; each output is its own leaf, \
+             which is not a conflict"
+        );
+    }
+    // Keys disagreeing only with each other about one join are counted too:
+    // each host believes only its own MERGEs, so neither side reaches the
+    // other. Per join: every result any key names, and whether some key
+    // names two by itself.
+    let mut by_join: BTreeMap<([u8; 32], &[[u8; 32]]), (BTreeSet<[u8; 32]>, bool)> =
+        BTreeMap::new();
+    for (merge, results) in &merges {
+        let (named, contradicted) = by_join
+            .entry((merge.collection, merge.inputs.as_slice()))
+            .or_default();
+        named.extend(results.iter().copied());
+        *contradicted |= results.len() > 1;
+    }
+    let across_keys = by_join
+        .values()
+        .filter(|(named, contradicted)| named.len() > 1 && !contradicted)
+        .count();
+    if across_keys > 0 {
+        println!(
+            "{across_keys} MERGE input set(s) carry different results from different keys; \
+             another key's MERGE is never believed, so these are not conflicts"
+        );
+    }
+
+    let disagreeing: Vec<_> = merges
+        .iter()
+        .filter(|(_, results)| results.len() > 1)
+        .collect();
     if disagreeing.is_empty() {
-        println!("No equation names two results for one input set");
+        println!("No key names two results for one MERGE input set");
         return Ok(());
     }
     let mut by_collection: BTreeMap<[u8; 32], usize> = BTreeMap::new();
     for (inputs, _) in &disagreeing {
-        let collection = match inputs {
-            EquationInputs::Merge { collection, .. } => collection,
-            EquationInputs::Derive { target, .. } => target,
-        };
-        *by_collection.entry(*collection).or_default() += 1;
+        *by_collection.entry(inputs.collection).or_default() += 1;
     }
     println!(
-        "{} input set(s) carry two or more results, in {} collection(s):",
+        "{} MERGE input set(s) carry two or more results from one key, in {} collection(s):",
         disagreeing.len(),
         by_collection.len()
     );
@@ -1055,31 +1079,21 @@ fn conflicts(path: &Path) -> Result<()> {
         println!("  {} {:>8}", hex::encode(collection), count);
     }
     println!();
-    for (inputs, outputs) in &disagreeing {
-        match inputs {
-            EquationInputs::Merge { collection, inputs } => {
-                println!("MERGE in {}", hex::encode(collection));
-                for input in inputs {
-                    println!("  input {}", hex::encode(input));
-                }
-            }
-            EquationInputs::Derive { target, locator } => println!(
-                "DERIVE into {}\n  locator {}",
-                hex::encode(target),
-                hex::encode(locator)
-            ),
+    for (merge, results) in &disagreeing {
+        println!(
+            "MERGE in {} signed by {}",
+            hex::encode(merge.collection),
+            hex::encode(merge.signer)
+        );
+        for input in &merge.inputs {
+            println!("  input {}", hex::encode(input));
         }
-        for (output, signers) in outputs.iter() {
-            let signers: Vec<String> = signers.iter().map(hex::encode).collect();
-            println!(
-                "  -> {}  signed by {}",
-                hex::encode(output),
-                signers.join(", ")
-            );
+        for result in results.iter() {
+            println!("  -> {}", hex::encode(result));
         }
     }
     anyhow::bail!(
-        "{} input set(s) name two or more results",
+        "{} MERGE input set(s) name two or more results under one key",
         disagreeing.len()
     )
 }
@@ -1135,7 +1149,35 @@ mod conflict_tests {
         ]);
         conflicts(&agreed.path().join("equations.pile")).unwrap();
 
+        // One key naming two results for one join is that key disagreeing
+        // with itself. The same join named in either order is one input set.
         let disagreeing = pile_with([
+            CollectionRecord::Merge(
+                CollectionMerge::sign(&one, collection, [input, other], Inline::new([30; 32]))
+                    .unwrap(),
+            ),
+            CollectionRecord::Merge(
+                CollectionMerge::sign(&one, collection, [other, input], Inline::new([31; 32]))
+                    .unwrap(),
+            ),
+        ]);
+        let error = conflicts(&disagreeing.path().join("equations.pile")).unwrap_err();
+        assert!(
+            error.to_string().contains("1 MERGE input set(s)"),
+            "unexpected report: {error}"
+        );
+    }
+
+    #[test]
+    fn other_keys_merges_and_several_outputs_per_locator_do_not_fail() {
+        let one = SigningKey::from_bytes(&[1; 32]);
+        let two = SigningKey::from_bytes(&[2; 32]);
+        let collection = Inline::new([7; 32]);
+        let input = Inline::new([10; 32]);
+        let other = Inline::new([11; 32]);
+        let legal = pile_with([
+            // A DERIVE is a relation: two outputs for one locator are two
+            // leaves, from two keys or from one.
             CollectionRecord::Derive(CollectionDerive::sign(
                 &one,
                 collection,
@@ -1148,20 +1190,29 @@ mod conflict_tests {
                 triblespace_core::collection::SourceLocator::of(input.raw),
                 Inline::new([21; 32]),
             )),
-            // The same join named in either order is one input set.
+            CollectionRecord::Derive(CollectionDerive::sign(
+                &one,
+                collection,
+                triblespace_core::collection::SourceLocator::of(other.raw),
+                Inline::new([22; 32]),
+            )),
+            CollectionRecord::Derive(CollectionDerive::sign(
+                &one,
+                collection,
+                triblespace_core::collection::SourceLocator::of(other.raw),
+                Inline::new([23; 32]),
+            )),
+            // Two keys naming different results for one join are two private
+            // lattices: a host never believes the other key's MERGE.
             CollectionRecord::Merge(
                 CollectionMerge::sign(&one, collection, [input, other], Inline::new([30; 32]))
                     .unwrap(),
             ),
             CollectionRecord::Merge(
-                CollectionMerge::sign(&one, collection, [other, input], Inline::new([31; 32]))
+                CollectionMerge::sign(&two, collection, [input, other], Inline::new([31; 32]))
                     .unwrap(),
             ),
         ]);
-        let error = conflicts(&disagreeing.path().join("equations.pile")).unwrap_err();
-        assert!(
-            error.to_string().contains("2 input set(s)"),
-            "unexpected report: {error}"
-        );
+        conflicts(&legal.path().join("equations.pile")).unwrap();
     }
 }
