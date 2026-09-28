@@ -240,10 +240,23 @@ pub fn held_threads_spawned() -> usize {
 }
 
 /// The held sets as one snapshot sees them.
-#[derive(Clone, Default, PartialEq)]
+#[derive(Clone, Default)]
 pub(crate) struct HeldView {
     generation: u64,
     sets: HeldSets,
+}
+
+/// Equal when the generations are and every collection holds the same set.
+/// A PATCH compares its keys only, so each held set is compared itself.
+impl PartialEq for HeldView {
+    fn eq(&self, other: &Self) -> bool {
+        self.generation == other.generation
+            && self.sets == other.sets
+            && self
+                .sets
+                .iter()
+                .all(|collection| self.sets.get(collection) == other.sets.get(collection))
+    }
 }
 
 impl std::fmt::Debug for HeldView {
@@ -2608,6 +2621,25 @@ mod tests {
                 "a proof C's authorization rejects seeded C"
             );
         }
+    }
+
+    /// Two views that differ only in what one collection holds are unequal:
+    /// a PATCH compares keys only, so the held sets are compared one by one.
+    #[test]
+    fn views_differing_only_in_one_held_set_are_unequal() {
+        let c = [1u8; 32];
+        let view = |blob: Raw| {
+            let mut held = HeldBlobs::new();
+            held.insert(&Entry::new(&blob));
+            let mut sets = HeldSets::new();
+            sets.replace(&Entry::with_value(&c, held));
+            HeldView {
+                generation: 1,
+                sets,
+            }
+        };
+        assert_eq!(view([2; 32]), view([2; 32]));
+        assert_ne!(view([2; 32]), view([3; 32]));
     }
 
     #[test]
