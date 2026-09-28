@@ -16,11 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   merges. The mirror of a source's merges is gone, and with it
   `ownership::owns_merge` and `CoverageIndex::drives_join`, which only it
   used; `CoverageIndex::joins_reading` is test-only. A merge needs no WRITE:
-  a key the target does not admit derives nothing and still carries, and
-  when it owes leaves for foundations of its own it reports
-  `UnauthorizedProducer` after the carry. `realize_as` follows: a signer
-  without WRITE answers `Realized::Unadmitted` and, under `Upkeep::Maintain`,
-  carries the collection first. A derived collection stored in a root's
+  under `maintain` a key the target does not admit derives nothing, reads
+  nothing of the source and carries, and that is all it reports; only the
+  per-write `ensure` still answers `UnauthorizedProducer` for a key that owes
+  leaves for foundations of its own. `realize_as` follows: a signer without
+  WRITE answers `Realized::Unadmitted` and, under `Upkeep::Maintain`, carries
+  the collection. What deriving could not do holds back neither the rest nor
+  the carry: a refused own foundation (`Derive`), a blob an own foundation
+  needs (`MissingDependency`, fetched before the operation runs again) and
+  `Unmappable` are all reported after the carry; only a storage failure ends
+  the operation first. A derived collection stored in a root's
   encoding carries only through its mapping (`maintain_with`); `maintain`
   still refuses it.
 - Derivation is scheduled by leaf, and any admitted leaf suffices: a source
@@ -30,7 +35,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   output cannot be obtained does not count; the fetch is tried once per
   pass, and a failed one means the output is unavailable now, not lost, so
   an original output arriving after a second derivation stands beside it and
-  nothing further is derived. The per-write `ensure` still derives only the
+  nothing further is derived. Outputs that are not here are named by the
+  operation and asked for together after its work -- deriving what needs no
+  fetch, and the carry -- rather than one restart each before anything is
+  mapped, and one call stops asking after eight failed fetches; the rest wait
+  for the next call. A foundation whose leaf another writer publishes while
+  the pass runs is left to that leaf (read from a fresh observation, used
+  only to skip work), and each key derives its own foundations first and
+  then the rest, each in an order hashed from the key and the foundation, so
+  two hosts rebuilding one collection at once do not walk it in step. The
+  per-write `ensure` still derives only the
   key's own foundations with no leaf at all; another owner's payload is
   never fetched. `DeriveMapping::FOREIGN_DERIVABLE` is gone.
   `DeriveMapping::computable_here` is the class-pin hook: a mapping pinned to
@@ -39,6 +53,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   documentation states the contract: foundations only, a total target join,
   a homomorphism when deterministic, and possibly non-deterministic or
   class-pinned.
+- `AsyncBlobStoreAcquire::acquires_remotely` says whether `acquire` can bring
+  bytes that are not already here. It defaults to `false`, which the local
+  stores (`MemoryRepo`, `Pile`, `Yard`) keep; wrappers answer as the store
+  they wrap, and the network peers answer `true`. Derive scheduling asks for a
+  leaf's missing output only through a store that answers `true`: from any
+  other a miss says nothing about elsewhere, so the foundation waits for its
+  output rather than being derived again.
 - `CollectionStoreExt::rederive` and `rederive_with` supplement a leaf known
   to be bad: they map the named foundations of the target's immediate source
   again and publish each result no believed leaf names as another leaf,
@@ -266,16 +287,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   creates one ensures it right then, for the commits already there.
 
 - `join_images` on `CollectionDerivation` and `DeriveMapping` no longer
-  takes a source union; it is the mapping's own route for joining two
-  images, defaulting to the encoding's `join_members`. The Rank9 route that
-  reused the raw union's bytes is gone, with the `source_union` parameter of
-  the archive merge. A source merge is mirrored by joining the two images
-  and recording `MERGE(image a, image b) -> image c` beside `DERIVE(c ->
-  image c)`, true by the homomorphism law; the merged source node is neither
-  read nor required to be resident, and the source frontier comes from the
-  index. The carry's absorbing merge takes the pairwise form whenever
-  exactly the two dominated images stand for their dominator. Rank9's tier
-  carry joins now instead of declining.
+  takes a source union; it is the mapping's own route for joining images,
+  defaulting to the encoding's join. The Rank9 route that reused the raw
+  union's bytes is gone, with the `source_union` parameter of the archive
+  merge. (The source-merge mirror this entry introduced was removed again
+  before release: a derived collection carries its own leaves, see above.)
 
 - Remove the exact collection API. `ensure_exact`, `ensure_exact_with`,
   `maintain_exact`, `maintain_exact_with` and `collection_exact` are gone,
@@ -305,15 +321,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is a `Resolution` error. `resolve_endorsed_lineage` remains only behind
   `admitted_record_witnesses`.
 
-- Carry by support size. Tiers are keyed by `ilog2` of a node's support, not
-  its byte length, so a target's tiers mirror its source's. Before pairing,
-  a frontier node whose support lies inside another's is consumed by
-  `MERGE(fine, coarse -> coarse)`, no bytes loaded, so the redundancy between
-  a fine image and the coarser one that covers it disappears in the fold
-  instead of being coarsened at every read; two nodes with one support keep
-  the lower node, as readers do. Source-guided coarsening is kept for the
-  joins that need the source union (Rank9): exactly two images under a
-  source node that together stand for it are joined with the union in hand.
+- Carry by support size. Tiers are keyed by the size of a node's support,
+  not its byte length (now `floor(log_8)`, with eight held nodes per MERGE).
+  Before joining, a frontier node whose support lies inside another's is
+  consumed by `MERGE(fine, coarse -> coarse)`, no bytes loaded, so the
+  redundancy between a fine image and the coarser one that covers it
+  disappears in the fold instead of being coarsened at every read; two nodes
+  with one support keep the lower node, as readers do. (The source-guided
+  coarsening this entry kept for Rank9 is gone: Rank9 is an attached
+  collection, and a derived collection never reads its source's merges.)
 
 - An acquisition ends the operation. `ensure_with`, `maintain_with` and the
   root ensure no longer freeze one control snapshot and then fetch through

@@ -480,7 +480,16 @@ target admits may derive it, not only the foundation's owner. A leaf whose
 output cannot be obtained does not count, and a fetch that fails means the
 output is unavailable now, not lost: if the original output arrives after
 the foundation was derived again, both leaves stand, both are joined, and
-nothing further is derived. A mapping pinned to a class of host
+nothing further is derived. Outputs that are not here are asked for after the
+rest of the pass -- deriving what needs no fetch, and the carry -- each once,
+and a pass stops asking after eight fetches have failed; the rest wait for
+the next pass. Only a store that can reach other holders asks at all: a
+plain pile answers from its own blobs, so a miss there says nothing about
+elsewhere, and the foundation waits for its output instead of being derived
+again. Each key derives in an order of its own, and a foundation whose leaf
+another writer publishes while the pass runs is left to that leaf, so two
+hosts rebuilding one collection at once do not both derive all of it. A
+mapping pinned to a class of host
 (`DeriveMapping::computable_here`) derives nothing on another host and raises
 nothing there; that host still carries the collection, whose leaves arrive by
 replication. A leaf known to be bad is supplemented only on request:
@@ -623,7 +632,9 @@ no support argument to pass along, and none to request narrower.
 - `maintain` derives every foundation this host can derive that has no usable
   leaf -- the key's own, fetching their payloads, and another owner's whose
   payload is already here -- then carries the target's own leaves the way a
-  root carries its commits. It also returns a fresh store snapshot.
+  root carries its commits. A foundation the mapping refuses holds back
+  neither the rest nor the carry; it is reported afterwards. It also returns
+  a fresh store snapshot.
 
 A derived operation never constructs an upstream member as a side effect, and
 the carry reads nothing outside the target's own lattice. If a target join
@@ -631,11 +642,13 @@ cannot run because an optional immutable dependency is absent or the encoding
 has reached a capacity limit, the finer exact target cover remains the answer.
 
 The signing key is explicit on every ensure/maintain call. Only a new leaf
-needs WRITE: a key the target does not admit derives nothing, fetches and maps
-nothing for it, and receives `UnauthorizedProducer` if it owes a leaf for a
-foundation of its own -- after the carry, which needs only the store's host
-key. Raw local `sign` and `insert` remain unconditional; typed publication does
-not reverify signatures it just produced.
+needs WRITE: a key the target does not admit derives nothing and fetches and
+maps nothing for it. Its `maintain` carries -- a merge needs only the store's
+host key -- and reports nothing more, without reading the source; its
+`ensure`, the write path, receives `UnauthorizedProducer` if it owes a leaf
+for a foundation of its own. Raw local `sign` and `insert` remain
+unconditional; typed publication does not reverify signatures it just
+produced.
 
 New work authenticates the immediate source and target producers it actually
 uses. It does not recursively acquire foundational data or re-run ancestral

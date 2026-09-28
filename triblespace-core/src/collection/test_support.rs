@@ -67,8 +67,9 @@ where
 /// `0xC1`, with union as its join.
 ///
 /// Every index this crate defines is attached, not derived, so tests of the
-/// derived machinery -- leaves, admission, mirroring, observation -- use this
-/// instead. Its encoding id was minted with `trible genid` on 2026-09-28.
+/// derived machinery -- leaves, admission, the derived carry, observation --
+/// use this instead. Its encoding id was minted with `trible genid` on
+/// 2026-09-28.
 pub(crate) struct TestImage;
 
 const TEST_IMAGE: crate::id::Id = crate::id_hex!("AFEDC28B3883A4AEB3BADA9E6E1CDE47");
