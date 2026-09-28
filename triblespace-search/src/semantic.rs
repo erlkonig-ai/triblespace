@@ -14,13 +14,16 @@
 //! A row is keyed by the content handle it embeds: the 32-byte value `V` of
 //! a selected `(entity, attribute, V)` fact. The index therefore asserts
 //! nothing about how many values an entity has. A multi-valued attribute is
-//! more values, one blob held by several entities is one row, and the
-//! mapping of a union is the union of the mappings, which is exactly the
-//! NVFP4 carrier's join. A reader reaches the entities through the source
-//! on the same value: the rows of an index constrain `v`, and
-//! `pattern(e, a, v)` over the source (with `a` bound to an attribute, or
-//! left free for "any attached content") names who holds it. See
-//! [`crate::nvfp4::ReconstructedCosines`].
+//! more values, and one blob held by several entities of one source member
+//! is embedded once, as one row. The handles of the mapping of a union are
+//! exactly the union of the mappings' handles. So are the rows when
+//! embedding reproduces bit for bit, which makes the mapping a homomorphism
+//! into the NVFP4 carrier's join; otherwise a blob that two members hold
+//! carries one row per differing embedding (see below). A reader reaches
+//! the entities through the source on the same value: the rows of an index
+//! constrain `v`, and `pattern(e, a, v)` over the source (with `a` bound to
+//! an attribute, or left free for "any attached content") names who holds
+//! it. See [`crate::nvfp4::ReconstructedCosines`].
 //!
 //! One index is one model. Images go through nomic-embed-vision-v1.5 and
 //! texts through the document side of nomic-embed-text-v1.5, the two halves
@@ -110,8 +113,9 @@ pub const NOMIC_ATTRIBUTES_TO_NVFP4: Id = id_hex!("523C31F03F049CA26A0E847CAAFC0
 attributes! {
     /// An attribute whose values are handles to content bytes; repeatable.
     /// Every distinct value under any selected attribute gets at most one
-    /// row, when the index's model has something to read in its bytes.
-    /// Minted 2026-09-13.
+    /// row per derivation, when the index's model has something to read in
+    /// its bytes; the joined index holds one row per differing embedding of
+    /// it and a reader binds the value once. Minted 2026-09-13.
     "13E4B93C65EA173282139D7DEBC1CC9B" as pub semantic_content_attribute: GenId;
     /// Historical archive-pinning argument, retained with its original id.
     /// A member archive of the pile's model collection carrying the roots

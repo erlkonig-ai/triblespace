@@ -285,9 +285,9 @@ impl Layout {
     }
 
     fn validate(&self, bytes: &[u8]) -> Result<(), NvFp4Error> {
-        let mut previous: Option<RowKey<'_>> = None;
+        let mut previous: Option<RowOrder<'_>> = None;
         for row in 0..self.rows {
-            let key = self.row_key(bytes, row);
+            let key = self.row_order(bytes, row);
             if previous.is_some_and(|old| old >= key) {
                 return Err(NvFp4Error::new(
                     "NVFP4 rows must be strictly increasing in the canonical row order",
@@ -325,9 +325,9 @@ impl Layout {
         &bytes[row * HANDLE_LEN..(row + 1) * HANDLE_LEN]
     }
 
-    /// The canonical key of one stored row, borrowed from its planes.
-    fn row_key<'a>(&self, bytes: &'a [u8], row: usize) -> RowKey<'a> {
-        row_key(
+    /// The order key of one stored row, borrowed from its planes.
+    fn row_order<'a>(&self, bytes: &'a [u8], row: usize) -> RowOrder<'a> {
+        row_order(
             self.handle(bytes, row),
             |stage| {
                 (
@@ -376,26 +376,27 @@ impl Layout {
     }
 }
 
-/// How many byte strings make up a row's canonical key: its handle, each
+/// How many byte strings make up a row's order key: its handle, each
 /// stage's global scale, block scales and codes, its norm and its error.
-const ROW_KEY_PARTS: usize = 1 + 3 * QUANT_STAGES + 2;
+const ROW_ORDER_PARTS: usize = 1 + 3 * QUANT_STAGES + 2;
 
-/// The canonical order of rows, as a key compared lexicographically: the
-/// row's own byte planes in layout order. The handle comes first, so handles
-/// are non-decreasing; the planes after it give the rows under one handle one
-/// total order. Every row of a member (and of every member of one cover) has
-/// the same plane widths, so comparing the parts in turn is comparing the
-/// concatenated row bytes, and two rows have equal keys exactly when they are
-/// the same row.
-type RowKey<'a> = [&'a [u8]; ROW_KEY_PARTS];
+/// A row's place in the canonical row order, as a key compared
+/// lexicographically: the row's own byte planes in layout order. The handle
+/// comes first, so handles are non-decreasing; the planes after it give the
+/// rows under one handle one total order. Every row of a member (and of every
+/// member of one cover) has the same plane widths, so comparing the parts in
+/// turn is comparing the concatenated row bytes, and two rows have equal
+/// order keys exactly when they are the same row. (The public "row key" of a
+/// reader is only the first part, the 32-byte handle it binds.)
+type RowOrder<'a> = [&'a [u8]; ROW_ORDER_PARTS];
 
-fn row_key<'a>(
+fn row_order<'a>(
     handle: &'a [u8],
     stage: impl Fn(usize) -> (&'a [u8], &'a [u8], &'a [u8]),
     norm: &'a [u8],
     error: &'a [u8],
-) -> RowKey<'a> {
-    let mut key: RowKey<'a> = [&[]; ROW_KEY_PARTS];
+) -> RowOrder<'a> {
+    let mut key: RowOrder<'a> = [&[]; ROW_ORDER_PARTS];
     key[0] = handle;
     for index in 0..QUANT_STAGES {
         let (global, block_scales, codes) = stage(index);
@@ -403,8 +404,8 @@ fn row_key<'a>(
         key[2 + 3 * index] = block_scales;
         key[3 + 3 * index] = codes;
     }
-    key[ROW_KEY_PARTS - 2] = norm;
-    key[ROW_KEY_PARTS - 1] = error;
+    key[ROW_ORDER_PARTS - 2] = norm;
+    key[ROW_ORDER_PARTS - 1] = error;
     key
 }
 
@@ -458,8 +459,8 @@ impl StoredRow {
         })
     }
 
-    fn key(&self) -> RowKey<'_> {
-        row_key(
+    fn order(&self) -> RowOrder<'_> {
+        row_order(
             &self.handle,
             |stage| {
                 let stage = &self.stages[stage];
@@ -475,7 +476,7 @@ impl StoredRow {
 // key's parts are exactly the row's fields.
 impl Ord for StoredRow {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.key().cmp(&other.key())
+        self.order().cmp(&other.order())
     }
 }
 
@@ -628,8 +629,8 @@ pub(crate) fn join_members<E: BlobEncoding>(
     let mut high_row = 0;
     while low_row < low_layout.rows && high_row < high_layout.rows {
         match low_layout
-            .row_key(low_bytes, low_row)
-            .cmp(&high_layout.row_key(high_bytes, high_row))
+            .row_order(low_bytes, low_row)
+            .cmp(&high_layout.row_order(high_bytes, high_row))
         {
             Ordering::Less => {
                 rows.push(owned_row(low_bytes, &low_layout, low_row));
@@ -1178,7 +1179,7 @@ where
 
     /// The cosine between `query` and every row's own two-stage NVFP4
     /// reconstruction, from one scan that fetches no source blob, kept once
-    /// per row key as the maximum over that key's rows.
+    /// per row key (the 32-byte handle) as the maximum over the rows under it.
     ///
     /// The whole answer for an index that holds no exact vector per row (the
     /// semantic index keys its rows by the value it embedded, not by an
@@ -1336,7 +1337,7 @@ where
         let mut heap = BinaryHeap::new();
         for (member, segment) in self.members.iter().enumerate() {
             if segment.layout.rows > 0 {
-                heap.push(Reverse((self.row_key(member, 0), member, 0usize)));
+                heap.push(Reverse((self.row_order(member, 0), member, 0usize)));
             }
         }
 
@@ -1356,16 +1357,16 @@ where
             for &(member, row) in &occurrences {
                 let next = row + 1;
                 if next < self.members[member].layout.rows {
-                    heap.push(Reverse((self.row_key(member, next), member, next)));
+                    heap.push(Reverse((self.row_order(member, next), member, next)));
                 }
             }
         }
         Ok(())
     }
 
-    fn row_key(&self, member: usize, row: usize) -> RowKey<'_> {
+    fn row_order(&self, member: usize, row: usize) -> RowOrder<'_> {
         let member = &self.members[member];
-        member.layout.row_key(member.bytes.as_ref(), row)
+        member.layout.row_order(member.bytes.as_ref(), row)
     }
 }
 
@@ -1427,8 +1428,9 @@ impl ReconstructedCosines {
 
 /// Collapse `(key, value)` pairs to one per key holding the maximum, in
 /// strictly ascending key order. The cover scan hands the pairs over in key
-/// order already, so the stable sort only checks that. A NaN, which no valid
-/// row produces, absorbs: an upper bound stays conservative.
+/// order already; on such input the stable sort moves nothing and runs in
+/// linear time. A NaN, which no valid row produces, absorbs: an upper bound
+/// stays conservative.
 fn keep_maximum_per_key(pairs: &mut Vec<([u8; HANDLE_LEN], f64)>) {
     pairs.sort_by(|left, right| left.0.cmp(&right.0));
     pairs.dedup_by(|next, kept| {
@@ -1636,6 +1638,42 @@ mod tests {
             })
             .unwrap();
         rows
+    }
+
+    /// One valid row per plane after the handle, each differing from `base`
+    /// in that plane alone: every stage's global scale, block scales and
+    /// codes, then the norm and the error.
+    fn planes_apart(base: &StoredRow) -> Vec<(String, StoredRow)> {
+        let next_up = |bytes: [u8; FLOAT_LEN]| f32::from_le_bytes(bytes).next_up().to_le_bytes();
+        let mut variants = Vec::new();
+        for stage in 0..QUANT_STAGES {
+            let mut global = base.clone();
+            global.stages[stage].global = next_up(global.stages[stage].global);
+            variants.push((format!("stage {stage} global scale"), global));
+
+            let mut scales = base.clone();
+            let scale = &mut scales.stages[stage].block_scales[0];
+            *scale = if *scale < 0x7e {
+                *scale + 1
+            } else {
+                *scale - 1
+            };
+            variants.push((format!("stage {stage} block scales"), scales));
+
+            // A different low code, never the rejected negative zero 0x8.
+            let mut codes = base.clone();
+            let pair = &mut codes.stages[stage].codes[0];
+            *pair = (*pair & 0xf0) | u8::from(*pair & 0x0f == 0);
+            variants.push((format!("stage {stage} codes"), codes));
+        }
+        let mut norm = base.clone();
+        norm.norm = next_up(norm.norm);
+        variants.push(("norm".to_owned(), norm));
+        let mut error = base.clone();
+        error.error = next_up(error.error);
+        variants.push(("error".to_owned(), error));
+        assert_eq!(variants.len(), ROW_ORDER_PARTS - 1);
+        variants
     }
 
     /// Candidate bounds as comparable bits.
@@ -2009,6 +2047,52 @@ mod tests {
         assert_eq!(reversed.bytes.as_ref(), all.bytes.as_ref());
     }
 
+    /// Rows under one handle are ordered by every plane of the row, not
+    /// only by the first plane that happens to differ: for each plane, a row
+    /// that differs from another only there is another row. The pair has one
+    /// encoding whatever the input order, passes the audit, joins to both
+    /// rows in either order, and a cover holding it twice reads each row
+    /// once.
+    #[test]
+    fn every_plane_orders_rows_under_one_handle() {
+        const DIMENSION: usize = 3;
+        let base = row(1, &[0.6, 0.8, 0.0]);
+        let alone = member([base.clone()], DIMENSION);
+        for (plane, variant) in planes_apart(&base) {
+            assert_ne!(variant, base, "{plane}");
+            assert_ne!(
+                variant.cmp(&base),
+                Ordering::Equal,
+                "{plane}: the order sees it"
+            );
+
+            let pair = member([variant.clone(), base.clone()], DIMENSION);
+            assert_eq!(
+                pair.bytes.as_ref(),
+                member([base.clone(), variant.clone()], DIMENSION)
+                    .bytes
+                    .as_ref(),
+                "{plane}: one encoding"
+            );
+            let layout = Layout::parse(pair.bytes.as_ref()).unwrap();
+            assert_eq!(layout.rows, 2, "{plane}");
+            layout.validate(pair.bytes.as_ref()).unwrap();
+
+            let other = member([variant], DIMENSION);
+            for joined in [
+                join_members(&alone, &other, DIMENSION).unwrap(),
+                join_members(&other, &alone, DIMENSION).unwrap(),
+            ] {
+                assert_eq!(joined.bytes.as_ref(), pair.bytes.as_ref(), "{plane}: join");
+            }
+            assert_eq!(
+                visited(&index(&[&alone, &other, &pair], DIMENSION)),
+                rows_of(&pair),
+                "{plane}: cover"
+            );
+        }
+    }
+
     /// The join is associative, commutative and idempotent on random row
     /// sets drawn from a small pool, so handles repeat with different rows
     /// and whole rows repeat across members. It is the encoding of the union
@@ -2025,9 +2109,20 @@ mod tests {
                     .collect()
             })
             .collect();
-        let pool: Vec<StoredRow> = (1..=3u8)
+        let mut pool: Vec<StoredRow> = (1..=3u8)
             .flat_map(|handle| vectors.iter().map(move |vector| row(handle, vector)))
             .collect();
+        // Rows that differ from a pool row in one late plane only (the
+        // second stage's codes, the norm, the error), so rows under one
+        // handle also tie on every plane before the one that decides.
+        let late: Vec<StoredRow> = planes_apart(&pool[0])
+            .into_iter()
+            .chain(planes_apart(&pool[5]))
+            .filter(|(plane, _)| plane == "stage 1 codes" || plane == "norm" || plane == "error")
+            .map(|(_, row)| row)
+            .collect();
+        assert_eq!(late.len(), 6);
+        pool.extend(late);
         assert_eq!(pool.iter().collect::<BTreeSet<_>>().len(), pool.len());
         let query: Vec<f32> = (0..DIMENSION)
             .map(|index| (index as f32 + 1.0).cos())
@@ -2218,8 +2313,8 @@ mod tests {
 
     /// The exact path: two rows under one embedding handle (a quantization
     /// that did not reproduce) are one candidate whose bound is the larger of
-    /// the two rows' bounds, fetched once and returned once by `above`,
-    /// `top_k` and `similar_to`.
+    /// the two rows' bounds, for a query either row favours, fetched once and
+    /// returned once by `above`, `top_k` and `similar_to`.
     #[test]
     fn exact_reads_fetch_and_bind_each_handle_once() {
         const DIMENSION: usize = 3;
@@ -2233,32 +2328,48 @@ mod tests {
         let left = member([stray.clone()], DIMENSION);
         let right = member([faithful.clone(), other_row], DIMENSION);
         let joined = join_members(&left, &right, DIMENSION).unwrap();
-        let query = [1.0, 0.0, 0.0];
-        let alone = |row: &StoredRow| {
+        let alone = |row: &StoredRow, query: &[f32]| {
             f64::from_bits(
                 candidate_bits(
                     &index(&[&member([row.clone()], DIMENSION)], DIMENSION),
-                    &query,
+                    query,
                 )[0]
                 .1,
             )
         };
-        let widest = alone(&faithful).max(alone(&stray));
-        assert!(alone(&faithful) != alone(&stray));
+        // Each query gives a different one of the two rows the larger bound,
+        // so the candidate's bound is their maximum, not whichever row the
+        // canonical order puts first or last.
+        let query = [1.0, 0.0, 0.0];
+        let toward_stray = [0.0, 1.0, 0.0];
+        assert!(alone(&faithful, &query) > alone(&stray, &query));
+        assert!(alone(&stray, &toward_stray) > alone(&faithful, &toward_stray));
 
         let scanner = CpuF64UpperScanner;
         for view in [
             index(&[&left, &right], DIMENSION),
             index(&[&joined], DIMENSION),
         ] {
-            let candidates = candidate_bits(&view, &query);
-            assert_eq!(candidates.len(), 2, "one candidate per handle");
-            let bound = candidates
-                .iter()
-                .find(|(handle, _)| *handle == exact.raw)
+            for probe in [&query, &toward_stray] {
+                let candidates = candidate_bits(&view, probe);
+                assert_eq!(candidates.len(), 2, "one candidate per handle");
+                let bound = candidates
+                    .iter()
+                    .find(|(handle, _)| *handle == exact.raw)
+                    .unwrap()
+                    .1;
+                let widest = alone(&faithful, probe).max(alone(&stray, probe));
+                assert_eq!(bound, widest.to_bits());
+            }
+
+            // The stray row's bound makes the handle a candidate; the exact
+            // rerank reads the vector once and rejects it.
+            let counted = Counting::new(&snapshot);
+            assert!(view
+                .above(&counted, &toward_stray, 0.5, &scanner)
                 .unwrap()
-                .1;
-            assert_eq!(bound, widest.to_bits());
+                .is_empty());
+            assert_eq!(counted.gets(), 1);
 
             let counted = Counting::new(&snapshot);
             let above = view.above(&counted, &query, 0.5, &scanner).unwrap();
