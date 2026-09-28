@@ -307,20 +307,25 @@ pub fn source(facts: &TribleSet) -> Result<Option<CollectionHandle>, RecordDecod
     )
 }
 
-/// The collection whose nodes this attached collection indexes, if it is an
-/// attached collection.
+/// The collections whose nodes this attached collection indexes, ascending:
+/// empty for a root or a derived collection.
 ///
-/// A root or a derived collection answers `None`.
-pub fn parent(facts: &TribleSet) -> Result<Option<CollectionHandle>, RecordDecodeError> {
+/// Attaching names exactly one parent, but nothing here counts them: a
+/// descriptor naming two is still an attached collection, whose records the
+/// fold drops like any other attached collection's. A reader that walks one
+/// parent's lattice asks for one, and leaves a descriptor it cannot read
+/// that way alone.
+pub fn parents(facts: &TribleSet) -> Result<Vec<CollectionHandle>, RecordDecodeError> {
     let descriptor = entity(facts)?;
-    at_most_one(
-        find!(
-            (v: CollectionHandle),
-            pattern!(facts, [{ descriptor @ collection_parent: ?v }])
-        )
-        .map(|(v,)| v),
-        "collection_parent",
+    let mut parents: Vec<CollectionHandle> = find!(
+        (v: CollectionHandle),
+        pattern!(facts, [{ descriptor @ collection_parent: ?v }])
     )
+    .map(|(v,)| v)
+    .collect();
+    parents.sort_unstable_by(|left, right| left.raw.cmp(&right.raw));
+    parents.dedup();
+    Ok(parents)
 }
 
 /// The sibling attached collections this attached collection's mapping

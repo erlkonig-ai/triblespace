@@ -505,8 +505,8 @@ mod tests {
         let parent = raw_root("first");
         let index = attached(&parent);
         assert_eq!(
-            descriptor_facts::parent(index.facts()),
-            Ok(Some(identity_for_tests(&parent)))
+            descriptor_facts::parents(index.facts()),
+            Ok(vec![identity_for_tests(&parent)])
         );
         assert_eq!(descriptor_facts::source(index.facts()), Ok(None));
         assert_eq!(descriptor_facts::name(index.facts()), Ok(None));

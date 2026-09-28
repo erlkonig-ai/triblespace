@@ -161,15 +161,15 @@ where
         let Ok(facts) = snapshot.get::<TribleSet, _>(collection) else {
             continue;
         };
-        let (Ok(Some(named)), Ok(representation), Ok(algorithm), Ok(siblings)) = (
-            descriptor::parent(&facts),
+        let (Ok(named), Ok(representation), Ok(algorithm), Ok(siblings)) = (
+            descriptor::parents(&facts),
             descriptor::representation(&facts),
             descriptor::mapping_algorithm(&facts),
             descriptor::reads_attached(&facts),
         ) else {
             continue;
         };
-        if named != parent {
+        if !named.contains(&parent) {
             continue;
         }
         pending.insert(

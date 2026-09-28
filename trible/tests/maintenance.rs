@@ -306,7 +306,7 @@ fn entity_id_set_cli_projects_receipt_values_without_changing_source_records() {
         let snapshot = pile.snapshot().unwrap();
         let target = Collection::<EntityIdSetBlob>::open(&snapshot, target_handle).unwrap();
         let facts: TribleSet = snapshot.get(target_handle).unwrap();
-        assert_eq!(descriptor::parent(&facts).unwrap(), Some(source.handle()));
+        assert_eq!(descriptor::parents(&facts).unwrap(), vec![source.handle()]);
         assert_eq!(
             descriptor::mapping_algorithm(&facts).unwrap(),
             Some(GENID_ATTRIBUTE_VALUES_MAPPING_V1)

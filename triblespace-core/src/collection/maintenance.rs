@@ -823,27 +823,40 @@ where
             "attached descriptor has the wrong representation: {error}"
         ))
     })?;
-    let parent = super::descriptor::parent(attached_descriptor.facts())
-        .map_err(|error| {
-            CollectionRealizationError::Resolution(format!("decode attached parent: {error}"))
-        })?
-        .ok_or_else(|| {
-            CollectionRealizationError::InvalidCover(format!(
+    let parents = super::descriptor::parents(attached_descriptor.facts()).map_err(|error| {
+        CollectionRealizationError::Resolution(format!("decode attached parent: {error}"))
+    })?;
+    // An attached read walks one parent's lattice. A descriptor naming
+    // several parents is one this reader does not read; attaching never
+    // writes one.
+    let parent = match parents.as_slice() {
+        [parent] => *parent,
+        [] => {
+            return Err(CollectionRealizationError::InvalidCover(format!(
                 "collection {} is not an attached collection",
                 hex::encode_upper(attached.handle().raw),
-            ))
-        })?;
+            )))
+        }
+        _ => {
+            return Err(CollectionRealizationError::InvalidCover(format!(
+                "attached collection {} names {} parents; an attached read walks one parent's \
+                 lattice",
+                hex::encode_upper(attached.handle().raw),
+                parents.len(),
+            )))
+        }
+    };
     let parent_descriptor = load(parent)?;
     let parent_is_root = super::descriptor::source(parent_descriptor.facts())
         .map_err(|error| {
             CollectionRealizationError::Resolution(format!("decode parent source: {error}"))
         })?
         .is_none()
-        && super::descriptor::parent(parent_descriptor.facts())
+        && super::descriptor::parents(parent_descriptor.facts())
             .map_err(|error| {
                 CollectionRealizationError::Resolution(format!("decode parent kind: {error}"))
             })?
-            .is_none();
+            .is_empty();
     if !parent_is_root {
         return Err(CollectionRealizationError::InvalidCover(
             "an attached collection's parent must be a root collection".to_owned(),

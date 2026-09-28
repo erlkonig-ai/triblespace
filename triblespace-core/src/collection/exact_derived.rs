@@ -303,14 +303,14 @@ where
         })?;
         // An attached collection is no lattice: it has no carry, no leaves
         // and no merges of its own, and nothing derives from it.
-        if descriptor::parent(loaded.fragment.facts())
+        if !descriptor::parents(loaded.fragment.facts())
             .map_err(|error| {
                 CollectionRealizationError::Resolution(format!(
                     "decode collection parent for {}: {error}",
                     hex::encode_upper(cursor.raw),
                 ))
             })?
-            .is_some()
+            .is_empty()
         {
             return Err(CollectionRealizationError::InvalidCover(format!(
                 "collection {} is an attached collection; maintain it through its mapping",

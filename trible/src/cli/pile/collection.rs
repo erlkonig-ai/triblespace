@@ -1009,9 +1009,12 @@ fn anchor(fields: &Fields) -> Anchor {
             return Anchor::Unreadable(format!("descriptor undecodable: {e}"));
         }
     };
-    match descriptor::parent(facts) {
-        Ok(Some(parent)) => return Anchor::Attached(parent),
-        Ok(None) => {}
+    match descriptor::parents(facts) {
+        Ok(parents) => {
+            if let Some(parent) = parents.first() {
+                return Anchor::Attached(*parent);
+            }
+        }
         Err(error) => return Anchor::Unreadable(error.to_string()),
     }
     match descriptor::source(facts) {
@@ -2715,7 +2718,7 @@ fn maintenance_order<R: BlobStoreGet>(
             })?;
             let mut upstream: Vec<CollectionHandle> = Vec::new();
             upstream.extend(descriptor::source(&facts)?);
-            upstream.extend(descriptor::parent(&facts)?);
+            upstream.extend(descriptor::parents(&facts)?);
             upstream.extend(descriptor::reads_attached(&facts)?);
             for dependency in upstream {
                 visit(snapshot, dependency, true, attempted, visiting, order)?;
@@ -2953,7 +2956,7 @@ async fn maintenance_pass_inner<S: Store + AsyncBlobStoreAcquire + Send>(
                     .map_err(|error| anyhow!("read collection descriptor: {error}"))?;
                 let representation = descriptor::representation(&facts)?;
                 let algorithm = descriptor::mapping_algorithm(&facts)?;
-                let attached = descriptor::parent(&facts)?.is_some();
+                let attached = !descriptor::parents(&facts)?.is_empty();
                 let before = cover_census(&snapshot, handle)?;
                 let started = Instant::now();
                 let after = if let Some(telemetry) = telemetry.as_deref_mut() {
@@ -3479,15 +3482,12 @@ fn run_search(
         );
         let argument = PortableBM25Blob::bind(&Fragment::empty(), &descriptor)
             .map_err(|error| anyhow!("bind BM25 mapping: {error}"))?;
-        let source = triblespace_core::collection::descriptor::parent(descriptor.facts())
-            .map_err(|error| anyhow!("read parent: {error:?}"))?
-            .ok_or_else(|| anyhow!("BM25 descriptor names no parent collection"))?;
-
         // Read the attached cover. New parent nodes may have no attachment
         // yet; they are the residual, and do not make the index unreadable.
         let view = snapshot
             .attached(collection)
             .map_err(|error| anyhow!("attach cover: {error:?}"))?;
+        let source = view.support().collection().handle();
         let members: Vec<_> = view.cover().members().collect();
         let residual = view.residual().len();
         if residual > 0 {

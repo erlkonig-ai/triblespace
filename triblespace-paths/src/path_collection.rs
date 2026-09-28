@@ -101,8 +101,8 @@ fn an_attached_summary_names_its_parent_and_carries_no_policy() {
     let (mut store, root, target) = attached_paths("edges");
     let descriptor = descriptor_for(&mut store, target);
     assert_eq!(
-        triblespace_core::collection::descriptor::parent(descriptor.facts()),
-        Ok(Some(root.handle()))
+        triblespace_core::collection::descriptor::parents(descriptor.facts()),
+        Ok(vec![root.handle()])
     );
     assert_eq!(
         triblespace_core::collection::descriptor::capability_policies(descriptor.facts(), None)

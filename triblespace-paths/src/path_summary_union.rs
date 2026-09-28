@@ -224,9 +224,9 @@ where
 /// immutable automaton child.
 impl CollectionEncoding for PathSummaryBlob {
     fn validate_descriptor(descriptor: &Fragment) -> Result<(), CollectionOperationError> {
-        let parent = descriptor::parent(descriptor.facts())
+        let parents = descriptor::parents(descriptor.facts())
             .map_err(|source| CollectionOperationError::Fatal(source.to_string()))?;
-        if parent.is_none() {
+        if parents.is_empty() {
             return Err(CollectionOperationError::Fatal(
                 "path-summary descriptor is missing its parent collection".to_owned(),
             ));
@@ -839,8 +839,8 @@ mod tests {
         // A summary names the collection whose nodes it indexes, and carries
         // no anchor and no policy of its own.
         assert_eq!(
-            descriptor::parent(first.facts()),
-            Ok(Some(collection_of(&source)))
+            descriptor::parents(first.facts()),
+            Ok(vec![collection_of(&source)])
         );
         assert_eq!(descriptor::source(first.facts()), Ok(None));
         assert!(

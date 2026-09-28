@@ -19,9 +19,9 @@ use crate::collection::lww_register::{LwwIndex, LwwRegisterBlob};
 use crate::collection::{
     empty_metadata_handle, simplearchive_union, succinctarchive_union, AdmissionPolicy, Collection,
     CollectionAttachment, CollectionCommit, CollectionData, CollectionDerive, CollectionEncoding,
-    CollectionMap, CollectionMerge, CollectionPolicy, CollectionRead, CollectionRecord,
-    CollectionSnapshotExt, CollectionStore, CollectionStoreExt, Cover, CoverageRead, SourceLocator,
-    TryFromCover,
+    CollectionMap, CollectionMerge, CollectionPolicy, CollectionRead, CollectionRealizationError,
+    CollectionRecord, CollectionSnapshotExt, CollectionStore, CollectionStoreExt, Cover,
+    CoverageRead, SourceLocator, TryFromCover,
 };
 use crate::id::{ExclusiveId, Id};
 use crate::inline::encodings::genid::GenId;
@@ -591,6 +591,57 @@ fn a_commit_derive_or_merge_aimed_at_an_attached_handle_is_not_parked() {
     assert_eq!(index.published().frontier(attached.handle()).count(), 0);
 }
 
+/// A descriptor naming two parents is still attached: a COMMIT aimed at it
+/// is dropped like one aimed at any attached collection, never parked
+/// waiting for a descriptor that is already here. How many parents it names
+/// is no question for the fold; a reader that walks one parent's lattice
+/// declines to read it.
+#[test]
+fn a_descriptor_naming_two_parents_is_attached_and_parks_nothing() {
+    use crate::collection::records::{
+        collection_mapping, collection_parent, collection_representation,
+        KIND_COLLECTION_DESCRIPTOR,
+    };
+    use crate::metadata::MetaDescribe;
+    let mut store = MemoryRepo::for_host(host().verifying_key());
+    let first = store.collection("first-parent", policy()).unwrap();
+    let second = store.collection("second-parent", policy()).unwrap();
+    let descriptor = entity! {
+        metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+        collection_parent*: [first.handle(), second.handle()],
+        collection_representation*: <SuccinctArchiveBlob as MetaDescribe>::describe(),
+        collection_mapping*: <SuccinctArchiveBlob as CollectionAttachment>::fragment(&()),
+    };
+    let handle = crate::collection::descriptor::put_closure(&mut store, &descriptor).unwrap();
+    assert_eq!(
+        crate::collection::descriptor::parents(descriptor.facts())
+            .unwrap()
+            .len(),
+        2
+    );
+    let payload: Blob<SimpleArchive> = row(1, 2, 3).to_blob();
+    let node = data(&payload);
+    store.put::<SimpleArchive, _>(payload).unwrap();
+    store
+        .insert(CollectionRecord::Commit(CollectionCommit::sign(
+            &host(),
+            handle,
+            node,
+            empty_metadata_handle(),
+        )))
+        .unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let index = snapshot.index(&BTreeSet::from([handle])).unwrap();
+    assert_eq!(index.parked(), 0);
+    assert!(index.coverage(handle, node).is_none());
+    let attached = Collection::<SuccinctArchiveBlob>::from_handle(handle);
+    let refused = snapshot.attached(attached);
+    assert!(matches!(
+        refused,
+        Err(CollectionRealizationError::InvalidCover(_))
+    ));
+}
+
 /// One maintenance pass carries the parent before it attaches: eight
 /// commits become one merge, and only that node is mapped.
 #[test]
@@ -636,7 +687,7 @@ fn attaching_with_a_key_that_is_not_the_host_is_an_error() {
     commit(&mut store, root, row(1, 2, 3));
     assert!(matches!(
         block_on(store.ensure_attached(attached, &other())),
-        Err(crate::collection::CollectionRealizationError::HostMismatch { .. })
+        Err(CollectionRealizationError::HostMismatch { .. })
     ));
 }
 

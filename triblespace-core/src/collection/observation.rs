@@ -43,9 +43,9 @@ where
     super::encoding::validate_descriptor_type::<E>(&loaded.fragment)
         .map_err(|error| CollectionRealizationError::Resolution(error.to_string()))?;
     let handle = target.handle();
-    if super::descriptor::parent(loaded.fragment.facts())
+    if !super::descriptor::parents(loaded.fragment.facts())
         .map_err(|error| CollectionRealizationError::Resolution(error.to_string()))?
-        .is_some()
+        .is_empty()
     {
         return Err(CollectionRealizationError::InvalidCover(format!(
             "collection {} is an attached collection; read it through `attached`",

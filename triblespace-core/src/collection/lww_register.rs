@@ -1388,8 +1388,8 @@ mod tests {
                 .unwrap()
                 .fragment;
         assert_eq!(
-            descriptor_facts::parent(target_descriptor.facts()),
-            Ok(Some(source.handle()))
+            descriptor_facts::parents(target_descriptor.facts()),
+            Ok(vec![source.handle()])
         );
         assert_eq!(
             descriptor_facts::capability_policies(target_descriptor.facts(), None).count(),

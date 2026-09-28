@@ -499,10 +499,11 @@ fn observe_lattice<R: triblespace_core::repo::StoreRead>(
         let source = facts
             .as_ref()
             .and_then(|facts| {
-                descriptor::source(facts)
-                    .ok()
-                    .flatten()
-                    .or_else(|| descriptor::parent(facts).ok().flatten())
+                descriptor::source(facts).ok().flatten().or_else(|| {
+                    descriptor::parents(facts)
+                        .ok()
+                        .and_then(|parents| parents.first().copied())
+                })
             })
             .map(|source| source.raw);
         let name = facts.as_ref().and_then(|facts| {

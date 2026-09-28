@@ -616,9 +616,10 @@ pub enum SourceResolution {
     Root,
     /// The collection this one derives from.
     Derived(CollectionHandle),
-    /// The collection whose nodes this attached collection indexes. It holds
-    /// no foundations and no merges; only a MAP attests anything about it.
-    Attached(CollectionHandle),
+    /// An attached collection: an index of another collection's nodes. It
+    /// holds no foundations and no merges; only a MAP attests anything about
+    /// it.
+    Attached,
     /// This descriptor is not resident, so the question has no answer yet. An
     /// absence, not a refusal — the blob may still arrive.
     Missing(CollectionHandle),
@@ -1228,7 +1229,7 @@ impl CoverageIndex {
                 // nothing, when its descriptor says so.
                 if matches!(
                     admission.source(entry.collection),
-                    SourceResolution::Attached(_)
+                    SourceResolution::Attached
                 ) {
                     self.fresh_joins
                         .remove(&join_key(entry.collection, &edge_key(&entry.attestation)));
@@ -1247,7 +1248,7 @@ impl CoverageIndex {
                     self.hold(Awaiting::Lineage(descriptor), entry);
                     return;
                 }
-                SourceResolution::Root | SourceResolution::Attached(_) => {
+                SourceResolution::Root | SourceResolution::Attached => {
                     // A derive into a root or an attached collection names
                     // no foundation of it.
                     return;
@@ -1257,7 +1258,7 @@ impl CoverageIndex {
                 // A commit written straight into a derived or an attached
                 // collection names no foundation of it. A missing descriptor
                 // is decided below, where admission parks it on that blob.
-                if let SourceResolution::Derived(_) | SourceResolution::Attached(_) =
+                if let SourceResolution::Derived(_) | SourceResolution::Attached =
                     admission.source(entry.collection)
                 {
                     return;
@@ -1738,9 +1739,11 @@ impl<'a, R: BlobStoreGet + CapabilityProofRead> StoreWriters<'a, R> {
             return SourceResolution::Missing(collection);
         };
         let facts = descriptor.fragment.facts();
-        match super::descriptor::parent(facts) {
-            Ok(Some(parent)) => return SourceResolution::Attached(parent),
-            Ok(None) => {}
+        // Any parent at all makes it attached: how many it names is not the
+        // fold's question.
+        match super::descriptor::parents(facts) {
+            Ok(parents) if !parents.is_empty() => return SourceResolution::Attached,
+            Ok(_) => {}
             Err(_) => return SourceResolution::Missing(collection),
         }
         match super::descriptor::source(facts) {
