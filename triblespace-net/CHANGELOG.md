@@ -18,7 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whole closure on blob arrival. A blob a peer reports in C's held set is
   recorded when the hint arrives, before the acquisition window filters it, so
   it is held in every replication mode. Generation-27 peers and version-4
-  wakes are refused.
+  wakes are refused. Collection AUTH evidence is judged by core's
+  `descriptor::validate_proof_evidence`, the predicate the held set's proof
+  seeds use too.
 
 - Extend collection repair to records, scoped AUTH and a positive resident-blob
   PATCH through new opcode `0x0E` on ALPN `/triblespace/pile-sync/26`;

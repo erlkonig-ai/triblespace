@@ -781,9 +781,12 @@ PATCH of resident handles, kept by the store itself
 (`triblespace_core::collection::held`) for the collections a sync host
 tracks. Seeds are the blobs C's replicated records name -- the descriptor,
 each COMMIT's data and metadata archive, each DERIVE's output -- and the
-capability definitions named by C's proofs, whether a proof is over C itself
-or over a resource whose descriptor routes to C (a descriptor that arrives
-after its proof routes it on arrival). A MERGE result is never a seed,
+capability definitions named by the proofs C's authorization evidence keeps.
+That is the predicate AUTH applies (`descriptor::validate_proof_evidence`): a
+proof over C from one of C's policy roots, or over a resource whose immutable
+descriptor entity both routes to C and declares the proof's root. A valid
+proof irrelevant to C seeds nothing, and a descriptor that arrives after its
+proof lets the proof be judged on arrival. A MERGE result is never a seed,
 and neither is a blob no record names. Reachability is conservative: an
 aligned 32-byte word is a child when that exact H is resident. It issues no
 network request, creates no WANT and remembers no absent word.
@@ -813,11 +816,15 @@ A serving snapshot is published with the closures of the records new in its
 store observation already computed against that observation. The start-up
 walk of a newly activated collection (that collection only) and the periodic
 walk of every collection run on the sync daemon's own threads, publish into
-later snapshots level by level, and never gate publication; a snapshot's held
-sets never change after it is taken. While a collection's start-up walk is
-owed, peer reports for it wait for that walk instead of being read while a
-snapshot is taken: after a restart peers report their whole held sets, and
-reading them there would repeat the start-up walk on the publication path.
+later snapshots batch by batch, and never gate publication; a snapshot's held
+sets never change after it is taken. A held set is closed: a blob joins only
+once every resident child it had when scanned has joined, so a walk publishes
+each batch deepest first, and a new record's closure never stops short at a
+blob a running walk has not finished. While a collection's start-up walk is
+owed, peer reports for it wait for that walk, which reads those its records do
+not reach, instead of being read while a snapshot is taken: after a restart
+peers report their whole held sets, and reading them there would repeat the
+start-up walk on the publication path.
 A collection whose records the store cannot select is left out of the held
 sets and selected again, never published short. Short-lived readers of the
 same pile track nothing and start no thread.
