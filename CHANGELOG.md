@@ -8,9 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 - `trible pile migrate SRC lattice-v3 --into DST` writes the lattice v3 pile
-  from a frozen copy: every COMMIT of every generation, every capability proof,
-  WANT, legacy pin and frame of unknown kind; no MERGE of any encoding or
-  signer; DERIVEs only into collections whose mapping stays derived, is
+  from a frozen copy: every COMMIT of every generation, every capability proof
+  (retired ones included), WANT, legacy pin and frame of unknown kind; no
+  MERGE of any encoding or signer; DERIVEs only into collections whose mapping stays derived, is
   unrecognised, or whose descriptor is not resident; and only the blobs that
   kept state reaches by the conservative walk, so merge results and the
   images of dropped DERIVEs are left behind. A source another process holds
@@ -18,10 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writing and prints the same report: counts by record kind, by mapping and
   by collection, blobs kept and left behind, and a readability check through
   the fold opened without a host key, which lists every believed foundation
-  whose payload is not resident. `--root` and `--roots-from` keep blobs
-  something outside the pile opens, such as the descriptor of a collection
-  no kept record names, and the report lists the resident descriptors left
-  behind. The core half is `PileFile::rewrite_retained_into_filtered` with a
+  whose payload is not resident, and names every reached blob no occurrence
+  of which matches its hash, which is not copied. `--root` and `--roots-from`
+  keep blobs something outside the pile opens, such as the descriptor of a
+  collection no kept record names, and the report lists the resident
+  descriptors left behind. The core half is `PileFile::rewrite_retained_into_filtered` with a
   `CollectionFrameFilter`, and `PileFile::plan_retained_rewrite`.
 
 - Remove the reference-summary collection encoding (`ReferenceSummaryBlob`,

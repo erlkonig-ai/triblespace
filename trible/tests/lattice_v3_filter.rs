@@ -1125,3 +1125,135 @@ fn a_pile_concatenated_with_itself_filters_to_the_same_pile() {
             + 4
     );
 }
+
+/// The retired capability-proof kind v1, copied from triblespace-core.
+const KIND_AUTH_PROOF_V1: &str = "29AC46C61788022D62BE6E2388DA4A164419BA648377D48B2E6DB092EE0A8053";
+
+/// One retired v1 capability-proof frame: a 96-byte prefix (frame, kind,
+/// body length, zero pad) and a 160-byte body of a root key and one edge
+/// whose delegate key closes it; the edge's first 96 bytes are not checked.
+fn retired_proof_v1(seed: u8) -> Vec<u8> {
+    let mut frame = vec![0u8; 256];
+    frame[..28].copy_from_slice(&hex::decode(FRAME_MAGIC).unwrap());
+    frame[28..32].copy_from_slice(&1u32.to_le_bytes());
+    frame[32..64].copy_from_slice(&hex::decode(KIND_AUTH_PROOF_V1).unwrap());
+    frame[64..72].copy_from_slice(&160u64.to_le_bytes());
+    frame[96..128].copy_from_slice(
+        &SigningKey::from_bytes(&[seed; 32])
+            .verifying_key()
+            .to_bytes(),
+    );
+    frame[128..224].fill(seed);
+    frame[224..256].copy_from_slice(
+        &SigningKey::from_bytes(&[seed.wrapping_add(1); 32])
+            .verifying_key()
+            .to_bytes(),
+    );
+    frame
+}
+
+fn retired_proofs(path: &Path) -> Vec<Vec<u8>> {
+    let mut records = PileRecords::open(path).unwrap();
+    let mut frames = Vec::new();
+    while let Some(record) = records.next() {
+        let record = record.unwrap();
+        if matches!(record.content, PileRecordContent::RetiredCapabilityProof) {
+            frames.push(records.bytes()[record.offset..record.offset + record.len].to_vec());
+        }
+    }
+    frames
+}
+
+#[test]
+fn retired_capability_proofs_are_carried_and_counted() {
+    let fixture = Fixture::new(false);
+    let proof = retired_proof_v1(0x65);
+    // Held twice, as a concatenation leaves it: carried and counted once.
+    append(&fixture.src, &proof);
+    append(&fixture.src, &proof);
+    let line = "capability proofs carried: 1 current, 1 retired";
+
+    let dry = fixture.run(&fixture.src, &["--dry-run"]);
+    assert_success(&dry);
+    let text = stdout(&dry);
+    assert!(text.lines().any(|candidate| candidate == line), "{text}");
+
+    let (destination, output) = fixture.filter_into("filtered.pile", &[]);
+    assert_success(&output);
+    let text = stdout(&output);
+    assert!(text.lines().any(|candidate| candidate == line), "{text}");
+    assert_eq!(retired_proofs(&destination), vec![proof]);
+}
+
+/// Replace one byte of the payload of every blob record of `raw`, so no
+/// occurrence of it matches its hash any more.
+fn damage_blob_payload(path: &Path, raw: Raw) {
+    use std::io::{Seek, SeekFrom};
+    let offsets: Vec<usize> = PileRecords::open(path)
+        .unwrap()
+        .filter_map(|record| match record.unwrap().content {
+            PileRecordContent::Blob {
+                hash, data_offset, ..
+            } if hash.raw == raw => Some(data_offset),
+            _ => None,
+        })
+        .collect();
+    assert!(!offsets.is_empty());
+    let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    for offset in offsets {
+        file.seek(SeekFrom::Start(offset as u64)).unwrap();
+        file.write_all(&[0xEE]).unwrap();
+    }
+    file.sync_all().unwrap();
+}
+
+/// A kept COMMIT whose payload is resident only as corrupt bytes: both runs
+/// name it as corrupt, count it as not resident in the readability check
+/// and refuse without `--allow-absent`; with it, both runs complete and
+/// print the same report.
+#[test]
+fn a_corrupt_payload_is_named_by_both_runs_and_refused_unless_allowed() {
+    let fixture = Fixture::new(false);
+    let CollectionRecord::Commit(commit) = fixture.commits[0] else {
+        unreachable!()
+    };
+    let payload = commit.data().raw;
+    damage_blob_payload(&fixture.src, payload);
+    let named = format!("  corrupt blake3:{}", hex::encode_upper(payload));
+    let counted = "corrupt blobs: 1 reached with no occurrence matching its hash, not copied";
+    let readability = "readability (keyless fold): 2 kept collections with believed foundations, 3 foundations, 1 not resident";
+
+    let dry = fixture.run(&fixture.src, &["--dry-run"]);
+    assert!(!dry.status.success(), "{}", stdout(&dry));
+    let (destination, real) = fixture.filter_into("refused.pile", &[]);
+    assert!(!real.status.success());
+    assert!(!destination.exists(), "a refused result is removed");
+    for output in [&dry, &real] {
+        let text = stdout(output);
+        for line in [counted, named.as_str(), readability] {
+            assert!(
+                text.lines().any(|candidate| candidate == line),
+                "{line:?} in\n{text}"
+            );
+        }
+        assert!(String::from_utf8_lossy(&output.stderr).contains("--allow-absent"));
+    }
+
+    let dry = fixture.run(&fixture.src, &["--dry-run", "--allow-absent"]);
+    assert_success(&dry);
+    let (destination, real) = fixture.filter_into("accepted.pile", &["--allow-absent"]);
+    assert_success(&real);
+    let dry = stdout(&dry);
+    let real = stdout(&real);
+    let dry_body: Vec<_> = dry.lines().skip(1).collect();
+    let real_body: Vec<_> = real.lines().skip(1).collect();
+    assert_eq!(&real_body[..dry_body.len()], &dry_body[..]);
+    assert!(real_body.iter().any(|line| *line == named));
+    let mut pile = Pile::open(&destination).unwrap();
+    let snapshot = pile.snapshot().unwrap();
+    assert!(!snapshot
+        .contains_blob(Inline::<Handle<UnknownBlob>>::new(payload))
+        .unwrap());
+    drop(snapshot);
+    pile.close().unwrap();
+}

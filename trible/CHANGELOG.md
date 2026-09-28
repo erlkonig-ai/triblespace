@@ -27,7 +27,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   in the source and every resident descriptor of a collection some frame
   names that is left behind. Counts are of records: one held in several
   frames counts once. A descriptor naming a mapping without a tagged
-  algorithm keeps its DERIVEs, as an unrecognised algorithm does.
+  algorithm keeps its DERIVEs, as an unrecognised algorithm does. Retired
+  capability proofs are carried and counted (`capability proofs carried:`).
+  A blob the walk reaches of which no occurrence matches its hash is not
+  copied, whether a kept record or another blob names it; both runs name it
+  under `corrupt blobs:`, and a corrupt foundation payload counts as not
+  resident in the readability check.
 - `pile net sync --health-collection <handle>` (with `--health-key`) and
   `pile net health --collection <handle>` report into and read from an
   explicit existing health generation instead of the reporting key's own

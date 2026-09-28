@@ -6,8 +6,8 @@
 //! computes for itself:
 //!
 //! - every COMMIT of every generation, retired generations included, is kept;
-//! - capability proofs, WANTs, legacy pins and frames of unknown kind travel
-//!   exactly as `pile compact` carries them;
+//! - capability proofs (current and retired), WANTs, legacy pins and frames
+//!   of unknown kind travel exactly as `pile compact` carries them;
 //! - every MERGE of every encoding and every signer (current v10, retired v8,
 //!   retired v2 and v6, legacy unsigned, legacy V3) is left behind: a host
 //!   folds only merges its own key signed, and rebuilds them;
@@ -19,16 +19,25 @@
 //! - a blob is kept only when the carried state reaches it: the conservative
 //!   walk (every aligned 32-byte word naming a resident blob is a child) from
 //!   what every kept record names (commit data and metadata, DERIVE outputs,
-//!   descriptors), from proofs, WANTs and pins, from the aligned words of kept
-//!   frames of unknown kind, and from the record-kind descriptions this binary
-//!   writes, and from every `--root`. Merge results and the images of
+//!   descriptors), from proofs, WANTs and pins, from every 32 bytes, at any
+//!   offset, of kept frames of unknown kind and retired proofs, from the
+//!   record-kind descriptions this binary writes, and from every `--root`.
+//!   Merge results and the images of
 //!   dropped DERIVEs no kept record reaches are left behind, and so is the
 //!   descriptor of a collection no kept record names (one that never held a
 //!   record, say): name such handles with `--root` or `--roots-from` when
 //!   something outside the pile (a sync or maintenance list, an exact-handle
 //!   override) still opens them. The report lists every resident descriptor
 //!   of a collection some frame names that is left behind. Archive the
-//!   source before replacing it.
+//!   source before replacing it;
+//! - a resident blob the walk reaches of which no occurrence matches its
+//!   hash has no valid bytes to keep: it is not copied, whether a kept
+//!   record, a root or another blob names it, and both runs name it under
+//!   `corrupt blobs`. Its damaged bytes are still read for what they name.
+//!   A believed foundation whose payload is corrupt counts as not resident
+//!   in the readability check, so both runs refuse it without
+//!   `--allow-absent`. The archived source keeps the damaged bytes; a peer
+//!   may hold valid ones.
 //!
 //! The source is read through a read-only descriptor, and the command refuses
 //! a source another process holds open: this rewrites a frozen copy, never a
@@ -348,7 +357,7 @@ fn generation_label(generation: CollectionFrameGeneration) -> &'static str {
 
 /// What the rewrite's own accounting says, identical for the plan and the
 /// real run.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct FrameAccounting {
     filtered: usize,
     superseded: usize,
@@ -356,6 +365,9 @@ struct FrameAccounting {
     repeated: usize,
     opaque_carried: usize,
     retired_carried: usize,
+    proofs_carried: usize,
+    retired_proofs_carried: usize,
+    corrupt: BTreeSet<Inline<Handle<UnknownBlob>>>,
 }
 
 /// The handles `--root` and `--roots-from` name, split by residency in the
@@ -446,8 +458,13 @@ type Readability = BTreeMap<[u8; 32], (usize, Vec<[u8; 32]>)>;
 
 /// Read `collections` through the fold of a store opened without a host
 /// key, which believes no merge, so each frontier is exactly the believed
-/// foundations; name every foundation whose payload is not resident.
-fn readability(pile: &mut Pile, collections: &BTreeSet<[u8; 32]>) -> Result<Readability> {
+/// foundations; name every foundation whose payload is not resident, or is
+/// resident only as `corrupt` bytes the rewrite does not copy.
+fn readability(
+    pile: &mut Pile,
+    collections: &BTreeSet<[u8; 32]>,
+    corrupt: &BTreeSet<Inline<Handle<UnknownBlob>>>,
+) -> Result<Readability> {
     let snapshot = pile
         .snapshot()
         .map_err(|error| anyhow!("snapshot for the readability check: {error:?}"))?;
@@ -460,9 +477,10 @@ fn readability(pile: &mut Pile, collections: &BTreeSet<[u8; 32]>) -> Result<Read
         for member in support.iter_ordered() {
             foundations += 1;
             let handle: Inline<Handle<UnknownBlob>> = Inline::new(*member);
-            if !snapshot
-                .contains_blob(handle)
-                .map_err(|error| anyhow!("residency lookup: {error:?}"))?
+            if corrupt.contains(&handle)
+                || !snapshot
+                    .contains_blob(handle)
+                    .map_err(|error| anyhow!("residency lookup: {error:?}"))?
             {
                 absent.push(*member);
             }
@@ -514,7 +532,7 @@ impl Census {
     /// The report both modes print, in full.
     fn report(
         &self,
-        accounting: FrameAccounting,
+        accounting: &FrameAccounting,
         blobs: BlobAccounting,
         roots: &Roots,
         left_descriptors: &[([u8; 32], bool)],
@@ -562,6 +580,11 @@ impl Census {
         );
         let _ = writeln!(
             out,
+            "capability proofs carried: {} current, {} retired",
+            accounting.proofs_carried, accounting.retired_proofs_carried,
+        );
+        let _ = writeln!(
+            out,
             "roots: {} named, {} resident and kept with what they reach, {} not resident in the source",
             roots.resident.len() + roots.absent.len(),
             roots.resident.len(),
@@ -580,6 +603,14 @@ impl Census {
             blobs.resident - blobs.kept,
             blobs.resident_bytes - blobs.kept_bytes,
         );
+        let _ = writeln!(
+            out,
+            "corrupt blobs: {} reached with no occurrence matching its hash, not copied",
+            accounting.corrupt.len(),
+        );
+        for handle in &accounting.corrupt {
+            let _ = writeln!(out, "  corrupt blake3:{}", hex::encode_upper(handle.raw));
+        }
 
         let mut by_mapping: BTreeMap<String, (Tally, usize)> = BTreeMap::new();
         for (collection, roles) in &self.by_collection {
@@ -817,8 +848,9 @@ fn refuse_absent(readability: &Readability, allow_absent: bool) -> Result<()> {
     if absent > 0 && !allow_absent {
         bail!(
             "{absent} believed foundation(s) of kept collections are not resident (listed \
-             above). They are not resident in the source either: the filter keeps every \
-             resident payload a kept record names. Pass --allow-absent to accept them"
+             above). Each is absent from the source too, or resident there only as corrupt \
+             bytes (listed under corrupt blobs): the filter keeps every valid resident payload \
+             a kept record names. Pass --allow-absent to accept them"
         );
     }
     Ok(())
@@ -911,6 +943,9 @@ fn dry_run(source_path: &Path, options: &Options) -> Result<()> {
             repeated: plan.repeated_frames,
             opaque_carried: plan.opaque_frames,
             retired_carried: plan.retired_equations,
+            proofs_carried: plan.capability_proofs,
+            retired_proofs_carried: plan.retired_capability_proofs,
+            corrupt: plan.corrupt_blobs,
         };
         let census = filter.census;
         let left = census.left_descriptors(|collection| {
@@ -922,12 +957,19 @@ fn dry_run(source_path: &Path, options: &Options) -> Result<()> {
             PileFile::open_read_only(source_path)
                 .map_err(|error| anyhow!("reopen source: {error:?}"))?,
         );
-        let read = readability(&mut keyless, &census.kept_collections());
+        let read = readability(
+            &mut keyless,
+            &census.kept_collections(),
+            &accounting.corrupt,
+        );
         keyless
             .close()
             .map_err(|error| anyhow!("close source: {error:?}"))?;
         let read = read?;
-        Ok((census.report(accounting, blobs, &roots, &left, &read), read))
+        Ok((
+            census.report(&accounting, blobs, &roots, &left, &read),
+            read,
+        ))
     })();
     let closed = source
         .close()
@@ -1009,6 +1051,9 @@ fn filter_into(source_path: &Path, destination_path: &Path, options: &Options) -
             repeated: stats.repeated_frames,
             opaque_carried: stats.opaque_frames,
             retired_carried: stats.retired_equations,
+            proofs_carried: stats.capability_proofs,
+            retired_proofs_carried: stats.retired_capability_proofs,
+            corrupt: stats.corrupt_blobs,
         };
         Ok((
             filter.census,
@@ -1062,7 +1107,11 @@ fn filter_into(source_path: &Path, destination_path: &Path, options: &Options) -
                 kept_bytes,
             };
             Ok((
-                readability(&mut written, &census.kept_collections())?,
+                readability(
+                    &mut written,
+                    &census.kept_collections(),
+                    &accounting.corrupt,
+                )?,
                 blobs,
                 left,
             ))
@@ -1102,7 +1151,10 @@ fn filter_into(source_path: &Path, destination_path: &Path, options: &Options) -
         source_path.display(),
         destination_path.display()
     );
-    print!("{}", census.report(accounting, blobs, &roots, &left, &read));
+    print!(
+        "{}",
+        census.report(&accounting, blobs, &roots, &left, &read)
+    );
     println!(
         "destination: {} -> {destination_len} bytes",
         options.stable_len

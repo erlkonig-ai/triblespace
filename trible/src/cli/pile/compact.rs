@@ -8,7 +8,8 @@
 //! retired records such as `RetiredCollectionDeriveV4`, historical PEER
 //! evidence, STORE_SCOPE assertions, and retired WANT logs. Repacked blob
 //! records receive fresh insertion timestamps. Distinct collection equations
-//! and commits are never inferred to be redundant. A frame whose kind this
+//! and commits are never inferred to be redundant. Retired capability proofs
+//! are capability records and are carried exactly. A frame whose kind this
 //! binary does not know is carried exactly, by its own length, and counted:
 //! nothing it could name is dropped here, and a binary that knows the kind
 //! reads it from the compacted pile unchanged (JP, 2026-09-13).
@@ -32,6 +33,7 @@ struct RecordCensus {
     blobs: usize,
     collection_records: usize,
     capability_proofs: usize,
+    retired_capability_proofs: usize,
     current_wants: usize,
     retired_want_records: usize,
     retired_team_records: usize,
@@ -53,6 +55,7 @@ fn census(path: &Path) -> Result<RecordCensus> {
             PileRecordContent::Blob { .. } => census.blobs += 1,
             PileRecordContent::Collection { .. } => census.collection_records += 1,
             PileRecordContent::CapabilityProof { .. } => census.capability_proofs += 1,
+            PileRecordContent::RetiredCapabilityProof => census.retired_capability_proofs += 1,
             PileRecordContent::Want { .. } => census.current_wants += 1,
             PileRecordContent::RetiredWantAssert { .. }
             | PileRecordContent::RetiredWantRetract { .. } => census.retired_want_records += 1,
@@ -226,7 +229,7 @@ pub(super) fn run(
     drop(destination_file);
 
     println!(
-        "Compacted {} into {}:\n  bytes: {} -> {}\n  blob records: {} -> {}\n  collection records: {} -> {}\n  capability proofs: {} -> {}\n  current WANT records: {} -> {}\n  retired WANT log records: {} -> {} (dropped)\n  retired team records: {} -> {} (dropped)\n  frames of unknown kind: {} ({} bytes) -> {} ({} bytes) (carried exactly)\n  active wants: {}\n  active legacy pins: {}",
+        "Compacted {} into {}:\n  bytes: {} -> {}\n  blob records: {} -> {}\n  collection records: {} -> {}\n  capability proofs: {} -> {}\n  retired capability proofs: {} -> {} (carried exactly)\n  current WANT records: {} -> {}\n  retired WANT log records: {} -> {} (dropped)\n  retired team records: {} -> {} (dropped)\n  frames of unknown kind: {} ({} bytes) -> {} ({} bytes) (carried exactly)\n  active wants: {}\n  active legacy pins: {}",
         source_path.display(),
         destination_path.display(),
         source_census.bytes,
@@ -237,6 +240,8 @@ pub(super) fn run(
         destination_census.collection_records,
         source_census.capability_proofs,
         destination_census.capability_proofs,
+        source_census.retired_capability_proofs,
+        destination_census.retired_capability_proofs,
         source_census.current_wants,
         destination_census.current_wants,
         source_census.retired_want_records,
