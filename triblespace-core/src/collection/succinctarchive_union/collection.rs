@@ -24,7 +24,8 @@ use crate::blob::encodings::succinctarchive::{
 };
 use crate::blob::{Blob, TryFromBlob};
 use crate::collection::{
-    AttachedSnapshot, CollectionData, CollectionEncoding, Cover, TryFromCover, TryFromCoverError,
+    AttachedRead, AttachedSnapshot, CollectionData, CollectionEncoding, Cover, Support,
+    TryFromCover, TryFromCoverError,
 };
 use crate::inline::encodings::hash::Handle;
 use crate::repo::{BlobStoreGet, StoreRead};
@@ -394,15 +395,14 @@ impl Error for ReadAttachedError {}
 /// This is the raw read of what no usable attachment reaches -- a commit
 /// written since the last maintenance pass, or written by another key and
 /// not attached here yet -- so a reader sees it without waiting for
-/// maintenance. A residual foundation whose bytes are not here is left out;
-/// the read counts it in [`AttachedSnapshot::residual`], and its bytes
-/// arriving turns [`AttachedSnapshot::is_current`] false. One whose bytes
-/// cannot form an archive -- malformed, or too wide for one segment -- is
-/// left out the same way: a reader skips what it cannot interpret. Only a
-/// store that cannot read resident bytes fails the read.
+/// maintenance. What it cannot read is named in [`AttachedRead::unread`],
+/// never dropped silently: a residual foundation whose bytes are not here
+/// (their arrival turns [`AttachedSnapshot::is_current`] false), and one
+/// whose bytes cannot form one archive -- malformed, or too wide for one
+/// segment. Only a store that cannot read resident bytes fails the read.
 pub fn read_attached<R, E>(
     attached: &AttachedSnapshot<R, E>,
-) -> Result<UnionArchive<OrderedUniverse>, ReadAttachedError>
+) -> Result<AttachedRead<UnionArchive<OrderedUniverse>>, ReadAttachedError>
 where
     R: StoreRead,
     E: CollectionEncoding,
@@ -411,6 +411,7 @@ where
 {
     let snapshot = attached.snapshot();
     let mut residual = Vec::new();
+    let mut unread = Vec::new();
     for foundation in attached.residual().members() {
         let member = Handle::<SimpleArchive>::to_hash(foundation);
         let failed = |reason: String| ReadAttachedError::Residual { member, reason };
@@ -419,25 +420,30 @@ where
             .map_err(|error| failed(error.to_string()))?
             .is_none()
         {
+            unread.push(member);
             continue;
         }
         let bytes: Blob<SimpleArchive> = snapshot
             .get(foundation)
             .map_err(|error| failed(error.to_string()))?;
-        let Ok(image) = super::derive_element(&bytes) else {
-            continue;
-        };
-        let Ok(archive) = SuccinctArchive::try_from_blob(image) else {
-            continue;
-        };
-        residual.push(archive);
+        let archive = super::derive_element(&bytes)
+            .ok()
+            .and_then(|image| SuccinctArchive::try_from_blob(image).ok());
+        match archive {
+            Some(archive) => residual.push(archive),
+            None => unread.push(member),
+        }
     }
     let cover: UnionArchive<OrderedUniverse> = attached
         .view()
         .map_err(|error| ReadAttachedError::Cover(error.to_string()))?;
-    Ok(if residual.is_empty() {
+    let union = if residual.is_empty() {
         cover
     } else {
         cover.with_segments(residual)
-    })
+    };
+    Ok(AttachedRead::new(
+        union,
+        Support::from_data(attached.support().collection(), unread),
+    ))
 }

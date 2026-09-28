@@ -610,22 +610,30 @@ mod tests {
         }
     }
 
-    /// The named case: one document present in two nodes, each attached.
-    /// The cover counts it once, so its document frequency is not summed,
-    /// and the scores are the union's.
+    /// The named case: one document present in two nodes, each attached by
+    /// a MAP, read back through the attached cover the store selects. The
+    /// cover counts the document once, so its document frequency is not
+    /// summed, and the scores are the union's. The same read with one of
+    /// the two nodes left unattached builds it in memory and answers alike.
     #[test]
     fn a_document_present_in_two_nodes_is_counted_once() {
+        use ed25519_dalek::SigningKey;
         use triblespace_core::collection::{
-            AdmissionPolicy, CollectionPolicy, CollectionStoreExt, TryFromCover,
+            AdmissionPolicy, CollectionMap, CollectionPolicy, CollectionRecord,
+            CollectionSnapshotExt, CollectionStore, CollectionStoreExt, TryFromCover,
         };
+        use triblespace_core::repo::BlobStoreGet;
 
+        let key = SigningKey::from_bytes(&[44; 32]);
+        let host = key.verifying_key();
         let attribute = Attribute::<Handle<UTF8String>>::named("bm25-twice");
         let argument = TextAttributeToBm25 {
             attribute: attribute.id(),
             tokenizer: Bm25Tokenizer::Word,
         };
-        let mut store = MemoryRepo::default();
-        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+        let mut store = MemoryRepo::for_host(host);
+        let policy =
+            CollectionPolicy::new(AdmissionPolicy::direct(host), AdmissionPolicy::direct(host));
         let root = store.collection("bm25-twice", policy).unwrap();
         let target = store.attach::<PortableBM25Blob>(root, argument).unwrap();
         let shared = store
@@ -633,35 +641,136 @@ mod tests {
             .unwrap();
         let other = store.put::<UTF8String, _>(String::from("hay")).unwrap();
         let left = text_facts(attribute.id(), [(1, shared), (2, other)]);
-        let right = text_facts(attribute.id(), [(1, shared)]);
+        let right = text_facts(attribute.id(), [(1, shared), (3, other)]);
         let mut union = left.clone();
         union += right.clone();
-
-        let snapshot = store.snapshot().unwrap();
-        let mut members = Vec::new();
-        for facts in [&left, &right, &union] {
-            let image = PortableBM25Blob::map(&argument, &facts.to_blob(), &[], &snapshot).unwrap();
-            members.push(store.put::<PortableBM25Blob, _>(image).unwrap());
-        }
-        let snapshot = store.snapshot().unwrap();
-        let descriptor = Fragment::from(PortableBM25Blob::fragment(&argument));
-        let through_cover: crate::portable_bm25::PortableBM25View = TryFromCover::try_from_cover(
-            &target.cover(members[..2].to_vec()),
-            &descriptor,
-            &snapshot,
-        )
-        .unwrap();
-        let through_union: crate::portable_bm25::PortableBM25View =
-            TryFromCover::try_from_cover(&target.cover([members[2]]), &descriptor, &snapshot)
-                .unwrap();
-        assert_eq!(through_cover.query().unwrap().doc_count(), 2);
-        for query in ["needle", "hay", "needle hay"] {
-            assert_eq!(
-                scores(&through_cover, query),
-                scores(&through_union, query),
-                "{query}"
+        let mut nodes = Vec::new();
+        for facts in [&left, &right] {
+            nodes.push(
+                store
+                    .commit(root, &key, Fragment::from(facts.clone()))
+                    .unwrap()
+                    .data(),
             );
         }
+        let attach = |store: &mut MemoryRepo, node: CollectionData| {
+            let snapshot = store.snapshot().unwrap();
+            let bytes: Blob<SimpleArchive> = snapshot
+                .get(Handle::<SimpleArchive>::from_hash(node))
+                .unwrap();
+            let image = PortableBM25Blob::map(&argument, &bytes, &[], &snapshot).unwrap();
+            drop(snapshot);
+            let attachment = store.put::<PortableBM25Blob, _>(image).unwrap();
+            store
+                .insert(CollectionRecord::Map(CollectionMap::sign(
+                    &key,
+                    target.handle(),
+                    node,
+                    Handle::<PortableBM25Blob>::to_hash(attachment),
+                )))
+                .unwrap();
+        };
+        attach(&mut store, nodes[0]);
+
+        // The expected answer: the index of the union, as one member.
+        let snapshot = store.snapshot().unwrap();
+        let expected = PortableBM25Blob::map(&argument, &union.to_blob(), &[], &snapshot).unwrap();
+        drop(snapshot);
+        let expected = store.put::<PortableBM25Blob, _>(expected).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let descriptor: Blob<SimpleArchive> = snapshot.get(target.handle()).unwrap();
+        let descriptor = Fragment::from(TribleSet::try_from_blob(descriptor).unwrap());
+        let through_union: crate::portable_bm25::PortableBM25View =
+            TryFromCover::try_from_cover(&target.cover([expected]), &descriptor, &snapshot)
+                .unwrap();
+
+        // One node attached, the other residual and built by the read.
+        let attached = snapshot.attached(target).unwrap();
+        assert_eq!(attached.cover().len(), 1);
+        assert_eq!(attached.residual().len(), 1);
+        let read = attached
+            .read::<crate::portable_bm25::PortableBM25View>()
+            .unwrap();
+        assert!(read.unread().is_empty());
+        drop(snapshot);
+
+        // Both attached: the cover the store selects holds both nodes.
+        attach(&mut store, nodes[1]);
+        let snapshot = store.snapshot().unwrap();
+        let attached = snapshot.attached(target).unwrap();
+        assert_eq!(attached.cover().len(), 2);
+        assert!(attached.residual().is_empty());
+        let through_cover: crate::portable_bm25::PortableBM25View = attached.view().unwrap();
+
+        for view in [&through_cover, read.value()] {
+            assert_eq!(view.query().unwrap().doc_count(), 3);
+            for query in ["needle", "hay", "needle hay"] {
+                assert_eq!(
+                    scores(view, query),
+                    scores(&through_union, query),
+                    "{query}"
+                );
+            }
+        }
+    }
+
+    /// A residual node whose text is not here is named unread, not read as
+    /// a shorter document; the text arriving moves the read off current,
+    /// and the next read includes it.
+    #[test]
+    fn a_residual_node_whose_text_is_absent_is_unread_until_it_arrives() {
+        use ed25519_dalek::SigningKey;
+        use triblespace_core::collection::{
+            AdmissionPolicy, CollectionPolicy, CollectionSnapshotExt, CollectionStoreExt,
+        };
+
+        let key = SigningKey::from_bytes(&[45; 32]);
+        let host = key.verifying_key();
+        let attribute = Attribute::<Handle<UTF8String>>::named("bm25-read-late");
+        let argument = TextAttributeToBm25 {
+            attribute: attribute.id(),
+            tokenizer: Bm25Tokenizer::Word,
+        };
+        let mut store = MemoryRepo::for_host(host);
+        let policy =
+            CollectionPolicy::new(AdmissionPolicy::direct(host), AdmissionPolicy::direct(host));
+        let root = store.collection("bm25-read-late", policy).unwrap();
+        let target = store.attach::<PortableBM25Blob>(root, argument).unwrap();
+        let text: Blob<UTF8String> = String::from("late arrival").to_blob();
+        let commit = store
+            .commit(
+                root,
+                &key,
+                Fragment::from(text_facts(attribute.id(), [(1, text.get_handle())])),
+            )
+            .unwrap();
+        let before = store.snapshot().unwrap();
+        let attached = before.attached(target).unwrap();
+        let read = attached
+            .read::<crate::portable_bm25::PortableBM25View>()
+            .unwrap();
+        assert_eq!(
+            read.unread()
+                .members()
+                .map(|member| member.raw)
+                .collect::<Vec<_>>(),
+            vec![commit.data().raw]
+        );
+        assert_eq!(read.value().query().unwrap().doc_count(), 0);
+
+        store.put::<UTF8String, _>(text).unwrap();
+        let after = store.snapshot().unwrap();
+        assert!(
+            !attached.is_current(&after),
+            "the text the read asked for moves it off current"
+        );
+        let read = after
+            .attached(target)
+            .unwrap()
+            .read::<crate::portable_bm25::PortableBM25View>()
+            .unwrap();
+        assert!(read.unread().is_empty());
+        assert_eq!(read.value().query().unwrap().doc_count(), 1);
     }
 
     /// A key that is not the store's host is refused before anything is
