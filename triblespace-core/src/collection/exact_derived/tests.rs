@@ -5217,4 +5217,33 @@ mod lattice_v2 {
             calls += 1;
         }
     }
+
+    /// Review finding, 2026-09-28: a refused own foundation was reported in
+    /// place of the carry's own failure, so a store that could not write the
+    /// carry's MERGE said only that one foundation was refused.
+    #[test]
+    fn a_failed_carry_is_reported_before_a_refused_foundation() {
+        reset_mapping_calls();
+        let (mut inner, root, first, _) = collections();
+        for entity in 0..8 {
+            own_commit(&mut inner, root, 41, entity);
+        }
+        let refused = own_commit(&mut inner, root, 41, 8);
+        FIRST_MAP_FATAL.replace(Some(refused));
+        let mut store = GuardStore::new(inner);
+        // Eight leaves go in; the carry's MERGE is the ninth insert.
+        store.reject_insert_at = Some(9);
+
+        let result = block_on(store.maintain(first, &key(41)));
+        assert!(
+            matches!(
+                result,
+                Err(CollectionRealizationError::Storage { operation, .. })
+                    if operation == "publish root carry MERGE"
+            ),
+            "{:?}",
+            result.err()
+        );
+        assert_eq!(leaves_by(&mut store.inner, first, 41).len(), 8);
+    }
 }

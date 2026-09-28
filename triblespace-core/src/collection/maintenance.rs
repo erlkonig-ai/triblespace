@@ -1057,10 +1057,10 @@ where
 /// ([`CollectionRealizationError::MissingDependency`], which the acquiring
 /// loop fetches before running everything again); it is a request, not a
 /// report, so it comes before anything reported. What is reported comes in
-/// this order: the first own foundation the mapping refused
-/// ([`CollectionRealizationError::Derive`]), then the carry's own failure,
-/// then, for `ensure` only, a key the target does not admit that owes
-/// leaves for foundations of its own
+/// this order: the carry's own failure, then the first own foundation the
+/// mapping refused ([`CollectionRealizationError::Derive`]), then, for
+/// `ensure` only, a key the target does not admit that owes leaves for
+/// foundations of its own
 /// ([`CollectionRealizationError::UnauthorizedProducer`]), then own
 /// foundations the mapping could not represent
 /// ([`CollectionRealizationError::Unmappable`]). The acquiring loop asks for
@@ -1103,10 +1103,10 @@ where
     if let Some(member) = derived.missing {
         return Err(CollectionRealizationError::MissingDependency { member });
     }
+    carried?;
     if let Some(refusal) = derived.refusal {
         return Err(refusal);
     }
-    carried?;
     if derived.unauthorized {
         return Err(CollectionRealizationError::UnauthorizedProducer {
             collection: target.handle(),
@@ -1134,7 +1134,8 @@ struct Derivation {
     /// everything else has been derived and carried.
     missing: Option<CollectionData>,
     /// The first own foundation the mapping refused: held until everything
-    /// else has been derived and carried.
+    /// else has been derived and carried, and reported after what the carry
+    /// reports.
     refusal: Option<CollectionRealizationError>,
 }
 
