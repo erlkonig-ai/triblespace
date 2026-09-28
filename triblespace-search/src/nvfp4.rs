@@ -2464,4 +2464,135 @@ mod tests {
                 .scores
         );
     }
+
+    /// Review finding, 2026-09-28 (test gap): the derived carry end to end
+    /// on this encoding. Four vectors are derived, and each gets a second
+    /// leaf from a run that disagrees -- another row under the same handle,
+    /// as an embedding that does not reproduce would give -- so eight held
+    /// leaves carry into one host MERGE whose image holds two rows per
+    /// handle, nothing is derived again, and the carried index scores each
+    /// handle once.
+    #[test]
+    fn eight_leaves_with_two_rows_per_handle_carry_into_one_merge() {
+        use triblespace_core::collection::{
+            CollectionDerive, CollectionRead, CollectionRecord, CollectionRecordSelector,
+            CollectionStore, SourceLocator,
+        };
+
+        const DIMENSION: usize = 3;
+        let host = SigningKey::from_bytes(&[75; 32]);
+        let root = host.verifying_key();
+        let policy =
+            CollectionPolicy::new(AdmissionPolicy::direct(root), AdmissionPolicy::direct(root));
+        let attribute = Attribute::<Handle<Embedding>>::named("nvfp4-derived-carry");
+        let mut store = MemoryRepo::for_host(root);
+        let source = store
+            .collection("nvfp4-derived-carry-source", policy.clone())
+            .unwrap();
+        let target = store
+            .derive::<NvFp4CosineSet<Embedding>>(
+                source,
+                NvFp4EmbeddingAttribute::new(attribute.id(), DIMENSION).unwrap(),
+                policy,
+            )
+            .unwrap();
+        let vectors = [
+            [1.0f32, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.6, 0.8, 0.0],
+        ];
+        let mut members = Vec::new();
+        for (entity, vector) in vectors.iter().enumerate() {
+            let embedding = store.put::<Embedding, _>(vector.to_vec()).unwrap();
+            let mut facts = TribleSet::new();
+            facts.insert(&Trible::force(
+                &Id::new([entity as u8 + 1; 16]).unwrap(),
+                &attribute.id(),
+                &embedding,
+            ));
+            let commit = store.commit(source, &host, Fragment::from(facts)).unwrap();
+            members.push((commit.data(), embedding, *vector));
+        }
+        block_on(store.maintain(target, &host)).unwrap();
+
+        let records = |store: &mut MemoryRepo| -> Vec<CollectionRecord> {
+            store
+                .snapshot()
+                .unwrap()
+                .select_records(&BTreeSet::from([CollectionRecordSelector::Collection(
+                    target.handle(),
+                )]))
+                .unwrap()
+        };
+        let derives = |records: &[CollectionRecord]| {
+            records
+                .iter()
+                .filter(|record| matches!(record, CollectionRecord::Derive(_)))
+                .count()
+        };
+        assert_eq!(derives(&records(&mut store)), 4);
+        for (commit, embedding, vector) in &members {
+            let stray = StoredRow::quantize(
+                embedding.raw,
+                &[vector[0] + 0.1, vector[1], vector[2] + 0.1],
+                DIMENSION,
+            )
+            .unwrap();
+            let output = store
+                .put::<NvFp4CosineSet<Embedding>, _>(member([stray], DIMENSION))
+                .unwrap();
+            store
+                .insert(CollectionRecord::Derive(CollectionDerive::sign(
+                    &host,
+                    target.handle(),
+                    SourceLocator::of(commit.raw),
+                    Handle::<NvFp4CosineSet<Embedding>>::to_hash(output),
+                )))
+                .unwrap();
+        }
+
+        block_on(store.maintain(target, &host)).unwrap();
+        let after = records(&mut store);
+        assert_eq!(derives(&after), 8, "nothing is derived again");
+        let merges: Vec<_> = after
+            .iter()
+            .filter_map(|record| match record {
+                CollectionRecord::Merge(merge) => Some(*merge),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(merges.len(), 1);
+        assert_eq!(merges[0].inputs().len(), 8);
+        assert_eq!(merges[0].public_key().raw, root.to_bytes());
+
+        let snapshot = store.snapshot().unwrap();
+        let joined: Blob<NvFp4CosineSet<Embedding>> = snapshot
+            .get(Handle::<NvFp4CosineSet<Embedding>>::from_hash(
+                merges[0].result(),
+            ))
+            .unwrap();
+        let rows = rows_of(&joined);
+        assert_eq!(rows.len(), 8);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.handle)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            4
+        );
+        let view = snapshot.collection(target).unwrap();
+        assert_eq!(
+            view.cover()
+                .members()
+                .map(|member| member.raw)
+                .collect::<Vec<_>>(),
+            vec![merges[0].result().raw]
+        );
+        let index = view.view::<NvFp4CosineIndex<Embedding>>().unwrap();
+        assert_eq!(index.len(), 8);
+        let cosines = index.reconstructed_cosines(&[1.0, 0.0, 0.0]).unwrap();
+        assert_eq!(cosines.len(), 4, "each handle scored once");
+        assert!(cosines.cosine(&members[0].1).unwrap() > 0.99);
+    }
 }
