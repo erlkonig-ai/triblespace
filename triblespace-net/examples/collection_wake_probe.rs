@@ -38,6 +38,7 @@ async fn main() -> Result<()> {
             direction: ReconcileDirection::ReadOnly,
         },
         provider_publication_budget: Some(0),
+        bind: None,
     };
     let harness = timeout(
         Duration::from_secs(10),

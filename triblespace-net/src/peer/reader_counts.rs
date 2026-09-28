@@ -606,6 +606,7 @@ fn leech_public_lazy_resident_snapshots_and_writes_remain_dormant() {
                 peers: Vec::new(),
                 qos: ReconcileQos::default(),
                 provider_publication_budget: Some(1),
+                bind: None,
             },
         );
         assert_eq!(

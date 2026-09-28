@@ -110,6 +110,7 @@ fn bring_up_with_publication_budget(
                 .collect(),
             qos,
             provider_publication_budget,
+            bind: None,
         },
         wiring,
     ));

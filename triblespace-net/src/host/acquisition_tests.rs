@@ -1538,6 +1538,7 @@ async fn zero_announcement_budget_still_answers_resident_self_hints() {
                     )],
                     qos: ReconcileQos::default(),
                     provider_publication_budget: Some(0),
+                    bind: None,
                 },
                 wiring,
             ));

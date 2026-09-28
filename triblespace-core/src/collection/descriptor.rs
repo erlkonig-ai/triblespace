@@ -31,8 +31,12 @@ use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::utf8string::UTF8String;
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::Blob;
-use crate::capability::policy::{capability_handle, resource_policies, resource_policy};
-use crate::capability::CapabilityHandle;
+use crate::capability::policy::{
+    capability_handle, resource_collection, resource_policies, resource_policy,
+};
+use crate::capability::{
+    CapabilityHandle, CapabilityProof, CapabilityProofError, CapabilityResource,
+};
 use crate::id::Id;
 use crate::inline::encodings::genid::GenId;
 use crate::inline::encodings::hash::Handle;
@@ -421,6 +425,78 @@ pub fn capability_policies<'a>(
 ) -> impl Iterator<Item = (CapabilityHandle, AdmissionPolicy)> + 'a {
     descriptor_entities(facts, representation)
         .flat_map(move |descriptor| resource_policies(facts, descriptor, None))
+}
+
+/// Why a capability proof is not authorization evidence for a collection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProofEvidenceError {
+    /// The proof names a different resource.
+    WrongResource,
+    /// The subordinate resource's immutable routing descriptor is not resident.
+    ResourceDescriptorUnavailable(CollectionHandle),
+    /// The proof starts outside every root the resource's policies declare.
+    WrongRoot,
+    /// A signature in the proof's prefix chain is invalid.
+    Invalid(CapabilityProofError),
+}
+
+/// Whether `proof` is authorization evidence for `collection`, whose
+/// descriptor facts are `descriptor`.
+///
+/// A proof over the collection itself must start at a root of one of its
+/// capability policies. A proof over another resource R counts only when R's
+/// immutable descriptor has an entity that both routes to the collection
+/// ([`resource_collection`]) and binds a policy the proof starts at: backlink
+/// and binding belong to the same entity, so a mutable collection fact can
+/// neither create nor change the route. Every signature must verify.
+/// Definitions need not be resident: this decides which proofs belong to the
+/// collection, not what they authorize. Every reader that asks which proofs
+/// are a collection's evidence asks this one predicate.
+pub fn validate_proof_evidence<R: BlobStoreGet>(
+    reader: &R,
+    collection: CollectionHandle,
+    descriptor: &TribleSet,
+    proof: &CapabilityProof,
+) -> Result<(), ProofEvidenceError> {
+    let resource = CollectionHandle::new(proof.resource().into_bytes());
+    if resource == collection {
+        return validate_proof_for_policies(
+            collection,
+            capability_policies(descriptor, None).map(|(_, policy)| policy),
+            proof,
+        );
+    }
+    let facts: TribleSet = reader
+        .get(resource)
+        .map_err(|_| ProofEvidenceError::ResourceDescriptorUnavailable(resource))?;
+    let policies = find!(
+        route: Id,
+        pattern!(&facts, [{ ?route @ resource_collection: collection }])
+    )
+    .flat_map(|route| resource_policies(&facts, route, None).map(|(_, policy)| policy));
+    validate_proof_for_policies(resource, policies, proof)
+}
+
+/// Whether `proof` is over exact `resource`, starts at a root of one of
+/// `policies`, and carries valid signatures. Assigns no authority and reads
+/// no blob.
+pub fn validate_proof_for_policies(
+    resource: CollectionHandle,
+    policies: impl IntoIterator<Item = AdmissionPolicy>,
+    proof: &CapabilityProof,
+) -> Result<(), ProofEvidenceError> {
+    if proof.resource() != CapabilityResource::from(resource) {
+        return Err(ProofEvidenceError::WrongResource);
+    }
+    if !policies
+        .into_iter()
+        .any(|policy| policy.has_root(proof.root_key()))
+    {
+        return Err(ProofEvidenceError::WrongRoot);
+    }
+    proof
+        .verify_signatures()
+        .map_err(ProofEvidenceError::Invalid)
 }
 
 /// Query supported policies for an action declared by a bound capability.

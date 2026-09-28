@@ -4729,6 +4729,9 @@ struct ArchivePartitionPlan {
     initial_slots: usize,
 }
 
+/// A PATCH is a set with payload: equality (and the root hash) cover the keys
+/// only, never the values; a type whose identity includes the values must
+/// compare them itself.
 impl<const KEY_LEN: usize, O, V, H> PartialEq for PATCH<KEY_LEN, O, V, H>
 where
     O: KeySchema<KEY_LEN>,

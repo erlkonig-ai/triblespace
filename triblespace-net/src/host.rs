@@ -10,6 +10,7 @@
 //! hints, never declarations of membership or authority.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
@@ -85,6 +86,21 @@ pub struct PeerConfig {
     /// resident self hints. Retries and renewals consume the same budget as
     /// first publication.
     pub provider_publication_budget: Option<u64>,
+    /// The one local socket the endpoint binds, for example `127.0.0.1:7001`.
+    ///
+    /// `None` keeps iroh's ordinary sockets (every IPv4 interface on a free
+    /// port, and IPv6 where available). `Some` binds this address and no
+    /// other, so a peer's route can be written down before it starts.
+    pub bind: Option<SocketAddr>,
+}
+
+/// What a started production host hands back from its thread.
+#[derive(Clone)]
+pub struct HostStarted {
+    /// The stock gossip wake plane on the host's endpoint.
+    pub wake_plane: CollectionWakePlane,
+    /// The local sockets the endpoint bound.
+    pub bound: Vec<SocketAddr>,
 }
 
 trait BlobSnapshotReader: Send + Sync + 'static {
@@ -1042,11 +1058,11 @@ pub async fn run_host<T: Transport>(harness: Harness<T>, config: PeerConfig, wir
 pub fn spawn(
     key: SigningKey,
     config: PeerConfig,
-) -> anyhow::Result<(NetSender, NetReceiver, CollectionWakePlane)> {
+) -> anyhow::Result<(NetSender, NetReceiver, HostStarted)> {
     let id: EndpointId = iroh_secret(&key).public().into();
     let (sender, receiver, wiring) = wire(id);
-    let wake_plane = start(key, config, wiring)?;
-    Ok((sender, receiver, wake_plane))
+    let started = start(key, config, wiring)?;
+    Ok((sender, receiver, started))
 }
 
 /// Start a production host over previously allocated, inert wiring.
@@ -1057,7 +1073,7 @@ pub(crate) fn start(
     key: SigningKey,
     config: PeerConfig,
     wiring: HostWiring,
-) -> anyhow::Result<CollectionWakePlane> {
+) -> anyhow::Result<HostStarted> {
     let secret = iroh_secret(&key);
     let (startup_tx, startup_rx) = mpsc::sync_channel(1);
     thread::Builder::new()
@@ -1078,8 +1094,11 @@ pub(crate) fn start(
                         return;
                     }
                 };
-                let wake_plane = harness.transport.wake_plane();
-                if startup_tx.send(Ok(wake_plane)).is_ok() {
+                let started = HostStarted {
+                    wake_plane: harness.transport.wake_plane(),
+                    bound: harness.transport.bound_sockets(),
+                };
+                if startup_tx.send(Ok(started)).is_ok() {
                     run_host(harness, config, wiring).await;
                 }
             });

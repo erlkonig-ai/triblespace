@@ -18,7 +18,6 @@ use std::sync::Arc;
 use ed25519_dalek::VerifyingKey;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{Blob, TryFromBlob};
-use triblespace_core::capability::policy::{resource_collection, resource_policies};
 use triblespace_core::capability::{
     CapabilityHandle, CapabilityProof, CapabilityProofError, CapabilityProofId, CapabilityRequest,
     CapabilityResource,
@@ -28,9 +27,7 @@ use triblespace_core::collection::{
     CollectionPolicy, CollectionRead, CollectionReadAudience, RecordDecodeError,
     collection_read_audience_by_policy, collection_reader_is_admitted_by_policy, descriptor,
 };
-use triblespace_core::id::Id;
 use triblespace_core::patch::{Blake3Merkle, Entry as PatchEntry, IdentitySchema, PATCH};
-use triblespace_core::prelude::{find, pattern};
 use triblespace_core::repo::{BlobStoreGet, CapabilityProofRead};
 use triblespace_core::trible::TribleSet;
 
@@ -126,32 +123,16 @@ impl CollectionAuthorizationEvidencePatch {
         )
     }
 
-    /// Validate exact resource, configured root, and the signed byte chain.
-    /// Capability definitions need not be resident for evidence to be repaired.
+    /// Validate exact resource, configured root, and the signed byte chain
+    /// ([`descriptor::validate_proof_evidence`], the predicate the held-blob
+    /// index also applies to proof seeds). Capability definitions need not be
+    /// resident for evidence to be repaired.
     pub fn validate_proof(
         &self,
         proof: &CapabilityProof,
     ) -> Result<(), CollectionAuthorizationEvidenceError> {
-        let resource = CollectionHandle::new(proof.resource().into_bytes());
-        if resource == self.collection {
-            return validate_evidence_for_policies(
-                self.collection,
-                self.capability_policies().map(|(_, policy)| policy),
-                proof,
-            );
-        }
-        let facts: TribleSet = self.reader.get(resource).map_err(|_| {
-            CollectionAuthorizationEvidenceError::ResourceDescriptorUnavailable(resource)
-        })?;
-        let collection = self.collection;
-        let policies = find!(
-            resource: Id,
-            pattern!(&facts, [{ ?resource @ resource_collection: collection }])
-        )
-        .flat_map(|resource| resource_policies(&facts, resource, None).map(|(_, policy)| policy));
-        // Backlink and binding must belong to the same entity in the immutable
-        // R blob. A mutable C fact can neither create nor change this route.
-        validate_evidence_for_policies(resource, policies, proof)
+        descriptor::validate_proof_evidence(&self.reader, self.collection, &self.descriptor, proof)
+            .map_err(Into::into)
     }
 
     pub(crate) fn reader_is_admitted_by(
@@ -263,7 +244,7 @@ impl CollectionAuthorizationEvidencePatch {
                 proof.resource() == CapabilityResource::from(self.collection)
                     && self
                         .read_policies()
-                        .any(|policy| root_is_relevant(&policy, proof.root_key()))
+                        .any(|policy| policy.has_root(proof.root_key()))
             })
             .filter_map(|proof| {
                 proof
@@ -466,6 +447,19 @@ pub enum CollectionAuthorizationEvidenceError {
     Invalid(CapabilityProofError),
     /// Cryptographically distinct proof values share one proof identity.
     ProofIdCollision(CapabilityProofId),
+}
+
+impl From<descriptor::ProofEvidenceError> for CollectionAuthorizationEvidenceError {
+    fn from(error: descriptor::ProofEvidenceError) -> Self {
+        match error {
+            descriptor::ProofEvidenceError::WrongResource => Self::WrongResource,
+            descriptor::ProofEvidenceError::ResourceDescriptorUnavailable(resource) => {
+                Self::ResourceDescriptorUnavailable(resource)
+            }
+            descriptor::ProofEvidenceError::WrongRoot => Self::WrongRoot,
+            descriptor::ProofEvidenceError::Invalid(source) => Self::Invalid(source),
+        }
+    }
 }
 
 impl fmt::Display for CollectionAuthorizationEvidenceError {
@@ -809,14 +803,6 @@ fn canonical_authorization_evidence<R: BlobStoreGet + Clone + Send + 'static>(
     Ok(evidence)
 }
 
-fn root_is_relevant(policy: &AdmissionPolicy, root: ed25519_dalek::VerifyingKey) -> bool {
-    policy.roots().is_some_and(|roots| {
-        roots
-            .binary_search_by_key(&root.to_bytes(), ed25519_dalek::VerifyingKey::to_bytes)
-            .is_ok()
-    })
-}
-
 /// Validate byte-only proof membership for an exact resource and configured root.
 /// This does not establish READ or WRITE authority without its definitions.
 pub fn validate_authorization_evidence_proof(
@@ -829,31 +815,12 @@ pub fn validate_authorization_evidence_proof(
     {
         return Err(CollectionAuthorizationEvidenceError::OpenPolicies);
     }
-    validate_evidence_for_policies(
+    descriptor::validate_proof_for_policies(
         collection,
         [policy.read().clone(), policy.write().clone()],
         proof,
     )
-}
-
-fn validate_evidence_for_policies(
-    collection: CollectionHandle,
-    policies: impl IntoIterator<Item = AdmissionPolicy>,
-    proof: &CapabilityProof,
-) -> Result<(), CollectionAuthorizationEvidenceError> {
-    // Header filters are cheap; they assign no authority and acquire no blobs.
-    if proof.resource() != CapabilityResource::from(collection) {
-        return Err(CollectionAuthorizationEvidenceError::WrongResource);
-    }
-    if !policies
-        .into_iter()
-        .any(|policy| root_is_relevant(&policy, proof.root_key()))
-    {
-        return Err(CollectionAuthorizationEvidenceError::WrongRoot);
-    }
-    proof
-        .verify_signatures()
-        .map_err(CollectionAuthorizationEvidenceError::Invalid)
+    .map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -864,7 +831,9 @@ mod tests {
     use std::num::NonZeroUsize;
 
     use ed25519_dalek::SigningKey;
-    use triblespace_core::capability::policy::{capability_handle, resource_policy};
+    use triblespace_core::capability::policy::{
+        capability_handle, resource_collection, resource_policy,
+    };
     use triblespace_core::capability::{
         CapabilityRequest, capability_action, capability_delegate_action,
         capability_quorum_authorizes,

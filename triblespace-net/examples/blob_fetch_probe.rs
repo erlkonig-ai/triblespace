@@ -50,6 +50,7 @@ async fn main() -> Result<()> {
         peers,
         qos,
         provider_publication_budget: Some(0),
+        bind: None,
     };
     // Own the production host task so endpoint shutdown can be awaited. The
     // Peer acquisition path is unchanged; there is no direct-GET fallback.

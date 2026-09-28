@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `PeerConfig::bind`: bind the production endpoint to exactly one local
+  socket (`None` keeps iroh's default sockets). The host thread hands back
+  `HostStarted { wake_plane, bound }` and `Peer::bound_sockets` reports the
+  sockets bound. The reconciler's selected collections are a PATCH set.
+
 - Transport generation `/triblespace/pile-sync/28` and wake version 5: sync
   exports foundations only. The record PATCH, its summary, served nodes,
   incremental updates and hydration roots carry COMMIT and DERIVE records
@@ -18,7 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whole closure on blob arrival. A blob a peer reports in C's held set is
   recorded when the hint arrives, before the acquisition window filters it, so
   it is held in every replication mode. Generation-27 peers and version-4
-  wakes are refused.
+  wakes are refused. Collection AUTH evidence is judged by core's
+  `descriptor::validate_proof_evidence`, the predicate the held set's proof
+  seeds use too.
 
 - Extend collection repair to records, scoped AUTH and a positive resident-blob
   PATCH through new opcode `0x0E` on ALPN `/triblespace/pile-sync/26`;

@@ -198,7 +198,8 @@ pub struct Reconciler {
     max_backoff: Duration,
     fetch_budget: Duration,
     mode: ReplicationMode,
-    collections: BTreeSet<CollectionHandle>,
+    /// The selected collections, keyed by the handle's bytes.
+    collections: PATCH<32, IdentitySchema>,
     observation_generation: u64,
     want_round: ExactRound,
     root_round: ExactRound,
@@ -243,7 +244,7 @@ impl Reconciler {
             max_backoff: max,
             fetch_budget: RECONCILE_FETCH_DEADLINE,
             mode: ReplicationMode::Demand,
-            collections: BTreeSet::new(),
+            collections: PATCH::new(),
             observation_generation: 0,
             want_round: ExactRound::default(),
             root_round: ExactRound::default(),
@@ -283,19 +284,34 @@ impl Reconciler {
         collections: impl IntoIterator<Item = CollectionHandle>,
     ) {
         self.mode = mode;
-        self.collections = collections.into_iter().collect();
-        self.blob_hints.retain(|collection, _| {
-            mode == ReplicationMode::Full && self.collections.contains(collection)
-        });
-        self.hint_rounds.retain(|collection, _| {
-            mode == ReplicationMode::Full && self.collections.contains(collection)
-        });
+        self.collections = PATCH::new();
+        for collection in collections {
+            self.collections.insert(&PatchEntry::new(&collection.raw));
+        }
+        let selected = |collection: &CollectionHandle| {
+            mode == ReplicationMode::Full && self.collections.get(&collection.raw).is_some()
+        };
+        self.blob_hints.retain(|collection, _| selected(collection));
+        self.hint_rounds
+            .retain(|collection, _| selected(collection));
         self.root_round = ExactRound::default();
         self.next_service = ServiceTurn::default();
         for state in self.states.values_mut() {
             state.root_since = None;
             state.first_root_attempt = false;
         }
+    }
+
+    /// Whether `collection` is selected for replication.
+    fn selects(&self, collection: &CollectionHandle) -> bool {
+        self.collections.get(&collection.raw).is_some()
+    }
+
+    /// The selected collections, in ascending handle order.
+    fn selected(&self) -> impl Iterator<Item = CollectionHandle> + '_ {
+        self.collections
+            .iter_ordered()
+            .map(|raw| CollectionHandle::new(*raw))
     }
 
     #[cfg(test)]
@@ -314,7 +330,7 @@ impl Reconciler {
         source: PeerId,
         handle: RawHash,
     ) {
-        if self.mode != ReplicationMode::Full || !self.collections.contains(&collection) {
+        if self.mode != ReplicationMode::Full || !self.selects(&collection) {
             return;
         }
         if !self.observe_hint_source(collection, source) {
@@ -406,7 +422,7 @@ impl Reconciler {
         collection: CollectionHandle,
         source: PeerId,
     ) {
-        if self.mode != ReplicationMode::Full || !self.collections.contains(&collection) {
+        if self.mode != ReplicationMode::Full || !self.selects(&collection) {
             return;
         }
         let Some(round) = self
@@ -496,7 +512,7 @@ impl Reconciler {
             }
         }
         for (collection, sources) in &other.hint_rounds {
-            if self.mode != ReplicationMode::Full || !self.collections.contains(collection) {
+            if self.mode != ReplicationMode::Full || !self.selects(collection) {
                 continue;
             }
             for (source, progress) in sources {
@@ -703,7 +719,7 @@ impl Reconciler {
     {
         if peer.reconciler().mode != self.mode || peer.reconciler().collections != self.collections
         {
-            peer.set_replication(self.mode, self.collections.iter().copied());
+            peer.set_replication(self.mode, self.selected());
         }
         // This is also the explicit external-Pile reobservation and inventory
         // admission boundary.
@@ -755,9 +771,8 @@ impl Reconciler {
             // One indexed read per selection retains membership only for this
             // tick. COMMIT signatures are checked once, before physical union.
             let observed = self
-                .collections
-                .iter()
-                .map(|collection| direct_roots(&snapshot, *collection))
+                .selected()
+                .map(|collection| direct_roots(&snapshot, collection))
                 .collect::<Result<Vec<_>, _>>();
             match observed {
                 Ok(roots) => roots,
@@ -2735,6 +2750,7 @@ mod tests {
                 peers: Vec::new(),
                 qos: crate::inventory::ReconcileQos::default(),
                 provider_publication_budget: Some(0),
+                bind: None,
             },
         );
         let frozen = peer.snapshot().unwrap();

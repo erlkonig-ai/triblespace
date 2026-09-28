@@ -67,6 +67,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   New selector `CollectionRecordSelector::Foundations(C)`: the COMMITs and
   DERIVEs of C, named positively, so a MERGE or any later record kind never
   matches.
+  A held set is closed: a blob joins only after every resident child it had
+  when scanned, so a walk publishes each batch of roots deepest first and a
+  new record's closure never stops at a blob a running walk has not finished.
+  Reports that waited for a start-up walk are read by that walk, never while
+  a snapshot is taken. Proof seeds are only the proofs C's authorization
+  evidence keeps. The index's retained state is PATCH relations.
+  Held sets are closed under the edge cache: a walk publishes each batch
+  children before parents, a child it learns under a held blob joins with
+  the edge, and a blob that cannot be read holds back everything above it on
+  every path. Every seed of a new record is reached, and a walk re-reads
+  blobs it could not read before its report rounds (at most 16 per walk).
+  Proofs judged against a resident but unreadable descriptor are judged
+  again after the next walk. `HeldView` equality compares each held set.
+- `descriptor::validate_proof_evidence` (with `validate_proof_for_policies`,
+  `ProofEvidenceError` and `AdmissionPolicy::has_root`): whether a capability
+  proof is authorization evidence for a collection, the one predicate both
+  the sync host's AUTH and the held-blob index's proof seeds apply.
 
 - Attached collections. `CollectionRecord::Map` is a fourth native record,
   `CollectionMap` (`attached`, `node`, `attachment`, signed), framed in a pile

@@ -42,6 +42,7 @@ fn config() -> PeerConfig {
         peers: vec![],
         qos: Default::default(),
         provider_publication_budget: Some(0),
+        bind: None,
     }
 }
 
@@ -116,6 +117,7 @@ async fn topic_capacity(count: u64, streams: Option<u32>, join_each: bool) {
         peers: vec![],
         qos: Default::default(),
         provider_publication_budget: Some(0),
+        bind: None,
     };
     let left = triblespace_net::transport::iroh::bind_with_endpoint(
         endpoint(&network, streams).await,

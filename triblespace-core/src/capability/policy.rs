@@ -245,6 +245,15 @@ impl AdmissionPolicy {
         }
     }
 
+    /// Whether `root` is one of this policy's roots. Open admission has none.
+    pub fn has_root(&self, root: VerifyingKey) -> bool {
+        self.roots().is_some_and(|roots| {
+            roots
+                .binary_search_by_key(&root.to_bytes(), VerifyingKey::to_bytes)
+                .is_ok()
+        })
+    }
+
     /// Invocation threshold, or `None` for open admission.
     pub const fn invoke_threshold(&self) -> Option<u32> {
         match self {
