@@ -998,6 +998,7 @@ impl<T: HeldSource> HeldIndex<T> {
         let mut known: HashMap<Raw, Option<Arc<[Raw]>>> = HashMap::new();
         let mut seen: BTreeMap<CollectionHandle, HashSet<Raw>> = BTreeMap::new();
         let mut latest: Option<T> = None;
+        let mut rounds = 0;
         loop {
             let snapshot = latest.as_ref().unwrap_or(snapshot);
             while let Some(batch) = next_batch(&mut queue) {
@@ -1007,6 +1008,31 @@ impl<T: HeldSource> HeldIndex<T> {
             }
             let mut state = self.lock();
             if state.epoch != epoch || abandoned() {
+                return;
+            }
+            if rounds == MAX_REPORT_ROUNDS {
+                // Reports keep arriving: the collections still owing some
+                // stay warming and are walked again by the walker's next turn.
+                let owing: Vec<CollectionHandle> = covered
+                    .iter()
+                    .copied()
+                    .filter(|collection| {
+                        !related(&state.deferred, &collection.raw).is_empty()
+                            || (state.warming.get(&collection.raw).is_some()
+                                && !related(&state.candidates, &collection.raw).is_empty())
+                    })
+                    .collect();
+                for collection in &covered {
+                    if !owing.contains(collection) {
+                        state.warming.remove(&collection.raw);
+                    }
+                }
+                if let Some(walker) = &mut state.walker {
+                    for collection in &owing {
+                        walker.requested.insert(&Entry::new(&collection.raw));
+                    }
+                    self.wake.notify_all();
+                }
                 return;
             }
             let mut reports = Vec::new();
@@ -1054,6 +1080,7 @@ impl<T: HeldSource> HeldIndex<T> {
             drop(state);
             // A blob the walk could not read holds only for the snapshot it
             // tried: forget it, so the round reads it again.
+            rounds += 1;
             known.retain(|handle, children| {
                 if children.is_none() {
                     for seen in seen.values_mut() {
@@ -1181,6 +1208,10 @@ fn next_batch(
 /// publishes a whole batch's closure at a time, so its held sets fill in
 /// progressively rather than only when it ends.
 const WALK_BATCH: usize = 4_096;
+
+/// Rounds of waiting reports one walk takes after its roots; reports that
+/// keep arriving beyond them are left for the walker's next turn.
+const MAX_REPORT_ROUNDS: usize = 16;
 
 /// Blobs published per lock hold by a walk.
 const PUBLISH_PIECE: usize = 16_384;
