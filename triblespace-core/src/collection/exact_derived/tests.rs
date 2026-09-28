@@ -276,6 +276,8 @@ thread_local! {
     /// Whether this host is outside the class a pinned test mapping is
     /// computed on.
     static FIRST_PINNED_ELSEWHERE: Cell<bool> = const { Cell::new(false) };
+    /// Every source the first mapping was called on, in order.
+    static FIRST_MAP_LOG: RefCell<Vec<CollectionData>> = const { RefCell::new(Vec::new()) };
 }
 
 fn reset_mapping_calls() {
@@ -290,6 +292,7 @@ fn reset_mapping_calls() {
     FIRST_MAP_CAPACITY.replace(None);
     FIRST_MAP_FATAL.replace(None);
     FIRST_PINNED_ELSEWHERE.set(false);
+    FIRST_MAP_LOG.replace(Vec::new());
 }
 
 /// The first mapping's image of `source` under `salt`: its facts, and one
@@ -334,6 +337,7 @@ impl CollectionDerivation for FirstEncoding {
         R: BlobStoreGet + BlobStoreMeta,
     {
         FIRST_MAP_CALLS.set(FIRST_MAP_CALLS.get() + 1);
+        FIRST_MAP_LOG.with_borrow_mut(|log| log.push(data(source)));
         if FIRST_MAP_MISSING.get() {
             return Err(CollectionOperationError::MissingDependency(
                 crate::inline::Inline::new([0xEE; 32]),
@@ -658,8 +662,14 @@ struct GuardStore {
     reject_insert_at: Option<usize>,
     acquirable: BTreeMap<CollectionData, Bytes>,
     acquired: Vec<CollectionData>,
+    /// How many writes `events` held when each acquisition was made.
+    acquired_at: Vec<usize>,
     inject_record_on_acquire: Option<CollectionRecord>,
     inject_proof_on_acquire: Option<CapabilityProof>,
+    /// What another writer publishes right after this store's first DERIVE:
+    /// records, and the bytes to store beside them, as a host deriving the
+    /// same collection at the same time would.
+    concurrent: Vec<(CollectionRecord, Option<Bytes>)>,
 }
 
 impl GuardStore {
@@ -676,8 +686,10 @@ impl GuardStore {
             reject_insert_at: None,
             acquirable: BTreeMap::new(),
             acquired: Vec::new(),
+            acquired_at: Vec::new(),
             inject_record_on_acquire: None,
             inject_proof_on_acquire: None,
+            concurrent: Vec::new(),
         }
     }
 
@@ -718,6 +730,7 @@ impl AsyncBlobStoreAcquire for GuardStore {
         self.assert_no_snapshot_while_acquiring();
         let member = Handle::<UnknownBlob>::to_hash(handle);
         self.acquired.push(member);
+        self.acquired_at.push(self.events.len());
         let result = match self.acquirable.get(&member).cloned() {
             Some(bytes) => self
                 .inner
@@ -740,6 +753,11 @@ impl AsyncBlobStoreAcquire for GuardStore {
             Ok(bytes)
         });
         std::future::ready(result)
+    }
+
+    /// It stands for a store that asks other holders: what it was offered.
+    fn acquires_remotely(&self) -> bool {
+        true
     }
 }
 
@@ -794,7 +812,20 @@ impl CollectionStore for GuardStore {
         }
         self.inner
             .insert(record)
-            .map_err(|error| GuardStoreError::Backend(error.to_string()))
+            .map_err(|error| GuardStoreError::Backend(error.to_string()))?;
+        if matches!(record, CollectionRecord::Derive(_)) {
+            for (record, bytes) in std::mem::take(&mut self.concurrent) {
+                if let Some(bytes) = bytes {
+                    self.inner
+                        .put::<UnknownBlob, _>(bytes)
+                        .map_err(|error| GuardStoreError::Backend(error.to_string()))?;
+                }
+                self.inner
+                    .insert(record)
+                    .map_err(|error| GuardStoreError::Backend(error.to_string()))?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2307,6 +2338,10 @@ fn complete_realization_is_reused_without_write_authority() {
     assert_eq!(FIRST_MAP_CALLS.get(), 0);
 }
 
+/// Only a key the target admits derives, and neither path computes or
+/// publishes anything for one it does not: the per-write `ensure` says the
+/// key owes a leaf it may not publish, and `maintain` -- whose work for such
+/// a key is the carry, here with nothing to carry -- reports nothing.
 #[test]
 fn missing_realization_requires_write_before_computation_or_publication() {
     let (mut inner, root, _first, _second) = collections();
@@ -2329,17 +2364,12 @@ fn missing_realization_requires_write_before_computation_or_publication() {
     let mut store = GuardStore::new(inner);
     reset_mapping_calls();
 
-    for maintain in [false, true] {
-        let result = if maintain {
-            block_on(store.maintain(target, &reader))
-        } else {
-            block_on(store.ensure(target, &reader))
-        };
-        assert!(matches!(result,
-            Err(CollectionRealizationError::UnauthorizedProducer { collection })
-                if collection == target.handle()
-        ));
-    }
+    let result = block_on(store.ensure(target, &reader));
+    assert!(matches!(result,
+        Err(CollectionRealizationError::UnauthorizedProducer { collection })
+            if collection == target.handle()
+    ));
+    drop(block_on(store.maintain(target, &reader)).unwrap());
     assert!(store.events.is_empty());
     assert!(store.acquired.is_empty());
     assert_eq!(FIRST_MAP_CALLS.get(), 0);
@@ -2381,18 +2411,15 @@ fn a_host_without_write_carries_a_derived_collection_and_derives_nothing() {
     let mut store = GuardStore::new(inner);
     reset_mapping_calls();
 
-    // Maintaining reports that the reader owes a leaf it may not publish,
-    // after carrying the owner's eight leaves into one MERGE of its own.
-    let result = block_on(store.maintain(first, &reader));
-    assert!(
-        matches!(
-            result,
-            Err(CollectionRealizationError::UnauthorizedProducer { collection })
-                if collection == first.handle()
-        ),
-        "{:?}",
-        result.err()
-    );
+    // Maintaining carries the owner's eight leaves into one MERGE of its
+    // own and is done: the reader's own foundation is the per-write
+    // ensure's to report, not maintenance's.
+    drop(block_on(store.maintain(first, &reader)).unwrap());
+    assert!(matches!(
+        block_on(store.ensure(first, &reader)),
+        Err(CollectionRealizationError::UnauthorizedProducer { collection })
+            if collection == first.handle()
+    ));
     assert_eq!(FIRST_MAP_CALLS.get(), 0, "nothing is derived without WRITE");
     assert!(store.acquired.is_empty());
     let carried: Vec<CollectionMerge> = records(&mut store.inner)
@@ -4655,5 +4682,343 @@ mod lattice_v2 {
         let carried = merges_in(&mut store, view.handle());
         assert_eq!(carried.len(), 1);
         assert_eq!(carried[0].public_key(), public(41));
+    }
+
+    /// `signer`'s leaf for `source` in the first view, under `salt`, as a
+    /// record and its output's bytes.
+    fn leaf_of(
+        first: Collection<FirstEncoding>,
+        signer: u8,
+        source: &Blob<SimpleArchive>,
+        salt: u8,
+    ) -> (CollectionRecord, Blob<FirstEncoding>) {
+        let image = salted_image(source, salt);
+        let record = CollectionRecord::Derive(CollectionDerive::sign(
+            &key(signer),
+            first.handle(),
+            SourceLocator::of(data(source).raw),
+            data(&image),
+        ));
+        (record, image)
+    }
+
+    fn leaves_by(
+        store: &mut MemoryRepo,
+        first: Collection<FirstEncoding>,
+        signer: u8,
+    ) -> Vec<CollectionDerive> {
+        derives_in(store, first.handle())
+            .into_iter()
+            .filter(|leaf| leaf.public_key() == public(signer))
+            .collect()
+    }
+
+    /// Review finding, 2026-09-28: two hosts rebuilding one index at once
+    /// each fixed what they owed from their own control snapshot, so each
+    /// mapped every foundation. A leaf another writer publishes while the
+    /// pass runs is now seen before the next foundation is mapped, and its
+    /// foundation is left to it.
+    #[test]
+    fn a_leaf_published_while_the_pass_runs_is_not_derived_again() {
+        reset_mapping_calls();
+        let (mut inner, root, first, _) = collections();
+        let sources: Vec<_> = (0..4).map(|entity| payload(42, entity)).collect();
+        for entity in 0..4 {
+            own_commit(&mut inner, root, 42, entity);
+        }
+        let mut store = GuardStore::new(inner);
+        // 42, deriving the same view elsewhere, publishes its four leaves as
+        // soon as 41 has published its first.
+        store.concurrent = sources
+            .iter()
+            .map(|source| {
+                let (record, image) = leaf_of(first, 42, source, 7);
+                (record, Some(image.bytes))
+            })
+            .collect();
+
+        drop(block_on(store.maintain(first, &key(41))).unwrap());
+        assert_eq!(FIRST_MAP_CALLS.get(), 1, "only the first was mapped");
+        assert_eq!(leaves_by(&mut store.inner, first, 41).len(), 1);
+        assert_eq!(leaves_by(&mut store.inner, first, 42).len(), 4);
+        assert!(store.acquired.is_empty());
+        let snapshot = store.inner.snapshot().unwrap();
+        assert!(snapshot
+            .collection(first)
+            .unwrap()
+            .missing_from(&snapshot.collection(root).unwrap())
+            .unwrap()
+            .is_empty());
+        drop(snapshot);
+
+        // The next pass finds every foundation done.
+        reset_mapping_calls();
+        let before = records(&mut store.inner).len();
+        drop(block_on(store.maintain(first, &key(41))).unwrap());
+        assert_eq!(FIRST_MAP_CALLS.get(), 0);
+        assert_eq!(records(&mut store.inner).len(), before);
+    }
+
+    /// A leaf that arrives while the pass runs without its output is left
+    /// alone too; the next pass asks for every such output once, after the
+    /// work that needed no fetch, and maps again only the foundation whose
+    /// output could not be had.
+    #[test]
+    fn a_leaf_that_arrives_without_its_output_waits_for_the_next_pass() {
+        reset_mapping_calls();
+        let (mut inner, root, first, _) = collections();
+        let sources: Vec<_> = (0..4).map(|entity| payload(42, entity)).collect();
+        for entity in 0..4 {
+            own_commit(&mut inner, root, 42, entity);
+        }
+        let mut store = GuardStore::new(inner);
+        let elsewhere: Vec<_> = sources
+            .iter()
+            .map(|source| leaf_of(first, 42, source, 7))
+            .collect();
+        store.concurrent = elsewhere
+            .iter()
+            .map(|(record, _)| (*record, None))
+            .collect();
+
+        drop(block_on(store.maintain(first, &key(41))).unwrap());
+        assert_eq!(FIRST_MAP_CALLS.get(), 1);
+        assert!(store.acquired.is_empty(), "nothing was known to fetch");
+        let mapped = FIRST_MAP_LOG.with_borrow(|log| log[0]);
+
+        // Three outputs are wanted now; two can be had.
+        let waiting: Vec<_> = elsewhere
+            .iter()
+            .filter(|(record, _)| match record {
+                CollectionRecord::Derive(leaf) => leaf.input() != SourceLocator::of(mapped.raw),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(waiting.len(), 3);
+        for (_, image) in &waiting[..2] {
+            store.offer(image);
+        }
+        let lost = data(&waiting[2].1);
+        let events = store.events.len();
+        drop(block_on(store.maintain(first, &key(41))).unwrap());
+        assert_eq!(
+            store.acquired.iter().copied().collect::<BTreeSet<_>>(),
+            waiting.iter().map(|(_, image)| data(image)).collect(),
+        );
+        assert_eq!(store.acquired.len(), 3, "each asked for once");
+        assert!(store.acquired_at.iter().all(|at| *at == events));
+        assert_eq!(FIRST_MAP_CALLS.get(), 2, "only the lost one mapped again");
+        let lost_source = sources
+            .iter()
+            .find(|source| leaf_of(first, 42, source, 7).1.get_handle().raw == lost.raw)
+            .unwrap();
+        assert_eq!(FIRST_MAP_LOG.with_borrow(|log| log[1]), data(lost_source));
+        let snapshot = store.inner.snapshot().unwrap();
+        assert!(snapshot
+            .collection(first)
+            .unwrap()
+            .missing_from(&snapshot.collection(root).unwrap())
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Review finding, 2026-09-28: every missing output cost one restart of
+    /// the operation, all of them before anything was mapped or carried, and
+    /// nothing bounded the time failed fetches could take. Now the work that
+    /// needs no fetch and the carry come first, the outputs are asked for
+    /// together afterwards, each once, and a call stops asking after eight
+    /// have failed; the rest wait for the next call.
+    #[test]
+    fn outputs_are_asked_for_after_the_work_and_a_call_stops_after_eight_failures() {
+        reset_mapping_calls();
+        let (mut inner, root, first, _) = collections();
+        for entity in 0..8 {
+            own_commit(&mut inner, root, 41, entity);
+        }
+        block_on(inner.ensure(first, &key(41))).unwrap();
+        let foreign: Vec<_> = (0..10).map(|entity| payload(42, entity)).collect();
+        for entity in 0..10 {
+            own_commit(&mut inner, root, 42, entity);
+        }
+        let mut outputs = BTreeSet::new();
+        for source in &foreign {
+            let (record, image) = leaf_of(first, 42, source, 7);
+            inner.insert(record).unwrap();
+            outputs.insert(data(&image));
+        }
+        // One more own foundation, with no leaf at all.
+        let fresh = own_commit(&mut inner, root, 41, 9);
+        let mut store = GuardStore::new(inner);
+        reset_mapping_calls();
+
+        drop(block_on(store.maintain(first, &key(41))).unwrap());
+        assert_eq!(store.acquired.len(), 8);
+        assert_eq!(
+            store.acquired.iter().collect::<BTreeSet<_>>().len(),
+            8,
+            "each asked for once"
+        );
+        assert!(store.acquired.iter().all(|output| outputs.contains(output)));
+        // Before the first fetch: the fresh foundation's leaf and the carry
+        // of the eight own leaves.
+        let first_fetch = store.acquired_at[0];
+        let before_fetch = &store.events[..first_fetch];
+        assert!(before_fetch.iter().any(|event| matches!(
+            event,
+            WriteEvent::Insert(CollectionRecord::Derive(leaf))
+                if leaf.input() == SourceLocator::of(fresh.raw)
+        )));
+        assert!(before_fetch
+            .iter()
+            .any(|event| matches!(event, WriteEvent::Insert(CollectionRecord::Merge(_)))));
+        assert!(!before_fetch.iter().any(|event| matches!(
+            event,
+            WriteEvent::Insert(CollectionRecord::Derive(leaf))
+                if leaf.input() != SourceLocator::of(fresh.raw)
+        )));
+        // Mapped again: the fresh one and the eight whose outputs failed.
+        assert_eq!(FIRST_MAP_CALLS.get(), 9);
+
+        // The next call asks for the last two.
+        drop(block_on(store.maintain(first, &key(41))).unwrap());
+        assert_eq!(store.acquired.len(), 10);
+        assert_eq!(
+            store.acquired.iter().copied().collect::<BTreeSet<_>>(),
+            outputs
+        );
+        assert_eq!(FIRST_MAP_CALLS.get(), 11);
+        let snapshot = store.inner.snapshot().unwrap();
+        assert!(snapshot
+            .collection(first)
+            .unwrap()
+            .missing_from(&snapshot.collection(root).unwrap())
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Review finding, 2026-09-28: a refusal of one own foundation ended the
+    /// pass where it stood, before the foundations after it and before the
+    /// carry. Now the rest is derived and the view carried, and the refusal
+    /// is reported after.
+    #[test]
+    fn a_refused_own_foundation_holds_back_neither_the_rest_nor_the_carry() {
+        reset_mapping_calls();
+        let (mut store, root, first, _) = collections();
+        for entity in 0..8 {
+            own_commit(&mut store, root, 41, entity);
+        }
+        let refused = own_commit(&mut store, root, 41, 8);
+        FIRST_MAP_FATAL.replace(Some(refused));
+
+        let result = block_on(store.maintain(first, &key(41)));
+        assert!(
+            matches!(
+                result,
+                Err(CollectionRealizationError::Derive { input, .. }) if input == refused
+            ),
+            "{:?}",
+            result.err()
+        );
+        assert_eq!(FIRST_MAP_CALLS.get(), 9, "every foundation was tried");
+        let leaves: BTreeSet<CollectionData> = derives_in(&mut store, first.handle())
+            .iter()
+            .map(|leaf| leaf.output())
+            .collect();
+        assert_eq!(
+            leaves,
+            (0..8)
+                .map(|entity| first_image(&payload(41, entity)))
+                .collect()
+        );
+        let carried = merges_in(&mut store, first.handle());
+        assert_eq!(carried.len(), 1);
+        assert_eq!(inputs(&carried[0]), leaves);
+    }
+
+    /// Review finding, 2026-09-28: a store that answers only from its own
+    /// blobs -- a plain pile -- "failed" every fetch at once, so a leaf whose
+    /// record arrived before its output was derived again at once. From such
+    /// a store a miss says nothing about elsewhere: the foundation waits for
+    /// the output, and nothing is derived when it arrives.
+    #[test]
+    fn a_store_that_cannot_fetch_waits_for_a_leafs_output() {
+        reset_mapping_calls();
+        let (mut store, root, first, _) = collections();
+        own_commit(&mut store, root, 42, 0);
+        let source = payload(42, 0);
+        let (record, image) = leaf_of(first, 42, &source, 7);
+        store.insert(record).unwrap();
+        let missing = |store: &mut MemoryRepo| -> BTreeSet<CollectionData> {
+            let snapshot = store.snapshot().unwrap();
+            let view = snapshot.collection(first).unwrap();
+            let source = snapshot.collection(root).unwrap();
+            view.missing_from(&source).unwrap().data_members().collect()
+        };
+
+        for signer in [41, 42] {
+            block_on(store.maintain(first, &key(signer))).unwrap();
+        }
+        assert_eq!(FIRST_MAP_CALLS.get(), 0);
+        assert_eq!(derives_in(&mut store, first.handle()).len(), 1);
+        assert_eq!(missing(&mut store), BTreeSet::from([data(&source)]));
+
+        store.put::<FirstEncoding, _>(image).unwrap();
+        block_on(store.maintain(first, &key(41))).unwrap();
+        assert_eq!(FIRST_MAP_CALLS.get(), 0);
+        assert_eq!(derives_in(&mut store, first.handle()).len(), 1);
+        assert!(missing(&mut store).is_empty());
+    }
+
+    /// Review finding, 2026-09-28 (test gap): another owner's foundation
+    /// whose payload is not here costs nothing, not even a fetch of an output
+    /// its leaf names.
+    #[test]
+    fn another_owners_foundation_that_is_not_here_asks_for_nothing() {
+        reset_mapping_calls();
+        let (mut inner, root, first, _) = collections();
+        foreign_commit(&mut inner, root, 42, 0);
+        let (record, image) = leaf_of(first, 42, &payload(42, 0), 7);
+        inner.insert(record).unwrap();
+        let mut store = GuardStore::new(inner);
+        store.offer(&image);
+
+        drop(block_on(store.maintain(first, &key(41))).unwrap());
+        assert!(store.acquired.is_empty(), "{:?}", store.acquired);
+        assert_eq!(FIRST_MAP_CALLS.get(), 0);
+    }
+
+    /// Each key derives in an order of its own, the same on every pass: two
+    /// hosts deriving one collection at once do not walk it in step. A key's
+    /// own foundations come first.
+    #[test]
+    fn two_keys_derive_the_same_foundations_in_orders_of_their_own() {
+        let order = |host: u8, own: u8| {
+            reset_mapping_calls();
+            let (mut store, root, first, _) = collections_as(&key(host));
+            for entity in 0..own {
+                own_commit(&mut store, root, host, entity);
+            }
+            for entity in 0..12 {
+                own_commit(&mut store, root, 43, entity);
+            }
+            block_on(store.maintain(first, &key(host))).unwrap();
+            FIRST_MAP_LOG.with_borrow(|log| log.clone())
+        };
+        let left = order(41, 0);
+        let again = order(41, 0);
+        let right = order(42, 0);
+        assert_eq!(left.len(), 12);
+        assert_eq!(left, again, "the same order on every pass");
+        assert_ne!(left, right);
+        assert_eq!(
+            left.iter().collect::<BTreeSet<_>>(),
+            right.iter().collect::<BTreeSet<_>>()
+        );
+
+        let mixed = order(41, 3);
+        let own: BTreeSet<CollectionData> =
+            (0..3).map(|entity| data(&payload(41, entity))).collect();
+        assert_eq!(mixed.len(), 15);
+        assert_eq!(mixed[..3].iter().copied().collect::<BTreeSet<_>>(), own);
     }
 }

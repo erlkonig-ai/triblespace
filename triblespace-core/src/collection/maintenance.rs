@@ -32,7 +32,11 @@
 //!   foundation it can -- the key's own, and another owner's whose payload
 //!   is already here -- so a reader never waits on an owner who is offline.
 //!   What the mapping cannot do with another owner's foundation stays that
-//!   owner's lag.
+//!   owner's lag. Outputs of leaves that are not here are asked for after
+//!   the rest of the work, a bounded number per call, and only through a
+//!   store that can reach other holders; each key walks the foundations in
+//!   an order of its own, and a foundation whose leaf appears while the
+//!   pass runs is left to it.
 //!
 //! A reader descends from a frontier node to the finer nodes beneath it
 //! through the host's driven joins, read from the index by the node's own
@@ -43,7 +47,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::UnknownBlob;
@@ -1045,17 +1049,26 @@ where
 /// images joined by [`DeriveMapping::join_images`]. The carry needs no WRITE
 /// and never reads the source: a key the target does not admit derives
 /// nothing and still carries, and so does a host that cannot compute the
-/// mapping. What deriving left undone is reported after everything else
-/// has been done, so it holds nothing back: first a key the target does
-/// not admit that owes leaves for foundations of its own
-/// ([`CollectionRealizationError::UnauthorizedProducer`]), then own
+/// mapping. Outputs of believed leaves that are not here go into `wanted`,
+/// for the acquiring loop to ask for once this operation is done.
+///
+/// What deriving left undone holds nothing back: the carry runs first, and
+/// then it is reported, in this order -- the first own foundation the
+/// mapping refused ([`CollectionRealizationError::Derive`]) or named a
+/// missing blob for ([`CollectionRealizationError::MissingDependency`], which
+/// the acquiring loop fetches before running again), then, for `ensure`
+/// only, a key the target does not admit that owes leaves for foundations of
+/// its own ([`CollectionRealizationError::UnauthorizedProducer`]), then own
 /// foundations the mapping could not represent
-/// ([`CollectionRealizationError::Unmappable`]).
+/// ([`CollectionRealizationError::Unmappable`]). Only a storage failure ends
+/// the operation before the carry.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn maintain_derived<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
     signing_key: &SigningKey,
     unavailable: &BTreeSet<CollectionData>,
+    wanted: &mut Vec<CollectionData>,
     frontier: &mut OperationFrontier<S::Snapshot>,
     carry_target: bool,
 ) -> Result<(), CollectionRealizationError>
@@ -1070,16 +1083,23 @@ where
         &bound,
         signing_key,
         unavailable,
+        wanted,
         frontier,
         carry_target,
     )?;
-    if carry_target {
+    let carried = if carry_target {
         carry(store, target, signing_key, frontier, |images, reader| {
             bound
                 .mapping
                 .join_images(&bound.target_descriptor, images, reader)
-        })?;
+        })
+    } else {
+        Ok(())
+    };
+    if let Some(failure) = derived.failure {
+        return Err(failure);
     }
+    carried?;
     if derived.unauthorized {
         return Err(CollectionRealizationError::UnauthorizedProducer {
             collection: target.handle(),
@@ -1098,10 +1118,31 @@ where
 #[derive(Default)]
 struct Derivation {
     /// The key owes leaves for foundations of its own, and the target does
-    /// not admit it to publish them.
+    /// not admit it to publish them. Only the per-write `ensure` asks.
     unauthorized: bool,
     /// Own foundations the mapping could not represent, and why.
     blocked: Vec<(CollectionData, String)>,
+    /// The first own foundation the mapping refused, or the first blob an
+    /// own foundation needs that is not here: held until everything else
+    /// has been derived and carried.
+    failure: Option<CollectionRealizationError>,
+}
+
+/// The order `key` derives foundations in: a hash of the key and the
+/// foundation.
+///
+/// Two hosts that derive one collection at the same time would otherwise
+/// walk it in the same order, in step, and derive every foundation twice
+/// before either saw the other's leaf. In orders of their own each mostly
+/// meets foundations the other has not reached, and one whose leaf the
+/// other published meanwhile is skipped ([`derive_leaf`]). This is local
+/// scheduling, not ownership: nothing is looked up by it.
+fn derive_order(key: &VerifyingKey, foundation: CollectionData) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"triblespace/derive-order");
+    hash.update(key.as_bytes());
+    hash.update(&foundation.raw);
+    *hash.finalize().as_bytes()
 }
 
 /// Publish a leaf, `DERIVE(target, L(F), f(F))` with an empty image
@@ -1115,20 +1156,30 @@ struct Derivation {
 /// `maintain` asks it of every foundation this host can derive: the key's
 /// own, and another owner's whose payload is already here -- nothing is
 /// fetched for another owner, and a reader of the target never waits on an
-/// owner who is offline. An output a believed leaf names that is not here is
-/// fetched, once per pass; when none of a foundation's leaves' outputs can
-/// be had, those leaves do not count and the foundation is mapped again. A
-/// failed fetch is current unavailability, not loss: a result equal to an
-/// output a leaf already names restores those bytes and publishes nothing,
-/// and a different one is a second leaf beside the first. When the first
-/// output arrives later, both are here, both are joined, and nothing
-/// further is derived.
+/// owner who is offline.
+///
+/// An output a believed leaf names that is not here is not waited for: it
+/// goes into `wanted`, and the acquiring loop asks for it once the rest of
+/// the work -- deriving what needs no fetch, and the carry -- is done
+/// ([`super::exact_derived`]). Until then its foundation is left alone.
+/// When none of a foundation's leaves' outputs could be had (`unavailable`),
+/// those leaves do not count and the foundation is mapped again. A failed
+/// fetch is current unavailability, not loss: a result equal to an output a
+/// leaf already names restores those bytes and publishes nothing, and a
+/// different one is a second leaf beside the first. When the first output
+/// arrives later, both are here, both are joined, and nothing further is
+/// derived.
+///
+/// Foundations are derived own first, each group in the key's own order
+/// ([`derive_order`]), and a foundation whose leaf another writer published
+/// while the pass ran is skipped ([`derive_leaf`]).
 ///
 /// Nothing is derived on a host that cannot compute the mapping
 /// ([`DeriveMapping::computable_here`]): its leaves arrive by replication,
-/// and that is no error. A key the target does not admit publishes nothing,
-/// so it fetches and maps nothing either; it only reports whether it owes
-/// leaves for foundations of its own.
+/// and that is no error. A key the target does not admit publishes nothing:
+/// under `maintain` it reads nothing of the source either, and under
+/// `ensure` it only reports whether it owes leaves for foundations of its
+/// own.
 ///
 /// An own source foundation owed a leaf whose bytes are not here is
 /// fetched. When nobody can hand them over, a root commit's payload is
@@ -1138,13 +1189,16 @@ struct Derivation {
 /// lags on it too, the same way a reader of the source does. Whatever the
 /// mapping cannot do with another owner's foundation -- a refusal, a
 /// capacity limit, a dependency not here -- is skipped quietly: it is not
-/// this key's failure.
+/// this key's failure. What it cannot do with an own foundation is held in
+/// the result, and the rest is derived regardless.
+#[allow(clippy::too_many_arguments)]
 fn derive_leaves<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
     bound: &Bound<M>,
     signing_key: &SigningKey,
     unavailable: &BTreeSet<CollectionData>,
+    wanted: &mut Vec<CollectionData>,
     frontier: &mut OperationFrontier<S::Snapshot>,
     maintain: bool,
 ) -> Result<Derivation, CollectionRealizationError>
@@ -1156,12 +1210,19 @@ where
         return Ok(Derivation::default());
     }
     let key = signing_key.verifying_key();
-    let scope = BTreeSet::from([bound.source, target.handle()]);
     let snapshot = open(store, frontier, "open leaf-derivation snapshot")?;
+    // Only a key the target admits publishes a leaf. Maintenance by any
+    // other key has nothing to derive and nothing to report: its work is
+    // the carry, so the source is not even read.
+    let admitted = producer_is_admitted(&snapshot, target, signing_key)?;
+    if !admitted && maintain {
+        return Ok(Derivation::default());
+    }
+    let scope = BTreeSet::from([bound.source, target.handle()]);
     let coverage = coverage_of(&snapshot, &scope)?;
     let (foundations, _) = coverage.frontier_support(bound.source);
     // Every foundation this pass may derive, with its locator and the
-    // outputs its believed leaves name; the key's own first.
+    // outputs its believed leaves name.
     let mut own = Vec::new();
     let mut foreign = Vec::new();
     for raw in foundations.iter_ordered() {
@@ -1180,6 +1241,13 @@ where
         } else {
             foreign.push((foundation, locator, outputs));
         }
+    }
+    if !admitted {
+        // `ensure` keeps exactly the key's own foundations with no leaf.
+        return Ok(Derivation {
+            unauthorized: !own.is_empty(),
+            ..Derivation::default()
+        });
     }
     if !foreign.is_empty() {
         let mut payloads = FrontierSet::new();
@@ -1204,44 +1272,35 @@ where
             CollectionRealizationError::storage("intersect leaf outputs with residency", error)
         })?
     };
+    drop(snapshot);
+    own.sort_by_cached_key(|(foundation, _, _)| derive_order(&key, *foundation));
+    foreign.sort_by_cached_key(|(foundation, _, _)| derive_order(&key, *foundation));
     // A foundation with a leaf whose output is here is done, whoever signed
-    // the leaf.
+    // the leaf. One whose leaves' outputs are not here waits for them to be
+    // asked for, and is owed a leaf only once none of them could be had.
     let mut owed = Vec::new();
     for (entries, owned) in [(own, true), (foreign, false)] {
         for (foundation, locator, outputs) in entries {
-            if !outputs
+            if outputs
                 .iter()
                 .any(|output| resident.get(&output.raw).is_some())
             {
+                continue;
+            }
+            let unasked = outputs
+                .iter()
+                .filter(|output| !unavailable.contains(*output))
+                .copied()
+                .collect::<Vec<_>>();
+            if unasked.is_empty() {
                 owed.push((foundation, locator, outputs, owned));
+            } else {
+                wanted.extend(unasked);
             }
         }
     }
-    if owed.is_empty() {
-        return Ok(Derivation::default());
-    }
-    // Only a key the target admits publishes a leaf, so any other fetches
-    // and maps nothing; it only says whether it owes leaves of its own.
-    if !producer_is_admitted(&snapshot, target, signing_key)? {
-        return Ok(Derivation {
-            unauthorized: owed
-                .iter()
-                .any(|(_, _, outputs, owned)| *owned && outputs.is_empty()),
-            blocked: Vec::new(),
-        });
-    }
-    // A leaf's output that is not here is asked for once: the acquiring loop
-    // fetches it and runs the pass again, or records that it could not be
-    // had. A foundation none of whose leaves' outputs could be had is owed a
-    // leaf again.
-    for (_, _, outputs, _) in &owed {
-        if let Some(member) = outputs.iter().find(|output| !unavailable.contains(*output)) {
-            return Err(CollectionRealizationError::MissingDependency { member: *member });
-        }
-    }
-    drop(snapshot);
 
-    let mut blocked = Vec::new();
+    let mut derivation = Derivation::default();
     for (foundation, locator, existing, own) in owed {
         match derive_leaf(
             store,
@@ -1252,15 +1311,16 @@ where
             foundation,
             locator,
             &existing,
+            true,
         )? {
-            Mapped::Done => {}
+            Mapped::Done | Mapped::Overtaken => {}
             // Resident when selected; nothing is fetched for another owner,
             // and whatever the mapping cannot do with another owner's
             // foundation is not this key's failure.
             Mapped::Absent | Mapped::Refused(_) if !own => {}
             Mapped::Absent if unavailable.contains(&foundation) => {
                 if bound.source_is_root {
-                    blocked.push((
+                    derivation.blocked.push((
                         foundation,
                         "the source commit's payload is not resident and could not be acquired"
                             .to_owned(),
@@ -1268,15 +1328,21 @@ where
                 }
             }
             Mapped::Absent => {
-                return Err(CollectionRealizationError::MissingDependency { member: foundation })
+                derivation
+                    .failure
+                    .get_or_insert(CollectionRealizationError::MissingDependency {
+                        member: foundation,
+                    });
             }
-            Mapped::Refused(error) => refused(foundation, error, unavailable, &mut blocked)?,
+            Mapped::Refused(error) => {
+                if let Err(error) = refused(foundation, error, unavailable, &mut derivation.blocked)
+                {
+                    derivation.failure.get_or_insert(error);
+                }
+            }
         }
     }
-    Ok(Derivation {
-        unauthorized: false,
-        blocked,
-    })
+    Ok(derivation)
 }
 
 /// What mapping one source foundation came to.
@@ -1286,14 +1352,53 @@ enum Mapped {
     /// Its image is stored, and published as a leaf unless a believed leaf
     /// already names that output.
     Done,
+    /// While the operation ran, another writer published a leaf for it, or
+    /// the output of one of its leaves arrived: nothing was mapped.
+    Overtaken,
     /// The mapping could not map it.
     Refused(CollectionOperationError),
+}
+
+/// Whether, since the operation's control snapshot, a leaf for `locator`
+/// that `existing` does not name was published -- by another host deriving
+/// the same collection, say -- or an output `existing` names arrived.
+///
+/// Read from `now`, a fresh observation of the store, and used only to skip
+/// work: an operation otherwise never sees records that arrived while it
+/// ran, so two hosts deriving one collection at once would each map every
+/// foundation. Skipping is always sound -- the next pass sees the new leaf
+/// from its own control snapshot, and asks for its output or maps again by
+/// the ordinary rule -- and nothing read here is published or joined.
+fn overtaken<R>(
+    now: &R,
+    target: CollectionHandle,
+    locator: SourceLocator,
+    existing: &[CollectionData],
+) -> Result<bool, CollectionRealizationError>
+where
+    R: StoreRead,
+{
+    let coverage = coverage_of(now, &BTreeSet::from([target]))?;
+    for output in coverage.leaf_outputs(target, locator) {
+        if !existing.contains(&output) {
+            return Ok(true);
+        }
+        if now
+            .metadata(Handle::<UnknownBlob>::from_hash(output))
+            .map_err(|error| CollectionRealizationError::storage("inspect a leaf output", error))?
+            .is_some()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Map one source foundation from its payload, store the image, and publish
 /// it as `DERIVE(target, locator, image)` unless `existing` -- the outputs
 /// its believed leaves name -- already holds it: then the bytes of a leaf
-/// already believed are restored and nothing is published.
+/// already believed are restored and nothing is published. With `recheck`,
+/// a foundation [`overtaken`] while the operation ran is left alone.
 #[allow(clippy::too_many_arguments)]
 fn derive_leaf<S, M>(
     store: &mut S,
@@ -1304,12 +1409,19 @@ fn derive_leaf<S, M>(
     foundation: CollectionData,
     locator: SourceLocator,
     existing: &[CollectionData],
+    recheck: bool,
 ) -> Result<Mapped, CollectionRealizationError>
 where
     S: Store,
     M: DeriveMapping,
 {
-    let snapshot = open(store, frontier, "open leaf mapping snapshot")?;
+    let now = store.snapshot().map_err(|error| {
+        CollectionRealizationError::storage("open leaf mapping snapshot", error)
+    })?;
+    if recheck && overtaken(&now, target.handle(), locator, existing)? {
+        return Ok(Mapped::Overtaken);
+    }
+    let snapshot = frontier.view(now);
     let handle = Handle::<M::Source>::from_hash(foundation);
     if snapshot
         .metadata(handle)
@@ -1485,8 +1597,9 @@ where
             foundation,
             locator,
             &existing,
+            false,
         )? {
-            Mapped::Done => {
+            Mapped::Done | Mapped::Overtaken => {
                 done.insert(foundation);
             }
             Mapped::Absent if unavailable.contains(&foundation) => blocked.push((

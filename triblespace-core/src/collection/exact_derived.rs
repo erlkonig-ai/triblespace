@@ -387,6 +387,7 @@ where
         target,
         signing_key,
         &BTreeSet::new(),
+        &mut Vec::new(),
         &mut frontier,
     )
 }
@@ -409,6 +410,7 @@ fn ensure_resident_in_frontier_with<S, M>(
     target: Collection<M::Target>,
     signing_key: &SigningKey,
     unavailable: &BTreeSet<CollectionData>,
+    wanted: &mut Vec<CollectionData>,
     frontier: &mut OperationFrontier<S::Snapshot>,
 ) -> Result<(), CollectionRealizationError>
 where
@@ -420,6 +422,7 @@ where
         target,
         signing_key,
         unavailable,
+        wanted,
         frontier,
         false,
     )
@@ -427,7 +430,7 @@ where
 
 /// Derive every foundation without a usable leaf and carry the target's own
 /// lattice through one mapping, in one frozen operation, without
-/// acquisition.
+/// acquisition: a foundation whose leaves' outputs are not here waits.
 #[cfg(test)]
 fn maintain_resident_with<S, M>(
     store: &mut S,
@@ -447,6 +450,7 @@ where
         target,
         signing_key,
         &BTreeSet::new(),
+        &mut Vec::new(),
         &mut frontier,
     )
 }
@@ -469,6 +473,7 @@ fn maintain_resident_in_frontier_with<S, M>(
     target: Collection<M::Target>,
     signing_key: &SigningKey,
     unavailable: &BTreeSet<CollectionData>,
+    wanted: &mut Vec<CollectionData>,
     frontier: &mut OperationFrontier<S::Snapshot>,
 ) -> Result<(), CollectionRealizationError>
 where
@@ -480,6 +485,7 @@ where
         target,
         signing_key,
         unavailable,
+        wanted,
         frontier,
         true,
     )
@@ -619,31 +625,78 @@ where
     }
 }
 
+/// How many optional fetches one call lets fail before the rest wait for a
+/// later call.
+///
+/// Through a store that asks other holders a failed fetch can wait out a
+/// network deadline -- `triblespace-net` gives an interactive fetch ten
+/// seconds -- so this bounds what one call spends on blobs nobody hands over
+/// to about eight such deadlines. A fetch that succeeds is not counted.
+const OPTIONAL_FETCH_FAILURES: usize = 8;
+
 /// Run one operation against a fresh control snapshot, acquiring what it
 /// names as missing and running it again from a fresh snapshot after every
 /// acquisition. An operation never sees bytes, records, or proofs that
 /// arrived while it ran; the next one sees all of them, which is what makes
 /// an acquired definition or descriptor count without re-deciding anything
 /// inside the operation that asked for it.
+///
+/// A blob the operation needs ends it with
+/// [`CollectionRealizationError::MissingDependency`], one at a time. A blob
+/// it could use but went on without -- the output of a leaf that is not
+/// here -- it names in `wanted` and finishes its work; those are asked for
+/// together afterwards, each once per call, and the operation runs once more
+/// if any was. They are asked for only through a store that can reach other
+/// holders ([`AsyncBlobStoreAcquire::acquires_remotely`]): from one that
+/// cannot, a miss says nothing about elsewhere, so what it names waits. Once
+/// [`OPTIONAL_FETCH_FAILURES`] of them have failed in one call, the rest wait
+/// for a later call too.
 async fn acquiring<S, F>(store: &mut S, mut operation: F) -> Result<(), CollectionRealizationError>
 where
     S: Store + AsyncBlobStoreAcquire,
     F: FnMut(
         &mut S,
         &BTreeSet<CollectionData>,
+        &mut Vec<CollectionData>,
         &mut OperationFrontier<S::Snapshot>,
     ) -> Result<(), CollectionRealizationError>,
 {
     let mut attempted = BTreeSet::new();
     let mut unavailable = BTreeSet::new();
+    let mut failures = 0;
     loop {
-        let missing = {
+        let mut wanted = Vec::new();
+        let result = {
             let mut frontier = OperationFrontier::new(store.snapshot().map_err(|error| {
                 CollectionRealizationError::storage("freeze operation control snapshot", error)
             })?);
-            match operation(store, &unavailable, &mut frontier) {
-                Err(CollectionRealizationError::MissingDependency { member }) => member,
-                result => return result,
+            operation(store, &unavailable, &mut wanted, &mut frontier)
+        };
+        let missing = match result {
+            Err(CollectionRealizationError::MissingDependency { member }) => member,
+            Err(error) => return Err(error),
+            Ok(()) => {
+                if !store.acquires_remotely() {
+                    return Ok(());
+                }
+                let mut asked = false;
+                for member in wanted {
+                    if failures == OPTIONAL_FETCH_FAILURES {
+                        break;
+                    }
+                    if attempted.contains(&member) {
+                        continue;
+                    }
+                    asked = true;
+                    if !acquire_missing(store, &mut attempted, member).await? {
+                        unavailable.insert(member);
+                        failures += 1;
+                    }
+                }
+                if !asked {
+                    return Ok(());
+                }
+                continue;
             }
         };
         // The operation is over and its control snapshot released before
@@ -666,8 +719,15 @@ where
     S: Store + AsyncBlobStoreAcquire,
     M: DeriveMapping,
 {
-    acquiring(store, |store, unavailable, frontier| {
-        ensure_resident_in_frontier_with::<S, M>(store, target, signing_key, unavailable, frontier)
+    acquiring(store, |store, unavailable, wanted, frontier| {
+        ensure_resident_in_frontier_with::<S, M>(
+            store,
+            target,
+            signing_key,
+            unavailable,
+            wanted,
+            frontier,
+        )
     })
     .await
 }
@@ -681,12 +741,13 @@ where
     S: Store + AsyncBlobStoreAcquire,
     M: DeriveMapping,
 {
-    acquiring(store, |store, unavailable, frontier| {
+    acquiring(store, |store, unavailable, wanted, frontier| {
         maintain_resident_in_frontier_with::<S, M>(
             store,
             target,
             signing_key,
             unavailable,
+            wanted,
             frontier,
         )
     })
@@ -708,7 +769,7 @@ where
     M: DeriveMapping,
 {
     let mut done = BTreeSet::new();
-    acquiring(store, |store, unavailable, frontier| {
+    acquiring(store, |store, unavailable, _wanted, frontier| {
         super::maintenance::rederive::<S, M>(
             store,
             target,
@@ -736,7 +797,7 @@ where
     S: Store + AsyncBlobStoreAcquire,
     E: CollectionEncoding,
 {
-    acquiring(store, |store, _unavailable, frontier| {
+    acquiring(store, |store, _unavailable, _wanted, frontier| {
         super::maintenance::carry_root(store, target, signing_key, frontier)
     })
     .await
@@ -784,7 +845,7 @@ where
     S: Store + AsyncBlobStoreAcquire,
     M: MapMapping,
 {
-    acquiring(store, |store, unavailable, frontier| {
+    acquiring(store, |store, unavailable, _wanted, frontier| {
         super::maintenance::attach_frontier::<S, M>(
             store,
             attached,

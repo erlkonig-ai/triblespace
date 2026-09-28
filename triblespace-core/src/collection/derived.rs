@@ -279,8 +279,8 @@ where
 ///
 /// Only a new leaf needs WRITE. A signer the target does not admit derives
 /// nothing and answers [`Realized::Unadmitted`]; under
-/// [`Upkeep::Maintain`] it still carries the target's own lattice first,
-/// because a merge needs only the store's host key.
+/// [`Upkeep::Maintain`] it still carries the target's own lattice, because
+/// a merge needs only the store's host key.
 pub async fn realize_as<S, T>(
     store: &mut S,
     derived: &Derived,
@@ -311,13 +311,8 @@ where
     match (upkeep, admitted) {
         (Upkeep::Ensure, false) => return Ok(Realized::Unadmitted),
         (Upkeep::Ensure, true) => drop(store.ensure(collection, signer).await?),
-        (Upkeep::Maintain, _) => match store.maintain(collection, signer).await {
-            Ok(snapshot) => drop(snapshot),
-            // The carry ran before this was reported: a key the target does
-            // not admit owes leaves it may not publish.
-            Err(CollectionRealizationError::UnauthorizedProducer { .. }) if !admitted => {}
-            Err(error) => return Err(error),
-        },
+        // A key the target does not admit derives nothing and carries.
+        (Upkeep::Maintain, _) => drop(store.maintain(collection, signer).await?),
     }
     Ok(if admitted {
         Realized::Done

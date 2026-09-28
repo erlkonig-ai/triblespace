@@ -274,7 +274,9 @@ pub trait CollectionDerivation: CollectionEncoding {
 /// output that is here or can be fetched, whoever signed that leaf, and any
 /// key the derived collection admits may derive it on a host that can
 /// compute the mapping, not only the foundation's owner. A leaf whose output
-/// cannot be obtained does not count. A fetch that fails says the output is
+/// cannot be obtained does not count; whether it can is asked only of a
+/// store that reaches other holders, and a store that cannot waits for the
+/// output instead. A fetch that fails says the output is
 /// not available now, not that it is lost: an original output that arrives
 /// after its foundation was derived again stands beside the newer leaf,
 /// both are joined, and nothing further is derived. A leaf known to be bad

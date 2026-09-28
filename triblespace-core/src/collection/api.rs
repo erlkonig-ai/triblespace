@@ -1777,13 +1777,18 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
     /// A derived collection gets a leaf for every source foundation this
     /// host can derive that has no usable leaf: any believed leaf whose
     /// output is here or can be fetched suffices, whoever signed it, and a
-    /// leaf whose output cannot be had does not count. The key's own
-    /// payloads are fetched; another owner's are used only when they are
-    /// here. Then the collection carries its own lattice exactly as a root
-    /// does, its leaf images joined by the mapping's join; it never reads its
-    /// source's merges. Deriving needs target WRITE authority, and a mapping
-    /// pinned to a class of host derives nothing on another host; carrying
-    /// needs neither, so such a key or host still carries. A derived
+    /// leaf whose output cannot be had does not count. Outputs that are not
+    /// here are asked for after the rest of the work, each once, and only
+    /// through a store that can reach other holders; a store that answers
+    /// from its own blobs alone leaves such a foundation waiting for its
+    /// output rather than deriving it again. The key's own payloads are
+    /// fetched; another owner's are used only when they are here. Then the
+    /// collection carries its own lattice exactly as a root does, its leaf
+    /// images joined by the mapping's join; it never reads its source's
+    /// merges, and a foundation the mapping refused does not hold it back.
+    /// Deriving needs target WRITE authority, and a mapping pinned to a class
+    /// of host derives nothing on another host; carrying needs neither, so
+    /// such a key or host carries and reports nothing more. A derived
     /// collection stored in a root's encoding carries only through its
     /// mapping (`maintain_with`); this method refuses it. There is no
     /// caller-visible budget or tuning knob; every useful result is
