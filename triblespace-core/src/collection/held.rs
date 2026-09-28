@@ -1011,6 +1011,23 @@ impl<T: HeldSource> HeldIndex<T> {
             }
             let mut reports = Vec::new();
             for collection in &covered {
+                if state.warming.get(&collection.raw).is_some() {
+                    // Reports noted since the last observation wait for this
+                    // walk too, if that observation had their blobs; the
+                    // others arrived after it and are ordinary reports.
+                    for handle in take_related(&mut state.candidates, &collection.raw) {
+                        let resident = state.fed.as_ref().is_some_and(|fed| {
+                            fed.contains_blob(Inline::<Handle<UnknownBlob>>::new(handle))
+                                .unwrap_or(false)
+                        });
+                        let key = pair(&collection.raw, &handle);
+                        if resident {
+                            state.deferred.insert(&Entry::new(&key));
+                        } else {
+                            state.candidates.insert(&Entry::new(&key));
+                        }
+                    }
+                }
                 let reached = seen.entry(*collection).or_default();
                 let mut unreached = Vec::new();
                 for handle in take_related(&mut state.deferred, &collection.raw) {
@@ -2692,6 +2709,52 @@ mod tests {
         until(&mut store, "the start-up walk", |snapshot| {
             held_set(snapshot, c) == BTreeSet::from([c.raw, metadata, fresh_metadata, a, leaf])
         });
+        drop(walker);
+    }
+
+    /// A report noted while the start-up walk runs, but not yet moved by an
+    /// observation when the walk ends, is still read by the walker.
+    #[test]
+    fn a_report_noted_as_the_start_up_walk_ends_is_read_by_the_walker() {
+        let _guard = walker_guard();
+        let mut store = Store::default();
+        let c = collection(&mut store, "report at the end");
+        let metadata = blob(&mut store, b"metadata");
+        let data = blob(&mut store, b"payload");
+        commit(&mut store, c, data, metadata);
+        let leaf = blob(&mut store, b"late report leaf");
+        let middle = blob_naming(&mut store, b"late report middle", &[leaf]);
+        let fetched = blob_naming(&mut store, b"late report root", &[middle]);
+        let walker = store.start_held_walker(walker_config(Duration::from_secs(3600)));
+        let _opener = store.gate.hold();
+        store.track_held([c]);
+        store.snapshot().unwrap();
+        store.gate.await_walker();
+        // No observation between the report and the end of the walk.
+        store.note_held(c, Inline::new(fetched));
+        store.gate.open();
+        let start = Instant::now();
+        while [c.raw, metadata, data]
+            .iter()
+            .any(|handle| reads(&store, handle) == 0)
+        {
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "the walk never ran"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        let expected = BTreeSet::from([c.raw, metadata, data, fetched, middle, leaf]);
+        until(&mut store, "the report", |snapshot| {
+            held_set(snapshot, c) == expected
+        });
+        let foreground = store.foreground.lock().unwrap().clone();
+        assert!(
+            foreground.is_empty(),
+            "a snapshot read {} blobs of a report the walk owed",
+            foreground.len()
+        );
         drop(walker);
     }
 
