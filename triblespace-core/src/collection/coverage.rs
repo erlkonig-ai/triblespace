@@ -108,6 +108,7 @@ use super::api::AdmissionEvidence;
 use super::records::{
     CollectionData, CollectionHandle, CollectionRecord, MergeInputs, SourceLocator,
 };
+#[cfg(test)]
 use super::store::CollectionRead;
 use crate::capability::QuorumOutcome;
 
@@ -1746,15 +1747,14 @@ impl<R: BlobStoreGet + CapabilityProofRead> RecordAdmission for StoreWriters<'_,
     }
 }
 
-/// Fold one store's whole record set into a coverage index.
+/// Fold one store's whole record set into a coverage index from scratch.
 ///
-/// The general path, for any store that enumerates records and can answer who
-/// may write a collection. A backend that maintains the index across appends
-/// — a pile does, during replay — should hand out its own instead of folding
-/// again; this is what everything else uses, and what an equivalence check
-/// compares that maintained index against.
+/// The oracle an index a backend maintains across appends -- a pile does,
+/// during replay -- is checked against in tests. Nothing else folds from
+/// scratch: every store hands out its own index.
 ///
 /// `host` is the key whose MERGEs the fold believes; `None` believes none.
+#[cfg(test)]
 pub(crate) fn coverage_of<R>(
     reader: &R,
     host: Option<Inline<ED25519PublicKey>>,
