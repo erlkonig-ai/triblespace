@@ -151,9 +151,12 @@ bytes of it name, at any offset (frames have not always kept their fields on
 32-byte boundaries), rather than widening to every resident blob. Without
 explicit roots it therefore keeps exactly what the carried records, headers,
 proofs, WANTs and pins reach. A blob the walk reaches of which no occurrence
-matches its hash has no valid bytes to copy: wherever the walk meets it, it
-is set aside and listed rather than copied, and its damaged bytes are still
-read for what they name.
+matches its hash has no valid bytes to copy. The walk finds one wherever it
+meets it, and by default the rewrite then refuses before writing anything,
+as an invalid explicitly selected blob fails the plain rewrite. A caller may
+set such blobs aside instead: they are listed, not copied, and their damaged
+bytes are still read for what they name, but a valid blob named only by a
+damaged word cannot be reached and is left behind.
 `PileFile::plan_retained_rewrite` runs the same selection pass and retention
 walk without writing, so a dry run reports exactly what the rewrite will do.
 The lattice v3 cutover (`trible pile migrate SRC lattice-v3`) is this rewrite

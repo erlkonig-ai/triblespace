@@ -19,20 +19,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the resident blobs any 32 bytes of it name, at any offset (the legacy V1
   envelope put its fields four bytes off 32-byte boundaries), rather than
   every resident blob, so without explicit roots it keeps exactly what the
-  carried state reaches. A resident blob its walk meets of which no
-  occurrence matches its hash is set aside, not copied, whether a carried
-  frame, a root or another blob names it, and listed in
-  `PileRewriteStats::corrupt_blobs`; its damaged bytes are still read for
-  children, so a valid blob reached only through it is kept. `PileFile::plan_retained_rewrite` runs the same selection
-  pass and retention walk without writing and returns the same counts and
-  the set of blobs it would copy (`RetainedRewritePlan`).
+  carried state reaches. It finds every resident blob its walk meets of
+  which no occurrence matches its hash, whether a carried frame, a root
+  (direct or recursive) or another blob names it. Under
+  `CorruptBlobPolicy::Refuse` such a blob fails the rewrite before anything
+  is written (`PileRewriteError::Corrupt`), as an invalid explicitly
+  selected blob fails the plain rewrite; under `CorruptBlobPolicy::SetAside`
+  it is not copied and is listed in `PileRewriteStats::corrupt_blobs`. Its
+  damaged bytes are read for children, but a valid blob named only by a
+  damaged word of it cannot be reached and is left behind, which is why
+  refusing is the first choice. `PileFile::plan_retained_rewrite` runs the
+  same selection pass and retention walk without writing and returns the
+  same counts, the set of blobs it would copy (`RetainedRewritePlan`), their
+  bytes as the copy takes them (each blob's first valid occurrence) and the
+  corrupt blobs it met.
   `rewrite_retained_into` and `rewrite_retained_into_leaving` keep their
   retention.
 - Retired capability proofs (pile kinds v1 and v2 of the proof record) are
   capability records: every retained rewrite now carries each distinct one
   byte for byte, as it carries current proofs, keeps every resident blob any
   32 bytes of it name, and counts them in
-  `PileRewriteStats::retired_capability_proofs`. Rewrites used to drop them.
+  `PileRewriteStats::retired_capability_proofs`. Yard reclamation carries
+  them too, and its collection keeps what they may name. Both used to drop
+  them.
 - Every retained rewrite considers a frame held again at a later offset (a
   current collection record, or a frame of unknown kind, as concatenation
   leaves them) once, and counts the repeats in
