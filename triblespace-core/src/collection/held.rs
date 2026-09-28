@@ -103,6 +103,55 @@ type Raw = [u8; 32];
 /// One collection's held set: positive, and served as a Merkle PATCH.
 pub type HeldBlobs = PATCH<32, IdentitySchema, (), Blake3Merkle>;
 
+/// Two 32-byte segments, so a prefix of the first enumerates the second.
+mod pair_key {
+    crate::key_segmentation!(Segments, 64, [32, 32]);
+    crate::key_schema!(Schema, Segments, 64, [0, 1]);
+}
+
+/// A relation between two 32-byte handles, keyed `first || second`: a
+/// prefix scan on `first` enumerates its seconds. Every state the index
+/// keeps across observations is one of these, a set of handles, or the held
+/// sets themselves.
+type Pairs = PATCH<64, pair_key::Schema, ()>;
+
+/// A set of 32-byte handles.
+type Handles = PATCH<32, IdentitySchema, ()>;
+
+/// `collection -> held set`, for every settled collection.
+type HeldSets = PATCH<32, IdentitySchema, HeldBlobs>;
+
+fn pair(first: &Raw, second: &Raw) -> [u8; 64] {
+    let mut key = [0u8; 64];
+    key[..32].copy_from_slice(first);
+    key[32..].copy_from_slice(second);
+    key
+}
+
+fn split(key: &[u8; 64]) -> (Raw, Raw) {
+    let mut first = [0u8; 32];
+    let mut second = [0u8; 32];
+    first.copy_from_slice(&key[..32]);
+    second.copy_from_slice(&key[32..]);
+    (first, second)
+}
+
+/// Every `second` related to `first`.
+fn related(pairs: &Pairs, first: &Raw) -> Vec<Raw> {
+    let mut seconds = Vec::new();
+    pairs.infixes(first, |second: &Raw| seconds.push(*second));
+    seconds
+}
+
+/// Remove and return every `second` related to `first`.
+fn take_related(pairs: &mut Pairs, first: &Raw) -> Vec<Raw> {
+    let seconds = related(pairs, first);
+    for second in &seconds {
+        pairs.remove(&pair(first, second));
+    }
+    seconds
+}
+
 /// The held sets of one immutable observation.
 pub trait HeldRead {
     /// Every blob `collection` holds in this observation, or `None` when the
@@ -194,7 +243,7 @@ pub fn held_threads_spawned() -> usize {
 #[derive(Clone, Default, PartialEq)]
 pub(crate) struct HeldView {
     generation: u64,
-    sets: BTreeMap<CollectionHandle, HeldBlobs>,
+    sets: HeldSets,
 }
 
 impl std::fmt::Debug for HeldView {
@@ -206,7 +255,12 @@ impl std::fmt::Debug for HeldView {
                 &self
                     .sets
                     .iter()
-                    .map(|(collection, held)| (collection.raw, held.len()))
+                    .map(|collection| {
+                        (
+                            *collection,
+                            self.sets.get(collection).map(|held| held.len()),
+                        )
+                    })
                     .collect::<Vec<_>>(),
             )
             .finish()
@@ -215,7 +269,7 @@ impl std::fmt::Debug for HeldView {
 
 impl HeldView {
     pub(crate) fn held(&self, collection: CollectionHandle) -> Option<HeldBlobs> {
-        self.sets.get(&collection).cloned()
+        self.sets.get(&collection.raw).cloned()
     }
 
     pub(crate) fn generation(&self) -> u64 {
@@ -223,49 +277,56 @@ impl HeldView {
     }
 }
 
-#[derive(Clone, Default)]
-struct Tracked {
-    /// Every blob C's records and proofs name, resident or not.
-    seeds: HashSet<Raw>,
-    /// Resident blobs peers reported in C that were not already held.
-    routes: BTreeSet<Raw>,
-    held: HeldBlobs,
-    /// Tracked, but its seeds have not been selected yet.
-    fresh: bool,
-    /// Its existing closure is left to a start-up walk that has not finished.
-    warming: bool,
-    /// Peer reports of resident blobs that arrived while it was fresh or
-    /// warming. With a walker, the walk that ends the warming reads those it
-    /// did not reach and makes them routes; without one, the next
-    /// observation resolves them.
-    deferred: BTreeSet<Raw>,
-}
-
 #[derive(Clone, Debug, Default)]
 struct Walker {
     /// Collections whose start-up walk is owed.
-    requested: BTreeSet<CollectionHandle>,
+    requested: Handles,
     stop: bool,
 }
 
+/// Everything the index keeps across observations. A tracked collection is
+/// *settled* once its seeds are selected: then it has a held set, until a
+/// reset or a stopped walker makes it unsettled again.
 #[derive(Clone)]
 struct State<T> {
-    tracked: BTreeMap<CollectionHandle, Tracked>,
-    /// Every scanned blob and its resident children when it was scanned.
-    edges: HashMap<Raw, Arc<[Raw]>>,
-    /// Seeds whose bytes were not readable yet, and the collections waiting.
-    pending: HashMap<Raw, BTreeSet<CollectionHandle>>,
-    /// Seeds a walk could not read that were resident by the time it
-    /// published: reached at the next observation.
-    ready: Vec<(CollectionHandle, Raw)>,
-    /// Resources of proofs whose descriptor was not resident, so the proofs
-    /// could not be routed; the arrival of one re-routes the proofs.
-    unrouted: HashSet<Raw>,
+    /// The collections held sets are kept for.
+    tracked: Handles,
+    /// The held set of every settled collection.
+    held: HeldSets,
+    /// Settled collections whose existing closure is left to a start-up
+    /// walk that has not finished.
+    warming: Handles,
+    /// `collection || blob`: every blob C's records and proofs name,
+    /// resident or not.
+    seeds: Pairs,
+    /// `collection || blob`: resident blobs peers reported in C that were not
+    /// already held.
+    routes: Pairs,
+    /// `collection || blob`: peer reports of resident blobs that arrived
+    /// while C was unsettled or warming. With a walker, the walk that ends
+    /// the warming reads those it did not reach and makes them routes;
+    /// without one, the next observation resolves them.
+    deferred: Pairs,
+    /// Every blob scanned since the last reset, whether it has children or
+    /// not.
+    scanned: Handles,
+    /// `parent || child`: each scanned blob and every child resident when it
+    /// was scanned.
+    edges: Pairs,
+    /// `blob || collection`: seeds whose bytes were not readable yet, and the
+    /// collections waiting for them.
+    pending: Pairs,
+    /// `collection || blob`: seeds a walk could not read that were resident
+    /// by the time it published, reached at the next observation.
+    ready: Pairs,
+    /// Collection and resource descriptors that were not resident when
+    /// proofs were judged; the arrival of one judges the proofs again.
+    unrouted: Handles,
     /// Proof seeds are recomputed at the next observation: reading the proofs
-    /// failed, or a resource descriptor arrived.
+    /// failed, or a descriptor arrived.
     proofs_stale: bool,
-    /// Peer reports since the last observation.
-    candidates: Vec<(CollectionHandle, Raw)>,
+    /// `collection || blob`: peer reports since the last observation.
+    candidates: Pairs,
     /// The last observation fed in.
     fed: Option<T>,
     generation: u64,
@@ -292,13 +353,19 @@ impl<T> Default for HeldIndex<T> {
     fn default() -> Self {
         Self {
             state: Mutex::new(State {
-                tracked: BTreeMap::new(),
-                edges: HashMap::new(),
-                pending: HashMap::new(),
-                ready: Vec::new(),
-                unrouted: HashSet::new(),
+                tracked: Handles::new(),
+                held: HeldSets::new(),
+                warming: Handles::new(),
+                seeds: Pairs::new(),
+                routes: Pairs::new(),
+                deferred: Pairs::new(),
+                scanned: Handles::new(),
+                edges: Pairs::new(),
+                pending: Pairs::new(),
+                ready: Pairs::new(),
+                unrouted: Handles::new(),
                 proofs_stale: false,
-                candidates: Vec::new(),
+                candidates: Pairs::new(),
                 fed: None,
                 generation: 0,
                 epoch: 0,
@@ -337,17 +404,16 @@ impl<T> HeldIndex<T> {
     pub(crate) fn track(&self, collections: impl IntoIterator<Item = CollectionHandle>) {
         let mut state = self.lock();
         for collection in collections {
-            state.tracked.entry(collection).or_insert_with(|| Tracked {
-                fresh: true,
-                ..Tracked::default()
-            });
+            state.tracked.insert(&Entry::new(&collection.raw));
         }
     }
 
     pub(crate) fn note(&self, collection: CollectionHandle, handle: Raw) {
         let mut state = self.lock();
-        if state.tracked.contains_key(&collection) {
-            state.candidates.push((collection, handle));
+        if state.tracked.get(&collection.raw).is_some() {
+            state
+                .candidates
+                .insert(&Entry::new(&pair(&collection.raw, &handle)));
         }
     }
 
@@ -449,7 +515,7 @@ fn proof_seeds<T: HeldSource>(
 
 /// Read one blob and list its resident children, or `None` if it is not
 /// readable. Children are probed in the store's index without reading them.
-fn scan<T: HeldSource>(snapshot: &T, handle: &Raw) -> Option<Arc<[Raw]>> {
+fn scan<T: HeldSource>(snapshot: &T, handle: &Raw) -> Option<Vec<Raw>> {
     let body: Bytes = snapshot
         .get::<Bytes, UnknownBlob>(Inline::<Handle<UnknownBlob>>::new(*handle))
         .ok()?;
@@ -465,70 +531,62 @@ fn scan<T: HeldSource>(snapshot: &T, handle: &Raw) -> Option<Arc<[Raw]>> {
         .collect();
     children.sort_unstable();
     children.dedup();
-    Some(children.into())
+    Some(children)
 }
 
 impl<T> State<T> {
     /// Forget every edge and held set; every collection is recomputed as if
     /// newly tracked. Seeds and peer reports are kept as roots.
     fn reset(&mut self) {
-        self.edges.clear();
-        self.pending.clear();
-        self.ready.clear();
+        self.scanned = Handles::new();
+        self.edges = Pairs::new();
+        self.pending = Pairs::new();
+        self.ready = Pairs::new();
         self.epoch += 1;
-        for tracked in self.tracked.values_mut() {
-            tracked.held = HeldBlobs::new();
-            tracked.fresh = true;
-            tracked.warming = false;
-        }
+        self.held = HeldSets::new();
+        self.warming = Handles::new();
     }
 
     /// No walker will finish the start-up walks still owed: those
-    /// collections are recomputed synchronously at the next observation.
-    /// A partly published walk may have left a held node without its
-    /// children, so their sets start over.
+    /// collections are unsettled again and recomputed synchronously at the
+    /// next observation.
     fn release_warming(&mut self) {
-        for tracked in self.tracked.values_mut() {
-            if tracked.warming {
-                tracked.warming = false;
-                tracked.fresh = true;
-                tracked.held = HeldBlobs::new();
-            }
+        for collection in self.warming.iter() {
+            self.held.remove(collection);
         }
+        self.warming = Handles::new();
     }
 
     fn publish_view(&mut self) {
         self.generation += 1;
         self.view = Arc::new(HeldView {
             generation: self.generation,
-            sets: self
-                .tracked
-                .iter()
-                .filter(|(_, tracked)| !tracked.fresh)
-                .map(|(collection, tracked)| (*collection, tracked.held.clone()))
-                .collect(),
+            sets: self.held.clone(),
         });
     }
 
-    /// Roots of one walk over `only` (every collection when `None`): the
-    /// seeds and peer reports of each collection whose seeds are known.
-    fn walk_roots(
-        &self,
-        only: Option<&BTreeSet<CollectionHandle>>,
-    ) -> Vec<(CollectionHandle, Vec<Raw>)> {
-        self.tracked
+    /// Roots of one walk over `only` (every settled collection when `None`):
+    /// the seeds and peer reports of each.
+    fn walk_roots(&self, only: Option<&Handles>) -> Vec<(CollectionHandle, Vec<Raw>)> {
+        self.held
             .iter()
-            .filter(|(collection, tracked)| {
-                !tracked.fresh && only.is_none_or(|only| only.contains(*collection))
-            })
-            .map(|(collection, tracked)| {
-                let mut roots: Vec<Raw> = tracked.seeds.iter().copied().collect();
-                roots.extend(tracked.routes.iter().copied());
+            .filter(|collection| only.is_none_or(|only| only.get(collection).is_some()))
+            .map(|collection| {
+                let mut roots = related(&self.seeds, collection);
+                roots.extend(related(&self.routes, collection));
                 roots.sort_unstable();
                 roots.dedup();
-                (*collection, roots)
+                (Inline::new(*collection), roots)
             })
             .collect()
+    }
+
+    /// Record one scan: the blob, and an edge to each resident child.
+    fn record_scan(&mut self, handle: Raw, children: &[Raw]) {
+        self.scanned.insert(&Entry::new(&handle));
+        for child in children {
+            self.edges.insert(&Entry::new(&pair(&handle, child)));
+        }
     }
 }
 
@@ -545,60 +603,59 @@ impl<T: HeldSource> State<T> {
         collection: CollectionHandle,
         roots: impl IntoIterator<Item = Raw>,
     ) -> bool {
-        let State {
-            tracked,
-            edges,
-            pending,
-            ..
-        } = self;
-        let Some(tracked) = tracked.get_mut(&collection) else {
+        let Some(mut held) = self.held.get(&collection.raw).cloned() else {
             return false;
         };
         let mut changed = false;
         // Scratch for this call: depth first, a blob's children before it.
         let mut entered: HashSet<Raw> = HashSet::new();
         let mut unknown: HashSet<Raw> = HashSet::new();
-        let mut stack: Vec<(Raw, Option<Arc<[Raw]>>)> =
+        let mut stack: Vec<(Raw, Option<Vec<Raw>>)> =
             roots.into_iter().map(|root| (root, None)).collect();
         while let Some((handle, visited)) = stack.pop() {
             if let Some(children) = visited {
                 if children.iter().any(|child| unknown.contains(child)) {
                     unknown.insert(handle);
                 } else {
-                    tracked.held.insert(&Entry::new(&handle));
+                    held.insert(&Entry::new(&handle));
                     changed = true;
                 }
                 continue;
             }
-            if tracked.held.has_prefix(&handle) || !entered.insert(handle) {
+            if held.has_prefix(&handle) || !entered.insert(handle) {
                 continue;
             }
-            let children = match (edges.get(&handle), snapshot) {
-                (Some(children), _) => children.clone(),
-                (None, Some(snapshot)) => match scan(snapshot, &handle) {
+            let children = if self.scanned.get(&handle).is_some() {
+                related(&self.edges, &handle)
+            } else if let Some(snapshot) = snapshot {
+                match scan(snapshot, &handle) {
                     Some(children) => {
-                        edges.insert(handle, children.clone());
+                        self.record_scan(handle, &children);
                         children
                     }
                     None => {
-                        if tracked.seeds.contains(&handle) {
-                            pending.entry(handle).or_default().insert(collection);
+                        if self.seeds.get(&pair(&collection.raw, &handle)).is_some() {
+                            self.pending
+                                .insert(&Entry::new(&pair(&handle, &collection.raw)));
                         }
                         continue;
                     }
-                },
-                (None, None) => {
-                    unknown.insert(handle);
-                    continue;
                 }
+            } else {
+                unknown.insert(handle);
+                continue;
             };
-            stack.push((handle, Some(children.clone())));
-            stack.extend(
-                children
-                    .iter()
-                    .filter(|child| !tracked.held.has_prefix(*child))
-                    .map(|child| (*child, None)),
-            );
+            let unheld: Vec<(Raw, Option<Vec<Raw>>)> = children
+                .iter()
+                .filter(|child| !held.has_prefix(*child))
+                .map(|child| (*child, None))
+                .collect();
+            // Popped after every child below it has been decided.
+            stack.push((handle, Some(children)));
+            stack.extend(unheld);
+        }
+        if changed {
+            self.held.replace(&Entry::with_value(&collection.raw, held));
         }
         changed
     }
@@ -609,14 +666,16 @@ impl<T: HeldSource> State<T> {
         found: ProofSeeds,
         roots: &mut BTreeMap<CollectionHandle, Vec<Raw>>,
     ) {
-        self.unrouted.extend(found.unrouted);
+        for descriptor in found.unrouted {
+            self.unrouted.insert(&Entry::new(&descriptor));
+        }
         for (collection, seed) in found.seeds {
-            let Some(entry) = self.tracked.get_mut(&collection) else {
+            let key = pair(&collection.raw, &seed);
+            if self.tracked.get(&collection.raw).is_none() || self.seeds.get(&key).is_some() {
                 continue;
-            };
-            if entry.seeds.insert(seed) {
-                roots.entry(collection).or_default().push(seed);
             }
+            self.seeds.insert(&Entry::new(&key));
+            roots.entry(collection).or_default().push(seed);
         }
     }
 }
@@ -627,7 +686,7 @@ impl<T: HeldSource> HeldIndex<T> {
     pub(crate) fn observe(&self, now: &T) -> Arc<HeldView> {
         let mut state = self.lock();
         if state.tracked.is_empty() {
-            state.candidates.clear();
+            state.candidates = Pairs::new();
             return state.view.clone();
         }
         let mut changed = false;
@@ -650,26 +709,31 @@ impl<T: HeldSource> HeldIndex<T> {
             changed = true;
         }
 
+        // Scratch for this observation: what to reach, per collection.
         let mut roots: BTreeMap<CollectionHandle, Vec<Raw>> = BTreeMap::new();
-        for (collection, handle) in std::mem::take(&mut state.ready) {
-            roots.entry(collection).or_default().push(handle);
+        for key in std::mem::take(&mut state.ready).iter() {
+            let (collection, handle) = split(key);
+            roots
+                .entry(Inline::new(collection))
+                .or_default()
+                .push(handle);
         }
         if let Some(fed) = state.fed.take() {
             if changes.contains(StoreChanges::COLLECTION_RECORDS) {
-                let tracked = &mut state.tracked;
+                let State { held, seeds, .. } = &mut *state;
                 now.for_each_record_since(Some(&fed), &mut |record| {
                     let collection = record.collection();
-                    let Some(entry) = tracked.get_mut(&collection) else {
-                        return;
-                    };
-                    if entry.fresh {
+                    // Untracked, or not settled: its selection reads it.
+                    if held.get(&collection.raw).is_none() {
                         return;
                     }
-                    let Some(seeds) = seeds_of(record) else {
+                    let Some(named) = seeds_of(record) else {
                         return;
                     };
-                    for seed in seeds {
-                        if entry.seeds.insert(seed) {
+                    for seed in named {
+                        let key = pair(&collection.raw, &seed);
+                        if seeds.get(&key).is_none() {
+                            seeds.insert(&Entry::new(&key));
                             roots.entry(collection).or_default().push(seed);
                         }
                     }
@@ -678,27 +742,25 @@ impl<T: HeldSource> HeldIndex<T> {
             if changes.contains(StoreChanges::BLOBS)
                 && !(state.pending.is_empty() && state.unrouted.is_empty())
             {
-                // Seeds whose bytes arrived since, and resource descriptors
-                // that may route a proof. A store without an indexed
+                // Seeds whose bytes arrived since, and descriptors that may
+                // let a proof be judged. A store without an indexed
                 // difference lists every blob; entries still match once.
                 for info in now.blobs_diff(&fed).flatten() {
                     let raw = info.handle.raw;
-                    if let Some(waiting) = state.pending.remove(&raw) {
-                        for collection in waiting {
-                            roots.entry(collection).or_default().push(raw);
-                        }
+                    for collection in take_related(&mut state.pending, &raw) {
+                        roots.entry(Inline::new(collection)).or_default().push(raw);
                     }
-                    if state.unrouted.remove(&raw) {
+                    if state.unrouted.get(&raw).is_some() {
+                        state.unrouted.remove(&raw);
                         state.proofs_stale = true;
                     }
                 }
             }
             if changes.contains(StoreChanges::CAPABILITY_PROOFS) || state.proofs_stale {
-                let settled: BTreeSet<_> = state
-                    .tracked
+                let settled: BTreeSet<CollectionHandle> = state
+                    .held
                     .iter()
-                    .filter(|(_, tracked)| !tracked.fresh)
-                    .map(|(collection, _)| *collection)
+                    .map(|collection| Inline::new(*collection))
                     .collect();
                 match proof_seeds(now, &settled) {
                     Ok(found) => {
@@ -711,11 +773,12 @@ impl<T: HeldSource> HeldIndex<T> {
             }
         }
 
-        let fresh: BTreeSet<_> = state
+        // Scratch: the tracked collections not settled yet.
+        let fresh: BTreeSet<CollectionHandle> = state
             .tracked
             .iter()
-            .filter(|(_, tracked)| tracked.fresh)
-            .map(|(collection, _)| *collection)
+            .filter(|collection| state.held.get(collection).is_none())
+            .map(|collection| Inline::new(*collection))
             .collect();
         if !fresh.is_empty() {
             let selectors = fresh
@@ -723,8 +786,8 @@ impl<T: HeldSource> HeldIndex<T> {
                 .map(|collection| CollectionRecordSelector::Foundations(*collection))
                 .collect();
             // A collection is settled only from a complete selection. When the
-            // store cannot answer, it stays fresh -- absent from the view, not
-            // short in it -- and is selected again at the next observation.
+            // store cannot answer, it stays unsettled -- absent from the view,
+            // not short in it -- and is selected again at the next observation.
             if let (Ok(records), Ok(proofs)) =
                 (now.select_records(&selectors), proof_seeds(now, &fresh))
             {
@@ -739,20 +802,27 @@ impl<T: HeldSource> HeldIndex<T> {
                         list.extend(named);
                     }
                 }
-                state.unrouted.extend(proofs.unrouted);
+                for descriptor in proofs.unrouted {
+                    state.unrouted.insert(&Entry::new(&descriptor));
+                }
                 for (collection, seed) in proofs.seeds {
                     seeds.get_mut(&collection).expect("fresh").push(seed);
                 }
                 let background = state.walker.is_some();
                 for (collection, mut list) in seeds {
-                    let entry = state.tracked.get_mut(&collection).expect("fresh");
-                    entry.seeds.extend(list.iter().copied());
-                    list.extend(entry.routes.iter().copied());
-                    entry.fresh = false;
-                    entry.warming = background;
+                    for seed in &list {
+                        state
+                            .seeds
+                            .insert(&Entry::new(&pair(&collection.raw, seed)));
+                    }
+                    list.extend(related(&state.routes, &collection.raw));
+                    state
+                        .held
+                        .replace(&Entry::with_value(&collection.raw, HeldBlobs::new()));
                     if background {
-                        // Its start-up walk reads these; only what is already
-                        // scanned joins now.
+                        // Its start-up walk reads these; only closures already
+                        // scanned join now.
+                        state.warming.insert(&Entry::new(&collection.raw));
                         state.reach(None, collection, list);
                     } else {
                         roots.entry(collection).or_default().extend(list);
@@ -760,7 +830,9 @@ impl<T: HeldSource> HeldIndex<T> {
                 }
                 changed = true;
                 if let Some(walker) = &mut state.walker {
-                    walker.requested.extend(fresh.iter().copied());
+                    for collection in &fresh {
+                        walker.requested.insert(&Entry::new(&collection.raw));
+                    }
                     self.wake.notify_all();
                 }
             }
@@ -770,26 +842,38 @@ impl<T: HeldSource> HeldIndex<T> {
             changed |= state.reach(Some(now), collection, list);
         }
 
-        let mut candidates = std::mem::take(&mut state.candidates);
+        // Scratch for this observation: the reports to resolve.
+        let mut candidates: Vec<(CollectionHandle, Raw)> = std::mem::take(&mut state.candidates)
+            .iter()
+            .map(|key| {
+                let (collection, handle) = split(key);
+                (Inline::new(collection), handle)
+            })
+            .collect();
         // Reports kept for a start-up walk that no walker will run (none is
         // attached, or it stopped): resolved here, as any report is then.
-        for (collection, tracked) in state.tracked.iter_mut() {
-            if !tracked.fresh && !tracked.warming && !tracked.deferred.is_empty() {
-                candidates.extend(
-                    std::mem::take(&mut tracked.deferred)
-                        .into_iter()
-                        .map(|handle| (*collection, handle)),
-                );
+        if !state.deferred.is_empty() {
+            let cold: Vec<Raw> = state
+                .held
+                .iter()
+                .filter(|collection| state.warming.get(collection).is_none())
+                .copied()
+                .collect();
+            for collection in cold {
+                for handle in take_related(&mut state.deferred, &collection) {
+                    candidates.push((Inline::new(collection), handle));
+                }
             }
         }
         for (collection, handle) in candidates {
-            let Some(entry) = state.tracked.get_mut(&collection) else {
-                continue;
-            };
-            if entry.held.has_prefix(&handle) {
+            if state.tracked.get(&collection.raw).is_none() {
                 continue;
             }
-            if entry.fresh || entry.warming {
+            let settled = state.held.get(&collection.raw);
+            if settled.is_some_and(|held| held.has_prefix(&handle)) {
+                continue;
+            }
+            if settled.is_none() || state.warming.get(&collection.raw).is_some() {
                 // Resolving it now could read a whole unscanned subtree while
                 // this snapshot is taken; the start-up walk reads it instead.
                 // A report of a blob that is not resident is dropped, as
@@ -798,17 +882,16 @@ impl<T: HeldSource> HeldIndex<T> {
                     .contains_blob(Inline::<Handle<UnknownBlob>>::new(handle))
                     .unwrap_or(false)
                 {
-                    entry.deferred.insert(handle);
+                    state
+                        .deferred
+                        .insert(&Entry::new(&pair(&collection.raw, &handle)));
                 }
                 continue;
             }
             if state.reach(Some(now), collection, [handle]) {
                 state
-                    .tracked
-                    .get_mut(&collection)
-                    .expect("tracked")
                     .routes
-                    .insert(handle);
+                    .insert(&Entry::new(&pair(&collection.raw, &handle)));
                 changed = true;
             }
         }
@@ -833,28 +916,18 @@ impl<T: HeldSource> HeldIndex<T> {
             return;
         }
         for (handle, children) in scanned {
-            let Some(children) = children else {
-                continue;
-            };
-            match state.edges.get_mut(&handle) {
-                Some(known) if **known == *children => {}
-                Some(known) => {
-                    let mut merged: Vec<Raw> =
-                        known.iter().chain(children.iter()).copied().collect();
-                    merged.sort_unstable();
-                    merged.dedup();
-                    *known = merged.into();
-                }
-                None => {
-                    state.edges.insert(handle, children);
-                }
+            if let Some(children) = children {
+                // Edges only accumulate: a rescan adds late children.
+                state.record_scan(handle, &children);
             }
         }
         for (collection, handle) in unreadable {
-            let Some(entry) = state.tracked.get(&collection) else {
+            let Some(held) = state.held.get(&collection.raw) else {
                 continue;
             };
-            if !entry.seeds.contains(&handle) || entry.held.has_prefix(&handle) {
+            if held.has_prefix(&handle)
+                || state.seeds.get(&pair(&collection.raw, &handle)).is_none()
+            {
                 continue;
             }
             // The walk read an older observation. A seed that arrived since
@@ -865,9 +938,13 @@ impl<T: HeldSource> HeldIndex<T> {
                     .unwrap_or(false)
             });
             if resident {
-                state.ready.push((collection, handle));
+                state
+                    .ready
+                    .insert(&Entry::new(&pair(&collection.raw, &handle)));
             } else {
-                state.pending.entry(handle).or_default().insert(collection);
+                state
+                    .pending
+                    .insert(&Entry::new(&pair(&handle, &collection.raw)));
             }
         }
         let mut changed = false;
@@ -891,12 +968,7 @@ impl<T: HeldSource> HeldIndex<T> {
     /// that waited for the walk and that it did not reach are walked last,
     /// against the latest observation, and become routes; the walk ends only
     /// when none is waiting, so none is left for a snapshot to read.
-    pub(crate) fn walk(
-        &self,
-        snapshot: &T,
-        threads: usize,
-        only: Option<&BTreeSet<CollectionHandle>>,
-    ) {
+    pub(crate) fn walk(&self, snapshot: &T, threads: usize, only: Option<&Handles>) {
         let (mut queue, epoch) = {
             let state = self.lock();
             (state.walk_roots(only), state.epoch)
@@ -923,24 +995,23 @@ impl<T: HeldSource> HeldIndex<T> {
             }
             let mut reports = Vec::new();
             for collection in &covered {
-                let Some(tracked) = state.tracked.get_mut(collection) else {
-                    continue;
-                };
                 let reached = seen.entry(*collection).or_default();
-                let unreached: Vec<Raw> = std::mem::take(&mut tracked.deferred)
-                    .into_iter()
-                    .filter(|handle| !reached.contains(handle))
-                    .collect();
+                let mut unreached = Vec::new();
+                for handle in take_related(&mut state.deferred, &collection.raw) {
+                    if !reached.contains(&handle) {
+                        state
+                            .routes
+                            .insert(&Entry::new(&pair(&collection.raw, &handle)));
+                        unreached.push(handle);
+                    }
+                }
                 if !unreached.is_empty() {
-                    tracked.routes.extend(unreached.iter().copied());
                     reports.push((*collection, unreached));
                 }
             }
             if reports.is_empty() {
                 for collection in &covered {
-                    if let Some(tracked) = state.tracked.get_mut(collection) {
-                        tracked.warming = false;
-                    }
+                    state.warming.remove(&collection.raw);
                 }
                 return;
             }
@@ -976,7 +1047,8 @@ impl<T: HeldSource> HeldIndex<T> {
                 .collect();
             need.sort_unstable();
             need.dedup();
-            let scanned = scan_all(snapshot, &need, threads, &abandoned);
+            let scanned: Vec<(Raw, Option<Arc<[Raw]>>)> =
+                scan_all(snapshot, &need, threads, &abandoned);
             if abandoned() {
                 // A partial level is not published.
                 return false;
@@ -1080,7 +1152,7 @@ fn scan_all<T: HeldSource>(
     let scan_part = |part: &[Raw]| {
         part.iter()
             .take_while(|_| !abandoned())
-            .map(|handle| (*handle, scan(snapshot, handle)))
+            .map(|handle| (*handle, scan(snapshot, handle).map(Arc::from)))
             .collect::<Vec<_>>()
     };
     if threads <= 1 || handles.len() < 2 {
