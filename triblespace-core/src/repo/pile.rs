@@ -1714,9 +1714,11 @@ pub enum PileRecordContent {
     },
     /// One structurally valid retired claim- or action-ID-based capability proof.
     ///
-    /// Current replay treats it as inert and semantic rewrites drop it. The
-    /// dedicated variant lets an old pile remain readable without mistaking
-    /// its earlier proof grammar for the current capability-handle grammar.
+    /// Current replay treats it as inert. It is still a capability record,
+    /// so retained rewrites carry its exact frame and keep every resident
+    /// blob its bytes may name. The dedicated variant lets an old pile remain
+    /// readable without mistaking its earlier proof grammar for the current
+    /// capability-handle grammar.
     RetiredCapabilityProof,
     /// One structurally valid retired PEER routing record.
     ///
@@ -3012,15 +3014,22 @@ pub struct PileFile {
     /// retained rewrite carries the frames exactly instead (`opaque_frames`).
     opaque_records: usize,
     /// Byte ranges `(offset, len)` of every opaque frame in the applied prefix,
-    /// in file order. A retained rewrite copies them by their own length,
-    /// because it keeps every resident blob and so cannot orphan whatever an
-    /// unknown kind names; a later binary that knows the kind reads them from
-    /// the rewritten pile exactly as it would have from the source.
+    /// in file order. A retained rewrite copies them by their own length and
+    /// keeps whatever resident blob they may name; a later binary that knows
+    /// the kind reads them from the rewritten pile exactly as it would have
+    /// from the source.
     opaque_frames: Vec<(usize, usize)>,
-    /// BLAKE3 digests of the exact bytes of those frames, so a rewrite into a
-    /// pile that already carries one appends nothing, at a set lookup per
-    /// frame rather than a scan of every earlier one.
-    opaque_digests: BTreeSet<[u8; 32]>,
+    /// Byte ranges `(offset, len)` of every retired capability-proof frame in
+    /// the applied prefix, in file order. Inert to replay, but capability
+    /// records, so a retained rewrite copies them exactly too. Shared with
+    /// snapshots, which see the log as it was when they were taken: an append
+    /// after one copies the log first.
+    retired_proof_frames: Arc<Vec<(usize, usize)>>,
+    /// BLAKE3 digests of the exact bytes of the opaque and retired-proof
+    /// frames, so a rewrite into a pile that already carries one appends
+    /// nothing, at a set lookup per frame rather than a scan of every earlier
+    /// one.
+    exact_frame_digests: PATCH<32, IdentitySchema>,
     /// Current grow-only blob request set. Retired weak-pin and typed LWW-log
     /// records are deliberately absent: they are raw input to the explicit
     /// WANT cutover migration, not live state that stale pile concatenation can
@@ -3065,6 +3074,8 @@ pub struct PileFileSnapshot {
     retired_equations: CollectionRecordIndex,
     capability_proofs: CapabilityProofIndex,
     wants: PATCH<WANT_REQUEST_BYTES_LEN, IdentitySchema>,
+    /// The pile's retired capability-proof frames as of this prefix.
+    retired_proof_frames: Arc<Vec<(usize, usize)>>,
 }
 
 /// Census of retired LWW WANT input relative to the current monotone set.
@@ -3097,6 +3108,7 @@ impl PileFileSnapshot {
         retired_equations: CollectionRecordIndex,
         capability_proofs: CapabilityProofIndex,
         wants: PATCH<WANT_REQUEST_BYTES_LEN, IdentitySchema>,
+        retired_proof_frames: Arc<Vec<(usize, usize)>>,
     ) -> Self {
         Self {
             record_origin,
@@ -3109,7 +3121,25 @@ impl PileFileSnapshot {
             retired_equations,
             capability_proofs,
             wants,
+            retired_proof_frames,
         }
+    }
+
+    /// The exact frame of every retired capability proof in this prefix, in
+    /// file order, a repeat of one included.
+    pub(crate) fn retired_capability_proof_frames(&self) -> impl Iterator<Item = &[u8]> + '_ {
+        self.retired_proof_frames
+            .iter()
+            .map(|(offset, len)| mapped_frame(self, *offset, *len))
+    }
+
+    /// Every handle any 32 bytes of a retired capability proof may name, so
+    /// a rewrite or a reclamation that carries the proof keeps what it names.
+    pub(crate) fn retired_capability_proof_references(
+        &self,
+    ) -> impl Iterator<Item = Inline<Handle<UnknownBlob>>> + '_ {
+        self.retired_capability_proof_frames()
+            .flat_map(frame_windows)
     }
 
     /// Returns an iterator over all blobs currently stored in the pile.
@@ -3259,6 +3289,74 @@ impl PileFileSnapshot {
             handle,
             length: header.data_len as u64,
         })
+    }
+
+    /// [`super::RetentionRoots::expanded`] for the filtered rewrite, which
+    /// returns apart, in the second set, every resident blob no occurrence of
+    /// which matches its hash, wherever it meets one: a direct root, a
+    /// recursive root or a child. Such a blob has no valid bytes to copy. Its
+    /// damaged bytes, every occurrence of them, are still read for children
+    /// (every aligned word naming a resident blob), so a valid blob named by
+    /// a word the damage left intact is kept. One named only by a damaged
+    /// word cannot be reached and is in neither set. A root that is not
+    /// resident stays in the keep set, where the copy refuses it, as
+    /// `expanded` leaves it.
+    fn expanded_setting_aside_corrupt(
+        &self,
+        roots: &super::RetentionRoots,
+    ) -> (
+        BTreeSet<Inline<Handle<UnknownBlob>>>,
+        BTreeSet<Inline<Handle<UnknownBlob>>>,
+    ) {
+        let mut keep = BTreeSet::new();
+        let mut corrupt = BTreeSet::new();
+        for handle in roots.direct() {
+            match self.get::<Bytes, UnknownBlob>(handle) {
+                Err(GetBlobError::ValidationError(_)) => corrupt.insert(handle),
+                _ => keep.insert(handle),
+            };
+        }
+        let mut seen: BTreeSet<[u8; 32]> = BTreeSet::new();
+        let mut queue: std::collections::VecDeque<_> = roots.recursive().collect();
+        while let Some(handle) = queue.pop_front() {
+            if !seen.insert(handle.raw) {
+                continue;
+            }
+            let read: Vec<Bytes> = match self.get::<Bytes, UnknownBlob>(handle) {
+                Ok(bytes) => {
+                    keep.insert(handle);
+                    vec![bytes]
+                }
+                Err(GetBlobError::ValidationError(_)) => {
+                    corrupt.insert(handle);
+                    let hash: &Inline<Hash<Blake3>> = handle.as_transmute();
+                    let mut occurrences = Vec::new();
+                    let mut entry = first_blob_occurrence(&self.blobs, &hash.raw);
+                    while let Some(at) = entry {
+                        occurrences.push(
+                            indexed_blob_record(&self.mmap, self.covered_len, at, hash).bytes,
+                        );
+                        entry = next_blob_occurrence(&self.blobs, &hash.raw, at);
+                    }
+                    occurrences
+                }
+                Err(_) => {
+                    keep.insert(handle);
+                    Vec::new()
+                }
+            };
+            for bytes in read {
+                for word in bytes.chunks_exact(32) {
+                    let child = Inline::<Handle<UnknownBlob>>::new(
+                        word.try_into().expect("chunks are 32 bytes"),
+                    );
+                    if !seen.contains(&child.raw) && self.blobs.has_prefix(&child.raw) {
+                        queue.push_back(child);
+                    }
+                }
+            }
+        }
+        (keep, corrupt)
     }
 
     /// Resolve one handle to any physical occurrence whose payload validates.
@@ -3433,6 +3531,7 @@ impl super::SnapshotSource for PileFile {
             self.retired_equations.clone(),
             self.capability_proofs.clone(),
             self.wants.clone(),
+            self.retired_proof_frames.clone(),
         ))
     }
 }
@@ -3829,7 +3928,8 @@ impl PileFile {
             retired_equations: CollectionRecordIndex::new(),
             opaque_records: 0,
             opaque_frames: Vec::new(),
-            opaque_digests: BTreeSet::new(),
+            retired_proof_frames: Arc::new(Vec::new()),
+            exact_frame_digests: PATCH::<32, IdentitySchema>::new(),
             wants: PATCH::<WANT_REQUEST_BYTES_LEN, IdentitySchema>::new(),
             applied_length: 0,
         })
@@ -4003,7 +4103,13 @@ impl PileFile {
                 }
                 Applied::CapabilityProof { id }
             }
-            PileRecordContent::RetiredCapabilityProof => Applied::RetiredCapabilityProof,
+            PileRecordContent::RetiredCapabilityProof => {
+                let frame_len = next_applied_length - start_offset;
+                Arc::make_mut(&mut self.retired_proof_frames).push((start_offset, frame_len));
+                self.exact_frame_digests
+                    .insert(&Entry::new(blake3::hash(&slice[..frame_len]).as_bytes()));
+                Applied::RetiredCapabilityProof
+            }
             PileRecordContent::RetiredPeerEvidenceV1 | PileRecordContent::RetiredStoreScopeV1 => {
                 Applied::RetiredTeamState
             }
@@ -4030,8 +4136,8 @@ impl PileFile {
                     .expect("opaque pile-record count overflow");
                 let frame_len = next_applied_length - start_offset;
                 self.opaque_frames.push((start_offset, frame_len));
-                self.opaque_digests
-                    .insert(*blake3::hash(&slice[..frame_len]).as_bytes());
+                self.exact_frame_digests
+                    .insert(&Entry::new(blake3::hash(&slice[..frame_len]).as_bytes()));
                 Applied::Opaque
             }
         };
@@ -4181,7 +4287,8 @@ impl PileFile {
             std::ptr::drop_in_place(&mut this.legacy_collection_headers);
             std::ptr::drop_in_place(&mut this.retired_equations);
             std::ptr::drop_in_place(&mut this.opaque_frames);
-            std::ptr::drop_in_place(&mut this.opaque_digests);
+            std::ptr::drop_in_place(&mut this.retired_proof_frames);
+            std::ptr::drop_in_place(&mut this.exact_frame_digests);
             std::ptr::drop_in_place(&mut this.wants);
         }
 
@@ -4496,6 +4603,21 @@ impl PileFile {
         Ok(())
     }
 
+    /// Carry every distinct retired capability proof into `destination`,
+    /// frame for frame: capability records, inert to replay. The
+    /// physical-rewrite primitive Yard reclaim uses beside
+    /// [`Self::preserve_retired_collection_equations_into`].
+    pub(crate) fn preserve_retired_capability_proofs_into(
+        &mut self,
+        destination: &mut PileFile,
+    ) -> Result<(), CollectionInsertError> {
+        let reader = self.snapshot()?;
+        for frame in reader.retired_capability_proof_frames() {
+            destination.preserve_exact_frame(frame)?;
+        }
+        Ok(())
+    }
+
     /// Carry every retired signed equation into `destination`, frame for
     /// frame. The physical-rewrite primitive Yard reclaim uses beside
     /// [`Self::preserve_legacy_collection_headers_into`].
@@ -4551,35 +4673,52 @@ impl PileFile {
         Ok(())
     }
 
-    /// Append one frame whose kind this binary does not model, exactly as it
-    /// was read, unless this pile already holds a byte-identical opaque frame.
+    /// Append one frame whose kind this binary does not model, or one retired
+    /// capability proof, exactly as it was read, unless this pile already
+    /// holds a byte-identical one.
     ///
     /// This is an internal physical-rewrite primitive. The frame is
     /// self-delimiting, so a reader of this pile skips or decodes it exactly
     /// as a reader of the source would; nothing about it is interpreted here.
-    fn preserve_opaque_frame(&mut self, frame: &[u8]) -> Result<(), CollectionInsertError> {
-        debug_assert!(matches!(
+    fn preserve_exact_frame(&mut self, frame: &[u8]) -> Result<(), CollectionInsertError> {
+        let retired_proof = matches!(
             decode_record(frame, 0),
             Ok(PileRecord {
-                content: PileRecordContent::Opaque { .. },
+                content: PileRecordContent::RetiredCapabilityProof,
                 ..
             })
-        ));
+        );
+        debug_assert!(
+            retired_proof
+                || matches!(
+                    decode_record(frame, 0),
+                    Ok(PileRecord {
+                        content: PileRecordContent::Opaque { .. },
+                        ..
+                    })
+                )
+        );
 
         self.file.lock()?;
         let result = (|| {
             self.refresh_locked()?;
 
-            if self.opaque_digests.contains(blake3::hash(frame).as_bytes()) {
+            if self
+                .exact_frame_digests
+                .get(blake3::hash(frame).as_bytes())
+                .is_some()
+            {
                 return Ok(());
             }
 
             self.dirty = true;
             self.file.write_all(frame)?;
 
-            match self.apply_next()? {
-                Some(Applied::Opaque) => Ok(()),
-                Some(_) | None => Err(CollectionInsertError::UnexpectedReadback),
+            match (self.apply_next()?, retired_proof) {
+                (Some(Applied::Opaque), false) | (Some(Applied::RetiredCapabilityProof), true) => {
+                    Ok(())
+                }
+                _ => Err(CollectionInsertError::UnexpectedReadback),
             }
         })();
         let unlock = self.file.unlock();
@@ -5790,7 +5929,7 @@ fn retired_signed_frame_equation_key(frame: &[u8]) -> Option<EquationKey> {
 }
 
 /// Deterministic accounting for one retained pile rewrite.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PileRewriteStats {
     /// Exact number of resident blobs selected and copied.
     pub retained_blobs: usize,
@@ -5800,6 +5939,8 @@ pub struct PileRewriteStats {
     pub wants: usize,
     /// Number of complete capability proofs preserved.
     pub capability_proofs: usize,
+    /// Number of distinct retired capability-proof frames carried exactly.
+    pub retired_capability_proofs: usize,
     /// Number of frames of unknown kind carried exactly, by their own length.
     pub opaque_frames: usize,
     /// Number of retired equation frames, unsigned or signed under a retired
@@ -5820,6 +5961,13 @@ pub struct PileRewriteStats {
     /// unknown kind held twice, as concatenation leaves them. The destination
     /// would store each once anyway.
     pub repeated_frames: usize,
+    /// Resident blobs the filtered rewrite's walk reached of which no
+    /// occurrence matches its hash, set aside under
+    /// [`CorruptBlobPolicy::SetAside`]: not copied, because there are no
+    /// valid bytes to copy. A valid blob named only by a damaged word of one
+    /// was not reached and is not copied either. Always empty for the plain
+    /// rewrites.
+    pub corrupt_blobs: BTreeSet<Inline<Handle<UnknownBlob>>>,
 }
 
 /// The accounting of a filtered retained rewrite, decided without writing
@@ -5834,8 +5982,13 @@ pub struct RetainedRewritePlan {
     pub retained: BTreeSet<Inline<Handle<UnknownBlob>>>,
     /// Distinct resident blobs that would be copied: `retained.len()`.
     pub retained_blobs: usize,
-    /// Their payload bytes.
+    /// Their payload bytes, counted from the occurrence the rewrite copies,
+    /// each blob's first valid one.
     pub retained_bytes: u64,
+    /// Complete capability proofs that would be preserved.
+    pub capability_proofs: usize,
+    /// Distinct retired capability-proof frames that would be carried.
+    pub retired_capability_proofs: usize,
     /// Frames of unknown kind that would be carried exactly.
     pub opaque_frames: usize,
     /// Retired equation frames left behind for a current signed twin.
@@ -5848,6 +6001,9 @@ pub struct RetainedRewritePlan {
     pub filtered_frames: usize,
     /// Frames held again at a later offset, considered once.
     pub repeated_frames: usize,
+    /// Reached resident blobs no occurrence of which matches its hash: the
+    /// rewrite refuses them, or sets them aside, as its caller decides.
+    pub corrupt_blobs: BTreeSet<Inline<Handle<UnknownBlob>>>,
 }
 
 /// The encoding generation of one collection-algebra frame.
@@ -5904,7 +6060,8 @@ pub struct CollectionFrame {
 /// header and every retired signed frame it crosses as opaque, before it
 /// applies drained generations or supersession. A frame repeated at a later
 /// offset (a pile made by concatenation) is asked about once. Frames of
-/// unknown kind, blobs, proofs, WANTs and pins are never asked about.
+/// unknown kind, blobs, proofs (current and retired), WANTs and pins are
+/// never asked about.
 ///
 /// [`PileFile::rewrite_retained_into_filtered`] roots only what carried
 /// frames name, so a frame the filter leaves behind roots nothing, and a blob
@@ -5932,6 +6089,8 @@ struct CollectionFrameSelection {
     strong_pins: PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>,
     legacy_headers: Vec<[u8; V3_HEADER_LEN]>,
     opaque_frames: Vec<(usize, usize)>,
+    /// Distinct retired capability-proof frames, in file order.
+    retired_proofs: Vec<(usize, usize)>,
     retired_equations: Vec<RetiredCollectionEquation>,
     /// Frame offsets of the current records to carry, in index order.
     current_records: Vec<[u8; 8]>,
@@ -5948,14 +6107,17 @@ enum FrameRetention {
     /// frame of unknown kind widens retention to every resident blob: the
     /// plain rewrite.
     EveryIndexedFrame,
-    /// Only carried frames root, and a carried frame of unknown kind roots
-    /// the resident blobs its aligned words name: the filtered rewrite.
+    /// Only carried frames root, a carried frame of unknown kind roots the
+    /// resident blobs any 32 bytes of it name, and a blob no occurrence of
+    /// which matches its hash is found wherever the walk meets it, for the
+    /// caller to refuse or set aside: the filtered rewrite.
     CarriedFrames,
 }
 
 /// What a retained rewrite keeps besides its frames.
 struct Retention {
     keep: BTreeSet<Inline<Handle<UnknownBlob>>>,
+    corrupt: BTreeSet<Inline<Handle<UnknownBlob>>>,
     capability_proofs: Vec<CapabilityProof>,
     preserved_wants: Vec<WantRequest>,
 }
@@ -5972,6 +6134,30 @@ pub struct DrainedGeneration {
     pub retired: CollectionHandle,
     /// The generation that now holds every one of its commits.
     pub current: CollectionHandle,
+}
+
+/// The bytes of the frame at `offset..offset + len` of `reader`'s mapping.
+fn mapped_frame(reader: &PileFileSnapshot, offset: usize, len: usize) -> &[u8] {
+    // Every caller passes a frame replay accepted below the covered prefix.
+    assert!(
+        offset + len <= reader.covered_len,
+        "frame beyond the prefix"
+    );
+    unsafe {
+        slice_from_raw_parts(reader.mmap.as_ptr().add(offset), len)
+            .as_ref()
+            .expect("mapped frame")
+    }
+}
+
+/// Every 32 bytes of a frame this binary does not interpret, at every byte
+/// offset, as a handle it may name. Frames have been laid out on a 36-byte
+/// prefix (the legacy V1 envelope) as well as on 32-byte boundaries, and a
+/// variable body may put a field anywhere, so no alignment is assumed.
+fn frame_windows(frame: &[u8]) -> impl Iterator<Item = Inline<Handle<UnknownBlob>>> + '_ {
+    frame
+        .windows(32)
+        .map(|window| Inline::new(window.try_into().expect("windows are 32 bytes")))
 }
 
 /// The blob handles a legacy V3 collection header names: a COMMIT's data and
@@ -6082,6 +6268,22 @@ fn close_drained_over_derivations(
     }
 }
 
+/// What [`PileFile::rewrite_retained_into_filtered`] does with a resident
+/// blob its walk reaches of which no occurrence matches its hash. Such a blob
+/// has no valid bytes to copy, and a valid blob named only by a damaged word
+/// of one cannot be reached.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CorruptBlobPolicy {
+    /// Fail the rewrite before anything is written, with
+    /// [`PileRewriteError::Corrupt`] naming every such blob.
+    Refuse,
+    /// Set each one aside: not copied, and listed in
+    /// [`PileRewriteStats::corrupt_blobs`]. Its damaged bytes are still read
+    /// for what they name, but a valid blob named only by a damaged word is
+    /// left behind.
+    SetAside,
+}
+
 /// Failure while copying one policy-selected pile state into another pile.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -6118,6 +6320,12 @@ pub enum PileRewriteError {
     },
     /// The drain check itself could not read the source.
     Drain(String),
+    /// The walk reached resident blobs of which no occurrence matches its
+    /// hash, under [`CorruptBlobPolicy::Refuse`]. Nothing was written.
+    Corrupt {
+        /// Every such blob.
+        blobs: BTreeSet<Inline<Handle<UnknownBlob>>>,
+    },
 }
 
 impl std::fmt::Display for PileRewriteError {
@@ -6149,6 +6357,17 @@ impl std::fmt::Display for PileRewriteError {
                 hex::encode(current.raw)
             ),
             Self::Drain(error) => write!(f, "failed to check a drained generation: {error}"),
+            Self::Corrupt { blobs } => {
+                write!(
+                    f,
+                    "{} reached blob(s) have no occurrence matching their hash:",
+                    blobs.len()
+                )?;
+                for blob in blobs {
+                    write!(f, " blake3:{}", hex::encode_upper(blob.raw))?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -6162,7 +6381,10 @@ impl Error for PileRewriteError {
             Self::Collection(error) => Some(error),
             Self::CapabilityProof(error) => Some(error),
             Self::Flush(error) => Some(error),
-            Self::StrongPinConflict { .. } | Self::Undrained { .. } | Self::Drain(_) => None,
+            Self::StrongPinConflict { .. }
+            | Self::Undrained { .. }
+            | Self::Drain(_)
+            | Self::Corrupt { .. } => None,
         }
     }
 }
@@ -6248,27 +6470,27 @@ impl PileFile {
     ) -> Result<RetainedRewritePlan, PileRewriteError> {
         let selection = self.select_collection_frames(drained_generations, filter)?;
         let retention = self.retention(&selection, explicit, wants, FrameRetention::CarriedFrames);
+        // The bytes the copy takes: each blob's first valid occurrence, which
+        // the walk has validated already, not its first occurrence.
         let retained_bytes = retention
             .keep
             .iter()
-            .filter_map(|handle| {
-                selection
-                    .reader
-                    .blob_info(*handle)
-                    .expect("PileFileSnapshot blob lookup is infallible")
-            })
-            .map(|info| info.length)
+            .filter_map(|handle| selection.reader.get::<Bytes, UnknownBlob>(*handle).ok())
+            .map(|bytes| bytes.len() as u64)
             .sum();
         Ok(RetainedRewritePlan {
             retained_blobs: retention.keep.len(),
             retained: retention.keep,
             retained_bytes,
+            capability_proofs: retention.capability_proofs.len(),
+            retired_capability_proofs: selection.retired_proofs.len(),
             opaque_frames: selection.opaque_frames.len(),
             superseded_equations: selection.superseded_equations,
             drained_frames: selection.drained_frames,
             retired_equations: selection.retired_equations.len(),
             filtered_frames: selection.filtered_frames,
             repeated_frames: selection.repeated_frames,
+            corrupt_blobs: retention.corrupt,
         })
     }
 
@@ -6281,13 +6503,27 @@ impl PileFile {
     /// Retention follows the frames carried, not every frame indexed: a frame
     /// left behind (filtered, drained or superseded) roots nothing, and a
     /// carried frame of a kind this binary does not model roots,
-    /// conservatively, every resident blob one of its aligned 32-byte words
-    /// names, instead of every resident blob. Carried records, proofs, WANTs
-    /// and legacy pins root what they name as in the plain rewrite, a carried
-    /// legacy V3 header roots the blob handles its fields name, and every
-    /// resident description of a record kind this binary writes is kept. So
-    /// with `explicit` naming every resident blob nothing is dropped, and with
-    /// no explicit roots every blob the carried state cannot reach is.
+    /// conservatively, every resident blob any 32 bytes of it name, at any
+    /// offset, instead of every resident blob. Carried records, proofs,
+    /// retired proofs, WANTs and legacy pins root what they name as in the
+    /// plain rewrite, a carried legacy V3 header roots the blob handles its
+    /// fields name, and every resident description of a record kind this
+    /// binary writes is kept. So with `explicit` naming every resident blob
+    /// nothing valid is dropped, and with no explicit roots every blob the
+    /// carried state cannot reach is.
+    ///
+    /// A resident blob no occurrence of which matches its hash has no valid
+    /// bytes to copy. The walk finds every one it meets, named by a carried
+    /// frame, by an explicit root (direct or recursive) or by another blob.
+    /// Under [`CorruptBlobPolicy::Refuse`] any such blob fails the rewrite
+    /// before anything is written, as a missing or invalid explicitly
+    /// selected blob fails the plain rewrite. Under
+    /// [`CorruptBlobPolicy::SetAside`] each is left out of the copy and listed
+    /// in [`PileRewriteStats::corrupt_blobs`]. Its damaged bytes are still
+    /// read for children, so a valid blob named by a word the damage left
+    /// intact is kept, but one named only by a damaged word cannot be reached
+    /// and is left behind: setting corruption aside can lose valid bytes,
+    /// which is why refusing is the caller's first choice.
     pub fn rewrite_retained_into_filtered(
         &mut self,
         destination: &mut PileFile,
@@ -6295,9 +6531,15 @@ impl PileFile {
         wants: WantRewritePolicy,
         drained_generations: &[DrainedGeneration],
         filter: &mut dyn CollectionFrameFilter,
+        corrupt: CorruptBlobPolicy,
     ) -> Result<PileRewriteStats, PileRewriteError> {
         let selection = self.select_collection_frames(drained_generations, filter)?;
         let retention = self.retention(&selection, explicit, wants, FrameRetention::CarriedFrames);
+        if corrupt == CorruptBlobPolicy::Refuse && !retention.corrupt.is_empty() {
+            return Err(PileRewriteError::Corrupt {
+                blobs: retention.corrupt,
+            });
+        }
         Self::write_selection(destination, selection, retention)
     }
 
@@ -6356,26 +6598,27 @@ impl PileFile {
                         roots.retain_direct(info.handle);
                     }
                 }
-                // Every frame lays its fields out in aligned 32-byte slots, so
-                // the conservative reading of an unknown frame is the one the
-                // blob walk applies to an unknown blob: every aligned word
-                // that names a resident blob is a reference.
+                // Not every frame kept its fields on 32-byte boundaries (the
+                // legacy V1 envelope's 36-byte prefix did not), so the
+                // conservative reading of an unknown frame is every 32 bytes
+                // of it, at every offset, that name a resident blob.
                 FrameRetention::CarriedFrames => {
                     for (offset, len) in &selection.opaque_frames {
-                        let frame = unsafe {
-                            slice_from_raw_parts(reader.mmap.as_ptr().add(*offset), *len)
-                                .as_ref()
-                                .expect("mapped opaque frame")
-                        };
-                        for word in frame.chunks_exact(32) {
-                            let handle = Inline::<Handle<UnknownBlob>>::new(
-                                word.try_into().expect("chunks are 32 bytes"),
-                            );
+                        for handle in frame_windows(mapped_frame(reader, *offset, *len)) {
                             if resident(handle) {
                                 roots.retain_recursive(handle);
                             }
                         }
                     }
+                }
+            }
+        }
+        // A retired proof is read no further than its structure, so it is
+        // read as an unknown frame is.
+        for (offset, len) in &selection.retired_proofs {
+            for handle in frame_windows(mapped_frame(reader, *offset, *len)) {
+                if resident(handle) {
+                    roots.retain_recursive(handle);
                 }
             }
         }
@@ -6511,14 +6754,19 @@ impl PileFile {
                 }
             }
         }
-        let mut keep = roots.expanded(reader);
+        let expand = |roots: &super::RetentionRoots| match mode {
+            FrameRetention::EveryIndexedFrame => (roots.expanded(reader), BTreeSet::new()),
+            FrameRetention::CarriedFrames => reader.expanded_setting_aside_corrupt(roots),
+        };
+        let (mut keep, mut corrupt) = expand(&roots);
         let emits_blob = keep.iter().any(|handle| resident(*handle));
         if emits_blob {
             retain_record_kind_if_resident(&mut roots, reader, blob_record_kind());
-            keep = roots.expanded(reader);
+            (keep, corrupt) = expand(&roots);
         }
         Retention {
             keep,
+            corrupt,
             capability_proofs,
             preserved_wants,
         }
@@ -6535,6 +6783,7 @@ impl PileFile {
             strong_pins,
             legacy_headers,
             opaque_frames,
+            retired_proofs,
             retired_equations,
             current_records,
             superseded_equations,
@@ -6544,6 +6793,7 @@ impl PileFile {
         } = selection;
         let Retention {
             keep,
+            corrupt,
             capability_proofs,
             preserved_wants,
         } = retention;
@@ -6583,13 +6833,8 @@ impl PileFile {
         }
 
         for (offset, len) in &opaque_frames {
-            let frame = unsafe {
-                slice_from_raw_parts(reader.mmap.as_ptr().add(*offset), *len)
-                    .as_ref()
-                    .expect("mapped opaque frame")
-            };
             destination
-                .preserve_opaque_frame(frame)
+                .preserve_exact_frame(mapped_frame(&reader, *offset, *len))
                 .map_err(PileRewriteError::Collection)?;
         }
 
@@ -6611,6 +6856,11 @@ impl PileFile {
                 .insert_proof(proof)
                 .map_err(PileRewriteError::CapabilityProof)?;
         }
+        for (offset, len) in &retired_proofs {
+            destination
+                .preserve_exact_frame(mapped_frame(&reader, *offset, *len))
+                .map_err(PileRewriteError::Collection)?;
+        }
 
         for request in &preserved_wants {
             destination.want(*request).map_err(PileRewriteError::Want)?;
@@ -6622,12 +6872,14 @@ impl PileFile {
             strong_pins: strong_pins.len() as usize,
             wants: preserved_wants.len(),
             capability_proofs: capability_proof_count,
+            retired_capability_proofs: retired_proofs.len(),
             opaque_frames: opaque_frames.len(),
             superseded_equations,
             drained_frames,
             retired_equations: retired_equations.len(),
             filtered_frames,
             repeated_frames,
+            corrupt_blobs: corrupt,
         })
     }
 
@@ -6663,7 +6915,7 @@ impl PileFile {
         // knows the kind reads them unchanged. Neither rewrite orphans what
         // such a frame names: the plain one widens retention to every
         // resident blob when it carries one, the filtered one roots every
-        // resident blob an aligned word of a carried one names. Yard
+        // resident blob any 32 bytes of a carried one name. Yard
         // reclamation, which drops blobs without either, still refuses on
         // them.
         self.physical_rewrite_guard()
@@ -6770,6 +7022,19 @@ impl PileFile {
                 continue;
             }
             opaque_frames.push((offset, len));
+        }
+
+        // Retired capability proofs are capability records: each distinct
+        // one is carried, never asked about.
+        let mut retired_proofs = Vec::new();
+        let mut proofs_seen: BTreeSet<[u8; 32]> = BTreeSet::new();
+        for (offset, len) in reader.retired_proof_frames.iter().copied() {
+            let frame = mapped_frame(&reader, offset, len);
+            if !proofs_seen.insert(*blake3::hash(frame).as_bytes()) {
+                repeated_frames += 1;
+                continue;
+            }
+            retired_proofs.push((offset, len));
         }
 
         let mut legacy_headers = Vec::new();
@@ -6888,6 +7153,7 @@ impl PileFile {
             strong_pins,
             legacy_headers,
             opaque_frames,
+            retired_proofs,
             retired_equations,
             current_records,
             superseded_equations,
@@ -10745,12 +11011,14 @@ mod tests {
                 strong_pins: 1,
                 wants: 1,
                 capability_proofs: 0,
+                retired_capability_proofs: 0,
                 opaque_frames: 0,
                 superseded_equations: 0,
                 drained_frames: 0,
                 retired_equations: 0,
                 filtered_frames: 0,
                 repeated_frames: 0,
+                corrupt_blobs: BTreeSet::new(),
             }
         );
 
@@ -13702,6 +13970,7 @@ mod tests {
                 WantRewritePolicy::Drop,
                 &[],
                 &mut rewriting,
+                CorruptBlobPolicy::Refuse,
             )
             .unwrap();
         assert_eq!(rewriting.asked, planning.asked);
@@ -13787,6 +14056,7 @@ mod tests {
                     target: dropped,
                     asked: Vec::new(),
                 },
+                CorruptBlobPolicy::Refuse,
             )
             .unwrap();
         assert_eq!(again.filtered_frames, stats.filtered_frames);
@@ -13917,6 +14187,7 @@ mod tests {
                 WantRewritePolicy::Drop,
                 &[],
                 &mut DropMergesAndDerivesInto(dropped),
+                CorruptBlobPolicy::Refuse,
             )
             .unwrap();
         assert_eq!(stats.retained_blobs, plan.retained_blobs);
@@ -14101,6 +14372,7 @@ mod tests {
                 WantRewritePolicy::Preserve,
                 &[],
                 &mut DropMerges,
+                CorruptBlobPolicy::Refuse,
             )
             .unwrap();
         assert_eq!(
@@ -14260,6 +14532,7 @@ mod tests {
                     WantRewritePolicy::Drop,
                     &[],
                     &mut rewriting,
+                    CorruptBlobPolicy::Refuse,
                 )
                 .unwrap();
             assert_eq!(planning.0, rewriting.0);
@@ -14306,6 +14579,697 @@ mod tests {
         assert_eq!(records_double, records_single);
         assert_eq!(blobs_double, blobs_single);
         assert_eq!(frames_double, frames_single);
+    }
+
+    /// Flip the payload byte at `at` of the `nth` blob record of `handle`, in
+    /// file order, for each `(nth, at)`.
+    fn damage_blob_occurrences(
+        path: &Path,
+        handle: Inline<Handle<UnknownBlob>>,
+        damage: &[(usize, usize)],
+    ) {
+        use std::io::{Seek, SeekFrom};
+        let offsets: Vec<usize> = PileRecords::open(path)
+            .unwrap()
+            .filter_map(|record| match record.unwrap().content {
+                PileRecordContent::Blob {
+                    hash, data_offset, ..
+                } if hash.raw == handle.raw => Some(data_offset),
+                _ => None,
+            })
+            .collect();
+        let bytes = std::fs::read(path).unwrap();
+        let mut file = OpenOptions::new().write(true).open(path).unwrap();
+        for (nth, at) in damage {
+            let position = offsets[*nth] + at;
+            file.seek(SeekFrom::Start(position as u64)).unwrap();
+            file.write_all(&[bytes[position] ^ 0xFF]).unwrap();
+        }
+        file.sync_all().unwrap();
+    }
+
+    /// Damage the first payload byte of every blob record of `handle`, so no
+    /// occurrence of it matches its hash any more.
+    fn damage_blob_payload(path: &Path, handle: Inline<Handle<UnknownBlob>>) {
+        let count = PileRecords::open(path)
+            .unwrap()
+            .filter(|record| {
+                matches!(
+                    record.as_ref().unwrap().content,
+                    PileRecordContent::Blob { hash, .. } if hash.raw == handle.raw
+                )
+            })
+            .count();
+        assert!(count > 0, "{handle:?} has a blob record");
+        let damage: Vec<_> = (0..count).map(|nth| (nth, 0)).collect();
+        damage_blob_occurrences(path, handle, &damage);
+    }
+
+    /// A frame this binary cannot interpret may name a blob at any byte
+    /// offset: the legacy V1 envelope's 36-byte prefix put every field four
+    /// bytes off a 32-byte boundary, so a retired local-cell Replace in it
+    /// holds its archive at bytes 52..84. The filtered rewrite, with no
+    /// explicit roots, keeps every resident blob such a carried frame names
+    /// at any offset, and still leaves behind what nothing names.
+    #[test]
+    fn a_filtered_rewrite_keeps_what_a_carried_opaque_frame_names_off_alignment() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "unaligned-source.pile");
+        let mut source = Pile::open(&source_path).unwrap();
+        let put = |source: &mut Pile, bytes: &[u8]| {
+            source
+                .put::<UnknownBlob, _>(Bytes::from_source(bytes.to_vec()))
+                .unwrap()
+        };
+        let cell_archive = put(&mut source, b"named by a retired enveloped cell");
+        let v1_field = put(&mut source, b"named by an unknown V1-envelope kind");
+        let current_field = put(&mut source, b"named off alignment by an unknown kind");
+        let unrelated = put(&mut source, b"named by nothing");
+        source.close().unwrap();
+
+        let mut cell = test_envelope_v1_bytes(
+            MAGIC_MARKER_LOCAL_CELL_V3,
+            ENVELOPE_HEADER_BLOCKS,
+            ENVELOPE_HEADER_LEN,
+        );
+        cell[52..84].copy_from_slice(&cell_archive.raw);
+        append_test_bytes(&source_path, &cell);
+        let mut unknown_v1 = test_envelope_v1_bytes([0x5E; 16], 1, ENVELOPE_BLOCK_LEN);
+        unknown_v1[36..68].copy_from_slice(&v1_field.raw);
+        append_test_bytes(&source_path, &unknown_v1);
+        let mut unknown = test_envelope_bytes(TEST_UNKNOWN_KIND_B, 1, ENVELOPE_BLOCK_LEN);
+        unknown[FRAME_BODY_OFFSET + 7..FRAME_BODY_OFFSET + 39].copy_from_slice(&current_field.raw);
+        append_test_bytes(&source_path, &unknown);
+
+        let mut source = Pile::open(&source_path).unwrap();
+        let plan = source
+            .plan_retained_rewrite(
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+                &[],
+                &mut CarryEveryFrame,
+            )
+            .unwrap();
+        let destination_path = fresh_empty_pile_path(&dir, "unaligned-destination.pile");
+        let mut destination = Pile::open(&destination_path).unwrap();
+        let stats = source
+            .rewrite_retained_into_filtered(
+                &mut destination,
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+                &[],
+                &mut CarryEveryFrame,
+                CorruptBlobPolicy::Refuse,
+            )
+            .unwrap();
+        assert_eq!(stats.opaque_frames, 3);
+        let reader = destination.snapshot().unwrap();
+        for handle in [cell_archive, v1_field, current_field] {
+            assert!(
+                reader.contains_blob(handle).unwrap(),
+                "{handle:?} is named by a carried frame"
+            );
+        }
+        assert!(!reader.contains_blob(unrelated).unwrap());
+        let held: BTreeSet<Inline<Handle<UnknownBlob>>> =
+            reader.blobs().map(|info| info.unwrap().handle).collect();
+        assert_eq!(held, plan.retained);
+        drop(reader);
+        destination.close().unwrap();
+        source.close().unwrap();
+    }
+
+    /// Retired capability proofs are capability records: a retained rewrite
+    /// carries each distinct one byte for byte, as it carries current proofs,
+    /// and keeps whatever resident blob its bytes may name at any offset. A
+    /// proof held twice (a concatenated pile) is carried once.
+    #[test]
+    fn retained_rewrites_carry_retired_capability_proofs_with_what_they_may_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "retired-proofs-source.pile");
+        let mut source = Pile::open(&source_path).unwrap();
+        let named = source
+            .put::<UnknownBlob, _>(Bytes::from_source(b"named inside a retired proof".to_vec()))
+            .unwrap();
+        let unrelated = source
+            .put::<UnknownBlob, _>(Bytes::from_source(b"named by nothing".to_vec()))
+            .unwrap();
+        source.close().unwrap();
+        // A V1 body: a root key and one 128-byte edge whose delegate key
+        // sits at 96..128; the edge's first 96 bytes are not checked, and
+        // hold the handle five bytes in.
+        let mut body = vec![0x3A; 160];
+        body[..32].copy_from_slice(&SigningKey::from_bytes(&[81; 32]).verifying_key().to_bytes());
+        body[32 + 5..32 + 37].copy_from_slice(&named.raw);
+        body[32 + 96..]
+            .copy_from_slice(&SigningKey::from_bytes(&[82; 32]).verifying_key().to_bytes());
+        let v1 = retired_capability_v1_record(&body);
+        let mut v2 = retired_capability_v1_record(&crate::capability::LEGACY_ACTION_PROOF_FIXTURE);
+        v2[FRAME_BODY_OFFSET - 32..FRAME_BODY_OFFSET]
+            .copy_from_slice(&record_kind::KIND_AUTH_PROOF_V2);
+        append_test_bytes(&source_path, &v1);
+        append_test_bytes(&source_path, &v2);
+        append_test_bytes(&source_path, &v1);
+
+        let retired_frames = |path: &Path| -> Vec<Vec<u8>> {
+            let mut records = PileRecords::open(path).unwrap();
+            let mut frames = Vec::new();
+            while let Some(record) = records.next() {
+                let record = record.unwrap();
+                if matches!(record.content, PileRecordContent::RetiredCapabilityProof) {
+                    frames
+                        .push(records.bytes()[record.offset..record.offset + record.len].to_vec());
+                }
+            }
+            frames
+        };
+
+        let mut source = Pile::open(&source_path).unwrap();
+        let plan = source
+            .plan_retained_rewrite(
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+                &[],
+                &mut CarryEveryFrame,
+            )
+            .unwrap();
+        assert_eq!(
+            (plan.retired_capability_proofs, plan.repeated_frames),
+            (2, 1)
+        );
+        let filtered_path = fresh_empty_pile_path(&dir, "retired-proofs-filtered.pile");
+        let mut filtered = Pile::open(&filtered_path).unwrap();
+        let stats = source
+            .rewrite_retained_into_filtered(
+                &mut filtered,
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+                &[],
+                &mut CarryEveryFrame,
+                CorruptBlobPolicy::Refuse,
+            )
+            .unwrap();
+        assert_eq!(
+            (stats.retired_capability_proofs, stats.repeated_frames),
+            (2, 1)
+        );
+        // A retry into the same destination appends nothing.
+        let before = std::fs::metadata(&filtered_path).unwrap().len();
+        source
+            .rewrite_retained_into_filtered(
+                &mut filtered,
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+                &[],
+                &mut CarryEveryFrame,
+                CorruptBlobPolicy::Refuse,
+            )
+            .unwrap();
+        assert_eq!(std::fs::metadata(&filtered_path).unwrap().len(), before);
+        let reader = filtered.snapshot().unwrap();
+        assert!(reader.contains_blob(named).unwrap());
+        assert!(!reader.contains_blob(unrelated).unwrap());
+        drop(reader);
+        filtered.close().unwrap();
+        assert_eq!(retired_frames(&filtered_path), vec![v1.clone(), v2.clone()]);
+
+        let plain_path = fresh_empty_pile_path(&dir, "retired-proofs-plain.pile");
+        let mut plain = Pile::open(&plain_path).unwrap();
+        let stats = source
+            .rewrite_retained_into(&mut plain, &RetentionRoots::new(), WantRewritePolicy::Drop)
+            .unwrap();
+        assert_eq!(stats.retired_capability_proofs, 2);
+        let reader = plain.snapshot().unwrap();
+        assert!(reader.contains_blob(named).unwrap());
+        drop(reader);
+        plain.close().unwrap();
+        assert_eq!(retired_frames(&plain_path), vec![v1, v2]);
+        source.close().unwrap();
+    }
+
+    /// A corrupt blob (resident, but no occurrence matches its hash) met
+    /// inside the walk fails the filtered rewrite by default, before anything
+    /// is written. Set aside, it is not copied, and its damaged bytes are
+    /// still read for children: a valid blob named by an intact word of it is
+    /// kept, but one named only by a damaged word cannot be reached and is
+    /// left behind, which is why refusing is the default.
+    #[test]
+    fn a_nested_corrupt_blob_is_refused_or_set_aside_with_its_intact_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "nested-corrupt-source.pile");
+        let key = SigningKey::from_bytes(&[91; 32]);
+        let root = collection_test_collection(92);
+        let mut source = Pile::open(&source_path).unwrap();
+        let put = |source: &mut Pile, bytes: Vec<u8>| {
+            source
+                .put::<UnknownBlob, _>(Bytes::from_source(bytes))
+                .unwrap()
+        };
+        let intact = put(&mut source, b"named by an intact word".to_vec());
+        let lost = put(&mut source, b"named only by a damaged word".to_vec());
+        let mut child_bytes = vec![0x77; 32];
+        child_bytes.extend_from_slice(&intact.raw);
+        child_bytes.extend_from_slice(&lost.raw);
+        let child = put(&mut source, child_bytes);
+        let mut parent_bytes = vec![0x11; 32];
+        parent_bytes.extend_from_slice(&child.raw);
+        let parent = put(&mut source, parent_bytes);
+        source
+            .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                &key,
+                root,
+                Inline::new(parent.raw),
+                empty_metadata_handle(),
+            )))
+            .unwrap();
+        source.close().unwrap();
+        // Damage a filler word and the word that names `lost`.
+        damage_blob_occurrences(&source_path, child, &[(0, 0), (0, 64)]);
+
+        let mut source = Pile::open(&source_path).unwrap();
+        let plan = source
+            .plan_retained_rewrite(
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+                &[],
+                &mut CarryEveryFrame,
+            )
+            .unwrap();
+        assert_eq!(plan.corrupt_blobs, BTreeSet::from([child]));
+        assert!(!plan.retained.contains(&lost));
+
+        let refused_path = fresh_empty_pile_path(&dir, "nested-corrupt-refused.pile");
+        let mut refused = Pile::open(&refused_path).unwrap();
+        let error = source
+            .rewrite_retained_into_filtered(
+                &mut refused,
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+                &[],
+                &mut CarryEveryFrame,
+                CorruptBlobPolicy::Refuse,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&error, PileRewriteError::Corrupt { blobs } if *blobs == BTreeSet::from([child])),
+            "{error}"
+        );
+        refused.close().unwrap();
+        assert_eq!(std::fs::metadata(&refused_path).unwrap().len(), 0);
+
+        let destination_path = fresh_empty_pile_path(&dir, "nested-corrupt-destination.pile");
+        let mut destination = Pile::open(&destination_path).unwrap();
+        let stats = source
+            .rewrite_retained_into_filtered(
+                &mut destination,
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+                &[],
+                &mut CarryEveryFrame,
+                CorruptBlobPolicy::SetAside,
+            )
+            .unwrap();
+        assert_eq!(stats.corrupt_blobs, BTreeSet::from([child]));
+        let reader = destination.snapshot().unwrap();
+        assert!(reader.contains_blob(parent).unwrap());
+        assert!(
+            reader.contains_blob(intact).unwrap(),
+            "a valid blob named by an intact word of a damaged one is kept"
+        );
+        assert!(!reader.contains_blob(child).unwrap());
+        assert!(
+            !reader.contains_blob(lost).unwrap(),
+            "a valid blob named only by a damaged word is left behind"
+        );
+        let held: BTreeSet<Inline<Handle<UnknownBlob>>> =
+            reader.blobs().map(|info| info.unwrap().handle).collect();
+        assert_eq!(held, plan.retained);
+        drop(reader);
+        destination.close().unwrap();
+        source.close().unwrap();
+    }
+
+    /// A corrupt blob a kept record names directly is found as one met inside
+    /// the walk is: refused by default, where the plan used to count it as
+    /// kept and the copy then failed on it, and set aside when told.
+    #[test]
+    fn a_corrupt_blob_a_kept_record_names_is_refused_or_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "rooted-corrupt-source.pile");
+        let key = SigningKey::from_bytes(&[93; 32]);
+        let root = collection_test_collection(94);
+        let mut source = Pile::open(&source_path).unwrap();
+        let payload = source
+            .put::<UnknownBlob, _>(Bytes::from_source(b"committed, then damaged".to_vec()))
+            .unwrap();
+        let other = source
+            .put::<UnknownBlob, _>(Bytes::from_source(b"committed and intact".to_vec()))
+            .unwrap();
+        for data in [payload, other] {
+            source
+                .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                    &key,
+                    root,
+                    Inline::new(data.raw),
+                    empty_metadata_handle(),
+                )))
+                .unwrap();
+        }
+        source.close().unwrap();
+        damage_blob_payload(&source_path, payload);
+
+        let mut source = Pile::open(&source_path).unwrap();
+        let plan = source
+            .plan_retained_rewrite(
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+                &[],
+                &mut CarryEveryFrame,
+            )
+            .unwrap();
+        assert_eq!(plan.corrupt_blobs, BTreeSet::from([payload]));
+        assert!(!plan.retained.contains(&payload));
+        let refused_path = fresh_empty_pile_path(&dir, "rooted-corrupt-refused.pile");
+        let mut refused = Pile::open(&refused_path).unwrap();
+        assert!(matches!(
+            source.rewrite_retained_into_filtered(
+                &mut refused,
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+                &[],
+                &mut CarryEveryFrame,
+                CorruptBlobPolicy::Refuse,
+            ),
+            Err(PileRewriteError::Corrupt { blobs }) if blobs == BTreeSet::from([payload])
+        ));
+        refused.close().unwrap();
+        assert_eq!(std::fs::metadata(&refused_path).unwrap().len(), 0);
+
+        let destination_path = fresh_empty_pile_path(&dir, "rooted-corrupt-destination.pile");
+        let mut destination = Pile::open(&destination_path).unwrap();
+        let stats = source
+            .rewrite_retained_into_filtered(
+                &mut destination,
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+                &[],
+                &mut CarryEveryFrame,
+                CorruptBlobPolicy::SetAside,
+            )
+            .unwrap();
+        assert_eq!(stats.retained_blobs, plan.retained_blobs);
+        assert_eq!(stats.corrupt_blobs, plan.corrupt_blobs);
+        let reader = destination.snapshot().unwrap();
+        assert!(reader.contains_blob(other).unwrap());
+        assert!(!reader.contains_blob(payload).unwrap());
+        let held: BTreeSet<Inline<Handle<UnknownBlob>>> =
+            reader.blobs().map(|info| info.unwrap().handle).collect();
+        assert_eq!(held, plan.retained);
+        drop(reader);
+        destination.close().unwrap();
+        source.close().unwrap();
+    }
+
+    /// A corrupt blob named as a direct root is found too: never counted as
+    /// kept, refused by default and set aside when told.
+    #[test]
+    fn a_corrupt_direct_root_is_refused_or_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "direct-corrupt-source.pile");
+        let mut source = Pile::open(&source_path).unwrap();
+        let damaged = source
+            .put::<UnknownBlob, _>(Bytes::from_source(b"a direct root, damaged".to_vec()))
+            .unwrap();
+        let intact = source
+            .put::<UnknownBlob, _>(Bytes::from_source(b"a direct root, intact".to_vec()))
+            .unwrap();
+        source.close().unwrap();
+        damage_blob_payload(&source_path, damaged);
+        let mut roots = RetentionRoots::new();
+        roots.retain_direct(damaged);
+        roots.retain_direct(intact);
+
+        let mut source = Pile::open(&source_path).unwrap();
+        let plan = source
+            .plan_retained_rewrite(&roots, WantRewritePolicy::Drop, &[], &mut CarryEveryFrame)
+            .unwrap();
+        assert_eq!(plan.corrupt_blobs, BTreeSet::from([damaged]));
+        assert_eq!(plan.retained, BTreeSet::from([intact]));
+        let refused_path = fresh_empty_pile_path(&dir, "direct-corrupt-refused.pile");
+        let mut refused = Pile::open(&refused_path).unwrap();
+        assert!(matches!(
+            source.rewrite_retained_into_filtered(
+                &mut refused,
+                &roots,
+                WantRewritePolicy::Drop,
+                &[],
+                &mut CarryEveryFrame,
+                CorruptBlobPolicy::Refuse,
+            ),
+            Err(PileRewriteError::Corrupt { blobs }) if blobs == BTreeSet::from([damaged])
+        ));
+        refused.close().unwrap();
+        assert_eq!(std::fs::metadata(&refused_path).unwrap().len(), 0);
+
+        let destination_path = fresh_empty_pile_path(&dir, "direct-corrupt-destination.pile");
+        let mut destination = Pile::open(&destination_path).unwrap();
+        let stats = source
+            .rewrite_retained_into_filtered(
+                &mut destination,
+                &roots,
+                WantRewritePolicy::Drop,
+                &[],
+                &mut CarryEveryFrame,
+                CorruptBlobPolicy::SetAside,
+            )
+            .unwrap();
+        assert_eq!(stats.corrupt_blobs, BTreeSet::from([damaged]));
+        let reader = destination.snapshot().unwrap();
+        let held: BTreeSet<Inline<Handle<UnknownBlob>>> =
+            reader.blobs().map(|info| info.unwrap().handle).collect();
+        assert_eq!(held, BTreeSet::from([intact]));
+        drop(reader);
+        destination.close().unwrap();
+        source.close().unwrap();
+    }
+
+    /// A blob held twice, each occurrence damaged in a different word, is
+    /// read through every occurrence: each valid child is named by an intact
+    /// word of one of them, so both are kept when the blob is set aside.
+    #[test]
+    fn every_occurrence_of_a_corrupt_blob_is_read_for_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "two-occurrences-source.pile");
+        let key = SigningKey::from_bytes(&[95; 32]);
+        let mut source = Pile::open(&source_path).unwrap();
+        let put = |source: &mut Pile, bytes: Vec<u8>| {
+            source
+                .put::<UnknownBlob, _>(Bytes::from_source(bytes))
+                .unwrap()
+        };
+        let first = put(&mut source, b"named by the first word".to_vec());
+        let second = put(&mut source, b"named by the second word".to_vec());
+        let mut twice_bytes = first.raw.to_vec();
+        twice_bytes.extend_from_slice(&second.raw);
+        let twice = put(&mut source, twice_bytes);
+        source
+            .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                &key,
+                collection_test_collection(96),
+                Inline::new(twice.raw),
+                empty_metadata_handle(),
+            )))
+            .unwrap();
+        source.close().unwrap();
+        // A second occurrence of the same blob record, as a concatenation
+        // leaves it.
+        let (offset, len) = PileRecords::open(&source_path)
+            .unwrap()
+            .map(|record| record.unwrap())
+            .find_map(|record| match record.content {
+                PileRecordContent::Blob { hash, .. } if hash.raw == twice.raw => {
+                    Some((record.offset, record.len))
+                }
+                _ => None,
+            })
+            .unwrap();
+        let record = std::fs::read(&source_path).unwrap()[offset..offset + len].to_vec();
+        append_test_bytes(&source_path, &record);
+        // The first occurrence loses the word naming `first`, the second the
+        // word naming `second`.
+        damage_blob_occurrences(&source_path, twice, &[(0, 0), (1, 32)]);
+
+        let mut source = Pile::open(&source_path).unwrap();
+        let destination_path = fresh_empty_pile_path(&dir, "two-occurrences-destination.pile");
+        let mut destination = Pile::open(&destination_path).unwrap();
+        let stats = source
+            .rewrite_retained_into_filtered(
+                &mut destination,
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+                &[],
+                &mut CarryEveryFrame,
+                CorruptBlobPolicy::SetAside,
+            )
+            .unwrap();
+        assert_eq!(stats.corrupt_blobs, BTreeSet::from([twice]));
+        let reader = destination.snapshot().unwrap();
+        let held: BTreeSet<Inline<Handle<UnknownBlob>>> =
+            reader.blobs().map(|info| info.unwrap().handle).collect();
+        assert_eq!(held, BTreeSet::from([first, second]));
+        drop(reader);
+        destination.close().unwrap();
+        source.close().unwrap();
+    }
+
+    /// A corrupt blob reached only through a carried frame of unknown kind,
+    /// or only through a retired capability proof, is found like any other:
+    /// refused by default, set aside when told, and read for children.
+    #[test]
+    fn a_corrupt_blob_reached_only_through_an_unknown_frame_or_a_retired_proof_is_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "frame-corrupt-source.pile");
+        let mut source = Pile::open(&source_path).unwrap();
+        let put = |source: &mut Pile, bytes: Vec<u8>| {
+            source
+                .put::<UnknownBlob, _>(Bytes::from_source(bytes))
+                .unwrap()
+        };
+        let child = put(
+            &mut source,
+            b"named by a damaged blob's intact word".to_vec(),
+        );
+        let mut via_frame_bytes = vec![0x21; 32];
+        via_frame_bytes.extend_from_slice(&child.raw);
+        let via_frame = put(&mut source, via_frame_bytes);
+        let via_proof = put(&mut source, b"named only by a retired proof".to_vec());
+        source.close().unwrap();
+        let mut unknown = test_envelope_bytes(TEST_UNKNOWN_KIND_B, 1, ENVELOPE_BLOCK_LEN);
+        unknown[FRAME_BODY_OFFSET + 7..FRAME_BODY_OFFSET + 39].copy_from_slice(&via_frame.raw);
+        append_test_bytes(&source_path, &unknown);
+        let mut body = vec![0x3A; 160];
+        body[..32].copy_from_slice(&SigningKey::from_bytes(&[83; 32]).verifying_key().to_bytes());
+        body[32 + 5..32 + 37].copy_from_slice(&via_proof.raw);
+        body[32 + 96..]
+            .copy_from_slice(&SigningKey::from_bytes(&[84; 32]).verifying_key().to_bytes());
+        append_test_bytes(&source_path, &retired_capability_v1_record(&body));
+        damage_blob_payload(&source_path, via_frame);
+        damage_blob_payload(&source_path, via_proof);
+
+        let mut source = Pile::open(&source_path).unwrap();
+        let plan = source
+            .plan_retained_rewrite(
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+                &[],
+                &mut CarryEveryFrame,
+            )
+            .unwrap();
+        assert_eq!(plan.corrupt_blobs, BTreeSet::from([via_frame, via_proof]));
+        let refused_path = fresh_empty_pile_path(&dir, "frame-corrupt-refused.pile");
+        let mut refused = Pile::open(&refused_path).unwrap();
+        assert!(matches!(
+            source.rewrite_retained_into_filtered(
+                &mut refused,
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+                &[],
+                &mut CarryEveryFrame,
+                CorruptBlobPolicy::Refuse,
+            ),
+            Err(PileRewriteError::Corrupt { .. })
+        ));
+        refused.close().unwrap();
+        assert_eq!(std::fs::metadata(&refused_path).unwrap().len(), 0);
+
+        let destination_path = fresh_empty_pile_path(&dir, "frame-corrupt-destination.pile");
+        let mut destination = Pile::open(&destination_path).unwrap();
+        let stats = source
+            .rewrite_retained_into_filtered(
+                &mut destination,
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+                &[],
+                &mut CarryEveryFrame,
+                CorruptBlobPolicy::SetAside,
+            )
+            .unwrap();
+        assert_eq!(stats.corrupt_blobs, plan.corrupt_blobs);
+        assert_eq!(
+            (stats.opaque_frames, stats.retired_capability_proofs),
+            (1, 1)
+        );
+        let reader = destination.snapshot().unwrap();
+        let held: BTreeSet<Inline<Handle<UnknownBlob>>> =
+            reader.blobs().map(|info| info.unwrap().handle).collect();
+        assert_eq!(held, BTreeSet::from([child]));
+        assert_eq!(held, plan.retained);
+        drop(reader);
+        destination.close().unwrap();
+        source.close().unwrap();
+    }
+
+    /// A blob whose first occurrence is corrupt and whose second is valid is
+    /// copied from the valid one, so the plan counts that occurrence's length,
+    /// as the destination holds it.
+    #[test]
+    fn a_plan_counts_the_bytes_of_the_occurrence_the_copy_takes() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "first-corrupt-source.pile");
+        let payload = vec![0x5C; 1024];
+        let hash = Inline::<Hash<Blake3>>::new(*blake3::hash(&payload).as_bytes());
+        // A one-byte occurrence claiming the 1024-byte payload's hash.
+        let blocks = envelope_blocks_for_payload(1).unwrap();
+        let mut forged = BlobRecordHeader::new(blocks, 0, 1, hash)
+            .as_bytes()
+            .to_vec();
+        forged.push(0x5C);
+        forged.resize(blocks as usize * ENVELOPE_BLOCK_LEN, 0);
+        append_test_bytes(&source_path, &forged);
+        let key = SigningKey::from_bytes(&[97; 32]);
+        let mut source = Pile::open(&source_path).unwrap();
+        let handle = source
+            .put::<UnknownBlob, _>(Bytes::from_source(payload))
+            .unwrap();
+        assert_eq!(handle.raw, hash.raw);
+        source
+            .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                &key,
+                collection_test_collection(98),
+                hash,
+                empty_metadata_handle(),
+            )))
+            .unwrap();
+        source.close().unwrap();
+
+        let mut source = Pile::open(&source_path).unwrap();
+        let plan = source
+            .plan_retained_rewrite(
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+                &[],
+                &mut CarryEveryFrame,
+            )
+            .unwrap();
+        let destination_path = fresh_empty_pile_path(&dir, "first-corrupt-destination.pile");
+        let mut destination = Pile::open(&destination_path).unwrap();
+        source
+            .rewrite_retained_into_filtered(
+                &mut destination,
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+                &[],
+                &mut CarryEveryFrame,
+                CorruptBlobPolicy::Refuse,
+            )
+            .unwrap();
+        let reader = destination.snapshot().unwrap();
+        let held: u64 = reader.blobs().map(|info| info.unwrap().length).sum();
+        drop(reader);
+        destination.close().unwrap();
+        source.close().unwrap();
+        assert_eq!(held, 1024);
+        assert_eq!(plan.retained_bytes, held);
     }
 
     /// Re-adding an existing set element is a no-op append.

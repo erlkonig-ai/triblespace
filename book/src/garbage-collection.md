@@ -146,10 +146,17 @@ the pile still recognises, before drained generations and supersession apply.
 A frame a concatenated pile holds twice is considered once. Its retention
 follows what it carries: a frame left behind roots nothing, a carried legacy
 V3 header roots the blob handles its fields name, and a carried frame of
-unknown kind roots the resident blobs its aligned 32-byte words name, the
-same conservative reading the blob walk gives an unknown blob, rather than
-widening to every resident blob. Without explicit roots it therefore keeps
-exactly what the carried records, headers, proofs, WANTs and pins reach.
+unknown kind or retired capability proof roots the resident blobs any 32
+bytes of it name, at any offset (frames have not always kept their fields on
+32-byte boundaries), rather than widening to every resident blob. Without
+explicit roots it therefore keeps exactly what the carried records, headers,
+proofs, WANTs and pins reach. A blob the walk reaches of which no occurrence
+matches its hash has no valid bytes to copy. The walk finds one wherever it
+meets it, and by default the rewrite then refuses before writing anything,
+as an invalid explicitly selected blob fails the plain rewrite. A caller may
+set such blobs aside instead: they are listed, not copied, and their damaged
+bytes are still read for what they name, but a valid blob named only by a
+damaged word cannot be reached and is left behind.
 `PileFile::plan_retained_rewrite` runs the same selection pass and retention
 walk without writing, so a dry run reports exactly what the rewrite will do.
 The lattice v3 cutover (`trible pile migrate SRC lattice-v3`) is this rewrite

@@ -342,8 +342,10 @@ impl Yard {
     /// The supplied roots are strong for this pass. Direct roots retain only
     /// themselves; recursive roots retain their resident descendants. Every
     /// retained native collection record and WANT adds all of its resident
-    /// direct references as recursive roots; self-contained capability proofs
-    /// add none. This structural ownership is independent of signatures,
+    /// direct references as recursive roots; a capability proof adds its
+    /// resident capability definitions, and a retired capability proof every
+    /// resident blob any 32 bytes of it name. This structural ownership is
+    /// independent of signatures,
     /// admission, or algebraic usefulness. Missing references remain missing
     /// and never trigger a fetch or prevent resident siblings from surviving.
     /// Pass an empty [`RetentionRoots`] explicitly when native records supply
@@ -446,8 +448,9 @@ impl Yard {
     /// generation's live PATCH set, so evicted blobs stop being readable through
     /// Yard readers, but they do not mutate the underlying append-only pile
     /// files. `reclaim` is the explicit physical step. For each generation it
-    /// writes the current live handles, every native collection record, and
-    /// every canonical complete proof to a sibling temporary pile. The active
+    /// writes the current live handles, every native collection record, every
+    /// canonical complete proof and every retired capability proof, byte for
+    /// byte, to a sibling temporary pile. The active
     /// young replacement also receives the complete surviving WANT union. It
     /// then closes both piles, atomically renames the temporary file over the
     /// original on the same filesystem, and reopens the generation. Recognized
@@ -595,7 +598,9 @@ impl Yard {
 
     /// Retain physical kind and resident capability definitions of native proofs.
     /// The opaque resource is not a blob reference; missing definitions remain
-    /// missing rather than causing acquisition during GC.
+    /// missing rather than causing acquisition during GC. A retired proof is
+    /// read no further than its structure, so every resident blob any 32
+    /// bytes of it name is retained, as the retained pile rewrites do.
     fn retention_with_capability_proofs(
         &self,
         snapshot: &YardSnapshot,
@@ -611,6 +616,13 @@ impl Yard {
         }
         for proof in proofs {
             for handle in proof.blob_references() {
+                if present.get(&handle.raw).is_some() {
+                    combined.retain_recursive(handle);
+                }
+            }
+        }
+        for generation in &snapshot.generations {
+            for handle in generation.snapshot.retired_capability_proof_references() {
                 if present.get(&handle.raw).is_some() {
                     combined.retain_recursive(handle);
                 }
@@ -1337,6 +1349,11 @@ where
     old_pile
         .preserve_retired_collection_equations_into(&mut new_pile)
         .map_err(YardReclaimError::CollectionRecord)?;
+    // Retired capability proofs are capability records: carried exactly, as
+    // the retained pile rewrites carry them.
+    old_pile
+        .preserve_retired_capability_proofs_into(&mut new_pile)
+        .map_err(YardReclaimError::RetiredCapabilityProof)?;
     before_final_guard();
     // Opaque-record refusal must come from one final source refresh. An opaque
     // addition observed here must not escape an earlier count and then be
@@ -1524,6 +1541,8 @@ pub enum YardReclaimError {
     },
     Transfer(TransferError<Infallible, GetBlobError<Infallible>, InsertError>),
     CollectionRecord(CollectionInsertError),
+    /// A retired capability proof could not be carried into the rewrite.
+    RetiredCapabilityProof(CollectionInsertError),
     CapabilityProof(CapabilityProofInsertError),
     Close(super::pile::FlushError),
     WantMarkers(std::io::Error),
@@ -1552,6 +1571,9 @@ impl fmt::Display for YardReclaimError {
             Self::Transfer(err) => write!(f, "failed to copy live yard blobs: {err}"),
             Self::CollectionRecord(err) => {
                 write!(f, "failed to copy a yard collection record: {err}")
+            }
+            Self::RetiredCapabilityProof(err) => {
+                write!(f, "failed to copy a yard retired capability proof: {err}")
             }
             Self::CapabilityProof(err) => {
                 write!(f, "failed to copy a yard capability proof: {err}")
@@ -2052,6 +2074,65 @@ mod tests {
             1
         );
         old.close().unwrap();
+    }
+
+    /// Retired capability proofs are capability records: reclamation carries
+    /// each one's exact frame and keeps whatever resident blob any 32 bytes
+    /// of it may name, across generations, as retained pile rewrites do.
+    #[test]
+    fn reclaim_carries_retired_capability_proofs_with_what_they_may_name() {
+        let (_dir, paths, mut yard) = yard_with_paths(2, YardConfig::default());
+        let named = yard
+            .put_in_generation::<RawBytes, _>(0, raw_blob(b"named inside a retired proof"))
+            .unwrap();
+        let orphan = yard
+            .put_in_generation::<RawBytes, _>(0, raw_blob(b"named by nothing"))
+            .unwrap();
+        yard.close().unwrap();
+
+        // A retired v1 proof frame (kind AUTH_PROOF_V1): a 96-byte prefix and
+        // a body of a root key and one edge closed by a delegate key. The
+        // edge's unchecked bytes name `named` off alignment, at byte 133.
+        let mut frame = vec![0u8; 256];
+        frame[..28].copy_from_slice(&hex_literal::hex!(
+            "0371B249F0626B2ABDDB80E23EA969059D9656A5EA5A497320351F3B"
+        ));
+        frame[28..32].copy_from_slice(&1u32.to_le_bytes());
+        frame[32..64].copy_from_slice(&hex_literal::hex!(
+            "29AC46C61788022D62BE6E2388DA4A164419BA648377D48B2E6DB092EE0A8053"
+        ));
+        frame[64..72].copy_from_slice(&160u64.to_le_bytes());
+        frame[96..128]
+            .copy_from_slice(&SigningKey::from_bytes(&[71; 32]).verifying_key().to_bytes());
+        frame[128..224].fill(0x3A);
+        frame[133..165].copy_from_slice(&named.raw);
+        frame[224..256]
+            .copy_from_slice(&SigningKey::from_bytes(&[72; 32]).verifying_key().to_bytes());
+        {
+            let mut file = OpenOptions::new().append(true).open(&paths[1]).unwrap();
+            file.write_all(&frame).unwrap();
+            file.sync_all().unwrap();
+        }
+        let mut yard = Yard::open(paths.clone(), YardConfig::default()).unwrap();
+        yard.collect(&RetentionRoots::new()).unwrap();
+        yard.reclaim().unwrap();
+        let reader = yard.snapshot().unwrap();
+        assert!(
+            get_raw(&reader, named).is_ok(),
+            "a retired proof keeps what it names"
+        );
+        assert!(get_raw(&reader, orphan).is_err());
+        drop(reader);
+        yard.close().unwrap();
+        let mut records = PileRecords::open(&paths[1]).unwrap();
+        let mut carried = Vec::new();
+        while let Some(record) = records.next() {
+            let record = record.unwrap();
+            if matches!(record.content, PileRecordContent::RetiredCapabilityProof) {
+                carried.push(records.bytes()[record.offset..record.offset + record.len].to_vec());
+            }
+        }
+        assert_eq!(carried, vec![frame]);
     }
 
     #[test]

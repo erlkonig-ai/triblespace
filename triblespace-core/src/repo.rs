@@ -405,8 +405,7 @@ use crate::blob::Blob;
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
 use crate::collection::{
-    CollectionData, CollectionRead, CollectionRecordSelector, CollectionStore,
-    CoverageRead,
+    CollectionData, CollectionRead, CollectionRecordSelector, CollectionStore, CoverageRead,
 };
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
@@ -716,8 +715,10 @@ pub trait BlobStoreKeep {
 /// These caller-selected roots supplement native-record ownership. Every
 /// retained collection record and WANT owns its resident direct references
 /// recursively; backends discover those edges separately from this explicit
-/// policy value and without semantic admission. Capability proofs are
-/// self-contained and therefore own no blobs.
+/// policy value and without semantic admission. A capability proof owns its
+/// resident capability definitions (not its opaque resource identity), and a
+/// retired capability proof, read no further than its structure, owns every
+/// resident blob any 32 bytes of it name.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RetentionRoots {
     direct: BTreeSet<[u8; INLINE_LEN]>,

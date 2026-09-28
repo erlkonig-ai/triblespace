@@ -44,7 +44,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   in the source and every resident descriptor of a collection some frame
   names that is left behind. Counts are of records: one held in several
   frames counts once. A descriptor naming a mapping without a tagged
-  algorithm keeps its DERIVEs, as an unrecognised algorithm does.
+  algorithm keeps its DERIVEs, as an unrecognised algorithm does. Retired
+  capability proofs are carried and counted (`capability proofs carried:`).
+  A blob the walk reaches of which no occurrence matches its hash, whether
+  a kept record, a root or another blob names it, makes both runs refuse
+  (the real run writes nothing) unless `--allow-corrupt`, which sets it
+  aside: not copied, named under `corrupt blobs:`, and counted apart in the
+  blobs, roots and readability lines. A valid blob named only by a damaged
+  word of it cannot be reached and is left behind, which is why refusing is
+  the default; `--allow-absent` does not accept corruption.
 - `pile net sync --health-collection <handle>` (with `--health-key`) and
   `pile net health --collection <handle>` report into and read from an
   explicit existing health generation instead of the reporting key's own
