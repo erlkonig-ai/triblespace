@@ -100,11 +100,12 @@ share the raw record's byte ownership. This is a validated membership projection
 not validation during Pile replay and not a shared global host index. Summaries
 and repair nodes expose only C's fixed prefix; hashes bind the full keys while
 wire keys and compressed paths omit that prefix. The three-component manifest
-uses repair opcode `0x0E` on `/triblespace/pile-sync/27`; old repair opcode
+uses repair opcode `0x0E` on `/triblespace/pile-sync/28`; old repair opcode
 `0x0D` is rejected before decoding. Generation 27 changed the blob locator,
-directory token and exact-GET proofs to one-block constructions, so
-generation-26 peers and installed `Leech` readers cannot connect and all
-nodes switch together. No AUTH or collection-repair operation transfers
+directory token and exact-GET proofs to one-block constructions; generation 28
+exports foundations only (COMMIT and DERIVE, never MERGE) and advertises each
+collection's held-blob set, so older peers cannot connect and all nodes switch
+together. No AUTH or collection-repair operation transfers
 blob bodies or creates WANT; exact H remains the blob read capability.
 
 DHT provider-directory operations use the ordinary blob-locator namespace,
@@ -266,7 +267,6 @@ visible without enabling broad packet-level tracing.
 ## Crate layout
 
 - `collection_activation` — per-collection record and authorization-evidence PATCHes
-- `collection_blob_inventory` — bounded passive resident-handle PATCH construction
 - `collection_session` / `collection_wire` — one READ-authorized repair stream
 - `patch_repair` — root-pinned Merkle difference walker
 - `peer` — synchronous store wrapper, monotone admission, and local WANT intent

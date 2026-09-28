@@ -3,9 +3,11 @@
 //! This module owns only the immutable evidence boundary: strict framing,
 //! intrinsic collection matching, ingress signature verification, canonical
 //! fingerprint ordering, and bounded `current - previous` selection. It deliberately
-//! does not resolve referenced blobs or decide READ/WRITE policy. A future
-//! authorized overlay can therefore store sparse MERGE/DERIVE equations as
-//! inert evidence and apply semantic validation only when a resolver uses one.
+//! does not resolve referenced blobs or decide READ/WRITE policy.
+//!
+//! Only foundations replicate: a collection's COMMITs and DERIVEs. A MERGE is
+//! the signing host's own lattice node; it never enters a record PATCH, is
+//! never encoded for a peer, and a peer's MERGE is refused on decode.
 
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -100,6 +102,8 @@ where
 pub enum CollectionDeltaError {
     Decode(RecordDecodeError),
     WrongCollection,
+    /// A MERGE: the signing host's own lattice node, which never replicates.
+    NotReplicated,
     FingerprintCollision(CollectionRecordFingerprint),
 }
 
@@ -108,6 +112,7 @@ impl fmt::Display for CollectionDeltaError {
         match self {
             Self::Decode(error) => write!(f, "decode collection record: {error}"),
             Self::WrongCollection => write!(f, "record names another collection"),
+            Self::NotReplicated => write!(f, "MERGE records never replicate"),
             Self::FingerprintCollision(fingerprint) => {
                 write!(
                     f,
@@ -133,7 +138,7 @@ impl From<RecordDecodeError> for CollectionDeltaError {
     }
 }
 
-/// Build the exact valued PATCH for one collection through its semantic
+/// Build the exact valued PATCH of one collection's foundations through their
 /// selector.
 ///
 /// This is the sole collection-overlay construction path: it never asks the
@@ -146,7 +151,7 @@ pub fn collection_record_patch<R>(
 where
     R: CollectionRead,
 {
-    let selectors = BTreeSet::from([CollectionRecordSelector::Collection(collection)]);
+    let selectors = BTreeSet::from([CollectionRecordSelector::Foundations(collection)]);
     let records = snapshot
         .select_records(&selectors)
         .map_err(CollectionRecordPatchError::Store)?;
@@ -166,7 +171,7 @@ where
     R: CollectionRead,
 {
     let expected = prior.collection;
-    let selectors = BTreeSet::from([CollectionRecordSelector::Collection(expected)]);
+    let selectors = BTreeSet::from([CollectionRecordSelector::Foundations(expected)]);
     let (added, removed) = current
         .select_record_changes(previous, &selectors)
         .map_err(CollectionRecordPatchError::Store)?;
@@ -204,7 +209,7 @@ pub fn encode_record(
 
 /// Strictly decode one complete self-tagged record for an implicit collection
 /// overlay. Trailing bytes, noncanonical MERGE inputs, unknown tags, wrong
-/// collections, and invalid signatures fail before insertion.
+/// collections, invalid signatures and MERGE records fail before insertion.
 pub fn decode_record(
     expected: CollectionHandle,
     bytes: &[u8],
@@ -220,6 +225,9 @@ fn validate_record(
 ) -> Result<(), CollectionDeltaError> {
     if record.collection() != expected {
         return Err(CollectionDeltaError::WrongCollection);
+    }
+    if matches!(record, CollectionRecord::Merge(_)) {
+        return Err(CollectionDeltaError::NotReplicated);
     }
     Ok(())
 }
@@ -304,13 +312,36 @@ mod tests {
         ]
     }
 
+    fn foundations(expected: CollectionHandle) -> [CollectionRecord; 2] {
+        let [commit, _, derive] = records(expected);
+        [commit, derive]
+    }
+
     #[test]
-    fn all_sparse_record_variants_roundtrip_for_the_implicit_collection() {
+    fn foundation_records_roundtrip_for_the_implicit_collection() {
         let expected = collection(1);
-        for record in records(expected) {
+        for record in foundations(expected) {
             let bytes = encode_record(expected, record).unwrap();
             assert_eq!(decode_record(expected, &bytes).unwrap(), record);
         }
+    }
+
+    #[test]
+    fn merge_records_are_never_encoded_decoded_or_patched() {
+        let expected = collection(1);
+        let merge = records(expected)[1];
+        assert_eq!(
+            encode_record(expected, merge),
+            Err(CollectionDeltaError::NotReplicated)
+        );
+        assert_eq!(
+            decode_record(expected, &merge.to_bytes()),
+            Err(CollectionDeltaError::NotReplicated)
+        );
+        assert!(matches!(
+            canonical_records(expected, records(expected)),
+            Err(CollectionDeltaError::NotReplicated)
+        ));
     }
 
     #[test]
@@ -324,7 +355,9 @@ mod tests {
             Err(CollectionDeltaError::WrongCollection)
         );
         for record in records(expected) {
-            let mut tampered = encode_record(expected, record).unwrap();
+            // Signature checks precede the replication rule, so a tampered
+            // MERGE fails as a decode error too.
+            let mut tampered = record.to_bytes();
             *tampered.last_mut().unwrap() ^= 1;
             assert!(matches!(
                 decode_record(expected, &tampered),
@@ -349,7 +382,7 @@ mod tests {
         use triblespace_core::repo::pile::{Pile, PileRecordContent, PileRecords};
 
         let expected = collection(1);
-        let record = records(expected)[1];
+        let record = records(expected)[2];
         let file = tempfile::NamedTempFile::new().unwrap();
         let mut pile = Pile::open(file.path()).unwrap();
         pile.insert(record).unwrap();
@@ -471,7 +504,7 @@ mod tests {
         ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
             assert_eq!(
                 selectors,
-                &BTreeSet::from([CollectionRecordSelector::Collection(self.expected)])
+                &BTreeSet::from([CollectionRecordSelector::Foundations(self.expected)])
             );
             self.selections.set(self.selections.get() + 1);
             Ok(self.selected.clone())
@@ -479,9 +512,9 @@ mod tests {
     }
 
     #[test]
-    fn overlay_patch_uses_only_the_exact_collection_selector() {
+    fn overlay_patch_uses_only_the_foundations_selector() {
         let expected = collection(1);
-        let selected = records(expected).to_vec();
+        let selected = foundations(expected).to_vec();
         let store = ExactSelectorStore {
             expected,
             selected: selected.clone(),

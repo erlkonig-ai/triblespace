@@ -22,7 +22,9 @@ use tracing::{Instrument as _, debug, debug_span, info_span, warn};
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::capability::CapabilityProof;
-use triblespace_core::collection::{CollectionHandle, CollectionRecordSelector};
+use triblespace_core::collection::{
+    CollectionHandle, CollectionRecordSelector, HeldBlobs, HeldRead,
+};
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::patch::{Entry as PatchEntry, IdentitySchema, PATCH};
@@ -33,9 +35,6 @@ use triblespace_core::repo::{
 use crate::bearer::{BearerLocatorIndex, blob_locator, locator_index, update_locator_index};
 use crate::channel::{NetEvent, NetEventBatch};
 use crate::collection_activation::{CollectionRepairOverlay, CollectionRepairOverlayError};
-use crate::collection_blob_inventory::{
-    BlobInventoryChange, CollectionBlobInventory, ResidentBlobPatch, ScanBudget,
-};
 use crate::collection_delta::update_collection_record_patch;
 use crate::collection_session::{
     CollectionRepairRefusal, InventoryRepairCursor, manifest, pull_collection,
@@ -157,8 +156,6 @@ impl BlobStoreGet for ResidentBlobReader {
 pub(crate) struct CollectionSnapshot {
     repair: Arc<CollectionRepairOverlay>,
     read_bootstrap: Arc<[CapabilityProof]>,
-    blob_seeds: ResidentBlobPatch,
-    blob_scan: CollectionBlobInventory,
 }
 
 impl CollectionSnapshot {
@@ -171,61 +168,17 @@ impl CollectionSnapshot {
         self.repair.wake_root()
     }
 
-    fn with_resident_inventory<R: BlobStoreGet>(
+    /// Bind the collection's held set, fixed by the same store observation
+    /// as the repair evidence. The store's held-blob index computed it: no
+    /// blob is scanned while publishing.
+    fn with_held(
         repair: CollectionRepairOverlay,
         read_bootstrap: Arc<[CapabilityProof]>,
-        prior: Option<&Self>,
-        reader: &R,
-        change: BlobInventoryChange,
-        budget: ScanBudget,
+        held: HeldBlobs,
     ) -> Self {
-        let mut seeds = prior.map_or_else(ResidentBlobPatch::new, |prior| prior.blob_seeds.clone());
-        let records = repair.records().patch();
-        let empty = triblespace_core::patch::PATCH::new();
-        let previous_records = prior.map_or(&empty, |prior| prior.repair.records().patch());
-        let removed = !previous_records.difference(records).is_empty();
-        let authority_changed = prior.is_none_or(|prior| {
-            prior.repair.authorization_evidence().summary()
-                != repair.authorization_evidence().summary()
-        });
-        if removed || authority_changed {
-            seeds = ResidentBlobPatch::new();
-        }
-        seeds.insert(&PatchEntry::new(&repair.collection().raw));
-        let additions = if removed || authority_changed {
-            records.clone()
-        } else {
-            records.difference(previous_records)
-        };
-        for id in additions.iter_ordered() {
-            for handle in additions
-                .get(id)
-                .expect("PATCH entry exists")
-                .blob_references()
-            {
-                seeds.insert(&PatchEntry::new(&handle.raw));
-            }
-        }
-        if removed || authority_changed {
-            for proof in repair.authorization_evidence().proofs() {
-                for handle in proof.blob_references() {
-                    seeds.insert(&PatchEntry::new(&handle.raw));
-                }
-            }
-        }
-        let mut scan = prior.map_or_else(CollectionBlobInventory::default, |prior| {
-            prior.blob_scan.clone()
-        });
-        scan.observe_patch(seeds.clone(), change);
-        // A bounded CPU quantum per active collection; no network operation
-        // or complete payload walk is hidden in snapshot publication.
-        scan.advance(reader, budget);
-        let repair = repair.with_blob_inventory(Arc::new(scan.patch().clone()));
         Self {
-            repair: Arc::new(repair),
+            repair: Arc::new(repair.with_blob_inventory(Arc::new(held))),
             read_bootstrap,
-            blob_seeds: seeds,
-            blob_scan: scan,
         }
     }
 }
@@ -301,7 +254,7 @@ impl StoreSnapshot {
         changes: StoreChanges,
     ) -> anyhow::Result<Self>
     where
-        R: StoreRead + Clone,
+        R: StoreRead + HeldRead + Clone,
     {
         let mut collections = CollectionSnapshotIndex::new();
         let bearer_locators = match (previous_store, previous) {
@@ -319,26 +272,11 @@ impl StoreSnapshot {
         // not change. A later peer request may name a previously unseen R or
         // capability definition, outside any construction-time read set.
         let reader = ResidentBlobReader::new(&snapshot);
-        let active_count = usize::try_from(active.len()).unwrap_or(usize::MAX).max(1);
-        let scan_budget = ScanBudget {
-            words: (16_384 / active_count).clamp(1, 1024),
-            sources: (1024 / active_count).clamp(1, 64),
-        };
-        let blob_change = match previous {
-            None => BlobInventoryChange::MayRemove,
-            Some(previous)
-                if !previous
-                    .bearer_locators
-                    .difference(&bearer_locators)
-                    .is_empty() =>
-            {
-                BlobInventoryChange::MayRemove
-            }
-            Some(_) if changes.contains(StoreChanges::BLOBS) => BlobInventoryChange::Additions,
-            Some(_) => BlobInventoryChange::Unchanged,
-        };
         for raw in active.iter_ordered() {
             let collection = CollectionHandle::new(*raw);
+            // Positive, possibly incomplete while a start-up walk runs; an
+            // untracked collection holds nothing.
+            let held = snapshot.held(collection).unwrap_or_default();
             let prior = previous.and_then(|prior| prior.collections.get(&collection.raw));
             let relevant = match (previous_store, previous, prior) {
                 (Some(before), Some(previous), Some(prior)) if previous.local == local => {
@@ -348,13 +286,10 @@ impl StoreSnapshot {
             };
             if let Some(prior) = prior.filter(|_| relevant.is_empty()) {
                 let value = prior.value.as_ref().map(|prior| {
-                    Arc::new(CollectionSnapshot::with_resident_inventory(
+                    Arc::new(CollectionSnapshot::with_held(
                         prior.repair.as_ref().clone().with_reader(reader.clone()),
                         prior.read_bootstrap.clone(),
-                        Some(prior),
-                        &reader,
-                        blob_change,
-                        scan_budget,
+                        held.clone(),
                     ))
                 });
                 collections.insert(&PatchEntry::with_value(
@@ -428,7 +363,7 @@ impl StoreSnapshot {
                 }
             };
             // Reused components keep their interests. In particular, reusing
-            // the record PATCH must not lose its whole-C selector merely
+            // the record PATCH must not lose its foundations selector merely
             // because this pass read only authority inputs.
             let mut dependencies = if authorization.is_some() {
                 prior.unwrap().dependencies.clone()
@@ -437,14 +372,11 @@ impl StoreSnapshot {
             };
             dependencies
                 .records
-                .insert(CollectionRecordSelector::Collection(collection));
-            let value = Arc::new(CollectionSnapshot::with_resident_inventory(
+                .insert(CollectionRecordSelector::Foundations(collection));
+            let value = Arc::new(CollectionSnapshot::with_held(
                 repair.with_reader(reader.clone()),
                 read_bootstrap,
-                prior_value.map(Arc::as_ref),
-                &reader,
-                blob_change,
-                scan_budget,
+                held,
             ));
             collections.insert(&PatchEntry::with_value(
                 raw,
@@ -483,15 +415,6 @@ impl StoreSnapshot {
 
     pub(crate) fn bearer_locators(&self) -> &BearerLocatorIndex {
         &self.bearer_locators
-    }
-
-    pub(crate) fn inventory_pending(&self) -> bool {
-        self.collections.iter_ordered().any(|key| {
-            self.collections
-                .get(key)
-                .and_then(|entry| entry.value.as_ref())
-                .is_some_and(|entry| entry.blob_scan.has_pending_work())
-        })
     }
 }
 
@@ -3503,6 +3426,9 @@ mod tests {
         let collection = store
             .put::<SimpleArchive, _>(descriptor.facts().clone())
             .unwrap();
+        // The definition a proof names is a seed of the held set; it is held
+        // once it arrives.
+        triblespace_core::collection::HeldStore::track_held(&mut store, [collection]);
         let proof = CapabilityProof::new(
             CapabilityResource::from(collection),
             &root,

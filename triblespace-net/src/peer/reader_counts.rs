@@ -181,6 +181,38 @@ impl<R: BlobStoreMeta> BlobStoreMeta for Counted<R> {
 
 impl<R: BlobChildren> BlobChildren for Counted<R> {}
 
+impl<R: triblespace_core::collection::HeldRead> triblespace_core::collection::HeldRead
+    for Counted<R>
+{
+    fn held(
+        &self,
+        collection: triblespace_core::collection::CollectionHandle,
+    ) -> Option<triblespace_core::collection::HeldBlobs> {
+        self.inner.held(collection)
+    }
+
+    fn held_generation(&self) -> u64 {
+        self.inner.held_generation()
+    }
+}
+
+impl<S: HeldStore> HeldStore for Counted<S> {
+    fn track_held(
+        &mut self,
+        collections: impl IntoIterator<Item = triblespace_core::collection::CollectionHandle>,
+    ) {
+        self.inner.track_held(collections)
+    }
+
+    fn note_held(
+        &mut self,
+        collection: triblespace_core::collection::CollectionHandle,
+        handle: Inline<Handle<UnknownBlob>>,
+    ) {
+        self.inner.note_held(collection, handle)
+    }
+}
+
 impl<R: triblespace_core::collection::CoverageRead> triblespace_core::collection::CoverageRead
     for Counted<R>
 {
@@ -537,6 +569,8 @@ fn memory_repo_conservative_delta_is_counted_without_claiming_native_pile_cost()
 
 fn assert_leech_has_no_serving_inventory(leech: &Leech<Counted<Pile>>, counts: &Counts) {
     assert_eq!(counts.inventory(), [0, 0, 0, 0]);
+    // A faculty-style open tracks no held set and starts no walker thread.
+    assert_eq!(triblespace_core::collection::held::held_walker_threads(), 0);
     assert!(leech.peer.last_store_snapshot.is_none());
     assert!(leech.peer.sender.current_snapshot().is_none());
     assert_eq!(leech.peer.serving_snapshot_rebuilds, 0);
@@ -583,6 +617,11 @@ fn leech_public_lazy_resident_snapshots_and_writes_remain_dormant() {
         for _ in 0..3 {
             leech.snapshot().unwrap();
         }
+        assert_eq!(
+            triblespace_core::collection::HeldRead::held_generation(&*frozen),
+            0,
+            "no held set was ever computed"
+        );
         let bytes = Bytes::from_source(b"local leech payload".to_vec());
         let handle = leech.put::<UnknownBlob, _>(bytes.clone()).unwrap();
         assert!(!frozen.contains_blob(handle).unwrap());

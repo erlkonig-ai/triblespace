@@ -1,9 +1,11 @@
 //! Exact per-collection semantic repair state.
 //!
 //! Collection records and authorization proofs are independent grow-only
-//! sets. A newly arrived proof may activate an old COMMIT or admit a new reader
-//! without changing the record PATCH. A collection wake commits to both and to
-//! its pinned positive resident-blob inventory, without disclosing those handles.
+//! sets. The records are the collection's foundations -- COMMITs and DERIVEs;
+//! a MERGE is its signer's own lattice node and never replicates. A newly
+//! arrived proof may activate an old COMMIT or admit a new reader without
+//! changing the record PATCH. A collection wake commits to both and to the
+//! collection's held-blob set, without disclosing those handles.
 //! The authorization projection contains byte-valid proofs for exact C and its
 //! configured roots. Definition residency determines authority, not membership.
 
@@ -39,7 +41,9 @@ use crate::host::ResidentBlobReader;
 use crate::patch_repair::PatchSummary;
 
 const COLLECTION_REPAIR_ROOT_DOMAIN: &[u8] = b"triblespace.collection.repair-overlay\0";
-const COLLECTION_REPAIR_ROOT_VERSION: u32 = 2;
+/// Version 3: the record component holds foundations only (COMMIT and DERIVE)
+/// and the blob component is the held set of the core index.
+const COLLECTION_REPAIR_ROOT_VERSION: u32 = 3;
 
 type AuthorizationEvidencePatch = PATCH<64, IdentitySchema, CapabilityProof, Blake3Merkle>;
 
@@ -1461,8 +1465,11 @@ mod tests {
         assert_ne!(before.wake_root(), after.wake_root());
     }
 
+    /// Only foundations replicate: a DERIVE enters the record PATCH, a MERGE
+    /// (the signer's own lattice node) never does, and adding one changes
+    /// neither the record summary nor the wake root.
     #[test]
-    fn merge_and_derive_equations_participate_in_collection_repair() {
+    fn merge_equations_never_enter_collection_repair_and_derives_do() {
         let writer = key(3);
         let mut store = MemoryRepo::default();
         store
@@ -1494,6 +1501,11 @@ mod tests {
                     .unwrap(),
             ))
             .unwrap();
+        let merged_snapshot = store.snapshot().unwrap();
+        let merged = collection_repair_overlay(&merged_snapshot, collection.handle()).unwrap();
+        assert_eq!(before.records().summary(), merged.records().summary());
+        assert_eq!(before.wake_root(), merged.wake_root());
+
         store
             .insert(CollectionRecord::Derive(CollectionDerive::sign(
                 &writer,
@@ -1508,18 +1520,19 @@ mod tests {
 
         assert_ne!(before.records().summary(), after.records().summary());
         assert_ne!(before.wake_root(), after.wake_root());
-        assert_eq!(after.records().len(), 3);
+        assert_eq!(after.records().len(), 2);
         assert_eq!(
             after
                 .records()
                 .get(CollectionRecord::Commit(commit).fingerprint()),
             Some(CollectionRecord::Commit(commit))
         );
-        assert!(after.records().records().any(|record| matches!(
-            record,
-            CollectionRecord::Merge(merge)
-                if merge.collection() == collection.handle()
-        )));
+        assert!(
+            !after
+                .records()
+                .records()
+                .any(|record| matches!(record, CollectionRecord::Merge(_)))
+        );
         assert!(after.records().records().any(|record| matches!(
             record,
             CollectionRecord::Derive(derive)
