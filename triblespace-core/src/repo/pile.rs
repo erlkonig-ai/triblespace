@@ -5754,6 +5754,11 @@ pub struct PileRewriteStats {
     /// Number of collection-algebra frames the caller's
     /// [`CollectionFrameFilter`] left behind. Zero without a filter.
     pub filtered_frames: usize,
+    /// Number of frames not considered again because an identical frame at
+    /// an earlier offset was: a current collection record or a frame of
+    /// unknown kind held twice, as concatenation leaves them. The destination
+    /// would store each once anyway.
+    pub repeated_frames: usize,
 }
 
 /// The accounting of a filtered retained rewrite, decided without writing
@@ -5762,9 +5767,11 @@ pub struct PileRewriteStats {
 /// [`PileFile::rewrite_retained_into_filtered`] returns for the same prefix,
 /// roots, WANT policy, filter and drained generations, because both run one
 /// shared selection pass and one shared retention walk.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RetainedRewritePlan {
-    /// Distinct resident blobs that would be copied.
+    /// The resident blobs that would be copied.
+    pub retained: BTreeSet<Inline<Handle<UnknownBlob>>>,
+    /// Distinct resident blobs that would be copied: `retained.len()`.
     pub retained_blobs: usize,
     /// Their payload bytes.
     pub retained_bytes: u64,
@@ -5778,6 +5785,8 @@ pub struct RetainedRewritePlan {
     pub retired_equations: usize,
     /// Collection-algebra frames the filter leaves behind.
     pub filtered_frames: usize,
+    /// Frames held again at a later offset, considered once.
+    pub repeated_frames: usize,
 }
 
 /// The encoding generation of one collection-algebra frame.
@@ -5826,13 +5835,16 @@ pub struct CollectionFrame {
 
 /// Decides which collection-algebra frames a retained rewrite carries.
 ///
-/// The rewrite asks once about every current collection record (each
-/// indexed frame, repeats included), every distinct retired v8/v9 equation,
-/// every distinct legacy header and every retired signed frame it crosses as
-/// opaque, before it applies drained generations or supersession. Frames of
-/// unknown kind, blobs, proofs, WANTs and pins are never asked about. A frame
-/// left behind still roots the blobs it names, so a filter changes which
-/// frames travel, never which blobs do.
+/// The rewrite asks once about every distinct frame it would carry: every
+/// current collection record, every retired v8/v9 equation, every legacy
+/// header and every retired signed frame it crosses as opaque, before it
+/// applies drained generations or supersession. A frame repeated at a later
+/// offset (a pile made by concatenation) is asked about once. Frames of
+/// unknown kind, blobs, proofs, WANTs and pins are never asked about.
+///
+/// [`PileFile::rewrite_retained_into_filtered`] roots only what carried
+/// frames name, so a frame the filter leaves behind roots nothing, and a blob
+/// only it named stays behind unless an explicit root reaches it.
 pub trait CollectionFrameFilter {
     /// Whether the rewrite carries this frame.
     fn carries(&mut self, frame: &CollectionFrame) -> bool;
@@ -5862,6 +5874,7 @@ struct CollectionFrameSelection {
     superseded_equations: usize,
     drained_frames: usize,
     filtered_frames: usize,
+    repeated_frames: usize,
 }
 
 /// Which frames root the blobs a retained rewrite keeps.
@@ -5895,6 +5908,30 @@ pub struct DrainedGeneration {
     pub retired: CollectionHandle,
     /// The generation that now holds every one of its commits.
     pub current: CollectionHandle,
+}
+
+/// The blob handles a legacy V3 collection header names: a COMMIT's data and
+/// metadata, a MERGE's inputs and result, a DERIVE's input and output. A
+/// definition names only 16-byte ids, so nothing.
+fn legacy_v3_header_references(
+    header: &[u8; V3_HEADER_LEN],
+) -> impl Iterator<Item = Inline<Handle<UnknownBlob>>> {
+    let magic: RawId = header[..16]
+        .try_into()
+        .expect("a V3 header starts with its marker");
+    let fields: Option<Vec<RawInline>> = match magic {
+        MAGIC_MARKER_COLLECTION_COMMIT_V3 => CollectionCommitHeaderV3::try_read_from_prefix(header)
+            .ok()
+            .map(|(header, _)| vec![header.data, header.metadata]),
+        MAGIC_MARKER_COLLECTION_MERGE_V3 => CollectionMergeHeaderV3::try_read_from_prefix(header)
+            .ok()
+            .map(|(header, _)| vec![header.low, header.high, header.result]),
+        MAGIC_MARKER_COLLECTION_DERIVE_V3 => CollectionDeriveHeaderV3::try_read_from_prefix(header)
+            .ok()
+            .map(|(header, _)| vec![header.input, header.output]),
+        _ => None,
+    };
+    fields.into_iter().flatten().map(Inline::new)
 }
 
 /// The collection a retired signed frame names, when its kind is one of the
@@ -6160,12 +6197,14 @@ impl PileFile {
             .sum();
         Ok(RetainedRewritePlan {
             retained_blobs: retention.keep.len(),
+            retained: retention.keep,
             retained_bytes,
             opaque_frames: selection.opaque_frames.len(),
             superseded_equations: selection.superseded_equations,
             drained_frames: selection.drained_frames,
             retired_equations: selection.retired_equations.len(),
             filtered_frames: selection.filtered_frames,
+            repeated_frames: selection.repeated_frames,
         })
     }
 
@@ -6180,7 +6219,8 @@ impl PileFile {
     /// carried frame of a kind this binary does not model roots,
     /// conservatively, every resident blob one of its aligned 32-byte words
     /// names, instead of every resident blob. Carried records, proofs, WANTs
-    /// and legacy pins root what they name as in the plain rewrite, and every
+    /// and legacy pins root what they name as in the plain rewrite, a carried
+    /// legacy V3 header roots the blob handles its fields name, and every
     /// resident description of a record kind this binary writes is kept. So
     /// with `explicit` naming every resident blob nothing is dropped, and with
     /// no explicit roots every blob the carried state cannot reach is.
@@ -6342,27 +6382,42 @@ impl PileFile {
                     root_record(&mut roots, reader.record_at(offset));
                 }
                 for header in &selection.legacy_headers {
-                    if let Ok(PileRecord {
-                        content: PileRecordContent::LegacyUnsignedCollectionEquation { equation },
-                        ..
-                    }) = decode_record(header, 0)
-                    {
-                        let kind = match equation {
-                            LegacyUnsignedCollectionEquation::Merge { .. } => {
-                                record_kind::KIND_COLLECTION_MERGE_UNSIGNED
-                            }
-                            LegacyUnsignedCollectionEquation::Derive { .. } => {
-                                record_kind::KIND_COLLECTION_DERIVE_UNSIGNED
-                            }
-                        };
-                        for handle in equation
-                            .blob_references()
-                            .chain(std::iter::once(Inline::new(kind)))
-                        {
-                            if resident(handle) {
-                                roots.retain_recursive(handle);
+                    match decode_record(header, 0) {
+                        Ok(PileRecord {
+                            content:
+                                PileRecordContent::LegacyUnsignedCollectionEquation { equation },
+                            ..
+                        }) => {
+                            let kind = match equation {
+                                LegacyUnsignedCollectionEquation::Merge { .. } => {
+                                    record_kind::KIND_COLLECTION_MERGE_UNSIGNED
+                                }
+                                LegacyUnsignedCollectionEquation::Derive { .. } => {
+                                    record_kind::KIND_COLLECTION_DERIVE_UNSIGNED
+                                }
+                            };
+                            for handle in equation
+                                .blob_references()
+                                .chain(std::iter::once(Inline::new(kind)))
+                            {
+                                if resident(handle) {
+                                    roots.retain_recursive(handle);
+                                }
                             }
                         }
+                        // Inert to replay, but a carried header keeps what
+                        // its fields name, as a carried record does.
+                        Ok(PileRecord {
+                            content: PileRecordContent::LegacyCollectionV3 { .. },
+                            ..
+                        }) => {
+                            for handle in legacy_v3_header_references(header) {
+                                if resident(handle) {
+                                    roots.retain_recursive(handle);
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 for equation in &selection.retired_equations {
@@ -6421,6 +6476,7 @@ impl PileFile {
             superseded_equations,
             drained_frames,
             filtered_frames,
+            repeated_frames,
         } = selection;
         let Retention {
             keep,
@@ -6507,6 +6563,7 @@ impl PileFile {
             drained_frames,
             retired_equations: retired_equations.len(),
             filtered_frames,
+            repeated_frames,
         })
     }
 
@@ -6538,10 +6595,13 @@ impl PileFile {
         }
         let strong_pins = self.branches.clone();
         // Frames whose kind this binary does not model are carried exactly,
-        // by their own length, from the observed prefix: this rewrite keeps
-        // every resident blob, so it cannot orphan whatever such a frame
-        // names, and a binary that knows the kind reads them unchanged. Yard
-        // reclamation, which does drop blobs, still refuses on them.
+        // by their own length, from the observed prefix, and a binary that
+        // knows the kind reads them unchanged. Neither rewrite orphans what
+        // such a frame names: the plain one widens retention to every
+        // resident blob when it carries one, the filtered one roots every
+        // resident blob an aligned word of a carried one names. Yard
+        // reclamation, which drops blobs without either, still refuses on
+        // them.
         self.physical_rewrite_guard()
             .map_err(PileRewriteError::Source)?;
         let covered = reader.covered_len;
@@ -6568,6 +6628,7 @@ impl PileFile {
         let mut superseded_equations = 0usize;
         let mut drained_frames = 0usize;
         let mut filtered_frames = 0usize;
+        let mut repeated_frames = 0usize;
         let legacy_collection_headers = self.legacy_collection_headers.clone();
         // Which collections are being left behind: the named generations and,
         // to a fixpoint, everything derived from them. Candidates are every
@@ -6610,6 +6671,9 @@ impl PileFile {
         }
 
         let mut opaque_frames = Vec::new();
+        // Replay indexes every copy of a frame; the destination keeps one per
+        // content, so each is considered once.
+        let mut opaque_seen: BTreeSet<[u8; 32]> = BTreeSet::new();
         for (offset, len) in self.opaque_frames.iter().copied() {
             if offset + len > covered {
                 continue;
@@ -6619,6 +6683,10 @@ impl PileFile {
                     .as_ref()
                     .expect("mapped opaque frame")
             };
+            if !opaque_seen.insert(*blake3::hash(frame).as_bytes()) {
+                repeated_frames += 1;
+                continue;
+            }
             if let Some(stated) = retired_signed_collection_frame(frame) {
                 if !filter.carries(&stated) {
                     filtered_frames += 1;
@@ -6721,9 +6789,14 @@ impl PileFile {
         }
 
         let mut current_records = Vec::new();
+        let mut run = MemberRun::new();
         for key in collection_records.iter_ordered() {
             let offset: [u8; 8] = key[64..].try_into().expect("key tail is the offset");
             let record = reader.record_at(&offset);
+            if !run.first(key, record) {
+                repeated_frames += 1;
+                continue;
+            }
             let role = match record {
                 CollectionRecord::Commit(_) => CollectionFrameRole::Commit,
                 CollectionRecord::Merge(_) => CollectionFrameRole::Merge,
@@ -6755,6 +6828,7 @@ impl PileFile {
             superseded_equations,
             drained_frames,
             filtered_frames,
+            repeated_frames,
         })
     }
 }
@@ -10541,6 +10615,7 @@ mod tests {
                 drained_frames: 0,
                 retired_equations: 0,
                 filtered_frames: 0,
+                repeated_frames: 0,
             }
         );
 
@@ -13742,6 +13817,336 @@ mod tests {
         drop(reader);
         plain.close().unwrap();
         source.close().unwrap();
+    }
+
+    /// With no explicit roots, what a filtered rewrite carries keeps what it
+    /// names: a carried legacy V3 COMMIT its data and metadata (and what they
+    /// reach), a carried V3 DERIVE its input and output, a preserved WANT its
+    /// handle, a legacy pin its head and a capability proof its definition.
+    /// A V3 MERGE left behind roots nothing. The plan names exactly the blobs
+    /// the destination holds.
+    #[test]
+    fn a_filtered_rewrite_keeps_what_carried_headers_wants_pins_and_proofs_name() {
+        struct DropMerges;
+        impl CollectionFrameFilter for DropMerges {
+            fn carries(&mut self, frame: &CollectionFrame) -> bool {
+                frame.role != CollectionFrameRole::Merge
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "legacy-reach-source.pile");
+        let mut source = Pile::open(&source_path).unwrap();
+        let put = |source: &mut Pile, bytes: Vec<u8>| {
+            source
+                .put::<UnknownBlob, _>(Bytes::from_source(bytes))
+                .unwrap()
+        };
+        let child = put(&mut source, b"named by the V3 commit's metadata".to_vec());
+        let v3_data = put(&mut source, b"a V3 commit's data".to_vec());
+        let mut metadata_bytes = vec![0x11; 32];
+        metadata_bytes.extend_from_slice(&child.raw);
+        let v3_metadata = put(&mut source, metadata_bytes);
+        let v3_input = put(&mut source, b"a V3 derive's input".to_vec());
+        let v3_output = put(&mut source, b"a V3 derive's output".to_vec());
+        let v3_first = put(&mut source, b"a V3 merge's first input".to_vec());
+        let v3_second = put(&mut source, b"a V3 merge's second input".to_vec());
+        let v3_result = put(&mut source, b"a V3 merge's result".to_vec());
+        let wanted = put(&mut source, b"named only by a WANT".to_vec());
+        let pinned = put(&mut source, b"named only by a legacy pin".to_vec());
+        let unrelated = put(&mut source, b"named by nothing".to_vec());
+        let definition = source.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
+        let proof = CapabilityProof::new(
+            CapabilityResource::new([61; 32]),
+            &SigningKey::from_bytes(&[62; 32]),
+            definition,
+            SigningKey::from_bytes(&[63; 32]).verifying_key(),
+        );
+        source.insert_proof(proof.clone()).unwrap();
+        source.want(WantRequest::blob(wanted)).unwrap();
+        let pin_id = Id::new([64; 16]).unwrap();
+        source
+            .append_legacy_pin_for_test(pin_id, None, Some(pinned.transmute()))
+            .unwrap();
+        source.close().unwrap();
+        let (low, high) = if v3_first.raw <= v3_second.raw {
+            (v3_first.raw, v3_second.raw)
+        } else {
+            (v3_second.raw, v3_first.raw)
+        };
+        for header in [
+            fixed_collection_header(
+                CollectionDefinitionHeaderV3 {
+                    magic_marker: MAGIC_MARKER_COLLECTION_DEFINITION_V3,
+                    scope: [1; 16],
+                    representation: [2; 16],
+                    recipe: [3; 16],
+                    reserved: [0; 192],
+                }
+                .as_bytes(),
+            ),
+            fixed_collection_header(
+                CollectionCommitHeaderV3 {
+                    magic_marker: MAGIC_MARKER_COLLECTION_COMMIT_V3,
+                    collection: [4; 16],
+                    data: v3_data.raw,
+                    metadata: v3_metadata.raw,
+                    public_key: [7; 32],
+                    signature_r: [8; 32],
+                    signature_s: [9; 32],
+                    reserved: [0; 64],
+                }
+                .as_bytes(),
+            ),
+            fixed_collection_header(
+                CollectionMergeHeaderV3 {
+                    magic_marker: MAGIC_MARKER_COLLECTION_MERGE_V3,
+                    collection: [10; 16],
+                    low,
+                    high,
+                    result: v3_result.raw,
+                    reserved: [0; 128],
+                }
+                .as_bytes(),
+            ),
+            fixed_collection_header(
+                CollectionDeriveHeaderV3 {
+                    magic_marker: MAGIC_MARKER_COLLECTION_DERIVE_V3,
+                    source: [14; 16],
+                    target: [15; 16],
+                    input: v3_input.raw,
+                    output: v3_output.raw,
+                    reserved: [0; 144],
+                }
+                .as_bytes(),
+            ),
+        ] {
+            append_test_bytes(&source_path, &header);
+        }
+
+        let mut source = Pile::open(&source_path).unwrap();
+        let plan = source
+            .plan_retained_rewrite(
+                &RetentionRoots::new(),
+                WantRewritePolicy::Preserve,
+                &[],
+                &mut DropMerges,
+            )
+            .unwrap();
+        let destination_path = fresh_empty_pile_path(&dir, "legacy-reach-destination.pile");
+        let mut destination = Pile::open(&destination_path).unwrap();
+        let stats = source
+            .rewrite_retained_into_filtered(
+                &mut destination,
+                &RetentionRoots::new(),
+                WantRewritePolicy::Preserve,
+                &[],
+                &mut DropMerges,
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                stats.filtered_frames,
+                stats.wants,
+                stats.strong_pins,
+                stats.capability_proofs,
+                stats.retained_blobs,
+            ),
+            (1, 1, 1, 1, plan.retained_blobs)
+        );
+        assert_eq!(plan.filtered_frames, 1);
+
+        let reader = destination.snapshot().unwrap();
+        for handle in [
+            child,
+            v3_data,
+            v3_metadata,
+            v3_input,
+            v3_output,
+            wanted,
+            pinned,
+            definition.transmute(),
+        ] {
+            assert!(
+                reader.contains_blob(handle).unwrap(),
+                "{handle:?} is reached"
+            );
+        }
+        for handle in [v3_first, v3_second, v3_result, unrelated] {
+            assert!(!reader.contains_blob(handle).unwrap(), "{handle:?} is not");
+        }
+        let held: BTreeSet<Inline<Handle<UnknownBlob>>> =
+            reader.blobs().map(|info| info.unwrap().handle).collect();
+        assert_eq!(held, plan.retained);
+        assert_eq!(
+            reader
+                .wants()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![WantRequest::blob(wanted)]
+        );
+        assert_eq!(
+            reader
+                .proofs()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![proof]
+        );
+        drop(reader);
+        assert_eq!(
+            destination.legacy_pin_head_for_test(pin_id).unwrap(),
+            Some(pinned.transmute())
+        );
+        destination.close().unwrap();
+        assert_eq!(
+            legacy_collection_headers_at(&destination_path)
+                .into_iter()
+                .map(|(kind, _)| kind)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                LegacyCollectionRecordKindV3::Definition,
+                LegacyCollectionRecordKindV3::Commit,
+                LegacyCollectionRecordKindV3::Derive,
+            ])
+        );
+        source.close().unwrap();
+    }
+
+    /// A pile concatenated with itself holds every frame twice. The rewrite
+    /// considers each once: the filter is asked the questions it is asked
+    /// about the original, the repeats are counted, and the destination
+    /// holds what the original's rewrite holds.
+    #[test]
+    fn a_pile_concatenated_with_itself_is_rewritten_as_the_original() {
+        use crate::collection::SourceLocator;
+
+        #[derive(Default)]
+        struct Recording(Vec<CollectionFrame>);
+        impl CollectionFrameFilter for Recording {
+            fn carries(&mut self, frame: &CollectionFrame) -> bool {
+                self.0.push(*frame);
+                frame.role != CollectionFrameRole::Merge
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let single_path = fresh_empty_pile_path(&dir, "single.pile");
+        let key = SigningKey::from_bytes(&[71; 32]);
+        let root = collection_test_collection(72);
+        let derived = collection_test_collection(73);
+        let mut single = Pile::open(&single_path).unwrap();
+        let payload = single
+            .put::<UnknownBlob, _>(Bytes::from_source(b"a committed payload".to_vec()))
+            .unwrap();
+        let data = Inline::<Hash<Blake3>>::new(payload.raw);
+        for record in [
+            CollectionRecord::Commit(CollectionCommit::sign(
+                &key,
+                root,
+                data,
+                empty_metadata_handle(),
+            )),
+            CollectionRecord::Merge(
+                CollectionMerge::sign(
+                    &key,
+                    root,
+                    [collection_test_hash(1), collection_test_hash(2)],
+                    collection_test_hash(3),
+                )
+                .unwrap(),
+            ),
+            CollectionRecord::Derive(CollectionDerive::sign(
+                &key,
+                derived,
+                SourceLocator::of(data.raw),
+                collection_test_hash(4),
+            )),
+        ] {
+            single.insert(record).unwrap();
+        }
+        single.close().unwrap();
+        let mut retired =
+            test_envelope_bytes(record_kind::KIND_COLLECTION_DERIVE_WITNESSED_V7, 2, 512);
+        retired[FRAME_BODY_OFFSET..FRAME_BODY_OFFSET + 32].copy_from_slice(&derived.raw);
+        append_test_bytes(&single_path, &retired);
+        append_test_bytes(
+            &single_path,
+            &test_envelope_bytes(TEST_UNKNOWN_KIND_A, 1, 256),
+        );
+        let double_path = fresh_empty_pile_path(&dir, "double.pile");
+        let bytes = std::fs::read(&single_path).unwrap();
+        append_test_bytes(&double_path, &bytes);
+        append_test_bytes(&double_path, &bytes);
+
+        let rewrite = |source_path: &Path, name: &str| {
+            let mut source = Pile::open(source_path).unwrap();
+            let mut planning = Recording::default();
+            let plan = source
+                .plan_retained_rewrite(
+                    &RetentionRoots::new(),
+                    WantRewritePolicy::Drop,
+                    &[],
+                    &mut planning,
+                )
+                .unwrap();
+            let destination_path = fresh_empty_pile_path(&dir, name);
+            let mut destination = Pile::open(&destination_path).unwrap();
+            let mut rewriting = Recording::default();
+            let stats = source
+                .rewrite_retained_into_filtered(
+                    &mut destination,
+                    &RetentionRoots::new(),
+                    WantRewritePolicy::Drop,
+                    &[],
+                    &mut rewriting,
+                )
+                .unwrap();
+            assert_eq!(planning.0, rewriting.0);
+            assert_eq!(plan.repeated_frames, stats.repeated_frames);
+            let reader = destination.snapshot().unwrap();
+            let records = sorted_collection_records(
+                reader
+                    .records()
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap(),
+            );
+            let blobs: BTreeSet<_> = reader.blobs().map(|info| info.unwrap().handle).collect();
+            drop(reader);
+            destination.close().unwrap();
+            source.close().unwrap();
+            let frames: Vec<_> = PileRecords::open(&destination_path)
+                .unwrap()
+                .map(|record| {
+                    let record = record.unwrap();
+                    (record.offset, record.len)
+                })
+                .collect();
+            (rewriting.0, stats, records, blobs, frames)
+        };
+        let (asked_single, stats_single, records_single, blobs_single, frames_single) =
+            rewrite(&single_path, "single-rewritten.pile");
+        let (asked_double, stats_double, records_double, blobs_double, frames_double) =
+            rewrite(&double_path, "double-rewritten.pile");
+        // Three current records and one retired signed frame are asked
+        // about; the frame of unknown kind is not.
+        assert_eq!(asked_single.len(), 4);
+        assert_eq!(asked_double, asked_single);
+        assert_eq!(stats_single.repeated_frames, 0);
+        // Three current records and two frames of unknown kind repeated.
+        assert_eq!(stats_double.repeated_frames, 5);
+        assert_eq!(
+            PileRewriteStats {
+                repeated_frames: 0,
+                ..stats_double
+            },
+            stats_single
+        );
+        assert_eq!(records_double, records_single);
+        assert_eq!(blobs_double, blobs_single);
+        assert_eq!(frames_double, frames_single);
     }
 
     /// Re-adding an existing set element is a no-op append.

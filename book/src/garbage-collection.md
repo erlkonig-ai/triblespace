@@ -143,17 +143,19 @@ A retained rewrite can also leave collection-algebra frames behind.
 `PileFile::rewrite_retained_into_filtered` asks a `CollectionFrameFilter`
 about every COMMIT, MERGE and DERIVE frame it would carry, in every encoding
 the pile still recognises, before drained generations and supersession apply.
-Its retention follows what it carries: a frame left behind roots nothing, and
-a carried frame of unknown kind roots the resident blobs its aligned 32-byte
-words name, the same conservative reading the blob walk gives an unknown
-blob, rather than widening to every resident blob. Without explicit roots it
-therefore keeps exactly what the carried records, proofs, WANTs and pins
-reach. `PileFile::plan_retained_rewrite` runs the same selection pass and
-retention walk without writing, so a dry run reports exactly what the rewrite
-will do. The lattice v3 cutover (`trible pile migrate SRC lattice-v3`) is
-this rewrite with no explicit roots: it drops every MERGE, since each host
-folds and rebuilds only its own, the DERIVEs of mappings that became attached
-indexes or were deleted, and every blob only those reached.
+A frame a concatenated pile holds twice is considered once. Its retention
+follows what it carries: a frame left behind roots nothing, a carried legacy
+V3 header roots the blob handles its fields name, and a carried frame of
+unknown kind roots the resident blobs its aligned 32-byte words name, the
+same conservative reading the blob walk gives an unknown blob, rather than
+widening to every resident blob. Without explicit roots it therefore keeps
+exactly what the carried records, headers, proofs, WANTs and pins reach.
+`PileFile::plan_retained_rewrite` runs the same selection pass and retention
+walk without writing, so a dry run reports exactly what the rewrite will do.
+The lattice v3 cutover (`trible pile migrate SRC lattice-v3`) is this rewrite
+with no explicit roots: it drops every MERGE, since each host folds and
+rebuilds only its own, the DERIVEs of mappings that became attached indexes
+or were deleted, and every blob only those reached.
 
 ## Conservative Reachability
 
