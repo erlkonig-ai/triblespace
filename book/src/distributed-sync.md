@@ -781,7 +781,9 @@ PATCH of resident handles, kept by the store itself
 (`triblespace_core::collection::held`) for the collections a sync host
 tracks. Seeds are the blobs C's replicated records name -- the descriptor,
 each COMMIT's data and metadata archive, each DERIVE's output -- and the
-capability definitions named by C's proofs. A MERGE result is never a seed,
+capability definitions named by C's proofs, whether a proof is over C itself
+or over a resource whose descriptor routes to C (a descriptor that arrives
+after its proof routes it on arrival). A MERGE result is never a seed,
 and neither is a blob no record names. Reachability is conservative: an
 aligned 32-byte word is a child when that exact H is resident. It issues no
 network request, creates no WANT and remembers no absent word.
@@ -790,7 +792,8 @@ Each blob is scanned once, when first reached, and its edges to the children
 resident at that moment enter one edge cache shared by every collection. A new
 seed, edge or membership then extends a held set without reading bytes again;
 an already scanned blob shared with another collection joins it for free. A
-seed whose bytes arrive after its record is scanned on arrival. The late
+seed whose bytes arrive after its record is scanned on arrival, including
+while a walk that could not read it is still running. The late
 child -- resident only after its parent was scanned -- is caught three ways:
 
 - it is itself a seed of some collection;
@@ -808,10 +811,16 @@ child -- resident only after its parent was scanned -- is caught three ways:
 
 A serving snapshot is published with the closures of the records new in its
 store observation already computed against that observation. The start-up
-walk of a newly activated collection and the periodic walk run on the sync
-daemon's own threads, publish into later snapshots level by level, and never
-gate publication; a snapshot's held sets never change after it is taken.
-Short-lived readers of the same pile track nothing and start no thread.
+walk of a newly activated collection (that collection only) and the periodic
+walk of every collection run on the sync daemon's own threads, publish into
+later snapshots level by level, and never gate publication; a snapshot's held
+sets never change after it is taken. While a collection's start-up walk is
+owed, peer reports for it wait for that walk instead of being read while a
+snapshot is taken: after a restart peers report their whole held sets, and
+reading them there would repeat the start-up walk on the publication path.
+A collection whose records the store cannot select is left out of the held
+sets and selected again, never published short. Short-lived readers of the
+same pile track nothing and start no thread.
 
 Anti-entropy compares like with like: the inventory walk diffs the remote
 held set against the local held set under Merkle pruning.
