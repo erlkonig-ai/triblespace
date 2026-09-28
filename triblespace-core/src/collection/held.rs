@@ -14,9 +14,12 @@
 //! DERIVE's output, and the capability definitions named by the proofs C's
 //! authorization evidence keeps ([`validate_proof_evidence`], the predicate
 //! the sync host applies: over C from one of C's policy roots, or over a
-//! resource whose descriptor entity routes to C and declares the root; a
-//! proof whose descriptors arrive later is judged on their arrival). A
-//! valid proof irrelevant to C seeds nothing. A MERGE never replicates, so
+//! resource whose descriptor entity routes to C and declares the root,
+//! whether or not that resource is tracked too; a proof whose descriptors
+//! arrive later is judged on their arrival, and one judged while a
+//! descriptor was resident but unreadable is judged again after the next
+//! walk). A valid proof irrelevant to C seeds nothing. A MERGE never
+//! replicates, so
 //! its result is never a seed, and a blob no record names (an attachment, a
 //! scratch archive) is never one either.
 //!
@@ -51,27 +54,35 @@
 //!
 //! Every snapshot carries the held sets as they stood when it was taken, and
 //! they never change afterwards. Taking a snapshot first extends the sets by
-//! the closures of what arrived since the previous one -- new records' seeds,
-//! seeds whose bytes arrived, memberships peers reported -- computed against
+//! the closures of what arrived since the previous one -- every seed of a new
+//! record (one another record already named included), seeds whose bytes
+//! arrived, memberships peers reported -- computed against
 //! that snapshot. That is the publication barrier: an observation is never
 //! handed out ahead of its new records' closures. Background walks only
 //! enter later snapshots; a changed [`HeldRead::held_generation`] says one did.
 //!
-//! A held set is *closed*: a blob joins only once every resident child it
-//! had when scanned has joined, so every closure computed later stops at a
-//! held blob without missing anything below it.
+//! A held set is *closed* under the edge cache: a blob joins only once every
+//! child the cache names for it has joined, and when a walk learns a new
+//! child of a held blob, the child joins with the edge. So every closure
+//! computed later stops at a held blob without missing anything the cache
+//! knows below it. A blob that cannot be read -- absent, or resident and
+//! failing to read -- is unknown on every path: nothing above it joins until
+//! a walk reads it, and the reports and seeds above it stay roots of the
+//! periodic walk, which tries again.
 //!
 //! When a collection is first tracked, its existing closure is computed
 //! synchronously if no walker is attached, and otherwise by a start-up walk
-//! of that collection in the background. The walk publishes batch by batch
-//! (a positive set is safe to publish incomplete), each blob only after its
-//! closure. The start-up walk and the periodic walk never gate a snapshot.
-//! While a collection's start-up walk is owed, peer reports for it wait for
-//! that walk, which reads those its records do not reach, rather than being
+//! of that collection in the background. The walk reads a batch of roots to
+//! the end and publishes it children before parents (a positive set is safe
+//! to publish incomplete). The start-up walk and the periodic walk never gate
+//! a snapshot. While a collection's start-up walk is owed, peer reports for
+//! it -- observed or only noted -- wait for that walk, which reads those its
+//! records do not reach, against the latest observation, rather than being
 //! read while a snapshot is taken: after a restart peers report their whole
 //! held sets, and resolving those reports at once would be the full walk
-//! again, on the publication path. Only a caller that owns a long-running
-//! host starts a walker; nothing here starts a thread by itself.
+//! again, on the publication path. A walk takes at most 16 rounds of such
+//! reports; later ones wait for the walker's next turn. Only a caller that owns a long-running host starts a
+//! walker; nothing here starts a thread by itself.
 //!
 //! A snapshot that lost a blob its predecessor had (a store that forgets
 //! blobs) resets the index: the edges are forgotten and every collection is

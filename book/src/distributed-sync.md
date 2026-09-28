@@ -784,9 +784,11 @@ each COMMIT's data and metadata archive, each DERIVE's output -- and the
 capability definitions named by the proofs C's authorization evidence keeps.
 That is the predicate AUTH applies (`descriptor::validate_proof_evidence`): a
 proof over C from one of C's policy roots, or over a resource whose immutable
-descriptor entity both routes to C and declares the proof's root. A valid
-proof irrelevant to C seeds nothing, and a descriptor that arrives after its
-proof lets the proof be judged on arrival. A MERGE result is never a seed,
+descriptor entity both routes to C and declares the proof's root, whether or
+not that resource is tracked as well. A valid proof irrelevant to C seeds
+nothing. A descriptor that arrives after its proof lets the proof be judged on
+arrival; proofs judged while a descriptor was resident but could not be read
+are judged again after the next walk. A MERGE result is never a seed,
 and neither is a blob no record names. Reachability is conservative: an
 aligned 32-byte word is a child when that exact H is resident. It issues no
 network request, creates no WANT and remembers no absent word.
@@ -817,14 +819,20 @@ store observation already computed against that observation. The start-up
 walk of a newly activated collection (that collection only) and the periodic
 walk of every collection run on the sync daemon's own threads, publish into
 later snapshots batch by batch, and never gate publication; a snapshot's held
-sets never change after it is taken. A held set is closed: a blob joins only
-once every resident child it had when scanned has joined, so a walk publishes
-each batch deepest first, and a new record's closure never stops short at a
-blob a running walk has not finished. While a collection's start-up walk is
-owed, peer reports for it wait for that walk, which reads those its records do
-not reach, instead of being read while a snapshot is taken: after a restart
-peers report their whole held sets, and reading them there would repeat the
-start-up walk on the publication path.
+sets never change after it is taken. Every seed of a new record is reached,
+including one another record already named. A held set is closed under the
+edge cache: a blob joins only once every child the cache names for it has
+joined, a walk reads a batch of roots to the end and publishes it children
+before parents, and a child a walk newly learns under a held blob joins with
+the edge. A blob that cannot be read, absent or resident and failing to read,
+is unknown on every path: nothing above it joins until a walk reads it. While
+a collection's start-up walk is owed, peer reports for it, observed or only
+noted, wait for that walk, which reads those its records do not reach against
+the latest observation (a blob it could not read before is read again), instead
+of being read while a snapshot is taken: after a restart peers report their
+whole held sets, and reading them there would repeat the start-up walk on the
+publication path. One walk takes at most 16 rounds of such reports; later ones
+wait for the walker's next turn.
 A collection whose records the store cannot select is left out of the held
 sets and selected again, never published short. Short-lived readers of the
 same pile track nothing and start no thread.
