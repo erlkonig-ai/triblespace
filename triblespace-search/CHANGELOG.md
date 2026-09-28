@@ -32,6 +32,27 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   source embeddings are never requantized to read an existing member. The
   constructor also stops re-reading its own freshly encoded output.
 
+- `NvFp4CosineSet` holds a set of rows, not one row per handle. One handle may
+  carry several different rows (two derivations of one content that did not
+  reproduce bit for bit), and a row two members hold identically is one row.
+  Rows are ordered by a canonical key, the row's own byte planes in layout
+  order with the handle first, so every set of rows has one encoding. The join
+  is set union: total, associative, commutative and idempotent, where it
+  returned an error for two different rows under one handle. `validate_member`
+  audits strict ascent in that order. Readers bind each handle once:
+  `reconstructed_cosines` keeps the maximum over a handle's rows (`cosine`,
+  `similar_to` and `len` are per handle), and the exact `top_k`, `above` and
+  `similar_to` take one candidate per handle, bounded by the largest
+  certificate over its rows, so each handle is fetched and returned once.
+  Every member that was canonical before is unchanged and joins to the same
+  bytes, but a reader of the old recipe would misread several rows under one
+  handle, so the recipe is a new type: `NVFP4_COSINE_SET` is
+  `7442860EF495677853BE03EC0E5079AC` (minted with `trible genid`), replacing
+  `9F1A2851ADCA92BAB92688441B262DEA`, and the recipe description states the
+  set rows. Derived descriptors embed both, so every `NvFp4CosineSet`
+  collection gets a new handle; collections under the old recipe are not
+  rebound and must be derived again.
+
 ### The semantic index (`semantic`, feature `semantic`)
 
 - Rows are keyed by the content handle they embed, the value `V` of a
@@ -39,14 +60,17 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   and `[attribute | entity]`. That key claimed one value per entity: a second
   value under one key made the carrier refuse the join, a union kept only the
   smallest value, and a row named an entity no query could join the source
-  on. Now a multi-valued attribute is more values, a blob several entities
-  hold is one row, the mapping of a union is the join of the mappings, and a
-  reader joins the source on the value (`pattern(e, a, v)`, with `a` free for
-  any attached content). One index is one model (`SemanticModel::Vision` or
-  `SemanticModel::Text` with its tokenizer), so the kind of a row is the
-  index it lives in and each kind gets its own floor; the bytes decide which
-  model reads a value, so a vision and a text index over one source are
-  disjoint. `semantic_content_attribute` is repeatable and the
+  on. Now a multi-valued attribute is more values, a blob several entities of
+  one member hold is one row, the handles of the mapping of a union are the
+  union of the mappings' handles (and its rows are the join of the mappings'
+  rows when embedding reproduces bit for bit; otherwise a blob two members
+  hold keeps one row per differing embedding, see the set rows entry above),
+  and a reader joins the source on the value (`pattern(e, a, v)`, with `a`
+  free for any attached content). One index is one model
+  (`SemanticModel::Vision` or `SemanticModel::Text` with its tokenizer), so
+  the kind of a row is the index it lives in and each kind gets its own
+  floor; the bytes decide which model reads a value, so a vision and a text
+  index over one source are disjoint. `semantic_content_attribute` is repeatable and the
   `semantic_text_attribute` argument is gone (text attributes are content
   attributes whose values are text). `row_key` and `row_entity` are gone.
   Minted the mapping id `523C31F03F049CA26A0E847CAAFC08F7`, replacing

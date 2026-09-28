@@ -1,10 +1,21 @@
 //! Canonical row-local NVFP4 cosine collection.
 //!
 //! The persisted value is a set of independently quantized embedding rows,
-//! keyed and ordered by the exact embedding blob handle.  A row owns its FP32
-//! global scale; adding another row can therefore never requantize an existing
-//! one.  That independence is what makes sorted set union a canonical,
-//! associative, commutative, and idempotent collection join.
+//! each keyed by a 32-byte handle.  A row owns its FP32 global scale; adding
+//! another row can therefore never requantize an existing one.  That
+//! independence is what makes sorted set union a canonical, associative,
+//! commutative, and idempotent collection join.
+//!
+//! The set is a set of rows, not a map from handles: one handle may carry
+//! several different rows. Two derivations of one content that did not
+//! reproduce bit for bit (another run, another kernel) are both kept, and a
+//! row that two members hold identically is one row. Rows are ordered by
+//! their canonical key, the row's own byte planes in layout order compared
+//! lexicographically: `handle`, then for each stage its global scale, block
+//! scales and codes, then `norm_f32`, then `error_f32`. Handles are therefore
+//! non-decreasing, and the rows under one handle have one total order, so
+//! every set of rows has exactly one encoding. Readers bind each handle once,
+//! scored by the maximum over its rows.
 //!
 //! Each row stores a primary NVFP4 reconstruction and a second NVFP4
 //! reconstruction of its residual. A member is a gapless structure-of-arrays:
@@ -12,14 +23,14 @@
 //! q0_e2m1_codes[N][ceil256(D)/2] | q1_globals[N] |
 //! q1_e4m3_scales[N][ceil256(D)/16] | q1_e2m1_codes[N][ceil256(D)/2] |
 //! norm_f32[N] | error_f32[N] | N_u64 | D_u64`.
-//! Integers and floats are little-endian; handles are strictly ascending;
-//! negative FP4 zero is rejected. `norm_f32` is an upward-rounded norm of the
-//! summed canonical `f64` reconstruction. `error_f32` is one upward-rounded
-//! row certificate which encloses both the transform-and-two-stage-
-//! quantization L2 error and the discrepancy between the canonical `f64`
-//! reconstruction and the encoding's prescribed explicit-`f32`
-//! reconstruction. The latter lets a binary32 scanner remain exact without a
-//! sidecar or another persisted plane.
+//! Integers and floats are little-endian; rows are strictly ascending in the
+//! canonical row order; negative FP4 zero is rejected. `norm_f32` is an
+//! upward-rounded norm of the summed canonical `f64` reconstruction.
+//! `error_f32` is one upward-rounded row certificate which encloses both the
+//! transform-and-two-stage-quantization L2 error and the discrepancy between
+//! the canonical `f64` reconstruction and the encoding's prescribed
+//! explicit-`f32` reconstruction. The latter lets a binary32 scanner remain
+//! exact without a sidecar or another persisted plane.
 //!
 //! Approximation is confined to candidate discovery.  [`NvFp4CosineIndex`]
 //! uses conservative error bounds and fetches original embedding blobs for
@@ -27,7 +38,8 @@
 //! [`NvFp4CosineIndex::above`] retain exact cosine semantics. An index that
 //! holds no exact vector per row (the semantic index keys its rows by the
 //! content they embed) is read through its reconstructions instead:
-//! [`NvFp4CosineIndex::reconstructed_cosines`] scores every row once, and its
+//! [`NvFp4CosineIndex::reconstructed_cosines`] scores every distinct row once
+//! and keeps the best score per handle, and its
 //! [`ReconstructedCosines::similar_to`] is the threshold as a query constraint.
 
 use std::cmp::{Ordering, Reverse};
@@ -65,11 +77,21 @@ const FLOAT_LEN: usize = FLOAT_BYTES;
 const FOOTER_LEN: usize = 16;
 
 // Stable marker for this exact byte and cosine recipe. Minted with
-// `trible genid` on 2026-09-01 after strengthening `error_f32` to cover the
-// prescribed explicit-f32 decode. It is embedded in the derived encoding's
-// identity together with E, so a recipe or exact embedding encoding change
-// necessarily produces another collection encoding.
-pub const NVFP4_COSINE_SET: Id = id_hex!("9F1A2851ADCA92BAB92688441B262DEA");
+// `trible genid` on 2026-09-28, when a set of rows replaced one row per
+// handle. It is embedded in the derived encoding's identity together with E,
+// so a recipe or exact embedding encoding change necessarily produces another
+// collection encoding.
+//
+// It replaces `9F1A2851ADCA92BAB92688441B262DEA` (minted 2026-09-01 after
+// strengthening `error_f32` to cover the prescribed explicit-f32 decode),
+// whose values hold at most one row per handle. Those values are canonical
+// here too, with the same bytes and the same joins, but the converse fails: a
+// reader of that recipe given several rows under one handle scores the handle
+// twice, or refuses the cover as conflicting. A wider value space is another
+// type, so a reader that does not know it finds no collection instead of
+// misreading one. Collections under the old marker are neither rewritten nor
+// rebound; they are derived again under this one.
+pub const NVFP4_COSINE_SET: Id = id_hex!("7442860EF495677853BE03EC0E5079AC");
 
 // Stable identity for the SimpleArchive attribute-selection mapping. Minted
 // with `trible genid` on 2026-09-01 for the strengthened row certificate. The
@@ -125,7 +147,7 @@ impl MetaDescribe for NvFp4CosineRecipe {
         let id = NVFP4_COSINE_SET;
         entity! { ExclusiveId::force_ref(&id) @
             metadata::name: "nvfp4-cosine-recipe",
-            metadata::description: "Canonical row-local two-stage residual NVFP4 cosine carrier. Rows are ordered by exact embedding handle and independently normalized, deterministically rotated, block-scaled, quantized twice, and conservatively error-bounded for both canonical f64 and prescribed explicit-f32 reconstruction. Join is set union by handle; exact source embeddings remain lazy reranking dependencies.",
+            metadata::description: "Canonical row-local two-stage residual NVFP4 cosine carrier. A value is a set of rows, and one handle may carry several different rows. Each row is independently normalized, deterministically rotated, block-scaled, quantized twice, and conservatively error-bounded for both canonical f64 and prescribed explicit-f32 reconstruction. Rows are ordered by handle, then by their own stored bytes in layout order, and identical rows are one row. Join is set union of rows. A reader binds each handle once, and its reconstruction score and candidate bound are the maximum over its rows; exact source embeddings remain lazy reranking dependencies.",
             metadata::tag: metadata::KIND_TAG,
         }
     }
@@ -265,15 +287,15 @@ impl Layout {
     }
 
     fn validate(&self, bytes: &[u8]) -> Result<(), NvFp4Error> {
-        let mut previous: Option<&[u8]> = None;
+        let mut previous: Option<RowOrder<'_>> = None;
         for row in 0..self.rows {
-            let handle = self.handle(bytes, row);
-            if previous.is_some_and(|old| old >= handle) {
+            let key = self.row_order(bytes, row);
+            if previous.is_some_and(|old| old >= key) {
                 return Err(NvFp4Error::new(
-                    "NVFP4 embedding handles must be strictly increasing",
+                    "NVFP4 rows must be strictly increasing in the canonical row order",
                 ));
             }
-            previous = Some(handle);
+            previous = Some(key);
             for stage in 0..QUANT_STAGES {
                 validate_nonnegative_f32(self.global(bytes, row, stage), "global scale")?;
                 if self
@@ -305,9 +327,28 @@ impl Layout {
         &bytes[row * HANDLE_LEN..(row + 1) * HANDLE_LEN]
     }
 
+    /// The order key of one stored row, borrowed from its planes.
+    fn row_order<'a>(&self, bytes: &'a [u8], row: usize) -> RowOrder<'a> {
+        row_order(
+            self.handle(bytes, row),
+            |stage| {
+                (
+                    self.global_bytes(bytes, row, stage),
+                    self.block_scales(bytes, row, stage),
+                    self.codes(bytes, row, stage),
+                )
+            },
+            self.norm_bytes(bytes, row),
+            self.error_bytes(bytes, row),
+        )
+    }
+
+    fn global_bytes<'a>(&self, bytes: &'a [u8], row: usize, stage: usize) -> &'a [u8] {
+        &bytes[self.stages[stage].globals.start + row * FLOAT_LEN..][..FLOAT_LEN]
+    }
+
     fn global(&self, bytes: &[u8], row: usize, stage: usize) -> f32 {
-        let offset = self.stages[stage].globals.start + row * FLOAT_LEN;
-        read_f32(&bytes[offset..offset + FLOAT_LEN])
+        read_f32(self.global_bytes(bytes, row, stage))
     }
 
     fn block_scales<'a>(&self, bytes: &'a [u8], row: usize, stage: usize) -> &'a [u8] {
@@ -320,13 +361,54 @@ impl Layout {
         &bytes[start..start + self.codes_per_row]
     }
 
+    fn norm_bytes<'a>(&self, bytes: &'a [u8], row: usize) -> &'a [u8] {
+        &bytes[self.norms.start + row * FLOAT_LEN..][..FLOAT_LEN]
+    }
+
     fn norm(&self, bytes: &[u8], row: usize) -> f32 {
-        read_f32(&bytes[self.norms.start + row * FLOAT_LEN..][..FLOAT_LEN])
+        read_f32(self.norm_bytes(bytes, row))
+    }
+
+    fn error_bytes<'a>(&self, bytes: &'a [u8], row: usize) -> &'a [u8] {
+        &bytes[self.errors.start + row * FLOAT_LEN..][..FLOAT_LEN]
     }
 
     fn error(&self, bytes: &[u8], row: usize) -> f32 {
-        read_f32(&bytes[self.errors.start + row * FLOAT_LEN..][..FLOAT_LEN])
+        read_f32(self.error_bytes(bytes, row))
     }
+}
+
+/// How many byte strings make up a row's order key: its handle, each
+/// stage's global scale, block scales and codes, its norm and its error.
+const ROW_ORDER_PARTS: usize = 1 + 3 * QUANT_STAGES + 2;
+
+/// A row's place in the canonical row order, as a key compared
+/// lexicographically: the row's own byte planes in layout order. The handle
+/// comes first, so handles are non-decreasing; the planes after it give the
+/// rows under one handle one total order. Every row of a member (and of every
+/// member of one cover) has the same plane widths, so comparing the parts in
+/// turn is comparing the concatenated row bytes, and two rows have equal
+/// order keys exactly when they are the same row. (The public "row key" of a
+/// reader is only the first part, the 32-byte handle it binds.)
+type RowOrder<'a> = [&'a [u8]; ROW_ORDER_PARTS];
+
+fn row_order<'a>(
+    handle: &'a [u8],
+    stage: impl Fn(usize) -> (&'a [u8], &'a [u8], &'a [u8]),
+    norm: &'a [u8],
+    error: &'a [u8],
+) -> RowOrder<'a> {
+    let mut key: RowOrder<'a> = [&[]; ROW_ORDER_PARTS];
+    key[0] = handle;
+    for index in 0..QUANT_STAGES {
+        let (global, block_scales, codes) = stage(index);
+        key[1 + 3 * index] = global;
+        key[2 + 3 * index] = block_scales;
+        key[3 + 3 * index] = codes;
+    }
+    key[ROW_ORDER_PARTS - 2] = norm;
+    key[ROW_ORDER_PARTS - 1] = error;
+    key
 }
 
 fn take_plane(
@@ -378,44 +460,77 @@ impl StoredRow {
             error: *quantized.error_bound_bytes(),
         })
     }
+
+    fn order(&self) -> RowOrder<'_> {
+        row_order(
+            &self.handle,
+            |stage| {
+                let stage = &self.stages[stage];
+                (&stage.global[..], &stage.block_scales[..], &stage.codes[..])
+            },
+            &self.norm,
+            &self.error,
+        )
+    }
 }
 
+// The canonical row order; consistent with the derived equality, since the
+// key's parts are exactly the row's fields.
+impl Ord for StoredRow {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.order().cmp(&other.order())
+    }
+}
+
+impl PartialOrd for StoredRow {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Encode a set of rows: sorted into the canonical row order, with identical
+/// rows collapsed. Different rows under one handle are all kept.
 pub(crate) fn encode_rows<E: BlobEncoding>(
     dimension: usize,
     mut rows: Vec<StoredRow>,
 ) -> Result<Blob<NvFp4CosineSet<E>>, NvFp4Error> {
+    let (blocks_per_row, codes_per_row) = row_geometry(dimension)?;
+    if rows.iter().any(|row| {
+        row.stages.iter().any(|stage| {
+            stage.block_scales.len() != blocks_per_row || stage.codes.len() != codes_per_row
+        })
+    }) {
+        return Err(NvFp4Error::new(
+            "NVFP4 row payload does not match its dimension",
+        ));
+    }
+    // Linear on the already ordered input the join hands over.
+    rows.sort_unstable();
+    rows.dedup();
+    let bytes = lay_out(dimension, blocks_per_row, codes_per_row, &rows)?;
+    Ok(Blob::new(Bytes::from_source(bytes)))
+}
+
+/// Block scales and code bytes per row stage for a logical `dimension`.
+fn row_geometry(dimension: usize) -> Result<(usize, usize), NvFp4Error> {
     if dimension == 0 {
         return Err(NvFp4Error::new("NVFP4 dimension must be positive"));
     }
-    rows.sort_unstable_by_key(|row| row.handle);
     let physical_dimension = dimension
         .checked_add(ROTATION_BLOCK - 1)
         .map(|value| value / ROTATION_BLOCK * ROTATION_BLOCK)
         .ok_or_else(|| NvFp4Error::new("NVFP4 padded dimension overflows usize"))?;
-    let blocks_per_row = physical_dimension / QUANT_BLOCK;
-    let codes_per_row = physical_dimension / 2;
-    let mut distinct: Vec<StoredRow> = Vec::with_capacity(rows.len());
-    for row in rows {
-        if row.stages.iter().any(|stage| {
-            stage.block_scales.len() != blocks_per_row || stage.codes.len() != codes_per_row
-        }) {
-            return Err(NvFp4Error::new(
-                "NVFP4 row payload does not match its dimension",
-            ));
-        }
-        if let Some(previous) = distinct.last() {
-            if previous.handle == row.handle {
-                if previous != &row {
-                    return Err(NvFp4Error::new(
-                        "one embedding handle has two different NVFP4 rows",
-                    ));
-                }
-                continue;
-            }
-        }
-        distinct.push(row);
-    }
+    Ok((physical_dimension / QUANT_BLOCK, physical_dimension / 2))
+}
 
+/// Member bytes for `rows` in the order given; [`encode_rows`] is the one
+/// producer, and hands it the canonical order.
+fn lay_out(
+    dimension: usize,
+    blocks_per_row: usize,
+    codes_per_row: usize,
+    rows: &[StoredRow],
+) -> Result<Vec<u8>, NvFp4Error> {
     let stage_width = FLOAT_LEN
         .checked_add(blocks_per_row)
         .and_then(|value| value.checked_add(codes_per_row))
@@ -426,34 +541,34 @@ pub(crate) fn encode_rows<E: BlobEncoding>(
         .and_then(|value| value.checked_add(FLOAT_LEN))
         .and_then(|value| value.checked_add(FLOAT_LEN))
         .ok_or_else(|| NvFp4Error::new("NVFP4 row width overflows usize"))?;
-    let capacity = distinct
+    let capacity = rows
         .len()
         .checked_mul(row_width)
         .and_then(|value| value.checked_add(FOOTER_LEN))
         .ok_or_else(|| NvFp4Error::new("NVFP4 member length overflows usize"))?;
     let mut bytes = Vec::with_capacity(capacity);
-    for row in &distinct {
+    for row in rows {
         bytes.extend_from_slice(&row.handle);
     }
     for stage in 0..QUANT_STAGES {
-        for row in &distinct {
+        for row in rows {
             bytes.extend_from_slice(&row.stages[stage].global);
         }
-        for row in &distinct {
+        for row in rows {
             bytes.extend_from_slice(&row.stages[stage].block_scales);
         }
-        for row in &distinct {
+        for row in rows {
             bytes.extend_from_slice(&row.stages[stage].codes);
         }
     }
-    for row in &distinct {
+    for row in rows {
         bytes.extend_from_slice(&row.norm);
     }
-    for row in &distinct {
+    for row in rows {
         bytes.extend_from_slice(&row.error);
     }
     bytes.extend_from_slice(
-        &u64::try_from(distinct.len())
+        &u64::try_from(rows.len())
             .map_err(|_| NvFp4Error::new("NVFP4 row count exceeds u64"))?
             .to_le_bytes(),
     );
@@ -463,7 +578,7 @@ pub(crate) fn encode_rows<E: BlobEncoding>(
             .to_le_bytes(),
     );
     debug_assert_eq!(bytes.len(), capacity);
-    Ok(Blob::new(Bytes::from_source(bytes)))
+    Ok(bytes)
 }
 
 fn owned_row(bytes: &[u8], layout: &Layout, row: usize) -> StoredRow {
@@ -473,58 +588,39 @@ fn owned_row(bytes: &[u8], layout: &Layout, row: usize) -> StoredRow {
             .try_into()
             .expect("32-byte handle"),
         stages: std::array::from_fn(|stage| StoredStage {
-            global: bytes[layout.stages[stage].globals.start + row * FLOAT_LEN..][..FLOAT_LEN]
+            global: layout
+                .global_bytes(bytes, row, stage)
                 .try_into()
                 .expect("four-byte global scale"),
             block_scales: layout.block_scales(bytes, row, stage).to_vec(),
             codes: layout.codes(bytes, row, stage).to_vec(),
         }),
-        norm: bytes[layout.norms.start + row * FLOAT_LEN..][..FLOAT_LEN]
+        norm: layout
+            .norm_bytes(bytes, row)
             .try_into()
             .expect("four-byte reconstruction norm"),
-        error: bytes[layout.errors.start + row * FLOAT_LEN..][..FLOAT_LEN]
+        error: layout
+            .error_bytes(bytes, row)
             .try_into()
             .expect("four-byte error bound"),
     }
 }
 
-fn rows_equal(
-    left_bytes: &[u8],
-    left_layout: &Layout,
-    left_row: usize,
-    right_bytes: &[u8],
-    right_layout: &Layout,
-    right_row: usize,
-) -> bool {
-    let stages_equal = (0..QUANT_STAGES).all(|stage| {
-        let left_global = left_layout.stages[stage].globals.start + left_row * FLOAT_LEN;
-        let right_global = right_layout.stages[stage].globals.start + right_row * FLOAT_LEN;
-        left_bytes[left_global..left_global + FLOAT_LEN]
-            == right_bytes[right_global..right_global + FLOAT_LEN]
-            && left_layout.block_scales(left_bytes, left_row, stage)
-                == right_layout.block_scales(right_bytes, right_row, stage)
-            && left_layout.codes(left_bytes, left_row, stage)
-                == right_layout.codes(right_bytes, right_row, stage)
-    });
-    let left_norm = left_layout.norms.start + left_row * FLOAT_LEN;
-    let right_norm = right_layout.norms.start + right_row * FLOAT_LEN;
-    let left_error = left_layout.errors.start + left_row * FLOAT_LEN;
-    let right_error = right_layout.errors.start + right_row * FLOAT_LEN;
-    left_layout.handle(left_bytes, left_row) == right_layout.handle(right_bytes, right_row)
-        && stages_equal
-        && left_bytes[left_norm..left_norm + FLOAT_LEN]
-            == right_bytes[right_norm..right_norm + FLOAT_LEN]
-        && left_bytes[left_error..left_error + FLOAT_LEN]
-            == right_bytes[right_error..right_error + FLOAT_LEN]
-}
-
+/// The join: the set union of both members' rows. Identical rows collapse;
+/// different rows under one handle are all kept, so the join is total.
+///
+/// Canonical members are merged in one pass. The result is the encoding of
+/// the union whatever order the inputs hold, so the join is associative,
+/// commutative and idempotent on row sets, not only on canonical bytes.
 pub(crate) fn join_members<E: BlobEncoding>(
     low: &Blob<NvFp4CosineSet<E>>,
     high: &Blob<NvFp4CosineSet<E>>,
     dimension: usize,
 ) -> Result<Blob<NvFp4CosineSet<E>>, NvFp4Error> {
-    let low_layout = Layout::parse(low.bytes.as_ref())?;
-    let high_layout = Layout::parse(high.bytes.as_ref())?;
+    let low_bytes = low.bytes.as_ref();
+    let high_bytes = high.bytes.as_ref();
+    let low_layout = Layout::parse(low_bytes)?;
+    let high_layout = Layout::parse(high_bytes)?;
     if low_layout.dimension != dimension || high_layout.dimension != dimension {
         return Err(NvFp4Error::new(format!(
             "NVFP4 join member dimension does not match descriptor {dimension}"
@@ -535,39 +631,26 @@ pub(crate) fn join_members<E: BlobEncoding>(
     let mut high_row = 0;
     while low_row < low_layout.rows && high_row < high_layout.rows {
         match low_layout
-            .handle(low.bytes.as_ref(), low_row)
-            .cmp(high_layout.handle(high.bytes.as_ref(), high_row))
+            .row_order(low_bytes, low_row)
+            .cmp(&high_layout.row_order(high_bytes, high_row))
         {
             Ordering::Less => {
-                rows.push(owned_row(low.bytes.as_ref(), &low_layout, low_row));
+                rows.push(owned_row(low_bytes, &low_layout, low_row));
                 low_row += 1;
             }
             Ordering::Greater => {
-                rows.push(owned_row(high.bytes.as_ref(), &high_layout, high_row));
+                rows.push(owned_row(high_bytes, &high_layout, high_row));
                 high_row += 1;
             }
             Ordering::Equal => {
-                let left = owned_row(low.bytes.as_ref(), &low_layout, low_row);
-                let right = owned_row(high.bytes.as_ref(), &high_layout, high_row);
-                if left != right {
-                    return Err(NvFp4Error::new(
-                        "one embedding handle has two different NVFP4 rows",
-                    ));
-                }
-                rows.push(left);
+                rows.push(owned_row(low_bytes, &low_layout, low_row));
                 low_row += 1;
                 high_row += 1;
             }
         }
     }
-    while low_row < low_layout.rows {
-        rows.push(owned_row(low.bytes.as_ref(), &low_layout, low_row));
-        low_row += 1;
-    }
-    while high_row < high_layout.rows {
-        rows.push(owned_row(high.bytes.as_ref(), &high_layout, high_row));
-        high_row += 1;
-    }
+    rows.extend((low_row..low_layout.rows).map(|row| owned_row(low_bytes, &low_layout, row)));
+    rows.extend((high_row..high_layout.rows).map(|row| owned_row(high_bytes, &high_layout, row)));
     encode_rows(dimension, rows)
 }
 
@@ -933,9 +1016,12 @@ where
 {
     /// Exact top `k` cosine neighbours, ranked by score then handle.
     ///
-    /// Candidate discovery scans the compact rows once. Original embeddings
-    /// are fetched in descending certified-upper-bound order until the stored
-    /// envelopes prove that no unseen row can enter the exact result.
+    /// Candidate discovery scans the compact rows once. Each handle is one
+    /// candidate, bounded by the largest certified upper bound over its rows,
+    /// so a handle with several rows is fetched and returned at most once.
+    /// Original embeddings are fetched in descending certified-upper-bound
+    /// order until the stored envelopes prove that no unseen handle can enter
+    /// the exact result.
     pub fn top_k<R, S>(
         &self,
         snapshot: &R,
@@ -1001,10 +1087,11 @@ where
         Ok(ranked)
     }
 
-    /// Every embedding whose exact cosine is at least `floor`.
+    /// Every embedding whose exact cosine is at least `floor`, each once.
     ///
-    /// Only rows whose conservative upper bound can cross the threshold cause
-    /// an exact blob fetch. Returned rows are ranked identically to `top_k`.
+    /// Only handles whose conservative upper bound (the largest over their
+    /// rows) can cross the threshold cause an exact blob fetch. Returned rows
+    /// are ranked identically to `top_k`.
     pub fn above<R, S>(
         &self,
         snapshot: &R,
@@ -1093,7 +1180,8 @@ where
     }
 
     /// The cosine between `query` and every row's own two-stage NVFP4
-    /// reconstruction, from one scan that fetches no source blob.
+    /// reconstruction, from one scan that fetches no source blob, kept once
+    /// per row key (the 32-byte handle) as the maximum over the rows under it.
     ///
     /// The whole answer for an index that holds no exact vector per row (the
     /// semantic index keys its rows by the value it embedded, not by an
@@ -1101,6 +1189,10 @@ where
     /// handles, since [`Self::top_k`] and [`Self::above`] then rerank exactly.
     /// A two-stage row's reconstruction cosine sits within about 1e-4 of the
     /// exact cosine (measured 2026-09-11 on 17,744 texts).
+    ///
+    /// A key with several rows (two derivations of one content that did not
+    /// reproduce bit for bit) is one entry: it clears a floor when any of its
+    /// rows does, and it ranks by its best row.
     ///
     /// The result is a query-scoped table: [`ReconstructedCosines::similar_to`]
     /// turns a floor into a constraint for `find!`, and
@@ -1113,7 +1205,7 @@ where
         let coordinates = prepared.scan_coordinates();
         let segments = self.scan_segments();
         let mut scores = Vec::new();
-        self.for_each_unique_row(|handle, member_index, _member, row| {
+        self.for_each_unique_row(|handle, member_index, row| {
             let segment = segments[member_index];
             let norm = segment.row_certificate(row)?.reconstruction_norm();
             let score = if norm == 0.0 {
@@ -1129,9 +1221,7 @@ where
             scores.push((handle, score.clamp(-1.0, 1.0)));
             Ok(())
         })?;
-        // `for_each_unique_row` visits handles in ascending order, which is
-        // the order `cosine` searches.
-        debug_assert!(scores.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        keep_maximum_per_key(&mut scores);
         Ok(ReconstructedCosines { scores })
     }
 
@@ -1182,8 +1272,8 @@ where
             .map_err(|source| NvFp4Error::new(format!("NVFP4 upper scan failed: {source}")))?;
 
         let certificate = CandidateCertificate::new(query);
-        let mut candidates = Vec::new();
-        self.for_each_unique_row(|handle, member_index, _member, row| {
+        let mut uppers = Vec::new();
+        self.for_each_unique_row(|handle, member_index, row| {
             let dot_index = offsets[member_index]
                 .checked_add(row)
                 .expect("validated physical row offset");
@@ -1191,10 +1281,17 @@ where
                 segments[member_index].row_certificate(row)?,
                 upper_raw_dots[dot_index],
             )?;
-            candidates.push(Candidate { handle, upper });
+            uppers.push((handle, upper));
             Ok(())
         })?;
-        Ok(candidates)
+        // One candidate per handle. A row faithful to the exact vector the
+        // handle names bounds that vector's cosine, and the largest bound over
+        // the handle's rows is at least the faithful row's, whichever it is.
+        keep_maximum_per_key(&mut uppers);
+        Ok(uppers
+            .into_iter()
+            .map(|(handle, upper)| Candidate { handle, upper })
+            .collect())
     }
 
     fn exact_hit<R>(
@@ -1231,67 +1328,53 @@ where
         Ok(SimilarityHit { embedding, score })
     }
 
+    /// Visit every distinct row of the cover once, in the canonical row
+    /// order, as `(handle, member index, row index)`. A row that several
+    /// members hold identically is visited once, from one of them; the
+    /// different rows under one handle are visited one after another.
     fn for_each_unique_row<F>(&self, mut visit: F) -> Result<(), NvFp4Error>
     where
-        F: FnMut([u8; HANDLE_LEN], usize, &Member, usize) -> Result<(), NvFp4Error>,
+        F: FnMut([u8; HANDLE_LEN], usize, usize) -> Result<(), NvFp4Error>,
     {
         let mut heap = BinaryHeap::new();
         for (member, segment) in self.members.iter().enumerate() {
             if segment.layout.rows > 0 {
-                let handle = segment
-                    .layout
-                    .handle(segment.bytes.as_ref(), 0)
-                    .try_into()
-                    .expect("32-byte handle");
-                heap.push(Reverse((handle, member, 0usize)));
+                heap.push(Reverse((self.row_order(member, 0), member, 0usize)));
             }
         }
 
         let mut occurrences = Vec::new();
-        while let Some(Reverse((handle, member, row))) = heap.pop() {
+        while let Some(Reverse((key, member, row))) = heap.pop() {
             occurrences.clear();
             occurrences.push((member, row));
             while heap
                 .peek()
-                .is_some_and(|Reverse((next, _, _))| next == &handle)
+                .is_some_and(|Reverse((next, _, _))| next == &key)
             {
                 let Reverse((_, member, row)) = heap.pop().expect("peeked row");
                 occurrences.push((member, row));
             }
-            for &(other_member, other_row) in &occurrences[1..] {
-                if !rows_equal(
-                    self.members[member].bytes.as_ref(),
-                    &self.members[member].layout,
-                    row,
-                    self.members[other_member].bytes.as_ref(),
-                    &self.members[other_member].layout,
-                    other_row,
-                ) {
-                    return Err(NvFp4Error::new(
-                        "one embedding handle has conflicting rows across cover members",
-                    ));
-                }
-            }
-            visit(handle, member, &self.members[member], row)?;
+            visit(key[0].try_into().expect("32-byte handle"), member, row)?;
 
             for &(member, row) in &occurrences {
                 let next = row + 1;
                 if next < self.members[member].layout.rows {
-                    let next_handle = self.members[member]
-                        .layout
-                        .handle(self.members[member].bytes.as_ref(), next)
-                        .try_into()
-                        .expect("32-byte handle");
-                    heap.push(Reverse((next_handle, member, next)));
+                    heap.push(Reverse((self.row_order(member, next), member, next)));
                 }
             }
         }
         Ok(())
     }
+
+    fn row_order(&self, member: usize, row: usize) -> RowOrder<'_> {
+        let member = &self.members[member];
+        member.layout.row_order(member.bytes.as_ref(), row)
+    }
 }
 
-/// The reconstruction cosine of every row of an [`NvFp4CosineIndex`] against
-/// one query vector, from [`NvFp4CosineIndex::reconstructed_cosines`].
+/// The reconstruction cosine of every row key of an [`NvFp4CosineIndex`]
+/// against one query vector, from [`NvFp4CosineIndex::reconstructed_cosines`]:
+/// one entry per key, the maximum over the rows the key carries.
 ///
 /// A threshold is a set, so it is a constraint: [`Self::similar_to`] binds a
 /// variable to every row key whose cosine clears the floor and composes with
@@ -1302,13 +1385,15 @@ where
 /// join that source's pattern on the same variable.
 #[derive(Clone, Debug, Default)]
 pub struct ReconstructedCosines {
-    /// Every row key with its cosine, in ascending key order.
+    /// Every row key once with its best cosine, in strictly ascending key
+    /// order.
     scores: Vec<([u8; HANDLE_LEN], f64)>,
 }
 
 impl ReconstructedCosines {
-    /// Bind `variable` to every row key whose reconstruction cosine is at
-    /// least `floor`. A NaN floor admits nothing.
+    /// Bind `variable` once to every row key whose reconstruction cosine
+    /// (the best over its rows) is at least `floor`. A NaN floor admits
+    /// nothing.
     pub fn similar_to<V: InlineEncoding>(
         &self,
         variable: Variable<V>,
@@ -1323,8 +1408,8 @@ impl ReconstructedCosines {
         crate::constraint::SimilarTo::from_candidates(variable, candidates)
     }
 
-    /// The reconstruction cosine of the row keyed by `value`, or `None` when
-    /// the index holds no such row.
+    /// The reconstruction cosine of `value`, the maximum over the rows keyed
+    /// by it, or `None` when the index holds no such row.
     pub fn cosine<V: InlineEncoding>(&self, value: &Inline<V>) -> Option<f64> {
         self.scores
             .binary_search_by(|(key, _)| key.cmp(&value.raw))
@@ -1332,7 +1417,7 @@ impl ReconstructedCosines {
             .map(|at| self.scores[at].1)
     }
 
-    /// Number of distinct rows scored.
+    /// Number of distinct row keys scored.
     pub fn len(&self) -> usize {
         self.scores.len()
     }
@@ -1341,6 +1426,22 @@ impl ReconstructedCosines {
     pub fn is_empty(&self) -> bool {
         self.scores.is_empty()
     }
+}
+
+/// Collapse `(key, value)` pairs to one per key holding the maximum, in
+/// strictly ascending key order. The cover scan hands the pairs over in key
+/// order already; on such input the stable sort moves nothing and runs in
+/// linear time. A NaN, which no valid row produces, absorbs: an upper bound
+/// stays conservative.
+fn keep_maximum_per_key(pairs: &mut Vec<([u8; HANDLE_LEN], f64)>) {
+    pairs.sort_by(|left, right| left.0.cmp(&right.0));
+    pairs.dedup_by(|next, kept| {
+        let same_key = next.0 == kept.0;
+        if same_key && (next.1.is_nan() || next.1 > kept.1) {
+            kept.1 = next.1;
+        }
+        same_key
+    });
 }
 
 fn sort_hits<E: BlobEncoding>(hits: &mut [SimilarityHit<E>]) {
@@ -1491,6 +1592,122 @@ mod tests {
         dimension: usize,
     ) -> Blob<NvFp4CosineSet<Embedding>> {
         encode_rows(dimension, rows.into_iter().collect()).unwrap()
+    }
+
+    /// Member bytes holding `rows` exactly as given: unsorted, repeats kept.
+    fn raw_member(rows: &[StoredRow], dimension: usize) -> Vec<u8> {
+        let (blocks_per_row, codes_per_row) = row_geometry(dimension).unwrap();
+        lay_out(dimension, blocks_per_row, codes_per_row, rows).unwrap()
+    }
+
+    /// Every stored row of a member, in stored order.
+    fn rows_of(blob: &Blob<NvFp4CosineSet<Embedding>>) -> Vec<StoredRow> {
+        let layout = Layout::parse(blob.bytes.as_ref()).unwrap();
+        (0..layout.rows)
+            .map(|row| owned_row(blob.bytes.as_ref(), &layout, row))
+            .collect()
+    }
+
+    /// A lazy view over `blobs` as one cover.
+    fn index(
+        blobs: &[&Blob<NvFp4CosineSet<Embedding>>],
+        dimension: usize,
+    ) -> NvFp4CosineIndex<Embedding> {
+        NvFp4CosineIndex {
+            members: blobs
+                .iter()
+                .map(|blob| Member {
+                    content_handle: blob.get_handle().raw,
+                    layout: Layout::parse(blob.bytes.as_ref()).unwrap(),
+                    bytes: blob.bytes.clone(),
+                })
+                .collect(),
+            dimension,
+            _encoding: PhantomData,
+        }
+    }
+
+    /// Every row the cover scan visits, as owned rows, in visiting order.
+    fn visited(index: &NvFp4CosineIndex<Embedding>) -> Vec<StoredRow> {
+        let mut rows = Vec::new();
+        index
+            .for_each_unique_row(|handle, member, row| {
+                let member = &index.members[member];
+                let owned = owned_row(member.bytes.as_ref(), &member.layout, row);
+                assert_eq!(owned.handle, handle);
+                rows.push(owned);
+                Ok(())
+            })
+            .unwrap();
+        rows
+    }
+
+    /// One valid row per plane after the handle, each differing from `base`
+    /// in that plane alone: every stage's global scale, block scales and
+    /// codes, then the norm and the error.
+    fn planes_apart(base: &StoredRow) -> Vec<(String, StoredRow)> {
+        let next_up = |bytes: [u8; FLOAT_LEN]| f32::from_le_bytes(bytes).next_up().to_le_bytes();
+        let mut variants = Vec::new();
+        for stage in 0..QUANT_STAGES {
+            let mut global = base.clone();
+            global.stages[stage].global = next_up(global.stages[stage].global);
+            variants.push((format!("stage {stage} global scale"), global));
+
+            let mut scales = base.clone();
+            let scale = &mut scales.stages[stage].block_scales[0];
+            *scale = if *scale < 0x7e {
+                *scale + 1
+            } else {
+                *scale - 1
+            };
+            variants.push((format!("stage {stage} block scales"), scales));
+
+            // A different low code, never the rejected negative zero 0x8.
+            let mut codes = base.clone();
+            let pair = &mut codes.stages[stage].codes[0];
+            *pair = (*pair & 0xf0) | u8::from(*pair & 0x0f == 0);
+            variants.push((format!("stage {stage} codes"), codes));
+        }
+        let mut norm = base.clone();
+        norm.norm = next_up(norm.norm);
+        variants.push(("norm".to_owned(), norm));
+        let mut error = base.clone();
+        error.error = next_up(error.error);
+        variants.push(("error".to_owned(), error));
+        assert_eq!(variants.len(), ROW_ORDER_PARTS - 1);
+        variants
+    }
+
+    /// Candidate bounds as comparable bits.
+    fn candidate_bits(
+        index: &NvFp4CosineIndex<Embedding>,
+        query: &[f32],
+    ) -> Vec<([u8; HANDLE_LEN], u64)> {
+        let prepared = PreparedQuery::new(query, index.dimension).unwrap();
+        index
+            .candidates(&prepared, &CpuF64UpperScanner)
+            .unwrap()
+            .into_iter()
+            .map(|candidate| (candidate.handle, candidate.upper.to_bits()))
+            .collect()
+    }
+
+    /// SplitMix64, so the property cases are fixed: a failure names its case
+    /// and reproduces.
+    struct Cases(u64);
+
+    impl Cases {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            (self.next() % bound as u64) as usize
+        }
     }
 
     fn embedding_facts(
@@ -1762,9 +1979,26 @@ mod tests {
 
     #[test]
     fn canonical_audit_is_separate_from_structural_attachment() {
+        // Two rows under one handle are a set of two rows, not a conflict.
         let one = row(1, &[1.0, 0.0]);
-        let conflicting = row(1, &[0.0, 1.0]);
-        assert!(encode_rows::<Embedding>(2, vec![one, conflicting]).is_err());
+        let other = row(1, &[0.0, 1.0]);
+        let both = encode_rows::<Embedding>(2, vec![one.clone(), other.clone()]).unwrap();
+        let layout = Layout::parse(both.bytes.as_ref()).unwrap();
+        assert_eq!(layout.rows, 2);
+        layout.validate(both.bytes.as_ref()).unwrap();
+
+        // Out of canonical order, or the same row twice, fails the audit and
+        // still attaches.
+        let (low, high) = if one < other {
+            (one.clone(), other)
+        } else {
+            (other, one.clone())
+        };
+        for rows in [vec![high, low], vec![one.clone(), one]] {
+            let bytes = raw_member(&rows, 2);
+            let layout = Layout::parse(&bytes).unwrap();
+            assert!(layout.validate(&bytes).is_err());
+        }
 
         let mut malformed = member([row(2, &[1.0, 1.0])], 2).bytes.as_ref().to_vec();
         malformed[0] = 3;
@@ -1777,5 +2011,457 @@ mod tests {
         // Impossible plane geometry still fails before any row is read.
         malformed.pop();
         assert!(Layout::parse(&malformed).is_err());
+    }
+
+    /// Different rows under one handle are a set: the encoding keeps both in
+    /// one canonical order whatever order they arrive in, the audit accepts
+    /// it, and the join keeps both while collapsing the row both sides hold.
+    #[test]
+    fn different_rows_under_one_handle_encode_and_join() {
+        const DIMENSION: usize = 3;
+        let first = row(1, &[1.0, 0.0, 0.0]);
+        let second = row(1, &[0.0, 1.0, 0.0]);
+        let other = row(2, &[0.0, 0.0, 1.0]);
+        assert_ne!(first, second);
+
+        let all = member(
+            [other.clone(), second.clone(), first.clone(), second.clone()],
+            DIMENSION,
+        );
+        let forward = member([first.clone(), second.clone(), other.clone()], DIMENSION);
+        assert_eq!(all.bytes.as_ref(), forward.bytes.as_ref());
+        let layout = Layout::parse(all.bytes.as_ref()).unwrap();
+        assert_eq!(layout.rows, 3);
+        layout.validate(all.bytes.as_ref()).unwrap();
+        let handles: Vec<u8> = (0..layout.rows)
+            .map(|row| layout.handle(all.bytes.as_ref(), row)[0])
+            .collect();
+        assert_eq!(handles, [1, 1, 2]);
+        let mut expected = vec![first.clone(), second.clone(), other.clone()];
+        expected.sort();
+        assert_eq!(rows_of(&all), expected);
+
+        let left = member([first, other.clone()], DIMENSION);
+        let right = member([second, other], DIMENSION);
+        let joined = join_members(&left, &right, DIMENSION).unwrap();
+        assert_eq!(joined.bytes.as_ref(), all.bytes.as_ref());
+        let reversed = join_members(&right, &left, DIMENSION).unwrap();
+        assert_eq!(reversed.bytes.as_ref(), all.bytes.as_ref());
+    }
+
+    /// Rows under one handle are ordered by every plane of the row, not
+    /// only by the first plane that happens to differ: for each plane, a row
+    /// that differs from another only there is another row. The pair has one
+    /// encoding whatever the input order, passes the audit, joins to both
+    /// rows in either order, and a cover holding it twice reads each row
+    /// once.
+    #[test]
+    fn every_plane_orders_rows_under_one_handle() {
+        const DIMENSION: usize = 3;
+        let base = row(1, &[0.6, 0.8, 0.0]);
+        let alone = member([base.clone()], DIMENSION);
+        for (plane, variant) in planes_apart(&base) {
+            assert_ne!(variant, base, "{plane}");
+            assert_ne!(
+                variant.cmp(&base),
+                Ordering::Equal,
+                "{plane}: the order sees it"
+            );
+
+            let pair = member([variant.clone(), base.clone()], DIMENSION);
+            assert_eq!(
+                pair.bytes.as_ref(),
+                member([base.clone(), variant.clone()], DIMENSION)
+                    .bytes
+                    .as_ref(),
+                "{plane}: one encoding"
+            );
+            let layout = Layout::parse(pair.bytes.as_ref()).unwrap();
+            assert_eq!(layout.rows, 2, "{plane}");
+            layout.validate(pair.bytes.as_ref()).unwrap();
+
+            let other = member([variant], DIMENSION);
+            for joined in [
+                join_members(&alone, &other, DIMENSION).unwrap(),
+                join_members(&other, &alone, DIMENSION).unwrap(),
+            ] {
+                assert_eq!(joined.bytes.as_ref(), pair.bytes.as_ref(), "{plane}: join");
+            }
+            assert_eq!(
+                visited(&index(&[&alone, &other, &pair], DIMENSION)),
+                rows_of(&pair),
+                "{plane}: cover"
+            );
+        }
+    }
+
+    /// The join is associative, commutative and idempotent on random row
+    /// sets drawn from a small pool, so handles repeat with different rows
+    /// and whole rows repeat across members. It is the encoding of the union
+    /// of the row sets, and a cover of the overlapping members reads exactly
+    /// as their join: the scan visits the same rows in the same order, and
+    /// the per-handle scores and bounds are bit-identical.
+    #[test]
+    fn join_is_aci_on_row_sets_and_a_cover_reads_as_its_join() {
+        const DIMENSION: usize = 5;
+        let vectors: Vec<Vec<f32>> = (0..4)
+            .map(|vector| {
+                (0..DIMENSION)
+                    .map(|index| ((vector * 7 + index * 3) as f32).sin())
+                    .collect()
+            })
+            .collect();
+        let mut pool: Vec<StoredRow> = (1..=3u8)
+            .flat_map(|handle| vectors.iter().map(move |vector| row(handle, vector)))
+            .collect();
+        // Rows that differ from a pool row in one late plane only (the
+        // second stage's codes, the norm, the error), so rows under one
+        // handle also tie on every plane before the one that decides.
+        let late: Vec<StoredRow> = planes_apart(&pool[0])
+            .into_iter()
+            .chain(planes_apart(&pool[5]))
+            .filter(|(plane, _)| plane == "stage 1 codes" || plane == "norm" || plane == "error")
+            .map(|(_, row)| row)
+            .collect();
+        assert_eq!(late.len(), 6);
+        pool.extend(late);
+        assert_eq!(pool.iter().collect::<BTreeSet<_>>().len(), pool.len());
+        let query: Vec<f32> = (0..DIMENSION)
+            .map(|index| (index as f32 + 1.0).cos())
+            .collect();
+        let join = |low: &Blob<NvFp4CosineSet<Embedding>>,
+                    high: &Blob<NvFp4CosineSet<Embedding>>| {
+            join_members(low, high, DIMENSION).unwrap()
+        };
+
+        let mut cases = Cases(0x5E7_0C0F);
+        for case in 0..300 {
+            let mut draw = || -> Vec<StoredRow> {
+                let count = cases.below(7);
+                (0..count)
+                    .map(|_| pool[cases.below(pool.len())].clone())
+                    .collect()
+            };
+            let (a_rows, b_rows, c_rows) = (draw(), draw(), draw());
+            let (a, b, c) = (
+                member(a_rows.clone(), DIMENSION),
+                member(b_rows.clone(), DIMENSION),
+                member(c_rows.clone(), DIMENSION),
+            );
+
+            // One set, one encoding: order and repeats do not matter.
+            let mut shuffled: Vec<StoredRow> = a_rows.iter().rev().cloned().collect();
+            shuffled.extend(a_rows.iter().cloned());
+            assert_eq!(
+                member(shuffled, DIMENSION).bytes.as_ref(),
+                a.bytes.as_ref(),
+                "case {case}: canonical encoding"
+            );
+
+            let ab = join(&a, &b);
+            assert_eq!(
+                ab.bytes.as_ref(),
+                join(&b, &a).bytes.as_ref(),
+                "case {case}: commutative"
+            );
+            let abc = join(&ab, &c);
+            assert_eq!(
+                abc.bytes.as_ref(),
+                join(&a, &join(&b, &c)).bytes.as_ref(),
+                "case {case}: associative"
+            );
+            assert_eq!(
+                join(&a, &a).bytes.as_ref(),
+                a.bytes.as_ref(),
+                "case {case}: idempotent"
+            );
+            assert_eq!(
+                join(&ab, &b).bytes.as_ref(),
+                ab.bytes.as_ref(),
+                "case {case}: absorbs a member it already holds"
+            );
+
+            let union: BTreeSet<StoredRow> = a_rows.iter().chain(&b_rows).cloned().collect();
+            assert_eq!(
+                rows_of(&ab),
+                union.into_iter().collect::<Vec<_>>(),
+                "case {case}: the union of the row sets"
+            );
+            let layout = Layout::parse(abc.bytes.as_ref()).unwrap();
+            layout.validate(abc.bytes.as_ref()).unwrap();
+
+            let cover = index(&[&a, &b, &c], DIMENSION);
+            let joined = index(&[&abc], DIMENSION);
+            let everything: BTreeSet<StoredRow> = a_rows
+                .iter()
+                .chain(&b_rows)
+                .chain(&c_rows)
+                .cloned()
+                .collect();
+            assert_eq!(
+                visited(&cover),
+                everything.into_iter().collect::<Vec<_>>(),
+                "case {case}: the cover scan visits each distinct row once, in order"
+            );
+            assert_eq!(visited(&cover), visited(&joined), "case {case}");
+            if !cover.is_empty() {
+                let over_cover = cover.reconstructed_cosines(&query).unwrap();
+                let over_join = joined.reconstructed_cosines(&query).unwrap();
+                assert_eq!(over_cover.scores, over_join.scores, "case {case}");
+                assert!(over_cover
+                    .scores
+                    .windows(2)
+                    .all(|pair| pair[0].0 < pair[1].0));
+                assert_eq!(
+                    candidate_bits(&cover, &query),
+                    candidate_bits(&joined, &query),
+                    "case {case}"
+                );
+            }
+        }
+    }
+
+    /// Members that overlap hold some rows identically and some handles with
+    /// different rows: the scan visits every distinct row once, and every
+    /// handle is one candidate and one score.
+    #[test]
+    fn overlapping_members_deduplicate_identical_rows() {
+        const DIMENSION: usize = 3;
+        let near = row(1, &[1.0, 0.0, 0.0]);
+        let far = row(1, &[0.0, 1.0, 0.0]);
+        let middle = row(2, &[1.0, 1.0, 0.0]);
+        let last = row(3, &[0.0, 0.0, 1.0]);
+        let first_member = member([near.clone(), middle.clone()], DIMENSION);
+        let second_member = member([near.clone(), far.clone(), last.clone()], DIMENSION);
+        let third_member = member([middle.clone()], DIMENSION);
+        let cover = index(&[&first_member, &second_member, &third_member], DIMENSION);
+
+        let mut expected = vec![near, far, middle, last];
+        expected.sort();
+        assert_eq!(visited(&cover), expected);
+        let handles: Vec<u8> = visited(&cover).iter().map(|row| row.handle[0]).collect();
+        assert_eq!(handles, [1, 1, 2, 3]);
+
+        let query = [1.0, 0.5, 0.25];
+        assert_eq!(cover.len(), 6, "physical rows, duplicates included");
+        assert_eq!(cover.reconstructed_cosines(&query).unwrap().len(), 3);
+        let candidates = candidate_bits(&cover, &query);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|(handle, _)| handle[0])
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+
+        let joined = join_members(
+            &join_members(&first_member, &second_member, DIMENSION).unwrap(),
+            &third_member,
+            DIMENSION,
+        )
+        .unwrap();
+        assert_eq!(rows_of(&joined), expected);
+        assert_eq!(
+            candidate_bits(&index(&[&joined], DIMENSION), &query),
+            candidates
+        );
+    }
+
+    /// A handle whose rows disagree is bound once, with the best of its
+    /// rows: each query below matches one of the two rows, and the handle
+    /// clears the floor for both. Read through a two-member cover and
+    /// through its join alike.
+    #[test]
+    fn reconstructed_cosines_bind_each_handle_once_with_its_maximum() {
+        const DIMENSION: usize = 3;
+        let handle = Inline::<Handle<Embedding>>::new([1; HANDLE_LEN]);
+        let other = Inline::<Handle<Embedding>>::new([2; HANDLE_LEN]);
+        let left = member([row(1, &[1.0, 0.0, 0.0])], DIMENSION);
+        let right = member(
+            [row(1, &[0.0, 1.0, 0.0]), row(2, &[0.0, 0.0, 1.0])],
+            DIMENSION,
+        );
+        let joined = join_members(&left, &right, DIMENSION).unwrap();
+
+        for view in [
+            index(&[&left, &right], DIMENSION),
+            index(&[&joined], DIMENSION),
+        ] {
+            for query in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] {
+                let cosines = view.reconstructed_cosines(&query).unwrap();
+                assert_eq!(cosines.len(), 2, "one entry per handle");
+                assert!(
+                    cosines.cosine(&handle).unwrap() > 0.999,
+                    "the maximum over the handle's rows"
+                );
+                assert!(cosines.cosine(&other).unwrap().abs() < 0.01);
+
+                let bound: Vec<Inline<Handle<Embedding>>> = triblespace_core::find!(
+                    value: Inline<Handle<Embedding>>,
+                    cosines.similar_to::<Handle<Embedding>>(value, 0.9)
+                )
+                .collect();
+                assert_eq!(bound, vec![handle]);
+                let mut everything: Vec<Inline<Handle<Embedding>>> = triblespace_core::find!(
+                    value: Inline<Handle<Embedding>>,
+                    cosines.similar_to::<Handle<Embedding>>(value, -1.0)
+                )
+                .collect();
+                everything.sort_by_key(|value| value.raw);
+                assert_eq!(everything, vec![handle, other]);
+            }
+        }
+    }
+
+    /// The exact path: two rows under one embedding handle (a quantization
+    /// that did not reproduce) are one candidate whose bound is the larger of
+    /// the two rows' bounds, for a query either row favours, fetched once and
+    /// returned once by `above`, `top_k` and `similar_to`.
+    #[test]
+    fn exact_reads_fetch_and_bind_each_handle_once() {
+        const DIMENSION: usize = 3;
+        let mut store = MemoryRepo::default();
+        let exact = store.put::<Embedding, _>(vec![1.0f32, 0.0, 0.0]).unwrap();
+        let other = store.put::<Embedding, _>(vec![0.0f32, 0.0, 1.0]).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let faithful = StoredRow::quantize(exact.raw, &[1.0, 0.0, 0.0], DIMENSION).unwrap();
+        let stray = StoredRow::quantize(exact.raw, &[0.6, 0.8, 0.0], DIMENSION).unwrap();
+        let other_row = StoredRow::quantize(other.raw, &[0.0, 0.0, 1.0], DIMENSION).unwrap();
+        let left = member([stray.clone()], DIMENSION);
+        let right = member([faithful.clone(), other_row], DIMENSION);
+        let joined = join_members(&left, &right, DIMENSION).unwrap();
+        let alone = |row: &StoredRow, query: &[f32]| {
+            f64::from_bits(
+                candidate_bits(
+                    &index(&[&member([row.clone()], DIMENSION)], DIMENSION),
+                    query,
+                )[0]
+                .1,
+            )
+        };
+        // Each query gives a different one of the two rows the larger bound,
+        // so the candidate's bound is their maximum, not whichever row the
+        // canonical order puts first or last.
+        let query = [1.0, 0.0, 0.0];
+        let toward_stray = [0.0, 1.0, 0.0];
+        assert!(alone(&faithful, &query) > alone(&stray, &query));
+        assert!(alone(&stray, &toward_stray) > alone(&faithful, &toward_stray));
+
+        let scanner = CpuF64UpperScanner;
+        for view in [
+            index(&[&left, &right], DIMENSION),
+            index(&[&joined], DIMENSION),
+        ] {
+            for probe in [&query, &toward_stray] {
+                let candidates = candidate_bits(&view, probe);
+                assert_eq!(candidates.len(), 2, "one candidate per handle");
+                let bound = candidates
+                    .iter()
+                    .find(|(handle, _)| *handle == exact.raw)
+                    .unwrap()
+                    .1;
+                let widest = alone(&faithful, probe).max(alone(&stray, probe));
+                assert_eq!(bound, widest.to_bits());
+            }
+
+            // The stray row's bound makes the handle a candidate; the exact
+            // rerank reads the vector once and rejects it.
+            let counted = Counting::new(&snapshot);
+            assert!(view
+                .above(&counted, &toward_stray, 0.5, &scanner)
+                .unwrap()
+                .is_empty());
+            assert_eq!(counted.gets(), 1);
+
+            let counted = Counting::new(&snapshot);
+            let above = view.above(&counted, &query, 0.5, &scanner).unwrap();
+            assert_eq!(
+                above.iter().map(|hit| hit.embedding).collect::<Vec<_>>(),
+                vec![exact]
+            );
+            assert_eq!(above[0].score, 1.0);
+            assert_eq!(counted.gets(), 1, "the handle is fetched once");
+
+            let top = view.top_k(&snapshot, &query, 5, &scanner).unwrap();
+            assert_eq!(
+                top.iter().map(|hit| hit.embedding).collect::<Vec<_>>(),
+                vec![exact, other]
+            );
+
+            let bound: Vec<Inline<Handle<Embedding>>> = triblespace_core::find!(
+                neighbour: Inline<Handle<Embedding>>,
+                view.similar_to(&snapshot, exact, neighbour, 0.5, &scanner)
+                    .unwrap()
+            )
+            .collect();
+            assert_eq!(bound, vec![exact]);
+        }
+    }
+
+    /// Through the collection encoding with a real descriptor: the join of
+    /// two members that disagree on a handle succeeds, passes the explicit
+    /// audit, and a two-member cover opened by `try_from_cover` reads like
+    /// the joined member.
+    #[test]
+    fn collection_encoding_joins_audits_and_reads_set_rows() {
+        const DIMENSION: usize = 3;
+        let authority = SigningKey::from_bytes(&[74; 32]);
+        let root = authority.verifying_key();
+        let policy =
+            CollectionPolicy::new(AdmissionPolicy::direct(root), AdmissionPolicy::direct(root));
+        let attribute = Attribute::<Handle<Embedding>>::named("nvfp4-set-rows");
+        let mut store = MemoryRepo::default();
+        let source = store
+            .collection("nvfp4-set-rows-source", policy.clone())
+            .unwrap();
+        let target = store
+            .derive::<NvFp4CosineSet<Embedding>>(
+                source,
+                NvFp4EmbeddingAttribute::new(attribute.id(), DIMENSION).unwrap(),
+                policy,
+            )
+            .unwrap();
+        let left = member([row(1, &[1.0, 0.0, 0.0])], DIMENSION);
+        let right = member(
+            [row(1, &[0.0, 1.0, 0.0]), row(2, &[0.0, 0.0, 1.0])],
+            DIMENSION,
+        );
+        let left_handle = store
+            .put::<NvFp4CosineSet<Embedding>, _>(left.clone())
+            .unwrap();
+        let right_handle = store
+            .put::<NvFp4CosineSet<Embedding>, _>(right.clone())
+            .unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let descriptor: Blob<SimpleArchive> = snapshot.get(target.handle()).unwrap();
+        let descriptor = Fragment::from(TribleSet::try_from_blob(descriptor).unwrap());
+
+        let joined = <NvFp4CosineSet<Embedding> as CollectionEncoding>::join_members(
+            &descriptor,
+            &left,
+            &right,
+            &snapshot,
+        )
+        .unwrap();
+        <NvFp4CosineSet<Embedding> as CollectionEncoding>::validate_member(
+            &descriptor,
+            &joined,
+            &snapshot,
+        )
+        .unwrap();
+        assert_eq!(Layout::parse(joined.bytes.as_ref()).unwrap().rows, 3);
+
+        let cover = target.cover([left_handle, right_handle]);
+        let view =
+            NvFp4CosineIndex::<Embedding>::try_from_cover(&cover, &descriptor, &snapshot).unwrap();
+        assert_eq!(visited(&view), rows_of(&joined));
+        let query = [0.0, 1.0, 0.0];
+        assert_eq!(
+            view.reconstructed_cosines(&query).unwrap().scores,
+            index(&[&joined], DIMENSION)
+                .reconstructed_cosines(&query)
+                .unwrap()
+                .scores
+        );
     }
 }
