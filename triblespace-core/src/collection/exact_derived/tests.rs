@@ -5021,4 +5021,108 @@ mod lattice_v2 {
         assert_eq!(mixed.len(), 15);
         assert_eq!(mixed[..3].iter().copied().collect::<BTreeSet<_>>(), own);
     }
+
+    /// The order a pass by `signer` derives `foundation` in, computed as
+    /// maintenance computes it, so a test can place one foundation after
+    /// others in it.
+    fn derive_rank(signer: u8, foundation: CollectionData) -> [u8; 32] {
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"triblespace/derive-order");
+        hash.update(key(signer).verifying_key().as_bytes());
+        hash.update(&foundation.raw);
+        *hash.finalize().as_bytes()
+    }
+
+    /// Review finding, 2026-09-28: a refused own foundation ended the call
+    /// before it asked for the outputs it had gone on without. While one
+    /// foundation stayed refused, an output that could be fetched never was,
+    /// and one that could not be had never let its foundation be derived
+    /// again. The call now asks for them, derives and carries what that
+    /// makes possible, and reports the refusal after.
+    #[test]
+    fn a_refused_own_foundation_does_not_stop_the_outputs_the_rest_wants() {
+        reset_mapping_calls();
+        let (mut inner, root, first, _) = collections();
+        let refused = own_commit(&mut inner, root, 41, 0);
+        FIRST_MAP_FATAL.replace(Some(refused));
+        let fetched = payload(42, 1);
+        let rederived = payload(42, 2);
+        own_commit(&mut inner, root, 42, 1);
+        own_commit(&mut inner, root, 42, 2);
+        let (record, obtainable) = leaf_of(first, 42, &fetched, 7);
+        inner.insert(record).unwrap();
+        let (record, lost) = leaf_of(first, 42, &rederived, 7);
+        inner.insert(record).unwrap();
+        let mut store = GuardStore::new(inner);
+        store.offer(&obtainable);
+
+        for pass in 0..2 {
+            let result = block_on(store.maintain(first, &key(41)));
+            assert!(
+                matches!(
+                    result,
+                    Err(CollectionRealizationError::Derive { input, .. }) if input == refused
+                ),
+                "pass {pass}: {:?}",
+                result.err()
+            );
+        }
+        assert_eq!(
+            store.acquired.iter().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from([data(&obtainable), data(&lost)])
+        );
+        assert_eq!(store.acquired.len(), 2, "each asked for once");
+        let mapped = FIRST_MAP_LOG.with_borrow(|log| log.clone());
+        assert!(!mapped.contains(&data(&fetched)), "a fetched output counts");
+        assert_eq!(
+            mapped
+                .iter()
+                .filter(|source| **source == data(&rederived))
+                .count(),
+            1,
+            "derived again once"
+        );
+        let own = leaves_by(&mut store.inner, first, 41);
+        assert_eq!(
+            own.iter().map(|leaf| leaf.input()).collect::<Vec<_>>(),
+            vec![SourceLocator::of(data(&rederived).raw)]
+        );
+    }
+
+    /// Review finding, 2026-09-28: the first own foundation the mapping
+    /// refused was the one thing a pass reported, so a payload another own
+    /// foundation after it in the key's order needed was never fetched
+    /// while the refusal stood.
+    #[test]
+    fn a_refused_own_foundation_does_not_hide_a_payload_another_needs() {
+        reset_mapping_calls();
+        let (mut inner, root, first, _) = collections();
+        let refused = own_commit(&mut inner, root, 41, 0);
+        FIRST_MAP_FATAL.replace(Some(refused));
+        let entity = (1..64)
+            .find(|entity| derive_rank(41, data(&payload(41, *entity))) > derive_rank(41, refused))
+            .unwrap();
+        let elsewhere = payload(41, entity);
+        foreign_commit(&mut inner, root, 41, entity);
+        let mut store = GuardStore::new(inner);
+        store.offer(&elsewhere);
+
+        let result = block_on(store.maintain(first, &key(41)));
+        assert!(
+            matches!(
+                result,
+                Err(CollectionRealizationError::Derive { input, .. }) if input == refused
+            ),
+            "{:?}",
+            result.err()
+        );
+        assert_eq!(store.acquired, vec![data(&elsewhere)]);
+        assert_eq!(
+            leaves_by(&mut store.inner, first, 41)
+                .iter()
+                .map(|leaf| leaf.input())
+                .collect::<Vec<_>>(),
+            vec![SourceLocator::of(data(&elsewhere).raw)]
+        );
+    }
 }

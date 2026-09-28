@@ -1052,16 +1052,20 @@ where
 /// mapping. Outputs of believed leaves that are not here go into `wanted`,
 /// for the acquiring loop to ask for once this operation is done.
 ///
-/// What deriving left undone holds nothing back: the carry runs first, and
-/// then it is reported, in this order -- the first own foundation the
-/// mapping refused ([`CollectionRealizationError::Derive`]) or named a
-/// missing blob for ([`CollectionRealizationError::MissingDependency`], which
-/// the acquiring loop fetches before running again), then, for `ensure`
-/// only, a key the target does not admit that owes leaves for foundations of
-/// its own ([`CollectionRealizationError::UnauthorizedProducer`]), then own
+/// What deriving left undone holds nothing back: the carry runs first. A
+/// blob an own foundation needs is then asked for
+/// ([`CollectionRealizationError::MissingDependency`], which the acquiring
+/// loop fetches before running everything again); it is a request, not a
+/// report, so it comes before anything reported. What is reported comes in
+/// this order: the first own foundation the mapping refused
+/// ([`CollectionRealizationError::Derive`]), then the carry's own failure,
+/// then, for `ensure` only, a key the target does not admit that owes
+/// leaves for foundations of its own
+/// ([`CollectionRealizationError::UnauthorizedProducer`]), then own
 /// foundations the mapping could not represent
-/// ([`CollectionRealizationError::Unmappable`]). Only a storage failure ends
-/// the operation before the carry.
+/// ([`CollectionRealizationError::Unmappable`]). The acquiring loop asks for
+/// `wanted` before it returns any of these. Only a storage failure ends the
+/// operation before the carry.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn maintain_derived<S, M>(
     store: &mut S,
@@ -1096,8 +1100,11 @@ where
     } else {
         Ok(())
     };
-    if let Some(failure) = derived.failure {
-        return Err(failure);
+    if let Some(member) = derived.missing {
+        return Err(CollectionRealizationError::MissingDependency { member });
+    }
+    if let Some(refusal) = derived.refusal {
+        return Err(refusal);
     }
     carried?;
     if derived.unauthorized {
@@ -1122,10 +1129,13 @@ struct Derivation {
     unauthorized: bool,
     /// Own foundations the mapping could not represent, and why.
     blocked: Vec<(CollectionData, String)>,
-    /// The first own foundation the mapping refused, or the first blob an
-    /// own foundation needs that is not here: held until everything else
-    /// has been derived and carried.
-    failure: Option<CollectionRealizationError>,
+    /// The first blob an own foundation needs that is not here -- its
+    /// payload, or a dependency the mapping named -- asked for once
+    /// everything else has been derived and carried.
+    missing: Option<CollectionData>,
+    /// The first own foundation the mapping refused: held until everything
+    /// else has been derived and carried.
+    refusal: Option<CollectionRealizationError>,
 }
 
 /// The order `key` derives foundations in: a hash of the key and the
@@ -1328,16 +1338,17 @@ where
                 }
             }
             Mapped::Absent => {
-                derivation
-                    .failure
-                    .get_or_insert(CollectionRealizationError::MissingDependency {
-                        member: foundation,
-                    });
+                derivation.missing.get_or_insert(foundation);
             }
             Mapped::Refused(error) => {
-                if let Err(error) = refused(foundation, error, unavailable, &mut derivation.blocked)
-                {
-                    derivation.failure.get_or_insert(error);
+                match refused(foundation, error, unavailable, &mut derivation.blocked) {
+                    Ok(()) => {}
+                    Err(CollectionRealizationError::MissingDependency { member }) => {
+                        derivation.missing.get_or_insert(member);
+                    }
+                    Err(error) => {
+                        derivation.refusal.get_or_insert(error);
+                    }
                 }
             }
         }

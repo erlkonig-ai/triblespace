@@ -651,6 +651,11 @@ const OPTIONAL_FETCH_FAILURES: usize = 8;
 /// cannot, a miss says nothing about elsewhere, so what it names waits. Once
 /// [`OPTIONAL_FETCH_FAILURES`] of them have failed in one call, the rest wait
 /// for a later call too.
+///
+/// An operation that reports something after its work -- a foundation its
+/// mapping refused, a carry that failed -- has its `wanted` asked for, and
+/// runs again, before that report is returned: nothing it reports holds back
+/// a fetch. Only a storage error ends the call at once.
 async fn acquiring<S, F>(store: &mut S, mut operation: F) -> Result<(), CollectionRealizationError>
 where
     S: Store + AsyncBlobStoreAcquire,
@@ -672,41 +677,44 @@ where
             })?);
             operation(store, &unavailable, &mut wanted, &mut frontier)
         };
-        let missing = match result {
-            Err(CollectionRealizationError::MissingDependency { member }) => member,
-            Err(error) => return Err(error),
-            Ok(()) => {
-                if !store.acquires_remotely() {
-                    return Ok(());
-                }
-                let mut asked = false;
-                for member in wanted {
-                    if failures == OPTIONAL_FETCH_FAILURES {
-                        break;
-                    }
-                    if attempted.contains(&member) {
-                        continue;
-                    }
-                    asked = true;
-                    if !acquire_missing(store, &mut attempted, member).await? {
-                        unavailable.insert(member);
-                        failures += 1;
-                    }
-                }
-                if !asked {
-                    return Ok(());
+        // The operation is over and its control snapshot released before
+        // anything is fetched: acquisition holds no view of the store.
+        let reported = match result {
+            Ok(()) => None,
+            Err(error @ CollectionRealizationError::Storage { .. }) => return Err(error),
+            Err(CollectionRealizationError::MissingDependency { member })
+                if !attempted.contains(&member) =>
+            {
+                if !acquire_missing(store, &mut attempted, member).await? {
+                    unavailable.insert(member);
                 }
                 continue;
             }
+            Err(error) => Some(error),
         };
-        // The operation is over and its control snapshot released before
-        // anything is fetched: acquisition holds no view of the store.
-        if attempted.contains(&missing) {
-            return Err(CollectionRealizationError::MissingDependency { member: missing });
+        if store.acquires_remotely() && failures < OPTIONAL_FETCH_FAILURES {
+            let mut asked = false;
+            for member in wanted {
+                if failures >= OPTIONAL_FETCH_FAILURES {
+                    break;
+                }
+                if attempted.contains(&member) {
+                    continue;
+                }
+                asked = true;
+                if !acquire_missing(store, &mut attempted, member).await? {
+                    unavailable.insert(member);
+                    failures += 1;
+                }
+            }
+            if asked {
+                continue;
+            }
         }
-        if !acquire_missing(store, &mut attempted, missing).await? {
-            unavailable.insert(missing);
-        }
+        return match reported {
+            Some(error) => Err(error),
+            None => Ok(()),
+        };
     }
 }
 
