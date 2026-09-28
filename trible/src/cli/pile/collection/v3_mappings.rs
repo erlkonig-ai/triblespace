@@ -98,12 +98,14 @@ const EMBEDDING_ATTRIBUTE_TO_NVFP4_BEFORE_A1927BD0: Id =
 
 /// Every mapping algorithm lattice v3 classifies.
 ///
-/// The attached list follows the build brief (decisions 4 and 12, spec
-/// resolution 7): Succinct, Rank9, the LWW register, latest states,
-/// EntityIdSet, both BM25 mappings and PathSummary become attached;
-/// ReferenceSummary is deleted; the semantic index and the stored-vector
-/// NVFP4 set stay derived. It is frozen against that list, not against the
-/// attached implementations themselves, which land separately.
+/// Attached are the mappings every reader of a node can compute
+/// deterministically, detecting any missing dependency: Succinct, Rank9, the
+/// LWW register, latest states, EntityIdSet, both BM25 mappings and
+/// PathSummary. ReferenceSummary is deleted. The semantic index and the
+/// stored-vector NVFP4 set stay derived: they need a model, or a vector
+/// source not every reader has. The table is frozen against this list of the
+/// lattice v3 design, not against the attached implementations themselves,
+/// which land separately.
 pub(crate) const V3_MAPPINGS: &[V3Mapping] = &[
     V3Mapping {
         id: SIMPLE_TO_SUCCINCT_MAPPING_V1,
@@ -241,23 +243,25 @@ mod tests {
     /// listing gives it, so a mapping added there cannot go unclassified.
     #[test]
     fn every_algorithm_the_listing_names_is_classified() {
-        let mut named = 0;
-        for mapping in V3_MAPPINGS {
-            if let Some(name) = super::super::mapping_algorithm_name(mapping.id) {
-                named += 1;
-                assert_eq!(mapping.name, name, "{:X}", mapping.id);
-            }
-        }
+        let known = super::super::known_mapping_algorithms();
         // Nine core and paths mappings, plus the three search mappings when
         // this build has the search feature.
         let search = if cfg!(feature = "search") { 3 } else { 0 };
-        assert_eq!(named, 9 + search);
+        assert_eq!(known.len(), 9 + search);
+        for (id, name) in known {
+            let mapping =
+                v3_mapping(id).unwrap_or_else(|| panic!("{name} ({id:X}) is not classified"));
+            assert_eq!(mapping.name, name, "{id:X}");
+        }
     }
 
+    /// A second statement, independent of the table, of the mappings whose
+    /// DERIVEs the filter leaves behind. Every table entry it does not name
+    /// must stay derived, so giving any id, new or old, a fate that drops
+    /// records takes an edit here as well as in the table.
     #[test]
-    fn the_fates_follow_the_build_brief() {
-        let fate = |id| v3_mapping(id).map(|mapping| mapping.fate);
-        for attached in [
+    fn only_the_named_mappings_leave_their_derives_behind() {
+        let attached = [
             SIMPLE_TO_SUCCINCT_MAPPING_V1,
             RAW_TO_RANK9_ACCELERATED_MAPPING_V1_32_LE,
             RAW_TO_RANK9_ACCELERATED_MAPPING_V1_32_BE,
@@ -269,14 +273,20 @@ mod tests {
             REGULAR_PATH_MAPPING_V1,
             TEXT_ATTRIBUTE_TO_BM25,
             ARCHIVE_BLOCK_TEXT_BM25_MAPPING_V1,
-        ] {
-            assert_eq!(fate(attached), Some(V3Fate::Attached), "{attached:X}");
+        ];
+        let deleted = [REFERENCE_SUMMARY_MAPPING_V2, REFERENCE_SUMMARY_MAPPING_V1];
+        for id in attached.iter().chain(&deleted) {
+            assert!(v3_mapping(*id).is_some(), "{id:X} is classified");
         }
-        for deleted in [REFERENCE_SUMMARY_MAPPING_V2, REFERENCE_SUMMARY_MAPPING_V1] {
-            assert_eq!(fate(deleted), Some(V3Fate::Deleted), "{deleted:X}");
-        }
-        for derived in [NOMIC_ATTRIBUTES_TO_NVFP4, EMBEDDING_ATTRIBUTE_TO_NVFP4] {
-            assert_eq!(fate(derived), Some(V3Fate::Derived), "{derived:X}");
+        for mapping in V3_MAPPINGS {
+            let expected = if attached.contains(&mapping.id) {
+                V3Fate::Attached
+            } else if deleted.contains(&mapping.id) {
+                V3Fate::Deleted
+            } else {
+                V3Fate::Derived
+            };
+            assert_eq!(mapping.fate, expected, "{}", mapping.name);
         }
     }
 
