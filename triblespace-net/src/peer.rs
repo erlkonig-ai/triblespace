@@ -30,7 +30,7 @@ use triblespace_core::repo::{
 };
 
 use crate::channel::{MAX_ADMISSION_BRIDGE_BATCHES, NetEvent};
-use crate::host::{self, ActiveCollections, NetReceiver, NetSender, StoreSnapshot};
+use crate::host::{self, ActiveCollections, HostStarted, NetReceiver, NetSender, StoreSnapshot};
 use crate::protocol::RawHash;
 use crate::reconcile::{ReconcileStats, Reconciler, ReplicationMode};
 use crate::wake::CollectionWakePlane;
@@ -115,7 +115,7 @@ where
 
 enum HostState {
     /// Allocating channels does not start any runtime or network activity.
-    Dormant(Box<dyn FnOnce() -> Result<Option<CollectionWakePlane>, PeerOpenError> + Send>),
+    Dormant(Box<dyn FnOnce() -> Result<Option<HostStarted>, PeerOpenError> + Send>),
     Running,
     /// Startup is attempted once per peer. Local operations remain available.
     Failed(String),
@@ -126,7 +126,7 @@ enum HostState {
 struct SharedHost {
     state: HostState,
     sender: NetSender,
-    wake_plane: Option<CollectionWakePlane>,
+    started: Option<HostStarted>,
 }
 
 impl SharedHost {
@@ -148,8 +148,8 @@ impl SharedHost {
             unreachable!("only a dormant host reaches startup")
         };
         match start() {
-            Ok(wake_plane) => {
-                self.wake_plane = wake_plane;
+            Ok(started) => {
+                self.started = started;
                 Ok(())
             }
             Err(error) => {
@@ -225,14 +225,14 @@ where
     /// Spawn a production host. No team scope or connection proof exists.
     pub fn new(store: S, key: SigningKey, config: PeerConfig) -> Result<Self, PeerOpenError> {
         let qos = config.qos;
-        let (sender, receiver, wake_plane) =
+        let (sender, receiver, started) =
             host::spawn(key, config).map_err(PeerOpenError::HostStartup)?;
         Ok(Self::assemble(
             store,
             qos,
             sender,
             receiver,
-            Some(wake_plane),
+            Some(started),
             HostState::Running,
         ))
     }
@@ -280,7 +280,7 @@ where
         qos: ReconcileQos,
         sender: NetSender,
         receiver: NetReceiver,
-        wake_plane: Option<CollectionWakePlane>,
+        started: Option<HostStarted>,
         host: HostState,
     ) -> Self {
         sender.observe_direction(qos.direction);
@@ -289,7 +289,7 @@ where
             host: Arc::new(Mutex::new(SharedHost {
                 state: host,
                 sender: sender.clone(),
-                wake_plane,
+                started,
             })),
             sender,
             receiver,
@@ -375,7 +375,26 @@ where
     /// Collection possession is enough to join a production topic; following a
     /// wake into anti-entropy remains separately authorized.
     pub fn wake_plane(&self) -> Option<CollectionWakePlane> {
-        self.host.lock().expect("host mutex").wake_plane.clone()
+        self.host
+            .lock()
+            .expect("host mutex")
+            .started
+            .as_ref()
+            .map(|started| started.wake_plane.clone())
+    }
+
+    /// The local sockets this peer's endpoint bound
+    /// ([`PeerConfig::bind`](crate::host::PeerConfig::bind)). Empty for
+    /// caller-owned wiring and for a lazy peer whose host has not started.
+    /// This accessor never starts a host.
+    pub fn bound_sockets(&self) -> Vec<std::net::SocketAddr> {
+        self.host
+            .lock()
+            .expect("host mutex")
+            .started
+            .as_ref()
+            .map(|started| started.bound.clone())
+            .unwrap_or_default()
     }
 
     pub const fn qos(&self) -> ReconcileQos {
@@ -653,7 +672,7 @@ where
         {
             let mut host = self.host.lock().expect("host mutex");
             host.state = HostState::Closed;
-            host.wake_plane = None;
+            host.started = None;
         }
         let store = self
             .store
@@ -883,6 +902,7 @@ mod tests {
                 direction: ReconcileDirection::ReadOnly,
             },
             provider_publication_budget: Some(0),
+            bind: None,
         }
     }
 

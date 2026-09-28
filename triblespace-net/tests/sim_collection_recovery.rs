@@ -46,6 +46,7 @@ fn bring_up(
             // Gossip discovers the initial participants. This test measures
             // repair recovery, not the timing of provider publication.
             provider_publication_budget: Some(0),
+            bind: None,
         },
         wiring,
     ));

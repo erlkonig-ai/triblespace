@@ -915,8 +915,18 @@ trible pile net sync DATA.pile \
     [--key EXISTING_SELF_KEY] \
     --collection COLLECTION_HANDLE [--collection COLLECTION_HANDLE ...] \
     [--peers ENDPOINT_TICKET ...] [--direction bidirectional|read-only|write-only] \
-    [--replication demand|shallow|full]
+    [--replication demand|shallow|full] [--bind IP:PORT]
 ```
+
+`--bind` binds the endpoint to exactly that local socket instead of iroh's
+default sockets. At startup the daemon prints `bound: <ip:port>[ <ip:port>...]`
+on stderr, the sockets it actually bound. A peer's ticket can then be written
+before it starts: `trible pile net identity --key KEY --bind IP:PORT` prints
+`node: <endpoint id>` and `ticket: <endpoint ticket>` naming exactly that
+address, which the other daemon takes in `--peers`. After each pass the daemon
+prints one plain line on stderr per peer it completed collection repair with
+since the previous pass: `reconciled with peer <endpoint id hex>: <n>
+collections`.
 
 The long-running daemon uses one existing durable key for its authenticated
 endpoint, signed wakes, health reports and telemetry. Key resolution is

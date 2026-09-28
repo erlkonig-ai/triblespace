@@ -126,6 +126,7 @@ async fn bring_up_owned(
         peers,
         qos: ReconcileQos::default(),
         provider_publication_budget: None,
+        bind: None,
     };
     let harness = triblespace_net::transport::iroh::bind_with_endpoint(endpoint, &config).await;
     let (sender, receiver, wiring) = host::wire(id);

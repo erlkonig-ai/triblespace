@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `PeerConfig::bind`: bind the production endpoint to exactly one local
+  socket (`None` keeps iroh's default sockets). The host thread hands back
+  `HostStarted { wake_plane, bound }` and `Peer::bound_sockets` reports the
+  sockets bound.
+
 - Transport generation `/triblespace/pile-sync/28` and wake version 5: sync
   exports foundations only. The record PATCH, its summary, served nodes,
   incremental updates and hydration roots carry COMMIT and DERIVE records

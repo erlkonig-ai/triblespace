@@ -38,6 +38,7 @@ async fn receive_half_termination(malformed: bool) {
             peers: vec![],
             qos: Default::default(),
             provider_publication_budget: Some(0),
+            bind: None,
         },
     )
     .await;

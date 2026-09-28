@@ -48,6 +48,11 @@ impl IrohTransport {
     pub fn wake_plane(&self) -> CollectionWakePlane {
         self.wake_plane.clone()
     }
+
+    /// The local sockets this transport's endpoint bound.
+    pub fn bound_sockets(&self) -> Vec<std::net::SocketAddr> {
+        self.ep.bound_sockets()
+    }
 }
 
 /// Owner of everything that must not drop while the node runs.
@@ -310,7 +315,15 @@ pub async fn bind(
     secret: iroh_base::SecretKey,
     config: &PeerConfig,
 ) -> anyhow::Result<Harness<IrohTransport>> {
-    let ep = bind_n0_endpoint(n0_endpoint_builder(secret)).await?;
+    let mut builder = n0_endpoint_builder(secret);
+    if let Some(addr) = config.bind {
+        // Exactly this socket: the default wildcard sockets are dropped.
+        builder = builder
+            .clear_ip_transports()
+            .bind_addr(addr)
+            .map_err(|error| anyhow::anyhow!("iroh bind address {addr}: {error}"))?;
+    }
+    let ep = bind_n0_endpoint(builder).await?;
     Ok(bind_with_endpoint(ep, config).await)
 }
 

@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
+- `pile net sync --bind <ip:port>` binds the endpoint to exactly that socket
+  and prints `bound: <ip:port>[ <ip:port>...]` on stderr at startup;
+  `pile net identity --bind <ip:port>` also prints `ticket: <ticket>` for a
+  daemon bound there, so two daemons can be given each other's tickets before
+  either starts. After each pass `pile net sync` prints one plain stderr line
+  per peer it completed collection repair with: `reconciled with peer
+  <endpoint id hex>: <n> collections`.
 - `pile net sync --health-collection <handle>` (with `--health-key`) and
   `pile net health --collection <handle>` report into and read from an
   explicit existing health generation instead of the reporting key's own

@@ -104,6 +104,10 @@ pub enum Command {
         /// Path to the node's signing key.
         #[arg(long)]
         key: Option<PathBuf>,
+        /// Also print the ticket of a sync daemon started with this key and
+        /// `--bind <ADDR>`, so a peer can be given it before either starts.
+        #[arg(long, value_name = "IP:PORT")]
+        bind: Option<std::net::SocketAddr>,
     },
     /// Show locally recorded swarm health; never performs a network probe.
     ///
@@ -235,12 +239,17 @@ pub enum Command {
             value_parser = clap::value_parser!(u64).range(1..=64)
         )]
         held_walk_threads: u64,
+        /// Bind the endpoint to exactly this local socket (for example
+        /// `127.0.0.1:7001`) instead of iroh's default sockets. Printed at
+        /// startup as `bound: <ip:port>`.
+        #[arg(long, value_name = "IP:PORT")]
+        bind: Option<std::net::SocketAddr>,
     },
 }
 
 pub fn run(command: Command) -> Result<()> {
     match command {
-        Command::Identity { key } => run_identity(key),
+        Command::Identity { key, bind } => run_identity(key, bind),
         Command::Health {
             pile,
             key,
@@ -285,6 +294,7 @@ pub fn run(command: Command) -> Result<()> {
             quiescent_for,
             held_walk_interval,
             held_walk_threads,
+            bind,
         } => run_sync(
             pile,
             peers,
@@ -304,20 +314,35 @@ pub fn run(command: Command) -> Result<()> {
                 interval: std::time::Duration::from_secs(held_walk_interval),
                 threads: held_walk_threads as usize,
             },
+            bind,
         ),
     }
 }
 
-fn run_identity(key: Option<PathBuf>) -> Result<()> {
+fn run_identity(key: Option<PathBuf>, bind: Option<std::net::SocketAddr>) -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let default_anchor = cwd.join("identity.pile");
     let path = triblespace_core::signing_key_file::resolve_path(key.as_deref(), &default_anchor);
     let key = triblespace_core::signing_key_file::init(&path)?;
-    println!(
-        "node: {}",
-        triblespace_net::identity::iroh_secret(&key).public()
-    );
+    let public = triblespace_net::identity::iroh_secret(&key).public();
+    println!("node: {public}");
+    if let Some(addr) = bind {
+        println!("ticket: {}", bound_ticket(public, addr));
+    }
     Ok(())
+}
+
+/// The ticket of an endpoint reached at exactly `addr`.
+fn bound_ticket(id: EndpointId, addr: std::net::SocketAddr) -> String {
+    use iroh_tickets::Ticket;
+    EndpointTicket::new(EndpointAddr::new(id).with_ip_addr(addr)).encode_string()
+}
+
+/// The startup line naming the sockets the endpoint bound:
+/// `bound: <ip:port>[ <ip:port>...]`.
+fn bound_line(sockets: &[std::net::SocketAddr]) -> String {
+    let sockets: Vec<String> = sockets.iter().map(ToString::to_string).collect();
+    format!("bound: {}", sockets.join(" "))
 }
 
 fn run_sync(
@@ -334,6 +359,7 @@ fn run_sync(
     duration: Option<u64>,
     quiescent_for: Option<u64>,
     held_walk: HeldWalkConfig,
+    bind: Option<std::net::SocketAddr>,
 ) -> Result<()> {
     let key = load_existing_key(key_path, &pile_path)?;
     let peers = parse_peers(&peer_values)?;
@@ -408,11 +434,13 @@ fn run_sync(
             peers,
             qos,
             provider_publication_budget,
+            bind,
         },
     )?;
     peer.activate_collections(collections.iter().copied());
 
     eprintln!("node: {}", peer.id());
+    eprintln!("{}", bound_line(&peer.bound_sockets()));
     eprintln!("active collections: {}", collections.len());
     eprintln!("local replication: {replication:?}");
     if health_collection.is_some() {
@@ -754,6 +782,136 @@ fn run_health(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_bound_ticket_names_exactly_the_bound_socket() {
+        use iroh_base::{EndpointId, SecretKey};
+        let id: EndpointId = SecretKey::from_bytes(&[7; 32]).public();
+        let addr: std::net::SocketAddr = "127.0.0.1:7001".parse().unwrap();
+        let ticket = super::bound_ticket(id, addr);
+        let peers = super::parse_peers(&[ticket]).unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].id, id);
+        assert_eq!(peers[0].ip_addrs().copied().collect::<Vec<_>>(), vec![addr]);
+        assert_eq!(super::bound_line(&[addr]), "bound: 127.0.0.1:7001");
+        let v6: std::net::SocketAddr = "[::1]:7002".parse().unwrap();
+        assert_eq!(
+            super::bound_line(&[addr, v6]),
+            "bound: 127.0.0.1:7001 [::1]:7002"
+        );
+    }
+
+    /// Two production peers, each bound to a chosen loopback port and given
+    /// the other's ticket, written before either starts, repair a collection
+    /// in both directions.
+    #[test]
+    fn two_bound_peers_reach_each_other_from_tickets_written_before_launch() {
+        use ed25519_dalek::SigningKey;
+        use triblespace_core::collection::{
+            empty_metadata_handle, AdmissionPolicy, CollectionCommit, CollectionData,
+            CollectionPolicy, CollectionRead, CollectionRecord, CollectionStore,
+            CollectionStoreExt,
+        };
+        use triblespace_core::repo::memoryrepo::MemoryRepo;
+        use triblespace_net::peer::{Peer, PeerConfig, ReconcileQos};
+
+        fn free_port() -> std::net::SocketAddr {
+            // Released at once; the peer binds it a moment later.
+            std::net::UdpSocket::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+        }
+        let keys = [
+            SigningKey::from_bytes(&[0x51; 32]),
+            SigningKey::from_bytes(&[0x52; 32]),
+        ];
+        let addrs = [free_port(), free_port()];
+        let tickets: Vec<String> = keys
+            .iter()
+            .zip(addrs)
+            .map(|(key, addr)| {
+                super::bound_ticket(triblespace_net::identity::iroh_secret(key).public(), addr)
+            })
+            .collect();
+        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+        let mut peers = Vec::new();
+        let mut collection = None;
+        for (index, key) in keys.iter().enumerate() {
+            let mut store = MemoryRepo::default();
+            let handle = store
+                .collection("bound loopback pair", policy.clone())
+                .unwrap()
+                .handle();
+            collection = Some(handle);
+            let other = super::parse_peers(&[tickets[1 - index].clone()]).unwrap();
+            let mut peer = Peer::new(
+                store,
+                key.clone(),
+                PeerConfig {
+                    peers: other,
+                    qos: ReconcileQos::default(),
+                    provider_publication_budget: Some(0),
+                    bind: Some(addrs[index]),
+                },
+            )
+            .unwrap();
+            assert_eq!(peer.bound_sockets(), vec![addrs[index]]);
+            peer.activate_collection(handle);
+            peers.push(peer);
+        }
+        let collection = collection.unwrap();
+        for (index, key) in keys.iter().enumerate() {
+            peers[index]
+                .store()
+                .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                    key,
+                    collection,
+                    CollectionData::new([0x60 + index as u8; 32]),
+                    empty_metadata_handle(),
+                )))
+                .unwrap();
+            peers[index].refresh();
+        }
+        let started = std::time::Instant::now();
+        loop {
+            let counts: Vec<usize> = peers
+                .iter_mut()
+                .map(|peer| {
+                    peer.refresh();
+                    peer.snapshot().unwrap().records().unwrap().count()
+                })
+                .collect();
+            if counts == [2, 2] {
+                break;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(90),
+                "the bound peers did not repair each other: {counts:?} records"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        for peer in peers {
+            drop(peer.into_store());
+        }
+    }
+
+    #[test]
+    fn sync_takes_a_bind_address() {
+        let super::Command::Sync { bind, .. } = super::Command::try_parse_from([
+            "net",
+            "sync",
+            "pile",
+            "--collection",
+            "00",
+            "--bind",
+            "127.0.0.1:7001",
+        ])
+        .unwrap() else {
+            panic!("sync");
+        };
+        assert_eq!(bind, Some("127.0.0.1:7001".parse().unwrap()));
+    }
+
     #[test]
     fn a_reconciled_line_per_peer_for_new_successful_rounds_only() {
         let mut seen = std::collections::BTreeMap::new();

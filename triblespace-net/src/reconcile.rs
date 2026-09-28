@@ -2735,6 +2735,7 @@ mod tests {
                 peers: Vec::new(),
                 qos: crate::inventory::ReconcileQos::default(),
                 provider_publication_budget: Some(0),
+                bind: None,
             },
         );
         let frozen = peer.snapshot().unwrap();
