@@ -333,9 +333,12 @@ where
     /// This is the reader's half of "read raw, build, or report a gap": a
     /// residual foundation whose bytes are here is mapped the way
     /// maintenance would map it, and the view is formed over the cover and
-    /// those images together, so it answers like the view of the parent's
-    /// whole support and never less than a fact read of the same
-    /// observation. Nothing is stored or published. What cannot be built
+    /// those images together, so, by the mapping's cover-query law
+    /// ([`MapMapping`]), it answers like the view of the parent's whole
+    /// support and never less than a fact read of the same observation. A
+    /// mapping whose law is a premise about its input answers so only where
+    /// the premise holds; where it does not, nothing here is unread to show
+    /// it. Nothing is stored or published. What cannot be built
     /// here -- bytes not here, a dependency the mapping names not here, a
     /// node the mapping cannot represent or interpret, or any node at all
     /// when the mapping reads sibling attachments -- is named in
@@ -437,8 +440,11 @@ impl<V> AttachedRead<V> {
     /// The residual foundations the value leaves out, each a gap: its bytes
     /// are not here, a dependency its mapping names is not here, or the
     /// mapping cannot represent or interpret it here. The rest of the
-    /// residual is in the value. Empty when the value answers for
-    /// everything the parent stands on in this observation.
+    /// residual is in the value. Empty when every foundation the parent
+    /// stands on in this observation went into the value; whether the value
+    /// then answers like their union is the mapping's cover-query law, which
+    /// for some mappings is a premise about the input that nothing here
+    /// checks ([`MapMapping`]).
     pub fn unread(&self) -> &Support<SimpleArchive> {
         &self.unread
     }

@@ -923,6 +923,81 @@ fn attached_collections_are_found_from_their_parent_siblings_first() {
     assert_eq!(read.cover().len(), 2);
 }
 
+/// A descriptor naming the parent beside another parent is one no attached
+/// read here serves: a read walks one parent's lattice. Upkeep of either
+/// parent passes it by, so its presence changes nothing the parent's own
+/// attachments do. Any record naming it, whoever signed it, lists it.
+#[test]
+fn a_descriptor_naming_two_parents_is_upkept_with_neither() {
+    use crate::collection::records::{
+        collection_mapping, collection_parent, collection_representation,
+        KIND_COLLECTION_DESCRIPTOR,
+    };
+    use crate::metadata::MetaDescribe;
+    let mut store = MemoryRepo::for_host(host().verifying_key());
+    let root = store.collection("upkept", policy()).unwrap();
+    let second = store.collection("second-parent", policy()).unwrap();
+    let succinct = store.attach::<SuccinctArchiveBlob>(root, ()).unwrap();
+    let descriptor = entity! {
+        metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+        collection_parent*: [root.handle(), second.handle()],
+        collection_representation*: <SuccinctArchiveBlob as MetaDescribe>::describe(),
+        collection_mapping*: <SuccinctArchiveBlob as CollectionAttachment>::fragment(&()),
+    };
+    let both = crate::collection::descriptor::put_closure(&mut store, &descriptor).unwrap();
+    let payload: Blob<SimpleArchive> = row(7, 8, 9).to_blob();
+    let stray = data(&payload);
+    store.put::<SimpleArchive, _>(payload).unwrap();
+    store
+        .insert(CollectionRecord::Commit(CollectionCommit::sign(
+            &other(),
+            both,
+            stray,
+            empty_metadata_handle(),
+        )))
+        .unwrap();
+    let node = commit(&mut store, root, row(1, 2, 3));
+    map_succinct(&mut store, succinct, node, &host());
+    commit(&mut store, root, row(4, 5, 6));
+    assert!(store
+        .snapshot()
+        .unwrap()
+        .collections()
+        .unwrap()
+        .contains(&both));
+
+    for maintain in [false, true] {
+        let report = if maintain {
+            block_on(crate::collection::maintain_downstream(
+                &mut store,
+                root.handle(),
+                &host(),
+                &mut crate::collection::CoreRealizer,
+            ))
+        } else {
+            block_on(crate::collection::ensure_downstream(
+                &mut store,
+                root.handle(),
+                &host(),
+                &mut crate::collection::CoreRealizer,
+            ))
+        }
+        .unwrap();
+        assert_eq!(report.realized, vec![succinct.handle()]);
+        assert!(report.failed_attached.is_empty());
+    }
+    let snapshot = store.snapshot().unwrap();
+    for parent in [root, second] {
+        assert!(crate::collection::attached_to(&snapshot, parent.handle())
+            .unwrap()
+            .iter()
+            .all(|attached| attached.handle != both));
+    }
+    let read = snapshot.attached(succinct).unwrap();
+    assert!(read.residual().is_empty());
+    assert_eq!(read.support().len(), 2);
+}
+
 // ---------------------------------------------------------------------------
 // Cover-query equivalence.
 // ---------------------------------------------------------------------------

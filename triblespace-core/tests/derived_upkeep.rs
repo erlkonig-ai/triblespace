@@ -249,6 +249,103 @@ fn a_key_that_is_not_the_host_fails_and_an_unknown_representation_is_named_not_g
     );
 }
 
+/// One attached collection failing is that collection's lag, not the
+/// pass's: it is named with why, every other collection attached to the
+/// source is still taken as far as asked, and the write stays readable
+/// through them.
+#[test]
+fn one_attached_collection_failing_leaves_the_others_upkept() {
+    use triblespace_core::blob::encodings::entity_id_set::EntityIdSetBlob;
+    use triblespace_core::collection::CollectionHandle;
+
+    /// The core realizer, except that one attached collection fails.
+    struct FailsOne(CollectionHandle);
+    impl<S: Store + AsyncBlobStoreAcquire + Send> RealizeDerived<S> for FailsOne {
+        async fn realize(
+            &mut self,
+            store: &mut S,
+            derived: &Derived,
+            signer: &SigningKey,
+            upkeep: Upkeep,
+        ) -> Result<Realized, CollectionRealizationError> {
+            CoreRealizer.realize(store, derived, signer, upkeep).await
+        }
+
+        async fn realize_attached(
+            &mut self,
+            store: &mut S,
+            attached: &Attached,
+            signer: &SigningKey,
+            upkeep: Upkeep,
+        ) -> Result<Realized, CollectionRealizationError> {
+            if attached.handle == self.0 {
+                return Err(CollectionRealizationError::Resolution(
+                    "this one cannot be taken up".to_owned(),
+                ));
+            }
+            CoreRealizer
+                .realize_attached(store, attached, signer, upkeep)
+                .await
+        }
+    }
+
+    let owner = key(6);
+    let mut store = MemoryRepo::for_host(owner.verifying_key());
+    let pair = pair(&mut store, "isolated", &owner);
+    let named = store
+        .attach::<EntityIdSetBlob>(pair.source, metadata::name.id())
+        .unwrap();
+    store
+        .commit(pair.source, &owner, fragment("first"))
+        .unwrap();
+    seed(&mut store, &pair, &owner);
+    block_on(store.ensure_attached(named, &owner)).unwrap();
+    // The failing collection is visited before the Rank9 collection, which
+    // reads the Succinct one.
+    let order: Vec<_> = attached_to(&store.snapshot().unwrap(), pair.source.handle())
+        .unwrap()
+        .into_iter()
+        .map(|attached| attached.handle)
+        .collect();
+    let position = |handle| order.iter().position(|listed| *listed == handle).unwrap();
+    assert!(position(named.handle()) < position(pair.rank9.handle()));
+
+    store
+        .commit(pair.source, &owner, fragment("second"))
+        .unwrap();
+    for upkeep in [Upkeep::Ensure, Upkeep::Maintain] {
+        let mut realizer = FailsOne(named.handle());
+        let report = block_on(async {
+            match upkeep {
+                Upkeep::Ensure => {
+                    ensure_downstream(&mut store, pair.source.handle(), &owner, &mut realizer).await
+                }
+                Upkeep::Maintain => {
+                    maintain_downstream(&mut store, pair.source.handle(), &owner, &mut realizer)
+                        .await
+                }
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            report.realized,
+            [pair.succinct.handle(), pair.rank9.handle()]
+        );
+        assert_eq!(
+            report
+                .failed_attached
+                .iter()
+                .map(|(attached, reason)| (attached.handle, reason.contains("cannot be taken up")))
+                .collect::<Vec<_>>(),
+            [(named.handle(), true)]
+        );
+    }
+    let snapshot = store.snapshot().unwrap();
+    let observed = snapshot.attached(pair.rank9).unwrap();
+    assert_eq!(observed.support().len(), 2);
+    assert!(observed.residual().is_empty());
+}
+
 #[test]
 fn a_descriptor_naming_another_mapping_is_left_to_whoever_registered_it() {
     use triblespace_core::blob::Blob;

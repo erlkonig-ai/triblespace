@@ -410,6 +410,30 @@ impl<T: CollectionDerivation> DeriveMapping for CanonicalDerivation<T> {
 /// cover, a text index takes each entity's maximum score, and a count or any
 /// other non-idempotent aggregate is never summed over overlapping supports.
 /// Every implementor is tested against this law over random covers.
+///
+/// The law holds for every cover when an image is built from single facts,
+/// as every implementor in this crate's is. A mapping whose image aggregates
+/// facts of several entities cannot tell from one node that an entity has
+/// more facts elsewhere, and then no combination of per-node images is
+/// exact once a cover splits that entity; nothing refuses such a node, so
+/// the answer can be wrong with an empty residual and nothing unread. For
+/// such a mapping the law is a premise about its input, which the
+/// implementor states. The one known is the Archive block BM25 mapping in
+/// faculties (`ArchiveBlockTextBm25Mapping`), whose document is a block and
+/// whose term frequency sums over the block's parts: it answers like the
+/// union for every cover whose nodes hold whole source units (a block with
+/// all its parts and their facts); a node holding part of a block scores
+/// that block from the part it holds, with no refusal and no residual to
+/// show it, so a cover that splits a block undercounts it. Faculties' own
+/// Archive importer commits whole source units, and a test there pins it:
+/// that is the premise for data it writes, not for another writer's commits
+/// or historical input, and the writer keeps the fragments it is given
+/// whole without checking that they hold whole blocks. The ignored
+/// faculties tests `a_block_whose_parts_sit_in_two_nodes_scores_like_their_union`,
+/// `a_block_extended_by_a_node_without_its_tag_scores_like_their_union` and
+/// `archive_block_covers_answer_like_the_union_when_parts_spread_over_nodes`
+/// are the acceptance tests of the structural fix: a per-fact text index
+/// over the content fact's payload, with blocks ranked at query time.
 pub trait MapMapping: Sized {
     /// Encoding of the attachments.
     type Target: CollectionEncoding;
