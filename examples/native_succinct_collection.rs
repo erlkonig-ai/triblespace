@@ -20,14 +20,16 @@ fn main() {
     let path = tmp.path().join("native-succinct.pile");
     std::fs::File::create(&path).expect("create pile file");
 
-    let mut pile = Pile::open(&path).expect("open pile");
+    // The pile is opened as the key that maintains it: its fold believes the
+    // merges that key signs and no other key's.
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let authority = signing_key.verifying_key();
+    let mut pile = Pile::open_as(&path, authority).expect("open pile");
     pile.refresh().expect("load pile");
 
     // A root collection is the handle of a self-contained descriptor. Its
     // independent READ and WRITE policies participate in that content identity.
     let name = "literature";
-    let signing_key = SigningKey::generate(&mut OsRng);
-    let authority = signing_key.verifying_key();
     let policy = CollectionPolicy::new(
         AdmissionPolicy::direct(authority),
         AdmissionPolicy::direct(authority),

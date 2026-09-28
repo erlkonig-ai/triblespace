@@ -483,9 +483,11 @@ impl Fixture {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("counted-maintenance.pile");
         std::fs::File::create(&path).unwrap();
-        let mut pile = Pile::open(&path).unwrap();
-        let writer = Pile::open(&path).unwrap();
         let signer = SigningKey::from_bytes(&[71; 32]);
+        // The maintained handle is opened as the key the passes sign with, as
+        // the CLI opens it; the writer only appends commits.
+        let mut pile = Pile::open_as(&path, signer.verifying_key()).unwrap();
+        let writer = Pile::open(&path).unwrap();
         let policy = CollectionPolicy::new(
             AdmissionPolicy::direct(signer.verifying_key()),
             AdmissionPolicy::direct(signer.verifying_key()),

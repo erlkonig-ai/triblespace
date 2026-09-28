@@ -759,7 +759,7 @@ fn main() {
         let mut ident: Option<BuildShape> = None;
         for i in 0..(build_warmup + build_iters) {
             let recording = i >= build_warmup;
-            let mut store = MemoryRepo::default();
+            let mut store = MemoryRepo::for_host(signing_key.verifying_key());
             let source = store
                 .collection(name, policy.clone())
                 .expect("register source collection");

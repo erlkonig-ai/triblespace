@@ -3,6 +3,7 @@ use clap::Parser;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use ed25519_dalek::VerifyingKey;
 use triblespace_core::repo::pile::{Pile, ReadError};
 
 pub mod blob;
@@ -159,8 +160,97 @@ pub(crate) fn pile_read_error(path: &Path, err: ReadError) -> anyhow::Error {
 /// torn, or unsupported tail without modifying it. Deliberate repair of
 /// genuine corruption stays a separate, boundary-confirmed
 /// `trible pile amputate <path> --truncate-to <byte-offset>` step.
+///
+/// The fold has no host, so it believes no MERGE and every believed
+/// foundation is its own frontier node.
+///
+/// The rule for every command: open as a host, the key it signs with,
+/// through [`open_refreshed_as`] or [`open_refreshed_with`], exactly when
+/// what the command does depends on which MERGEs the fold believes, because
+/// it publishes merges (a carry, or a derived view's upkeep) or reads through
+/// them (an attached read such as `collection search`, or the dashboard's
+/// member lattice). Every other command opens here, with no host, including
+/// one that signs records: a COMMIT, DERIVE, grant or descriptor is admitted
+/// by WRITE, never by the host, and a record scan or copy never asks the
+/// fold.
 pub(crate) fn open_refreshed(path: &Path) -> Result<Pile> {
-    let mut pile = Pile::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
+    open_refreshed_with(path, None)
+}
+
+/// [`open_refreshed`] as `host`: the fold believes the MERGEs `host` signed
+/// and no other key's. Maintenance signing with a key needs the pile opened
+/// as that key, or the merges it publishes are never believed and the carry
+/// refuses to publish them.
+pub(crate) fn open_refreshed_as(path: &Path, host: VerifyingKey) -> Result<Pile> {
+    open_refreshed_with(path, Some(host))
+}
+
+/// The host a command that reads through merges folds as: the key it would
+/// sign with.
+///
+/// An explicit key must load, so a mistyped `--key` is an error rather than
+/// a quietly keyless read. Without one, the default (`TRIBLESPACE_KEY`, else
+/// `self.key` beside the pile) is used when it loads, and with no loadable
+/// key the read believes no MERGE: correct, only wider, since it attaches
+/// every believed foundation instead of the host's merges over them.
+pub(crate) fn reading_host(explicit: Option<&Path>, pile: &Path) -> Result<Option<VerifyingKey>> {
+    let path = triblespace_core::signing_key_file::resolve_path(explicit, pile);
+    match triblespace_core::signing_key_file::load_existing(&path) {
+        Ok(key) => Ok(Some(key.verifying_key())),
+        Err(error) if explicit.is_some() => {
+            Err(anyhow!("load signing key {}: {error}", path.display()))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod reading_host_tests {
+    use super::{open_refreshed_with, reading_host};
+    use std::collections::BTreeSet;
+    use triblespace_core::collection::CoverageRead;
+    use triblespace_core::repo::SnapshotSource;
+
+    #[test]
+    fn an_explicit_key_is_the_host_the_pile_opens_as_and_must_load() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("read.pile");
+        std::fs::File::create(&pile).unwrap();
+        let key = directory.path().join("reader.key");
+        let signer = triblespace_core::signing_key_file::init(&key).unwrap();
+        let host = reading_host(Some(&key), &pile).unwrap();
+        assert_eq!(host, Some(signer.verifying_key()));
+        // The opened store folds as that key, which is what makes its reads
+        // attach the key's own merges.
+        let mut opened = open_refreshed_with(&pile, host).unwrap();
+        let folded_as = opened
+            .snapshot()
+            .unwrap()
+            .index(&BTreeSet::new())
+            .unwrap()
+            .host();
+        assert_eq!(
+            folded_as.map(|key| key.raw),
+            Some(signer.verifying_key().to_bytes())
+        );
+        opened.close().unwrap();
+
+        let missing = directory.path().join("missing.key");
+        assert!(
+            reading_host(Some(&missing), &pile).is_err(),
+            "a key named on the command line that does not load is an error, not a keyless read"
+        );
+        assert!(!missing.exists(), "resolving a key never creates one");
+    }
+}
+
+/// [`open_refreshed`] with or without a host.
+pub(crate) fn open_refreshed_with(path: &Path, host: Option<VerifyingKey>) -> Result<Pile> {
+    let opened = match host {
+        Some(host) => Pile::open_as(path, host),
+        None => Pile::open(path),
+    };
+    let mut pile = opened.map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.refresh() {
         let _ = pile.close();
         return Err(pile_read_error(path, err));

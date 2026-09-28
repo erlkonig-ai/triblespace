@@ -174,7 +174,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let authority = SigningKey::from_bytes(&[113; 32]);
     let policy = direct_policy(&authority);
     let attribute = Attribute::<Handle<Embedding>>::named("nvfp4-corpus-embedding");
-    let mut store = MemoryRepo::default();
+    let mut store = MemoryRepo::for_host(authority.verifying_key());
     let mut facts = TribleSet::new();
     for (index, (&expected, vector)) in corpus.handles.iter().zip(&corpus.vectors).enumerate() {
         let handle = store.put::<Embedding, _>(vector.clone())?;

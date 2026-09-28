@@ -276,7 +276,7 @@ fn assert_mixed_states(frame: &Frame) {
     let derived: Vec<_> = lattice.iter().filter(|c| c.source.is_some()).collect();
     assert_eq!(derived.len(), 1, "one derivation is registered");
     assert_eq!(
-        derived[0].stored(),
+        derived[0].foundations(),
         0,
         "and never maintained, which must draw as an unperformed derivation"
     );

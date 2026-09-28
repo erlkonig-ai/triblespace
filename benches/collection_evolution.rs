@@ -702,8 +702,9 @@ fn register_collections(store: &mut MemoryRepo) -> Collections {
     }
 }
 
-fn new_source_store(expected: &Collections) -> MemoryRepo {
-    let mut store = MemoryRepo::default();
+/// A store opened as the key the run maintains with.
+fn new_source_store(expected: &Collections, host: &SigningKey) -> MemoryRepo {
+    let mut store = MemoryRepo::for_host(host.verifying_key());
     assert_eq!(&register_collections(&mut store), expected);
     store
 }
@@ -740,10 +741,10 @@ fn run_iteration(
     let mut maintained_snapshot = None;
     let source = collections.source;
     let signing_key = SigningKey::from_bytes(&[0x71; 32]);
-    let mut source_accounting = new_source_store(collections);
-    let mut cold_ensure_source = new_source_store(collections);
-    let mut warm_ensure = new_source_store(collections);
-    let mut snapshot_source = new_source_store(collections);
+    let mut source_accounting = new_source_store(collections, &signing_key);
+    let mut cold_ensure_source = new_source_store(collections, &signing_key);
+    let mut warm_ensure = new_source_store(collections, &signing_key);
+    let mut snapshot_source = new_source_store(collections, &signing_key);
 
     let mut published = 0usize;
     let mut previous_rows = 0u64;

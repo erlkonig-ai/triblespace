@@ -476,8 +476,8 @@ fn render_mesh(ui: &mut egui::Ui, frame: &Frame) {
 /// there, what is not, and where did it come from" — the three questions the
 /// cluster view was wanted for. They are one picture because they come from
 /// one frozen observation: a node is a collection, a left-to-right edge is a
-/// derivation, a short arc is endorsed work whose bytes are not here, and a
-/// dashed mark is a collection this store knows only by name.
+/// derivation, a short arc is foundations whose bytes have not replicated
+/// here yet, and a dashed mark is a collection this store knows only by name.
 ///
 /// Clicking a node dims everything off its chain and prints that chain in full
 /// underneath, which is how a derived collection gets walked back to the root
@@ -525,16 +525,19 @@ fn render_lattice(ui: &mut egui::Ui, frame: &Frame, selected: &mut Option<[u8; 3
                 true => LatticePresence::Present,
                 false => LatticePresence::Absent,
             },
-            // No records naming it means nothing to divide, which draws as an
-            // empty track. That is absence of evidence, not full residency.
+            // No COMMIT or DERIVE naming it means nothing to divide, which
+            // draws as an empty track. That is absence of evidence, not full
+            // residency.
             // Deliberately not the admission channel. A collection is not
             // itself admitted or waiting; some of its MEMBERS are, and that
             // count already has a home in the text below. Spending one channel
             // on "this element is waiting" and "this element contains
             // something waiting" would make the mark mean two things.
             admission: LatticeAdmission::Unknown,
-            coverage: (collection.stored() > 0)
-                .then(|| collection.result_resident as f32 / collection.stored() as f32),
+            // Over the foundations alone: a MERGE never replicates, so its
+            // result being absent is nothing a peer will send.
+            coverage: (collection.foundations() > 0)
+                .then(|| collection.foundations_resident as f32 / collection.foundations() as f32),
             // A collection is named or derived, so something produced it by
             // construction; "reached only as an input" is a fact about members,
             // not about collections.
@@ -616,8 +619,9 @@ fn render_lattice(ui: &mut egui::Ui, frame: &Frame, selected: &mut Option<[u8; 3
     ui.small(
         "Left to right is derivation; sources are always to the left. Square authored, \
          circle computed. Dashed is a hole: a collection known only by name, or a \
-         derivation declared and never performed. Arc: result blobs resident over \
-         records naming that collection, per collection, in this pile alone.",
+         derivation declared and never performed. Arc: payloads resident over the \
+         COMMITs and DERIVEs naming that collection, per collection, in this pile \
+         alone. MERGEs never replicate, so their results are not in the arc.",
     );
 
     // Hover previews a chain; a click pins it. Previewing on hover is what
@@ -648,13 +652,13 @@ fn render_lattice(ui: &mut egui::Ui, frame: &Frame, selected: &mut Option<[u8; 3
             chain.reverse();
             let focus = &collections[index];
             ui.small(format!(
-                "{} · {} commit / {} merge / {} derive · {} of {} result blobs resident{}",
+                "{} · {} commit / {} derive · {} of {} resident · {} merge stored{}",
                 label(focus),
                 focus.commits,
-                focus.merges,
                 focus.derives,
-                focus.result_resident,
-                focus.stored(),
+                focus.foundations_resident,
+                focus.foundations(),
+                focus.merges,
                 match focus.descriptor_resident {
                     true => "",
                     false => " · descriptor not resident here",
@@ -738,43 +742,57 @@ fn render_members(ui: &mut egui::Ui, frame: &Frame, chosen: Option<[u8; 32]>) {
             },
             // A commit is produced by definition — an author asserted it. For
             // the rest, this is whether a record HERE made it. False is the
-            // member reached only as somebody else's join input, which until
+            // member reached only as an input of a waiting join, which until
             // now was a count printed beside a mark that looked exactly like a
             // fully-produced one.
             produced: member.committed || member.produced,
             label_known: true,
         })
         .collect();
+    // Every edge here comes from one of the host's MERGEs; another key's
+    // draws nothing. A driven join is solid. A join still waiting for an
+    // input's support is dashed: declared, and not performed, since no reader
+    // descends it until every input has a support -- the same meaning a
+    // dashed edge has in the collection lattice. Absence of a join is a
+    // member with nothing above it, not a dashed edge.
     let edges: Vec<LatticeEdge> = members
         .joins
         .iter()
-        .map(|(from, to)| LatticeEdge {
+        .map(|(from, to)| (from, to, true))
+        .chain(members.waiting.iter().map(|(from, to)| (from, to, false)))
+        .map(|(from, to, endorsed)| LatticeEdge {
             from: *from,
             to: *to,
-            // Every edge here comes from a stored MERGE. Absence of a join is
-            // a member with nothing above it, not a dashed edge.
-            endorsed: true,
+            endorsed,
         })
         .collect();
 
+    // A waiting join has consumed nothing: its inputs are still on the
+    // frontier, so only driven edges make a member joined.
     let maximal = (0..nodes.len())
-        .filter(|node| !edges.iter().any(|edge| edge.from == *node))
+        .filter(|node| !members.joins.iter().any(|(from, _)| from == node))
         .count();
     ui.add(LatticeGraph::new(&nodes, &edges));
     ui.horizontal_wrapped(|ui| {
         ui.small(format!(
-            "{} members · {} joins · {maximal} not yet joined into anything",
+            "{} members · {} join edges · {maximal} not yet joined into anything",
             nodes.len(),
-            edges.len()
+            members.joins.len()
         ));
+        if !members.waiting.is_empty() {
+            ui.small(format!(
+                "· {} dashed edges of joins still waiting for an input's support",
+                members.waiting.len()
+            ));
+        }
         // The clauses are separate labels so the row can wrap between them,
         // which means each one carries its own separator: without it they run
         // together into one unreadable sentence at any width that fits them
         // both on a line.
         if members.unproduced != 0 {
             ui.small(format!(
-                "· {} reached only as a join input — each one drawn with a gap \
-                 at the bottom of its mark, so you can point at them",
+                "· {} reached only as a waiting join's input — each one drawn with \
+                 a gap at the bottom of its mark, so you can point at them",
                 members.unproduced
             ));
         }
@@ -797,10 +815,12 @@ fn render_members(ui: &mut egui::Ui, frame: &Frame, chosen: Option<[u8; 32]>) {
     ui.small(
         "Inside the selection: square is a commit, circle a join result or mapping \
          output, a circle with a gap at the bottom a member nothing here produced — \
-         it was reached as somebody else's join input and the record that made it is \
+         it was reached only as a waiting join's input and the record that made it is \
          elsewhere. A solid mark is vouched for, an outline is a member here that no \
          capability proof admits yet, and dashed is a member whose bytes are not here \
-         at all. Each join's two edges are its MERGE inputs.",
+         at all. Each join's edges are the inputs of one of this host's MERGEs: solid \
+         when every input has a support and a reader descends it, dashed while one \
+         still waits. Another key's MERGEs are not believed and are not drawn.",
     );
 }
 

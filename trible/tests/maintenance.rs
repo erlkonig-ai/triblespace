@@ -750,7 +750,9 @@ fn maintain_all_carries_a_reached_root_once_before_its_views() {
                 "the root's one carry, and its mirror in each view (select_root = {select_root})"
             );
         }
-        let mut pile = Pile::open(&fixture.path).unwrap();
+        // Read as the key the pass signed with: its fold believes the
+        // mirror, so the view is that one merge.
+        let mut pile = Pile::open_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
         let snapshot = pile.snapshot().unwrap();
         let observed = snapshot.collection(fixture.rank9).unwrap();
         assert_eq!(observed.cover().len(), 1);
@@ -761,6 +763,17 @@ fn maintain_all_carries_a_reached_root_once_before_its_views() {
         let facts = observed.view::<UnionArchive<OrderedUniverse>>().unwrap();
         assert_eq!(facts.iter().collect::<TribleSet>(), expected);
         drop(observed);
+        drop(snapshot);
+        pile.close().unwrap();
+        // Read as no key, the same pile believes no MERGE: every leaf is
+        // read on its own and the facts are the same.
+        let mut pile = Pile::open(&fixture.path).unwrap();
+        let snapshot = pile.snapshot().unwrap();
+        let wide = snapshot.collection(fixture.rank9).unwrap();
+        assert_eq!(wide.cover().len(), 8);
+        let facts = wide.view::<UnionArchive<OrderedUniverse>>().unwrap();
+        assert_eq!(facts.iter().collect::<TribleSet>(), expected);
+        drop(wide);
         drop(snapshot);
         pile.close().unwrap();
     }
