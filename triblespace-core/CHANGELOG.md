@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Derived collections carry their own lattice. `maintain` on a derived
+  collection derives its leaves and then carries its own frontier exactly as
+  a root's carry does: held leaf images, eight per support tier, joined into
+  the host's own MERGEs by `DeriveMapping::join_images`, which is now the
+  k-way join of target images (default: the encoding's `join_many`;
+  `CollectionDerivation::join_images` likewise). It never reads the source's
+  merges. The mirror of a source's merges is gone, and with it
+  `ownership::owns_merge` and `CoverageIndex::drives_join`, which only it
+  used; `CoverageIndex::joins_reading` is test-only. A merge needs no WRITE:
+  a key the target does not admit derives nothing and still carries, and
+  when it owes leaves for foundations of its own it reports
+  `UnauthorizedProducer` after the carry. `realize_as` follows: a signer
+  without WRITE answers `Realized::Unadmitted` and, under `Upkeep::Maintain`,
+  carries the collection first. A derived collection stored in a root's
+  encoding carries only through its mapping (`maintain_with`); `maintain`
+  still refuses it.
+- Derivation is scheduled by leaf, and any admitted leaf suffices: a source
+  foundation is derived only when no believed leaf for its locator has an
+  output that is here or can be fetched, whoever signed that leaf, and any
+  key the target admits may derive it, not only its owner. A leaf whose
+  output cannot be obtained does not count; the fetch is tried once per
+  pass, and a failed one means the output is unavailable now, not lost, so
+  an original output arriving after a second derivation stands beside it and
+  nothing further is derived. The per-write `ensure` still derives only the
+  key's own foundations with no leaf at all; another owner's payload is
+  never fetched. `DeriveMapping::FOREIGN_DERIVABLE` is gone.
+  `DeriveMapping::computable_here` is the class-pin hook: a mapping pinned to
+  a class of host answers false elsewhere, and there maintenance derives
+  nothing, raises nothing for it, and still carries. The `DeriveMapping`
+  documentation states the contract: foundations only, a total target join,
+  a homomorphism when deterministic, and possibly non-deterministic or
+  class-pinned.
+- `CollectionStoreExt::rederive` and `rederive_with` supplement a leaf known
+  to be bad: they map the named foundations of the target's immediate source
+  again and publish each result no believed leaf names as another leaf,
+  replacing none. They need a key the target admits and a host that can
+  compute the mapping, and they fetch each named payload that is not here.
+
 - A retained rewrite can leave collection-algebra frames behind:
   `PileFile::rewrite_retained_into_filtered` asks a `CollectionFrameFilter`
   about every current COMMIT, MERGE and DERIVE frame, every retired v8/v9
@@ -142,10 +180,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can read the node, no join required) and its law, cover-query equivalence.
   `REPLICA_INDEPENDENT` is gone from `DeriveMapping` and
   `CollectionDerivation`. The one thing it decided, whether `maintain`
-  derives a leafless foundation another key owns, is
-  `DeriveMapping::FOREIGN_DERIVABLE` until derivation is scheduled by leaf
-  rather than by owner. It now also decides whether the mirror maps a
-  source merge that holds another owner's foundation.
+  derives a leafless foundation another key owns, is now decided by leaf
+  (see the scheduling entry above).
 
 - A MERGE is believed only when the store's own host key signed it, with no
   WRITE check; a COMMIT or a DERIVE is still believed when its signer may
@@ -162,8 +198,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signers. The believed host joins are published in `Coverage`, and
   `Coverage::producers(collection, node)` returns the driven ones by the
   node's own key; a join parked but not decided yet is not published.
-  `CoverageIndex::believes_join` is renamed `drives_join`, which is what it
-  answers. `fold_index` and `fold_coverage`, which had no callers, are
+  `CoverageIndex::believes_join` is gone: `producers` answers which joins
+  are driven. `fold_index` and `fold_coverage`, which had no callers, are
   removed.
 
 - The root carry merges every held node into the host's own merges, whoever
@@ -173,12 +209,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   held node that covers it absorbs it. Maintenance that would publish a
   MERGE with a key other than the store's host, or into a keyless store,
   fails with the new `CollectionRealizationError::HostMismatch` instead of
-  stalling: open the store as the signing key to maintain it. Until derived
-  collections carry their own leaf images, two source merges are not
-  mirrored and the view keeps the finer images beneath them: one that holds
-  a foundation the view's mapping refused, and one that holds another
-  owner's foundation when the mapping sets `FOREIGN_DERIVABLE` to false
-  (`SemanticIndex`).
+  stalling: open the store as the signing key to maintain it.
 
 - `ensure_derived`, `maintain_derived` and `upkeep_derived` are now
   `ensure_downstream`, `maintain_downstream` and `upkeep_downstream`.

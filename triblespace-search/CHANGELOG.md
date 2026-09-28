@@ -6,6 +6,15 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## Unreleased
 
+- `SemanticIndex` is pinned to the compute class its descriptor names
+  through `DeriveMapping::computable_here`, which replaces
+  `FOREIGN_DERIVABLE`: on another class maintenance derives nothing, raises
+  nothing and still carries the index, whose rows arrive by replication.
+  On the class, any key the index admits embeds any content without a row
+  whose bytes are here or can be fetched, whoever saved it, and the index
+  carries its own rows into the host's merges instead of mirroring its
+  source's.
+
 - `PortableBM25Blob` is attached to its root through `TextAttributeToBm25`
   (`CollectionAttachment`) instead of derived. `mary` is an optional
   dependency behind the new `nvfp4` feature, which `semantic` and

@@ -443,24 +443,52 @@ never a second history or a new authority root.
 
 ## Derive another representation
 
-Suppose `f` is a canonical join homomorphism. Its target encoding implements
+A mapping that not every reader of a node can compute -- a model whose output
+is canonical on one class of accelerator, an embedding that does not reproduce
+bit for bit -- is *derived*: its images are published as signed `DERIVE`
+leaves, `DERIVE(target, L(F), f(F))` for a source foundation `F` with locator
+`L(F)`, and replicate with the collection. Its target encoding implements
 `CollectionDerivation`, naming one canonical `Source` encoding and a runtime
-`Argument` carried by the concrete mapping descriptor:
+`Argument` carried by the concrete mapping descriptor.
 
 If a downstream crate owns neither the source nor target encoding, Rust's
 orphan rule prevents that target-owned implementation. It can instead provide
 an explicit `DeriveMapping` and select the same engine through
-`derive_with`, `ensure_with`, and `maintain_with`.
+`derive_with`, `ensure_with`, `maintain_with`, and `rederive_with`.
+
+A derived collection is a set of foundations, like a root: its leaves. It
+carries its own lattice exactly as a root carries its commits -- the host
+joins held leaf images, eight at a time per support tier, with the mapping's
+join (`DeriveMapping::join_images`, by default the encoding's) into `MERGE`s
+of its own -- and never reads its source's merges. A mapping maps foundations
+only, and its target encoding's join is total, so every set of leaves has a
+join whoever derived them. A deterministic mapping is a join homomorphism,
 
 ```text
 f(a ⊔ b) = f(a) ⊔ f(b)
 ```
 
-Then a resolver may derive a merged source once, derive leaves separately and
-merge their images, or reuse any stored mixture already present. `DERIVE`
-records expose those reusable edges across collection lattices. Newly executed
-joins and mappings publish every successful result and equation, even when a
-later planning or storage step fails or selects another route. Publication is
+so the join of a collection's leaves is the image of everything its source's
+foundations hold. A non-deterministic one may give one foundation several
+leaves, and their join keeps what each derivation observed: the `DERIVE`
+relation is not a function.
+
+Derivation is scheduled by leaf: any admitted leaf suffices. A source
+foundation is derived only when no believed leaf for its locator has an
+output that is here or can be fetched, whoever signed that leaf; any key the
+target admits may derive it, not only the foundation's owner. A leaf whose
+output cannot be obtained does not count, and a fetch that fails means the
+output is unavailable now, not lost: if the original output arrives after
+the foundation was derived again, both leaves stand, both are joined, and
+nothing further is derived. A mapping pinned to a class of host
+(`DeriveMapping::computable_here`) derives nothing on another host and raises
+nothing there; that host still carries the collection, whose leaves arrive by
+replication. A leaf known to be bad is supplemented only on request:
+`rederive_with` maps the named foundations again and adds each differing
+result as a second leaf. Nothing replaces a leaf.
+
+Newly executed joins and mappings publish every successful result and
+equation, even when a later planning or storage step fails. Publication is
 operation-ordered rather than phase-batched, so a failure leaves the complete
 successful prefix addressable instead of stranding its blobs without their
 equations. Canonical joins, mappings, and logical cover views receive one
@@ -588,88 +616,32 @@ no support argument to pass along, and none to request narrower.
   performs no acquisition or collection algebra and binds only the
   resident target cover visible in that immutable snapshot. What that cover
   stands on is its `support()`.
-- For a derived target, `ensure` freezes the resident, admitted realization of
-  its immediate source, publishes only missing `DERIVE` work, and returns a
-  fresh store snapshot. Missing source members are invisible to selection: an
+- For a derived target, `ensure` publishes a leaf for each foundation of its
+  immediate source the key owns that has no leaf yet, and returns a fresh
+  store snapshot. Missing source members are invisible to selection: an
   immutable snapshot never promises work which will happen later.
-- `maintain` additionally reuses coarsening already resident in the immediate
-  source, then carries colliding target members by serialized-size tier. It
-  also returns a fresh store snapshot.
+- `maintain` derives every foundation this host can derive that has no usable
+  leaf -- the key's own, fetching their payloads, and another owner's whose
+  payload is already here -- then carries the target's own leaves the way a
+  root carries its commits. It also returns a fresh store snapshot.
 
-An ensure may follow existing `MERGE` equations to reuse a resident
-support-equivalent target decomposition, but newly executed work crosses only
-the mapping. It stores each target artifact before its signed `DERIVE`
-record. It never creates a source or target `MERGE`.
+A derived operation never constructs an upstream member as a side effect, and
+the carry reads nothing outside the target's own lattice. If a target join
+cannot run because an optional immutable dependency is absent or the encoding
+has reached a capacity limit, the finer exact target cover remains the answer.
 
-Maintenance starts from that derive-complete target cover. If a member `c` of
-the coarsest resident source cover provably subsumes at least two current target
-images, maintenance can publish `f(c)` even when those images occupy different
-target size tiers. A direct source equation `a ⊔ b = c` and resident images
-`f(a)`, `f(b)` let the mapping reuse their join with the already-built `c` as a
-witness. Otherwise it maps `c` directly. Historical intermediate images are not
-constructed merely to reach the selected coarse image; existing equal or larger
-target images already discharge the opportunity.
-
-This adds a source-guided route, not recursive upstream maintenance or a global
-cost optimizer. It publishes only target `DERIVE` and `MERGE` records and their
-outputs. If a target join cannot run because an optional immutable dependency
-is absent or the encoding has reached a capacity limit, the finer exact target
-cover remains the answer. A downstream operation never constructs an upstream
-member as a side effect.
-
-The signing key is explicit on every ensure/maintain call. A call which only
-reuses existing work does not need WRITE. If missing support requires a new
-derivation, an unauthorized producer receives `UnauthorizedProducer` before
-the mapping runs. Optional compaction without WRITE leaves the finer cover
-unchanged. Raw local `sign` and `insert` remain unconditional; typed publication
-does not reverify signatures it just produced.
+The signing key is explicit on every ensure/maintain call. Only a new leaf
+needs WRITE: a key the target does not admit derives nothing, fetches and maps
+nothing for it, and receives `UnauthorizedProducer` if it owes a leaf for a
+foundation of its own -- after the carry, which needs only the store's host
+key. Raw local `sign` and `insert` remain unconditional; typed publication does
+not reverify signatures it just produced.
 
 New work authenticates the immediate source and target producers it actually
-uses. Its signed equation names those exact native input witnesses. It does
-not recursively acquire foundational data or re-run ancestral authorization
-merely because the immediate input was itself derived. A mapping remains one
-hop; `maintain-all` is the explicit scheduler for upstream work.
-
-The subsequent target-only LSM policy has no knob: a target member belongs to
-`floor(log2(max(1, serialized_len)))`, and the lowest two content handles in
-the lowest colliding tier are carried first. An unavailable join route or
-capacity limit may leave a collision stable; otherwise the resulting cover has at
-most one member per tier. Pairwise-disjoint carries in one tier share a
-deterministic semantic plan, but each output is constructed against a cheap
-fresh store snapshot and published immediately. The exact per-point planner is
-re-entered before another tier is selected. This avoids a full semantic
-re-probe per pair without retaining a tier of newly generated bytes in memory.
-
-Every position uses the same `Cover<E>` shape, but its typed handles cannot be
-mixed across representations. `Cover<SimpleArchive>` contains only
-`Handle<SimpleArchive>`; `Cover<SuccinctArchiveBlob>` contains only
-`Handle<SuccinctArchiveBlob>`; the second stage uses
-`Handle<Rank9AcceleratedSuccinctArchiveBlob>`. Stored `MERGE` equations define
-support-equivalent routes; `Cover` carries no route-mode bit. Ordinary raw
-Succinct derivation follows the resident-node priority above while preserving
-foundational support. The accelerated stage resolves the ordinary derived
-lattice over that same support. Its cover-aware view
-reads each embedded raw handle through the store snapshot and validates the
-exact raw/index pair before constructing the query runtime. There is no
-separate member-image mode.
-
-None of them signs a replacement root, advances a head, flushes implicitly, or
-adds a special manifest. [Regular-path summaries](regular-path-indexes.md) and
-Rank9 acceleration both use the same collection algebra. The accelerated
-encoding is a Merkle root whose first 32 bytes name its exact portable raw
-child. It is also a full lattice: resident accelerated children `A(a)` and
-`A(b)` join canonically to `A(a ⊔ b)` when their exact raw union is already
-resident with a source-merge witness. The mapping's optional `join_images` hook
-passes that union to accelerated construction, avoiding raw serialization and
-hashing; the hook's default is the ordinary canonical target join. If the raw
-union is absent, accelerated maintenance declines that carry before attempting
-to reconstruct it and keeps `{A(a), A(b)}`; a
-separate upstream maintenance call may later publish the raw union, after which
-a retry can carry the accelerated lattice. Each mapping or join emits exactly
-one blob and then its equation. Physical resolution excludes an accelerated
-member whose named raw child is unavailable and retries a finer
-support-equivalent route; the typed view repeats the raw/index check at its
-decoding boundary.
+uses. It does not recursively acquire foundational data or re-run ancestral
+authorization merely because the immediate input was itself derived. A
+mapping remains one hop; `maintain-all` is the explicit scheduler for upstream
+work.
 
 ## WANT missing content
 

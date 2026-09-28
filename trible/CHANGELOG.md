@@ -20,6 +20,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
+- `pile collection rederive <pile> <collection> <member>... [--key]` derives
+  named source members of a derived collection again and publishes each
+  result no leaf already names as another leaf, replacing none: the explicit
+  supplement to a leaf known to be bad. It prints how many leaves it added.
+  `maintain` and `maintain-all` never do this on their own: a member with a
+  leaf whose image is here or can be fetched is not derived again, whoever
+  derived it, and a derived collection carries its own leaves instead of
+  mirroring its source's merges.
 - `pile collection search --key <path>` names the key whose merges and
   attachments the read believes; a named key that does not load is an error.
   Without it the default key (`TRIBLESPACE_KEY`, else `self.key` beside the
@@ -92,9 +100,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   health` publish merges, and `pile collection search` and `pile net
   dashboard` read through them. A store believes only its host's MERGEs. A
   root carry on a store opened as no key, or as another key, fails with
-  `HostMismatch` instead of publishing merges nothing would believe; a derived
-  view's upkeep there publishes no mirrored MERGE, since it mirrors only the
-  host's own source merges and the store believes none. Every other command
+  `HostMismatch` instead of publishing merges nothing would believe, and so
+  does a derived collection's carry. Every other command
   opens with no host: those that sign records (`init`, `derive`, the grants,
   `adopt`, `pile net sync`), because a COMMIT, DERIVE, grant or descriptor is
   admitted by WRITE and never by the host, and those that only scan or copy
