@@ -10,11 +10,7 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::Debug;
 
-use crate::inline::encodings::ed25519::ED25519PublicKey;
-use crate::inline::Inline;
-use crate::repo::{BlobStoreGet, CapabilityProofRead};
-
-use super::coverage::{coverage_of, Coverage, CoverageIndex};
+use super::coverage::{Coverage, CoverageIndex};
 use super::{CollectionData, CollectionHandle, CollectionRecord};
 
 /// One raw selection route into the grow-only collection-record set.
@@ -237,36 +233,6 @@ impl<R: CoverageRead> CoverageRead for &R {
     ) -> Result<Coverage, Self::RecordsError> {
         (**self).coverage(lineage)
     }
-}
-
-/// Fold coverage from scratch over one reader.
-///
-/// This is the cost [`CoverageRead`] refuses to hide: one enumeration of
-/// every record, and an admission query for each one this reader does not
-/// admit. It is the right answer for a reader that has no index of its own
-/// and no inner store to delegate to, and it is written at the call site so
-/// that it is visible there. `host` is the key whose MERGEs the fold
-/// believes; `None` believes none, and every believed foundation stays on
-/// its frontier.
-pub fn fold_index<R>(
-    reader: &R,
-    host: Option<Inline<ED25519PublicKey>>,
-) -> Result<CoverageIndex, R::RecordsError>
-where
-    R: CollectionRead + BlobStoreGet + CapabilityProofRead,
-{
-    coverage_of(reader, host)
-}
-
-/// [`fold_index`]'s published half.
-pub fn fold_coverage<R>(
-    reader: &R,
-    host: Option<Inline<ED25519PublicKey>>,
-) -> Result<Coverage, R::RecordsError>
-where
-    R: CollectionRead + BlobStoreGet + CapabilityProofRead,
-{
-    Ok(fold_index(reader, host)?.published().clone())
 }
 
 impl<R> CollectionRead for &R

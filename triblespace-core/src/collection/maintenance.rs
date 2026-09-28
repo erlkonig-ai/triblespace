@@ -958,7 +958,7 @@ where
             .into_iter()
             .filter(|merge| {
                 owns_merge(merge, &key)
-                    && index.believes_join(source, &merge.merge_inputs(), merge.result())
+                    && index.drives_join(source, &merge.merge_inputs(), merge.result())
             })
             .map(|merge| merge.merge_inputs())
             .collect();

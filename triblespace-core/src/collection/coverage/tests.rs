@@ -1198,7 +1198,7 @@ fn a_host_join_over_a_node_only_a_foreign_merge_produced_stays_blocked() {
     assert!(index.published().producers(c, data(5)).is_empty());
     assert_eq!(frontier(&index, c), vec![[1u8; 32], [2u8; 32], [3u8; 32]]);
     let blocked = MergeInputs::new([data(3), data(5)]).unwrap();
-    assert!(!index.believes_join(c, &blocked, data(6)));
+    assert!(!index.drives_join(c, &blocked, data(6)));
     // Believed, but not driven: the consumer side still names it.
     assert_eq!(index.joins_reading(c, data(3)), vec![(blocked, data(6))]);
 
@@ -1208,7 +1208,7 @@ fn a_host_join_over_a_node_only_a_foreign_merge_produced_stays_blocked() {
         &AdmitEveryRecord,
     );
     assert!(!index.published().has_blocked(c));
-    assert!(index.believes_join(c, &blocked, data(6)));
+    assert!(index.drives_join(c, &blocked, data(6)));
     assert_eq!(index.published().producers(c, data(6)), vec![blocked]);
     assert_eq!(
         members(&index, c, data(6)),
@@ -1300,4 +1300,58 @@ fn producers_are_the_host_joins_that_drive_a_node() {
         .published()
         .producers(collection(5), data(7))
         .is_empty());
+}
+
+/// A host join replay parked in a collection nobody has settled yet has not
+/// been decided, so it is no producer of its result: `producers` names only
+/// believed joins, whichever collections the caller settled. Here one
+/// collection was settled earlier, two host joins of it arrive afterwards,
+/// and a reader settles only another collection. Neither join is named,
+/// not even the one whose inputs all have supports. Deciding them names the
+/// drivable one; the other waits for its input and is named when it drives.
+#[test]
+fn a_host_join_nobody_has_decided_is_no_producer() {
+    let (earlier, read) = (collection(1), collection(2));
+    let mut index = hosted(1);
+    for payload in [1, 3] {
+        index.park_record(&commit(1, earlier, data(payload)));
+    }
+    index.settle_collections(&AdmitEveryRecord, &BTreeSet::from([earlier]));
+    let waiting = MergeInputs::new([data(1), data(2)]).unwrap();
+    let drivable = MergeInputs::new([data(1), data(3)]).unwrap();
+    index.park_record(&merge(1, earlier, waiting.as_slice(), data(5)));
+    index.park_record(&merge(1, earlier, drivable.as_slice(), data(6)));
+    index.park_record(&commit(1, read, data(9)));
+    index.settle_collections(&AdmitEveryRecord, &BTreeSet::from([read]));
+
+    assert!(index.has_fresh());
+    assert_eq!(index.stored_joins(), 2);
+    assert!(!index.published().has_blocked(earlier));
+    assert!(index.published().producers(earlier, data(5)).is_empty());
+    assert!(index.published().producers(earlier, data(6)).is_empty());
+    assert!(index.joins_reading(earlier, data(1)).is_empty());
+
+    index.settle_collections(&AdmitEveryRecord, &BTreeSet::from([earlier]));
+    assert!(!index.has_fresh());
+    assert_eq!(index.stored_joins(), 2);
+    assert!(index.published().has_blocked(earlier));
+    assert!(index.published().producers(earlier, data(5)).is_empty());
+    assert_eq!(
+        index.published().producers(earlier, data(6)),
+        vec![drivable]
+    );
+    assert!(!index.drives_join(earlier, &waiting, data(5)));
+    assert_eq!(
+        index.joins_reading(earlier, data(2)),
+        vec![(waiting, data(5))]
+    );
+
+    // The missing input arrives: the waiting join drives and is named.
+    index.apply(&commit(1, earlier, data(2)), &AdmitEveryRecord);
+    assert!(index.drives_join(earlier, &waiting, data(5)));
+    assert_eq!(index.published().producers(earlier, data(5)), vec![waiting]);
+    // Parking a believed join again leaves it believed and adds no copy.
+    index.park_record(&merge(1, earlier, waiting.as_slice(), data(5)));
+    assert!(!index.has_fresh());
+    assert_eq!(index.stored_joins(), 2);
 }
