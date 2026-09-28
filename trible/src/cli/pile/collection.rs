@@ -59,7 +59,7 @@ use triblespace_core::repo::{
 use triblespace_core::trible::Fragment;
 use triblespace_core::trible::TribleSet;
 
-use super::open_refreshed;
+use super::{open_refreshed, open_refreshed_as};
 
 mod adopt;
 #[cfg(test)]
@@ -301,14 +301,23 @@ pub enum Command {
         /// Print the first characters of each hit's text
         #[arg(long)]
         snippet: bool,
+        /// Signing key whose merges the read believes (default:
+        /// TRIBLESPACE_KEY or self.key beside the pile, when it loads).
+        /// Without a key the read believes no merge and attaches every
+        /// member separately: the same hits, read wider.
+        #[arg(long)]
+        key: Option<PathBuf>,
     },
     /// Maintain selected collections, without maintaining their dependencies.
     ///
-    /// Root collections roll up their admitted commits; derived collections
-    /// fill missing images of available source members and roll up results.
-    /// Readers can then use those merged members. Deterministic and
-    /// idempotent: run again, it publishes nothing new. New equations are
-    /// signed by the supplied durable key and admitted under target WRITE.
+    /// Root collections roll up every admitted commit held here, whoever
+    /// signed it; derived collections fill missing images of available
+    /// source members and roll up results. Readers opened as the same key
+    /// can then use those merged members. Deterministic and idempotent: run
+    /// again, it publishes nothing new. New equations are signed by the
+    /// supplied durable key, and the pile is opened as that key so its fold
+    /// believes them: a MERGE needs no WRITE and is believed only by a store
+    /// opened as its signer, a DERIVE is admitted under target WRITE.
     /// Each target uses the immediate-source members already available. Use
     /// maintain-all to advance its source dependencies first. --watch keeps
     /// one pile open and retries after content or authorization changes.
@@ -338,11 +347,12 @@ pub enum Command {
     /// Maintain selected targets and their source dependencies, upstream first.
     ///
     /// Shared dependencies run once per pass. Every root reached runs the
-    /// key's own carry; every derived collection reached gets the key's own
-    /// leaves, a leaf for every foundation another key has left without one
-    /// (a derive is a function; a reader must not wait on an absent owner),
-    /// and a mirror of the key's own source merges, after its source.
-    /// Nobody else's nodes are merged. This is scheduling over
+    /// carry, which merges every held node into the key's own merges,
+    /// whoever signed the foundations beneath it; every derived collection
+    /// reached gets the key's own leaves, a leaf for every foundation
+    /// another key has left without one (a reader must not wait on an
+    /// absent owner), and a mirror of the key's own source merges, after its
+    /// source. Another key's merges are never believed. This is scheduling over
     /// ordinary one-edge operations; mappings and joins do not acquire
     /// recursive construction side effects. Only the requested targets and
     /// their descriptor source chains are selected, not historical indexes.
@@ -493,7 +503,8 @@ pub fn run(cmd: Command) -> Result<()> {
             query,
             top,
             snippet,
-        } => run_search(pile, collection, query, top, snippet),
+            key,
+        } => run_search(pile, collection, query, top, snippet, key),
         Command::Maintain {
             pile,
             collections,
@@ -3043,7 +3054,9 @@ fn run_maintain(
         let _entered = runtime.enter();
         crate::cli::util::shutdown_signal()?
     };
-    let mut pile = open_refreshed(&path)?;
+    // The fold believes the MERGEs of the key this pass signs with, and no
+    // other key's: the carry merges every held node into that key's merges.
+    let mut pile = open_refreshed_as(&path, signer.verifying_key())?;
     let mut telemetry = match telemetry_config {
         Some(config) => match maintenance_telemetry::Telemetry::open(&mut pile, config, &signer) {
             Ok(telemetry) => Some(telemetry),
@@ -3366,6 +3379,49 @@ fn derive_bm25(
     ))
 }
 
+/// The host a reading command folds as: the key it would sign with.
+///
+/// An explicit key must load. Without one, the default (`TRIBLESPACE_KEY`,
+/// else `self.key` beside the pile) is used when it loads, and a read with no
+/// loadable key believes no MERGE: correct, only wider, since it attaches
+/// every believed foundation instead of the host's merges over them.
+#[cfg(feature = "search")]
+fn reading_host(
+    explicit: Option<&std::path::Path>,
+    pile: &std::path::Path,
+) -> Result<Option<VerifyingKey>> {
+    let path = triblespace_core::signing_key_file::resolve_path(explicit, pile);
+    match triblespace_core::signing_key_file::load_existing(&path) {
+        Ok(key) => Ok(Some(key.verifying_key())),
+        Err(error) if explicit.is_some() => {
+            Err(anyhow!("load signing key {}: {error}", path.display()))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+#[cfg(all(test, feature = "search"))]
+mod reading_host_tests {
+    use super::reading_host;
+
+    #[test]
+    fn an_explicit_key_is_the_host_and_must_load() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("read.pile");
+        let key = directory.path().join("reader.key");
+        let signer = triblespace_core::signing_key_file::init(&key).unwrap();
+        assert_eq!(
+            reading_host(Some(&key), &pile).unwrap(),
+            Some(signer.verifying_key())
+        );
+        let missing = directory.path().join("missing.key");
+        assert!(
+            reading_host(Some(&missing), &pile).is_err(),
+            "a key named on the command line that does not load is an error, not a keyless read"
+        );
+    }
+}
+
 #[cfg(feature = "search")]
 fn run_search(
     path: PathBuf,
@@ -3373,6 +3429,7 @@ fn run_search(
     query: String,
     top: usize,
     snippet: bool,
+    key: Option<PathBuf>,
 ) -> Result<()> {
     use anybytes::View;
     use triblespace_core::blob::encodings::utf8string::UTF8String;
@@ -3386,7 +3443,11 @@ fn run_search(
         bigram_tokens, code_tokens, hash_tokens, BigramHash, WordHash,
     };
 
-    let mut pile = open_refreshed(&path)?;
+    // A read, but one of merged carriers: opened as the host it attaches the
+    // host's merges instead of every leaf.
+    use super::open_refreshed_with;
+    let host = reading_host(key.as_deref(), &path)?;
+    let mut pile = open_refreshed_with(&path, host)?;
     let res = (|| -> Result<()> {
         let snapshot = pile
             .snapshot()
@@ -3523,6 +3584,7 @@ fn run_search(
     _query: String,
     _top: usize,
     _snippet: bool,
+    _key: Option<PathBuf>,
 ) -> Result<()> {
     Err(anyhow!(
         "this binary was built without the search feature and cannot search BM25 collections"

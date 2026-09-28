@@ -21,8 +21,10 @@ use triblespace_net::health_record::{self, Recorder, DEFAULT_MAX_AGE, REPORT_EVE
 use triblespace_net::peer::{Peer, PeerConfig, ReconcileDirection, ReconcileQos};
 use triblespace_net::reconcile::ReplicationMode;
 
-fn open_pile(path: &PathBuf) -> Result<Pile> {
-    crate::cli::pile::open_refreshed(path)
+/// Open the pile as `host`, the key this process signs with: its fold then
+/// believes exactly the MERGEs every other process of this host believes.
+fn open_pile(path: &PathBuf, host: ed25519_dalek::VerifyingKey) -> Result<Pile> {
+    crate::cli::pile::open_refreshed_as(path, host)
 }
 
 fn parse_peers(values: &[String]) -> Result<Vec<EndpointAddr>> {
@@ -322,7 +324,7 @@ fn run_sync(
         let _entered = runtime.enter();
         crate::cli::util::shutdown_signal()?
     };
-    let mut pile = open_pile(&pile_path)?;
+    let mut pile = open_pile(&pile_path, key.verifying_key())?;
     let mut telemetry = telemetry::Publisher::open(&mut pile, &key, telemetry_options)?;
     let mut recorder = Recorder::new(key.verifying_key());
     let health_collection = if health || health_collection_value.is_some() {
@@ -556,7 +558,8 @@ fn run_health(
 
     let signer = load_existing_key(key_path, &pile_path)?;
     let authority = signer.verifying_key();
-    let mut pile = open_pile(&pile_path)?;
+    // This command maintains: its carry signs with `signer`.
+    let mut pile = open_pile(&pile_path, authority)?;
     let result = (|| -> Result<()> {
         let source = open_health_collection(&mut pile, authority, collection_value.as_deref())?;
         // Derived chains carry the source's policy, so an explicit shared
