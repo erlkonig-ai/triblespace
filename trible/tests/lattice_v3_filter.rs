@@ -1348,6 +1348,78 @@ fn a_corrupt_descriptor_is_reported_as_corrupt() {
     }
 }
 
+/// A descriptor only frames the filter leaves behind name (a MERGE, a MAP)
+/// is read to classify them, but no kept frame or root reaches it, so a
+/// corrupt one is not among the corrupt blobs and refuses nothing. It is
+/// listed among the descriptors left behind as corrupt, without pointing at
+/// a corrupt-blob list that does not name it. The MAP is left behind like
+/// the MERGE.
+#[test]
+fn a_corrupt_descriptor_only_dropped_frames_name_refuses_nothing_and_says_why() {
+    use triblespace_core::collection::CollectionMap;
+    let fixture = Fixture::new(false);
+    let key = SigningKey::from_bytes(&[0x24; 32]);
+    let mut pile = Pile::open(&fixture.src).unwrap();
+    let merged_only = pile
+        .collection("named only by a MERGE", policy(&key))
+        .unwrap()
+        .handle();
+    let mapped_only = pile
+        .collection("named only by a MAP", policy(&key))
+        .unwrap()
+        .handle();
+    let a = put_raw(&mut pile, b"merge input a");
+    let b = put_raw(&mut pile, b"merge input b");
+    let result = put_raw(&mut pile, b"merge result");
+    let attachment = put_raw(&mut pile, b"attachment");
+    pile.insert(CollectionRecord::Merge(
+        CollectionMerge::sign(&key, merged_only, [a, b], result).unwrap(),
+    ))
+    .unwrap();
+    let map = CollectionRecord::Map(CollectionMap::sign(
+        &key,
+        mapped_only,
+        Inline::new(a.raw),
+        Inline::new(attachment.raw),
+    ));
+    pile.insert(map).unwrap();
+    pile.close().unwrap();
+    damage_blob_payload(&fixture.src, merged_only.raw);
+    damage_blob_payload(&fixture.src, mapped_only.raw);
+
+    let dry = fixture.run(&fixture.src, &["--dry-run"]);
+    assert_success(&dry);
+    let (destination, real) = fixture.filter_into("filtered.pile", &[]);
+    assert_success(&real);
+    for text in [stdout(&dry), stdout(&real)] {
+        let mut lines = vec![
+            "corrupt blobs: 0 reached with no occurrence matching its hash, not copied".to_owned(),
+            "  MAP (current): 0 / 1".to_owned(),
+        ];
+        for collection in [merged_only, mapped_only] {
+            lines.push(format!(
+                "  blake3:{} (corrupt descriptor): resident only as corrupt bytes; no kept record or root reaches it",
+                hex::encode_upper(collection.raw)
+            ));
+        }
+        for line in lines {
+            assert!(
+                text.lines().any(|candidate| candidate == line),
+                "{line:?} in\n{text}"
+            );
+        }
+        assert!(!text.contains("see corrupt blobs"), "{text}");
+    }
+    assert!(!records(&destination).contains(&map));
+    let mut written = Pile::open(&destination).unwrap();
+    let snapshot = written.snapshot().unwrap();
+    assert!(!snapshot
+        .contains_blob(Inline::<Handle<UnknownBlob>>::new(attachment.raw))
+        .unwrap());
+    drop(snapshot);
+    written.close().unwrap();
+}
+
 /// A blob whose first occurrence is corrupt and whose second is valid is
 /// copied from the valid one. The dry run counts that occurrence's bytes, as
 /// the real run's destination holds them, so both print the same report.

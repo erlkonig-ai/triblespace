@@ -756,8 +756,16 @@ impl Census {
         for (collection, derives_left) in left_descriptors {
             let class = self.classes.get(collection);
             let label = class.map(|class| class.label(attached)).unwrap_or_default();
-            let why = if class == Some(&Class::Corrupt) {
+            // A descriptor only frames the filter leaves behind name is read
+            // to classify them, but nothing kept reaches it, so the walk never
+            // meets it and the corrupt-blob list does not name it.
+            let reached = accounting
+                .corrupt
+                .contains(&Inline::<Handle<UnknownBlob>>::new(*collection));
+            let why = if class == Some(&Class::Corrupt) && reached {
                 "resident only as corrupt bytes (see corrupt blobs)"
+            } else if class == Some(&Class::Corrupt) {
+                "resident only as corrupt bytes; no kept record or root reaches it"
             } else if *derives_left {
                 "its DERIVEs are left behind"
             } else {
