@@ -442,6 +442,8 @@ fn run_sync(
         eprintln!("quiescent stop: {seconds}s without events");
     }
     eprintln!("live collection repair active. (Ctrl-C to stop; also SIGTERM on Unix)\n");
+    let node = *peer.id().as_bytes();
+    let mut rounds_seen = std::collections::BTreeMap::new();
 
     let started = std::time::Instant::now();
     let duration_limit = duration.map(std::time::Duration::from_secs);
@@ -522,6 +524,24 @@ fn run_sync(
                     last_pending_logged = Some(stats.pending);
                 }
             }
+            let health = peer.health();
+            let rounds = health.collections.iter().flat_map(|collection| {
+                collection
+                    .peers
+                    .iter()
+                    .filter(|repair| repair.peer != node)
+                    .map(|repair| {
+                        (
+                            repair.peer,
+                            collection.collection.raw,
+                            repair.last_completed_at,
+                            repair.last_failure_at,
+                        )
+                    })
+            });
+            for (remote, count) in completed_rounds(rounds, &mut rounds_seen) {
+                eprintln!("{}", reconciled_line(&remote, count));
+            }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         Ok::<(), anyhow::Error>(())
@@ -544,6 +564,43 @@ fn run_sync(
         .close()
         .map_err(|error| anyhow!("close pile: {error}"));
     result.and(close)
+}
+
+/// The line printed, on stderr and without colour, for each peer with which
+/// at least one collection repair round completed without failure since the
+/// previous check: `reconciled with peer <endpoint id hex>: <n> collections`.
+/// The prefix and shape are stable for scripts.
+fn reconciled_line(peer: &[u8; 32], collections: usize) -> String {
+    format!(
+        "reconciled with peer {}: {collections} collections",
+        hex::encode(peer)
+    )
+}
+
+/// Collection repair rounds with a peer that completed without failure since
+/// the last call, counted per peer. Each round is `(peer, collection,
+/// completed at, failed at)`; a round that failed has both times equal.
+/// `seen` keeps the last completion per peer and collection.
+fn completed_rounds<T: Copy + Ord>(
+    rounds: impl IntoIterator<Item = ([u8; 32], [u8; 32], Option<T>, Option<T>)>,
+    seen: &mut std::collections::BTreeMap<([u8; 32], [u8; 32]), T>,
+) -> std::collections::BTreeMap<[u8; 32], usize> {
+    let mut completed = std::collections::BTreeMap::new();
+    for (peer, collection, completed_at, failed_at) in rounds {
+        let Some(at) = completed_at else {
+            continue;
+        };
+        if seen
+            .insert((peer, collection), at)
+            .is_some_and(|previous| previous >= at)
+        {
+            continue;
+        }
+        if failed_at != Some(at) {
+            *completed.entry(peer).or_default() += 1;
+        }
+    }
+    completed
 }
 
 /// The health collection reports go into: an explicit existing generation by
@@ -697,6 +754,38 @@ fn run_health(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_reconciled_line_per_peer_for_new_successful_rounds_only() {
+        let mut seen = std::collections::BTreeMap::new();
+        let (first, second) = ([1; 32], [2; 32]);
+        let (a, b) = ([10; 32], [11; 32]);
+        let rounds = [
+            (first, a, Some(5_u64), None),
+            (first, b, Some(6), Some(3)),
+            (second, a, Some(7), Some(7)),
+            (second, b, None, None),
+        ];
+        let completed = super::completed_rounds(rounds, &mut seen);
+        assert_eq!(
+            completed,
+            std::collections::BTreeMap::from([(first, 2)]),
+            "a failed round and a round never completed print nothing"
+        );
+        assert!(
+            super::completed_rounds(rounds, &mut seen).is_empty(),
+            "a round is reported once"
+        );
+        let later = [(first, a, Some(9_u64), None), (second, a, Some(8), Some(7))];
+        assert_eq!(
+            super::completed_rounds(later, &mut seen),
+            std::collections::BTreeMap::from([(first, 1), (second, 1)])
+        );
+        assert_eq!(
+            super::reconciled_line(&first, 2),
+            format!("reconciled with peer {}: 2 collections", "01".repeat(32))
+        );
+    }
+
     use super::*;
     use iroh_base::{SecretKey, TransportAddr};
 
