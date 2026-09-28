@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- A retained rewrite can leave collection-algebra frames behind:
+  `PileFile::rewrite_retained_into_filtered` asks a `CollectionFrameFilter`
+  about every current COMMIT, MERGE and DERIVE frame, every retired v8/v9
+  equation, every legacy unsigned equation and V3 header and every retired
+  signed frame it crosses as opaque, before drained generations and
+  supersession apply, and counts what it refuses in
+  `PileRewriteStats::filtered_frames`. Its retention follows the frames it
+  carries: a frame left behind roots nothing, a carried legacy V3 header roots
+  the blob handles its fields name, and a carried frame of unknown kind roots
+  the resident blobs its aligned 32-byte words name rather than every
+  resident blob, so without explicit roots it keeps exactly what the carried
+  state reaches. `PileFile::plan_retained_rewrite` runs the same selection
+  pass and retention walk without writing and returns the same counts and
+  the set of blobs it would copy (`RetainedRewritePlan`).
+  `rewrite_retained_into` and `rewrite_retained_into_leaving` keep their
+  retention.
+- Every retained rewrite considers a frame held again at a later offset (a
+  current collection record, or a frame of unknown kind, as concatenation
+  leaves them) once, and counts the repeats in
+  `PileRewriteStats::repeated_frames`. The destination already stored each
+  once; the counts now say so.
+
 - `CollectionMapping` is now `DeriveMapping`, named for what its images
   become: `DERIVE` leaves of a derived collection. A new, still empty
   `MapMapping` trait states the contract of a mapping attached to another

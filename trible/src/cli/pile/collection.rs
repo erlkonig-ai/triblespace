@@ -65,6 +65,7 @@ mod adopt;
 #[cfg(test)]
 mod maintenance_counts;
 mod maintenance_telemetry;
+pub(crate) mod v3_mappings;
 
 /// Hex characters shown for a handle or key when the full value is not asked
 /// for. Sixteen is far past the point where two collections in one pile
@@ -740,8 +741,10 @@ fn nvfp4_mapping_id() -> Option<Id> {
     }
 }
 
-/// Resolve a mapping-algorithm id against the algorithms declared in core.
-fn mapping_algorithm_name(id: Id) -> Option<&'static str> {
+/// Every mapping algorithm this binary implements, with the name the listing
+/// gives it. [`mapping_algorithm_name`] answers from this list, and the
+/// lattice v3 classification ([`v3_mappings`]) is tested against it.
+fn known_mapping_algorithms() -> Vec<(Id, &'static str)> {
     use triblespace_core::collection::latest::LATEST_STATES_MAPPING_V1;
     use triblespace_core::collection::lww_register::REGISTER_COORDINATES_MAPPING_V1;
     use triblespace_core::collection::succinctarchive_union::{
@@ -750,33 +753,54 @@ fn mapping_algorithm_name(id: Id) -> Option<&'static str> {
         SIMPLE_TO_SUCCINCT_MAPPING_V1,
     };
 
-    if id == SIMPLE_TO_SUCCINCT_MAPPING_V1 {
-        Some("SIMPLE_TO_SUCCINCT_MAPPING_V1")
-    } else if id == RAW_TO_RANK9_ACCELERATED_MAPPING_V1_32_LE {
-        Some("RAW_TO_RANK9_ACCELERATED_MAPPING_V1_32_LE")
-    } else if id == RAW_TO_RANK9_ACCELERATED_MAPPING_V1_32_BE {
-        Some("RAW_TO_RANK9_ACCELERATED_MAPPING_V1_32_BE")
-    } else if id == RAW_TO_RANK9_ACCELERATED_MAPPING_V1_64_LE {
-        Some("RAW_TO_RANK9_ACCELERATED_MAPPING_V1_64_LE")
-    } else if id == RAW_TO_RANK9_ACCELERATED_MAPPING_V1_64_BE {
-        Some("RAW_TO_RANK9_ACCELERATED_MAPPING_V1_64_BE")
-    } else if id == GENID_ATTRIBUTE_VALUES_MAPPING_V1 {
-        Some("GENID_ATTRIBUTE_VALUES_MAPPING_V1")
-    } else if id == LATEST_STATES_MAPPING_V1 {
-        Some("LATEST_STATES_MAPPING_V1")
-    } else if id == REGISTER_COORDINATES_MAPPING_V1 {
-        Some("REGISTER_COORDINATES_MAPPING_V1")
-    } else if id == triblespace_paths::REGULAR_PATH_MAPPING_V1 {
-        Some("REGULAR_PATH_MAPPING_V1")
-    } else if nvfp4_mapping_id().is_some_and(|nvfp4| id == nvfp4) {
-        Some("EMBEDDING_ATTRIBUTE_TO_NVFP4")
-    } else if semantic_mapping_id().is_some_and(|semantic| id == semantic) {
-        Some("NOMIC_ATTRIBUTES_TO_NVFP4")
-    } else if bm25_mapping_id().is_some_and(|bm25| id == bm25) {
-        Some("TEXT_ATTRIBUTE_TO_BM25")
-    } else {
-        None
-    }
+    let mut known = vec![
+        (
+            SIMPLE_TO_SUCCINCT_MAPPING_V1,
+            "SIMPLE_TO_SUCCINCT_MAPPING_V1",
+        ),
+        (
+            RAW_TO_RANK9_ACCELERATED_MAPPING_V1_32_LE,
+            "RAW_TO_RANK9_ACCELERATED_MAPPING_V1_32_LE",
+        ),
+        (
+            RAW_TO_RANK9_ACCELERATED_MAPPING_V1_32_BE,
+            "RAW_TO_RANK9_ACCELERATED_MAPPING_V1_32_BE",
+        ),
+        (
+            RAW_TO_RANK9_ACCELERATED_MAPPING_V1_64_LE,
+            "RAW_TO_RANK9_ACCELERATED_MAPPING_V1_64_LE",
+        ),
+        (
+            RAW_TO_RANK9_ACCELERATED_MAPPING_V1_64_BE,
+            "RAW_TO_RANK9_ACCELERATED_MAPPING_V1_64_BE",
+        ),
+        (
+            GENID_ATTRIBUTE_VALUES_MAPPING_V1,
+            "GENID_ATTRIBUTE_VALUES_MAPPING_V1",
+        ),
+        (LATEST_STATES_MAPPING_V1, "LATEST_STATES_MAPPING_V1"),
+        (
+            REGISTER_COORDINATES_MAPPING_V1,
+            "REGISTER_COORDINATES_MAPPING_V1",
+        ),
+        (
+            triblespace_paths::REGULAR_PATH_MAPPING_V1,
+            "REGULAR_PATH_MAPPING_V1",
+        ),
+    ];
+    known.extend(nvfp4_mapping_id().map(|id| (id, "EMBEDDING_ATTRIBUTE_TO_NVFP4")));
+    known.extend(semantic_mapping_id().map(|id| (id, "NOMIC_ATTRIBUTES_TO_NVFP4")));
+    known.extend(bm25_mapping_id().map(|id| (id, "TEXT_ATTRIBUTE_TO_BM25")));
+    known
+}
+
+/// Resolve a mapping-algorithm id against the algorithms this binary
+/// implements.
+fn mapping_algorithm_name(id: Id) -> Option<&'static str> {
+    known_mapping_algorithms()
+        .into_iter()
+        .find(|(known, _)| *known == id)
+        .map(|(_, name)| name)
 }
 
 fn semantic_mapping_id() -> Option<Id> {

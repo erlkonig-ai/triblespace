@@ -8,6 +8,7 @@ use triblespace_core::repo::{BlobStoreGet, SnapshotSource};
 
 mod branch_to_collection;
 mod clean;
+mod lattice_v3;
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Migration {
@@ -51,6 +52,27 @@ pub enum Command {
     /// and counted; maintenance rebuilds merges. The source is only read,
     /// through a read-only descriptor, and locked only while it is replayed.
     Clean(clean::CleanArgs),
+    /// Write a lattice v3 pile from a frozen copy: every COMMIT of every
+    /// generation, no MERGE, DERIVEs only of mappings that stay derived.
+    ///
+    /// A stop-the-world compaction filter. Every COMMIT of every generation
+    /// is kept, and so are capability proofs, WANTs, legacy pins and frames
+    /// of unknown kind. Every MERGE of every encoding and signer is left
+    /// behind; each host rebuilds its own. A DERIVE is left behind when its
+    /// target's descriptor names only mapping algorithms that become
+    /// attached or are deleted, and kept when the mapping stays derived (the
+    /// semantic index), is unrecognised, or the descriptor is not resident.
+    /// A blob is kept only when the kept state or a `--root` reaches it by
+    /// the conservative walk, so merge results and dropped images are left
+    /// behind, and so is the descriptor of a collection no kept record names
+    /// unless a root keeps it: archive the source first, and name with
+    /// `--root` or `--roots-from` every handle something outside the pile
+    /// opens. The source is only read, and a
+    /// source another process holds open is refused. Afterwards every kept
+    /// collection is read through the fold without a host key, and each
+    /// believed foundation's payload must be resident. `--dry-run` decides
+    /// the same frames and blobs, writes nothing and prints the same report.
+    LatticeV3(lattice_v3::LatticeV3Args),
     /// Re-sign one verified legacy branch as native collection commits.
     ///
     /// This is deliberately a same-pile migration: one frozen pin observation
@@ -92,6 +114,7 @@ pub fn run(pile_path: PathBuf, cmd: Command) -> Result<()> {
         Command::List => list_migrations(&pile_path),
         Command::Reframe { into } => reframe(&pile_path, &into),
         Command::Clean(args) => clean::run(pile_path, args),
+        Command::LatticeV3(args) => lattice_v3::run(pile_path, args),
         Command::BranchToCollection {
             branch,
             collection_name,
