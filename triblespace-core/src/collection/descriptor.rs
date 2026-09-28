@@ -10,8 +10,8 @@
 //! A root carries [`collection_name`] while a derived collection carries
 //! [`collection_source`] and one concrete [`collection_mapping`]
 //! instance instead. An attached collection carries [`collection_parent`]
-//! and one concrete mapping, and no policy at all: it never replicates and
-//! its records are believed on the host's own key. Mapping parameters hang
+//! and one concrete mapping, and no policy at all: its records are believed
+//! on the host's own key alone, and nowhere else. Mapping parameters hang
 //! from that mapping entity, not from the collection descriptor, so the
 //! conversion remains independently identifiable and queryable. Roots and
 //! derived collections carry independent, self-contained capability policy
@@ -199,8 +199,8 @@ where
 /// parent's handle, the attachment encoding and the mapping, and nothing
 /// else.
 ///
-/// There is no policy. An attached collection never replicates, and a MAP is
-/// believed only when the host's own key signed it, so no WRITE or READ
+/// There is no policy. A MAP is believed only when the host's own key signed
+/// it, so no other store's belief depends on it and no WRITE or READ
 /// audience is there to state; the handle is then the same on every host
 /// that holds the parent, though nothing depends on that.
 pub(crate) fn attaching_with<M>(parent: CollectionHandle, mapping: &M) -> Fragment

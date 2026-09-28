@@ -1113,8 +1113,8 @@ impl CollectionDerive {
 /// its parent collection's lattice to `attachment`.
 ///
 /// A MAP is a host's own index of one of its own nodes. It adds no
-/// foundation and never replicates: a reader believes it only when the
-/// store's host signed it, and only for a node the reader reaches in the
+/// foundation and means nothing to another store: a reader believes it only
+/// when the store's host signed it, and only for a node the reader reaches in the
 /// parent's lattice. The node is named by its handle directly: an attached
 /// collection indexes nodes, not source foundations, so there is no locator.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

@@ -591,9 +591,9 @@ genid` on 2026-09-28: semantic kind `329669AA662709605053C123671DF1D2`,
 pile description anchor `ED7B98CD20AD9A4D172F037A08CC47F1` (description
 `pile-collection-map-v1`, handle above pinned by the description-recomputation
 test), signed over the domain `4A5191C36898D0B453FEFF99ED0E3852` ||
-`4AADD87ED8EB8620BD39623B5221B5BE`. It carries no witness, adds no foundation
-and is never replicated: a store believes a MAP only when its own host key
-signed it, keeps it as the attachment of its node, and a reader uses it only
+`4AADD87ED8EB8620BD39623B5221B5BE`. It carries no witness and adds no
+foundation, and it means nothing to another store: a store believes a MAP only
+when its own host key signed it, keeps it as the attachment of its node, and a reader uses it only
 for a node it reaches in the parent's lattice. A Rank9-accelerated member is
 an ordinary blob root plus its portable raw child, attached to the same node
 as that child's Succinct attachment; neither attached collection has

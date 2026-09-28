@@ -139,8 +139,8 @@ descriptor facts.
 An index attached to a root collection: its descriptor names the parent root
 and a mapping, and carries no policy. It has no lattice of its own. A `MAP`
 record, signed by the store's host, names the attachment built from one node of
-the parent's lattice; a store believes only its own host's `MAP`s, and attached
-collections are never replicated. A read takes, for each frontier node widest
+the parent's lattice; a store believes only its own host's `MAP`s, so one that
+reaches another store stays inert. A read takes, for each frontier node widest
 first, its usable attachment -- bytes and dependencies resident -- and
 otherwise descends through the host's merges; the foundations no attachment
 reaches are the read's residual. Succinct, Rank9, id-set, latest-state,

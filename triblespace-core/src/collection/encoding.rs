@@ -379,8 +379,9 @@ impl<T: CollectionDerivation> DeriveMapping for CanonicalDerivation<T> {
 ///
 /// An attached collection's descriptor names its parent collection and one
 /// concrete mapping, and no policy: its records are `MAP(node ->
-/// attachment)` signed by the host, which no other host believes and which
-/// never replicate. The contract an implementor takes on:
+/// attachment)` signed by the host, which no other host believes: one that
+/// reaches another store stays inert there. The contract an implementor
+/// takes on:
 ///
 /// - It maps any node of its parent's lattice, a merge result as well as a
 ///   foundation. The parent is a root collection: its nodes are

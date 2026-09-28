@@ -22,9 +22,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `LwwRegisterBlob`, which are no longer `CollectionDerivation`s.
   `CollectionStoreExt::attach`, `attach_with`, `ensure_attached` and
   `maintain_attached` register and maintain them; `CollectionSnapshotExt::attached`
-  reads an `AttachedSnapshot` (cover, support, residual, currency), and
-  `succinctarchive_union::read_attached` reads a Succinct or Rank9 one with its
-  residual built from the bytes that are here. The fold believes a `MAP` only
+  reads an `AttachedSnapshot` (cover, support, residual, currency). Its
+  `read` and `read_with` form a view over the cover and an image of every
+  residual foundation built in memory through the mapping, so an index answers
+  for what a fact read of the same observation holds; `view` is the cover
+  alone. `succinctarchive_union::read_attached` reads a Succinct or Rank9 one
+  with its residual read from the bytes that are here. Both return an
+  `AttachedRead`, which names the residual foundations it could not include
+  (`unread`: bytes or a dependency not here, or a node the mapping cannot
+  represent). `descriptor::parents` lists an attached descriptor's parents
+  without counting them; the fold treats any descriptor naming a parent as
+  attached. The fold believes a `MAP` only
   from the host, keeps it as the attachment of a node of the parent, and drops
   a `COMMIT`, `DERIVE` or `MERGE` aimed at an attached handle
   (`SourceResolution::Attached`). `attached_to` and `realize_attached_as` find
@@ -37,6 +45,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `4AADD87ED8EB8620BD39623B5221B5BE`, `collection_parent`
   `9B20AA2BE739DB1B4911186620368262`, `mapping_reads_attached`
   `7A852B1D4097983EA823D04C8CD1A53A`.
+  Removed with the derived Succinct and Rank9 path they checked:
+  `succinctarchive_union::validate_derive`, `validate_merge`,
+  `SuccinctArchiveUnionValidationError`, `DescriptorRole` and `ElementRole`.
+  One member is validated by `CollectionEncoding::validate_member`, and an
+  attachment's usability by `missing_representation_dependencies`.
 
 - `CollectionMapping` is now `DeriveMapping`, named for what its images
   become: `DERIVE` leaves of a derived collection. A new, still empty

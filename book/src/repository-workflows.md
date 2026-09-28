@@ -481,8 +481,11 @@ SimpleArchive node --MAP--> SuccinctArchiveBlob
 ```
 
 An attached collection has no carry, no `COMMIT`, `DERIVE` or `MERGE` of its
-own, and is never replicated: every host builds its own attachments, and a
-store believes only the `MAP`s its own host signed. Maintenance carries the
+own, and no policy: every host builds its own attachments, and a store believes
+only the `MAP`s its own host signed, so another host's that reach it stay
+inert. A read's residual -- foundations no usable attachment reaches -- is not
+missing data: `AttachedSnapshot::read` builds their images in memory for the
+view, and names what it cannot build in `AttachedRead::unread`. Maintenance carries the
 root first and then attaches the frontier the carry leaves, so a merged node's
 attachment is mapped from the merged node's bytes and nothing is built for a
 node the carry is about to consume. A mapping that reads another attached

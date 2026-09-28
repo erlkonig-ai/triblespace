@@ -10,6 +10,9 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   (`CollectionAttachment`) instead of derived. `mary` is an optional
   dependency behind the new `nvfp4` feature, which `semantic` and
   `nvfp4-cuda` enable: BM25 is an ordinary dependency with default features.
+  The `nvfp4` module and its tests (the unit tests and
+  `tests/nvfp4_collection.rs`) build only with that feature, so a test run
+  that should cover them passes `--features nvfp4`.
 
 - Portable BM25 attachment retains its encoded members and checks framing only.
   `index.query()` / `view.query()` explicitly prepare the global scoring
