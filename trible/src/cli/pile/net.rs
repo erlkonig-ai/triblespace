@@ -328,11 +328,25 @@ fn run_identity(key: Option<PathBuf>, bind: Option<std::net::SocketAddr>) -> Res
     let path = triblespace_core::signing_key_file::resolve_path(key.as_deref(), &default_anchor);
     let key = triblespace_core::signing_key_file::init(&path)?;
     let public = triblespace_net::identity::iroh_secret(&key).public();
+    let addr = bind.map(ticket_address).transpose()?;
     println!("node: {public}");
-    if let Some(addr) = bind {
+    if let Some(addr) = addr {
         println!("ticket: {}", bound_ticket(public, addr));
     }
     Ok(())
+}
+
+/// The address a ticket written before launch may name: the daemon binds it
+/// later, so it must be a concrete address a peer can reach and a fixed port.
+/// Port 0 and the unspecified addresses (0.0.0.0, ::) name no socket the
+/// daemon will have.
+fn ticket_address(addr: std::net::SocketAddr) -> Result<std::net::SocketAddr> {
+    if addr.port() == 0 || addr.ip().is_unspecified() {
+        return Err(anyhow!(
+            "--bind {addr}: a ticket written before launch needs a concrete reachable address and a nonzero port"
+        ));
+    }
+    Ok(addr)
 }
 
 /// The ticket of an endpoint reached at exactly `addr`.
@@ -812,7 +826,9 @@ mod tests {
 
     /// Two production peers, each bound to a chosen loopback port and given
     /// the other's ticket, written before either starts, repair a collection
-    /// in both directions.
+    /// in both directions. This proves the bind, the tickets and collection
+    /// record repair between them, with synthetic commit handles; it says
+    /// nothing about payload residency.
     #[test]
     fn two_bound_peers_reach_each_other_from_tickets_written_before_launch() {
         use ed25519_dalek::SigningKey;
@@ -902,6 +918,22 @@ mod tests {
         }
         for peer in peers {
             drop(peer.into_store());
+        }
+    }
+
+    #[test]
+    fn a_prelaunch_ticket_refuses_port_zero_and_unspecified_addresses() {
+        for refused in ["127.0.0.1:0", "0.0.0.0:7001", "[::]:7001", "0.0.0.0:0"] {
+            let addr: std::net::SocketAddr = refused.parse().unwrap();
+            let error = super::ticket_address(addr).unwrap_err().to_string();
+            assert!(
+                error.contains("concrete reachable address and a nonzero port"),
+                "{refused}: {error}"
+            );
+        }
+        for accepted in ["127.0.0.1:7001", "[::1]:7002", "192.0.2.7:7003"] {
+            let addr: std::net::SocketAddr = accepted.parse().unwrap();
+            assert_eq!(super::ticket_address(addr).unwrap(), addr);
         }
     }
 

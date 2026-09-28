@@ -821,11 +821,14 @@ walk of every collection run on the sync daemon's own threads, publish into
 later snapshots batch by batch, and never gate publication; a snapshot's held
 sets never change after it is taken. Every seed of a new record is reached,
 including one another record already named. A held set is closed under the
-edge cache: a blob joins only once every child the cache names for it has
-joined, a walk reads a batch of roots to the end and publishes it children
-before parents, and a child a walk newly learns under a held blob joins with
-the edge. A blob that cannot be read, absent or resident and failing to read,
-is unknown on every path: nothing above it joins until a walk reads it. While
+edge cache for readable children: a blob joins only once every child the
+cache names for it has joined, a walk reads a batch of roots to the end and
+publishes it children before parents, and a readable child a walk newly
+learns under a held blob joins with the edge. A blob that cannot be read,
+absent or resident and failing to read, is unknown on every path: nothing
+above it joins until a walk reads it. The boundary: a blob already held whose
+newly learned child cannot be read stays held without that child until a
+periodic walk reads it. While
 a collection's start-up walk is owed, peer reports for it, observed or only
 noted, wait for that walk, which reads those its records do not reach against
 the latest observation (a blob it could not read before is read again), instead
