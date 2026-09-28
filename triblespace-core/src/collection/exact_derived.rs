@@ -15,6 +15,7 @@ use std::error::Error;
 use std::fmt;
 
 use ed25519_dalek::SigningKey;
+use rand::seq::SliceRandom;
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::UnknownBlob;
@@ -410,7 +411,7 @@ fn ensure_resident_in_frontier_with<S, M>(
     target: Collection<M::Target>,
     signing_key: &SigningKey,
     unavailable: &BTreeSet<CollectionData>,
-    wanted: &mut Vec<CollectionData>,
+    wanted: &mut Vec<Vec<CollectionData>>,
     frontier: &mut OperationFrontier<S::Snapshot>,
 ) -> Result<(), CollectionRealizationError>
 where
@@ -473,7 +474,7 @@ fn maintain_resident_in_frontier_with<S, M>(
     target: Collection<M::Target>,
     signing_key: &SigningKey,
     unavailable: &BTreeSet<CollectionData>,
-    wanted: &mut Vec<CollectionData>,
+    wanted: &mut Vec<Vec<CollectionData>>,
     frontier: &mut OperationFrontier<S::Snapshot>,
 ) -> Result<(), CollectionRealizationError>
 where
@@ -625,13 +626,32 @@ where
     }
 }
 
-/// How many optional fetches one call lets fail before the rest wait for a
-/// later call.
+/// How many optional fetches one call lets fail before it starts on no
+/// further group of them.
 ///
 /// Through a store that asks other holders a failed fetch can wait out a
 /// network deadline -- `triblespace-net` gives an interactive fetch ten
-/// seconds -- so this bounds what one call spends on blobs nobody hands over
-/// to about eight such deadlines. A fetch that succeeds is not counted.
+/// seconds -- so this bounds what one call spends on blobs nobody hands over.
+/// A fetch that succeeds is not counted. What an operation went on without
+/// comes in groups, each of which one blob completes -- for derive
+/// scheduling, the outputs of one foundation's leaves, any one of which is a
+/// usable leaf -- and a group once started is asked to the end: until one of
+/// its blobs arrives or every one has failed, so a foundation with more
+/// unavailable outputs than this is still decided in one call. One call
+/// therefore lets fewer than eight fetches fail before the last group it
+/// starts, plus that group's own.
+///
+/// Each call starts the groups in an order drawn afresh. A call keeps no
+/// memory of the last one -- a faculty's store lives for one command -- and
+/// with nothing new arriving two calls would otherwise make the same
+/// choices, spending every call's failures on the same leading groups and
+/// never reaching the rest. With a fresh order a group is started whenever
+/// fewer than eight fetches failed in the groups drawn before it: at least
+/// when it is drawn first, and, when every group holds one blob (one leaf
+/// per foundation), whenever it is among the first eight. So of `n` groups
+/// waiting, a given one is reached in a call with probability at least
+/// `1/n`, and at least `min(8, n)/n` when every group holds one blob: within
+/// `n` calls in expectation, or `n/8` in the one-blob case.
 const OPTIONAL_FETCH_FAILURES: usize = 8;
 
 /// Run one operation against a fresh control snapshot, acquiring what it
@@ -642,15 +662,15 @@ const OPTIONAL_FETCH_FAILURES: usize = 8;
 /// inside the operation that asked for it.
 ///
 /// A blob the operation needs ends it with
-/// [`CollectionRealizationError::MissingDependency`], one at a time. A blob
-/// it could use but went on without -- the output of a leaf that is not
-/// here -- it names in `wanted` and finishes its work; those are asked for
-/// together afterwards, each once per call, and the operation runs once more
-/// if any was. They are asked for only through a store that can reach other
-/// holders ([`AsyncBlobStoreAcquire::acquires_remotely`]): from one that
-/// cannot, a miss says nothing about elsewhere, so what it names waits. Once
-/// [`OPTIONAL_FETCH_FAILURES`] of them have failed in one call, the rest wait
-/// for a later call too.
+/// [`CollectionRealizationError::MissingDependency`], one at a time. Blobs it
+/// could use but went on without -- the outputs of leaves that are not here
+/// -- it names in `wanted`, grouped so that any one blob of a group
+/// completes it, and finishes its work; those are asked for together
+/// afterwards, each once per call and within [`OPTIONAL_FETCH_FAILURES`], and
+/// the operation runs once more if any was. They are asked for only through
+/// a store that can reach other holders
+/// ([`AsyncBlobStoreAcquire::acquires_remotely`]): from one that cannot, a
+/// miss says nothing about elsewhere, so what it names waits.
 ///
 /// An operation that reports something after its work -- a foundation its
 /// mapping refused, a carry that failed -- has its `wanted` asked for, and
@@ -662,7 +682,7 @@ where
     F: FnMut(
         &mut S,
         &BTreeSet<CollectionData>,
-        &mut Vec<CollectionData>,
+        &mut Vec<Vec<CollectionData>>,
         &mut OperationFrontier<S::Snapshot>,
     ) -> Result<(), CollectionRealizationError>,
 {
@@ -693,16 +713,20 @@ where
             Err(error) => Some(error),
         };
         if store.acquires_remotely() && failures < OPTIONAL_FETCH_FAILURES {
+            wanted.shuffle(&mut rand::thread_rng());
             let mut asked = false;
-            for member in wanted {
+            for group in wanted {
                 if failures >= OPTIONAL_FETCH_FAILURES {
                     break;
                 }
-                if attempted.contains(&member) {
-                    continue;
-                }
-                asked = true;
-                if !acquire_missing(store, &mut attempted, member).await? {
+                for member in group {
+                    if attempted.contains(&member) {
+                        continue;
+                    }
+                    asked = true;
+                    if acquire_missing(store, &mut attempted, member).await? {
+                        break;
+                    }
                     unavailable.insert(member);
                     failures += 1;
                 }

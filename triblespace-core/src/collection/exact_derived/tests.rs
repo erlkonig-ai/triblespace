@@ -273,6 +273,9 @@ thread_local! {
     static FIRST_SALT_ROTATES: Cell<bool> = const { Cell::new(false) };
     static FIRST_MAP_CAPACITY: RefCell<Option<CollectionData>> = const { RefCell::new(None) };
     static FIRST_MAP_FATAL: RefCell<Option<CollectionData>> = const { RefCell::new(None) };
+    /// Sources the first mapping refuses, like `FIRST_MAP_FATAL`, for
+    /// tests that need several.
+    static FIRST_MAP_REFUSED: RefCell<BTreeSet<CollectionData>> = const { RefCell::new(BTreeSet::new()) };
     /// Whether this host is outside the class a pinned test mapping is
     /// computed on.
     static FIRST_PINNED_ELSEWHERE: Cell<bool> = const { Cell::new(false) };
@@ -291,6 +294,7 @@ fn reset_mapping_calls() {
     FIRST_SALT_ROTATES.set(false);
     FIRST_MAP_CAPACITY.replace(None);
     FIRST_MAP_FATAL.replace(None);
+    FIRST_MAP_REFUSED.replace(BTreeSet::new());
     FIRST_PINNED_ELSEWHERE.set(false);
     FIRST_MAP_LOG.replace(Vec::new());
 }
@@ -348,7 +352,9 @@ impl CollectionDerivation for FirstEncoding {
                 "injected source capacity".to_owned(),
             ));
         }
-        if FIRST_MAP_FATAL.with_borrow(|refused| *refused == Some(data(source))) {
+        if FIRST_MAP_FATAL.with_borrow(|refused| *refused == Some(data(source)))
+            || FIRST_MAP_REFUSED.with_borrow(|refused| refused.contains(&data(source)))
+        {
             return Err(CollectionOperationError::Fatal(
                 "injected source refusal".to_owned(),
             ));
@@ -5124,5 +5130,91 @@ mod lattice_v2 {
                 .collect::<Vec<_>>(),
             vec![SourceLocator::of(data(&elsewhere).raw)]
         );
+    }
+
+    /// Review finding, 2026-09-28: a call stopped asking after eight failed
+    /// fetches, in the same order on every call, so a foundation whose
+    /// ninth leaf's output could be had never had it asked for. A call now
+    /// asks for every output of a foundation it starts until one arrives or
+    /// all have failed.
+    #[test]
+    fn a_foundations_ninth_output_is_asked_for_after_eight_fail() {
+        reset_mapping_calls();
+        let (mut inner, root, first, _) = collections();
+        let source = payload(42, 0);
+        own_commit(&mut inner, root, 42, 0);
+        let mut leaves: Vec<_> = (1..=9)
+            .map(|salt| leaf_of(first, 42, &source, salt))
+            .collect();
+        leaves.sort_by_key(|(_, image)| data(image).raw);
+        for (record, _) in &leaves {
+            inner.insert(*record).unwrap();
+        }
+        let obtainable = leaves[8].1.clone();
+        let mut store = GuardStore::new(inner);
+        store.offer(&obtainable);
+
+        drop(block_on(store.maintain(first, &key(41))).unwrap());
+        assert!(
+            store.acquired.contains(&data(&obtainable)),
+            "{} asked, the last not among them",
+            store.acquired.len()
+        );
+        assert_eq!(store.acquired.len(), 9);
+        assert_eq!(FIRST_MAP_CALLS.get(), 0, "the fetched output counts");
+        drop(block_on(store.maintain(first, &key(41))).unwrap());
+        assert_eq!(store.acquired.len(), 9, "nothing is asked again");
+    }
+
+    /// Review finding, 2026-09-28: with eight foundations whose outputs
+    /// never arrive and whose mapping is refused here, every call spent its
+    /// eight failed fetches on them, in the same order, and a ninth after
+    /// them was never asked about nor derived. Each call now starts the
+    /// foundations in an order of its own, so no fixed prefix starves the
+    /// rest: the ninth is reached in a call unless it is drawn last, one
+    /// chance in nine, and every output is eventually asked for.
+    #[test]
+    fn foundations_that_always_fail_first_starve_no_other() {
+        reset_mapping_calls();
+        let (mut inner, root, first, _) = collections();
+        let mut sources: Vec<_> = (0..9).map(|entity| payload(42, entity)).collect();
+        for entity in 0..9 {
+            own_commit(&mut inner, root, 42, entity);
+        }
+        sources.sort_by_key(|source| derive_rank(41, data(source)));
+        let mappable = sources.pop().unwrap();
+        FIRST_MAP_REFUSED.with_borrow_mut(|refused| refused.extend(sources.iter().map(data)));
+        let mut outputs = BTreeSet::new();
+        for source in sources.iter().chain([&mappable]) {
+            let (record, image) = leaf_of(first, 42, source, 7);
+            inner.insert(record).unwrap();
+            outputs.insert(data(&image));
+        }
+        let mappable_output = data(&leaf_of(first, 42, &mappable, 7).1);
+        let mut store = GuardStore::new(inner);
+
+        let mut calls = 0;
+        while leaves_by(&mut store.inner, first, 41).is_empty() {
+            assert!(
+                calls < 32,
+                "starved: {calls} calls asked only {:?}",
+                store.acquired.iter().collect::<BTreeSet<_>>().len()
+            );
+            drop(block_on(store.maintain(first, &key(41))).unwrap());
+            calls += 1;
+        }
+        assert!(store.acquired.contains(&mappable_output));
+        assert_eq!(
+            leaves_by(&mut store.inner, first, 41)
+                .iter()
+                .map(|leaf| leaf.input())
+                .collect::<Vec<_>>(),
+            vec![SourceLocator::of(data(&mappable).raw)]
+        );
+        while store.acquired.iter().copied().collect::<BTreeSet<_>>() != outputs {
+            assert!(calls < 64, "an output was never asked for");
+            drop(block_on(store.maintain(first, &key(41))).unwrap());
+            calls += 1;
+        }
     }
 }

@@ -1072,7 +1072,7 @@ pub(super) fn maintain_derived<S, M>(
     target: Collection<M::Target>,
     signing_key: &SigningKey,
     unavailable: &BTreeSet<CollectionData>,
-    wanted: &mut Vec<CollectionData>,
+    wanted: &mut Vec<Vec<CollectionData>>,
     frontier: &mut OperationFrontier<S::Snapshot>,
     carry_target: bool,
 ) -> Result<(), CollectionRealizationError>
@@ -1168,12 +1168,14 @@ fn derive_order(key: &VerifyingKey, foundation: CollectionData) -> [u8; 32] {
 /// fetched for another owner, and a reader of the target never waits on an
 /// owner who is offline.
 ///
-/// An output a believed leaf names that is not here is not waited for: it
-/// goes into `wanted`, and the acquiring loop asks for it once the rest of
-/// the work -- deriving what needs no fetch, and the carry -- is done
-/// ([`super::exact_derived`]). Until then its foundation is left alone.
-/// When none of a foundation's leaves' outputs could be had (`unavailable`),
-/// those leaves do not count and the foundation is mapped again. A failed
+/// An output a believed leaf names that is not here is not waited for: the
+/// outputs of one foundation's leaves go into `wanted` together, as one
+/// group any one of which would do, and the acquiring loop asks for them
+/// once the rest of the work -- deriving what needs no fetch, and the carry
+/// -- is done ([`super::exact_derived`]). Until then its foundation is left
+/// alone. When none of a foundation's leaves' outputs could be had
+/// (`unavailable`), those leaves do not count and the foundation is mapped
+/// again. A failed
 /// fetch is current unavailability, not loss: a result equal to an output a
 /// leaf already names restores those bytes and publishes nothing, and a
 /// different one is a second leaf beside the first. When the first output
@@ -1208,7 +1210,7 @@ fn derive_leaves<S, M>(
     bound: &Bound<M>,
     signing_key: &SigningKey,
     unavailable: &BTreeSet<CollectionData>,
-    wanted: &mut Vec<CollectionData>,
+    wanted: &mut Vec<Vec<CollectionData>>,
     frontier: &mut OperationFrontier<S::Snapshot>,
     maintain: bool,
 ) -> Result<Derivation, CollectionRealizationError>
@@ -1305,7 +1307,7 @@ where
             if unasked.is_empty() {
                 owed.push((foundation, locator, outputs, owned));
             } else {
-                wanted.extend(unasked);
+                wanted.push(unasked);
             }
         }
     }
