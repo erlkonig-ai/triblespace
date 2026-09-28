@@ -16,7 +16,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CollectionDerivation`. The one thing it decided, whether `maintain`
   derives a leafless foundation another key owns, is
   `DeriveMapping::FOREIGN_DERIVABLE` until derivation is scheduled by leaf
-  rather than by owner.
+  rather than by owner. It now also decides whether the mirror maps a
+  source merge that holds another owner's foundation.
+
+- A MERGE is believed only when the store's own host key signed it, with no
+  WRITE check; a COMMIT or a DERIVE is still believed when its signer may
+  WRITE its collection. `CoverageIndex` carries a host key fixed for its
+  life (`CoverageIndex::for_host`, `with_host`, `host`), set by
+  `Pile::open_as`, `Covered::with_host` and `Covered::for_host`, and
+  `MemoryRepo::for_host`. `Pile::open` and `MemoryRepo::default` stay
+  keyless: they believe no MERGE, and every believed foundation stays on the
+  frontier. Another key's MERGE stays in the store and folds into nothing --
+  no support, consumer edge, owner or frontier move -- which closes support
+  injection by other keys for records whose signatures were checked at
+  ingress (native pile replay and object-store listings do not check
+  signatures again). `Coverage::owners` names only COMMIT and DERIVE
+  signers. The believed host joins are published in `Coverage`, and
+  `Coverage::producers(collection, node)` returns the driven ones by the
+  node's own key; a join parked but not decided yet is not published.
+  `CoverageIndex::believes_join` is renamed `drives_join`, which is what it
+  answers. `fold_index` and `fold_coverage`, which had no callers, are
+  removed.
+
+- The root carry merges every held node into the host's own merges, whoever
+  signed the foundations beneath it; the fan-in stays 8 and merges need no
+  WRITE. A frontier node whose bytes are not here is never joined or fetched,
+  so it raises no `MissingDependency` and restarts no acquisition loop, but a
+  held node that covers it absorbs it. Maintenance that would publish a
+  MERGE with a key other than the store's host, or into a keyless store,
+  fails with the new `CollectionRealizationError::HostMismatch` instead of
+  stalling: open the store as the signing key to maintain it. Until derived
+  collections carry their own leaf images, two source merges are not
+  mirrored and the view keeps the finer images beneath them: one that holds
+  a foundation the view's mapping refused, and one that holds another
+  owner's foundation when the mapping sets `FOREIGN_DERIVABLE` to false
+  (`SemanticIndex`).
 
 - `ensure_derived`, `maintain_derived` and `upkeep_derived` are now
   `ensure_downstream`, `maintain_downstream` and `upkeep_downstream`.

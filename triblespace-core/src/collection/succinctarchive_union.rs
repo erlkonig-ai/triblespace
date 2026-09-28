@@ -13,7 +13,8 @@
 //! producer, ingress, or offline-audit boundaries. Warm collection resolution
 //! does not replay them. It does not authorize commits, select semantic roots,
 //! retain artifacts, or assign authority to construction records. Storage
-//! admits signed `DERIVE` and `MERGE` records as reusable materialized work.
+//! believes a signed `DERIVE` when its signer may write the target, and a
+//! signed `MERGE` only when the store's own host key signed it.
 
 use super::descriptor as descriptor_facts;
 use super::records::{mapping_algorithm, RecordDecodeError, KIND_COLLECTION_MAPPING};

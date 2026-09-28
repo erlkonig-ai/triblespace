@@ -177,21 +177,22 @@ WRITE admission decides which signed COMMITs and DERIVEs contribute
 membership. A DERIVE needs WRITE on its target; source WRITE alone is
 insufficient. A MERGE needs no WRITE: a store believes only the MERGEs its own
 host key signed, and any other key's MERGE folds into nothing, whatever that
-key may write. It signs both the computation's
-payload handles and fingerprints of the exact input records whose support the
-producer validated. Readers admit target producers, then follow those native
-witnesses without repeating ancestor authorization or loading ancestral data,
-metadata, or proof definitions. Descriptor lineage and exact record closure
+key may write. A MERGE signs the payload handles of its inputs and result, a
+DERIVE the locator of its source foundation and its output; neither names an
+input record. Readers admit foundation producers, then follow the host's own
+merges without repeating ancestor authorization or loading ancestral data,
+metadata, or proof definitions. Descriptor lineage and the producing records
 are still required to establish `Support`; selected output blobs and their
 encoding dependencies are required to read the value.
 
 The signature identifies a producer, not a mathematical proof. An authorized
-incorrect producer can still endorse a false computation or bad input
-validation. Readers do not replay that computation. Conversely, another record
-with the same payload does not inherit this signature's endorsement: exact
-witness references prevent alternate decompositions from inflating support.
+incorrect producer can still endorse a false computation, and a bug in the
+host's own merge is believed as signed. Readers do not replay that
+computation. Because a store folds only its host's merges, another key cannot
+inflate what a node stands for by signing an alternative decomposition of it.
 Current collection-record signatures are checked at foreign ingress or explicit
-audit, not again by ordinary trusted-local attachment.
+audit, not again by ordinary trusted-local attachment, so that holds for
+records whose signatures were checked when they entered the store.
 
 Local publication can retain an inactive record before a suitable proof
 arrives. Later proof or definition residency can activate it. Generic WRITE

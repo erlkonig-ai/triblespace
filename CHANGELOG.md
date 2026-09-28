@@ -16,6 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports them as unknown, and `collection maintain` refuses them as an
   unimplemented representation.
 
+- A store believes only the MERGEs its own host key signed, and each host
+  merges every node it holds into a lattice of its own, whoever signed the
+  foundations. Merges need no WRITE. A store opened without a host
+  (`Pile::open`) believes no MERGE and reads every foundation separately.
+  Maintaining a root on it, or with a key other than its host, fails with
+  `HostMismatch` as soon as a merge would be published, so maintenance opens
+  the store as its signing key (`Pile::open_as`). See the
+  `triblespace-core` changelog.
+
 - Replace the string-context hashes of the bearer and DHT layer with one-block
   constructions over random 32-byte context keys (generated from the OS random
   source): locator `BLAKE3(LOCATOR_CONTEXT || H)`, directory token

@@ -159,10 +159,13 @@ a synthetic entity ID. A repeat insert is a no-op. The network PATCH keys a
 record by a full-width BLAKE3 fingerprint of the kind and canonical payload;
 the pile keys it by the collection and member it names and the frame it sits
 in. Neither key is collection semantics. All three records
-are signed and admitted by WRITE on the collection they name. Multiple
-endorsers can sign the same equation: these are distinct provenance records
-but one semantic equation. Inferred equations carry only endpoints, not
-fabricated signatures or provenance records.
+are signed. A COMMIT or a DERIVE is admitted by WRITE on the collection it
+names. A MERGE needs no WRITE: a store folds only the MERGEs its own host key
+signed, each host joining the same foundations into a lattice of its own, and
+another key's MERGE stays in the store and folds into nothing. Several keys can
+sign the same DERIVE: these are distinct provenance records but one semantic
+equation. Inferred equations carry only endpoints, not fabricated signatures or
+provenance records.
 
 The algebra has no distinguished head. Several commits coexist, and the value
 of a selected collection view is the join of its admitted members. This makes a
