@@ -186,6 +186,55 @@ fn scheduled_handles(output: &Output) -> Vec<String> {
         .collect()
 }
 
+/// The counts one pass summary line reports.
+#[derive(Debug, PartialEq, Eq)]
+struct PassLine {
+    pass: u64,
+    targets: u64,
+    maintained: u64,
+    published: u64,
+    failed: u64,
+}
+
+/// Parses exactly `maintenance pass <n> done in <secs> s: targets <t>,
+/// maintained <m>, published <p>, failed <f>` with `<n>` from 1 and `<secs>`
+/// carrying one decimal; anything else is `None`.
+fn pass_line(line: &str) -> Option<PassLine> {
+    fn count(text: &str) -> Option<u64> {
+        if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        text.parse().ok()
+    }
+    let rest = line.strip_prefix("maintenance pass ")?;
+    let (pass, rest) = rest.split_once(" done in ")?;
+    let (seconds, rest) = rest.split_once(" s: targets ")?;
+    let (whole, tenths) = seconds.split_once('.')?;
+    if count(whole).is_none() || tenths.len() != 1 || count(tenths).is_none() {
+        return None;
+    }
+    let (targets, rest) = rest.split_once(", maintained ")?;
+    let (maintained, rest) = rest.split_once(", published ")?;
+    let (published, failed) = rest.split_once(", failed ")?;
+    Some(PassLine {
+        pass: count(pass).filter(|pass| *pass > 0)?,
+        targets: count(targets)?,
+        maintained: count(maintained)?,
+        published: count(published)?,
+        failed: count(failed)?,
+    })
+}
+
+/// Every pass line on stdout, in order; a line that starts like one and does
+/// not parse fails the test.
+fn pass_lines(stdout: &str) -> Vec<PassLine> {
+    stdout
+        .lines()
+        .filter(|line| line.starts_with("maintenance pass"))
+        .map(|line| pass_line(line).unwrap_or_else(|| panic!("malformed pass line {line:?}")))
+        .collect()
+}
+
 #[test]
 fn entity_id_set_cli_projects_receipt_values_without_changing_source_records() {
     use triblespace_core::blob::encodings::entity_id_set::{
@@ -1301,6 +1350,221 @@ fn watch_follows_an_external_append_and_closes(verb: &str, signal: &str) {
         !log.contains("Pile dropped without calling close()"),
         "{log}"
     );
+    let mut pile = fixture.open();
+    let snapshot = pile.snapshot().unwrap();
+    let observed = snapshot.attached(fixture.rank9).unwrap();
+    assert_eq!(facts(&observed), fixture.expected);
+    drop((observed, snapshot));
+    pile.close().unwrap();
+}
+
+#[test]
+fn each_completed_pass_prints_one_summary_line_even_when_quiet_or_failed() {
+    fn maintained_lines(stdout: &str) -> u64 {
+        stdout
+            .lines()
+            .filter(|line| line.starts_with("maintained "))
+            .count() as u64
+    }
+
+    let fixture = Fixture::new();
+    let mut published = Vec::new();
+    // The first run publishes the chain's attachments. The second finds
+    // nothing to publish and is still a completed pass with its own line.
+    for _ in 0..2 {
+        let output = fixture.run("maintain-all", &[fixture.rank9.handle()]);
+        assert_success(&output);
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let passes = pass_lines(&stdout);
+        assert_eq!(passes.len(), 1, "one line per pass: {stdout}");
+        let pass = &passes[0];
+        assert_eq!(
+            pass_line(stdout.lines().last().unwrap()).as_ref(),
+            Some(pass),
+            "the pass line follows the pass's hop lines: {stdout}"
+        );
+        assert_eq!(
+            (pass.pass, pass.targets, pass.failed),
+            (1, 1, 0),
+            "{stdout}"
+        );
+        assert_eq!(pass.maintained, maintained_lines(&stdout), "{stdout}");
+        assert!(pass.maintained > 0, "{stdout}");
+        published.push(pass.published);
+    }
+    assert!(published[0] > 0, "the first pass publishes: {published:?}");
+    assert_eq!(published[1], 0, "the settled pass publishes nothing");
+
+    // A failed selection does not stop the pass from completing: the line
+    // counts it, and the command then reports the failure.
+    let mut command = trible();
+    command
+        .args(["pile", "collection", "maintain-all"])
+        .arg(&fixture.path)
+        .arg(handle_text(fixture.rank9.handle()))
+        .arg("name:no collection has this name")
+        .arg("--key")
+        .arg(&fixture.key);
+    let output = Command::from_std(command)
+        .timeout(Duration::from_secs(30))
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!output.status.success(), "{stdout}\n{stderr}");
+    assert_eq!(
+        pass_lines(&stdout),
+        vec![PassLine {
+            pass: 1,
+            targets: 1,
+            maintained: maintained_lines(&stdout),
+            published: 0,
+            failed: 1,
+        }],
+        "{stdout}\n{stderr}"
+    );
+    assert!(
+        stderr.contains("1 maintenance selection(s) failed"),
+        "{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn watch_prints_one_summary_line_per_completed_pass() {
+    use std::process::{Child, Stdio};
+    use std::time::Instant;
+
+    struct Watcher(Child);
+    impl Drop for Watcher {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Stdout up to its last newline: a line still being written is left out.
+    fn complete_lines(path: &Path) -> String {
+        let text = std::fs::read_to_string(path).unwrap();
+        let end = text.rfind('\n').map_or(0, |end| end + 1);
+        text[..end].to_owned()
+    }
+
+    /// Settled: the rank9 attachment covers `support` commits, `publishing`
+    /// pass lines report publications, and the last line closes a pass.
+    fn settled(fixture: &Fixture, stdout: &Path, support: usize, publishing: usize) -> bool {
+        let mut pile = fixture.open();
+        let snapshot = pile.snapshot().unwrap();
+        let observed = snapshot.attached(fixture.rank9).unwrap();
+        let reached = observed.support().len() == support;
+        drop((observed, snapshot));
+        pile.close().unwrap();
+        let text = complete_lines(stdout);
+        reached
+            && pass_lines(&text)
+                .iter()
+                .filter(|pass| pass.published > 0)
+                .count()
+                >= publishing
+            && text
+                .lines()
+                .last()
+                .is_some_and(|line| pass_line(line).is_some())
+    }
+
+    fn wait_until_settled(
+        fixture: &Fixture,
+        watcher: &mut Watcher,
+        (stdout, stderr): (&Path, &Path),
+        support: usize,
+        publishing: usize,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !settled(fixture, stdout, support, publishing) {
+            assert!(
+                watcher.0.try_wait().unwrap().is_none(),
+                "watch exited early: {}",
+                std::fs::read_to_string(stderr).unwrap(),
+            );
+            assert!(
+                Instant::now() < deadline,
+                "watch did not settle with {support} support members and \
+                 {publishing} publishing pass lines:\n{}\n{}",
+                std::fs::read_to_string(stdout).unwrap(),
+                std::fs::read_to_string(stderr).unwrap(),
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    let mut fixture = Fixture::new();
+    let stdout_path = fixture.path.with_extension("watch.out");
+    let stderr_path = fixture.path.with_extension("watch.err");
+    let logs = (stdout_path.as_path(), stderr_path.as_path());
+    let mut command = fixture.command("maintain-all", &[fixture.rank9.handle()]);
+    command
+        .args(["--watch", "--interval-ms", "10"])
+        .stdin(Stdio::null())
+        .stdout(std::fs::File::create(&stdout_path).unwrap())
+        .stderr(std::fs::File::create(&stderr_path).unwrap());
+    let mut watcher = Watcher(command.spawn().unwrap());
+    wait_until_settled(&fixture, &mut watcher, logs, 2, 1);
+
+    let mut writer = Pile::open(&fixture.path).unwrap();
+    let fragment = entity! { metadata::description: "external append" };
+    fixture.expected += fragment.facts().clone();
+    writer
+        .commit(fixture.source, &fixture.signer, fragment)
+        .unwrap();
+    writer.close().unwrap();
+    wait_until_settled(&fixture, &mut watcher, logs, 3, 2);
+
+    assert!(ProcessCommand::new("kill")
+        .args(["-TERM", &watcher.0.id().to_string()])
+        .status()
+        .unwrap()
+        .success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = watcher.0.try_wait().unwrap() {
+            assert!(
+                status.success(),
+                "watch did not close normally: {status}\n{}",
+                std::fs::read_to_string(&stderr_path).unwrap(),
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline, "SIGTERM did not stop the watch");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let stdout = std::fs::read_to_string(&stdout_path).unwrap();
+    let passes = pass_lines(&stdout);
+    assert!(passes.len() >= 2, "{stdout}");
+    assert_eq!(
+        passes.iter().map(|pass| pass.pass).collect::<Vec<_>>(),
+        (1..=passes.len() as u64).collect::<Vec<_>>(),
+        "passes are numbered from one, each exactly once: {stdout}"
+    );
+    // Stdout holds only hop lines and pass lines, and each pass line counts
+    // the hop lines printed since the previous one: it closes its own pass.
+    let mut maintained = 0;
+    for line in stdout.lines() {
+        if line.starts_with("maintained blake3:") {
+            maintained += 1;
+            continue;
+        }
+        let pass =
+            pass_line(line).unwrap_or_else(|| panic!("unexpected stdout line {line:?}: {stdout}"));
+        assert_eq!(pass.maintained, maintained, "{stdout}");
+        assert_eq!((pass.targets, pass.failed), (1, 0), "{stdout}");
+        maintained = 0;
+    }
+    assert!(
+        passes.iter().filter(|pass| pass.published > 0).count() >= 2,
+        "the first pass and the one after the append publish: {stdout}"
+    );
+
     let mut pile = fixture.open();
     let snapshot = pile.snapshot().unwrap();
     let observed = snapshot.attached(fixture.rank9).unwrap();

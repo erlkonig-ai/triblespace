@@ -566,7 +566,8 @@ async fn name_selection_wakes_once_per_emission_without_observer_feedback() {
             Some(&mut producer)
         )
         .await
-        .unwrap(),
+        .unwrap()
+        .failures,
         0
     );
     let settled = fixture.store.snapshot().unwrap();
@@ -593,7 +594,8 @@ async fn real_pass_counts_publications_then_successful_settled_no_publication_pa
             Some(&mut producer)
         )
         .await
-        .unwrap(),
+        .unwrap()
+        .failures,
         0
     );
     assert!(producer.publications.maps > 0);
@@ -609,7 +611,8 @@ async fn real_pass_counts_publications_then_successful_settled_no_publication_pa
             Some(&mut producer)
         )
         .await
-        .unwrap(),
+        .unwrap()
+        .failures,
         0
     );
     assert_eq!(producer.publications, published);
