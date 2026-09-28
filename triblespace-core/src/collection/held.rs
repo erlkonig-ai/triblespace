@@ -305,7 +305,8 @@ impl HeldView {
 struct Walker {
     /// Collections whose start-up walk is owed.
     requested: Handles,
-    stop: bool,
+    /// Walker threads attached; the last to stop detaches the walker.
+    threads: usize,
 }
 
 /// Everything the index keeps across observations. A tracked collection is
@@ -369,11 +370,12 @@ struct State<T> {
 pub(crate) struct HeldIndex<T> {
     state: Mutex<State<T>>,
     wake: Condvar,
-    /// Set while a walker is being stopped, so a walk in progress returns
-    /// after the blob it is reading rather than after its level.
-    halt: AtomicBool,
     /// The state's epoch, readable by a walk without taking the lock.
     epoch: AtomicU64,
+    /// Test hook: run once by the next walk after it has taken what it
+    /// walks, before it reads anything.
+    #[cfg(test)]
+    walk_taken: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl<T> Default for HeldIndex<T> {
@@ -401,8 +403,9 @@ impl<T> Default for HeldIndex<T> {
                 walker: None,
             }),
             wake: Condvar::new(),
-            halt: AtomicBool::new(false),
             epoch: AtomicU64::new(0),
+            #[cfg(test)]
+            walk_taken: Mutex::new(None),
         }
     }
 }
@@ -418,8 +421,9 @@ impl<T: Clone> HeldIndex<T> {
         Self {
             state: Mutex::new(state),
             wake: Condvar::new(),
-            halt: AtomicBool::new(false),
             epoch: AtomicU64::new(epoch),
+            #[cfg(test)]
+            walk_taken: Mutex::new(None),
         }
     }
 }
@@ -445,10 +449,20 @@ impl<T> HeldIndex<T> {
         }
     }
 
-    /// The walk that started in `epoch` should stop: the walker is being
-    /// stopped, or a reset made its results stale.
-    fn abandoned(&self, epoch: u64) -> bool {
-        self.halt.load(Ordering::Relaxed) || self.epoch.load(Ordering::Relaxed) != epoch
+    /// Run the test hook, if one is set.
+    fn walk_taken(&self) {
+        #[cfg(test)]
+        if let Some(hook) = self.walk_taken.lock().unwrap().take() {
+            hook();
+        }
+    }
+
+    /// The walk that started in `epoch` should stop: its own walker is being
+    /// stopped (`stop`, owned by that walker alone; an explicit walk has
+    /// none), or a reset made its results stale. Both only ever turn true.
+    fn abandoned(&self, epoch: u64, stop: Option<&AtomicBool>) -> bool {
+        stop.is_some_and(|stop| stop.load(Ordering::Relaxed))
+            || self.epoch.load(Ordering::Relaxed) != epoch
     }
 }
 
@@ -1045,10 +1059,12 @@ impl<T: HeldSource> HeldIndex<T> {
         }
     }
 
-    /// One walk against `snapshot` over `only` (every tracked collection when
-    /// `None`): rescan every blob reachable from their seeds and peer
-    /// reports, and refresh the edge cache. A walk that completes ends the
-    /// start-up walks it covered.
+    /// One walk against the latest observation over `only` (every tracked
+    /// collection when `None`): rescan every blob reachable from their seeds
+    /// and peer reports, and refresh the edge cache. A walk that completes
+    /// ends the start-up walks it covered. The observation, the roots and the
+    /// epoch the results belong to are taken in one lock hold, so a reset
+    /// after it abandons the walk and a reset before it is already seen.
     ///
     /// The roots are walked in batches. Each batch is read to the end and
     /// then published children before parents -- each blob's edges with its
@@ -1059,15 +1075,19 @@ impl<T: HeldSource> HeldIndex<T> {
     /// that waited for the walk and that it did not reach are walked last,
     /// against the latest observation, and become routes; the walk ends only
     /// when none is waiting, so none is left for a snapshot to read.
-    pub(crate) fn walk(&self, snapshot: &T, threads: usize, only: Option<&Handles>) {
-        let (mut queue, epoch) = {
+    pub(crate) fn walk(&self, threads: usize, only: Option<&Handles>, stop: Option<&AtomicBool>) {
+        let (first, mut queue, epoch) = {
             let state = self.lock();
-            (state.walk_roots(only), state.epoch)
+            let Some(first) = state.fed.clone() else {
+                return;
+            };
+            (first, state.walk_roots(only), state.epoch)
         };
+        self.walk_taken();
         let covered: Vec<CollectionHandle> =
             queue.iter().map(|(collection, _)| *collection).collect();
         let threads = threads.max(1);
-        let abandoned = || self.abandoned(epoch);
+        let abandoned = || self.abandoned(epoch, stop);
         // Scratch for this walk: what it read, and what it reached per
         // collection, so no blob is read twice by one walk.
         let mut known: HashMap<Raw, Option<Arc<[Raw]>>> = HashMap::new();
@@ -1075,9 +1095,11 @@ impl<T: HeldSource> HeldIndex<T> {
         let mut latest: Option<T> = None;
         let mut rounds = 0;
         loop {
-            let snapshot = latest.as_ref().unwrap_or(snapshot);
+            let snapshot = latest.as_ref().unwrap_or(&first);
             while let Some(batch) = next_batch(&mut queue) {
-                if !self.walk_batch(snapshot, epoch, threads, batch, &mut known, &mut seen) {
+                if !self.walk_batch(
+                    snapshot, epoch, threads, &abandoned, batch, &mut known, &mut seen,
+                ) {
                     return;
                 }
             }
@@ -1174,16 +1196,17 @@ impl<T: HeldSource> HeldIndex<T> {
     /// unreadable seeds as they come; then publish what it read and reached,
     /// children before parents, in bounded pieces. `false` when the walk was
     /// abandoned.
+    #[allow(clippy::too_many_arguments)]
     fn walk_batch(
         &self,
         snapshot: &T,
         epoch: u64,
         threads: usize,
+        abandoned: &(dyn Fn() -> bool + Sync),
         mut frontier: Vec<(CollectionHandle, Vec<Raw>)>,
         known: &mut HashMap<Raw, Option<Arc<[Raw]>>>,
         seen: &mut BTreeMap<CollectionHandle, HashSet<Raw>>,
     ) -> bool {
-        let abandoned = || self.abandoned(epoch);
         // Scratch for this batch: the collections that reached each readable
         // blob.
         let mut reached: HashMap<Raw, Vec<CollectionHandle>> = HashMap::new();
@@ -1199,7 +1222,7 @@ impl<T: HeldSource> HeldIndex<T> {
             need.sort_unstable();
             need.dedup();
             let scanned: Vec<(Raw, Option<Arc<[Raw]>>)> =
-                scan_all(snapshot, &need, threads, &abandoned);
+                scan_all(snapshot, &need, threads, abandoned);
             if abandoned() {
                 // A partial level is not published.
                 return false;
@@ -1380,54 +1403,61 @@ impl Drop for HeldWalker {
 }
 
 impl<T: HeldSource> HeldIndex<T> {
-    /// Attach the background walker. At most one walker per index: a second
-    /// call stops nothing and starts another thread that shares the work.
+    /// Attach a background walker. A second call starts another thread that
+    /// shares the work; each is stopped by its own handle alone, and the
+    /// last one stopped detaches the walker.
     pub(crate) fn start_walker(self: &Arc<Self>, config: HeldWalkConfig) -> HeldWalker {
         {
             let mut state = self.lock();
             // Collections already settled were computed in full; the
             // interval decides their next walk.
-            state.walker.get_or_insert_with(Walker::default).stop = false;
+            state.walker.get_or_insert_with(Walker::default).threads += 1;
         }
+        // This walker's own stop: only its handle sets it, and nothing ever
+        // clears it, so no other walk can see it or lose it.
+        let stop = Arc::new(AtomicBool::new(false));
         WALKER_THREADS.fetch_add(1, Ordering::SeqCst);
         SPAWNED_THREADS.fetch_add(1, Ordering::SeqCst);
         let index = Arc::clone(self);
         let thread = std::thread::Builder::new()
             .name("held-blob-walk".into())
-            .spawn(move || {
-                index.run_walker(config);
-                // An explicit walk after this walker is gone runs in full.
-                index.halt.store(false, Ordering::Relaxed);
-                WALKER_THREADS.fetch_sub(1, Ordering::SeqCst);
+            .spawn({
+                let stop = Arc::clone(&stop);
+                move || {
+                    index.run_walker(config, &stop);
+                    WALKER_THREADS.fetch_sub(1, Ordering::SeqCst);
+                }
             })
             .expect("spawn the held-blob walker thread");
         let index = Arc::clone(self);
         HeldWalker {
             stop: Some(Box::new(move || {
-                index.halt.store(true, Ordering::Relaxed);
-                let mut state = index.lock();
-                if let Some(walker) = &mut state.walker {
-                    walker.stop = true;
-                }
+                stop.store(true, Ordering::Relaxed);
+                // Under the lock, so a walker about to wait sees the stop or
+                // is woken by this.
+                let _state = index.lock();
                 index.wake.notify_all();
             })),
             thread: Some(thread),
         }
     }
 
-    fn run_walker(&self, config: HeldWalkConfig) {
+    fn run_walker(&self, config: HeldWalkConfig, stop: &AtomicBool) {
         let mut due = Instant::now() + config.interval;
         loop {
-            let (snapshot, only) = {
+            let only = {
                 let mut state = self.lock();
                 loop {
-                    let (stop, requested) = match &state.walker {
-                        None => return,
-                        Some(walker) => (walker.stop, !walker.requested.is_empty()),
+                    let Some(walker) = &mut state.walker else {
+                        return;
                     };
-                    if stop {
-                        state.walker = None;
-                        state.release_warming();
+                    let requested = !walker.requested.is_empty();
+                    if stop.load(Ordering::Relaxed) {
+                        walker.threads -= 1;
+                        if walker.threads == 0 {
+                            state.walker = None;
+                            state.release_warming();
+                        }
                         return;
                     }
                     let now = Instant::now();
@@ -1455,11 +1485,9 @@ impl<T: HeldSource> HeldIndex<T> {
                 } else {
                     Some(requested)
                 };
-                (state.fed.clone(), only)
+                only
             };
-            if let Some(snapshot) = snapshot {
-                self.walk(&snapshot, config.threads, only.as_ref());
-            }
+            self.walk(config.threads, only.as_ref(), Some(stop));
         }
     }
 }
@@ -3035,7 +3063,7 @@ mod tests {
             .name("held-blob-walk".into())
             .spawn({
                 let index = Arc::clone(&index);
-                move || index.walk(&now, 1, None)
+                move || index.walk(1, None, None)
             })
             .unwrap();
         store.gate.await_walker();
@@ -3116,6 +3144,91 @@ mod tests {
         assert!(
             held_set(&walked, c).contains(&definition.raw),
             "a proof judged against an unreadable descriptor was never judged again"
+        );
+    }
+
+    /// A walk takes the observation it reads and the epoch its results
+    /// belong to together: a reset between the two cannot make it publish,
+    /// as current, a blob the store lost before the walk began.
+    #[test]
+    fn a_walk_never_publishes_a_blob_lost_before_it_began() {
+        let _guard = walker_guard();
+        let mut store = Counting::default();
+        let c = collection(&mut store, "lost before the walk");
+        let metadata = blob(&mut store, b"metadata");
+        let lost = blob(&mut store, b"forgotten by the store");
+        let data = blob_naming(&mut store, b"names the lost blob", &[lost]);
+        commit(&mut store, c, data, metadata);
+        let index: Arc<HeldIndex<CountingSnapshot>> = Arc::new(HeldIndex::default());
+        index.track([c]);
+        let before = store.snapshot().unwrap();
+        index.observe(&before);
+        let (arrived, taken) = std::sync::mpsc::channel();
+        let (go, resume) = std::sync::mpsc::channel::<()>();
+        *index.walk_taken.lock().unwrap() = Some(Box::new(move || {
+            arrived.send(()).unwrap();
+            resume.recv().unwrap();
+        }));
+        // The periodic walk is due at once.
+        let walker = index.start_walker(walker_config(Duration::from_millis(10)));
+        taken
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the walker took a walk");
+        let kept: Vec<_> = before
+            .blobs()
+            .map(|info| info.unwrap().handle)
+            .filter(|handle| handle.raw != lost)
+            .collect();
+        store.inner.blobs.keep(kept);
+        index.observe(&store.snapshot().unwrap());
+        go.send(()).unwrap();
+        let start = Instant::now();
+        loop {
+            let view = index.observe(&store.snapshot().unwrap());
+            if let Some(held) = view.held(c).filter(|held| held.has_prefix(&data)) {
+                assert!(
+                    !held.has_prefix(&lost),
+                    "a walk published a blob the store lost before it began"
+                );
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "no walk held the data"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        drop(walker);
+    }
+
+    /// A stop belongs to the walker it stops. Stopping one of two walkers,
+    /// and then the other, leaves nothing that stops a later explicit walk.
+    #[test]
+    fn a_stopped_walker_leaves_no_stop_for_other_walks() {
+        let _guard = walker_guard();
+        let mut store = Store::default();
+        let c = collection(&mut store, "stop owner");
+        let metadata = blob(&mut store, b"metadata");
+        let h_bytes = unresident_naming(b"late child", &[]);
+        let h = handle_of(&h_bytes);
+        let p = blob_naming(&mut store, b"parent of a late child", &[h]);
+        commit(&mut store, c, p, metadata);
+        store.track_held([c]);
+        store.snapshot().unwrap();
+        let first = store.start_held_walker(walker_config(Duration::from_secs(3600)));
+        let second = store.start_held_walker(walker_config(Duration::from_secs(3600)));
+        drop(first);
+        let start = Instant::now();
+        while held_walker_threads() != 0 && start.elapsed() < Duration::from_secs(1) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        drop(second);
+        assert_eq!(held_walker_threads(), 0);
+        store.put::<UnknownBlob, _>(h_bytes).unwrap();
+        store.walk_held(1).unwrap();
+        assert!(
+            held_set(&store.snapshot().unwrap(), c).contains(&h),
+            "an explicit walk after the walkers stopped did nothing"
         );
     }
 
