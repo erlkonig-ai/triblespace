@@ -15,11 +15,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the resident blobs peers reported in C (`HeldStore::note_held`, in memory
   only). Each blob is scanned once and its edges cached for every collection;
   a periodic full walk on a `HeldWalker` catches children that arrived after
-  their parent was scanned. Snapshots carry fixed held sets
-  (`HeldRead::held`); background walks only enter later ones. A store that
-  tracks nothing (`HeldStore::track_held`) pays nothing and starts no thread.
+  their parent was scanned. With a walker attached, a newly tracked
+  collection's existing closure is computed by a start-up walk of that
+  collection alone, and peer reports for it wait for that walk instead of
+  being read while a snapshot is taken. Snapshots carry fixed held sets
+  (`HeldRead::held`); background walks only enter later ones. A collection
+  whose records or proofs the store cannot read is left out of the held sets
+  and read again, never published short. A store that tracks nothing
+  (`HeldStore::track_held`) pays nothing and starts no thread
+  (`held::held_threads_spawned` counts every thread the index starts).
   New selector `CollectionRecordSelector::Foundations(C)`: the COMMITs and
-  DERIVEs of C, never a MERGE.
+  DERIVEs of C, named positively, so a MERGE or any later record kind never
+  matches.
 
 - `CollectionMapping` is now `DeriveMapping`, named for what its images
   become: `DERIVE` leaves of a derived collection. A new, still empty

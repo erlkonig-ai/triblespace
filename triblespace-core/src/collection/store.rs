@@ -67,8 +67,12 @@ pub(crate) fn selectors_match_record(
     if selectors.contains(&CollectionRecordSelector::Collection(collection)) {
         return true;
     }
-    if !matches!(record, CollectionRecord::Merge(_))
-        && selectors.contains(&CollectionRecordSelector::Foundations(collection))
+    // Named positively: a record kind added later replicates only once it
+    // is listed here.
+    if matches!(
+        record,
+        CollectionRecord::Commit(_) | CollectionRecord::Derive(_)
+    ) && selectors.contains(&CollectionRecordSelector::Foundations(collection))
     {
         return true;
     }
