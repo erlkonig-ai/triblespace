@@ -145,6 +145,10 @@ impl<S: AsyncBlobStoreAcquire> AsyncBlobStoreAcquire for ObservedStore<S> {
         self.observe_blob(handle);
         self.inner.acquire(handle)
     }
+
+    fn acquires_remotely(&self) -> bool {
+        self.inner.acquires_remotely()
+    }
 }
 
 impl<R: StoreSnapshot> StoreSnapshot for ObservedStore<R> {

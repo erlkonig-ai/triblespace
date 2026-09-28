@@ -100,6 +100,18 @@ pub trait AsyncBlobStoreAcquire {
         &mut self,
         handle: Inline<Handle<UnknownBlob>>,
     ) -> impl Future<Output = Result<Option<Bytes>, Self::AcquireError>> + Send;
+
+    /// Whether [`acquire`](Self::acquire) can bring bytes that are not
+    /// already here: `true` for a store that asks other holders, `false` --
+    /// the default -- for one that answers from its own blobs alone.
+    ///
+    /// From a store that answers `false`, `Ok(None)` says only that the
+    /// bytes are not here, never that they cannot be had elsewhere, so a
+    /// caller deciding whether something is available anywhere must not
+    /// read it as a refusal. A wrapper answers as the store it wraps.
+    fn acquires_remotely(&self) -> bool {
+        false
+    }
 }
 
 impl<S> AsyncBlobStoreAcquire for &mut S
@@ -113,6 +125,10 @@ where
         handle: Inline<Handle<UnknownBlob>>,
     ) -> impl Future<Output = Result<Option<Bytes>, Self::AcquireError>> + Send {
         (**self).acquire(handle)
+    }
+
+    fn acquires_remotely(&self) -> bool {
+        (**self).acquires_remotely()
     }
 }
 
@@ -202,6 +218,10 @@ where
         handle: Inline<Handle<UnknownBlob>>,
     ) -> impl Future<Output = Result<Option<Bytes>, Self::AcquireError>> + Send {
         self.blobs.acquire(handle)
+    }
+
+    fn acquires_remotely(&self) -> bool {
+        self.blobs.acquires_remotely()
     }
 }
 

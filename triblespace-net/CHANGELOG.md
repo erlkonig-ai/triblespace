@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `Peer` and `Leech` answer `AsyncBlobStoreAcquire::acquires_remotely` with
+  `true`: they ask the network for what is not here, so derive scheduling
+  may take a failed fetch of a leaf's output as current unavailability.
+
 - `PeerConfig::bind`: bind the production endpoint to exactly one local
   socket (`None` keeps iroh's default sockets). The host thread hands back
   `HostStarted { wake_plane, bound }` and `Peer::bound_sockets` reports the

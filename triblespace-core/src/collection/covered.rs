@@ -350,6 +350,10 @@ impl<S: SnapshotSource + AsyncBlobStoreAcquire> AsyncBlobStoreAcquire for Covere
     {
         self.inner.acquire(handle)
     }
+
+    fn acquires_remotely(&self) -> bool {
+        self.inner.acquires_remotely()
+    }
 }
 
 impl<S: SnapshotSource + PinSnapshotSource> PinSnapshotSource for Covered<S> {

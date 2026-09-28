@@ -141,6 +141,11 @@ where
     ) -> impl Future<Output = Result<Option<Bytes>, Self::AcquireError>> + Send {
         Leech::acquire(self, handle)
     }
+
+    /// A leech asks the network for what is not here.
+    fn acquires_remotely(&self) -> bool {
+        true
+    }
 }
 
 impl<S> BlobStorePut for Leech<S>

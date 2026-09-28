@@ -741,6 +741,11 @@ where
     ) -> impl std::future::Future<Output = Result<Option<Bytes>, Self::AcquireError>> + Send {
         Peer::acquire(self, handle)
     }
+
+    /// A peer asks the network for what is not here.
+    fn acquires_remotely(&self) -> bool {
+        true
+    }
 }
 
 impl<S> CollectionStore for Peer<S>

@@ -175,6 +175,10 @@ impl<S: AsyncBlobStoreAcquire> AsyncBlobStoreAcquire for CountedStore<'_, S> {
     > + Send {
         self.inner.acquire(handle)
     }
+
+    fn acquires_remotely(&self) -> bool {
+        self.inner.acquires_remotely()
+    }
 }
 
 #[derive(Default)]
