@@ -1,5 +1,6 @@
-//! Incrementally query a growing collection: the Succinct target answers the
-//! full side, the source payloads the view chain newly absorbed are the delta.
+//! Incrementally query a growing collection: the attached Succinct cover
+//! answers the full side, the source payloads it newly stands for are the
+//! delta.
 //!
 //! Run with: `cargo run --example collection_pattern_changes`
 
@@ -9,7 +10,6 @@ use std::io;
 use ed25519_dalek::SigningKey;
 use futures::executor::block_on;
 use rand::rngs::OsRng;
-use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
     OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
 };
@@ -18,7 +18,7 @@ use triblespace::core::collection::{
     CoverAdvanceError, Support,
 };
 use triblespace::core::examples::literature;
-use triblespace::core::repo::memoryrepo::{MemoryRepo, MemoryRepoSnapshot};
+use triblespace::core::repo::memoryrepo::MemoryRepo;
 use triblespace::prelude::*;
 
 fn rebuild(
@@ -65,52 +65,26 @@ fn changes(
 }
 
 // ANCHOR: collection_pattern_changes_observe
-/// The source payloads the view chain has absorbed: every source foundation
-/// the first view answers for, provided the second view answers for all the
-/// first stands on. `None` while the second view lags. A leaf whose image has
-/// not arrived is lag too: `missing_from` counts what each observation reads,
-/// never a record alone, so the token cannot pass facts the view never held.
-fn absorbed(
-    snapshot: &MemoryRepoSnapshot,
-    source: Collection<SimpleArchive>,
-    raw: Collection<SuccinctArchiveBlob>,
-    accelerated: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
-) -> Result<Option<Support>, Box<dyn Error>> {
-    let source = snapshot.collection(source)?;
-    let raw = snapshot.collection(raw)?;
-    if !snapshot
-        .collection(accelerated)?
-        .missing_from(&raw)?
-        .is_empty()
-    {
-        return Ok(None);
-    }
-    let lag = raw.missing_from(&source)?;
-    Ok(Some(source.support()?.difference(&lag)?))
-}
-
 fn observe(
     store: &mut MemoryRepo,
     signing_key: &SigningKey,
-    source: Collection<SimpleArchive>,
     raw: Collection<SuccinctArchiveBlob>,
     accelerated: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
     checkpoint: &mut Option<Support>,
     mut consume: impl FnMut(&str) -> Result<(), Box<dyn Error>>,
 ) -> Result<Vec<String>, Box<dyn Error>> {
-    // Maintain each mapping edge -- this key's own leaves and merges -- then
-    // read everything from the snapshot that observes all of that work.
-    block_on(store.maintain(raw, signing_key))?;
-    let snapshot = block_on(store.maintain(accelerated, signing_key))?;
+    // Maintain both attachments -- the Succinct index, then the Rank9
+    // accelerator that reads it -- and read from the snapshot that observes
+    // all of that work.
+    block_on(store.maintain_attached(raw, signing_key))?;
+    let snapshot = block_on(store.maintain_attached(accelerated, signing_key))?;
+    let attached = snapshot.attached(accelerated)?;
 
-    // The continuation token is the set of source payloads the view chain
-    // has absorbed, not what the source stands on: another writer's payload
-    // is in the source before its writer derives it, and a token that
-    // advanced past it would never deliver it. A view that lags holds the
-    // token back.
-    let Some(current) = absorbed(&snapshot, source, raw, accelerated)? else {
-        return Ok(Vec::new());
-    };
+    // The continuation token is the set of source payloads the attached cover
+    // stands for, not what the source holds: a payload without an attachment
+    // yet is the cover's residual, and a token that advanced past it would
+    // never deliver it.
+    let current = attached.support().clone();
     let changed = match checkpoint.as_ref() {
         Some(previous) => {
             if previous == &current {
@@ -134,9 +108,9 @@ fn observe(
         None => None,
     };
 
-    // The accelerated view answers the full side: it stands for everything
-    // the token names.
-    let full: UnionArchive<OrderedUniverse> = snapshot.collection(accelerated)?.view()?;
+    // The attached cover answers the full side: it stands for everything the
+    // token names.
+    let full: UnionArchive<OrderedUniverse> = attached.view()?;
     let titles = match changed {
         Some(changed) => changes(&full, &changed, &mut consume)?,
         None => rebuild(&full, &mut consume)?,
@@ -158,8 +132,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         AdmissionPolicy::direct(authority),
         AdmissionPolicy::direct(authority),
     );
-    let mut store = MemoryRepo::default();
-    let collection = store.collection(name, policy.clone())?;
+    // The store is opened as the key that maintains it: only its own MERGEs
+    // and MAPs are believed.
+    let mut store = MemoryRepo::for_host(authority);
+    let collection = store.collection(name, policy)?;
 
     let author = entity! {
         literature::firstname: "Frank",
@@ -176,14 +152,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         },
     )?;
 
-    let raw = store.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
-    let accelerated = store.derive::<Rank9AcceleratedSuccinctArchiveBlob>(raw, (), policy)?;
+    let raw = store.attach::<SuccinctArchiveBlob>(collection, ())?;
+    let accelerated = store.attach::<Rank9AcceleratedSuccinctArchiveBlob>(collection, raw)?;
     let mut checkpoint = None;
 
     let first = observe(
         &mut store,
         &signing_key,
-        collection,
         raw,
         accelerated,
         &mut checkpoint,
@@ -204,7 +179,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let failed = observe(
         &mut store,
         &signing_key,
-        collection,
         raw,
         accelerated,
         &mut checkpoint,
@@ -216,7 +190,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let retry = observe(
         &mut store,
         &signing_key,
-        collection,
         raw,
         accelerated,
         &mut checkpoint,
@@ -227,7 +200,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let unchanged = observe(
         &mut store,
         &signing_key,
-        collection,
         raw,
         accelerated,
         &mut checkpoint,

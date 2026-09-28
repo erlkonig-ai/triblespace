@@ -399,8 +399,8 @@ struct LatticeCollection {
     handle: [u8; 32],
     /// The name a root descriptor carries, when its bytes are here.
     name: Option<String>,
-    /// The collection this one derives from. `None` is what being a root
-    /// means; it is not a failure to read one.
+    /// The collection this one derives from, or the parent it is attached
+    /// to. `None` is what being a root means; it is not a failure to read one.
     source: Option<[u8; 32]>,
     /// Whether this collection's descriptor archive is resident and decodable
     /// in this observation.
@@ -498,7 +498,12 @@ fn observe_lattice<R: triblespace_core::repo::StoreRead>(
         let facts: Option<TribleSet> = snapshot.get(handle).ok();
         let source = facts
             .as_ref()
-            .and_then(|facts| descriptor::source(facts).ok().flatten())
+            .and_then(|facts| {
+                descriptor::source(facts)
+                    .ok()
+                    .flatten()
+                    .or_else(|| descriptor::parent(facts).ok().flatten())
+            })
             .map(|source| source.raw);
         let name = facts.as_ref().and_then(|facts| {
             let named = descriptor::name(facts).ok().flatten()?;
@@ -1524,20 +1529,18 @@ mod tests {
     use triblespace_core::prelude::*;
     use triblespace_net::telemetry::MetricValue;
 
-    /// A root collection with one commit, plus a derivation registered over it
-    /// that has never been maintained.
+    /// A root collection with one commit, plus an index attached to it that
+    /// has never been maintained.
     fn lattice_fixture() -> (MemoryRepo, CollectionHandle, CollectionHandle) {
         use triblespace_core::blob::encodings::succinctarchive::SuccinctArchiveBlob;
         let mut store = MemoryRepo::default();
         let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
-        let source: Collection<SimpleArchive> = store.collection("facts", policy.clone()).unwrap();
+        let source: Collection<SimpleArchive> = store.collection("facts", policy).unwrap();
         let signer = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
         store
             .commit(source, &signer, entity! { metadata::name: "first" })
             .unwrap();
-        let target = store
-            .derive::<SuccinctArchiveBlob>(source, (), policy)
-            .unwrap();
+        let target = store.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
         (store, source.handle(), target.handle())
     }
 
@@ -1583,8 +1586,8 @@ mod tests {
             .iter()
             .find(|collection| collection.handle == target.raw)
             .expect("a seeded handle is projected");
-        assert_eq!(derived.stored(), 0, "nothing has been derived yet");
-        assert_eq!(derived.derives, 0);
+        assert_eq!(derived.stored(), 0, "nothing has been attached yet");
+        assert_eq!(derived.maps, 0);
         assert!(derived.descriptor_resident, "its descriptor is right here");
     }
 

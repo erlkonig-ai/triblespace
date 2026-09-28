@@ -1,6 +1,8 @@
 //! The command schedules existing collection algebra; it does not introduce a
 //! second dependency or publication model. These fixtures deliberately register
-//! descriptors before publishing any equation for their targets.
+//! descriptors before publishing any record for their targets. The Succinct and
+//! Rank9 collections are attached to their root: the command's key is the host
+//! that maps them, so a reader opens the pile as that key to believe its MAPs.
 
 use assert_cmd::Command;
 use ed25519_dalek::SigningKey;
@@ -16,6 +18,7 @@ use triblespace_core::blob::encodings::succinctarchive::{
 use triblespace_core::collection::records::{
     collection_representation, CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
 };
+use triblespace_core::collection::AttachedSnapshot;
 use triblespace_core::collection::{
     AdmissionPolicy, Collection, CollectionPolicy, CollectionRead, CollectionRecord,
     CollectionSnapshotExt, CollectionStoreExt,
@@ -25,59 +28,6 @@ use triblespace_core::metadata;
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::{BlobStorePut, SnapshotSource};
 use triblespace_core::trible::TribleSet;
-
-/// The root commits a view stands for, following each root foundation up
-/// the view's descriptor chain through the leaves of every hop. Lattice v2
-/// supports are collection-local, so this is the only way a test can still
-/// say "this view stands for these commits".
-fn stood_for<R, E>(
-    view: &triblespace_core::collection::CollectionSnapshot<R, E>,
-) -> triblespace_core::collection::Support
-where
-    R: triblespace_core::repo::StoreRead,
-    E: triblespace_core::collection::CollectionEncoding,
-{
-    use triblespace_core::collection::{descriptor, Collection, SourceLocator};
-    use triblespace_core::inline::encodings::hash::Handle;
-    let snapshot = view.snapshot();
-    let mut chain = vec![view.cover().collection().handle()];
-    loop {
-        let facts: triblespace_core::trible::TribleSet =
-            snapshot.get(*chain.last().unwrap()).unwrap();
-        match descriptor::source(&facts).unwrap() {
-            Some(source) => chain.push(source),
-            None => break,
-        }
-    }
-    let root: Collection<triblespace_core::blob::encodings::simplearchive::SimpleArchive> =
-        Collection::open(snapshot, *chain.last().unwrap()).unwrap();
-    let scope: std::collections::BTreeSet<_> = chain.iter().copied().collect();
-    let coverage = snapshot.coverage(&scope).unwrap();
-    let top: std::collections::BTreeSet<[u8; 32]> = view
-        .support()
-        .unwrap()
-        .members()
-        .map(|member| member.raw)
-        .collect();
-    let (foundations, _) = coverage.frontier_support(root.handle());
-    root.cover(
-        foundations
-            .iter_ordered()
-            .filter(|raw| {
-                let mut images = std::collections::BTreeSet::from([**raw]);
-                for hop in chain.iter().rev().skip(1) {
-                    images = images
-                        .iter()
-                        .flat_map(|image| coverage.leaf_outputs(*hop, SourceLocator::of(*image)))
-                        .map(|output| output.raw)
-                        .collect();
-                }
-                images.iter().any(|image| top.contains(image))
-            })
-            .map(|raw| Handle::from_hash(triblespace_core::inline::Inline::new(*raw)))
-            .collect::<Vec<_>>(),
-    )
-}
 
 struct Fixture {
     _directory: TempDir,
@@ -101,11 +51,9 @@ impl Fixture {
         let mut pile = Pile::open(&path).unwrap();
         let policy = policy(&signer);
         let source = pile.collection("facts", policy.clone()).unwrap();
-        let succinct = pile
-            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-            .unwrap();
+        let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
         let rank9 = pile
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy.clone())
+            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
             .unwrap();
         let mut expected = TribleSet::new();
         for text in ["first fact", "other fact"] {
@@ -116,7 +64,7 @@ impl Fixture {
 
         let unrelated_source = pile.collection("not-selected", policy.clone()).unwrap();
         let unrelated = pile
-            .derive::<SuccinctArchiveBlob>(unrelated_source, (), policy)
+            .attach::<SuccinctArchiveBlob>(unrelated_source, ())
             .unwrap();
         pile.commit(
             unrelated_source,
@@ -147,6 +95,11 @@ impl Fixture {
             .arg("--key")
             .arg(&self.key);
         command
+    }
+
+    /// The pile opened as the command's key, whose MAPs are the ones believed.
+    fn open(&self) -> Pile {
+        Pile::open_as(&self.path, self.signer.verifying_key()).unwrap()
     }
 
     fn run(&self, verb: &str, targets: &[CollectionHandle]) -> Output {
@@ -183,6 +136,17 @@ fn policy(signer: &SigningKey) -> CollectionPolicy {
 
 fn handle_text(handle: CollectionHandle) -> String {
     format!("blake3:{}", hex::encode(handle.raw))
+}
+
+/// The facts an attached Rank9 read holds.
+fn facts<R: triblespace_core::repo::StoreRead>(
+    observed: &AttachedSnapshot<R, Rank9AcceleratedSuccinctArchiveBlob>,
+) -> TribleSet {
+    observed
+        .view::<UnionArchive<OrderedUniverse>>()
+        .unwrap()
+        .iter()
+        .collect()
 }
 
 fn records(path: &Path) -> Vec<CollectionRecord> {
@@ -275,13 +239,11 @@ fn entity_id_set_cli_projects_receipt_values_without_changing_source_records() {
     let derive = || {
         let mut command = trible();
         command
-            .args(["pile", "collection", "derive"])
+            .args(["pile", "collection", "attach"])
             .arg(&fixture.path)
             .arg(handle_text(source.handle()))
             .args(["entity-id-set", "--attribute"])
-            .arg(format!("{attribute:X}"))
-            .arg("--key")
-            .arg(&fixture.key);
+            .arg(format!("{attribute:X}"));
         let output = Command::from_std(command)
             .timeout(Duration::from_secs(30))
             .output()
@@ -328,7 +290,7 @@ fn entity_id_set_cli_projects_receipt_values_without_changing_source_records() {
             .collect::<Vec<_>>();
         assert!(target_records
             .iter()
-            .any(|record| matches!(record, CollectionRecord::Derive(_))));
+            .any(|record| matches!(record, CollectionRecord::Map(_))));
         assert!(target_records
             .iter()
             .all(|record| !matches!(record, CollectionRecord::Commit(_))));
@@ -336,15 +298,15 @@ fn entity_id_set_cli_projects_receipt_values_without_changing_source_records() {
             record.verify_strict().unwrap();
         }
         if let Some(previous) = &previous_records {
-            assert_eq!(&after, previous, "warm upkeep publishes no new equations");
+            assert_eq!(&after, previous, "warm upkeep publishes no new records");
         }
         previous_records = Some(after);
 
-        let mut pile = Pile::open(&fixture.path).unwrap();
+        let mut pile = fixture.open();
         let snapshot = pile.snapshot().unwrap();
         let target = Collection::<EntityIdSetBlob>::open(&snapshot, target_handle).unwrap();
         let facts: TribleSet = snapshot.get(target_handle).unwrap();
-        assert_eq!(descriptor::source(&facts).unwrap(), Some(source.handle()));
+        assert_eq!(descriptor::parent(&facts).unwrap(), Some(source.handle()));
         assert_eq!(
             descriptor::mapping_algorithm(&facts).unwrap(),
             Some(GENID_ATTRIBUTE_VALUES_MAPPING_V1)
@@ -353,7 +315,8 @@ fn entity_id_set_cli_projects_receipt_values_without_changing_source_records() {
             descriptor::mapping_argument(&facts, metadata::attribute.id()).unwrap(),
             Some(GenId::encode(attribute).raw)
         );
-        let observed = snapshot.collection(target).unwrap();
+        let observed = snapshot.attached(target).unwrap();
+        assert!(observed.residual().is_empty());
         let projected = observed.view::<EntityIdSet>().unwrap();
         assert_eq!(
             projected.iter().collect::<BTreeSet<_>>(),
@@ -388,13 +351,11 @@ fn entity_id_set_cli_uses_the_existing_attribute_argument_conventions() {
     let derive = |arguments: &[&str]| {
         let mut command = trible();
         command
-            .args(["pile", "collection", "derive"])
+            .args(["pile", "collection", "attach"])
             .arg(&fixture.path)
             .arg(handle_text(fixture.source.handle()))
             .arg("entity-id-set")
-            .args(arguments)
-            .arg("--key")
-            .arg(&fixture.key);
+            .args(arguments);
         Command::from_std(command)
             .timeout(Duration::from_secs(30))
             .output()
@@ -437,7 +398,7 @@ fn entity_id_set_cli_uses_the_existing_attribute_argument_conventions() {
             .unwrap(),
     );
     assert_success(&fixture.run("maintain-all", &[target_handle]));
-    let mut pile = Pile::open(&fixture.path).unwrap();
+    let mut pile = fixture.open();
     let snapshot = pile.snapshot().unwrap();
     let target = Collection::<EntityIdSetBlob>::open(&snapshot, target_handle).unwrap();
     let facts: TribleSet = snapshot.get(target_handle).unwrap();
@@ -445,14 +406,12 @@ fn entity_id_set_cli_uses_the_existing_attribute_argument_conventions() {
         descriptor::mapping_argument(&facts, metadata::attribute.id()).unwrap(),
         Some(GenId::encode(attribute).raw)
     );
-    let observed = snapshot.collection(target).unwrap();
-    // Both source commits have their leaf, and both leaves are the same
-    // empty image: the view's own support is that one image.
-    assert!(observed
-        .missing_from(&snapshot.collection(fixture.source).unwrap())
-        .unwrap()
-        .is_empty());
-    assert_eq!(observed.support().unwrap().len(), 1);
+    let observed = snapshot.attached(target).unwrap();
+    // Both source commits are attached, and both attachments are the same
+    // empty image: the cover is that one image, standing for both commits.
+    assert!(observed.residual().is_empty());
+    assert_eq!(observed.cover().len(), 1);
+    assert_eq!(observed.support().len(), 2);
     assert!(observed.view::<EntityIdSet>().unwrap().is_empty());
     drop(observed);
     drop(snapshot);
@@ -550,22 +509,23 @@ fn maintain_is_one_edge_and_accepts_descriptor_only_targets() {
     let raw_records = records(&fixture.path);
     assert!(raw_records.iter().any(|record| matches!(
         record,
-        CollectionRecord::Derive(record) if record.collection() == fixture.succinct.handle()
+        CollectionRecord::Map(record) if record.collection() == fixture.succinct.handle()
     )));
     assert!(raw_records
         .iter()
         .all(|record| record.collection() != fixture.rank9.handle()));
 
     assert_success(&fixture.run("maintain", &[fixture.rank9.handle()]));
-    let mut pile = Pile::open(&fixture.path).unwrap();
+    let mut pile = fixture.open();
     let snapshot = pile.snapshot().unwrap();
-    let observed = snapshot.collection(fixture.rank9).unwrap();
+    let observed = snapshot.attached(fixture.rank9).unwrap();
     assert_eq!(
-        stood_for(&observed),
-        fixture.source.admitted(&snapshot).unwrap()
+        observed.support(),
+        &fixture.source.admitted(&snapshot).unwrap()
     );
-    let facts = observed.view::<UnionArchive<OrderedUniverse>>().unwrap();
-    assert_eq!(facts.iter().collect::<TribleSet>(), fixture.expected);
+    assert_eq!(facts(&observed), fixture.expected);
+    drop(observed);
+    drop(snapshot);
     pile.close().unwrap();
 }
 
@@ -609,52 +569,43 @@ fn maintain_all_follows_dependencies_and_leaves_the_unrelated_root_alone() {
     }
     assert!(before.iter().all(|record| after.contains(record)));
 
-    let mut pile = Pile::open(&fixture.path).unwrap();
+    let mut pile = fixture.open();
     let snapshot = pile.snapshot().unwrap();
     let support = fixture.source.admitted(&snapshot).unwrap();
-    // A derived collection has no carry of its own, and its source has no
-    // merge to mirror: each view holds one leaf per commit.
+    // Two commits sit below the fan-in, so the carry merges nothing: each
+    // attached collection holds one attachment per commit.
     for len in [
-        snapshot.collection(fixture.succinct).unwrap().cover().len(),
-        snapshot.collection(fixture.rank9).unwrap().cover().len(),
+        snapshot.attached(fixture.succinct).unwrap().cover().len(),
+        snapshot.attached(fixture.rank9).unwrap().cover().len(),
     ] {
-        assert_eq!(len, 2, "one leaf per commit, nothing merged");
+        assert_eq!(len, 2, "one attachment per commit, nothing merged");
     }
-    let observed = snapshot.collection(fixture.rank9).unwrap();
-    assert_eq!(stood_for(&observed), support);
+    let observed = snapshot.attached(fixture.rank9).unwrap();
+    assert_eq!(observed.support(), &support);
     assert_eq!(support.len(), 2);
-    let facts = observed.view::<UnionArchive<OrderedUniverse>>().unwrap();
-    assert_eq!(facts.iter().collect::<TribleSet>(), fixture.expected);
+    assert_eq!(facts(&observed), fixture.expected);
+    drop(observed);
+    drop(snapshot);
     pile.close().unwrap();
 
     let bytes = std::fs::metadata(&fixture.path).unwrap().len();
     assert_success(&fixture.run("maintain-all", &[fixture.rank9.handle()]));
-    assert_eq!(
-        records(&fixture.path),
-        after,
-        "a warm pass adds no equations"
-    );
+    assert_eq!(records(&fixture.path), after, "a warm pass adds no records");
     assert_eq!(std::fs::metadata(&fixture.path).unwrap().len(), bytes);
 }
 
 #[test]
 fn maintain_all_schedules_a_shared_upstream_once() {
+    use triblespace_core::blob::encodings::entity_id_set::EntityIdSetBlob;
+
     let fixture = Fixture::new();
     let mut pile = Pile::open(&fixture.path).unwrap();
-    // A distinct READ policy gives the second target its own descriptor while
-    // keeping the same writable source and the same deterministic mapping.
+    // A second collection attached to the same root: the root is upstream of
+    // both it and the pair, and Succinct is upstream of Rank9.
     let second = pile
-        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(
-            fixture.succinct,
-            (),
-            CollectionPolicy::new(
-                AdmissionPolicy::Open,
-                AdmissionPolicy::direct(fixture.signer.verifying_key()),
-            ),
-        )
+        .attach::<EntityIdSetBlob>(fixture.source, metadata::supersedes.id())
         .unwrap();
     pile.close().unwrap();
-    assert_ne!(fixture.rank9.handle(), second.handle());
 
     let output = fixture.run(
         "maintain-all",
@@ -674,28 +625,30 @@ fn maintain_all_schedules_a_shared_upstream_once() {
         "shared dependencies and explicit targets run once"
     );
     assert_eq!(order[0], handle_text(fixture.source.handle()));
-    assert_eq!(order[1], handle_text(fixture.succinct.handle()));
-    assert_eq!(
-        order[2..].iter().cloned().collect::<BTreeSet<_>>(),
-        [fixture.rank9.handle(), second.handle()]
-            .into_iter()
-            .map(handle_text)
-            .collect(),
-        "both downstream targets follow their shared source",
+    let position = |handle: CollectionHandle| {
+        order
+            .iter()
+            .position(|scheduled| *scheduled == handle_text(handle))
+            .unwrap()
+    };
+    assert!(
+        position(fixture.succinct.handle()) < position(fixture.rank9.handle()),
+        "Rank9 follows the Succinct collection it reads"
     );
+    assert!(order.contains(&handle_text(second.handle())));
     let stdout = String::from_utf8(output.stdout).unwrap();
     let upstream = format!("maintained {} ", handle_text(fixture.succinct.handle()));
     assert_eq!(stdout.matches(&upstream).count(), 1, "{stdout}");
 
-    let mut pile = Pile::open(&fixture.path).unwrap();
+    let mut pile = fixture.open();
     let snapshot = pile.snapshot().unwrap();
     let support = fixture.source.admitted(&snapshot).unwrap();
-    for target in [fixture.rank9, second] {
-        let observed = snapshot.collection(target).unwrap();
-        assert_eq!(stood_for(&observed), support);
-        let facts = observed.view::<UnionArchive<OrderedUniverse>>().unwrap();
-        assert_eq!(facts.iter().collect::<TribleSet>(), fixture.expected);
-    }
+    let observed = snapshot.attached(fixture.rank9).unwrap();
+    assert_eq!(observed.support(), &support);
+    assert_eq!(facts(&observed), fixture.expected);
+    assert_eq!(snapshot.attached(second).unwrap().support(), &support);
+    drop(observed);
+    drop(snapshot);
     pile.close().unwrap();
 }
 
@@ -733,33 +686,45 @@ fn maintain_all_carries_a_reached_root_once_before_its_views() {
             "select_root = {select_root}"
         );
         let after = records(&fixture.path);
-        for collection in [
-            fixture.source.handle(),
-            fixture.succinct.handle(),
-            fixture.rank9.handle(),
-        ] {
+        let merges = |collection: CollectionHandle| {
+            after
+                .iter()
+                .filter(|record| {
+                    matches!(
+                        record,
+                        CollectionRecord::Merge(record) if record.collection() == collection
+                    )
+                })
+                .count()
+        };
+        assert_eq!(
+            merges(fixture.source.handle()),
+            1,
+            "the root's one carry (select_root = {select_root})"
+        );
+        for collection in [fixture.succinct.handle(), fixture.rank9.handle()] {
+            assert_eq!(merges(collection), 0, "an attached collection has no carry");
             assert_eq!(
                 after
                     .iter()
                     .filter(|record| matches!(
                         record,
-                        CollectionRecord::Merge(record) if record.collection() == collection
+                        CollectionRecord::Map(record) if record.collection() == collection
                     ))
                     .count(),
                 1,
-                "the root's one carry, and its mirror in each view (select_root = {select_root})"
+                "only the merged node is attached (select_root = {select_root})"
             );
         }
-        let mut pile = Pile::open(&fixture.path).unwrap();
+        let mut pile = fixture.open();
         let snapshot = pile.snapshot().unwrap();
-        let observed = snapshot.collection(fixture.rank9).unwrap();
+        let observed = snapshot.attached(fixture.rank9).unwrap();
         assert_eq!(observed.cover().len(), 1);
         assert_eq!(
-            stood_for(&observed),
-            fixture.source.admitted(&snapshot).unwrap()
+            observed.support(),
+            &fixture.source.admitted(&snapshot).unwrap()
         );
-        let facts = observed.view::<UnionArchive<OrderedUniverse>>().unwrap();
-        assert_eq!(facts.iter().collect::<TribleSet>(), expected);
+        assert_eq!(facts(&observed), expected);
         drop(observed);
         drop(snapshot);
         pile.close().unwrap();
@@ -783,30 +748,15 @@ fn one_failed_target_does_not_prevent_independent_targets_from_advancing() {
                 pile.put::<SimpleArchive, _>(descriptor.facts().clone())
                     .unwrap()
             } else {
-                let other = SigningKey::from_bytes(&[81; 32]);
-                // The command's key writes this source, so the target's leaf
-                // for its commit is the key's to derive.
-                let source = pile
-                    .collection("own source, foreign target", policy(&fixture.signer))
+                // An attached collection whose parent this pile has never
+                // held: nothing can open its lineage.
+                let mut elsewhere = triblespace_core::repo::memoryrepo::MemoryRepo::default();
+                let absent = elsewhere
+                    .collection("a root this pile never held", policy(&fixture.signer))
                     .unwrap();
-                pile.commit(
-                    source,
-                    &fixture.signer,
-                    entity! { metadata::description: "own fact" },
-                )
-                .unwrap();
-                // The command's key can READ this target, but cannot sign new
-                // derivations which satisfy its independent WRITE policy.
-                pile.derive::<SuccinctArchiveBlob>(
-                    source,
-                    (),
-                    CollectionPolicy::new(
-                        AdmissionPolicy::direct(fixture.signer.verifying_key()),
-                        AdmissionPolicy::direct(other.verifying_key()),
-                    ),
-                )
-                .unwrap()
-                .handle()
+                pile.attach::<SuccinctArchiveBlob>(absent, ())
+                    .unwrap()
+                    .handle()
             };
             pile.close().unwrap();
 
@@ -820,27 +770,28 @@ fn one_failed_target_does_not_prevent_independent_targets_from_advancing() {
             assert!(after.iter().all(|record| record.collection() != bad_target));
             assert!(after.iter().any(|record| matches!(
                 record,
-                CollectionRecord::Derive(record) if record.collection() == fixture.succinct.handle()
+                CollectionRecord::Map(record) if record.collection() == fixture.succinct.handle()
             )));
-            let mut pile = Pile::open(&fixture.path).unwrap();
+            let mut pile = fixture.open();
             let snapshot = pile.snapshot().unwrap();
-            let observed = snapshot.collection(fixture.succinct).unwrap();
+            let observed = snapshot.attached(fixture.succinct).unwrap();
             let facts = observed.view::<UnionArchive<OrderedUniverse>>().unwrap();
             assert_eq!(facts.iter().collect::<TribleSet>(), fixture.expected);
+            drop((facts, observed, snapshot));
             pile.close().unwrap();
         }
     }
 }
 
 #[test]
-fn failed_upstream_upkeep_does_not_suppress_available_downstream_work() {
+fn an_upstream_node_left_unattached_does_not_suppress_available_downstream_work() {
     use triblespace_core::blob::IntoBlob;
     use triblespace_core::collection::records::CollectionCommit;
     use triblespace_core::collection::{empty_metadata_handle, CollectionStore};
     use triblespace_core::inline::encodings::hash::Handle;
 
     let fixture = Fixture::new();
-    let mut pile = Pile::open(&fixture.path).unwrap();
+    let mut pile = fixture.open();
     // A source of our own, so the upstream can be seeded on its first commit
     // and then left behind by a second one.
     let source = pile.collection("staged", policy(&fixture.signer)).unwrap();
@@ -850,50 +801,45 @@ fn failed_upstream_upkeep_does_not_suppress_available_downstream_work() {
         entity! { metadata::description: "first fact" },
     )
     .unwrap();
-    let succinct = pile
-        .derive::<SuccinctArchiveBlob>(source, (), policy(&fixture.signer))
-        .unwrap();
+    let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
     let rank9 = pile
-        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy(&fixture.signer))
+        .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
         .unwrap();
     let seeded = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap()
-        .block_on(pile.ensure(succinct, &fixture.signer))
+        .block_on(pile.ensure_attached(succinct, &fixture.signer))
         .unwrap();
     let first = source.admitted(&seeded).unwrap();
     assert_eq!(first.len(), 1);
-    let available = seeded.collection(succinct).unwrap();
-    assert_eq!(stood_for(&available), first);
+    let available = seeded.attached(succinct).unwrap();
+    assert_eq!(available.support(), &first);
     let expected = available
         .view::<UnionArchive<OrderedUniverse>>()
         .unwrap()
         .iter()
         .collect::<TribleSet>();
-    assert!(seeded
-        .collection(rank9)
-        .unwrap()
-        .support()
-        .unwrap()
-        .is_empty());
-    // The second commit leaves the upstream behind: it is the key's own, so
-    // its leaf is the key's to derive, but its payload is not here and
-    // nothing can hand it over. Deriving it fails; nothing else has to.
+    assert!(seeded.attached(rank9).unwrap().support().is_empty());
+    drop((available, seeded));
+    // The second commit's payload is not here and nothing hands it over:
+    // no collection can attach it, and maintenance fetches nothing for it.
     let cold: triblespace_core::blob::Blob<SimpleArchive> =
         entity! { metadata::description: "a fact whose payload never arrives" }
             .facts()
             .clone()
             .to_blob();
+    let cold = Handle::<SimpleArchive>::to_hash(cold.get_handle());
     pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
         &fixture.signer,
         source.handle(),
-        Handle::<SimpleArchive>::to_hash(cold.get_handle()),
+        cold,
         empty_metadata_handle(),
     )))
     .unwrap();
     let snapshot = pile.snapshot().unwrap();
     let all = source.admitted(&snapshot).unwrap();
     assert_eq!(all.len(), 2);
+    drop(snapshot);
     pile.close().unwrap();
     let upstream_before = records(&fixture.path)
         .into_iter()
@@ -901,17 +847,7 @@ fn failed_upstream_upkeep_does_not_suppress_available_downstream_work() {
         .collect::<Vec<_>>();
 
     let output = fixture.run("maintain-all", &[rank9.handle()]);
-    assert!(
-        !output.status.success(),
-        "the failed upstream work is reported\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("have no leaf the mapping can represent"),
-        "{stderr}"
-    );
+    assert_success(&output);
     let after = records(&fixture.path);
     assert_eq!(
         after
@@ -920,34 +856,41 @@ fn failed_upstream_upkeep_does_not_suppress_available_downstream_work() {
             .filter(|record| record.collection() == succinct.handle())
             .collect::<Vec<_>>(),
         upstream_before,
-        "the upstream publishes nothing it cannot derive",
+        "the upstream attaches nothing it does not hold",
     );
     let downstream = after
         .iter()
         .filter(|record| record.collection() == rank9.handle())
         .collect::<Vec<_>>();
     assert_eq!(downstream.len(), 1);
-    assert!(matches!(downstream[0], CollectionRecord::Derive(_)));
+    assert!(matches!(downstream[0], CollectionRecord::Map(_)));
     downstream[0].verify_strict().unwrap();
     assert_eq!(
         downstream[0].public_key().raw,
         fixture.signer.verifying_key().to_bytes(),
     );
 
-    let mut pile = Pile::open(&fixture.path).unwrap();
+    let mut pile = fixture.open();
     let snapshot = pile.snapshot().unwrap();
     assert_eq!(source.admitted(&snapshot).unwrap(), all);
-    // The upstream still stands on what it had; the downstream now stands on
-    // everything its source realized, which is that same first commit.
-    assert_eq!(stood_for(&snapshot.collection(succinct).unwrap()), first);
-    let available = snapshot.collection(rank9).unwrap();
-    assert_eq!(stood_for(&available), first);
-    assert!(available
-        .missing_from(&snapshot.collection(succinct).unwrap())
-        .unwrap()
-        .is_empty());
-    let facts = available.view::<UnionArchive<OrderedUniverse>>().unwrap();
-    assert_eq!(facts.iter().collect::<TribleSet>(), expected);
+    // Both stand on the first commit; the cold one is their residual.
+    for (support, residual) in [
+        {
+            let read = snapshot.attached(succinct).unwrap();
+            (read.support().clone(), read.residual().clone())
+        },
+        {
+            let read = snapshot.attached(rank9).unwrap();
+            (read.support().clone(), read.residual().clone())
+        },
+    ] {
+        assert_eq!(support, first);
+        assert_eq!(residual.len(), 1);
+        assert!(residual.contains(Handle::<SimpleArchive>::from_hash(cold)));
+    }
+    let available = snapshot.attached(rank9).unwrap();
+    assert_eq!(facts(&available), expected);
+    drop((available, snapshot));
     pile.close().unwrap();
 }
 
@@ -955,7 +898,7 @@ fn failed_upstream_upkeep_does_not_suppress_available_downstream_work() {
 #[test]
 fn bm25_search_without_selected_snippets_does_not_load_source_payloads() {
     use triblespace_core::blob::{Blob, IntoBlob};
-    use triblespace_core::collection::records::{CollectionCommit, CollectionDerive};
+    use triblespace_core::collection::records::{CollectionCommit, CollectionMap};
     use triblespace_core::collection::CollectionStore;
     use triblespace_core::inline::encodings::genid::GenId;
     use triblespace_core::inline::encodings::hash::Handle;
@@ -968,13 +911,12 @@ fn bm25_search_without_selected_snippets_does_not_load_source_payloads() {
     let fixture = Fixture::new();
     let mut pile = Pile::open(&fixture.path).unwrap();
     let index = pile
-        .derive::<PortableBM25Blob>(
+        .attach::<PortableBM25Blob>(
             fixture.source,
             TextAttributeToBm25 {
                 attribute: metadata::description.id(),
                 tokenizer: Bm25Tokenizer::Word,
             },
-            policy(&fixture.signer),
         )
         .unwrap();
     let cold = entity! { metadata::description: "cold" };
@@ -997,10 +939,10 @@ fn bm25_search_without_selected_snippets_does_not_load_source_payloads() {
     )
     .unwrap();
     let output = pile.put::<PortableBM25Blob, _>(carrier).unwrap();
-    pile.insert(CollectionRecord::Derive(CollectionDerive::sign(
+    pile.insert(CollectionRecord::Map(CollectionMap::sign(
         &fixture.signer,
         index.handle(),
-        triblespace_core::collection::SourceLocator::of(commit.data().raw),
+        commit.data(),
         Handle::<PortableBM25Blob>::to_hash(output),
     )))
     .unwrap();
@@ -1024,7 +966,9 @@ fn bm25_search_without_selected_snippets_does_not_load_source_payloads() {
             .args(["pile", "collection", "search"])
             .arg(&fixture.path)
             .arg(handle_text(index.handle()))
-            .args(&args);
+            .args(&args)
+            .arg("--key")
+            .arg(&fixture.key);
         let output = Command::from_std(command)
             .timeout(Duration::from_secs(30))
             .output()
@@ -1051,19 +995,18 @@ fn search_reads_existing_bm25_support_and_snippets_after_source_growth() {
     let fixture = Fixture::new();
     let mut pile = Pile::open(&fixture.path).unwrap();
     let index = pile
-        .derive::<PortableBM25Blob>(
+        .attach::<PortableBM25Blob>(
             fixture.source,
             TextAttributeToBm25 {
                 attribute: metadata::description.id(),
                 tokenizer: Bm25Tokenizer::Word,
             },
-            policy(&fixture.signer),
         )
         .unwrap();
     pile.close().unwrap();
     assert_success(&fixture.run("maintain", &[index.handle()]));
 
-    let mut writer = Pile::open(&fixture.path).unwrap();
+    let mut writer = fixture.open();
     writer
         .commit(
             fixture.source,
@@ -1073,10 +1016,10 @@ fn search_reads_existing_bm25_support_and_snippets_after_source_growth() {
         .unwrap();
     let snapshot = writer.snapshot().unwrap();
     assert_eq!(fixture.source.admitted(&snapshot).unwrap().len(), 3);
-    assert_eq!(
-        snapshot.collection(index).unwrap().support().unwrap().len(),
-        2
-    );
+    let attached = snapshot.attached(index).unwrap();
+    assert_eq!(attached.support().len(), 2);
+    assert_eq!(attached.residual().len(), 1);
+    drop(attached);
     writer.close().unwrap();
     let before = records(&fixture.path);
     let bytes = std::fs::metadata(&fixture.path).unwrap().len();
@@ -1086,7 +1029,9 @@ fn search_reads_existing_bm25_support_and_snippets_after_source_growth() {
         .args(["pile", "collection", "search"])
         .arg(&fixture.path)
         .arg(handle_text(index.handle()))
-        .args(["first", "--snippet"]);
+        .args(["first", "--snippet"])
+        .arg("--key")
+        .arg(&fixture.key);
     let output = Command::from_std(command)
         .timeout(Duration::from_secs(30))
         .output()
@@ -1188,15 +1133,16 @@ fn watch_follows_an_external_append_and_closes(verb: &str, signal: &str) {
                 "watch exited early: {}",
                 std::fs::read_to_string(log).unwrap(),
             );
-            let mut pile = Pile::open(&fixture.path).unwrap();
+            let mut pile = fixture.open();
             let snapshot = pile.snapshot().unwrap();
-            let observed = snapshot.collection(fixture.rank9).unwrap();
-            if observed.support().unwrap().len() == count {
-                let facts = observed.view::<UnionArchive<OrderedUniverse>>().unwrap();
-                assert_eq!(facts.iter().collect::<TribleSet>(), fixture.expected);
+            let observed = snapshot.attached(fixture.rank9).unwrap();
+            if observed.support().len() == count {
+                assert_eq!(facts(&observed), fixture.expected);
+                drop((observed, snapshot));
                 pile.close().unwrap();
                 return;
             }
+            drop((observed, snapshot));
             pile.close().unwrap();
             assert!(
                 Instant::now() < deadline,
@@ -1261,13 +1207,10 @@ fn watch_follows_an_external_append_and_closes(verb: &str, signal: &str) {
         !log.contains("Pile dropped without calling close()"),
         "{log}"
     );
-    let mut pile = Pile::open(&fixture.path).unwrap();
+    let mut pile = fixture.open();
     let snapshot = pile.snapshot().unwrap();
-    let facts = snapshot
-        .collection(fixture.rank9)
-        .unwrap()
-        .view::<UnionArchive<OrderedUniverse>>()
-        .unwrap();
-    assert_eq!(facts.iter().collect::<TribleSet>(), fixture.expected);
+    let observed = snapshot.attached(fixture.rank9).unwrap();
+    assert_eq!(facts(&observed), fixture.expected);
+    drop((observed, snapshot));
     pile.close().unwrap();
 }

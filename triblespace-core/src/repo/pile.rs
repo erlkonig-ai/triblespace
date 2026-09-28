@@ -12802,7 +12802,6 @@ mod tests {
     /// successor lacks refuses the rewrite instead.
     #[test]
     fn a_drained_generation_and_its_derivations_are_left_behind_by_rewrite() {
-        use crate::blob::encodings::succinctarchive::SuccinctArchiveBlob;
         use crate::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
 
         let dir = tempfile::tempdir().unwrap();
@@ -12820,7 +12819,7 @@ mod tests {
         let new = source.collection("gen", policy(&other)).unwrap();
         assert_ne!(old.handle(), new.handle());
         let derived = source
-            .derive::<SuccinctArchiveBlob>(old, (), policy(&key))
+            .derive::<crate::collection::test_support::TestImage>(old, (), policy(&key))
             .unwrap();
         let data = [collection_test_hash(1), collection_test_hash(2)];
         for member in data {

@@ -6,16 +6,14 @@ use std::sync::{Arc, Mutex};
 use ed25519_dalek::SigningKey;
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
-use crate::blob::encodings::succinctarchive::{
-    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
-};
 use crate::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
 use crate::capability::{CapabilityProof, CapabilityProofId};
+use crate::collection::test_support::{TestImage, TestImageTwo};
 use crate::collection::{
-    descriptor, read_capability, succinctarchive_union, write_capability, AdmissionPolicy,
-    Collection, CollectionCommit, CollectionData, CollectionDerivation, CollectionDerive,
-    CollectionMerge, CollectionPolicy, CollectionRead, CollectionRecord, CollectionRecordSelector,
-    CollectionSnapshotExt, CollectionStore, CollectionStoreExt,
+    descriptor, read_capability, write_capability, AdmissionPolicy, Collection, CollectionCommit,
+    CollectionData, CollectionDerive, CollectionMerge, CollectionPolicy, CollectionRead,
+    CollectionRecord, CollectionRecordSelector, CollectionSnapshotExt, CollectionStore,
+    CollectionStoreExt,
 };
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
@@ -56,11 +54,11 @@ struct OneHop {
     store: MemoryRepo,
     source_descriptor: Fragment,
     source: Collection<SimpleArchive>,
-    target: Collection<SuccinctArchiveBlob>,
+    target: Collection<TestImage>,
     source_blob: Blob<SimpleArchive>,
     metadata: Blob<SimpleArchive>,
     commit: CollectionCommit,
-    output: Blob<SuccinctArchiveBlob>,
+    output: Blob<TestImage>,
     equation: CollectionRecord,
     source_owner: SigningKey,
     producer: SigningKey,
@@ -75,7 +73,7 @@ fn one_hop() -> OneHop {
     // The producer maintains the view, so its merges are the ones believed.
     let mut store = MemoryRepo::for_host(producer.verifying_key());
     let target = store
-        .derive::<SuccinctArchiveBlob>(source, (), policy(&producer))
+        .derive::<TestImage>(source, (), policy(&producer))
         .unwrap();
     let source_blob = facts(1, 21).to_blob();
     let metadata = facts(2, 22).to_blob();
@@ -85,8 +83,8 @@ fn one_hop() -> OneHop {
         data(&source_blob),
         metadata.get_handle(),
     );
-    let output = succinctarchive_union::derive_element(&source_blob).unwrap();
-    store.put::<SuccinctArchiveBlob, _>(output.clone()).unwrap();
+    let output = TestImage::image(&source_blob);
+    store.put::<TestImage, _>(output.clone()).unwrap();
     let equation = CollectionRecord::Derive(CollectionDerive::sign(
         &producer,
         target.handle(),
@@ -312,8 +310,8 @@ fn target_reads_its_own_leaf_from_the_index_whatever_its_source_holds() {
         observed.support().unwrap().members().collect::<Vec<_>>(),
         [fixture.output.get_handle()]
     );
-    let view: UnionArchive<OrderedUniverse> = observed.view().unwrap();
-    assert_eq!(view.iter().collect::<TribleSet>(), facts(1, 21));
+    let view: TribleSet = observed.view().unwrap();
+    assert_eq!(view, facts(1, 21));
     before.assert_no_record_enumeration();
     before.assert_not_loaded(data(&fixture.source_blob));
     before.assert_not_loaded(data(&fixture.metadata));
@@ -345,8 +343,8 @@ fn target_reads_its_own_leaf_from_the_index_whatever_its_source_holds() {
         complete.cover().members().collect::<Vec<_>>(),
         [fixture.output.get_handle()]
     );
-    let view: UnionArchive<OrderedUniverse> = complete.view().unwrap();
-    assert_eq!(view.iter().collect::<TribleSet>(), facts(1, 21));
+    let view: TribleSet = complete.view().unwrap();
+    assert_eq!(view, facts(1, 21));
     let support = &crate::collection::test_support::stood_for(&complete);
     assert_eq!(support.collection(), fixture.source);
     assert_eq!(support.len(), 1);
@@ -380,11 +378,8 @@ fn unauthorized_target_producers_neither_admit_outputs_nor_hide_authorized_input
         data(&other_source),
         fixture.metadata.get_handle(),
     );
-    let wrong = succinctarchive_union::derive_element(&other_source).unwrap();
-    fixture
-        .store
-        .put::<SuccinctArchiveBlob, _>(wrong.clone())
-        .unwrap();
+    let wrong = TestImage::image(&other_source);
+    fixture.store.put::<TestImage, _>(wrong.clone()).unwrap();
     fixture
         .store
         .insert(CollectionRecord::Derive(CollectionDerive::sign(
@@ -414,14 +409,7 @@ fn unauthorized_target_producers_neither_admit_outputs_nor_hide_authorized_input
         observed.cover().members().collect::<Vec<_>>(),
         [fixture.output.get_handle()]
     );
-    assert_eq!(
-        observed
-            .view::<UnionArchive<OrderedUniverse>>()
-            .unwrap()
-            .iter()
-            .collect::<TribleSet>(),
-        facts(1, 21)
-    );
+    assert_eq!(observed.view::<TribleSet>().unwrap(), facts(1, 21));
     assert_eq!(snapshot.proofs().unwrap().count(), 0);
 }
 
@@ -441,10 +429,10 @@ fn absent_target_parent_is_read_through_its_resident_merge_inputs() {
         .store
         .insert(CollectionRecord::Commit(other_commit))
         .unwrap();
-    let other_output = succinctarchive_union::derive_element(&other_source).unwrap();
+    let other_output = TestImage::image(&other_source);
     fixture
         .store
-        .put::<SuccinctArchiveBlob, _>(other_output.clone())
+        .put::<TestImage, _>(other_output.clone())
         .unwrap();
     let other_equation = CollectionRecord::Derive(CollectionDerive::sign(
         &fixture.producer,
@@ -455,7 +443,7 @@ fn absent_target_parent_is_read_through_its_resident_merge_inputs() {
     fixture.store.insert(other_equation).unwrap();
     let mut union = facts(1, 21);
     union.union(facts(3, 23));
-    let union_blob = succinctarchive_union::derive_element(&union.clone().to_blob()).unwrap();
+    let union_blob = TestImage::image(&union.clone().to_blob());
     // The parent's record is here; its bytes are not. The frontier is the
     // parent alone, and the read descends through the MERGE that produced
     // it to the two resident images beneath.
@@ -482,18 +470,11 @@ fn absent_target_parent_is_read_through_its_resident_merge_inputs() {
     assert!(before.cover().contains(fixture.output.get_handle()));
     assert!(before.cover().contains(other_output.get_handle()));
     assert_eq!(crate::collection::test_support::stood_for(&before), both);
-    assert_eq!(
-        before
-            .view::<UnionArchive<OrderedUniverse>>()
-            .unwrap()
-            .iter()
-            .collect::<TribleSet>(),
-        union
-    );
+    assert_eq!(before.view::<TribleSet>().unwrap(), union);
 
     fixture
         .store
-        .put::<SuccinctArchiveBlob, _>(union_blob.clone())
+        .put::<TestImage, _>(union_blob.clone())
         .unwrap();
     let after = fixture
         .store
@@ -506,23 +487,9 @@ fn absent_target_parent_is_read_through_its_resident_merge_inputs() {
         [union_blob.get_handle()]
     );
     assert_eq!(crate::collection::test_support::stood_for(&after), both);
-    assert_eq!(
-        after
-            .view::<UnionArchive<OrderedUniverse>>()
-            .unwrap()
-            .iter()
-            .collect::<TribleSet>(),
-        union
-    );
+    assert_eq!(after.view::<TribleSet>().unwrap(), union);
     assert_eq!(before.cover().len(), 2);
-    assert_eq!(
-        before
-            .view::<UnionArchive<OrderedUniverse>>()
-            .unwrap()
-            .iter()
-            .collect::<TribleSet>(),
-        union
-    );
+    assert_eq!(before.view::<TribleSet>().unwrap(), union);
 }
 
 #[test]
@@ -546,12 +513,7 @@ fn direct_commit_in_a_derived_target_does_not_become_foundational_membership() {
         .unwrap();
     assert!(before.cover().is_empty());
     assert!(before.support().unwrap().is_empty());
-    assert!(before
-        .view::<UnionArchive<OrderedUniverse>>()
-        .unwrap()
-        .iter()
-        .next()
-        .is_none());
+    assert!(before.view::<TribleSet>().unwrap().is_empty());
     fixture.store.insert(fixture.equation).unwrap();
     let after = fixture
         .store
@@ -571,23 +533,15 @@ fn direct_commit_in_a_derived_target_does_not_become_foundational_membership() {
 fn second_hop(
     fixture: &mut OneHop,
     final_owner: &SigningKey,
-) -> (
-    Collection<Rank9AcceleratedSuccinctArchiveBlob>,
-    Blob<Rank9AcceleratedSuccinctArchiveBlob>,
-) {
+) -> (Collection<TestImageTwo>, Blob<TestImageTwo>) {
     let final_target = fixture
         .store
-        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(fixture.target, (), policy(final_owner))
+        .derive::<TestImageTwo>(fixture.target, (), policy(final_owner))
         .unwrap();
-    let accelerated = Rank9AcceleratedSuccinctArchiveBlob::map(
-        &(),
-        &fixture.output,
-        &fixture.store.snapshot().unwrap(),
-    )
-    .unwrap();
+    let accelerated = TestImageTwo::image(&fixture.output);
     fixture
         .store
-        .put::<Rank9AcceleratedSuccinctArchiveBlob, _>(accelerated.clone())
+        .put::<TestImageTwo, _>(accelerated.clone())
         .unwrap();
     fixture
         .store
@@ -628,8 +582,8 @@ fn multihop_read_takes_cover_and_support_from_the_index_without_payload_reads() 
         observed.cover().members().collect::<Vec<_>>(),
         [accelerated.get_handle()]
     );
-    let view: UnionArchive<OrderedUniverse> = observed.view().unwrap();
-    assert_eq!(view.iter().collect::<TribleSet>(), facts(1, 21));
+    let view: TribleSet = observed.view().unwrap();
+    assert_eq!(view, facts(1, 21));
     snapshot.assert_no_record_enumeration();
     snapshot.assert_not_loaded(data(&fixture.source_blob));
     snapshot.assert_not_loaded(data(&fixture.metadata));
@@ -704,14 +658,7 @@ fn multihop_read_stands_on_its_own_writer_above_an_unadmitted_ancestor() {
         observed.support().unwrap().members().collect::<Vec<_>>(),
         [accelerated.get_handle()]
     );
-    assert_eq!(
-        observed
-            .view::<UnionArchive<OrderedUniverse>>()
-            .unwrap()
-            .iter()
-            .collect::<TribleSet>(),
-        facts(1, 21)
-    );
+    assert_eq!(observed.view::<TribleSet>().unwrap(), facts(1, 21));
     // Nothing walked the chain to read it: no enumeration, no root payload.
     snapshot.assert_no_record_enumeration();
     snapshot.assert_not_loaded(data(&fixture.source_blob));
@@ -760,13 +707,12 @@ fn pile_observation_tracks_only_consulted_lineage_and_target_changes() {
     let dir = tempfile::tempdir().unwrap();
     let mut pile = empty_pile(&dir);
     assert_eq!(
-        pile.derive::<SuccinctArchiveBlob>(fixture.source, (), policy(&fixture.producer))
+        pile.derive::<TestImage>(fixture.source, (), policy(&fixture.producer))
             .unwrap(),
         fixture.target
     );
     descriptor::put_closure(&mut pile, &fixture.source_descriptor).unwrap();
-    pile.put::<SuccinctArchiveBlob, _>(fixture.output.clone())
-        .unwrap();
+    pile.put::<TestImage, _>(fixture.output.clone()).unwrap();
     pile.insert(fixture.equation).unwrap();
     let before = pile.snapshot().unwrap();
     // The image is ahead of its input, and that no longer blocks anything:
@@ -856,10 +802,8 @@ fn pile_observation_tracks_only_consulted_lineage_and_target_changes() {
         after_target
             .collection(fixture.target)
             .unwrap()
-            .view::<UnionArchive<OrderedUniverse>>()
-            .unwrap()
-            .iter()
-            .collect::<TribleSet>(),
+            .view::<TribleSet>()
+            .unwrap(),
         facts(1, 21)
     );
 }
@@ -870,7 +814,7 @@ fn pile_observation_tracks_a_missing_selected_output_occurrence() {
     let dir = tempfile::tempdir().unwrap();
     let mut pile = empty_pile(&dir);
     assert_eq!(
-        pile.derive::<SuccinctArchiveBlob>(fixture.source, (), policy(&fixture.producer))
+        pile.derive::<TestImage>(fixture.source, (), policy(&fixture.producer))
             .unwrap(),
         fixture.target
     );
@@ -881,20 +825,14 @@ fn pile_observation_tracks_a_missing_selected_output_occurrence() {
     let before = pile.snapshot().unwrap();
     let observed = before.collection(fixture.target).unwrap();
     assert!(observed.cover().is_empty());
-    assert!(observed
-        .view::<UnionArchive<OrderedUniverse>>()
-        .unwrap()
-        .iter()
-        .next()
-        .is_none());
+    assert!(observed.view::<TribleSet>().unwrap().is_empty());
     assert!(observed.is_current(&before));
 
     pile.put::<SimpleArchive, _>(facts(8, 28).to_blob())
         .unwrap();
     let unrelated = pile.snapshot().unwrap();
     assert!(observed.is_current(&unrelated));
-    pile.put::<SuccinctArchiveBlob, _>(fixture.output.clone())
-        .unwrap();
+    pile.put::<TestImage, _>(fixture.output.clone()).unwrap();
     let after = pile.snapshot().unwrap();
     assert!(!observed.is_current(&after));
     assert!(observed.is_current(&before));
@@ -914,14 +852,7 @@ fn pile_observation_tracks_a_missing_selected_output_occurrence() {
     );
     let recovered = after.collection(fixture.target).unwrap();
     assert!(recovered.cover().contains(fixture.output.get_handle()));
-    assert_eq!(
-        recovered
-            .view::<UnionArchive<OrderedUniverse>>()
-            .unwrap()
-            .iter()
-            .collect::<TribleSet>(),
-        facts(1, 21)
-    );
+    assert_eq!(recovered.view::<TribleSet>().unwrap(), facts(1, 21));
 }
 
 #[test]
@@ -941,8 +872,7 @@ fn pile_observation_tracks_missing_target_write_definition_without_new_records()
     pile.put::<SimpleArchive, _>(fixture.source_descriptor.facts().clone())
         .unwrap();
     pile.put::<SimpleArchive, _>(read_definition).unwrap();
-    pile.put::<SuccinctArchiveBlob, _>(fixture.output.clone())
-        .unwrap();
+    pile.put::<TestImage, _>(fixture.output.clone()).unwrap();
     pile.insert(CollectionRecord::Commit(fixture.commit))
         .unwrap();
     pile.insert(fixture.equation).unwrap();
@@ -977,12 +907,5 @@ fn pile_observation_tracks_missing_target_write_definition_without_new_records()
     assert_eq!(after.proofs().unwrap().count(), 0);
     let recovered = after.collection(fixture.target).unwrap();
     assert!(recovered.cover().contains(fixture.output.get_handle()));
-    assert_eq!(
-        recovered
-            .view::<UnionArchive<OrderedUniverse>>()
-            .unwrap()
-            .iter()
-            .collect::<TribleSet>(),
-        facts(1, 21)
-    );
+    assert_eq!(recovered.view::<TribleSet>().unwrap(), facts(1, 21));
 }

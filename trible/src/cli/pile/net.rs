@@ -556,23 +556,21 @@ fn run_health(
 
     let signer = load_existing_key(key_path, &pile_path)?;
     let authority = signer.verifying_key();
-    let mut pile = open_pile(&pile_path)?;
+    // Opened as the key it maintains with: only that key's MERGEs and MAPs
+    // are believed.
+    let mut pile = crate::cli::pile::open_refreshed_as(&pile_path, authority)?;
     let result = (|| -> Result<()> {
         let source = open_health_collection(&mut pile, authority, collection_value.as_deref())?;
-        // Derived chains carry the source's policy, so an explicit shared
-        // generation yields the same chain handles every reader derives.
-        let policy = source.policy(&pile.snapshot()?)?;
-        let facts = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
-        let latest = pile.derive::<LwwRegisterBlob>(
-            source,
-            (attrs::node.id(), metadata::created_at.id()),
-            policy,
-        )?;
+        // Attached indexes name the source and their mapping and nothing
+        // else, so every reader of the same source attaches the same ones.
+        let facts = pile.attach::<SuccinctArchiveBlob>(source, ())?;
+        let latest =
+            pile.attach::<LwwRegisterBlob>(source, (attrs::node.id(), metadata::created_at.id()))?;
         // Pile is local-only: missing report bytes cannot start acquisition.
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
         runtime.block_on(async {
-            drop(pile.maintain(facts, &signer).await?);
-            drop(pile.maintain(latest, &signer).await?);
+            drop(pile.maintain_attached(facts, &signer).await?);
+            drop(pile.maintain_attached(latest, &signer).await?);
             Ok::<_, anyhow::Error>(())
         })?;
         let now = triblespace_core::clock::epoch_now()
@@ -580,9 +578,9 @@ fn run_health(
             .total_nanoseconds();
         let snapshot = pile.snapshot()?;
         let facts = snapshot
-            .collection(facts)?
+            .attached(facts)?
             .view::<UnionArchive<OrderedUniverse>>()?;
-        let latest = snapshot.collection(latest)?.view::<LwwIndex>()?.query()?;
+        let latest = snapshot.attached(latest)?.view::<LwwIndex>()?.query()?;
         let mut count = 0;
         for (report, node, session, endpoint, created) in find!(
             (report: Id, node: Id, session: Id, endpoint: ed25519_dalek::VerifyingKey,

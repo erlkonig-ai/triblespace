@@ -15,20 +15,25 @@ struct Fixture<S = MemoryRepo> {
 
 impl Fixture<MemoryRepo> {
     fn new() -> Self {
-        Self::with_store(MemoryRepo::default())
+        Self::with_store(MemoryRepo::for_host(signer().verifying_key()))
     }
+}
+
+/// The fixture's maintainer, and the host its stores are opened as.
+fn signer() -> SigningKey {
+    SigningKey::from_bytes(&[73; 32])
 }
 
 impl<S: Store> Fixture<S> {
     fn with_store(mut store: S) -> Self {
-        let signer = SigningKey::from_bytes(&[73; 32]);
+        let signer = signer();
         let policy = CollectionPolicy::new(
             AdmissionPolicy::direct(signer.verifying_key()),
             AdmissionPolicy::direct(signer.verifying_key()),
         );
         let source = store.collection("observed source", policy.clone()).unwrap();
         let target = store
-            .derive::<EntityIdSetBlob>(source, metadata::supersedes.id(), policy.clone())
+            .attach::<EntityIdSetBlob>(source, metadata::supersedes.id())
             .unwrap();
         let reports = store
             .collection("maintenance observations", policy)
@@ -86,7 +91,7 @@ fn pile_fixture() -> (tempfile::TempDir, Fixture<Pile>) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("maintenance-telemetry.pile");
     std::fs::File::create(&path).unwrap();
-    let store = Pile::open(&path).unwrap();
+    let store = Pile::open_as(&path, signer().verifying_key()).unwrap();
     (directory, Fixture::with_store(store))
 }
 
@@ -591,7 +596,7 @@ async fn real_pass_counts_publications_then_successful_settled_no_publication_pa
         .unwrap(),
         0
     );
-    assert!(producer.publications.derives > 0);
+    assert!(producer.publications.maps > 0);
     let published = producer.publications;
     assert_eq!(
         maintenance_pass_observed(

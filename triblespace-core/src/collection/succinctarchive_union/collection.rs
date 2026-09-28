@@ -1,30 +1,33 @@
 //! Logical views for canonical SuccinctArchive collection encodings.
 //!
-//! The public view is an ordinary two-stage collection derivation:
+//! Both are attached to a `SimpleArchive` root:
 //!
 //! ```text
-//! SimpleArchive --DERIVE--> SuccinctArchiveBlob
-//!                --DERIVE--> Rank9AcceleratedSuccinctArchiveBlob
+//! SimpleArchive node --MAP--> SuccinctArchiveBlob
+//!                   --MAP--> Rank9AcceleratedSuccinctArchiveBlob
 //! ```
 //!
-//! Both encodings are full lattices with canonical `MERGE` operations. The
+//! the accelerator mapped from the same node's Succinct attachment. The
 //! accelerated encoding is an ordinary blob whose header names its portable
-//! raw source. [`TryFromCover`] attaches those roots directly through the
-//! immutable store snapshot; collection admission, derivation, and maintenance
-//! use the generic store APIs rather than a domain lifecycle facade.
+//! raw source. [`TryFromCover`] attaches a cover of either directly through
+//! the immutable store snapshot; attachment and maintenance use the generic
+//! store APIs rather than a domain lifecycle facade.
 
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 
+use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::succinctarchive::{
     OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchive, SuccinctArchiveBlob,
     SuccinctArchiveError, UnionArchive,
 };
 use crate::blob::{Blob, TryFromBlob};
-use crate::collection::{CollectionData, Cover, TryFromCover, TryFromCoverError};
+use crate::collection::{
+    AttachedSnapshot, CollectionData, CollectionEncoding, Cover, TryFromCover, TryFromCoverError,
+};
 use crate::inline::encodings::hash::Handle;
-use crate::repo::BlobStoreGet;
+use crate::repo::{BlobStoreGet, StoreRead};
 use crate::trible::Fragment;
 
 impl TryFromCover<SuccinctArchiveBlob> for UnionArchive<OrderedUniverse> {
@@ -142,65 +145,19 @@ impl TryFromCover<Rank9AcceleratedSuccinctArchiveBlob> for UnionArchive<OrderedU
 #[cfg(test)]
 mod tests {
     use anybytes::Bytes;
-    use ed25519_dalek::SigningKey;
-    use futures::executor::block_on;
 
     use crate::blob::encodings::simplearchive::SimpleArchive;
     use crate::blob::encodings::succinctarchive::{
         Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
     };
     use crate::blob::{Blob, IntoBlob};
-    use crate::collection::descriptor;
-    use crate::collection::{
-        Collection, CollectionCommit, CollectionData, CollectionDerivation, CollectionDerive,
-        CollectionEncoding, CollectionHandle, CollectionMerge, CollectionOperationError,
-        CollectionPolicy, CollectionRead, CollectionRecord, CollectionSnapshotExt, CollectionStore,
-        CollectionStoreExt, Support,
-    };
+    use crate::collection::{CollectionEncoding, CollectionOperationError};
     use crate::inline::encodings::hash::Handle;
-    use crate::metadata::MetaDescribe;
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::repo::{BlobStorePut, SnapshotSource};
     use crate::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
     use super::*;
-
-    fn authority() -> ed25519_dalek::VerifyingKey {
-        SigningKey::from_bytes(&[7; 32]).verifying_key()
-    }
-
-    fn direct_policy() -> CollectionPolicy {
-        CollectionPolicy::new(
-            crate::collection::AdmissionPolicy::direct(authority()),
-            crate::collection::AdmissionPolicy::direct(authority()),
-        )
-    }
-
-    fn input_record(collection: CollectionHandle, data: CollectionData) -> CollectionRecord {
-        CollectionRecord::Commit(CollectionCommit::sign(
-            &SigningKey::from_bytes(&[7; 32]),
-            collection,
-            data,
-            crate::collection::empty_metadata_handle(),
-        ))
-    }
-
-    fn collections(
-        store: &mut MemoryRepo,
-    ) -> (
-        Collection<SimpleArchive>,
-        Collection<SuccinctArchiveBlob>,
-        Collection<Rank9AcceleratedSuccinctArchiveBlob>,
-    ) {
-        let source = store.collection("facts", direct_policy()).unwrap();
-        let raw = store
-            .derive::<SuccinctArchiveBlob>(source, (), direct_policy())
-            .unwrap();
-        let accelerated = store
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(raw, (), direct_policy())
-            .unwrap();
-        (source, raw, accelerated)
-    }
 
     fn row(entity: u8, attribute: u8, value: u8) -> Trible {
         let mut row = [value; TRIBLE_LEN];
@@ -218,45 +175,8 @@ mod tests {
         super::super::derive_element(&simple).unwrap()
     }
 
-    fn simple(rows: impl IntoIterator<Item = Trible>) -> Blob<SimpleArchive> {
-        rows.into_iter().collect::<TribleSet>().to_blob()
-    }
-
     fn accelerated(raw: &Blob<SuccinctArchiveBlob>) -> Blob<Rank9AcceleratedSuccinctArchiveBlob> {
-        let mut store = MemoryRepo::default();
-        let snapshot = store.snapshot().unwrap();
-        Rank9AcceleratedSuccinctArchiveBlob::map(&(), raw, &snapshot).unwrap()
-    }
-
-    #[test]
-    fn descriptors_form_a_two_stage_ordinary_derivation() {
-        let mut store = MemoryRepo::default();
-        let (source, raw, accelerated) = collections(&mut store);
-        let snapshot = store.snapshot().unwrap();
-        let raw_descriptor =
-            crate::collection::api::load_collection_descriptor(&snapshot, raw.handle())
-                .unwrap()
-                .fragment;
-        let accelerated_descriptor =
-            crate::collection::api::load_collection_descriptor(&snapshot, accelerated.handle())
-                .unwrap()
-                .fragment;
-        assert_eq!(
-            descriptor::source(raw_descriptor.facts()).unwrap(),
-            Some(source.handle())
-        );
-        assert_eq!(
-            descriptor::source(accelerated_descriptor.facts()).unwrap(),
-            Some(raw.handle())
-        );
-        assert_eq!(
-            descriptor::representation(raw_descriptor.facts()).unwrap(),
-            SuccinctArchiveBlob::id()
-        );
-        assert_eq!(
-            descriptor::representation(accelerated_descriptor.facts()).unwrap(),
-            Rank9AcceleratedSuccinctArchiveBlob::id()
-        );
+        SuccinctArchive::<OrderedUniverse>::build_accelerated_root(raw.clone()).unwrap()
     }
 
     #[test]
@@ -395,245 +315,6 @@ mod tests {
     }
 
     #[test]
-    fn ensure_uses_ordinary_derives_for_both_stages() {
-        let mut store = MemoryRepo::default();
-        let (source_collection, raw_collection, accelerated_collection) = collections(&mut store);
-        let source: Blob<SimpleArchive> = [row(1, 2, 3), row(4, 5, 6)]
-            .into_iter()
-            .collect::<TribleSet>()
-            .to_blob();
-        store.put::<SimpleArchive, _>(source.clone()).unwrap();
-        store.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
-        store
-            .insert(input_record(
-                source_collection.handle(),
-                Handle::<SimpleArchive>::to_hash(source.get_handle()),
-            ))
-            .unwrap();
-
-        block_on(store.ensure(raw_collection, &SigningKey::from_bytes(&[7; 32]))).unwrap();
-        let snapshot =
-            block_on(store.ensure(accelerated_collection, &SigningKey::from_bytes(&[7; 32])))
-                .unwrap();
-        let attached = snapshot.collection(accelerated_collection).unwrap();
-        let view: UnionArchive<OrderedUniverse> = attached.view().unwrap();
-        assert_eq!(view.iter().count(), 2);
-
-        let snapshot = store.snapshot().unwrap();
-        let records = snapshot
-            .records()
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        let raw = records
-            .iter()
-            .find_map(|record| match record {
-                CollectionRecord::Derive(derive)
-                    if derive.collection() == raw_collection.handle() =>
-                {
-                    Some(derive.output())
-                }
-                _ => None,
-            })
-            .expect("raw DERIVE was published");
-        let accelerated = records
-            .iter()
-            .find_map(|record| match record {
-                CollectionRecord::Derive(derive)
-                    if derive.collection() == accelerated_collection.handle() =>
-                {
-                    assert_eq!(
-                        derive.input(),
-                        crate::collection::SourceLocator::of(raw.raw)
-                    );
-                    Some(derive.output())
-                }
-                _ => None,
-            })
-            .expect("accelerated DERIVE was published");
-        assert_ne!(raw, accelerated);
-    }
-
-    #[test]
-    fn ordinary_observation_contains_only_support_realized_at_its_snapshot() {
-        let mut store = MemoryRepo::default();
-        let (source_collection, raw_collection, accelerated_collection) = collections(&mut store);
-        let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let first = store
-            .commit(
-                source_collection,
-                &signing_key,
-                Fragment::from([row(1, 2, 3)].into_iter().collect::<TribleSet>()),
-            )
-            .unwrap();
-        let first_support = Support::from_data(source_collection, [first.data()]);
-
-        block_on(store.ensure(raw_collection, &SigningKey::from_bytes(&[7; 32]))).unwrap();
-        let snapshot =
-            block_on(store.ensure(accelerated_collection, &SigningKey::from_bytes(&[7; 32])))
-                .unwrap();
-        // The source grows after the target was realized: the attachment
-        // reports what the target stands on in its snapshot, not what the
-        // source admits now.
-        let second = store
-            .commit(
-                source_collection,
-                &signing_key,
-                Fragment::from([row(4, 5, 6)].into_iter().collect::<TribleSet>()),
-            )
-            .unwrap();
-        let full_support = Support::from_data(source_collection, [first.data(), second.data()]);
-        let observed = snapshot.collection(accelerated_collection).unwrap();
-        assert_eq!(
-            crate::collection::test_support::stood_for(&observed),
-            first_support
-        );
-
-        block_on(store.ensure(raw_collection, &SigningKey::from_bytes(&[7; 32]))).unwrap();
-        let snapshot =
-            block_on(store.ensure(accelerated_collection, &SigningKey::from_bytes(&[7; 32])))
-                .unwrap();
-        let observed = snapshot.collection(accelerated_collection).unwrap();
-        assert_eq!(
-            crate::collection::test_support::stood_for(&observed),
-            full_support
-        );
-        let view: UnionArchive<OrderedUniverse> = observed.view().unwrap();
-        assert_eq!(view.iter().count(), 2);
-    }
-
-    #[test]
-    fn downstream_ensure_never_constructs_an_upstream_member() {
-        let mut store = MemoryRepo::default();
-        let (source_collection, raw_collection, accelerated_collection) = collections(&mut store);
-        let source = simple([row(1, 2, 3)]);
-        let source_data = Handle::<SimpleArchive>::to_hash(source.get_handle());
-        store.put::<SimpleArchive, _>(source).unwrap();
-        store.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
-        store
-            .insert(input_record(source_collection.handle(), source_data))
-            .unwrap();
-
-        // The accelerated target stands for what the raw frontier stands on;
-        // with no raw member realized that is nothing, and nothing is built.
-        let before_raw =
-            block_on(store.ensure(accelerated_collection, &SigningKey::from_bytes(&[7; 32])))
-                .unwrap();
-        assert!(before_raw
-            .collection(accelerated_collection)
-            .unwrap()
-            .cover()
-            .is_empty());
-        assert!(!before_raw
-            .records()
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
-            .iter()
-            .any(|record| matches!(
-                record,
-                CollectionRecord::Derive(derive)
-                    if derive.collection() == raw_collection.handle()
-            )));
-
-        block_on(store.ensure(raw_collection, &SigningKey::from_bytes(&[7; 32]))).unwrap();
-        let snapshot =
-            block_on(store.ensure(accelerated_collection, &SigningKey::from_bytes(&[7; 32])))
-                .unwrap();
-        let attached = snapshot.collection(accelerated_collection).unwrap();
-        let view: UnionArchive<OrderedUniverse> = attached.view().unwrap();
-        assert_eq!(view.iter().count(), 1);
-    }
-
-    #[test]
-    fn exact_observation_accepts_a_multihop_mirrored_union_image() {
-        let key = SigningKey::from_bytes(&[7; 32]);
-        // The key signs the merges below, so it is the store's host.
-        let mut store = MemoryRepo::for_host(key.verifying_key());
-        let (source_collection, raw_collection, accelerated_collection) = collections(&mut store);
-        let source_a = simple([row(1, 2, 3)]);
-        let source_b = simple([row(4, 5, 6)]);
-        let source_a_data = Handle::<SimpleArchive>::to_hash(source_a.get_handle());
-        let source_b_data = Handle::<SimpleArchive>::to_hash(source_b.get_handle());
-        let a = super::super::derive_element(&source_a).unwrap();
-        let b = super::super::derive_element(&source_b).unwrap();
-        let c = super::super::join(&a, &b).unwrap();
-        let a_data = Handle::<SuccinctArchiveBlob>::to_hash(a.get_handle());
-        let b_data = Handle::<SuccinctArchiveBlob>::to_hash(b.get_handle());
-        let c_data = Handle::<SuccinctArchiveBlob>::to_hash(c.get_handle());
-        let [fa, fb, fc] = [&a, &b, &c].map(accelerated);
-        let [fa_data, fb_data, fc_data] = [&fa, &fb, &fc]
-            .map(|blob| Handle::<Rank9AcceleratedSuccinctArchiveBlob>::to_hash(blob.get_handle()));
-
-        for member in [source_a, source_b] {
-            store.put::<SimpleArchive, _>(member).unwrap();
-        }
-        store.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
-        for data in [source_a_data, source_b_data] {
-            store
-                .insert(input_record(source_collection.handle(), data))
-                .unwrap();
-        }
-        for member in [a, b, c] {
-            store.put::<SuccinctArchiveBlob, _>(member).unwrap();
-        }
-        for member in [fa, fb, fc] {
-            store
-                .put::<Rank9AcceleratedSuccinctArchiveBlob, _>(member)
-                .unwrap();
-        }
-        let leaf = |collection: CollectionHandle, input: [u8; 32], output| {
-            CollectionRecord::Derive(CollectionDerive::sign(
-                &key,
-                collection,
-                crate::collection::SourceLocator::of(input),
-                output,
-            ))
-        };
-        let merge = |collection: CollectionHandle, inputs: [CollectionData; 2], result| {
-            CollectionRecord::Merge(
-                CollectionMerge::sign(&key, collection, inputs, result).unwrap(),
-            )
-        };
-        // Each hop holds one leaf per foundation of its source, and the raw
-        // union c = join(a, b) is mirrored one level up: the accelerated
-        // image of c's own bytes, as the MERGE over the leaves' images.
-        for record in [
-            leaf(raw_collection.handle(), source_a_data.raw, a_data),
-            leaf(raw_collection.handle(), source_b_data.raw, b_data),
-            merge(raw_collection.handle(), [a_data, b_data], c_data),
-            leaf(accelerated_collection.handle(), a_data.raw, fa_data),
-            leaf(accelerated_collection.handle(), b_data.raw, fb_data),
-            merge(accelerated_collection.handle(), [fa_data, fb_data], fc_data),
-        ] {
-            store.insert(record).unwrap();
-        }
-
-        let support = Support::from_data(source_collection, [source_a_data, source_b_data]);
-        let snapshot = store.snapshot().unwrap();
-        let attached = snapshot.collection(accelerated_collection).unwrap();
-
-        assert_eq!(
-            crate::collection::test_support::stood_for(&attached),
-            support
-        );
-        assert_eq!(
-            attached.cover().data_members().collect::<Vec<_>>(),
-            vec![fc_data],
-        );
-        assert_eq!(
-            attached
-                .support()
-                .unwrap()
-                .data_members()
-                .collect::<std::collections::BTreeSet<_>>(),
-            std::collections::BTreeSet::from([fa_data, fb_data]),
-        );
-        let view: UnionArchive<OrderedUniverse> = attached.view().unwrap();
-        assert_eq!(view.iter().count(), 2);
-    }
-
-    #[test]
     fn accelerated_member_validation_reports_a_missing_raw_child() {
         let raw = raw([row(1, 2, 3)]);
         let root = accelerated(&raw);
@@ -674,4 +355,89 @@ mod tests {
             Err(CollectionOperationError::Fatal(_))
         ));
     }
+}
+
+/// Failure to read an attached Succinct or Rank9 collection with its
+/// residual ([`read_attached`]).
+#[derive(Debug)]
+pub enum ReadAttachedError {
+    /// The attached cover could not be read.
+    Cover(String),
+    /// The store could not read a residual foundation whose bytes are here.
+    Residual {
+        /// The parent foundation.
+        member: CollectionData,
+        /// What went wrong.
+        reason: String,
+    },
+}
+
+impl fmt::Display for ReadAttachedError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cover(reason) => write!(formatter, "read the attached cover: {reason}"),
+            Self::Residual { member, reason } => write!(
+                formatter,
+                "read residual foundation {}: {reason}",
+                hex::encode_upper(member.raw),
+            ),
+        }
+    }
+}
+
+impl Error for ReadAttachedError {}
+
+/// Read an attached Succinct or Rank9 collection as one union: the segments
+/// of its cover, and one more segment for every residual foundation whose
+/// bytes the read's snapshot holds, built from those bytes.
+///
+/// This is the raw read of what no usable attachment reaches -- a commit
+/// written since the last maintenance pass, or written by another key and
+/// not attached here yet -- so a reader sees it without waiting for
+/// maintenance. A residual foundation whose bytes are not here is left out;
+/// the read counts it in [`AttachedSnapshot::residual`], and its bytes
+/// arriving turns [`AttachedSnapshot::is_current`] false. One whose bytes
+/// cannot form an archive -- malformed, or too wide for one segment -- is
+/// left out the same way: a reader skips what it cannot interpret. Only a
+/// store that cannot read resident bytes fails the read.
+pub fn read_attached<R, E>(
+    attached: &AttachedSnapshot<R, E>,
+) -> Result<UnionArchive<OrderedUniverse>, ReadAttachedError>
+where
+    R: StoreRead,
+    E: CollectionEncoding,
+    UnionArchive<OrderedUniverse>: TryFromCover<E>,
+    <UnionArchive<OrderedUniverse> as TryFromCover<E>>::Error: fmt::Display,
+{
+    let snapshot = attached.snapshot();
+    let mut residual = Vec::new();
+    for foundation in attached.residual().members() {
+        let member = Handle::<SimpleArchive>::to_hash(foundation);
+        let failed = |reason: String| ReadAttachedError::Residual { member, reason };
+        if snapshot
+            .metadata(foundation)
+            .map_err(|error| failed(error.to_string()))?
+            .is_none()
+        {
+            continue;
+        }
+        let bytes: Blob<SimpleArchive> = snapshot
+            .get(foundation)
+            .map_err(|error| failed(error.to_string()))?;
+        let Ok(image) = super::derive_element(&bytes) else {
+            continue;
+        };
+        let Ok(archive) = SuccinctArchive::try_from_blob(image) else {
+            continue;
+        };
+        residual.push(archive);
+    }
+    let cover: UnionArchive<OrderedUniverse> = attached
+        .view()
+        .map_err(|error| ReadAttachedError::Cover(error.to_string()))?;
+    Ok(if residual.is_empty() {
+        cover
+    } else {
+        cover.with_segments(residual)
+    })
 }

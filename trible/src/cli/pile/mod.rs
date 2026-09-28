@@ -3,6 +3,7 @@ use clap::Parser;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use ed25519_dalek::VerifyingKey;
 use triblespace_core::repo::pile::{Pile, ReadError};
 
 pub mod blob;
@@ -159,8 +160,30 @@ pub(crate) fn pile_read_error(path: &Path, err: ReadError) -> anyhow::Error {
 /// torn, or unsupported tail without modifying it. Deliberate repair of
 /// genuine corruption stays a separate, boundary-confirmed
 /// `trible pile amputate <path> --truncate-to <byte-offset>` step.
+///
+/// The fold has no host, so it believes no MERGE and every believed
+/// foundation is its own frontier node: right for a command that scans or
+/// copies records and never merges. A command that maintains, or that holds
+/// the key it would sign with, opens with [`open_refreshed_as`] instead.
 pub(crate) fn open_refreshed(path: &Path) -> Result<Pile> {
-    let mut pile = Pile::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
+    open_refreshed_with(path, None)
+}
+
+/// [`open_refreshed`] as `host`: the fold believes the MERGEs `host` signed
+/// and no other key's. Maintenance signing with a key needs the pile opened
+/// as that key, or the merges it publishes are never believed and the carry
+/// refuses to publish them.
+pub(crate) fn open_refreshed_as(path: &Path, host: VerifyingKey) -> Result<Pile> {
+    open_refreshed_with(path, Some(host))
+}
+
+/// [`open_refreshed`] with or without a host.
+pub(crate) fn open_refreshed_with(path: &Path, host: Option<VerifyingKey>) -> Result<Pile> {
+    let opened = match host {
+        Some(host) => Pile::open_as(path, host),
+        None => Pile::open(path),
+    };
+    let mut pile = opened.map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.refresh() {
         let _ = pile.close();
         return Err(pile_read_error(path, err));

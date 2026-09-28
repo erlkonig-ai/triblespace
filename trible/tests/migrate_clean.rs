@@ -22,30 +22,37 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::succinctarchive::{
-    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchive, SuccinctArchiveBlob,
 };
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::Blob;
 use triblespace_core::capability::CapabilityProof;
+use triblespace_core::collection::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
 use triblespace_core::collection::records::{
     CollectionData, CollectionHandle, DERIVE_HANDLE_TRANSCRIPT_DOMAIN_RETIRED,
     KIND_COLLECTION_DERIVE_HANDLE_RETIRED, KIND_COLLECTION_MERGE_BINARY_RETIRED,
     MERGE_BINARY_TRANSCRIPT_DOMAIN_RETIRED,
 };
+use triblespace_core::collection::succinctarchive_union::{
+    self, RawToRank9AcceleratedMappingV1, SimpleToSuccinctMappingV1,
+};
 use triblespace_core::collection::{
-    grant_collection_write, AdmissionPolicy, CollectionCommit, CollectionMerge, CollectionPolicy,
-    CollectionRead, CollectionRecord, CollectionStore, CollectionStoreExt,
-    RetiredCollectionEquation, SourceLocator,
+    grant_collection_write, AdmissionPolicy, CollectionCommit, CollectionMerge,
+    CollectionOperationError, CollectionPolicy, CollectionRead, CollectionRecord, CollectionStore,
+    CollectionStoreExt, DeriveMapping, RetiredCollectionEquation, SourceLocator,
 };
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::Inline;
 use triblespace_core::macros::entity;
 use triblespace_core::metadata;
+use triblespace_core::metadata::MetaDescribe;
 use triblespace_core::repo::pile::{Pile, PileFile, PileRecordContent, PileRecords};
+use triblespace_core::repo::StoreRead;
 use triblespace_core::repo::{
     BlobStoreList, BlobStorePut, CapabilityProofRead, SnapshotSource, WantRequest, WantStore,
 };
+use triblespace_core::trible::Fragment;
 
 const FRAME_MAGIC: &str = "0371B249F0626B2ABDDB80E23EA969059D9656A5EA5A497320351F3B";
 /// Pile record kinds of the retired binary MERGE (v8) and handle DERIVE (v9).
@@ -53,6 +60,64 @@ const KIND_MERGE_V8: &str = "424E7CF62C69A76E6829DF9F71CDFCB42B2B4795143AC6CC5CF
 const KIND_DERIVE_V9: &str = "5839C091F53DFDDCC32BB1909471989E3C40F934A64E4A2F7729E610ACF0494F";
 
 type Raw = [u8; 32];
+
+/// The derived Succinct descriptor of the piles this migration reads.
+/// Succinct is now attached to its root rather than derived, so the
+/// fixture registers the old shape through a mapping of its own.
+struct LegacySuccinct;
+
+impl DeriveMapping for LegacySuccinct {
+    type Source = SimpleArchive;
+    type Target = SuccinctArchiveBlob;
+
+    fn fragment(&self) -> Fragment {
+        entity! {
+            metadata::tag: KIND_COLLECTION_MAPPING,
+            mapping_algorithm*: <SimpleToSuccinctMappingV1 as MetaDescribe>::describe(),
+        }
+    }
+
+    fn bind(_: &Fragment, _: &Fragment) -> Result<Self, CollectionOperationError> {
+        Ok(Self)
+    }
+
+    fn map<R: StoreRead>(
+        &self,
+        source: &Blob<SimpleArchive>,
+        _reader: &R,
+    ) -> Result<Blob<SuccinctArchiveBlob>, CollectionOperationError> {
+        succinctarchive_union::derive_element(source)
+            .map_err(|error| CollectionOperationError::Fatal(error.to_string()))
+    }
+}
+
+/// The derived Rank9 descriptor over [`LegacySuccinct`], likewise.
+struct LegacyRank9;
+
+impl DeriveMapping for LegacyRank9 {
+    type Source = SuccinctArchiveBlob;
+    type Target = Rank9AcceleratedSuccinctArchiveBlob;
+
+    fn fragment(&self) -> Fragment {
+        entity! {
+            metadata::tag: KIND_COLLECTION_MAPPING,
+            mapping_algorithm*: <RawToRank9AcceleratedMappingV1 as MetaDescribe>::describe(),
+        }
+    }
+
+    fn bind(_: &Fragment, _: &Fragment) -> Result<Self, CollectionOperationError> {
+        Ok(Self)
+    }
+
+    fn map<R: StoreRead>(
+        &self,
+        source: &Blob<SuccinctArchiveBlob>,
+        _reader: &R,
+    ) -> Result<Blob<Rank9AcceleratedSuccinctArchiveBlob>, CollectionOperationError> {
+        SuccinctArchive::<OrderedUniverse>::build_accelerated_root(source.clone())
+            .map_err(|error| CollectionOperationError::Fatal(error.to_string()))
+    }
+}
 
 fn trible() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_trible"));
@@ -239,10 +304,10 @@ impl Fixture {
         let current = policy(&a);
         let root = pile.collection("facts", current.clone()).unwrap();
         let succinct = pile
-            .derive::<SuccinctArchiveBlob>(root, (), current.clone())
+            .derive_with(root, LegacySuccinct, current.clone())
             .unwrap();
         let rank9 = pile
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), current.clone())
+            .derive_with(succinct, LegacyRank9, current.clone())
             .unwrap();
         // The previous generation of the same name: a different policy, so a
         // different descriptor.
@@ -252,7 +317,7 @@ impl Fixture {
         );
         let retired = pile.collection("facts", old.clone()).unwrap();
         let retired_view = pile
-            .derive::<SuccinctArchiveBlob>(retired, (), old.clone())
+            .derive_with(retired, LegacySuccinct, old.clone())
             .unwrap();
         let other = pile.collection("other", current.clone()).unwrap();
         let mut proofs = Vec::new();
@@ -1103,9 +1168,7 @@ fn a_leaf_over_an_absent_payload_keeps_what_its_image_names() {
     let a = triblespace_core::signing_key_file::init(&key_path).unwrap();
     let mut pile = Pile::open(&src).unwrap();
     let root = pile.collection("facts", policy(&a)).unwrap();
-    let succinct = pile
-        .derive::<SuccinctArchiveBlob>(root, (), policy(&a))
-        .unwrap();
+    let succinct = pile.derive_with(root, LegacySuccinct, policy(&a)).unwrap();
     // This replica holds the commit and the image, never the payload.
     let payload = data(b"a payload this replica never held");
     let metadata = pile

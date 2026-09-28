@@ -59,7 +59,7 @@ use triblespace_core::repo::{
 use triblespace_core::trible::Fragment;
 use triblespace_core::trible::TribleSet;
 
-use super::open_refreshed;
+use super::{open_refreshed, open_refreshed_as};
 
 mod adopt;
 #[cfg(test)]
@@ -234,21 +234,47 @@ pub enum Command {
     Adopt(adopt::AdoptArgs),
     /// Register one derived collection over a source and print its exact handle.
     ///
-    /// The kind picks the encoding and its mapping. The descriptor then carries
-    /// the source, the mapping and its arguments, which is everything `maintain`
-    /// and every reader need; nothing has to be told twice. As for `init`, the
-    /// existing signing key becomes the direct READ and WRITE root.
+    /// Only a mapping not every reader can compute is derived: its leaves
+    /// replicate. The descriptor carries the source, the mapping and its
+    /// arguments, which is everything `maintain` and every reader need. As
+    /// for `init`, the existing signing key becomes the direct READ and WRITE
+    /// root. An index every reader can compute is attached instead (`attach`).
     Derive {
         /// Path to the pile file to update
         pile: PathBuf,
         /// Source collection: name, or descriptor handle
         source: String,
-        /// What to derive. succinct and rank9 take no arguments; entity-id-set
-        /// takes --attribute; latest takes --observes; lww takes --identity and
-        /// --orders; nvfp4 takes --attribute and --dimension; bm25 takes --text
-        /// and --tokenizer; path takes --expr.
+        /// What to derive. nvfp4 takes --attribute and --dimension.
         #[arg(value_enum)]
         kind: DeriveKind,
+        /// nvfp4: the attribute carrying f32 embedding blobs
+        #[arg(long)]
+        attribute: Option<String>,
+        /// nvfp4: the embedding dimension
+        #[arg(long)]
+        dimension: Option<usize>,
+        /// Existing READ/WRITE-root signing key (default: beside the pile)
+        #[arg(long)]
+        key: Option<PathBuf>,
+    },
+    /// Register one attached collection over a root and print its exact handle.
+    ///
+    /// An attached collection is an index of the root's nodes that every host
+    /// holding a node computes for itself: its descriptor is the parent's
+    /// handle and the mapping, with no policy, and its records are MAPs this
+    /// host signs and nobody else believes. Registering it needs no key; it
+    /// publishes the descriptor only. rank9 also registers the Succinct
+    /// attachment it reads, and names it.
+    Attach {
+        /// Path to the pile file to update
+        pile: PathBuf,
+        /// Parent root collection: name, or descriptor handle
+        parent: String,
+        /// What to attach. succinct and rank9 take no arguments; entity-id-set
+        /// takes --attribute; latest takes --observes; lww takes --identity and
+        /// --orders; bm25 takes --text and --tokenizer; path takes --expr.
+        #[arg(value_enum)]
+        kind: AttachKind,
         /// latest: the attribute whose GenId values name the state observed
         #[arg(long)]
         observes: Option<String>,
@@ -258,13 +284,9 @@ pub enum Command {
         /// lww: the attribute carrying the register order coordinate
         #[arg(long)]
         orders: Option<String>,
-        /// entity-id-set: the attribute carrying GenId values; nvfp4: the
-        /// attribute carrying f32 embedding blobs
+        /// entity-id-set: the attribute carrying GenId values
         #[arg(long)]
         attribute: Option<String>,
-        /// nvfp4: the embedding dimension
-        #[arg(long)]
-        dimension: Option<usize>,
         /// bm25: the attribute carrying UTF8String text blobs
         #[arg(long)]
         text: Option<String>,
@@ -276,9 +298,6 @@ pub enum Command {
         /// `A (^B | C)+ D?` with A..D as 32-hex-digit attribute ids.
         #[arg(long)]
         expr: Option<String>,
-        /// Existing READ/WRITE-root signing key (default: beside the pile)
-        #[arg(long)]
-        key: Option<PathBuf>,
     },
     /// Search a maintained BM25 collection from the command line.
     ///
@@ -301,6 +320,12 @@ pub enum Command {
         /// Print the first characters of each hit's text
         #[arg(long)]
         snippet: bool,
+        /// Signing key whose merges and attachments the read believes
+        /// (default: TRIBLESPACE_KEY or self.key beside the pile, when it
+        /// loads). Without a key the read believes no MAP, so every
+        /// foundation is unattached: nothing is searched.
+        #[arg(long)]
+        key: Option<PathBuf>,
     },
     /// Maintain selected collections, without maintaining their dependencies.
     ///
@@ -410,22 +435,28 @@ pub enum Command {
 /// The derivations this binary can register from the command line.
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 pub enum DeriveKind {
-    /// SuccinctArchiveBlob over a SimpleArchive source
-    Succinct,
-    /// Rank9AcceleratedSuccinctArchiveBlob over a SuccinctArchiveBlob source
-    Rank9,
-    /// EntityIdSetBlob over one attribute's GenId values in a SimpleArchive source
-    EntityIdSet,
-    /// LatestBlob over a SimpleArchive source
-    Latest,
-    /// LwwRegisterBlob over a SimpleArchive source
-    Lww,
     /// NvFp4CosineSet over f32 embeddings in a SimpleArchive source
     Nvfp4,
-    /// PortableBM25Blob over UTF8String texts in a SimpleArchive source
+}
+
+/// The attachments this binary can register from the command line.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum AttachKind {
+    /// SuccinctArchiveBlob of each node of a SimpleArchive root
+    Succinct,
+    /// Rank9AcceleratedSuccinctArchiveBlob of each node, from its Succinct
+    /// attachment
+    Rank9,
+    /// EntityIdSetBlob over one attribute's GenId values in each node
+    EntityIdSet,
+    /// LatestBlob of each node
+    Latest,
+    /// LwwRegisterBlob of each node
+    Lww,
+    /// PortableBM25Blob over UTF8String texts in each node
     Bm25,
-    /// PathSummaryBlob over a SimpleArchive source, for the regular path
-    /// expression given as --expr
+    /// PathSummaryBlob of each node, for the regular path expression given
+    /// as --expr
     Path,
 }
 
@@ -462,30 +493,34 @@ pub fn run(cmd: Command) -> Result<()> {
             pile,
             source,
             kind,
+            attribute,
+            dimension,
+            key,
+        } => run_derive(pile, source, kind, attribute, dimension, key),
+        Command::Attach {
+            pile,
+            parent,
+            kind,
             observes,
             identity,
             orders,
             attribute,
-            dimension,
             text,
             tokenizer,
             expr,
-            key,
-        } => run_derive(
+        } => run_attach(
             pile,
-            source,
+            parent,
             kind,
-            DeriveArguments {
+            AttachArguments {
                 observes,
                 identity,
                 orders,
                 attribute,
-                dimension,
                 text,
                 tokenizer,
                 expr,
             },
-            key,
         ),
         Command::Search {
             pile,
@@ -493,7 +528,8 @@ pub fn run(cmd: Command) -> Result<()> {
             query,
             top,
             snippet,
-        } => run_search(pile, collection, query, top, snippet),
+            key,
+        } => run_search(pile, collection, query, top, snippet, key),
         Command::Maintain {
             pile,
             collections,
@@ -955,11 +991,13 @@ struct Enumerated {
     fields: Fields,
 }
 
-/// What a descriptor is anchored to. A root is named directly and a
-/// derivation is anchored by the collection it derives from.
+/// What a descriptor is anchored to. A root is named directly, a derivation
+/// is anchored by the collection it derives from, and an attached collection
+/// by the collection whose nodes it indexes.
 enum Anchor {
     Root(Result<String, String>),
     Derived(CollectionHandle),
+    Attached(CollectionHandle),
     Unreadable(String),
 }
 
@@ -971,6 +1009,11 @@ fn anchor(fields: &Fields) -> Anchor {
             return Anchor::Unreadable(format!("descriptor undecodable: {e}"));
         }
     };
+    match descriptor::parent(facts) {
+        Ok(Some(parent)) => return Anchor::Attached(parent),
+        Ok(None) => {}
+        Err(error) => return Anchor::Unreadable(error.to_string()),
+    }
     match descriptor::source(facts) {
         Ok(Some(source)) => {
             if matches!(descriptor::name(facts), Ok(Some(_))) {
@@ -999,7 +1042,9 @@ fn sort_key(row: &Enumerated) -> (u8, String, [u8; 32]) {
     match anchor(&row.fields) {
         Anchor::Root(Ok(name)) => (0, name, row.handle.raw),
         Anchor::Root(Err(_)) => (1, String::new(), row.handle.raw),
-        Anchor::Derived(source) => (2, handle_hex(source), row.handle.raw),
+        Anchor::Derived(source) | Anchor::Attached(source) => {
+            (2, handle_hex(source), row.handle.raw)
+        }
         Anchor::Unreadable(_) => (3, String::new(), row.handle.raw),
     }
 }
@@ -1210,6 +1255,7 @@ fn run_list(path: PathBuf, named_only: bool, metadata: bool, long: bool) -> Resu
 
         let mut named: Vec<Vec<String>> = Vec::new();
         let mut derived: Vec<Vec<String>> = Vec::new();
+        let mut attached: Vec<Vec<String>> = Vec::new();
         let mut anchorless: Vec<(String, Vec<String>)> = Vec::new();
         for row in &rows {
             match anchor(&row.fields) {
@@ -1226,6 +1272,11 @@ fn run_list(path: PathBuf, named_only: bool, metadata: bool, long: bool) -> Resu
                     cells.extend(tail(row));
                     derived.push(cells);
                 }
+                Anchor::Attached(parent) => {
+                    let mut cells = vec![abbrev(&handle_hex(parent), long)];
+                    cells.extend(tail(row));
+                    attached.push(cells);
+                }
                 Anchor::Unreadable(why) => {
                     anchorless.push((why, tail(row)));
                 }
@@ -1237,6 +1288,7 @@ fn run_list(path: PathBuf, named_only: bool, metadata: bool, long: bool) -> Resu
         let summary: Vec<String> = [
             (named.len(), "named"),
             (derived.len(), "derived"),
+            (attached.len(), "attached"),
             (anchorless.len(), "without a readable anchor"),
         ]
         .into_iter()
@@ -1286,11 +1338,15 @@ fn run_list(path: PathBuf, named_only: bool, metadata: bool, long: bool) -> Resu
         }
 
         if named_only {
-            let hidden: Vec<String> = [(derived.len(), "derived"), (anchorless.len(), "unnamed")]
-                .into_iter()
-                .filter(|(count, _)| *count > 0)
-                .map(|(count, what)| format!("{count} {what}"))
-                .collect();
+            let hidden: Vec<String> = [
+                (derived.len(), "derived"),
+                (attached.len(), "attached"),
+                (anchorless.len(), "unnamed"),
+            ]
+            .into_iter()
+            .filter(|(count, _)| *count > 0)
+            .map(|(count, what)| format!("{count} {what}"))
+            .collect();
             if !hidden.is_empty() {
                 println!();
                 println!("  ({} hidden by --named)", hidden.join(", "));
@@ -1309,6 +1365,19 @@ fn run_list(path: PathBuf, named_only: bool, metadata: bool, long: bool) -> Resu
                 Align::Right => Align::Right,
             }));
             print_table(&headers, &aligns, &derived, "  ");
+        }
+
+        if !attached.is_empty() {
+            println!();
+            println!("attached to another collection:");
+            let mut headers = vec!["PARENT"];
+            headers.extend(tail_headers.iter().copied());
+            let mut aligns = vec![Align::Left];
+            aligns.extend(tail_aligns.iter().map(|align| match align {
+                Align::Left => Align::Left,
+                Align::Right => Align::Right,
+            }));
+            print_table(&headers, &aligns, &attached, "  ");
         }
 
         if !anchorless.is_empty() {
@@ -1529,6 +1598,9 @@ fn run_show(path: PathBuf, reference: String) -> Result<()> {
             Anchor::Derived(source) => {
                 println!("source:         {}", handle_hex(source));
             }
+            Anchor::Attached(parent) => {
+                println!("parent:         {}", handle_hex(parent));
+            }
             Anchor::Unreadable(why) => println!("anchor:         <{why}>"),
         }
         match descriptor::policy(&descriptor) {
@@ -1624,6 +1696,7 @@ fn run_log(path: PathBuf, reference: String, limit: usize, long: bool) -> Result
         match anchor(&row.fields) {
             Anchor::Root(Ok(name)) => print!("  ({name})"),
             Anchor::Derived(source) => print!("  (derived from {})", handle_hex(source)),
+            Anchor::Attached(parent) => print!("  (attached to {})", handle_hex(parent)),
             _ => {}
         }
         println!();
@@ -1817,16 +1890,15 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("scoped-maintenance.pile");
         std::fs::File::create(&path).unwrap();
-        let mut pile = Pile::open(&path).unwrap();
-        let mut writer = Pile::open(&path).unwrap();
         let signer = SigningKey::from_bytes(&[61; 32]);
+        // The maintainer is the pile's host: its MAPs are the ones believed.
+        let mut pile = Pile::open_as(&path, signer.verifying_key()).unwrap();
+        let mut writer = Pile::open(&path).unwrap();
         let policy = direct_policy(signer.verifying_key());
         let source = pile.collection("scoped source", policy.clone()).unwrap();
-        let succinct = pile
-            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-            .unwrap();
+        let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
         let target = pile
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy.clone())
+            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
             .unwrap();
         let other = pile.collection("unrelated source", policy).unwrap();
         for text in ["first scoped member", "second scoped member"] {
@@ -1928,9 +2000,9 @@ mod tests {
         ));
         let (failures, cold_interests) =
             observed_maintenance_pass(&mut pile, &selected, &signer, &mut calls);
-        assert!(
-            failures > 0,
-            "cold foundational input is still an explicit error"
+        assert_eq!(
+            failures, 0,
+            "a node whose bytes are not here is left to the residual, not an error"
         );
         assert_eq!(calls, 4);
         assert!(cold_interests
@@ -1938,10 +2010,10 @@ mod tests {
             .contains(&Handle::<SimpleArchive>::to_hash(cold.get_handle())));
         let absent = pile.snapshot().unwrap();
         assert!(!absent.contains_blob(cold.get_handle()).unwrap());
-        assert_eq!(
-            absent.collection(target).unwrap().support().unwrap().len(),
-            2
-        );
+        let read = absent.attached(target).unwrap();
+        assert_eq!(read.support().len(), 2);
+        assert_eq!(read.residual().len(), 1);
+        drop(read);
         let wants_before = absent.wants().unwrap().count();
         assert_eq!(wants_before, 1, "maintenance did not manufacture a WANT");
         assert!(!maintenance_changed(
@@ -1960,15 +2032,7 @@ mod tests {
             observed_maintenance_pass(&mut pile, &selected, &signer, &mut calls);
         assert_eq!(failures, 0);
         let complete = pile.snapshot().unwrap();
-        assert_eq!(
-            complete
-                .collection(target)
-                .unwrap()
-                .support()
-                .unwrap()
-                .len(),
-            3
-        );
+        assert_eq!(complete.attached(target).unwrap().support().len(), 3);
         assert!(maintenance_changed(
             &resident,
             &complete,
@@ -1999,19 +2063,15 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("scoped-authority.pile");
         std::fs::File::create(&path).unwrap();
-        let mut pile = Pile::open(&path).unwrap();
         let root = SigningKey::from_bytes(&[62; 32]);
         let signer = SigningKey::from_bytes(&[63; 32]);
+        let mut pile = Pile::open_as(&path, signer.verifying_key()).unwrap();
         let policy = direct_policy(root.verifying_key());
-        // The signer writes the source member itself, so its leaf in the
-        // target is the signer's to derive -- through a delegated grant whose
-        // definition is not here yet.
-        let source = pile
-            .collection("delegated source", direct_policy(signer.verifying_key()))
-            .unwrap();
-        let target = pile
-            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-            .unwrap();
+        // The signer writes the source through a delegated grant whose
+        // definition is not here yet, so its member is not admitted, and the
+        // attached target has nothing to attach until the definition arrives.
+        let source = pile.collection("delegated source", policy.clone()).unwrap();
+        let target = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
         pile.commit(
             source,
             &signer,
@@ -2026,7 +2086,7 @@ mod tests {
         .clone()
         .to_blob();
         pile.insert_proof(CapabilityProof::new(
-            CapabilityResource::from(target.handle()),
+            CapabilityResource::from(source.handle()),
             &root,
             definition.get_handle(),
             signer.verifying_key(),
@@ -2044,8 +2104,8 @@ mod tests {
         let (failures, interests) =
             observed_maintenance_pass(&mut pile, &targets, &signer, &mut calls);
         assert_eq!(
-            failures, 2,
-            "missing descriptor and unavailable target WRITE are independent failures"
+            failures, 1,
+            "the missing descriptor fails; the target has nothing to do"
         );
         assert!(interests.capability_proofs);
         for handle in [late.handle(), definition.get_handle()] {
@@ -2055,7 +2115,7 @@ mod tests {
         }
         assert!(!interests.all_records && !interests.all_blobs);
         let failed = pile.snapshot().unwrap();
-        assert!(failed.collection(target).unwrap().cover().is_empty());
+        assert!(failed.attached(target).unwrap().cover().is_empty());
         pile.put::<UTF8String, _>("unrelated between failures")
             .unwrap();
         let unrelated = pile.snapshot().unwrap();
@@ -2068,15 +2128,7 @@ mod tests {
             observed_maintenance_pass(&mut pile, &targets, &signer, &mut calls);
         assert_eq!(failures, 0);
         let complete = pile.snapshot().unwrap();
-        assert_eq!(
-            complete
-                .collection(target)
-                .unwrap()
-                .support()
-                .unwrap()
-                .len(),
-            1
-        );
+        assert_eq!(complete.attached(target).unwrap().support().len(), 1);
         assert_eq!(calls, 2);
         assert!(maintenance_changed(
             &available,
@@ -2452,23 +2504,81 @@ fn cover_census<R: CollectionRead>(
 ///
 /// The descriptor is the whole of the information needed: a root names its
 /// blob representation, a derivation names its source and mapping as well,
-/// and `Collection::open` checks the typed handle against those facts. What
-/// a binary cannot do is maintain an encoding it was not compiled with, so
-/// the dispatch asks each encoding this binary implements for its own id,
-/// exactly as [`representation_name`] does, and reports an unknown one
-/// rather than guessing.
+/// an attached collection its parent and mapping, and `Collection::open`
+/// checks the typed handle against those facts. What a binary cannot do is
+/// maintain an encoding it was not compiled with, so the dispatch asks each
+/// encoding this binary implements for its own id, exactly as
+/// [`representation_name`] does, and reports an unknown one rather than
+/// guessing. An attached collection carries its parent first and then
+/// attaches the parent's new frontier.
 async fn maintain_by_representation<S: Store + AsyncBlobStoreAcquire + Send>(
     pile: &mut S,
     snapshot: &S::Snapshot,
     handle: CollectionHandle,
     representation: Id,
     algorithm: Option<Id>,
+    attached: bool,
     signer: &SigningKey,
     succinct_backend: SuccinctBackend,
 ) -> Result<S::Snapshot> {
     use triblespace_core::collection::latest::LatestBlob;
     use triblespace_core::collection::lww_register::LwwRegisterBlob;
-    use triblespace_core::collection::CollectionRealization;
+    use triblespace_core::collection::{CollectionAttachment, CollectionRealization};
+    use triblespace_search::portable_bm25::PortableBM25Blob;
+
+    async fn attach<S, T>(
+        pile: &mut S,
+        snapshot: &S::Snapshot,
+        handle: CollectionHandle,
+        signer: &SigningKey,
+    ) -> Result<S::Snapshot>
+    where
+        S: Store + AsyncBlobStoreAcquire + Send,
+        T: CollectionAttachment + MetaDescribe,
+        Handle<T>: triblespace_core::inline::InlineEncoding,
+    {
+        let collection: Collection<T> = Collection::open(snapshot, handle)
+            .map_err(|error| anyhow!("open collection descriptor: {error}"))?;
+        pile.maintain_attached(collection, signer)
+            .await
+            .map_err(|error| anyhow!("maintain attached collection: {error}"))
+    }
+
+    if attached {
+        return if representation == <SuccinctArchiveBlob as MetaDescribe>::id() {
+            #[cfg(feature = "succinct-cuda")]
+            if matches!(succinct_backend, SuccinctBackend::Cuda) {
+                let collection = Collection::<SuccinctArchiveBlob>::open(snapshot, handle)
+                    .map_err(|error| anyhow!("open collection descriptor: {error}"))?;
+                return pile
+                    .maintain_attached_with::<triblespace_gpu::CudaSuccinctMapping>(
+                        collection, signer,
+                    )
+                    .await
+                    .map_err(|error| anyhow!("maintain CUDA Succinct attachments: {error}"));
+            }
+            #[cfg(not(feature = "succinct-cuda"))]
+            succinct_backend.check_available()?;
+            attach::<S, SuccinctArchiveBlob>(pile, snapshot, handle, signer).await
+        } else if representation == <Rank9AcceleratedSuccinctArchiveBlob as MetaDescribe>::id() {
+            attach::<S, Rank9AcceleratedSuccinctArchiveBlob>(pile, snapshot, handle, signer).await
+        } else if representation == <EntityIdSetBlob as MetaDescribe>::id() {
+            attach::<S, EntityIdSetBlob>(pile, snapshot, handle, signer).await
+        } else if representation == <LatestBlob as MetaDescribe>::id() {
+            attach::<S, LatestBlob>(pile, snapshot, handle, signer).await
+        } else if representation == <LwwRegisterBlob as MetaDescribe>::id() {
+            attach::<S, LwwRegisterBlob>(pile, snapshot, handle, signer).await
+        } else if representation == <triblespace_paths::PathSummaryBlob as MetaDescribe>::id() {
+            attach::<S, triblespace_paths::PathSummaryBlob>(pile, snapshot, handle, signer).await
+        } else if representation == <PortableBM25Blob as MetaDescribe>::id() {
+            attach::<S, PortableBM25Blob>(pile, snapshot, handle, signer).await
+        } else {
+            Err(anyhow!(
+                "attached representation {representation:X} is not implemented by this binary; \
+                 nothing here can maintain it"
+            ))
+        };
+    }
 
     async fn go<S, T>(
         pile: &mut S,
@@ -2495,36 +2605,11 @@ async fn maintain_by_representation<S: Store + AsyncBlobStoreAcquire + Send>(
             ));
         }
         go::<S, SimpleArchive>(pile, snapshot, handle, signer).await
-    } else if representation == <SuccinctArchiveBlob as MetaDescribe>::id() {
-        #[cfg(feature = "succinct-cuda")]
-        if matches!(succinct_backend, SuccinctBackend::Cuda) {
-            let collection = Collection::<SuccinctArchiveBlob>::open(snapshot, handle)
-                .map_err(|error| anyhow!("open collection descriptor: {error}"))?;
-            return pile
-                .maintain_with::<triblespace_gpu::CudaSuccinctMapping>(collection, signer)
-                .await
-                .map_err(|error| anyhow!("maintain CUDA Succinct collection: {error}"));
-        }
-        #[cfg(not(feature = "succinct-cuda"))]
-        succinct_backend.check_available()?;
-        go::<S, SuccinctArchiveBlob>(pile, snapshot, handle, signer).await
-    } else if representation == <Rank9AcceleratedSuccinctArchiveBlob as MetaDescribe>::id() {
-        go::<S, Rank9AcceleratedSuccinctArchiveBlob>(pile, snapshot, handle, signer).await
-    } else if representation == <EntityIdSetBlob as MetaDescribe>::id() {
-        go::<S, EntityIdSetBlob>(pile, snapshot, handle, signer).await
-    } else if representation == <LatestBlob as MetaDescribe>::id() {
-        go::<S, LatestBlob>(pile, snapshot, handle, signer).await
-    } else if representation == <LwwRegisterBlob as MetaDescribe>::id() {
-        go::<S, LwwRegisterBlob>(pile, snapshot, handle, signer).await
-    } else if representation == <triblespace_paths::PathSummaryBlob as MetaDescribe>::id() {
-        go::<S, triblespace_paths::PathSummaryBlob>(pile, snapshot, handle, signer).await
     } else if nvfp4_embedding_set_id().is_some_and(|nvfp4| representation == nvfp4) {
         // Both the ordinary embedding conversion and model inference produce
         // this encoding. Its algorithm, not just its representation, chooses
         // the executable mapping.
         maintain_nvfp4_embedding_set(pile, snapshot, handle, algorithm, signer).await
-    } else if bm25_carrier_id().is_some_and(|bm25| representation == bm25) {
-        maintain_bm25(pile, snapshot, handle, signer).await
     } else {
         Err(anyhow!(
             "representation {representation:X} is not implemented by this binary; \
@@ -2601,36 +2686,54 @@ fn resolve_maintenance_target<R: StoreRead>(
 }
 
 /// A temporary call order, not a second model of the collection descriptors.
-/// Source links are queried in one immutable observation and discarded.
+/// Source, parent and sibling links are queried in one immutable observation
+/// and discarded: a derived collection after its source, an attached one
+/// after its parent and after the attached siblings its mapping reads.
 fn maintenance_order<R: BlobStoreGet>(
     snapshot: &R,
     target: CollectionHandle,
     dependencies: bool,
     attempted: &BTreeSet<CollectionHandle>,
 ) -> Result<Vec<CollectionHandle>> {
-    let mut order = Vec::new();
-    let mut visiting = BTreeSet::new();
-    let mut current = target;
-    loop {
-        if attempted.contains(&current) {
-            break;
+    fn visit<R: BlobStoreGet>(
+        snapshot: &R,
+        current: CollectionHandle,
+        dependencies: bool,
+        attempted: &BTreeSet<CollectionHandle>,
+        visiting: &mut BTreeSet<CollectionHandle>,
+        order: &mut Vec<CollectionHandle>,
+    ) -> Result<()> {
+        if attempted.contains(&current) || order.contains(&current) {
+            return Ok(());
         }
         if !visiting.insert(current) {
             return Err(anyhow!("cyclic collection source dependency"));
         }
-        order.push(current);
-        if !dependencies {
-            break;
+        if dependencies {
+            let facts: TribleSet = snapshot.get(current).map_err(|error| {
+                anyhow!("read descriptor blake3:{}: {error}", handle_hex(current))
+            })?;
+            let mut upstream: Vec<CollectionHandle> = Vec::new();
+            upstream.extend(descriptor::source(&facts)?);
+            upstream.extend(descriptor::parent(&facts)?);
+            upstream.extend(descriptor::reads_attached(&facts)?);
+            for dependency in upstream {
+                visit(snapshot, dependency, true, attempted, visiting, order)?;
+            }
         }
-        let facts: TribleSet = snapshot
-            .get(current)
-            .map_err(|error| anyhow!("read descriptor blake3:{}: {error}", handle_hex(current)))?;
-        let Some(source) = descriptor::source(&facts)? else {
-            break;
-        };
-        current = source;
+        visiting.remove(&current);
+        order.push(current);
+        Ok(())
     }
-    order.reverse();
+    let mut order = Vec::new();
+    visit(
+        snapshot,
+        target,
+        dependencies,
+        attempted,
+        &mut BTreeSet::new(),
+        &mut order,
+    )?;
     Ok(order)
 }
 
@@ -2850,6 +2953,7 @@ async fn maintenance_pass_inner<S: Store + AsyncBlobStoreAcquire + Send>(
                     .map_err(|error| anyhow!("read collection descriptor: {error}"))?;
                 let representation = descriptor::representation(&facts)?;
                 let algorithm = descriptor::mapping_algorithm(&facts)?;
+                let attached = descriptor::parent(&facts)?.is_some();
                 let before = cover_census(&snapshot, handle)?;
                 let started = Instant::now();
                 let after = if let Some(telemetry) = telemetry.as_deref_mut() {
@@ -2863,6 +2967,7 @@ async fn maintenance_pass_inner<S: Store + AsyncBlobStoreAcquire + Send>(
                         handle,
                         representation,
                         algorithm,
+                        attached,
                         signer,
                         succinct_backend,
                     )
@@ -2874,6 +2979,7 @@ async fn maintenance_pass_inner<S: Store + AsyncBlobStoreAcquire + Send>(
                         handle,
                         representation,
                         algorithm,
+                        attached,
                         signer,
                         succinct_backend,
                     )
@@ -3030,7 +3136,9 @@ fn run_maintain(
         let _entered = runtime.enter();
         crate::cli::util::shutdown_signal()?
     };
-    let mut pile = open_refreshed(&path)?;
+    // The fold believes the MERGEs and MAPs of the key this pass signs with,
+    // and no other key's.
+    let mut pile = open_refreshed_as(&path, signer.verifying_key())?;
     let mut telemetry = match telemetry_config {
         Some(config) => match maintenance_telemetry::Telemetry::open(&mut pile, config, &signer) {
             Ok(telemetry) => Some(telemetry),
@@ -3119,13 +3227,12 @@ async fn maintain_nvfp4_embedding_set<S: Store + AsyncBlobStoreAcquire + Send>(
     unreachable!("the NVFP4 representation is only recognised with the search feature")
 }
 
-/// The optional per-kind arguments of `derive`, validated by the kind.
-struct DeriveArguments {
+/// The optional per-kind arguments of `attach`, validated by the kind.
+struct AttachArguments {
     observes: Option<String>,
     identity: Option<String>,
     orders: Option<String>,
     attribute: Option<String>,
-    dimension: Option<usize>,
     text: Option<String>,
     tokenizer: String,
     expr: Option<String>,
@@ -3136,11 +3243,26 @@ fn parse_attribute_id(flag: &str, value: Option<&str>) -> Result<Id> {
     Id::from_hex(text.trim()).ok_or_else(|| anyhow!("{flag}: {text:?} is not a 32-hex-digit id"))
 }
 
+/// Resolve and open one collection of this pile by name or handle.
+fn open_resolved<E>(pile: &mut Pile, reference: &str) -> Result<Collection<E>>
+where
+    E: triblespace_core::collection::CollectionEncoding,
+{
+    let snapshot = pile
+        .snapshot()
+        .map_err(|error| anyhow!("pile snapshot: {error:?}"))?;
+    let rows = enumerate(&snapshot)?;
+    let handle = resolve(&rows, reference)?;
+    Collection::open(&snapshot, handle)
+        .map_err(|error| anyhow!("open collection descriptor: {error}"))
+}
+
 fn run_derive(
     path: PathBuf,
     source: String,
     kind: DeriveKind,
-    arguments: DeriveArguments,
+    attribute: Option<String>,
+    dimension: Option<usize>,
     key: Option<PathBuf>,
 ) -> Result<()> {
     let key_path = triblespace_core::signing_key_file::resolve_path(key.as_deref(), &path);
@@ -3157,69 +3279,90 @@ fn run_derive(
 
     let mut pile = open_refreshed(&path)?;
     let res = (|| -> Result<CollectionHandle> {
-        let source_handle = {
-            let snapshot = pile
-                .snapshot()
-                .map_err(|error| anyhow!("pile snapshot: {error:?}"))?;
-            let rows = enumerate(&snapshot)?;
-            resolve(&rows, &source)?
-        };
-        fn open_source<E>(pile: &mut Pile, handle: CollectionHandle) -> Result<Collection<E>>
-        where
-            E: triblespace_core::collection::CollectionEncoding,
-        {
-            let snapshot = pile
-                .snapshot()
-                .map_err(|error| anyhow!("pile snapshot: {error:?}"))?;
-            Collection::open(&snapshot, handle)
-                .map_err(|error| anyhow!("open source collection descriptor: {error}"))
+        let source: Collection<SimpleArchive> = open_resolved(&mut pile, &source)?;
+        match kind {
+            DeriveKind::Nvfp4 => derive_nvfp4(&mut pile, source, attribute, dimension, policy),
         }
-        let registered = |error| anyhow!("register derived collection: {error:?}");
+    })();
+    let close_res = pile
+        .close()
+        .map_err(|error| anyhow!("pile close: {error:?}"));
+    let handle = res.and_then(|handle| close_res.map(|()| handle))?;
+    println!("blake3:{}", handle_hex(handle));
+    Ok(())
+}
+
+fn run_attach(
+    path: PathBuf,
+    parent: String,
+    kind: AttachKind,
+    arguments: AttachArguments,
+) -> Result<()> {
+    use triblespace_core::collection::latest::LatestBlob;
+    use triblespace_core::collection::lww_register::LwwRegisterBlob;
+    use triblespace_search::portable_bm25::PortableBM25Blob;
+    use triblespace_search::text_bm25::{Bm25Tokenizer, TextAttributeToBm25};
+
+    let mut pile = open_refreshed(&path)?;
+    let res = (|| -> Result<CollectionHandle> {
+        let parent: Collection<SimpleArchive> = open_resolved(&mut pile, &parent)?;
+        let registered = |error| anyhow!("register attached collection: {error:?}");
         let handle = match kind {
-            DeriveKind::Succinct => {
-                let source: Collection<SimpleArchive> = open_source(&mut pile, source_handle)?;
-                pile.derive::<SuccinctArchiveBlob>(source, (), policy)
-                    .map_err(registered)?
-                    .handle()
-            }
-            DeriveKind::Rank9 => {
-                let source: Collection<SuccinctArchiveBlob> =
-                    open_source(&mut pile, source_handle)?;
-                pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(source, (), policy)
-                    .map_err(registered)?
-                    .handle()
-            }
-            DeriveKind::EntityIdSet => {
-                let attribute = parse_attribute_id("--attribute", arguments.attribute.as_deref())?;
-                let source: Collection<SimpleArchive> = open_source(&mut pile, source_handle)?;
-                pile.derive::<EntityIdSetBlob>(source, attribute, policy)
-                    .map_err(registered)?
-                    .handle()
-            }
-            DeriveKind::Latest => {
-                let observes = parse_attribute_id("--observes", arguments.observes.as_deref())?;
-                let source: Collection<SimpleArchive> = open_source(&mut pile, source_handle)?;
-                pile.derive::<triblespace_core::collection::latest::LatestBlob>(
-                    source, observes, policy,
-                )
+            AttachKind::Succinct => pile
+                .attach::<SuccinctArchiveBlob>(parent, ())
                 .map_err(registered)?
-                .handle()
+                .handle(),
+            AttachKind::Rank9 => {
+                let succinct = pile
+                    .attach::<SuccinctArchiveBlob>(parent, ())
+                    .map_err(registered)?;
+                eprintln!(
+                    "reads the Succinct attachment blake3:{}",
+                    handle_hex(succinct.handle())
+                );
+                pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(parent, succinct)
+                    .map_err(registered)?
+                    .handle()
             }
-            DeriveKind::Lww => {
+            AttachKind::EntityIdSet => {
+                let attribute = parse_attribute_id("--attribute", arguments.attribute.as_deref())?;
+                pile.attach::<EntityIdSetBlob>(parent, attribute)
+                    .map_err(registered)?
+                    .handle()
+            }
+            AttachKind::Latest => {
+                let observes = parse_attribute_id("--observes", arguments.observes.as_deref())?;
+                pile.attach::<LatestBlob>(parent, observes)
+                    .map_err(registered)?
+                    .handle()
+            }
+            AttachKind::Lww => {
                 let identity = parse_attribute_id("--identity", arguments.identity.as_deref())?;
                 let orders = parse_attribute_id("--orders", arguments.orders.as_deref())?;
-                let source: Collection<SimpleArchive> = open_source(&mut pile, source_handle)?;
-                pile.derive::<triblespace_core::collection::lww_register::LwwRegisterBlob>(
-                    source,
-                    (identity, orders),
-                    policy,
+                pile.attach::<LwwRegisterBlob>(parent, (identity, orders))
+                    .map_err(registered)?
+                    .handle()
+            }
+            AttachKind::Bm25 => {
+                let attribute = parse_attribute_id("--text", arguments.text.as_deref())?;
+                let tokenizer =
+                    Bm25Tokenizer::from_name(&arguments.tokenizer).ok_or_else(|| {
+                        anyhow!(
+                            "--tokenizer {:?} is not one of word, bigram, code",
+                            arguments.tokenizer
+                        )
+                    })?;
+                pile.attach::<PortableBM25Blob>(
+                    parent,
+                    TextAttributeToBm25 {
+                        attribute,
+                        tokenizer,
+                    },
                 )
                 .map_err(registered)?
                 .handle()
             }
-            DeriveKind::Nvfp4 => derive_nvfp4(&mut pile, source_handle, &arguments, policy)?,
-            DeriveKind::Bm25 => derive_bm25(&mut pile, source_handle, &arguments, policy)?,
-            DeriveKind::Path => {
+            AttachKind::Path => {
                 let text = arguments
                     .expr
                     .as_deref()
@@ -3227,8 +3370,7 @@ fn run_derive(
                 let automaton = super::path_text::parse(text)
                     .map_err(|error| anyhow!("--expr: {error}"))?
                     .compile();
-                let source: Collection<SimpleArchive> = open_source(&mut pile, source_handle)?;
-                pile.derive::<triblespace_paths::PathSummaryBlob>(source, automaton, policy)
+                pile.attach::<triblespace_paths::PathSummaryBlob>(parent, automaton)
                     .map_err(registered)?
                     .handle()
             }
@@ -3246,23 +3388,15 @@ fn run_derive(
 #[cfg(feature = "search")]
 fn derive_nvfp4(
     pile: &mut Pile,
-    source_handle: CollectionHandle,
-    arguments: &DeriveArguments,
+    source: Collection<SimpleArchive>,
+    attribute: Option<String>,
+    dimension: Option<usize>,
     policy: CollectionPolicy,
 ) -> Result<CollectionHandle> {
-    let attribute = parse_attribute_id("--attribute", arguments.attribute.as_deref())?;
-    let dimension = arguments
-        .dimension
-        .ok_or_else(|| anyhow!("--dimension is required for nvfp4"))?;
+    let attribute = parse_attribute_id("--attribute", attribute.as_deref())?;
+    let dimension = dimension.ok_or_else(|| anyhow!("--dimension is required for nvfp4"))?;
     let argument = triblespace_search::nvfp4::NvFp4EmbeddingAttribute::new(attribute, dimension)
         .map_err(|error| anyhow!("nvfp4 argument: {error}"))?;
-    let source: Collection<SimpleArchive> = {
-        let snapshot = pile
-            .snapshot()
-            .map_err(|error| anyhow!("pile snapshot: {error:?}"))?;
-        Collection::open(&snapshot, source_handle)
-            .map_err(|error| anyhow!("open source collection descriptor: {error}"))?
-    };
     Ok(pile
         .derive::<triblespace_search::nvfp4::NvFp4CosineSet<triblespace_search::schemas::Embedding>>(
             source, argument, policy,
@@ -3274,8 +3408,9 @@ fn derive_nvfp4(
 #[cfg(not(feature = "search"))]
 fn derive_nvfp4(
     _pile: &mut Pile,
-    _source_handle: CollectionHandle,
-    _arguments: &DeriveArguments,
+    _source: Collection<SimpleArchive>,
+    _attribute: Option<String>,
+    _dimension: Option<usize>,
     _policy: CollectionPolicy,
 ) -> Result<CollectionHandle> {
     Err(anyhow!(
@@ -3283,76 +3418,36 @@ fn derive_nvfp4(
     ))
 }
 
-async fn maintain_bm25<S: Store + AsyncBlobStoreAcquire + Send>(
-    pile: &mut S,
-    snapshot: &S::Snapshot,
-    handle: CollectionHandle,
-    signer: &SigningKey,
-) -> Result<S::Snapshot> {
-    use triblespace_core::collection::CollectionStoreExt as _;
-    let collection: Collection<triblespace_search::portable_bm25::PortableBM25Blob> =
-        Collection::open(snapshot, handle)
-            .map_err(|error| anyhow!("open collection descriptor: {error}"))?;
-    pile.maintain(collection, signer)
-        .await
-        .map_err(|error| anyhow!("maintain BM25 collection: {error}"))
+/// The host a reading command folds as: the key it would sign with.
+///
+/// An explicit key must load. Without one, the default (`TRIBLESPACE_KEY`,
+/// else `self.key` beside the pile) is used when it loads, and a read with no
+/// loadable key believes no MERGE and no MAP.
+fn reading_host(
+    explicit: Option<&std::path::Path>,
+    pile: &std::path::Path,
+) -> Result<Option<VerifyingKey>> {
+    let path = triblespace_core::signing_key_file::resolve_path(explicit, pile);
+    match triblespace_core::signing_key_file::load_existing(&path) {
+        Ok(key) => Ok(Some(key.verifying_key())),
+        Err(error) if explicit.is_some() => {
+            Err(anyhow!("load signing key {}: {error}", path.display()))
+        }
+        Err(_) => Ok(None),
+    }
 }
 
-#[cfg(feature = "search")]
-fn derive_bm25(
-    pile: &mut Pile,
-    source_handle: CollectionHandle,
-    arguments: &DeriveArguments,
-    policy: CollectionPolicy,
-) -> Result<CollectionHandle> {
-    use triblespace_search::text_bm25::{Bm25Tokenizer, TextAttributeToBm25};
-    let attribute = parse_attribute_id("--text", arguments.text.as_deref())?;
-    let tokenizer = Bm25Tokenizer::from_name(&arguments.tokenizer).ok_or_else(|| {
-        anyhow!(
-            "--tokenizer {:?} is not one of word, bigram, code",
-            arguments.tokenizer
-        )
-    })?;
-    let argument = TextAttributeToBm25 {
-        attribute,
-        tokenizer,
-    };
-    let source: Collection<SimpleArchive> = {
-        let snapshot = pile
-            .snapshot()
-            .map_err(|error| anyhow!("pile snapshot: {error:?}"))?;
-        Collection::open(&snapshot, source_handle)
-            .map_err(|error| anyhow!("open source collection descriptor: {error}"))?
-    };
-    Ok(pile
-        .derive::<triblespace_search::portable_bm25::PortableBM25Blob>(source, argument, policy)
-        .map_err(|error| anyhow!("register derived collection: {error:?}"))?
-        .handle())
-}
-
-#[cfg(not(feature = "search"))]
-fn derive_bm25(
-    _pile: &mut Pile,
-    _source_handle: CollectionHandle,
-    _arguments: &DeriveArguments,
-    _policy: CollectionPolicy,
-) -> Result<CollectionHandle> {
-    Err(anyhow!(
-        "this binary was built without the search feature and cannot register BM25 collections"
-    ))
-}
-
-#[cfg(feature = "search")]
 fn run_search(
     path: PathBuf,
     reference: String,
     query: String,
     top: usize,
     snippet: bool,
+    key: Option<PathBuf>,
 ) -> Result<()> {
     use anybytes::View;
     use triblespace_core::blob::encodings::utf8string::UTF8String;
-    use triblespace_core::collection::{CollectionDerivation, CollectionSnapshotExt};
+    use triblespace_core::collection::{CollectionAttachment, CollectionSnapshotExt};
     use triblespace_core::inline::encodings::genid::GenId;
     use triblespace_core::inline::IntoInline;
     use triblespace_core::prelude::{find, TriblePattern};
@@ -3362,7 +3457,10 @@ fn run_search(
         bigram_tokens, code_tokens, hash_tokens, BigramHash, WordHash,
     };
 
-    let mut pile = open_refreshed(&path)?;
+    // Only the host's MAPs are believed: opened as the key it would sign
+    // with, the read attaches that key's attachments.
+    let host = reading_host(key.as_deref(), &path)?;
+    let mut pile = super::open_refreshed_with(&path, host)?;
     let res = (|| -> Result<()> {
         let snapshot = pile
             .snapshot()
@@ -3381,16 +3479,23 @@ fn run_search(
         );
         let argument = PortableBM25Blob::bind(&Fragment::empty(), &descriptor)
             .map_err(|error| anyhow!("bind BM25 mapping: {error}"))?;
-        let source = triblespace_core::collection::descriptor::source(descriptor.facts())
-            .map_err(|error| anyhow!("read source: {error:?}"))?
-            .ok_or_else(|| anyhow!("BM25 descriptor names no source collection"))?;
+        let source = triblespace_core::collection::descriptor::parent(descriptor.facts())
+            .map_err(|error| anyhow!("read parent: {error:?}"))?
+            .ok_or_else(|| anyhow!("BM25 descriptor names no parent collection"))?;
 
-        // Read the target's resident realization. New source commits may not
-        // have index images yet; they do not make the existing index unreadable.
+        // Read the attached cover. New parent nodes may have no attachment
+        // yet; they are the residual, and do not make the index unreadable.
         let view = snapshot
-            .collection(collection)
+            .attached(collection)
             .map_err(|error| anyhow!("attach cover: {error:?}"))?;
         let members: Vec<_> = view.cover().members().collect();
+        let residual = view.residual().len();
+        if residual > 0 {
+            eprintln!(
+                "{residual} parent foundation(s) have no attachment yet and are not searched; \
+                 run 'collection maintain'"
+            );
+        }
         if members.is_empty() {
             println!("the collection has no members yet; run 'collection maintain' first");
             return Ok(());
@@ -3490,17 +3595,4 @@ fn run_search(
         .close()
         .map_err(|error| anyhow!("pile close: {error:?}"));
     res.and(close_res)
-}
-
-#[cfg(not(feature = "search"))]
-fn run_search(
-    _path: PathBuf,
-    _reference: String,
-    _query: String,
-    _top: usize,
-    _snippet: bool,
-) -> Result<()> {
-    Err(anyhow!(
-        "this binary was built without the search feature and cannot search BM25 collections"
-    ))
 }

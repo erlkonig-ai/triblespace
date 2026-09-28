@@ -1436,15 +1436,14 @@ mod tests {
         let mut store = MemoryRepo::default();
         let descriptor = Fragment::empty();
         let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
-        let source = store.collection("test BM25", policy.clone()).unwrap();
+        let source = store.collection("test BM25", policy).unwrap();
         let collection = store
-            .derive::<PortableBM25Blob>(
+            .attach::<PortableBM25Blob>(
                 source,
                 TextAttributeToBm25 {
                     attribute: metadata::name.id(),
                     tokenizer: Bm25Tokenizer::Bigram,
                 },
-                policy,
             )
             .unwrap();
         let left = golden_index();

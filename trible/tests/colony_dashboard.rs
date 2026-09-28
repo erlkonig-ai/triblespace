@@ -45,7 +45,7 @@ impl Fixture {
         let mut pile = Pile::open(&path).unwrap();
         let source = pile.collection("generated facts", policy.clone()).unwrap();
         let target = pile
-            .derive::<EntityIdSetBlob>(source, metadata::supersedes.id(), policy.clone())
+            .attach::<EntityIdSetBlob>(source, metadata::supersedes.id())
             .unwrap();
         let reports = pile.collection("generated telemetry", policy).unwrap();
         let expected = *genid();
@@ -85,7 +85,8 @@ impl Fixture {
     }
 
     fn observe(&self) -> (Vec<WorkerReport>, bool) {
-        let mut pile = Pile::open(&self.path).unwrap();
+        // Opened as the maintaining key: only its MAPs are believed.
+        let mut pile = Pile::open_as(&self.path, self.author).unwrap();
         let snapshot = pile.snapshot().unwrap();
         let facts = snapshot
             .collection(self.reports)
@@ -100,13 +101,13 @@ impl Fixture {
             Duration::from_secs(300),
         );
         let projected = snapshot
-            .collection(self.target)
+            .attached(self.target)
             .unwrap()
             .view::<EntityIdSet>()
             .unwrap()
             .contains(self.expected);
         let mut commits = 0;
-        let mut derives = 0;
+        let mut maps = 0;
         for record in snapshot.records().unwrap() {
             let record = record.unwrap();
             if record.collection() == self.reports.handle() {
@@ -119,18 +120,15 @@ impl Fixture {
                 commits += 1;
             }
             if record.collection() == self.target.handle()
-                && matches!(record, CollectionRecord::Derive(_))
+                && matches!(record, CollectionRecord::Map(_))
             {
-                assert!(record.verify_strict().is_ok(), "invalid derive signature");
+                assert!(record.verify_strict().is_ok(), "invalid map signature");
                 assert_eq!(record.public_key().raw, self.author.to_bytes());
-                derives += 1;
+                maps += 1;
             }
         }
         assert!(reports.is_empty() || commits > 0);
-        assert!(
-            !projected || derives > 0,
-            "projection requires a real derive"
-        );
+        assert!(!projected || maps > 0, "projection requires a real map");
         drop(snapshot);
         pile.close().unwrap();
         (reports, projected)

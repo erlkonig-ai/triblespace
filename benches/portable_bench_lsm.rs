@@ -11,11 +11,10 @@
 //!                 iteration first publishes the input chunks as independent
 //!                 native `SimpleArchive` collection commits and freezes what
 //!                 that collection stands on OUTSIDE the timer. The timer then
-//!                 covers the two direct `maintain` stages:
-//!                 source validation/derivation, canonical raw blob puts,
-//!                 deterministic dyadic target maintenance, ordinary
-//!                 raw-to-Rank9 derivation, equation publication, and final
-//!                 attachment. Source serialization, signing, and publication
+//!                 covers the two attached `maintain` stages: the source's
+//!                 carry, the Succinct attachment of every frontier node,
+//!                 raw blob puts, the Rank9 accelerator of each, MAP
+//!                 publication, and the final read. Source serialization, signing, and publication
 //!                 are deliberately excluded. There is one fixed maintenance
 //!                 policy and no fanout, level, or planner tuning knob. An
 //!                 input pile is opened read-only; each iteration writes only
@@ -759,16 +758,16 @@ fn main() {
         let mut ident: Option<BuildShape> = None;
         for i in 0..(build_warmup + build_iters) {
             let recording = i >= build_warmup;
-            let mut store = MemoryRepo::default();
+            let mut store = MemoryRepo::for_host(signing_key.verifying_key());
             let source = store
                 .collection(name, policy.clone())
                 .expect("register source collection");
             let raw = store
-                .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-                .expect("register raw Succinct projection");
+                .attach::<SuccinctArchiveBlob>(source, ())
+                .expect("attach the Succinct index");
             let accelerated = store
-                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(raw, (), policy.clone())
-                .expect("register accelerated Succinct projection");
+                .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, raw)
+                .expect("attach the Rank9 accelerator");
             for chunk in &chunks {
                 store
                     .commit(source, &signing_key, Fragment::from(chunk.content.clone()))
@@ -779,42 +778,27 @@ fn main() {
             drop(snapshot);
 
             let t = Instant::now();
-            block_on(store.maintain(raw, &signing_key)).expect("maintain raw Succinct cover");
-            let snapshot = block_on(store.maintain(accelerated, &signing_key))
-                .expect("maintain accelerated Succinct cover");
+            block_on(store.maintain_attached(raw, &signing_key))
+                .expect("maintain Succinct attachments");
+            let snapshot = block_on(store.maintain_attached(accelerated, &signing_key))
+                .expect("maintain Rank9 attachments");
             let attached = snapshot
-                .collection(accelerated)
-                .expect("observe accelerated Succinct cover");
+                .attached(accelerated)
+                .expect("observe the Rank9 attachments");
             let union: UnionArchive<OrderedUniverse> =
                 attached.view().expect("materialize Succinct cover");
             if recording {
                 samples.push(t.elapsed().as_secs_f64() * 1000.0);
             }
-            // Supports are collection-local: freshness is asked hop by hop,
-            // as the view's leaves against its source's foundations.
-            let raw_view = snapshot
-                .collection(raw)
-                .expect("observe raw Succinct cover");
-            let source_view = snapshot.collection(source).expect("observe source");
-            assert_eq!(source_view.support().expect("source support"), &support);
+            assert_eq!(attached.support(), &support);
             assert!(
-                raw_view
-                    .missing_from(&source_view)
-                    .expect("raw freshness")
-                    .is_empty()
-                    && attached
-                        .missing_from(&raw_view)
-                        .expect("accelerated freshness")
-                        .is_empty(),
-                "the maintained chain has a leaf for every source foundation",
+                attached.residual().is_empty(),
+                "every source foundation is reached by an attachment",
             );
 
-            // Inspect the resident raw physical cover outside the timer. This
-            // reports construction shape through a lookup-only attachment
-            // which executes no collection algebra.
-            let raw_cover = attached
-                .snapshot()
-                .collection(raw)
+            // Inspect the resident raw physical cover outside the timer.
+            let raw_cover = snapshot
+                .attached(raw)
                 .expect("observe raw cover for metrics");
             let shape = BuildShape {
                 source_cover_members: support.len(),
@@ -824,8 +808,7 @@ fn main() {
                     .cover()
                     .members()
                     .map(|handle| {
-                        attached
-                            .snapshot()
+                        snapshot
                             .get::<Blob<SuccinctArchiveBlob>, _>(handle)
                             .expect("load raw target member")
                             .bytes

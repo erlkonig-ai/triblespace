@@ -26,7 +26,7 @@ use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
 use crate::blob::{Blob, BlobEncoding, TryFromBlob};
 use crate::collection::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
 use crate::collection::{
-    descriptor, CollectionData, CollectionDerivation, CollectionEncoding, CollectionOperationError,
+    descriptor, CollectionAttachment, CollectionData, CollectionEncoding, CollectionOperationError,
     Cover, TryFromCover, TryFromCoverError,
 };
 use crate::id::{ExclusiveId, Id, RawId, ID_LEN};
@@ -249,8 +249,7 @@ pub fn derive_element(
     Ok(encode_rows(values))
 }
 
-impl CollectionDerivation for EntityIdSetBlob {
-    type Source = SimpleArchive;
+impl CollectionAttachment for EntityIdSetBlob {
     type Argument = Id;
 
     fn fragment(attribute: &Id) -> Fragment {
@@ -261,7 +260,7 @@ impl CollectionDerivation for EntityIdSetBlob {
         }
     }
 
-    fn bind(_source: &Fragment, target: &Fragment) -> Result<Id, CollectionOperationError> {
+    fn bind(_parent: &Fragment, target: &Fragment) -> Result<Id, CollectionOperationError> {
         let algorithm = descriptor::mapping_algorithm(target.facts())
             .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?;
         if algorithm != Some(GENID_ATTRIBUTE_VALUES_MAPPING_V1) {
@@ -287,13 +286,14 @@ impl CollectionDerivation for EntityIdSetBlob {
 
     fn map<R>(
         attribute: &Id,
-        source: &Blob<SimpleArchive>,
+        node: &Blob<SimpleArchive>,
+        _siblings: &[crate::collection::CollectionData],
         _reader: &R,
     ) -> Result<Blob<Self>, CollectionOperationError>
     where
         R: StoreRead,
     {
-        derive_element(source, *attribute)
+        derive_element(node, *attribute)
             .map_err(|error| CollectionOperationError::Fatal(error.to_string()))
     }
 }
@@ -420,7 +420,7 @@ mod tests {
 
     use crate::blob::MemoryBlobStore;
     use crate::collection::{
-        AdmissionPolicy, CanonicalDerivation, Collection, CollectionHandle, CollectionPolicy,
+        AdmissionPolicy, CanonicalAttachment, Collection, CollectionHandle, CollectionPolicy,
         CollectionRead, CollectionSnapshotExt, CollectionStoreExt,
     };
     use crate::inline::encodings::time::NsTAIInterval;
@@ -542,15 +542,13 @@ mod tests {
             .collection("id-value-projection", policy.clone())
             .unwrap();
         let argument = metadata::supersedes.id();
-        let target = descriptor::deriving_with(
+        let target = descriptor::attaching_with(
             source.handle(),
-            &CanonicalDerivation::<EntityIdSetBlob>::new(argument),
-            policy.clone(),
+            &CanonicalAttachment::<EntityIdSetBlob>::new(argument),
         );
-        let other_attribute = descriptor::deriving_with(
+        let other_attribute = descriptor::attaching_with(
             source.handle(),
-            &CanonicalDerivation::<EntityIdSetBlob>::new(metadata::tag.id()),
-            policy.clone(),
+            &CanonicalAttachment::<EntityIdSetBlob>::new(metadata::tag.id()),
         );
         assert_ne!(target, other_attribute);
         assert_eq!(
@@ -565,10 +563,9 @@ mod tests {
             EntityIdSetBlob::bind(&Fragment::empty(), &target).unwrap(),
             argument,
         );
-        let another_algorithm = descriptor::deriving_with(
+        let another_algorithm = descriptor::attaching_with(
             source.handle(),
-            &CanonicalDerivation::<crate::collection::latest::LatestBlob>::new(argument),
-            policy,
+            &CanonicalAttachment::<crate::collection::latest::LatestBlob>::new(argument),
         );
         assert!(EntityIdSetBlob::bind(&Fragment::empty(), &another_algorithm).is_err());
 
@@ -584,16 +581,16 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_maintenance_derives_receipt_values_without_changing_source_commits() {
+    fn attached_maintenance_projects_receipt_values_without_changing_source_commits() {
         let key = SigningKey::from_bytes(&[11; 32]);
         let policy = CollectionPolicy::new(
             AdmissionPolicy::direct(key.verifying_key()),
             AdmissionPolicy::direct(key.verifying_key()),
         );
-        let mut store = MemoryRepo::default();
-        let source = store.collection("receipt-facts", policy.clone()).unwrap();
+        let mut store = MemoryRepo::for_host(key.verifying_key());
+        let source = store.collection("receipt-facts", policy).unwrap();
         let target = store
-            .derive::<EntityIdSetBlob>(source, metadata::supersedes.id(), policy)
+            .attach::<EntityIdSetBlob>(source, metadata::supersedes.id())
             .unwrap();
         let first_receipt = id(31);
         let second_receipt = id(32);
@@ -601,9 +598,9 @@ mod tests {
             metadata::supersedes: id(1),
         };
         store.commit(source, &key, first).unwrap();
-        let early = block_on(store.maintain(target, &key))
+        let early = block_on(store.maintain_attached(target, &key))
             .unwrap()
-            .collection(target)
+            .attached(target)
             .unwrap();
         assert_eq!(
             early
@@ -631,10 +628,10 @@ mod tests {
                 },
             )
             .unwrap();
-        let completed = block_on(store.maintain(target, &key)).unwrap();
+        let completed = block_on(store.maintain_attached(target, &key)).unwrap();
         assert_eq!(
             completed
-                .collection(target)
+                .attached(target)
                 .unwrap()
                 .view::<EntityIdSet>()
                 .unwrap()
@@ -662,7 +659,7 @@ mod tests {
             "ordinary receipt facts remain intact"
         );
         let records = completed.records().unwrap().count();
-        let repeated = block_on(store.maintain(target, &key)).unwrap();
+        let repeated = block_on(store.maintain_attached(target, &key)).unwrap();
         assert_eq!(repeated.records().unwrap().count(), records);
         assert_eq!(repeated.wants().unwrap().count(), 0);
     }

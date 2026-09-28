@@ -107,4 +107,7 @@ mod oracle;
 mod equation_admission_tests;
 
 #[cfg(test)]
+mod attached_tests;
+
+#[cfg(test)]
 pub(crate) mod test_support;

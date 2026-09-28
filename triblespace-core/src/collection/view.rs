@@ -13,6 +13,7 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 
+use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::repo::{BlobStoreGet, StoreChanges, StoreRead, StoreSnapshot};
 use crate::trible::Fragment;
 
@@ -189,6 +190,115 @@ where
         R: StoreRead,
     {
         Ok((self.snapshot, self.support, self.cover))
+    }
+}
+
+/// One immutable observation of an attached collection: the attached cover
+/// over its parent's lattice.
+///
+/// The cover is a set of attachments, one per parent node taken; the
+/// support is the parent foundations those nodes stand for, read from the
+/// parent's own rows in the same observation; the residual is the parent
+/// foundations no attachment reaches. An attached collection has no support
+/// of its own: it stands for its parent's.
+pub struct AttachedSnapshot<R, E>
+where
+    R: StoreSnapshot,
+    E: CollectionEncoding,
+{
+    snapshot: R,
+    cover: Cover<E>,
+    support: Support<SimpleArchive>,
+    residual: Support<SimpleArchive>,
+    dependencies: DependencyTracker,
+}
+
+impl<R, E> Clone for AttachedSnapshot<R, E>
+where
+    R: StoreSnapshot,
+    E: CollectionEncoding,
+{
+    fn clone(&self) -> Self {
+        Self {
+            snapshot: self.snapshot.clone(),
+            cover: self.cover.clone(),
+            support: self.support.clone(),
+            residual: self.residual.clone(),
+            dependencies: self.dependencies.clone(),
+        }
+    }
+}
+
+impl<R, E> AttachedSnapshot<R, E>
+where
+    R: StoreSnapshot,
+    E: CollectionEncoding,
+{
+    pub(crate) fn new(
+        snapshot: R,
+        cover: Cover<E>,
+        support: Support<SimpleArchive>,
+        residual: Support<SimpleArchive>,
+        dependencies: DependencyTracker,
+    ) -> Self {
+        Self {
+            snapshot,
+            cover,
+            support,
+            residual,
+            dependencies,
+        }
+    }
+
+    /// Immutable store observation against which the cover is valid.
+    pub fn snapshot(&self) -> &R {
+        &self.snapshot
+    }
+
+    /// Whether everything consulted is unchanged in `snapshot`: the parent's
+    /// and the attached collection's records, and the residency of every
+    /// attachment and dependency looked at and of every residual foundation.
+    /// A MAP, an attachment's bytes or a residual foundation's bytes arriving
+    /// moves an observation off current, and so does a new parent node.
+    pub fn is_current(&self, snapshot: &R) -> bool {
+        let dependencies = self
+            .dependencies
+            .lock()
+            .expect("dependency tracker poisoned");
+        snapshot.changes_for(&self.snapshot, &dependencies) == StoreChanges::NONE
+    }
+
+    /// The attachments taken, in the attached collection.
+    pub fn cover(&self) -> &Cover<E> {
+        &self.cover
+    }
+
+    /// The parent foundations the taken attachments stand for.
+    pub fn support(&self) -> &Support<SimpleArchive> {
+        &self.support
+    }
+
+    /// The parent foundations no taken attachment reaches: a node whose
+    /// attachment is not built yet, cannot be represented, or waits for a
+    /// dependency. Read these raw, build them, or report them as a gap;
+    /// membership never implies that their bytes are here.
+    pub fn residual(&self) -> &Support<SimpleArchive> {
+        &self.residual
+    }
+
+    /// Reconstruct one caller-chosen logical value from the attachments
+    /// taken. The residual is not part of it.
+    pub fn view<V>(&self) -> Result<V, TryFromCoverError<R::GetError<Infallible>, V::Error>>
+    where
+        R: BlobStoreGet,
+        V: TryFromCover<E>,
+    {
+        let observed =
+            ObservedStore::with_tracker(self.snapshot.clone(), self.dependencies.clone());
+        let descriptor =
+            super::api::load_collection_descriptor(&observed, self.cover.collection().handle())
+                .map_err(TryFromCoverError::from)?;
+        V::try_from_cover(&self.cover, &descriptor.fragment, &observed)
     }
 }
 

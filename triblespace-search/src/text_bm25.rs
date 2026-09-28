@@ -1,12 +1,13 @@
-//! BM25 as a derived collection: from one text attribute to the portable
-//! carrier.
+//! BM25 as an attached collection: from one text attribute of a node to the
+//! portable carrier.
 //!
 //! [`PortableBM25Blob`] already joins by document union and pointwise-maximum
 //! term frequency, so the LSM maintenance folds it exactly. What was missing
 //! was a way to *get* one from facts: this module is the mapping. Its argument
 //! is the attribute whose values are [`UTF8String`] handles and the tokenizer
-//! to cut them with; both live in the derived descriptor, so `maintain` and
-//! every reader act on the descriptor alone.
+//! to cut them with; both live in the attached descriptor, so maintenance and
+//! every reader act on the descriptor alone. Every host that holds a node and
+//! its texts computes its attachment, so it is attached, never derived.
 //!
 //! The document key is the entity. An entity with several texts under the
 //! attribute gets, per term, the largest frequency any one of its texts has:
@@ -14,6 +15,9 @@
 //! maximum over texts makes the map a homomorphism over source union,
 //! `map(A ∪ B) = map(A) ⊔ map(B)`, when one entity's texts land in different
 //! members. With one text per entity, which is the common case, the two agree.
+//! The same maximum is what makes a reader's cover of attachments answer
+//! alike whatever its granularity: a document present in two nodes' images
+//! is one document, its frequencies the pointwise maximum, never a sum.
 //!
 //! A text handle that is not resident is a missing dependency, never a
 //! silently shorter document.
@@ -25,7 +29,9 @@ use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::{Blob, TryFromBlob};
 use triblespace_core::collection::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
-use triblespace_core::collection::{CollectionDerivation, CollectionOperationError};
+use triblespace_core::collection::{
+    CollectionAttachment, CollectionData, CollectionOperationError,
+};
 use triblespace_core::id::{id_hex, ExclusiveId, Id, RawId};
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::hash::Handle;
@@ -33,7 +39,7 @@ use triblespace_core::inline::encodings::shortstring::ShortString;
 use triblespace_core::inline::{Encodes, Inline, IntoInline, RawInline};
 use triblespace_core::macros::{attributes, entity};
 use triblespace_core::metadata::{self, MetaDescribe};
-use triblespace_core::repo::{BlobStoreGet, BlobStoreMeta};
+use triblespace_core::repo::StoreRead;
 use triblespace_core::trible::{Fragment, TRIBLE_LEN};
 
 use crate::portable_bm25::{PortableBM25Blob, PortableBM25Index};
@@ -128,8 +134,7 @@ fn fatal(message: impl Into<String>) -> CollectionOperationError {
     CollectionOperationError::Fatal(message.into())
 }
 
-impl CollectionDerivation for PortableBM25Blob {
-    type Source = SimpleArchive;
+impl CollectionAttachment for PortableBM25Blob {
     type Argument = TextAttributeToBm25;
 
     fn fragment(argument: &Self::Argument) -> Fragment {
@@ -137,7 +142,7 @@ impl CollectionDerivation for PortableBM25Blob {
     }
 
     fn bind(
-        _source: &Fragment,
+        _parent: &Fragment,
         target: &Fragment,
     ) -> Result<Self::Argument, CollectionOperationError> {
         let descriptor =
@@ -178,10 +183,11 @@ impl CollectionDerivation for PortableBM25Blob {
     fn map<R>(
         argument: &Self::Argument,
         source: &Blob<SimpleArchive>,
+        _siblings: &[CollectionData],
         reader: &R,
     ) -> Result<Blob<Self>, CollectionOperationError>
     where
-        R: BlobStoreGet + BlobStoreMeta,
+        R: StoreRead,
     {
         triblespace_core::collection::simplearchive_union::validate_element(source)
             .map_err(|source| fatal(source.to_string()))?;
@@ -295,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn derived_through_a_store_the_descriptor_binds_and_maintains() {
+    fn attached_through_a_store_the_descriptor_binds_and_maintains() {
         use ed25519_dalek::SigningKey;
         use futures::executor::block_on;
         use triblespace_core::collection::{
@@ -312,14 +318,12 @@ mod tests {
             attribute: attribute.id(),
             tokenizer: Bm25Tokenizer::Bigram,
         };
-        let mut store = MemoryRepo::default();
+        let mut store = MemoryRepo::for_host(root);
         let text = store
             .put::<UTF8String, _>(String::from("the quick brown fox"))
             .unwrap();
-        let source = store.collection("bm25-texts", policy.clone()).unwrap();
-        let target = store
-            .derive::<PortableBM25Blob>(source, argument, policy)
-            .unwrap();
+        let source = store.collection("bm25-texts", policy).unwrap();
+        let target = store.attach::<PortableBM25Blob>(source, argument).unwrap();
         store
             .commit(
                 source,
@@ -338,16 +342,326 @@ mod tests {
         );
         drop(snapshot);
 
-        // Maintenance realises one member holding the one document.
-        let snapshot = block_on(store.maintain(target, &authority)).unwrap();
-        let collection = snapshot.collection(target).unwrap();
-        let members: Vec<_> = collection.cover().members().collect();
+        // Maintenance attaches the one node, holding the one document.
+        let snapshot = block_on(store.maintain_attached(target, &authority)).unwrap();
+        let attached = snapshot.attached(target).unwrap();
+        assert!(attached.residual().is_empty());
+        let members: Vec<_> = attached.cover().members().collect();
         assert_eq!(members.len(), 1);
         let member: Blob<PortableBM25Blob> = snapshot.get(members[0]).unwrap();
         let index =
             PortableBM25Index::<GenId, BigramHash>::from_bytes(member.bytes.clone()).unwrap();
         assert_eq!(index.doc_count(), 1);
         assert_eq!(index.term_count(), 3);
+    }
+
+    /// A node whose text is not here has no attachment: it is the reader's
+    /// residual, named, not a shorter document. When the text arrives the
+    /// next pass attaches it.
+    #[test]
+    fn a_node_whose_text_is_absent_stays_residual_until_the_text_arrives() {
+        use ed25519_dalek::SigningKey;
+        use futures::executor::block_on;
+        use triblespace_core::collection::{
+            AdmissionPolicy, CollectionPolicy, CollectionSnapshotExt, CollectionStoreExt,
+        };
+
+        let authority = SigningKey::from_bytes(&[42; 32]);
+        let root = authority.verifying_key();
+        let policy =
+            CollectionPolicy::new(AdmissionPolicy::direct(root), AdmissionPolicy::direct(root));
+        let attribute = Attribute::<Handle<UTF8String>>::named("bm25-late-text");
+        let argument = TextAttributeToBm25 {
+            attribute: attribute.id(),
+            tokenizer: Bm25Tokenizer::Word,
+        };
+        let mut store = MemoryRepo::for_host(root);
+        let source = store.collection("bm25-late", policy).unwrap();
+        let target = store.attach::<PortableBM25Blob>(source, argument).unwrap();
+        let text: Blob<UTF8String> = String::from("late arrival").to_blob();
+        let handle = text.get_handle();
+        let commit = store
+            .commit(
+                source,
+                &authority,
+                Fragment::from(text_facts(attribute.id(), [(1, handle)])),
+            )
+            .unwrap();
+
+        let snapshot = block_on(store.maintain_attached(target, &authority)).unwrap();
+        let attached = snapshot.attached(target).unwrap();
+        assert!(attached.cover().is_empty());
+        assert_eq!(
+            attached
+                .residual()
+                .members()
+                .map(|member| member.raw)
+                .collect::<Vec<_>>(),
+            vec![commit.data().raw]
+        );
+
+        store.put::<UTF8String, _>(text).unwrap();
+        let later = block_on(store.maintain_attached(target, &authority)).unwrap();
+        assert!(
+            !attached.is_current(&later),
+            "the text's arrival moves the read"
+        );
+        let attached = later.attached(target).unwrap();
+        assert!(attached.residual().is_empty());
+        assert_eq!(attached.cover().len(), 1);
+    }
+
+    /// A seeded splitmix64 stream, for reproducible random lattices.
+    struct Stream(u64);
+
+    impl Stream {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            self.next() % bound
+        }
+    }
+
+    const WORDS: [&str; 6] = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"];
+
+    /// Scores, per document, for one query, rounded to compare across two
+    /// summation orders.
+    fn scores(
+        view: &crate::portable_bm25::PortableBM25View,
+        query: &str,
+    ) -> BTreeMap<RawInline, i64> {
+        view.query()
+            .unwrap()
+            .query_multi(&hash_tokens(query))
+            .into_iter()
+            .map(|(document, score)| (document.raw, (f64::from(score) * 1e4).round() as i64))
+            .collect()
+    }
+
+    /// The cover-query equivalence law for BM25 attachments: over random
+    /// commits and host merges (overlapping inputs included), with an
+    /// attachment present at random nodes and the residual built in memory,
+    /// the attached cover scores every query exactly as the index of the
+    /// union of every foundation does.
+    #[test]
+    fn attached_covers_answer_like_the_index_of_the_union() {
+        use ed25519_dalek::SigningKey;
+        use futures::executor::block_on;
+        use triblespace_core::collection::{
+            simplearchive_union, AdmissionPolicy, CollectionMap, CollectionMerge, CollectionPolicy,
+            CollectionRecord, CollectionSnapshotExt, CollectionStore, CollectionStoreExt,
+            CoverageRead, TryFromCover,
+        };
+        use triblespace_core::repo::BlobStoreGet;
+
+        let key = SigningKey::from_bytes(&[43; 32]);
+        let host = key.verifying_key();
+        let attribute = Attribute::<Handle<UTF8String>>::named("bm25-law");
+        let argument = TextAttributeToBm25 {
+            attribute: attribute.id(),
+            tokenizer: Bm25Tokenizer::Word,
+        };
+        for seed in 0..24u64 {
+            let mut random = Stream(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) + 3);
+            let mut store = MemoryRepo::for_host(host);
+            let policy =
+                CollectionPolicy::new(AdmissionPolicy::direct(host), AdmissionPolicy::direct(host));
+            let root = store
+                .collection(&format!("bm25-law-{seed}"), policy)
+                .unwrap();
+            let target = store.attach::<PortableBM25Blob>(root, argument).unwrap();
+            let mut union = TribleSet::new();
+            for _ in 0..2 + random.below(14) {
+                let mut rows = Vec::new();
+                for _ in 0..1 + random.below(3) {
+                    let words: Vec<&str> = (0..1 + random.below(4))
+                        .map(|_| WORDS[random.below(WORDS.len() as u64) as usize])
+                        .collect();
+                    let text = store.put::<UTF8String, _>(words.join(" ")).unwrap();
+                    rows.push((1 + random.below(5) as u8, text));
+                }
+                let facts = text_facts(attribute.id(), rows);
+                union += facts.clone();
+                store.commit(root, &key, Fragment::from(facts)).unwrap();
+            }
+            if random.below(2) == 0 {
+                block_on(store.maintain(root, &key)).unwrap();
+            }
+            // Host merges over random, possibly overlapping, nodes.
+            let nodes = |store: &mut MemoryRepo| {
+                let snapshot = store.snapshot().unwrap();
+                let coverage =
+                    CoverageRead::coverage(&snapshot, &BTreeSet::from([root.handle()])).unwrap();
+                let mut seen = BTreeSet::new();
+                let mut pending: Vec<CollectionData> = coverage.frontier(root.handle()).collect();
+                while let Some(node) = pending.pop() {
+                    if seen.insert(node) {
+                        for inputs in coverage.producers(root.handle(), node) {
+                            pending.extend(inputs.iter());
+                        }
+                    }
+                }
+                seen.into_iter().collect::<Vec<_>>()
+            };
+            for _ in 0..random.below(4) {
+                let lattice = nodes(&mut store);
+                if lattice.len() < 2 {
+                    break;
+                }
+                let picked: BTreeSet<CollectionData> = (0..2 + random.below(2))
+                    .map(|_| lattice[random.below(lattice.len() as u64) as usize])
+                    .collect();
+                if picked.len() < 2 {
+                    continue;
+                }
+                let snapshot = store.snapshot().unwrap();
+                let blobs: Vec<Blob<SimpleArchive>> = picked
+                    .iter()
+                    .map(|node| {
+                        snapshot
+                            .get(Handle::<SimpleArchive>::from_hash(*node))
+                            .unwrap()
+                    })
+                    .collect();
+                drop(snapshot);
+                let joined = blobs.iter().skip(1).fold(blobs[0].clone(), |joined, blob| {
+                    simplearchive_union::join(&joined, blob).unwrap()
+                });
+                let result = store.put::<SimpleArchive, _>(joined).unwrap();
+                store
+                    .insert(CollectionRecord::Merge(
+                        CollectionMerge::sign(
+                            &key,
+                            root.handle(),
+                            picked.iter().copied(),
+                            Handle::<SimpleArchive>::to_hash(result),
+                        )
+                        .unwrap(),
+                    ))
+                    .unwrap();
+            }
+            // An attachment at random nodes.
+            for node in nodes(&mut store) {
+                if random.below(2) == 0 {
+                    continue;
+                }
+                let snapshot = store.snapshot().unwrap();
+                let bytes: Blob<SimpleArchive> = snapshot
+                    .get(Handle::<SimpleArchive>::from_hash(node))
+                    .unwrap();
+                let image = PortableBM25Blob::map(&argument, &bytes, &[], &snapshot).unwrap();
+                drop(snapshot);
+                let attachment = store.put::<PortableBM25Blob, _>(image).unwrap();
+                store
+                    .insert(CollectionRecord::Map(CollectionMap::sign(
+                        &key,
+                        target.handle(),
+                        node,
+                        Handle::<PortableBM25Blob>::to_hash(attachment),
+                    )))
+                    .unwrap();
+            }
+
+            let snapshot = store.snapshot().unwrap();
+            let attached = snapshot.attached(target).unwrap();
+            let mut members: Vec<_> = attached.cover().members().collect();
+            let residual: Vec<_> = attached.residual().members().collect();
+            drop(attached);
+            for foundation in residual {
+                let bytes: Blob<SimpleArchive> = snapshot.get(foundation).unwrap();
+                let image = PortableBM25Blob::map(&argument, &bytes, &[], &snapshot).unwrap();
+                members.push(store.put::<PortableBM25Blob, _>(image).unwrap());
+            }
+            let expected =
+                PortableBM25Blob::map(&argument, &union.to_blob(), &[], &snapshot).unwrap();
+            let expected = store.put::<PortableBM25Blob, _>(expected).unwrap();
+            let snapshot = store.snapshot().unwrap();
+            let descriptor: Blob<SimpleArchive> = snapshot.get(target.handle()).unwrap();
+            let descriptor = Fragment::from(TribleSet::try_from_blob(descriptor).unwrap());
+            let through_cover: crate::portable_bm25::PortableBM25View =
+                TryFromCover::try_from_cover(&target.cover(members), &descriptor, &snapshot)
+                    .unwrap();
+            let through_union: crate::portable_bm25::PortableBM25View =
+                TryFromCover::try_from_cover(&target.cover([expected]), &descriptor, &snapshot)
+                    .unwrap();
+            assert_eq!(
+                through_cover.query().unwrap().doc_count(),
+                through_union.query().unwrap().doc_count(),
+                "seed {seed}"
+            );
+            for word in WORDS {
+                assert_eq!(
+                    scores(&through_cover, word),
+                    scores(&through_union, word),
+                    "seed {seed}, query {word}"
+                );
+            }
+            assert_eq!(
+                scores(&through_cover, "alpha delta foxtrot"),
+                scores(&through_union, "alpha delta foxtrot"),
+                "seed {seed}"
+            );
+        }
+    }
+
+    /// The named case: one document present in two nodes, each attached.
+    /// The cover counts it once, so its document frequency is not summed,
+    /// and the scores are the union's.
+    #[test]
+    fn a_document_present_in_two_nodes_is_counted_once() {
+        use triblespace_core::collection::{
+            AdmissionPolicy, CollectionPolicy, CollectionStoreExt, TryFromCover,
+        };
+
+        let attribute = Attribute::<Handle<UTF8String>>::named("bm25-twice");
+        let argument = TextAttributeToBm25 {
+            attribute: attribute.id(),
+            tokenizer: Bm25Tokenizer::Word,
+        };
+        let mut store = MemoryRepo::default();
+        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+        let root = store.collection("bm25-twice", policy).unwrap();
+        let target = store.attach::<PortableBM25Blob>(root, argument).unwrap();
+        let shared = store
+            .put::<UTF8String, _>(String::from("needle hay"))
+            .unwrap();
+        let other = store.put::<UTF8String, _>(String::from("hay")).unwrap();
+        let left = text_facts(attribute.id(), [(1, shared), (2, other)]);
+        let right = text_facts(attribute.id(), [(1, shared)]);
+        let mut union = left.clone();
+        union += right.clone();
+
+        let snapshot = store.snapshot().unwrap();
+        let mut members = Vec::new();
+        for facts in [&left, &right, &union] {
+            let image = PortableBM25Blob::map(&argument, &facts.to_blob(), &[], &snapshot).unwrap();
+            members.push(store.put::<PortableBM25Blob, _>(image).unwrap());
+        }
+        let snapshot = store.snapshot().unwrap();
+        let descriptor = Fragment::from(PortableBM25Blob::fragment(&argument));
+        let through_cover: crate::portable_bm25::PortableBM25View = TryFromCover::try_from_cover(
+            &target.cover(members[..2].to_vec()),
+            &descriptor,
+            &snapshot,
+        )
+        .unwrap();
+        let through_union: crate::portable_bm25::PortableBM25View =
+            TryFromCover::try_from_cover(&target.cover([members[2]]), &descriptor, &snapshot)
+                .unwrap();
+        assert_eq!(through_cover.query().unwrap().doc_count(), 2);
+        for query in ["needle", "hay", "needle hay"] {
+            assert_eq!(
+                scores(&through_cover, query),
+                scores(&through_union, query),
+                "{query}"
+            );
+        }
     }
 
     #[test]
@@ -372,9 +686,12 @@ mod tests {
         let mut union = left.clone();
         union += right.clone();
 
-        let mapped_left = PortableBM25Blob::map(&argument, &left.to_blob(), &snapshot).unwrap();
-        let mapped_right = PortableBM25Blob::map(&argument, &right.to_blob(), &snapshot).unwrap();
-        let mapped_union = PortableBM25Blob::map(&argument, &union.to_blob(), &snapshot).unwrap();
+        let mapped_left =
+            PortableBM25Blob::map(&argument, &left.to_blob(), &[], &snapshot).unwrap();
+        let mapped_right =
+            PortableBM25Blob::map(&argument, &right.to_blob(), &[], &snapshot).unwrap();
+        let mapped_union =
+            PortableBM25Blob::map(&argument, &union.to_blob(), &[], &snapshot).unwrap();
         let descriptor = PortableBM25Blob::fragment(&argument);
         let joined =
             PortableBM25Blob::join_members(&descriptor, &mapped_left, &mapped_right, &snapshot)
@@ -404,7 +721,7 @@ mod tests {
         let absent: Inline<Handle<UTF8String>> = Inline::new([7u8; 32]);
         let facts = text_facts(attribute.id(), [(1, absent)]);
         assert!(matches!(
-            PortableBM25Blob::map(&argument, &facts.to_blob(), &snapshot),
+            PortableBM25Blob::map(&argument, &facts.to_blob(), &[], &snapshot),
             Err(CollectionOperationError::MissingDependency(_))
         ));
     }

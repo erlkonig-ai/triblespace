@@ -2991,13 +2991,10 @@ fn equal_payload_commit_does_not_restart_completed_target_maintenance() {
 mod lattice_v2 {
     use super::*;
 
-    use crate::blob::encodings::entity_id_set::{EntityIdSet, EntityIdSetBlob};
-    use crate::blob::encodings::succinctarchive::{
-        OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
-    };
+    use crate::collection::test_support::{TestImage, TestImageTwo};
     use crate::collection::{
-        maintain_downstream, simplearchive_union, CollectionHandle, CoreRealizer, CoverageRead,
-        SourceLocator, MERGE_FAN_IN,
+        maintain_downstream, simplearchive_union, CollectionHandle, CoverageRead, SourceLocator,
+        MERGE_FAN_IN,
     };
 
     fn key(byte: u8) -> SigningKey {
@@ -3290,58 +3287,34 @@ mod lattice_v2 {
     }
 
     #[test]
-    fn a_view_publishes_an_empty_image_as_a_leaf() {
-        let id = |byte: u8| Id::new([byte; 16]).unwrap();
+    fn a_view_publishes_the_image_of_an_empty_commit_as_a_leaf() {
         let owner = key(41);
         let mut store = MemoryRepo::for_host(owner.verifying_key());
         let root = store.collection("receipts", policy()).unwrap();
-        let ids = store
-            .derive::<EntityIdSetBlob>(root, crate::metadata::supersedes.id(), policy())
-            .unwrap();
-        let receipt = id(31);
+        let images = store.derive::<TestImage>(root, (), policy()).unwrap();
         store
             .commit(
                 root,
                 &owner,
-                crate::macros::entity! { ExclusiveId::force_ref(&receipt) @
-                    crate::metadata::supersedes: id(1),
-                },
+                crate::macros::entity! { crate::metadata::name: "something" },
             )
             .unwrap();
-        let unrelated = store
-            .commit(
-                root,
-                &owner,
-                crate::macros::entity! { crate::metadata::name: "nothing superseded" },
-            )
-            .unwrap();
-        block_on(store.ensure(ids, &owner)).unwrap();
+        let empty = store.commit(root, &owner, Fragment::empty()).unwrap();
+        block_on(store.ensure(images, &owner)).unwrap();
 
-        let leaves = derives_in(&mut store, ids.handle());
+        let leaves = derives_in(&mut store, images.handle());
         assert_eq!(leaves.len(), 2);
         let snapshot = store.snapshot().unwrap();
-        let empty = <EntityIdSetBlob as CollectionDerivation>::map(
-            &crate::metadata::supersedes.id(),
-            &TribleSet::new().to_blob(),
-            &snapshot,
-        )
-        .unwrap();
+        let image = TestImage::image(&TribleSet::new().to_blob());
         let leaf = leaves
             .iter()
-            .find(|leaf| leaf.input() == SourceLocator::of(unrelated.data().raw))
-            .expect("the unrelated commit has its leaf");
-        assert_eq!(leaf.output(), data(&empty));
-        let view = snapshot.collection(ids).unwrap();
+            .find(|leaf| leaf.input() == SourceLocator::of(empty.data().raw))
+            .expect("the empty commit has its leaf");
+        assert_eq!(leaf.output(), data(&image));
+        let view = snapshot.collection(images).unwrap();
         let source = snapshot.collection(root).unwrap();
         assert!(view.missing_from(&source).unwrap().is_empty());
         assert_eq!(view.support().unwrap().len(), 2);
-        assert_eq!(
-            view.view::<EntityIdSet>()
-                .unwrap()
-                .iter()
-                .collect::<Vec<_>>(),
-            [id(1)]
-        );
     }
 
     #[test]
@@ -3492,17 +3465,48 @@ mod lattice_v2 {
         assert_eq!(frontier(&mut store, first.handle()).len(), 1);
     }
 
+    /// Realizes the test images through their canonical mappings.
+    struct TestRealizer;
+
+    impl<S> crate::collection::RealizeDerived<S> for TestRealizer
+    where
+        S: crate::repo::Store + crate::repo::async_store::AsyncBlobStoreAcquire + Send,
+    {
+        async fn realize(
+            &mut self,
+            store: &mut S,
+            derived: &crate::collection::Derived,
+            signer: &SigningKey,
+            upkeep: crate::collection::Upkeep,
+        ) -> Result<crate::collection::Realized, CollectionRealizationError> {
+            if derived.representation == <TestImage as MetaDescribe>::id() {
+                crate::collection::realize_as::<S, TestImage>(store, derived, signer, upkeep).await
+            } else if derived.representation == <TestImageTwo as MetaDescribe>::id() {
+                crate::collection::realize_as::<S, TestImageTwo>(store, derived, signer, upkeep)
+                    .await
+            } else {
+                Ok(crate::collection::Realized::Unknown)
+            }
+        }
+
+        async fn realize_attached(
+            &mut self,
+            _store: &mut S,
+            _attached: &crate::collection::Attached,
+            _signer: &SigningKey,
+            _upkeep: crate::collection::Upkeep,
+        ) -> Result<crate::collection::Realized, CollectionRealizationError> {
+            Ok(crate::collection::Realized::Unknown)
+        }
+    }
+
     #[test]
     fn a_chain_is_maintained_upstream_first_in_one_pass() {
         let owner = key(41);
         let mut store = MemoryRepo::for_host(owner.verifying_key());
         let root = store.collection("facts", policy()).unwrap();
-        let raw = store
-            .derive::<SuccinctArchiveBlob>(root, (), policy())
-            .unwrap();
-        let accelerated = store
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(raw, (), policy())
-            .unwrap();
+        let raw = store.derive::<TestImage>(root, (), policy()).unwrap();
+        let accelerated = store.derive::<TestImageTwo>(raw, (), policy()).unwrap();
         // Whoever registers a view realizes it once; from then on the
         // store lists it.
         own_commit(&mut store, root, 41, 0);
@@ -3517,13 +3521,13 @@ mod lattice_v2 {
             &mut store,
             root.handle(),
             &owner,
-            &mut CoreRealizer,
+            &mut TestRealizer,
         ))
         .unwrap();
         assert_eq!(report.realized, vec![raw.handle(), accelerated.handle()]);
 
-        // Rank9's leaves name Succinct's own foundations, and its one merge
-        // mirrors Succinct's, which had to exist first.
+        // The second hop's leaves name the first hop's own foundations, and
+        // its one merge mirrors the first hop's, which had to exist first.
         let raw_leaves = derives_in(&mut store, raw.handle());
         assert_eq!(raw_leaves.len(), 8);
         let raw_images: BTreeSet<_> = raw_leaves
@@ -3550,15 +3554,14 @@ mod lattice_v2 {
 
         let snapshot = store.snapshot().unwrap();
         let view = snapshot.collection(accelerated).unwrap();
-        let facts: UnionArchive<OrderedUniverse> = view.view().unwrap();
+        let facts: TribleSet = view.view().unwrap();
         let expected: TribleSet = (0..8).map(|entity| row(entity + 1, 41)).collect();
-        assert_eq!(facts.iter().collect::<TribleSet>(), expected);
+        assert_eq!(facts, expected);
         let raw_view = snapshot.collection(raw).unwrap();
         let source = snapshot.collection(root).unwrap();
         assert!(raw_view.missing_from(&source).unwrap().is_empty());
         assert!(view.missing_from(&raw_view).unwrap().is_empty());
     }
-
     #[test]
     fn a_view_mirrors_only_merges_its_maintainer_signed() {
         let owner = key(41);
