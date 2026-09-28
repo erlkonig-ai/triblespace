@@ -1389,8 +1389,9 @@ impl<R> CollectionSnapshotExt for R where R: StoreRead {}
 ///
 /// Root `SimpleArchive` collections acquire their signed support and carry
 /// every node the store holds into the host's own merges. Encodings with a
-/// canonical [`CollectionDerivation`] derive their maintainer's own leaves and
-/// mirror its own source merges. This operational capability is separate from
+/// canonical [`CollectionDerivation`] derive leaves for the source
+/// foundations that have no usable leaf and carry their own leaf images the
+/// same way. This operational capability is separate from
 /// the pure encoding and mapping laws; no fictitious self-derivation is needed
 /// for a root collection. The explicit key is the maintainer: it decides what
 /// is owned, and signs only records published by realization; pure mapping and
@@ -1401,7 +1402,8 @@ impl<R> CollectionSnapshotExt for R where R: StoreRead {}
 /// mappings remain available through their `*_with` counterparts.
 pub trait CollectionRealization: CollectionEncoding {
     /// A root acquires its admitted commits, whoever wrote them; a derived
-    /// collection gets a leaf for every source foundation the key owns.
+    /// collection gets a leaf for every source foundation the key owns that
+    /// has no leaf yet.
     fn ensure<'a, S>(
         store: &'a mut S,
         target: Collection<Self>,
@@ -1411,9 +1413,9 @@ pub trait CollectionRealization: CollectionEncoding {
         S: Store + AsyncBlobStoreAcquire + Send;
 
     /// A root carries every held node to its LSM fixed point in the host's
-    /// merges; a derived collection gets the key's leaves, a leaf for every
-    /// foundation another key owns that has none yet (a derive is a function
-    /// anyone may compute), and a mirror of every source merge the key owns.
+    /// merges; a derived collection gets a leaf for every source foundation
+    /// without a usable one that this host can derive, whoever owns it, and
+    /// carries its own leaf images the same way.
     fn maintain<'a, S>(
         store: &'a mut S,
         target: Collection<Self>,
@@ -1714,9 +1716,10 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
     /// A root acquires its admitted commits, whoever wrote them. A derived
     /// collection gets a leaf, `DERIVE(target, L(F), f(F))`, for every
     /// foundation `F` of its immediate source the key owns whose locator it
-    /// has no leaf for yet; empty images are published too. Other owners'
-    /// foundations are theirs to derive here; `maintain` derives those an
-    /// owner has left without a leaf. Each publishing operation runs
+    /// has no leaf for yet, whoever signed an existing one; empty images are
+    /// published too. Other owners' foundations are left to `maintain`,
+    /// which derives those left without a usable leaf. Each publishing
+    /// operation runs
     /// against one frozen control snapshot; when it names a missing image or
     /// descriptor, acquisition ends the operation and the retry starts from a
     /// fresh snapshot that sees everything that arrived, records and proofs
@@ -1769,18 +1772,24 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
     /// frontier node whose bytes are not here sits out and is not fetched. A
     /// root's merges need no WRITE authority, only a store opened as the key
     /// (its host); signing with another key is
-    /// [`CollectionRealizationError::HostMismatch`]. A
-    /// derived collection is ensured, an own leaf whose image is absent is
-    /// fetched or mapped again, and every believed source `MERGE` the key
-    /// signed is mirrored, bottom-up, as a target `MERGE` over its inputs'
-    /// images, the result mapped from the merged source node's bytes. A
-    /// derived collection has no carry of its own, and one stored in a
-    /// root's encoding is refused rather than carried. There is no
-    /// caller-visible budget or tuning knob; every useful result is published
-    /// independently. The live store may acquire exact dependencies while
-    /// doing so. The supplied key signs each newly published `MERGE` or
-    /// `DERIVE`. Without target WRITE authority, a derived collection's
-    /// optional mirroring is skipped.
+    /// [`CollectionRealizationError::HostMismatch`].
+    ///
+    /// A derived collection gets a leaf for every source foundation this
+    /// host can derive that has no usable leaf: any believed leaf whose
+    /// output is here or can be fetched suffices, whoever signed it, and a
+    /// leaf whose output cannot be had does not count. The key's own
+    /// payloads are fetched; another owner's are used only when they are
+    /// here. Then the collection carries its own lattice exactly as a root
+    /// does, its leaf images joined by the mapping's join; it never reads its
+    /// source's merges. Deriving needs target WRITE authority, and a mapping
+    /// pinned to a class of host derives nothing on another host; carrying
+    /// needs neither, so such a key or host still carries. A derived
+    /// collection stored in a root's encoding carries only through its
+    /// mapping (`maintain_with`); this method refuses it. There is no
+    /// caller-visible budget or tuning knob; every useful result is
+    /// published independently. The live store may acquire exact
+    /// dependencies while doing so. The supplied key signs each newly
+    /// published `MERGE` or `DERIVE`.
     fn maintain<'a, T>(
         &'a mut self,
         target: Collection<T>,
@@ -1812,6 +1821,66 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
                 .await?;
             self.snapshot().map_err(|error| {
                 CollectionRealizationError::storage("freeze post-maintenance snapshot", error)
+            })
+        }
+    }
+
+    /// Derive the named source foundations again through `T`'s canonical
+    /// mapping; see [`Self::rederive_with`].
+    fn rederive<'a, T>(
+        &'a mut self,
+        target: Collection<T>,
+        foundations: &Cover<T::Source>,
+        signing_key: &'a SigningKey,
+    ) -> impl Future<Output = Result<Self::Snapshot, CollectionRealizationError>> + Send + 'a
+    where
+        T: CollectionDerivation,
+        Self: Store + AsyncBlobStoreAcquire + Send,
+        Handle<T>: InlineEncoding,
+    {
+        self.rederive_with::<CanonicalDerivation<T>>(target, foundations, signing_key)
+    }
+
+    /// Derive the named source foundations again and publish each result
+    /// that no believed leaf already names as another leaf: the explicit
+    /// supplement to a leaf known to be bad.
+    ///
+    /// Maintenance never replaces a leaf, and never derives a foundation that
+    /// already has a usable one, whoever signed it. A leaf whose output is
+    /// wrong therefore stays; this adds a second leaf beside it, and the
+    /// derived collection's join holds both. A foundation whose result equals
+    /// an output its leaves already name adds nothing. `foundations` must be
+    /// a cover of the target's immediate source naming believed foundations
+    /// of it; each payload that is not here is fetched, whoever owns it,
+    /// because re-deriving it was asked for. The key must be one the target
+    /// admits ([`CollectionRealizationError::UnauthorizedProducer`]), the host
+    /// one that can compute the mapping, and anything the mapping cannot do
+    /// with a named foundation is an error.
+    fn rederive_with<'a, M>(
+        &'a mut self,
+        target: Collection<M::Target>,
+        foundations: &Cover<M::Source>,
+        signing_key: &'a SigningKey,
+    ) -> impl Future<Output = Result<Self::Snapshot, CollectionRealizationError>> + Send + 'a
+    where
+        M: DeriveMapping,
+        Self: Store + AsyncBlobStoreAcquire + Send,
+        Handle<M::Target>: InlineEncoding,
+    {
+        let source = foundations.collection().handle();
+        let members: BTreeSet<CollectionData> = foundations.data_members().collect();
+        async move {
+            super::exact_derived::acquire_authority(self, target).await?;
+            super::exact_derived::rederive_acquiring_with::<Self, M>(
+                self,
+                target,
+                source,
+                &members,
+                signing_key,
+            )
+            .await?;
+            self.snapshot().map_err(|error| {
+                CollectionRealizationError::storage("freeze post-re-derivation snapshot", error)
             })
         }
     }

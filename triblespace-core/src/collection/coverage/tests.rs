@@ -1198,7 +1198,7 @@ fn a_host_join_over_a_node_only_a_foreign_merge_produced_stays_blocked() {
     assert!(index.published().producers(c, data(5)).is_empty());
     assert_eq!(frontier(&index, c), vec![[1u8; 32], [2u8; 32], [3u8; 32]]);
     let blocked = MergeInputs::new([data(3), data(5)]).unwrap();
-    assert!(!index.drives_join(c, &blocked, data(6)));
+    assert!(!index.published().producers(c, data(6)).contains(&blocked));
     // Believed, but not driven: the consumer side still names it.
     assert_eq!(index.joins_reading(c, data(3)), vec![(blocked, data(6))]);
 
@@ -1208,7 +1208,7 @@ fn a_host_join_over_a_node_only_a_foreign_merge_produced_stays_blocked() {
         &AdmitEveryRecord,
     );
     assert!(!index.published().has_blocked(c));
-    assert!(index.drives_join(c, &blocked, data(6)));
+    assert!(index.published().producers(c, data(6)).contains(&blocked));
     assert_eq!(index.published().producers(c, data(6)), vec![blocked]);
     assert_eq!(
         members(&index, c, data(6)),
@@ -1340,7 +1340,10 @@ fn a_host_join_nobody_has_decided_is_no_producer() {
         index.published().producers(earlier, data(6)),
         vec![drivable]
     );
-    assert!(!index.drives_join(earlier, &waiting, data(5)));
+    assert!(!index
+        .published()
+        .producers(earlier, data(5))
+        .contains(&waiting));
     assert_eq!(
         index.joins_reading(earlier, data(2)),
         vec![(waiting, data(5))]
@@ -1348,7 +1351,10 @@ fn a_host_join_nobody_has_decided_is_no_producer() {
 
     // The missing input arrives: the waiting join drives and is named.
     index.apply(&commit(1, earlier, data(2)), &AdmitEveryRecord);
-    assert!(index.drives_join(earlier, &waiting, data(5)));
+    assert!(index
+        .published()
+        .producers(earlier, data(5))
+        .contains(&waiting));
     assert_eq!(index.published().producers(earlier, data(5)), vec![waiting]);
     // Parking a believed join again leaves it believed and adds no copy.
     index.park_record(&merge(1, earlier, waiting.as_slice(), data(5)));

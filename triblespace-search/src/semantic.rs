@@ -48,9 +48,14 @@
 //!
 //! The mapping is a function of the content bytes and the selected model
 //! roots on the compute class it names. A GPU is not bit-deterministic across
-//! hardware, so the descriptor carries the class it was computed on and
-//! [`SemanticIndex::map`] refuses to compute on another: there the DERIVE
-//! results arrive by replication. Within the class two embeddings of one
+//! hardware, so the descriptor carries the class it was computed on and the
+//! mapping is pinned to it ([`DeriveMapping::computable_here`]): maintenance
+//! on another class derives nothing, raises no error and still carries the
+//! index, whose DERIVE results arrive by replication, and
+//! [`SemanticIndex::map`] refuses to compute there. Any key the index
+//! admits derives a file on the class, not only the file's writer, and a
+//! content that already has a row whose bytes are here or can be fetched is
+//! not embedded again. Within the class two embeddings of one
 //! content need not agree bit for bit. A blob that two source members both
 //! hold is embedded by both, and when the two rows differ the carrier keeps
 //! both under the one content handle: its rows are a set, so the join stays
@@ -627,12 +632,6 @@ where
     View<[f32]>: TryFromBlob<E>,
     <View<[f32]> as TryFromBlob<E>>::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    /// Model inference: each foundation's owner derives its image and other
-    /// hosts receive it by replication, and a source merge holding another
-    /// owner's foundation is not mirrored. The compute-class refusal below
-    /// is a separate check.
-    const FOREIGN_DERIVABLE: bool = false;
-
     type Source = SimpleArchive;
     type Target = NvFp4CosineSet<E>;
 
@@ -659,6 +658,12 @@ where
             semantic_text_root?: text,
             semantic_tokenizer_root?: tokenizer,
         }
+    }
+
+    /// The index is pinned to the compute class its descriptor names: on any
+    /// other, maintenance derives nothing and still carries the index.
+    fn computable_here(&self) -> bool {
+        self.compute == local_compute()
     }
 
     fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {

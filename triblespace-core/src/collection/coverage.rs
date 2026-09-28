@@ -982,11 +982,11 @@ impl CoverageIndex {
     /// input set and result, ascending by result. A join still waiting for
     /// another input's support is included: it is believed, not driven.
     ///
-    /// This is the consumer side of the MERGE relation, read by its own key:
-    /// what a maintainer asks to find whether a join of exactly these nodes
-    /// is already believed, without computing anything to look it up. Every
-    /// join here is the host's.
-    pub fn joins_reading(
+    /// The consumer side of the MERGE relation, read by its own key; every
+    /// join here is the host's. A reader needs the producer side only
+    /// ([`Coverage::producers`]), so this answers tests of the fold.
+    #[cfg(test)]
+    pub(crate) fn joins_reading(
         &self,
         collection: CollectionHandle,
         node: CollectionData,
@@ -1001,39 +1001,6 @@ impl CoverageIndex {
                 _ => None,
             })
             .collect()
-    }
-
-    /// Whether the index has driven the join of exactly `inputs` into
-    /// `result` in `collection`: it is believed, and every input has a
-    /// support, so the join stands for their union. A believed join still
-    /// waiting for an input is not driven; [`Self::joins_reading`] still
-    /// names it.
-    ///
-    /// A raw MERGE is not a belief: a store keeps MERGEs other keys signed,
-    /// and those never reach the index. Only believed joins have consumer
-    /// edges, so this reads the edges of the join's first input, the MERGE
-    /// relation by its own key, looks for this one among them, and asks
-    /// whether that edge is still blocked on an input.
-    pub fn drives_join(
-        &self,
-        collection: CollectionHandle,
-        inputs: &MergeInputs,
-        result: CollectionData,
-    ) -> bool {
-        let Some(first) = inputs.iter().next() else {
-            return false;
-        };
-        let Some(edges) = self.consumers.get(&row_key(collection, first)) else {
-            return false;
-        };
-        let blocked = self.published.blocked.get(&collection.raw);
-        edges.iter_ordered().any(|edge| {
-            matches!(
-                self.edge_join(collection, edge),
-                Some(Attestation::Join { inputs: read, result: produced })
-                    if read == *inputs && produced == result
-            ) && blocked.map_or(true, |blocked| blocked.get(edge).is_none())
-        })
     }
 
     /// How many distinct joins the index keeps inputs for, believed or

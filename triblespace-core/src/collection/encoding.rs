@@ -224,24 +224,18 @@ pub trait CollectionDerivation: CollectionEncoding {
     where
         R: StoreRead;
 
-    /// Join two target images.
-    ///
-    /// A returned blob is the same canonical target join as
-    /// [`CollectionEncoding::join_members`]; only the computation differs, so
-    /// a mapping may route it through its own backend. `Ok(None)` declines
-    /// this route without claiming capacity failure or naming an unknown
-    /// dependency.
+    /// Join target images: the k-way join a MERGE of the derived collection
+    /// states. See [`DeriveMapping::join_images`].
     fn join_images<R>(
         _argument: &Self::Argument,
         target_descriptor: &Fragment,
-        low: &Blob<Self>,
-        high: &Blob<Self>,
+        images: &[Blob<Self>],
         reader: &R,
-    ) -> Result<Option<Blob<Self>>, CollectionOperationError>
+    ) -> Result<Blob<Self>, CollectionOperationError>
     where
         R: BlobStoreGet + BlobStoreMeta,
     {
-        Self::join_members(target_descriptor, low, high, reader).map(Some)
+        Self::join_many(target_descriptor, images, reader)
     }
 }
 
@@ -249,39 +243,52 @@ pub trait CollectionDerivation: CollectionEncoding {
 /// images are derived into a collection of their own.
 ///
 /// Its images are published as `DERIVE` leaves of the derived collection and
-/// replicate with it. An index that every reader of a node can compute for
-/// itself is a [`MapMapping`] instead.
+/// replicate with it. Only a mapping not every reader of a node can compute
+/// is derived; an index that every reader of a node can compute for itself
+/// is a [`MapMapping`] instead. The contract an implementor takes on:
+///
+/// - It maps foundations only: a commit payload of a root source, or a leaf
+///   image of a derived one. It never maps a merge result: the derived
+///   collection carries its own leaf images into a lattice of its own, joined
+///   with [`Self::join_images`], and never reads its source's merges.
+/// - The target encoding's join is total: any two members that are each
+///   valid join, so every set of leaves has a join, whoever derived them.
+///   Several leaves may name one source foundation -- two derivations that
+///   disagree, or a re-derivation -- and the join keeps what each says. A
+///   join that cannot be represented in one member is `Capacity`, which
+///   leaves the finer cover standing; it is never `Fatal` for valid members.
+/// - A deterministic mapping is a join homomorphism into that join,
+///   `map(a join b) = map(a) join map(b)`, so the join of a collection's
+///   leaves is the image of everything the source's foundations hold. A
+///   mapping may also be non-deterministic -- an embedding that does not
+///   reproduce bit for bit -- and then the join of its leaves holds what
+///   each derivation observed.
+/// - It may be pinned to a class of host ([`Self::computable_here`]): a model
+///   whose output is canonical on one accelerator class only. Another host
+///   derives nothing through it and still carries the collection; its leaves
+///   arrive by replication.
+///
+/// Derivation is scheduled per source foundation by one rule, which every
+/// mapping in this crate follows: any admitted leaf suffices. Maintenance
+/// derives a foundation only when no believed leaf for its locator has an
+/// output that is here or can be fetched, whoever signed that leaf, and any
+/// key the derived collection admits may derive it on a host that can
+/// compute the mapping, not only the foundation's owner. A leaf whose output
+/// cannot be obtained does not count. A fetch that fails says the output is
+/// not available now, not that it is lost: an original output that arrives
+/// after its foundation was derived again stands beside the newer leaf,
+/// both are joined, and nothing further is derived. A leaf known to be bad
+/// is supplemented only on request
+/// ([`CollectionStoreExt::rederive_with`](super::CollectionStoreExt::rederive_with)),
+/// which adds a second leaf and never replaces one.
 ///
 /// This is the coherence-safe extension point for mappings whose source and
 /// target encodings are both owned elsewhere. Prefer [`CollectionDerivation`]
 /// when a target encoding owns one canonical incoming derivation; explicit
 /// mappings are selected through the `*_with` collection-store methods.
-/// Implementations must be a join homomorphism:
-///
-/// `map(a join b) = map(a) join map(b)`.
 pub trait DeriveMapping: Sized {
     /// Canonical source encoding.
     type Source: CollectionEncoding;
-
-    /// Whether maintenance maps source foundations another key owns.
-    ///
-    /// It decides two things, both in `maintain` only. With `true`, after the
-    /// maintaining key's own foundations it derives every foundation of
-    /// another owner that has no leaf at all, when the view admits the
-    /// maintaining key and the payload is already here; and it mirrors a
-    /// source merge of its own by mapping the merged node's bytes, whoever
-    /// signed the foundations inside it. With `false` it does neither: each
-    /// such foundation waits for a leaf from its owner, and a source merge
-    /// holding one is not mirrored, so the view keeps the finer images
-    /// beneath it. `ensure` never derives another owner's foundation.
-    ///
-    /// Temporary: it stands in until derivation is scheduled by leaf rather
-    /// than by owner (a foundation with any admitted leaf is done, whoever
-    /// signed it) and derived collections carry their own leaf images rather
-    /// than mirroring their source's merges. A mapping only some hosts can
-    /// compute then says so through a hook of its own, and this constant
-    /// goes.
-    const FOREIGN_DERIVABLE: bool = true;
     /// Canonical target encoding.
     type Target: CollectionEncoding;
 
@@ -305,23 +312,37 @@ pub trait DeriveMapping: Sized {
     where
         R: StoreRead;
 
-    /// Join two target images.
+    /// Whether this host can compute the mapping: the class-pin hook.
     ///
-    /// Any returned blob must be the canonical target join, without
-    /// constructing upstream members or changing storage; a mapping may
-    /// compute it through its own backend. `Ok(None)` declines this route
-    /// without claiming capacity failure or naming an unknown dependency.
+    /// A mapping pinned to a class of host -- a model whose output is
+    /// canonical on one accelerator class, say -- answers `false` on every
+    /// other host. There maintenance derives nothing through it, raises no
+    /// error for it, and still carries the derived collection: its leaves
+    /// arrive by replication and are joined like any others. The default,
+    /// `true`, is every host.
+    fn computable_here(&self) -> bool {
+        true
+    }
+
+    /// Join target images: the k-way join one MERGE of the derived
+    /// collection states, which is how a derived collection carries its own
+    /// lattice.
+    ///
+    /// The result must be the encoding's canonical join
+    /// ([`CollectionEncoding::join_many`], the default), without constructing
+    /// upstream members or changing storage; a mapping may compute it through
+    /// its own backend. `Capacity` and `MissingDependency` leave the finer
+    /// cover standing.
     fn join_images<R>(
         &self,
         target_descriptor: &Fragment,
-        low: &Blob<Self::Target>,
-        high: &Blob<Self::Target>,
+        images: &[Blob<Self::Target>],
         reader: &R,
-    ) -> Result<Option<Blob<Self::Target>>, CollectionOperationError>
+    ) -> Result<Blob<Self::Target>, CollectionOperationError>
     where
         R: BlobStoreGet + BlobStoreMeta,
     {
-        Self::Target::join_members(target_descriptor, low, high, reader).map(Some)
+        Self::Target::join_many(target_descriptor, images, reader)
     }
 }
 
@@ -363,14 +384,13 @@ impl<T: CollectionDerivation> DeriveMapping for CanonicalDerivation<T> {
     fn join_images<R>(
         &self,
         target_descriptor: &Fragment,
-        low: &Blob<Self::Target>,
-        high: &Blob<Self::Target>,
+        images: &[Blob<Self::Target>],
         reader: &R,
-    ) -> Result<Option<Blob<Self::Target>>, CollectionOperationError>
+    ) -> Result<Blob<Self::Target>, CollectionOperationError>
     where
         R: BlobStoreGet + BlobStoreMeta,
     {
-        T::join_images(&self.argument, target_descriptor, low, high, reader)
+        T::join_images(&self.argument, target_descriptor, images, reader)
     }
 }
 

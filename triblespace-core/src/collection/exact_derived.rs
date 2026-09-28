@@ -3,10 +3,12 @@
 //! A collection's support is a cover of its own foundations: commit payloads
 //! in a root, leaf images in a derived collection. `ensure` on a derived
 //! collection derives the maintaining key's own missing leaves; `maintain`
-//! also mirrors its own source merges; `maintain` on a root carries every
-//! node the store holds, whoever signed the foundations beneath it, into the
-//! host's own merges. None of them manufactures an upstream dependency as a
-//! side effect of downstream work, and none fetches another owner's payload.
+//! derives every foundation without a usable leaf this host can derive and
+//! carries the collection's own leaf images into the host's merges;
+//! `maintain` on a root carries every node the store holds, whoever signed
+//! the foundations beneath it, into the host's own merges. None of them
+//! manufactures an upstream dependency as a side effect of downstream work,
+//! none reads a source's merges, and none fetches another owner's payload.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -85,7 +87,7 @@ pub enum CollectionRealizationError {
     /// Own source foundations the mapping cannot represent as leaves: its
     /// capacity refused them, a dependency of the mapping could not be
     /// acquired, or the payload of a root commit could not be. Everything
-    /// else was derived and mirrored.
+    /// else was derived and carried.
     Unmappable {
         /// Each foundation left without a leaf, and why.
         blocked: Vec<(CollectionData, String)>,
@@ -423,8 +425,9 @@ where
     )
 }
 
-/// Derive the key's own missing leaves and mirror its own source merges
-/// through one mapping, in one frozen operation, without acquisition.
+/// Derive every foundation without a usable leaf and carry the target's own
+/// lattice through one mapping, in one frozen operation, without
+/// acquisition.
 #[cfg(test)]
 fn maintain_resident_with<S, M>(
     store: &mut S,
@@ -682,6 +685,36 @@ where
         maintain_resident_in_frontier_with::<S, M>(
             store,
             target,
+            signing_key,
+            unavailable,
+            frontier,
+        )
+    })
+    .await
+}
+
+/// Map the named source foundations again through one mapping, adding a
+/// leaf wherever the result is not already a leaf's output, acquiring each
+/// payload that is not here.
+pub(crate) async fn rederive_acquiring_with<S, M>(
+    store: &mut S,
+    target: Collection<M::Target>,
+    source: CollectionHandle,
+    foundations: &BTreeSet<CollectionData>,
+    signing_key: &SigningKey,
+) -> Result<(), CollectionRealizationError>
+where
+    S: Store + AsyncBlobStoreAcquire,
+    M: DeriveMapping,
+{
+    let mut done = BTreeSet::new();
+    acquiring(store, |store, unavailable, frontier| {
+        super::maintenance::rederive::<S, M>(
+            store,
+            target,
+            source,
+            foundations,
+            &mut done,
             signing_key,
             unavailable,
             frontier,

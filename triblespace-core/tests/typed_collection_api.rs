@@ -225,7 +225,7 @@ fn derived_apis_accept_a_derived_source_encoding() {
 }
 
 #[test]
-fn maintenance_follows_a_resident_source_union_across_target_size_tiers() {
+fn a_source_union_changes_nothing_downstream() {
     let authority = SigningKey::from_bytes(&[61; 32]);
     let policy = CollectionPolicy::new(
         AdmissionPolicy::direct(authority.verifying_key()),
@@ -274,8 +274,9 @@ fn maintenance_follows_a_resident_source_union_across_target_size_tiers() {
         "ordinary target LSM would not pair these"
     );
 
-    // An independent producer has already compacted the immediate source.
-    // Target maintenance must consume this fact, not create upstream artifacts.
+    // The host has already compacted the immediate source. A derived
+    // collection's lattice is its own: its maintenance neither reads that
+    // merge nor creates upstream artifacts.
     let union = Image::join(&inputs);
     let expected_root = ImageTwo::image(&union);
     let union_handle = store.put(union).unwrap();
@@ -339,67 +340,33 @@ fn maintenance_follows_a_resident_source_union_across_target_size_tiers() {
         records_before
     );
 
+    // Two leaves are below the fan-in, and the source's merge is not the
+    // target's: maintenance publishes nothing and stores nothing, and the
+    // target still reads every fact.
     let after = block_on(store.maintain(accelerated, &authority)).unwrap();
     let observed = after.collection(accelerated).unwrap();
     assert_eq!(stood_for(&observed), support);
-    assert_eq!(
-        observed.cover().members().collect::<Vec<_>>(),
-        vec![expected_root.get_handle()]
-    );
+    assert_eq!(observed.cover().len(), 2);
+    assert!(!observed.cover().contains(expected_root.get_handle()));
     assert_eq!(observed.view::<ImageFacts>().unwrap().0, expected);
-    let blobs_after = after
-        .blobs()
-        .map(|info| info.unwrap().handle)
-        .collect::<BTreeSet<_>>();
     assert_eq!(
-        blobs_after.difference(&blobs_before).count(),
-        1,
-        "only the target root is new"
-    );
-    assert!(blobs_before.is_subset(&blobs_after));
-    assert_eq!(after.wants().unwrap().count(), 0);
-    let records_after = after
-        .records()
-        .unwrap()
-        .collect::<Result<BTreeSet<_>, _>>()
-        .unwrap();
-    for record in records_after.difference(&records_before) {
-        record.verify_strict().unwrap();
-        assert_eq!(
-            record.public_key().raw,
-            authority.verifying_key().to_bytes()
-        );
-        let collection = match record {
-            CollectionRecord::Derive(record) => record.collection(),
-            CollectionRecord::Merge(record) => record.collection(),
-            CollectionRecord::Commit(_) => panic!("maintenance must not author roots"),
-            CollectionRecord::Map(_) => panic!("nothing here is attached"),
-        };
-        assert_eq!(
-            collection,
-            accelerated.handle(),
-            "upstream equation published"
-        );
-    }
-    assert_eq!(children.collection(raw).unwrap().cover().len(), 2);
-    assert_eq!(children.collection(accelerated).unwrap().cover().len(), 2);
-
-    let again = block_on(store.maintain(accelerated, &authority)).unwrap();
-    assert_eq!(
-        again
+        after
             .blobs()
             .map(|info| info.unwrap().handle)
             .collect::<BTreeSet<_>>(),
-        blobs_after
+        blobs_before
     );
+    assert_eq!(after.wants().unwrap().count(), 0);
     assert_eq!(
-        again
+        after
             .records()
             .unwrap()
             .collect::<Result<BTreeSet<_>, _>>()
             .unwrap(),
-        records_after
+        records_before
     );
+    assert_eq!(children.collection(raw).unwrap().cover().len(), 2);
+    assert_eq!(children.collection(accelerated).unwrap().cover().len(), 2);
 }
 
 #[test]

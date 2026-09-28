@@ -61,7 +61,7 @@ pub mod held;
 pub mod latest;
 /// Maintained stated last-write-wins registers over exact source covers.
 pub mod lww_register;
-/// Maintenance: root carries into the host's merges, leaves and aligned merges.
+/// Maintenance: carries into the host's merges, leaves and attachments.
 mod maintenance;
 /// Carrying content between collections, and proving it arrived.
 pub mod migration;

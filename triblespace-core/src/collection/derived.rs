@@ -16,22 +16,22 @@
 //! derived collection realizes it once, then, when the source has something
 //! to image; from then on every write's [`ensure_downstream`] finds it.
 //!
-//! Maintenance is "derive what you wrote". [`ensure_downstream`] gives every
-//! derived collection a leaf for each source foundation the signer owns and
-//! the collection has none for yet, and publishes no merge; a write that
-//! calls it after its commit leaves the commit readable through every view,
-//! at the cost of one locator per own foundation and that commit's own
-//! images. [`maintain_downstream`] also derives the foundations other
-//! owners have left without a leaf, and mirrors the signer's own source
-//! merges into each of them, as the daemon does; a derived collection has no
-//! carry of its own. Both visit a collection after its source, which is what
-//! makes a source's mirrored merge result resident before the collection
-//! above it maps it. Neither decides what is cheap: the first call on a cold
-//! store may take as long as the backlog is, and says so by taking it.
-//! A representation this binary cannot map, or a descriptor naming a mapping
-//! other than the representation's canonical one, is named in the report
-//! rather than guessed at; a signer the target's policy does not admit is
-//! named too.
+//! Upkeep on a write is "derive what you wrote". [`ensure_downstream`] gives
+//! every derived collection a leaf for each source foundation the signer
+//! owns and the collection has none for yet, and publishes no merge; a
+//! write that calls it after its commit leaves the commit readable through
+//! every view, at the cost of one locator per own foundation and that
+//! commit's own images. [`maintain_downstream`] also derives every
+//! foundation left without a usable leaf, whoever owns it, and carries each
+//! derived collection's own lattice of leaf images into the signer's merges,
+//! as the daemon does; nothing reads a source's merges. Both visit a
+//! collection after its source, so a leaf image of the source is here
+//! before the collection above it maps it. Neither decides what is cheap:
+//! the first call on a cold store may take as long as the backlog is, and
+//! says so by taking it. A representation this binary cannot map, or a
+//! descriptor naming a mapping other than the representation's canonical
+//! one, is named in the report rather than guessed at; a signer the target's
+//! policy does not admit is named too, after its collection is carried.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
@@ -219,8 +219,9 @@ pub enum Upkeep {
     /// Derive the signer's own missing leaves, or attach the parent's
     /// current frontier; publish no merge.
     Ensure,
-    /// Ensure, then mirror the signer's own source merges; for an attached
-    /// collection, carry its parent first and attach the frontier after.
+    /// Derive every foundation left without a usable leaf and carry the
+    /// derived collection's own lattice; for an attached collection, carry
+    /// its parent first and attach the frontier after.
     Maintain,
 }
 
@@ -229,7 +230,9 @@ pub enum Upkeep {
 pub enum Realized {
     /// The target was taken as far as asked.
     Done,
-    /// The signer may not write the target, so nothing was published.
+    /// The signer may not write the target, so no leaf was derived. Under
+    /// [`Upkeep::Maintain`] the target's own lattice was still carried: a
+    /// merge needs no WRITE.
     Unadmitted,
     /// This realizer knows neither the target's representation nor the
     /// mapping its descriptor names, so nothing was published.
@@ -266,13 +269,18 @@ where
 }
 
 /// Take one collection of a known encoding as far as asked through its
-/// canonical mapping, or say why nothing was published: the descriptor names
-/// another mapping than `T`'s canonical one, or the signer may not write it.
+/// canonical mapping, or say why it was not: the descriptor names another
+/// mapping than `T`'s canonical one, or the signer may not write it.
 ///
 /// A descriptor registered through an explicit mapping value carries that
 /// mapping's algorithm, and `T`'s canonical mapping refuses to bind to it.
 /// That refusal is the answer, not an error: whoever registered the mapping
 /// realizes it, and a realizer that knows the mapping answers for it first.
+///
+/// Only a new leaf needs WRITE. A signer the target does not admit derives
+/// nothing and answers [`Realized::Unadmitted`]; under
+/// [`Upkeep::Maintain`] it still carries the target's own lattice first,
+/// because a merge needs only the store's host key.
 pub async fn realize_as<S, T>(
     store: &mut S,
     derived: &Derived,
@@ -300,14 +308,22 @@ where
         .writer_is_admitted(&snapshot, signer.verifying_key())
         .map_err(|error| CollectionRealizationError::storage("admit derived writer", error))?;
     drop(snapshot);
-    if !admitted {
-        return Ok(Realized::Unadmitted);
+    match (upkeep, admitted) {
+        (Upkeep::Ensure, false) => return Ok(Realized::Unadmitted),
+        (Upkeep::Ensure, true) => drop(store.ensure(collection, signer).await?),
+        (Upkeep::Maintain, _) => match store.maintain(collection, signer).await {
+            Ok(snapshot) => drop(snapshot),
+            // The carry ran before this was reported: a key the target does
+            // not admit owes leaves it may not publish.
+            Err(CollectionRealizationError::UnauthorizedProducer { .. }) if !admitted => {}
+            Err(error) => return Err(error),
+        },
     }
-    match upkeep {
-        Upkeep::Ensure => drop(store.ensure(collection, signer).await?),
-        Upkeep::Maintain => drop(store.maintain(collection, signer).await?),
-    }
-    Ok(Realized::Done)
+    Ok(if admitted {
+        Realized::Done
+    } else {
+        Realized::Unadmitted
+    })
 }
 
 /// Take one attached collection of a known encoding as far as asked through
@@ -399,7 +415,8 @@ pub struct UpkeepReport {
     /// Taken as far as asked, in the order they were visited: derived
     /// collections first, then attached ones.
     pub realized: Vec<CollectionHandle>,
-    /// Left alone because the signer may not write them.
+    /// Derived collections given no leaf because the signer may not write
+    /// them; under maintenance each was still carried.
     pub unadmitted: Vec<CollectionHandle>,
     /// Derived collections left alone because no realizer knows their
     /// representation or the mapping their descriptor names; each carries
@@ -481,9 +498,9 @@ where
     upkeep_downstream(store, source, signer, Upkeep::Ensure, realizer).await
 }
 
-/// Derive the signer's own leaves into every collection derived from
-/// `source` and mirror its own source merges there, each after its own
-/// source; then carry `source` and attach its new frontier into every
+/// Derive every foundation left without a usable leaf into every collection
+/// derived from `source` and carry each one's own lattice, each after its
+/// own source; then carry `source` and attach its new frontier into every
 /// collection attached to it. What the daemon does for its configured
 /// sources.
 pub async fn maintain_downstream<S, R>(
