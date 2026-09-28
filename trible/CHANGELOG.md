@@ -74,6 +74,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   keys; no signing key is needed, because a descriptor is content, and root
   order does not change the handle. Without `--root` the command still makes
   the signing key the single direct root.
+- `pile collection maintain` and `maintain-all` end every completed pass, a
+  quiet one included, with one plain stdout line after that pass's
+  `maintained` lines: `maintenance pass <n> done in <secs> s: targets <t>,
+  maintained <m>, published <p>, failed <f>`. `<n>` counts passes since the
+  command started, `<t>` the selected targets, `<m>` the hops that
+  maintained (one `maintained` line each), `<p>` the hops that published a
+  MERGE, DERIVE or MAP, and `<f>` the failed selections. A pass that errors
+  prints no line, and under `--watch` a poll that sees no relevant change
+  runs no pass.
 
 ### Changed
 

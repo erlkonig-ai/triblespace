@@ -2834,6 +2834,17 @@ impl<R: StoreSnapshot> MaintenanceState<R> {
     }
 }
 
+/// What one completed pass did: the targets it selected, the hops that
+/// maintained (one `maintained` line each), the hops that published a MERGE,
+/// DERIVE or MAP, and the selections that failed.
+#[derive(Clone, Copy, Debug, Default)]
+struct MaintenancePass {
+    targets: usize,
+    maintained: usize,
+    published: usize,
+    failures: usize,
+}
+
 #[cfg(test)]
 async fn maintenance_pass<S: Store + AsyncBlobStoreAcquire + Send>(
     pile: &mut S,
@@ -2853,6 +2864,7 @@ async fn maintenance_pass<S: Store + AsyncBlobStoreAcquire + Send>(
         None,
     )
     .await
+    .map(|pass| pass.failures)
 }
 
 async fn maintenance_pass_observed<S: Store + AsyncBlobStoreAcquire + Send>(
@@ -2863,7 +2875,7 @@ async fn maintenance_pass_observed<S: Store + AsyncBlobStoreAcquire + Send>(
     succinct_backend: SuccinctBackend,
     state: &mut MaintenanceState<S::Snapshot>,
     mut telemetry: Option<&mut maintenance_telemetry::Telemetry>,
-) -> Result<usize> {
+) -> Result<MaintenancePass> {
     let started = telemetry
         .as_deref_mut()
         .map(|telemetry| telemetry.begin_pass());
@@ -2878,7 +2890,10 @@ async fn maintenance_pass_observed<S: Store + AsyncBlobStoreAcquire + Send>(
     )
     .await;
     if let (Some(telemetry), Some(started)) = (telemetry, started) {
-        telemetry.finish_pass(started, matches!(result, Ok(0)));
+        telemetry.finish_pass(
+            started,
+            result.as_ref().is_ok_and(|pass| pass.failures == 0),
+        );
         telemetry.emit_due(pile);
     }
     result
@@ -2892,13 +2907,13 @@ async fn maintenance_pass_inner<S: Store + AsyncBlobStoreAcquire + Send>(
     succinct_backend: SuccinctBackend,
     state: &mut MaintenanceState<S::Snapshot>,
     mut telemetry: Option<&mut maintenance_telemetry::Telemetry>,
-) -> Result<usize> {
+) -> Result<MaintenancePass> {
     let snapshot = ObservedStore::new(
         pile.snapshot()
             .map_err(|error| anyhow!("pile snapshot: {error:?}"))?,
     );
     let mut selected = BTreeSet::new();
-    let mut failures = 0;
+    let mut pass = MaintenancePass::default();
     for reference in references {
         match resolve_maintenance_target(&snapshot, reference) {
             Ok(handle) => {
@@ -2906,10 +2921,11 @@ async fn maintenance_pass_inner<S: Store + AsyncBlobStoreAcquire + Send>(
             }
             Err(error) => {
                 eprintln!("maintenance target {reference:?}: {error:#}");
-                failures += 1;
+                pass.failures += 1;
             }
         }
     }
+    pass.targets = selected.len();
     state.planning = snapshot.dependencies();
     drop(snapshot);
 
@@ -2943,7 +2959,7 @@ async fn maintenance_pass_inner<S: Store + AsyncBlobStoreAcquire + Send>(
                     "maintenance target blake3:{}: {error:#}",
                     handle_hex(target)
                 );
-                failures += 1;
+                pass.failures += 1;
                 continue;
             }
         };
@@ -2963,7 +2979,7 @@ async fn maintenance_pass_inner<S: Store + AsyncBlobStoreAcquire + Send>(
                         "maintenance blake3:{}: pile snapshot: {error:?}",
                         handle_hex(handle)
                     );
-                    failures += 1;
+                    pass.failures += 1;
                     continue;
                 }
             };
@@ -2975,6 +2991,14 @@ async fn maintenance_pass_inner<S: Store + AsyncBlobStoreAcquire + Send>(
                 telemetry.emit_due(pile);
                 started
             });
+            // Publications are counted at the insert call, the count telemetry
+            // keeps; without telemetry the hop keeps its own.
+            let mut untracked = maintenance_telemetry::Publications::default();
+            let publications = match telemetry.as_deref_mut() {
+                Some(telemetry) => &mut telemetry.publications,
+                None => &mut untracked,
+            };
+            let published_before = *publications;
             let mut observed = ObservedStore::new(&mut *pile);
             let result = async {
                 let snapshot = observed
@@ -2988,35 +3012,21 @@ async fn maintenance_pass_inner<S: Store + AsyncBlobStoreAcquire + Send>(
                 let attached = !descriptor::parents(&facts)?.is_empty();
                 let before = cover_census(&snapshot, handle)?;
                 let started = Instant::now();
-                let after = if let Some(telemetry) = telemetry.as_deref_mut() {
-                    let mut counted = maintenance_telemetry::CountedStore {
-                        inner: &mut observed,
-                        counts: &mut telemetry.publications,
-                    };
-                    maintain_by_representation(
-                        &mut counted,
-                        &snapshot,
-                        handle,
-                        representation,
-                        algorithm,
-                        attached,
-                        signer,
-                        succinct_backend,
-                    )
-                    .await?
-                } else {
-                    maintain_by_representation(
-                        &mut observed,
-                        &snapshot,
-                        handle,
-                        representation,
-                        algorithm,
-                        attached,
-                        signer,
-                        succinct_backend,
-                    )
-                    .await?
+                let mut counted = maintenance_telemetry::CountedStore {
+                    inner: &mut observed,
+                    counts: &mut *publications,
                 };
+                let after = maintain_by_representation(
+                    &mut counted,
+                    &snapshot,
+                    handle,
+                    representation,
+                    algorithm,
+                    attached,
+                    signer,
+                    succinct_backend,
+                )
+                .await?;
                 let after = cover_census(&after, handle)?;
                 println!(
                     "maintained blake3:{} in {:.1} s: commits {} -> {}, merges {} -> {}, derives {} -> {}, maps {} -> {}",
@@ -3034,6 +3044,10 @@ async fn maintenance_pass_inner<S: Store + AsyncBlobStoreAcquire + Send>(
                 Ok::<(), anyhow::Error>(())
             }
             .await;
+            // A hop that failed after publishing still published.
+            if *publications != published_before {
+                pass.published += 1;
+            }
             let interests = observed.dependencies();
             drop(observed);
             if let (Some(telemetry), Some(started)) = (telemetry.as_deref_mut(), hop_started) {
@@ -3052,11 +3066,14 @@ async fn maintenance_pass_inner<S: Store + AsyncBlobStoreAcquire + Send>(
                     retry_on_pass: result.is_err(),
                 },
             );
-            if let Err(error) = result {
-                eprintln!("maintenance blake3:{}: {error:#}", handle_hex(handle));
-                failures += 1;
-                // Failed upkeep does not retract its existing resident nodes.
-                // A downstream target can still consume that available input.
+            match result {
+                Ok(()) => pass.maintained += 1,
+                Err(error) => {
+                    eprintln!("maintenance blake3:{}: {error:#}", handle_hex(handle));
+                    pass.failures += 1;
+                    // Failed upkeep does not retract its existing resident nodes.
+                    // A downstream target can still consume that available input.
+                }
             }
         }
     }
@@ -3064,7 +3081,7 @@ async fn maintenance_pass_inner<S: Store + AsyncBlobStoreAcquire + Send>(
     // Failed planning retains its exact misses above; when that route becomes
     // available, absent entries run afresh rather than reusing an old answer.
     state.hops.retain(|handle, _| attempted.contains(handle));
-    Ok(failures)
+    Ok(pass)
 }
 
 fn maintenance_changed<S: StoreSnapshot>(
@@ -3089,6 +3106,7 @@ async fn maintenance_loop(
     let mut catch_up = true;
     let mut interests = StoreDependencies::default();
     let mut state = MaintenanceState::default();
+    let mut passes: u64 = 0;
     loop {
         if let Some(telemetry) = telemetry.as_deref_mut() {
             telemetry.emit_due(pile);
@@ -3103,7 +3121,8 @@ async fn maintenance_loop(
                 .as_ref()
                 .is_some_and(|previous| maintenance_changed(previous, &before, &interests))
         {
-            let failures = maintenance_pass_observed(
+            let started = Instant::now();
+            let pass = maintenance_pass_observed(
                 pile,
                 references,
                 signer,
@@ -3113,6 +3132,20 @@ async fn maintenance_loop(
                 telemetry.as_deref_mut(),
             )
             .await?;
+            passes += 1;
+            // Every completed pass, a quiet one too, ends with one line after
+            // its hop lines on stdout. A pass that errors returns the error
+            // above and prints none; a poll that finds no relevant change
+            // runs no pass.
+            println!(
+                "maintenance pass {passes} done in {:.1} s: targets {}, maintained {}, published {}, failed {}",
+                started.elapsed().as_secs_f64(),
+                pass.targets,
+                pass.maintained,
+                pass.published,
+                pass.failures,
+            );
+            let failures = pass.failures;
             interests = state.interests();
             let after = pile
                 .snapshot()
