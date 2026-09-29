@@ -5299,6 +5299,109 @@ mod lattice_v2 {
         assert_eq!(leaves_by(&mut store.inner, first, 41).len(), 8);
     }
 
+    /// Review finding, 2026-09-29: a blob an own foundation needed was asked
+    /// for before the carry's own failure was looked at. A MERGE that could
+    /// not be stored once was then lost: the call fetched the blob, ran
+    /// again, the carry went through, and the call returned Ok. A storage
+    /// error the carry raises now ends the call at once, ahead of that
+    /// request, and the blob is asked for by the next call.
+    #[test]
+    fn a_failed_carry_is_reported_before_a_blob_an_own_foundation_needs() {
+        reset_mapping_calls();
+        let (mut inner, root, first, _) = collections();
+        for entity in 0..8 {
+            own_commit(&mut inner, root, 41, entity);
+        }
+        // An own foundation whose payload is elsewhere, and can be had.
+        foreign_commit(&mut inner, root, 41, 8);
+        let elsewhere = payload(41, 8);
+        let mut store = GuardStore::new(inner);
+        store.offer(&elsewhere);
+        // Eight leaves go in; the carry's MERGE is the ninth insert, and
+        // storing it fails once.
+        store.reject_insert_at = Some(9);
+
+        let result = block_on(store.maintain(first, &key(41)));
+        assert!(
+            matches!(
+                result,
+                Err(CollectionRealizationError::Storage { operation, .. })
+                    if operation == "publish root carry MERGE"
+            ),
+            "{:?}",
+            result.err()
+        );
+        assert!(store.acquired.is_empty(), "{:?}", store.acquired);
+        assert_eq!(leaves_by(&mut store.inner, first, 41).len(), 8);
+
+        // The next call carries, asks for the payload and derives it.
+        drop(block_on(store.maintain(first, &key(41))).unwrap());
+        assert_eq!(store.acquired, vec![data(&elsewhere)]);
+        assert_eq!(leaves_by(&mut store.inner, first, 41).len(), 9);
+        assert_eq!(merges_in(&mut store.inner, first.handle()).len(), 1);
+    }
+
+    /// The rule's other half: a carry error that is not a storage error --
+    /// a join that fails on a leaf whose bytes read and do not decode, the
+    /// same on every call -- is reported after the request, so it hides no
+    /// payload an own foundation needs. The payload is fetched and mapped,
+    /// and the join's failure is still what the call reports.
+    #[test]
+    fn a_carry_that_cannot_join_hides_no_payload_an_own_foundation_needs() {
+        reset_mapping_calls();
+        let (mut inner, root, first, _) = collections();
+        for entity in 0..7 {
+            own_commit(&mut inner, root, 41, entity);
+        }
+        // An own foundation whose payload is elsewhere, and can be had.
+        foreign_commit(&mut inner, root, 41, 7);
+        let elsewhere = payload(41, 7);
+        // Another owner's foundation, here, whose leaf's output reads and
+        // does not decode. It sorts below every other leaf's output, so
+        // every carry's first group holds it.
+        let lowest = (0..8)
+            .map(|entity| data(&salted_image(&payload(41, entity), 0)).raw)
+            .min()
+            .unwrap();
+        let malformed = (0..=u16::MAX)
+            .map(|salt| Blob::<FirstEncoding>::new(salt.to_be_bytes().to_vec().into()))
+            .find(|blob| data(blob).raw < lowest)
+            .unwrap();
+        let foreign = payload(42, 1);
+        own_commit(&mut inner, root, 42, 1);
+        inner.put::<FirstEncoding, _>(malformed.clone()).unwrap();
+        inner
+            .insert(CollectionRecord::Derive(CollectionDerive::sign(
+                &key(42),
+                first.handle(),
+                SourceLocator::of(data(&foreign).raw),
+                data(&malformed),
+            )))
+            .unwrap();
+        let mut store = GuardStore::new(inner);
+        store.offer(&elsewhere);
+
+        for call in 0..2 {
+            let result = block_on(store.maintain(first, &key(41)));
+            assert!(
+                matches!(
+                    &result,
+                    Err(CollectionRealizationError::Merge { inputs, .. })
+                        if inputs.contains(&data(&malformed))
+                ),
+                "call {call}: {:?}",
+                result.err()
+            );
+            assert_eq!(store.acquired, vec![data(&elsewhere)], "call {call}");
+        }
+        let own = leaves_by(&mut store.inner, first, 41);
+        assert_eq!(own.len(), 8);
+        assert!(own
+            .iter()
+            .any(|leaf| leaf.input() == SourceLocator::of(data(&elsewhere).raw)));
+        assert!(merges_in(&mut store.inner, first.handle()).is_empty());
+    }
+
     /// Review finding, 2026-09-28: a fetch that failed outright -- a peer
     /// endpoint that cannot start, or a fetched blob that cannot be kept --
     /// ended the whole call at that output. The rest is now asked for, and

@@ -1069,19 +1069,24 @@ where
 /// for the acquiring loop to ask for once this operation is done.
 ///
 /// What deriving left undone holds nothing back: the carry runs first. A
-/// blob an own foundation needs is then asked for
+/// storage error ends the operation at once, deriving's before the carry
+/// and the carry's own -- a leaf image or MERGE that cannot be stored, a
+/// held node that cannot be loaded -- before anything else, and it is the
+/// one error the call reports. It is never held behind a request: that
+/// would run the operation again, and a retry that went through would lose
+/// it. Otherwise a blob an own foundation needs is asked for
 /// ([`CollectionRealizationError::MissingDependency`], which the acquiring
 /// loop fetches before running everything again); it is a request, not a
-/// report, so it comes before anything reported. What is reported comes in
-/// this order: the carry's own failure, then the first own foundation the
-/// mapping refused ([`CollectionRealizationError::Derive`]), then, for
-/// `ensure` only, a key the target does not admit that owes leaves for
-/// foundations of its own
+/// report, so it comes before anything reported, and a carry that fails the
+/// same way on every call -- a join refusing a leaf that reads and does not
+/// decode -- hides no payload. What is reported comes in this order: the
+/// carry's own failure, then the first own foundation the mapping refused
+/// ([`CollectionRealizationError::Derive`]), then, for `ensure` only, a key
+/// the target does not admit that owes leaves for foundations of its own
 /// ([`CollectionRealizationError::UnauthorizedProducer`]), then own
 /// foundations the mapping could not represent
 /// ([`CollectionRealizationError::Unmappable`]). The acquiring loop asks for
-/// `wanted` before it returns any of these. Only a storage failure ends the
-/// operation before the carry.
+/// `wanted` before it returns any of these.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn maintain_derived<S, M>(
     store: &mut S,
@@ -1116,6 +1121,9 @@ where
     } else {
         Ok(())
     };
+    if matches!(carried, Err(CollectionRealizationError::Storage { .. })) {
+        return carried;
+    }
     if let Some(member) = derived.missing {
         return Err(CollectionRealizationError::MissingDependency { member });
     }
