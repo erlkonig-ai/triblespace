@@ -482,14 +482,17 @@ output is unavailable now, not lost: if the original output arrives after
 the foundation was derived again, both leaves stand, both are joined, and
 nothing further is derived. A fetch that fails outright -- the store cannot
 reach other holders, or cannot keep what it got -- is a fault here rather
-than an answer about any holder: nothing is derived in its place, and the
-fault is reported once the rest is done. Outputs that are not here are asked
-for after the rest of the pass -- deriving what needs no fetch, and the
-carry -- each once. The outputs of one foundation's leaves are asked for
-until one arrives or all have failed, and a pass starts no further
-foundation once eight fetches have failed. Each pass starts the foundations
-in an order of its own, drawn afresh, so foundations whose fetches always
-fail cannot keep the same others waiting pass after pass. A leaf counts only
+than an answer about any holder, whether the blob was needed to map a
+foundation or named as a leaf's output: nothing is derived in its place,
+and the fault is reported once the rest is done. Outputs that are not here
+are asked for after the rest of the pass -- deriving what needs no fetch,
+and the carry -- each once. The outputs of one foundation's leaves are asked
+for until one arrives or all have failed, and not at all once one of them
+arrived for another foundation whose leaf names the same output. A pass
+starts no further foundation once eight fetches have failed. Each pass
+starts the foundations in an order of its own, drawn afresh, so foundations
+whose fetches always fail cannot keep the same others waiting pass after
+pass. A leaf counts only
 when its output reads: damaged bytes a pile still lists are treated as an
 absent output, and a network peer fetches good bytes for them. The carry
 joins only nodes whose bytes read, a root's carry too, and says nothing

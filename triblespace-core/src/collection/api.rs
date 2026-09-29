@@ -1785,7 +1785,10 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
     /// other holders; a store that answers from its own blobs alone leaves
     /// such a foundation waiting for its output rather than deriving it
     /// again. A fetch that fails outright is reported after the work and is
-    /// no reason to derive in its place. One call lets a
+    /// no reason to derive in its place, whatever the blob is to the call. A
+    /// storage error, the carry's included, ends the call at once and is the
+    /// error reported, ahead of any fetch; a carry that fails otherwise is
+    /// reported after the fetches the rest needs. One call lets a
     /// bounded number of such fetches fail and starts foundations in an
     /// order of its own, so no foundation waits on the same others call
     /// after call. The key's own payloads are fetched; another owner's are

@@ -29,16 +29,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `UnauthorizedProducer`, then `Unmappable` -- is returned only after the
   outputs the call went on without were asked for. A storage error ends the
   call at once, the carry's included (a MERGE or image that cannot be stored,
-  a held node that cannot be loaded), and is the one reported; those outputs
-  are then asked for by the next call. A fetch that fails outright (the
-  store cannot reach other holders, or cannot keep what it got) is a fault,
-  not an answer about any holder: a blob a step needs is not here for that
-  call, and an output the call went on without is not counted unavailable,
-  so nothing is derived in its place. The first fault is reported once the
-  work is done, ahead of what the operation reported, except `HostMismatch`,
-  which stops an upkeep pass and so comes first. A derived collection stored
-  in a root's encoding carries only through its mapping (`maintain_with`);
-  `maintain` still refuses it.
+  a held node that cannot be loaded), ahead even of a blob an own foundation
+  needs, and is the one reported; those outputs and that blob are then asked
+  for by the next call. A carry that fails otherwise (a join that refuses a
+  leaf) is reported after that blob is fetched, so it hides no payload. A
+  fetch that fails outright (the store cannot reach other holders, or cannot
+  keep what it got) is a fault, not an answer about any holder, and never
+  counts a blob unavailable, whatever the blob is to the call -- needed by
+  one foundation, the output of another's leaf, or both: what needs it waits
+  for that call, and nothing is derived in its place. The first fault is
+  reported once the work is done, ahead of what the operation reported,
+  except `HostMismatch`, which stops an upkeep pass and so comes first. A
+  derived collection stored in a root's encoding carries only through its
+  mapping (`maintain_with`); `maintain` still refuses it.
 - Derivation is scheduled by leaf, and any admitted leaf suffices: a source
   foundation is derived only when no believed leaf for its locator has an
   output that is here or can be fetched, whoever signed that leaf, and any
@@ -50,8 +53,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operation and asked for together after its work -- deriving what needs no
   fetch, and the carry -- rather than one restart each before anything is
   mapped. The outputs of one foundation's leaves are asked for as a group
-  until one arrives or all have failed, and one call starts no further
-  foundation once eight fetches have failed. Each call starts the
+  until one arrives or all have failed; the leaves of two foundations may
+  name one output, and a group one of whose outputs the call already
+  fetched asks nothing more. One call starts no further foundation once
+  eight fetches have failed. Each call starts the
   foundations in an order drawn afresh, so foundations whose fetches always
   fail cannot keep the same others waiting call after call: of `n`
   foundations waiting, a given one is reached in a call with probability at
