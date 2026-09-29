@@ -61,6 +61,7 @@ use crate::trible::Fragment;
 use super::coverage::{Coverage, CoverageIndex, CoverageSet, FrontierSet};
 use super::exact_derived::{
     data_identity, load_lineage, producer_is_admitted, CollectionRealizationError, Lineage,
+    Unfetched,
 };
 use super::operation_snapshot::{OperationFrontier, OperationSnapshot};
 use super::ownership::owns;
@@ -915,7 +916,7 @@ pub(super) fn attach_frontier<S, M>(
     store: &mut S,
     attached: Collection<M::Target>,
     signing_key: &SigningKey,
-    unavailable: &BTreeSet<CollectionData>,
+    unfetched: &Unfetched,
     frontier: &mut OperationFrontier<S::Snapshot>,
 ) -> Result<(), CollectionRealizationError>
 where
@@ -987,7 +988,7 @@ where
             }
             Err(CollectionOperationError::Capacity(_)) => Ok(false),
             Err(CollectionOperationError::MissingDependency(member))
-                if unavailable.contains(&member) =>
+                if unfetched.contains(&member) =>
             {
                 Ok(false)
             }
@@ -1086,7 +1087,7 @@ pub(super) fn maintain_derived<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
     signing_key: &SigningKey,
-    unavailable: &BTreeSet<CollectionData>,
+    unfetched: &Unfetched,
     wanted: &mut Vec<Vec<CollectionData>>,
     frontier: &mut OperationFrontier<S::Snapshot>,
     carry_target: bool,
@@ -1101,7 +1102,7 @@ where
         target,
         &bound,
         signing_key,
-        unavailable,
+        unfetched,
         wanted,
         frontier,
         carry_target,
@@ -1193,10 +1194,11 @@ fn derive_order(key: &VerifyingKey, foundation: CollectionData) -> [u8; 32] {
 /// acquiring loop asks for them once the rest of the work -- deriving what
 /// needs no fetch, and the carry -- is done ([`super::exact_derived`]).
 /// Until then its foundation is left alone. When no holder handed over any
-/// of a foundation's leaves' outputs (`unavailable`), those leaves do not
-/// count and the foundation is mapped again; a fetch that failed outright
-/// is no answer about any holder, and the foundation waits. A failed
-/// fetch is current unavailability, not loss: a result equal to an output a
+/// of a foundation's leaves' outputs ([`Unfetched::unavailable`]), those
+/// leaves do not count and the foundation is mapped again. A fetch that
+/// failed outright is no answer about any holder, even when it was made for
+/// another foundation that needs the same blob: the foundation waits. A
+/// failed fetch is current unavailability, not loss: a result equal to an output a
 /// leaf already names restores those bytes and publishes nothing, and a
 /// different one is a second leaf beside the first. When the first output
 /// arrives later, both are here, both are joined, and nothing further is
@@ -1229,7 +1231,7 @@ fn derive_leaves<S, M>(
     target: Collection<M::Target>,
     bound: &Bound<M>,
     signing_key: &SigningKey,
-    unavailable: &BTreeSet<CollectionData>,
+    unfetched: &Unfetched,
     wanted: &mut Vec<Vec<CollectionData>>,
     frontier: &mut OperationFrontier<S::Snapshot>,
     maintain: bool,
@@ -1328,7 +1330,7 @@ where
             }
             let unasked = outputs
                 .iter()
-                .filter(|output| !unavailable.contains(*output))
+                .filter(|output| !unfetched.unavailable.contains(*output))
                 .copied()
                 .collect::<Vec<_>>();
             if unasked.is_empty() {
@@ -1357,7 +1359,7 @@ where
             // and whatever the mapping cannot do with another owner's
             // foundation is not this key's failure.
             Mapped::Absent | Mapped::Refused(_) if !own => {}
-            Mapped::Absent if unavailable.contains(&foundation) => {
+            Mapped::Absent if unfetched.contains(&foundation) => {
                 if bound.source_is_root {
                     derivation.blocked.push((
                         foundation,
@@ -1369,7 +1371,7 @@ where
                 derivation.missing.get_or_insert(foundation);
             }
             Mapped::Refused(error) => {
-                match refused(foundation, error, unavailable, &mut derivation.blocked) {
+                match refused(foundation, error, unfetched, &mut derivation.blocked) {
                     Ok(()) => {}
                     Err(CollectionRealizationError::MissingDependency { member }) => {
                         derivation.missing.get_or_insert(member);
@@ -1505,12 +1507,12 @@ where
 fn refused(
     foundation: CollectionData,
     error: CollectionOperationError,
-    unavailable: &BTreeSet<CollectionData>,
+    unfetched: &Unfetched,
     blocked: &mut Vec<(CollectionData, String)>,
 ) -> Result<(), CollectionRealizationError> {
     match error {
         CollectionOperationError::Capacity(reason) => blocked.push((foundation, reason)),
-        CollectionOperationError::MissingDependency(member) if unavailable.contains(&member) => {
+        CollectionOperationError::MissingDependency(member) if unfetched.contains(&member) => {
             blocked.push((
                 foundation,
                 format!(
@@ -1560,7 +1562,7 @@ pub(super) fn rederive<S, M>(
     foundations: &BTreeSet<CollectionData>,
     done: &mut BTreeSet<CollectionData>,
     signing_key: &SigningKey,
-    unavailable: &BTreeSet<CollectionData>,
+    unfetched: &Unfetched,
     frontier: &mut OperationFrontier<S::Snapshot>,
 ) -> Result<(), CollectionRealizationError>
 where
@@ -1620,7 +1622,7 @@ where
         CollectionRealizationError::storage("intersect named payloads with residency", error)
     })?;
     if let Some((member, _, _)) = owed.iter().find(|(foundation, _, _)| {
-        resident.get(&foundation.raw).is_none() && !unavailable.contains(foundation)
+        resident.get(&foundation.raw).is_none() && !unfetched.contains(foundation)
     }) {
         return Err(CollectionRealizationError::MissingDependency { member: *member });
     }
@@ -1641,14 +1643,14 @@ where
             Mapped::Done | Mapped::Overtaken => {
                 done.insert(foundation);
             }
-            Mapped::Absent if unavailable.contains(&foundation) => blocked.push((
+            Mapped::Absent if unfetched.contains(&foundation) => blocked.push((
                 foundation,
                 "the source foundation's payload cannot be read here or acquired".to_owned(),
             )),
             Mapped::Absent => {
                 return Err(CollectionRealizationError::MissingDependency { member: foundation })
             }
-            Mapped::Refused(error) => refused(foundation, error, unavailable, &mut blocked)?,
+            Mapped::Refused(error) => refused(foundation, error, unfetched, &mut blocked)?,
         }
     }
     if blocked.is_empty() {

@@ -387,7 +387,7 @@ where
         store,
         target,
         signing_key,
-        &BTreeSet::new(),
+        &Unfetched::default(),
         &mut Vec::new(),
         &mut frontier,
     )
@@ -410,7 +410,7 @@ fn ensure_resident_in_frontier_with<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
     signing_key: &SigningKey,
-    unavailable: &BTreeSet<CollectionData>,
+    unfetched: &Unfetched,
     wanted: &mut Vec<Vec<CollectionData>>,
     frontier: &mut OperationFrontier<S::Snapshot>,
 ) -> Result<(), CollectionRealizationError>
@@ -422,7 +422,7 @@ where
         store,
         target,
         signing_key,
-        unavailable,
+        unfetched,
         wanted,
         frontier,
         false,
@@ -450,7 +450,7 @@ where
         store,
         target,
         signing_key,
-        &BTreeSet::new(),
+        &Unfetched::default(),
         &mut Vec::new(),
         &mut frontier,
     )
@@ -473,7 +473,7 @@ fn maintain_resident_in_frontier_with<S, M>(
     store: &mut S,
     target: Collection<M::Target>,
     signing_key: &SigningKey,
-    unavailable: &BTreeSet<CollectionData>,
+    unfetched: &Unfetched,
     wanted: &mut Vec<Vec<CollectionData>>,
     frontier: &mut OperationFrontier<S::Snapshot>,
 ) -> Result<(), CollectionRealizationError>
@@ -485,7 +485,7 @@ where
         store,
         target,
         signing_key,
-        unavailable,
+        unfetched,
         wanted,
         frontier,
         true,
@@ -654,6 +654,27 @@ where
 /// `n` calls in expectation, or `n/8` in the one-blob case.
 const OPTIONAL_FETCH_FAILURES: usize = 8;
 
+/// The blobs one call asked for and did not get.
+#[derive(Default)]
+pub(super) struct Unfetched {
+    /// No holder handed these over: an answer about elsewhere, so a leaf
+    /// naming one of them as its output does not count.
+    pub(super) unavailable: BTreeSet<CollectionData>,
+    /// Fetching these failed outright -- the store could not ask other
+    /// holders, or could not keep what it got. That is a fault here and says
+    /// nothing about any holder, so a leaf naming one of them is not given
+    /// up on: its foundation waits.
+    pub(super) failed: BTreeSet<CollectionData>,
+}
+
+impl Unfetched {
+    /// Whether `member` was asked for and is not here, for either reason:
+    /// for this call, what needs it waits.
+    pub(super) fn contains(&self, member: &CollectionData) -> bool {
+        self.unavailable.contains(member) || self.failed.contains(member)
+    }
+}
+
 /// Run one operation against a fresh control snapshot, acquiring what it
 /// names as missing and running it again from a fresh snapshot after every
 /// acquisition. An operation never sees bytes, records, or proofs that
@@ -677,30 +698,31 @@ const OPTIONAL_FETCH_FAILURES: usize = 8;
 /// runs again, before that report is returned: nothing it reports holds back
 /// a fetch. Only a storage error ends the call at once.
 ///
-/// A fetch that fails outright -- the store cannot ask other holders now, or
-/// cannot keep what it got -- is a fault here, not an answer about
-/// elsewhere. A blob the operation needs is then not here for this call, so
-/// what needs it waits, as for any blob it cannot have. A blob it went on
-/// without is not counted unavailable: whatever a holder may have, nothing
-/// is done in its place -- no foundation is derived again for a leaf whose
-/// output a fault kept out -- and it is asked for again by the next call.
-/// The first such error is reported once the work is done, in preference to
-/// what the operation reported, except a signer that is not the store's host
-/// ([`CollectionRealizationError::HostMismatch`]): that stops a whole upkeep
-/// pass, so it is reported first. A storage error the operation itself
-/// raises ends the call at once and is the one reported.
+/// Every blob asked for and not got is [`Unfetched`] for the rest of the
+/// call, and the operation is told which and why. A fetch that fails
+/// outright is a fault here, not an answer about elsewhere, whichever role
+/// the blob plays -- needed by one foundation, the output of another's leaf,
+/// or both: it is never counted unavailable. What needs the blob waits, as
+/// for any blob it cannot have; nothing is done in its place -- no
+/// foundation is derived again for a leaf whose output a fault kept out --
+/// and the next call asks for it again. Only a blob no holder handed over is
+/// unavailable. The first such error is reported once the work is done, in
+/// preference to what the operation reported, except a signer that is not
+/// the store's host ([`CollectionRealizationError::HostMismatch`]): that
+/// stops a whole upkeep pass, so it is reported first. A storage error the
+/// operation itself raises ends the call at once and is the one reported.
 async fn acquiring<S, F>(store: &mut S, mut operation: F) -> Result<(), CollectionRealizationError>
 where
     S: Store + AsyncBlobStoreAcquire,
     F: FnMut(
         &mut S,
-        &BTreeSet<CollectionData>,
+        &Unfetched,
         &mut Vec<Vec<CollectionData>>,
         &mut OperationFrontier<S::Snapshot>,
     ) -> Result<(), CollectionRealizationError>,
 {
     let mut attempted = BTreeSet::new();
-    let mut unavailable = BTreeSet::new();
+    let mut unfetched = Unfetched::default();
     let mut failures = 0;
     let mut broken = None;
     loop {
@@ -709,7 +731,7 @@ where
             let mut frontier = OperationFrontier::new(store.snapshot().map_err(|error| {
                 CollectionRealizationError::storage("freeze operation control snapshot", error)
             })?);
-            operation(store, &unavailable, &mut wanted, &mut frontier)
+            operation(store, &unfetched, &mut wanted, &mut frontier)
         };
         // The operation is over and its control snapshot released before
         // anything is fetched: acquisition holds no view of the store.
@@ -719,9 +741,7 @@ where
             Err(CollectionRealizationError::MissingDependency { member })
                 if !attempted.contains(&member) =>
             {
-                if ask(store, &mut attempted, &mut broken, member).await != Asked::Here {
-                    unavailable.insert(member);
-                }
+                ask(store, &mut attempted, &mut unfetched, &mut broken, member).await;
                 continue;
             }
             Err(error) => Some(error),
@@ -738,14 +758,10 @@ where
                         continue;
                     }
                     asked = true;
-                    match ask(store, &mut attempted, &mut broken, member).await {
-                        Asked::Here => break,
-                        Asked::Unavailable => {
-                            unavailable.insert(member);
-                            failures += 1;
-                        }
-                        Asked::Failed => failures += 1,
+                    if ask(store, &mut attempted, &mut unfetched, &mut broken, member).await {
+                        break;
                     }
+                    failures += 1;
                 }
             }
             if asked {
@@ -760,35 +776,30 @@ where
     }
 }
 
-/// What asking for one blob came to.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Asked {
-    /// Its bytes are here now.
-    Here,
-    /// No holder handed it over.
-    Unavailable,
-    /// The fetch failed outright: the store could not ask, or could not
-    /// keep what it got. This says nothing about the blob elsewhere.
-    Failed,
-}
-
-/// Ask for one blob this call has not asked for. The first fetch that fails
-/// outright is kept in `broken`, to be reported once the work is done.
+/// Ask for one blob this call has not asked for: whether its bytes are here
+/// now. One no holder handed over is recorded `unavailable`; one whose fetch
+/// failed outright is recorded `failed`, and the first such error is kept in
+/// `broken`, to be reported once the work is done.
 async fn ask<S>(
     store: &mut S,
     attempted: &mut BTreeSet<CollectionData>,
+    unfetched: &mut Unfetched,
     broken: &mut Option<CollectionRealizationError>,
     member: CollectionData,
-) -> Asked
+) -> bool
 where
     S: AsyncBlobStoreAcquire,
 {
     match acquire_missing(store, attempted, member).await {
-        Ok(true) => Asked::Here,
-        Ok(false) => Asked::Unavailable,
+        Ok(true) => true,
+        Ok(false) => {
+            unfetched.unavailable.insert(member);
+            false
+        }
         Err(error) => {
+            unfetched.failed.insert(member);
             broken.get_or_insert(error);
-            Asked::Failed
+            false
         }
     }
 }
@@ -802,12 +813,12 @@ where
     S: Store + AsyncBlobStoreAcquire,
     M: DeriveMapping,
 {
-    acquiring(store, |store, unavailable, wanted, frontier| {
+    acquiring(store, |store, unfetched, wanted, frontier| {
         ensure_resident_in_frontier_with::<S, M>(
             store,
             target,
             signing_key,
-            unavailable,
+            unfetched,
             wanted,
             frontier,
         )
@@ -824,12 +835,12 @@ where
     S: Store + AsyncBlobStoreAcquire,
     M: DeriveMapping,
 {
-    acquiring(store, |store, unavailable, wanted, frontier| {
+    acquiring(store, |store, unfetched, wanted, frontier| {
         maintain_resident_in_frontier_with::<S, M>(
             store,
             target,
             signing_key,
-            unavailable,
+            unfetched,
             wanted,
             frontier,
         )
@@ -852,7 +863,7 @@ where
     M: DeriveMapping,
 {
     let mut done = BTreeSet::new();
-    acquiring(store, |store, unavailable, _wanted, frontier| {
+    acquiring(store, |store, unfetched, _wanted, frontier| {
         super::maintenance::rederive::<S, M>(
             store,
             target,
@@ -860,7 +871,7 @@ where
             foundations,
             &mut done,
             signing_key,
-            unavailable,
+            unfetched,
             frontier,
         )
     })
@@ -880,7 +891,7 @@ where
     S: Store + AsyncBlobStoreAcquire,
     E: CollectionEncoding,
 {
-    acquiring(store, |store, _unavailable, _wanted, frontier| {
+    acquiring(store, |store, _unfetched, _wanted, frontier| {
         super::maintenance::carry_root(store, target, signing_key, frontier)
     })
     .await
@@ -928,12 +939,12 @@ where
     S: Store + AsyncBlobStoreAcquire,
     M: MapMapping,
 {
-    acquiring(store, |store, unavailable, _wanted, frontier| {
+    acquiring(store, |store, unfetched, _wanted, frontier| {
         super::maintenance::attach_frontier::<S, M>(
             store,
             attached,
             signing_key,
-            unavailable,
+            unfetched,
             frontier,
         )
     })

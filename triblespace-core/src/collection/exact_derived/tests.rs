@@ -276,6 +276,9 @@ thread_local! {
     /// Sources the first mapping refuses, like `FIRST_MAP_FATAL`, for
     /// tests that need several.
     static FIRST_MAP_REFUSED: RefCell<BTreeSet<CollectionData>> = const { RefCell::new(BTreeSet::new()) };
+    /// A blob the first mapping needs for a source: that source maps only
+    /// once the blob's bytes are here, and asks for it until then.
+    static FIRST_MAP_NEEDS: RefCell<BTreeMap<CollectionData, CollectionData>> = const { RefCell::new(BTreeMap::new()) };
     /// Whether this host is outside the class a pinned test mapping is
     /// computed on.
     static FIRST_PINNED_ELSEWHERE: Cell<bool> = const { Cell::new(false) };
@@ -295,6 +298,7 @@ fn reset_mapping_calls() {
     FIRST_MAP_CAPACITY.replace(None);
     FIRST_MAP_FATAL.replace(None);
     FIRST_MAP_REFUSED.replace(BTreeSet::new());
+    FIRST_MAP_NEEDS.replace(BTreeMap::new());
     FIRST_PINNED_ELSEWHERE.set(false);
     FIRST_MAP_LOG.replace(Vec::new());
 }
@@ -335,7 +339,7 @@ impl CollectionDerivation for FirstEncoding {
     fn map<R>(
         _argument: &Self::Argument,
         source: &Blob<Self::Source>,
-        _reader: &R,
+        reader: &R,
     ) -> Result<Blob<Self>, CollectionOperationError>
     where
         R: BlobStoreGet + BlobStoreMeta,
@@ -346,6 +350,16 @@ impl CollectionDerivation for FirstEncoding {
             return Err(CollectionOperationError::MissingDependency(
                 crate::inline::Inline::new([0xEE; 32]),
             ));
+        }
+        if let Some(needed) = FIRST_MAP_NEEDS.with_borrow(|needs| needs.get(&data(source)).copied())
+        {
+            let here = reader
+                .metadata(Handle::<UnknownBlob>::from_hash(needed))
+                .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?
+                .is_some();
+            if !here {
+                return Err(CollectionOperationError::MissingDependency(needed));
+            }
         }
         if FIRST_MAP_CAPACITY.with_borrow(|blocked| *blocked == Some(data(source))) {
             return Err(CollectionOperationError::Capacity(
@@ -5375,6 +5389,125 @@ mod lattice_v2 {
             .is_some());
         assert!(!FIRST_MAP_LOG.with_borrow(|log| log.contains(&data(&faulted_source))));
         assert_eq!(leaves_by(&mut store.inner, first, 41).len(), 1);
+    }
+
+    /// Review finding, 2026-09-29: a blob an own foundation needs was
+    /// counted unavailable when fetching it failed outright, and one blob
+    /// can also be the output another foundation's leaf names. That
+    /// foundation was then derived again, beside a leaf a holder could hand
+    /// over. A fetch that fails outright counts a blob unavailable in
+    /// neither role: the foundation that needs it waits, the one whose leaf
+    /// names it waits, and the fault is reported once the work is done.
+    #[test]
+    fn a_needed_blob_whose_fetch_fails_outright_is_no_unavailable_leaf_output() {
+        reset_mapping_calls();
+        let (mut inner, root, first, _) = collections();
+        // Another owner's foundation, here, whose admitted leaf names the
+        // blob as its output.
+        let leafed = payload(42, 1);
+        own_commit(&mut inner, root, 42, 1);
+        let (record, shared) = leaf_of(first, 42, &leafed, 7);
+        inner.insert(record).unwrap();
+        // An own foundation, here, that maps only once that blob is here.
+        let needing = own_commit(&mut inner, root, 41, 0);
+        FIRST_MAP_NEEDS.with_borrow_mut(|needs| needs.insert(needing, data(&shared)));
+        let mut store = GuardStore::new(inner);
+        // A holder has the blob; keeping it fails here.
+        store.offer(&shared);
+        store.acquire_fails.insert(data(&shared));
+
+        let result = block_on(store.maintain(first, &key(41)));
+        let reported = format!("{:?}", result.as_ref().err());
+        assert!(
+            matches!(result, Err(CollectionRealizationError::Storage { .. }))
+                && reported.contains(r#"Injected("acquire")"#),
+            "{reported}"
+        );
+        assert_eq!(store.acquired, vec![data(&shared)], "asked for once");
+        assert!(
+            !FIRST_MAP_LOG.with_borrow(|log| log.contains(&data(&leafed))),
+            "a fault is no reason to derive again"
+        );
+        assert!(leaves_by(&mut store.inner, first, 41).is_empty());
+
+        // The fault clears: the blob is fetched, the own foundation maps,
+        // and the other's leaf counts.
+        store.acquire_fails.remove(&data(&shared));
+        drop(block_on(store.maintain(first, &key(41))).unwrap());
+        assert_eq!(store.acquired, vec![data(&shared), data(&shared)]);
+        assert!(!FIRST_MAP_LOG.with_borrow(|log| log.contains(&data(&leafed))));
+        assert_eq!(
+            leaves_by(&mut store.inner, first, 41)
+                .iter()
+                .map(|leaf| leaf.input())
+                .collect::<Vec<_>>(),
+            vec![SourceLocator::of(needing.raw)]
+        );
+    }
+
+    /// The same fault met the other way round: a leaf's output whose fetch
+    /// failed outright was still asked for again as a blob an own
+    /// foundation needs, and that request, standing first, hid the payload
+    /// another own foundation after it needed. A blob whose fetch failed is
+    /// not here for the rest of the call, in either role: the foundation
+    /// that needs it waits and the payload is fetched.
+    #[test]
+    fn a_leaf_output_whose_fetch_fails_outright_hides_no_payload_another_needs() {
+        reset_mapping_calls();
+        let (mut inner, root, first, _) = collections();
+        // Another owner's foundation, here, whose leaf names the blob.
+        let leafed = payload(42, 1);
+        own_commit(&mut inner, root, 42, 1);
+        let (record, shared) = leaf_of(first, 42, &leafed, 7);
+        inner.insert(record).unwrap();
+        // Two own foundations, each with a leaf whose output nobody has: the
+        // first is here and needs the blob, the second, after it in the
+        // key's order, has its payload elsewhere.
+        let needing = own_commit(&mut inner, root, 41, 0);
+        FIRST_MAP_NEEDS.with_borrow_mut(|needs| needs.insert(needing, data(&shared)));
+        let entity = (1..64)
+            .find(|entity| derive_rank(41, data(&payload(41, *entity))) > derive_rank(41, needing))
+            .unwrap();
+        let elsewhere = payload(41, entity);
+        foreign_commit(&mut inner, root, 41, entity);
+        let (record, _) = leaf_of(first, 42, &payload(41, 0), 7);
+        inner.insert(record).unwrap();
+        let (record, _) = leaf_of(first, 42, &elsewhere, 7);
+        inner.insert(record).unwrap();
+        let mut store = GuardStore::new(inner);
+        store.offer(&shared);
+        store.offer(&elsewhere);
+        store.acquire_fails.insert(data(&shared));
+
+        let result = block_on(store.maintain(first, &key(41)));
+        let reported = format!("{:?}", result.as_ref().err());
+        assert!(
+            matches!(result, Err(CollectionRealizationError::Storage { .. }))
+                && reported.contains(r#"Injected("acquire")"#),
+            "{reported}"
+        );
+        assert!(
+            store.acquired.contains(&data(&elsewhere)),
+            "the payload was hidden: asked {:?}",
+            store.acquired
+        );
+        assert_eq!(
+            store
+                .acquired
+                .iter()
+                .filter(|member| **member == data(&shared))
+                .count(),
+            1,
+            "asked for once"
+        );
+        assert!(!FIRST_MAP_LOG.with_borrow(|log| log.contains(&data(&leafed))));
+        assert_eq!(
+            leaves_by(&mut store.inner, first, 41)
+                .iter()
+                .map(|leaf| leaf.input())
+                .collect::<Vec<_>>(),
+            vec![SourceLocator::of(data(&elsewhere).raw)]
+        );
     }
 
     /// Damage one byte of `blob` where a pile file holds it, the last
