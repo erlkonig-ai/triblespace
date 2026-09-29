@@ -631,15 +631,15 @@ where
 ///
 /// Through a store that asks other holders a failed fetch can wait out a
 /// network deadline -- `triblespace-net` gives an interactive fetch ten
-/// seconds -- so this bounds what one call spends on blobs nobody hands over.
-/// A fetch that succeeds is not counted. What an operation went on without
-/// comes in groups, each of which one blob completes -- for derive
-/// scheduling, the outputs of one foundation's leaves, any one of which is a
-/// usable leaf -- and a group once started is asked to the end: until one of
-/// its blobs arrives or every one has failed, so a foundation with more
-/// unavailable outputs than this is still decided in one call. One call
-/// therefore lets fewer than eight fetches fail before the last group it
-/// starts, plus that group's own.
+/// seconds -- so this bounds what one call spends on blobs nobody hands over,
+/// and on fetches that fail outright. A fetch that succeeds is not counted.
+/// What an operation went on without comes in groups, each of which one blob
+/// completes -- for derive scheduling, the outputs of one foundation's
+/// leaves, any one of which is a usable leaf -- and a group once started is
+/// asked to the end: until one of its blobs arrives or every one has failed,
+/// so a foundation with more unavailable outputs than this is still decided
+/// in one call. One call therefore lets fewer than eight fetches fail before
+/// the last group it starts, plus that group's own.
 ///
 /// Each call starts the groups in an order drawn afresh. A call keeps no
 /// memory of the last one -- a faculty's store lives for one command -- and
@@ -675,11 +675,17 @@ const OPTIONAL_FETCH_FAILURES: usize = 8;
 /// An operation that reports something after its work -- a foundation its
 /// mapping refused, a carry that failed -- has its `wanted` asked for, and
 /// runs again, before that report is returned: nothing it reports holds back
-/// a fetch. Only a storage error ends the call at once. A fetch that fails
-/// outright -- the store cannot reach other holders now, or cannot keep what
-/// it got -- makes that blob unavailable for this call like any failed
-/// fetch, and the first such error is reported once the work is done, in
-/// preference to what the operation reported.
+/// a fetch. Only a storage error ends the call at once.
+///
+/// A fetch that fails outright -- the store cannot ask other holders now, or
+/// cannot keep what it got -- is a fault here, not an answer about
+/// elsewhere. A blob the operation needs is then not here for this call, so
+/// what needs it waits, as for any blob it cannot have. A blob it went on
+/// without is not counted unavailable: whatever a holder may have, nothing
+/// is done in its place -- no foundation is derived again for a leaf whose
+/// output a fault kept out -- and it is asked for again by the next call.
+/// The first such error is reported once the work is done, in preference to
+/// what the operation reported.
 async fn acquiring<S, F>(store: &mut S, mut operation: F) -> Result<(), CollectionRealizationError>
 where
     S: Store + AsyncBlobStoreAcquire,
@@ -710,7 +716,7 @@ where
             Err(CollectionRealizationError::MissingDependency { member })
                 if !attempted.contains(&member) =>
             {
-                if !ask(store, &mut attempted, &mut broken, member).await {
+                if ask(store, &mut attempted, &mut broken, member).await != Asked::Here {
                     unavailable.insert(member);
                 }
                 continue;
@@ -729,11 +735,14 @@ where
                         continue;
                     }
                     asked = true;
-                    if ask(store, &mut attempted, &mut broken, member).await {
-                        break;
+                    match ask(store, &mut attempted, &mut broken, member).await {
+                        Asked::Here => break,
+                        Asked::Unavailable => {
+                            unavailable.insert(member);
+                            failures += 1;
+                        }
+                        Asked::Failed => failures += 1,
                     }
-                    unavailable.insert(member);
-                    failures += 1;
                 }
             }
             if asked {
@@ -747,24 +756,35 @@ where
     }
 }
 
-/// Ask for one blob this call has not asked for, and say whether it is here
-/// now. A fetch that fails outright is that blob being unavailable for this
-/// call, like one nobody hands over; the first such error is kept in
-/// `broken`, to be reported once the work is done.
+/// What asking for one blob came to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Asked {
+    /// Its bytes are here now.
+    Here,
+    /// No holder handed it over.
+    Unavailable,
+    /// The fetch failed outright: the store could not ask, or could not
+    /// keep what it got. This says nothing about the blob elsewhere.
+    Failed,
+}
+
+/// Ask for one blob this call has not asked for. The first fetch that fails
+/// outright is kept in `broken`, to be reported once the work is done.
 async fn ask<S>(
     store: &mut S,
     attempted: &mut BTreeSet<CollectionData>,
     broken: &mut Option<CollectionRealizationError>,
     member: CollectionData,
-) -> bool
+) -> Asked
 where
     S: AsyncBlobStoreAcquire,
 {
     match acquire_missing(store, attempted, member).await {
-        Ok(here) => here,
+        Ok(true) => Asked::Here,
+        Ok(false) => Asked::Unavailable,
         Err(error) => {
             broken.get_or_insert(error);
-            false
+            Asked::Failed
         }
     }
 }

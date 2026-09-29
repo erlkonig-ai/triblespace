@@ -5256,55 +5256,94 @@ mod lattice_v2 {
 
     /// Review finding, 2026-09-28: a fetch that failed outright -- a peer
     /// endpoint that cannot start, or a fetched blob that cannot be kept --
-    /// ended the whole call at that output. It now means that blob is
-    /// unavailable for this call, like any failed fetch, whether a leaf's
-    /// output or an own payload: the rest is asked for, a foundation whose
-    /// output could not be had is derived again, and the failure is
-    /// reported once the work is done.
+    /// ended the whole call at that output. The rest is now asked for, and
+    /// the failure is reported once the work is done.
+    ///
+    /// Review finding, 2026-09-29: that failure was then counted as the
+    /// blob being unavailable, so a foundation whose leaf's output a holder
+    /// did have was derived again, and a second leaf published beside one
+    /// that could be had. A fetch that fails outright is a fault here, not
+    /// an answer about elsewhere: the foundation waits, every call reports
+    /// the fault, and once it clears the output is fetched and counts. An
+    /// own payload that cannot be fetched either way leaves its foundation
+    /// underived for the call.
     #[test]
-    fn a_fetch_that_fails_outright_is_unavailability_reported_after_the_work() {
+    fn a_fetch_that_fails_outright_is_reported_and_derives_nothing_in_its_place() {
         reset_mapping_calls();
         let (mut inner, root, first, _) = collections();
         let fresh = own_commit(&mut inner, root, 41, 0);
         // An own foundation whose payload is elsewhere, and cannot be had.
         foreign_commit(&mut inner, root, 41, 3);
         let unreachable = payload(41, 3);
-        let broken_source = payload(42, 1);
+        let faulted_source = payload(42, 1);
         let fetched_source = payload(42, 2);
         own_commit(&mut inner, root, 42, 1);
         own_commit(&mut inner, root, 42, 2);
-        let (record, broken) = leaf_of(first, 42, &broken_source, 7);
+        let (record, faulted) = leaf_of(first, 42, &faulted_source, 7);
         inner.insert(record).unwrap();
         let (record, obtainable) = leaf_of(first, 42, &fetched_source, 7);
         inner.insert(record).unwrap();
         let mut store = GuardStore::new(inner);
+        // A holder has both outputs; keeping the first fails here.
+        store.offer(&faulted);
         store.offer(&obtainable);
-        store.acquire_fails.insert(data(&broken));
+        store.acquire_fails.insert(data(&faulted));
         store.acquire_fails.insert(data(&unreachable));
 
-        let result = block_on(store.maintain(first, &key(41)));
-        let reported = format!("{:?}", result.as_ref().err());
+        for pass in 0..2 {
+            let result = block_on(store.maintain(first, &key(41)));
+            let reported = format!("{:?}", result.as_ref().err());
+            assert!(
+                matches!(result, Err(CollectionRealizationError::Storage { .. })),
+                "pass {pass}: {reported}"
+            );
+            assert!(
+                reported.contains(r#"Injected("acquire")"#),
+                "pass {pass}: {reported}"
+            );
+        }
+        let mapped = FIRST_MAP_LOG.with_borrow(|log| log.clone());
         assert!(
-            matches!(result, Err(CollectionRealizationError::Storage { .. })),
-            "{reported}"
+            !mapped.contains(&data(&faulted_source)),
+            "a fault is no reason to derive again"
         );
-        assert!(reported.contains(r#"Injected("acquire")"#), "{reported}");
-        assert_eq!(
-            store.acquired.iter().copied().collect::<BTreeSet<_>>(),
-            BTreeSet::from([data(&broken), data(&obtainable), data(&unreachable)])
+        assert!(
+            !mapped.contains(&data(&fetched_source)),
+            "a fetched output counts"
         );
-        assert_eq!(store.acquired.len(), 3, "each asked for once");
-        assert!(!FIRST_MAP_LOG.with_borrow(|log| log.contains(&data(&fetched_source))));
         assert_eq!(
             leaves_by(&mut store.inner, first, 41)
                 .iter()
                 .map(|leaf| leaf.input())
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from([
-                SourceLocator::of(fresh.raw),
-                SourceLocator::of(data(&broken_source).raw)
-            ])
+                .collect::<Vec<_>>(),
+            vec![SourceLocator::of(fresh.raw)]
         );
+        // Each call asks once for what it lacks: the first all three, the
+        // second the two that failed.
+        assert_eq!(
+            store.acquired.iter().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from([data(&faulted), data(&obtainable), data(&unreachable)])
+        );
+        assert_eq!(store.acquired.len(), 5, "{:?}", store.acquired);
+
+        // The fault clears: the output is fetched and counts.
+        store.acquire_fails.remove(&data(&faulted));
+        let result = block_on(store.maintain(first, &key(41)));
+        assert!(
+            matches!(result, Err(CollectionRealizationError::Storage { .. })),
+            "the own payload still fails: {:?}",
+            result.err()
+        );
+        assert_eq!(store.acquired.len(), 7, "{:?}", store.acquired);
+        assert!(store
+            .inner
+            .snapshot()
+            .unwrap()
+            .metadata(Handle::<FirstEncoding>::from_hash(data(&faulted)))
+            .unwrap()
+            .is_some());
+        assert!(!FIRST_MAP_LOG.with_borrow(|log| log.contains(&data(&faulted_source))));
+        assert_eq!(leaves_by(&mut store.inner, first, 41).len(), 1);
     }
 
     /// Review finding, 2026-09-28: whether a leaf was usable was asked of

@@ -1194,7 +1194,8 @@ fn derive_order(key: &VerifyingKey, foundation: CollectionData) -> [u8; 32] {
 /// needs no fetch, and the carry -- is done ([`super::exact_derived`]).
 /// Until then its foundation is left alone. When none of a foundation's
 /// leaves' outputs could be had (`unavailable`, or damaged), those leaves do
-/// not count and the foundation is mapped again. A failed
+/// not count and the foundation is mapped again; a fetch that failed
+/// outright is no answer about any holder, and the foundation waits. A failed
 /// fetch is current unavailability, not loss: a result equal to an output a
 /// leaf already names restores those bytes and publishes nothing, and a
 /// different one is a second leaf beside the first. When the first output
