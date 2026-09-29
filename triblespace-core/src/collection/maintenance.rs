@@ -1185,17 +1185,17 @@ fn derive_order(key: &VerifyingKey, foundation: CollectionData) -> [u8; 32] {
 /// owner who is offline.
 ///
 /// A leaf counts only when its output reads: an output that is here but
-/// does not read -- damaged bytes a pile's index still lists -- is no more
-/// use than an absent one, and as it cannot be fetched either (it is here),
-/// it counts as unavailable at once. An output a believed leaf names that
-/// is not here is not waited for: the outputs of one foundation's leaves go
-/// into `wanted` together, as one group any one of which would do, and the
+/// does not read -- damaged bytes a pile's index still lists -- is treated
+/// exactly as an absent one, and a store that asks other holders fetches
+/// good bytes for it. An output a believed leaf names that does not read
+/// here is not waited for: the outputs of one foundation's leaves go into
+/// `wanted` together, as one group any one of which would do, and the
 /// acquiring loop asks for them once the rest of the work -- deriving what
 /// needs no fetch, and the carry -- is done ([`super::exact_derived`]).
-/// Until then its foundation is left alone. When none of a foundation's
-/// leaves' outputs could be had (`unavailable`, or damaged), those leaves do
-/// not count and the foundation is mapped again; a fetch that failed
-/// outright is no answer about any holder, and the foundation waits. A failed
+/// Until then its foundation is left alone. When no holder handed over any
+/// of a foundation's leaves' outputs (`unavailable`), those leaves do not
+/// count and the foundation is mapped again; a fetch that failed outright
+/// is no answer about any holder, and the foundation waits. A failed
 /// fetch is current unavailability, not loss: a result equal to an output a
 /// leaf already names restores those bytes and publishes nothing, and a
 /// different one is a second leaf beside the first. When the first output
@@ -1314,9 +1314,9 @@ where
     own.sort_by_cached_key(|(foundation, _, _)| derive_order(&key, *foundation));
     foreign.sort_by_cached_key(|(foundation, _, _)| derive_order(&key, *foundation));
     // A foundation with a leaf whose output reads here is done, whoever
-    // signed the leaf. One whose leaves' outputs are not here waits for them
-    // to be asked for, and is owed a leaf only once none of them could be
-    // had; an output here that does not read cannot be had.
+    // signed the leaf. One whose leaves' outputs do not read here -- absent,
+    // or damaged -- waits for them to be asked for, and is owed a leaf only
+    // once no holder handed any of them over.
     let mut owed = Vec::new();
     for (entries, owned) in [(own, true), (foreign, false)] {
         for (foundation, locator, outputs) in entries {
@@ -1328,9 +1328,7 @@ where
             }
             let unasked = outputs
                 .iter()
-                .filter(|output| {
-                    !unavailable.contains(*output) && resident.get(&output.raw).is_none()
-                })
+                .filter(|output| !unavailable.contains(*output))
                 .copied()
                 .collect::<Vec<_>>();
             if unasked.is_empty() {
@@ -1363,8 +1361,7 @@ where
                 if bound.source_is_root {
                     derivation.blocked.push((
                         foundation,
-                        "the source commit's payload is not resident and could not be acquired"
-                            .to_owned(),
+                        "the source commit's payload cannot be read here or acquired".to_owned(),
                     ));
                 }
             }
@@ -1646,8 +1643,7 @@ where
             }
             Mapped::Absent if unavailable.contains(&foundation) => blocked.push((
                 foundation,
-                "the source foundation's payload is not resident and could not be acquired"
-                    .to_owned(),
+                "the source foundation's payload cannot be read here or acquired".to_owned(),
             )),
             Mapped::Absent => {
                 return Err(CollectionRealizationError::MissingDependency { member: foundation })

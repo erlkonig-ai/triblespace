@@ -493,6 +493,9 @@ struct GuardSnapshot {
     live: Arc<AtomicUsize>,
     semantic_probes: Arc<AtomicUsize>,
     selected_collections: Arc<Mutex<Vec<BTreeSet<CollectionRecordSelector>>>>,
+    /// Blobs whose bytes are here and do not read, as damaged bytes a
+    /// pile's index still lists: resident, with no metadata.
+    damaged: Arc<Mutex<BTreeSet<CollectionData>>>,
 }
 
 impl Clone for GuardSnapshot {
@@ -503,6 +506,7 @@ impl Clone for GuardSnapshot {
             live: Arc::clone(&self.live),
             semantic_probes: Arc::clone(&self.semantic_probes),
             selected_collections: Arc::clone(&self.selected_collections),
+            damaged: Arc::clone(&self.damaged),
         }
     }
 }
@@ -539,7 +543,19 @@ impl BlobStoreMeta for GuardSnapshot {
         S: BlobEncoding + 'static,
         Handle<S>: InlineEncoding,
     {
+        let member = Handle::<S>::to_hash(handle);
+        if self.damaged.lock().unwrap().contains(&member) {
+            return Ok(None);
+        }
         self.inner.metadata(handle)
+    }
+
+    /// The index lists a damaged blob: it is resident without reading.
+    fn resident(
+        &self,
+        handles: &crate::patch::PATCH<32, crate::patch::IdentitySchema, ()>,
+    ) -> Result<crate::patch::PATCH<32, crate::patch::IdentitySchema, ()>, Self::MetaError> {
+        self.inner.resident(handles)
     }
 }
 
@@ -671,6 +687,9 @@ struct GuardStore {
     /// start, or a fetched blob that cannot be kept, would.
     acquire_fails: BTreeSet<CollectionData>,
     acquired: Vec<CollectionData>,
+    /// Blobs whose bytes here do not read ([`GuardSnapshot`]); fetching one
+    /// a holder has restores it.
+    damaged: Arc<Mutex<BTreeSet<CollectionData>>>,
     /// How many writes `events` held when each acquisition was made.
     acquired_at: Vec<usize>,
     inject_record_on_acquire: Option<CollectionRecord>,
@@ -696,6 +715,7 @@ impl GuardStore {
             acquirable: BTreeMap::new(),
             acquire_fails: BTreeSet::new(),
             acquired: Vec::new(),
+            damaged: Arc::new(Mutex::new(BTreeSet::new())),
             acquired_at: Vec::new(),
             inject_record_on_acquire: None,
             inject_proof_on_acquire: None,
@@ -708,6 +728,14 @@ impl GuardStore {
         Handle<E>: InlineEncoding,
     {
         self.acquirable.insert(data(blob), blob.bytes.clone());
+    }
+
+    /// Damage a resident blob: its bytes stay listed and no longer read.
+    fn damage<E: BlobEncoding>(&mut self, blob: &Blob<E>)
+    where
+        Handle<E>: InlineEncoding,
+    {
+        self.damaged.lock().unwrap().insert(data(blob));
     }
 
     /// A publishing operation holds exactly its frozen control snapshot.
@@ -745,11 +773,13 @@ impl AsyncBlobStoreAcquire for GuardStore {
             return std::future::ready(Err(GuardStoreError::Injected("acquire")));
         }
         let result = match self.acquirable.get(&member).cloned() {
-            Some(bytes) => self
-                .inner
-                .put::<UnknownBlob, _>(bytes.clone())
-                .map_err(|error| GuardStoreError::Backend(error.to_string()))
-                .map(|_| Some(bytes)),
+            Some(bytes) => {
+                self.damaged.lock().unwrap().remove(&member);
+                self.inner
+                    .put::<UnknownBlob, _>(bytes.clone())
+                    .map_err(|error| GuardStoreError::Backend(error.to_string()))
+                    .map(|_| Some(bytes))
+            }
             None => Ok(None),
         };
         let result = result.and_then(|bytes| {
@@ -809,6 +839,7 @@ impl SnapshotSource for GuardStore {
             live: Arc::clone(&self.live),
             semantic_probes: Arc::clone(&self.semantic_probes),
             selected_collections: Arc::clone(&self.selected_collections),
+            damaged: Arc::clone(&self.damaged),
         })
     }
 }
@@ -5346,109 +5377,149 @@ mod lattice_v2 {
         assert_eq!(leaves_by(&mut store.inner, first, 41).len(), 1);
     }
 
+    /// Damage one byte of `blob` where a pile file holds it, the last
+    /// occurrence of its bytes in the file.
+    fn damage_in_file<E: BlobEncoding>(path: &std::path::Path, blob: &Blob<E>) {
+        let mut bytes = std::fs::read(path).unwrap();
+        let at = bytes
+            .windows(blob.bytes.len())
+            .rposition(|window| window == blob.bytes.as_ref())
+            .unwrap();
+        bytes[at + 8] ^= 0x40;
+        std::fs::write(path, &bytes).unwrap();
+    }
+
     /// Review finding, 2026-09-28: whether a leaf was usable was asked of
     /// the pile's index, which says a blob is present without reading it.
-    /// A leaf whose output bytes are damaged therefore counted: its
-    /// foundation was never derived again, and every carry that grouped it
-    /// failed to read it. A leaf now counts only when its output reads, as
-    /// the Files lag count already asked, and the carry joins only nodes
-    /// whose bytes read. A mapping that reproduces restores the bytes; one
-    /// that does not adds a leaf, and the damaged one sits out.
+    /// A leaf whose output bytes are damaged therefore counted, and every
+    /// carry that grouped it failed to read it. A leaf now counts only when
+    /// its output reads, and the carry joins only nodes whose bytes read.
+    ///
+    /// Review finding, 2026-09-29: the damaged output then counted as
+    /// unavailable at once, and its foundation was derived again -- by a
+    /// store that asks nobody else, which waits for an absent output. A
+    /// damaged output is now waited for or asked for exactly like an absent
+    /// one: through a plain pile, nothing is derived in its place, and the
+    /// carry reads around it.
     #[test]
-    fn a_leaf_whose_output_is_damaged_is_derived_again_and_the_carry_reads_around_it() {
+    fn a_plain_pile_waits_for_a_damaged_output_and_the_carry_reads_around_it() {
         use crate::repo::pile::Pile;
 
-        for reproduces in [true, false] {
-            reset_mapping_calls();
-            let file = tempfile::NamedTempFile::new().unwrap();
-            let host = key(41);
-            let mut pile = Pile::open_as(file.path(), host.verifying_key()).unwrap();
-            let root = pile.collection("root", policy()).unwrap();
-            let first = pile.derive::<FirstEncoding>(root, (), policy()).unwrap();
-            let sources: Vec<_> = (0..8).map(|entity| payload(41, entity)).collect();
-            for source in &sources {
-                pile.put::<SimpleArchive, _>(source.clone()).unwrap();
-                let metadata = pile
-                    .put::<SimpleArchive, _>(TribleSet::new().to_blob())
-                    .unwrap();
-                pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
-                    &host,
-                    root.handle(),
-                    data(source),
-                    metadata,
-                )))
+        reset_mapping_calls();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let host = key(41);
+        let mut pile = Pile::open_as(file.path(), host.verifying_key()).unwrap();
+        let root = pile.collection("root", policy()).unwrap();
+        let first = pile.derive::<FirstEncoding>(root, (), policy()).unwrap();
+        let sources: Vec<_> = (0..9).map(|entity| payload(41, entity)).collect();
+        for source in &sources {
+            pile.put::<SimpleArchive, _>(source.clone()).unwrap();
+            let metadata = pile
+                .put::<SimpleArchive, _>(TribleSet::new().to_blob())
                 .unwrap();
-            }
-            drop(block_on(pile.ensure(first, &host)).unwrap());
-            pile.close().unwrap();
-
-            // Damage one byte of the first source's image in the file.
-            let image = salted_image(&sources[0], 0);
-            let damaged = data(&image);
-            let mut bytes = std::fs::read(file.path()).unwrap();
-            let at = bytes
-                .windows(image.bytes.len())
-                .rposition(|window| window == image.bytes.as_ref())
-                .unwrap();
-            bytes[at + 8] ^= 0x40;
-            std::fs::write(file.path(), &bytes).unwrap();
-
-            let mut pile = Pile::open_as(file.path(), host.verifying_key()).unwrap();
-            let snapshot = pile.snapshot().unwrap();
-            let handle = Handle::<FirstEncoding>::from_hash(damaged);
-            assert!(snapshot.contains_blob(handle).unwrap(), "present");
-            assert!(snapshot.metadata(handle).unwrap().is_none(), "unreadable");
-            drop(snapshot);
-
-            if !reproduces {
-                FIRST_SALT.set(9);
-            }
-            let mapped = FIRST_MAP_CALLS.get();
-            let result = block_on(pile.maintain(first, &host));
-            assert!(result.is_ok(), "{:?}", result.err());
-            assert_eq!(FIRST_MAP_CALLS.get() - mapped, 1, "derived again");
-            let records: Vec<CollectionRecord> = pile
-                .snapshot()
-                .unwrap()
-                .records()
-                .unwrap()
-                .map(Result::unwrap)
-                .collect();
-            let leaves: Vec<CollectionData> = records
-                .iter()
-                .filter_map(|record| match record {
-                    CollectionRecord::Derive(leaf) if leaf.collection() == first.handle() => {
-                        Some(leaf.output())
-                    }
-                    _ => None,
-                })
-                .collect();
-            let merges: Vec<CollectionMerge> = records
-                .iter()
-                .filter_map(|record| match record {
-                    CollectionRecord::Merge(merge) if merge.collection() == first.handle() => {
-                        Some(*merge)
-                    }
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(merges.len(), 1);
-            let mut carried: BTreeSet<CollectionData> = sources[1..]
-                .iter()
-                .map(|source| data(&salted_image(source, 0)))
-                .collect();
-            if reproduces {
-                assert_eq!(leaves.len(), 8, "the leaf's bytes are restored");
-                carried.insert(damaged);
-                let snapshot = pile.snapshot().unwrap();
-                assert!(snapshot.metadata(handle).unwrap().is_some(), "readable");
-            } else {
-                assert_eq!(leaves.len(), 9, "a second leaf");
-                carried.insert(data(&salted_image(&sources[0], 9)));
-            }
-            assert_eq!(inputs(&merges[0]), carried);
-            pile.close().unwrap();
+            pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
+                &host,
+                root.handle(),
+                data(source),
+                metadata,
+            )))
+            .unwrap();
         }
+        drop(block_on(pile.ensure(first, &host)).unwrap());
+        pile.close().unwrap();
+        let image = salted_image(&sources[0], 0);
+        let damaged = data(&image);
+        damage_in_file(file.path(), &image);
+
+        let mut pile = Pile::open_as(file.path(), host.verifying_key()).unwrap();
+        let snapshot = pile.snapshot().unwrap();
+        let handle = Handle::<FirstEncoding>::from_hash(damaged);
+        assert!(snapshot.contains_blob(handle).unwrap(), "present");
+        assert!(snapshot.metadata(handle).unwrap().is_none(), "unreadable");
+        drop(snapshot);
+
+        let mapped = FIRST_MAP_CALLS.get();
+        let result = block_on(pile.maintain(first, &host));
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert_eq!(
+            FIRST_MAP_CALLS.get(),
+            mapped,
+            "nothing is derived in its place"
+        );
+        let records: Vec<CollectionRecord> = pile
+            .snapshot()
+            .unwrap()
+            .records()
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let leaves = records
+            .iter()
+            .filter(|record| {
+                matches!(record, CollectionRecord::Derive(leaf) if leaf.collection() == first.handle())
+            })
+            .count();
+        let merges: Vec<CollectionMerge> = records
+            .iter()
+            .filter_map(|record| match record {
+                CollectionRecord::Merge(merge) if merge.collection() == first.handle() => {
+                    Some(*merge)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(leaves, 9);
+        assert_eq!(merges.len(), 1);
+        let carried: BTreeSet<CollectionData> = sources[1..]
+            .iter()
+            .map(|source| data(&salted_image(source, 0)))
+            .collect();
+        assert_eq!(inputs(&merges[0]), carried);
+        pile.close().unwrap();
+    }
+
+    /// Review finding, 2026-09-29: a leaf output that is here but does not
+    /// read counted as unavailable at once, so its foundation was derived
+    /// again even when a holder could hand the bytes over: a second leaf
+    /// published automatically beside one that could be had. Through a
+    /// store that asks other holders a damaged output is now asked for like
+    /// an absent one, and only when nobody hands it over is its foundation
+    /// derived again.
+    #[test]
+    fn a_damaged_output_is_asked_for_before_its_foundation_is_derived_again() {
+        reset_mapping_calls();
+        let (mut inner, root, first, _) = collections();
+        let restored_source = payload(42, 1);
+        let lost_source = payload(42, 2);
+        own_commit(&mut inner, root, 42, 1);
+        own_commit(&mut inner, root, 42, 2);
+        let (record, restored) = leaf_of(first, 42, &restored_source, 7);
+        inner.put::<FirstEncoding, _>(restored.clone()).unwrap();
+        inner.insert(record).unwrap();
+        let (record, lost) = leaf_of(first, 42, &lost_source, 7);
+        inner.put::<FirstEncoding, _>(lost.clone()).unwrap();
+        inner.insert(record).unwrap();
+        let mut store = GuardStore::new(inner);
+        store.damage(&restored);
+        store.damage(&lost);
+        store.offer(&restored);
+
+        drop(block_on(store.maintain(first, &key(41))).unwrap());
+        assert_eq!(
+            store.acquired.iter().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from([data(&restored), data(&lost)])
+        );
+        assert_eq!(
+            FIRST_MAP_LOG.with_borrow(|log| log.clone()),
+            vec![data(&lost_source)],
+            "only the output nobody handed over is derived again"
+        );
+        assert!(store
+            .snapshot()
+            .unwrap()
+            .metadata(Handle::<FirstEncoding>::from_hash(data(&restored)))
+            .unwrap()
+            .is_some());
     }
 
     /// Review finding, 2026-09-29: a fetch that failed outright was reported

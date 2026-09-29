@@ -356,7 +356,6 @@ struct Fixture {
 
 impl Fixture {
     fn new(resident: usize, eager: bool) -> Self {
-        let counts = Arc::new(Counts::default());
         let file = tempfile::NamedTempFile::new().unwrap();
         let mut inner = Pile::open(file.path()).unwrap();
         for index in 0..resident {
@@ -364,12 +363,39 @@ impl Fixture {
                 .put::<UnknownBlob, _>(Bytes::from_source((index as u64).to_le_bytes().to_vec()))
                 .unwrap();
         }
+        Self::on(file, inner, eager)
+    }
+
+    /// The remote blob's bytes are in the pile, damaged: its index lists
+    /// the blob, and its bytes fail validation.
+    fn damaged() -> Self {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut inner = Pile::open(file.path()).unwrap();
+        inner.put::<UnknownBlob, _>(Self::remote().bytes).unwrap();
+        inner.close().unwrap();
+        let mut bytes = std::fs::read(file.path()).unwrap();
+        let remote = Self::remote();
+        let at = bytes
+            .windows(remote.bytes.len())
+            .rposition(|window| window == remote.bytes.as_ref())
+            .unwrap();
+        bytes[at + 8] ^= 0x40;
+        std::fs::write(file.path(), &bytes).unwrap();
+        let inner = Pile::open(file.path()).unwrap();
+        Self::on(file, inner, false)
+    }
+
+    fn remote() -> Blob<UnknownBlob> {
+        Blob::<UnknownBlob>::new(Bytes::from_source(b"exact missing payload".to_vec()))
+    }
+
+    fn on(file: tempfile::NamedTempFile, inner: Pile, eager: bool) -> Self {
+        let counts = Arc::new(Counts::default());
         let store = Counted {
             inner,
             counts: counts.clone(),
         };
-        let remote =
-            Blob::<UnknownBlob>::new(Bytes::from_source(b"exact missing payload".to_vec()));
+        let remote = Self::remote();
         let key = SigningKey::from_bytes(&[86; 32]);
         let (sender, receiver, wiring) =
             host::wire(crate::identity::iroh_secret(&key).public().into());
@@ -726,4 +752,30 @@ async fn leech_first_and_repeated_exact_acquire_never_build_serving_inventory() 
         assert_eq!(counts.inventory(), [0, 0, 0, 0]);
         counts.report("leech-exact-acquire-repeat-write-close", resident);
     }
+}
+
+/// A copy here whose bytes do not read is not resident: acquisition asks
+/// the network for it like an absent blob, and the verified bytes land
+/// beside the damaged ones and read from then on.
+#[tokio::test]
+async fn a_damaged_local_copy_is_fetched_again() {
+    let Fixture {
+        mut peer,
+        counts,
+        remote,
+        _file,
+    } = Fixture::damaged();
+    let handle = remote.get_handle();
+    let before = peer.store().snapshot().unwrap();
+    assert!(before.contains_blob(handle).unwrap(), "listed");
+    assert!(before.metadata(handle).unwrap().is_none(), "unreadable");
+    drop(before);
+
+    let acquired = peer.acquire(handle).await;
+    assert_eq!(acquired.unwrap(), Some(remote.bytes.clone()));
+    assert_eq!(counts.requests.load(Ordering::Relaxed), 1);
+    let after = peer.store().snapshot().unwrap();
+    assert!(after.metadata(handle).unwrap().is_some(), "restored");
+    drop(after);
+    peer.close().unwrap();
 }

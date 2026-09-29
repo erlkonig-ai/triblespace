@@ -100,7 +100,7 @@ impl<E: Error + 'static> Error for PeerGetError<E> {
 impl<S> PeerSnapshot<S>
 where
     S: SnapshotSource + BlobStorePut + Send,
-    S::Snapshot: BlobStoreGet + BlobStoreList,
+    S::Snapshot: BlobStoreGet + BlobStoreList + BlobStoreMeta,
 {
     pub(crate) fn fetch_verified_with_deadline(
         &self,
@@ -172,13 +172,19 @@ where
 
     // Only the blob read below consumes this reader. Never expose its later
     // records as part of `self`: the original semantic observation is frozen.
+    //
+    // A blob is here when its bytes read. A copy the backend lists but whose
+    // bytes fail validation -- a pile's index answers presence without
+    // reading -- is fetched like an absent blob, and the verified bytes land
+    // beside it and are the ones read from then on.
     pub(super) async fn acquire_reader(
         &self,
         handle: Inline<Handle<UnknownBlob>>,
     ) -> Result<Option<S::Snapshot>, PeerAcquireError> {
         let contains = |reader: &S::Snapshot| {
             reader
-                .contains_blob(handle)
+                .metadata(handle)
+                .map(|metadata| metadata.is_some())
                 .map_err(|error| PeerAcquireError(format!("cannot check blob residency: {error}")))
         };
         if contains(&self.frozen)? {
@@ -233,7 +239,7 @@ where
 impl<S> AsyncBlobStoreGet for PeerSnapshot<S>
 where
     S: SnapshotSource + BlobStorePut + Send,
-    S::Snapshot: BlobStoreGet + BlobStoreList,
+    S::Snapshot: BlobStoreGet + BlobStoreList + BlobStoreMeta,
 {
     type GetError<E: Error + Send + Sync + 'static> =
         PeerGetError<<S::Snapshot as BlobStoreGet>::GetError<E>>;
