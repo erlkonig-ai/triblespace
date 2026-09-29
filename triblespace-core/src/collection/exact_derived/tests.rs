@@ -5522,6 +5522,69 @@ mod lattice_v2 {
             .is_some());
     }
 
+    /// Review finding, 2026-09-29: the carry holds only frontier nodes whose
+    /// bytes read, so on a root it reads around a damaged commit, publishes
+    /// nothing about it, and maintenance succeeds. The damage is not hidden
+    /// by that: attaching a cover validates no byte, so a reader takes the
+    /// node, and reading it fails naming it.
+    #[test]
+    fn a_root_carry_reads_around_a_damaged_commit_and_a_read_names_it() {
+        use crate::repo::pile::Pile;
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let host = key(41);
+        let mut pile = Pile::open_as(file.path(), host.verifying_key()).unwrap();
+        let root = pile.collection("root", policy()).unwrap();
+        let sources: Vec<_> = (0..9).map(|entity| payload(41, entity)).collect();
+        for source in &sources {
+            pile.put::<SimpleArchive, _>(source.clone()).unwrap();
+            let metadata = pile
+                .put::<SimpleArchive, _>(TribleSet::new().to_blob())
+                .unwrap();
+            pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
+                &host,
+                root.handle(),
+                data(source),
+                metadata,
+            )))
+            .unwrap();
+        }
+        pile.close().unwrap();
+        let damaged = data(&sources[0]);
+        damage_in_file(file.path(), &sources[0]);
+
+        let mut pile = Pile::open_as(file.path(), host.verifying_key()).unwrap();
+        let result = block_on(pile.maintain(root, &host));
+        assert!(result.is_ok(), "{:?}", result.err());
+        let snapshot = pile.snapshot().unwrap();
+        let merges: Vec<CollectionMerge> = snapshot
+            .records()
+            .unwrap()
+            .map(Result::unwrap)
+            .filter_map(|record| match record {
+                CollectionRecord::Merge(merge) if merge.collection() == root.handle() => {
+                    Some(merge)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(merges.len(), 1);
+        let good: BTreeSet<CollectionData> = sources[1..].iter().map(data).collect();
+        assert_eq!(inputs(&merges[0]), good);
+
+        let observed = snapshot.collection(root).unwrap();
+        assert!(observed.cover().data_members().any(|node| node == damaged));
+        match observed.view::<TribleSet>() {
+            Err(crate::collection::TryFromCoverError::MemberGet { member, .. }) => {
+                assert_eq!(member, damaged)
+            }
+            other => panic!("the read names the damaged commit: {:?}", other.err()),
+        }
+        drop(observed);
+        drop(snapshot);
+        pile.close().unwrap();
+    }
+
     /// Review finding, 2026-09-29: a fetch that failed outright was reported
     /// in place of whatever the operation reported, so a signer that is not
     /// the store's host -- which stops a whole upkeep pass -- read as a
