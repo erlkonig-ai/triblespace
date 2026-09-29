@@ -5451,6 +5451,41 @@ mod lattice_v2 {
         }
     }
 
+    /// Review finding, 2026-09-29: a fetch that failed outright was reported
+    /// in place of whatever the operation reported, so a signer that is not
+    /// the store's host -- which stops a whole upkeep pass -- read as a
+    /// storage failure, and the pass went on.
+    #[test]
+    fn a_signer_that_is_not_the_host_is_reported_before_a_failed_fetch() {
+        reset_mapping_calls();
+        let (mut inner, root, first, _) = collections();
+        for entity in 0..8 {
+            let source = payload(42, entity);
+            own_commit(&mut inner, root, 42, entity);
+            let (record, image) = leaf_of(first, 42, &source, 0);
+            inner.put::<FirstEncoding, _>(image).unwrap();
+            inner.insert(record).unwrap();
+        }
+        let waiting = payload(42, 8);
+        own_commit(&mut inner, root, 42, 8);
+        let (record, output) = leaf_of(first, 42, &waiting, 7);
+        inner.insert(record).unwrap();
+        let mut store = GuardStore::new(inner);
+        store.acquire_fails.insert(data(&output));
+
+        let result = block_on(store.maintain(first, &key(42)));
+        assert!(
+            matches!(
+                result,
+                Err(CollectionRealizationError::HostMismatch { host: Some(host), signer })
+                    if host == public(41) && signer == public(42)
+            ),
+            "{:?}",
+            result.err()
+        );
+        assert_eq!(store.acquired, vec![data(&output)], "the fetch was made");
+    }
+
     /// Review finding, 2026-09-28: one derived collection failing stopped
     /// the pass at it, before every derived collection after it and every
     /// attached one. It is now that collection's lag, named with why, like
@@ -5463,8 +5498,9 @@ mod lattice_v2 {
             Realized, Upkeep,
         };
 
-        /// The test realizer, except that one derived collection fails.
-        struct FailsOne(CollectionHandle);
+        /// The test realizer, except that one derived collection fails,
+        /// with the error the flag picks: a resolution or a storage one.
+        struct FailsOne(CollectionHandle, bool);
         impl<S> RealizeDerived<S> for FailsOne
         where
             S: crate::repo::Store + crate::repo::async_store::AsyncBlobStoreAcquire + Send,
@@ -5477,9 +5513,16 @@ mod lattice_v2 {
                 upkeep: Upkeep,
             ) -> Result<Realized, CollectionRealizationError> {
                 if derived.handle == self.0 {
-                    return Err(CollectionRealizationError::Resolution(
-                        "this one cannot be taken up".to_owned(),
-                    ));
+                    return Err(if self.1 {
+                        CollectionRealizationError::storage(
+                            "take this one up",
+                            GuardStoreError::Backend("this one cannot be taken up".to_owned()),
+                        )
+                    } else {
+                        CollectionRealizationError::Resolution(
+                            "this one cannot be taken up".to_owned(),
+                        )
+                    });
                 }
                 if derived.representation == <FirstEncoding as MetaDescribe>::id() {
                     return crate::collection::realize_as::<S, FirstEncoding>(
@@ -5521,9 +5564,14 @@ mod lattice_v2 {
         assert_eq!(listed.len(), 2);
         let (failing, other) = (listed[0], listed[1]);
 
-        for (entity, upkeep) in [(1, Upkeep::Ensure), (2, Upkeep::Maintain)] {
+        for (entity, upkeep, storage) in [
+            (1, Upkeep::Ensure, false),
+            (2, Upkeep::Maintain, false),
+            (3, Upkeep::Ensure, true),
+            (4, Upkeep::Maintain, true),
+        ] {
             own_commit(&mut store, root, 41, entity);
-            let mut realizer = FailsOne(failing);
+            let mut realizer = FailsOne(failing, storage);
             let report = block_on(async {
                 match upkeep {
                     Upkeep::Ensure => {
@@ -5549,6 +5597,72 @@ mod lattice_v2 {
             );
             assert!(report.failed_attached.is_empty());
         }
+    }
+
+    /// Review finding, 2026-09-29 (test gap): a signer that is not the
+    /// store's host stops the pass at a derived collection, as at an
+    /// attached one -- no collection would believe its merges -- where any
+    /// other failure of a derived collection is that collection's lag.
+    #[test]
+    fn a_signer_that_is_not_the_host_stops_the_pass_at_a_derived_collection() {
+        use crate::collection::{Attached, Derived, RealizeDerived, Realized, Upkeep};
+
+        /// Realizes the first test view and knows nothing else.
+        struct OnlyFirst;
+        impl<S> RealizeDerived<S> for OnlyFirst
+        where
+            S: crate::repo::Store + crate::repo::async_store::AsyncBlobStoreAcquire + Send,
+        {
+            async fn realize(
+                &mut self,
+                store: &mut S,
+                derived: &Derived,
+                signer: &SigningKey,
+                upkeep: Upkeep,
+            ) -> Result<Realized, CollectionRealizationError> {
+                if derived.representation == <FirstEncoding as MetaDescribe>::id() {
+                    return crate::collection::realize_as::<S, FirstEncoding>(
+                        store, derived, signer, upkeep,
+                    )
+                    .await;
+                }
+                Ok(Realized::Unknown)
+            }
+
+            async fn realize_attached(
+                &mut self,
+                _store: &mut S,
+                _attached: &Attached,
+                _signer: &SigningKey,
+                _upkeep: Upkeep,
+            ) -> Result<Realized, CollectionRealizationError> {
+                Ok(Realized::Unknown)
+            }
+        }
+
+        reset_mapping_calls();
+        let (mut store, root, first, _) = collections();
+        for entity in 0..8 {
+            own_commit(&mut store, root, 42, entity);
+        }
+        // Its leaves list the derived collection; `ensure` merges nothing.
+        drop(block_on(store.ensure(first, &key(42))).unwrap());
+        let result = block_on(maintain_downstream(
+            &mut store,
+            root.handle(),
+            &key(42),
+            &mut OnlyFirst,
+        ));
+        assert!(
+            matches!(
+                result,
+                Err(CollectionRealizationError::HostMismatch { host: Some(host), signer })
+                    if host == public(41) && signer == public(42)
+            ),
+            "{:?}",
+            result
+        );
+        assert!(merges_in(&mut store, first.handle()).is_empty());
     }
 
     /// The carry binds a derived collection's mapping, which reads the

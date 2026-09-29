@@ -685,7 +685,10 @@ const OPTIONAL_FETCH_FAILURES: usize = 8;
 /// is done in its place -- no foundation is derived again for a leaf whose
 /// output a fault kept out -- and it is asked for again by the next call.
 /// The first such error is reported once the work is done, in preference to
-/// what the operation reported.
+/// what the operation reported, except a signer that is not the store's host
+/// ([`CollectionRealizationError::HostMismatch`]): that stops a whole upkeep
+/// pass, so it is reported first. A storage error the operation itself
+/// raises ends the call at once and is the one reported.
 async fn acquiring<S, F>(store: &mut S, mut operation: F) -> Result<(), CollectionRealizationError>
 where
     S: Store + AsyncBlobStoreAcquire,
@@ -749,9 +752,10 @@ where
                 continue;
             }
         }
-        return match broken.or(reported) {
-            Some(error) => Err(error),
-            None => Ok(()),
+        return match (broken, reported) {
+            (_, Some(error @ CollectionRealizationError::HostMismatch { .. })) => Err(error),
+            (Some(error), _) | (None, Some(error)) => Err(error),
+            (None, None) => Ok(()),
         };
     }
 }
