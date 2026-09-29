@@ -638,8 +638,9 @@ where
 /// leaves, any one of which is a usable leaf -- and a group once started is
 /// asked to the end: until one of its blobs arrives or every one has failed,
 /// so a foundation with more unavailable outputs than this is still decided
-/// in one call. One call therefore lets fewer than eight fetches fail before
-/// the last group it starts, plus that group's own.
+/// in one call. A group one of whose blobs has already arrived, fetched for
+/// another group, asks nothing. One call therefore lets fewer than eight
+/// fetches fail before the last group it starts, plus that group's own.
 ///
 /// Each call starts the groups in an order drawn afresh. A call keeps no
 /// memory of the last one -- a faculty's store lives for one command -- and
@@ -687,9 +688,10 @@ impl Unfetched {
 /// could use but went on without -- the outputs of leaves that are not here
 /// -- it names in `wanted`, grouped so that any one blob of a group
 /// completes it, and finishes its work; those are asked for together
-/// afterwards, each once per call and within [`OPTIONAL_FETCH_FAILURES`], and
-/// the operation runs once more if any was. They are asked for only through
-/// a store that can reach other holders
+/// afterwards, each once per call and within [`OPTIONAL_FETCH_FAILURES`], a
+/// group no further once any of its blobs is here, and the operation runs
+/// once more if any was. They are asked for only through a store that can
+/// reach other holders
 /// ([`AsyncBlobStoreAcquire::acquires_remotely`]): from one that cannot, a
 /// miss says nothing about elsewhere, so what it names waits.
 ///
@@ -748,22 +750,15 @@ where
         };
         if store.acquires_remotely() && failures < OPTIONAL_FETCH_FAILURES {
             wanted.shuffle(&mut rand::thread_rng());
-            let mut asked = false;
-            for group in wanted {
-                if failures >= OPTIONAL_FETCH_FAILURES {
-                    break;
-                }
-                for member in group {
-                    if attempted.contains(&member) {
-                        continue;
-                    }
-                    asked = true;
-                    if ask(store, &mut attempted, &mut unfetched, &mut broken, member).await {
-                        break;
-                    }
-                    failures += 1;
-                }
-            }
+            let asked = ask_wanted(
+                store,
+                wanted,
+                &mut attempted,
+                &mut unfetched,
+                &mut broken,
+                &mut failures,
+            )
+            .await;
             if asked {
                 continue;
             }
@@ -774,6 +769,50 @@ where
             (None, None) => Ok(()),
         };
     }
+}
+
+/// Ask for the blobs an operation went on without, group by group in the
+/// order given, while fewer than [`OPTIONAL_FETCH_FAILURES`] fetches have
+/// failed: whether any was asked for. A group is asked until one of its
+/// blobs arrives or every one has failed. One blob can belong to several
+/// groups -- the leaves of two foundations may name one output -- and a
+/// group one of whose blobs this call already fetched, for another group or
+/// before, is satisfied: nothing more of it is asked for.
+async fn ask_wanted<S>(
+    store: &mut S,
+    wanted: Vec<Vec<CollectionData>>,
+    attempted: &mut BTreeSet<CollectionData>,
+    unfetched: &mut Unfetched,
+    broken: &mut Option<CollectionRealizationError>,
+    failures: &mut usize,
+) -> bool
+where
+    S: AsyncBlobStoreAcquire,
+{
+    let mut asked = false;
+    for group in wanted {
+        if *failures >= OPTIONAL_FETCH_FAILURES {
+            break;
+        }
+        // Asked for and not unfetched: its bytes are here.
+        if group
+            .iter()
+            .any(|member| attempted.contains(member) && !unfetched.contains(member))
+        {
+            continue;
+        }
+        for member in group {
+            if attempted.contains(&member) {
+                continue;
+            }
+            asked = true;
+            if ask(store, attempted, unfetched, broken, member).await {
+                break;
+            }
+            *failures += 1;
+        }
+    }
+    asked
 }
 
 /// Ask for one blob this call has not asked for: whether its bytes are here

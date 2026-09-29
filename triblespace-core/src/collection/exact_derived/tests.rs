@@ -5510,6 +5510,91 @@ mod lattice_v2 {
         );
     }
 
+    /// Review finding, 2026-09-29: the leaves of two foundations can name
+    /// one output -- equal images from different locators are valid -- so
+    /// one blob can complete two groups of wanted outputs. When the group
+    /// holding only that blob was asked first, the other group skipped the
+    /// blob as already asked and went on to its next output, whose fetch
+    /// failed: the call reported a fault although every foundation had a
+    /// usable leaf. In the other order the call succeeded. A group any of
+    /// whose outputs this call already fetched is satisfied and asks
+    /// nothing more, so the call succeeds whichever order it draws; each
+    /// run below draws either with even odds.
+    #[test]
+    fn an_output_fetched_for_one_foundation_satisfies_another_naming_it() {
+        reset_mapping_calls();
+        for run in 0..24 {
+            let (mut inner, root, first, _) = collections();
+            let one = payload(42, 1);
+            own_commit(&mut inner, root, 42, 1);
+            let (record, shared) = leaf_of(first, 42, &one, 7);
+            inner.insert(record).unwrap();
+            // The other foundation's own image sorts after the shared one,
+            // so its group asks for the shared output first.
+            let entity = (2..64)
+                .find(|entity| {
+                    data(&salted_image(&payload(42, *entity), 7)).raw > data(&shared).raw
+                })
+                .unwrap();
+            let other = payload(42, entity);
+            own_commit(&mut inner, root, 42, entity);
+            let (record, faulting) = leaf_of(first, 42, &other, 7);
+            inner.insert(record).unwrap();
+            inner
+                .insert(CollectionRecord::Derive(CollectionDerive::sign(
+                    &key(42),
+                    first.handle(),
+                    SourceLocator::of(data(&other).raw),
+                    data(&shared),
+                )))
+                .unwrap();
+            let mut store = GuardStore::new(inner);
+            store.offer(&shared);
+            store.offer(&faulting);
+            store.acquire_fails.insert(data(&faulting));
+
+            let result = block_on(store.maintain(first, &key(41)));
+            assert!(result.is_ok(), "run {run}: {:?}", result.err());
+            assert_eq!(store.acquired, vec![data(&shared)], "run {run}");
+            assert_eq!(FIRST_MAP_CALLS.get(), 0, "run {run}");
+        }
+    }
+
+    /// The wanted fetches above with the order a call draws fixed, both
+    /// ways: one group holds only the shared output, the other the shared
+    /// output and then one whose fetch fails outright. Whichever group
+    /// comes first, the shared output is fetched once and the failing one
+    /// is never asked for.
+    #[test]
+    fn a_group_an_earlier_fetch_satisfied_asks_nothing_in_either_order() {
+        let shared = salted_image(&payload(42, 1), 7);
+        let faulting = salted_image(&payload(42, 2), 7);
+        let (x, y) = (data(&shared), data(&faulting));
+        for wanted in [vec![vec![x], vec![x, y]], vec![vec![x, y], vec![x]]] {
+            let (inner, _, _, _) = collections();
+            let mut store = GuardStore::new(inner);
+            store.offer(&shared);
+            store.offer(&faulting);
+            store.acquire_fails.insert(y);
+            let mut attempted = BTreeSet::new();
+            let mut unfetched = Unfetched::default();
+            let mut broken = None;
+            let mut failures = 0;
+            let asked = block_on(ask_wanted(
+                &mut store,
+                wanted.clone(),
+                &mut attempted,
+                &mut unfetched,
+                &mut broken,
+                &mut failures,
+            ));
+            assert!(asked, "{wanted:?}");
+            assert_eq!(store.acquired, vec![x], "{wanted:?}");
+            assert!(broken.is_none(), "{wanted:?}: {broken:?}");
+            assert_eq!(failures, 0, "{wanted:?}");
+        }
+    }
+
     /// Damage one byte of `blob` where a pile file holds it, the last
     /// occurrence of its bytes in the file.
     fn damage_in_file<E: BlobEncoding>(path: &std::path::Path, blob: &Blob<E>) {
