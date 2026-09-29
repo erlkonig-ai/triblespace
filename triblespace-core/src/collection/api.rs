@@ -1765,11 +1765,13 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
 
     /// Maintain one collection for the key.
     ///
-    /// A root carries every frontier node whose bytes are here, whoever
-    /// signed the foundations beneath it: a node inside another held node's
-    /// support is absorbed, and every tier (`floor(log_8 |support|)`) holding
-    /// eight held nodes is joined by one n-ary `MERGE`, until none does. A
-    /// frontier node whose bytes are not here sits out and is not fetched. A
+    /// A root carries every frontier node whose bytes are here and read,
+    /// whoever signed the foundations beneath it: a node inside another held
+    /// node's support is absorbed, and every tier (`floor(log_8 |support|)`)
+    /// holding eight held nodes is joined by one n-ary `MERGE`, until none
+    /// does. A frontier node whose bytes are not here, or do not read, sits
+    /// out and is not fetched; one that does not read is reported by a read
+    /// that takes it, not here. A
     /// root's merges need no WRITE authority, only a store opened as the key
     /// (its host); signing with another key is
     /// [`CollectionRealizationError::HostMismatch`].
@@ -1777,11 +1779,13 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
     /// A derived collection gets a leaf for every source foundation this
     /// host can derive that has no usable leaf: any believed leaf whose
     /// output is here and reads, or can be fetched, suffices, whoever signed
-    /// it, and a leaf whose output cannot be had does not count. Outputs
-    /// that are not here are asked for after the rest of the work, each
-    /// once, and only through a store that can reach other holders; a store
-    /// that answers from its own blobs alone leaves such a foundation
-    /// waiting for its output rather than deriving it again. One call lets a
+    /// it, and a leaf whose output no holder hands over does not count.
+    /// Outputs that are not here, or do not read, are asked for after the
+    /// rest of the work, each once, and only through a store that can reach
+    /// other holders; a store that answers from its own blobs alone leaves
+    /// such a foundation waiting for its output rather than deriving it
+    /// again. A fetch that fails outright is reported after the work and is
+    /// no reason to derive in its place. One call lets a
     /// bounded number of such fetches fail and starts foundations in an
     /// order of its own, so no foundation waits on the same others call
     /// after call. The key's own payloads are fetched; another owner's are

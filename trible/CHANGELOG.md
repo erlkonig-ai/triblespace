@@ -25,12 +25,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   result no leaf already names as another leaf, replacing none: the explicit
   supplement to a leaf known to be bad. It prints how many leaves it added.
   `maintain` and `maintain-all` never do this on their own: a member with a
-  leaf whose image is here or can be fetched is not derived again, whoever
-  derived it, and a derived collection carries its own leaves instead of
-  mirroring its source's merges. They open a plain pile, which cannot fetch,
-  so a member whose leaf's image has not arrived waits for it rather than
-  being derived again, and a key the derived collection does not admit
-  carries it and does not count as a failed selection.
+  leaf whose image is here and reads, or can be fetched, is not derived
+  again, whoever derived it, and a derived collection carries its own leaves
+  instead of mirroring its source's merges. They open a plain pile, which
+  cannot fetch, so a member whose leaf's image has not arrived, or whose
+  bytes here do not read, waits for it rather than being derived again, and
+  a key the derived collection does not admit carries it and does not count
+  as a failed selection. A carry, a root's too, leaves out a held node whose
+  bytes do not read and reports nothing about it; a read that takes that
+  node fails naming it, and `pile diagnose check` finds it.
 - `pile collection search --key <path>` names the key whose merges and
   attachments the read believes; a named key that does not load is an error.
   Without it the default key (`TRIBLESPACE_KEY`, else `self.key` beside the

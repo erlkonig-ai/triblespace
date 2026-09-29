@@ -336,8 +336,11 @@ pub enum Command {
     /// signed it; derived collections derive every available source member
     /// with no usable image yet and roll up their own images, never their
     /// source's merges. An image is usable when it is here and reads; one
-    /// whose leaf is here but whose bytes are not is waited for, because
-    /// the pile cannot fetch it. Readers opened as the same key
+    /// whose leaf is here but whose bytes are not, or do not read, is waited
+    /// for, because the pile cannot fetch it. A held member whose bytes do
+    /// not read is left out of the roll-up and not reported here; a read
+    /// that takes it names it, and 'pile diagnose check' finds it. Readers
+    /// opened as the same key
     /// can then use those merged members. Deterministic and idempotent: run
     /// again, it publishes nothing new. New equations are signed by the
     /// supplied durable key, and the pile is opened as that key so its fold
@@ -379,7 +382,8 @@ pub enum Command {
     /// owner), and carries its own leaves the same way. A leaf whose image
     /// is here and reads suffices, whoever derived it. This command opens
     /// the pile itself, which cannot fetch from other holders, so a leaf
-    /// whose image is not here is waited for rather than derived again;
+    /// whose image is not here, or does not read, is waited for rather than
+    /// derived again;
     /// 'collection rederive' supplements a leaf known to be bad. Another
     /// key's merges are never believed. This is scheduling over
     /// ordinary one-edge operations; mappings and joins do not acquire

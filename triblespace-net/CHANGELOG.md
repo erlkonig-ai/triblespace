@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Acquisition (`Peer::acquire`, `Leech::acquire`, `PeerSnapshot::get`)
+  treats a local copy whose bytes do not read -- a pile lists it, its bytes
+  fail validation -- as absent: it asks other holders, and the verified bytes
+  land beside the damaged ones and are read from then on. It used to answer
+  from the damaged copy and fail reading it. The acquiring half of
+  `PeerSnapshot` now needs `BlobStoreMeta` on the store's snapshot.
+
 - `Peer` and `Leech` answer `AsyncBlobStoreAcquire::acquires_remotely` with
   `true`: they ask the network for what is not here, so derive scheduling
   may take a failed fetch of a leaf's output as current unavailability.

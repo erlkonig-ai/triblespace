@@ -25,14 +25,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the carry, nor the fetches of outputs the rest is waiting for: a blob an
   own foundation needs (`MissingDependency`) is fetched and everything runs
   again, and what is reported -- the carry's own failure first, then a
-  refused own foundation (`Derive`), then `Unmappable` -- is returned only
-  after the outputs the call went on without were asked for; only a storage
-  failure ends the operation first. A fetch that fails outright (the store
-  cannot reach other holders, or cannot keep what it got) is that blob's
-  unavailability for the call, like any failed fetch, and is reported once
-  the work is done, ahead of the rest. A derived collection stored in a root's
-  encoding carries only through its mapping (`maintain_with`); `maintain`
-  still refuses it.
+  refused own foundation (`Derive`), then, for `ensure`,
+  `UnauthorizedProducer`, then `Unmappable` -- is returned only after the
+  outputs the call went on without were asked for. A storage error ends the
+  call at once, the carry's included (a MERGE or image that cannot be stored,
+  a held node that cannot be loaded), and is the one reported; those outputs
+  are then asked for by the next call. A fetch that fails outright (the
+  store cannot reach other holders, or cannot keep what it got) is a fault,
+  not an answer about any holder: a blob a step needs is not here for that
+  call, and an output the call went on without is not counted unavailable,
+  so nothing is derived in its place. The first fault is reported once the
+  work is done, ahead of what the operation reported, except `HostMismatch`,
+  which stops an upkeep pass and so comes first. A derived collection stored
+  in a root's encoding carries only through its mapping (`maintain_with`);
+  `maintain` still refuses it.
 - Derivation is scheduled by leaf, and any admitted leaf suffices: a source
   foundation is derived only when no believed leaf for its locator has an
   output that is here or can be fetched, whoever signed that leaf, and any
@@ -51,17 +57,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   foundations waiting, a given one is reached in a call with probability at
   least `1/n`, and at least `min(8, n)/n` when each has one leaf. A leaf
   counts only when its output reads: an output a store lists but cannot read
-  (damaged bytes in a pile) makes its foundation owed at once, and a mapping
-  that reproduces restores the bytes. The carry holds only frontier nodes
-  whose bytes read, so a damaged node sits out like an absent one instead of
-  failing every carry. A foundation whose leaf another writer publishes while
-  the pass runs is left to that leaf (read from a fresh observation, used
-  only to skip work), and each key derives its own foundations first and
-  then the rest, each in an order hashed from the key and the foundation, so
-  two hosts rebuilding one collection at once do not walk it in step. The
-  per-write `ensure` still derives only the
-  key's own foundations with no leaf at all; another owner's payload is
-  never fetched. `DeriveMapping::FOREIGN_DERIVABLE` is gone.
+  (damaged bytes in a pile) is treated exactly as an absent one -- asked for
+  through a store that can reach other holders, whose network peers fetch
+  good bytes for a damaged copy, and waited for through one that cannot.
+  The carry holds only frontier nodes whose bytes read, so a damaged node
+  sits out like an absent one instead of failing every carry, a root's too:
+  maintenance then succeeds and names nothing. Readers are unchanged:
+  attaching a cover validates no byte, so a read that takes a damaged node
+  fails naming it (`TryFromCoverError::MemberGet`). A foundation whose leaf
+  another writer publishes while the pass runs is left to that leaf (read
+  from a fresh observation, used only to skip work), and each key derives its
+  own foundations first and then the rest, each in an order hashed from the
+  key and the foundation, so two hosts rebuilding one collection at once do
+  not walk it in step. The per-write `ensure` still derives only the key's
+  own foundations with no leaf at all; another owner's payload is never
+  fetched. `DeriveMapping::FOREIGN_DERIVABLE` is gone.
   `DeriveMapping::computable_here` is the class-pin hook: a mapping pinned to
   a class of host answers false elsewhere, and there maintenance derives
   nothing, raises nothing for it, and still carries. The `DeriveMapping`

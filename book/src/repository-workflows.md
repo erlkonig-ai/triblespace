@@ -480,18 +480,24 @@ target admits may derive it, not only the foundation's owner. A leaf whose
 output cannot be obtained does not count, and a fetch that fails means the
 output is unavailable now, not lost: if the original output arrives after
 the foundation was derived again, both leaves stand, both are joined, and
-nothing further is derived. Outputs that are not here are asked for after the
-rest of the pass -- deriving what needs no fetch, and the carry -- each once.
-The outputs of one foundation's leaves are asked for until one arrives or all
-have failed, and a pass starts no further foundation once eight fetches have
-failed. Each pass starts the foundations in an order of its own, drawn
-afresh, so foundations whose fetches always fail cannot keep the same others
-waiting pass after pass. A leaf counts only when its output reads: damaged
-bytes a pile still lists are no usable leaf, and the carry joins only nodes
-whose bytes read. Only a store that can reach other holders asks at all: a
-plain pile answers from its own blobs, so a miss there says nothing about
-elsewhere, and the foundation waits for its output instead of being derived
-again. Each key derives in an order of its own, and a foundation whose leaf
+nothing further is derived. A fetch that fails outright -- the store cannot
+reach other holders, or cannot keep what it got -- is a fault here rather
+than an answer about any holder: nothing is derived in its place, and the
+fault is reported once the rest is done. Outputs that are not here are asked
+for after the rest of the pass -- deriving what needs no fetch, and the
+carry -- each once. The outputs of one foundation's leaves are asked for
+until one arrives or all have failed, and a pass starts no further
+foundation once eight fetches have failed. Each pass starts the foundations
+in an order of its own, drawn afresh, so foundations whose fetches always
+fail cannot keep the same others waiting pass after pass. A leaf counts only
+when its output reads: damaged bytes a pile still lists are treated as an
+absent output, and a network peer fetches good bytes for them. The carry
+joins only nodes whose bytes read, a root's carry too, and says nothing
+about the rest; a reader's attach validates no byte, so a read that takes a
+damaged node fails naming it. Only a store that can reach other holders
+asks at all: a plain pile answers from its own blobs, so a miss there says
+nothing about elsewhere, and the foundation waits for its output instead of
+being derived again. Each key derives in an order of its own, and a foundation whose leaf
 another writer publishes while the pass runs is left to that leaf, so two
 hosts rebuilding one collection at once do not both derive all of it. A
 mapping pinned to a class of host
