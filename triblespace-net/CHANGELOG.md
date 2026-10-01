@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.47.0] - 2026-10-01
+
 - Raise the reconciler's shared exact-fetch request window from four to eight.
   Keep the original round deadline, cancellation ownership, service-class
   rotation, serial landing and retry rules. Eight leaves nominal headroom below

@@ -6,6 +6,87 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## Unreleased
 
+## 0.47.0 - 2026-10-01
+
+- `semantic_wemm::WemmIndex` describes one native text/image model, a selected
+  model collection/root, strong config/tokenizer/template handles and a fixed
+  GB10 native BF16 kernel/input profile. Selected attributes are a PATCH set;
+  each distinct selected content handle yields one canonical 4096-D NVFP4 row.
+  No host embedding/norm/scoring or automatic generic-store model loading is
+  introduced. The existing Nomic mapping remains independently readable.
+  Shared content/compute attribute definitions retain their exact anchors,
+  descriptions and old public re-exports.
+
+  `semantic-wemm` enables descriptor binding and image carry without CUDA;
+  `semantic-wemm-cuda` adds explicit native execution. The caller establishes
+  frozen model-collection membership and Mary's genuine immutable pile-alias
+  lifetime premise. The runtime then checks the actual selected root/assets
+  and driver-reported NVIDIA GB10 CC12.1, not an OS/architecture heuristic.
+  An owned `Rc<RefCell<_>>` lease is synchronous/thread-scoped, refuses nesting
+  and concurrent use, and clears on errors or unwinding. Every use checks
+  descriptor identity. Missing runtime is an explicit computation error.
+
+  Exact selected-body readiness is checked before forwards, without retaining
+  the content collection. Text is not truncated (at most 256 framed native
+  IDs); PNG/JPEG use the same fixed complete-image preparation. Unsupported,
+  malformed or overlength selected content fails the entire source image,
+  never a successful partial leaf. Only no selected values maps to empty.
+
+  Minted by the operator with `trible genid`, 2026-10-01: mapping recipe
+  `C2218047C697B76F657619C33B0B560D`, kernel/input profile
+  `56AA6AA44ECDFF68B91CA45E39BC9EB6`, and attribute anchors config
+  `C1FEADBAD086C8A7EC00C1080D7E2F13`, tokenizer
+  `438EE4FAA8F9465B38DD8CCAD595D3DE`, template
+  `6850FB2F899C4EA04257547C9C5D63BC`, profile
+  `B3CC3C4ED14B1F099A3D47FCC876E51C`. These are new mapping/profile identities,
+  not a new NVFP4 carrier recipe. Eight focused descriptor/selection, exact
+  missing-body versus backend-fault, image-carry and owned-scope tests passed
+  both with `semantic-wemm,succinct` and with the CUDA runtime branch compiled
+  (`semantic-wemm-cuda,succinct`). GPU visibility was disabled: no model or
+  device was initialized. The exact offline numerical closure was checked
+  before compilation against Mary's executed lock, with one local core path.
+  The gate used Mary `f0242b72` and the explicit Burn `21adb25b`, CubeCL
+  `1fc64da1`/macros `8b2aa74e`, AnyBytes `066c32a7`, netwatch `10ab7b32`
+  root-patch overlay inherited from the bridge gate; this is not evidence that
+  the root's unmodified dependency patches resolve the same runtime. Two
+  initial local import/query-type compile defects and one Mary provenance
+  import defect were corrected with failed evidence retained. The whole
+  workspace suite, real WeMM DERIVE and Files end-to-end integration remain
+  separate, unexecuted gates for this candidate.
+
+- Pack already quantized 4096-D Mary rows into the unchanged canonical set
+  carrier, without reading back or re-quantizing source embeddings. The
+  `nvfp4-score-cuda` bridge accepts a GPU-prepared query and returns ordinary
+  `ReconstructedCosines`, preserving overlapping-cover deduplication and the
+  maximum over differing rows under one content handle. It performs per-call
+  plane uploads, not retained caching; the producer still supplies the logical
+  dimension premise that padded quantized bytes cannot independently prove.
+  On GB10, a locked library check and two exact selected tests passed: one
+  ordinary row-byte/set-law test and one GPU witness with four pile-backed
+  BF16 inputs (three unit spikes and zero), four prepared queries and three
+  overlapping/reordered/joined cover arrangements. The witness compares row
+  bytes and reconstructed score bits against the existing CPU test oracle,
+  repeats scores, checks maximum-per-key and `find!` constraints, and exercises
+  incompatible dimensions, malformed framing and a nonfinite certificate.
+  This is not a whole-model, Files integration, cross-host or throughput gate.
+
+  The executed dependency closure uses Mary `f913f1dc`, CubeCL `1fc64da1`,
+  Burn `21adb25b`, CubeCL macros `8b2aa74e`, AnyBytes `066c32a7` and netwatch
+  `10ab7b32`. Dependency-local Cargo patches are not inherited: the gate used
+  an explicit root overlay (SHA256 `3c770d0bbf3d14042f622286c2b428341fdb1bcf215019732698d270e0882736`)
+  and a generated lock (`c13f5998071be3e1288f29f48a106c70233d47545715398cab1f6b7f8e84c3c4`),
+  both retained with the gate evidence rather than committed here. Integrating
+  that root patch closure into a production build remains required; this gate
+  does not establish that the unmodified workspace patches select it.
+
+  Earlier failed runs remain evidence: the first refused resolver drift
+  (`cudarc` 0.19.10 versus executed 0.19.8, and workspace-metadata HIP drift)
+  before compilation; the second passed the library check but could not compile
+  existing BM25/HNSW tests with `succinct` disabled. The successful successor
+  retained the validated numerical lock and explicitly enabled ordinary
+  `succinct` alongside `nvfp4-score-cuda-gate`; no numerical assertion or source
+  implementation changed between these runs.
+
 - `SemanticIndex` is pinned to the compute class its descriptor names
   through `DeriveMapping::computable_here`, which replaces
   `FOREIGN_DERIVABLE`: on another class maintenance derives nothing, raises

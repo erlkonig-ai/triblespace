@@ -140,6 +140,25 @@ impl From<mary::nn::nvfp4_cosine::Error> for NvFp4Error {
 /// Canonical row-local NVFP4 carrier for exact embedding encoding `E`.
 pub struct NvFp4CosineSet<E: BlobEncoding>(PhantomData<E>);
 
+impl<E: BlobEncoding> NvFp4CosineSet<E> {
+    /// Pack already quantized 4096-D rows in the existing canonical set format.
+    /// Only encoded bytes are copied; no embedding readback, normalization or
+    /// quantization occurs here. Identical rows collapse and different rows
+    /// under one key coexist, exactly as in collection joins.
+    ///
+    /// The producer must have quantized logical dimension 4096 (for example,
+    /// with Mary's `CudaRowEncoder4096`). `QuantizedRow` carries physical byte
+    /// geometry, not the logical model dimension: padded dimensions such as
+    /// 4000 and 4096 cannot be distinguished from those bytes. The selected
+    /// descriptor/model producer supplies that premise; this is not a model
+    /// identity or numerical provenance check. Incompatible geometry is refused.
+    pub fn from_quantized_rows_4096(
+        rows: impl IntoIterator<Item = ([u8; HANDLE_LEN], QuantizedRow)>,
+    ) -> Result<Blob<Self>, NvFp4Error> {
+        encode_rows(4096, rows.into_iter().map(|(handle, row)| StoredRow::from_quantized(handle, &row)).collect())
+    }
+}
+
 struct NvFp4CosineRecipe;
 
 impl MetaDescribe for NvFp4CosineRecipe {
@@ -446,7 +465,12 @@ impl StoredRow {
         dimension: usize,
     ) -> Result<Self, NvFp4Error> {
         let quantized = QuantizedRow::quantize(embedding, dimension)?;
-        Ok(Self {
+        Ok(Self::from_quantized(handle, &quantized))
+    }
+
+    /// Byte transport only; the set encoder checks physical row geometry.
+    fn from_quantized(handle: [u8; HANDLE_LEN], quantized: &QuantizedRow) -> Self {
+        Self {
             handle,
             stages: std::array::from_fn(|stage| {
                 let stage = &quantized.stages()[stage];
@@ -458,7 +482,7 @@ impl StoredRow {
             }),
             norm: *quantized.reconstruction_norm_bytes(),
             error: *quantized.error_bound_bytes(),
-        })
+        }
     }
 
     fn order(&self) -> RowOrder<'_> {
@@ -1225,6 +1249,56 @@ where
         Ok(ReconstructedCosines { scores })
     }
 
+    /// GPU canonical reconstruction scores for an already GPU-prepared query.
+    ///
+    /// This uploads this frozen view's physical planes for this call, then
+    /// associates returned segment/row scores through the existing unique-row
+    /// traversal and maximum-per-key policy. It does not fetch original
+    /// embeddings, reselect members, retain a second catalogue, or run host
+    /// normalization/dot arithmetic. The result is the ordinary `find!`
+    /// constraint, not a candidate upper bound or exact source reranking.
+    /// Repeated calls currently repeat the plane uploads; no cache/performance
+    /// promise is implied. Even an empty non-4096 view is outside this API.
+    #[cfg(feature = "nvfp4-score-cuda")]
+    pub fn reconstructed_cosines_cuda_4096(
+        &self,
+        scorer: &mary::nn::nvfp4_cosine::cuda_score::CudaReconstructedScorer4096,
+        query: &mary::nn::nvfp4_cosine::cuda_score::CudaPreparedQuery4096,
+    ) -> Result<ReconstructedCosines, NvFp4Error> {
+        if self.dimension != 4096 {
+            return Err(NvFp4Error::new("GPU reconstruction requires logical dimension 4096"));
+        }
+        if self.is_empty() {
+            return Ok(ReconstructedCosines::default());
+        }
+        let segments = self.scan_segments();
+        // Per-call row-address scratch only, tied to the same immutable members.
+        let mut offsets = Vec::with_capacity(segments.len());
+        let mut total = 0usize;
+        for segment in &segments {
+            offsets.push(total);
+            total = total.checked_add(segment.rows())
+                .ok_or_else(|| NvFp4Error::new("NVFP4 physical row count overflow"))?;
+        }
+        let resident = segments.iter().map(|&segment| scorer.upload(segment))
+            .collect::<Result<Vec<_>, _>>()?;
+        let physical_scores = scorer.score(query, &resident)?;
+        if physical_scores.len() != total {
+            return Err(NvFp4Error::new("GPU returned the wrong physical row count"));
+        }
+        let mut scores = Vec::new();
+        self.for_each_unique_row(|handle, member, row| {
+            let at = offsets[member].checked_add(row)
+                .ok_or_else(|| NvFp4Error::new("NVFP4 physical row offset overflow"))?;
+            let score = *physical_scores.get(at)
+                .ok_or_else(|| NvFp4Error::new("NVFP4 physical row offset is outside scores"))?;
+            scores.push((handle, score));
+            Ok(())
+        })?;
+        keep_maximum_per_key(&mut scores);
+        Ok(ReconstructedCosines { scores })
+    }
+
     fn above_candidates<R>(
         &self,
         snapshot: &R,
@@ -1585,6 +1659,128 @@ mod tests {
 
     fn row(handle: u8, values: &[f32]) -> StoredRow {
         StoredRow::quantize([handle; HANDLE_LEN], values, values.len()).unwrap()
+    }
+
+    #[test]
+    fn supplied_quantized_rows_preserve_bytes_and_set_laws() {
+        const D: usize = 4096;
+        // CPU quantization here is only the existing representation oracle.
+        let mut x = vec![0.0; D]; x[17] = 1.0;
+        let mut y = vec![0.0; D]; y[29] = 1.0;
+        let a = QuantizedRow::quantize(&x, D).unwrap();
+        let b = QuantizedRow::quantize(&y, D).unwrap();
+        let supplied = NvFp4CosineSet::<Embedding>::from_quantized_rows_4096([
+            ([2; HANDLE_LEN], a.clone()), ([1; HANDLE_LEN], b.clone()),
+            ([1; HANDLE_LEN], a.clone()), ([1; HANDLE_LEN], a.clone()),
+        ]).unwrap();
+        let previous = member([row(1, &x), row(2, &x), row(1, &y)], D);
+        assert_eq!(supplied.bytes.as_ref(), previous.bytes.as_ref());
+        assert_eq!(rows_of(&supplied).len(), 3, "different same-key rows survive, identical rows collapse");
+        let left = NvFp4CosineSet::<Embedding>::from_quantized_rows_4096([
+            ([1; HANDLE_LEN], a.clone()), ([2; HANDLE_LEN], a.clone()),
+        ]).unwrap();
+        let right = NvFp4CosineSet::<Embedding>::from_quantized_rows_4096([
+            ([1; HANDLE_LEN], b), ([2; HANDLE_LEN], a),
+        ]).unwrap();
+        let joined = join_members(&left, &right, D).unwrap();
+        assert_eq!(joined.bytes.as_ref(), supplied.bytes.as_ref());
+        assert_eq!(join_members(&right, &left, D).unwrap().bytes.as_ref(), joined.bytes.as_ref());
+        assert_eq!(join_members(&joined, &joined, D).unwrap().bytes.as_ref(), joined.bytes.as_ref());
+        let wrong = QuantizedRow::quantize(&[1.0; 256], 256).unwrap();
+        assert!(NvFp4CosineSet::<Embedding>::from_quantized_rows_4096([([0; HANDLE_LEN], wrong)]).is_err());
+        let empty = NvFp4CosineSet::<Embedding>::from_quantized_rows_4096([]).unwrap();
+        assert_eq!(empty.bytes.as_ref(), encode_rows::<Embedding>(D, Vec::new()).unwrap().bytes.as_ref());
+    }
+
+    #[cfg(feature = "nvfp4-score-cuda-gate")]
+    #[test]
+    #[ignore = "requires reserved CUDA and an explicit fresh retained fixture pile path"]
+    fn gpu_quantized_rows_and_cover_scores_keep_canonical_bits_and_keys() {
+        use mary::nn::cuda_bf16_alias::CudaBf16Aliases;
+        use mary::nn::nvfp4_cosine::{cuda_encode::CudaRowEncoder4096, cuda_score::CudaReconstructedScorer4096};
+        use triblespace_core::blob::encodings::tensor::{Tensor, elements::BF16};
+        use triblespace_core::repo::pile::Pile;
+        const D: usize = 4096;
+        let path = std::path::PathBuf::from(std::env::var("WEMM_NVFP4_BRIDGE_PILE").expect("explicit retained fresh pile"));
+        std::fs::File::create_new(&path).unwrap(); // Never replace an earlier fixture or live pile.
+        let mut pile = Pile::open(&path).unwrap();
+        let mut x = vec![0u16; D]; x[17] = 0x3f80;
+        let mut y = vec![0u16; D]; y[29] = 0x3f80;
+        let mut z = vec![0u16; D]; z[41] = 0x3f80;
+        let patterns = [x, y, z, vec![0u16; D]];
+        let mut handles = Vec::new();
+        for values in &patterns {
+            let bytes: Vec<u8> = values.iter().flat_map(|b| b.to_le_bytes()).collect();
+            let leaf = mary::leaf::leaf_blob::<BF16, 2>([1, D as u64], bytes.into()).unwrap();
+            handles.push(pile.put::<Tensor<BF16, 2>, _>(leaf).unwrap());
+        }
+        let snapshot = pile.snapshot().unwrap();
+        let mut aliases = CudaBf16Aliases::new(Default::default(), handles.len()).unwrap();
+        let mut tensors = Vec::new();
+        for handle in handles {
+            let leaf: Blob<Tensor<BF16, 2>> = snapshot.get(handle).unwrap();
+            // SAFETY: this freshly created private pile remains immutable and
+            // is retained on disk through runtime teardown, including page prefixes.
+            tensors.push(unsafe { aliases.bind_pile_leaf(leaf) }.unwrap());
+        }
+        drop(snapshot);
+        pile.close().unwrap();
+        let encoder = CudaRowEncoder4096::new(Default::default()).unwrap();
+        let scorer = CudaReconstructedScorer4096::new(Default::default()).unwrap();
+        let rows: Vec<_> = tensors.iter().map(|t| encoder.encode(t).unwrap()).collect();
+        // CPU source-vector arithmetic is an independent test oracle only.
+        let values: Vec<Vec<f32>> = patterns.iter().map(|v|
+            v.iter().map(|&bits| f32::from_bits(u32::from(bits) << 16)).collect()).collect();
+        for (row, values) in rows.iter().zip(&values) {
+            assert_eq!(*row, QuantizedRow::quantize(values, D).unwrap());
+        }
+        let left = NvFp4CosineSet::<Embedding>::from_quantized_rows_4096([
+            ([1; HANDLE_LEN], rows[0].clone()), ([2; HANDLE_LEN], rows[2].clone()),
+        ]).unwrap();
+        let right = NvFp4CosineSet::<Embedding>::from_quantized_rows_4096([
+            ([1; HANDLE_LEN], rows[1].clone()), ([2; HANDLE_LEN], rows[2].clone()),
+            ([3; HANDLE_LEN], rows[3].clone()),
+        ]).unwrap();
+        let joined = join_members(&left, &right, D).unwrap();
+        let empty = NvFp4CosineSet::<Embedding>::from_quantized_rows_4096([]).unwrap();
+        let reference = index(&[&joined], D);
+        for (tensor, values) in tensors.iter().zip(&values) {
+            let query = scorer.prepare(tensor).unwrap();
+            let cpu = reference.reconstructed_cosines(values).unwrap();
+            let score_bits = |scores: &ReconstructedCosines| scores.scores.iter()
+                .map(|(key, score)| (*key, score.to_bits())).collect::<Vec<_>>();
+            for view in [index(&[&left, &right, &left], D), index(&[&right, &empty, &left], D), index(&[&joined], D)] {
+                let first = view.reconstructed_cosines_cuda_4096(&scorer, &query).unwrap();
+                let second = view.reconstructed_cosines_cuda_4096(&scorer, &query).unwrap();
+                assert_eq!(score_bits(&first), score_bits(&cpu));
+                assert_eq!(score_bits(&second), score_bits(&first));
+                assert_eq!(first.len(), 3, "maximum over differing rows, each key once");
+                for floor in [-1.0, 0.0, 0.9, f64::NAN] {
+                    let mut actual: Vec<Inline<Handle<Embedding>>> = triblespace_core::find!(
+                        value: Inline<Handle<Embedding>>, first.similar_to(value, floor)
+                    ).collect();
+                    let mut expected: Vec<Inline<Handle<Embedding>>> = triblespace_core::find!(
+                        value: Inline<Handle<Embedding>>, cpu.similar_to(value, floor)
+                    ).collect();
+                    actual.sort_by_key(|h| h.raw); expected.sort_by_key(|h| h.raw);
+                    assert_eq!(actual, expected);
+                }
+            }
+            assert!(index(&[&empty], D).reconstructed_cosines_cuda_4096(&scorer, &query).unwrap().is_empty());
+            let wrong = member([], 256);
+            assert!(index(&[&wrong], 256).reconstructed_cosines_cuda_4096(&scorer, &query)
+                .unwrap_err().to_string().contains("dimension 4096"));
+        }
+        // Ordinary attachment still checks layout; GPU scoring retains the
+        // canonical reader's separate finite/certificate failure semantics.
+        assert!(Layout::parse(&left.bytes[..left.bytes.len() - 1]).is_err());
+        let mut damaged = rows_of(&left); damaged[0].norm = f32::NAN.to_le_bytes();
+        let damaged = member(damaged, D);
+        let query = scorer.prepare(&tensors[0]).unwrap();
+        assert!(index(&[&damaged], D).reconstructed_cosines(&values[0]).is_err());
+        assert!(index(&[&damaged], D).reconstructed_cosines_cuda_4096(&scorer, &query).is_err());
+        assert_eq!(aliases.stats().registrations, patterns.len());
+        println!("retained immutable BF16 fixture: {}", path.display());
     }
 
     fn member(

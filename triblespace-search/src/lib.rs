@@ -114,6 +114,10 @@ pub mod ring;
 pub mod schemas;
 #[cfg(feature = "semantic")]
 pub mod semantic;
+#[cfg(any(feature = "semantic", feature = "semantic-wemm"))]
+pub mod semantic_attributes;
+#[cfg(feature = "semantic-wemm")]
+pub mod semantic_wemm;
 #[cfg(feature = "succinct")]
 pub mod succinct;
 pub mod text_bm25;

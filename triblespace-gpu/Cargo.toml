@@ -21,9 +21,9 @@ wgpu = ["dep:cubecl", "cubecl/wgpu", "dep:jerky", "dep:itertools"]
 cuda = ["dep:cubecl", "cubecl/cuda"]
 
 [dependencies]
-cubecl = { version = "=0.10.0", default-features = false, features = ["std"], optional = true }
+cubecl = { version = "=0.10.0", default-features = false, features = ["std"], optional = true, package = "maryml-cubecl", path = "../../cubecl-fork/crates/cubecl" }
 itertools = { version = "0.14.0", optional = true }
-jerky = { version = "0.9.0", git = "https://github.com/triblespace/jerky.git", rev = "a03b927dc9d1fac0e6085f1275cd8f8504c36648", default-features = false, features = ["gpu"], optional = true }
+jerky = { version = "0.10.0", default-features = false, features = ["gpu"], optional = true, path = "../../jerky" }
 triblespace-core = { version = "0.47.0", path = "../triblespace-core", default-features = false }
 tracing = "0.1"
 

@@ -116,12 +116,6 @@ use crate::nvfp4::{encode_rows, nvfp4_dimension, NvFp4CosineSet, StoredRow, HAND
 pub const NOMIC_ATTRIBUTES_TO_NVFP4: Id = id_hex!("523C31F03F049CA26A0E847CAAFC08F7");
 
 attributes! {
-    /// An attribute whose values are handles to content bytes; repeatable.
-    /// Every distinct value under any selected attribute gets at most one
-    /// row per derivation, when the index's model has something to read in
-    /// its bytes; the joined index holds one row per differing embedding of
-    /// it and a reader binds the value once. Minted 2026-09-13.
-    "13E4B93C65EA173282139D7DEBC1CC9B" as pub semantic_content_attribute: GenId;
     /// Historical archive-pinning argument, retained with its original id.
     /// A member archive of the pile's model collection carrying the roots
     /// named below and their tokenizer; repeatable. These pin the exact
@@ -136,10 +130,9 @@ attributes! {
     /// The text tokenizer root in the named collection. Minted with
     /// `trible genid` 2026-09-14: `E6A241C22B0457CD24AE65C1FC6AC177`.
     "E6A241C22B0457CD24AE65C1FC6AC177" as pub semantic_tokenizer_root: GenId;
-    /// The compute class this index is canonical on; see [`local_compute`].
-    /// Minted 2026-09-13.
-    "1B1FFA9CC2BC1FCA50D2389F1B980BAC" as pub semantic_compute: ShortString;
 }
+
+pub use crate::semantic_attributes::{semantic_compute, semantic_content_attribute};
 
 /// The containing model collection, shared with Mary's model references.
 pub use mary::format::attrs::model_collection as semantic_model_collection;

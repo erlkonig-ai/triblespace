@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.47.0] - 2026-10-01
+
 - Reuse the lazy coverage memo across consecutive snapshots only when the
   backend reports no changed component. Warming an older operation control
   after a newer equivalent residency snapshot now also warms later readers.

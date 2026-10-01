@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 rust-version = "1.91"
-name = "iroh-gossip"
+name = "triblespace-gossip"
 version = "0.101.0"
 authors = ["n0 team"]
 build = false
@@ -21,10 +21,10 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "gossip messages over broadcast trees"
+description = "TribleSpace ordered-stream fork of iroh-gossip; gossip messages over broadcast trees"
 readme = "README.md"
 license = "MIT/Apache-2.0"
-repository = "https://github.com/n0-computer/iroh-gossip"
+repository = "https://github.com/erlkonig-ai/triblespace"
 resolver = "2"
 
 [package.metadata.docs.rs]

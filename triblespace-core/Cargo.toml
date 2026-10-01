@@ -19,7 +19,7 @@ memmap2 = "0.9.5"
 json-event-parser = "0.2.2"
 winnow = "0.7.13"
 zerocopy = { version = "0.8", features = ["derive"] }
-anybytes = { version = "0.20.2", features = ["bytes", "zerocopy", "winnow", "mmap"] }
+anybytes = { version = "0.20.3", features = ["bytes", "zerocopy", "winnow", "mmap"], path = "../../anybytes" }
 rand = "0.8"
 ux = "0.1.5"
 siphasher = "1.0.1"
@@ -43,7 +43,7 @@ hifitime = "4.1.2"
 f256 = "0.7.0"
 # Structural borrowed attachment, canonical alphabet widths and the measured
 # batched-rank lineage. Pin the substrate so query behavior is reproducible.
-jerky = { version = "0.9.0", git = "https://github.com/triblespace/jerky.git", rev = "a03b927dc9d1fac0e6085f1275cd8f8504c36648" }
+jerky = { version = "0.10.0", path = "../../jerky" }
 itertools = "0.14.0"
 libc = "0.2"
 zeroize = "1.9"

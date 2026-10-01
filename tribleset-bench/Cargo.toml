@@ -69,14 +69,14 @@ gpu = ["subject/gpu"]
 # current` restores the default). The suite restricts itself to the
 # stable macro surface (find!/pattern!/TriblePattern) — the discipline
 # proven era-portable across 441 commits and three engine eras.
-subject = { package = "triblespace", path = "subjects/current" }
+subject = { package = "triblespace", path = "subjects/current", version = "0.47.0" }
 # Direct handle on the subject's CORE crate. The core proc macros the
 # vendored queries use (pattern!/entity!/attributes! via
 # subject::core::prelude) expand to absolute `::triblespace_core::…`
 # paths, which must resolve in THIS crate's extern prelude — to the
 # same crate instance `subject::core` re-exports. Pointing at the same
 # path the subject's own core dep uses makes cargo unify the two.
-triblespace_core = { package = "triblespace-core", path = "subjects/current/triblespace-core" }
+triblespace_core = { package = "triblespace-core", path = "subjects/current/triblespace-core", version = "0.47.0" }
 # The results ledger: a stable native-collection revision, used ONLY to
 # write/read sessions, spans, and outcome entities. Measurement I/O never
 # depends on the era of the subject. The exact git revision keeps the two
@@ -85,12 +85,12 @@ triblespace_core = { package = "triblespace-core", path = "subjects/current/trib
 # macros (`triblespace::prelude`/`triblespace::macros`) — they expand to
 # `::triblespace::core` paths, which resolve to this dep; the core-macro flavor
 # would leak to the subject's core.
-triblespace = { git = "https://github.com/triblespace/triblespace-rs", rev = "a08d3ea0343a6d822134e3ce4df91ac8b0f1a873" }
+triblespace = { version = "0.47.0", path = ".." }
 anyhow = "1"
 # Serve the vendored queries: blob views, SPARQL regex functions, and
 # the NsTAIInterval date folds. anybytes must unify with the subject
 # core's own requirement so `View` is one type.
-anybytes = "0.20.2"
+anybytes = { version = "0.20.3", path = "../../anybytes" }
 regex = "1"
 hifitime = "4.1.2"
 # Collection signing, plus throwaway legacy Repository signing only when the
@@ -99,7 +99,7 @@ ed25519-dalek = { version = "2.1.0", features = ["rand_core"] }
 rand = "0.8"
 # GORBIE 0.18.1's CardCtx calls its markdown helper unconditionally, so this
 # feature is required even though the fingerprint itself uses plain egui text.
-GORBIE = { version = "0.18.1", features = ["markdown"], optional = true }
+GORBIE = { version = "0.19.0", features = ["markdown"], optional = true, package = "lissajous", path = "../../GORBIE" }
 egui = { version = "0.34", optional = true }
 egui_plot = { version = "0.35", optional = true }
 

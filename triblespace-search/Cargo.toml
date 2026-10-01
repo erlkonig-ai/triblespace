@@ -41,18 +41,18 @@ triblespace-core = { version = "0.47.0", path = "../triblespace-core", default-f
 # Only the NVFP4 embedding path needs it (`nvfp4` feature): BM25 and the
 # rest of the crate are plain CPU code over triblespace-core, so a host
 # without a model still builds every attached text index.
-mary = { version = "0.1.0", path = "../../mary", optional = true }
+mary = { package = "maryml", version = "0.1.0", path = "../../mary", optional = true }
 # PDF text layers for the semantic index (`semantic` feature only): a typed
 # document carries its text; a scanned one does not, and needs an OCR model.
 lopdf = { version = "0.44", default-features = false, optional = true }
 # Image format probing for the same classification; the decoders themselves
 # live in mary's embedder.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"], optional = true }
-anybytes = "0.20"
+anybytes = { version = "0.20.3", path = "../../anybytes" }
 # jerky — succinct data structures; optional for the v1 scaffold,
 # required once we flip from flat-array prototypes to the
 # wavelet-matrix-backed blobs.
-jerky = { version = "0.9", git = "https://github.com/triblespace/jerky.git", rev = "a03b927dc9d1fac0e6085f1275cd8f8504c36648", optional = true }
+jerky = { version = "0.10.0", optional = true, path = "../../jerky" }
 # zerocopy — safe byte<->struct conversion for serializing
 # jerky's CompactVectorMeta into the succinct blob header. Pulled
 # in along with jerky, so no added transitive cost.
@@ -74,8 +74,16 @@ nvfp4 = ["dep:mary"]
 # The semantic index: rows embedded straight from source facts through the
 # nomic models in the same pile (`semantic` module). Pulls mary's embedders.
 semantic = ["nvfp4", "mary/embed", "dep:lopdf", "dep:image"]
+# WeMM descriptor binding and image carry require no GPU or Nomic loader.
+semantic-wemm = ["nvfp4"]
+# Explicit native computation only; model/pile binding remains caller-owned.
+semantic-wemm-cuda = ["semantic-wemm", "nvfp4-score-cuda", "mary/wemm-input"]
 # The production execution path targets the provisioned GB10/Spark appliance.
 nvfp4-cuda = ["nvfp4", "mary/nvfp4-cuda"]
+# Direct GPU-prepared 4096-D queries and canonical reconstructed scores.
+nvfp4-score-cuda = ["nvfp4", "mary/nvfp4-score-cuda"]
+# Explicit GPU test fixture: genuine pile-backed BF16 inputs, no CPU tensor path.
+nvfp4-score-cuda-gate = ["nvfp4-score-cuda", "mary/cuda-bf16-alias"]
 # Swap the naive flat-array implementations for the succinct
 # jerky-backed ones. On until we have both working; off lets us
 # test the naive path in isolation.

@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.47.0] - 2026-10-01
+
+- Release the ten workspace packages together at 0.47.0, including the
+  `triblespace-paths` and `triblespace-gpu` packages. Optional model and GUI
+  dependencies use `maryml` 0.1.0 (library name `mary`) and GORBIE 0.19.0.
+
+- Add a separate native WeMM mapping: one model for text and PNG/JPEG,
+  content-keyed 4096-D NVFP4 rows and GPU reconstruction queries. Descriptor
+  binding and image joins remain GPU-independent; compute requires an explicit
+  owned scoped runtime whose actual root, assets and GB10 device match. Nomic
+  descriptors are unchanged, with no reinterpretation or fallback.
+
+- NVFP4 sets can pack already GPU-quantized 4096-D row bytes without a host
+  embedding or second quantization. The opt-in CUDA reconstruction bridge
+  scores fixed physical segments on GPU and keeps the existing unique-row,
+  maximum-per-content and query-constraint behavior; carrier bytes and recipe
+  identity are unchanged. Plane uploads are per call, not a retained cache.
+  The executed gate is one ordinary row-law test plus one four-input synthetic
+  GPU bridge witness on GB10, not a Files/model integration or performance
+  result. Its explicit root dependency overlay and earlier gate refusals are
+  recorded in the `triblespace-search` changelog.
+
 - Raise the sync reconciler's exact-fetch request window from four to eight,
   preserving deadline, cancellation, fairness and serial-landing behavior.
   Exact-body receive and backing/scratch limits remain independent and unchanged;

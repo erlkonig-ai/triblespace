@@ -8,7 +8,7 @@ description = "The Triblespace: A lightweight knowledge base for rust."
 homepage = "https://trible.space"
 license = "MIT OR Apache-2.0"
 documentation = "https://docs.rs/triblespace"
-repository = "https://github.com/triblespace/triblespace-rs"
+repository = "https://github.com/erlkonig-ai/triblespace"
 
 [package.metadata.docs.rs]
 # The `wasm` feature requires the `wasm32-unknown-unknown` Rust target at build time
@@ -49,7 +49,7 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter"], optional =
 thread_local = { version = "1", optional = true }
 
 [dev-dependencies]
-triblespace-paths = { path = "./triblespace-paths" }
+triblespace-paths = { version = "0.47.0", path = "./triblespace-paths" }
 criterion = "0.6.0"
 futures = "0.3"
 fake = "4.3.0"
@@ -60,7 +60,7 @@ trybuild = "1.0.99"
 proptest = "1.6.0"
 rand = "0.8"
 ed25519-dalek = { version = "2.1.0", features = ["rand_core"] }
-anybytes = { version = "0.20.2", features = ["bytes", "zerocopy", "mmap"] }
+anybytes = { version = "0.20.3", features = ["bytes", "zerocopy", "mmap"], path = "../anybytes" }
 memmap2 = "0.9.5"
 url = "2.5.0"
 serde_json = "1.0"
@@ -174,16 +174,11 @@ debug = 0
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(nightly)', 'cfg(kani)'] }
 
-# Keep every CubeCL 0.10 consumer on the project's runtime fork. The fork adds
-# immutable external-buffer registration so mmap-backed storage can be exposed
-# to Metal without an upload when a caller has a suitable layout and lifetime.
+# SOURCE-BUILD-ONLY: retain the tested network readiness repair.
+# Registry consumers intentionally use upstream netwatch without these fixes.
+# Root patches are not inherited; this source/registry difference is deliberate.
 [patch.crates-io]
-# Section freezes are immutable views, not durability barriers. Keep the same
-# AnyBytes lineage at every build root; dependency patch tables are ignored.
-anybytes = { git = "https://github.com/triblespace/anybytes.git", rev = "066c32a7cfcc470a6750c849499c1e88a0e0c50a" }
 netwatch = { git = "https://github.com/erlkonig-ai/net-tools.git", rev = "10ab7b328809103be74f6ca24258249715fae52b" }
-cubecl-runtime = { git = "https://github.com/erlkonig-ai/cubecl.git", rev = "75635270eed8cfacd1cd0f171f2f6b45a5e65b9c" }
-cubecl-wgpu = { git = "https://github.com/erlkonig-ai/cubecl.git", rev = "75635270eed8cfacd1cd0f171f2f6b45a5e65b9c" }
 
 [package.metadata.kani.flags]
 default-unwind = "1"

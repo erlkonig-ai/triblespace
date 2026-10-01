@@ -36,12 +36,12 @@ triblespace = { version = "0.47.0", path = "..", default-features = false }
 # This selection is independent of runtime CPU quotas.
 triblespace-core = { version = "0.47.0", path = "../triblespace-core", default-features = false, features = ["object-store"] }
 triblespace-gpu = { version = "0.47.0", path = "../triblespace-gpu", default-features = false, optional = true }
-triblespace-paths = { path = "../triblespace-paths" }
-anybytes = "0.20"
+triblespace-paths = { version = "0.47.0", path = "../triblespace-paths" }
+anybytes = { version = "0.20.3", path = "../../anybytes" }
 # BM25 and the other plain-CPU search encodings are attached to their parent
 # by every host that reads it, so every build carries them. The model-bearing
 # part stays behind the `search` feature.
-triblespace-search = { path = "../triblespace-search", default-features = false }
+triblespace-search = { version = "0.47.0", path = "../triblespace-search", default-features = false }
 file_type = "0.8"
 chrono = "0.4"
 hifitime = "4.1.2"
@@ -55,7 +55,7 @@ blake3 = "1.8"
 serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-GORBIE = { version = "0.18.1", path = "../../GORBIE", default-features = false, optional = true }
+GORBIE = { version = "0.19.0", path = "../../GORBIE", default-features = false, optional = true, package = "lissajous" }
 egui = { version = "0.34", optional = true }
 
 [target.'cfg(unix)'.dependencies]
