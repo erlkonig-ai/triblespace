@@ -223,8 +223,10 @@ const MAX_BLOB_HINT_SOURCES_PER_COLLECTION: usize = 128;
 #[cfg(test)]
 const TEST_BLOB_HINT_SOURCE: PeerId = [249; 32];
 
-/// Shared exact-demand and positive-inventory window, not a throughput guarantee.
-const EXACT_FETCHES_IN_FLIGHT: usize = 4;
+/// Shared exact-demand and positive-inventory request window. Eight leaves
+/// nominal headroom below the sixteen process-wide exact body receivers; this
+/// is neither a reserved slot allocation nor a throughput or memory guarantee.
+const EXACT_FETCHES_IN_FLIGHT: usize = 8;
 
 impl Default for Reconciler {
     fn default() -> Self {
@@ -2303,15 +2305,15 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_exact_tick_cancels_only_its_bounded_started_window() {
-        let mut fixture = exact_fixture(9, 9);
+        // Eight pending requests must leave more than one window untouched.
+        let count = 2 * EXACT_FETCHES_IN_FLIGHT + 1;
+        let mut fixture = exact_fixture(count, count);
         let mut reconciler =
             Reconciler::new().with_replication(ReplicationMode::Shallow, [fixture.collection]);
         let mut tick = Box::pin(reconciler.tick(&mut fixture.peer));
         assert!(futures::poll!(tick.as_mut()).is_pending());
-        assert_eq!(
-            fixture.fetches.trace.lock().unwrap().active,
-            EXACT_FETCHES_IN_FLIGHT
-        );
+        assert_eq!(fixture.fetches.trace.lock().unwrap().active, 8);
+        assert!(fixture.roots.len() - 8 > 8);
         drop(tick);
         {
             let trace = fixture.fetches.trace.lock().unwrap();
@@ -2342,7 +2344,9 @@ mod tests {
     #[cfg(feature = "sim")]
     #[tokio::test(start_paused = true)]
     async fn exact_window_refills_share_one_deadline_instead_of_renewing_it() {
-        let mut fixture = exact_fixture(9, 0);
+        // Two complete waves fit; the third still owes its original deadline.
+        let completed = 2 * EXACT_FETCHES_IN_FLIGHT;
+        let mut fixture = exact_fixture(completed + 1, 0);
         *fixture.fetches.delay.lock().unwrap() = Duration::from_secs(10);
         let mut reconciler = Reconciler::new()
             .with_replication(ReplicationMode::Shallow, [fixture.collection])
@@ -2353,21 +2357,22 @@ mod tests {
             tokio::time::Instant::now().duration_since(started),
             Duration::from_secs(25)
         );
-        assert_eq!(stats.replication.acquired, 8);
+        assert_eq!(stats.replication.acquired, completed);
         assert_eq!(stats.replication.pending, 1);
         let trace = fixture.fetches.trace.lock().unwrap();
-        assert_eq!(trace.calls.len(), 9);
+        assert_eq!(trace.calls.len(), fixture.roots.len());
         assert_eq!(trace.peak, EXACT_FETCHES_IN_FLIGHT);
         assert_eq!(trace.active, 0);
         assert_eq!(trace.cancelled, 1);
-        assert_eq!(fixture.landings.lock().unwrap().put.len(), 8);
+        assert_eq!(fixture.landings.lock().unwrap().put.len(), completed);
         assert_eq!(fixture.landings.lock().unwrap().flushes, 0);
     }
 
     #[cfg(feature = "sim")]
     #[tokio::test(start_paused = true)]
     async fn exact_window_deadline_preserves_the_unstarted_tail_and_next_service() {
-        let mut fixture = exact_fixture(9, 9);
+        let count = 2 * EXACT_FETCHES_IN_FLIGHT + 1;
+        let mut fixture = exact_fixture(count, count);
         let mut reconciler =
             Reconciler::with_backoff(Duration::from_secs(5), Duration::from_secs(20))
                 .with_replication(ReplicationMode::Full, [fixture.collection])

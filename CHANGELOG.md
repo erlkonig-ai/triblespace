@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Raise the sync reconciler's exact-fetch request window from four to eight,
+  preserving deadline, cancellation, fairness and serial-landing behavior.
+  Exact-body receive and backing/scratch limits remain independent and unchanged;
+  the wider request bound is not a throughput or memory guarantee. See the
+  `triblespace-net` changelog.
+
 - Share lazy coverage work between unchanged store observations, avoiding
   replay when an older maintenance control warms after a newer snapshot was
   taken. Changed observations retain separate frozen coverage memos.

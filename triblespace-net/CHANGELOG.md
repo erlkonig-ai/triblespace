@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Raise the reconciler's shared exact-fetch request window from four to eight.
+  Keep the original round deadline, cancellation ownership, service-class
+  rotation, serial landing and retry rules. Eight leaves nominal headroom below
+  the sixteen process-wide exact-body receive slots, not reserved capacity or a
+  throughput/memory guarantee. The separate 64 GiB aggregate temporary backing
+  budget and 1 MiB shared scratch are unchanged. Extend the existing deadline
+  and cancellation fixtures beyond two windows of work.
+
 - Acquisition (`Peer::acquire`, `Leech::acquire`, `PeerSnapshot::get`)
   treats a local copy whose bytes do not read -- a pile lists it, its bytes
   fail validation -- as absent: it asks other holders, and the verified bytes

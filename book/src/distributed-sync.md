@@ -883,7 +883,7 @@ a completeness certificate. Hints create no durable WANT and do not widen the
 explicit collection selection.
 
 Exact WANTs, direct roots and positive hints use the existing KDF(H) discovery,
-mutual bearer proof and final hash verification. A shared four-wide fetch
+mutual bearer proof and final hash verification. A shared eight-wide fetch
 window serves one eligible class's finite round under its original deadline.
 Ready verified bodies land individually, without a per-body flush or serving
 rebuild; `Peer::reconcile()` publishes one snapshot after the completed batch.
