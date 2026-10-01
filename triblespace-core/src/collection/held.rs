@@ -1728,7 +1728,11 @@ mod tests {
         {
             self.gate.pass(&handle.raw);
             if self.faults.unreadable.lock().unwrap().contains(&handle.raw) {
-                return Err(crate::blob::MemoryStoreGetError::NotFound());
+                return Err(crate::blob::MemoryStoreGetError::NotFound(
+                    crate::repo::MissingBlob {
+                        handle: handle.transmute(),
+                    },
+                ));
             }
             *self.reads.lock().unwrap().entry(handle.raw).or_default() += 1;
             if std::thread::current().name() != Some("held-blob-walk") {

@@ -820,10 +820,52 @@ where
     R: StoreRead,
     E: CollectionEncoding,
 {
+    attached_lineage_mode(snapshot, attached, false)
+}
+
+pub(super) fn attached_lineage_acquiring<R, E>(
+    snapshot: &R,
+    attached: Collection<E>,
+) -> Result<
+    (
+        Collection<SimpleArchive>,
+        crate::trible::Fragment,
+        crate::trible::Fragment,
+    ),
+    CollectionRealizationError,
+>
+where
+    R: StoreRead,
+    E: CollectionEncoding,
+{
+    attached_lineage_mode(snapshot, attached, true)
+}
+
+fn attached_lineage_mode<R, E>(
+    snapshot: &R,
+    attached: Collection<E>,
+    acquire: bool,
+) -> Result<
+    (
+        Collection<SimpleArchive>,
+        crate::trible::Fragment,
+        crate::trible::Fragment,
+    ),
+    CollectionRealizationError,
+>
+where
+    R: StoreRead,
+    E: CollectionEncoding,
+{
     let load = |collection: CollectionHandle| {
-        if !snapshot.contains_blob(collection).map_err(|error| {
-            CollectionRealizationError::storage("inspect collection descriptor residency", error)
-        })? {
+        if !acquire
+            && !snapshot.contains_blob(collection).map_err(|error| {
+                CollectionRealizationError::storage(
+                    "inspect collection descriptor residency",
+                    error,
+                )
+            })?
+        {
             return Err(CollectionRealizationError::MissingDependency {
                 member: Handle::<SimpleArchive>::to_hash(collection),
             });
@@ -831,6 +873,11 @@ where
         super::api::load_collection_descriptor(snapshot, collection)
             .map(|loaded| loaded.fragment)
             .map_err(|error| {
+                if acquire && crate::repo::is_missing_blob(&error) {
+                    return CollectionRealizationError::MissingDependency {
+                        member: Handle::<SimpleArchive>::to_hash(collection),
+                    };
+                }
                 CollectionRealizationError::Resolution(format!(
                     "load collection descriptor {}: {error}",
                     hex::encode_upper(collection.raw),

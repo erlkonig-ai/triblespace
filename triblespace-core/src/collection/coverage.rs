@@ -1420,6 +1420,43 @@ impl CoverageIndex {
         }
     }
 
+    /// An explicit acquisition operation may now read definitions absent from
+    /// the frozen snapshot. Re-offer only that snapshot's parked attestations
+    /// in the requested collections; published rows and unrelated backlogs
+    /// are untouched. No native record is enumerated or newly observed.
+    #[cfg(feature = "object-store")]
+    pub(crate) fn retry_collections<A: RecordAdmission>(
+        &mut self,
+        admission: &A,
+        collections: &BTreeSet<CollectionHandle>,
+    ) {
+        let mut woken = Vec::new();
+        for waiters in [&mut self.awaiting_lineage, &mut self.awaiting_proof] {
+            let keys: Vec<_> = waiters.iter_ordered().copied().collect();
+            for key in keys {
+                let Some(mut entries) = waiters.get(&key).cloned() else {
+                    continue;
+                };
+                let selected: Vec<_> = held_keys(&entries)
+                    .filter(|entry| collections.contains(&parked_collection(entry)))
+                    .collect();
+                for entry in selected {
+                    entries.remove(&entry);
+                    woken.push(entry);
+                }
+                if entries.is_empty() {
+                    waiters.remove(&key);
+                } else {
+                    waiters.replace(&Entry::with_value(&key, entries));
+                }
+            }
+        }
+        for entry in self.parked_entries(woken) {
+            self.park(entry.collection, entry.attestation, entry.signer);
+        }
+        self.settle_collections(admission, collections);
+    }
+
     /// Re-offer every parked attestation, whatever it is waiting for.
     ///
     /// The unconditional form, for a store that cannot say which evidence

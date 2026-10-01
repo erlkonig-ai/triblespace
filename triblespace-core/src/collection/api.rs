@@ -294,6 +294,8 @@ pub enum CollectionAdmissionError<ProofsError, GetError> {
     Descriptor(CollectionDescriptorError<GetError>),
     /// The resident capability-proof observation could not be completed.
     Evidence(CollectionEvidenceDiscoveryError<ProofsError>),
+    /// A definition read failed, rather than merely being unavailable.
+    Definition(crate::repo::ReadFailure),
 }
 
 /// The Invoke audience derivable for one capability and proof snapshot.
@@ -317,6 +319,7 @@ where
         match self {
             Self::Descriptor(source) => source.fmt(formatter),
             Self::Evidence(source) => source.fmt(formatter),
+            Self::Definition(source) => source.fmt(formatter),
         }
     }
 }
@@ -330,6 +333,7 @@ where
         match self {
             Self::Descriptor(source) => Some(source),
             Self::Evidence(source) => Some(source),
+            Self::Definition(source) => Some(source),
         }
     }
 }
@@ -1234,6 +1238,63 @@ impl<L: CollectionEncoding> Collection<L> {
         Ok(evidence.authorizes(snapshot, subject))
     }
 
+    /// Command admission through an exact-byte reader. Frozen proof evidence
+    /// is unchanged; unavailable definitions grant nothing, and actual backend
+    /// failures cannot be swallowed as a denial by the open-world query.
+    pub fn writer_is_admitted_acquiring<S>(
+        self,
+        snapshot: &S,
+        subject: VerifyingKey,
+    ) -> Result<bool, CollectionAdmissionError<S::ProofsError, S::GetError<Infallible>>>
+    where
+        S: StoreSnapshot + BlobStoreGet + CapabilityProofRead,
+    {
+        self.admitted_acquiring(snapshot, subject, super::ACTION_WRITE)
+    }
+
+    /// The READ counterpart of [`Self::writer_is_admitted_acquiring`].
+    pub fn reader_is_admitted_acquiring<S>(
+        self,
+        snapshot: &S,
+        subject: VerifyingKey,
+    ) -> Result<bool, CollectionAdmissionError<S::ProofsError, S::GetError<Infallible>>>
+    where
+        S: StoreSnapshot + BlobStoreGet + CapabilityProofRead,
+    {
+        self.admitted_acquiring(snapshot, subject, super::ACTION_READ)
+    }
+
+    fn admitted_acquiring<S>(
+        self,
+        snapshot: &S,
+        subject: VerifyingKey,
+        action: Id,
+    ) -> Result<bool, CollectionAdmissionError<S::ProofsError, S::GetError<Infallible>>>
+    where
+        S: StoreSnapshot + BlobStoreGet + CapabilityProofRead,
+    {
+        let loaded = load_collection_descriptor(snapshot, self.handle())
+            .map_err(CollectionAdmissionError::Descriptor)?;
+        let attempt = crate::repo::read_attempt::ReadAttempt::new(snapshot);
+        let evidence = discover_admission_evidence(
+            snapshot,
+            descriptor::admission_policies(
+                &attempt,
+                loaded.fragment.facts(),
+                action,
+                Some(L::id()),
+            ),
+            action,
+            self.handle(),
+        )
+        .map_err(CollectionAdmissionError::Evidence)?;
+        let admitted = evidence.authorizes(&attempt, subject);
+        attempt
+            .finish()
+            .map_err(CollectionAdmissionError::Definition)?;
+        Ok(admitted)
+    }
+
     /// Decide whether `subject` is admitted as a reader in this snapshot.
     ///
     /// This is the disclosure boundary corresponding to the descriptor's READ
@@ -1333,6 +1394,24 @@ impl<L: CollectionEncoding> Collection<L> {
             .view()
             .map_err(CollectionReadError::View)
     }
+
+    /// Read known support through exact acquisition without choosing another
+    /// record/proof frontier after bytes arrive. Unlike a passive read, missing
+    /// chosen foundation bytes fail the view rather than disappearing from it.
+    pub fn read_acquiring<V, S>(
+        self,
+        snapshot: &S,
+    ) -> Result<V, CollectionReadError<S::GetError<Infallible>, V::Error>>
+    where
+        S: StoreRead,
+        V: TryFromCover<L>,
+    {
+        snapshot
+            .collection_acquiring(self)
+            .map_err(CollectionReadError::Realization)?
+            .view()
+            .map_err(CollectionReadError::View)
+    }
 }
 
 /// Immutable collection observations implemented by every complete store snapshot.
@@ -1360,6 +1439,21 @@ pub trait CollectionSnapshotExt: StoreRead + Sized {
         super::observation::attach(self, target)
     }
 
+    /// Select the resident cover plus known foundations it does not represent.
+    /// A fetching reader can then read that fixed cover's exact bytes through
+    /// `view`. No new observation is taken during acquisition; a view which
+    /// cannot read a chosen member returns an error, not a partial value.
+    fn collection_acquiring<E>(
+        &self,
+        target: Collection<E>,
+    ) -> Result<CollectionSnapshot<Self, E>, CollectionRealizationError>
+    where
+        E: CollectionEncoding,
+        Handle<E>: InlineEncoding,
+    {
+        super::observation::attach_acquiring(self, target)
+    }
+
     /// Observe what one attached collection holds for its parent in this
     /// immutable snapshot: the attached cover.
     ///
@@ -1380,6 +1474,22 @@ pub trait CollectionSnapshotExt: StoreRead + Sized {
         Handle<E>: InlineEncoding,
     {
         super::observation::attach_attached(self, attached)
+    }
+
+    /// Select one fixed attached observation, reading its explicit target and
+    /// parent descriptors even when frozen residency says absent. A fetching
+    /// reader may acquire those exact bytes. Selection otherwise uses the same
+    /// frozen records/proofs and resident attachment cover as `attached`;
+    /// `read_acquiring` subsequently reads its fixed residual.
+    fn attached_acquiring<E>(
+        &self,
+        attached: Collection<E>,
+    ) -> Result<AttachedSnapshot<Self, E>, CollectionRealizationError>
+    where
+        E: CollectionEncoding,
+        Handle<E>: InlineEncoding,
+    {
+        super::observation::attach_attached_acquiring(self, attached)
     }
 }
 

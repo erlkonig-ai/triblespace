@@ -409,26 +409,70 @@ where
     UnionArchive<OrderedUniverse>: TryFromCover<E>,
     <UnionArchive<OrderedUniverse> as TryFromCover<E>>::Error: fmt::Display,
 {
+    read_attached_mode(attached, false)
+}
+
+/// Read exactly the selected attachment and residual, acquiring exact residual
+/// bytes through the supplied reader instead of skipping frozen nonresidency.
+/// Unavailable residuals stay unread; storage and malformed-byte failures are
+/// errors. This never refreshes the selected support, records or proofs.
+pub fn read_attached_acquiring<R, E>(
+    attached: &AttachedSnapshot<R, E>,
+) -> Result<AttachedRead<UnionArchive<OrderedUniverse>>, ReadAttachedError>
+where
+    R: StoreRead,
+    E: CollectionEncoding,
+    UnionArchive<OrderedUniverse>: TryFromCover<E>,
+    <UnionArchive<OrderedUniverse> as TryFromCover<E>>::Error: fmt::Display,
+{
+    read_attached_mode(attached, true)
+}
+
+fn read_attached_mode<R, E>(
+    attached: &AttachedSnapshot<R, E>,
+    acquire: bool,
+) -> Result<AttachedRead<UnionArchive<OrderedUniverse>>, ReadAttachedError>
+where
+    R: StoreRead,
+    E: CollectionEncoding,
+    UnionArchive<OrderedUniverse>: TryFromCover<E>,
+    <UnionArchive<OrderedUniverse> as TryFromCover<E>>::Error: fmt::Display,
+{
     let snapshot = attached.snapshot();
     let mut residual = Vec::new();
     let mut unread = Vec::new();
     for foundation in attached.residual().members() {
         let member = Handle::<SimpleArchive>::to_hash(foundation);
         let failed = |reason: String| ReadAttachedError::Residual { member, reason };
-        if snapshot
-            .metadata(foundation)
-            .map_err(|error| failed(error.to_string()))?
-            .is_none()
+        if !acquire
+            && snapshot
+                .metadata(foundation)
+                .map_err(|error| failed(error.to_string()))?
+                .is_none()
         {
             unread.push(member);
             continue;
         }
-        let bytes: Blob<SimpleArchive> = snapshot
-            .get(foundation)
-            .map_err(|error| failed(error.to_string()))?;
-        let archive = super::derive_element(&bytes)
-            .ok()
-            .and_then(|image| SuccinctArchive::try_from_blob(image).ok());
+        let bytes: Blob<SimpleArchive> = match snapshot.get(foundation) {
+            Ok(bytes) => bytes,
+            Err(error) if acquire && crate::repo::is_missing_blob(&error) => {
+                unread.push(member);
+                continue;
+            }
+            Err(error) => return Err(failed(error.to_string())),
+        };
+        let archive = match super::derive_element(&bytes) {
+            Ok(image) => match SuccinctArchive::try_from_blob(image) {
+                Ok(archive) => Some(archive),
+                Err(error) if acquire => return Err(failed(error.to_string())),
+                Err(_) => None,
+            },
+            Err(error @ (crate::blob::encodings::succinctarchive::SuccinctArchiveRawBuildError::Source(_)
+                | crate::blob::encodings::succinctarchive::SuccinctArchiveRawBuildError::Construction(_))) if acquire => {
+                return Err(failed(error.to_string()));
+            }
+            Err(_) => None,
+        };
         match archive {
             Some(archive) => residual.push(archive),
             None => unread.push(member),

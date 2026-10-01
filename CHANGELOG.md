@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Foreground readers can acquire exact bytes through a frozen store observation.
+  Core's `AcquiringReader`, acquiring admission checks, `collection_acquiring`
+  and attached `read_acquiring` keep record/proof evidence fixed while fetching
+  descriptors, definitions, selected members and residual foundations. Passive
+  discovery and residency remain unchanged; unread support is explicit, and
+  backend/decoding faults are not converted into missing data.
+  Text BM25 reads each required text by exact handle rather than treating
+  frozen residency as a fetch prohibition; unavailable text remains a named
+  dependency and storage faults remain errors.
+
 - `trible pile migrate SRC lattice-v3 --into DST` writes the lattice v3 pile
   from a frozen copy: every COMMIT of every generation, every capability proof
   (retired ones included), WANT, legacy pin and frame of unknown kind; no

@@ -222,7 +222,7 @@ impl IntoIterator for MemoryBlobStoreSnapshot {
 #[derive(Debug)]
 pub enum MemoryStoreGetError<E: Error> {
     /// This error occurs when a blob is requested that does not exist in the store.
-    NotFound(),
+    NotFound(crate::repo::MissingBlob),
     /// This error occurs when a blob is requested that exists, but cannot be converted to the requested type.
     ConversionFailed(E),
 }
@@ -230,13 +230,20 @@ pub enum MemoryStoreGetError<E: Error> {
 impl<E: Error> fmt::Display for MemoryStoreGetError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            MemoryStoreGetError::NotFound() => write!(f, "Blob not found in memory store"),
+            MemoryStoreGetError::NotFound(missing) => write!(f, "{missing}"),
             MemoryStoreGetError::ConversionFailed(e) => write!(f, "Blob conversion failed: {e}"),
         }
     }
 }
 
-impl<E: Error> Error for MemoryStoreGetError<E> {}
+impl<E: Error + 'static> Error for MemoryStoreGetError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::NotFound(missing) => Some(missing),
+            Self::ConversionFailed(error) => Some(error),
+        }
+    }
+}
 
 /// Iterator returned by [`MemoryBlobStoreSnapshot::iter`].
 ///
@@ -336,7 +343,9 @@ impl BlobStoreGet for MemoryBlobStoreSnapshot {
     {
         let handle: Inline<Handle<UnknownBlob>> = handle.transmute();
         let Some(blob) = self.blobs.get(&handle.raw) else {
-            return Err(MemoryStoreGetError::NotFound());
+            return Err(MemoryStoreGetError::NotFound(crate::repo::MissingBlob {
+                handle,
+            }));
         };
         let blob: Blob<S> = blob.clone().transmute();
         match blob.try_from_blob() {

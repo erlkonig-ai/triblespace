@@ -294,9 +294,10 @@ snapshot never promises work which will happen later.
 There is no assertion form which takes a requested support: what a target
 stands on is read back through `support()`, and a caller who needs two views
 to agree attaches both from one snapshot and compares their supports.
-Neither observation method reads the clock: identical operations on one frozen
-store snapshot have identical results even while wall time passes. A decision
-using later-arriving proof or definition evidence requires a new snapshot.
+Neither passive observation method reads the clock: identical operations on one
+frozen store snapshot have identical results even while wall time passes. A
+passive decision using later-arriving proof or definition evidence requires a
+new snapshot.
 Storage snapshots have no timestamp or historical-time selector.
 `changes_since` classifies content only. Generic collection authorization has
 no proof-validity clock; action-specific deadlines belong to the application
@@ -317,6 +318,47 @@ through that frozen observation. For a `SimpleArchive`, `V = TribleSet`; for a
 shards. `collection.read::<V, _>(&snapshot)` remains a concise
 resident collection read when the intermediate support and physical cover are
 irrelevant.
+
+### Foreground exact-byte acquisition
+
+An operation that needs selected bytes can wrap one immutable peer snapshot in
+`repo::async_store::AcquiringReader`. Its synchronous `get` drives that
+snapshot's asynchronous exact-handle get; the store owner and runtime must stay
+alive for the operation. Run synchronous reads outside a Tokio task (an async
+operation can use `spawn_blocking`). This does not make resident inventory,
+records, proofs or change detection live.
+
+Before its first selection, the acquiring reader can retry parked records from
+the original index using the same frozen proof evidence and acquired descriptor
+or capability-definition bytes. It cannot discover a later grant or a later
+collection record. `reader_is_admitted_acquiring` and
+`writer_is_admitted_acquiring` likewise acquire definitions against frozen
+proofs; unavailable definitions grant no authority, while actual backend or
+decoding faults are returned rather than hidden as denial.
+
+Use `snapshot.collection_acquiring(target)` when an operation needs all known
+target foundations, including those not represented by the resident cover.
+Its `view` reads that fixed selection and fails if a selected member cannot be
+read. Derived foundations are still the known admitted images, not a promise to
+derive missing images from upstream data.
+
+For an attached collection, first select once with `attached_acquiring` through
+the acquiring reader. This exact-gets its target and parent descriptors instead
+of requiring their residency in the frozen index. Then call `read_acquiring`,
+or `succinctarchive_union::read_attached_acquiring`
+for fact shards. These read the fixed attached cover and demand its exact
+residual foundations without a frozen-residency precheck. They do not maintain,
+publish, or replace a selected view after obtaining bytes. The result carries
+`unread` support for unavailable bytes/dependencies or an unrepresentable
+mapping. A complete operational value requires checking `unread`; taking only
+`into_value` is an explicit partial-read choice. This says nothing about peer
+records which have not yet arrived or bulk synchronization completion.
+
+`AttachedSnapshot<AcquiringReader<R>, E>::into_frozen` removes only the adapter,
+retaining its exact original reader, chosen cover/support/residual and read-set.
+It allows an async owner to retain selected coordinates and later acquire their
+bytes without selecting again. It does not replace the underlying snapshot's
+resident index with the operation's acquired interpretation.
 
 For maintained indexes, attachment checks safe typed framing and retains the
 stored sections; it does not rerun canonical construction or semantic audits.

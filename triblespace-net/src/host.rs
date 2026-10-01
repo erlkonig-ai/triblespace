@@ -159,7 +159,11 @@ impl BlobStoreGet for ResidentBlobReader {
         let bytes = self
             .0
             .get_blob(handle.raw)
-            .ok_or(MemoryStoreGetError::NotFound())?;
+            .ok_or(MemoryStoreGetError::NotFound(
+                triblespace_core::repo::MissingBlob {
+                    handle: handle.transmute(),
+                },
+            ))?;
         // The snapshot returned these bytes for this exact handle. Preserve
         // that store invariant instead of hashing its output again.
         T::try_from_blob(Blob::with_handle(bytes, handle))

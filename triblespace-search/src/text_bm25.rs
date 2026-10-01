@@ -19,8 +19,9 @@
 //! alike whatever its granularity: a document present in two nodes' images
 //! is one document, its frequencies the pointwise maximum, never a sum.
 //!
-//! A text handle that is not resident is a missing dependency, never a
-//! silently shorter document.
+//! A text handle that cannot be read is a missing dependency, never a
+//! silently shorter document. Exact gets through an acquiring reader may
+//! obtain the text while its record and residency observation stay frozen.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -212,19 +213,20 @@ impl CollectionAttachment for PortableBM25Blob {
             let mut frequencies: BTreeMap<RawInline, u32> = BTreeMap::new();
             for raw in handles {
                 let handle = Inline::<Handle<UTF8String>>::new(raw);
-                let resident = reader
-                    .metadata(handle)
-                    .map_err(|source| fatal(source.to_string()))?;
-                if resident.is_none() {
-                    return Err(CollectionOperationError::MissingDependency(Handle::<
-                        UTF8String,
-                    >::to_hash(
-                        handle
-                    )));
-                }
-                let blob: Blob<UTF8String> = reader
-                    .get(handle)
-                    .map_err(|source| fatal(source.to_string()))?;
+                // The logical dependency is this exact text, not a claim
+                // about its frozen residency. A local reader stays passive;
+                // an acquiring one can supply bytes without a newer view.
+                let blob: Blob<UTF8String> = match reader.get(handle) {
+                    Ok(blob) => blob,
+                    Err(error) if triblespace_core::repo::is_missing_blob(&error) => {
+                        return Err(CollectionOperationError::MissingDependency(Handle::<
+                            UTF8String,
+                        >::to_hash(
+                            handle
+                        )));
+                    }
+                    Err(error) => return Err(fatal(error.to_string())),
+                };
                 let text: View<str> = View::try_from_blob(blob).map_err(|source| {
                     fatal(format!(
                         "text {} is not UTF-8: {source:?}",

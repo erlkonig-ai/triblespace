@@ -163,7 +163,10 @@ where
             !coverage
                 .leaf_outputs(target, SourceLocator::of(foundation.raw))
                 .into_iter()
-                .any(|output| self.support.contains(crate::inline::Inline::new(output.raw)))
+                .any(|output| {
+                    self.support
+                        .contains(crate::inline::Inline::new(output.raw))
+                })
         });
         Ok(Cover::from_data(source_collection, missing))
     }
@@ -215,6 +218,26 @@ where
     support: Support<SimpleArchive>,
     residual: Support<SimpleArchive>,
     dependencies: DependencyTracker,
+}
+
+#[cfg(feature = "object-store")]
+impl<R, E> AttachedSnapshot<crate::repo::async_store::AcquiringReader<R>, E>
+where
+    R: StoreSnapshot,
+    E: CollectionEncoding,
+{
+    /// Remove only the acquisition adapter, retaining this selected cover,
+    /// support, residual and read-set. This extracts the exact original frozen
+    /// reader; it cannot substitute another snapshot or reselect after a fetch.
+    pub fn into_frozen(self) -> AttachedSnapshot<R, E> {
+        AttachedSnapshot {
+            snapshot: self.snapshot.into_frozen(),
+            cover: self.cover,
+            support: self.support,
+            residual: self.residual,
+            dependencies: self.dependencies,
+        }
+    }
 }
 
 impl<R, E> Clone for AttachedSnapshot<R, E>
@@ -326,6 +349,54 @@ where
         self.read_with::<super::encoding::CanonicalAttachment<E>, V>()
     }
 
+    /// Read this exact selected cover and residual through an acquiring reader.
+    /// Missing residual bytes are requested by handle, not skipped on the
+    /// snapshot's frozen residency. Unavailable inputs remain explicit unread
+    /// members; other read and mapping failures are returned. No records,
+    /// proofs, cover, or support are refreshed and no work is published.
+    pub fn read_acquiring<V>(
+        &self,
+    ) -> Result<AttachedRead<V>, AttachedReadError<R::GetError<Infallible>, V::Error>>
+    where
+        R: StoreRead,
+        E: super::CollectionAttachment,
+        V: TryFromCover<E>,
+    {
+        self.read_with_acquiring::<super::encoding::CanonicalAttachment<E>, V>()
+    }
+
+    /// The explicit-mapping form of [`Self::read_acquiring`].
+    pub fn read_with_acquiring<M, V>(
+        &self,
+    ) -> Result<AttachedRead<V>, AttachedReadError<R::GetError<Infallible>, V::Error>>
+    where
+        R: StoreRead,
+        M: MapMapping<Target = E>,
+        V: TryFromCover<E>,
+    {
+        self.read_mode::<M, V>(true)
+    }
+
+    /// Wrap only the byte reader of this already-selected observation.
+    /// The caller must keep the runtime and network store owner alive and
+    /// execute synchronous reads outside an async task (e.g. spawn_blocking).
+    #[cfg(feature = "object-store")]
+    pub fn acquiring(
+        &self,
+        runtime: tokio::runtime::Handle,
+    ) -> AttachedSnapshot<crate::repo::async_store::AcquiringReader<R>, E> {
+        AttachedSnapshot {
+            snapshot: crate::repo::async_store::AcquiringReader::with_handle(
+                self.snapshot.clone(),
+                runtime,
+            ),
+            cover: self.cover.clone(),
+            support: self.support.clone(),
+            residual: self.residual.clone(),
+            dependencies: self.dependencies.clone(),
+        }
+    }
+
     /// Reconstruct one caller-chosen logical value over everything the
     /// parent stands on in this observation: the attachments taken, and an
     /// image of every residual foundation built in memory through `M`.
@@ -356,6 +427,18 @@ where
         M: MapMapping<Target = E>,
         V: TryFromCover<E>,
     {
+        self.read_mode::<M, V>(false)
+    }
+
+    fn read_mode<M, V>(
+        &self,
+        acquire: bool,
+    ) -> Result<AttachedRead<V>, AttachedReadError<R::GetError<Infallible>, V::Error>>
+    where
+        R: StoreRead,
+        M: MapMapping<Target = E>,
+        V: TryFromCover<E>,
+    {
         let observed =
             ObservedStore::with_tracker(self.snapshot.clone(), self.dependencies.clone());
         let attached = self.cover.collection();
@@ -378,20 +461,29 @@ where
                 continue;
             }
             let failed = |reason: String| AttachedReadError::Residual { member, reason };
-            if observed
-                .metadata(foundation)
-                .map_err(|error| failed(error.to_string()))?
-                .is_none()
+            if !acquire
+                && observed
+                    .metadata(foundation)
+                    .map_err(|error| failed(error.to_string()))?
+                    .is_none()
             {
                 unread.push(member);
                 continue;
             }
-            let node: Blob<SimpleArchive> = observed
-                .get(foundation)
-                .map_err(|error| failed(error.to_string()))?;
+            let node: Blob<SimpleArchive> = match observed.get(foundation) {
+                Ok(node) => node,
+                Err(error) if acquire && crate::repo::is_missing_blob(&error) => {
+                    unread.push(member);
+                    continue;
+                }
+                Err(error) => return Err(failed(error.to_string())),
+            };
             match mapping.map(&node, &[], &observed) {
                 Ok(image) => {
                     images.insert(image.get_handle().raw, image.bytes);
+                }
+                Err(super::CollectionOperationError::Fatal(reason)) if acquire => {
+                    return Err(failed(reason));
                 }
                 Err(_) => unread.push(member),
             }

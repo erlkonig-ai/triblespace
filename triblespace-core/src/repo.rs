@@ -6,6 +6,8 @@
 //! encodings remain readable so existing piles can be migrated and retained,
 //! but this module deliberately exposes no API for mutating named pins.
 pub mod async_store;
+pub(crate) mod read_attempt;
+pub use read_attempt::ReadFailure;
 
 pub mod branch;
 /// Commit metadata construction and signature verification.
@@ -61,6 +63,20 @@ impl std::fmt::Display for MissingBlob {
 }
 
 impl std::error::Error for MissingBlob {}
+
+/// Whether a backend error's source chain names unavailable exact bytes.
+/// Check before a diagnostic boundary converts the error into text.
+pub fn is_missing_blob(mut error: &(dyn std::error::Error + 'static)) -> bool {
+    loop {
+        if error.is::<MissingBlob>() {
+            return true;
+        }
+        match error.source() {
+            Some(source) => error = source,
+            None => return false,
+        }
+    }
+}
 
 impl std::fmt::Debug for MissingBlob {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

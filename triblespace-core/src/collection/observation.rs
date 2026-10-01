@@ -37,6 +37,29 @@ where
     R: StoreRead,
     E: CollectionEncoding,
 {
+    attach_mode(snapshot, target, false)
+}
+
+pub(super) fn attach_acquiring<R, E>(
+    snapshot: &R,
+    target: Collection<E>,
+) -> Result<CollectionSnapshot<R, E>, CollectionRealizationError>
+where
+    R: StoreRead,
+    E: CollectionEncoding,
+{
+    attach_mode(snapshot, target, true)
+}
+
+fn attach_mode<R, E>(
+    snapshot: &R,
+    target: Collection<E>,
+    acquire: bool,
+) -> Result<CollectionSnapshot<R, E>, CollectionRealizationError>
+where
+    R: StoreRead,
+    E: CollectionEncoding,
+{
     let observed = ObservedStore::new(snapshot.clone());
     let loaded = super::api::load_collection_descriptor(&observed, target.handle())
         .map_err(|error| CollectionRealizationError::storage("read target descriptor", error))?;
@@ -75,8 +98,24 @@ where
     )
     .map_err(|error| CollectionRealizationError::storage("read WRITE evidence", error))?;
     let selection = super::maintenance::select(&observed, &coverage, target)?;
-    let support = Support::from_patch(target, selection.covered.clone());
-    let cover = Cover::from_data(target, selection.nodes());
+    let (support, cover) = if acquire {
+        let (support, _) = coverage.frontier_support(handle);
+        let missing = support.difference(&selection.covered);
+        let cover = Cover::from_data(
+            target,
+            selection.nodes().into_iter().chain(
+                missing
+                    .iter_ordered()
+                    .map(|raw| crate::inline::Inline::new(*raw)),
+            ),
+        );
+        (Support::from_patch(target, support), cover)
+    } else {
+        (
+            Support::from_patch(target, selection.covered.clone()),
+            Cover::from_data(target, selection.nodes()),
+        )
+    };
     Ok(CollectionSnapshot::from_frontier(
         observed.inner().clone(),
         support,
@@ -100,17 +139,44 @@ where
     R: StoreRead,
     E: CollectionEncoding,
 {
+    attach_attached_mode(snapshot, attached, false)
+}
+
+pub(super) fn attach_attached_acquiring<R, E>(
+    snapshot: &R,
+    attached: Collection<E>,
+) -> Result<AttachedSnapshot<R, E>, CollectionRealizationError>
+where
+    R: StoreRead,
+    E: CollectionEncoding,
+{
+    attach_attached_mode(snapshot, attached, true)
+}
+
+fn attach_attached_mode<R, E>(
+    snapshot: &R,
+    attached: Collection<E>,
+    acquire: bool,
+) -> Result<AttachedSnapshot<R, E>, CollectionRealizationError>
+where
+    R: StoreRead,
+    E: CollectionEncoding,
+{
     let observed = ObservedStore::new(snapshot.clone());
-    let (parent, _, parent_descriptor) = super::maintenance::attached_lineage(&observed, attached)
-        .map_err(|error| match error {
-            CollectionRealizationError::MissingDependency { member } => {
-                CollectionRealizationError::Resolution(format!(
-                    "attached lineage descriptor {} is not resident",
-                    hex::encode_upper(member.raw),
-                ))
-            }
-            other => other,
-        })?;
+    let lineage = if acquire {
+        super::maintenance::attached_lineage_acquiring(&observed, attached)
+    } else {
+        super::maintenance::attached_lineage(&observed, attached)
+    };
+    let (parent, _, parent_descriptor) = lineage.map_err(|error| match error {
+        CollectionRealizationError::MissingDependency { member } if !acquire => {
+            CollectionRealizationError::Resolution(format!(
+                "attached lineage descriptor {} is not resident",
+                hex::encode_upper(member.raw),
+            ))
+        }
+        other => other,
+    })?;
     let charged = BTreeSet::from([attached.handle(), parent.handle()]);
     let coverage = observed
         .coverage(&charged)

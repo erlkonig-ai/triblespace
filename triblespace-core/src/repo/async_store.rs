@@ -35,6 +35,11 @@ use std::error::Error;
 use std::fmt::Debug;
 use std::future::Future;
 
+#[cfg(feature = "object-store")]
+mod acquiring;
+#[cfg(feature = "object-store")]
+pub use acquiring::AcquiringReader;
+
 use anybytes::Bytes;
 
 use crate::blob::encodings::UnknownBlob;

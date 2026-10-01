@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `repo::async_store::AcquiringReader` bridges exact async blob gets into
+  synchronous foreground reads without refreshing records, proofs or residency.
+  First collection selection retries only the frozen index's parked records
+  against acquired descriptor/admission definitions. Acquiring admission checks
+  retain actual backend errors instead of letting open-world policy queries
+  hide them as denial. Missing memory-store bytes now carry `MissingBlob` in
+  their error source chain, like pile/peer reads.
+- `collection_acquiring` selects known target foundations not represented by
+  the resident cover; `attached_acquiring` exact-gets the explicit lineage
+  descriptors before first selection, without falsifying frozen residency.
+  `AttachedSnapshot::read_acquiring` and
+  `succinctarchive_union::read_attached_acquiring` read a fixed selected cover
+  and request residual foundations even when frozen metadata says absent.
+  They neither publish mappings nor select later records. Unavailable or
+  unrepresentable residual support stays structured `unread`; actual read,
+  archive validation and fatal mapping errors fail the read. Passive APIs
+  remain resident-only. Removing an acquisition adapter with `into_frozen`
+  retains the exact selected coordinates, not a replacement snapshot.
+
 - Derived collections carry their own lattice. `maintain` on a derived
   collection derives its leaves and then carries its own frontier exactly as
   a root's carry does: held leaf images, eight per support tier, joined into
