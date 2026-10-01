@@ -304,6 +304,15 @@ no proof-validity clock; action-specific deadlines belong to the application
 interpreting that action, with an explicit evaluation time separate from its
 immutable evidence snapshot.
 
+The lazy coverage memo is shared between consecutive store observations only
+when `changes_since` reports `NONE`. Reading an older operation control can
+therefore warm a newer, otherwise identical residency observation as well.
+This shares computed work, not mutable records or storage: each snapshot keeps
+its own underlying observation and held-blob view. Any reported change forks
+the memo, including a new blob occurrence or capability proof, so newer
+membership, authority and residency cannot leak into an older read. Backends
+whose conservative classification reports `ALL` keep the separate-memo path.
+
 `observed.is_current(&later_snapshot)` compares the raw dependencies actually
 consulted by attachment, views, and explicit support queries. Indexed backends
 ignore unrelated collection and blob appends. Missing lookups count too: a

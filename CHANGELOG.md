@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Share lazy coverage work between unchanged store observations, avoiding
+  replay when an older maintenance control warms after a newer snapshot was
+  taken. Changed observations retain separate frozen coverage memos.
+
 - Foreground readers can acquire exact bytes through a frozen store observation.
   Core's `AcquiringReader`, acquiring admission checks, `collection_acquiring`
   and attached `read_acquiring` keep record/proof evidence fixed while fetching

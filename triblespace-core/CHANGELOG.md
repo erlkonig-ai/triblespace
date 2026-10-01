@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Reuse the lazy coverage memo across consecutive snapshots only when the
+  backend reports no changed component. Warming an older operation control
+  after a newer equivalent residency snapshot now also warms later readers.
+  Changed records, proofs or blob observations still fork the memo; frozen
+  membership, authority and residency are not advanced.
+
 - `repo::async_store::AcquiringReader` bridges exact async blob gets into
   synchronous foreground reads without refreshing records, proofs or residency.
   First collection selection retries only the frozen index's parked records

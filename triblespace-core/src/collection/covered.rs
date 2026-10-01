@@ -200,6 +200,16 @@ where
                 settled: BTreeSet::new(),
             }));
         };
+        // Equal observed inputs may share lazy work, even when an older
+        // control is first read after a newer residency snapshot was taken.
+        // Copying a still-cold memo here would strand that later warming on
+        // the control while self.last (and every successor) stayed cold.
+        // NONE is conservative: records, proofs AND blob retrievability are
+        // unchanged. Any change, including an unknown mask, keeps the fork
+        // below so no newer evidence can enter an older frozen observation.
+        if now.changes_since(fed).is_empty() {
+            return std::sync::Arc::clone(last);
+        }
         let mut memo = last.lock().expect("coverage memo is not poisoned").clone();
         // A blob matters only as the descriptor some parked record is waiting
         // on; when nothing waits, the blob walk is skipped entirely.
@@ -385,8 +395,9 @@ impl<S: SnapshotSource + StorageClose> Covered<S> {
 /// One immutable observation of a [`Covered`] store: the inner snapshot and
 /// the coverage index for exactly that prefix, decided one lineage at a time
 /// as readers ask. The index is a persistent root behind a lock shared by
-/// every clone of this snapshot, so a lineage settled through one clone is
-/// settled for all of them, and handing it out is a constant-time clone.
+/// every clone and consecutive unchanged observation, so a lineage settled
+/// through an older equivalent observation also warms its newer peers. A
+/// changed observation forks the memo; handing it out is a constant-time clone.
 #[derive(Clone)]
 pub struct CoveredSnapshot<T> {
     inner: T,
@@ -733,6 +744,151 @@ mod tests {
         let later = store.snapshot().unwrap();
         let carried = later.index(&BTreeSet::from([first.handle()])).unwrap();
         assert_eq!(carried.published().len(), 3);
+    }
+
+    /// A maintenance control observation may be older than the store's last
+    /// residency observation when it first asks for the index. Warming that
+    /// control must remain available to equivalent observations taken before
+    /// OR after the work, not only clones of the control itself.
+    #[test]
+    fn unchanged_snapshots_share_late_control_warming() {
+        let root = SigningKey::from_bytes(&[73; 32]);
+        let mut store = MemoryRepo::default();
+        let collection: Collection<SimpleArchive> =
+            store.collection("late control warming", policy(&root)).unwrap();
+        store
+            .commit(collection, &root, entity! { crate::metadata::name: "one" })
+            .unwrap();
+        let control = store.snapshot().unwrap();
+        let residency = store.snapshot().unwrap();
+        let lineage = BTreeSet::from([collection.handle()]);
+        assert!(residency.memo.lock().unwrap().settled.is_empty());
+
+        let warmed = control.index(&lineage).unwrap();
+        assert_eq!(warmed.published().len(), 1);
+        // Inspect before calling residency.index(): a cold memo would replay
+        // the whole lineage and hide the regression behind an equal answer.
+        assert!(residency.memo.lock().unwrap().settled.contains(&collection.handle()));
+        assert_eq!(residency.memo.lock().unwrap().index, warmed);
+        let next = store.snapshot().unwrap();
+        assert!(next.memo.lock().unwrap().settled.contains(&collection.handle()));
+        assert_eq!(next.index(&lineage).unwrap(), warmed);
+    }
+
+    #[test]
+    fn changed_records_fork_late_control_warming_without_advancing_it() {
+        let root = SigningKey::from_bytes(&[73; 32]);
+        let mut store = MemoryRepo::default();
+        let collection: Collection<SimpleArchive> =
+            store.collection("changed control records", policy(&root)).unwrap();
+        store
+            .commit(collection, &root, entity! { crate::metadata::name: "one" })
+            .unwrap();
+        let control = store.snapshot().unwrap();
+        let residency = store.snapshot().unwrap();
+        store
+            .commit(collection, &root, entity! { crate::metadata::name: "two" })
+            .unwrap();
+        let changed = store.snapshot().unwrap();
+        let lineage = BTreeSet::from([collection.handle()]);
+        assert!(!std::sync::Arc::ptr_eq(&control.memo, &changed.memo));
+
+        // Warming B after C was created must not settle C's changed prefix
+        // using B's older records. C still owes its own complete first fold.
+        assert_eq!(residency.index(&lineage).unwrap().published().len(), 1);
+        assert!(changed.memo.lock().unwrap().settled.is_empty());
+        assert_eq!(changed.index(&lineage).unwrap().published().len(), 2);
+        // Warming C must not back-propagate its new membership either.
+        assert_eq!(control.index(&lineage).unwrap().published().len(), 1);
+        assert_eq!(residency.index(&lineage).unwrap().published().len(), 1);
+    }
+
+    #[test]
+    fn changed_proofs_fork_the_memo_without_advancing_old_authority() {
+        let root = SigningKey::from_bytes(&[71; 32]);
+        let writer = SigningKey::from_bytes(&[72; 32]);
+        let mut store = MemoryRepo::default();
+        let collection: Collection<SimpleArchive> =
+            store.collection("changed control authority", policy(&root)).unwrap();
+        store
+            .commit(collection, &writer, entity! { crate::metadata::name: "waiting" })
+            .unwrap();
+        let control = store.snapshot().unwrap();
+        let residency = store.snapshot().unwrap();
+        store
+            .insert_proof(CapabilityProof::new(
+                CapabilityResource::from(collection.handle()),
+                &root,
+                write_capability(),
+                writer.verifying_key(),
+            ))
+            .unwrap();
+        let changed = store.snapshot().unwrap();
+        assert_eq!(changed.changes_since(&control), StoreChanges::CAPABILITY_PROOFS);
+        assert!(!std::sync::Arc::ptr_eq(&control.memo, &changed.memo));
+        let lineage = BTreeSet::from([collection.handle()]);
+        assert_eq!(changed.index(&lineage).unwrap().published().len(), 1);
+        let old = control.index(&lineage).unwrap();
+        assert!(old.published().is_empty());
+        assert_eq!(old.parked_on_signers(), 1);
+        assert_eq!(residency.index(&lineage).unwrap(), old);
+    }
+
+    #[test]
+    fn changed_blob_residency_forks_the_memo_without_filling_old_misses() {
+        let root = SigningKey::from_bytes(&[71; 32]);
+        let mut elsewhere = MemoryRepo::default();
+        let collection: Collection<SimpleArchive> =
+            elsewhere.collection("late control descriptor", policy(&root)).unwrap();
+        let record = elsewhere
+            .commit(collection, &root, entity! { crate::metadata::name: "one" })
+            .unwrap();
+        let descriptor: Blob<UnknownBlob> = elsewhere.snapshot().unwrap()
+            .get(collection.handle().transmute()).unwrap();
+        let mut store = MemoryRepo::default();
+        // Give both observations the ordinary capability definitions, while
+        // withholding only the descriptor whose arrival this test isolates.
+        let _: Collection<SimpleArchive> = store
+            .collection("known capability definitions", policy(&root)).unwrap();
+        store.insert(CollectionRecord::Commit(record)).unwrap();
+        let control = store.snapshot().unwrap();
+        let residency = store.snapshot().unwrap();
+        store.put::<UnknownBlob, _>(descriptor).unwrap();
+        let changed = store.snapshot().unwrap();
+        assert_eq!(changed.changes_since(&control), StoreChanges::BLOBS);
+        assert!(!std::sync::Arc::ptr_eq(&control.memo, &changed.memo));
+        assert!(!control.contains_blob(collection.handle()).unwrap());
+        assert!(changed.contains_blob(collection.handle()).unwrap());
+        let lineage = BTreeSet::from([collection.handle()]);
+        assert_eq!(changed.index(&lineage).unwrap().published().len(), 1);
+        let old = control.index(&lineage).unwrap();
+        assert!(old.published().is_empty());
+        assert_eq!(old.parked_on_lineages(), 1);
+        assert_eq!(residency.index(&lineage).unwrap(), old);
+    }
+
+    #[test]
+    fn unchanged_pile_snapshots_share_late_control_warming() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SigningKey::from_bytes(&[73; 32]);
+        let path = dir.path().join("memo.pile");
+        std::fs::File::create(&path).unwrap();
+        let mut store = crate::repo::pile::Pile::open(&path).unwrap();
+        let collection: Collection<SimpleArchive> =
+            store.collection("pile control warming", policy(&root)).unwrap();
+        store
+            .commit(collection, &root, entity! { crate::metadata::name: "one" })
+            .unwrap();
+        let control = store.snapshot().unwrap();
+        let residency = store.snapshot().unwrap();
+        assert_eq!(residency.changes_since(&control), StoreChanges::NONE);
+        let lineage = BTreeSet::from([collection.handle()]);
+        let warmed = control.index(&lineage).unwrap();
+        assert_eq!(warmed.published().len(), 1);
+        assert!(residency.memo.lock().unwrap().settled.contains(&collection.handle()));
+        let next = store.snapshot().unwrap();
+        assert!(next.memo.lock().unwrap().settled.contains(&collection.handle()));
+        assert_eq!(next.index(&lineage).unwrap(), warmed);
     }
 
     /// Drive one store through every arrival the index reacts to -- a
