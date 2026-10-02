@@ -49,8 +49,8 @@ use crate::identity::iroh_secret;
 use crate::inventory::ReconcileQos;
 use crate::protocol::{
     OP_FIND_NODE, OP_GET_BLOB, OP_PROVIDER_GET, OP_PROVIDER_PUT, PILE_SYNC_ALPN, PROVIDER_PUT_FULL,
-    PROVIDER_PUT_OK, RawHash, op_find_node, op_get_blob, op_provider_get, op_provider_put,
-    recv_hash, recv_u8, send_hash, send_u8, serve_get_blob,
+    PROVIDER_PUT_OK, RawHash, op_find_node, op_get_blob_with_limit, op_provider_get,
+    op_provider_put, recv_hash, recv_u8, send_hash, send_u8, serve_get_blob,
 };
 use crate::provider::{
     ProviderDirectory, ProviderKey, ProviderObservation, ProviderPublication, ProviderPublisher,
@@ -1149,25 +1149,188 @@ struct PublicationOutcome {
     completed_at: crate::clock::Mono,
 }
 
-/// The host owns at most one descriptor fetch per explicitly active collection,
-/// including a fetched value waiting for admission. Repeated repair ticks must
-/// not create detached copies behind a full store-side channel.
+// Warmup policy, not descriptor validity or ordinary exact-read limits.
+pub(crate) const METADATA_BLOB_BYTES: u64 = 1024 * 1024;
+const METADATA_DEPENDENCIES: usize = 64;
+const METADATA_CANDIDATES: usize = 256;
+const METADATA_SELECTIONS_PER_ROUND: usize = 256;
+const METADATA_COLLECTIONS_IN_FLIGHT: usize = 4;
+const METADATA_CHILDREN_IN_FLIGHT: usize = 4;
+const METADATA_FETCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+const METADATA_CHILD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// One owned warmup per pull-selected collection, including pending admission.
+/// No detached fetch survives removal, host shutdown, or the attempt deadline.
 #[derive(Default)]
 struct DescriptorFetches {
-    pending: HashMap<RawHash, futures::future::BoxFuture<'static, ()>>,
+    pending: PATCH<32, IdentitySchema, Mutex<futures::future::BoxFuture<'static, ()>>>,
+    after: Option<RawHash>,
 }
 
 impl DescriptorFetches {
     fn start(&mut self, collection: RawHash, fetch: impl Future<Output = ()> + Send + 'static) {
-        self.pending
-            .entry(collection)
-            .or_insert_with(|| fetch.boxed());
+        if self.pending.get(&collection).is_none()
+            && self.pending.len() < METADATA_COLLECTIONS_IN_FLIGHT as u64
+        {
+            self.pending.insert(&PatchEntry::with_value(
+                &collection,
+                Mutex::new(
+                    async move {
+                        let _ = tokio::time::timeout(METADATA_FETCH_DEADLINE, fetch).await;
+                    }
+                    .boxed(),
+                ),
+            ));
+            self.after = Some(collection);
+        }
     }
 
     fn poll(&mut self, mut is_active: impl FnMut(&RawHash) -> bool) {
-        self.pending.retain(|collection, fetch| {
-            is_active(collection) && fetch.as_mut().now_or_never().is_none()
-        });
+        // Scratch removal list only; the retained owner index is PATCH.
+        let removed: Vec<_> = self
+            .pending
+            .iter_ordered()
+            .filter(|collection| {
+                !is_active(collection)
+                    || self
+                        .pending
+                        .get(*collection)
+                        .unwrap()
+                        .lock()
+                        .unwrap()
+                        .as_mut()
+                        .now_or_never()
+                        .is_some()
+            })
+            .copied()
+            .collect();
+        for collection in removed {
+            self.pending.remove(&collection);
+        }
+    }
+
+    fn selected_round<V>(
+        &self,
+        active: &PATCH<32, IdentitySchema, V>,
+        pulls: bool,
+    ) -> Vec<RawHash> {
+        if !pulls {
+            return Vec::new();
+        }
+        // A bounded observation of the selected relation, not a second
+        // collection catalogue. Resume after the last admitted attempt.
+        active
+            .iter_ordered()
+            .filter(|raw| self.after.is_none_or(|after| **raw > after))
+            .chain(
+                active
+                    .iter_ordered()
+                    .take_while(|raw| self.after.is_some_and(|after| **raw <= after)),
+            )
+            .take(METADATA_SELECTIONS_PER_ROUND)
+            .copied()
+            .collect()
+    }
+}
+
+fn descriptor_metadata(bytes: Bytes) -> Vec<RawHash> {
+    use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+    use triblespace_core::blob::encodings::utf8string::UTF8String;
+    use triblespace_core::capability::CapabilityHandle;
+    use triblespace_core::capability::policy::{capability_handle, resource_policy};
+    use triblespace_core::collection::{KIND_COLLECTION_DESCRIPTOR, collection_name};
+    use triblespace_core::prelude::{find, pattern};
+    use triblespace_core::trible::TribleSet;
+
+    // Bound resident input too, before archive decoding or typed joins. Unknown
+    // facts are ignored; a warmup limit never declares a descriptor invalid.
+    if bytes.len() as u64 > METADATA_BLOB_BYTES {
+        return Vec::new();
+    }
+    let Ok(facts) = Blob::<SimpleArchive>::new(bytes).try_from_blob::<TribleSet>() else {
+        return Vec::new();
+    };
+    let names = find!(
+        (name: Inline<Handle<UTF8String>>),
+        pattern!(&facts, [{
+            triblespace_core::metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            collection_name: ?name,
+        }])
+    )
+    .map(|(name,)| name.raw);
+    // Acquire associated definition bytes, not policy authority. Bound raw
+    // linked rows without interpreting policy (a rejecting policy iterator
+    // can perform arbitrarily many joins before yielding one supported row).
+    let definitions = find!(
+        (binding: triblespace_core::id::Id, handle: CapabilityHandle),
+        pattern!(&facts, [
+            { triblespace_core::metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+              resource_policy: ?binding },
+            { ?binding @ capability_handle: ?handle },
+        ])
+    )
+    .map(|(_, handle)| handle.raw);
+    // Ephemeral de-duplication of this bounded descriptor observation only.
+    let mut seen = BTreeSet::new();
+    names
+        .chain(definitions)
+        .take(METADATA_CANDIDATES)
+        .filter(|handle| seen.insert(*handle))
+        .take(METADATA_DEPENDENCIES)
+        .collect()
+}
+
+async fn warm_descriptor<R, F>(
+    collection: RawHash,
+    resident: R,
+    fetch: F,
+    events: tokio::sync::mpsc::Sender<NetEventBatch>,
+) where
+    R: Fn(RawHash) -> Option<Bytes>,
+    F: Fn(RawHash) -> futures::future::BoxFuture<'static, Option<Blob<UnknownBlob>>>,
+{
+    let bytes = match resident(collection) {
+        Some(bytes) => bytes,
+        None => {
+            let Ok(Some(verified)) =
+                tokio::time::timeout(INTERACTIVE_FETCH_DEADLINE, fetch(collection)).await
+            else {
+                return;
+            };
+            let bytes = verified.bytes.clone();
+            let mut batch = NetEventBatch::default();
+            if batch.try_push(NetEvent::Blob(verified)).is_err()
+                || events.send(batch).await.is_err()
+            {
+                return;
+            }
+            bytes
+        }
+    };
+    let dependencies = descriptor_metadata(bytes);
+    let mut pending = futures::stream::iter(
+        dependencies
+            .into_iter()
+            .filter(|handle| resident(*handle).is_none()),
+    )
+    .map(|handle| {
+        let future = fetch(handle);
+        async move {
+            tokio::time::timeout(METADATA_CHILD_DEADLINE, future)
+                .await
+                .ok()
+                .flatten()
+        }
+    })
+    .buffer_unordered(METADATA_CHILDREN_IN_FLIGHT);
+    while let Some(answer) = pending.next().await {
+        let Some(verified) = answer else {
+            continue;
+        };
+        let mut batch = NetEventBatch::default();
+        if batch.try_push(NetEvent::Blob(verified)).is_err() || events.send(batch).await.is_err() {
+            return;
+        }
     }
 }
 
@@ -1944,34 +2107,52 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
             // The anti-entropy tick also notices expired participant leases,
             // but DHT recovery keeps its own backoff and in-flight state.
             next_discovery = next_discovery.min(now);
+            for raw in descriptor_fetches
+                .selected_round(current_collections, config.qos.direction.pulls())
+                .into_iter()
+                .take(METADATA_SELECTIONS_PER_ROUND)
+            {
+                if descriptor_fetches.pending.len() >= METADATA_COLLECTIONS_IN_FLIGHT as u64 {
+                    break;
+                }
+                let snapshot = wiring.snapshot.borrow().clone();
+                let client = provider_client.clone();
+                let events = wiring.evt_tx.clone();
+                descriptor_fetches.start(
+                    raw,
+                    warm_descriptor(
+                        raw,
+                        move |handle| {
+                            snapshot
+                                .as_ref()
+                                .and_then(|snapshot| snapshot.get_blob(&handle))
+                        },
+                        move |handle| {
+                            let client = client.clone();
+                            async move {
+                                client
+                                    .fetch_blob_with_limit(
+                                        handle,
+                                        Some(BACKGROUND_LOOKUP_DEADLINE),
+                                        METADATA_BLOB_BYTES,
+                                    )
+                                    .await
+                                    .ok()
+                                    .flatten()
+                            }
+                            .boxed()
+                        },
+                        events,
+                    ),
+                );
+                // A resident/no-work attempt must not occupy a scarce owner
+                // slot until the next thirty-second anti-entropy period.
+                // Bound how many such ready observations this round performs.
+                descriptor_fetches.poll(|raw| current_collections.get(raw).is_some());
+            }
             for raw in current_collections.iter_ordered() {
                 if config.qos.direction.pulls() {
                     let collection = CollectionHandle::new(*raw);
-                    let descriptor_missing = wiring
-                        .snapshot
-                        .borrow()
-                        .as_ref()
-                        .is_none_or(|snapshot| snapshot.get_blob(raw).is_none());
-                    if descriptor_missing {
-                        let client = provider_client.clone();
-                        let events = wiring.evt_tx.clone();
-                        descriptor_fetches.start(collection.raw, async move {
-                            match client
-                                .fetch_blob(collection.raw, Some(BACKGROUND_LOOKUP_DEADLINE))
-                                .await
-                            {
-                                Ok(Some(verified)) => {
-                                    let mut batch = NetEventBatch::default();
-                                    let _ = batch.try_push(NetEvent::Blob(verified));
-                                    let _ = events.send(batch).await;
-                                }
-                                Ok(None) => {}
-                                Err(error) => {
-                                    debug!(%error, "collection descriptor fetch failed");
-                                }
-                            }
-                        });
-                    }
                     // Periodic gossip replaces blind pulls of every remembered
                     // participant. Only incomplete/failed work needs a retry;
                     // ordinary new work is derived from advertised roots.
@@ -2507,10 +2688,20 @@ impl<T: Transport> ProviderClient<T> {
         hash: RawHash,
         peer: PeerId,
     ) -> anyhow::Result<Option<Blob<UnknownBlob>>> {
+        self.fetch_from_provider_with_limit(hash, peer, crate::protocol::MAX_EXACT_BLOB_BYTES)
+            .await
+    }
+
+    async fn fetch_from_provider_with_limit(
+        &self,
+        hash: RawHash,
+        peer: PeerId,
+        max_bytes: u64,
+    ) -> anyhow::Result<Option<Blob<UnknownBlob>>> {
         let connection = pool_get(&self.transport, &self.pool, peer).await?;
         let response = tokio::time::timeout(
             OP_DEADLINE,
-            op_get_blob(connection.conn(), self.my_id, &hash),
+            op_get_blob_with_limit(connection.conn(), self.my_id, &hash, max_bytes),
         )
         .await
         .map_err(|_| anyhow::anyhow!("exact blob provider request deadline exceeded"))
@@ -2524,7 +2715,9 @@ impl<T: Transport> ProviderClient<T> {
             Err(error) => {
                 // Local receive saturation says nothing about the authenticated
                 // provider or this connection. Keep it warm for a later retry.
-                if !error.is::<crate::protocol::ExactBlobReceiveResourceError>() {
+                if !error.is::<crate::protocol::ExactBlobReceiveResourceError>()
+                    && !error.is::<crate::protocol::ExactBlobReceivePolicyError>()
+                {
                     pool_invalidate(&self.pool, peer, &connection.entry);
                 }
                 Err(error)
@@ -2540,6 +2733,16 @@ impl<T: Transport> ProviderClient<T> {
         &self,
         hash: RawHash,
         lookup_limit: Option<std::time::Duration>,
+    ) -> anyhow::Result<Option<Blob<UnknownBlob>>> {
+        self.fetch_blob_with_limit(hash, lookup_limit, crate::protocol::MAX_EXACT_BLOB_BYTES)
+            .await
+    }
+
+    async fn fetch_blob_with_limit(
+        &self,
+        hash: RawHash,
+        lookup_limit: Option<std::time::Duration>,
+        max_bytes: u64,
     ) -> anyhow::Result<Option<Blob<UnknownBlob>>> {
         enum Progress {
             Routing(PeerId, anyhow::Result<Vec<PeerId>>),
@@ -2603,7 +2806,14 @@ impl<T: Transport> ProviderClient<T> {
                             directory_body_turn = false;
                             bodies_in_flight += 1;
                             requests.push(Box::pin(async move {
-                                Progress::Blob(self.fetch_from_provider(hash, peer).await)
+                                Progress::Blob(
+                                    if max_bytes == crate::protocol::MAX_EXACT_BLOB_BYTES {
+                                        self.fetch_from_provider(hash, peer).await
+                                    } else {
+                                        self.fetch_from_provider_with_limit(hash, peer, max_bytes)
+                                            .await
+                                    },
+                                )
                             }));
                             continue;
                         }
@@ -3353,6 +3563,397 @@ mod tests {
             assert!(fetches.pending.is_empty());
             completion.await.unwrap();
         }
+    }
+
+    fn metadata_fixture(
+        name: &str,
+    ) -> (
+        Blob<UnknownBlob>,
+        super::PATCH<32, super::IdentitySchema, anybytes::Bytes>,
+    ) {
+        use triblespace_core::blob::IntoBlob;
+        use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+        use triblespace_core::capability::policy::resource_policy;
+        use triblespace_core::collection::{
+            AdmissionPolicy, CollectionPolicy, KIND_COLLECTION_DESCRIPTOR, collection_name,
+        };
+        use triblespace_core::prelude::{BlobStoreGet, BlobStoreList, SnapshotSource, entity};
+
+        let fragment = entity! {
+            triblespace_core::metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            collection_name: name.to_owned(),
+            resource_policy*: CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open).fragment(),
+            // A real attached blob, but not part of this typed warmup grammar.
+            triblespace_core::metadata::description: "do not prefetch this annotation".to_owned(),
+        };
+        let descriptor: Blob<SimpleArchive> = fragment.facts().to_blob();
+        let mut answers = super::PATCH::new();
+        let reader = fragment.blobs().clone().snapshot().unwrap();
+        for info in reader.blobs() {
+            let handle = info.unwrap().handle;
+            let bytes = reader.get::<anybytes::Bytes, _>(handle).unwrap();
+            answers.insert(&super::PatchEntry::with_value(&handle.raw, bytes));
+        }
+        answers.insert(&super::PatchEntry::with_value(
+            &descriptor.get_handle().raw,
+            descriptor.bytes.clone(),
+        ));
+        (descriptor.transmute(), answers)
+    }
+
+    #[tokio::test]
+    async fn selected_empty_descriptor_warmup_lands_name_but_not_annotations_or_other_collections()
+    {
+        use futures::FutureExt;
+        use std::sync::{Arc, Mutex};
+        use triblespace_core::repo::{BlobStoreGet, BlobStorePut, SnapshotSource};
+        let (descriptor, answers) = metadata_fixture("selected empty");
+        let (other, _) = metadata_fixture("unselected empty");
+        let collection = descriptor.get_handle().raw;
+        let dependencies = super::descriptor_metadata(descriptor.bytes.clone());
+        let name = dependencies[0];
+        let answers = Arc::new(answers);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = calls.clone();
+        let (events, mut received) = tokio::sync::mpsc::channel(16);
+        let mut owners = DescriptorFetches::default();
+        owners.start(
+            collection,
+            super::warm_descriptor(
+                collection,
+                |_| None,
+                move |hash| {
+                    observed.lock().unwrap().push(hash);
+                    let answer = answers.get(&hash).cloned();
+                    async move { answer.map(Blob::<UnknownBlob>::new) }.boxed()
+                },
+                events,
+            ),
+        );
+        owners.poll(|raw| *raw == collection);
+        assert!(owners.pending.is_empty());
+
+        let mut store = triblespace_core::repo::memoryrepo::MemoryRepo::default();
+        while let Ok(batch) = received.try_recv() {
+            for event in batch.into_events() {
+                let super::NetEvent::Blob(blob) = event else {
+                    panic!("only blobs");
+                };
+                store.put::<UnknownBlob, _>(blob).unwrap();
+            }
+        }
+        let snapshot = store.snapshot().unwrap();
+        assert!(
+            snapshot
+                .get::<anybytes::Bytes, UnknownBlob>(super::Inline::new(collection))
+                .is_ok()
+        );
+        assert_eq!(
+            &*snapshot
+                .get::<anybytes::Bytes, UnknownBlob>(super::Inline::new(name))
+                .unwrap(),
+            b"selected empty"
+        );
+        let calls = calls.lock().unwrap();
+        assert!(calls.contains(&collection));
+        assert!(dependencies.iter().all(|hash| calls.contains(hash)));
+        assert_eq!(calls.len(), dependencies.len() + 1);
+        assert!(!calls.contains(&other.get_handle().raw));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_metadata_child_does_not_starve_a_later_sibling() {
+        use futures::FutureExt;
+        use std::sync::Arc;
+        let (descriptor, answers) = metadata_fixture("reachable sibling");
+        let collection = descriptor.get_handle().raw;
+        let dependencies = super::descriptor_metadata(descriptor.bytes.clone());
+        let name = dependencies[0];
+        let answers = Arc::new(answers);
+        let (events, mut received) = tokio::sync::mpsc::channel(16);
+        let warmup = super::warm_descriptor(
+            collection,
+            move |hash| (hash == collection).then(|| descriptor.bytes.clone()),
+            move |hash| {
+                let answer = answers.get(&hash).cloned();
+                async move {
+                    if hash == name {
+                        std::future::pending::<()>().await;
+                    }
+                    answer.map(Blob::<UnknownBlob>::new)
+                }
+                .boxed()
+            },
+            events,
+        );
+        warmup.await;
+        // The name times out, but another recognized dependency was attempted
+        // and the whole attempt finishes within its warmup-only child budget.
+        assert_eq!(dependencies.len(), 3);
+        assert!(received.try_recv().is_ok());
+        assert!(received.try_recv().is_ok());
+        assert!(received.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn metadata_owners_bound_fanout_rotate_and_skip_push_only() {
+        let mut active = super::PATCH::<32, super::IdentitySchema>::new();
+        for byte in 1..=9 {
+            active.insert(&super::PatchEntry::new(&[byte; 32]));
+        }
+        let mut owners = DescriptorFetches::default();
+        assert!(owners.selected_round(&active, false).is_empty());
+        for raw in owners.selected_round(&active, true) {
+            owners.start(raw, std::future::pending());
+        }
+        assert_eq!(
+            owners.pending.len(),
+            super::METADATA_COLLECTIONS_IN_FLIGHT as u64
+        );
+        assert_eq!(owners.selected_round(&active, true)[0], [5; 32]);
+        owners.poll(|_| false);
+        assert!(owners.pending.is_empty());
+        for raw in owners.selected_round(&active, true) {
+            owners.start(raw, std::future::pending());
+        }
+        assert_eq!(owners.selected_round(&active, true)[0], [9; 32]);
+    }
+
+    #[tokio::test]
+    async fn resident_metadata_prefix_releases_owner_slots_in_the_same_selection_round() {
+        use futures::FutureExt;
+        use std::sync::Arc;
+        let mut resident: super::PATCH<32, super::IdentitySchema, anybytes::Bytes> =
+            super::PATCH::new();
+        let mut active = super::PATCH::<32, super::IdentitySchema>::new();
+        for ordinal in 0..12 {
+            let (descriptor, answers) = metadata_fixture(&format!("warm prefix {ordinal}"));
+            let collection = descriptor.get_handle().raw;
+            for raw in answers.iter_ordered() {
+                resident.insert(&super::PatchEntry::with_value(
+                    raw,
+                    answers.get(raw).unwrap().clone(),
+                ));
+            }
+            active.insert(&super::PatchEntry::new(&collection));
+        }
+        let cold = *active.iter_ordered().max().unwrap();
+        resident.remove(&cold);
+        let resident = Arc::new(resident);
+        let (events, _received) = tokio::sync::mpsc::channel(16);
+        let mut owners = DescriptorFetches::default();
+        for raw in owners
+            .selected_round(&active, true)
+            .into_iter()
+            .take(super::METADATA_SELECTIONS_PER_ROUND)
+        {
+            let resident = resident.clone();
+            owners.start(
+                raw,
+                super::warm_descriptor(
+                    raw,
+                    move |hash| resident.get(&hash).cloned(),
+                    |_| std::future::pending().boxed(),
+                    events.clone(),
+                ),
+            );
+            owners.poll(|raw| active.get(raw).is_some());
+        }
+        assert_eq!(owners.pending.len(), 1);
+        assert!(
+            owners.pending.get(&cold).is_some(),
+            "warm prefix cannot consume all launch slots"
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_metadata_warmup_is_cancelled_while_real_admission_handoff_is_blocked() {
+        use futures::FutureExt;
+        let (descriptor, _) = metadata_fixture("blocked handoff");
+        let collection = descriptor.get_handle().raw;
+        let (events, mut received) = tokio::sync::mpsc::channel(1);
+        events.try_send(super::NetEventBatch::default()).unwrap();
+        let (owned, mut observer) = tokio::sync::oneshot::channel::<()>();
+        let mut owners = DescriptorFetches::default();
+        owners.start(collection, async move {
+            let _owned = owned;
+            super::warm_descriptor(
+                collection,
+                |_| None,
+                move |_| {
+                    let descriptor = descriptor.clone();
+                    async move { Some(descriptor) }.boxed()
+                },
+                events,
+            )
+            .await;
+        });
+        owners.poll(|raw| *raw == collection);
+        assert_eq!(owners.pending.len(), 1);
+        assert_eq!(
+            observer.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        );
+        owners.poll(|_| false);
+        assert!(owners.pending.is_empty());
+        assert_eq!(
+            observer.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        );
+        assert!(received.try_recv().unwrap().is_empty());
+        assert!(
+            received.try_recv().is_err(),
+            "cancelled metadata must not land later"
+        );
+    }
+
+    #[test]
+    fn resident_oversized_descriptor_is_not_decoded_and_typed_fanout_is_bounded() {
+        use triblespace_core::blob::IntoBlob;
+        use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+        use triblespace_core::collection::{KIND_COLLECTION_DESCRIPTOR, collection_name};
+        use triblespace_core::prelude::entity;
+        assert!(
+            super::descriptor_metadata(anybytes::Bytes::from_source(vec![
+                0_u8;
+                super::METADATA_BLOB_BYTES
+                    as usize
+                    + 1
+            ]))
+            .is_empty()
+        );
+        let mut fragment = triblespace_core::trible::Fragment::empty();
+        for ordinal in 0..512 {
+            fragment += entity! {
+                triblespace_core::metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+                collection_name: format!("name-{ordinal}"),
+            };
+        }
+        let blob: Blob<SimpleArchive> = fragment.facts().to_blob();
+        assert_eq!(
+            super::descriptor_metadata(blob.bytes).len(),
+            super::METADATA_DEPENDENCIES
+        );
+    }
+
+    #[test]
+    fn rejected_policy_cross_product_is_not_interpreted_before_the_raw_row_bound() {
+        use triblespace_core::blob::IntoBlob;
+        use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+        use triblespace_core::capability::policy::{
+            KIND_ADMISSION_POLICY_QUORUM, admission_invoke_threshold, capability_handle,
+            resource_policy,
+        };
+        use triblespace_core::collection::KIND_COLLECTION_DESCRIPTOR;
+        use triblespace_core::prelude::{entity, rngid};
+        let binding = rngid();
+        let handles = (0_u32..5000).map(|ordinal| {
+            let mut raw = [0; 32];
+            raw[..4].copy_from_slice(&ordinal.to_be_bytes());
+            super::Inline::<super::Handle<SimpleArchive>>::new(raw)
+        });
+        let mut fragment = entity! { &binding @
+            triblespace_core::metadata::tag: KIND_ADMISSION_POLICY_QUORUM,
+            admission_invoke_threshold: 0_u32,
+            capability_handle*: handles,
+        };
+        for _ in 0..5000 {
+            let descriptor = rngid();
+            fragment += entity! { &descriptor @
+                triblespace_core::metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+                resource_policy: &binding,
+            };
+        }
+        let blob: Blob<SimpleArchive> = fragment.facts().to_blob();
+        assert!(blob.bytes.len() as u64 <= super::METADATA_BLOB_BYTES);
+        // Twenty-five million potential unsupported interpretations remain
+        // ordinary facts. Only a bounded prefix of typed associated handles
+        // is observed, without attempting to decide this quorum's authority.
+        assert_eq!(
+            super::descriptor_metadata(blob.bytes).len(),
+            super::METADATA_DEPENDENCIES
+        );
+    }
+
+    #[cfg(feature = "sim")]
+    #[tokio::test]
+    async fn warmup_byte_rejection_preserves_shared_provider_connection_and_concurrent_exact_read()
+    {
+        use crate::transport::Conn;
+        use crate::transport::sim::{SimConfig, SimNet};
+        use std::sync::{Arc, Mutex};
+        let requester_key = SigningKey::from_bytes(&[91; 32]);
+        let provider_key = SigningKey::from_bytes(&[92; 32]);
+        let requester = requester_key.verifying_key().to_bytes();
+        let provider = provider_key.verifying_key().to_bytes();
+        let net = SimNet::new(0xB10B_CAFE, SimConfig::default());
+        let requester_harness = net.join(&requester_key);
+        let mut provider_harness = net.join(&provider_key);
+        let bytes =
+            anybytes::Bytes::from_source(vec![19_u8; super::METADATA_BLOB_BYTES as usize + 1]);
+        let hash = Blob::<UnknownBlob>::new(bytes.clone()).get_handle().raw;
+        let serving = tokio::spawn(async move {
+            let connection = provider_harness.incoming.recv().await.unwrap().conn;
+            while let Some((mut send, mut recv)) = connection.accept_bi().await {
+                let bytes = bytes.clone();
+                tokio::spawn(async move {
+                    assert_eq!(
+                        crate::protocol::recv_u8(&mut recv).await.unwrap(),
+                        crate::protocol::OP_GET_BLOB
+                    );
+                    let _ = crate::protocol::serve_get_blob(
+                        &mut recv,
+                        &mut send,
+                        requester,
+                        provider,
+                        |locator| (locator == super::blob_locator(hash)).then_some(hash),
+                        |requested| (requested == hash).then_some(bytes),
+                    )
+                    .await;
+                });
+            }
+        });
+        let client = super::ProviderClient {
+            transport: requester_harness.transport,
+            pool: super::new_shared_pool(),
+            providers: Arc::new(Mutex::new(super::ProviderDirectory::new(requester))),
+            candidates: Arc::new(Mutex::new(super::RoutingTable::new(requester, [provider]))),
+            my_id: requester,
+        };
+        let before = super::pool_get(&client.transport, &client.pool, provider)
+            .await
+            .unwrap();
+        let (limited, ordinary) = tokio::join!(
+            client.fetch_from_provider_with_limit(hash, provider, super::METADATA_BLOB_BYTES),
+            client.fetch_from_provider(hash, provider),
+        );
+        assert!(
+            limited
+                .unwrap_err()
+                .is::<crate::protocol::ExactBlobReceivePolicyError>()
+        );
+        assert_eq!(
+            ordinary.unwrap().unwrap().bytes.len() as u64,
+            super::METADATA_BLOB_BYTES + 1
+        );
+        let after = client
+            .pool
+            .lock()
+            .unwrap()
+            .entries
+            .get(&provider)
+            .cloned()
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&before.entry, &after),
+            "local warmup policy must not evict a shared connection"
+        );
+        let exact = crate::protocol::op_get_blob(before.conn(), requester, &hash)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(exact.bytes.len() as u64, super::METADATA_BLOB_BYTES + 1);
+        serving.abort();
     }
 
     #[test]

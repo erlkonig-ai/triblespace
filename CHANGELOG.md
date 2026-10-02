@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Warm recognized names and resource-policy definition blobs for explicitly
+  pull-selected collections, including empty collections, with bounded host
+  ownership, typed extraction and pre-body byte limits. Ordinary exact reads,
+  passive snapshots and resident-only stores retain their existing semantics.
+
+- Use file-backed mapped sections for SimpleArchive unions and portable
+  Succinct CPU construction/merging, preserving canonical bytes and hashes.
+  See the `triblespace-core` changelog for allocation and working-set limits.
+
 ## [0.47.0] - 2026-10-01
 
 - Release the ten workspace packages together at 0.47.0, including the

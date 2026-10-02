@@ -37,6 +37,10 @@
 use std::fmt;
 use std::ops::Range;
 
+use anybytes::area::{ByteArea, Section, SectionWriter};
+use anybytes::{Bytes, View};
+use zerocopy::{FromBytes, Immutable, KnownLayout};
+
 use crate::id::{id_from_value, Id};
 use crate::inline::RawInline;
 
@@ -189,14 +193,14 @@ pub(crate) struct PortableParts<'a> {
 pub(crate) struct PortableView<'a> {
     bytes: &'a [u8],
     layout: Layout,
-    prefix_counts: [Vec<usize>; PREFIX_COUNT],
+    prefix_counts: [View<[usize]>; PREFIX_COUNT],
 }
 
 /// Exact, runtime-independent logical content of one canonical portable
 /// archive. Codes are local to `domain`; `rows` are strictly increasing EAV.
 pub(super) struct CanonicalEavU32 {
-    pub(super) domain: Vec<RawInline>,
-    pub(super) rows: Vec<[u32; 3]>,
+    pub(super) domain: View<[RawInline]>,
+    pub(super) rows: View<[[u32; 3]]>,
 }
 
 impl PortableView<'_> {
@@ -229,7 +233,7 @@ impl PortableView<'_> {
         }
 
         let expected = canonical_bytes_from_eav(self, &rows)?;
-        if expected != self.bytes {
+        if expected.as_ref() != self.bytes {
             return Err(PortableError::new(
                 "payload is not the exact canonical derivation of its EAV source ring",
             ));
@@ -276,41 +280,45 @@ impl PortableView<'_> {
                 "decoded EAV source rows are not strictly increasing",
             ));
         }
-        let domain = (0..self.layout.domain_len)
-            .map(|code| self.domain_value(code))
-            .collect::<Vec<_>>();
+        let mut area = scratch_area()?;
+        let mut writer = area.sections();
+        let mut domain = reserve::<RawInline>(&mut writer, self.layout.domain_len)?;
+        for (code, value) in domain.iter_mut().enumerate() {
+            *value = self.domain_value(code);
+        }
+        let domain = freeze_view(domain)?;
 
         Ok(CanonicalEavU32 { domain, rows })
     }
 
-    fn candidate_eav_codes(&self) -> Result<Vec<[usize; 3]>, PortableError> {
+    fn candidate_eav_codes(&self) -> Result<View<[[usize; 3]]>, PortableError> {
         self.candidate_eav_codes_as(Ok)
     }
 
-    fn candidate_eav_codes_as<T>(
+    fn candidate_eav_codes_as<T: FromBytes + Immutable + KnownLayout + 'static>(
         &self,
         mut convert: impl FnMut(usize) -> Result<T, PortableError>,
-    ) -> Result<Vec<[T; 3]>, PortableError> {
-        let starts: [Vec<usize>; PREFIX_COUNT] = std::array::from_fn(|axis| {
+    ) -> Result<View<[[T; 3]]>, PortableError> {
+        let mut area = scratch_area()?;
+        let mut writer = area.sections();
+        let mut starts = Vec::with_capacity(PREFIX_COUNT);
+        for axis in 0..PREFIX_COUNT {
+            let mut section = reserve::<usize>(&mut writer, self.layout.domain_len)?;
             let mut cursor = 0usize;
-            self.prefix_counts[axis]
-                .iter()
-                .copied()
-                .map(|count| {
-                    let start = cursor;
-                    cursor += count;
-                    start
-                })
-                .collect::<Vec<_>>()
-        });
+            for (start, count) in section.iter_mut().zip(self.prefix_counts[axis].iter()) {
+                *start = cursor;
+                cursor += count;
+            }
+            starts.push(section);
+        }
 
-        let eav = PortableWavelet::new(self, Rotation::Eav);
-        let vea = PortableWavelet::new(self, Rotation::Vea);
-        let ave = PortableWavelet::new(self, Rotation::Ave);
+        let eav = PortableWavelet::new(self, Rotation::Eav)?;
+        let vea = PortableWavelet::new(self, Rotation::Vea)?;
+        let ave = PortableWavelet::new(self, Rotation::Ave)?;
         let value_starts = &starts[PrefixAxis::Value.index()];
         let attribute_starts = &starts[PrefixAxis::Attribute.index()];
 
-        let mut candidate = Vec::with_capacity(self.layout.triple_count);
+        let mut candidate = reserve::<[T; 3]>(&mut writer, self.layout.triple_count)?;
         for eav_position in 0..self.layout.triple_count {
             let value = eav.access(eav_position).ok_or_else(|| {
                 PortableError::new(format!("EAV wavelet cannot decode row {eav_position}"))
@@ -358,9 +366,9 @@ impl PortableView<'_> {
             if entity >= self.layout.domain_len {
                 return Err(PortableError::new("AVE entity code is outside the domain"));
             }
-            candidate.push([convert(entity)?, convert(attribute)?, convert(value)?]);
+            candidate[eav_position] = [convert(entity)?, convert(attribute)?, convert(value)?];
         }
-        Ok(candidate)
+        freeze_view(candidate)
     }
 }
 
@@ -369,8 +377,10 @@ fn verify_canonical_eav_u32(
     view: &PortableView<'_>,
     rows: &[[u32; 3]],
 ) -> Result<(), PortableError> {
-    let mut work = rows.to_vec();
-    let mut row_scratch = Vec::with_capacity(rows.len());
+    let mut work_storage = rows.to_vec();
+    let mut scratch_storage = vec![[0; 3]; rows.len()];
+    let mut work = work_storage.as_mut_slice();
+    let mut row_scratch = scratch_storage.as_mut_slice();
     let mut radix_counts = vec![0u32; view.layout.domain_len];
     let mut sequence = Vec::with_capacity(rows.len());
     let mut sequence_scratch = Vec::with_capacity(rows.len());
@@ -540,7 +550,7 @@ fn verify_canonical_rotation(
 fn canonical_bytes_from_eav(
     view: &PortableView<'_>,
     eav_rows: &[[usize; 3]],
-) -> Result<Vec<u8>, PortableError> {
+) -> Result<Bytes, PortableError> {
     let domain_len = view.layout.domain_len;
     let domain: Vec<_> = (0..domain_len)
         .map(|code| view.domain_value(code))
@@ -684,15 +694,22 @@ fn set_bit(words: &mut [u64], position: usize) {
 struct PortableWavelet<'a> {
     view: &'a PortableView<'a>,
     rotation: Rotation,
-    ranks: Vec<usize>,
+    ranks: View<[usize]>,
     rank_stride: usize,
     zero_counts: Vec<usize>,
 }
 
 impl<'a> PortableWavelet<'a> {
-    fn new(view: &'a PortableView<'a>, rotation: Rotation) -> Self {
+    fn new(view: &'a PortableView<'a>, rotation: Rotation) -> Result<Self, PortableError> {
         let rank_stride = view.layout.row_words + 1;
-        let mut ranks = vec![0usize; view.layout.alphabet_width * rank_stride];
+        let mut area = scratch_area()?;
+        let mut writer = area.sections();
+        let rank_len = view
+            .layout
+            .alphabet_width
+            .checked_mul(rank_stride)
+            .ok_or_else(|| PortableError::new("rank directory length overflows usize"))?;
+        let mut ranks = reserve::<usize>(&mut writer, rank_len)?;
         let mut zero_counts = vec![0usize; view.layout.alphabet_width];
         for (depth, zero_count) in zero_counts.iter_mut().enumerate() {
             let base = depth * rank_stride;
@@ -702,13 +719,13 @@ impl<'a> PortableWavelet<'a> {
             }
             *zero_count = view.layout.triple_count - ranks[base + view.layout.row_words];
         }
-        Self {
+        Ok(Self {
             view,
             rotation,
-            ranks,
+            ranks: freeze_view(ranks)?,
             rank_stride,
             zero_counts,
-        }
+        })
     }
 
     fn rank1(&self, depth: usize, position: usize) -> usize {
@@ -770,18 +787,34 @@ impl<'a> PortableWavelet<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PortableError {
     message: String,
+    allocation: bool,
 }
 
 impl PortableError {
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            allocation: false,
         }
+    }
+
+    pub(super) fn allocation(error: std::io::Error) -> Self {
+        Self {
+            message: error.to_string(),
+            allocation: true,
+        }
+    }
+
+    pub(super) fn is_allocation(&self) -> bool {
+        self.allocation
     }
 }
 
 impl fmt::Display for PortableError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.allocation {
+            return write!(formatter, "mapped succinct allocation: {}", self.message);
+        }
         write!(
             formatter,
             "invalid portable succinct archive: {}",
@@ -791,6 +824,90 @@ impl fmt::Display for PortableError {
 }
 
 impl std::error::Error for PortableError {}
+
+/// Start with an aligned word so empty typed sections still have a nonempty
+/// mapping. The prefix is outside every frozen logical section.
+pub(super) fn scratch_area() -> Result<ByteArea, PortableError> {
+    let mut area = ByteArea::new().map_err(PortableError::allocation)?;
+    area.sections()
+        .reserve::<u64>(1)
+        .map_err(PortableError::allocation)?;
+    Ok(area)
+}
+
+/// Check geometry before entering AnyBytes' unchecked section arithmetic.
+pub(super) fn reserve<'area, T: FromBytes + Immutable>(
+    writer: &mut SectionWriter<'area>,
+    len: usize,
+) -> Result<Section<'area, T>, PortableError> {
+    let bytes = len
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or_else(|| PortableError::new("mapped section byte length overflows usize"))?;
+    // A one-byte section exposes the writer's actual cursor without keeping
+    // duplicate allocation state. Unlike an empty probe it maps successfully
+    // even when the preceding section ends exactly at a page boundary.
+    let probe = writer.reserve::<u8>(1).map_err(PortableError::allocation)?;
+    let cursor = probe
+        .handle()
+        .offset
+        .checked_add(1)
+        .ok_or_else(|| PortableError::new("mapped area cursor overflows usize"))?;
+    drop(probe);
+    let alignment = std::mem::align_of::<T>();
+    let start = cursor
+        .checked_add(alignment - 1)
+        .map(|offset| offset & !(alignment - 1))
+        .ok_or_else(|| PortableError::new("mapped section alignment overflows usize"))?;
+    let end = start
+        .checked_add(bytes)
+        .ok_or_else(|| PortableError::new("mapped area byte length overflows usize"))?;
+    if end > isize::MAX as usize {
+        return Err(PortableError::new(
+            "mapped section exceeds addressable slice geometry",
+        ));
+    }
+    // AnyBytes maps through the section's end. An empty typed section whose
+    // aligned start is page-aligned would otherwise request a zero-byte mmap.
+    if len == 0 && start % page_size::get() == 0 {
+        if alignment >= page_size::get() {
+            return Err(PortableError::new(
+                "empty section alignment exceeds mapping geometry",
+            ));
+        }
+        let padding_end = cursor
+            .checked_add(alignment + 1)
+            .ok_or_else(|| PortableError::new("empty section padding overflows usize"))?;
+        if padding_end > isize::MAX as usize {
+            return Err(PortableError::new(
+                "empty section padding exceeds addressable geometry",
+            ));
+        }
+        writer
+            .reserve::<u8>(start - cursor + 1)
+            .map_err(PortableError::allocation)?;
+    }
+    writer.reserve::<T>(len).map_err(PortableError::allocation)
+}
+
+fn freeze_view<T: FromBytes + Immutable + KnownLayout + 'static>(
+    section: Section<'_, T>,
+) -> Result<View<[T]>, PortableError> {
+    section
+        .freeze()
+        .map_err(PortableError::allocation)?
+        .view::<[T]>()
+        .map_err(|error| PortableError::new(error.to_string()))
+}
+
+fn empty_counts() -> [View<[usize]>; PREFIX_COUNT] {
+    static EMPTY: [usize; 1] = [0];
+    std::array::from_fn(|_| {
+        Bytes::from_source(zerocopy::IntoBytes::as_bytes(&EMPTY[..]))
+            .slice(0..0)
+            .view::<[usize]>()
+            .expect("aligned empty typed view")
+    })
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct Layout {
@@ -892,7 +1009,7 @@ pub(crate) const fn alphabet_width(domain_len: usize) -> usize {
 }
 
 /// Writes one portable payload and validates its raw-layout invariants.
-pub(crate) fn encode(parts: PortableParts<'_>) -> Result<Vec<u8>, PortableError> {
+pub(crate) fn encode(parts: PortableParts<'_>) -> Result<Bytes, PortableError> {
     let layout = Layout::new(parts.triple_count, parts.domain.len())?;
 
     for (axis, words) in PrefixAxis::ALL.into_iter().zip(parts.prefixes) {
@@ -913,28 +1030,39 @@ pub(crate) fn encode(parts: PortableParts<'_>) -> Result<Vec<u8>, PortableError>
         .map_err(|_| PortableError::new("triple count does not fit u64"))?;
     let domain_len = u64::try_from(parts.domain.len())
         .map_err(|_| PortableError::new("domain cardinality does not fit u64"))?;
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(layout.byte_len)
-        .map_err(|_| PortableError::new("cannot allocate portable payload"))?;
+    let mut area = scratch_area()?;
+    let mut writer = area.sections();
+    let mut output = reserve::<u64>(&mut writer, layout.byte_len / WORD_LEN)?;
+    let bytes = zerocopy::IntoBytes::as_mut_bytes(output.as_mut_slice());
+    let mut position = 0;
     for value in parts.domain {
-        bytes.extend_from_slice(value);
+        bytes[position..position + RAW_INLINE_LEN].copy_from_slice(value);
+        position += RAW_INLINE_LEN;
     }
     for words in parts.prefixes {
-        push_words(&mut bytes, words);
+        for word in words {
+            bytes[position..position + WORD_LEN].copy_from_slice(&word.to_le_bytes());
+            position += WORD_LEN;
+        }
     }
     for words in parts.changes {
-        push_words(&mut bytes, words);
+        for word in words {
+            bytes[position..position + WORD_LEN].copy_from_slice(&word.to_le_bytes());
+            position += WORD_LEN;
+        }
     }
     for words in parts.wavelets {
-        push_words(&mut bytes, words);
+        for word in words {
+            bytes[position..position + WORD_LEN].copy_from_slice(&word.to_le_bytes());
+            position += WORD_LEN;
+        }
     }
-    push_word(&mut bytes, triple_count);
-    push_word(&mut bytes, domain_len);
+    bytes[position..position + WORD_LEN].copy_from_slice(&triple_count.to_le_bytes());
+    bytes[position + WORD_LEN..].copy_from_slice(&domain_len.to_le_bytes());
     debug_assert_eq!(bytes.len(), layout.byte_len);
 
     parse(&bytes)?;
-    Ok(bytes)
+    output.freeze().map_err(PortableError::allocation)
 }
 
 /// Writes the canonical portable payload directly from one EAV-sorted row set.
@@ -954,8 +1082,8 @@ pub(crate) fn encode(parts: PortableParts<'_>) -> Result<Vec<u8>, PortableError>
 /// stay `u32`; the caller must reject wider domains before entering here.
 pub(super) fn encode_canonical_eav_u32(
     domain: &[RawInline],
-    rows: Vec<[u32; 3]>,
-) -> Result<Vec<u8>, PortableError> {
+    rows: &mut [[u32; 3]],
+) -> Result<Bytes, PortableError> {
     encode_canonical_eav_u32_using(
         domain,
         rows,
@@ -975,17 +1103,19 @@ pub(super) fn encode_canonical_eav_u32(
 
 pub(super) fn encode_canonical_eav_u32_with_backend<B>(
     domain: &[RawInline],
-    rows: Vec<[u32; 3]>,
+    rows: &mut [[u32; 3]],
     backend: &B,
-) -> Result<Vec<u8>, PortableError>
+) -> Result<Bytes, PortableError>
 where
     B: WaveletMatrixFreezeBackend,
     B::Error: fmt::Display,
 {
-    // Vec<u8> promises no u64 alignment. Use one reusable rotation-sized
-    // allocation and serialize its words explicitly, without pointer casts or
-    // host-endian assumptions. The other five output rotations stay in place.
-    let mut packed = Vec::<u64>::new();
+    // One mapped, aligned rotation-sized staging section preserves the GPU
+    // seam; words are serialized explicitly in portable little-endian order.
+    let layout = Layout::new(rows.len(), domain.len())?;
+    let mut area = scratch_area()?;
+    let mut writer = area.sections();
+    let mut packed = reserve::<u64>(&mut writer, layout.row_words * layout.alphabet_width)?;
     encode_canonical_eav_u32_using(
         domain,
         rows,
@@ -994,7 +1124,6 @@ where
                 return Ok(());
             }
             let range = &layout.wavelets[rotation.index()];
-            packed.resize(range.len() / WORD_LEN, 0);
             packed.fill(0);
             let rotation = match rotation {
                 Rotation::Eav => SuccinctRotation::Eav,
@@ -1025,12 +1154,13 @@ where
                     "wavelet backend wrote nonzero {rotation:?} padding"
                 )));
             }
-            for (destination, word) in bytes[range.clone()].chunks_exact_mut(WORD_LEN).zip(&packed)
+            for (destination, word) in bytes[range.clone()]
+                .chunks_exact_mut(WORD_LEN)
+                .zip(packed.iter())
             {
                 destination.copy_from_slice(&word.to_le_bytes());
             }
-            sequence.clear();
-            scratch.clear();
+            let _ = scratch;
             Ok(())
         },
     )
@@ -1038,15 +1168,15 @@ where
 
 fn encode_canonical_eav_u32_using(
     domain: &[RawInline],
-    mut rows: Vec<[u32; 3]>,
+    rows: &mut [[u32; 3]],
     freeze: &mut impl FnMut(
         &mut [u8],
         &Layout,
         Rotation,
-        &mut Vec<u32>,
-        &mut Vec<u32>,
+        &mut [u32],
+        &mut [u32],
     ) -> Result<(), PortableError>,
-) -> Result<Vec<u8>, PortableError> {
+) -> Result<Bytes, PortableError> {
     if domain.len() > u32::MAX as usize {
         return Err(PortableError::new(format!(
             "ordered domain contains {} values, exceeding u32 construction codes",
@@ -1101,7 +1231,10 @@ fn encode_canonical_eav_u32_using(
         .map_err(|_| PortableError::new("triple count does not fit u64"))?;
     let domain_len = u64::try_from(domain.len())
         .map_err(|_| PortableError::new("domain cardinality does not fit u64"))?;
-    let mut bytes = vec![0u8; layout.byte_len];
+    let mut output_area = scratch_area()?;
+    let mut output_writer = output_area.sections();
+    let mut output = reserve::<u64>(&mut output_writer, layout.byte_len / WORD_LEN)?;
+    let mut bytes = zerocopy::IntoBytes::as_mut_bytes(output.as_mut_slice());
     for (code, value) in domain.iter().enumerate() {
         let start = layout.domain.start + code * RAW_INLINE_LEN;
         bytes[start..start + RAW_INLINE_LEN].copy_from_slice(value);
@@ -1111,10 +1244,14 @@ fn encode_canonical_eav_u32_using(
     bytes[layout.count_footer.start + WORD_LEN..layout.count_footer.end]
         .copy_from_slice(&domain_len.to_le_bytes());
 
-    let mut row_scratch = Vec::with_capacity(rows.len());
-    let mut radix_counts = vec![0u32; domain.len()];
-    let mut sequence = Vec::with_capacity(rows.len());
-    let mut sequence_scratch = Vec::with_capacity(rows.len());
+    let mut area = scratch_area()?;
+    let mut writer = area.sections();
+    let mut row_section = reserve::<[u32; 3]>(&mut writer, rows.len())?;
+    let mut rows = &mut *rows;
+    let mut row_scratch = row_section.as_mut_slice();
+    let mut radix_counts = reserve::<u32>(&mut writer, domain.len())?;
+    let mut sequence = reserve::<u32>(&mut writer, rows.len())?;
+    let mut sequence_scratch = reserve::<u32>(&mut writer, rows.len())?;
 
     write_canonical_rotation(
         &mut bytes,
@@ -1197,13 +1334,14 @@ fn encode_canonical_eav_u32_using(
     // The construction above owns every bit in the gapless layout. Keep a
     // debug-only structural oracle close to the writer without charging the
     // production build path for a second full scan and rank scratch.
-    debug_assert!(parse(&bytes).is_ok());
-    Ok(bytes)
+    #[cfg(debug_assertions)]
+    parse(&bytes)?;
+    output.freeze().map_err(PortableError::allocation)
 }
 
-fn stable_sort_rows_by_component(
-    rows: &mut Vec<[u32; 3]>,
-    scratch: &mut Vec<[u32; 3]>,
+fn stable_sort_rows_by_component<'a>(
+    rows: &mut &'a mut [[u32; 3]],
+    scratch: &mut &'a mut [[u32; 3]],
     counts: &mut [u32],
     component: usize,
 ) -> Result<(), PortableError> {
@@ -1229,7 +1367,6 @@ fn stable_sort_rows_by_component(
         ));
     }
 
-    scratch.resize(rows.len(), [0; 3]);
     for row in rows.iter().copied() {
         let destination = &mut counts[row[component] as usize];
         scratch[*destination as usize] = row;
@@ -1248,20 +1385,19 @@ fn write_canonical_rotation(
     prefix_axis: Option<PrefixAxis>,
     change_axis: ChangeAxis,
     rotation: Rotation,
-    sequence: &mut Vec<u32>,
-    sequence_scratch: &mut Vec<u32>,
+    sequence: &mut [u32],
+    sequence_scratch: &mut [u32],
     freeze: &mut impl FnMut(
         &mut [u8],
         &Layout,
         Rotation,
-        &mut Vec<u32>,
-        &mut Vec<u32>,
+        &mut [u32],
+        &mut [u32],
     ) -> Result<(), PortableError>,
 ) -> Result<(), PortableError> {
     let [first_component, middle_component, last_component] = components;
     let mut previous_first = None;
     let mut previous_pair = None;
-    sequence.clear();
 
     for (position, row) in rows.iter().enumerate() {
         let first = row[first_component] as usize;
@@ -1280,7 +1416,7 @@ fn write_canonical_rotation(
             set_range_bit(bytes, &layout.changes[change_axis.index()], position);
             previous_pair = Some(pair);
         }
-        sequence.push(row[last_component]);
+        sequence[position] = row[last_component];
     }
 
     if let Some(axis) = prefix_axis {
@@ -1297,15 +1433,14 @@ fn write_canonical_rotation(
     freeze(bytes, layout, rotation, sequence, sequence_scratch)
 }
 
-fn write_wavelet(
+fn write_wavelet<'a>(
     bytes: &mut [u8],
     range: &Range<usize>,
     width: usize,
     row_words: usize,
-    sequence: &mut Vec<u32>,
-    scratch: &mut Vec<u32>,
+    mut sequence: &'a mut [u32],
+    mut scratch: &'a mut [u32],
 ) {
-    scratch.resize(sequence.len(), 0);
     for depth in 0..width {
         let shift = width - depth - 1;
         let plane = range.start + depth * row_words * WORD_LEN
@@ -1330,11 +1465,9 @@ fn write_wavelet(
                     one += 1;
                 }
             }
-            std::mem::swap(sequence, scratch);
+            std::mem::swap(&mut sequence, &mut scratch);
         }
     }
-    sequence.clear();
-    scratch.clear();
 }
 
 fn set_range_bit(bytes: &mut [u8], range: &Range<usize>, position: usize) {
@@ -1353,16 +1486,6 @@ fn expect_words(name: &str, actual: &[u64], expected: usize) -> Result<(), Porta
     }
 }
 
-fn push_word(bytes: &mut Vec<u8>, word: u64) {
-    bytes.extend_from_slice(&word.to_le_bytes());
-}
-
-fn push_words(bytes: &mut Vec<u8>, words: &[u64]) {
-    for word in words {
-        push_word(bytes, *word);
-    }
-}
-
 /// Explicitly audits the local invariants of one portable payload.
 ///
 /// Validation scans every raw section once, then checks the `D` possible codes
@@ -1377,7 +1500,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<PortableView<'_>, PortableError> {
     let mut view = PortableView {
         bytes,
         layout,
-        prefix_counts: std::array::from_fn(|_| Vec::new()),
+        prefix_counts: empty_counts(),
     };
     validate_domain(&view)?;
     view.prefix_counts = validate_prefixes(&view)?;
@@ -1424,7 +1547,7 @@ pub(super) fn decode_eav(bytes: &[u8]) -> Result<CanonicalEavU32, PortableError>
     let mut view = PortableView {
         bytes,
         layout,
-        prefix_counts: std::array::from_fn(|_| Vec::new()),
+        prefix_counts: empty_counts(),
     };
     // The source rotation needs these counts; unrelated masks/columns stay unread.
     view.prefix_counts = decode_prefixes(&view)?;
@@ -1470,11 +1593,15 @@ fn validate_domain(view: &PortableView<'_>) -> Result<(), PortableError> {
     Ok(())
 }
 
-fn decode_prefixes(view: &PortableView<'_>) -> Result<[Vec<usize>; PREFIX_COUNT], PortableError> {
+fn decode_prefixes(
+    view: &PortableView<'_>,
+) -> Result<[View<[usize]>; PREFIX_COUNT], PortableError> {
+    let mut area = scratch_area()?;
+    let mut writer = area.sections();
     let mut axis_counts = Vec::with_capacity(PREFIX_COUNT);
     for axis in PrefixAxis::ALL {
         let range = &view.layout.prefixes[axis.index()];
-        let mut counts = vec![0usize; view.layout.domain_len];
+        let mut counts = reserve::<usize>(&mut writer, view.layout.domain_len)?;
         let mut separators = 0usize;
         for position in 0..view.layout.prefix_bits {
             if bit(view.bytes, range, position) {
@@ -1506,13 +1633,15 @@ fn decode_prefixes(view: &PortableView<'_>) -> Result<[Vec<usize>; PREFIX_COUNT]
                 view.layout.domain_len + 1
             )));
         }
-        axis_counts.push(counts);
+        axis_counts.push(freeze_view(counts)?);
     }
 
     Ok(axis_counts.try_into().expect("three prefix axes"))
 }
 
-fn validate_prefixes(view: &PortableView<'_>) -> Result<[Vec<usize>; PREFIX_COUNT], PortableError> {
+fn validate_prefixes(
+    view: &PortableView<'_>,
+) -> Result<[View<[usize]>; PREFIX_COUNT], PortableError> {
     let axis_counts = decode_prefixes(view)?;
     for axis in PrefixAxis::ALL {
         validate_tail(
@@ -1525,8 +1654,8 @@ fn validate_prefixes(view: &PortableView<'_>) -> Result<[Vec<usize>; PREFIX_COUN
     for (code, ((entity_uses, attribute_uses), value_uses)) in axis_counts
         [PrefixAxis::Entity.index()]
     .iter()
-    .zip(&axis_counts[PrefixAxis::Attribute.index()])
-    .zip(&axis_counts[PrefixAxis::Value.index()])
+    .zip(axis_counts[PrefixAxis::Attribute.index()].iter())
+    .zip(axis_counts[PrefixAxis::Value.index()].iter())
     .enumerate()
     {
         if *entity_uses == 0 && *attribute_uses == 0 && *value_uses == 0 {
@@ -1563,7 +1692,7 @@ fn validate_changes(view: &PortableView<'_>) -> Result<(), PortableError> {
 
 fn validate_wavelets(
     view: &PortableView<'_>,
-    prefix_counts: &[Vec<usize>; PREFIX_COUNT],
+    prefix_counts: &[View<[usize]>; PREFIX_COUNT],
 ) -> Result<(), PortableError> {
     for rotation in Rotation::ALL {
         let range = &view.layout.wavelets[rotation.index()];
@@ -1578,7 +1707,7 @@ fn validate_wavelets(
             )?;
         }
 
-        let histogram = wavelet_histogram(view, rotation);
+        let histogram = wavelet_histogram(view, rotation)?;
         let axis = rotation.last_axis();
         if histogram != prefix_counts[axis.index()] {
             return Err(PortableError::new(format!(
@@ -1591,15 +1720,20 @@ fn validate_wavelets(
     Ok(())
 }
 
-fn wavelet_histogram(view: &PortableView<'_>, rotation: Rotation) -> Vec<usize> {
-    let wavelet = PortableWavelet::new(view, rotation);
-    (0..view.layout.domain_len)
-        .map(|code| {
-            wavelet
-                .rank(view.layout.triple_count, code)
-                .expect("code belongs to the validated domain")
-        })
-        .collect()
+fn wavelet_histogram(
+    view: &PortableView<'_>,
+    rotation: Rotation,
+) -> Result<View<[usize]>, PortableError> {
+    let wavelet = PortableWavelet::new(view, rotation)?;
+    let mut area = scratch_area()?;
+    let mut writer = area.sections();
+    let mut histogram = reserve::<usize>(&mut writer, view.layout.domain_len)?;
+    for (code, count) in histogram.iter_mut().enumerate() {
+        *count = wavelet
+            .rank(view.layout.triple_count, code)
+            .expect("code belongs to the validated domain");
+    }
+    freeze_view(histogram)
 }
 
 fn validate_tail(
@@ -1681,6 +1815,87 @@ mod tests {
     );
 
     #[test]
+    fn mapped_canonical_writer_matches_frozen_heap_writer_fixtures() {
+        for golden in [
+            EMPTY_GOLDEN.as_slice(),
+            SINGLETON_GOLDEN.as_slice(),
+            MULTI_GOLDEN.as_slice(),
+        ] {
+            let source = decode_eav(golden).unwrap();
+            let mut area = scratch_area().unwrap();
+            let mut writer = area.sections();
+            let mut rows = reserve::<[u32; 3]>(&mut writer, source.rows.len()).unwrap();
+            rows.copy_from_slice(&source.rows);
+            let encoded = encode_canonical_eav_u32(&source.domain, &mut rows).unwrap();
+            assert_eq!(encoded.as_ref(), golden);
+            assert_eq!(blake3::hash(&encoded), blake3::hash(golden));
+            assert_eq!(encoded.as_ptr() as usize % std::mem::align_of::<u64>(), 0);
+        }
+    }
+
+    #[test]
+    fn mapped_sort_and_wavelet_scratch_match_independent_writer_for_six_permutations() {
+        let domain = [ID_ONE, ID_TWO, ID_THREE, ID_FOUR];
+        let source = [[0u32, 1, 2], [0, 2, 3], [1, 0, 3], [3, 2, 0]];
+        for components in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let mut expected_rows = source.map(|row| components.map(|component| row[component]));
+            expected_rows.sort_unstable();
+            let mut area = scratch_area().unwrap();
+            let mut writer = area.sections();
+            let mut rows = reserve::<[u32; 3]>(&mut writer, source.len()).unwrap();
+            rows.copy_from_slice(&expected_rows);
+            let encoded = encode_canonical_eav_u32(&domain, &mut rows).unwrap();
+            let view = parse(&encoded).unwrap();
+            let independent_rows = expected_rows.map(|row| row.map(|code| code as usize));
+            let expected = canonical_bytes_from_eav(&view, &independent_rows).unwrap();
+            assert_eq!(encoded, expected, "permutation {components:?}");
+            verify_canonical_eav_u32(&view, &expected_rows).unwrap();
+        }
+    }
+
+    #[test]
+    fn mapped_reservation_handles_empty_sections_at_page_boundaries() {
+        let mut area = scratch_area().unwrap();
+        let mut writer = area.sections();
+        let page = page_size::get();
+        // Both a page-aligned cursor and an alignment step reaching the next
+        // page must support exact empty slices without zero-length mmap.
+        let padding = writer.reserve::<u8>(page - 8).unwrap();
+        drop(padding);
+        let empty = reserve::<u64>(&mut writer, 0).unwrap();
+        assert!(empty.is_empty());
+        assert!(freeze_view(empty).unwrap().is_empty());
+        let empty = reserve::<u32>(&mut writer, 0).unwrap();
+        assert!(empty.is_empty());
+        let cursor = empty.handle().offset;
+        drop(empty);
+        let padding = writer.reserve::<u8>(page * 2 - 4 - cursor).unwrap();
+        drop(padding);
+        let empty = reserve::<u64>(&mut writer, 0).unwrap();
+        assert!(empty.is_empty());
+        assert!(freeze_view(empty).unwrap().is_empty());
+        assert!(reserve::<u64>(&mut writer, usize::MAX).is_err());
+        let error = PortableError::allocation(std::io::Error::from_raw_os_error(28));
+        assert!(error.is_allocation());
+        assert!(error.to_string().contains("mapped succinct allocation"));
+    }
+
+    #[test]
+    fn mapped_canonical_writer_rejects_duplicate_rows() {
+        let mut rows = [[0, 1, 2], [0, 1, 2]];
+        let error = encode_canonical_eav_u32(&[ID_ONE, ID_TWO, VALUE_ONE], &mut rows).unwrap_err();
+        assert!(!error.is_allocation());
+        assert!(error.to_string().contains("not strictly increasing"));
+    }
+
+    #[test]
     fn width_is_minimal_for_cardinality() {
         let cases = [
             (0, 1),
@@ -1707,7 +1922,7 @@ mod tests {
             wavelets: [&[]; WAVELET_COUNT],
         })
         .unwrap();
-        assert_eq!(encoded, EMPTY_GOLDEN);
+        assert_eq!(encoded.as_ref(), EMPTY_GOLDEN);
         assert_eq!(
             blake3::hash(&encoded).to_hex().as_str(),
             "2a5c88cdcc7a9df5e0815cadb233b5dcf192e7c21e8393afc681c940ab7aa0dd"
@@ -1728,7 +1943,7 @@ mod tests {
             wavelets: [&[1, 0], &[0, 1], &[0, 0], &[0, 0], &[0, 1], &[1, 0]],
         })
         .unwrap();
-        assert_eq!(encoded, SINGLETON_GOLDEN);
+        assert_eq!(encoded.as_ref(), SINGLETON_GOLDEN);
         assert_eq!(
             blake3::hash(&encoded).to_hex().as_str(),
             "c55fa61e822974f3cb0e5b2d156dbf35b0e5bbb7599595209e6672ec91d8b8c1"
@@ -1750,7 +1965,7 @@ mod tests {
             wavelets: [&[1, 1], &[2, 2], &[1, 0], &[1, 0], &[1, 2], &[2, 1]],
         })
         .unwrap();
-        assert_eq!(encoded, MULTI_GOLDEN);
+        assert_eq!(encoded.as_ref(), MULTI_GOLDEN);
         assert_eq!(
             blake3::hash(&encoded).to_hex().as_str(),
             "a2ea03cd06c60f36762dee4a65add3cfa84545f55ab0a717f924333183691aee"

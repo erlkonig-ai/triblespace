@@ -165,6 +165,76 @@ async fn acquire_once(
 }
 
 #[test]
+fn demand_pull_selection_warms_an_empty_collection_without_a_want() {
+    let _guard = test_guard();
+    let clock = virtual_clock();
+    clock.reset();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    runtime.block_on(tokio::task::LocalSet::new().run_until(async {
+        let net = SimNet::new(0xD35C_0105, SimConfig::default());
+        let source_key = key(81);
+        let receiver_key = key(82);
+        let mut source_store = MemoryRepo::default();
+        let collection = source_store
+            .collection(
+                "empty selected metadata",
+                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+            )
+            .unwrap();
+        let unselected = source_store
+            .collection(
+                "unselected metadata",
+                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+            )
+            .unwrap();
+        let facts: TribleSet = source_store
+            .snapshot()
+            .unwrap()
+            .get(collection.handle())
+            .unwrap();
+        let name = triblespace_core::collection::descriptor::name(&facts)
+            .unwrap()
+            .unwrap();
+        let source_id = source_key.verifying_key().to_bytes();
+        let mut source = bring_up(
+            &net,
+            &source_key,
+            source_store,
+            Vec::new(),
+            ReconcileDirection::WriteOnly,
+        );
+        let mut receiver = bring_up(
+            &net,
+            &receiver_key,
+            MemoryRepo::default(),
+            vec![source_id],
+            ReconcileDirection::ReadOnly,
+        );
+        source.activate_collection(collection.handle());
+        receiver.activate_collection(collection.handle());
+        // Deliberately no Reconciler tick, acquire(), WANT, or COMMIT. Metadata
+        // preparation belongs to the one pull-selection host owner in Demand.
+        advance(&clock, &mut [&mut source, &mut receiver], 100).await;
+        let snapshot = receiver.snapshot().unwrap();
+        assert!(BlobStoreGet::get::<TribleSet, _>(&snapshot, collection.handle()).is_ok());
+        assert_eq!(
+            &*BlobStoreGet::get::<anybytes::View<str>, _>(&snapshot, name).unwrap(),
+            "empty selected metadata"
+        );
+        for handle in [read_capability(), write_capability()] {
+            assert!(BlobStoreGet::get::<TribleSet, _>(&snapshot, handle).is_ok());
+        }
+        assert!(BlobStoreGet::get::<TribleSet, _>(&snapshot, unselected.handle()).is_err());
+        assert_eq!(snapshot.wants().unwrap().count(), 0);
+        assert_eq!(snapshot.records().unwrap().count(), 0);
+    }));
+}
+
+#[test]
 fn issuer_held_read_proof_bootstraps_a_handle_only_recipient() {
     let _guard = test_guard();
     let clock = virtual_clock();
@@ -225,7 +295,6 @@ fn issuer_held_read_proof_bootstraps_a_handle_only_recipient() {
             ReconcileDirection::ReadOnly,
         );
         issuer.activate_collection(collection.handle());
-        recipient.activate_collection(collection.handle());
 
         // The recipient begins with only C and one issuer endpoint. An initial
         // exact-H lookup also gives the issuer's provider leases a reachable
@@ -254,10 +323,15 @@ fn issuer_held_read_proof_bootstraps_a_handle_only_recipient() {
             let snapshot = recipient.snapshot().unwrap();
             Collection::<SimpleArchive>::open(&snapshot, collection.handle()).unwrap()
         };
+        let before_selection = recipient.snapshot().unwrap();
+        assert!(!before_selection.contains_blob(read_capability()).unwrap());
+        assert!(!before_selection.contains_blob(write_capability()).unwrap());
+        recipient.activate_collection(collection.handle());
 
         // With C resident, the issuer can authorize the endpoint using its
         // resident READ definition. Repair sends only proof/collection records;
-        // the recipient still needs the named definitions to interpret them.
+        // the separate selected metadata owner obtains definitions, not grants
+        // or the committed payload. This makes the received valid proof usable.
         advance(&clock, &mut [&mut issuer, &mut recipient], 32).await;
         let dangling = recipient.snapshot().unwrap();
         assert_eq!(dangling.records().unwrap().count(), 1);
@@ -267,16 +341,16 @@ fn issuer_held_read_proof_bootstraps_a_handle_only_recipient() {
             .map(Result::unwrap)
             .collect::<Vec<_>>();
         assert_eq!(received, [read_proof]);
-        assert!(!dangling.contains_blob(read_capability()).unwrap());
-        assert!(!dangling.contains_blob(write_capability()).unwrap());
+        assert!(dangling.contains_blob(read_capability()).unwrap());
+        assert!(dangling.contains_blob(write_capability()).unwrap());
         assert!(!dangling.contains_blob(payload_handle).unwrap());
         assert!(
-            !recipient_collection
+            recipient_collection
                 .reader_is_admitted(&dangling, recipient_key.verifying_key())
                 .unwrap(),
-            "proof bytes alone do not interpret a nonresident capability definition",
+            "selected definitions interpret the already-received valid READ evidence",
         );
-        assert!(recipient_collection.admitted(&dangling).unwrap().is_empty());
+        assert_eq!(recipient_collection.admitted(&dangling).unwrap().len(), 1);
         assert!(
             dangling
                 .collection(recipient_collection)
@@ -295,7 +369,7 @@ fn issuer_held_read_proof_bootstraps_a_handle_only_recipient() {
             )
             .await
             .is_some(),
-            "the named READ definition uses the ordinary exact-H DHT path",
+            "ordinary exact acquisition remains available for the prepared READ definition",
         );
         let read_ready = recipient.snapshot().unwrap();
         assert!(
@@ -305,16 +379,12 @@ fn issuer_held_read_proof_bootstraps_a_handle_only_recipient() {
         );
         assert!(
             !recipient_collection
-                .reader_is_admitted(&dangling, recipient_key.verifying_key())
+                .reader_is_admitted(&before_selection, recipient_key.verifying_key())
                 .unwrap()
         );
-        assert!(!read_ready.contains_blob(write_capability()).unwrap());
-        assert!(
-            recipient_collection
-                .admitted(&read_ready)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(!before_selection.contains_blob(read_capability()).unwrap());
+        assert!(read_ready.contains_blob(write_capability()).unwrap());
+        assert_eq!(recipient_collection.admitted(&read_ready).unwrap().len(), 1);
         assert!(!read_ready.contains_blob(payload_handle).unwrap());
         assert_eq!(read_ready.wants().unwrap().count(), 0);
 
@@ -327,7 +397,7 @@ fn issuer_held_read_proof_bootstraps_a_handle_only_recipient() {
             )
             .await
             .is_some(),
-            "interpreting COMMIT producer authority fetches its definition, not its payload",
+            "ordinary exact acquisition remains available for the prepared WRITE definition",
         );
         let admitted = recipient.snapshot().unwrap();
         assert_eq!(recipient_collection.admitted(&admitted).unwrap().len(), 1);

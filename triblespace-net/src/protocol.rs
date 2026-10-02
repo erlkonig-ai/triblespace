@@ -86,6 +86,18 @@ impl std::fmt::Display for ExactBlobReceiveResourceError {
 
 impl std::error::Error for ExactBlobReceiveResourceError {}
 
+/// A caller's narrower prefetch policy says nothing about provider health.
+#[derive(Debug)]
+pub(crate) struct ExactBlobReceivePolicyError;
+
+impl std::fmt::Display for ExactBlobReceivePolicyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("blob response exceeds the local acquisition byte bound")
+    }
+}
+
+impl std::error::Error for ExactBlobReceivePolicyError {}
+
 /// Charge actual file growth, rounded up to a MiB per nonempty backing. An idle
 /// announcement reserves no disk; tiny completed mappings still cost one unit.
 /// The aggregate covers partial files AND returned mappings until their last
@@ -210,21 +222,50 @@ pub async fn op_get_blob<C: Conn>(
     requester: PeerId,
     hash: &RawHash,
 ) -> Result<Option<Blob<UnknownBlob>>> {
+    op_get_blob_with_limit(conn, requester, hash, MAX_EXACT_BLOB_BYTES).await
+}
+
+/// A local acquisition-policy limit, checked before receiving the body. It
+/// changes neither the wire protocol nor the ordinary exact-read allowance.
+pub(crate) async fn op_get_blob_with_limit<C: Conn>(
+    conn: &C,
+    requester: PeerId,
+    hash: &RawHash,
+    max_bytes: u64,
+) -> Result<Option<Blob<UnknownBlob>>> {
     let provider = conn.remote_id();
     let (mut send, mut recv) = conn
         .open_bi()
         .await
         .map_err(|error| anyhow!("open_bi: {error}"))?;
     send_u8(&mut send, OP_GET_BLOB).await?;
-    fetch_get_blob_stream(&mut send, &mut recv, requester, provider, hash).await
+    fetch_get_blob_stream_with_limit(&mut send, &mut recv, requester, provider, hash, max_bytes)
+        .await
 }
 
+#[cfg(test)]
 async fn fetch_get_blob_stream<W, R>(
     send: &mut W,
     recv: &mut R,
     requester: PeerId,
     provider: PeerId,
     hash: &RawHash,
+) -> Result<Option<Blob<UnknownBlob>>>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    fetch_get_blob_stream_with_limit(send, recv, requester, provider, hash, MAX_EXACT_BLOB_BYTES)
+        .await
+}
+
+async fn fetch_get_blob_stream_with_limit<W, R>(
+    send: &mut W,
+    recv: &mut R,
+    requester: PeerId,
+    provider: PeerId,
+    hash: &RawHash,
+    max_bytes: u64,
 ) -> Result<Option<Blob<UnknownBlob>>>
 where
     W: AsyncWrite + Unpin,
@@ -253,7 +294,7 @@ where
     send.shutdown()
         .await
         .map_err(|error| anyhow!("finish: {error}"))?;
-    let Some(bytes) = recv_blob_response(recv).await? else {
+    let Some(bytes) = recv_blob_response_with_limit(recv, max_bytes).await? else {
         return Ok(None);
     };
     // Hash once at ingress, then carry Blob's cached handle through local
@@ -419,15 +460,24 @@ async fn require_response_eof<R: AsyncRead + Unpin>(recv: &mut R) -> Result<()> 
     Ok(())
 }
 
+#[cfg(test)]
 async fn recv_blob_response<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Option<Bytes>> {
+    recv_blob_response_with_limit(recv, MAX_EXACT_BLOB_BYTES).await
+}
+
+async fn recv_blob_response_with_limit<R: AsyncRead + Unpin>(
+    recv: &mut R,
+    max_bytes: u64,
+) -> Result<Option<Bytes>> {
     let len = recv_u64_be(recv).await?;
     if len == u64::MAX {
         return Ok(None);
     }
     if len > MAX_EXACT_BLOB_BYTES {
-        return Err(anyhow!(
-            "blob response exceeds the {MAX_EXACT_BLOB_BYTES}-byte transport bound"
-        ));
+        return Err(anyhow!("blob response exceeds the transport byte bound"));
+    }
+    if len > max_bytes {
+        return Err(ExactBlobReceivePolicyError.into());
     }
     let len = usize::try_from(len)
         .map_err(|_| anyhow!("blob response length does not fit this address space"))?;
@@ -1046,6 +1096,28 @@ mod tests {
         assert_eq!(received.get_handle().raw, content_handle);
         assert_eq!(&*received.bytes, content);
         serving.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn metadata_limit_rejects_before_body_and_does_not_poison_ordinary_exact_receive() {
+        let _guard = exact_blob_receive_test_guard();
+        let content = vec![42; crate::host::METADATA_BLOB_BYTES as usize + 1];
+        let mut response = (content.len() as u64).to_be_bytes().to_vec();
+        response.extend_from_slice(&content);
+        let mut limited = response.as_slice();
+        let mut ordinary = response.as_slice();
+        let (rejected, exact) = tokio::join!(
+            recv_blob_response_with_limit(&mut limited, crate::host::METADATA_BLOB_BYTES),
+            recv_blob_response(&mut ordinary),
+        );
+        assert!(rejected.is_err());
+        assert_eq!(
+            limited.len(),
+            content.len(),
+            "warmup reads no oversized body byte"
+        );
+        assert_eq!(&*exact.unwrap().unwrap(), content.as_slice());
+        assert!(ordinary.is_empty());
     }
 
     #[tokio::test]

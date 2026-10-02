@@ -114,6 +114,7 @@ impl CollectionEncoding for SuccinctArchiveBlob {
                 CollectionOperationError::Capacity(source.to_string())
             }
             SuccinctArchiveRawMergeError::InvalidInput { .. }
+            | SuccinctArchiveRawMergeError::Allocation(_)
             | SuccinctArchiveRawMergeError::Construction(_) => {
                 CollectionOperationError::Fatal(source.to_string())
             }
@@ -198,6 +199,7 @@ impl CollectionEncoding for Rank9AcceleratedSuccinctArchiveBlob {
                             CollectionOperationError::Capacity(source.to_string())
                         }
                         SuccinctArchiveRawMergeError::InvalidInput { .. }
+                        | SuccinctArchiveRawMergeError::Allocation(_)
                         | SuccinctArchiveRawMergeError::Construction(_) => {
                             CollectionOperationError::Fatal(source.to_string())
                         }
@@ -305,6 +307,7 @@ impl CollectionAttachment for SuccinctArchiveBlob {
                 CollectionOperationError::Capacity(source.to_string())
             }
             SuccinctArchiveRawBuildError::Source(_)
+            | SuccinctArchiveRawBuildError::Allocation(_)
             | SuccinctArchiveRawBuildError::Construction(_) => {
                 CollectionOperationError::Fatal(source.to_string())
             }

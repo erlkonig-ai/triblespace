@@ -358,7 +358,9 @@ inventory.
 
 Activation repair does not fetch descriptor dependencies, payloads, metadata,
 attachments, or derived artifacts. It transfers lattice evidence and positive
-resident-handle observations, not those bytes. A resolver can then select the
+resident-handle observations, not those bytes. The separate bounded host
+metadata warmup described below is not part of the repair stream. A resolver can
+then select the
 cheapest resident
 support-equivalent cover and request only the missing immutable handles that
 matter to that computation.
@@ -709,8 +711,36 @@ For an explicitly active collection with a missing descriptor, the host owns
 one independent bearer fetch until its result reaches the bounded admission
 bridge. Repair ticks cannot spawn additional copies while that handoff is
 blocked. Removing the interest or dropping the host cancels the pending fetch;
-a completed miss or failed attempt permits a later retry. This does not fetch
-descriptor dependencies or introduce a durable WANT.
+a completed miss or failed attempt permits a later retry.
+
+That same owner performs best-effort metadata warmup for pull-selected
+collections, even before their descriptor is admitted and when they have no
+records. From a descriptor of at most 1 MiB it queries only UTF-8 name handles
+on tagged descriptor entities and typed definition handles linked by their
+resource-policy bindings. The warmup does not interpret the binding's authority
+or require it to be supported by this consumer. Unknown annotations, source
+descriptors, mapping parameters, proof paths, and record payloads are not
+traversed. This is acquisition, not
+READ or WRITE authority, and introduces no durable WANT.
+
+At most four collection attempts run at once, in round-robin selection order.
+Each repair round examines at most 256 selections; ready resident-only attempts
+release their slot immediately instead of waiting for the next 30-second round.
+Each owns a 30-second end-to-end deadline including admission-channel handoff;
+the descriptor read gets at most ten seconds. Extraction examines at most 256
+typed rows and admits at most 64 distinct direct dependencies, with names
+first. Up to four children per owner run concurrently (sixteen child requests
+across these owners), each with a one-second end-to-end deadline. Every remote
+response is limited to 1 MiB **before** receiving its body; resident descriptor
+bytes are also size-checked before decoding. Existing exact receive-slot and
+global staging quotas still apply.
+
+These are warmup limits, not schema validity rules or assertions of absence.
+An oversized descriptor or dependency, excess fanout, slow provider, or blocked
+handoff can leave metadata unprepared. No completion catalogue is retained;
+later selected rounds reobserve the store and retry. Ordinary foreground
+exact-H acquisition retains its existing larger byte allowance and deadline,
+and passive snapshots and resident-only stores do not acquire anything.
 
 Foreground exact-H acquisition has one end-to-end deadline, normally ten
 seconds, including capability readiness, cold bootstrap dialing, DHT lookup,
@@ -856,6 +886,10 @@ of activation and authority:
 | `Demand` (default) | Explicit WANTs only. |
 | `Shallow` | Also direct blob references of the selected collections' foundations. |
 | `Full` | Also positive resident handles learned through selected collections' READ-authorized repair. |
+
+These reconciler modes are separate from the bounded metadata warmup of
+explicitly active pull-selected descriptors described above. Demand still
+does not hydrate record payloads without an exact WANT.
 
 Selecting a collection does not grant READ or WRITE and does not activate it.
 Structurally valid but WRITE-inert records can name direct roots; acquiring
