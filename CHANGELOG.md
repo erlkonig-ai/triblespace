@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Use file-backed mapped sections for SimpleArchive unions and portable
+  Succinct CPU construction/merging, preserving canonical bytes and hashes.
+  See the `triblespace-core` changelog for allocation and working-set limits.
+
 - Raise the sync reconciler's exact-fetch request window from four to eight,
   preserving deadline, cancellation, fairness and serial-landing behavior.
   Exact-body receive and backing/scratch limits remain independent and unchanged;

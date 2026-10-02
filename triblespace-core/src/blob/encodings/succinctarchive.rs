@@ -116,6 +116,8 @@ pub enum SuccinctArchiveRawBuildError {
     DomainTooWide(usize),
     /// An internal checked layout or canonical-section invariant failed.
     Construction(String),
+    /// Temporary file creation, resizing, mapping, or protection failed.
+    Allocation(String),
 }
 
 impl From<UnarchiveError> for SuccinctArchiveRawBuildError {
@@ -142,6 +144,7 @@ impl std::fmt::Display for SuccinctArchiveRawBuildError {
                     "cannot construct portable succinct archive: {message}"
                 )
             }
+            Self::Allocation(message) => write!(formatter, "mapped succinct allocation failed: {message}"),
         }
     }
 }
@@ -150,7 +153,10 @@ impl std::error::Error for SuccinctArchiveRawBuildError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Source(error) => Some(error),
-            Self::TooManyRows(_) | Self::DomainTooWide(_) | Self::Construction(_) => None,
+            Self::TooManyRows(_)
+            | Self::DomainTooWide(_)
+            | Self::Construction(_)
+            | Self::Allocation(_) => None,
         }
     }
 }
@@ -179,6 +185,8 @@ pub enum SuccinctArchiveRawMergeError {
     /// Encoding the representable merged result violated an internal format
     /// invariant.
     Construction(SuccinctArchiveError),
+    /// Temporary mapped storage could not be created or frozen.
+    Allocation(String),
 }
 
 impl std::fmt::Display for SuccinctArchiveRawMergeError {
@@ -197,6 +205,10 @@ impl std::fmt::Display for SuccinctArchiveRawMergeError {
             Self::Construction(source) => {
                 write!(formatter, "cannot encode merged succinct archive: {source}")
             }
+            Self::Allocation(message) => write!(
+                formatter,
+                "mapped succinct merge allocation failed: {message}"
+            ),
         }
     }
 }
@@ -205,7 +217,7 @@ impl std::error::Error for SuccinctArchiveRawMergeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidInput { source, .. } | Self::Construction(source) => Some(source),
-            Self::DomainTooWide | Self::TooManyRows => None,
+            Self::DomainTooWide | Self::TooManyRows | Self::Allocation(_) => None,
         }
     }
 }
@@ -237,7 +249,8 @@ impl SuccinctArchiveBlob {
     /// Domain construction, sorting and section layout remain on the CPU. The
     /// backend contract and validation are those of [`WaveletMatrixFreezeBackend`].
     /// A returned backend error is a construction failure; callers may retry the
-    /// canonical CPU builder. Allocation failure, panic and OOM are not caught.
+    /// canonical CPU builder. Mapped-storage failures are reported separately;
+    /// backend panics and allocator OOM are not caught.
     pub fn build_from_simple_archive_with_backend<B>(
         source: &Blob<SimpleArchive>,
         backend: &B,
@@ -253,7 +266,7 @@ impl SuccinctArchiveBlob {
 
     fn build_from_simple_archive_using(
         source: &Blob<SimpleArchive>,
-        encode: impl FnOnce(&[RawInline], Vec<[u32; 3]>) -> Result<Vec<u8>, portable::PortableError>,
+        encode: impl FnOnce(&[RawInline], &mut [[u32; 3]]) -> Result<Bytes, portable::PortableError>,
     ) -> Result<Blob<Self>, SuccinctArchiveRawBuildError> {
         let bytes = source.bytes.as_ref();
         if bytes.len() % 64 != 0 {
@@ -269,9 +282,12 @@ impl SuccinctArchiveBlob {
                 "source-domain capacity overflows usize".to_owned(),
             )
         })?;
-        let mut domain = Vec::with_capacity(domain_capacity);
+        let mut area = portable::scratch_area().map_err(raw_build_codec_error)?;
+        let mut writer = area.sections();
+        let mut domain = portable::reserve::<RawInline>(&mut writer, domain_capacity)
+            .map_err(raw_build_codec_error)?;
         let mut previous: Option<&[u8]> = None;
-        for chunk in bytes.chunks_exact(64) {
+        for (position, chunk) in bytes.chunks_exact(64).enumerate() {
             let row: &[u8; 64] = chunk.try_into().expect("exact SimpleArchive row");
             if Trible::as_transmute_force_raw(row).is_none() {
                 return Err(UnarchiveError::BadTrible.into());
@@ -288,26 +304,33 @@ impl SuccinctArchiveBlob {
 
             let entity: &[u8; 16] = row[..16].try_into().expect("entity width");
             let attribute: &[u8; 16] = row[16..32].try_into().expect("attribute width");
-            domain.push(id_into_value(entity));
-            domain.push(id_into_value(attribute));
-            domain.push(row[32..].try_into().expect("value width"));
+            domain[position * 3] = id_into_value(entity);
+            domain[position * 3 + 1] = id_into_value(attribute);
+            domain[position * 3 + 2] = row[32..].try_into().expect("value width");
         }
         domain.sort_unstable();
-        domain.dedup();
-        domain.shrink_to_fit();
+        let mut domain_len = 0;
+        for position in 0..domain.len() {
+            if domain_len == 0 || domain[domain_len - 1] != domain[position] {
+                domain[domain_len] = domain[position];
+                domain_len += 1;
+            }
+        }
+        let domain = &domain[..domain_len];
         if domain.len() > u32::MAX as usize {
             return Err(SuccinctArchiveRawBuildError::DomainTooWide(domain.len()));
         }
 
-        let mut eav_rows = Vec::with_capacity(row_count);
-        for chunk in bytes.chunks_exact(64) {
+        let mut eav_rows =
+            portable::reserve::<[u32; 3]>(&mut writer, row_count).map_err(raw_build_codec_error)?;
+        for (position, chunk) in bytes.chunks_exact(64).enumerate() {
             let row: &[u8; 64] = chunk.try_into().expect("exact SimpleArchive row");
             let entity: &[u8; 16] = row[..16].try_into().expect("entity width");
             let attribute: &[u8; 16] = row[16..32].try_into().expect("attribute width");
             let entity = id_into_value(entity);
             let attribute = id_into_value(attribute);
             let value: RawInline = row[32..].try_into().expect("value width");
-            eav_rows.push([
+            eav_rows[position] = [
                 u32::try_from(
                     domain
                         .binary_search(&entity)
@@ -326,12 +349,11 @@ impl SuccinctArchiveBlob {
                         .expect("source value was inserted into the domain"),
                 )
                 .expect("domain width checked above"),
-            ]);
+            ];
         }
 
-        let portable = encode(&domain, eav_rows)
-            .map_err(|error| SuccinctArchiveRawBuildError::Construction(error.to_string()))?;
-        Ok(Blob::new(Bytes::from(portable)))
+        let portable = encode(domain, &mut eav_rows).map_err(raw_build_codec_error)?;
+        Ok(Blob::new(portable))
     }
 
     /// Computes the canonical set union of portable succinct archive blobs.
@@ -372,12 +394,15 @@ impl SuccinctArchiveBlob {
 
     fn merge_using(
         segments: &[Blob<Self>],
-        encode: impl FnOnce(&[RawInline], Vec<[u32; 3]>) -> Result<Vec<u8>, portable::PortableError>,
+        encode: impl FnOnce(&[RawInline], &mut [[u32; 3]]) -> Result<Bytes, portable::PortableError>,
     ) -> Result<Blob<Self>, SuccinctArchiveRawMergeError> {
         let mut decoded = Vec::with_capacity(segments.len());
         for (index, segment) in segments.iter().enumerate() {
             decoded.push(
                 portable::decode_eav(segment.bytes.as_ref()).map_err(|error| {
+                    if error.is_allocation() {
+                        return SuccinctArchiveRawMergeError::Allocation(error.to_string());
+                    }
                     SuccinctArchiveRawMergeError::InvalidInput {
                         index,
                         source: raw_merge_error(format!("source decoding failed: {error}")),
@@ -386,11 +411,12 @@ impl SuccinctArchiveBlob {
             );
         }
 
-        let (domain, rows) = merge_raw_eav_parts(decoded)?;
-        let bytes = encode(&domain, rows).map_err(|error| {
-            SuccinctArchiveRawMergeError::Construction(raw_merge_error(error.to_string()))
-        })?;
-        Ok(Blob::new(Bytes::from(bytes)))
+        let mut area = portable::scratch_area().map_err(raw_merge_codec_error)?;
+        let mut writer = area.sections();
+        let (domain, domain_len, mut rows, row_len) = merge_raw_eav_parts(decoded, &mut writer)?;
+        let bytes =
+            encode(&domain[..domain_len], &mut rows[..row_len]).map_err(raw_merge_codec_error)?;
+        Ok(Blob::new(bytes))
     }
 
     /// Explicitly audits all semantic/canonical invariants of a raw archive.
@@ -1759,14 +1785,41 @@ fn raw_merge_error(message: impl Into<String>) -> SuccinctArchiveError {
     SuccinctArchiveError(invalid_rank9_metadata(message.into()))
 }
 
+fn raw_build_codec_error(error: portable::PortableError) -> SuccinctArchiveRawBuildError {
+    if error.is_allocation() {
+        SuccinctArchiveRawBuildError::Allocation(error.to_string())
+    } else {
+        SuccinctArchiveRawBuildError::Construction(error.to_string())
+    }
+}
+
+fn raw_merge_codec_error(error: portable::PortableError) -> SuccinctArchiveRawMergeError {
+    if error.is_allocation() {
+        SuccinctArchiveRawMergeError::Allocation(error.to_string())
+    } else {
+        SuccinctArchiveRawMergeError::Construction(raw_merge_error(error.to_string()))
+    }
+}
+
 /// Merge exact-decoded raw inputs without constructing a query runtime.
-fn merge_raw_eav_parts(
+fn merge_raw_eav_parts<'area>(
     parts: Vec<portable::CanonicalEavU32>,
-) -> Result<(Vec<RawInline>, Vec<[u32; 3]>), SuccinctArchiveRawMergeError> {
-    let mut remaps: Vec<Vec<u32>> = parts
-        .iter()
-        .map(|part| vec![0; part.domain.len()])
-        .collect();
+    writer: &mut SectionWriter<'area>,
+) -> Result<
+    (
+        Section<'area, RawInline>,
+        usize,
+        Section<'area, [u32; 3]>,
+        usize,
+    ),
+    SuccinctArchiveRawMergeError,
+> {
+    let mut remaps = Vec::with_capacity(parts.len());
+    for part in &parts {
+        remaps.push(
+            portable::reserve::<u32>(writer, part.domain.len()).map_err(raw_merge_codec_error)?,
+        );
+    }
     let mut domain_heap = BinaryHeap::with_capacity(parts.len());
     for (source, part) in parts.iter().enumerate() {
         if let Some(&value) = part.domain.first() {
@@ -1774,77 +1827,85 @@ fn merge_raw_eav_parts(
         }
     }
 
-    // The largest input domain is a lower bound on the union. Starting there
-    // avoids retaining a sum-sized allocation when the inputs overlap heavily.
-    let domain_capacity = parts
-        .iter()
-        .map(|part| part.domain.len())
-        .max()
-        .unwrap_or(0);
-    let mut domain = Vec::with_capacity(domain_capacity);
+    // First count the exact union, then fill its mapped section. This avoids
+    // sum-sized capacity slack when many segments share the same values.
+    let mut domain_len = 0usize;
+    let mut previous = None;
     while let Some(Reverse((value, source, old_code))) = domain_heap.pop() {
-        let new_code = if domain.last() == Some(&value) {
-            domain.len() - 1
-        } else {
-            if domain.len() == u32::MAX as usize {
+        if previous != Some(value) {
+            if domain_len == u32::MAX as usize {
                 return Err(SuccinctArchiveRawMergeError::DomainTooWide);
             }
-            domain.push(value);
-            domain.len() - 1
-        };
-        remaps[source][old_code] =
-            u32::try_from(new_code).expect("merged domain length was checked before insertion");
-
-        let next_code = old_code + 1;
-        if let Some(&next) = parts[source].domain.get(next_code) {
-            domain_heap.push(Reverse((next, source, next_code)));
+            domain_len += 1;
+            previous = Some(value);
+        }
+        if let Some(&next) = parts[source].domain.get(old_code + 1) {
+            domain_heap.push(Reverse((next, source, old_code + 1)));
+        }
+    }
+    let mut domain =
+        portable::reserve::<RawInline>(writer, domain_len).map_err(raw_merge_codec_error)?;
+    for (source, part) in parts.iter().enumerate() {
+        if let Some(&value) = part.domain.first() {
+            domain_heap.push(Reverse((value, source, 0usize)));
+        }
+    }
+    let mut position = 0usize;
+    previous = None;
+    while let Some(Reverse((value, source, old_code))) = domain_heap.pop() {
+        if previous != Some(value) {
+            domain[position] = value;
+            position += 1;
+            previous = Some(value);
+        }
+        remaps[source][old_code] = (position - 1) as u32;
+        if let Some(&next) = parts[source].domain.get(old_code + 1) {
+            domain_heap.push(Reverse((next, source, old_code + 1)));
         }
     }
     drop(domain_heap);
 
-    let runs = parts
-        .into_iter()
-        .zip(remaps)
-        .map(|(part, remap)| {
-            let mut rows = part.rows;
-            for row in &mut rows {
-                row[0] = remap[row[0] as usize];
-                row[1] = remap[row[1] as usize];
-                row[2] = remap[row[2] as usize];
-            }
-            debug_assert!(rows.windows(2).all(|pair| pair[0] < pair[1]));
-            rows
-        })
-        .collect::<Vec<_>>();
-    // Input domains and remap tables are gone before the output writer's
-    // equally-sized rotation scratch appears.
-    domain.shrink_to_fit();
-
-    let row_capacity = runs.iter().map(Vec::len).max().unwrap_or(0);
-    let mut rows = Vec::with_capacity(row_capacity);
-    let mut row_heap = BinaryHeap::with_capacity(runs.len());
-    for (source, run) in runs.iter().enumerate() {
-        if let Some(&row) = run.first() {
-            row_heap.push(Reverse((row, source, 0usize)));
+    // Remap at the heap boundary, retaining no second set of input row runs.
+    let remap_row = |source: usize, row: [u32; 3]| row.map(|code| remaps[source][code as usize]);
+    let mut row_heap = BinaryHeap::with_capacity(parts.len());
+    let mut row_len = 0usize;
+    let mut previous_row = None;
+    for (source, part) in parts.iter().enumerate() {
+        if let Some(&row) = part.rows.first() {
+            row_heap.push(Reverse((remap_row(source, row), source, 0usize)));
         }
     }
-
     while let Some(Reverse((row, source, position))) = row_heap.pop() {
-        if rows.last() != Some(&row) {
-            if rows.len() == u32::MAX as usize {
+        if previous_row != Some(row) {
+            if row_len == u32::MAX as usize {
                 return Err(SuccinctArchiveRawMergeError::TooManyRows);
             }
-            rows.push(row);
+            row_len += 1;
+            previous_row = Some(row);
         }
-        let next_position = position + 1;
-        if let Some(&next) = runs[source].get(next_position) {
-            row_heap.push(Reverse((next, source, next_position)));
+        if let Some(&next) = parts[source].rows.get(position + 1) {
+            row_heap.push(Reverse((remap_row(source, next), source, position + 1)));
         }
     }
-    drop(row_heap);
-    drop(runs);
-    rows.shrink_to_fit();
-    Ok((domain, rows))
+    let mut rows = portable::reserve::<[u32; 3]>(writer, row_len).map_err(raw_merge_codec_error)?;
+    for (source, part) in parts.iter().enumerate() {
+        if let Some(&row) = part.rows.first() {
+            row_heap.push(Reverse((remap_row(source, row), source, 0usize)));
+        }
+    }
+    let mut position = 0usize;
+    previous_row = None;
+    while let Some(Reverse((row, source, old_position))) = row_heap.pop() {
+        if previous_row != Some(row) {
+            rows[position] = row;
+            position += 1;
+            previous_row = Some(row);
+        }
+        if let Some(&next) = parts[source].rows.get(old_position + 1) {
+            row_heap.push(Reverse((remap_row(source, next), source, old_position + 1)));
+        }
+    }
+    Ok((domain, domain_len, rows, row_len))
 }
 
 struct MergedRows<'a> {

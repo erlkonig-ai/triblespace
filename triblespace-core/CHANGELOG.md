@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Build SimpleArchive binary/k-way unions and portable Succinct archives in
+  file-backed `ByteArea` sections rather than artifact-sized heap vectors.
+  The CPU Succinct domain, decoded merge inputs, counting-sort and wavelet
+  scratch, and final output use mapped sections; freezing retains their
+  mappings without copying. Canonical archive bytes and encoding identities
+  are unchanged. Allocation failures are reported separately from malformed
+  archives, with checked section-size arithmetic. GPU device readback,
+  runtime-to-portable serialization, explicit canonical audits and small
+  per-input metadata remain separate allocations; mapped pages still consume
+  working-set memory and temporary backing space.
+
 - Reuse the lazy coverage memo across consecutive snapshots only when the
   backend reports no changed component. Warming an older operation control
   after a newer equivalent residency snapshot now also warms later readers.

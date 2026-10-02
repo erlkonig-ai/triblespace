@@ -20,7 +20,9 @@ use super::policy::CollectionPolicy;
 use super::records::RecordDecodeError;
 use std::error::Error;
 use std::fmt;
+use std::io;
 
+use anybytes::area::{ByteArea, Section};
 use anybytes::{Bytes, View};
 use ed25519_dalek::SigningKey;
 
@@ -82,6 +84,45 @@ impl CollectionEncoding for SimpleArchive {
         R: crate::repo::BlobStoreGet + crate::repo::BlobStoreMeta,
     {
         join_all(members).map_err(|source| CollectionOperationError::Fatal(source.to_string()))
+    }
+}
+
+/// Failure to compute a canonical `SimpleArchive` union.
+#[derive(Debug)]
+pub enum SimpleArchiveJoinError {
+    /// An input is not a canonical archive.
+    InvalidElement(UnarchiveError),
+    /// Temporary output storage could not be allocated or frozen.
+    Storage(io::Error),
+}
+
+impl fmt::Display for SimpleArchiveJoinError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidElement(source) => write!(f, "invalid SimpleArchive input: {source}"),
+            Self::Storage(source) => write!(f, "SimpleArchive union output storage: {source}"),
+        }
+    }
+}
+
+impl Error for SimpleArchiveJoinError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidElement(source) => Some(source),
+            Self::Storage(source) => Some(source),
+        }
+    }
+}
+
+impl From<UnarchiveError> for SimpleArchiveJoinError {
+    fn from(source: UnarchiveError) -> Self {
+        Self::InvalidElement(source)
+    }
+}
+
+impl From<io::Error> for SimpleArchiveJoinError {
+    fn from(source: io::Error) -> Self {
+        Self::Storage(source)
     }
 }
 
@@ -357,14 +398,15 @@ pub fn validate_element(blob: &Blob<SimpleArchive>) -> Result<(), UnarchiveError
 /// Both inputs are validated before an identity fast path or output allocation
 /// is taken. Equal and empty inputs reuse their immutable bytes but recompute
 /// the returned handle; every other case performs one lexicographic two-pointer
-/// merge and emits shared rows once.
+/// merge and emits shared rows once into temporary mmap-backed storage. The
+/// result owns the frozen used prefix without copying it into a heap buffer.
 pub fn join(
     left: &Blob<SimpleArchive>,
     right: &Blob<SimpleArchive>,
-) -> Result<Blob<SimpleArchive>, UnarchiveError> {
+) -> Result<Blob<SimpleArchive>, SimpleArchiveJoinError> {
     let left_rows = canonical_rows(left)?;
     let right_rows = canonical_rows(right)?;
-    Ok(join_canonical_rows(left, right, &left_rows, &right_rows))
+    join_canonical_rows(left, right, &left_rows, &right_rows)
 }
 
 /// Compute the exact canonical union of one or more `SimpleArchive` elements:
@@ -372,8 +414,11 @@ pub fn join(
 ///
 /// Every input is validated first. One lexicographic k-way merge then emits
 /// each distinct row once, so the result is the same canonical archive a
-/// fold of [`join`] would produce, without its intermediate archives.
-pub fn join_all(members: &[Blob<SimpleArchive>]) -> Result<Blob<SimpleArchive>, UnarchiveError> {
+/// fold of [`join`] would produce, without its intermediate archives. Output
+/// rows are written into temporary mmap-backed storage, not a heap buffer.
+pub fn join_all(
+    members: &[Blob<SimpleArchive>],
+) -> Result<Blob<SimpleArchive>, SimpleArchiveJoinError> {
     let rows = members
         .iter()
         .map(canonical_rows)
@@ -392,8 +437,11 @@ pub fn join_all(members: &[Blob<SimpleArchive>]) -> Result<Blob<SimpleArchive>, 
         _ => {}
     }
     let mut cursors = vec![0usize; rows.len()];
-    let total: usize = rows.iter().map(|rows| rows.len()).sum();
-    let mut out: Vec<[u8; TRIBLE_LEN]> = Vec::with_capacity(total);
+    let total = union_row_capacity(rows.iter().map(|rows| rows.len()))?;
+    let mut area = ByteArea::new()?;
+    let mut sections = area.sections();
+    let mut out = sections.reserve::<[u8; TRIBLE_LEN]>(total)?;
+    let mut used = 0;
     loop {
         let mut least: Option<&[u8; TRIBLE_LEN]> = None;
         for (index, rows) in rows.iter().enumerate() {
@@ -411,9 +459,10 @@ pub fn join_all(members: &[Blob<SimpleArchive>]) -> Result<Blob<SimpleArchive>, 
                 cursors[index] += 1;
             }
         }
-        out.push(least);
+        out[used] = least;
+        used += 1;
     }
-    Ok(Blob::new(Bytes::from(out)))
+    freeze_union_rows(out, used)
 }
 
 /// Validate a discovered commit as one canonical root of this collection.
@@ -553,17 +602,54 @@ fn join_canonical_rows(
     right: &Blob<SimpleArchive>,
     left_rows: &[[u8; TRIBLE_LEN]],
     right_rows: &[[u8; TRIBLE_LEN]],
-) -> Blob<SimpleArchive> {
+) -> Result<Blob<SimpleArchive>, SimpleArchiveJoinError> {
     if left.bytes == right.bytes || right_rows.is_empty() {
-        return Blob::new(left.bytes.clone());
+        return Ok(Blob::new(left.bytes.clone()));
     }
     if left_rows.is_empty() {
-        return Blob::new(right.bytes.clone());
+        return Ok(Blob::new(right.bytes.clone()));
     }
 
-    let mut rows = Vec::with_capacity(left_rows.len() + right_rows.len());
-    rows.extend(UnionRows::new(left_rows, right_rows).copied());
-    Blob::new(Bytes::from(rows))
+    let capacity = union_row_capacity([left_rows.len(), right_rows.len()].into_iter())?;
+    let mut area = ByteArea::new()?;
+    let mut sections = area.sections();
+    let mut out = sections.reserve::<[u8; TRIBLE_LEN]>(capacity)?;
+    let mut used = 0;
+    for row in UnionRows::new(left_rows, right_rows) {
+        out[used] = *row;
+        used += 1;
+    }
+    freeze_union_rows(out, used)
+}
+
+fn union_row_capacity(mut lengths: impl Iterator<Item = usize>) -> io::Result<usize> {
+    let capacity = lengths.try_fold(0usize, |total, length| {
+        total.checked_add(length).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "union row capacity overflow")
+        })
+    })?;
+    union_row_bytes(capacity)?;
+    Ok(capacity)
+}
+
+fn union_row_bytes(rows: usize) -> io::Result<usize> {
+    // ByteArea's reserve arithmetic is unchecked. This single section starts
+    // at zero with byte alignment, so bounding its byte length also bounds
+    // every mmap and slice length it constructs.
+    rows.checked_mul(TRIBLE_LEN)
+        .filter(|&bytes| bytes <= isize::MAX as usize)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "union byte capacity overflow"))
+}
+
+fn freeze_union_rows(
+    rows: Section<'_, [u8; TRIBLE_LEN]>,
+    used: usize,
+) -> Result<Blob<SimpleArchive>, SimpleArchiveJoinError> {
+    let len = union_row_bytes(used)?;
+    // Freeze the original mapping once and expose only initialized union
+    // rows. Bytes retains that mapping after the area unlinks its temp file;
+    // neither freezing the entire area nor copying the prefix is necessary.
+    Ok(Blob::new(rows.freeze()?.slice(..len)))
 }
 
 fn canonical_rows(blob: &Blob<SimpleArchive>) -> Result<View<[[u8; TRIBLE_LEN]]>, UnarchiveError> {
@@ -1208,6 +1294,130 @@ mod tests {
         let right_associated = join(&a, &join(&b, &c).unwrap()).unwrap();
         assert_eq!(left_associated, right_associated);
         assert_eq!(left_associated.bytes.len(), 5 * TRIBLE_LEN);
+    }
+
+    #[test]
+    fn mmap_union_matches_exact_canonical_bytes_and_handle() {
+        let left = archive([row(1, 1, 1), row(3, 1, 3), row(5, 1, 5)]);
+        let right = archive([row(2, 1, 2), row(3, 1, 3), row(4, 1, 4)]);
+        let expected = raw_archive((1..=5).map(|n| row(n, 1, n)).collect());
+
+        let joined = join(&left, &right).unwrap();
+
+        assert_eq!(joined.bytes, expected.bytes);
+        assert_eq!(joined.get_handle(), expected.get_handle());
+        assert_eq!(joined.bytes.len(), 5 * TRIBLE_LEN);
+        validate_element(&joined).unwrap();
+    }
+
+    #[test]
+    fn mmap_k_way_union_matches_exact_bytes_with_overlap_and_empty_members() {
+        let empty = archive([]);
+        let a = archive([row(1, 1, 1), row(3, 1, 3)]);
+        let b = archive([row(2, 1, 2), row(3, 1, 3)]);
+        let c = archive([row(1, 1, 1), row(4, 1, 4)]);
+        let expected = raw_archive((1..=4).map(|n| row(n, 1, n)).collect());
+
+        let joined = join_all(&[c, empty, a.clone(), b, a]).unwrap();
+
+        assert_eq!(joined.bytes, expected.bytes);
+        assert_eq!(joined.get_handle(), expected.get_handle());
+        assert_eq!(joined.bytes.len(), 4 * TRIBLE_LEN);
+        validate_element(&joined).unwrap();
+    }
+
+    #[test]
+    fn union_identity_paths_reuse_bytes_and_k_way_identity_is_exact() {
+        let empty = archive([]);
+        let member = archive([row(1, 1, 1), row(2, 1, 2)]);
+        for joined in [
+            join(&empty, &member).unwrap(),
+            join(&member, &empty).unwrap(),
+            join(&member, &member).unwrap(),
+            join_all(std::slice::from_ref(&member)).unwrap(),
+            join_all(&[empty.clone(), member.clone(), empty.clone()]).unwrap(),
+        ] {
+            assert_eq!(joined.bytes.as_ptr(), member.bytes.as_ptr());
+            assert_eq!(joined.get_handle(), member.get_handle());
+        }
+        assert_eq!(join_all(&[]).unwrap(), empty);
+        assert_eq!(join_all(&[empty.clone(), empty.clone()]).unwrap(), empty);
+        let idempotent = join_all(&[member.clone(), member.clone(), member.clone()]).unwrap();
+        assert_eq!(idempotent.bytes, member.bytes);
+        assert_eq!(idempotent.get_handle(), member.get_handle());
+    }
+
+    #[test]
+    fn frozen_union_prefix_keeps_mapping_and_outlives_area_and_blob() {
+        let expected = raw_archive(vec![row(1, 1, 1), row(2, 1, 2)]);
+        let (joined, mapped_ptr) = {
+            let mut area = ByteArea::new().unwrap();
+            let mut sections = area.sections();
+            let mut rows = sections.reserve::<[u8; TRIBLE_LEN]>(3).unwrap();
+            rows[0] = row(1, 1, 1);
+            rows[1] = row(2, 1, 2);
+            let mapped_ptr = rows.as_ptr().cast::<u8>();
+            (freeze_union_rows(rows, 2).unwrap(), mapped_ptr)
+        };
+        assert_eq!(joined.bytes.as_ptr(), mapped_ptr, "freezing must not copy");
+        assert_eq!(joined.bytes.len(), 2 * TRIBLE_LEN);
+        assert_eq!(joined.get_handle(), expected.get_handle());
+        let retained_rows = canonical_rows(&joined).unwrap();
+        drop(joined);
+        assert_eq!(&*retained_rows, &[row(1, 1, 1), row(2, 1, 2)]);
+    }
+
+    #[test]
+    fn union_validates_inputs_before_identity_paths() {
+        let empty = archive([]);
+        let invalid = raw_archive(vec![row(1, 1, 1), row(1, 1, 1)]);
+        for error in [
+            join(&invalid, &invalid).unwrap_err(),
+            join(&invalid, &empty).unwrap_err(),
+            join(&empty, &invalid).unwrap_err(),
+            join_all(&[empty, invalid]).unwrap_err(),
+        ] {
+            assert!(matches!(
+                error,
+                SimpleArchiveJoinError::InvalidElement(
+                    UnarchiveError::BadCanonicalizationRedundancy
+                )
+            ));
+        }
+    }
+
+    #[test]
+    fn union_output_errors_preserve_storage_cause_and_check_size_bounds() {
+        let error = SimpleArchiveJoinError::from(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "temporary output denied",
+        ));
+        assert!(error.to_string().contains("output storage"));
+        assert_eq!(
+            error
+                .source()
+                .unwrap()
+                .downcast_ref::<io::Error>()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(matches!(error, SimpleArchiveJoinError::Storage(_)));
+
+        for source in [
+            union_row_capacity([usize::MAX, 1].into_iter()).unwrap_err(),
+            union_row_bytes(usize::MAX / TRIBLE_LEN + 1).unwrap_err(),
+            union_row_bytes(isize::MAX as usize / TRIBLE_LEN + 1).unwrap_err(),
+        ] {
+            let error = SimpleArchiveJoinError::from(source);
+            assert!(matches!(
+                error,
+                SimpleArchiveJoinError::Storage(ref source)
+                    if source.kind() == io::ErrorKind::InvalidInput
+            ));
+        }
+        assert_eq!(union_row_bytes(0).unwrap(), 0);
+        assert_eq!(union_row_bytes(3).unwrap(), 3 * TRIBLE_LEN);
     }
 
     #[test]
