@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.47.1] - 2026-10-03
+
 - Build SimpleArchive binary/k-way unions and portable Succinct archives in
   file-backed `ByteArea` sections rather than artifact-sized heap vectors.
   The CPU Succinct domain, decoded merge inputs, counting-sort and wavelet

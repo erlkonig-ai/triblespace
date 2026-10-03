@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.47.1] - 2026-10-03
+
+- Warm recognized names and resource-policy definition blobs for explicitly
+  pull-selected collections, including empty collections, with bounded host
+  ownership, typed extraction and pre-body byte limits. Passive snapshots,
+  ordinary exact reads and resident-only stores retain their semantics.
+- Require core 0.47.1 with the mapped archive buffer repair.
+
 ## [0.47.0] - 2026-10-01
 
 - Raise the reconciler's shared exact-fetch request window from four to eight.

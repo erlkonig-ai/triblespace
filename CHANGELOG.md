@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.47.1] - 2026-10-03
+
+- Publish the mapped archive buffer repair and bounded descriptor metadata
+  warmup in core, net and the facade. The facade and net require core 0.47.1;
+  unchanged companion crates retain their published 0.47.0 versions.
+
 - Warm recognized names and resource-policy definition blobs for explicitly
   pull-selected collections, including empty collections, with bounded host
   ownership, typed extraction and pre-body byte limits. Ordinary exact reads,

@@ -1,6 +1,6 @@
 [package]
 name = "triblespace"
-version = "0.47.0"
+version = "0.47.1"
 authors = ["Jan Bramkamp <crest@rlwinm.de>", "⚫️ <jp@bultmann.eu>", "Vanja Sophie Cangalovic <vanja@bultmann.eu>"]
 edition = "2021"
 rust-version = "1.89"
@@ -38,7 +38,7 @@ exclude = ["tribleset-bench", "vendor/iroh-gossip"]
 resolver = "2"
 
 [dependencies]
-triblespace-core = { version = "0.47.0", path = "./triblespace-core", default-features = false }
+triblespace-core = { version = "0.47.1", path = "./triblespace-core", default-features = false }
 triblespace-gpu = { version = "0.47.0", path = "./triblespace-gpu", optional = true }
 triblespace-macros = { version = "0.47.0", path = "./triblespace-macros" }
 ed25519-dalek = { version = "2.1.0", features = ["rand_core"], optional = true }
