@@ -3300,6 +3300,26 @@ impl SnapshotHandler {
                     send_hash(send, &peer).await?;
                 }
             }
+            crate::protocol::OP_FIND_VALUE => {
+                let requester = peer.to_bytes();
+                let routes = |key| {
+                    let mut routes = self.candidates.lock().unwrap().closest_verified(key, K);
+                    routes.retain(|route| *route != requester);
+                    routes
+                };
+                let hints = |key| {
+                    let resident = self
+                        .snapshot
+                        .borrow()
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.bearer_handle(key));
+                    self.providers
+                        .lock()
+                        .unwrap()
+                        .hints(key, crate::clock::mono_now(), resident)
+                };
+                crate::protocol::serve_find_value(recv, send, routes, hints).await?;
+            }
             _ => anyhow::bail!("unknown direct RPC operation {op:#x}"),
         }
         self.candidates
@@ -3330,6 +3350,7 @@ fn op_name(op: u8) -> &'static str {
         OP_PROVIDER_PUT => "PROVIDER_PUT",
         OP_PROVIDER_GET => "PROVIDER_GET",
         OP_FIND_NODE => "FIND_NODE",
+        crate::protocol::OP_FIND_VALUE => "FIND_VALUE",
         OP_COLLECTION_REPAIR => "COLLECTION_REPAIR",
         _ => "UNKNOWN",
     }

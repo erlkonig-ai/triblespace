@@ -41,6 +41,10 @@ pub const OP_PROVIDER_PUT: u8 = 0x06;
 pub const OP_PROVIDER_GET: u8 = 0x07;
 pub const OP_FIND_NODE: u8 = 0x0C;
 // 0x0E is OP_COLLECTION_REPAIR, owned by collection_wire.
+/// One DHT lookup step: the routes of `FIND_NODE` and the hints of
+/// `PROVIDER_GET` in one reply. Served, never sent on this generation: an
+/// older peer fails the stream on an unknown opcode.
+pub const OP_FIND_VALUE: u8 = 0x0F;
 
 pub const PROVIDER_PUT_OK: u8 = 0x00;
 pub const PROVIDER_PUT_FULL: u8 = 0x01;
@@ -402,18 +406,25 @@ pub async fn op_provider_get<C: Conn>(conn: &C, key: &RawHash) -> Result<Vec<(Ra
     send.shutdown()
         .await
         .map_err(|error| anyhow!("finish: {error}"))?;
-    let count = recv_u8(&mut recv).await? as usize;
+    let providers = recv_provider_hints(&mut recv).await?;
+    require_response_eof(&mut recv).await?;
+    Ok(providers)
+}
+
+async fn recv_provider_hints<R: AsyncRead + Unpin>(
+    recv: &mut R,
+) -> Result<Vec<(RawHash, RawHash)>> {
+    let count = recv_u8(recv).await? as usize;
     if count > crate::provider::MAX_PROVIDERS_PER_REPLY {
         return Err(anyhow!(
-            "provider-get response has {count} entries; limit is {}",
+            "response has {count} provider hints; limit is {}",
             crate::provider::MAX_PROVIDERS_PER_REPLY
         ));
     }
     let mut providers = Vec::with_capacity(count);
     for _ in 0..count {
-        providers.push((recv_hash(&mut recv).await?, recv_hash(&mut recv).await?));
+        providers.push((recv_hash(recv).await?, recv_hash(recv).await?));
     }
-    require_response_eof(&mut recv).await?;
     Ok(providers)
 }
 
@@ -437,10 +448,16 @@ pub async fn op_find_node<C: Conn>(
 pub(crate) async fn recv_find_node_response<R: AsyncRead + Unpin>(
     recv: &mut R,
 ) -> Result<Vec<crate::transport::PeerId>> {
+    let peers = recv_routes(recv).await?;
+    require_response_eof(recv).await?;
+    Ok(peers)
+}
+
+async fn recv_routes<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Vec<crate::transport::PeerId>> {
     let count = recv_u8(recv).await? as usize;
     if count > crate::routing::K {
         return Err(anyhow!(
-            "FIND_NODE response has {count} entries; limit is {}",
+            "response has {count} routes; limit is {}",
             crate::routing::K
         ));
     }
@@ -448,8 +465,47 @@ pub(crate) async fn recv_find_node_response<R: AsyncRead + Unpin>(
     for _ in 0..count {
         peers.push(recv_hash(recv).await?);
     }
-    require_response_eof(recv).await?;
     Ok(peers)
+}
+
+/// Serve one `FIND_VALUE(key)`: at most K verified routes nearest the key,
+/// then at most one reply of token-bearing provider hints for it.
+pub(crate) async fn serve_find_value<R, W>(
+    recv: &mut R,
+    send: &mut W,
+    closest: impl FnOnce(RawHash) -> Vec<PeerId>,
+    hints: impl FnOnce(RawHash) -> Vec<(PeerId, RawHash)>,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let key = recv_hash(recv).await?;
+    require_response_eof(recv).await?;
+    let routes = closest(key);
+    let hints = hints(key);
+    debug_assert!(routes.len() <= crate::routing::K);
+    debug_assert!(hints.len() <= crate::provider::MAX_PROVIDERS_PER_REPLY);
+    send_u8(send, routes.len() as u8).await?;
+    for route in &routes {
+        send_hash(send, route).await?;
+    }
+    send_u8(send, hints.len() as u8).await?;
+    for (provider, token) in &hints {
+        send_hash(send, provider).await?;
+        send_hash(send, token).await?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) async fn recv_find_value_response<R: AsyncRead + Unpin>(
+    recv: &mut R,
+) -> Result<(Vec<PeerId>, Vec<(RawHash, RawHash)>)> {
+    let routes = recv_routes(recv).await?;
+    let hints = recv_provider_hints(recv).await?;
+    require_response_eof(recv).await?;
+    Ok((routes, hints))
 }
 
 async fn require_response_eof<R: AsyncRead + Unpin>(recv: &mut R) -> Result<()> {
@@ -1281,6 +1337,60 @@ mod tests {
             recv_find_node_response(&mut [0, 1].as_slice())
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn find_value_carries_routes_then_hints_within_both_bounds() {
+        let key = [0xAB; 32];
+        let routes = (0..crate::routing::K as u8)
+            .map(|byte| [byte; 32])
+            .collect::<Vec<_>>();
+        let hints = (0..crate::provider::MAX_PROVIDERS_PER_REPLY as u8)
+            .map(|byte| ([byte; 32], [!byte; 32]))
+            .collect::<Vec<_>>();
+        let (client, server) = duplex(64 * 1024);
+        let (mut client_recv, mut client_send) = split(client);
+        let (mut server_recv, mut server_send) = split(server);
+        let (served_routes, served_hints) = (routes.clone(), hints.clone());
+        let serving = tokio::spawn(async move {
+            serve_find_value(
+                &mut server_recv,
+                &mut server_send,
+                |asked| {
+                    assert_eq!(asked, key);
+                    served_routes
+                },
+                |asked| {
+                    assert_eq!(asked, key);
+                    served_hints
+                },
+            )
+            .await?;
+            server_send
+                .shutdown()
+                .await
+                .map_err(|error| anyhow!("finish: {error}"))
+        });
+        send_hash(&mut client_send, &key).await.unwrap();
+        client_send.shutdown().await.unwrap();
+        assert_eq!(
+            recv_find_value_response(&mut client_recv).await.unwrap(),
+            (routes, hints)
+        );
+        serving.await.unwrap().unwrap();
+
+        let too_many_routes = [crate::routing::K as u8 + 1];
+        let too_many_hints = [0, crate::provider::MAX_PROVIDERS_PER_REPLY as u8 + 1];
+        let malformed: [&[u8]; 4] = [&too_many_routes, &too_many_hints, &[0], &[0, 0, 0]];
+        for mut reply in malformed {
+            assert!(recv_find_value_response(&mut reply).await.is_err());
+        }
+        assert_eq!(
+            recv_find_value_response(&mut [0, 0].as_slice())
+                .await
+                .unwrap(),
+            (Vec::new(), Vec::new())
         );
     }
 

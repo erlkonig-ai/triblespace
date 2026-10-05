@@ -957,6 +957,7 @@ bearer/DHT framing:
 | `PROVIDER_PUT` | `0x06` | renew this endpoint's opaque provider lease |
 | `PROVIDER_GET` | `0x07` | obtain bounded candidates for one opaque key |
 | `FIND_NODE` | `0x0C` | iterative XOR-DHT routing step |
+| `FIND_VALUE` | `0x0F` | `FIND_NODE` routes and `PROVIDER_GET` hints in one reply; served, never sent before the next generation |
 | `COLLECTION_REPAIR` | `0x0E` | READ-gated foundation-record, authorization-evidence and held-blob PATCH walks |
 
 Opcode `0x0D` is no longer served. Mixed-generation collection repair is not

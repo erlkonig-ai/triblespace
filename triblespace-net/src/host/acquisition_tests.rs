@@ -1745,3 +1745,100 @@ async fn local_receive_saturation_preserves_the_provider_connection() {
     );
     fixture.assert_no_control_effects();
 }
+
+#[tokio::test(start_paused = true)]
+async fn find_value_answers_find_node_routes_and_provider_hints_in_one_reply() {
+    use tokio::io::AsyncWriteExt as _;
+
+    async fn find_value<C: Conn>(
+        connection: &C,
+        key: ProviderKey,
+    ) -> (Vec<PeerId>, Vec<(PeerId, ProviderToken)>) {
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        send_u8(&mut send, crate::protocol::OP_FIND_VALUE)
+            .await
+            .unwrap();
+        send_hash(&mut send, &key).await.unwrap();
+        send.shutdown().await.unwrap();
+        crate::protocol::recv_find_value_response(&mut recv)
+            .await
+            .unwrap()
+    }
+
+    let _guard = crate::protocol::exact_blob_receive_test_guard();
+    let fixture = Fixture::new(false);
+    let requester = fixture.client.my_id;
+    // A key equal to the requester's id puts the requester nearest of all,
+    // among more verified routes than one reply carries.
+    let unheld = requester;
+    {
+        let mut routes = fixture.provider_routes.lock().unwrap();
+        routes.promote_authenticated(requester);
+        for byte in 1..=3 * K as u8 {
+            routes.promote_authenticated(
+                SigningKey::from_bytes(&[byte; 32])
+                    .verifying_key()
+                    .to_bytes(),
+            );
+        }
+        assert!(routes.closest_verified(unheld, K + 1).len() > K);
+    }
+    let resident = blob_locator(fixture.hash);
+    let foreign = (100..200_u8)
+        .map(|byte| {
+            (
+                SigningKey::from_bytes(&[byte; 32])
+                    .verifying_key()
+                    .to_bytes(),
+                [byte; 32],
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    {
+        let mut directory = fixture.provider_directory.lock().unwrap();
+        let now = crate::clock::mono_now();
+        for (peer, token) in &foreign {
+            assert!(directory.put(resident, *peer, *token, now));
+        }
+        for (peer, token) in foreign.iter().take(10) {
+            assert!(directory.put(unheld, *peer, *token, now));
+        }
+    }
+    let connection = pool_get(
+        &fixture.client.transport,
+        &fixture.client.pool,
+        fixture.provider,
+    )
+    .await
+    .unwrap();
+    let connection = connection.conn();
+
+    let (routes, hints) = find_value(connection, unheld).await;
+    assert_eq!(routes.len(), K - 1, "the K closest, less the requester");
+    assert!(!routes.contains(&requester));
+    assert_eq!(routes, op_find_node(connection, &unheld).await.unwrap());
+    assert_eq!(hints.len(), 10);
+    assert_eq!(hints, op_provider_get(connection, &unheld).await.unwrap());
+
+    // Above the reply limit the stored leases are sampled behind this node's
+    // own resident hint; every sampled entry is a stored lease.
+    let (_, hints) = find_value(connection, resident).await;
+    assert_eq!(hints.len(), crate::provider::MAX_PROVIDERS_PER_REPLY);
+    assert_eq!(
+        hints[0],
+        (
+            fixture.provider,
+            blob_provider_token(fixture.hash, fixture.provider)
+        )
+    );
+    assert!(
+        hints[1..]
+            .iter()
+            .all(|(peer, token)| foreign.get(peer) == Some(token))
+    );
+    assert_eq!(
+        hints[1..].iter().collect::<BTreeSet<_>>().len(),
+        crate::provider::MAX_PROVIDERS_PER_REPLY - 1
+    );
+    assert_eq!(fixture.blob_reads.load(Ordering::Relaxed), 0);
+}

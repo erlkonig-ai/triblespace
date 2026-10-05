@@ -745,6 +745,30 @@ impl ProviderDirectory {
         live
     }
 
+    /// The token-bearing hints this node answers for one exact key: its
+    /// directory sample, led by this node's own current hint when `resident`
+    /// names the blob behind the key. That hint replaces any stored self
+    /// entry and, in a full reply, one uniformly chosen other entry.
+    pub(crate) fn hints(
+        &mut self,
+        key: ProviderKey,
+        now: Mono,
+        resident: Option<[u8; 32]>,
+    ) -> Vec<(PeerId, ProviderToken)> {
+        let mut hints = self.get(key, now);
+        if let Some(handle) = resident {
+            hints.retain(|(provider, _)| *provider != self.local_id);
+            if hints.len() == MAX_PROVIDERS_PER_REPLY {
+                hints.remove(self.sampler.gen_range(0..hints.len()));
+            }
+            hints.insert(
+                0,
+                (self.local_id, blob_provider_token(handle, self.local_id)),
+            );
+        }
+        hints
+    }
+
     fn prune_expired(&mut self, now: Mono) {
         for _ in 0..MAX_EXPIRED_PROVIDER_MEMBERSHIPS_PER_CALL {
             let Some((expires_at, key, provider)) = self.deadlines.first().copied() else {
@@ -1250,6 +1274,40 @@ mod tests {
             .collect::<BTreeMap<_, _>>();
         assert_eq!(seen, expected);
         assert_eq!(directory.retained_counts(), (200, 1));
+    }
+
+    #[test]
+    fn resident_hint_leads_a_full_reply_and_replaces_the_stored_self_entry() {
+        let now = crate::clock::mono_now();
+        let key = [3; 32];
+        let handle = [4; 32];
+        let local = [0; 32];
+        let own = (local, blob_provider_token(handle, local));
+        let publishers = (0..100).map(publisher).collect::<Vec<_>>();
+        let mut directory = seeded_directory(5, 1 << 16);
+        assert!(directory.put(key, local, [0; 32], now));
+        for provider in &publishers {
+            assert!(directory.put(key, *provider, [1; 32], now));
+        }
+        let mut seen = BTreeSet::new();
+        for _ in 0..64 {
+            let hints = directory.hints(key, now, Some(handle));
+            assert_eq!(hints.len(), MAX_PROVIDERS_PER_REPLY);
+            assert_eq!(hints[0], own);
+            assert!(hints[1..].windows(2).all(|pair| pair[0].0 < pair[1].0));
+            assert!(
+                hints[1..]
+                    .iter()
+                    .all(|(provider, token)| *provider != local && *token == [1; 32])
+            );
+            seen.extend(hints[1..].iter().map(|(provider, _)| *provider));
+        }
+        assert_eq!(seen, publishers.iter().copied().collect());
+
+        let lone = [5; 32];
+        assert!(directory.put(lone, local, [0; 32], now));
+        assert_eq!(directory.hints(lone, now, Some(handle)), vec![own]);
+        assert_eq!(directory.hints(lone, now, None), vec![(local, [0; 32])]);
     }
 
     #[test]
