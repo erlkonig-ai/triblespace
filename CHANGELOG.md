@@ -12,6 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reachability retention; ordinary compact still preserves all resident blobs.
   Absent handles and missing or ambiguous names refuse before destination creation.
 
+- Add the sync selection register to core (`collection::selection`): which
+  collections a pile syncs, one register per collection in the pile's own
+  configuration collection, written by the faculties, `trible` or an app and
+  read without a tie-break. `private_policy` and the configuration handle move
+  into core so every writer and the sync daemon derive the same collection.
+  See the `triblespace-core` changelog.
+
 ## [0.47.1] - 2026-10-03
 
 - Publish the mapped archive buffer repair and bounded descriptor metadata

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add `collection::selection`, the sync selection register. Each synced
+  collection has one register in the pile's own configuration collection:
+  states anchored by `sync_collection` (`99D9A2B7C5636FEFDE482DB3A6D01EE6`)
+  say `sync_selected` (`24EB46425226C0025A3C85D34F8919CE`) and are ordered by
+  `metadata::supersedes`. `write_sync_selection` supersedes every head it sees
+  and mints a fresh state id per write. `sync_selection` reads the heads as
+  unset, selected, unselected or conflicted, and never breaks a tie.
+  `config_handle` derives the configuration collection from the pile's key
+  exactly as the faculties do, and `config_facts` reads it from a snapshot,
+  with an unconfigured pile reading as empty rather than as an error.
+- Move `private_policy` (READ and WRITE both admitting one key) into
+  `collection`, so `trible` and the faculties derive the same handles from one
+  definition.
+
 ## [0.47.1] - 2026-10-03
 
 - Build SimpleArchive binary/k-way unions and portable Succinct archives in
