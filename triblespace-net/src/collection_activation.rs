@@ -51,6 +51,18 @@ fn evidence_key(collection: CollectionHandle, id: CapabilityProofId) -> [u8; 64]
     key
 }
 
+/// Each prefix of `proof` with the key it names, truncated there: the signed
+/// chain that subject holds, without later delegates or their capability
+/// handles. Resource, root and the kept signatures are the proof's own, so a
+/// prefix of a valid evidence proof is valid evidence too.
+fn subject_prefixes(
+    proof: &CapabilityProof,
+) -> impl Iterator<Item = (VerifyingKey, CapabilityProof)> + '_ {
+    proof
+        .prefixes()
+        .map(|prefix| (prefix.subject(), prefix.to_proof()))
+}
+
 /// Canonical collection-scoped set of structurally relevant authorization proofs.
 ///
 /// Keys are repair audience C | proof hash, not proof resource | proof hash.
@@ -247,12 +259,9 @@ impl CollectionAuthorizationEvidencePatch {
                         .any(|policy| policy.has_root(proof.root_key()))
             })
             .filter_map(|proof| {
-                proof
-                    .prefixes()
-                    .filter(|prefix| prefix.subject() == subject)
-                    .find_map(|prefix| {
-                        let witness = CapabilityProof::from_bytes(prefix.as_bytes())
-                            .expect("an exact prefix of a canonical proof is canonical");
+                subject_prefixes(proof)
+                    .filter(|(named, _)| *named == subject)
+                    .find_map(|(_, witness)| {
                         witness
                             .verify(
                                 &self.reader,
