@@ -13,6 +13,9 @@ use triblespace_core::collection::CollectionRead;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{BlobStorePut, SnapshotSource, WantRead};
 
+use tokio::io::AsyncWriteExt as _;
+
+use crate::protocol::TAG_RECON;
 use crate::transport::sim::{SimConfig, SimNet, SimTransport};
 
 use super::*;
@@ -74,13 +77,10 @@ impl Fixture {
         let my_id = client_key.verifying_key().to_bytes();
         let mut server_harness = net.join(&provider_key);
         let client_harness = net.join(&client_key);
-        let client = ProviderClient {
-            transport: client_harness.transport,
-            pool: new_shared_pool(),
-            providers: Arc::new(Mutex::new(ProviderDirectory::new(my_id))),
-            candidates: Arc::new(Mutex::new(RoutingTable::new(my_id, [provider]))),
-            my_id,
-        };
+        let client = ProviderClient::for_test(
+            client_harness.transport,
+            RoutingTable::new(my_id, [provider]),
+        );
         let (sender, _receiver, wiring) = wire(EndpointId::from_bytes(&my_id).unwrap());
         wiring.install_test_capability(Arc::new(NetCap {
             client: client.clone(),
@@ -125,21 +125,12 @@ impl Fixture {
             serve_collections: false,
             local_id: provider,
             events: events_tx,
-            inbound_connections: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
-            inbound_requests: Arc::new(tokio::sync::Semaphore::new(MAX_REQUESTS_GLOBAL)),
         };
+        let connections = ConnectionTable::new(server_harness.transport.clone(), handler);
         let server = tokio::spawn(async move {
             while let Some(incoming) = server_harness.incoming.recv().await {
                 assert_eq!(incoming.alpn, PILE_SYNC_ALPN);
-                let permit = handler
-                    .inbound_connections
-                    .clone()
-                    .try_acquire_owned()
-                    .unwrap();
-                let handler = handler.clone();
-                tokio::spawn(async move {
-                    handler.handle::<SimTransport>(incoming.conn, permit).await;
-                });
+                connections.accept(incoming.conn);
             }
         });
         Self {
@@ -201,21 +192,12 @@ impl RecoveryNode {
             serve_collections: false,
             local_id: peer,
             events: events_tx,
-            inbound_connections: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
-            inbound_requests: Arc::new(tokio::sync::Semaphore::new(MAX_REQUESTS_GLOBAL)),
         };
+        let connections = ConnectionTable::new(harness.transport.clone(), handler);
         let server = tokio::spawn(async move {
             while let Some(incoming) = harness.incoming.recv().await {
                 assert_eq!(incoming.alpn, PILE_SYNC_ALPN);
-                let permit = handler
-                    .inbound_connections
-                    .clone()
-                    .try_acquire_owned()
-                    .unwrap();
-                let handler = handler.clone();
-                tokio::spawn(async move {
-                    handler.handle::<SimTransport>(incoming.conn, permit).await;
-                });
+                connections.accept(incoming.conn);
             }
         });
         Self {
@@ -278,6 +260,11 @@ impl DelayedDirectory {
                         let replies = replies.clone();
                         let queries = queries.clone();
                         tokio::spawn(async move {
+                            // The dialler's own recon/1 stream carries no request.
+                            match recv_u8(&mut recv).await.unwrap() {
+                                TAG_RECON => return,
+                                tag => assert_eq!(tag, TAG_DHT),
+                            }
                             let op = recv_u8(&mut recv).await.unwrap();
                             let _key = recv_exact_key(&mut recv).await.unwrap();
                             match op {
@@ -386,20 +373,17 @@ async fn later_directory_hint_case(stalled: bool) {
         Some(Duration::from_secs(1)),
     );
     for peer in [first.peer, later.peer, fixture.provider] {
-        pool_get(&fixture.client.transport, &fixture.client.pool, peer)
-            .await
-            .unwrap();
+        fixture.client.connections.connect(peer).await.unwrap();
     }
     if stalled {
         fixture.net.stall_dials(missing.peer);
     } else {
-        pool_get(
-            &fixture.client.transport,
-            &fixture.client.pool,
-            missing.peer,
-        )
-        .await
-        .unwrap();
+        fixture
+            .client
+            .connections
+            .connect(missing.peer)
+            .await
+            .unwrap();
     }
     *fixture.client.candidates.lock().unwrap() =
         RoutingTable::new(fixture.client.my_id, [first.peer, later.peer]);
@@ -421,13 +405,7 @@ async fn later_directory_hint_case(stalled: bool) {
     );
     if stalled {
         assert!(
-            !fixture
-                .client
-                .pool
-                .lock()
-                .unwrap()
-                .entries
-                .contains_key(&missing.peer),
+            !fixture.client.connections.peers().contains(&missing.peer),
             "success cancels and releases the unrelated pending provider dial",
         );
     }
@@ -593,11 +571,9 @@ async fn stale_provider_lease_survives_loss_alternate_fetch_and_same_endpoint_re
     assert!(
         !fixture
             .client
-            .pool
-            .lock()
-            .unwrap()
-            .entries
-            .contains_key(&fixture.provider)
+            .connections
+            .peers()
+            .contains(&fixture.provider)
     );
     let dials_before_restart = fixture
         .net
@@ -700,12 +676,10 @@ async fn cancelled_discovered_provider_dial_leaves_a_same_client_retry_usable() 
             .dial_count(fixture.client.my_id, fixture.provider),
         1
     );
-    {
-        let pool = fixture.client.pool.lock().unwrap();
-        assert!(!pool.entries.contains_key(&fixture.provider));
-        assert!(pool.entries.contains_key(&directory.peer));
-        assert_eq!(pool.entries.len(), 1);
-    }
+    assert_eq!(
+        fixture.client.connections.peers(),
+        BTreeSet::from([directory.peer])
+    );
     assert_eq!(fixture.blob_reads.load(Ordering::Relaxed), 0);
     fixture.net.unstall_dials(fixture.provider);
     assert_eq!(
@@ -761,10 +735,9 @@ async fn alternate_provider_success_cancels_a_stalled_discovered_dial() {
     );
     assert_eq!(started.elapsed(), Duration::from_secs(4));
     assert_eq!(fixture.net.dial_count(fixture.client.my_id, stalled), 1);
-    let pool = fixture.client.pool.lock().unwrap();
-    assert!(!pool.entries.contains_key(&stalled));
-    assert_eq!(pool.entries.len(), 2);
-    drop(pool);
+    let peers = fixture.client.connections.peers();
+    assert!(!peers.contains(&stalled));
+    assert_eq!(peers.len(), 2);
     assert_eq!(fixture.blob_reads.load(Ordering::Relaxed), 1);
     fixture.assert_no_control_effects();
     directory.assert_no_events();
@@ -837,11 +810,9 @@ async fn mid_transfer_crash_rejects_old_bytes_after_restart_and_allows_fresh_ret
     assert!(
         !fixture
             .client
-            .pool
-            .lock()
-            .unwrap()
-            .entries
-            .contains_key(&fixture.provider)
+            .connections
+            .peers()
+            .contains(&fixture.provider)
     );
     assert_eq!(
         fixture
@@ -907,15 +878,14 @@ async fn serving_telemetry_counts_live_exchange_but_not_bytes_before_bearer_proo
 
     let _guard = crate::protocol::exact_blob_receive_test_guard();
     let mut fixture = Fixture::new(false);
-    let conn = pool_get(
-        &fixture.client.transport,
-        &fixture.client.pool,
-        fixture.provider,
-    )
-    .await
-    .unwrap();
-    let (mut send, mut recv) = conn.connection.open_bi().await.unwrap();
-    send_u8(&mut send, OP_GET_BLOB).await.unwrap();
+    let conn = fixture
+        .client
+        .connections
+        .connect(fixture.provider)
+        .await
+        .unwrap();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    send_u8(&mut send, TAG_BLOB).await.unwrap();
     send_hash(&mut send, &blob_locator(fixture.hash))
         .await
         .unwrap();
@@ -1451,25 +1421,14 @@ async fn known_resident_outside_selected_dht_replicas_is_not_directly_probed() {
                 let (sender, _receiver) = tokio::sync::mpsc::channel(1);
                 sender
             },
-            inbound_connections: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
-            inbound_requests: Arc::new(tokio::sync::Semaphore::new(MAX_REQUESTS_GLOBAL)),
         };
+        let connections = ConnectionTable::new(harness.transport.clone(), handler);
         servers.push(tokio::spawn(async move {
             while let Some(incoming) = harness.incoming.recv().await {
-                let permit = handler
-                    .inbound_connections
-                    .clone()
-                    .try_acquire_owned()
-                    .unwrap();
-                let handler = handler.clone();
-                tokio::spawn(async move {
-                    handler.handle::<SimTransport>(incoming.conn, permit).await;
-                });
+                connections.accept(incoming.conn);
             }
         }));
-        pool_get(&fixture.client.transport, &fixture.client.pool, peer)
-            .await
-            .unwrap();
+        fixture.client.connections.connect(peer).await.unwrap();
     }
     *fixture.client.candidates.lock().unwrap() = RoutingTable::new(
         fixture.client.my_id,
@@ -1546,13 +1505,10 @@ async fn zero_announcement_budget_still_answers_resident_self_hints() {
                 },
                 wiring,
             ));
-            let client = ProviderClient {
-                transport: client_harness.transport,
-                pool: new_shared_pool(),
-                providers: Arc::new(Mutex::new(ProviderDirectory::new(client_id))),
-                candidates: Arc::new(Mutex::new(RoutingTable::new(client_id, [server_id]))),
-                my_id: client_id,
-            };
+            let client = ProviderClient::for_test(
+                client_harness.transport,
+                RoutingTable::new(client_id, [server_id]),
+            );
             assert_eq!(
                 client
                     .fetch_blob(hash, None)
@@ -1593,13 +1549,12 @@ async fn warm_provider_miss_is_not_a_transport_failure() {
     // Neither a directory lease nor the serving snapshot knows this exact H.
     // A warm successful directory miss remains distinct from transport failure.
     let missing = *blake3::hash(b"absent warm provider query").as_bytes();
-    pool_get(
-        &fixture.client.transport,
-        &fixture.client.pool,
-        fixture.provider,
-    )
-    .await
-    .unwrap();
+    fixture
+        .client
+        .connections
+        .connect(fixture.provider)
+        .await
+        .unwrap();
     let started = tokio::time::Instant::now();
     assert!(
         fixture
@@ -1715,11 +1670,9 @@ async fn local_receive_saturation_preserves_the_provider_connection() {
     assert!(
         fixture
             .client
-            .pool
-            .lock()
-            .unwrap()
-            .entries
-            .contains_key(&fixture.provider)
+            .connections
+            .peers()
+            .contains(&fixture.provider)
     );
     assert_eq!(
         fixture

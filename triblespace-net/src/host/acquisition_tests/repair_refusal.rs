@@ -7,14 +7,13 @@ use triblespace_core::collection::{
 
 use crate::collection_session::CollectionRepairRefusal;
 use crate::collection_wire::{recv_repair_collection, recv_repair_hello};
-use crate::transport::sim::SimConn;
+use crate::protocol::{TAG_DHT, TAG_REPAIR};
 
 use super::*;
 
 struct RepairFixture {
     net: SimNet,
-    transport: SimTransport,
-    pool: SharedPool<SimConn>,
+    client: ProviderClient<SimTransport>,
     provider: PeerId,
     snapshot: StoreSnapshot,
     allowed: CollectionHandle,
@@ -24,7 +23,7 @@ struct RepairFixture {
     events: tokio::sync::mpsc::Sender<NetEventBatch>,
     received: tokio::sync::mpsc::Receiver<NetEventBatch>,
     health: Health,
-    requests: Arc<tokio::sync::Semaphore>,
+    server_connections: ConnectionTable<SimTransport, SnapshotHandler>,
     server: tokio::task::JoinHandle<()>,
 }
 
@@ -39,9 +38,12 @@ impl RepairFixture {
         let provider_key = SigningKey::from_bytes(&[113; 32]);
         let client_key = SigningKey::from_bytes(&[114; 32]);
         let provider = provider_key.verifying_key().to_bytes();
-        let client = client_key.verifying_key().to_bytes();
+        let client_id = client_key.verifying_key().to_bytes();
         let mut provider_harness = net.join(&provider_key);
-        let transport = net.join(&client_key).transport;
+        let client = ProviderClient::for_test(
+            net.join(&client_key).transport,
+            RoutingTable::new(client_id, [provider]),
+        );
         let mut remote = MemoryRepo::default();
         let mut local = MemoryRepo::default();
         let open = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
@@ -112,7 +114,6 @@ impl RepairFixture {
         )
         .unwrap();
         let (server_events, _server_received) = tokio::sync::mpsc::channel(16);
-        let requests = Arc::new(tokio::sync::Semaphore::new(MAX_REQUESTS_GLOBAL));
         let handler = SnapshotHandler {
             snapshot: tokio::sync::watch::channel(Some(Arc::new(remote_snapshot))).1,
             health: Health::new(EndpointId::from_bytes(&provider).unwrap()),
@@ -121,39 +122,32 @@ impl RepairFixture {
             serve_collections: true,
             local_id: provider,
             events: server_events,
-            inbound_connections: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
-            inbound_requests: requests.clone(),
         };
+        let server_connections = ConnectionTable::new(provider_harness.transport.clone(), handler);
+        let connections = server_connections.clone();
         let server = tokio::spawn(async move {
             while let Some(incoming) = provider_harness.incoming.recv().await {
-                let handler = handler.clone();
+                if !malformed_reply {
+                    connections.accept(incoming.conn);
+                    continue;
+                }
                 tokio::spawn(async move {
-                    if malformed_reply {
-                        // Negative control: this is not an expected admission
-                        // refusal; the peer emits an invalid wire discriminant.
-                        let (mut send, mut recv) = incoming.conn.accept_bi().await.unwrap();
-                        assert_eq!(recv_u8(&mut recv).await.unwrap(), OP_COLLECTION_REPAIR);
-                        recv_repair_collection(&mut recv).await.unwrap();
-                        recv_repair_hello(&mut recv).await.unwrap();
-                        send_u8(&mut send, 0xff).await.unwrap();
-                        send.shutdown().await.unwrap();
-                    } else {
-                        let permit = handler
-                            .inbound_connections
-                            .clone()
-                            .acquire_owned()
-                            .await
-                            .unwrap();
-                        handler.handle::<SimTransport>(incoming.conn, permit).await;
-                    }
+                    // Negative control: this is not an expected admission
+                    // refusal; the peer emits an invalid wire discriminant.
+                    let _recon = incoming.conn.accept_bi().await.unwrap();
+                    let (mut send, mut recv) = incoming.conn.accept_bi().await.unwrap();
+                    assert_eq!(recv_u8(&mut recv).await.unwrap(), TAG_REPAIR);
+                    recv_repair_collection(&mut recv).await.unwrap();
+                    recv_repair_hello(&mut recv).await.unwrap();
+                    send_u8(&mut send, 0xff).await.unwrap();
+                    send.shutdown().await.unwrap();
                 });
             }
         });
         let (events, received) = tokio::sync::mpsc::channel(16);
         Self {
             net,
-            transport,
-            pool: new_shared_pool(),
+            client,
             provider,
             snapshot,
             allowed,
@@ -162,16 +156,15 @@ impl RepairFixture {
             record,
             events,
             received,
-            health: Health::new(EndpointId::from_bytes(&client).unwrap()),
-            requests,
+            health: Health::new(EndpointId::from_bytes(&client_id).unwrap()),
+            server_connections,
             server,
         }
     }
 
     async fn repair(&self, collection: CollectionHandle) -> anyhow::Result<bool> {
         reconcile_collection_peer(
-            &self.transport,
-            &self.pool,
+            &self.client.connections,
             RepairTarget {
                 collection,
                 peer: self.provider,
@@ -194,16 +187,22 @@ impl Drop for RepairFixture {
 
 async fn refusal_preserves_other_streams(expected: CollectionRepairRefusal) {
     let mut fixture = RepairFixture::new(false);
-    let connection = pool_get(&fixture.transport, &fixture.pool, fixture.provider)
+    let connection = fixture
+        .client
+        .connections
+        .connect(fixture.provider)
         .await
         .unwrap();
-    let (mut held_send, mut held_recv) = connection.conn().open_bi().await.unwrap();
+    let (mut held_send, mut held_recv) = connection.open_bi().await.unwrap();
+    send_u8(&mut held_send, TAG_DHT).await.unwrap();
     send_u8(&mut held_send, OP_FIND_NODE).await.unwrap();
     send_hash(&mut held_send, &[0; 32]).await.unwrap();
-    // Withhold EOF: a real SnapshotHandler stream and its permit remain live
-    // across the collection refusal, not merely an unused client handle.
+    // Withhold EOF: a real served stream and its permit remain live across
+    // the collection refusal, not merely an unused client handle.
     tokio::time::timeout(Duration::from_secs(1), async {
-        while fixture.requests.available_permits() == MAX_REQUESTS_GLOBAL {
+        while fixture.server_connections.available_requests()
+            == crate::connection::MAX_REQUESTS_GLOBAL
+        {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     })
@@ -226,13 +225,7 @@ async fn refusal_preserves_other_streams(expected: CollectionRepairRefusal) {
         "refusal must not admit data"
     );
     assert!(
-        fixture
-            .pool
-            .lock()
-            .unwrap()
-            .entries
-            .get(&fixture.provider)
-            .is_some_and(|entry| Arc::ptr_eq(entry, &connection.entry)),
+        fixture.client.connections.current(fixture.provider) == Some(connection.clone()),
         "an expected per-collection refusal evicted the shared connection"
     );
 
@@ -262,20 +255,12 @@ async fn refusal_preserves_other_streams(expected: CollectionRepairRefusal) {
     assert_eq!(
         fixture
             .net
-            .dial_count(fixture.transport.local_id(), fixture.provider),
+            .dial_count(fixture.client.my_id, fixture.provider),
         1,
         "redial must not mask destruction of the original shared connection"
     );
-    assert!(
-        fixture
-            .pool
-            .lock()
-            .unwrap()
-            .entries
-            .get(&fixture.provider)
-            .is_some_and(|entry| Arc::ptr_eq(entry, &connection.entry))
-    );
-    connection.conn().close(0, b"test complete");
+    assert!(fixture.client.connections.current(fixture.provider) == Some(connection.clone()));
+    connection.close(0, b"test complete");
 }
 
 #[tokio::test(start_paused = true)]
@@ -291,7 +276,10 @@ async fn rejected_collection_preserves_shared_connection_and_other_streams() {
 #[tokio::test(start_paused = true)]
 async fn malformed_repair_reply_still_invalidates_shared_connection() {
     let fixture = RepairFixture::new(true);
-    let connection = pool_get(&fixture.transport, &fixture.pool, fixture.provider)
+    let connection = fixture
+        .client
+        .connections
+        .connect(fixture.provider)
         .await
         .unwrap();
     let error = fixture
@@ -300,15 +288,14 @@ async fn malformed_repair_reply_still_invalidates_shared_connection() {
         .expect_err("invalid admission tag must fail");
     assert!(error.downcast_ref::<CollectionRepairRefusal>().is_none());
     assert!(
-        !fixture
-            .pool
-            .lock()
-            .unwrap()
-            .entries
-            .contains_key(&fixture.provider)
+        fixture
+            .client
+            .connections
+            .current(fixture.provider)
+            .is_none()
     );
     assert!(
-        connection.conn().open_bi().await.is_err(),
-        "malformed peer must not keep its pooled connection"
+        connection.open_bi().await.is_err(),
+        "malformed peer must not keep its shared connection"
     );
 }

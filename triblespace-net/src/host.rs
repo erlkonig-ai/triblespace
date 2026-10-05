@@ -18,8 +18,8 @@ use anybytes::Bytes;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use futures::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
 use iroh_base::{EndpointAddr, EndpointId};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tracing::{Instrument as _, debug, debug_span, info_span, warn};
+use tokio::io::AsyncReadExt as _;
+use tracing::{debug, warn};
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::capability::CapabilityProof;
@@ -41,23 +41,24 @@ use crate::collection_session::{
     CollectionRepairRefusal, InventoryRepairCursor, manifest, pull_collection,
     serve_collection_repair,
 };
-use crate::collection_wire::{MAX_COLLECTION_READ_BOOTSTRAP_PROOFS, OP_COLLECTION_REPAIR};
+use crate::collection_wire::MAX_COLLECTION_READ_BOOTSTRAP_PROOFS;
+use crate::connection::{ConnectionTable, RESET_UNKNOWN, Service};
 use crate::health::{
     CollectionHealth, Health, HealthSnapshot, RepairComparison, RepairFailure, StoreHealth,
 };
 use crate::identity::iroh_secret;
 use crate::inventory::ReconcileQos;
 use crate::protocol::{
-    OP_FIND_NODE, OP_GET_BLOB, OP_PROVIDER_GET, OP_PROVIDER_PUT, PILE_SYNC_ALPN, PROVIDER_PUT_FULL,
-    PROVIDER_PUT_OK, RawHash, op_find_node, op_get_blob_with_limit, op_provider_get,
-    op_provider_put, recv_hash, recv_u8, send_hash, send_u8, serve_get_blob,
+    OP_FIND_NODE, OP_PROVIDER_GET, OP_PROVIDER_PUT, PILE_SYNC_ALPN, PROVIDER_PUT_FULL,
+    PROVIDER_PUT_OK, RawHash, TAG_BLOB, TAG_DHT, TAG_REPAIR, op_find_node, op_get_blob_with_limit,
+    op_provider_get, op_provider_put, recv_hash, recv_u8, send_hash, send_u8, serve_get_blob,
 };
 use crate::provider::{
     ProviderDirectory, ProviderKey, ProviderObservation, ProviderPublication, ProviderPublisher,
     ProviderPutResult, ProviderToken, PublicationResult, blob_provider_token,
 };
 use crate::routing::{ALPHA, IterativeLookup, K, RoutingKey, RoutingTable};
-use crate::transport::{Conn, Harness, PeerId, Transport};
+use crate::transport::{Conn, Harness, PeerId, RecvStream, SendStream, Transport};
 use crate::wake::{
     CollectionWakeEvent, CollectionWakeNetwork, CollectionWakePlane, CollectionWakeRoot,
     CollectionWakeSubscription, ReceivedCollectionWake,
@@ -632,191 +633,26 @@ fn forget_participant(
     empty
 }
 
-struct PoolEntry<C> {
-    connection: tokio::sync::OnceCell<Result<C, Arc<anyhow::Error>>>,
-}
-
-impl<C> Default for PoolEntry<C> {
-    fn default() -> Self {
-        Self {
-            connection: tokio::sync::OnceCell::new(),
-        }
-    }
-}
-
-#[derive(Clone)]
-struct PooledConnection<C> {
-    entry: Arc<PoolEntry<C>>,
-    connection: C,
-}
-
-impl<C> PooledConnection<C> {
-    fn conn(&self) -> &C {
-        &self.connection
-    }
-}
-
-struct ConnectionPool<C> {
-    entries: HashMap<PeerId, Arc<PoolEntry<C>>>,
-    least_to_most_recent: VecDeque<PeerId>,
-}
-
-impl<C> ConnectionPool<C> {
-    fn entry(&mut self, peer: PeerId) -> Arc<PoolEntry<C>> {
-        self.entries
-            .entry(peer)
-            .or_insert_with(|| Arc::new(PoolEntry::default()))
-            .clone()
-    }
-
-    fn release_waiter(
-        &mut self,
-        peer: PeerId,
-        entry: Arc<PoolEntry<C>>,
-    ) -> Option<Arc<PoolEntry<C>>> {
-        if !self
-            .entries
-            .get(&peer)
-            .is_some_and(|current| Arc::ptr_eq(current, &entry))
-        {
-            // An evicted/replaced entry may own a connection. Return its last
-            // reference so destruction happens outside the pool mutex.
-            return Some(entry);
-        }
-        // The map still owns this entry, so dropping the waiter cannot destroy
-        // its connection. Release this reference before unlocking: concurrent
-        // cancellations must not each see the other's departing reference and
-        // both leave an abandoned entry behind.
-        drop(entry);
-        let current = self.entries.get(&peer).unwrap();
-        if current.connection.get().is_none() && Arc::strong_count(current) == 1 {
-            // Uninitialized entries have never been admitted to the LRU.
-            self.entries.remove(&peer)
-        } else {
-            None
-        }
-    }
-
-    fn admit(&mut self, peer: PeerId, expected: &Arc<PoolEntry<C>>) -> Option<Arc<PoolEntry<C>>> {
-        if !self
-            .entries
-            .get(&peer)
-            .is_some_and(|current| Arc::ptr_eq(current, expected))
-        {
-            return None;
-        }
-        self.least_to_most_recent
-            .retain(|candidate| *candidate != peer);
-        self.least_to_most_recent.push_back(peer);
-        if self.least_to_most_recent.len() <= MAX_CONNECTIONS {
-            return None;
-        }
-        let oldest = self.least_to_most_recent.pop_front().unwrap();
-        self.entries.remove(&oldest)
-    }
-
-    fn remove_if(
-        &mut self,
-        peer: PeerId,
-        expected: &Arc<PoolEntry<C>>,
-    ) -> Option<Arc<PoolEntry<C>>> {
-        if !self
-            .entries
-            .get(&peer)
-            .is_some_and(|current| Arc::ptr_eq(current, expected))
-        {
-            return None;
-        }
-        self.least_to_most_recent
-            .retain(|candidate| *candidate != peer);
-        self.entries.remove(&peer)
-    }
-}
-
-type SharedPool<C> = Arc<Mutex<ConnectionPool<C>>>;
-
-fn new_shared_pool<C>() -> SharedPool<C> {
-    Arc::new(Mutex::new(ConnectionPool {
-        entries: HashMap::new(),
-        least_to_most_recent: VecDeque::new(),
-    }))
-}
-
-/// Owns one request's entry until it hands off a completed connection. The
-/// final cancelled waiter removes an uninitialized entry; remaining waiters
-/// keep the same OnceCell and can take over its cancelled initializer.
-struct PoolWaiter<'a, C> {
-    pool: &'a SharedPool<C>,
-    peer: PeerId,
-    entry: Option<Arc<PoolEntry<C>>>,
-}
-
-impl<C> Drop for PoolWaiter<'_, C> {
-    fn drop(&mut self) {
-        if let Some(entry) = self.entry.take() {
-            let released = self.pool.lock().unwrap().release_waiter(self.peer, entry);
-            drop(released);
-        }
-    }
-}
-
-async fn pool_get<T: Transport>(
-    transport: &T,
-    pool: &SharedPool<T::Conn>,
-    peer: PeerId,
-) -> anyhow::Result<PooledConnection<T::Conn>> {
-    let mut waiter = PoolWaiter {
-        pool,
-        peer,
-        entry: Some(pool.lock().unwrap().entry(peer)),
-    };
-    let entry = waiter.entry.as_ref().unwrap();
-    let initialized = entry
-        .connection
-        .get_or_init(|| async {
-            tokio::time::timeout(DIAL_DEADLINE, transport.dial(peer, PILE_SYNC_ALPN))
-                .await
-                .map_err(|_| anyhow::anyhow!("connection setup deadline exceeded"))
-                .and_then(|result| result)
-                .and_then(|connection| {
-                    if connection.remote_id() != peer {
-                        anyhow::bail!("dialed endpoint identity does not match requested peer")
-                    }
-                    Ok(connection)
-                })
-                .map_err(Arc::new)
-        })
-        .await;
-    let connection = match initialized {
-        Ok(connection) => connection.clone(),
-        Err(error) => {
-            pool.lock().unwrap().remove_if(peer, entry);
-            return Err(anyhow::anyhow!(error.to_string()));
-        }
-    };
-    drop(pool.lock().unwrap().admit(peer, entry));
-    Ok(PooledConnection {
-        entry: waiter.entry.take().unwrap(),
-        connection,
-    })
-}
-
-fn pool_invalidate<C: Conn>(pool: &SharedPool<C>, peer: PeerId, entry: &Arc<PoolEntry<C>>) {
-    let removed = pool.lock().unwrap().remove_if(peer, entry);
-    if removed.is_some()
-        && let Some(Ok(connection)) = entry.connection.get()
-    {
-        connection.close(0, b"pool evict");
-    }
-}
-
 #[derive(Clone)]
 struct ProviderClient<T: Transport> {
-    transport: T,
-    pool: SharedPool<T::Conn>,
+    connections: ConnectionTable<T, SnapshotHandler>,
     providers: Arc<Mutex<ProviderDirectory>>,
     candidates: RoutingCandidates,
     my_id: PeerId,
+}
+
+#[cfg(test)]
+impl<T: Transport> ProviderClient<T> {
+    /// A client whose own connections serve an empty snapshot.
+    fn for_test(transport: T, routes: RoutingTable) -> Self {
+        let handler = SnapshotHandler::for_test(transport.local_id(), routes);
+        Self {
+            providers: handler.providers.clone(),
+            candidates: handler.candidates.clone(),
+            my_id: handler.local_id,
+            connections: ConnectionTable::new(transport, handler),
+        }
+    }
 }
 
 struct NetCap<T: Transport> {
@@ -1112,7 +948,6 @@ pub(crate) fn start(
         .map_err(|_| anyhow::anyhow!("network host stopped during startup"))?
 }
 
-const DIAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 const BACKGROUND_LOOKUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
 const OP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 const REPAIR_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
@@ -1120,11 +955,6 @@ const REPAIR_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
 const COLLECTION_RECONNECT_PERIOD: std::time::Duration = std::time::Duration::from_secs(300);
 const HOST_POLL_PERIOD: std::time::Duration = std::time::Duration::from_millis(10);
 const PROVIDER_PROGRESS_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
-const CONNECTION_IDLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
-const REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
-const MAX_CONNECTIONS: usize = 64;
-const MAX_REQUESTS_PER_CONNECTION: usize = 16;
-const MAX_REQUESTS_GLOBAL: usize = 16;
 const MAX_CONCURRENT_REPAIRS: usize = 8;
 const MAX_PENDING_REPAIRS: usize = 512;
 
@@ -1685,11 +1515,21 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
         configured.iter().copied(),
     )));
     let participants = Arc::new(Mutex::new(HashMap::new()));
-    let pool = new_shared_pool();
     let providers = Arc::new(Mutex::new(ProviderDirectory::new(my_id)));
+    let handler = SnapshotHandler {
+        snapshot: wiring.snapshot.clone(),
+        health: wiring.health.clone(),
+        candidates: candidates.clone(),
+        providers: providers.clone(),
+        serve_collections: config.qos.direction.serves(),
+        local_id: my_id,
+        events: wiring.evt_tx.clone(),
+    };
+    // One table holds the connections of both directions; each serves the
+    // same handler, whichever side dialled it.
+    let connections = ConnectionTable::new(transport.clone(), handler);
     let provider_client = ProviderClient {
-        transport: transport.clone(),
-        pool: pool.clone(),
+        connections: connections.clone(),
         providers: providers.clone(),
         candidates: candidates.clone(),
         my_id,
@@ -1699,17 +1539,6 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
     });
     let _ = wiring.cap_tx.send(Some(cap as Arc<dyn NetCapability>));
 
-    let handler = SnapshotHandler {
-        snapshot: wiring.snapshot.clone(),
-        health: wiring.health.clone(),
-        candidates: candidates.clone(),
-        providers: providers.clone(),
-        serve_collections: config.qos.direction.serves(),
-        local_id: my_id,
-        events: wiring.evt_tx.clone(),
-        inbound_connections: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
-        inbound_requests: Arc::new(tokio::sync::Semaphore::new(MAX_REQUESTS_GLOBAL)),
-    };
     tokio::spawn(async move {
         while let Some(accepted) = incoming.recv().await {
             debug!(
@@ -1717,19 +1546,12 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
                 peer = %hex::encode(accepted.conn.remote_id()),
                 "host received forwarded connection"
             );
+            // Production forwards only this ALPN; the simulator forwards any.
             if accepted.alpn != PILE_SYNC_ALPN {
                 accepted.conn.close(1, b"unknown protocol");
                 continue;
             }
-            let Ok(permit) = handler.inbound_connections.clone().try_acquire_owned() else {
-                debug!(target: "triblespace_net::handoff", "host inbound connection limit reached");
-                accepted.conn.close(1, b"inbound connection limit exceeded");
-                continue;
-            };
-            let handler = handler.clone();
-            tokio::spawn(async move {
-                handler.handle::<T>(accepted.conn, permit).await;
-            });
+            connections.accept(accepted.conn);
         }
     });
 
@@ -2258,8 +2080,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
                     .with_peer(target.collection, target.peer, |health| {
                         health.started(now);
                     });
-                let transport = transport.clone();
-                let pool = pool.clone();
+                let connections = provider_client.connections.clone();
                 let events = wiring.evt_tx.clone();
                 let repair_tx = repair_tx.clone();
                 let health = wiring.health.clone();
@@ -2268,8 +2089,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
                     let result = tokio::time::timeout(
                         REPAIR_DEADLINE,
                         reconcile_collection_peer(
-                            &transport,
-                            &pool,
+                            &connections,
                             target,
                             local,
                             &events,
@@ -2421,17 +2241,16 @@ impl AdmissionBatcher {
 }
 
 async fn reconcile_collection_peer<T: Transport>(
-    transport: &T,
-    pool: &SharedPool<T::Conn>,
+    connections: &ConnectionTable<T, SnapshotHandler>,
     target: RepairTarget,
     local: Arc<CollectionSnapshot>,
     events: &tokio::sync::mpsc::Sender<NetEventBatch>,
     health: &Health,
     inventory_cursor: Option<InventoryRepairCursor>,
 ) -> anyhow::Result<(bool, Option<InventoryRepairCursor>)> {
-    let connection = pool_get(transport, pool, target.peer).await?;
+    let connection = connections.connect(target.peer).await?;
     let delta = match pull_collection(
-        connection.conn(),
+        &connection,
         &local.repair,
         local.read_bootstrap.iter().cloned().collect(),
         inventory_cursor,
@@ -2443,7 +2262,7 @@ async fn reconcile_collection_peer<T: Transport>(
             // READ refusal or absent C is a valid answer on this stream.
             // Other collections may be repairing over this same connection.
             if !error.is::<CollectionRepairRefusal>() {
-                pool_invalidate(pool, target.peer, &connection.entry);
+                connections.invalidate(&connection);
             }
             return Err(error);
         }
@@ -2498,8 +2317,8 @@ async fn reconcile_collection_peer<T: Transport>(
 
 impl<T: Transport> ProviderClient<T> {
     async fn find_node(&self, peer: PeerId, target: RoutingKey) -> anyhow::Result<Vec<PeerId>> {
-        let connection = pool_get(&self.transport, &self.pool, peer).await?;
-        let response = tokio::time::timeout(OP_DEADLINE, op_find_node(connection.conn(), &target))
+        let connection = self.connections.connect(peer).await?;
+        let response = tokio::time::timeout(OP_DEADLINE, op_find_node(&connection, &target))
             .await
             .map_err(|_| anyhow::anyhow!("FIND_NODE deadline exceeded"))?;
         match response {
@@ -2508,7 +2327,7 @@ impl<T: Transport> ProviderClient<T> {
                 Ok(peers)
             }
             Err(error) => {
-                pool_invalidate(&self.pool, peer, &connection.entry);
+                self.connections.invalidate(&connection);
                 Err(error)
             }
         }
@@ -2570,15 +2389,10 @@ impl<T: Transport> ProviderClient<T> {
                 ProviderPutResult::ExplicitlyRejected
             };
         }
-        let Ok(connection) = pool_get(&self.transport, &self.pool, peer).await else {
+        let Ok(connection) = self.connections.connect(peer).await else {
             return ProviderPutResult::Unavailable;
         };
-        match tokio::time::timeout(
-            OP_DEADLINE,
-            op_provider_put(connection.conn(), &key, &token),
-        )
-        .await
-        {
+        match tokio::time::timeout(OP_DEADLINE, op_provider_put(&connection, &key, &token)).await {
             Ok(Ok(stored)) => {
                 self.candidates.lock().unwrap().promote_authenticated(peer);
                 if stored {
@@ -2587,10 +2401,12 @@ impl<T: Transport> ProviderClient<T> {
                     ProviderPutResult::ExplicitlyRejected
                 }
             }
-            Ok(Err(_)) | Err(_) => {
-                pool_invalidate(&self.pool, peer, &connection.entry);
+            Ok(Err(_)) => {
+                self.connections.invalidate(&connection);
                 ProviderPutResult::Unavailable
             }
+            // A slow reply says nothing against the shared connection.
+            Err(_) => ProviderPutResult::Unavailable,
         }
     }
 
@@ -2624,18 +2440,17 @@ impl<T: Transport> ProviderClient<T> {
                 .unwrap()
                 .get(key, crate::clock::mono_now()));
         }
-        let connection = pool_get(&self.transport, &self.pool, peer).await?;
-        let response = tokio::time::timeout(OP_DEADLINE, op_provider_get(connection.conn(), &key))
+        let connection = self.connections.connect(peer).await?;
+        let response = tokio::time::timeout(OP_DEADLINE, op_provider_get(&connection, &key))
             .await
-            .map_err(|_| anyhow::anyhow!("DHT provider query deadline exceeded"))
-            .and_then(|response| response);
+            .map_err(|_| anyhow::anyhow!("DHT provider query deadline exceeded"))?;
         match response {
             Ok(providers) => {
                 self.candidates.lock().unwrap().promote_authenticated(peer);
                 Ok(providers)
             }
             Err(error) => {
-                pool_invalidate(&self.pool, peer, &connection.entry);
+                self.connections.invalidate(&connection);
                 Err(error)
             }
         }
@@ -2702,14 +2517,13 @@ impl<T: Transport> ProviderClient<T> {
         peer: PeerId,
         max_bytes: u64,
     ) -> anyhow::Result<Option<Blob<UnknownBlob>>> {
-        let connection = pool_get(&self.transport, &self.pool, peer).await?;
+        let connection = self.connections.connect(peer).await?;
         let response = tokio::time::timeout(
             OP_DEADLINE,
-            op_get_blob_with_limit(connection.conn(), self.my_id, &hash, max_bytes),
+            op_get_blob_with_limit(&connection, self.my_id, &hash, max_bytes),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("exact blob provider request deadline exceeded"))
-        .and_then(|response| response);
+        .map_err(|_| anyhow::anyhow!("exact blob provider request deadline exceeded"))?;
         match response {
             Ok(Some(bytes)) => {
                 self.candidates.lock().unwrap().promote_authenticated(peer);
@@ -2722,7 +2536,7 @@ impl<T: Transport> ProviderClient<T> {
                 if !error.is::<crate::protocol::ExactBlobReceiveResourceError>()
                     && !error.is::<crate::protocol::ExactBlobReceivePolicyError>()
                 {
-                    pool_invalidate(&self.pool, peer, &connection.entry);
+                    self.connections.invalidate(&connection);
                 }
                 Err(error)
             }
@@ -3115,88 +2929,42 @@ struct SnapshotHandler {
     serve_collections: bool,
     local_id: PeerId,
     events: tokio::sync::mpsc::Sender<NetEventBatch>,
-    inbound_connections: Arc<tokio::sync::Semaphore>,
-    inbound_requests: Arc<tokio::sync::Semaphore>,
 }
 
+#[cfg(test)]
 impl SnapshotHandler {
-    async fn handle<T: Transport>(
-        &self,
-        connection: T::Conn,
-        _permit: tokio::sync::OwnedSemaphorePermit,
-    ) {
-        let peer_id = connection.remote_id();
-        let span = info_span!("connection", peer = %hex::encode(&peer_id[..4]));
-        async move {
-            debug!(target: "triblespace_net::handoff", "host connection handler started");
-            let peer = match VerifyingKey::from_bytes(&peer_id) {
-                Ok(peer) => peer,
-                Err(error) => {
-                    warn!(%error, "invalid transport peer key");
-                    connection.close(1, b"invalid peer identity");
-                    return;
-                }
-            };
-            let per_connection = Arc::new(tokio::sync::Semaphore::new(MAX_REQUESTS_PER_CONNECTION));
-            loop {
-                let accepted = tokio::select! {
-                    stream = connection.accept_bi() => stream,
-                    () = tokio::time::sleep(CONNECTION_IDLE_DEADLINE) => {
-                        debug!(target: "triblespace_net::handoff", "host connection idle deadline reached");
-                        connection.close(0, b"connection idle timeout");
-                        return;
-                    }
-                };
-                let Some((mut send, mut recv)) = accepted else {
-                    debug!(target: "triblespace_net::handoff", "host connection accept ended");
-                    return;
-                };
-                tracing::trace!(target: "triblespace_net::handoff", "host accepted RPC stream");
-                // Backpressure a burst instead of closing its entire connection:
-                // other streams may already be repairing independent collections.
-                // This loop retains at most one accepted, waiting stream per
-                // bounded connection, and spawns a task only with both permits.
-                let Ok(connection_permit) = per_connection.clone().acquire_owned().await else {
-                    return;
-                };
-                let Ok(global_permit) = self.inbound_requests.clone().acquire_owned().await else {
-                    return;
-                };
-                let handler = self.clone();
-                tokio::spawn(
-                    async move {
-                        let operation = tokio::time::timeout(
-                            REQUEST_DEADLINE,
-                            handler.serve_stream::<T::Conn>(peer, &mut send, &mut recv),
-                        )
-                        .await;
-                        match operation {
-                            Ok(Ok(())) => {}
-                            Ok(Err(error)) => debug!(%error, "direct RPC stream failed"),
-                            Err(_) => warn!("direct RPC stream deadline exceeded"),
-                        }
-                        let _ = send.shutdown().await;
-                        drop((connection_permit, global_permit));
-                    }
-                    .instrument(debug_span!("stream", op = tracing::field::Empty).or_current()),
-                );
-            }
+    /// A handler serving an empty snapshot and an empty directory.
+    fn for_test(local_id: PeerId, routes: RoutingTable) -> Self {
+        Self {
+            snapshot: tokio::sync::watch::channel(None).1,
+            health: Health::new(EndpointId::from_bytes(&local_id).unwrap()),
+            candidates: Arc::new(Mutex::new(routes)),
+            providers: Arc::new(Mutex::new(ProviderDirectory::new(local_id))),
+            serve_collections: false,
+            local_id,
+            events: tokio::sync::mpsc::channel(1).0,
         }
-        .instrument(span)
-        .await;
     }
+}
 
-    async fn serve_stream<C: Conn>(
+/// The request streams of every connection, answered from the current
+/// serving snapshot.
+impl Service for SnapshotHandler {
+    async fn serve<W, R>(
         &self,
-        peer: VerifyingKey,
-        send: &mut C::SendHalf,
-        recv: &mut C::RecvHalf,
-    ) -> anyhow::Result<()> {
-        let op = recv_u8(recv).await?;
-        tracing::Span::current().record("op", op_name(op));
-        tracing::trace!(target: "triblespace_net::handoff", op = op_name(op), "host received RPC opcode");
-        match op {
-            OP_COLLECTION_REPAIR => {
+        peer: PeerId,
+        tag: u8,
+        send: &mut W,
+        recv: &mut R,
+    ) -> anyhow::Result<()>
+    where
+        W: SendStream,
+        R: RecvStream,
+    {
+        let peer = VerifyingKey::from_bytes(&peer)
+            .map_err(|error| anyhow::anyhow!("invalid transport peer key: {error}"))?;
+        match tag {
+            TAG_REPAIR => {
                 if !self.serve_collections {
                     let _ = serve_collection_repair(recv, send, peer, |_| None).await?;
                 } else {
@@ -3215,7 +2983,7 @@ impl SnapshotHandler {
                     admissions.flush().await?;
                 }
             }
-            OP_GET_BLOB => {
+            TAG_BLOB => {
                 let activity = self.health.begin_blob_serve();
                 let snapshot = self.snapshot.borrow().clone();
                 let blob_snapshot = snapshot.clone();
@@ -3241,6 +3009,32 @@ impl SnapshotHandler {
                 .await?;
                 activity.complete(payload_bytes);
             }
+            TAG_DHT => self.serve_dht(peer, send, recv).await?,
+            other => anyhow::bail!("not a request stream tag {other:#x}"),
+        }
+        self.candidates
+            .lock()
+            .unwrap()
+            .promote_authenticated(peer.to_bytes());
+        Ok(())
+    }
+}
+
+impl SnapshotHandler {
+    /// Serve one `dht/1` operation.
+    async fn serve_dht<W, R>(
+        &self,
+        peer: VerifyingKey,
+        send: &mut W,
+        recv: &mut R,
+    ) -> anyhow::Result<()>
+    where
+        W: SendStream,
+        R: RecvStream,
+    {
+        let op = recv_u8(recv).await?;
+        tracing::trace!(target: "triblespace_net::handoff", op = op_name(op), "host received DHT operation");
+        match op {
             OP_PROVIDER_PUT => {
                 let key = recv_hash(recv).await?;
                 let token = recv_hash(recv).await?;
@@ -3289,12 +3083,14 @@ impl SnapshotHandler {
                 let hints = |key| self.provider_hints(key);
                 crate::protocol::serve_find_value(recv, send, routes, hints).await?;
             }
-            _ => anyhow::bail!("unknown direct RPC operation {op:#x}"),
+            _ => {
+                // Like an unknown tag, an unknown operation resets only its
+                // own stream.
+                send.reset(RESET_UNKNOWN);
+                recv.stop(RESET_UNKNOWN);
+                anyhow::bail!("unknown DHT operation {op:#x}")
+            }
         }
-        self.candidates
-            .lock()
-            .unwrap()
-            .promote_authenticated(peer.to_bytes());
         Ok(())
     }
 
@@ -3330,12 +3126,10 @@ async fn require_stream_eof<R: tokio::io::AsyncRead + Unpin>(recv: &mut R) -> an
 
 fn op_name(op: u8) -> &'static str {
     match op {
-        OP_GET_BLOB => "GET_BLOB",
         OP_PROVIDER_PUT => "PROVIDER_PUT",
         OP_PROVIDER_GET => "PROVIDER_GET",
         OP_FIND_NODE => "FIND_NODE",
         crate::protocol::OP_FIND_VALUE => "FIND_VALUE",
-        OP_COLLECTION_REPAIR => "COLLECTION_REPAIR",
         _ => "UNKNOWN",
     }
 }
@@ -3895,7 +3689,6 @@ mod tests {
     {
         use crate::transport::Conn;
         use crate::transport::sim::{SimConfig, SimNet};
-        use std::sync::{Arc, Mutex};
         let requester_key = SigningKey::from_bytes(&[91; 32]);
         let provider_key = SigningKey::from_bytes(&[92; 32]);
         let requester = requester_key.verifying_key().to_bytes();
@@ -3911,10 +3704,11 @@ mod tests {
             while let Some((mut send, mut recv)) = connection.accept_bi().await {
                 let bytes = bytes.clone();
                 tokio::spawn(async move {
-                    assert_eq!(
-                        crate::protocol::recv_u8(&mut recv).await.unwrap(),
-                        crate::protocol::OP_GET_BLOB
-                    );
+                    // The dialler's own recon/1 stream carries no request.
+                    match crate::protocol::recv_u8(&mut recv).await.unwrap() {
+                        crate::protocol::TAG_RECON => return,
+                        tag => assert_eq!(tag, crate::protocol::TAG_BLOB),
+                    }
                     let _ = crate::protocol::serve_get_blob(
                         &mut recv,
                         &mut send,
@@ -3927,16 +3721,11 @@ mod tests {
                 });
             }
         });
-        let client = super::ProviderClient {
-            transport: requester_harness.transport,
-            pool: super::new_shared_pool(),
-            providers: Arc::new(Mutex::new(super::ProviderDirectory::new(requester))),
-            candidates: Arc::new(Mutex::new(super::RoutingTable::new(requester, [provider]))),
-            my_id: requester,
-        };
-        let before = super::pool_get(&client.transport, &client.pool, provider)
-            .await
-            .unwrap();
+        let client = super::ProviderClient::for_test(
+            requester_harness.transport,
+            super::RoutingTable::new(requester, [provider]),
+        );
+        let before = client.connections.connect(provider).await.unwrap();
         let (limited, ordinary) = tokio::join!(
             client.fetch_from_provider_with_limit(hash, provider, super::METADATA_BLOB_BYTES),
             client.fetch_from_provider(hash, provider),
@@ -3950,19 +3739,11 @@ mod tests {
             ordinary.unwrap().unwrap().bytes.len() as u64,
             super::METADATA_BLOB_BYTES + 1
         );
-        let after = client
-            .pool
-            .lock()
-            .unwrap()
-            .entries
-            .get(&provider)
-            .cloned()
-            .unwrap();
         assert!(
-            Arc::ptr_eq(&before.entry, &after),
+            client.connections.current(provider) == Some(before.clone()),
             "local warmup policy must not evict a shared connection"
         );
-        let exact = crate::protocol::op_get_blob(before.conn(), requester, &hash)
+        let exact = crate::protocol::op_get_blob(&before, requester, &hash)
             .await
             .unwrap()
             .unwrap();

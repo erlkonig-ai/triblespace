@@ -14,8 +14,9 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::Instant;
 
 use super::*;
+use crate::protocol::TAG_RECON;
 use crate::transport::sim::SimConn;
-use crate::transport::{Alpn, Conn, Transport};
+use crate::transport::{Alpn, Conn, RecvStream, SendStream, Transport};
 
 const REPEATS: usize = 16;
 const BODY_BYTES: usize = 223;
@@ -31,6 +32,8 @@ struct Event {
 struct Call {
     clock: Arc<AtomicUsize>,
     peer: PeerId,
+    tag: Option<u8>,
+    /// The stream's tag, or for `dht/1` the operation after it.
     op: Option<u8>,
     opened: Event,
     request_bytes: usize,
@@ -46,6 +49,22 @@ impl Call {
             at: Instant::now(),
             order: self.clock.fetch_add(1, Ordering::SeqCst),
         }
+    }
+
+    fn request(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            if self.op.is_some() {
+                break;
+            }
+            if self.tag.is_none() {
+                self.tag = Some(byte);
+                if byte == TAG_DHT {
+                    continue;
+                }
+            }
+            self.op = Some(byte);
+        }
+        self.request_bytes += bytes.len();
     }
 }
 
@@ -64,6 +83,7 @@ impl Trace {
         let call = Arc::new(Mutex::new(Call {
             clock: self.1.clone(),
             peer,
+            tag: None,
             op: None,
             opened: self.mark(),
             request_bytes: 0,
@@ -85,15 +105,26 @@ impl Trace {
         self.0.lock().unwrap().clear();
     }
 
+    /// Request streams, without the dialler's own `recon/1` streams.
+    fn requests(&self) -> Vec<Arc<Mutex<Call>>> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.lock().unwrap().op != Some(TAG_RECON))
+            .cloned()
+            .collect()
+    }
+
     fn counts(&self) -> Counts {
         let mut counts = Counts::default();
-        for call in self.0.lock().unwrap().iter() {
+        for call in self.requests() {
             let call = call.lock().unwrap();
             match call.op {
                 Some(OP_FIND_NODE) => counts.find += 1,
                 Some(OP_PROVIDER_GET) => counts.directory += 1,
                 Some(OP_PROVIDER_PUT) => counts.put += 1,
-                Some(OP_GET_BLOB) => counts.body += 1,
+                Some(TAG_BLOB) => counts.body += 1,
                 None => counts.no_opcode += 1,
                 Some(op) => panic!("unexpected fixture opcode {op:#x}"),
             }
@@ -109,21 +140,18 @@ impl Trace {
     }
 
     fn call(&self, peer: PeerId, opcode: u8) -> Arc<Mutex<Call>> {
-        self.0
-            .lock()
-            .unwrap()
-            .iter()
+        self.requests()
+            .into_iter()
             .find(|call| {
                 let call = call.lock().unwrap();
                 call.peer == peer && call.op == Some(opcode)
             })
             .unwrap()
-            .clone()
     }
 
     fn assert_request_bound(&self) -> usize {
         let mut events = Vec::new();
-        for call in self.0.lock().unwrap().iter() {
+        for call in self.requests() {
             let call = call.lock().unwrap();
             events.push((call.opened.order, true));
             if let Some(dropped) = call.receiver_dropped {
@@ -147,7 +175,7 @@ impl Trace {
     }
 
     fn assert_closed_before(&self, returned: Event) {
-        for call in self.0.lock().unwrap().iter() {
+        for call in self.requests() {
             let call = call.lock().unwrap();
             assert!(call.receiver_dropped.unwrap().order < returned.order);
         }
@@ -155,7 +183,7 @@ impl Trace {
     }
 
     fn assert_authenticated_directories(&self) {
-        let calls = self.0.lock().unwrap();
+        let calls = self.requests();
         let mut queried = BTreeSet::new();
         for call in calls.iter() {
             let call = call.lock().unwrap();
@@ -183,12 +211,12 @@ impl Trace {
     fn assert_stage_order(&self, holder: PeerId, returned: Event) {
         self.assert_authenticated_directories();
         self.assert_closed_before(returned);
-        let calls = self.0.lock().unwrap();
+        let calls = self.requests();
         let body = calls
             .iter()
             .find(|call| {
                 let call = call.lock().unwrap();
-                call.peer == holder && call.op == Some(OP_GET_BLOB)
+                call.peer == holder && call.op == Some(TAG_BLOB)
             })
             .unwrap()
             .lock()
@@ -300,17 +328,14 @@ impl<S: AsyncRead + Unpin> AsyncRead for Tap<S> {
             let bytes = &buf.filled()[before..];
             let mut call = self.call.lock().unwrap();
             if self.request {
-                if call.op.is_none() {
-                    call.op = bytes.first().copied();
-                }
-                call.request_bytes += bytes.len();
+                call.request(bytes);
             } else {
                 let prior = call.response_bytes;
                 call.response_bytes += bytes.len();
                 // Successful GET: status1 + provider proof32 + length8,
                 // followed by body bytes. An empty read with spare capacity
                 // is the protocol's EOF observation, not a zero-length poll.
-                if call.op == Some(OP_GET_BLOB) && prior <= 41 && call.response_bytes > 41 {
+                if call.op == Some(TAG_BLOB) && prior <= 41 && call.response_bytes > 41 {
                     call.first_body_byte = Some(call.mark());
                 }
                 if bytes.is_empty() && available != 0 && call.response_eof.is_none() {
@@ -332,10 +357,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Tap<S> {
         if let Poll::Ready(Ok(count)) = &result {
             let mut call = self.call.lock().unwrap();
             if self.request {
-                if call.op.is_none() {
-                    call.op = bytes[..*count].first().copied();
-                }
-                call.request_bytes += *count;
+                call.request(&bytes[..*count]);
             } else {
                 call.response_bytes += *count;
             }
@@ -349,6 +371,18 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Tap<S> {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl<S: SendStream> SendStream for Tap<S> {
+    fn reset(&mut self, code: u32) {
+        self.inner.reset(code);
+    }
+}
+
+impl<S: RecvStream> RecvStream for Tap<S> {
+    fn stop(&mut self, code: u32) {
+        self.inner.stop(code);
     }
 }
 
@@ -485,28 +519,24 @@ impl Node {
             serve_collections: false,
             local_id: peer,
             events: events_tx,
-            inbound_connections: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
-            inbound_requests: Arc::new(tokio::sync::Semaphore::new(MAX_REQUESTS_GLOBAL)),
         };
         let server_trace = trace.clone();
         let server_gate = gate.clone();
+        // The server task owns the table: aborting it closes every connection.
+        let connections = ConnectionTable::new(
+            TracedTransport {
+                inner: harness.transport.clone(),
+                trace: server_trace.clone(),
+            },
+            handler,
+        );
         let server = tokio::spawn(async move {
-            let mut connections = tokio::task::JoinSet::new();
             while let Some(incoming) = harness.incoming.recv().await {
                 assert_eq!(incoming.alpn, PILE_SYNC_ALPN);
-                let permit = handler
-                    .inbound_connections
-                    .clone()
-                    .try_acquire_owned()
-                    .unwrap();
-                let handler = handler.clone();
-                let connection = TracedConn {
+                connections.accept(TracedConn {
                     inner: incoming.conn,
                     trace: server_trace.clone(),
                     gate: server_gate.clone(),
-                };
-                connections.spawn(async move {
-                    handler.handle::<TracedTransport>(connection, permit).await;
                 });
             }
         });
@@ -595,19 +625,13 @@ impl ThreeNodes {
         }
         let my_id = client_key.verifying_key().to_bytes();
         let transport = net.join(&client_key).transport;
-        let client = ProviderClient {
-            transport: TracedTransport {
+        let client = ProviderClient::for_test(
+            TracedTransport {
                 inner: transport,
                 trace: Trace::default(),
             },
-            pool: new_shared_pool(),
-            providers: Arc::new(Mutex::new(ProviderDirectory::new(my_id))),
-            candidates: Arc::new(Mutex::new(RoutingTable::new(
-                my_id,
-                [holder.peer, other.peer],
-            ))),
-            my_id,
-        };
+            RoutingTable::new(my_id, [holder.peer, other.peer]),
+        );
         Self {
             net,
             client,
@@ -622,11 +646,9 @@ impl ThreeNodes {
 
     async fn warm_connections(&self) {
         for peer in [self.holder.peer, self.other.peer] {
-            pool_get(&self.client.transport, &self.client.pool, peer)
-                .await
-                .unwrap();
+            self.client.connections.connect(peer).await.unwrap();
         }
-        assert_eq!(self.client.transport.trace.counts(), Counts::default());
+        assert_eq!(self.trace().counts(), Counts::default());
     }
 
     fn assert_no_control_effects(&mut self) {
@@ -635,6 +657,10 @@ impl ThreeNodes {
         assert_eq!(snapshot.wants().unwrap().count(), 0);
         assert!(self.holder.events.try_recv().is_err());
         assert!(self.other.events.try_recv().is_err());
+    }
+
+    fn trace(&self) -> &Trace {
+        &self.client.connections.transport().trace
     }
 
     fn dials(&self) -> usize {
@@ -657,7 +683,7 @@ async fn exact_h_repeated_fetches_count_rpcs_not_simulator_throughput() {
             // Without prewarming only the first fetch is cold. Later fetches
             // deliberately retain connections and the learned routing table.
             for iteration in 0..REPEATS {
-                let trace = &fixture.client.transport.trace;
+                let trace = fixture.trace();
                 trace.clear();
                 let started = Instant::now();
                 let bytes = tokio::time::timeout(
@@ -686,16 +712,16 @@ async fn exact_h_repeated_fetches_count_rpcs_not_simulator_throughput() {
                 );
                 assert_eq!(
                     counts.request_bytes,
-                    (counts.find + counts.directory) * 33 + 65
+                    (counts.find + counts.directory) * 34 + 65
                 );
-                for call in trace.0.lock().unwrap().iter() {
+                for call in trace.requests() {
                     let call = call.lock().unwrap();
                     let response_bytes = match call.op.unwrap() {
                         OP_FIND_NODE => 1,
                         OP_PROVIDER_GET => {
                             1 + 64 * usize::from(call.peer == fixture.holder.peer || advertised)
                         }
-                        OP_GET_BLOB => 41 + BODY_BYTES,
+                        TAG_BLOB => 41 + BODY_BYTES,
                         op => panic!("unexpected fetch opcode {op:#x}"),
                     };
                     if call.response_eof.is_some() {
@@ -752,12 +778,10 @@ async fn exact_h_responsive_body_precedes_stalled_routing_or_directory_drop() {
                 .unwrap();
             assert_eq!(bytes.bytes, fixture.bytes);
         }
-        let returned = fixture.client.transport.trace.mark();
-        let counts = fixture.client.transport.trace.counts();
+        let returned = fixture.trace().mark();
+        let counts = fixture.trace().counts();
         fixture
-            .client
-            .transport
-            .trace
+            .trace()
             .assert_stage_order(fixture.holder.peer, returned);
         assert_eq!(
             (counts.find, counts.body, counts.put, counts.no_opcode),
@@ -765,17 +789,9 @@ async fn exact_h_responsive_body_precedes_stalled_routing_or_directory_drop() {
         );
         assert_eq!(counts.dropped_without_eof, 1);
         assert!(returned.at.duration_since(started) < Duration::from_secs(1));
-        let body = fixture
-            .client
-            .transport
-            .trace
-            .call(fixture.holder.peer, OP_GET_BLOB);
+        let body = fixture.trace().call(fixture.holder.peer, TAG_BLOB);
         let body_eof = body.lock().unwrap().response_eof.unwrap();
-        let stalled = fixture
-            .client
-            .transport
-            .trace
-            .call(fixture.other.peer, opcode);
+        let stalled = fixture.trace().call(fixture.other.peer, opcode);
         let stalled = stalled.lock().unwrap();
         assert!(stalled.response_eof.is_none());
         assert_eq!(stalled.response_bytes, 0);
@@ -797,12 +813,12 @@ async fn exact_h_responsive_body_precedes_stalled_routing_or_directory_drop() {
 #[tokio::test(start_paused = true)]
 async fn exact_h_routing_expiry_keeps_a_pending_body_within_the_caller_deadline() {
     let _guard = crate::protocol::exact_blob_receive_test_guard();
-    let body_gate = Gate::new(OP_GET_BLOB);
+    let body_gate = Gate::new(TAG_BLOB);
     let find_gate = Gate::new(OP_FIND_NODE);
     let mut fixture =
         ThreeNodes::with_gates(false, Some(body_gate.clone()), Some(find_gate.clone()));
     fixture.warm_connections().await;
-    let trace = fixture.client.transport.trace.clone();
+    let trace = fixture.trace().clone();
     let started = Instant::now();
     let caller_deadline = started + INTERACTIVE_FETCH_DEADLINE;
     let routing_dropped;
@@ -837,7 +853,7 @@ async fn exact_h_routing_expiry_keeps_a_pending_body_within_the_caller_deadline(
         routing_dropped = find.receiver_dropped.unwrap();
         assert_eq!(routing_dropped.at, routing_deadline);
         drop(find);
-        let body = trace.call(fixture.holder.peer, OP_GET_BLOB);
+        let body = trace.call(fixture.holder.peer, TAG_BLOB);
         let body = body.lock().unwrap();
         assert!(body.opened.order < routing_dropped.order);
         assert!(body.response_eof.is_none());
@@ -861,7 +877,7 @@ async fn exact_h_routing_expiry_keeps_a_pending_body_within_the_caller_deadline(
     }
     let returned = trace.mark();
     trace.assert_stage_order(fixture.holder.peer, returned);
-    let body = trace.call(fixture.holder.peer, OP_GET_BLOB);
+    let body = trace.call(fixture.holder.peer, TAG_BLOB);
     assert!(released.order < body.lock().unwrap().response_eof.unwrap().order);
     assert!(returned.at < caller_deadline);
     assert_eq!(returned.at.duration_since(started), Duration::from_secs(4));
@@ -885,7 +901,7 @@ async fn exact_h_empty_early_directory_waits_for_referred_holder_authentication(
         .unwrap()
         .promote_authenticated(fixture.holder.peer);
     fixture.warm_connections().await;
-    let trace = fixture.client.transport.trace.clone();
+    let trace = fixture.trace().clone();
     let released;
     {
         let fetch = fixture.client.fetch_blob(fixture.hash, None);
@@ -991,7 +1007,7 @@ async fn exact_h_stale_early_hints_leave_room_for_fresh_routing_and_final_holder
     let mut slow: Vec<_> = farther
         .into_iter()
         .map(|signing| {
-            let gate = Gate::new(OP_GET_BLOB);
+            let gate = Gate::new(TAG_BLOB);
             (
                 Node::new(&fixture.net, &signing, None, Some(gate.clone())),
                 gate,
@@ -1030,11 +1046,9 @@ async fn exact_h_stale_early_hints_leave_room_for_fresh_routing_and_final_holder
         .into_iter()
         .chain(slow.iter().map(|(node, _)| node.peer))
     {
-        pool_get(&fixture.client.transport, &fixture.client.pool, peer)
-            .await
-            .unwrap();
+        fixture.client.connections.connect(peer).await.unwrap();
     }
-    let trace = fixture.client.transport.trace.clone();
+    let trace = fixture.trace().clone();
     let started = Instant::now();
     let caller_deadline = started + Duration::from_secs(2);
     {
@@ -1059,7 +1073,7 @@ async fn exact_h_stale_early_hints_leave_room_for_fresh_routing_and_final_holder
         assert_eq!(trace.assert_request_bound(), ALPHA);
         let relay_released = trace.mark();
         for (node, _) in slow.iter().take(2) {
-            let body = trace.call(node.peer, OP_GET_BLOB);
+            let body = trace.call(node.peer, TAG_BLOB);
             let body = body.lock().unwrap();
             assert!(body.opened.order < relay_released.order);
             assert!(body.receiver_dropped.is_none());
@@ -1092,13 +1106,13 @@ async fn exact_h_stale_early_hints_leave_room_for_fresh_routing_and_final_holder
     assert!(later_find_eof.order < directory.opened.order);
     let directory_eof = directory.response_eof.unwrap();
     drop(directory);
-    let body = trace.call(fixture.holder.peer, OP_GET_BLOB);
+    let body = trace.call(fixture.holder.peer, TAG_BLOB);
     let body = body.lock().unwrap();
     assert!(directory_eof.order < body.opened.order);
     let body_eof = body.response_eof.unwrap();
     drop(body);
     for (node, _) in slow.iter().take(2) {
-        let stale = trace.call(node.peer, OP_GET_BLOB);
+        let stale = trace.call(node.peer, TAG_BLOB);
         let stale = stale.lock().unwrap();
         assert!(stale.response_eof.is_none());
         assert!(body_eof.order < stale.receiver_dropped.unwrap().order);
@@ -1108,9 +1122,7 @@ async fn exact_h_stale_early_hints_leave_room_for_fresh_routing_and_final_holder
     assert_eq!((later_counts.find, later_counts.directory), (1, 0));
     assert_eq!(
         trace
-            .0
-            .lock()
-            .unwrap()
+            .requests()
             .iter()
             .filter(|call| call.lock().unwrap().peer == later_directory.peer)
             .count(),
@@ -1163,10 +1175,13 @@ async fn exact_h_routing_and_data_share_alpha_and_caller_cancellation_drops_both
         .unwrap()
         .promote_authenticated(late.peer);
     fixture.warm_connections().await;
-    pool_get(&fixture.client.transport, &fixture.client.pool, third.peer)
+    fixture
+        .client
+        .connections
+        .connect(third.peer)
         .await
         .unwrap();
-    let trace = fixture.client.transport.trace.clone();
+    let trace = fixture.trace().clone();
     let cancelled;
     {
         let fetch = fixture.client.fetch_blob(fixture.hash, None);
@@ -1199,7 +1214,7 @@ async fn exact_h_routing_and_data_share_alpha_and_caller_cancellation_drops_both
     trace.assert_closed_before(returned);
     let counts = trace.counts();
     assert_eq!(counts.dropped_without_eof, ALPHA);
-    for call in trace.0.lock().unwrap().iter() {
+    for call in trace.requests() {
         let call = call.lock().unwrap();
         if call.response_eof.is_none() {
             assert!(call.opened.order < cancelled.order);
@@ -1225,7 +1240,7 @@ async fn exact_h_direct_bearer_control_has_one_rpc_and_329_application_bytes() {
         .unwrap();
     assert_eq!(returned.get_handle().raw, fixture.hash);
     assert_eq!(returned.bytes, fixture.bytes);
-    let counts = fixture.client.transport.trace.counts();
+    let counts = fixture.trace().counts();
     assert_eq!(
         (counts.find, counts.directory, counts.put, counts.body),
         (0, 0, 0, 1)
@@ -1247,7 +1262,7 @@ async fn exact_h_warm_publication_repeats_routing_and_remote_puts() {
     let mut fixture = ThreeNodes::new(false, None);
     fixture.warm_connections().await;
     for iteration in 0..REPEATS {
-        fixture.client.transport.trace.clear();
+        fixture.trace().clear();
         assert_eq!(
             fixture
                 .client
@@ -1258,14 +1273,14 @@ async fn exact_h_warm_publication_repeats_routing_and_remote_puts() {
                 .await,
             PublicationResult::Published
         );
-        let counts = fixture.client.transport.trace.counts();
+        let counts = fixture.trace().counts();
         assert_eq!(
             (counts.find, counts.put, counts.directory, counts.body),
             (2, 2, 0, 0)
         );
         assert_eq!(
             (counts.request_bytes, counts.response_bytes),
-            (2 * 33 + 2 * 65, 4)
+            (2 * 34 + 2 * 66, 4)
         );
         assert_eq!(counts.completed, 4);
         assert_eq!(fixture.dials(), 2);

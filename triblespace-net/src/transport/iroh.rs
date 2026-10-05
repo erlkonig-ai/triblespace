@@ -67,6 +67,19 @@ struct Anchors {
 #[derive(Clone)]
 pub struct IrohConn(pub iroh::endpoint::Connection);
 
+impl super::SendStream for iroh::endpoint::SendStream {
+    fn reset(&mut self, code: u32) {
+        // An already finished or reset stream has nothing left to abandon.
+        let _ = iroh::endpoint::SendStream::reset(self, code.into());
+    }
+}
+
+impl super::RecvStream for iroh::endpoint::RecvStream {
+    fn stop(&mut self, code: u32) {
+        let _ = iroh::endpoint::RecvStream::stop(self, code.into());
+    }
+}
+
 impl Conn for IrohConn {
     type SendHalf = iroh::endpoint::SendStream;
     type RecvHalf = iroh::endpoint::RecvStream;

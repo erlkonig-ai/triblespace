@@ -19,13 +19,6 @@ use crate::protocol::{
     recv_hash, recv_u8, recv_u32_be, recv_u64_be, send_hash, send_u8, send_u32_be, send_u64_be,
 };
 
-/// Direct-RPC operation which opens one collection repair session.
-///
-/// `0x0E` introduces the resident-inventory manifest. The former record/AUTH-only
-/// `0x0D` operation is no longer accepted; its manifest is not interchangeable.
-/// The common ALPN remains unchanged for exact bearer and directory clients.
-pub(crate) const OP_COLLECTION_REPAIR: u8 = 0x0E;
-
 /// Maximum native READ proof branches accepted at one session boundary.
 pub(crate) const MAX_COLLECTION_READ_BOOTSTRAP_PROOFS: usize = 16;
 /// Aggregate bound across the length-prefixed READ proof frames.
@@ -165,7 +158,7 @@ pub(crate) async fn send_repair_bootstrap<W: AsyncWrite + Unpin>(
 }
 
 /// Decode the body after the caller has already consumed
-/// [`OP_COLLECTION_REPAIR`].
+/// [`crate::protocol::TAG_REPAIR`].
 pub(crate) async fn recv_repair_hello<R: AsyncRead + Unpin>(
     recv: &mut R,
 ) -> Result<CollectionRepairHello> {
@@ -523,7 +516,9 @@ mod tests {
         };
         let sent_hello = hello.clone();
         let writer = tokio::spawn(async move {
-            send_u8(&mut left, OP_COLLECTION_REPAIR).await.unwrap();
+            send_u8(&mut left, crate::protocol::TAG_REPAIR)
+                .await
+                .unwrap();
             send_hash(&mut left, &collection.raw).await.unwrap();
             send_repair_bootstrap(&mut left, &sent_hello.bootstrap_proofs)
                 .await
@@ -534,7 +529,10 @@ mod tests {
                 .unwrap();
         });
 
-        assert_eq!(recv_u8(&mut right).await.unwrap(), OP_COLLECTION_REPAIR);
+        assert_eq!(
+            recv_u8(&mut right).await.unwrap(),
+            crate::protocol::TAG_REPAIR
+        );
         assert_eq!(
             recv_repair_collection(&mut right).await.unwrap(),
             collection

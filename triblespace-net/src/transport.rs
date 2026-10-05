@@ -24,7 +24,8 @@
 //! Stream IO is plain `tokio::io::{AsyncRead, AsyncWrite}` — iroh's
 //! QUIC streams already implement both, and an in-memory duplex pipe
 //! trivially does. `SendStream::finish()` maps to
-//! `AsyncWriteExt::shutdown()`.
+//! `AsyncWriteExt::shutdown()`. Abandoning a stream is not a finish, so the
+//! halves also carry [`SendStream::reset`] and [`RecvStream::stop`].
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
@@ -39,16 +40,31 @@ pub type PeerId = [u8; 32];
 /// borrowed static slice suffices and keeps dispatch alloc-free.
 pub type Alpn = &'static [u8];
 
+/// The sending half of a bidirectional stream.
+pub trait SendStream: AsyncWrite + Unpin + Send + 'static {
+    /// Abandon the stream: buffered bytes are dropped and the peer's reads
+    /// fail with `code`. Shutting down instead finishes the stream, which the
+    /// peer reads as a complete response.
+    fn reset(&mut self, code: u32);
+}
+
+/// The receiving half of a bidirectional stream.
+pub trait RecvStream: AsyncRead + Unpin + Send + 'static {
+    /// Stop reading: unread bytes are dropped and the peer's writes fail with
+    /// `code`.
+    fn stop(&mut self, code: u32);
+}
+
 /// A bidirectional connection to one remote peer on one ALPN.
 ///
 /// Mirrors the slice of iroh's `Connection` the protocol actually
 /// uses: open/accept bidirectional byte streams, learn the remote's
 /// TLS-verified identity, close with a code. Clone is shallow
-/// (`Arc`-like) — the pool and concurrent stream users share one
-/// connection.
+/// (`Arc`-like) — the connection table and concurrent stream users share
+/// one connection.
 pub trait Conn: Clone + Send + Sync + 'static {
-    type SendHalf: AsyncWrite + Unpin + Send + 'static;
-    type RecvHalf: AsyncRead + Unpin + Send + 'static;
+    type SendHalf: SendStream;
+    type RecvHalf: RecvStream;
 
     /// The remote peer's verified identity. In production this is
     /// iroh's TLS-level `remote_id` — the subject checked by pinned local
