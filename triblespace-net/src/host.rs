@@ -3689,6 +3689,7 @@ mod tests {
     {
         use crate::transport::Conn;
         use crate::transport::sim::{SimConfig, SimNet};
+        let _guard = crate::protocol::exact_blob_receive_test_guard();
         let requester_key = SigningKey::from_bytes(&[91; 32]);
         let provider_key = SigningKey::from_bytes(&[92; 32]);
         let requester = requester_key.verifying_key().to_bytes();
