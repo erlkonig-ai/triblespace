@@ -209,6 +209,18 @@ impl<'a> CapabilityProofPrefix<'a> {
     pub fn capabilities(self) -> impl ExactSizeIterator<Item = CapabilityHandle> + 'a {
         self.proof.capabilities().take(self.steps)
     }
+    /// This prefix as a standalone proof that shares the parent's bytes. An
+    /// exact prefix of a canonical proof is canonical, so nothing is copied
+    /// or decoded again.
+    pub fn to_proof(self) -> CapabilityProof {
+        CapabilityProof {
+            bytes: self
+                .proof
+                .bytes
+                .field_to_view(self.as_bytes())
+                .expect("a prefix lies inside its proof's bytes"),
+        }
+    }
 }
 
 impl CapabilityProof {
@@ -1053,6 +1065,32 @@ mod tests {
         assert!(weak.upgrade().is_some());
         clone.verify_signatures().unwrap();
         assert_eq!(clone.into_bytes(), expected.as_bytes());
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn prefix_proofs_share_the_parent_view() {
+        let cap = CapabilityHandle::new([4; 32]);
+        let first = CapabilityProof::new(resource(9), &key(1), cap, key(2).verifying_key());
+        let second = first
+            .delegate(&key(2), cap, key(3).verifying_key())
+            .unwrap();
+        let weak = second.bytes.downgrade();
+        let address = second.as_bytes().as_ptr();
+        let [head, whole] = [0, 1].map(|step| second.prefixes().nth(step).unwrap().to_proof());
+        assert_eq!(head, first);
+        assert_eq!(head.leaf_key(), key(2).verifying_key());
+        assert_eq!(whole, second);
+        for proof in [&head, &whole] {
+            assert_eq!(proof.as_bytes().as_ptr(), address);
+        }
+        drop((second, whole));
+        assert!(
+            weak.upgrade().is_some(),
+            "a prefix keeps the parent's owner"
+        );
+        head.verify_signatures().unwrap();
+        drop(head);
         assert!(weak.upgrade().is_none());
     }
 
