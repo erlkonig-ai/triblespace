@@ -10,7 +10,7 @@ use crate::connection::{
     CONNECTION_IDLE_DEADLINE, DRAIN_GRACE, FRAME_OPEN, MAX_CONNECTIONS, MAX_RECON_FRAME_BYTES,
     write_frame,
 };
-use crate::protocol::TAG_RECON;
+use crate::protocol::{TAG_DHT, TAG_RECON};
 use crate::transport::sim::{SimConfig, SimConn, SimNet, SimTransport};
 
 use super::*;
@@ -78,6 +78,16 @@ async fn open_recon(conn: &SimConn, sequence: u64) -> <SimConn as Conn>::SendHal
         .await
         .unwrap();
     send
+}
+
+/// Open a FIND_NODE request and withhold its end: the server holds the
+/// stream, serving or waiting for a permit, until the request ends.
+async fn held_find_node<C: Conn>(conn: &C) -> (C::SendHalf, C::RecvHalf) {
+    let (mut send, recv) = conn.open_bi().await.unwrap();
+    send_u8(&mut send, TAG_DHT).await.unwrap();
+    send_u8(&mut send, OP_FIND_NODE).await.unwrap();
+    send_hash(&mut send, &[0; 32]).await.unwrap();
+    (send, recv)
 }
 
 #[tokio::test(start_paused = true)]
@@ -404,6 +414,47 @@ async fn recon_frames_keep_a_connection_open_past_the_idle_deadline() {
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(server.table.current(chatty_id).is_none());
     assert!(chatty.accept_bi().await.is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_retired_connection_with_a_stalled_request_still_goes_idle() {
+    let net = network(Duration::from_secs(1));
+    let server = Node::join(&net, &key(1));
+    let client = net.join(&key(2));
+    let dial = || client.transport.dial(server.peer, PILE_SYNC_ALPN);
+    let older = dial().await.unwrap();
+    let _older_recon = open_recon(&older, 1).await;
+    // A request on the older connection stalls: no frame crosses it again.
+    let (_stalled_send, mut stalled_recv) = held_find_node(&older).await;
+    settle().await;
+    let newer = dial().await.unwrap();
+    let mut newer_recon = open_recon(&newer, 2).await;
+    settle().await;
+    assert_eq!(
+        server
+            .table
+            .current(client.transport.local_id())
+            .unwrap()
+            .sequence(),
+        Some(2)
+    );
+
+    // The request keeps the retired connection from draining, but not from
+    // the idle deadline every connection has.
+    tokio::time::sleep(DRAIN_GRACE * 10).await;
+    assert_eq!(server.table.len(), 2);
+    write_frame(&mut newer_recon, 0x7F, b"keep the winner")
+        .await
+        .unwrap();
+    tokio::time::sleep(CONNECTION_IDLE_DEADLINE - DRAIN_GRACE * 5).await;
+    assert_eq!(server.table.len(), 1);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), older.accept_bi())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(stalled_recv.read(&mut [0; 1]).await.is_err());
 }
 
 /// Fill one direction of `center`'s table past the cap, with its oldest

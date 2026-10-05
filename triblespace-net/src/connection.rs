@@ -13,7 +13,8 @@
 //! same one: of crossed dials, the one dialled by the lower key; of two dials
 //! by one side, the higher sequence number. The loser drains: nothing new is
 //! opened on it, and it closes once no request stream is in flight on it and
-//! no frame has crossed it for [`DRAIN_GRACE`].
+//! no frame has crossed it for [`DRAIN_GRACE`], or like any other connection
+//! when it goes idle.
 //!
 //! A connection closes after [`CONNECTION_IDLE_DEADLINE`] without a frame on
 //! any of its streams, sent or received. Above [`MAX_CONNECTIONS`] in one
@@ -190,13 +191,18 @@ impl State {
         self.epoch + Duration::from_nanos(self.last_frame.load(Ordering::Relaxed))
     }
 
-    /// When the connection closes unless a frame crosses it first; `None`
-    /// while a retired connection still carries a request stream.
-    fn deadline(&self) -> Option<Instant> {
-        if !self.retired.load(Ordering::SeqCst) {
-            return Some(self.last_frame() + CONNECTION_IDLE_DEADLINE);
-        }
-        (self.in_flight.load(Ordering::SeqCst) == 0).then(|| self.last_frame() + DRAIN_GRACE)
+    /// When the connection closes unless a frame crosses it first. A retired
+    /// connection waits only [`DRAIN_GRACE`] once no request stream is in
+    /// flight on it.
+    fn deadline(&self) -> Instant {
+        let drained =
+            self.retired.load(Ordering::SeqCst) && self.in_flight.load(Ordering::SeqCst) == 0;
+        self.last_frame()
+            + if drained {
+                DRAIN_GRACE
+            } else {
+                CONNECTION_IDLE_DEADLINE
+            }
     }
 
     fn retire(&self) {
@@ -739,8 +745,8 @@ async fn accept_loop<T: Transport, S: Service>(
                         .instrument(debug_span!("stream", tag = tracing::field::Empty).or_current()),
                 );
             }
-            () = sleep_until(deadline) => {
-                if state.deadline().is_some_and(|deadline| Instant::now() >= deadline) {
+            () = tokio::time::sleep_until(deadline) => {
+                if Instant::now() >= state.deadline() {
                     break Some(if state.retired.load(Ordering::SeqCst) {
                         "connection drained"
                     } else {
@@ -757,13 +763,6 @@ async fn accept_loop<T: Transport, S: Service>(
     }
     if let Some(table) = shared.upgrade() {
         table.table.lock().unwrap().remove(&state);
-    }
-}
-
-async fn sleep_until(deadline: Option<Instant>) {
-    match deadline {
-        Some(deadline) => tokio::time::sleep_until(deadline).await,
-        None => std::future::pending().await,
     }
 }
 
