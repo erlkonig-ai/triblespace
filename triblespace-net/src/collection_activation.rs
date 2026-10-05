@@ -2457,4 +2457,57 @@ mod tests {
         assert_eq!(mixed.proof_digest(subject).leaf_count(), 1);
         assert_eq!(mixed.proofs_naming(subject).collect::<Vec<_>>(), [&valid]);
     }
+
+    #[test]
+    fn a_subject_digest_ignores_other_subjects_and_collections() {
+        let root = key(160);
+        let subject = key(161);
+        let other = key(162);
+        let onward = key(163);
+        let collection = Inline::new([164; 32]);
+        let elsewhere = Inline::new([165; 32]);
+        let grants = |collection: CollectionHandle, to: &SigningKey| {
+            vec![
+                root_proof(&root, to, scope(read_capability(), collection)),
+                root_proof(&root, to, write_scope(collection)),
+            ]
+        };
+        let observe = |collection: CollectionHandle, proofs: Vec<CapabilityProof>| {
+            canonical_authorization_evidence(
+                &definitions(),
+                collection,
+                policy_facts(CollectionPolicy::new(
+                    AdmissionPolicy::direct(root.verifying_key()),
+                    AdmissionPolicy::direct(root.verifying_key()),
+                )),
+                proofs,
+            )
+            .unwrap()
+        };
+        let alone = observe(collection, grants(collection, &subject));
+        let mut crowded = grants(collection, &subject);
+        crowded.extend(grants(collection, &other));
+        crowded.push(
+            crowded[2]
+                .delegate(&other, read_capability(), onward.verifying_key())
+                .unwrap(),
+        );
+        let crowded = observe(collection, crowded);
+        // One host index over two collections, as an exchange will serve it.
+        let mut host = crowded.clone();
+        host.subjects
+            .union(observe(elsewhere, grants(elsewhere, &other)).subjects);
+        let [subject, other] = [subject, other].map(|key| key.verifying_key());
+        let digest = alone.proof_digest(subject);
+        assert_eq!(digest.leaf_count(), 2);
+        // Alone, the subject's two entries are the whole PATCH; elsewhere they
+        // sit under a branch beside other subjects' entries.
+        assert_eq!(PatchSummary::from_patch(&alone.subjects), digest);
+        for evidence in [&crowded, &host] {
+            assert_ne!(PatchSummary::from_patch(&evidence.subjects), digest);
+            assert_eq!(evidence.proof_digest(subject), digest);
+        }
+        assert_eq!(crowded.proof_digest(other).leaf_count(), 2);
+        assert_eq!(host.proof_digest(other).leaf_count(), 4);
+    }
 }
