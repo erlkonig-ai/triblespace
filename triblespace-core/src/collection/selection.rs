@@ -12,10 +12,11 @@
 //! [`config_handle`] derives the collection from the pile's signing key and
 //! the fixed name [`CONFIG_COLLECTION_NAME`] under [`private_policy`]. Nothing
 //! has to remember the handle: a process holding the key already knows where
-//! to look, and a host that was never configured derives the same handle,
-//! finds no descriptor, and reads an empty selection. The derivation is
-//! byte-for-byte the faculties' own, because a daemon reading one collection
-//! while the faculties write another would sync nothing.
+//! to look. [`config_facts`] reads it, and a host that was never configured
+//! holds no descriptor there and reads an empty configuration, in which every
+//! register is unset. The derivation is byte-for-byte the faculties' own,
+//! because a daemon reading one collection while the faculties write another
+//! would sync nothing.
 //!
 //! # One register per collection
 //!
@@ -63,7 +64,7 @@ use crate::metadata;
 use crate::prelude::{and, find, pattern};
 use crate::query::register::{maximal, ObservationOrder};
 use crate::query::TriblePattern;
-use crate::repo::{BlobStoreGet, BlobStorePut, SnapshotSource, StoreRead};
+use crate::repo::{BlobStoreGet, BlobStoreList, BlobStorePut, SnapshotSource, StoreRead};
 use crate::trible::TribleSet;
 
 use super::simplearchive_union::FactViewError;
@@ -86,6 +87,34 @@ pub const CONFIG_COLLECTION_NAME: &str = "config";
 /// receives the same handle.
 pub fn config_handle(authority: VerifyingKey) -> CollectionHandle {
     descriptor::root_handle_to_read(CONFIG_COLLECTION_NAME, private_policy(authority))
+}
+
+/// The configuration `snapshot` holds for the pile `authority` signs for.
+///
+/// A pile that was never configured holds no descriptor at
+/// [`config_handle`], and that reads as an empty configuration rather than
+/// as an error. Whether the descriptor is there is observed, never fetched,
+/// so an unconfigured host does not ask its peers for one.
+pub fn config_facts<S>(
+    snapshot: &S,
+    authority: VerifyingKey,
+) -> Result<
+    TribleSet,
+    ConfigReadError<<S as BlobStoreList>::Err, <S as BlobStoreGet>::GetError<Infallible>>,
+>
+where
+    S: StoreRead,
+{
+    let handle = config_handle(authority);
+    if !snapshot
+        .contains_blob(handle)
+        .map_err(ConfigReadError::Residency)?
+    {
+        return Ok(TribleSet::new());
+    }
+    Collection::<SimpleArchive>::from_handle(handle)
+        .read::<TribleSet, _>(snapshot)
+        .map_err(ConfigReadError::Read)
 }
 
 attributes! {
@@ -123,9 +152,10 @@ pub enum Selection {
 
 /// The sync selection `facts` holds for `collection`.
 ///
-/// `facts` is the configuration collection as the caller reads it. The
-/// heads are the states nothing in `facts` supersedes; a state whose value
-/// this reader cannot decode is not read.
+/// `facts` is the configuration collection as the caller reads it, for
+/// example through [`config_facts`]. The heads are the states nothing in
+/// `facts` supersedes; a state whose value this reader cannot decode is not
+/// read.
 pub fn sync_selection<P>(facts: &P, collection: CollectionHandle) -> Selection
 where
     P: TriblePattern + Sync,
@@ -256,6 +286,45 @@ where
     }
 }
 
+/// Failure to read a pile's configuration.
+#[derive(Debug)]
+pub enum ConfigReadError<ResidencyError, GetError> {
+    /// The snapshot could not say whether the configuration exists.
+    Residency(ResidencyError),
+    /// The configuration exists and could not be read.
+    Read(CollectionReadError<GetError, FactViewError>),
+}
+
+impl<ResidencyError, GetError> fmt::Display for ConfigReadError<ResidencyError, GetError>
+where
+    ResidencyError: fmt::Display,
+    GetError: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Residency(source) => {
+                write!(formatter, "failed to look for the configuration: {source}")
+            }
+            Self::Read(source) => {
+                write!(formatter, "failed to read the configuration: {source}")
+            }
+        }
+    }
+}
+
+impl<ResidencyError, GetError> Error for ConfigReadError<ResidencyError, GetError>
+where
+    ResidencyError: Error + 'static,
+    GetError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Residency(source) => Some(source),
+            Self::Read(source) => Some(source),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,6 +401,28 @@ mod tests {
             config_handle(signer(1).verifying_key()),
             config_handle(signer(2).verifying_key()),
             "one pile's configuration must not be another's"
+        );
+    }
+
+    /// A pile nobody configured reads as an empty configuration, not as an
+    /// error, and a configured one reads as what was written to it.
+    #[test]
+    fn an_unconfigured_pile_reads_as_empty() {
+        let key = signer(1);
+        let mut store = MemoryRepo::default();
+        let facts = config_facts(&store.snapshot().unwrap(), key.verifying_key()).unwrap();
+        assert_eq!(sync_selection(&facts, handle(1)), Selection::Unset);
+
+        let config = config(&mut store, &key);
+        write_sync_selection(&mut store, config, &key, handle(1), true).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let facts = config_facts(&snapshot, key.verifying_key()).unwrap();
+        assert_eq!(sync_selection(&facts, handle(1)), Selection::Selected);
+        let facts = config_facts(&snapshot, signer(2).verifying_key()).unwrap();
+        assert_eq!(
+            sync_selection(&facts, handle(1)),
+            Selection::Unset,
+            "another pile's configuration is not this one's"
         );
     }
 
