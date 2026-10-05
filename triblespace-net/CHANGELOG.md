@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `op_provider_get`. Requesters still check every hint's token. A lookup
   that finds no verified hint while some request failed or was still
   unanswered when its window closed reports itself incomplete.
+- Requesters rank candidate providers by `keyed(salt; key || provider)` under
+  a salt each draws once and never sends, instead of by the provider's public
+  XOR distance from the key, which a provider could grind an identity for.
 
 ## [0.47.1] - 2026-10-03
 

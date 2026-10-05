@@ -639,6 +639,8 @@ struct ProviderClient<T: Transport> {
     providers: Arc<Mutex<ProviderDirectory>>,
     candidates: RoutingCandidates,
     my_id: PeerId,
+    /// Drawn once per requester and never sent; see [`provider_rank`].
+    salt: [u8; 32],
 }
 
 #[cfg(test)]
@@ -650,6 +652,7 @@ impl<T: Transport> ProviderClient<T> {
             providers: handler.providers.clone(),
             candidates: handler.candidates.clone(),
             my_id: handler.local_id,
+            salt: rand::random(),
             connections: ConnectionTable::new(transport, handler),
         }
     }
@@ -1533,6 +1536,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
         providers: providers.clone(),
         candidates: candidates.clone(),
         my_id,
+        salt: rand::random(),
     };
     let cap = Arc::new(NetCap {
         client: provider_client.clone(),
@@ -2464,6 +2468,7 @@ impl<T: Transport> ProviderClient<T> {
             lookup.miss()?;
         }
         Ok(canonical_provider_subset(
+            &self.salt,
             key,
             providers,
             crate::provider::MAX_PROVIDERS_PER_REPLY,
@@ -2547,7 +2552,7 @@ impl<T: Transport> ProviderClient<T> {
         // authenticated reply, or the closed lookup, places us among the
         // key's replicas. Later responders can only push us out.
         let mut local_decided = false;
-        let mut candidates = ProgressiveBlobProviders::new(hash, self.my_id);
+        let mut candidates = ProgressiveBlobProviders::new(hash, self.my_id, self.salt);
         let mut bodies: FuturesUnordered<
             futures::future::BoxFuture<'_, anyhow::Result<Option<Blob<UnknownBlob>>>>,
         > = FuturesUnordered::new();
@@ -2752,14 +2757,15 @@ impl ReplicaLookup {
 }
 
 /// Per-fetch scheduling only. At most 64 distinct providers can be attempted;
-/// pending slots are XOR-ranked among the verified hints which have arrived
-/// so far. A later reply may replace a pending candidate, never an
-/// already-started attempt. Thus transient attempts deliberately need not
-/// equal the canonical final union used by collection discovery, and remain
-/// bounded under hint floods.
+/// pending slots are ranked by [`provider_rank`] among the verified hints
+/// which have arrived so far. A later reply may replace a pending candidate,
+/// never an already-started attempt. Thus transient attempts deliberately
+/// need not equal the canonical final union used by collection discovery,
+/// and remain bounded under hint floods.
 struct ProgressiveBlobProviders {
     hash: RawHash,
     local: PeerId,
+    salt: [u8; 32],
     attempted: BTreeSet<PeerId>,
     pending: Vec<PeerId>,
     /// Some hint so far carried a valid token, our own included.
@@ -2767,10 +2773,11 @@ struct ProgressiveBlobProviders {
 }
 
 impl ProgressiveBlobProviders {
-    fn new(hash: RawHash, local: PeerId) -> Self {
+    fn new(hash: RawHash, local: PeerId, salt: [u8; 32]) -> Self {
         Self {
             hash,
             local,
+            salt,
             attempted: BTreeSet::new(),
             pending: Vec::new(),
             verified: false,
@@ -2791,6 +2798,7 @@ impl ProgressiveBlobProviders {
             }
         }
         self.pending = canonical_provider_subset(
+            &self.salt,
             blob_locator(self.hash),
             self.pending.drain(..).chain(arrived),
             crate::provider::MAX_PROVIDERS_PER_REPLY - self.attempted.len(),
@@ -2808,26 +2816,39 @@ impl ProgressiveBlobProviders {
     }
 }
 
+/// A requester's rank of one provider for one key: `keyed(salt; key ||
+/// provider)`, under a salt it draws once and never sends. A public rank, such
+/// as the provider's XOR distance from the key, would let a provider grind an
+/// identity that every requester tries first.
+fn provider_rank(salt: &[u8; 32], key: ProviderKey, provider: PeerId) -> [u8; 32] {
+    let mut block = [0; 64];
+    block[..32].copy_from_slice(&key);
+    block[32..].copy_from_slice(&provider);
+    *blake3::keyed_hash(salt, &block).as_bytes()
+}
+
 /// Canonical union of the supplied replies for one exact key, bounded by `limit`.
 ///
 /// Each queried DHT replica independently bounds its response, but their union
-/// may still be `K` times larger. Ranking the deduplicated union by the same XOR
-/// order as routing makes the selected subset independent of asynchronous reply
-/// order. Collection discovery supplies all replies; progressive exact fetches
-/// use the same ordering for their currently available, not-yet-attempted hints.
+/// may still be `K` times larger. Ranking the deduplicated union by
+/// [`provider_rank`] makes the selected subset independent of asynchronous
+/// reply order. Collection discovery supplies all replies; progressive exact
+/// fetches use the same ranking for their currently available,
+/// not-yet-attempted hints.
 fn canonical_provider_subset(
+    salt: &[u8; 32],
     key: ProviderKey,
     providers: impl IntoIterator<Item = PeerId>,
     limit: usize,
 ) -> Vec<PeerId> {
-    let mut providers = providers
+    providers
         .into_iter()
+        .map(|provider| (provider_rank(salt, key, provider), provider))
         .collect::<BTreeSet<_>>()
         .into_iter()
-        .collect::<Vec<_>>();
-    providers.sort_unstable_by(|left, right| crate::routing::distance_cmp(key, *left, *right));
-    providers.truncate(limit);
-    providers
+        .take(limit)
+        .map(|(_, provider)| provider)
+        .collect()
 }
 
 #[derive(Clone)]
@@ -3051,7 +3072,7 @@ mod tests {
         MAX_COLLECTION_PARTICIPANTS, MAX_PENDING_REPAIRS, ProgressiveBlobProviders,
         ProviderPublicationBudget, RepairTarget, WakeBootstrapPeers, blob_provider_token,
         canonical_provider_subset, enqueue_repair, forget_participant, has_repair_candidate,
-        live_participants, observe_participant, retain_active_repair_state,
+        live_participants, observe_participant, provider_rank, retain_active_repair_state,
     };
 
     fn endpoint(byte: u8) -> EndpointId {
@@ -3937,7 +3958,7 @@ mod tests {
         let hash = [7; 32];
         let local = peer(0);
         let hint = |provider| (provider, blob_provider_token(hash, provider));
-        let mut candidates = ProgressiveBlobProviders::new(hash, local);
+        let mut candidates = ProgressiveBlobProviders::new(hash, local, [0; 32]);
         // A forged token names no candidate; our own valid hint verifies the
         // lookup but names none either.
         candidates.observe([(peer(1), [0; 32])]);
@@ -3996,12 +4017,15 @@ mod tests {
                 .all(|reply| reply.len() == MAX_PROVIDERS_PER_REPLY)
         );
 
+        let salt = [0x5A; 32];
         let forward = canonical_provider_subset(
+            &salt,
             key,
             replies.iter().flatten().copied(),
             MAX_PROVIDERS_PER_REPLY,
         );
         let reversed = canonical_provider_subset(
+            &salt,
             key,
             replies
                 .iter()
@@ -4009,13 +4033,12 @@ mod tests {
                 .flat_map(|reply| reply.iter().rev().copied()),
             MAX_PROVIDERS_PER_REPLY,
         );
-        let mut expected_indices = (1..=16).chain(100..100 + K as u16 * 48).collect::<Vec<_>>();
-        expected_indices.sort_unstable_by_key(|index| index ^ key_index);
-        expected_indices.truncate(MAX_PROVIDERS_PER_REPLY);
-        let expected = expected_indices
-            .into_iter()
+        let mut expected = (1..=16)
+            .chain(100..100 + K as u16 * 48)
             .map(provider)
             .collect::<Vec<_>>();
+        expected.sort_unstable_by_key(|peer| provider_rank(&salt, key, *peer));
+        expected.truncate(MAX_PROVIDERS_PER_REPLY);
 
         assert_eq!(forward.len(), MAX_PROVIDERS_PER_REPLY);
         assert_eq!(forward, expected);
@@ -4024,6 +4047,34 @@ mod tests {
             forward.iter().copied().collect::<BTreeSet<_>>().len(),
             forward.len()
         );
+    }
+
+    #[test]
+    fn providers_near_a_key_gain_no_rank_and_requesters_rank_independently() {
+        fn provider(index: u16) -> PeerId {
+            let mut peer = [0; 32];
+            peer[30..].copy_from_slice(&index.to_be_bytes());
+            peer
+        }
+        // Under a public XOR rank the 64 identities nearest this key would be
+        // every requester's choice among 1000, so a provider would grind an
+        // identity near the keys it wants to be asked for.
+        let key = [0; 32];
+        let nearest = (1..=64).map(provider).collect::<BTreeSet<_>>();
+        let choices = [[1; 32], [2; 32]].map(|salt| {
+            canonical_provider_subset(
+                &salt,
+                key,
+                (1..=1000).map(provider),
+                MAX_PROVIDERS_PER_REPLY,
+            )
+        });
+        for choice in &choices {
+            assert_eq!(choice.len(), MAX_PROVIDERS_PER_REPLY);
+            // About 64 * 64 / 1000, or four, of them by chance.
+            assert!(choice.iter().filter(|peer| nearest.contains(*peer)).count() < 16);
+        }
+        assert_ne!(choices[0], choices[1]);
     }
 
     #[test]

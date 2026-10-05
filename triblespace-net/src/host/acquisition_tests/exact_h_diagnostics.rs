@@ -922,34 +922,40 @@ async fn exact_h_stale_early_hints_leave_room_for_fresh_routing_and_final_holder
     );
     let key = blob_locator(fixture.hash);
     // Deterministic fixture identities, bounded independently of routing.
-    // Every stale hint and the later replica are farther than the holder:
-    // routing reaches the holder first, and its useful hint outranks the
-    // third still-pending stale provider.
-    let mut farther: Vec<_> = (0_u16..4096)
-        .filter_map(|seed| {
+    // The later replica is farther than the holder, so routing reaches the
+    // holder first. Every stale hint ranks behind the holder for this
+    // requester, so the holder's useful hint outranks the third, still
+    // pending, stale provider. A fixed salt keeps the selection fixed.
+    fixture.client.salt = [156; 32];
+    let rank = |peer| provider_rank(&fixture.client.salt, key, peer);
+    let mut identities = (0_u16..4096)
+        .map(|seed| {
             let mut secret = [156; 32];
             secret[..2].copy_from_slice(&seed.to_le_bytes());
-            let signing = SigningKey::from_bytes(&secret);
-            let peer = signing.verifying_key().to_bytes();
-            (![
+            SigningKey::from_bytes(&secret)
+        })
+        .filter(|signing| {
+            ![
                 fixture.client.my_id,
                 fixture.holder.peer,
                 fixture.other.peer,
                 relay.peer,
             ]
-            .contains(&peer)
-                && crate::routing::distance_cmp(key, peer, fixture.holder.peer).is_gt())
-            .then_some(signing)
+            .contains(&signing.verifying_key().to_bytes())
+        });
+    let later = identities
+        .by_ref()
+        .find(|signing| {
+            let peer = signing.verifying_key().to_bytes();
+            crate::routing::distance_cmp(key, peer, fixture.holder.peer).is_gt()
         })
-        .take(4)
+        .expect("bounded fixture must supply a farther replica");
+    let mut later = Node::new(&fixture.net, &later, None, None);
+    let stale: Vec<_> = identities
+        .filter(|signing| rank(signing.verifying_key().to_bytes()) > rank(fixture.holder.peer))
+        .take(3)
         .collect();
-    assert_eq!(
-        farther.len(),
-        4,
-        "bounded fixture must supply four farther peers"
-    );
-    let mut later = Node::new(&fixture.net, &farther.pop().unwrap(), None, None);
-    let mut slow: Vec<_> = farther
+    let mut slow: Vec<_> = stale
         .into_iter()
         .map(|signing| {
             let gate = Gate::new(TAG_BLOB);
@@ -962,11 +968,9 @@ async fn exact_h_stale_early_hints_leave_room_for_fresh_routing_and_final_holder
     assert_eq!(
         slow.len(),
         3,
-        "bounded fixture must supply three farther hints"
+        "bounded fixture must supply three lower-ranked hints"
     );
-    slow.sort_unstable_by(|(left, _), (right, _)| {
-        crate::routing::distance_cmp(key, left.peer, right.peer)
-    });
+    slow.sort_unstable_by_key(|(node, _)| rank(node.peer));
     for (node, _) in &slow {
         assert!(fixture.other.directory.lock().unwrap().put(
             key,

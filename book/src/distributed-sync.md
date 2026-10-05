@@ -464,10 +464,13 @@ the same unchanged routing window; this is not a proof of equal discovery
 coverage under every timing pattern. Empty early hints do not end
 a lookup whose routing remains open. At most 64 distinct providers can be
 attempted per fetch.
-Duplicate hints never spend another attempt. Pending providers are ranked by
-XOR distance among the hints received so far, bounded by the remaining attempt
-allowance. A later closer hint can replace pending work, not an already-started
-request. The transient attempt subset is therefore deliberately arrival-sensitive;
+Duplicate hints never spend another attempt. Pending providers are ranked
+among the hints received so far, bounded by the remaining attempt allowance,
+by `keyed(salt; L || provider)` under a salt the requester draws once and never
+sends; collection discovery ranks its union the same way. A public rank such as
+the provider's XOR distance from L would let a provider grind an identity that
+every requester tries first. A later better-ranked hint can replace pending
+work, not an already-started request. The transient attempt subset is therefore deliberately arrival-sensitive;
 it need not equal the closest 64 in the final reply union. Collection discovery
 still waits for its canonical, reply-order-independent union.
 
