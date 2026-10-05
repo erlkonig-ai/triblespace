@@ -273,23 +273,18 @@ impl CollectionAuthorizationEvidencePatch {
                     .find_map(|prefix| {
                         let witness = CapabilityProof::from_bytes(prefix.as_bytes())
                             .expect("an exact prefix of a canonical proof is canonical");
-                        let verified = witness.verify(
-                            &self.reader,
-                            proof.root_key(),
-                            subject,
-                            CapabilityRequest::new(
-                                CapabilityResource::from(self.collection),
-                                ACTION_READ,
-                            ),
-                        );
-                        // A witness stopped at an absent definition stays, so
-                        // the quorum below names that definition as Undefined.
-                        match verified {
-                            Ok(()) | Err(CapabilityProofError::UnavailableDefinition { .. }) => {
-                                Some(witness)
-                            }
-                            Err(_) => None,
-                        }
+                        witness
+                            .verify(
+                                &self.reader,
+                                proof.root_key(),
+                                subject,
+                                CapabilityRequest::new(
+                                    CapabilityResource::from(self.collection),
+                                    ACTION_READ,
+                                ),
+                            )
+                            .is_ok()
+                            .then_some(witness)
                     })
             })
             .collect::<Vec<_>>();
@@ -299,11 +294,9 @@ impl CollectionAuthorizationEvidencePatch {
         ) {
             return Vec::new();
         }
-        // Each witness ends at the earliest READ prefix for this subject that
-        // is valid or stopped at an absent definition; later delegates and
-        // their capability handles never enter bootstrap. Delete only proofs
-        // not required by the independently rooted quorum, which a stopped
-        // witness never is.
+        // Each witness ends at the earliest valid READ prefix for this subject;
+        // later delegates and their capability handles never enter bootstrap.
+        // Delete only proofs not required by the independently rooted quorum.
         let mut index = selected.len();
         while index > 0 {
             index -= 1;
