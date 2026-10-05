@@ -1066,6 +1066,16 @@ fn scoped_unrelated_blobs_reuse_proofs_bootstrap_and_records_without_blob_reads(
                 old.repair.authorization_evidence().get(id).unwrap(),
                 new.repair.authorization_evidence().get(id).unwrap(),
             ));
+            // The subject index is part of the reused evidence, not rebuilt.
+            let [old_naming, new_naming] = [&old, &new].map(|snapshot| {
+                snapshot
+                    .repair
+                    .authorization_evidence()
+                    .proofs_naming(fixture.local)
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(old_naming, [&fixture.proofs[index]]);
+            assert!(std::ptr::eq(old_naming[0], new_naming[0]));
         }
         assert!(before.1.get_blob(&arrived.raw).is_none());
         assert!(after.1.get_blob(&arrived.raw).is_some());
@@ -1122,11 +1132,12 @@ fn scoped_proof_change_refreshes_authorization_without_losing_record_interests()
     let selected = fixture.active();
     let before = fixture.observe(&selected, None);
     fixture.take_counts();
+    let reader = SigningKey::from_bytes(&[113; 32]).verifying_key();
     let proof = CapabilityProof::new(
         CapabilityResource::from(fixture.collections[0].handle()),
         &fixture.root,
         read_capability(),
-        SigningKey::from_bytes(&[113; 32]).verifying_key(),
+        reader,
     );
     fixture.store.insert_proof(proof.clone()).unwrap();
     let after = fixture.observe(&selected, Some(&before));
@@ -1134,10 +1145,20 @@ fn scoped_proof_change_refreshes_authorization_without_losing_record_interests()
     // CapabilityProofRead currently enumerates the whole component. Its raw
     // dependency must remain conservative even for a proof naming just one C.
     assert_eq!((records, proofs), (0, 2));
+    let old = before
+        .1
+        .collection(fixture.collections[0].handle())
+        .unwrap();
     let new = after.1.collection(fixture.collections[0].handle()).unwrap();
     assert_eq!(
         new.repair.authorization_evidence().get(proof.id()),
         Some(&proof)
+    );
+    let evidence = [&old, &new].map(|snapshot| snapshot.repair.authorization_evidence());
+    assert_eq!(evidence[0].proof_digest(reader).leaf_count(), 0);
+    assert_eq!(
+        evidence[1].proofs_naming(reader).collect::<Vec<_>>(),
+        [&proof]
     );
 
     let record = fixture

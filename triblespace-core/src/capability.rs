@@ -193,11 +193,7 @@ impl<'a> CapabilityProofPrefix<'a> {
         self.proof.resource()
     }
     pub fn subject(self) -> VerifyingKey {
-        self.proof
-            .edges()
-            .nth(self.steps - 1)
-            .expect("prefix is nonempty")
-            .delegate
+        self.proof.edge(self.steps - 1).delegate
     }
     pub const fn step_count(self) -> usize {
         self.steps
@@ -208,6 +204,18 @@ impl<'a> CapabilityProofPrefix<'a> {
     }
     pub fn capabilities(self) -> impl ExactSizeIterator<Item = CapabilityHandle> + 'a {
         self.proof.capabilities().take(self.steps)
+    }
+    /// This prefix as a standalone proof that shares the parent's bytes. An
+    /// exact prefix of a canonical proof is canonical, so nothing is copied
+    /// or decoded again.
+    pub fn to_proof(self) -> CapabilityProof {
+        CapabilityProof {
+            bytes: self
+                .proof
+                .bytes
+                .field_to_view(self.as_bytes())
+                .expect("a prefix lies inside its proof's bytes"),
+        }
     }
 }
 
@@ -438,24 +446,27 @@ impl CapabilityProof {
     fn edges(
         &self,
     ) -> impl ExactSizeIterator<Item = CapabilityProofEdge> + DoubleEndedIterator + '_ {
-        self.bytes[CAPABILITY_PROOF_HEADER_LEN..]
-            .chunks_exact(CAPABILITY_PROOF_EDGE_LEN)
-            .enumerate()
-            .map(|(step, edge)| CapabilityProofEdge {
-                capability: Inline::new(
-                    edge[..CAPABILITY_HANDLE_LEN]
-                        .try_into()
-                        .expect("fixed capability handle"),
-                ),
-                delegate: parse_key(&edge[CAPABILITY_HANDLE_LEN..EDGE_BODY_LEN])
-                    .expect("proof delegate was validated at construction"),
-                signature: Signature::from_bytes(
-                    edge[EDGE_BODY_LEN..].try_into().expect("fixed signature"),
-                ),
-                signature_offset: CAPABILITY_PROOF_HEADER_LEN
-                    + step * CAPABILITY_PROOF_EDGE_LEN
-                    + EDGE_BODY_LEN,
-            })
+        (0..self.step_count()).map(|step| self.edge(step))
+    }
+
+    /// Decode one edge alone. Iterator adapters decode every edge they skip,
+    /// so a single step must not go through [`Self::edges`].
+    fn edge(&self, step: usize) -> CapabilityProofEdge {
+        let start = CAPABILITY_PROOF_HEADER_LEN + step * CAPABILITY_PROOF_EDGE_LEN;
+        let edge = &self.bytes[start..start + CAPABILITY_PROOF_EDGE_LEN];
+        CapabilityProofEdge {
+            capability: Inline::new(
+                edge[..CAPABILITY_HANDLE_LEN]
+                    .try_into()
+                    .expect("fixed capability handle"),
+            ),
+            delegate: parse_key(&edge[CAPABILITY_HANDLE_LEN..EDGE_BODY_LEN])
+                .expect("proof delegate was validated at construction"),
+            signature: Signature::from_bytes(
+                edge[EDGE_BODY_LEN..].try_into().expect("fixed signature"),
+            ),
+            signature_offset: start + EDGE_BODY_LEN,
+        }
     }
 }
 
@@ -1047,6 +1058,10 @@ mod tests {
             [1, 2]
         );
         assert_eq!(
+            second.prefixes().map(|p| p.subject()).collect::<Vec<_>>(),
+            [middle.verifying_key(), leaf.verifying_key()]
+        );
+        assert_eq!(
             CapabilityProof::from_bytes(second.prefixes().next().unwrap().as_bytes()).unwrap(),
             first
         );
@@ -1081,6 +1096,32 @@ mod tests {
         assert!(weak.upgrade().is_some());
         clone.verify_signatures().unwrap();
         assert_eq!(clone.into_bytes(), expected.as_bytes());
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn prefix_proofs_share_the_parent_view() {
+        let cap = CapabilityHandle::new([4; 32]);
+        let first = CapabilityProof::new(resource(9), &key(1), cap, key(2).verifying_key());
+        let second = first
+            .delegate(&key(2), cap, key(3).verifying_key())
+            .unwrap();
+        let weak = second.bytes.downgrade();
+        let address = second.as_bytes().as_ptr();
+        let [head, whole] = [0, 1].map(|step| second.prefixes().nth(step).unwrap().to_proof());
+        assert_eq!(head, first);
+        assert_eq!(head.leaf_key(), key(2).verifying_key());
+        assert_eq!(whole, second);
+        for proof in [&head, &whole] {
+            assert_eq!(proof.as_bytes().as_ptr(), address);
+        }
+        drop((second, whole));
+        assert!(
+            weak.upgrade().is_some(),
+            "a prefix keeps the parent's owner"
+        );
+        head.verify_signatures().unwrap();
+        drop(head);
         assert!(weak.upgrade().is_none());
     }
 
