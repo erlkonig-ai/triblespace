@@ -12,6 +12,7 @@ use crate::connection::{
     RESET_REPLACED, RESET_UNKNOWN, write_frame,
 };
 use crate::protocol::{OP_FIND_VALUE, TAG_DHT, TAG_RECON, recv_find_value_response};
+use crate::recon::FRAME_PEER_REQUEST;
 use crate::transport::sim::{SimConfig, SimConn, SimNet, SimTransport};
 
 use super::*;
@@ -472,7 +473,7 @@ async fn recon_protocol_violations_close_the_connection() {
         &(MAX_RECON_FRAME_BYTES + 1).to_be_bytes(),
     ]
     .concat();
-    let cases: [(&str, Vec<u8>, bool); 6] = [
+    let cases: [(&str, Vec<u8>, bool); 7] = [
         ("an oversized frame", oversized, false),
         (
             "a malformed opening frame",
@@ -493,6 +494,11 @@ async fn recon_protocol_violations_close_the_connection() {
         (
             "a well-formed opening and a later kind",
             [open(1), vec![0x7F, 0, 0, 0, 0]].concat(),
+            false,
+        ),
+        (
+            "a peering request shorter than its collection",
+            [open(1), vec![FRAME_PEER_REQUEST, 0, 0, 0, 5, 1, 2, 3, 4, 5]].concat(),
             false,
         ),
     ];
