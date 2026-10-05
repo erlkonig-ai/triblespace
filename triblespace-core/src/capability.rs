@@ -606,14 +606,21 @@ pub enum QuorumOutcome {
 impl QuorumOutcome {
     /// Decide alternatives: one met alternative admits, and otherwise every
     /// definition an alternative stopped at could still change the answer.
-    /// Alternatives after the first met one are not evaluated.
+    /// Each definition is named once, however many alternatives stopped at
+    /// it. Alternatives after the first met one are not evaluated.
     pub fn any(alternatives: impl IntoIterator<Item = QuorumOutcome>) -> QuorumOutcome {
         let mut undefined = Vec::new();
         for outcome in alternatives {
             match outcome {
                 QuorumOutcome::Met => return QuorumOutcome::Met,
                 QuorumOutcome::Unmet => {}
-                QuorumOutcome::Undefined(handles) => undefined.extend(handles),
+                QuorumOutcome::Undefined(handles) => {
+                    for handle in handles {
+                        if !undefined.contains(&handle) {
+                            undefined.push(handle);
+                        }
+                    }
+                }
             }
         }
         if undefined.is_empty() {
