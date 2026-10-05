@@ -1,14 +1,16 @@
 //! One connection per peer pair over real QUIC: crossed dials converge on the
-//! connection dialled by the lower key, and it carries both directions.
+//! connection dialled by the lower key, and it carries both directions; a
+//! stream with an unknown tag is reset and stopped without the connection.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use iroh::{Endpoint, endpoint::presets, test_utils::test_transport::TestNetwork};
+use iroh::endpoint::{ReadError, VarInt, WriteError, presets};
+use iroh::{Endpoint, test_utils::test_transport::TestNetwork};
 use iroh_base::SecretKey;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use triblespace_net::connection::{Connection, ConnectionTable, Service};
+use triblespace_net::connection::{Connection, ConnectionTable, RESET_UNKNOWN, Service};
 use triblespace_net::host::PeerConfig;
 use triblespace_net::protocol::TAG_DHT;
 use triblespace_net::transport::iroh::{IrohConn, IrohTransport, bind_with_endpoint};
@@ -151,6 +153,64 @@ async fn crossed_dials_converge_on_the_connection_dialled_by_the_lower_key() {
         tokio::join!(
             left.table.transport().shutdown(),
             right.table.transport().shutdown()
+        )
+    })
+    .await
+    .expect("transport shutdown stalled");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unknown_tag_resets_and_stops_only_its_stream() {
+    let network = TestNetwork::new();
+    let (client, server) = tokio::join!(node(&network), node(&network));
+    let connection = tokio::time::timeout(Duration::from_secs(5), client.table.connect(server.id))
+        .await
+        .expect("dial did not establish")
+        .unwrap();
+    let (mut send, mut recv) = connection.open_bi().await.unwrap();
+    // No stream type uses this byte.
+    send.write_all(&[0x7E]).await.unwrap();
+    let read = tokio::time::timeout(Duration::from_secs(5), recv.read(&mut [0; 1]))
+        .await
+        .expect("the stream was neither reset nor finished");
+    let error = read.unwrap_err();
+    // A finish would read as a clean end of the stream instead.
+    assert_eq!(
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<ReadError>()),
+        Some(&ReadError::Reset(VarInt::from_u32(RESET_UNKNOWN))),
+        "{error}"
+    );
+    let error = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Err(error) = send.write_all(b"unread").await {
+                return error;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the stream was not stopped");
+    assert_eq!(
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<WriteError>()),
+        Some(&WriteError::Stopped(VarInt::from_u32(RESET_UNKNOWN))),
+        "{error}"
+    );
+    drop((send, recv));
+
+    assert_eq!(echo(&connection, b"still serving").await, b"still serving");
+    assert!(client.table.current(server.id) == Some(connection));
+    assert_eq!(server.accepted.load(Ordering::SeqCst), 1, "no second dial");
+
+    client.accept.abort();
+    server.accept.abort();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            client.table.transport().shutdown(),
+            server.table.transport().shutdown()
         )
     })
     .await
