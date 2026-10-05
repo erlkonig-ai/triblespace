@@ -7,7 +7,8 @@ use futures::poll;
 use tokio::io::AsyncWriteExt as _;
 
 use crate::connection::{
-    CONNECTION_IDLE_DEADLINE, DRAIN_GRACE, FRAME_OPEN, MAX_CONNECTIONS, MAX_RECON_FRAME_BYTES,
+    CONNECTION_IDLE_DEADLINE, DRAIN_GRACE, FRAME_OPEN, MAX_CONNECTIONS,
+    MAX_HELD_REQUESTS_PER_CONNECTION, MAX_RECON_FRAME_BYTES, MAX_REQUESTS_GLOBAL, RESET_BUSY,
     RESET_REPLACED, RESET_UNKNOWN, write_frame,
 };
 use crate::protocol::{TAG_DHT, TAG_RECON};
@@ -301,6 +302,47 @@ async fn an_unknown_tag_or_operation_resets_its_stream_and_the_connection_keeps_
     }
     assert_eq!(net.dial_count(client.peer, server.peer), 1);
     assert_eq!(server.table.len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn request_streams_beyond_the_held_bound_are_reset() {
+    let net = network(Duration::from_secs(1));
+    let server = Node::join(&net, &key(1));
+    let client = net.join(&key(2));
+    let client_id = client.transport.local_id();
+    let conn = client
+        .transport
+        .dial(server.peer, PILE_SYNC_ALPN)
+        .await
+        .unwrap();
+    let _recon = open_recon(&conn, 1).await;
+    // Every request slot is busy, and the opener abandons the next requests
+    // while the server still holds them, waiting for a slot.
+    let mut serving = Vec::new();
+    for _ in 0..MAX_REQUESTS_GLOBAL {
+        serving.push(held_find_node(&conn).await);
+    }
+    for _ in MAX_REQUESTS_GLOBAL..MAX_HELD_REQUESTS_PER_CONNECTION {
+        let (mut send, recv) = held_find_node(&conn).await;
+        send.shutdown().await.unwrap();
+        drop((send, recv));
+    }
+    settle().await;
+    assert_eq!(server.table.available_requests(), 0);
+
+    // The connection holds no more: the next request is reset at once, so the
+    // abandoned ones cannot take the opener's stream credit from recon/1.
+    let (mut send, mut recv) = held_find_node(&conn).await;
+    send.shutdown().await.unwrap();
+    assert!(reads_reset(&mut recv, RESET_BUSY).await);
+    let _reopened = open_recon(&conn, 1).await;
+    settle().await;
+    assert!(server.table.current(client_id).is_some());
+
+    for (mut send, _recv) in serving {
+        send.shutdown().await.unwrap();
+    }
+    op_find_node(&conn, &[0; 32]).await.unwrap();
 }
 
 #[tokio::test(start_paused = true)]

@@ -5,8 +5,9 @@
 //! accepted, runs one accept loop. The first byte of each stream is its type
 //! tag ([`TAG_RECON`], [`TAG_DHT`], [`TAG_BLOB`] and the transitional
 //! [`TAG_REPAIR`]). The loop reads the tag before it takes any permit:
-//! `recon/1` takes none, request streams take one of their connection's and
-//! one of the table's, and an unknown tag resets only its own stream.
+//! `recon/1` takes none, a request stream takes one of its connection's (or
+//! is reset when none is left) and waits for one of the table's, and an
+//! unknown tag resets only its own stream.
 //!
 //! The dialler opens `recon/1`, and its first frame carries the dialler's
 //! sequence number. When a pair holds two connections, both sides keep the
@@ -53,10 +54,15 @@ const TAG_DEADLINE: Duration = Duration::from_secs(10);
 /// Connections per direction, neighbours not counted. Above it the least
 /// recently used one is evicted.
 pub(crate) const MAX_CONNECTIONS: usize = 64;
-/// Request streams each side opens on one connection, and request streams
-/// served at once on one connection. QUIC allows 100 open bidirectional
-/// streams per direction, so `recon/1` can always reopen.
+/// Request streams each side opens on one connection. QUIC allows 100 open
+/// bidirectional streams per direction, so `recon/1` can always reopen.
 pub(crate) const MAX_REQUESTS_PER_CONNECTION: usize = 16;
+/// Request streams the accepting side holds on one connection, waiting for a
+/// permit or being served; one more is reset at once. An opener's own cap
+/// lapses when it abandons a stream the acceptor still holds, so this bound
+/// is what keeps stream credit free for `recon/1`. It is twice the opener's
+/// cap, so an opener within its cap never meets it.
+pub(crate) const MAX_HELD_REQUESTS_PER_CONNECTION: usize = 2 * MAX_REQUESTS_PER_CONNECTION;
 /// Request streams served at once across every connection.
 pub(crate) const MAX_REQUESTS_GLOBAL: usize = 16;
 
@@ -75,6 +81,9 @@ const CLOSE_VIOLATION: u32 = 1;
 pub const RESET_UNKNOWN: u32 = 1;
 /// Stream reset code: a newer `recon/1` stream replaced this one.
 pub const RESET_REPLACED: u32 = 2;
+/// Stream reset code: the connection already holds
+/// [`MAX_HELD_REQUESTS_PER_CONNECTION`] request streams.
+pub const RESET_BUSY: u32 = 3;
 
 /// What request streams mean. The table decides which streams reach it and
 /// holds their permits; the service answers them.
@@ -160,7 +169,7 @@ struct State {
     /// `recon/1` stream.
     changed: Notify,
     opened: Arc<Semaphore>,
-    served: Arc<Semaphore>,
+    held: Arc<Semaphore>,
 }
 
 impl State {
@@ -179,7 +188,7 @@ impl State {
             recon: AtomicU64::new(0),
             changed: Notify::new(),
             opened: Arc::new(Semaphore::new(MAX_REQUESTS_PER_CONNECTION)),
-            served: Arc::new(Semaphore::new(MAX_REQUESTS_PER_CONNECTION)),
+            held: Arc::new(Semaphore::new(MAX_HELD_REQUESTS_PER_CONNECTION)),
         })
     }
 
@@ -807,12 +816,18 @@ async fn stream<T: Transport, S: Service>(
     match tag {
         TAG_RECON => recon(shared, conn, state, Some(order), send, recv).await,
         TAG_DHT | TAG_BLOB | TAG_REPAIR => {
-            let _request = InFlight::new(&state, None);
-            // Backpressure a burst instead of closing the connection: other
-            // streams may be serving independent requests on it.
-            let Ok(_connection) = state.served.clone().acquire_owned().await else {
+            // A held stream keeps the opener's stream credit even after the
+            // opener gave up on it, so the connection holds a bounded number
+            // and resets the rest. Within the bound, a burst waits for its
+            // permit instead: other streams may be serving independent
+            // requests on the connection.
+            let Ok(_held) = state.held.clone().try_acquire_owned() else {
+                debug!("resetting a request stream beyond the connection's bound");
+                send.reset(RESET_BUSY);
+                recv.stop(RESET_BUSY);
                 return;
             };
+            let _request = InFlight::new(&state, None);
             let Ok(_global) = requests.acquire_owned().await else {
                 return;
             };
