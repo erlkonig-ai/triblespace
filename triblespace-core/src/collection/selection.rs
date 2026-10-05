@@ -26,12 +26,17 @@
 //! ordinary change needs no clock and no retraction, and the history of what
 //! was selected stays readable.
 //!
-//! The supersession edges are part of each state's identity core. A state
-//! written without an explicit id takes its id from its own facts, so if the
-//! edges were added afterwards, "select C again, replacing the unselect"
-//! would re-mint the original "select C" state, which would then both
-//! supersede and be superseded by the unselect. With the edges inside, a
-//! revert is a different statement and mints a new state.
+//! Every write mints a fresh id for its state. An id derived from the state's
+//! own facts would make two writes that say the same thing one state, and
+//! that is wrong here whether or not the supersession edges are among those
+//! facts. Without them, "select C again, replacing the unselect" re-mints the
+//! original "select C", which then both supersedes and is superseded by the
+//! unselect. With them, a writer whose frame is stale repeats an earlier
+//! state exactly: "select C" written having seen nothing IS the first
+//! "select C", already superseded, so a write that disagrees with the current
+//! head would vanish into the history instead of standing beside it as a
+//! conflict. A fresh id gives up only idempotence, and that buys nothing
+//! here: writes that agree already read as one value.
 //!
 //! # Reading
 //!
@@ -50,7 +55,7 @@ use std::fmt;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
-use crate::id::Id;
+use crate::id::{genid, Id};
 use crate::inline::encodings::boolean::Boolean;
 use crate::inline::encodings::hash::Handle;
 use crate::macros::{attributes, entity};
@@ -152,9 +157,10 @@ where
 /// Select or unselect `collection` in `config`, superseding every head.
 ///
 /// The heads are read from one snapshot of `config` and the new state is
-/// committed under `signing_key`. Every state of the register that nothing
-/// supersedes is superseded, whatever it says, so a conflict is settled by
-/// this write and a head this reader cannot decode does not survive it.
+/// committed under `signing_key` with a fresh id. Every state of the
+/// register that nothing supersedes is superseded, whatever it says, so a
+/// conflict is settled by this write and a head this reader cannot decode
+/// does not survive it.
 pub fn write_sync_selection<S>(
     store: &mut S,
     config: Collection<SimpleArchive>,
@@ -189,7 +195,7 @@ where
     .collect();
     drop(snapshot);
 
-    let state = entity! {
+    let state = entity! { &genid() @
         sync_collection: collection,
         sync_selected: selected,
         metadata::supersedes*: heads,
@@ -254,7 +260,7 @@ where
 mod tests {
     use super::*;
 
-    use crate::id::{genid, ExclusiveId};
+    use crate::id::ExclusiveId;
     use crate::inline::Inline;
     use crate::prelude::exists;
     use crate::repo::memoryrepo::MemoryRepo;
@@ -474,6 +480,42 @@ mod tests {
                 pattern!(&facts, [{ first @ metadata::supersedes: ?earlier }])
             ),
             "the first state supersedes nothing, so the history has no cycle"
+        );
+    }
+
+    /// A write from a stale frame stands beside the head it never saw.
+    ///
+    /// The stale writer saw nothing, so it says exactly what the first state
+    /// of the other history said. Merged, the two histories must still hold
+    /// two heads that disagree, not one history that silently absorbed the
+    /// stale write.
+    #[test]
+    fn a_stale_write_that_disagrees_is_a_conflict() {
+        let key = signer(1);
+        let synced = handle(1);
+
+        let mut current = MemoryRepo::default();
+        let current_config = config(&mut current, &key);
+        write_sync_selection(&mut current, current_config, &key, synced, true).unwrap();
+        write_sync_selection(&mut current, current_config, &key, synced, false).unwrap();
+        let current = read(&mut current, current_config);
+
+        let mut stale = MemoryRepo::default();
+        let stale_config = config(&mut stale, &key);
+        write_sync_selection(&mut stale, stale_config, &key, synced, true).unwrap();
+        let stale = read(&mut stale, stale_config);
+
+        let mut heads = states(&stale, synced);
+        heads.extend(find!(
+            state: Id,
+            pattern!(&current, [{ ?state @ sync_selected: false }])
+        ));
+        let mut merged = current;
+        merged += stale;
+        assert_eq!(heads.len(), 2);
+        assert_eq!(
+            sync_selection(&merged, synced),
+            Selection::Conflicted(heads)
         );
     }
 }
