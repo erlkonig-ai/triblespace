@@ -44,6 +44,7 @@ pub mod identity;
 pub mod inventory;
 pub mod patch_repair;
 pub mod peer;
+pub(crate) mod peering;
 pub mod protocol;
 pub mod provider;
 pub mod recon;

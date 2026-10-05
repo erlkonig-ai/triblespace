@@ -145,6 +145,28 @@ pub struct CollectionHealth {
     pub peers: Vec<RepairHealth>,
 }
 
+/// One collection's peering with one key, on one connection, as this side
+/// sees it. A key on two connections at once, while a tie-break settles,
+/// can appear twice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PeeringHealth {
+    pub collection: CollectionHandle,
+    pub peer: PeerId,
+    /// This side asked for the peering: the peer is one of its asked-for
+    /// neighbours for the collection, or about to be.
+    pub asked: bool,
+    /// Both sides accepted.
+    pub peered: bool,
+    /// The collection flows from this side to the peer.
+    pub sends: bool,
+    /// The collection flows from the peer to this side.
+    pub receives: bool,
+    /// This side refused the peer's request, and invites it once admitted.
+    pub refused_by_me: bool,
+    /// The peer refused this side's request.
+    pub refused_by_them: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StoreFailure {
     Snapshot,
@@ -254,6 +276,9 @@ pub struct HealthSnapshot {
     pub collections: Vec<CollectionHealth>,
     pub publication: PublicationHealth,
     pub blob_serving: BlobServeHealth,
+    /// Every collection peering on an open connection, by collection and
+    /// peer. Written only by the peering task.
+    pub peerings: Vec<PeeringHealth>,
 }
 
 fn fresh(at: Option<Mono>, now: Mono, max_age: Duration) -> bool {
@@ -330,6 +355,7 @@ impl Health {
             collections: Vec::new(),
             publication: PublicationHealth::default(),
             blob_serving: BlobServeHealth::default(),
+            peerings: Vec::new(),
         })))
     }
 

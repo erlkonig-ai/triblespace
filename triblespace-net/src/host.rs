@@ -23,6 +23,7 @@ use tracing::{debug, warn};
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::capability::CapabilityProof;
+use triblespace_core::collection::selection::{Selection, config_facts, sync_selection};
 use triblespace_core::collection::{
     CollectionHandle, CollectionRecordSelector, HeldBlobs, HeldRead,
 };
@@ -32,6 +33,7 @@ use triblespace_core::patch::{Entry as PatchEntry, IdentitySchema, PATCH};
 use triblespace_core::repo::{
     BlobStoreGet, ObservedStore, StoreChanges, StoreDependencies, StoreRead,
 };
+use triblespace_core::trible::TribleSet;
 
 use crate::bearer::{BearerLocatorIndex, blob_locator, locator_index, update_locator_index};
 use crate::channel::{NetEvent, NetEventBatch};
@@ -42,7 +44,7 @@ use crate::collection_session::{
     serve_collection_repair,
 };
 use crate::collection_wire::MAX_COLLECTION_READ_BOOTSTRAP_PROOFS;
-use crate::connection::{ConnectionTable, RESET_UNKNOWN, Service};
+use crate::connection::{ConnectionTable, RESET_UNKNOWN, ReconEvent, Service};
 use crate::health::{
     CollectionHealth, Health, HealthSnapshot, RepairComparison, RepairFailure, StoreHealth,
 };
@@ -185,6 +187,11 @@ impl CollectionSnapshot {
         self.repair.collection()
     }
 
+    /// The collection's records and authorization evidence.
+    pub(crate) fn repair(&self) -> &CollectionRepairOverlay {
+        &self.repair
+    }
+
     fn wake_root(&self) -> [u8; 32] {
         self.repair.wake_root()
     }
@@ -204,28 +211,13 @@ impl CollectionSnapshot {
     }
 }
 
-/// Bounded, rotating sample of authority identities. These are only possible
-/// topic contacts; neither an AUTH edge nor a descriptor asserts residency.
-fn collection_bootstrap_candidates(
-    snapshot: &CollectionSnapshot,
-    local: PeerId,
-    salt: PeerId,
-) -> Vec<EndpointId> {
-    let mut selected = BTreeSet::new();
-    for key in snapshot.repair.discovery_candidates() {
-        let peer = key.to_bytes();
-        if peer == local {
-            continue;
-        }
-        let rank = std::array::from_fn::<_, 32, _>(|index| peer[index] ^ salt[index]);
-        selected.insert((rank, peer));
-        if selected.len() > MAX_COLLECTION_PARTICIPANTS {
-            selected.pop_last();
-        }
-    }
-    selected
+/// Bounded, rotating sample of the collection's peering candidates, as
+/// topic contacts. Neither an AUTH edge nor a descriptor asserts residency.
+fn collection_topic_contacts(snapshot: &CollectionSnapshot, local: PeerId) -> Vec<EndpointId> {
+    crate::peering::candidate_order(snapshot, &[], local, &rand::random())
         .into_iter()
-        .filter_map(|(_, peer)| EndpointId::from_bytes(&peer).ok())
+        .filter_map(|peer| EndpointId::from_bytes(&peer).ok())
+        .take(MAX_COLLECTION_PARTICIPANTS)
         .collect()
 }
 
@@ -263,6 +255,8 @@ pub(crate) struct StoreSnapshot {
     local: VerifyingKey,
     blobs: Arc<dyn BlobSnapshotReader>,
     bearer_locators: Arc<BearerLocatorIndex>,
+    /// This pile's configuration collection, where its sync selection lives.
+    config: Arc<TribleSet>,
 }
 
 impl StoreSnapshot {
@@ -288,6 +282,21 @@ impl StoreSnapshot {
             }
             (_, Some(previous)) => previous.bearer_locators.clone(),
             _ => Arc::new(locator_index(&snapshot)?),
+        };
+        // The selection lives in the configuration collection, whose writes
+        // are records.
+        let config = match previous {
+            Some(previous)
+                if previous_store.is_some()
+                    && previous.local == local
+                    && !changes.contains(StoreChanges::COLLECTION_RECORDS) =>
+            {
+                previous.config.clone()
+            }
+            _ => Arc::new(config_facts(&snapshot, local).unwrap_or_else(|error| {
+                warn!(%error, "configuration unreadable; no collection is selected for sync");
+                TribleSet::new()
+            })),
         };
         // This unobserved reader advances even when fixed per-C products do
         // not change. A later peer request may name a previously unseen R or
@@ -412,11 +421,29 @@ impl StoreSnapshot {
             local,
             blobs: reader.0,
             bearer_locators,
+            config,
         })
     }
 
-    fn collection(&self, collection: CollectionHandle) -> Option<Arc<CollectionSnapshot>> {
+    pub(crate) fn collection(
+        &self,
+        collection: CollectionHandle,
+    ) -> Option<Arc<CollectionSnapshot>> {
         self.collections.get(&collection.raw)?.value.clone()
+    }
+
+    /// The collection, if it is active here and the pile selects it for
+    /// sync. A conflicted or unset register selects nothing.
+    pub(crate) fn selected(&self, collection: CollectionHandle) -> Option<Arc<CollectionSnapshot>> {
+        let selected = sync_selection(&*self.config, collection) == Selection::Selected;
+        self.collection(collection).filter(|_| selected)
+    }
+
+    /// The active collections, selected or not.
+    pub(crate) fn active(&self) -> impl Iterator<Item = CollectionHandle> + '_ {
+        self.collections
+            .iter_ordered()
+            .map(|raw| CollectionHandle::new(*raw))
     }
 
     #[cfg(test)]
@@ -426,7 +453,7 @@ impl StoreSnapshot {
             .filter_map(move |key| self.collections.get(key)?.value.clone())
     }
 
-    fn get_blob(&self, hash: &RawHash) -> Option<Bytes> {
+    pub(crate) fn get_blob(&self, hash: &RawHash) -> Option<Bytes> {
         self.blobs.get_blob(*hash)
     }
 
@@ -1516,6 +1543,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
     )));
     let participants = Arc::new(Mutex::new(HashMap::new()));
     let providers = Arc::new(Mutex::new(ProviderDirectory::new(my_id)));
+    let (recon_tx, recon_rx) = tokio::sync::mpsc::channel(crate::peering::RECON_EVENTS);
     let handler = SnapshotHandler {
         snapshot: wiring.snapshot.clone(),
         health: wiring.health.clone(),
@@ -1524,10 +1552,21 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
         serve_collections: config.qos.direction.serves(),
         local_id: my_id,
         events: wiring.evt_tx.clone(),
+        recon: Some(recon_tx),
     };
     // One table holds the connections of both directions; each serves the
     // same handler, whichever side dialled it.
     let connections = ConnectionTable::new(transport.clone(), handler);
+    // Peerings ride the connections' recon/1 streams beside the wake and
+    // repair paths below.
+    let (found_tx, found_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(crate::peering::run(
+        connections.clone(),
+        wiring.snapshot.clone(),
+        recon_rx,
+        found_rx,
+        wiring.health.clone(),
+    ));
     let provider_client = ProviderClient {
         connections: connections.clone(),
         providers: providers.clone(),
@@ -1647,8 +1686,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
                                     != entry.repair.authorization_evidence().summary()
                             });
                         if changed_authority {
-                            let peers =
-                                collection_bootstrap_candidates(entry, my_id, rand::random());
+                            let peers = collection_topic_contacts(entry, my_id);
                             let _ = topic.send(WakeCommand::Join(peers));
                         }
                     }
@@ -1910,6 +1948,8 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
                 .into_iter()
                 .filter(|peer| *peer != my_id)
                 .collect::<Vec<_>>();
+            // The providers are the last tier of the collection's candidates.
+            let _ = found_tx.send((collection, peers.clone()));
             if !peers.is_empty()
                 && let Some(topic) = wake_topics.get(&collection.raw)
             {
@@ -2012,8 +2052,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
                         .and_then(|entry| entry.value.as_ref())
                         && let Some(topic) = wake_topics.get(raw)
                     {
-                        let mut peers =
-                            collection_bootstrap_candidates(snapshot, my_id, rand::random());
+                        let mut peers = collection_topic_contacts(snapshot, my_id);
                         peers.extend(bootstrap_ids.iter().copied());
                         let _ = topic.send(WakeCommand::Join(peers));
                     }
@@ -2929,6 +2968,8 @@ struct SnapshotHandler {
     serve_collections: bool,
     local_id: PeerId,
     events: tokio::sync::mpsc::Sender<NetEventBatch>,
+    /// Where `recon/1` events go: the host's peering task.
+    recon: Option<tokio::sync::mpsc::Sender<ReconEvent>>,
 }
 
 #[cfg(test)]
@@ -2943,6 +2984,7 @@ impl SnapshotHandler {
             serve_collections: false,
             local_id,
             events: tokio::sync::mpsc::channel(1).0,
+            recon: None,
         }
     }
 }
@@ -3017,6 +3059,12 @@ impl Service for SnapshotHandler {
             .unwrap()
             .promote_authenticated(peer.to_bytes());
         Ok(())
+    }
+
+    async fn recon(&self, event: ReconEvent) {
+        if let Some(recon) = &self.recon {
+            let _ = recon.send(event).await;
+        }
     }
 }
 

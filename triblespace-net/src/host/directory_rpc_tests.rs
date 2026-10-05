@@ -163,6 +163,7 @@ async fn find_value_answers_find_node_routes_and_provider_hints_in_one_reply() {
             serve_collections: false,
             local_id: provider,
             events,
+            recon: None,
         },
         requester: requester_key.verifying_key(),
     };

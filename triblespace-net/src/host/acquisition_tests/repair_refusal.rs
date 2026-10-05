@@ -122,6 +122,7 @@ impl RepairFixture {
             serve_collections: true,
             local_id: provider,
             events: server_events,
+            recon: None,
         };
         let server_connections = ConnectionTable::new(provider_harness.transport.clone(), handler);
         let connections = server_connections.clone();

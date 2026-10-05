@@ -519,6 +519,7 @@ impl Node {
             serve_collections: false,
             local_id: peer,
             events: events_tx,
+            recon: None,
         };
         let server_trace = trace.clone();
         let server_gate = gate.clone();

@@ -161,6 +161,18 @@ impl Link {
     pub fn closed(&self) -> bool {
         self.state.closed.load(Ordering::SeqCst)
     }
+
+    /// A link to no connection, whose queued frames the test reads back.
+    #[cfg(test)]
+    pub(crate) fn detached(id: u64, peer: PeerId) -> (Self, mpsc::UnboundedReceiver<Frame>) {
+        let state = State::new(id, peer, [0; 32], true);
+        let (outbox, frames) = mpsc::unbounded_channel();
+        let state = Arc::new(State {
+            outbox,
+            ..Arc::into_inner(state).unwrap()
+        });
+        (Self { state }, frames)
+    }
 }
 
 impl std::fmt::Debug for Link {
