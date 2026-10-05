@@ -47,6 +47,11 @@
 //! that disagree give [`Selection::Conflicted`] with every head, and the
 //! reader decides; inventing an order between concurrent states is the one
 //! thing a register here never does. One write superseding them settles it.
+//!
+//! A head whose value the reader cannot decode is skipped, as any fact it
+//! cannot model is, so every outcome speaks for the heads it can decode. The
+//! state that head superseded stays superseded: skipping a head never brings
+//! back an older value.
 
 use std::collections::BTreeSet;
 use std::convert::Infallible;
@@ -137,16 +142,16 @@ attributes! {
     "24EB46425226C0025A3C85D34F8919CE" as pub sync_selected: Boolean;
 }
 
-/// What the heads of one collection's register say.
+/// What the decodable heads of one collection's register say.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Selection {
-    /// No state names the collection.
+    /// No head this reader can decode names the collection.
     Unset,
-    /// Every head selects the collection.
+    /// Every head this reader can decode selects the collection.
     Selected,
-    /// Every head unselects the collection.
+    /// Every head this reader can decode unselects the collection.
     Unselected,
-    /// The heads disagree, and these are all of them.
+    /// The heads this reader can decode disagree, and these are all of them.
     Conflicted(BTreeSet<Id>),
 }
 
@@ -154,8 +159,8 @@ pub enum Selection {
 ///
 /// `facts` is the configuration collection as the caller reads it, for
 /// example through [`config_facts`]. The heads are the states nothing in
-/// `facts` supersedes; a state whose value this reader cannot decode is not
-/// read.
+/// `facts` supersedes; a head whose value this reader cannot decode is
+/// skipped.
 pub fn sync_selection<P>(facts: &P, collection: CollectionHandle) -> Selection
 where
     P: TriblePattern + Sync,
@@ -608,5 +613,61 @@ mod tests {
             sync_selection(&merged, synced),
             Selection::Conflicted(heads)
         );
+    }
+
+    /// A head this reader cannot decode is not read, and the next write
+    /// supersedes it all the same.
+    #[test]
+    fn an_undecodable_head_is_skipped_and_superseded() {
+        let key = signer(1);
+        let mut store = MemoryRepo::default();
+        let config = config(&mut store, &key);
+        let synced = handle(1);
+
+        let undecodable = entity! {
+            sync_collection: synced,
+            sync_selected: Inline::<Boolean>::new([0x5A; 32]),
+        };
+        let undecodable_id = undecodable.root().unwrap();
+        store.commit(config, &key, undecodable).unwrap();
+        store
+            .commit(
+                config,
+                &key,
+                entity! { sync_collection: synced, sync_selected: true },
+            )
+            .unwrap();
+        assert_eq!(
+            sync_selection(&read(&mut store, config), synced),
+            Selection::Selected,
+            "the undecodable head is not a disagreeing one"
+        );
+
+        write_sync_selection(&mut store, config, &key, synced, false).unwrap();
+        let facts = read(&mut store, config);
+        assert_eq!(sync_selection(&facts, synced), Selection::Unselected);
+        assert!(
+            exists!(
+                (later: Id),
+                pattern!(&facts, [{ ?later @ metadata::supersedes: undecodable_id }])
+            ),
+            "the write supersedes the head it could not decode"
+        );
+    }
+
+    /// Skipping a head this reader cannot decode does not bring back the
+    /// state that head superseded.
+    #[test]
+    fn a_skipped_head_still_supersedes() {
+        let synced = handle(1);
+        let earlier = genid().id;
+        let later = genid().id;
+        let mut facts = state(earlier, synced, true, &[]);
+        facts += entity! { ExclusiveId::force_ref(&later) @
+            sync_collection: synced,
+            sync_selected: Inline::<Boolean>::new([0x5A; 32]),
+            metadata::supersedes: earlier,
+        };
+        assert_eq!(sync_selection(&facts, synced), Selection::Unset);
     }
 }
