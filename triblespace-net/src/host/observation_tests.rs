@@ -14,7 +14,7 @@ use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
 use triblespace_core::capability::policy::{resource_collection, resource_policy};
 use triblespace_core::capability::{
-    CapabilityProof, CapabilityProofId, CapabilityResource, capability_action,
+    CapabilityProof, CapabilityProofId, CapabilityResource, QuorumOutcome, capability_action,
 };
 use triblespace_core::collection::{
     ACTION_READ, AdmissionPolicy, Collection, CollectionCommit, CollectionHandle, CollectionPolicy,
@@ -643,10 +643,11 @@ fn proof_arrival_refreshes_read_bootstrap_without_record_enumeration() {
     assert_same_record_leaves(&old, &new, &fixture.records);
     assert_ne!(old.wake_root(), new.wake_root());
     assert_eq!(new.read_bootstrap.as_ref(), &[proof.clone()]);
-    assert!(
+    assert_eq!(
         new.repair
             .authorization_evidence()
-            .reader_is_admitted_by(reader, &[proof])
+            .reader_is_admitted_by(reader, &[proof]),
+        QuorumOutcome::Met
     );
 }
 
@@ -855,10 +856,11 @@ fn arriving_read_definition_refreshes_admission_with_same_wake_root_and_record_l
     .unwrap();
     let old = serving_before.collection(collection).unwrap();
     assert!(old.read_bootstrap.is_empty());
-    assert!(
-        !old.repair
+    assert_eq!(
+        old.repair
             .authorization_evidence()
-            .reader_is_admitted_by(reader, &[proof.clone()])
+            .reader_is_admitted_by(reader, &[proof.clone()]),
+        QuorumOutcome::Unmet
     );
     assert_eq!(enumerations.swap(0, Ordering::Relaxed), 1);
 
@@ -894,15 +896,17 @@ fn arriving_read_definition_refreshes_admission_with_same_wake_root_and_record_l
     assert_ne!(old.wake_root(), new.wake_root());
     assert!(!Arc::ptr_eq(&old.repair, &new.repair));
     assert_eq!(new.read_bootstrap.as_ref(), &[proof.clone()]);
-    assert!(
+    assert_eq!(
         new.repair
             .authorization_evidence()
-            .reader_is_admitted_by(reader, &[proof.clone()])
+            .reader_is_admitted_by(reader, &[proof.clone()]),
+        QuorumOutcome::Met
     );
-    assert!(
-        !old.repair
+    assert_eq!(
+        old.repair
             .authorization_evidence()
-            .reader_is_admitted_by(reader, &[proof])
+            .reader_is_admitted_by(reader, &[proof]),
+        QuorumOutcome::Unmet
     );
 }
 
@@ -1232,10 +1236,11 @@ fn scoped_missing_definition_landing_changes_bootstrap_without_rebuilding_record
     let before = fixture.observe(&selected, None);
     let old = before.1.collection(collection).unwrap();
     assert!(old.read_bootstrap.is_empty());
-    assert!(
-        !old.repair
+    assert_eq!(
+        old.repair
             .authorization_evidence()
-            .reader_is_admitted_by(fixture.local, &[proof.clone()])
+            .reader_is_admitted_by(fixture.local, &[proof.clone()]),
+        QuorumOutcome::Unmet
     );
     fixture.take_counts();
 
@@ -1277,15 +1282,17 @@ fn scoped_missing_definition_landing_changes_bootstrap_without_rebuilding_record
     assert_ne!(old.wake_root(), new.wake_root());
     assert!(new.repair.blob_inventory().get(&capability.raw).is_some());
     assert_eq!(new.read_bootstrap.as_ref(), &[proof.clone()]);
-    assert!(
+    assert_eq!(
         new.repair
             .authorization_evidence()
-            .reader_is_admitted_by(fixture.local, &[proof.clone()])
+            .reader_is_admitted_by(fixture.local, &[proof.clone()]),
+        QuorumOutcome::Met
     );
-    assert!(
-        !old.repair
+    assert_eq!(
+        old.repair
             .authorization_evidence()
-            .reader_is_admitted_by(fixture.local, &[proof])
+            .reader_is_admitted_by(fixture.local, &[proof]),
+        QuorumOutcome::Unmet
     );
 }
 
@@ -1345,15 +1352,17 @@ fn scoped_reuse_rebinds_novel_request_resource_and_definition_reads() {
         .authorization_evidence()
         .validate_proof(&incoming_resource)
         .unwrap();
-    assert!(
-        !old.repair
+    assert_eq!(
+        old.repair
             .authorization_evidence()
-            .reader_is_admitted_by(recipient, &[incoming_read.clone()])
+            .reader_is_admitted_by(recipient, &[incoming_read.clone()]),
+        QuorumOutcome::Undefined(incoming_read.capabilities().collect())
     );
-    assert!(
+    assert_eq!(
         new.repair
             .authorization_evidence()
-            .reader_is_admitted_by(recipient, &[incoming_read])
+            .reader_is_admitted_by(recipient, &[incoming_read]),
+        QuorumOutcome::Met
     );
     // Reader freshness does not silently publish either newly received proof.
     assert!(

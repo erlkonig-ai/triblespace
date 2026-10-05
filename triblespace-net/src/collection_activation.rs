@@ -25,7 +25,8 @@ use triblespace_core::capability::{
 use triblespace_core::collection::{
     ACTION_READ, ACTION_WRITE, AdmissionPolicy, CollectionDescriptorError, CollectionHandle,
     CollectionPolicy, CollectionRead, CollectionReadAudience, RecordDecodeError,
-    collection_read_audience_by_policy, collection_reader_is_admitted_by_policy, descriptor,
+    collection_read_audience_by_policy, collection_reader_is_admitted_by_policy,
+    collection_writer_is_admitted_by_policy, descriptor,
 };
 use triblespace_core::patch::{Blake3Merkle, Entry as PatchEntry, IdentitySchema, PATCH};
 use triblespace_core::repo::{BlobStoreGet, CapabilityProofRead};
@@ -135,23 +136,39 @@ impl CollectionAuthorizationEvidencePatch {
             .map_err(Into::into)
     }
 
-    pub(crate) fn reader_is_admitted_by(
+    /// Decide READ admission of `subject` from the supplied proofs. An unmet
+    /// decision names the capability definitions those proofs stopped at.
+    pub fn reader_is_admitted_by(
         &self,
         subject: VerifyingKey,
         proofs: &[CapabilityProof],
-    ) -> bool {
-        self.read_policies().any(|policy| {
-            matches!(
-                collection_reader_is_admitted_by_policy(
-                    &self.reader,
-                    self.collection,
-                    &policy,
-                    subject,
-                    proofs,
-                ),
-                QuorumOutcome::Met
+    ) -> QuorumOutcome {
+        QuorumOutcome::any(self.read_policies().map(|policy| {
+            collection_reader_is_admitted_by_policy(
+                &self.reader,
+                self.collection,
+                &policy,
+                subject,
+                proofs,
             )
-        })
+        }))
+    }
+
+    /// The WRITE counterpart of [`Self::reader_is_admitted_by`].
+    pub fn writer_is_admitted_by(
+        &self,
+        subject: VerifyingKey,
+        proofs: &[CapabilityProof],
+    ) -> QuorumOutcome {
+        QuorumOutcome::any(self.write_policies().map(|policy| {
+            collection_writer_is_admitted_by_policy(
+                &self.reader,
+                self.collection,
+                &policy,
+                subject,
+                proofs,
+            )
+        }))
     }
 
     /// Root and count of the immutable native-proof PATCH.
@@ -256,32 +273,45 @@ impl CollectionAuthorizationEvidencePatch {
                     .find_map(|prefix| {
                         let witness = CapabilityProof::from_bytes(prefix.as_bytes())
                             .expect("an exact prefix of a canonical proof is canonical");
-                        witness
-                            .verify(
-                                &self.reader,
-                                proof.root_key(),
-                                subject,
-                                CapabilityRequest::new(
-                                    CapabilityResource::from(self.collection),
-                                    ACTION_READ,
-                                ),
-                            )
-                            .is_ok()
-                            .then_some(witness)
+                        let verified = witness.verify(
+                            &self.reader,
+                            proof.root_key(),
+                            subject,
+                            CapabilityRequest::new(
+                                CapabilityResource::from(self.collection),
+                                ACTION_READ,
+                            ),
+                        );
+                        // A witness stopped at an absent definition stays, so
+                        // the quorum below names that definition as Undefined.
+                        match verified {
+                            Ok(()) | Err(CapabilityProofError::UnavailableDefinition { .. }) => {
+                                Some(witness)
+                            }
+                            Err(_) => None,
+                        }
                     })
             })
             .collect::<Vec<_>>();
-        if !self.reader_is_admitted_by(subject, &selected) {
+        if !matches!(
+            self.reader_is_admitted_by(subject, &selected),
+            QuorumOutcome::Met
+        ) {
             return Vec::new();
         }
-        // Each witness ends at the earliest valid READ prefix for this subject;
-        // later delegates and their capability handles never enter bootstrap.
-        // Delete only proofs not required by the independently rooted quorum.
+        // Each witness ends at the earliest READ prefix for this subject that
+        // is valid or stopped at an absent definition; later delegates and
+        // their capability handles never enter bootstrap. Delete only proofs
+        // not required by the independently rooted quorum, which a stopped
+        // witness never is.
         let mut index = selected.len();
         while index > 0 {
             index -= 1;
             let removed = selected.remove(index);
-            if !self.reader_is_admitted_by(subject, &selected) {
+            if !matches!(
+                self.reader_is_admitted_by(subject, &selected),
+                QuorumOutcome::Met
+            ) {
                 selected.insert(index, removed);
             }
         }
@@ -949,7 +979,10 @@ mod tests {
         let evidence = overlay.authorization_evidence();
         assert!(evidence.is_empty());
         assert_eq!(evidence.read_policies().count(), 0);
-        assert!(!evidence.reader_is_admitted_by(first.verifying_key(), &[]));
+        assert_eq!(
+            evidence.reader_is_admitted_by(first.verifying_key(), &[]),
+            QuorumOutcome::Unmet
+        );
         let mut expected =
             [first.verifying_key(), second.verifying_key()].map(|key| key.to_bytes());
         expected.sort();
@@ -1007,7 +1040,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(evidence.len(), 1);
-        assert!(!evidence.reader_is_admitted_by(leaf.verifying_key(), &[chain]));
+        assert_eq!(
+            evidence.reader_is_admitted_by(leaf.verifying_key(), &[chain]),
+            QuorumOutcome::Unmet
+        );
         let candidates = evidence.discovery_candidates().collect::<Vec<_>>();
         assert_eq!(
             candidates,
@@ -1053,7 +1089,10 @@ mod tests {
         for proof in [bound, unknown_definition] {
             evidence.validate_proof(&proof).unwrap();
             assert_eq!(evidence.get(proof.id()), Some(&proof));
-            assert!(!evidence.reader_is_admitted_by(subject.verifying_key(), &[proof]));
+            assert_eq!(
+                evidence.reader_is_admitted_by(subject.verifying_key(), &[proof]),
+                QuorumOutcome::Unmet
+            );
         }
         for proof in invalid {
             assert!(evidence.validate_proof(&proof).is_err());
@@ -1202,7 +1241,10 @@ mod tests {
         assert_eq!(evidence.write_policies().count(), 0);
         let proofs = evidence.proofs().cloned().collect::<Vec<_>>();
         for reader in [reader_a.verifying_key(), reader_b.verifying_key()] {
-            assert!(evidence.reader_is_admitted_by(reader, &proofs));
+            assert_eq!(
+                evidence.reader_is_admitted_by(reader, &proofs),
+                QuorumOutcome::Met
+            );
             assert_eq!(
                 triblespace_core::collection::collection_reader_is_admitted_by(
                     &snapshot, collection, reader, &proofs,
@@ -1211,7 +1253,10 @@ mod tests {
                 QuorumOutcome::Met
             );
         }
-        assert!(!evidence.reader_is_admitted_by(key(44).verifying_key(), &proofs));
+        assert_eq!(
+            evidence.reader_is_admitted_by(key(44).verifying_key(), &proofs),
+            QuorumOutcome::Unmet
+        );
         let CollectionReadAudience::Restricted(audience) = evidence.authorized_readers() else {
             panic!("restricted READ alternatives must not become Open");
         };
@@ -1262,7 +1307,10 @@ mod tests {
                     .write_policies()
                     .any(|policy| matches!(policy, AdmissionPolicy::Open))
             );
-            assert!(!evidence.reader_is_admitted_by(key(44).verifying_key(), &[]));
+            assert_eq!(
+                evidence.reader_is_admitted_by(key(44).verifying_key(), &[]),
+                QuorumOutcome::Unmet
+            );
             assert_eq!(
                 evidence.authorized_readers(),
                 CollectionReadAudience::Restricted(Vec::new())
@@ -1302,7 +1350,10 @@ mod tests {
         let evidence = overlay.authorization_evidence();
         assert!(evidence.is_empty());
         assert_eq!(evidence.write_policies().count(), 0);
-        assert!(evidence.reader_is_admitted_by(key(44).verifying_key(), &[]));
+        assert_eq!(
+            evidence.reader_is_admitted_by(key(44).verifying_key(), &[]),
+            QuorumOutcome::Met
+        );
         assert_eq!(evidence.authorized_readers(), CollectionReadAudience::Open);
         assert!(
             collection_read_bootstrap_proofs(&snapshot, collection, key(44).verifying_key(), 0)
@@ -1543,7 +1594,10 @@ mod tests {
             first.authorization_evidence(),
             second.authorization_evidence(),
         ] {
-            assert!(evidence.reader_is_admitted_by(reader.verifying_key(), &[proof.clone()]));
+            assert_eq!(
+                evidence.reader_is_admitted_by(reader.verifying_key(), &[proof.clone()]),
+                QuorumOutcome::Met
+            );
         }
     }
 
@@ -1566,25 +1620,28 @@ mod tests {
             before.authorization_evidence().get(proof.id()),
             Some(&proof)
         );
-        assert!(
-            !before
+        assert_eq!(
+            before
                 .authorization_evidence()
-                .reader_is_admitted_by(reader.verifying_key(), &[proof.clone()])
+                .reader_is_admitted_by(reader.verifying_key(), &[proof.clone()]),
+            QuorumOutcome::Unmet
         );
         store
             .put::<SimpleArchive, _>(entity! { capability_action: ACTION_READ }.facts().clone())
             .unwrap();
         let after = collection_repair_overlay(&store.snapshot().unwrap(), collection).unwrap();
         assert_eq!(before.wake_root(), after.wake_root());
-        assert!(
+        assert_eq!(
             after
                 .authorization_evidence()
-                .reader_is_admitted_by(reader.verifying_key(), &[proof.clone()])
+                .reader_is_admitted_by(reader.verifying_key(), &[proof.clone()]),
+            QuorumOutcome::Met
         );
-        assert!(
-            !before
+        assert_eq!(
+            before
                 .authorization_evidence()
-                .reader_is_admitted_by(reader.verifying_key(), &[proof])
+                .reader_is_admitted_by(reader.verifying_key(), &[proof]),
+            QuorumOutcome::Unmet
         );
     }
 
@@ -1618,7 +1675,53 @@ mod tests {
         assert!(evidence.is_empty());
         let proof = root_proof(&root, &reader, scope(definition, collection.handle()));
         evidence.validate_proof(&proof).unwrap();
-        assert!(evidence.reader_is_admitted_by(reader.verifying_key(), &[proof]));
+        assert_eq!(
+            evidence.reader_is_admitted_by(reader.verifying_key(), &[proof]),
+            QuorumOutcome::Met
+        );
+    }
+
+    #[test]
+    fn an_absent_proof_definition_is_named_for_read_and_write_until_it_lands() {
+        let root = key(120);
+        let subject = key(121);
+        let collection = Inline::new([122; 32]);
+        let definition = entity! { capability_action*: [ACTION_READ, ACTION_WRITE] };
+        let capability =
+            IntoBlob::<SimpleArchive>::to_blob(definition.facts().clone()).get_handle();
+        let proofs = [root_proof(&root, &subject, scope(capability, collection))];
+        let descriptor = policy_facts(CollectionPolicy::new(
+            AdmissionPolicy::direct(root.verifying_key()),
+            AdmissionPolicy::direct(root.verifying_key()),
+        ));
+        let mut blobs = MemoryBlobStore::new();
+        for (_, blob) in definitions().iter() {
+            blobs.insert(blob);
+        }
+        let evidence = |blobs: &mut MemoryBlobStore| {
+            canonical_authorization_evidence(
+                &blobs.snapshot().unwrap(),
+                collection,
+                descriptor.clone(),
+                proofs.clone(),
+            )
+            .unwrap()
+        };
+        let absent = evidence(&mut blobs);
+        blobs.insert::<SimpleArchive>(definition.facts().clone().to_blob());
+        let landed = evidence(&mut blobs);
+        let subject = subject.verifying_key();
+        let undefined = QuorumOutcome::Undefined(vec![capability]);
+        assert_eq!(absent.reader_is_admitted_by(subject, &proofs), undefined);
+        assert_eq!(absent.writer_is_admitted_by(subject, &proofs), undefined);
+        assert_eq!(
+            landed.reader_is_admitted_by(subject, &proofs),
+            QuorumOutcome::Met
+        );
+        assert_eq!(
+            landed.writer_is_admitted_by(subject, &proofs),
+            QuorumOutcome::Met
+        );
     }
 
     #[test]
@@ -1719,7 +1822,10 @@ mod tests {
             assert!(evidence.validate_proof(&proof).is_err());
             assert!(evidence.get(proof.id()).is_none());
         }
-        assert!(!evidence.reader_is_admitted_by(reader.verifying_key(), &accepted));
+        assert_eq!(
+            evidence.reader_is_admitted_by(reader.verifying_key(), &accepted),
+            QuorumOutcome::Unmet
+        );
         let mut candidates = overlay
             .discovery_candidates()
             .map(|key| key.to_bytes())
@@ -2002,10 +2108,11 @@ mod tests {
         .unwrap();
         assert_eq!(selected, [relevant.clone()]);
         let overlay = collection_repair_overlay(&snapshot, collection.handle()).unwrap();
-        assert!(
+        assert_eq!(
             overlay
                 .authorization_evidence()
-                .reader_is_admitted_by(reader.verifying_key(), &[relevant])
+                .reader_is_admitted_by(reader.verifying_key(), &[relevant]),
+            QuorumOutcome::Met
         );
         assert!(matches!(
             collection_read_bootstrap_proofs(
@@ -2081,15 +2188,17 @@ mod tests {
             assert_eq!(witness.capabilities().collect::<Vec<_>>(), [delegating]);
         }
         let overlay = collection_repair_overlay(&snapshot, collection.handle()).unwrap();
-        assert!(
+        assert_eq!(
             overlay
                 .authorization_evidence()
-                .reader_is_admitted_by(reader.verifying_key(), &selected)
+                .reader_is_admitted_by(reader.verifying_key(), &selected),
+            QuorumOutcome::Met
         );
-        assert!(
-            !overlay
+        assert_eq!(
+            overlay
                 .authorization_evidence()
-                .reader_is_admitted_by(reader.verifying_key(), &selected[..1])
+                .reader_is_admitted_by(reader.verifying_key(), &selected[..1]),
+            QuorumOutcome::Unmet
         );
         assert!(matches!(
             collection_read_bootstrap_proofs(
@@ -2182,11 +2291,12 @@ mod tests {
         )
         .unwrap();
         assert!(selected.is_empty());
-        assert!(
+        assert_eq!(
             collection_repair_overlay(&snapshot, collection.handle())
                 .unwrap()
                 .authorization_evidence()
-                .reader_is_admitted_by(key(27).verifying_key(), &[])
+                .reader_is_admitted_by(key(27).verifying_key(), &[]),
+            QuorumOutcome::Met
         );
     }
 }

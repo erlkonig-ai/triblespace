@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `CollectionAuthorizationEvidencePatch::reader_is_admitted_by` returns the
+  `QuorumOutcome` and is public, beside a new `writer_is_admitted_by`. Serving
+  still admits only on `Met`. The READ bootstrap keeps a witness that stopped
+  at an absent definition, so its quorum names that definition; the selected
+  witnesses are unchanged.
+
 ## [0.47.1] - 2026-10-03
 
 - Warm recognized names and resource-policy definition blobs for explicitly

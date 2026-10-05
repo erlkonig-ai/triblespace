@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use ed25519_dalek::VerifyingKey;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use triblespace_core::capability::{CapabilityProof, CapabilityProofId};
+use triblespace_core::capability::{CapabilityProof, CapabilityProofId, QuorumOutcome};
 use triblespace_core::collection::{CollectionHandle, CollectionRecord};
 use triblespace_core::patch::{Blake3Merkle, IdentitySchema, PATCH};
 
@@ -140,7 +140,10 @@ where
         .proofs()
         .cloned()
         .collect::<Vec<_>>();
-    let admitted = evidence.reader_is_admitted_by(remote, &read_evidence);
+    let admitted = matches!(
+        evidence.reader_is_admitted_by(remote, &read_evidence),
+        QuorumOutcome::Met
+    );
     if !admitted {
         send_repair_admission(send, CollectionRepairAdmission::Rejected).await?;
         send.shutdown().await?;
