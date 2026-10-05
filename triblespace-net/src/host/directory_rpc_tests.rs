@@ -2,19 +2,67 @@
 //! pipes instead of a simulated network, so they run without `sim`.
 
 use std::collections::BTreeMap;
+use std::io;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 
-use tokio::io::{DuplexStream, duplex};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, DuplexStream, ReadBuf, duplex};
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{BlobStorePut, SnapshotSource};
 
-use crate::protocol::{OP_FIND_VALUE, recv_find_value_response};
+use crate::protocol::{OP_FIND_VALUE, TAG_DHT, recv_find_value_response};
 use crate::provider::MAX_PROVIDERS_PER_REPLY;
 
 use super::*;
 
-/// Every opened stream is one `serve_stream` call, finished as the accept
-/// loop finishes it.
+/// One direction of an in-memory stream. The directory RPCs never abandon
+/// their streams, so a reset or a stop here fails the test.
+struct Pipe(DuplexStream);
+
+impl AsyncRead for Pipe {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Pipe {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
+impl SendStream for Pipe {
+    fn reset(&mut self, code: u32) {
+        panic!("a directory RPC reset its stream with code {code}");
+    }
+}
+
+impl RecvStream for Pipe {
+    fn stop(&mut self, code: u32) {
+        panic!("a directory RPC stopped its stream with code {code}");
+    }
+}
+
+/// Every opened stream has its tag read, as the connection table's accept
+/// loop reads it, and is then one `Service::serve` call, finished as the
+/// accept loop finishes it.
 #[derive(Clone)]
 struct PipeConn {
     handler: SnapshotHandler,
@@ -22,28 +70,30 @@ struct PipeConn {
 }
 
 impl Conn for PipeConn {
-    type SendHalf = DuplexStream;
-    type RecvHalf = DuplexStream;
+    type SendHalf = Pipe;
+    type RecvHalf = Pipe;
 
     fn remote_id(&self) -> PeerId {
         self.handler.local_id
     }
 
-    async fn open_bi(&self) -> anyhow::Result<(DuplexStream, DuplexStream)> {
-        let (request, mut serve_recv) = duplex(1 << 16);
-        let (mut serve_send, reply) = duplex(1 << 16);
+    async fn open_bi(&self) -> anyhow::Result<(Pipe, Pipe)> {
+        let (request, serve_recv) = duplex(1 << 16);
+        let (serve_send, reply) = duplex(1 << 16);
         let (handler, requester) = (self.handler.clone(), self.requester);
         tokio::spawn(async move {
+            let (mut serve_send, mut serve_recv) = (Pipe(serve_send), Pipe(serve_recv));
+            let tag = recv_u8(&mut serve_recv).await.unwrap();
             handler
-                .serve_stream::<PipeConn>(requester, &mut serve_send, &mut serve_recv)
+                .serve(requester.to_bytes(), tag, &mut serve_send, &mut serve_recv)
                 .await
                 .unwrap();
             serve_send.shutdown().await.unwrap();
         });
-        Ok((request, reply))
+        Ok((Pipe(request), Pipe(reply)))
     }
 
-    async fn accept_bi(&self) -> Option<(DuplexStream, DuplexStream)> {
+    async fn accept_bi(&self) -> Option<(Pipe, Pipe)> {
         None
     }
 
@@ -67,6 +117,7 @@ async fn find_value(
     key: ProviderKey,
 ) -> (Vec<PeerId>, Vec<(PeerId, ProviderToken)>) {
     let (mut send, mut recv) = connection.open_bi().await.unwrap();
+    send_u8(&mut send, TAG_DHT).await.unwrap();
     send_u8(&mut send, OP_FIND_VALUE).await.unwrap();
     send_hash(&mut send, &key).await.unwrap();
     send.shutdown().await.unwrap();
@@ -112,8 +163,6 @@ async fn find_value_answers_find_node_routes_and_provider_hints_in_one_reply() {
             serve_collections: false,
             local_id: provider,
             events,
-            inbound_connections: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
-            inbound_requests: Arc::new(tokio::sync::Semaphore::new(MAX_REQUESTS_GLOBAL)),
         },
         requester: requester_key.verifying_key(),
     };
