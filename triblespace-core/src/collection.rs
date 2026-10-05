@@ -73,6 +73,8 @@ pub mod ownership;
 /// Immutable collection-local READ and WRITE authorization ceilings.
 pub mod policy;
 pub mod records;
+/// Which collections the pile syncs, in its own configuration collection.
+pub mod selection;
 /// Canonical `SimpleArchive` set-union collection kind.
 pub mod simplearchive_union;
 /// Native grow-only storage for collection-calculus records.

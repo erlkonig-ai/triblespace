@@ -17,8 +17,7 @@ use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::collection::{
-    AdmissionPolicy, Collection, CollectionCommit, CollectionPolicy, CollectionRecord,
-    CollectionStoreExt,
+    private_policy, Collection, CollectionCommit, CollectionRecord, CollectionStoreExt,
 };
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::Handle;
@@ -33,10 +32,6 @@ use super::super::signing::load_signing_key;
 
 type ArchiveHandle = Inline<Handle<SimpleArchive>>;
 type NameHandle = Inline<Handle<UTF8String>>;
-
-fn private_policy(root: VerifyingKey) -> CollectionPolicy {
-    CollectionPolicy::new(AdmissionPolicy::direct(root), AdmissionPolicy::direct(root))
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MigrationReport {

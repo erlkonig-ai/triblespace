@@ -4,6 +4,8 @@
 //! value is only a producer (or explicit scalar diagnostic), never a catalog
 //! loaded to decide which facts are visible.
 
+use ed25519_dalek::VerifyingKey;
+
 use crate::blob::{encodings::simplearchive::SimpleArchive, IntoBlob};
 use crate::capability::capability_action;
 use crate::prelude::entity;
@@ -102,6 +104,21 @@ impl CollectionPolicy {
             bindings,
         }
     }
+}
+
+/// The policy of a collection only `authority` reads and writes: READ and
+/// WRITE each admit that one key directly.
+///
+/// Every faculty root and a pile's own configuration collection use it, and
+/// because the policy is part of descriptor identity, a reader that must find
+/// one of those collections by derivation has to build exactly this value.
+/// That is why it lives here rather than in each consumer: `trible` and the
+/// faculties derive one configuration handle only while they share it.
+pub fn private_policy(authority: VerifyingKey) -> CollectionPolicy {
+    CollectionPolicy::new(
+        AdmissionPolicy::direct(authority),
+        AdmissionPolicy::direct(authority),
+    )
 }
 
 fn bind_definition(definition: Fragment, policy: &AdmissionPolicy) -> Fragment {
