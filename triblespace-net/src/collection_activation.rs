@@ -50,14 +50,25 @@ type SubjectProofPatch = PATCH<64, IdentitySchema, CapabilityProof, Blake3Merkle
 
 /// Most subject-truncated proofs one proof exchange accepts.
 ///
-/// One proof is at most
+/// The count is of prefixes, so a key named k times along one chain takes
+/// k entries. One proof is at most
 /// [`MAX_CAPABILITY_PROOF_BYTES`](triblespace_core::capability::MAX_CAPABILITY_PROOF_BYTES)
 /// = 96 + 255 * 128 = 32,736 bytes, so an exchange carries at most
 /// 1,024 * 32,736 = 33,521,664 bytes, just under 32 MiB. A one-step grant is
 /// 224 bytes, so 1,024 of them are 224 KiB. READ and WRITE grants to one key
-/// for 130 collections are 260 proofs, which leaves four times that for
-/// quorum shares and longer chains. A subject holding more keeps its digests
-/// unequal.
+/// for 130 collections are 260 entries, about a quarter of the cap, which
+/// leaves 764 for quorum shares and longer chains.
+///
+/// Honest grants stay far below this, but it is not a bound an adversary
+/// cannot reach. Counting needs only [`validate_proof`], which reads no
+/// definitions, so any key holding a chain from one of C's roots can sign
+/// any number of counted chains to any key, and their hashes, which order a
+/// subject's entries, are its to choose. A subject holding more than the cap
+/// keeps its digests unequal; which entries an exchange over the cap keeps
+/// is not decided here, and key order alone would let such chains crowd out
+/// real grants.
+///
+/// [`validate_proof`]: CollectionAuthorizationEvidencePatch::validate_proof
 pub const MAX_PROOFS_PER_EXCHANGE: usize = 1024;
 
 fn evidence_key(collection: CollectionHandle, id: CapabilityProofId) -> [u8; 64] {
