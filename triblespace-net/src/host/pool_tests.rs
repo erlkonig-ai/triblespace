@@ -8,7 +8,7 @@ use tokio::io::AsyncWriteExt as _;
 
 use crate::connection::{
     CONNECTION_IDLE_DEADLINE, DRAIN_GRACE, FRAME_OPEN, MAX_CONNECTIONS, MAX_RECON_FRAME_BYTES,
-    write_frame,
+    RESET_REPLACED, write_frame,
 };
 use crate::protocol::{TAG_DHT, TAG_RECON};
 use crate::transport::sim::{SimConfig, SimConn, SimNet, SimTransport};
@@ -88,6 +88,17 @@ async fn held_find_node<C: Conn>(conn: &C) -> (C::SendHalf, C::RecvHalf) {
     send_u8(&mut send, OP_FIND_NODE).await.unwrap();
     send_hash(&mut send, &[0; 32]).await.unwrap();
     (send, recv)
+}
+
+/// Whether a read fails with the stream reset carrying `code`.
+async fn reads_reset<R: tokio::io::AsyncRead + Unpin>(recv: &mut R, code: u32) -> bool {
+    match tokio::time::timeout(Duration::from_secs(1), recv.read(&mut [0; 1])).await {
+        Ok(Err(error)) => {
+            error.kind() == std::io::ErrorKind::ConnectionReset
+                && error.to_string().contains(&format!("code {code}"))
+        }
+        _ => false,
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -289,6 +300,35 @@ async fn an_unknown_tag_resets_its_stream_and_the_connection_keeps_serving() {
     assert!(client.table.current(server.peer) == Some(connection));
     assert_eq!(net.dial_count(client.peer, server.peer), 1);
     assert_eq!(server.table.len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_recon_stream_opened_later_replaces_one_whose_tag_arrives_later() {
+    let net = network(Duration::from_secs(1));
+    let server = Node::join(&net, &key(1));
+    let client = net.join(&key(2));
+    let client_id = client.transport.local_id();
+    let conn = client
+        .transport
+        .dial(server.peer, PILE_SYNC_ALPN)
+        .await
+        .unwrap();
+    let (mut earlier, mut earlier_recv) = conn.open_bi().await.unwrap();
+    let (mut later, mut later_recv) = conn.open_bi().await.unwrap();
+    let mut open = vec![TAG_RECON];
+    open.extend_from_slice(&[FRAME_OPEN, 0, 0, 0, 8]);
+    open.extend_from_slice(&5_u64.to_be_bytes());
+    // The later stream's tag arrives first.
+    later.write_all(&open).await.unwrap();
+    settle().await;
+    earlier.write_all(&open).await.unwrap();
+    settle().await;
+
+    assert!(reads_reset(&mut earlier_recv, RESET_REPLACED).await);
+    assert!(poll!(Box::pin(later_recv.read(&mut [0; 1]))).is_pending());
+    write_frame(&mut later, 0x7F, b"still read").await.unwrap();
+    settle().await;
+    assert!(server.table.current(client_id).is_some());
 }
 
 #[tokio::test(start_paused = true)]

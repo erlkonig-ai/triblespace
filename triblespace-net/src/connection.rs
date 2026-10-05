@@ -73,7 +73,8 @@ const CLOSE_NORMAL: u32 = 0;
 const CLOSE_VIOLATION: u32 = 1;
 // Stream reset codes.
 const RESET_UNKNOWN_TAG: u32 = 1;
-const RESET_REPLACED: u32 = 2;
+/// Stream reset code: a newer `recon/1` stream replaced this one.
+pub const RESET_REPLACED: u32 = 2;
 
 /// What request streams mean. The table decides which streams reach it and
 /// holds their permits; the service answers them.
@@ -152,8 +153,8 @@ struct State {
     in_flight: AtomicUsize,
     retired: AtomicBool,
     neighbour: AtomicBool,
-    /// Counts accepted `recon/1` streams; a reader that is no longer the
-    /// newest yields to its replacement.
+    /// The accept order of the newest `recon/1` stream; a reader that is no
+    /// longer the newest yields to its replacement.
     recon: AtomicU64,
     /// Woken on retirement, on the last in-flight stream, and on a new
     /// `recon/1` stream.
@@ -662,11 +663,12 @@ impl<T: Transport, S: Service> Shared<T, S> {
         .and_then(|opened| opened)
         .map_err(Arc::new)?;
         let (conn, state, send, recv) = opened;
+        // The dialler's own stream is its connection's only `recon/1`.
         tokio::spawn(recon(
             Arc::downgrade(self),
             conn.clone(),
             state.clone(),
-            true,
+            None,
             send,
             recv,
         ));
@@ -724,6 +726,9 @@ async fn accept_loop<T: Transport, S: Service>(
     state: Arc<State>,
 ) {
     debug!(target: "triblespace_net::handoff", dialled = state.dialled, "connection accept loop started");
+    // Streams are accepted in the order the peer opened them, which their
+    // tasks may not keep: a replacement `recon/1` is the later-opened one.
+    let mut accepted_streams = 0;
     let closing = loop {
         let changed = state.changed.notified();
         tokio::pin!(changed);
@@ -740,8 +745,14 @@ async fn accept_loop<T: Transport, S: Service>(
                 };
                 let (service, requests) = (table.service.clone(), table.requests.clone());
                 drop(table);
+                accepted_streams += 1;
+                let accepted = Accepted {
+                    order: accepted_streams,
+                    send: Tracked::new(send, &state, None),
+                    recv: Tracked::new(recv, &state, None),
+                };
                 tokio::spawn(
-                    stream(shared.clone(), conn.clone(), state.clone(), service, requests, send, recv)
+                    stream(shared.clone(), conn.clone(), state.clone(), service, requests, accepted)
                         .instrument(debug_span!("stream", tag = tracing::field::Empty).or_current()),
                 );
             }
@@ -766,6 +777,13 @@ async fn accept_loop<T: Transport, S: Service>(
     }
 }
 
+/// A stream the peer opened, numbered in accept order.
+struct Accepted<C: Conn> {
+    order: u64,
+    send: Tracked<C::SendHalf>,
+    recv: Tracked<C::RecvHalf>,
+}
+
 /// Dispatch one accepted stream on its tag.
 async fn stream<T: Transport, S: Service>(
     shared: Weak<Shared<T, S>>,
@@ -773,11 +791,13 @@ async fn stream<T: Transport, S: Service>(
     state: Arc<State>,
     service: S,
     requests: Arc<Semaphore>,
-    send: <T::Conn as Conn>::SendHalf,
-    recv: <T::Conn as Conn>::RecvHalf,
+    accepted: Accepted<T::Conn>,
 ) {
-    let mut send = Tracked::new(send, &state, None);
-    let mut recv = Tracked::new(recv, &state, None);
+    let Accepted {
+        order,
+        mut send,
+        mut recv,
+    } = accepted;
     let tag = match tokio::time::timeout(TAG_DEADLINE, recv_u8(&mut recv)).await {
         Ok(Ok(tag)) => tag,
         Ok(Err(error)) => return debug!(%error, "stream ended before its tag"),
@@ -785,7 +805,7 @@ async fn stream<T: Transport, S: Service>(
     };
     tracing::Span::current().record("tag", tag_name(tag));
     match tag {
-        TAG_RECON => recon(shared, conn, state, false, send, recv).await,
+        TAG_RECON => recon(shared, conn, state, Some(order), send, recv).await,
         TAG_DHT | TAG_BLOB | TAG_REPAIR => {
             let _request = InFlight::new(&state, None);
             // Backpressure a burst instead of closing the connection: other
@@ -826,28 +846,29 @@ fn tag_name(tag: u8) -> &'static str {
     }
 }
 
-/// Run one `recon/1` stream after its tag: the dialler's own stream when
-/// `opened`, otherwise one the peer opened. On the accepting side the first
+/// Run one `recon/1` stream after its tag: the dialler's own stream, or one
+/// the peer opened, with its accept order. On the accepting side the first
 /// frame names the dialler's sequence number, which decides between this
-/// connection and any other to the same peer. A newer `recon/1` stream on the
-/// connection replaces this one.
+/// connection and any other to the same peer. A `recon/1` stream the peer
+/// opened later on the connection replaces this one.
 async fn recon<T: Transport, S: Service>(
     shared: Weak<Shared<T, S>>,
     conn: T::Conn,
     state: Arc<State>,
-    opened: bool,
+    accepted: Option<u64>,
     mut send: Tracked<<T::Conn as Conn>::SendHalf>,
     mut recv: Tracked<<T::Conn as Conn>::RecvHalf>,
 ) {
-    let outcome = if !opened && state.dialled {
+    let outcome = if accepted.is_some() && state.dialled {
         Err(FrameError::Violation(
             "recon/1 opened by the side that did not dial",
         ))
     } else {
-        let generation = state.recon.fetch_add(1, Ordering::SeqCst) + 1;
+        let order = accepted.unwrap_or(0);
+        state.recon.fetch_max(order, Ordering::SeqCst);
         state.changed.notify_waiters();
         let frames = async {
-            if !opened {
+            if accepted.is_some() {
                 let sequence = match read_frame(&mut recv).await? {
                     Some((FRAME_OPEN, payload)) => u64::from_be_bytes(
                         payload
@@ -884,19 +905,21 @@ async fn recon<T: Transport, S: Service>(
                 let changed = state.changed.notified();
                 tokio::pin!(changed);
                 changed.as_mut().enable();
-                if state.recon.load(Ordering::SeqCst) != generation {
+                if state.recon.load(Ordering::SeqCst) != order {
                     return;
                 }
                 changed.await;
             }
         };
+        // A stream already replaced reads none of its frames.
         tokio::select! {
-            outcome = frames => outcome,
+            biased;
             () = superseded => {
                 send.reset(RESET_REPLACED);
                 recv.stop(RESET_REPLACED);
                 Ok(())
             }
+            outcome = frames => outcome,
         }
     };
     match outcome {
