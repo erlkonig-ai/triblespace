@@ -414,10 +414,11 @@ usual limit remains 64 leases.
 Each directory node keeps a bottom-k sample of every key's publishers rather
 than its first arrivals. It ranks each (key, provider) pair by BLAKE3 keyed
 with a salt it draws once at start-up and never sends. A key may store an even
-share of the remaining membership budget, never less than one 64-entry reply.
-A newcomer to a key at that cap is kept only if it ranks below the key's
-largest-ranked member, which it replaces. A shrinking cap trims a key's
-largest-ranked members when the key is next touched. A renewal keeps its place.
+share of the remaining membership budget, never less than one 64-entry reply
+and never more than 1024, which bounds what one request walks. A newcomer to
+a key at that cap is kept only if it ranks below the key's largest-ranked
+member, which it replaces. A shrinking cap trims a key's largest-ranked members
+when the key is next touched. A renewal keeps its place.
 Arrival order therefore does not decide membership, renewals cause no churn,
 and the K replicas of a key keep independent samples. Because the salt is
 secret, a publisher cannot choose identities that rank well. A key storing

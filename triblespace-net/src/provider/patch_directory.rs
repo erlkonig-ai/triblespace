@@ -78,7 +78,10 @@ impl PatchDirectory {
     fn stored_cap(&self) -> u64 {
         ((self.limits.memberships as u64).saturating_sub(self.members.len())
             / self.members.segmented_len(&[]).max(1))
-        .max(MAX_PROVIDERS_PER_REPLY as u64)
+        .clamp(
+            MAX_PROVIDERS_PER_REPLY as u64,
+            MAX_PROVIDERS_STORED_PER_KEY as u64,
+        )
     }
 
     fn largest(&self, prefix: [u8; 32]) -> Option<[u8; 64]> {
@@ -217,7 +220,14 @@ fn same_state(reference: &ProviderDirectory, candidate: &PatchDirectory) {
             (candidate.decode(*key), (deadline, token))
         })
         .collect::<BTreeMap<_, _>>();
-    assert_eq!(reference.memberships, members);
+    let memberships = reference
+        .ranked
+        .iter()
+        .map(|((distance, _, provider), lease)| {
+            ((reference.distance(*distance), *provider), *lease)
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(memberships, members);
     let deadlines = reference
         .deadlines
         .iter()
@@ -229,8 +239,8 @@ fn same_state(reference: &ProviderDirectory, candidate: &PatchDirectory) {
     assert_eq!(candidate.members.len(), candidate.deadlines.len());
     let farthest = reference
         .ranked
-        .last()
-        .map(|(distance, _, provider)| (reference.distance(*distance), *provider));
+        .last_key_value()
+        .map(|((distance, _, provider), _)| (reference.distance(*distance), *provider));
     assert_eq!(
         farthest,
         candidate.farthest().map(|key| candidate.decode(key))
@@ -331,6 +341,38 @@ fn patch_directory_keeps_exact_prune_ties_and_full_key_renewal() {
         candidate.get([1; 32], expired)
     );
     same_state(&reference, &candidate);
+}
+
+#[test]
+fn patch_directory_matches_the_per_key_ceiling() {
+    // A lone locator under the whole membership budget fills only to the
+    // per-key ceiling, then keeps the same bottom-k sample as the reference.
+    let mut rng = StdRng::seed_from_u64(183);
+    let local = rng.r#gen();
+    let limits = DirectoryLimits {
+        lease: PROVIDER_LEASE_LIFETIME,
+        memberships: MAX_PROVIDER_MEMBERSHIPS,
+    };
+    let mut reference = ProviderDirectory {
+        limits,
+        ..ProviderDirectory::with_sampler(local, StdRng::seed_from_u64(184))
+    };
+    let mut candidate = PatchDirectory::new(local, limits, StdRng::seed_from_u64(184));
+    let locator = rng.r#gen();
+    let now = crate::clock::mono_now();
+    for _ in 0..MAX_PROVIDERS_STORED_PER_KEY + 100 {
+        let (provider, token) = (rng.r#gen(), rng.r#gen());
+        assert_eq!(
+            reference.put(locator, provider, token, now),
+            candidate.put(locator, provider, token, now)
+        );
+    }
+    assert_eq!(
+        candidate.retained_counts(),
+        (MAX_PROVIDERS_STORED_PER_KEY, 1)
+    );
+    same_state(&reference, &candidate);
+    assert_eq!(reference.get(locator, now), candidate.get(locator, now));
 }
 
 #[test]
