@@ -1306,10 +1306,13 @@ async fn resident_self_hint_reserves_a_bounded_slot_and_deduplicates_self() {
             assert!(directory.put(key, *peer, *token, crate::clock::mono_now()));
         }
     }
+    // One uniformly chosen lease makes room for our own hint; the others
+    // keep their peer-id order.
     let reply = fixture.client.get(fixture.provider, key).await.unwrap();
     assert_eq!(reply.len(), crate::provider::MAX_PROVIDERS_PER_REPLY);
     assert_eq!(reply[0], own);
-    assert_eq!(&reply[1..], &foreign[..foreign.len() - 1]);
+    assert!(reply[1..].windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(reply[1..].iter().all(|lease| foreign.contains(lease)));
     assert_eq!(
         fixture.provider_directory.lock().unwrap().retained_counts(),
         (foreign.len(), 1)
@@ -1326,7 +1329,8 @@ async fn resident_self_hint_reserves_a_bounded_slot_and_deduplicates_self() {
         }
     }
     let deduplicated = fixture.client.get(fixture.provider, key).await.unwrap();
-    assert_eq!(deduplicated, reply);
+    assert_eq!(deduplicated[0], own);
+    assert_eq!(&deduplicated[1..], &foreign[..foreign.len() - 1]);
     assert_eq!(
         deduplicated
             .iter()

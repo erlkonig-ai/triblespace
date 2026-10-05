@@ -3263,28 +3263,7 @@ impl SnapshotHandler {
             }
             OP_PROVIDER_GET => {
                 let key = recv_exact_key(recv).await?;
-                let mut providers = self
-                    .providers
-                    .lock()
-                    .unwrap()
-                    .get(key, crate::clock::mono_now());
-                let resident = self
-                    .snapshot
-                    .borrow()
-                    .as_ref()
-                    .and_then(|snapshot| snapshot.bearer_handle(key));
-                if let Some(handle) = resident {
-                    // Answer from the same resident index as bearer GET, without
-                    // reading bytes or installing a lease. Reserve one slot for
-                    // our own current hint; stored advertisements cannot crowd
-                    // it out. The remaining leases retain their peer-id order.
-                    providers.retain(|(provider, _)| *provider != self.local_id);
-                    providers.truncate(crate::provider::MAX_PROVIDERS_PER_REPLY - 1);
-                    providers.insert(
-                        0,
-                        (self.local_id, blob_provider_token(handle, self.local_id)),
-                    );
-                }
+                let providers = self.provider_hints(key);
                 send_u8(send, providers.len() as u8).await?;
                 for (provider, token) in providers {
                     send_hash(send, &provider).await?;
@@ -3307,17 +3286,7 @@ impl SnapshotHandler {
                     routes.retain(|route| *route != requester);
                     routes
                 };
-                let hints = |key| {
-                    let resident = self
-                        .snapshot
-                        .borrow()
-                        .as_ref()
-                        .and_then(|snapshot| snapshot.bearer_handle(key));
-                    self.providers
-                        .lock()
-                        .unwrap()
-                        .hints(key, crate::clock::mono_now(), resident)
-                };
+                let hints = |key| self.provider_hints(key);
                 crate::protocol::serve_find_value(recv, send, routes, hints).await?;
             }
             _ => anyhow::bail!("unknown direct RPC operation {op:#x}"),
@@ -3327,6 +3296,21 @@ impl SnapshotHandler {
             .unwrap()
             .promote_authenticated(peer.to_bytes());
         Ok(())
+    }
+
+    /// The directory's hints for one exact key, led by our own current hint
+    /// when the blob is resident. Residency comes from the same index as
+    /// bearer GET, without reading bytes or installing a lease.
+    fn provider_hints(&self, key: ProviderKey) -> Vec<(PeerId, ProviderToken)> {
+        let resident = self
+            .snapshot
+            .borrow()
+            .as_ref()
+            .and_then(|snapshot| snapshot.bearer_handle(key));
+        self.providers
+            .lock()
+            .unwrap()
+            .hints(key, crate::clock::mono_now(), resident)
     }
 }
 

@@ -407,9 +407,10 @@ For an ordinary `PROVIDER_GET(L)`, the selected DHT node also consults its
 already-installed, snapshot-coherent L→H index. If L is resident there, it
 returns its own endpoint-bound token without waiting for a `PROVIDER_PUT`.
 This deliberately extends the old lease-only answer: one reply slot is reserved
-for the resident self hint, any stored self entry is deduplicated, and at most
-63 other live leases follow in peer-ID order. Without a resident self hint, the
-usual limit remains 64 leases.
+for the resident self hint and any stored self entry is deduplicated. At most
+63 other live leases follow in peer-ID order; when 64 are available, one chosen
+uniformly at random makes room. Without a resident self hint, the usual limit
+remains 64 leases.
 
 Each directory node keeps a bottom-k sample of every key's publishers rather
 than its first arrivals. It ranks each (key, provider) pair by BLAKE3 keyed
