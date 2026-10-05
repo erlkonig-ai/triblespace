@@ -165,6 +165,24 @@ folds and rebuilds only its own, the DERIVEs of mappings that became attached
 indexes or were deleted, and every blob only those reached, including the
 descriptor of a collection no kept record names unless a root keeps it.
 
+`trible pile compact SRC --into DST --drop-collection NAME_OR_FULL_HANDLE`
+is another explicit filtered rewrite. Repeated selections leave the named
+collections' frames behind and close over resident descriptor sources,
+attached parents and sibling-index dependencies. Missing or ambiguous names
+refuse before creating the destination. Full handles select exact identities
+referenced by collection records or present as resident tagged descriptors;
+absent handles refuse as well. A descriptor needs no name or admitted member.
+Unreadable descriptors remain conservative: the command does not invent their
+ancestry. Selected mode opts into reachability GC, so raw blobs with no carried
+record, proof, WANT, pin or opaque-frame reference are not promised retention.
+Shared payloads and metadata reached by retained collections remain. The
+native planner runs before destination creation and reached corrupt blobs
+refuse. Without this option, compact stays conservative and roots every
+resident blob. `--drop-drained` still applies its existing validation when
+combined. Neither mode retracts distributed assertions or revokes authority;
+normal synchronization can restore excluded records to a later replica.
+Retained proof evidence can still name an excluded collection.
+
 ## Conservative Reachability
 
 Canonical archives contain fixed 64-byte tribles whose value half is one

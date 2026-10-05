@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add opt-in `trible pile compact --drop-collection` for exact local collection
+  exclusion and resident descriptor descendants. Selected mode uses native
+  reachability retention; ordinary compact still preserves all resident blobs.
+  Absent handles and missing or ambiguous names refuse before destination creation.
+
 ## [0.47.1] - 2026-10-03
 
 - Publish the mapped archive buffer repair and bounded descriptor metadata

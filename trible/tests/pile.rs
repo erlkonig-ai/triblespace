@@ -682,6 +682,447 @@ fn compact_removes_destination_after_post_create_failure() {
 }
 
 #[test]
+fn compact_selected_collection_drops_descendants_but_keeps_shared_typed_closure() {
+    use anybytes::Bytes;
+    use triblespace::prelude::*;
+    use triblespace_core::blob::encodings::tensor::{elements::F32, tensor_blob, TensorView};
+    use triblespace_core::collection::grant_collection_read;
+    use triblespace_core::collection::records::{
+        collection_parent, collection_representation, collection_source, CollectionDerive,
+        CollectionMap, SourceLocator, KIND_COLLECTION_DESCRIPTOR,
+    };
+    use triblespace_core::metadata::{self, MetaDescribe};
+    let dir = tempdir().unwrap();
+    let source_path = dir.path().join("selected-source.pile");
+    let destination_path = dir.path().join("selected-copy.pile");
+    std::fs::File::create(&source_path).unwrap();
+    let key = SigningKey::from_bytes(&[73; 32]);
+    let policy = CollectionPolicy::new(
+        AdmissionPolicy::direct(key.verifying_key()),
+        AdmissionPolicy::direct(key.verifying_key()),
+    );
+    let mut source = Pile::open(&source_path).unwrap();
+    let dropped = source.collection("drop-me", policy.clone()).unwrap();
+    let kept = source.collection("keep-me", policy).unwrap();
+    let shared = source.put::<UTF8String, _>("shared typed payload").unwrap();
+    let unrooted = source.put::<UTF8String, _>("raw unrooted payload").unwrap();
+    let mut kept_fragment = entity! { metadata::description: shared };
+    kept_fragment.describe_with(entity! { metadata::name: "kept native metadata" });
+    let kept_commit = source.commit(kept, &key, kept_fragment).unwrap();
+    let tensor_blob = tensor_blob::<F32, 2>([2, 2], Bytes::from_source(vec![0_u8; 16])).unwrap();
+    let tensor = source.put(tensor_blob.clone()).unwrap();
+    // Spatial consumers' opaque bytes need no CLI-specific decoder. This
+    // envelope also exercises an aligned child handle to the typed tensor.
+    let spatial = source
+        .put::<UnknownBlob, _>(Bytes::from_source(tensor.raw.to_vec()))
+        .unwrap();
+    source.want(WantRequest::blob(spatial)).unwrap();
+    grant_collection_read(&mut source, dropped.handle(), &key, key.verifying_key()).unwrap();
+    let before = source.snapshot().unwrap();
+    let proofs = before
+        .proofs()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    drop(before);
+    source
+        .commit(dropped, &key, entity! { metadata::description: shared })
+        .unwrap();
+    let private = source
+        .put::<UTF8String, _>("only dropped closure owns this")
+        .unwrap();
+    let drop_commit = source
+        .commit(dropped, &key, entity! { metadata::description: private })
+        .unwrap();
+    let derived = source
+        .register_collection::<SimpleArchive>(entity! {
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            collection_source: dropped.handle(),
+            collection_representation*: <SimpleArchive as MetaDescribe>::describe(),
+        })
+        .unwrap();
+    let child_body = source
+        .put::<SimpleArchive, _>(
+            entity! {
+                metadata::name: "dropped derived output"
+            }
+            .into_facts(),
+        )
+        .unwrap();
+    source
+        .insert(CollectionRecord::Derive(CollectionDerive::sign(
+            &key,
+            derived.handle(),
+            SourceLocator::of(drop_commit.data().raw),
+            Inline::new(child_body.raw),
+        )))
+        .unwrap();
+    let attached = source
+        .register_collection::<SimpleArchive>(entity! {
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            collection_parent: derived.handle(),
+            collection_representation*: <SimpleArchive as MetaDescribe>::describe(),
+        })
+        .unwrap();
+    source
+        .insert(CollectionRecord::Map(CollectionMap::sign(
+            &key,
+            attached.handle(),
+            Inline::new(child_body.raw),
+            Inline::new(child_body.raw),
+        )))
+        .unwrap();
+    source.close().unwrap();
+    let original = std::fs::read(&source_path).unwrap();
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "compact"])
+        .arg(&source_path)
+        .arg("--into")
+        .arg(&destination_path)
+        .args(["--drop-collection", "drop-me"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("blob policy: reachability GC"));
+    assert_eq!(std::fs::read(&source_path).unwrap(), original);
+    let mut copy = Pile::open(&destination_path).unwrap();
+    let snapshot = copy.snapshot().unwrap();
+    let records = snapshot
+        .records()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(records, vec![CollectionRecord::Commit(kept_commit)]);
+    let _: Blob<UTF8String> = snapshot.get(shared).unwrap();
+    let _: Blob<SimpleArchive> = snapshot
+        .get(Inline::<Handle<SimpleArchive>>::new(kept_commit.data().raw))
+        .unwrap();
+    let _: Blob<SimpleArchive> = snapshot.get(kept_commit.metadata()).unwrap();
+    assert_eq!(
+        snapshot
+            .proofs()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        proofs
+    );
+    for proof in &proofs {
+        for capability in proof.capabilities() {
+            let _: Blob<SimpleArchive> = snapshot.get(capability).unwrap();
+        }
+    }
+    assert_eq!(
+        snapshot
+            .wants()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        vec![WantRequest::blob(spatial)]
+    );
+    let actual: Blob<UnknownBlob> = snapshot.get(spatial).unwrap();
+    assert_eq!(actual.bytes.as_ref(), tensor.raw);
+    let actual = snapshot.get::<Blob<_>, _>(tensor).unwrap();
+    assert_eq!(actual.bytes.as_ref(), tensor_blob.bytes.as_ref());
+    let view: TensorView = actual.try_from_blob().unwrap();
+    assert_eq!(view.dims(), &[2, 2]);
+    assert!(snapshot.get::<Blob<UTF8String>, _>(private).is_err());
+    assert!(snapshot.get::<Blob<UTF8String>, _>(unrooted).is_err());
+    assert!(snapshot.get::<Blob<SimpleArchive>, _>(child_body).is_err());
+    drop(snapshot);
+    copy.close().unwrap();
+}
+
+#[test]
+fn compact_collection_selection_refuses_missing_or_ambiguous_names_before_create() {
+    use triblespace::prelude::*;
+    use triblespace_core::metadata;
+    let dir = tempdir().unwrap();
+    let source_path = dir.path().join("ambiguous.pile");
+    std::fs::File::create(&source_path).unwrap();
+    let mut source = Pile::open(&source_path).unwrap();
+    let mut handles = Vec::new();
+    for seed in [74, 75] {
+        let key = SigningKey::from_bytes(&[seed; 32]);
+        let root = source
+            .collection(
+                "duplicate-name",
+                CollectionPolicy::new(
+                    AdmissionPolicy::direct(key.verifying_key()),
+                    AdmissionPolicy::direct(key.verifying_key()),
+                ),
+            )
+            .unwrap();
+        source
+            .commit(root, &key, entity! { metadata::name: "source fact" })
+            .unwrap();
+        handles.push(root.handle());
+    }
+    source.close().unwrap();
+    let original = std::fs::read(&source_path).unwrap();
+    let absent = hex::encode([0xAD; 32]);
+    let absent_prefixed = format!("blake3:{absent}");
+    for (index, name) in ["missing-name", "duplicate-name", &absent, &absent_prefixed]
+        .into_iter()
+        .enumerate()
+    {
+        let destination = dir.path().join(format!("new-dir-{index}/refused.pile"));
+        Command::cargo_bin("trible")
+            .unwrap()
+            .args(["pile", "compact"])
+            .arg(&source_path)
+            .arg("--into")
+            .arg(&destination)
+            .args(["--drop-collection", name])
+            .assert()
+            .failure();
+        assert!(!destination.parent().unwrap().exists());
+        assert_eq!(std::fs::read(&source_path).unwrap(), original);
+    }
+    let destination = dir.path().join("exact-handle.pile");
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "compact"])
+        .arg(&source_path)
+        .arg("--into")
+        .arg(&destination)
+        .arg("--drop-collection")
+        .arg(hex::encode(handles[0].raw))
+        .assert()
+        .success();
+    assert_eq!(std::fs::read(&source_path).unwrap(), original);
+}
+
+#[test]
+fn compact_selected_handles_accept_unnamed_and_grant_only_descriptors() {
+    use triblespace::prelude::*;
+    use triblespace_core::collection::grant_collection_read;
+    use triblespace_core::collection::records::{
+        collection_representation, KIND_COLLECTION_DESCRIPTOR,
+    };
+    use triblespace_core::metadata::{self, MetaDescribe};
+    let dir = tempdir().unwrap();
+    let source_path = dir.path().join("descriptor-only.pile");
+    let destination = dir.path().join("copy.pile");
+    std::fs::File::create(&source_path).unwrap();
+    let key = SigningKey::from_bytes(&[76; 32]);
+    let mut source = Pile::open(&source_path).unwrap();
+    let unnamed = source
+        .register_collection::<SimpleArchive>(entity! {
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            collection_representation*: SimpleArchive::describe(),
+        })
+        .unwrap();
+    let granted = source
+        .collection(
+            "grant-only",
+            CollectionPolicy::new(
+                AdmissionPolicy::direct(key.verifying_key()),
+                AdmissionPolicy::direct(key.verifying_key()),
+            ),
+        )
+        .unwrap();
+    grant_collection_read(&mut source, granted.handle(), &key, key.verifying_key()).unwrap();
+    let before = source.snapshot().unwrap();
+    assert_eq!(before.records().unwrap().count(), 0);
+    let proofs = before
+        .proofs()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    drop(before);
+    source.close().unwrap();
+    let original = std::fs::read(&source_path).unwrap();
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "compact"])
+        .arg(&source_path)
+        .arg("--into")
+        .arg(&destination)
+        .arg("--drop-collection")
+        .arg(hex::encode(unnamed.handle().raw))
+        .arg("--drop-collection")
+        .arg(format!("blake3:{}", hex::encode(granted.handle().raw)))
+        .assert()
+        .success();
+    assert_eq!(std::fs::read(&source_path).unwrap(), original);
+    let mut copy = Pile::open(&destination).unwrap();
+    let snapshot = copy.snapshot().unwrap();
+    assert_eq!(snapshot.records().unwrap().count(), 0);
+    assert_eq!(
+        snapshot
+            .proofs()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        proofs
+    );
+    drop(snapshot);
+    copy.close().unwrap();
+}
+
+#[test]
+fn compact_selected_sibling_and_sparse_lineage_keep_parent_and_unknown_lineage() {
+    use triblespace::prelude::*;
+    use triblespace_core::collection::records::{
+        collection_mapping, collection_parent, collection_representation, collection_source,
+        mapping_reads_attached, CollectionDerive, CollectionMap, SourceLocator,
+        KIND_COLLECTION_DESCRIPTOR,
+    };
+    use triblespace_core::metadata::{self, MetaDescribe};
+    let dir = tempdir().unwrap();
+    let source_path = dir.path().join("siblings.pile");
+    let destination = dir.path().join("copy.pile");
+    std::fs::File::create(&source_path).unwrap();
+    let key = SigningKey::from_bytes(&[77; 32]);
+    let mut source = Pile::open(&source_path).unwrap();
+    let root = source
+        .collection(
+            "parent",
+            CollectionPolicy::new(
+                AdmissionPolicy::direct(key.verifying_key()),
+                AdmissionPolicy::direct(key.verifying_key()),
+            ),
+        )
+        .unwrap();
+    let commit = source
+        .commit(root, &key, entity! { metadata::name: "kept parent" })
+        .unwrap();
+    let raw = source
+        .register_collection::<SimpleArchive>(entity! {
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            collection_parent: root.handle(),
+            collection_representation*: SimpleArchive::describe(),
+        })
+        .unwrap();
+    let sibling = source
+        .register_collection::<SimpleArchive>(entity! {
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            collection_parent: root.handle(),
+            collection_representation*: SimpleArchive::describe(),
+            collection_mapping*: entity! { mapping_reads_attached: raw.handle() },
+        })
+        .unwrap();
+    // No record names this middle descriptor. Its resident source edge still
+    // connects the grandchild's record to the excluded collection.
+    let middle = source
+        .register_collection::<SimpleArchive>(entity! {
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            collection_source: raw.handle(),
+            collection_representation*: SimpleArchive::describe(),
+        })
+        .unwrap();
+    let grandchild = source
+        .register_collection::<SimpleArchive>(entity! {
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            collection_source: middle.handle(),
+            collection_representation*: SimpleArchive::describe(),
+        })
+        .unwrap();
+    source
+        .insert(CollectionRecord::Derive(CollectionDerive::sign(
+            &key,
+            grandchild.handle(),
+            SourceLocator::of(commit.data().raw),
+            commit.data(),
+        )))
+        .unwrap();
+    let mut kept_map = None;
+    for handle in [raw.handle(), sibling.handle(), Inline::new([91; 32])] {
+        let record = CollectionRecord::Map(CollectionMap::sign(
+            &key,
+            handle,
+            commit.data(),
+            commit.data(),
+        ));
+        source.insert(record).unwrap();
+        kept_map = Some(record);
+    }
+    source.close().unwrap();
+    let original = std::fs::read(&source_path).unwrap();
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "compact"])
+        .arg(&source_path)
+        .arg("--into")
+        .arg(&destination)
+        .arg("--drop-collection")
+        .arg(hex::encode(raw.handle().raw))
+        .arg("--drop-collection")
+        .arg(hex::encode(raw.handle().raw))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("collection frames excluded: 3"));
+    assert_eq!(std::fs::read(&source_path).unwrap(), original);
+    let mut copy = Pile::open(&destination).unwrap();
+    let snapshot = copy.snapshot().unwrap();
+    let records = snapshot
+        .records()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(records.len(), 2);
+    assert!(records.contains(&CollectionRecord::Commit(commit)));
+    assert!(records.contains(&kept_map.unwrap()));
+    let _: Blob<SimpleArchive> = snapshot.get(root.handle()).unwrap();
+    drop(snapshot);
+    copy.close().unwrap();
+}
+
+#[test]
+fn compact_selected_reached_corruption_refuses_before_destination_creation() {
+    use triblespace::prelude::*;
+    use triblespace_core::metadata;
+    let dir = tempdir().unwrap();
+    let source_path = dir.path().join("corrupt-selected.pile");
+    let destination = dir.path().join("new-directory/copy.pile");
+    std::fs::File::create(&source_path).unwrap();
+    let key = SigningKey::from_bytes(&[78; 32]);
+    let mut source = Pile::open(&source_path).unwrap();
+    // Write the doomed bytes first so the canonical record iterator can name
+    // their payload offset without depending on the envelope's byte layout.
+    let damaged = source
+        .put::<UTF8String, _>("reached corrupt bytes")
+        .unwrap();
+    let policy = CollectionPolicy::new(
+        AdmissionPolicy::direct(key.verifying_key()),
+        AdmissionPolicy::direct(key.verifying_key()),
+    );
+    let dropped = source.collection("drop", policy.clone()).unwrap();
+    let kept = source.collection("keep", policy).unwrap();
+    source
+        .commit(dropped, &key, entity! { metadata::name: "drop" })
+        .unwrap();
+    source
+        .commit(kept, &key, entity! { metadata::description: damaged })
+        .unwrap();
+    source.close().unwrap();
+    let payload_offset = PileRecords::open(&source_path)
+        .unwrap()
+        .find_map(|record| match record.unwrap().content {
+            PileRecordContent::Blob { data_offset, .. } => Some(data_offset),
+            _ => None,
+        })
+        .unwrap();
+    let mut original = std::fs::read(&source_path).unwrap();
+    original[payload_offset] ^= 0xFF;
+    std::fs::write(&source_path, &original).unwrap();
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "compact"])
+        .arg(&source_path)
+        .arg("--into")
+        .arg(&destination)
+        .args(["--drop-collection", "drop"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "corrupt blobs; refusing before destination creation",
+        ));
+    assert!(!destination.parent().unwrap().exists());
+    assert_eq!(std::fs::read(&source_path).unwrap(), original);
+}
+
+#[test]
 fn collection_init_registers_direct_root_without_a_commit_and_is_idempotent() {
     use triblespace::prelude::TryToInline;
 

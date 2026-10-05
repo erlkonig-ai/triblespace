@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `pile compact --drop-collection NAME_OR_FULL_HANDLE` leaves selected collections
+  and their resident descriptor descendants behind in a fresh destination. This
+  explicitly enables reachability GC, including raw orphan removal, while keeping
+  proofs, WANTs, pins, shared payloads and conservative opaque-frame references.
+  Absent handles and missing or ambiguous names fail before creating output.
+  This local copy policy does not revoke grants or prevent future synchronization.
+
 ## [0.47.0] - 2026-10-01
 
 ### Changed

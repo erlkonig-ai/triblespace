@@ -48,12 +48,14 @@ pub enum PileCommand {
         /// Path to the pile file to create
         path: PathBuf,
     },
-    /// Repack one pile into a fresh file without garbage-collecting blobs.
+    /// Repack one pile into a fresh file; preserve all blobs by default.
     ///
-    /// Every distinct valid blob is retained. Exact duplicate blob,
+    /// By default every distinct valid blob is retained. Exact duplicate blob,
     /// collection, and proof records collapse through their native set
     /// identities; active WANTs and legacy pin state are projected once. All
-    /// distinct current native COMMIT/MERGE/DERIVE records remain. Retired
+    /// distinct current native COMMIT/MERGE/DERIVE/MAP records remain unless
+    /// explicitly excluded. --drop-collection opts into reachability garbage
+    /// collection, dropping selected collection frames and unrooted blobs. Retired
     /// PEER and STORE_SCOPE records are recognized and dropped.
     /// The source is never modified, the destination must not exist, and
     /// opaque framed records are carried byte-for-byte without interpreting
@@ -75,6 +77,14 @@ pub enum PileCommand {
         /// of RETIRED is present in CURRENT. Repeat for several generations.
         #[arg(long = "drop-drained", value_name = "RETIRED=CURRENT")]
         drop_drained: Vec<String>,
+        /// Explicitly leave collections and their resident descriptor
+        /// descendants behind. Repeat names or full handles. Unlike default
+        /// compact, this opts into reachability GC: unrooted blobs are dropped.
+        /// Proofs, WANTs, pins and unknown frames retain their ordinary roots.
+        /// Absent handles and missing or ambiguous names are refused. This
+        /// does not revoke grants or prevent sync from restoring the data.
+        #[arg(long = "drop-collection", value_name = "NAME_OR_FULL_HANDLE")]
+        drop_collection: Vec<String>,
     },
     /// Diagnostic helpers for inspecting and repairing piles.
     Diagnose {
@@ -284,7 +294,8 @@ pub fn run(cmd: PileCommand) -> Result<()> {
             source,
             into,
             drop_drained,
-        } => compact::run(source, into, drop_drained),
+            drop_collection,
+        } => compact::run(source, into, drop_drained, drop_collection),
         PileCommand::Net { cmd } => net::run(cmd),
         PileCommand::Diagnose { cmd } => diagnose::run(cmd),
         PileCommand::Verify { pile } => verify::run(&pile),

@@ -1,6 +1,6 @@
-//! Conservative whole-pile physical compaction.
+//! Whole-pile physical compaction, conservative by default.
 //!
-//! This is deliberately not garbage collection. Every distinct resident blob
+//! The default mode is not garbage collection. Every distinct resident blob
 //! is an explicit direct root; the retained-rewrite machinery then projects
 //! current native sets and legacy pin state through their own semantics. The
 //! rewrite drops physical duplicates, superseded log entries, corrupt blob
@@ -18,12 +18,21 @@
 //! but callers requiring an exact whole-file result must still quiesce writers:
 //! an append after the final check can remain outside the valid observed-prefix
 //! result.
+//!
+//! `--drop-collection` is deliberately different: it opts into reachability
+//! garbage collection. Only bytes reached by carried records, proofs, WANTs,
+//! pins and opaque-frame conservative references survive. Raw unrooted blobs
+//! are not promised retention. Exclusion is physical copying policy, not
+//! revocation, semantic retraction, or a promise that sync will not restore it.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
+use triblespace_core::collection::records::CollectionHandle;
 use triblespace_core::repo::pile::{
-    DrainedGeneration, Pile, PileRecordContent, PileRecords, PileRewriteStats, WantRewritePolicy,
+    CollectionFrame, CollectionFrameFilter, CorruptBlobPolicy, DrainedGeneration, Pile,
+    PileRecordContent, PileRecords, PileRewriteStats, WantRewritePolicy,
 };
 use triblespace_core::repo::{BlobStoreList, RetentionRoots, SnapshotSource};
 
@@ -99,15 +108,16 @@ fn compact_into(
     destination: &mut Pile,
     stable_source_len: u64,
     drained: &[DrainedGeneration],
+    excluded: &BTreeSet<CollectionHandle>,
 ) -> Result<PileRewriteStats> {
     let snapshot = source.snapshot().context("freeze source pile")?;
     let mut roots = RetentionRoots::new();
-    for info in snapshot.blobs() {
-        let info = info.map_err(|error| anyhow!("list source blobs: {error}"))?;
-        // Direct is intentional: this command preserves every blob already in
-        // the pile, so recursive discovery would add work without changing the
-        // keep set.
-        roots.retain_direct(info.handle);
+    if excluded.is_empty() {
+        for info in snapshot.blobs() {
+            let info = info.map_err(|error| anyhow!("list source blobs: {error}"))?;
+            // Default compact is conservative, not reachability GC.
+            roots.retain_direct(info.handle);
+        }
     }
     drop(snapshot);
 
@@ -123,9 +133,24 @@ fn compact_into(
         );
     }
 
-    let stats = source
-        .rewrite_retained_into_leaving(destination, &roots, WantRewritePolicy::Preserve, drained)
-        .map_err(|error| anyhow!("compact pile: {error}"))?;
+    let stats = if excluded.is_empty() {
+        source.rewrite_retained_into_leaving(
+            destination,
+            &roots,
+            WantRewritePolicy::Preserve,
+            drained,
+        )
+    } else {
+        source.rewrite_retained_into_filtered(
+            destination,
+            &roots,
+            WantRewritePolicy::Preserve,
+            drained,
+            &mut ExcludeCollections(excluded),
+            CorruptBlobPolicy::Refuse,
+        )
+    }
+    .map_err(|error| anyhow!("compact pile: {error}"))?;
 
     let final_source_len = source
         .backing_file_metadata()
@@ -141,10 +166,21 @@ fn compact_into(
     Ok(stats)
 }
 
+struct ExcludeCollections<'a>(&'a BTreeSet<CollectionHandle>);
+
+impl CollectionFrameFilter for ExcludeCollections<'_> {
+    fn carries(&mut self, frame: &CollectionFrame) -> bool {
+        !frame
+            .collection
+            .is_some_and(|collection| self.0.contains(&collection))
+    }
+}
+
 pub(super) fn run(
     source_path: PathBuf,
     destination_path: PathBuf,
     drop_drained: Vec<String>,
+    drop_collection: Vec<String>,
 ) -> Result<()> {
     let drained = drop_drained
         .iter()
@@ -180,6 +216,48 @@ pub(super) fn run(
         );
     }
 
+    // Resolve every selection and native rewrite refusal before even creating
+    // the destination directory/file. The planner is the writer's own walk.
+    let selection = (|| -> Result<_> {
+        if drop_collection.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let snapshot = source.snapshot().context("freeze exclusion selection")?;
+        let excluded = super::collection::resolve_exclusions(&snapshot, &drop_collection)?;
+        drop(snapshot);
+        let plan = source
+            .plan_retained_rewrite(
+                &RetentionRoots::new(),
+                WantRewritePolicy::Preserve,
+                &drained,
+                &mut ExcludeCollections(&excluded),
+            )
+            .map_err(|error| anyhow!("plan collection exclusion: {error}"))?;
+        if !plan.corrupt_blobs.is_empty() {
+            bail!("collection exclusion reaches {} corrupt blobs; refusing before destination creation",
+                plan.corrupt_blobs.len());
+        }
+        let planned_len = source
+            .backing_file_metadata()
+            .context("stat source after exclusion plan")?
+            .len();
+        if planned_len != stable_source_len {
+            bail!(
+                "source pile changed during collection exclusion preflight ({} -> {} bytes)",
+                stable_source_len,
+                planned_len
+            );
+        }
+        Ok(excluded)
+    })();
+    let excluded = match selection {
+        Ok(excluded) => excluded,
+        Err(error) => {
+            let _ = source.close();
+            return Err(error);
+        }
+    };
+
     if let Some(parent) = destination_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -201,8 +279,14 @@ pub(super) fn run(
         }
     };
 
-    let operation = compact_into(&mut source, &mut destination, stable_source_len, &drained)
-        .and_then(|stats| Ok((stats, census(&destination_path)?)));
+    let operation = compact_into(
+        &mut source,
+        &mut destination,
+        stable_source_len,
+        &drained,
+        &excluded,
+    )
+    .and_then(|stats| Ok((stats, census(&destination_path)?)));
     let destination_close = destination
         .close()
         .map_err(|error| anyhow!("close destination: {error}"));
@@ -259,6 +343,10 @@ pub(super) fn run(
         "  retired equations left behind, signed twin present: {}",
         stats.superseded_equations
     );
+    if !drop_collection.is_empty() {
+        println!("  excluded collections (including resident descriptor descendants): {}\n  collection frames excluded: {}\n  blob policy: reachability GC; raw unrooted blobs are not retained",
+            excluded.len(), stats.filtered_frames);
+    }
     println!(
         "  frames left behind with drained generations: {}",
         stats.drained_frames

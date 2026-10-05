@@ -73,11 +73,28 @@ Run `trible <COMMAND>` to invoke a subcommand.
   Blob records receive fresh timestamps, corrupt physical occurrences
   disappear when another occurrence validates, and known semantically inert
   records—including retired PEER and STORE_SCOPE state—are dropped. Opaque
-  kinds are refused. Quiesce writers for an exact whole-file result because a
+  frames are carried exactly. Quiesce writers for an exact whole-file result because a
   late append may remain outside the valid observed prefix. On Unix the
   destination starts no broader than mode 0600, then receives the source
   permissions through its open handle after rewriting. On post-create failure
   the command attempts to remove the destination and reports cleanup failure.
+- `pile compact <SOURCE> --into <DESTINATION> --drop-collection <NAME_OR_FULL_HANDLE>`
+  — explicitly exclude the selected collection records and derived/attached
+  descendants whose resident descriptors name them, including sibling-index
+  dependencies. Repeat the option for several collections; a full handle is
+  exact and must be referenced by a collection record or name a resident tagged
+  descriptor. Absent handles and missing or ambiguous names refuse before
+  destination creation; a descriptor needs no name or admitted member.
+  `name:` disambiguates a name which itself looks like a handle. This opts into
+  **reachability garbage collection**, unlike conservative default compact:
+  raw unrooted blobs are not promised retention. Carried native records and
+  their typed payload/metadata closures, shared blobs, capability proofs,
+  WANTs, pins and conservative opaque-frame references still retain bytes.
+  Missing/unreadable descriptors are not assigned invented ancestry. Corrupt
+  reached bytes refuse. The source stays unchanged; this is physical exclusion
+  in a fresh copy, not authority revocation or semantic retraction. Sync may
+  restore excluded records. Existing `--drop-drained RETIRED=CURRENT` may be
+  combined and retains its drain-validation rules.
 - `pile migrate <PILE> list` — list known migrations and whether they are needed for this pile.
 - `pile migrate <PILE> run <MIGRATION>` — run one explicitly named migration.
   Pass `--dry-run` to preview changes. In particular, `monotone-wants` is a

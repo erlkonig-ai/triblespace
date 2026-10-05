@@ -40,7 +40,9 @@ use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::IntoBlob;
 use triblespace_core::blob::TryFromBlob;
-use triblespace_core::collection::records::{CollectionHandle, CollectionRecord};
+use triblespace_core::collection::records::{
+    CollectionHandle, CollectionRecord, KIND_COLLECTION_DESCRIPTOR,
+};
 use triblespace_core::collection::CollectionRead;
 use triblespace_core::collection::{
     descriptor, grant_collection_read, grant_collection_write, AdmissionPolicy, Collection,
@@ -50,6 +52,7 @@ use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::{Blake3, Handle, Hash};
 use triblespace_core::inline::Inline;
 use triblespace_core::metadata::{self, MetaDescribe};
+use triblespace_core::prelude::{exists, pattern};
 use triblespace_core::repo::async_store::AsyncBlobStoreAcquire;
 use triblespace_core::repo::pile::{Pile, PileSnapshot};
 use triblespace_core::repo::{
@@ -1206,6 +1209,75 @@ fn resolve(rows: &[Enumerated], reference: &str) -> Result<CollectionHandle> {
                 .collect::<Vec<_>>()
                 .join("\n")
         )),
+    }
+}
+
+/// Explicit exclusions and every resident descriptor dependency downstream.
+/// Unknown/nonresident descriptors stay conservative: no ancestry is invented.
+pub(super) fn resolve_exclusions(
+    snapshot: &PileSnapshot,
+    references: &[String],
+) -> Result<BTreeSet<CollectionHandle>> {
+    let rows = enumerate(snapshot)?;
+    let mut excluded = references
+        .iter()
+        .map(|reference| {
+            // Full handles are exact identities, even if a root happened to
+            // use the same 64 hexadecimal characters as its descriptive name.
+            if !reference.starts_with("name:") {
+                if let Ok(handle) = parse_collection_handle(reference) {
+                    let fields = Fields::load(snapshot, handle);
+                    if rows.iter().any(|row| row.handle == handle)
+                        || fields.facts().is_some_and(|facts| {
+                            exists!(pattern!(facts, [{
+                                metadata::tag: KIND_COLLECTION_DESCRIPTOR
+                            }]))
+                        })
+                    {
+                        return Ok(handle);
+                    }
+                    bail!("collection handle {} is neither referenced by a collection record nor a resident descriptor in this pile", handle_hex(handle));
+                }
+            }
+            resolve(&rows, reference)
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    let mut dependencies = Vec::new();
+    let mut visited = BTreeSet::new();
+    let mut pending: Vec<_> = rows
+        .into_iter()
+        .map(|row| (row.handle, row.fields))
+        .collect();
+    while let Some((handle, fields)) = pending.pop() {
+        if !visited.insert(handle) {
+            continue;
+        }
+        let Some(facts) = fields.facts() else {
+            continue;
+        };
+        let mut upstream = descriptor::parents(facts)?;
+        upstream.extend(descriptor::source(facts)?);
+        upstream.extend(descriptor::reads_attached(facts)?);
+        // A sparse pile may retain a downstream record and its descriptor
+        // chain without any record naming an intermediate collection. Follow
+        // only those native references, never the ambient blob inventory.
+        for parent in &upstream {
+            if !visited.contains(parent) {
+                pending.push((*parent, Fields::load(snapshot, *parent)));
+            }
+        }
+        dependencies.push((handle, upstream));
+    }
+    loop {
+        let before = excluded.len();
+        for (handle, upstream) in &dependencies {
+            if upstream.iter().any(|parent| excluded.contains(parent)) {
+                excluded.insert(*handle);
+            }
+        }
+        if before == excluded.len() {
+            return Ok(excluded);
+        }
     }
 }
 
