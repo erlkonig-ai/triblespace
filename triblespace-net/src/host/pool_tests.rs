@@ -11,7 +11,7 @@ use crate::connection::{
     MAX_HELD_REQUESTS_PER_CONNECTION, MAX_RECON_FRAME_BYTES, MAX_REQUESTS_GLOBAL, RESET_BUSY,
     RESET_REPLACED, RESET_UNKNOWN, write_frame,
 };
-use crate::protocol::{OP_FIND_VALUE, TAG_DHT, TAG_RECON, recv_find_value_response};
+use crate::protocol::{OP_FIND_VALUE, TAG_DHT, TAG_RECON, op_find_value, send_hash};
 use crate::transport::sim::{SimConfig, SimConn, SimNet, SimTransport};
 
 use super::*;
@@ -82,14 +82,20 @@ async fn open_recon(conn: &SimConn, sequence: u64) -> <SimConn as Conn>::SendHal
     send
 }
 
-/// Open a FIND_NODE request and withhold its end: the server holds the
+/// Open a FIND_VALUE request and withhold its end: the server holds the
 /// stream, serving or waiting for a permit, until the request ends.
-async fn held_find_node<C: Conn>(conn: &C) -> (C::SendHalf, C::RecvHalf) {
+async fn held_find_value<C: Conn>(conn: &C) -> (C::SendHalf, C::RecvHalf) {
     let (mut send, recv) = conn.open_bi().await.unwrap();
     send_u8(&mut send, TAG_DHT).await.unwrap();
-    send_u8(&mut send, OP_FIND_NODE).await.unwrap();
+    send_u8(&mut send, OP_FIND_VALUE).await.unwrap();
     send_hash(&mut send, &[0; 32]).await.unwrap();
     (send, recv)
+}
+
+/// Whether one FIND_VALUE on `conn` is answered, with nothing: these
+/// nodes know no routes and hold no leases.
+async fn answers_empty<C: Conn>(conn: &C) -> bool {
+    op_find_value(conn, &[0; 32]).await.unwrap() == (vec![], vec![])
 }
 
 /// Whether a read fails with the stream reset carrying `code`.
@@ -236,8 +242,8 @@ async fn crossed_dials_keep_the_connection_dialled_by_the_lower_key() {
     // The loser drains and closes; one connection carries both directions.
     tokio::time::sleep(DRAIN_GRACE + Duration::from_secs(1)).await;
     assert_eq!((left.table.len(), right.table.len()), (1, 1));
-    assert!(op_find_node(&on_left, &[0; 32]).await.unwrap().is_empty());
-    assert!(op_find_node(&on_right, &[0; 32]).await.unwrap().is_empty());
+    assert!(answers_empty(&on_left).await);
+    assert!(answers_empty(&on_right).await);
     assert!(left.table.current(right.peer) == Some(on_left));
     assert_eq!(net.dial_count(left.peer, right.peer), 1);
     assert_eq!(net.dial_count(right.peer, left.peer), 1);
@@ -273,7 +279,7 @@ async fn a_double_dial_from_one_side_keeps_the_higher_sequence() {
             "the lower sequence drains and closes"
         );
         assert!(older.table.current(server.peer).is_none());
-        assert!(op_find_node(&new, &[0; 32]).await.unwrap().is_empty());
+        assert!(answers_empty(&new).await);
     }
 }
 
@@ -283,8 +289,14 @@ async fn an_unknown_tag_or_operation_resets_its_stream_and_the_connection_keeps_
     let client = Node::join(&net, &key(1));
     let server = Node::join(&net, &key(2));
     let connection = client.table.connect(server.peer).await.unwrap();
-    // No stream type uses the first byte, and no dht/1 operation the second.
-    for request in [&[0x7E][..], &[TAG_DHT, 0x7E]] {
+    // No stream type uses the first byte, and no dht/1 operation the second:
+    // 0x07 and 0x0C were PROVIDER_GET and FIND_NODE, which FIND_VALUE replaced.
+    for request in [
+        &[0x7E][..],
+        &[TAG_DHT, 0x7E],
+        &[TAG_DHT, 0x07],
+        &[TAG_DHT, 0x0C],
+    ] {
         let (mut send, mut recv) = connection.open_bi().await.unwrap();
         send.write_all(request).await.unwrap();
         // A finish would read as a clean end of the stream instead.
@@ -296,12 +308,7 @@ async fn an_unknown_tag_or_operation_resets_its_stream_and_the_connection_keeps_
         // connection it shares with the server's own requests.
         client.table.invalidate(&connection);
 
-        assert!(
-            op_find_node(&connection, &[0; 32])
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(answers_empty(&connection).await);
         assert!(client.table.current(server.peer) == Some(connection.clone()));
     }
     assert_eq!(net.dial_count(client.peer, server.peer), 1);
@@ -309,7 +316,7 @@ async fn an_unknown_tag_or_operation_resets_its_stream_and_the_connection_keeps_
 }
 
 #[tokio::test(start_paused = true)]
-async fn find_value_and_provider_get_are_served_under_the_dht_tag() {
+async fn find_value_is_served_under_the_dht_tag() {
     let net = network(Duration::from_secs(1));
     let client = Node::join(&net, &key(1));
     let server = Node::join(&net, &key(2));
@@ -331,17 +338,10 @@ async fn find_value_and_provider_get_are_served_under_the_dht_tag() {
     let connection = client.table.connect(server.peer).await.unwrap();
 
     // FIND_VALUE is a dht/1 operation: the table dispatches the tag and the
-    // handler the operation, as for FIND_NODE and PROVIDER_GET.
-    let (mut send, mut recv) = connection.open_bi().await.unwrap();
-    send_u8(&mut send, TAG_DHT).await.unwrap();
-    send_u8(&mut send, OP_FIND_VALUE).await.unwrap();
-    send_hash(&mut send, &locator).await.unwrap();
-    send.shutdown().await.unwrap();
-    let (routes, hints) = recv_find_value_response(&mut recv).await.unwrap();
+    // handler the operation. One reply carries the route and the lease.
+    let (routes, hints) = op_find_value(&connection, &locator).await.unwrap();
     assert_eq!(routes, [route]);
-    assert_eq!(routes, op_find_node(&connection, &locator).await.unwrap());
     assert_eq!(hints, [lease]);
-    assert_eq!(hints, op_provider_get(&connection, &locator).await.unwrap());
     assert_eq!(net.dial_count(client.peer, server.peer), 1);
 }
 
@@ -354,7 +354,7 @@ async fn a_request_deadline_keeps_the_connection_the_peer_is_using() {
     settle().await;
     // The right side has a request of its own in flight on the connection.
     let on_right = right.table.current(left.peer).unwrap();
-    let (mut own_send, mut own_recv) = held_find_node(&on_right).await;
+    let (mut own_send, mut own_recv) = held_find_value(&on_right).await;
 
     // A third peer occupies every request slot on the right, so a request
     // from the left waits there until its deadline.
@@ -366,23 +366,27 @@ async fn a_request_deadline_keeps_the_connection_the_peer_is_using() {
         .unwrap();
     let mut occupying = Vec::new();
     for _ in 0..MAX_REQUESTS_GLOBAL {
-        occupying.push(held_find_node(&third).await);
+        occupying.push(held_find_value(&third).await);
     }
     settle().await;
     assert_eq!(right.table.available_requests(), 0);
-    let error = left.client.get(right.peer, [7; 32]).await.unwrap_err();
+    let error = left
+        .client
+        .find_value(right.peer, [7; 32])
+        .await
+        .unwrap_err();
     assert!(error.to_string().contains("deadline"), "{error}");
 
     // The deadline closed nothing: the right side's request completes.
     assert!(left.table.current(right.peer) == Some(connection.clone()));
     own_send.shutdown().await.unwrap();
-    crate::protocol::recv_find_node_response(&mut own_recv)
+    crate::protocol::recv_find_value_response(&mut own_recv)
         .await
         .unwrap();
     for (mut send, _recv) in occupying {
         send.shutdown().await.unwrap();
     }
-    left.client.find_node(right.peer, [0; 32]).await.unwrap();
+    left.client.find_value(right.peer, [0; 32]).await.unwrap();
     assert!(left.table.current(right.peer) == Some(connection));
     assert_eq!(net.dial_count(left.peer, right.peer), 1);
     assert_eq!(net.dial_count(right.peer, left.peer), 0);
@@ -404,10 +408,10 @@ async fn request_streams_beyond_the_held_bound_are_reset() {
     // while the server still holds them, waiting for a slot.
     let mut serving = Vec::new();
     for _ in 0..MAX_REQUESTS_GLOBAL {
-        serving.push(held_find_node(&conn).await);
+        serving.push(held_find_value(&conn).await);
     }
     for _ in MAX_REQUESTS_GLOBAL..MAX_HELD_REQUESTS_PER_CONNECTION {
-        let (mut send, recv) = held_find_node(&conn).await;
+        let (mut send, recv) = held_find_value(&conn).await;
         send.shutdown().await.unwrap();
         drop((send, recv));
     }
@@ -416,7 +420,7 @@ async fn request_streams_beyond_the_held_bound_are_reset() {
 
     // The connection holds no more: the next request is reset at once, so the
     // abandoned ones cannot take the opener's stream credit from recon/1.
-    let (mut send, mut recv) = held_find_node(&conn).await;
+    let (mut send, mut recv) = held_find_value(&conn).await;
     send.shutdown().await.unwrap();
     assert!(reads_reset(&mut recv, RESET_BUSY).await);
     let _reopened = open_recon(&conn, 1).await;
@@ -426,7 +430,7 @@ async fn request_streams_beyond_the_held_bound_are_reset() {
     for (mut send, _recv) in serving {
         send.shutdown().await.unwrap();
     }
-    op_find_node(&conn, &[0; 32]).await.unwrap();
+    assert!(answers_empty(&conn).await);
 }
 
 #[tokio::test(start_paused = true)]
@@ -574,7 +578,7 @@ async fn recon_frames_keep_a_connection_open_past_the_idle_deadline() {
     assert!(server.table.current(quiet_id).is_none());
     assert!(quiet.accept_bi().await.is_none());
     assert!(server.table.current(chatty_id).is_some());
-    assert!(op_find_node(&chatty, &[0; 32]).await.unwrap().is_empty());
+    assert!(answers_empty(&chatty).await);
 
     tokio::time::sleep(CONNECTION_IDLE_DEADLINE - Duration::from_secs(1)).await;
     assert!(server.table.current(chatty_id).is_some());
@@ -592,7 +596,7 @@ async fn a_retired_connection_with_a_stalled_request_still_goes_idle() {
     let older = dial().await.unwrap();
     let _older_recon = open_recon(&older, 1).await;
     // A request on the older connection stalls: no frame crosses it again.
-    let (_stalled_send, mut stalled_recv) = held_find_node(&older).await;
+    let (_stalled_send, mut stalled_recv) = held_find_value(&older).await;
     settle().await;
     let newer = dial().await.unwrap();
     let mut newer_recon = open_recon(&newer, 2).await;
@@ -679,12 +683,7 @@ async fn outbound_eviction_spares_a_neighbour_and_stale_invalidation_is_harmless
     client.table.invalidate(&old);
     settle().await;
     assert!(client.table.current(server.peer) == Some(replacement.clone()));
-    assert!(
-        op_find_node(&replacement, &[0; 32])
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert!(answers_empty(&replacement).await);
     assert_eq!(net.dial_count(client.peer, server.peer), 2);
 }
 
@@ -704,5 +703,5 @@ async fn outbound_eviction_spares_a_connection_a_caller_holds() {
     assert_eq!(center.table.len(), MAX_CONNECTIONS);
     assert!(center.table.current(others[0].peer) == Some(held.clone()));
     assert!(center.table.current(others[1].peer).is_none());
-    op_find_node(&held, &[0; 32]).await.unwrap();
+    assert!(answers_empty(&held).await);
 }

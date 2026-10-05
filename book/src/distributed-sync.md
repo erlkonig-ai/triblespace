@@ -403,7 +403,7 @@ identity would make the swapped pair coincide, but such an H is public anyway.
 An exchange whose two endpoints are the same identity authenticates nothing and
 is refused.
 
-For an ordinary `PROVIDER_GET(L)`, the selected DHT node also consults its
+When a DHT node answers `FIND_VALUE(L)`, it also consults its
 already-installed, snapshot-coherent L→H index. If L is resident there, it
 returns its own endpoint-bound token without waiting for a `PROVIDER_PUT`.
 This deliberately extends the old lease-only answer: one reply slot is reserved
@@ -443,31 +443,25 @@ token counts separately, alongside its existing totals, without logging handles
 or tokens. These classify hint sources, not cryptographic publication receipts;
 neither category proves that a subsequent GET will succeed.
 
-An experimental exact-H fetch can query a directory as soon as it directly
-answers an authenticated FIND_NODE, rather than waiting for the final routing
-barrier. Named referrals remain unverified candidates until they answer in
-turn. Early targets come from the current closest authenticated responder set
-(including the local endpoint); routing-free local fallback remains available
-when lookup completes. No cold lookup starts from a retained local provider
-lease before routing progress. Publication and collection discovery still
-select their final replica set before directory operations.
+A lookup is one `FIND_VALUE(L)` per hop. Each authenticated reply carries the
+responder's K closest verified routes and its hints for L, so no directory
+round follows routing: every replica the lookup reaches has already answered
+with its hints. Named referrals remain unverified candidates until they answer
+in turn. The requester checks every token and drops a hint whose token does not
+prove knowledge of H before any dial. The local directory answers like a
+replica's when the first authenticated reply, or the closed lookup, places this
+endpoint among the key's closest K; no cold lookup starts from a retained local
+provider lease before routing progress. Publication runs the whole lookup and
+puts to the closest K responders, ignoring their hints. Collection discovery
+runs the whole lookup and takes the union of every verified hint.
 
-FIND_NODE, directory queries and exact provider GETs share three concurrent
-request slots. While routing is open, acquisition occupies at most two, leaving
-capacity for fresh routing. While unstarted directory queries remain, bodies
-normally occupy at most two slots, including after routing finishes. A directory
-reply contributing a retained untried hint earns one body turn before the next
-directory, so a useful answer need not wait for every remaining directory.
-Already-attempted or discarded hints earn no such turn. Subject to these
-reservations, a usable provider takes the next free slot ahead of an unstarted
-directory query. At most K early directory
-attempts are admitted, then a final closest-K sweep supplies unqueried targets;
-the total is at most 2K distinct directories, including any local query. This
-can spend K more queries than waiting for the final set, and the one reserved
-routing slot can reduce acquisition concurrency. Conversely, two progressing
-acquisitions leave only one routing slot in the same unchanged routing window;
-this is not a proof of equal discovery coverage under every timing pattern.
-Empty early hints do not end
+An exact-H fetch starts a verified provider as soon as a reply names it, rather
+than waiting for the lookup to finish. Lookup requests and exact provider GETs
+share three concurrent request slots. While routing is open, provider GETs
+occupy at most two, leaving capacity for fresh routing; a usable provider takes
+the next such slot. Two progressing acquisitions leave only one routing slot in
+the same unchanged routing window; this is not a proof of equal discovery
+coverage under every timing pattern. Empty early hints do not end
 a lookup whose routing remains open. At most 64 distinct providers can be
 attempted per fetch.
 Duplicate hints never spend another attempt. Pending providers are ranked by
@@ -478,18 +472,17 @@ it need not equal the closest 64 in the final reply union. Collection discovery
 still waits for its canonical, reply-order-independent union.
 
 This removes routing's final barrier when early evidence is useful, not every
-possible head-of-line delay. Three stalled requests can still occupy the shared slots;
-in particular, three stalled first directory queries prevent an unstarted
-directory from supplying its hint within a shorter caller deadline. An early
-large set of valid but unavailable hints can also exhaust the 64-attempt cap
-before a later useful hint arrives. Early nonfinal directories can supply those
-hints too: reserving the final directory sweep does not reserve body attempts
-and does not prove baseline reachability is preserved for every reply order.
-The caller's existing end-to-end timeout,
-per-operation deadlines, pooled-connection cancellation rules, provider-token
-checks, mutual bearer proof, body-receive memory bound, and final hash check
-are unchanged. Routing expiry drops only issued routing requests; a progressing
-directory/body stream continues within the original caller deadline. Early
+possible head-of-line delay. Three stalled requests can still occupy the shared
+slots; in particular, two stalled provider GETs and a stalled lookup request
+keep a later replica's hint from arriving within a shorter caller deadline. An
+early large set of valid but unavailable hints can also exhaust the 64-attempt
+cap before a later useful hint arrives. The caller's existing end-to-end
+timeout, per-operation deadlines, pooled-connection cancellation rules,
+provider-token checks, mutual bearer proof, body-receive memory bound, and
+final hash check are unchanged. Routing expiry drops only issued lookup
+requests; their hints are then unknown, so a fetch that found no verified hint
+reports the lookup incomplete rather than the blob absent. A progressing body
+continues within the original caller deadline. Early
 verified success or caller cancellation drops all owned futures without
 fabricating protocol failures or closing healthy pooled connections. No provider
 hint or result is persisted by this scheduling step.
@@ -624,7 +617,7 @@ re-enters authority/descriptor-provider discovery for each active collection.
 ### Restart contact experiment
 
 `routing/warm_start.rs` is a test-only experiment, not enabled host persistence.
-It runs the real `RoutingTable` and `IterativeLookup` with synthetic `FIND_NODE`
+It runs the real `RoutingTable` and `IterativeLookup` with synthetic lookup
 responses. Its one durable relation is a bounded set of previously authenticated
 endpoint identities, canonicalized with `PATCH<32>` and packed into ordinary
 `RawBytes`. A temporary-file write, sync, reopen and restore exercise the byte
@@ -957,12 +950,11 @@ bearer/DHT framing:
 |---|---:|---|
 | `GET_BLOB` | `0x02` | locator-addressed, mutual-proof exact bearer transport |
 | `PROVIDER_PUT` | `0x06` | renew this endpoint's opaque provider lease |
-| `PROVIDER_GET` | `0x07` | obtain bounded candidates for one opaque key |
-| `FIND_NODE` | `0x0C` | iterative XOR-DHT routing step |
-| `FIND_VALUE` | `0x0F` | `FIND_NODE` routes and `PROVIDER_GET` hints in one reply; served, never sent before the next generation |
+| `FIND_VALUE` | `0x0F` | one iterative XOR-DHT lookup step: the K closest verified routes and bounded provider hints for one opaque key |
 | `COLLECTION_REPAIR` | `0x0E` | READ-gated foundation-record, authorization-evidence and held-blob PATCH walks |
 
-Opcode `0x0D` is no longer served. Mixed-generation collection repair is not
+Opcode `0x0D` is no longer served, nor are the DHT operations `0x07`
+(`PROVIDER_GET`) and `0x0C` (`FIND_NODE`), which `FIND_VALUE` replaces. Mixed-generation collection repair is not
 supported: deploy the new repair cohort together. Per-collection topic v2
 separates its root advertisements from the previous forwarding protocol.
 

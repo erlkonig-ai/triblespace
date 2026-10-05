@@ -1,7 +1,7 @@
 //! Saturated request slots must not kill unrelated streams on a shared connection.
 
 use crate::connection::{MAX_REQUESTS_GLOBAL, MAX_REQUESTS_PER_CONNECTION};
-use crate::protocol::TAG_DHT;
+use crate::protocol::{TAG_DHT, recv_find_value_response};
 use crate::transport::sim::SimConn;
 
 use super::*;
@@ -123,9 +123,9 @@ async fn saturated_requests_complete_without_closing_connection(connection_count
         for _ in 0..per_connection {
             let (mut send, recv) = connection.open_bi().await.unwrap();
             send_u8(&mut send, TAG_DHT).await.unwrap();
-            send_u8(&mut send, OP_FIND_NODE).await.unwrap();
+            send_u8(&mut send, OP_FIND_VALUE).await.unwrap();
             send_hash(&mut send, &target).await.unwrap();
-            // FIND_NODE waits for EOF before responding. These are legitimate
+            // FIND_VALUE waits for EOF before responding. These are legitimate
             // in-flight requests; no artificial semaphore acquisition is used.
             held_streams.push((send, recv));
         }
@@ -144,7 +144,7 @@ async fn saturated_requests_complete_without_closing_connection(connection_count
     // or scheduler-iteration count guesses when the overload branch ran.
     let (mut queued_send, mut queued_recv) = connections[0].open_bi().await.unwrap();
     send_u8(&mut queued_send, TAG_DHT).await.unwrap();
-    send_u8(&mut queued_send, OP_FIND_NODE).await.unwrap();
+    send_u8(&mut queued_send, OP_FIND_VALUE).await.unwrap();
     send_hash(&mut queued_send, &target).await.unwrap();
     queued_send.shutdown().await.unwrap();
     tokio::time::timeout(
@@ -164,21 +164,27 @@ async fn saturated_requests_complete_without_closing_connection(connection_count
         send.shutdown().await.unwrap();
     }
     for (_, mut recv) in held_streams {
-        assert_eq!(recv_u8(&mut recv).await.unwrap(), 0);
-        require_stream_eof(&mut recv).await.unwrap();
+        assert_eq!(
+            recv_find_value_response(&mut recv).await.unwrap(),
+            (vec![], vec![])
+        );
     }
-    assert_eq!(recv_u8(&mut queued_recv).await.unwrap(), 0);
-    require_stream_eof(&mut queued_recv).await.unwrap();
+    assert_eq!(
+        recv_find_value_response(&mut queued_recv).await.unwrap(),
+        (vec![], vec![])
+    );
 
     // Do not let a reconnect mask connection destruction. A further request
     // must use the exact same Conn object and complete normally.
     let (mut send, mut recv) = connections[0].open_bi().await.unwrap();
     send_u8(&mut send, TAG_DHT).await.unwrap();
-    send_u8(&mut send, OP_FIND_NODE).await.unwrap();
+    send_u8(&mut send, OP_FIND_VALUE).await.unwrap();
     send_hash(&mut send, &target).await.unwrap();
     send.shutdown().await.unwrap();
-    assert_eq!(recv_u8(&mut recv).await.unwrap(), 0);
-    require_stream_eof(&mut recv).await.unwrap();
+    assert_eq!(
+        recv_find_value_response(&mut recv).await.unwrap(),
+        (vec![], vec![])
+    );
     for connection in connections {
         connection.close(0, b"test complete");
     }

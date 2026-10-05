@@ -3,8 +3,8 @@
 //! `cargo run --release -p triblespace-net --example blob_directory -- [--pile PATH] H PEER_ID...`
 //!
 //! H is an exact 64-hex-character bearer handle; it is never printed or sent.
-//! Each supplied peer is queried with FIND_NODE and PROVIDER_GET for its opaque
-//! locator. Returned routes are counted, never followed. Matching tokens prove
+//! Each supplied peer is queried with one FIND_VALUE for its opaque locator.
+//! Returned routes are counted, never followed. Matching tokens prove
 //! knowledge of H, not current blob residency or successful GET_BLOB transport.
 //! A valid self token may be synthesized from the answering node's snapshot;
 //! foreign entries in this host's replies come from retained advertisements.
@@ -30,7 +30,7 @@ use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::{BlobStoreList, SnapshotSource};
 use triblespace_net::host::PeerConfig;
 use triblespace_net::inventory::{ReconcileDirection, ReconcileQos};
-use triblespace_net::protocol::{PILE_SYNC_ALPN, op_find_node, op_provider_get};
+use triblespace_net::protocol::{PILE_SYNC_ALPN, op_find_value};
 use triblespace_net::provider::{blob_locator, blob_provider_token};
 use triblespace_net::transport::{Conn, Transport};
 
@@ -134,8 +134,8 @@ async fn main() -> Result<()> {
             let locator = blob_locator(*target_handle);
             let distance =
                 |route: [u8; 32]| -> [u8; 32] { std::array::from_fn(|i| route[i] ^ locator[i]) };
-            match timeout(DEADLINE, op_find_node(&conn, &locator)).await {
-                Ok(Ok(routes)) => {
+            match timeout(DEADLINE, op_find_value(&conn, &locator)).await {
+                Ok(Ok((routes, providers))) => {
                     let known = routes
                         .iter()
                         .filter(|route| peers.iter().any(|peer| peer.as_bytes() == *route))
@@ -144,23 +144,6 @@ async fn main() -> Result<()> {
                         .iter()
                         .filter(|route| distance(**route) < distance(*peer.as_bytes()))
                         .count();
-                    println!(
-                        "peer={index} target={label} find_node=ok routes={} known={known} unknown={} closer_than_directory={closer}",
-                        routes.len(),
-                        routes.len() - known
-                    );
-                }
-                Ok(Err(error)) => {
-                    println!("peer={index} target={label} find_node=error detail={error:#}");
-                    failed = true;
-                }
-                Err(_) => {
-                    println!("peer={index} target={label} find_node=deadline");
-                    failed = true;
-                }
-            }
-            match timeout(DEADLINE, op_provider_get(&conn, &locator)).await {
-                Ok(Ok(providers)) => {
                     let mut valid_self = 0;
                     let mut valid_foreign = 0;
                     for (provider, token) in &providers {
@@ -175,17 +158,19 @@ async fn main() -> Result<()> {
                     }
                     let valid = valid_self + valid_foreign;
                     println!(
-                        "peer={index} target={label} provider_get=ok providers={} valid_tokens={valid} valid_self_tokens={valid_self} valid_foreign_tokens={valid_foreign} invalid_tokens={}",
+                        "peer={index} target={label} find_value=ok routes={} known={known} unknown={} closer_than_directory={closer} providers={} valid_tokens={valid} valid_self_tokens={valid_self} valid_foreign_tokens={valid_foreign} invalid_tokens={}",
+                        routes.len(),
+                        routes.len() - known,
                         providers.len(),
                         providers.len() - valid
                     );
                 }
                 Ok(Err(error)) => {
-                    println!("peer={index} target={label} provider_get=error detail={error:#}");
+                    println!("peer={index} target={label} find_value=error detail={error:#}");
                     failed = true;
                 }
                 Err(_) => {
-                    println!("peer={index} target={label} provider_get=deadline");
+                    println!("peer={index} target={label} find_value=deadline");
                     failed = true;
                 }
             }

@@ -12,6 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   name a bound policy definition this reader lacks as `Undefined`, as well as
   the definitions the supplied proofs stopped at. Serving and the READ
   bootstrap still admit only on `Met`.
+- DHT lookups send `FIND_VALUE`: one request per hop returns the responder's
+  closest verified routes and its provider hints, so no `PROVIDER_GET` round
+  to the final replicas follows `FIND_NODE` routing. Neither operation is sent
+  or served any more; `protocol::op_find_value` replaces `op_find_node` and
+  `op_provider_get`. Requesters still check every hint's token. A lookup
+  that finds no verified hint while some request failed or was still
+  unanswered when its window closed reports itself incomplete.
 
 ## [0.47.1] - 2026-10-03
 

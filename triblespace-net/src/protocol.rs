@@ -49,13 +49,11 @@ pub const TAG_BLOB: u8 = 0x02;
 /// replaces it with pull walks on `recon/1` and deletes this tag.
 pub const TAG_REPAIR: u8 = 0x0E;
 
-// `dht/1` operations — the byte after the tag.
+// `dht/1` operations — the byte after the tag. 0x07 was PROVIDER_GET and
+// 0x0C was FIND_NODE; FIND_VALUE answers both in one reply.
 pub const OP_PROVIDER_PUT: u8 = 0x06;
-pub const OP_PROVIDER_GET: u8 = 0x07;
-pub const OP_FIND_NODE: u8 = 0x0C;
-/// One DHT lookup step: the routes of `FIND_NODE` and the hints of
-/// `PROVIDER_GET` in one reply. Served, never sent on this generation: an
-/// older peer fails the stream on an unknown operation.
+/// One DHT lookup step: at most K verified routes nearest a key, then the
+/// token-bearing provider hints this node holds for it.
 pub const OP_FIND_VALUE: u8 = 0x0F;
 
 pub const PROVIDER_PUT_OK: u8 = 0x00;
@@ -408,21 +406,24 @@ pub(crate) async fn op_provider_put<C: Conn>(
     Ok(stored)
 }
 
-/// Return bounded provider hints for one derived rendezvous key.
-pub async fn op_provider_get<C: Conn>(conn: &C, key: &RawHash) -> Result<Vec<(RawHash, RawHash)>> {
+/// One `FIND_VALUE(key)`: the peer's verified routes nearest the key and its
+/// provider hints for it. The hints' tokens are unchecked; only a requester
+/// that knows the key's identity can check them.
+pub async fn op_find_value<C: Conn>(
+    conn: &C,
+    key: &RawHash,
+) -> Result<(Vec<PeerId>, Vec<(RawHash, RawHash)>)> {
     let (mut send, mut recv) = conn
         .open_bi()
         .await
         .map_err(|error| anyhow!("open_bi: {error}"))?;
     send_u8(&mut send, TAG_DHT).await?;
-    send_u8(&mut send, OP_PROVIDER_GET).await?;
+    send_u8(&mut send, OP_FIND_VALUE).await?;
     send_hash(&mut send, key).await?;
     send.shutdown()
         .await
         .map_err(|error| anyhow!("finish: {error}"))?;
-    let providers = recv_provider_hints(&mut recv).await?;
-    require_response_eof(&mut recv).await?;
-    Ok(providers)
+    recv_find_value_response(&mut recv).await
 }
 
 async fn recv_provider_hints<R: AsyncRead + Unpin>(
@@ -440,32 +441,6 @@ async fn recv_provider_hints<R: AsyncRead + Unpin>(
         providers.push((recv_hash(recv).await?, recv_hash(recv).await?));
     }
     Ok(providers)
-}
-
-/// Return at most K verified routes nearest an arbitrary XOR target.
-pub async fn op_find_node<C: Conn>(
-    conn: &C,
-    target: &crate::routing::RoutingKey,
-) -> Result<Vec<crate::transport::PeerId>> {
-    let (mut send, mut recv) = conn
-        .open_bi()
-        .await
-        .map_err(|error| anyhow!("open_bi: {error}"))?;
-    send_u8(&mut send, TAG_DHT).await?;
-    send_u8(&mut send, OP_FIND_NODE).await?;
-    send_hash(&mut send, target).await?;
-    send.shutdown()
-        .await
-        .map_err(|error| anyhow!("finish: {error}"))?;
-    recv_find_node_response(&mut recv).await
-}
-
-pub(crate) async fn recv_find_node_response<R: AsyncRead + Unpin>(
-    recv: &mut R,
-) -> Result<Vec<crate::transport::PeerId>> {
-    let peers = recv_routes(recv).await?;
-    require_response_eof(recv).await?;
-    Ok(peers)
 }
 
 async fn recv_routes<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Vec<crate::transport::PeerId>> {
@@ -513,7 +488,6 @@ where
     Ok(())
 }
 
-#[cfg(test)]
 pub(crate) async fn recv_find_value_response<R: AsyncRead + Unpin>(
     recv: &mut R,
 ) -> Result<(Vec<PeerId>, Vec<(RawHash, RawHash)>)> {
@@ -1346,21 +1320,6 @@ mod tests {
 
         assert!(result.is_err());
         serving.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn find_node_enforces_count_and_exact_eof() {
-        let oversized = [u8::try_from(crate::routing::K + 1).unwrap()];
-        assert!(
-            recv_find_node_response(&mut oversized.as_slice())
-                .await
-                .is_err()
-        );
-        assert!(
-            recv_find_node_response(&mut [0, 1].as_slice())
-                .await
-                .is_err()
-        );
     }
 
     #[tokio::test]

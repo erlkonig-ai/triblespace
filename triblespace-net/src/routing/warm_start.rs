@@ -1,6 +1,6 @@
 //! Disposable restart experiment, not a host feature or published file format.
 //!
-//! This runs the real routing/lookup machine against synthetic FIND_NODE peers.
+//! This runs the real routing/lookup machine against synthetic FIND_VALUE routes.
 //! The only saved relation is a bounded set of authenticated endpoint identities;
 //! restoration supplies Candidates, never liveness, leases or authorization.
 //! No provider GET, blob H, collection record, or publication cursor is involved.

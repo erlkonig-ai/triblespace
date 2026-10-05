@@ -1664,7 +1664,7 @@ fn a_previous_generation_peer_is_refused() {
             .unwrap();
         let answer = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            triblespace_net::protocol::op_find_node(&current, &[7; 32]),
+            triblespace_net::protocol::op_find_value(&current, &[7; 32]),
         )
         .await
         .expect("the current generation answers");
@@ -1676,7 +1676,7 @@ fn a_previous_generation_peer_is_refused() {
             .unwrap();
         let refused = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            triblespace_net::protocol::op_find_node(&previous, &[7; 32]),
+            triblespace_net::protocol::op_find_value(&previous, &[7; 32]),
         )
         .await
         .expect("a refused connection fails promptly");

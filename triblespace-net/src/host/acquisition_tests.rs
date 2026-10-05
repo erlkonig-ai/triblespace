@@ -15,7 +15,7 @@ use triblespace_core::repo::{BlobStorePut, SnapshotSource, WantRead};
 
 use tokio::io::AsyncWriteExt as _;
 
-use crate::protocol::TAG_RECON;
+use crate::protocol::{TAG_RECON, send_hash};
 use crate::transport::sim::{SimConfig, SimNet, SimTransport};
 
 use super::*;
@@ -232,19 +232,19 @@ impl Drop for RecoveryNode {
     }
 }
 
-/// A directory which remains responsive to routing but delays its provider
-/// reply. This isolates the post-FIND_NODE barrier from cold-dial behavior.
-struct DelayedDirectory {
+/// A replica that answers each FIND_VALUE with no routes and fixed hints,
+/// after a delay or never. It serves no other request.
+struct ScriptedReplica {
     peer: PeerId,
     queries: Arc<AtomicUsize>,
     server: tokio::task::JoinHandle<()>,
 }
 
-impl DelayedDirectory {
+impl ScriptedReplica {
     fn new(
         net: &SimNet,
         key: &SigningKey,
-        replies: Vec<(PeerId, ProviderToken)>,
+        hints: Vec<(PeerId, ProviderToken)>,
         delay: Option<Duration>,
     ) -> Self {
         let peer = key.verifying_key().to_bytes();
@@ -253,11 +253,11 @@ impl DelayedDirectory {
         let counted = queries.clone();
         let server = tokio::spawn(async move {
             while let Some(incoming) = harness.incoming.recv().await {
-                let replies = replies.clone();
+                let hints = hints.clone();
                 let queries = counted.clone();
                 tokio::spawn(async move {
                     while let Some((mut send, mut recv)) = incoming.conn.accept_bi().await {
-                        let replies = replies.clone();
+                        let hints = hints.clone();
                         let queries = queries.clone();
                         tokio::spawn(async move {
                             // The dialler's own recon/1 stream carries no request.
@@ -265,24 +265,15 @@ impl DelayedDirectory {
                                 TAG_RECON => return,
                                 tag => assert_eq!(tag, TAG_DHT),
                             }
-                            let op = recv_u8(&mut recv).await.unwrap();
-                            let _key = recv_exact_key(&mut recv).await.unwrap();
-                            match op {
-                                OP_FIND_NODE => send_u8(&mut send, 0).await.unwrap(),
-                                OP_PROVIDER_GET => {
-                                    queries.fetch_add(1, Ordering::Relaxed);
-                                    match delay {
-                                        Some(delay) => tokio::time::sleep(delay).await,
-                                        None => std::future::pending::<()>().await,
-                                    }
-                                    send_u8(&mut send, replies.len() as u8).await.unwrap();
-                                    for (provider, token) in replies {
-                                        send_hash(&mut send, &provider).await.unwrap();
-                                        send_hash(&mut send, &token).await.unwrap();
-                                    }
-                                }
-                                other => panic!("unexpected directory opcode {other:#x}"),
+                            assert_eq!(recv_u8(&mut recv).await.unwrap(), OP_FIND_VALUE);
+                            queries.fetch_add(1, Ordering::Relaxed);
+                            match delay {
+                                Some(delay) => tokio::time::sleep(delay).await,
+                                None => std::future::pending::<()>().await,
                             }
+                            serve_find_value(&mut recv, &mut send, |_| Vec::new(), |_| hints)
+                                .await
+                                .unwrap();
                             send.shutdown().await.unwrap();
                         });
                     }
@@ -297,17 +288,24 @@ impl DelayedDirectory {
     }
 }
 
-impl Drop for DelayedDirectory {
+impl Drop for ScriptedReplica {
     fn drop(&mut self) {
         self.server.abort();
     }
 }
 
+impl<T: Transport> ProviderClient<T> {
+    /// The hints one peer's FIND_VALUE returns for `key`.
+    async fn hints(&self, peer: PeerId, key: ProviderKey) -> Vec<(PeerId, ProviderToken)> {
+        self.find_value(peer, key).await.unwrap().1
+    }
+}
+
 #[tokio::test(start_paused = true)]
-async fn verified_provider_fetch_does_not_wait_for_a_stalled_directory_reply() {
+async fn verified_provider_fetch_does_not_wait_for_a_stalled_lookup_reply() {
     let _guard = crate::protocol::exact_blob_receive_test_guard();
     let mut fixture = Fixture::new(false);
-    let slow = DelayedDirectory::new(
+    let slow = ScriptedReplica::new(
         &fixture.net,
         &SigningKey::from_bytes(&[133; 32]),
         Vec::new(),
@@ -316,11 +314,7 @@ async fn verified_provider_fetch_does_not_wait_for_a_stalled_directory_reply() {
     *fixture.client.candidates.lock().unwrap() =
         RoutingTable::new(fixture.client.my_id, [slow.peer, fixture.provider]);
     for peer in [slow.peer, fixture.provider] {
-        fixture
-            .client
-            .find_node(peer, blob_locator(fixture.hash))
-            .await
-            .unwrap();
+        fixture.client.connections.connect(peer).await.unwrap();
     }
 
     let budget = Duration::from_secs(2);
@@ -332,7 +326,7 @@ async fn verified_provider_fetch_does_not_wait_for_a_stalled_directory_reply() {
             .await
             .map(|blob| blob.bytes),
         Some(fixture.bytes.clone()),
-        "a verified provider is usable before unrelated directory replies complete",
+        "a verified provider is usable before unrelated lookup replies complete",
     );
     assert!(started.elapsed() < budget);
     assert_eq!(slow.queries.load(Ordering::Relaxed), 1);
@@ -341,20 +335,20 @@ async fn verified_provider_fetch_does_not_wait_for_a_stalled_directory_reply() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn later_directory_hint_recovers_from_an_unavailable_first_provider() {
-    later_directory_hint_case(false).await;
+async fn later_lookup_hint_recovers_from_an_unavailable_first_provider() {
+    later_lookup_hint_case(false).await;
 }
 
 #[tokio::test(start_paused = true)]
-async fn later_directory_hint_recovers_from_a_stalled_first_provider() {
-    later_directory_hint_case(true).await;
+async fn later_lookup_hint_recovers_from_a_stalled_first_provider() {
+    later_lookup_hint_case(true).await;
 }
 
-async fn later_directory_hint_case(stalled: bool) {
+async fn later_lookup_hint_case(stalled: bool) {
     let _guard = crate::protocol::exact_blob_receive_test_guard();
     let mut fixture = Fixture::new(false);
     let mut missing = RecoveryNode::new(&fixture.net, &SigningKey::from_bytes(&[134; 32]), None);
-    let first = DelayedDirectory::new(
+    let first = ScriptedReplica::new(
         &fixture.net,
         &SigningKey::from_bytes(&[135; 32]),
         vec![(
@@ -363,7 +357,7 @@ async fn later_directory_hint_case(stalled: bool) {
         )],
         Some(Duration::ZERO),
     );
-    let later = DelayedDirectory::new(
+    let later = ScriptedReplica::new(
         &fixture.net,
         &SigningKey::from_bytes(&[136; 32]),
         vec![(
@@ -415,10 +409,10 @@ async fn later_directory_hint_case(stalled: bool) {
 }
 
 #[tokio::test(start_paused = true)]
-async fn progressive_fetch_distinguishes_empty_directory_from_incomplete_lookup() {
+async fn progressive_fetch_distinguishes_an_empty_lookup_from_an_incomplete_one() {
     let _guard = crate::protocol::exact_blob_receive_test_guard();
     let mut fixture = Fixture::new(false);
-    let empty = DelayedDirectory::new(
+    let empty = ScriptedReplica::new(
         &fixture.net,
         &SigningKey::from_bytes(&[137; 32]),
         Vec::new(),
@@ -434,20 +428,29 @@ async fn progressive_fetch_distinguishes_empty_directory_from_incomplete_lookup(
             .unwrap()
             .is_none()
     );
-    let stalled = DelayedDirectory::new(
+    // A replica whose reply never comes, beside one that answered empty: the
+    // lookup window closes on it, and its hints are unknown.
+    let stalled = ScriptedReplica::new(
         &fixture.net,
         &SigningKey::from_bytes(&[138; 32]),
         Vec::new(),
         None,
     );
+    fixture
+        .client
+        .connections
+        .connect(stalled.peer)
+        .await
+        .unwrap();
     *fixture.client.candidates.lock().unwrap() =
-        RoutingTable::new(fixture.client.my_id, [stalled.peer]);
+        RoutingTable::new(fixture.client.my_id, [empty.peer, stalled.peer]);
     let error = fixture
         .client
         .fetch_blob(fixture.hash, None)
         .await
         .unwrap_err();
     assert!(error.to_string().contains("DHT provider lookup incomplete"));
+    assert_eq!(empty.queries.load(Ordering::Relaxed), 2);
     assert_eq!(stalled.queries.load(Ordering::Relaxed), 1);
     assert_eq!(fixture.blob_reads.load(Ordering::Relaxed), 0);
     fixture.assert_no_control_effects();
@@ -458,7 +461,7 @@ async fn progressive_fetch_preserves_unavailable_and_failed_provider_outcomes() 
     let _guard = crate::protocol::exact_blob_receive_test_guard();
     let mut fixture = Fixture::new(false);
     let mut absent = RecoveryNode::new(&fixture.net, &SigningKey::from_bytes(&[139; 32]), None);
-    let directory = DelayedDirectory::new(
+    let directory = ScriptedReplica::new(
         &fixture.net,
         &SigningKey::from_bytes(&[140; 32]),
         vec![(absent.peer, blob_provider_token(fixture.hash, absent.peer))],
@@ -489,7 +492,7 @@ async fn progressive_fetch_does_not_dial_an_invalid_provider_hint() {
     let mut fixture = Fixture::new(false);
     let mut token = blob_provider_token(fixture.hash, fixture.provider);
     token[0] ^= 1;
-    let directory = DelayedDirectory::new(
+    let directory = ScriptedReplica::new(
         &fixture.net,
         &SigningKey::from_bytes(&[141; 32]),
         vec![(fixture.provider, token)],
@@ -657,7 +660,8 @@ async fn cancelled_discovered_provider_dial_leaves_a_same_client_retry_usable() 
     // provider's dial rather than the bootstrap lookup.
     fixture
         .client
-        .find_node(directory.peer, blob_locator(fixture.hash))
+        .connections
+        .connect(directory.peer)
         .await
         .unwrap();
     fixture.net.stall_dials(fixture.provider);
@@ -720,7 +724,8 @@ async fn alternate_provider_success_cancels_a_stalled_discovered_dial() {
         RoutingTable::new(fixture.client.my_id, [directory.peer]);
     fixture
         .client
-        .find_node(directory.peer, blob_locator(fixture.hash))
+        .connections
+        .connect(directory.peer)
         .await
         .unwrap();
 
@@ -1008,7 +1013,8 @@ async fn repeated_directory_gossip_does_not_erase_recent_local_route_failure() {
     // explain any subsequent full background routing window.
     fixture
         .client
-        .find_node(fixture.provider, key)
+        .connections
+        .connect(fixture.provider)
         .await
         .unwrap();
     let stalled_key = SigningKey::from_bytes(&[93; 32]);
@@ -1016,7 +1022,7 @@ async fn repeated_directory_gossip_does_not_erase_recent_local_route_failure() {
     let _stalled_harness = fixture.net.join(&stalled_key);
     fixture.net.stall_dials(stalled);
     // The directory still has old direct-liveness evidence, so its production
-    // FIND_NODE handler re-advertises this unreachable route on every reply.
+    // FIND_VALUE handler re-advertises this unreachable route on every reply.
     assert!(
         fixture
             .provider_routes
@@ -1056,11 +1062,18 @@ async fn background_publication_retries_past_a_stale_issued_batch() {
     // identities closer to this exact locator occupy the whole first batch.
     fixture
         .client
-        .find_node(fixture.provider, key)
+        .connections
+        .connect(fixture.provider)
         .await
         .unwrap();
-    let stale_keys: Vec<_> = (0u8..=255)
-        .map(|byte| SigningKey::from_bytes(&[byte; 32]))
+    // The provider is close to this locator, so closer identities are rare:
+    // search enough seeds to find three.
+    let stale_keys: Vec<_> = (0u64..1 << 16)
+        .map(|index| {
+            let mut seed = [0; 32];
+            seed[..8].copy_from_slice(&index.to_be_bytes());
+            SigningKey::from_bytes(&seed)
+        })
         .filter(|signer| {
             let peer = signer.verifying_key().to_bytes();
             peer != fixture.client.my_id
@@ -1128,7 +1141,7 @@ async fn background_publication_retries_past_a_stale_issued_batch() {
             .topology_recovered
     );
     assert_eq!(publisher.next(retry_at), None);
-    let advertised = fixture.client.get(fixture.provider, key).await.unwrap();
+    let advertised = fixture.client.hints(fixture.provider, key).await;
     assert!(
         advertised.contains(&(fixture.client.my_id, token)),
         "the directory's own resident hint is not evidence of our remote publication"
@@ -1159,7 +1172,7 @@ async fn resident_self_hint_needs_no_lease_or_payload_read() {
     );
 
     assert_eq!(
-        fixture.client.get(fixture.provider, key).await.unwrap(),
+        fixture.client.hints(fixture.provider, key).await,
         vec![expected]
     );
     assert_eq!(fixture.blob_reads.load(Ordering::Relaxed), 0);
@@ -1197,32 +1210,18 @@ async fn self_hint_requires_a_present_serving_snapshot() {
     let mut fixture = Fixture::new(false);
     let key = blob_locator(fixture.hash);
     let snapshot = fixture.provider_snapshot.send_replace(None);
-    assert!(
-        fixture
-            .client
-            .get(fixture.provider, key)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert!(fixture.client.hints(fixture.provider, key).await.is_empty());
 
     fixture.provider_snapshot.send_replace(snapshot);
     assert_eq!(
-        fixture.client.get(fixture.provider, key).await.unwrap(),
+        fixture.client.hints(fixture.provider, key).await,
         vec![(
             fixture.provider,
             blob_provider_token(fixture.hash, fixture.provider)
         )]
     );
     fixture.provider_snapshot.send_replace(None);
-    assert!(
-        fixture
-            .client
-            .get(fixture.provider, key)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert!(fixture.client.hints(fixture.provider, key).await.is_empty());
     assert_eq!(
         fixture.provider_directory.lock().unwrap().retained_counts(),
         (0, 0)
@@ -1238,7 +1237,7 @@ async fn self_hint_requires_a_present_serving_snapshot() {
         crate::clock::mono_now()
     ));
     assert_eq!(
-        fixture.client.get(fixture.provider, key).await.unwrap(),
+        fixture.client.hints(fixture.provider, key).await,
         vec![(foreign, token)]
     );
     assert_eq!(fixture.blob_reads.load(Ordering::Relaxed), 0);
@@ -1278,7 +1277,7 @@ async fn resident_self_hint_reserves_a_bounded_slot_and_deduplicates_self() {
     }
     // One uniformly chosen lease makes room for our own hint; the others
     // keep their peer-id order.
-    let reply = fixture.client.get(fixture.provider, key).await.unwrap();
+    let reply = fixture.client.hints(fixture.provider, key).await;
     assert_eq!(reply.len(), crate::provider::MAX_PROVIDERS_PER_REPLY);
     assert_eq!(reply[0], own);
     assert!(reply[1..].windows(2).all(|pair| pair[0] < pair[1]));
@@ -1298,7 +1297,7 @@ async fn resident_self_hint_reserves_a_bounded_slot_and_deduplicates_self() {
             assert!(directory.put(key, *peer, *token, crate::clock::mono_now()));
         }
     }
-    let deduplicated = fixture.client.get(fixture.provider, key).await.unwrap();
+    let deduplicated = fixture.client.hints(fixture.provider, key).await;
     assert_eq!(deduplicated[0], own);
     assert_eq!(&deduplicated[1..], &foreign[..foreign.len() - 1]);
     assert_eq!(
@@ -1359,9 +1358,8 @@ async fn resident_descriptor_is_not_a_collection_participant_hint() {
     assert_eq!(
         fixture
             .client
-            .get(fixture.provider, blob_locator(handle.raw))
-            .await
-            .unwrap(),
+            .hints(fixture.provider, blob_locator(handle.raw))
+            .await,
         vec![(
             fixture.provider,
             blob_provider_token(handle.raw, fixture.provider)
@@ -1388,7 +1386,7 @@ async fn known_resident_outside_selected_dht_replicas_is_not_directly_probed() {
     let _guard = crate::protocol::exact_blob_receive_test_guard();
     let mut fixture = Fixture::new(false);
     let key = blob_locator(fixture.hash);
-    let closer_keys = (0u64..4096)
+    let closer_keys = (0u64..1 << 16)
         .map(|index| {
             let mut seed = [0; 32];
             seed[..8].copy_from_slice(&index.to_be_bytes());
@@ -1437,13 +1435,13 @@ async fn known_resident_outside_selected_dht_replicas_is_not_directly_probed() {
     // The holder is a known, connected, usable directory/provider. Only its
     // exclusion from the exact locator's replica set prevents its use below.
     assert_eq!(
-        fixture.client.get(fixture.provider, key).await.unwrap(),
+        fixture.client.hints(fixture.provider, key).await,
         vec![(
             fixture.provider,
             blob_provider_token(fixture.hash, fixture.provider)
         )]
     );
-    let replicas = fixture.client.lookup_replicas(key, None).await;
+    let replicas = fixture.client.lookup(key, None).await.0.replicas();
     assert_eq!(replicas.len(), K);
     assert!(!replicas.contains(&fixture.provider));
     assert!(
@@ -1526,11 +1524,7 @@ async fn zero_announcement_budget_still_answers_resident_self_hints() {
             );
             sender.clear_snapshot();
             assert!(
-                client
-                    .get(server_id, blob_locator(hash))
-                    .await
-                    .unwrap()
-                    .is_empty(),
+                client.hints(server_id, blob_locator(hash)).await.is_empty(),
                 "querying the self hint must not install a lease"
             );
             assert!(receiver.try_recv().is_none());
@@ -1700,5 +1694,97 @@ async fn local_receive_saturation_preserves_the_provider_connection() {
             .dial_count(fixture.client.my_id, fixture.provider),
         1
     );
+    fixture.assert_no_control_effects();
+}
+
+#[tokio::test(start_paused = true)]
+async fn provider_lookup_keeps_only_hints_whose_token_proves_the_identity() {
+    let fixture = Fixture::new(false);
+    let identity = *blake3::hash(b"provider lookup identity").as_bytes();
+    let honest = SigningKey::from_bytes(&[142; 32])
+        .verifying_key()
+        .to_bytes();
+    let forger = SigningKey::from_bytes(&[143; 32])
+        .verifying_key()
+        .to_bytes();
+    let mut forged = blob_provider_token(identity, forger);
+    forged[0] ^= 1;
+    // Neither a corrupted token nor one valid for another identity proves
+    // that the forger knows this one.
+    let forgeries = vec![
+        (forger, forged),
+        (forger, blob_provider_token(fixture.hash, forger)),
+    ];
+    let mixed = ScriptedReplica::new(
+        &fixture.net,
+        &SigningKey::from_bytes(&[144; 32]),
+        [(honest, blob_provider_token(identity, honest))]
+            .into_iter()
+            .chain(forgeries.iter().copied())
+            .collect(),
+        Some(Duration::ZERO),
+    );
+    let forged_only = ScriptedReplica::new(
+        &fixture.net,
+        &SigningKey::from_bytes(&[145; 32]),
+        forgeries,
+        Some(Duration::ZERO),
+    );
+    for (replica, expected) in [(&mixed, vec![honest]), (&forged_only, Vec::new())] {
+        *fixture.client.candidates.lock().unwrap() =
+            RoutingTable::new(fixture.client.my_id, [replica.peer]);
+        assert_eq!(
+            fixture
+                .client
+                .find_key(blob_locator(identity), blob_provider_token, identity, None)
+                .await
+                .unwrap(),
+            expected,
+            "forged hints alone are a plain miss, not a failed lookup"
+        );
+        assert_eq!(replica.queries.load(Ordering::Relaxed), 1);
+    }
+    assert_eq!(fixture.net.dial_count(fixture.client.my_id, forger), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn own_directory_answers_once_we_stand_among_the_replicas() {
+    let _guard = crate::protocol::exact_blob_receive_test_guard();
+    let mut fixture = Fixture::new(false);
+    let empty = ScriptedReplica::new(
+        &fixture.net,
+        &SigningKey::from_bytes(&[146; 32]),
+        Vec::new(),
+        Some(Duration::ZERO),
+    );
+    // The provider is no lookup candidate. Only the lease it installed here,
+    // as at any other replica of its key, names it.
+    *fixture.client.candidates.lock().unwrap() =
+        RoutingTable::new(fixture.client.my_id, [empty.peer]);
+    let key = blob_locator(fixture.hash);
+    assert!(fixture.client.providers.lock().unwrap().put(
+        key,
+        fixture.provider,
+        blob_provider_token(fixture.hash, fixture.provider),
+        crate::clock::mono_now(),
+    ));
+    assert_eq!(
+        fixture
+            .client
+            .fetch_blob(fixture.hash, None)
+            .await
+            .unwrap()
+            .map(|blob| blob.bytes),
+        Some(fixture.bytes.clone())
+    );
+    assert_eq!(
+        fixture
+            .client
+            .find_key(key, blob_provider_token, fixture.hash, None)
+            .await
+            .unwrap(),
+        [fixture.provider]
+    );
+    assert_eq!(empty.queries.load(Ordering::Relaxed), 2);
     fixture.assert_no_control_effects();
 }
