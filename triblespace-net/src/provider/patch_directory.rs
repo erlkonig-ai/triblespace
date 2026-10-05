@@ -239,15 +239,16 @@ fn same_state(reference: &ProviderDirectory, candidate: &PatchDirectory) {
 
 #[test]
 fn patch_directory_matches_capacity_renewal_expiry_and_removal() {
-    // Enough repeated providers on one locator to exercise the per-key limit,
-    // plus many other locators so bounded expiry can leave unrelated entries.
+    // Enough live providers on one locator to fill its stored cap, so
+    // newcomers must outrank a member, plus many other locators so bounded
+    // expiry can leave unrelated entries.
     let mut rng = StdRng::seed_from_u64(181);
     let locators: Vec<ProviderKey> = (0..128).map(|_| rng.r#gen()).collect();
-    let providers: Vec<PeerId> = (0..80).map(|_| rng.r#gen()).collect();
+    let providers: Vec<PeerId> = (0..160).map(|_| rng.r#gen()).collect();
     for capacity in [0, 1, 31, 64, 65, 512] {
         let local = rng.r#gen();
         let limits = DirectoryLimits {
-            lease: Duration::from_secs(20),
+            lease: Duration::from_secs(60),
             memberships: capacity,
         };
         let seed = rng.r#gen();
