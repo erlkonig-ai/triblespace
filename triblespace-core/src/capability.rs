@@ -193,11 +193,7 @@ impl<'a> CapabilityProofPrefix<'a> {
         self.proof.resource()
     }
     pub fn subject(self) -> VerifyingKey {
-        self.proof
-            .edges()
-            .nth(self.steps - 1)
-            .expect("prefix is nonempty")
-            .delegate
+        self.proof.edge(self.steps - 1).delegate
     }
     pub const fn step_count(self) -> usize {
         self.steps
@@ -450,24 +446,27 @@ impl CapabilityProof {
     fn edges(
         &self,
     ) -> impl ExactSizeIterator<Item = CapabilityProofEdge> + DoubleEndedIterator + '_ {
-        self.bytes[CAPABILITY_PROOF_HEADER_LEN..]
-            .chunks_exact(CAPABILITY_PROOF_EDGE_LEN)
-            .enumerate()
-            .map(|(step, edge)| CapabilityProofEdge {
-                capability: Inline::new(
-                    edge[..CAPABILITY_HANDLE_LEN]
-                        .try_into()
-                        .expect("fixed capability handle"),
-                ),
-                delegate: parse_key(&edge[CAPABILITY_HANDLE_LEN..EDGE_BODY_LEN])
-                    .expect("proof delegate was validated at construction"),
-                signature: Signature::from_bytes(
-                    edge[EDGE_BODY_LEN..].try_into().expect("fixed signature"),
-                ),
-                signature_offset: CAPABILITY_PROOF_HEADER_LEN
-                    + step * CAPABILITY_PROOF_EDGE_LEN
-                    + EDGE_BODY_LEN,
-            })
+        (0..self.step_count()).map(|step| self.edge(step))
+    }
+
+    /// Decode one edge alone. Iterator adapters decode every edge they skip,
+    /// so a single step must not go through [`Self::edges`].
+    fn edge(&self, step: usize) -> CapabilityProofEdge {
+        let start = CAPABILITY_PROOF_HEADER_LEN + step * CAPABILITY_PROOF_EDGE_LEN;
+        let edge = &self.bytes[start..start + CAPABILITY_PROOF_EDGE_LEN];
+        CapabilityProofEdge {
+            capability: Inline::new(
+                edge[..CAPABILITY_HANDLE_LEN]
+                    .try_into()
+                    .expect("fixed capability handle"),
+            ),
+            delegate: parse_key(&edge[CAPABILITY_HANDLE_LEN..EDGE_BODY_LEN])
+                .expect("proof delegate was validated at construction"),
+            signature: Signature::from_bytes(
+                edge[EDGE_BODY_LEN..].try_into().expect("fixed signature"),
+            ),
+            signature_offset: start + EDGE_BODY_LEN,
+        }
     }
 }
 
@@ -1029,6 +1028,10 @@ mod tests {
                 .map(|p| p.step_count())
                 .collect::<Vec<_>>(),
             [1, 2]
+        );
+        assert_eq!(
+            second.prefixes().map(|p| p.subject()).collect::<Vec<_>>(),
+            [middle.verifying_key(), leaf.verifying_key()]
         );
         assert_eq!(
             CapabilityProof::from_bytes(second.prefixes().next().unwrap().as_bytes()).unwrap(),
