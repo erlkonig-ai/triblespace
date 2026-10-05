@@ -557,15 +557,27 @@ pub struct SimConn {
 /// or rejoining an endpoint cannot reopen this connection. No driver task is
 /// needed: each half owns one cancellation-safe notification future.
 pub struct SimStream {
-    inner: DuplexStream,
+    /// Gone once this half reset or stopped its pipe; dropping it wakes the
+    /// other end, which then reads the code from `pipe`.
+    inner: Option<DuplexStream>,
+    pipe: Arc<Pipe>,
     closed: Arc<AtomicBool>,
     on_close: Pin<Box<tokio::sync::futures::OwnedNotified>>,
 }
 
+/// One direction of a stream, shared by its writing and its reading half.
+/// Each code is stored plus one, so zero means not set.
+#[derive(Default)]
+struct Pipe {
+    reset: AtomicU64,
+    stopped: AtomicU64,
+}
+
 impl SimStream {
-    fn new(inner: DuplexStream, connection: &SimConn) -> Self {
+    fn new(inner: DuplexStream, pipe: Arc<Pipe>, connection: &SimConn) -> Self {
         Self {
-            inner,
+            inner: Some(inner),
+            pipe,
             closed: connection.closed.clone(),
             // notify_waiters reaches futures created before the notification,
             // even before their first poll. Construct eagerly, not after the
@@ -574,14 +586,45 @@ impl SimStream {
         }
     }
 
-    fn poll_open(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
+    fn poll_open(&mut self, cx: &mut Context<'_>) -> io::Result<&mut DuplexStream> {
         if self.closed.load(Ordering::SeqCst) || self.on_close.as_mut().poll(cx).is_ready() {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionReset,
                 "simnet: connection reset",
             ));
         }
-        Ok(())
+        for (code, what) in [(&self.pipe.reset, "reset"), (&self.pipe.stopped, "stopped")] {
+            if let Some(code) = code.load(Ordering::SeqCst).checked_sub(1) {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    format!("simnet: stream {what} with code {code}"),
+                ));
+            }
+        }
+        // Both codes are stored before the half is dropped.
+        Ok(self
+            .inner
+            .as_mut()
+            .expect("an abandoned half recorded its code"))
+    }
+
+    fn abandon(&mut self, code: &AtomicU64, value: u32) {
+        let _ = code.compare_exchange(0, u64::from(value) + 1, Ordering::SeqCst, Ordering::SeqCst);
+        self.inner = None;
+    }
+}
+
+impl super::SendStream for SimStream {
+    fn reset(&mut self, code: u32) {
+        let pipe = self.pipe.clone();
+        self.abandon(&pipe.reset, code);
+    }
+}
+
+impl super::RecvStream for SimStream {
+    fn stop(&mut self, code: u32) {
+        let pipe = self.pipe.clone();
+        self.abandon(&pipe.stopped, code);
     }
 }
 
@@ -591,8 +634,7 @@ impl AsyncRead for SimStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        self.poll_open(cx)?;
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+        Pin::new(self.poll_open(cx)?).poll_read(cx, buf)
     }
 }
 
@@ -602,8 +644,7 @@ impl AsyncWrite for SimStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.poll_open(cx)?;
-        Pin::new(&mut self.inner).poll_write(cx, buf)
+        Pin::new(self.poll_open(cx)?).poll_write(cx, buf)
     }
 
     fn poll_write_vectored(
@@ -611,22 +652,21 @@ impl AsyncWrite for SimStream {
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        self.poll_open(cx)?;
-        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+        Pin::new(self.poll_open(cx)?).poll_write_vectored(cx, bufs)
     }
 
     fn is_write_vectored(&self) -> bool {
-        self.inner.is_write_vectored()
+        self.inner
+            .as_ref()
+            .is_some_and(DuplexStream::is_write_vectored)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.poll_open(cx)?;
-        Pin::new(&mut self.inner).poll_flush(cx)
+        Pin::new(self.poll_open(cx)?).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.poll_open(cx)?;
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        Pin::new(self.poll_open(cx)?).poll_shutdown(cx)
     }
 }
 
@@ -678,15 +718,16 @@ impl Conn for SimConn {
         // versa).
         let (local_send, remote_recv) = tokio::io::duplex(PIPE_CAPACITY);
         let (remote_send, local_recv) = tokio::io::duplex(PIPE_CAPACITY);
+        let (outbound, inbound) = (Arc::new(Pipe::default()), Arc::new(Pipe::default()));
         self.open_tx
             .send((
-                SimStream::new(remote_send, self),
-                SimStream::new(remote_recv, self),
+                SimStream::new(remote_send, inbound.clone(), self),
+                SimStream::new(remote_recv, outbound.clone(), self),
             ))
             .map_err(|_| anyhow::anyhow!("simnet: open_bi: remote end dropped"))?;
         Ok((
-            SimStream::new(local_send, self),
-            SimStream::new(local_recv, self),
+            SimStream::new(local_send, outbound, self),
+            SimStream::new(local_recv, inbound, self),
         ))
     }
 
@@ -983,6 +1024,46 @@ mod tests {
             matches!(accept.as_mut().poll(&mut context), Poll::Ready(None)),
             "closing must cancel even a mutex-blocked accept"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reset_and_stop_fail_only_their_own_stream() {
+        use crate::transport::{RecvStream as _, SendStream as _};
+
+        let (dialer, acceptor) = SimConn::pair([1; 32], [2; 32]);
+        let (mut c_send, mut c_recv) = dialer.open_bi().await.unwrap();
+        let (mut s_send, mut s_recv) = acceptor.accept_bi().await.unwrap();
+        // A parked read wakes on reset, and buffered bytes are not delivered.
+        s_send.write_all(b"discarded").await.unwrap();
+        let mut buf = [0; 16];
+        let mut read = Box::pin(c_recv.read(&mut buf));
+        assert!(matches!(futures::poll!(&mut read), Poll::Ready(Ok(9))));
+        drop(read);
+        let mut read = Box::pin(c_recv.read(&mut buf));
+        assert!(futures::poll!(&mut read).is_pending());
+        s_send.write_all(b"late").await.unwrap();
+        s_send.reset(7);
+        let error = read.await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+        assert!(error.to_string().contains("code 7"), "{error}");
+        assert!(s_send.write_all(b"after reset").await.is_err());
+
+        // Stop fails the remote writer, including one waiting for capacity.
+        c_send.write_all(&vec![b'x'; PIPE_CAPACITY]).await.unwrap();
+        let mut write = Box::pin(c_send.write_all(b"y"));
+        assert!(futures::poll!(&mut write).is_pending());
+        s_recv.stop(9);
+        let error = write.await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+        assert!(error.to_string().contains("code 9"), "{error}");
+
+        // The connection itself keeps carrying other streams.
+        let (mut send, _recv) = dialer.open_bi().await.unwrap();
+        let (_send, mut recv) = acceptor.accept_bi().await.unwrap();
+        send.write_all(b"ok").await.unwrap();
+        let mut bytes = [0; 2];
+        recv.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"ok");
     }
 
     #[tokio::test(start_paused = true)]

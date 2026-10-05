@@ -15,7 +15,7 @@ use tokio::time::Instant;
 
 use super::*;
 use crate::transport::sim::SimConn;
-use crate::transport::{Alpn, Conn, Transport};
+use crate::transport::{Alpn, Conn, RecvStream, SendStream, Transport};
 
 const REPEATS: usize = 16;
 const BODY_BYTES: usize = 223;
@@ -349,6 +349,18 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Tap<S> {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl<S: SendStream> SendStream for Tap<S> {
+    fn reset(&mut self, code: u32) {
+        self.inner.reset(code);
+    }
+}
+
+impl<S: RecvStream> RecvStream for Tap<S> {
+    fn stop(&mut self, code: u32) {
+        self.inner.stop(code);
     }
 }
 
