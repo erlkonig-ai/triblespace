@@ -1284,7 +1284,7 @@ async fn resident_self_hint_reserves_a_bounded_slot_and_deduplicates_self() {
         fixture.provider,
         blob_provider_token(fixture.hash, fixture.provider),
     );
-    let mut foreign = (1..=crate::provider::MAX_PROVIDERS_PER_KEY)
+    let mut foreign = (1..=crate::provider::MAX_PROVIDERS_PER_REPLY)
         .map(|byte| {
             (
                 SigningKey::from_bytes(&[byte as u8; 32])
@@ -1307,7 +1307,7 @@ async fn resident_self_hint_reserves_a_bounded_slot_and_deduplicates_self() {
         }
     }
     let reply = fixture.client.get(fixture.provider, key).await.unwrap();
-    assert_eq!(reply.len(), crate::provider::MAX_PROVIDERS_PER_KEY);
+    assert_eq!(reply.len(), crate::provider::MAX_PROVIDERS_PER_REPLY);
     assert_eq!(reply[0], own);
     assert_eq!(&reply[1..], &foreign[..foreign.len() - 1]);
     assert_eq!(

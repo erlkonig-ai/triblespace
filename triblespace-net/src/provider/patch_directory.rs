@@ -1,9 +1,10 @@
 //! A representation experiment, not another provider protocol.
 //!
 //! One segmented PATCH owns memberships, exact-key counts, and responsibility
-//! order. A second PATCH orders deadlines. Differential tests keep the current
-//! receiver-local TTL, bounded pruning, provider ordering, and eviction policy.
-//! Nothing here persists leases, changes trust, or changes live host behavior.
+//! and rank order. A second PATCH orders deadlines. Differential tests keep the
+//! current receiver-local TTL, bounded pruning, bottom-k sampling, and eviction
+//! policy. Nothing here persists leases, changes trust, or changes live host
+//! behavior.
 
 use super::*;
 
@@ -12,18 +13,25 @@ triblespace_core::key_schema!(MembershipOrder, MembershipSegments, 64, [0, 1]);
 
 struct PatchDirectory {
     local_id: PeerId,
-    // !(locator XOR local) | !provider: first key is farthest responsibility.
-    // XOR is bijective, so the first segment also identifies an exact locator.
-    members: PATCH<64, MembershipOrder, (Mono, ProviderToken)>,
+    salt: [u8; 32],
+    sampler: StdRng,
+    // !(locator XOR local) | !rank: the first key is the farthest locator's
+    // largest-ranked member, and a locator's first suffix is its own. XOR is
+    // bijective, so the first segment also identifies an exact locator. The
+    // rank hides the provider, so the value carries it.
+    members: PATCH<64, MembershipOrder, (PeerId, Mono, ProviderToken)>,
     // deadline | locator | provider preserves the old prune tie-breaking too.
     deadlines: PATCH<72>,
     limits: DirectoryLimits,
 }
 
 impl PatchDirectory {
-    fn new(local_id: PeerId, limits: DirectoryLimits) -> Self {
+    /// The salt is the sampler's first draw, as in [`ProviderDirectory`].
+    fn new(local_id: PeerId, limits: DirectoryLimits, mut sampler: StdRng) -> Self {
         Self {
             local_id,
+            salt: sampler.r#gen(),
+            sampler,
             members: PATCH::new(),
             deadlines: PATCH::new(),
             limits,
@@ -35,16 +43,20 @@ impl PatchDirectory {
     }
 
     fn key(&self, locator: ProviderKey, provider: PeerId) -> [u8; 64] {
+        let mut block = [0; 64];
+        block[..32].copy_from_slice(&locator);
+        block[32..].copy_from_slice(&provider);
+        let rank = blake3::keyed_hash(&self.salt, &block);
         let mut key = [0; 64];
         key[..32].copy_from_slice(&self.prefix(locator));
-        key[32..].copy_from_slice(&provider.map(|byte| !byte));
+        key[32..].copy_from_slice(&rank.as_bytes().map(|byte| !byte));
         key
     }
 
     fn decode(&self, key: [u8; 64]) -> (ProviderKey, PeerId) {
         (
             std::array::from_fn(|i| !key[i] ^ self.local_id[i]),
-            std::array::from_fn(|i| !key[32 + i]),
+            self.members.get(&key).unwrap().0,
         )
     }
 
@@ -63,9 +75,13 @@ impl PatchDirectory {
         )
     }
 
-    fn farthest(&self) -> Option<[u8; 64]> {
-        // Ordered descent, not an allocated ordered iterator for just one key.
-        let prefix = self.members.first_infix_range(&[], &[0; 32], &[255; 32])?;
+    fn stored_cap(&self) -> u64 {
+        ((self.limits.memberships as u64).saturating_sub(self.members.len())
+            / self.members.segmented_len(&[]).max(1))
+        .max(MAX_PROVIDERS_PER_REPLY as u64)
+    }
+
+    fn largest(&self, prefix: [u8; 32]) -> Option<[u8; 64]> {
         let suffix = self
             .members
             .first_infix_range(&prefix, &[0; 32], &[255; 32])?;
@@ -75,11 +91,17 @@ impl PatchDirectory {
         Some(key)
     }
 
+    fn farthest(&self) -> Option<[u8; 64]> {
+        // Ordered descent, not an allocated ordered iterator for just one key.
+        let prefix = self.members.first_infix_range(&[], &[0; 32], &[255; 32])?;
+        self.largest(prefix)
+    }
+
     fn remove(&mut self, key: [u8; 64]) {
-        let Some((deadline, _)) = self.members.get(&key).copied() else {
+        let Some((provider, deadline, _)) = self.members.get(&key).copied() else {
             return;
         };
-        let (locator, provider) = self.decode(key);
+        let (locator, _) = self.decode(key);
         self.deadlines
             .remove(&Self::deadline_key(deadline, locator, provider));
         self.members.remove(&key);
@@ -99,20 +121,27 @@ impl PatchDirectory {
         }
     }
 
-    fn prune_key(&mut self, locator: ProviderKey, now: Mono) {
+    fn fit(&mut self, locator: ProviderKey, now: Mono) -> bool {
         let prefix = self.prefix(locator);
+        if self.members.segmented_len(&prefix) < self.stored_cap() {
+            return false;
+        }
         let mut expired = Vec::new();
         self.members.infixes(&prefix, |suffix: &[u8; 32]| {
             let mut key = [0; 64];
             key[..32].copy_from_slice(&prefix);
             key[32..].copy_from_slice(suffix);
-            if self.members.get(&key).unwrap().0 <= now {
+            if self.members.get(&key).unwrap().1 <= now {
                 expired.push(key);
             }
         });
         for key in expired {
             self.remove(key);
         }
+        while self.members.segmented_len(&prefix) > self.stored_cap() {
+            self.remove(self.largest(prefix).unwrap());
+        }
+        self.members.segmented_len(&prefix) >= self.stored_cap()
     }
 
     fn put(
@@ -123,28 +152,29 @@ impl PatchDirectory {
         now: Mono,
     ) -> bool {
         self.prune(now);
+        let full = self.fit(locator, now);
         let key = self.key(locator, provider);
-        if let Some((old, _)) = self.members.get(&key).copied() {
+        if let Some((_, old, _)) = self.members.get(&key).copied() {
             self.deadlines
                 .remove(&Self::deadline_key(old, locator, provider));
-        } else {
-            self.prune_key(locator, now);
-            if self.members.segmented_len(&self.prefix(locator)) >= MAX_PROVIDERS_PER_KEY as u64 {
+        } else if full {
+            let largest = self.largest(self.prefix(locator)).unwrap();
+            if key <= largest {
                 return false;
             }
-            if self.members.len() >= self.limits.memberships as u64 {
-                let Some(farthest) = self.farthest() else {
-                    return false;
-                };
-                if key <= farthest {
-                    return false;
-                }
-                self.remove(farthest);
+            self.remove(largest);
+        } else if self.members.len() >= self.limits.memberships as u64 {
+            let Some(farthest) = self.farthest() else {
+                return false;
+            };
+            if key <= farthest {
+                return false;
             }
+            self.remove(farthest);
         }
         let deadline = now + self.limits.lease;
         self.members
-            .replace(&PatchEntry::with_value(&key, (deadline, token)));
+            .replace(&PatchEntry::with_value(&key, (provider, deadline, token)));
         self.deadlines.insert(&PatchEntry::new(&Self::deadline_key(
             deadline, locator, provider,
         )));
@@ -153,19 +183,27 @@ impl PatchDirectory {
 
     fn get(&mut self, locator: ProviderKey, now: Mono) -> Vec<(PeerId, ProviderToken)> {
         self.prune(now);
+        self.fit(locator, now);
         let prefix = self.prefix(locator);
-        let mut result = Vec::with_capacity(self.members.segmented_len(&prefix) as usize);
+        let mut live = Vec::with_capacity(self.members.segmented_len(&prefix) as usize);
         self.members.infixes(&prefix, |suffix: &[u8; 32]| {
             let mut key = [0; 64];
             key[..32].copy_from_slice(&prefix);
             key[32..].copy_from_slice(suffix);
-            let (deadline, token) = self.members.get(&key).unwrap();
+            let (provider, deadline, token) = self.members.get(&key).unwrap();
             if *deadline > now {
-                result.push((suffix.map(|byte| !byte), *token));
+                live.push((*provider, *token));
             }
         });
-        result.sort_unstable_by_key(|entry| entry.0);
-        result
+        live.sort_unstable_by_key(|entry| entry.0);
+        if live.len() > MAX_PROVIDERS_PER_REPLY {
+            live = live
+                .choose_multiple(&mut self.sampler, MAX_PROVIDERS_PER_REPLY)
+                .copied()
+                .collect();
+            live.sort_unstable_by_key(|entry| entry.0);
+        }
+        live
     }
 }
 
@@ -174,7 +212,10 @@ fn same_state(reference: &ProviderDirectory, candidate: &PatchDirectory) {
     let members = candidate
         .members
         .iter()
-        .map(|key| (candidate.decode(*key), *candidate.members.get(key).unwrap()))
+        .map(|key| {
+            let (_, deadline, token) = *candidate.members.get(key).unwrap();
+            (candidate.decode(*key), (deadline, token))
+        })
         .collect::<BTreeMap<_, _>>();
     assert_eq!(reference.memberships, members);
     let deadlines = reference
@@ -187,9 +228,9 @@ fn same_state(reference: &ProviderDirectory, candidate: &PatchDirectory) {
     assert_eq!(deadlines, candidate.deadlines.iter().copied().collect());
     assert_eq!(candidate.members.len(), candidate.deadlines.len());
     let farthest = reference
-        .responsibility
+        .ranked
         .last()
-        .map(|(_, locator, provider)| (*locator, *provider));
+        .map(|(distance, _, provider)| (reference.distance(*distance), *provider));
     assert_eq!(
         farthest,
         candidate.farthest().map(|key| candidate.decode(key))
@@ -198,8 +239,6 @@ fn same_state(reference: &ProviderDirectory, candidate: &PatchDirectory) {
 
 #[test]
 fn patch_directory_matches_capacity_renewal_expiry_and_removal() {
-    use rand::rngs::StdRng;
-    use rand::{Rng, SeedableRng};
     // Enough repeated providers on one locator to exercise the per-key limit,
     // plus many other locators so bounded expiry can leave unrelated entries.
     let mut rng = StdRng::seed_from_u64(181);
@@ -211,11 +250,12 @@ fn patch_directory_matches_capacity_renewal_expiry_and_removal() {
             lease: Duration::from_secs(20),
             memberships: capacity,
         };
+        let seed = rng.r#gen();
         let mut reference = ProviderDirectory {
             limits,
-            ..ProviderDirectory::new(local)
+            ..ProviderDirectory::with_sampler(local, StdRng::seed_from_u64(seed))
         };
-        let mut candidate = PatchDirectory::new(local, limits);
+        let mut candidate = PatchDirectory::new(local, limits, StdRng::seed_from_u64(seed));
         let mut now = crate::clock::mono_now();
         for step in 0..4000 {
             let locator = locators[if step % 3 == 0 {
@@ -255,9 +295,9 @@ fn patch_directory_keeps_exact_prune_ties_and_full_key_renewal() {
     };
     let mut reference = ProviderDirectory {
         limits,
-        ..ProviderDirectory::new(local)
+        ..ProviderDirectory::with_sampler(local, StdRng::seed_from_u64(182))
     };
-    let mut candidate = PatchDirectory::new(local, limits);
+    let mut candidate = PatchDirectory::new(local, limits, StdRng::seed_from_u64(182));
     let now = crate::clock::mono_now();
     for locator in [[0; 32], [1; 32], [2; 32]] {
         for byte in 0..64 {
@@ -265,12 +305,17 @@ fn patch_directory_keeps_exact_prune_ties_and_full_key_renewal() {
             assert!(candidate.put(locator, [byte; 32], [byte; 32], now));
         }
     }
-    assert!(!reference.put([1; 32], [65; 32], [65; 32], now));
-    assert!(!candidate.put([1; 32], [65; 32], [65; 32], now));
-    let later = now + Duration::from_secs(1);
-    assert!(reference.put([1; 32], [32; 32], [255; 32], later));
-    assert!(candidate.put([1; 32], [32; 32], [255; 32], later));
-    same_state(&reference, &candidate);
+    // Each key is at its stored cap: newcomers must outrank a member, and a
+    // renewal keeps its place.
+    for (provider, at) in [(65, now), (32, now + Duration::from_secs(1))] {
+        for locator in [[0; 32], [1; 32]] {
+            assert_eq!(
+                reference.put(locator, [provider; 32], [255; 32], at),
+                candidate.put(locator, [provider; 32], [255; 32], at)
+            );
+            same_state(&reference, &candidate);
+        }
+    }
     let expired = now + Duration::from_secs(10);
     assert_eq!(
         reference.get([2; 32], expired),
@@ -368,7 +413,7 @@ fn patch_directory_scale_probe() {
         }};
     }
     match mode.as_str() {
-        "patch" => measure!(PatchDirectory::new(local, limits)),
+        "patch" => measure!(PatchDirectory::new(local, limits, StdRng::seed_from_u64(0))),
         "btree" => measure!(ProviderDirectory {
             limits,
             ..ProviderDirectory::new(local)

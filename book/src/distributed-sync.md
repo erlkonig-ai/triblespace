@@ -408,8 +408,21 @@ already-installed, snapshot-coherent L→H index. If L is resident there, it
 returns its own endpoint-bound token without waiting for a `PROVIDER_PUT`.
 This deliberately extends the old lease-only answer: one reply slot is reserved
 for the resident self hint, any stored self entry is deduplicated, and at most
-63 other live leases follow in their existing deterministic peer-ID order.
-Without a resident self hint, the usual limit remains 64 leases.
+63 other live leases follow in peer-ID order. Without a resident self hint, the
+usual limit remains 64 leases.
+
+Each directory node keeps a bottom-k sample of every key's publishers rather
+than its first arrivals. It ranks each (key, provider) pair by BLAKE3 keyed
+with a salt it draws once at start-up and never sends. A key may store an even
+share of the remaining membership budget, never less than one 64-entry reply.
+A newcomer to a key at that cap is kept only if it ranks below the key's
+largest-ranked member, which it replaces. A shrinking cap trims a key's
+largest-ranked members when the key is next touched. A renewal keeps its place.
+Arrival order therefore does not decide membership, renewals cause no churn,
+and the K replicas of a key keep independent samples. Because the salt is
+secret, a publisher cannot choose identities that rank well. A key storing
+more than 64 members answers each request with a fresh uniform sample of 64,
+so repeated requests reach every member.
 
 This is a query-time answer, not a new lease or publication attempt. It reads
 no payload, creates no WANT or collection authority, and still works with a
@@ -1263,12 +1276,14 @@ and field meanings are pinned in `triblespace-net/src/telemetry.rs`.
 ## Directory representation experiment
 
 The live receiver-local `ProviderDirectory` uses four BTree indexes: membership
-values, providers by exact locator, expiry order, and XOR responsibility order.
-`provider/patch_directory.rs` is a **test-only** alternative with two PATCHes:
+values, member counts by exact locator, expiry order, and XOR responsibility
+then rank order. `provider/patch_directory.rs` is a **test-only** alternative
+with two PATCHes:
 
-- `!(locator XOR local_endpoint) | !provider`, segmented `32 | 32`, owns the
-  deadline/token value. Segment counts answer membership and exact-locator
-  cardinalities; the first ordered key identifies the farthest responsibility.
+- `!(locator XOR local_endpoint) | !rank`, segmented `32 | 32`, owns the
+  provider/deadline/token value. Segment counts answer membership and
+  exact-locator cardinalities; the first ordered key identifies the farthest
+  responsibility's largest-ranked member, and a locator's first suffix its own.
 - `deadline_ns | locator | provider` orders expiry. Keeping the original
   locator/provider order here preserves tie-breaking under the bounded prune
   budget, not merely the eventual set of live results.

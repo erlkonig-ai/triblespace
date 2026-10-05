@@ -403,10 +403,10 @@ pub async fn op_provider_get<C: Conn>(conn: &C, key: &RawHash) -> Result<Vec<(Ra
         .await
         .map_err(|error| anyhow!("finish: {error}"))?;
     let count = recv_u8(&mut recv).await? as usize;
-    if count > crate::provider::MAX_PROVIDERS_PER_KEY {
+    if count > crate::provider::MAX_PROVIDERS_PER_REPLY {
         return Err(anyhow!(
             "provider-get response has {count} entries; limit is {}",
-            crate::provider::MAX_PROVIDERS_PER_KEY
+            crate::provider::MAX_PROVIDERS_PER_REPLY
         ));
     }
     let mut providers = Vec::with_capacity(count);
