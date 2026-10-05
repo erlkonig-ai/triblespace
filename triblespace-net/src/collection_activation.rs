@@ -8,6 +8,8 @@
 //! collection's held-blob set, without disclosing those handles.
 //! The authorization projection contains byte-valid proofs for exact C and its
 //! configured roots. Definition residency determines authority, not membership.
+//! It also indexes each proof's prefixes under the keys they name, so a
+//! subject's grants can be compared by digest and delivered to that subject.
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -43,10 +45,31 @@ const COLLECTION_REPAIR_ROOT_DOMAIN: &[u8] = b"triblespace.collection.repair-ove
 const COLLECTION_REPAIR_ROOT_VERSION: u32 = 3;
 
 type AuthorizationEvidencePatch = PATCH<64, IdentitySchema, CapabilityProof, Blake3Merkle>;
+/// Subject key | hash of the proof prefix that ends at that subject.
+type SubjectProofPatch = PATCH<64, IdentitySchema, CapabilityProof, Blake3Merkle>;
+
+/// Most subject-truncated proofs one proof exchange accepts.
+///
+/// One proof is at most
+/// [`MAX_CAPABILITY_PROOF_BYTES`](triblespace_core::capability::MAX_CAPABILITY_PROOF_BYTES)
+/// = 96 + 255 * 128 = 32,736 bytes, so an exchange carries at most
+/// 1,024 * 32,736 = 33,521,664 bytes, just under 32 MiB. A one-step grant is
+/// 224 bytes, so 1,024 of them are 224 KiB. READ and WRITE grants to one key
+/// for 130 collections are 260 proofs, which leaves four times that for
+/// quorum shares and longer chains. A subject holding more keeps its digests
+/// unequal.
+pub const MAX_PROOFS_PER_EXCHANGE: usize = 1024;
 
 fn evidence_key(collection: CollectionHandle, id: CapabilityProofId) -> [u8; 64] {
     let mut key = [0; 64];
     key[..32].copy_from_slice(&collection.raw);
+    key[32..].copy_from_slice(&id.raw);
+    key
+}
+
+fn subject_proof_key(subject: VerifyingKey, id: CapabilityProofId) -> [u8; 64] {
+    let mut key = [0; 64];
+    key[..32].copy_from_slice(subject.as_bytes());
     key[32..].copy_from_slice(&id.raw);
     key
 }
@@ -71,11 +94,17 @@ fn subject_prefixes(
 /// public observation and repair protocol expose only the selected resource
 /// prefix, never the enclosing index. This is currently a per-overlay index,
 /// not a shared global host inventory.
+///
+/// The same proofs are indexed again by subject: every prefix of a retained
+/// proof sits under the key it names, so the index for S holds exactly the
+/// chains that end at S. Its keys carry no collection, so overlays union
+/// into one host index without collisions.
 #[derive(Clone, Debug)]
 pub struct CollectionAuthorizationEvidencePatch {
     collection: CollectionHandle,
     descriptor: TribleSet,
     proofs: AuthorizationEvidencePatch,
+    subjects: SubjectProofPatch,
     reader: ResidentBlobReader,
 }
 
@@ -199,6 +228,32 @@ impl CollectionAuthorizationEvidencePatch {
 
     pub(crate) const fn patch(&self) -> &AuthorizationEvidencePatch {
         &self.proofs
+    }
+
+    /// Root and count of the retained prefixes that end at `subject`.
+    ///
+    /// Only proofs that passed [`Self::validate_proof`] are retained, each
+    /// with every prefix that names `subject`. Observations holding equal
+    /// proofs give equal digests, whatever their arrival order.
+    pub fn proof_digest(&self, subject: VerifyingKey) -> PatchSummary {
+        match self.subjects.merkle_node(subject.as_bytes()) {
+            Some(node) => PatchSummary::new(Some(node.digest()), node.leaf_count())
+                .expect("a retained subject prefix is nonempty"),
+            None => PatchSummary::new(None, 0).expect("an absent subject prefix is canonical"),
+        }
+    }
+
+    /// Enumerate the retained prefixes that end at `subject`, in hash order.
+    pub fn proofs_naming(&self, subject: VerifyingKey) -> impl Iterator<Item = &CapabilityProof> {
+        let subject = subject.to_bytes();
+        self.subjects
+            .iter_ordered()
+            .filter(move |key| key[..32] == subject)
+            .map(|key| {
+                self.subjects
+                    .get(key)
+                    .expect("an ordered subject-index key retains its proof")
+            })
     }
 
     pub(crate) fn prefix_summary(&self, prefix: &[u8]) -> Option<PatchSummary> {
@@ -793,6 +848,7 @@ fn canonical_authorization_evidence<R: BlobStoreGet + Clone + Send + 'static>(
         collection,
         descriptor,
         proofs: AuthorizationEvidencePatch::new(),
+        subjects: SubjectProofPatch::new(),
         reader: ResidentBlobReader::new(snapshot),
     };
     for proof in candidates {
@@ -806,6 +862,19 @@ fn canonical_authorization_evidence<R: BlobStoreGet + Clone + Send + 'static>(
                 return Err(CollectionAuthorizationEvidenceError::ProofIdCollision(id));
             }
             continue;
+        }
+        for (subject, prefix) in subject_prefixes(&proof) {
+            let id = prefix.id();
+            let key = subject_proof_key(subject, id);
+            if let Some(existing) = evidence.subjects.get(&key) {
+                if existing != &prefix {
+                    return Err(CollectionAuthorizationEvidenceError::ProofIdCollision(id));
+                }
+                continue;
+            }
+            evidence
+                .subjects
+                .insert(&PatchEntry::with_value(&key, prefix));
         }
         evidence.proofs.insert(&PatchEntry::with_value(&key, proof));
     }
@@ -2192,5 +2261,189 @@ mod tests {
                 .authorization_evidence()
                 .reader_is_admitted_by(key(27).verifying_key(), &[])
         );
+    }
+
+    fn by_id(mut proofs: Vec<CapabilityProof>) -> Vec<CapabilityProof> {
+        proofs.sort_by_key(|proof| proof.id().raw);
+        proofs
+    }
+
+    #[test]
+    fn subject_index_holds_each_prefix_under_the_key_it_names() {
+        let root = key(130);
+        let middle = key(131);
+        let leaf = key(132);
+        let other = key(133);
+        let collection = Inline::new([134; 32]);
+        let custom = Inline::new([135; 32]);
+        // `middle` is named twice: granted by `root`, then self-delegated.
+        let first = root_proof(&root, &middle, scope(custom, collection));
+        let again = first
+            .delegate(&middle, custom, middle.verifying_key())
+            .unwrap();
+        let chain = again
+            .delegate(&middle, custom, leaf.verifying_key())
+            .unwrap();
+        let unrelated = root_proof(&root, &other, scope(custom, collection));
+        let evidence = canonical_authorization_evidence(
+            &definitions(),
+            collection,
+            policy_facts(CollectionPolicy::new(
+                AdmissionPolicy::direct(root.verifying_key()),
+                AdmissionPolicy::Open,
+            )),
+            [chain.clone(), unrelated.clone()],
+        )
+        .unwrap();
+        assert_eq!(evidence.len(), 2);
+        for (subject, expected) in [
+            (&middle, by_id(vec![first, again])),
+            (&leaf, vec![chain.clone()]),
+            (&other, vec![unrelated.clone()]),
+        ] {
+            let subject = subject.verifying_key();
+            let naming = evidence.proofs_naming(subject).cloned().collect::<Vec<_>>();
+            assert_eq!(naming, expected, "every prefix ending at the subject");
+            assert_eq!(
+                evidence.proof_digest(subject).leaf_count(),
+                naming.len() as u64
+            );
+            for prefix in naming {
+                assert_eq!(prefix.leaf_key(), subject);
+                evidence.validate_proof(&prefix).unwrap();
+            }
+        }
+        // Every leaf sits under the key its prefix ends at, keyed by its hash.
+        for raw in evidence.subjects.iter_ordered() {
+            let prefix = evidence.subjects.get(raw).unwrap();
+            assert_eq!(&raw[..32], prefix.leaf_key().as_bytes());
+            assert_eq!(&raw[32..], &prefix.id().raw);
+            assert!(
+                [&chain, &unrelated]
+                    .iter()
+                    .any(|proof| proof.as_bytes().starts_with(prefix.as_bytes()))
+            );
+        }
+        assert_eq!(evidence.subjects.len(), 4);
+        // A root names nobody by granting.
+        assert_eq!(evidence.proofs_naming(root.verifying_key()).count(), 0);
+        assert_eq!(
+            evidence.proof_digest(root.verifying_key()),
+            PatchSummary::new(None, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn stores_holding_equal_proofs_give_equal_subject_digests() {
+        let root = key(140);
+        let reader = key(141);
+        let writer = key(142);
+        let policy = CollectionPolicy::new(
+            AdmissionPolicy::direct(root.verifying_key()),
+            AdmissionPolicy::direct(root.verifying_key()),
+        );
+        let mut left = MemoryRepo::default();
+        let mut right = MemoryRepo::default();
+        let collection = left
+            .collection("subject-digest", policy.clone())
+            .unwrap()
+            .handle();
+        assert_eq!(
+            right.collection("subject-digest", policy).unwrap().handle(),
+            collection
+        );
+        let proofs = [
+            root_proof(&root, &reader, scope(read_capability(), collection)),
+            root_proof(&root, &reader, write_scope(collection)),
+            root_proof(&root, &writer, write_scope(collection)),
+        ];
+        for proof in &proofs {
+            store_proof(&mut left, proof.clone());
+        }
+        for proof in proofs.iter().rev().chain(&proofs[..1]) {
+            store_proof(&mut right, proof.clone());
+        }
+        let left = collection_repair_overlay(&left.snapshot().unwrap(), collection).unwrap();
+        let right = collection_repair_overlay(&right.snapshot().unwrap(), collection).unwrap();
+        for (subject, count) in [(&reader, 2), (&writer, 1)] {
+            let subject = subject.verifying_key();
+            let digest = left.authorization_evidence().proof_digest(subject);
+            assert_eq!(digest.leaf_count(), count);
+            assert_eq!(right.authorization_evidence().proof_digest(subject), digest);
+        }
+    }
+
+    #[test]
+    fn a_proof_held_on_one_side_only_leaves_subject_digests_unequal() {
+        let root = key(143);
+        let reader = key(144);
+        let later = key(145);
+        let collection = Inline::new([146; 32]);
+        let read = root_proof(&root, &reader, scope(read_capability(), collection));
+        let write = root_proof(&root, &reader, write_scope(collection));
+        let onward = read
+            .delegate(&reader, read_capability(), later.verifying_key())
+            .unwrap();
+        let observe = |proofs: &[&CapabilityProof]| {
+            canonical_authorization_evidence(
+                &definitions(),
+                collection,
+                policy_facts(CollectionPolicy::new(
+                    AdmissionPolicy::direct(root.verifying_key()),
+                    AdmissionPolicy::direct(root.verifying_key()),
+                )),
+                proofs.iter().map(|&proof| proof.clone()),
+            )
+            .unwrap()
+        };
+        let base = observe(&[&read]);
+        let extra = observe(&[&read, &write]);
+        let delegated = observe(&[&read, &onward]);
+        let [reader, later] = [reader, later].map(|key| key.verifying_key());
+        assert_ne!(base.proof_digest(reader), extra.proof_digest(reader));
+        assert_eq!(base.proof_digest(later), extra.proof_digest(later));
+        // Delegating onward leaves the delegator's own chain unchanged.
+        assert_eq!(base.proof_digest(reader), delegated.proof_digest(reader));
+        assert_ne!(base.proof_digest(later), delegated.proof_digest(later));
+    }
+
+    #[test]
+    fn proofs_failing_validation_are_not_counted_in_subject_digests() {
+        let root = key(147);
+        let subject = key(148);
+        let collection = Inline::new([149; 32]);
+        let valid = root_proof(&root, &subject, write_scope(collection));
+        let wrong_root = root_proof(&key(150), &subject, write_scope(collection));
+        let wrong_resource = root_proof(&root, &subject, write_scope(Inline::new([151; 32])));
+        let mut bytes =
+            root_proof(&root, &subject, scope(read_capability(), collection)).into_bytes();
+        *bytes.last_mut().unwrap() ^= 1;
+        let bad_signature = CapabilityProof::from_bytes(&bytes).unwrap();
+        let observe = |proofs: Vec<CapabilityProof>| {
+            canonical_authorization_evidence(
+                &definitions(),
+                collection,
+                policy_facts(CollectionPolicy::new(
+                    AdmissionPolicy::direct(root.verifying_key()),
+                    AdmissionPolicy::direct(root.verifying_key()),
+                )),
+                proofs,
+            )
+            .unwrap()
+        };
+        let counted = observe(vec![valid.clone()]);
+        let mixed = observe(vec![
+            wrong_root.clone(),
+            valid.clone(),
+            wrong_resource.clone(),
+            bad_signature.clone(),
+        ]);
+        for proof in [&wrong_root, &wrong_resource, &bad_signature] {
+            assert!(mixed.validate_proof(proof).is_err());
+        }
+        let subject = subject.verifying_key();
+        assert_eq!(mixed.proof_digest(subject), counted.proof_digest(subject));
+        assert_eq!(mixed.proof_digest(subject).leaf_count(), 1);
+        assert_eq!(mixed.proofs_naming(subject).collect::<Vec<_>>(), [&valid]);
     }
 }
