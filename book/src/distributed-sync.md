@@ -407,9 +407,24 @@ For an ordinary `PROVIDER_GET(L)`, the selected DHT node also consults its
 already-installed, snapshot-coherent L→H index. If L is resident there, it
 returns its own endpoint-bound token without waiting for a `PROVIDER_PUT`.
 This deliberately extends the old lease-only answer: one reply slot is reserved
-for the resident self hint, any stored self entry is deduplicated, and at most
-63 other live leases follow in their existing deterministic peer-ID order.
-Without a resident self hint, the usual limit remains 64 leases.
+for the resident self hint and any stored self entry is deduplicated. At most
+63 other live leases follow in peer-ID order; when 64 are available, one chosen
+uniformly at random makes room. Without a resident self hint, the usual limit
+remains 64 leases.
+
+Each directory node keeps a bottom-k sample of every key's publishers rather
+than its first arrivals. It ranks each (key, provider) pair by BLAKE3 keyed
+with a salt it draws once at start-up and never sends. A key may store an even
+share of the remaining membership budget, never less than one 64-entry reply
+and never more than 1024, which bounds what one request walks. A newcomer to
+a key at that cap is kept only if it ranks below the key's largest-ranked
+member, which it replaces. A shrinking cap trims a key's largest-ranked members
+when the key is next touched. A renewal keeps its place.
+Arrival order therefore does not decide membership, renewals cause no churn,
+and the K replicas of a key keep independent samples. Because the salt is
+secret, a publisher cannot choose identities that rank well. A key storing
+more than 64 members answers each request with a fresh uniform sample of 64,
+so repeated requests reach every member.
 
 This is a query-time answer, not a new lease or publication attempt. It reads
 no payload, creates no WANT or collection authority, and still works with a
@@ -944,6 +959,7 @@ bearer/DHT framing:
 | `PROVIDER_PUT` | `0x06` | renew this endpoint's opaque provider lease |
 | `PROVIDER_GET` | `0x07` | obtain bounded candidates for one opaque key |
 | `FIND_NODE` | `0x0C` | iterative XOR-DHT routing step |
+| `FIND_VALUE` | `0x0F` | `FIND_NODE` routes and `PROVIDER_GET` hints in one reply; served, never sent before the next generation |
 | `COLLECTION_REPAIR` | `0x0E` | READ-gated foundation-record, authorization-evidence and held-blob PATCH walks |
 
 Opcode `0x0D` is no longer served. Mixed-generation collection repair is not
@@ -1263,12 +1279,14 @@ and field meanings are pinned in `triblespace-net/src/telemetry.rs`.
 ## Directory representation experiment
 
 The live receiver-local `ProviderDirectory` uses four BTree indexes: membership
-values, providers by exact locator, expiry order, and XOR responsibility order.
-`provider/patch_directory.rs` is a **test-only** alternative with two PATCHes:
+values, member counts by exact locator, expiry order, and XOR responsibility
+then rank order. `provider/patch_directory.rs` is a **test-only** alternative
+with two PATCHes:
 
-- `!(locator XOR local_endpoint) | !provider`, segmented `32 | 32`, owns the
-  deadline/token value. Segment counts answer membership and exact-locator
-  cardinalities; the first ordered key identifies the farthest responsibility.
+- `!(locator XOR local_endpoint) | !rank`, segmented `32 | 32`, owns the
+  provider/deadline/token value. Segment counts answer membership and
+  exact-locator cardinalities; the first ordered key identifies the farthest
+  responsibility's largest-ranked member, and a locator's first suffix its own.
 - `deadline_ns | locator | provider` orders expiry. Keeping the original
   locator/provider order here preserves tie-breaking under the bounded prune
   budget, not merely the eventual set of live results.

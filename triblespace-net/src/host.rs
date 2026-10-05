@@ -2680,7 +2680,11 @@ impl<T: Transport> ProviderClient<T> {
                 anyhow::bail!("DHT provider lookup reached no remote replica");
             }
         }
-        Ok(canonical_provider_subset(key, providers))
+        Ok(canonical_provider_subset(
+            key,
+            providers,
+            crate::provider::MAX_PROVIDERS_PER_REPLY,
+        ))
     }
 
     async fn fetch_from_provider(
@@ -3053,18 +3057,19 @@ impl ProgressiveBlobProviders {
     /// Return whether this reply contributes an untried hint which survives
     /// ranking and the remaining total attempt budget.
     fn observe(&mut self, providers: impl IntoIterator<Item = PeerId>) -> bool {
+        let budget = crate::provider::MAX_PROVIDERS_PER_REPLY - self.attempted.len();
         let arrived = canonical_provider_subset(
             self.key,
             providers
                 .into_iter()
                 .filter(|peer| !self.attempted.contains(peer)),
+            budget,
         );
         self.pending = canonical_provider_subset(
             self.key,
             self.pending.drain(..).chain(arrived.iter().copied()),
+            budget,
         );
-        self.pending
-            .truncate(crate::provider::MAX_PROVIDERS_PER_KEY - self.attempted.len());
         arrived.iter().any(|peer| self.pending.contains(peer))
     }
 
@@ -3079,7 +3084,7 @@ impl ProgressiveBlobProviders {
     }
 }
 
-/// Canonical globally bounded union of the supplied replies for one exact key.
+/// Canonical union of the supplied replies for one exact key, bounded by `limit`.
 ///
 /// Each queried DHT replica independently bounds its response, but their union
 /// may still be `K` times larger. Ranking the deduplicated union by the same XOR
@@ -3089,6 +3094,7 @@ impl ProgressiveBlobProviders {
 fn canonical_provider_subset(
     key: ProviderKey,
     providers: impl IntoIterator<Item = PeerId>,
+    limit: usize,
 ) -> Vec<PeerId> {
     let mut providers = providers
         .into_iter()
@@ -3096,7 +3102,7 @@ fn canonical_provider_subset(
         .into_iter()
         .collect::<Vec<_>>();
     providers.sort_unstable_by(|left, right| crate::routing::distance_cmp(key, *left, *right));
-    providers.truncate(crate::provider::MAX_PROVIDERS_PER_KEY);
+    providers.truncate(limit);
     providers
 }
 
@@ -3257,28 +3263,7 @@ impl SnapshotHandler {
             }
             OP_PROVIDER_GET => {
                 let key = recv_exact_key(recv).await?;
-                let mut providers = self
-                    .providers
-                    .lock()
-                    .unwrap()
-                    .get(key, crate::clock::mono_now());
-                let resident = self
-                    .snapshot
-                    .borrow()
-                    .as_ref()
-                    .and_then(|snapshot| snapshot.bearer_handle(key));
-                if let Some(handle) = resident {
-                    // Answer from the same resident index as bearer GET, without
-                    // reading bytes or installing a lease. Reserve one slot for
-                    // our own current hint; stored advertisements cannot crowd
-                    // it out. The remaining leases retain their peer-id order.
-                    providers.retain(|(provider, _)| *provider != self.local_id);
-                    providers.truncate(crate::provider::MAX_PROVIDERS_PER_KEY - 1);
-                    providers.insert(
-                        0,
-                        (self.local_id, blob_provider_token(handle, self.local_id)),
-                    );
-                }
+                let providers = self.provider_hints(key);
                 send_u8(send, providers.len() as u8).await?;
                 for (provider, token) in providers {
                     send_hash(send, &provider).await?;
@@ -3294,6 +3279,16 @@ impl SnapshotHandler {
                     send_hash(send, &peer).await?;
                 }
             }
+            crate::protocol::OP_FIND_VALUE => {
+                let requester = peer.to_bytes();
+                let routes = |key| {
+                    let mut routes = self.candidates.lock().unwrap().closest_verified(key, K);
+                    routes.retain(|route| *route != requester);
+                    routes
+                };
+                let hints = |key| self.provider_hints(key);
+                crate::protocol::serve_find_value(recv, send, routes, hints).await?;
+            }
             _ => anyhow::bail!("unknown direct RPC operation {op:#x}"),
         }
         self.candidates
@@ -3301,6 +3296,21 @@ impl SnapshotHandler {
             .unwrap()
             .promote_authenticated(peer.to_bytes());
         Ok(())
+    }
+
+    /// The directory's hints for one exact key, led by our own current hint
+    /// when the blob is resident. Residency comes from the same index as
+    /// bearer GET, without reading bytes or installing a lease.
+    fn provider_hints(&self, key: ProviderKey) -> Vec<(PeerId, ProviderToken)> {
+        let resident = self
+            .snapshot
+            .borrow()
+            .as_ref()
+            .and_then(|snapshot| snapshot.bearer_handle(key));
+        self.providers
+            .lock()
+            .unwrap()
+            .hints(key, crate::clock::mono_now(), resident)
     }
 }
 
@@ -3324,6 +3334,7 @@ fn op_name(op: u8) -> &'static str {
         OP_PROVIDER_PUT => "PROVIDER_PUT",
         OP_PROVIDER_GET => "PROVIDER_GET",
         OP_FIND_NODE => "FIND_NODE",
+        crate::protocol::OP_FIND_VALUE => "FIND_VALUE",
         OP_COLLECTION_REPAIR => "COLLECTION_REPAIR",
         _ => "UNKNOWN",
     }
@@ -3331,6 +3342,9 @@ fn op_name(op: u8) -> &'static str {
 
 #[cfg(all(test, feature = "sim"))]
 mod acquisition_tests;
+
+#[cfg(test)]
+mod directory_rpc_tests;
 
 #[cfg(test)]
 mod observation_tests;
@@ -3343,7 +3357,7 @@ mod tests {
     use std::collections::{BTreeSet, HashMap};
 
     use crate::provider::{
-        MAX_PROVIDERS_PER_KEY, ProviderObservation, ProviderPublisher, ProviderPutResult,
+        MAX_PROVIDERS_PER_REPLY, ProviderObservation, ProviderPublisher, ProviderPutResult,
         PublicationResult,
     };
     use crate::routing::K;
@@ -4295,7 +4309,7 @@ mod tests {
         );
         assert_eq!(candidates.next(), Some(peer(1)));
         while candidates.next().is_some() {}
-        assert_eq!(candidates.attempted.len(), MAX_PROVIDERS_PER_KEY);
+        assert_eq!(candidates.attempted.len(), MAX_PROVIDERS_PER_REPLY);
         assert!(
             !candidates.observe([peer(2)]),
             "exhausted budget earns no body turn"
@@ -4324,11 +4338,11 @@ mod tests {
             candidates.observe((1..=64).map(peer));
             assert!(candidates.attempted.len() + candidates.pending.len() <= 64);
         }
-        assert_eq!(attempts.len(), crate::provider::MAX_PROVIDERS_PER_KEY);
+        assert_eq!(attempts.len(), MAX_PROVIDERS_PER_REPLY);
         assert!(attempts.contains(&early));
         assert_ne!(
             attempts,
-            canonical_provider_subset([0; 32], (1..=164).map(peer))
+            canonical_provider_subset([0; 32], (1..=164).map(peer), MAX_PROVIDERS_PER_REPLY)
                 .into_iter()
                 .collect::<BTreeSet<_>>(),
         );
@@ -4364,26 +4378,31 @@ mod tests {
         assert!(
             replies
                 .iter()
-                .all(|reply| reply.len() == MAX_PROVIDERS_PER_KEY)
+                .all(|reply| reply.len() == MAX_PROVIDERS_PER_REPLY)
         );
 
-        let forward = canonical_provider_subset(key, replies.iter().flatten().copied());
+        let forward = canonical_provider_subset(
+            key,
+            replies.iter().flatten().copied(),
+            MAX_PROVIDERS_PER_REPLY,
+        );
         let reversed = canonical_provider_subset(
             key,
             replies
                 .iter()
                 .rev()
                 .flat_map(|reply| reply.iter().rev().copied()),
+            MAX_PROVIDERS_PER_REPLY,
         );
         let mut expected_indices = (1..=16).chain(100..100 + K as u16 * 48).collect::<Vec<_>>();
         expected_indices.sort_unstable_by_key(|index| index ^ key_index);
-        expected_indices.truncate(MAX_PROVIDERS_PER_KEY);
+        expected_indices.truncate(MAX_PROVIDERS_PER_REPLY);
         let expected = expected_indices
             .into_iter()
             .map(provider)
             .collect::<Vec<_>>();
 
-        assert_eq!(forward.len(), MAX_PROVIDERS_PER_KEY);
+        assert_eq!(forward.len(), MAX_PROVIDERS_PER_REPLY);
         assert_eq!(forward, expected);
         assert_eq!(reversed, forward);
         assert_eq!(
