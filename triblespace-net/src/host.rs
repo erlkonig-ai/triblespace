@@ -3344,6 +3344,9 @@ fn op_name(op: u8) -> &'static str {
 mod acquisition_tests;
 
 #[cfg(test)]
+mod directory_rpc_tests;
+
+#[cfg(test)]
 mod observation_tests;
 
 #[cfg(all(test, feature = "sim"))]
