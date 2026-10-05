@@ -370,8 +370,9 @@ mod tests {
 
     #[test]
     fn prepared_compaction_refuses_source_append_before_copying() {
+        use triblespace_core::blob::encodings::utf8string::UTF8String;
         use triblespace_core::repo::pile::CarryEveryFrame;
-        use triblespace_core::repo::{BlobStorePut, StorageClose};
+        use triblespace_core::repo::BlobStorePut;
 
         let dir = tempfile::tempdir().unwrap();
         let source_path = dir.path().join("source.pile");
@@ -388,7 +389,9 @@ mod tests {
                 &mut CarryEveryFrame,
             )
             .unwrap();
-        source.put("appended after preparation").unwrap();
+        source
+            .put::<UTF8String, _>("appended after preparation")
+            .unwrap();
         let mut destination = Pile::open(&destination_path).unwrap();
         let error = compact_into(
             &mut source,
