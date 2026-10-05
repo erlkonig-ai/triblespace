@@ -337,7 +337,7 @@ where
     send_u8(send, BLOB_PROVIDER_PROOF).await?;
     send_hash(send, &provider_proof(handle, requester, provider)).await?;
     let supplied = recv_hash(recv).await?;
-    require_response_eof(recv).await?;
+    require_request_eof(recv).await?;
     let expected = requester_proof(handle, requester, provider);
     if !proof_matches(&supplied, &expected) {
         return Err(anyhow!("requester failed bearer proof"));
@@ -481,7 +481,7 @@ where
     W: AsyncWrite + Unpin,
 {
     let key = recv_hash(recv).await?;
-    require_response_eof(recv).await?;
+    require_request_eof(recv).await?;
     let routes = closest(key);
     let hints = hints(key);
     debug_assert!(routes.len() <= crate::routing::K);
@@ -512,6 +512,14 @@ async fn require_response_eof<R: AsyncRead + Unpin>(recv: &mut R) -> Result<()> 
     let mut trailing = [0; 1];
     if recv.read(&mut trailing).await? != 0 {
         return Err(anyhow!("response contains trailing bytes"));
+    }
+    Ok(())
+}
+
+async fn require_request_eof<R: AsyncRead + Unpin>(recv: &mut R) -> Result<()> {
+    let mut trailing = [0; 1];
+    if recv.read(&mut trailing).await? != 0 {
+        return Err(anyhow!("request contains trailing bytes"));
     }
     Ok(())
 }
@@ -1392,6 +1400,21 @@ mod tests {
                 .unwrap(),
             (Vec::new(), Vec::new())
         );
+
+        // Bytes after the key are a malformed request, refused before any
+        // lookup and without a reply.
+        let request = [0xAB; 33];
+        let mut reply = Vec::new();
+        let refused = serve_find_value(
+            &mut request.as_slice(),
+            &mut reply,
+            |_| unreachable!("a malformed request reaches no route lookup"),
+            |_| unreachable!("a malformed request reaches no directory"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused.to_string(), "request contains trailing bytes");
+        assert!(reply.is_empty());
     }
 
     #[tokio::test]
