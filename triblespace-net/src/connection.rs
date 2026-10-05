@@ -234,14 +234,21 @@ impl State {
 struct InFlight {
     state: Arc<State>,
     _permit: Option<OwnedSemaphorePermit>,
+    /// The handle an outgoing request was opened through.
+    handle: Option<Arc<Handle>>,
 }
 
 impl InFlight {
-    fn new(state: &Arc<State>, permit: Option<OwnedSemaphorePermit>) -> Self {
+    fn new(
+        state: &Arc<State>,
+        permit: Option<OwnedSemaphorePermit>,
+        handle: Option<Arc<Handle>>,
+    ) -> Self {
         state.in_flight.fetch_add(1, Ordering::SeqCst);
         Self {
             state: state.clone(),
             _permit: permit,
+            handle,
         }
     }
 }
@@ -254,6 +261,15 @@ impl Drop for InFlight {
     }
 }
 
+/// One caller's hold on a connection, shared by the clones of its
+/// [`Connection`].
+struct Handle {
+    state: Arc<State>,
+    /// A stream opened through this handle failed in the transport: the peer
+    /// reset or stopped it, or the connection was lost.
+    aborted: AtomicBool,
+}
+
 /// A connection handed out by a [`ConnectionTable`].
 ///
 /// Streams opened through it are request streams: each holds one of the
@@ -262,14 +278,14 @@ impl Drop for InFlight {
 /// yields nothing.
 pub struct Connection<C> {
     conn: C,
-    state: Arc<State>,
+    handle: Arc<Handle>,
 }
 
 impl<C: Clone> Clone for Connection<C> {
     fn clone(&self) -> Self {
         Self {
             conn: self.conn.clone(),
-            state: self.state.clone(),
+            handle: self.handle.clone(),
         }
     }
 }
@@ -277,26 +293,40 @@ impl<C: Clone> Clone for Connection<C> {
 /// Two handles are equal when they name the same connection.
 impl<C> PartialEq for Connection<C> {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.state, &other.state)
+        Arc::ptr_eq(&self.handle.state, &other.handle.state)
     }
 }
 
 impl<C> Eq for Connection<C> {}
 
 impl<C> Connection<C> {
+    fn new(conn: C, state: Arc<State>) -> Self {
+        Self {
+            conn,
+            handle: Arc::new(Handle {
+                state,
+                aborted: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    fn state(&self) -> &Arc<State> {
+        &self.handle.state
+    }
+
     /// The key that dialled this connection.
     pub fn dialler(&self) -> PeerId {
-        self.state.dialler
+        self.state().dialler
     }
 
     /// The dialler's sequence number, once known.
     pub fn sequence(&self) -> Option<u64> {
-        self.state.sequence.get().copied()
+        self.state().sequence.get().copied()
     }
 
     /// Mark or unmark this as a neighbour connection, which eviction spares.
     pub fn set_neighbour(&self, neighbour: bool) {
-        self.state.neighbour.store(neighbour, Ordering::SeqCst);
+        self.state().neighbour.store(neighbour, Ordering::SeqCst);
     }
 }
 
@@ -309,18 +339,22 @@ impl<C: Conn> Conn for Connection<C> {
     }
 
     async fn open_bi(&self) -> anyhow::Result<(Self::SendHalf, Self::RecvHalf)> {
-        let permit = self
-            .state
+        let state = self.state();
+        let permit = state
             .opened
             .clone()
             .acquire_owned()
             .await
             .expect("connection opener permits are never closed");
         let (send, recv) = self.conn.open_bi().await?;
-        let request = Arc::new(InFlight::new(&self.state, Some(permit)));
+        let request = Arc::new(InFlight::new(
+            state,
+            Some(permit),
+            Some(self.handle.clone()),
+        ));
         Ok((
-            Tracked::new(send, &self.state, Some(request.clone())),
-            Tracked::new(recv, &self.state, Some(request)),
+            Tracked::new(send, state, Some(request.clone())),
+            Tracked::new(recv, state, Some(request)),
         ))
     }
 
@@ -337,7 +371,7 @@ impl<C: Conn> Conn for Connection<C> {
 pub struct Tracked<S> {
     inner: S,
     state: Arc<State>,
-    _request: Option<Arc<InFlight>>,
+    request: Option<Arc<InFlight>>,
 }
 
 impl<S> Tracked<S> {
@@ -345,8 +379,28 @@ impl<S> Tracked<S> {
         Self {
             inner,
             state: state.clone(),
-            _request: request,
+            request,
         }
+    }
+
+    /// Note one poll of the inner half: progress keeps the connection from
+    /// going idle, and an error marks the handle the request was opened
+    /// through.
+    fn note<T>(&self, polled: Poll<io::Result<T>>, progressed: bool) -> Poll<io::Result<T>> {
+        match polled {
+            Poll::Ready(Ok(_)) if progressed => self.state.touch(),
+            Poll::Ready(Err(_)) => {
+                let handle = self
+                    .request
+                    .as_ref()
+                    .and_then(|request| request.handle.as_ref());
+                if let Some(handle) = handle {
+                    handle.aborted.store(true, Ordering::SeqCst);
+                }
+            }
+            _ => {}
+        }
+        polled
     }
 }
 
@@ -358,10 +412,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for Tracked<R> {
     ) -> Poll<io::Result<()>> {
         let before = buf.filled().len();
         let polled = Pin::new(&mut self.inner).poll_read(cx, buf);
-        if matches!(polled, Poll::Ready(Ok(()))) && buf.filled().len() > before {
-            self.state.touch();
-        }
-        polled
+        self.note(polled, buf.filled().len() > before)
     }
 }
 
@@ -372,10 +423,8 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Tracked<W> {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let polled = Pin::new(&mut self.inner).poll_write(cx, buf);
-        if matches!(polled, Poll::Ready(Ok(written)) if written > 0) {
-            self.state.touch();
-        }
-        polled
+        let progressed = matches!(polled, Poll::Ready(Ok(written)) if written > 0);
+        self.note(polled, progressed)
     }
 
     fn poll_write_vectored(
@@ -384,10 +433,8 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Tracked<W> {
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
         let polled = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
-        if matches!(polled, Poll::Ready(Ok(written)) if written > 0) {
-            self.state.touch();
-        }
-        polled
+        let progressed = matches!(polled, Poll::Ready(Ok(written)) if written > 0);
+        self.note(polled, progressed)
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -395,11 +442,13 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Tracked<W> {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+        let polled = Pin::new(&mut self.inner).poll_flush(cx);
+        self.note(polled, false)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        let polled = Pin::new(&mut self.inner).poll_shutdown(cx);
+        self.note(polled, false)
     }
 }
 
@@ -487,7 +536,13 @@ impl<T: Transport, S: Service> ConnectionTable<T, S> {
         let dial = waiter.dial.take().unwrap();
         let finished = self.shared.table.lock().unwrap().finish(peer, &dial);
         drop((dial, finished));
-        result.map_err(|error| anyhow::anyhow!(error.to_string()))
+        // Each caller holds its own handle, not the one the dial produced.
+        result
+            .map(|connection| {
+                let state = connection.state().clone();
+                Connection::new(connection.conn, state)
+            })
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
     }
 
     /// Take an inbound connection. It serves at once; it can be chosen for
@@ -498,10 +553,17 @@ impl<T: Transport, S: Service> ConnectionTable<T, S> {
         self.shared.register(conn, state)
     }
 
-    /// Close `connection` after a failed exchange, unless the table has
-    /// already let go of it.
+    /// Close `connection` after a request on it failed, unless the table has
+    /// already let go of it or the failure stayed on the request's stream: a
+    /// stream opened through this handle was reset or stopped by the peer, or
+    /// lost with the connection. Other requests and the peer's own streams
+    /// share the connection, so it closes only for a peer that broke a
+    /// request's protocol. Callers do not invalidate after a deadline.
     pub fn invalidate(&self, connection: &Connection<T::Conn>) {
-        let removed = self.shared.table.lock().unwrap().remove(&connection.state);
+        if connection.handle.aborted.load(Ordering::SeqCst) {
+            return;
+        }
+        let removed = self.shared.table.lock().unwrap().remove(connection.state());
         if removed {
             connection
                 .conn
@@ -531,10 +593,7 @@ impl<T: Transport, S> Drop for DialWaiter<'_, T, S> {
 impl<C: Conn> Table<C> {
     fn current(&self, peer: PeerId) -> Option<Connection<C>> {
         let entry = self.connections.get(self.current.get(&peer)?)?;
-        Some(Connection {
-            conn: entry.conn.clone(),
-            state: entry.state.clone(),
-        })
+        Some(Connection::new(entry.conn.clone(), entry.state.clone()))
     }
 
     fn dial(&mut self, peer: PeerId) -> Arc<Dial<C>> {
@@ -688,7 +747,7 @@ impl<T: Transport, S: Service> Shared<T, S> {
             .lock()
             .unwrap()
             .current(peer)
-            .unwrap_or(Connection { conn, state }))
+            .unwrap_or_else(|| Connection::new(conn, state)))
     }
 
     /// Hold a connection and start its accept loop.
@@ -827,7 +886,7 @@ async fn stream<T: Transport, S: Service>(
                 recv.stop(RESET_BUSY);
                 return;
             };
-            let _request = InFlight::new(&state, None);
+            let _request = InFlight::new(&state, None, None);
             let Ok(_global) = requests.acquire_owned().await else {
                 return;
             };

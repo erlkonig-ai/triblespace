@@ -39,6 +39,7 @@ async fn settle() {
 /// A node whose table dials, accepts and serves an empty snapshot.
 struct Node {
     peer: PeerId,
+    client: ProviderClient<SimTransport>,
     table: ConnectionTable<SimTransport, SnapshotHandler>,
     server: tokio::task::JoinHandle<()>,
 }
@@ -47,10 +48,9 @@ impl Node {
     fn join(net: &SimNet, key: &SigningKey) -> Self {
         let mut harness = net.join(key);
         let peer = harness.transport.local_id();
-        let table = ConnectionTable::new(
-            harness.transport.clone(),
-            SnapshotHandler::for_test(peer, RoutingTable::new(peer, [])),
-        );
+        let client =
+            ProviderClient::for_test(harness.transport.clone(), RoutingTable::new(peer, []));
+        let table = client.connections.clone();
         let connections = table.clone();
         let server = tokio::spawn(async move {
             while let Some(incoming) = harness.incoming.recv().await {
@@ -59,6 +59,7 @@ impl Node {
         });
         Self {
             peer,
+            client,
             table,
             server,
         }
@@ -291,6 +292,9 @@ async fn an_unknown_tag_or_operation_resets_its_stream_and_the_connection_keeps_
         let error = send.write_all(b"unread").await.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset, "{error}");
         drop((send, recv));
+        // The failure stayed on its stream, so the client keeps the
+        // connection it shares with the server's own requests.
+        client.table.invalidate(&connection);
 
         assert!(
             op_find_node(&connection, &[0; 32])
@@ -302,6 +306,49 @@ async fn an_unknown_tag_or_operation_resets_its_stream_and_the_connection_keeps_
     }
     assert_eq!(net.dial_count(client.peer, server.peer), 1);
     assert_eq!(server.table.len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_request_deadline_keeps_the_connection_the_peer_is_using() {
+    let net = network(Duration::from_secs(1));
+    let left = Node::join(&net, &key(1));
+    let right = Node::join(&net, &key(2));
+    let connection = left.table.connect(right.peer).await.unwrap();
+    settle().await;
+    // The right side has a request of its own in flight on the connection.
+    let on_right = right.table.current(left.peer).unwrap();
+    let (mut own_send, mut own_recv) = held_find_node(&on_right).await;
+
+    // A third peer occupies every request slot on the right, so a request
+    // from the left waits there until its deadline.
+    let harness = net.join(&key(3));
+    let third = harness
+        .transport
+        .dial(right.peer, PILE_SYNC_ALPN)
+        .await
+        .unwrap();
+    let mut occupying = Vec::new();
+    for _ in 0..MAX_REQUESTS_GLOBAL {
+        occupying.push(held_find_node(&third).await);
+    }
+    settle().await;
+    assert_eq!(right.table.available_requests(), 0);
+    let error = left.client.get(right.peer, [7; 32]).await.unwrap_err();
+    assert!(error.to_string().contains("deadline"), "{error}");
+
+    // The deadline closed nothing: the right side's request completes.
+    assert!(left.table.current(right.peer) == Some(connection.clone()));
+    own_send.shutdown().await.unwrap();
+    crate::protocol::recv_find_node_response(&mut own_recv)
+        .await
+        .unwrap();
+    for (mut send, _recv) in occupying {
+        send.shutdown().await.unwrap();
+    }
+    left.client.find_node(right.peer, [0; 32]).await.unwrap();
+    assert!(left.table.current(right.peer) == Some(connection));
+    assert_eq!(net.dial_count(left.peer, right.peer), 1);
+    assert_eq!(net.dial_count(right.peer, left.peer), 0);
 }
 
 #[tokio::test(start_paused = true)]

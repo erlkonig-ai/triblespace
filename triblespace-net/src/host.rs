@@ -2401,10 +2401,12 @@ impl<T: Transport> ProviderClient<T> {
                     ProviderPutResult::ExplicitlyRejected
                 }
             }
-            Ok(Err(_)) | Err(_) => {
+            Ok(Err(_)) => {
                 self.connections.invalidate(&connection);
                 ProviderPutResult::Unavailable
             }
+            // A slow reply says nothing against the shared connection.
+            Err(_) => ProviderPutResult::Unavailable,
         }
     }
 
@@ -2441,8 +2443,7 @@ impl<T: Transport> ProviderClient<T> {
         let connection = self.connections.connect(peer).await?;
         let response = tokio::time::timeout(OP_DEADLINE, op_provider_get(&connection, &key))
             .await
-            .map_err(|_| anyhow::anyhow!("DHT provider query deadline exceeded"))
-            .and_then(|response| response);
+            .map_err(|_| anyhow::anyhow!("DHT provider query deadline exceeded"))?;
         match response {
             Ok(providers) => {
                 self.candidates.lock().unwrap().promote_authenticated(peer);
@@ -2518,8 +2519,7 @@ impl<T: Transport> ProviderClient<T> {
             op_get_blob_with_limit(&connection, self.my_id, &hash, max_bytes),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("exact blob provider request deadline exceeded"))
-        .and_then(|response| response);
+        .map_err(|_| anyhow::anyhow!("exact blob provider request deadline exceeded"))?;
         match response {
             Ok(Some(bytes)) => {
                 self.candidates.lock().unwrap().promote_authenticated(peer);
