@@ -34,14 +34,14 @@
 //! `Conn::remote_id` always reports the true dialer, so
 //! identity-dependent per-request READ(C) subject binding is exercised honestly.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::io;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -50,8 +50,8 @@ use iroh_gossip::proto::DeliveryScope;
 use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
-use tokio::sync::mpsc;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use super::{Alpn, Conn, Harness, Incoming, PeerId, Transport};
 use crate::wake::{
@@ -59,9 +59,16 @@ use crate::wake::{
     CollectionWakeSubscription, ReceivedCollectionWake,
 };
 
-/// Capacity of each in-memory stream pipe. Bounded inventory blob ranges are
-/// at most 1 MiB; larger exact reads rely on normal concurrent backpressure.
-const PIPE_CAPACITY: usize = 4 * 1024 * 1024;
+/// Bytes one direction of a stream holds unread before its writer blocks:
+/// the credit QUIC grants each stream, noq-proto 1.2.0's default
+/// `stream_receive_window` (12.5 MB/s over a 100 ms round trip). A reader
+/// grants credit only by reading.
+const STREAM_WINDOW: usize = 1_250_000;
+
+/// Bidirectional streams one end of a connection holds open, noq-proto
+/// 1.2.0's default `max_concurrent_bidi_streams`. The next `open_bi` waits
+/// until the peer has closed one.
+const MAX_BIDI_STREAMS: usize = 100;
 
 /// Tunables for the simulated network.
 #[derive(Clone, Debug)]
@@ -544,40 +551,130 @@ pub struct SimConn {
     local: PeerId,
     remote: PeerId,
     /// Streams we open land on the remote's accept queue.
-    open_tx: mpsc::UnboundedSender<(SimStream, SimStream)>,
+    open_tx: mpsc::UnboundedSender<(SimSendStream, SimRecvStream)>,
     /// Streams the remote opens land here.
-    accept_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<(SimStream, SimStream)>>>,
+    accept_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<(SimSendStream, SimRecvStream)>>>,
+    /// Slots for the streams this end opens, [`MAX_BIDI_STREAMS`] of them.
+    streams: Arc<Semaphore>,
     /// Shared close flag — either end closing kills both directions.
     closed: Arc<AtomicBool>,
     notify_close: Arc<tokio::sync::Notify>,
 }
 
-/// One simulated stream half, permanently bound to its original connection.
-/// A reset discards buffered bytes and wakes pending reads and writes; healing
-/// or rejoining an endpoint cannot reopen this connection. No driver task is
+/// One simulated stream: its two directions and the opener's slot.
+struct Stream {
+    /// The opener's direction, then the acceptor's.
+    directions: [Direction; 2],
+    /// Held until the stream is closed on the acceptor's side.
+    slot: Option<OwnedSemaphorePermit>,
+}
+
+/// One direction of a stream, shared by its writing and its reading half.
+#[derive(Default)]
+struct Direction {
+    /// Written and not yet read, never more than [`STREAM_WINDOW`] bytes.
+    buffer: VecDeque<u8>,
+    sending: Sending,
+    receiving: Receiving,
+    writer: Option<Waker>,
+    reader: Option<Waker>,
+}
+
+/// The writing half's state. Dropping an open writer finishes it, as noq's
+/// `SendStream` does.
+#[derive(Clone, Copy, Default, PartialEq)]
+enum Sending {
+    #[default]
+    Open,
+    Finished,
+    Reset(u32),
+}
+
+/// The reading half's state. `Closed` means it read the end or the reset.
+/// Dropping an open reader stops it with code 0, as noq's `RecvStream` does.
+#[derive(Clone, Copy, Default, PartialEq)]
+enum Receiving {
+    #[default]
+    Open,
+    Closed,
+    Stopped(u32),
+}
+
+impl Stream {
+    /// Gives the opener's slot back once the acceptor has closed both its
+    /// halves: its own direction finished or reset, and the opener's read to
+    /// the end, its reset read, or stopped once its writer ended. noq-proto
+    /// raises the opener's stream limit at the same point (`stream_freed`).
+    fn release_closed_slot(&mut self) {
+        let [opener, acceptor] = &self.directions;
+        if opener.sending != Sending::Open
+            && opener.receiving != Receiving::Open
+            && acceptor.sending != Sending::Open
+        {
+            self.slot = None;
+        }
+    }
+}
+
+impl Direction {
+    fn finish(&mut self) {
+        if self.sending == Sending::Open {
+            self.sending = Sending::Finished;
+            wake(&mut self.reader);
+        }
+    }
+
+    /// Abandon sending: unread bytes are dropped and the reader fails with
+    /// `code`. A finished writer has delivered everything already.
+    fn reset(&mut self, code: u32) {
+        if self.sending == Sending::Open {
+            self.sending = Sending::Reset(code);
+            self.buffer.clear();
+            wake(&mut self.reader);
+        }
+    }
+
+    /// Stop reading: unread bytes are dropped and the writer fails with
+    /// `code`.
+    fn stop(&mut self, code: u32) {
+        if self.receiving == Receiving::Open {
+            self.receiving = Receiving::Stopped(code);
+            self.buffer.clear();
+            wake(&mut self.writer);
+        }
+    }
+}
+
+fn wake(waker: &mut Option<Waker>) {
+    if let Some(waker) = waker.take() {
+        waker.wake();
+    }
+}
+
+fn stream_error(what: &str, code: u32) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::ConnectionReset,
+        format!("simnet: stream {what} with code {code}"),
+    )
+}
+
+/// One half of a simulated stream, permanently bound to its original
+/// connection: closing the connection fails every read and write, and
+/// healing or rejoining an endpoint cannot reopen it. No driver task is
 /// needed: each half owns one cancellation-safe notification future.
-pub struct SimStream {
-    /// Gone once this half reset or stopped its pipe; dropping it wakes the
-    /// other end, which then reads the code from `pipe`.
-    inner: Option<DuplexStream>,
-    pipe: Arc<Pipe>,
+struct Half {
+    stream: Arc<Mutex<Stream>>,
+    /// The index of the direction this half writes or reads.
+    direction: usize,
     closed: Arc<AtomicBool>,
     on_close: Pin<Box<tokio::sync::futures::OwnedNotified>>,
 }
 
-/// One direction of a stream, shared by its writing and its reading half.
-/// Each code is stored plus one, so zero means not set.
-#[derive(Default)]
-struct Pipe {
-    reset: AtomicU64,
-    stopped: AtomicU64,
-}
-
-impl SimStream {
-    fn new(inner: DuplexStream, pipe: Arc<Pipe>, connection: &SimConn) -> Self {
+impl Half {
+    fn new(stream: &Arc<Mutex<Stream>>, direction: usize, connection: &SimConn) -> Self {
         Self {
-            inner: Some(inner),
-            pipe,
+            stream: stream.clone(),
+            direction,
             closed: connection.closed.clone(),
             // notify_waiters reaches futures created before the notification,
             // even before their first poll. Construct eagerly, not after the
@@ -586,87 +683,145 @@ impl SimStream {
         }
     }
 
-    fn poll_open(&mut self, cx: &mut Context<'_>) -> io::Result<&mut DuplexStream> {
+    fn check_open(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
         if self.closed.load(Ordering::SeqCst) || self.on_close.as_mut().poll(cx).is_ready() {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionReset,
                 "simnet: connection reset",
             ));
         }
-        for (code, what) in [(&self.pipe.reset, "reset"), (&self.pipe.stopped, "stopped")] {
-            if let Some(code) = code.load(Ordering::SeqCst).checked_sub(1) {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionReset,
-                    format!("simnet: stream {what} with code {code}"),
-                ));
-            }
-        }
-        // Both codes are stored before the half is dropped.
-        Ok(self
-            .inner
-            .as_mut()
-            .expect("an abandoned half recorded its code"))
+        Ok(())
     }
 
-    fn abandon(&mut self, code: &AtomicU64, value: u32) {
-        let _ = code.compare_exchange(0, u64::from(value) + 1, Ordering::SeqCst, Ordering::SeqCst);
-        self.inner = None;
+    fn update(&self, change: impl FnOnce(&mut Direction)) {
+        let mut stream = self.stream.lock().unwrap();
+        change(&mut stream.directions[self.direction]);
+        stream.release_closed_slot();
     }
 }
 
-impl super::SendStream for SimStream {
+/// The sending half of a simulated stream.
+pub struct SimSendStream(Half);
+
+/// The receiving half of a simulated stream.
+pub struct SimRecvStream(Half);
+
+impl super::SendStream for SimSendStream {
     fn reset(&mut self, code: u32) {
-        let pipe = self.pipe.clone();
-        self.abandon(&pipe.reset, code);
+        self.0.update(|direction| direction.reset(code));
     }
 }
 
-impl super::RecvStream for SimStream {
+impl super::RecvStream for SimRecvStream {
     fn stop(&mut self, code: u32) {
-        let pipe = self.pipe.clone();
-        self.abandon(&pipe.stopped, code);
+        self.0.update(|direction| direction.stop(code));
     }
 }
 
-impl AsyncRead for SimStream {
+impl Drop for SimSendStream {
+    fn drop(&mut self) {
+        self.0.update(Direction::finish);
+    }
+}
+
+impl Drop for SimRecvStream {
+    fn drop(&mut self) {
+        self.0.update(|direction| direction.stop(0));
+    }
+}
+
+impl AsyncRead for SimRecvStream {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(self.poll_open(cx)?).poll_read(cx, buf)
+        let half = &mut self.get_mut().0;
+        half.check_open(cx)?;
+        let mut stream = half.stream.lock().unwrap();
+        let stream = &mut *stream;
+        let direction = &mut stream.directions[half.direction];
+        match (direction.receiving, direction.sending) {
+            (Receiving::Stopped(code), _) => {
+                return Poll::Ready(Err(stream_error("stopped", code)));
+            }
+            (_, Sending::Reset(code)) => {
+                direction.receiving = Receiving::Closed;
+                stream.release_closed_slot();
+                return Poll::Ready(Err(stream_error("reset", code)));
+            }
+            _ => {}
+        }
+        if !direction.buffer.is_empty() {
+            let read = buf.remaining().min(direction.buffer.len());
+            let (front, back) = direction.buffer.as_slices();
+            let from_front = read.min(front.len());
+            buf.put_slice(&front[..from_front]);
+            buf.put_slice(&back[..read - from_front]);
+            direction.buffer.drain(..read);
+            wake(&mut direction.writer);
+            return Poll::Ready(Ok(()));
+        }
+        if direction.sending == Sending::Finished {
+            direction.receiving = Receiving::Closed;
+            stream.release_closed_slot();
+            return Poll::Ready(Ok(()));
+        }
+        direction.reader = Some(cx.waker().clone());
+        Poll::Pending
     }
 }
 
-impl AsyncWrite for SimStream {
+impl AsyncWrite for SimSendStream {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(self.poll_open(cx)?).poll_write(cx, buf)
+        let half = &mut self.get_mut().0;
+        half.check_open(cx)?;
+        let mut stream = half.stream.lock().unwrap();
+        let direction = &mut stream.directions[half.direction];
+        match (direction.sending, direction.receiving) {
+            (Sending::Reset(code), _) => return Poll::Ready(Err(stream_error("reset", code))),
+            (_, Receiving::Stopped(code)) => {
+                return Poll::Ready(Err(stream_error("stopped", code)));
+            }
+            (Sending::Finished, _) => {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "simnet: write after finish",
+                )));
+            }
+            (Sending::Open, _) => {}
+        }
+        let credit = STREAM_WINDOW - direction.buffer.len();
+        if credit == 0 {
+            direction.writer = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
+        let written = credit.min(buf.len());
+        direction.buffer.extend(&buf[..written]);
+        wake(&mut direction.reader);
+        Poll::Ready(Ok(written))
     }
 
-    fn poll_write_vectored(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[io::IoSlice<'_>],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(self.poll_open(cx)?).poll_write_vectored(cx, bufs)
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.get_mut().0.check_open(cx)?;
+        Poll::Ready(Ok(()))
     }
 
-    fn is_write_vectored(&self) -> bool {
-        self.inner
-            .as_ref()
-            .is_some_and(DuplexStream::is_write_vectored)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(self.poll_open(cx)?).poll_flush(cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(self.poll_open(cx)?).poll_shutdown(cx)
+    /// Finishing is harmless once the reader stopped, as in noq.
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let half = &mut self.get_mut().0;
+        half.check_open(cx)?;
+        let mut stream = half.stream.lock().unwrap();
+        if let Sending::Reset(code) = stream.directions[half.direction].sending {
+            return Poll::Ready(Err(stream_error("reset", code)));
+        }
+        stream.directions[half.direction].finish();
+        stream.release_closed_slot();
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -681,6 +836,7 @@ impl SimConn {
             remote: acceptor,
             open_tx: d2a_tx,
             accept_rx: Arc::new(tokio::sync::Mutex::new(a2d_rx)),
+            streams: Arc::new(Semaphore::new(MAX_BIDI_STREAMS)),
             closed: closed.clone(),
             notify_close: notify.clone(),
         };
@@ -689,6 +845,7 @@ impl SimConn {
             remote: dialer,
             open_tx: a2d_tx,
             accept_rx: Arc::new(tokio::sync::Mutex::new(d2a_rx)),
+            streams: Arc::new(Semaphore::new(MAX_BIDI_STREAMS)),
             closed,
             notify_close: notify,
         };
@@ -697,41 +854,49 @@ impl SimConn {
 }
 
 impl Conn for SimConn {
-    type SendHalf = SimStream;
-    type RecvHalf = SimStream;
+    type SendHalf = SimSendStream;
+    type RecvHalf = SimRecvStream;
 
     fn remote_id(&self) -> PeerId {
         self.remote
     }
 
-    async fn open_bi(&self) -> anyhow::Result<(SimStream, SimStream)> {
-        if self.closed.load(Ordering::SeqCst) {
+    async fn open_bi(&self) -> anyhow::Result<(SimSendStream, SimRecvStream)> {
+        // As in accept_bi, capture close before checking the flag.
+        let on_close = self.notify_close.notified();
+        let slot = if self.closed.load(Ordering::SeqCst) {
+            None
+        } else {
+            tokio::select! {
+                biased;
+                _ = on_close => None,
+                slot = self.streams.clone().acquire_owned() => Some(slot?),
+            }
+        };
+        let Some(slot) = slot else {
             anyhow::bail!(
                 "simnet: open_bi on closed conn {} -> {}",
                 hex_prefix(&self.local),
                 hex_prefix(&self.remote)
             );
-        }
-        // Two pipes per bi-stream: one per direction. Each duplex()
-        // call returns a connected pair; we use one side for writing
-        // and hand the other to the remote for reading (and vice
-        // versa).
-        let (local_send, remote_recv) = tokio::io::duplex(PIPE_CAPACITY);
-        let (remote_send, local_recv) = tokio::io::duplex(PIPE_CAPACITY);
-        let (outbound, inbound) = (Arc::new(Pipe::default()), Arc::new(Pipe::default()));
+        };
+        let stream = Arc::new(Mutex::new(Stream {
+            directions: Default::default(),
+            slot: Some(slot),
+        }));
         self.open_tx
             .send((
-                SimStream::new(remote_send, inbound.clone(), self),
-                SimStream::new(remote_recv, outbound.clone(), self),
+                SimSendStream(Half::new(&stream, 1, self)),
+                SimRecvStream(Half::new(&stream, 0, self)),
             ))
             .map_err(|_| anyhow::anyhow!("simnet: open_bi: remote end dropped"))?;
         Ok((
-            SimStream::new(local_send, outbound, self),
-            SimStream::new(local_recv, inbound, self),
+            SimSendStream(Half::new(&stream, 0, self)),
+            SimRecvStream(Half::new(&stream, 1, self)),
         ))
     }
 
-    async fn accept_bi(&self) -> Option<(SimStream, SimStream)> {
+    async fn accept_bi(&self) -> Option<(SimSendStream, SimRecvStream)> {
         // Capture close before checking the flag, and keep it in the select
         // while waiting for either the queue lock or the next stream.
         let on_close = self.notify_close.notified();
@@ -840,16 +1005,16 @@ mod tests {
         let (dialer, acceptor) = SimConn::pair([1; 32], [2; 32]);
         let (mut send, mut recv) = dialer.open_bi().await.unwrap();
         let (_s_send, _s_recv) = acceptor.accept_bi().await.unwrap();
-        // Split poll_open at exactly its flag-check/listener-poll boundary.
+        // Split check_open at exactly its flag-check/listener-poll boundary.
         // Both listeners already exist but neither has registered a waker.
-        assert!(!send.closed.load(Ordering::SeqCst));
-        assert!(!recv.closed.load(Ordering::SeqCst));
+        assert!(!send.0.closed.load(Ordering::SeqCst));
+        assert!(!recv.0.closed.load(Ordering::SeqCst));
         dialer.close(0, b"close in registration gap");
         let wake = Arc::new(WakeCount::default());
         let waker = futures::task::waker_ref(&wake);
         let mut context = Context::from_waker(&waker);
-        assert!(send.on_close.as_mut().poll(&mut context).is_ready());
-        assert!(recv.on_close.as_mut().poll(&mut context).is_ready());
+        assert!(send.0.on_close.as_mut().poll(&mut context).is_ready());
+        assert!(recv.0.on_close.as_mut().poll(&mut context).is_ready());
         assert!(send.write_all(b"late").await.is_err());
         assert!(recv.read(&mut [0]).await.is_err());
     }
@@ -862,7 +1027,7 @@ mod tests {
         let (dialer, acceptor) = SimConn::pair([1; 32], [2; 32]);
         let (mut c_send, mut c_recv) = dialer.open_bi().await.unwrap();
         let (mut s_send, mut s_recv) = acceptor.accept_bi().await.unwrap();
-        c_send.write_all(&vec![b'x'; PIPE_CAPACITY]).await.unwrap();
+        c_send.write_all(&vec![b'x'; STREAM_WINDOW]).await.unwrap();
         let wake = Arc::new(WakeCount::default());
         let waker = futures::task::waker_ref(&wake);
         let mut context = Context::from_waker(&waker);
@@ -1049,7 +1214,7 @@ mod tests {
         assert!(s_send.write_all(b"after reset").await.is_err());
 
         // Stop fails the remote writer, including one waiting for capacity.
-        c_send.write_all(&vec![b'x'; PIPE_CAPACITY]).await.unwrap();
+        c_send.write_all(&vec![b'x'; STREAM_WINDOW]).await.unwrap();
         let mut write = Box::pin(c_send.write_all(b"y"));
         assert!(futures::poll!(&mut write).is_pending());
         s_recv.stop(9);
@@ -1064,6 +1229,71 @@ mod tests {
         let mut bytes = [0; 2];
         recv.read_exact(&mut bytes).await.unwrap();
         assert_eq!(&bytes, b"ok");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn open_bi_beyond_the_limit_waits_until_the_acceptor_closes_a_stream() {
+        let (dialer, acceptor) = SimConn::pair([1; 32], [2; 32]);
+        let mut opened = Vec::new();
+        for _ in 0..MAX_BIDI_STREAMS {
+            opened.push(dialer.open_bi().await.unwrap());
+        }
+        let mut next = Box::pin(dialer.open_bi());
+        assert!(futures::poll!(&mut next).is_pending());
+        // The limit is per direction.
+        let _reverse = acceptor.open_bi().await.unwrap();
+
+        // A stream closes when the acceptor has read the opener's end and
+        // finished its own direction, whoever still holds the halves.
+        let (send, _recv) = &mut opened[0];
+        send.write_all(b"request").await.unwrap();
+        send.shutdown().await.unwrap();
+        assert!(futures::poll!(&mut next).is_pending());
+        let (mut s_send, mut s_recv) = acceptor.accept_bi().await.unwrap();
+        let mut request = Vec::new();
+        s_recv.read_to_end(&mut request).await.unwrap();
+        assert_eq!(request, b"request");
+        assert!(futures::poll!(&mut next).is_pending());
+        s_send.write_all(b"response").await.unwrap();
+        s_send.shutdown().await.unwrap();
+        next.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_writer_blocks_while_its_reader_does_not_read() {
+        let (dialer, acceptor) = SimConn::pair([1; 32], [2; 32]);
+        let (mut send, _recv) = dialer.open_bi().await.unwrap();
+        let (_send, mut recv) = acceptor.accept_bi().await.unwrap();
+        send.write_all(&vec![b'x'; STREAM_WINDOW]).await.unwrap();
+        let mut write = Box::pin(send.write_all(b"more"));
+        assert!(futures::poll!(&mut write).is_pending());
+        // Reading four bytes grants credit for four.
+        recv.read_exact(&mut [0; 4]).await.unwrap();
+        write.await.unwrap();
+        assert!(futures::poll!(Box::pin(send.write_all(b"!"))).is_pending());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reset_surfaces_its_code_on_the_peer_read_which_frees_the_slot() {
+        use crate::transport::SendStream as _;
+
+        let (dialer, acceptor) = SimConn::pair([1; 32], [2; 32]);
+        let mut opened = Vec::new();
+        for _ in 0..MAX_BIDI_STREAMS {
+            opened.push(dialer.open_bi().await.unwrap());
+        }
+        let (mut s_send, mut s_recv) = acceptor.accept_bi().await.unwrap();
+        s_send.shutdown().await.unwrap();
+        let mut next = Box::pin(dialer.open_bi());
+        let (send, _recv) = &mut opened[0];
+        send.write_all(b"discarded").await.unwrap();
+        send.reset(7);
+        // The stream holds its slot until the acceptor has read the reset.
+        assert!(futures::poll!(&mut next).is_pending());
+        let error = s_recv.read(&mut [0; 16]).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+        assert!(error.to_string().contains("code 7"), "{error}");
+        next.await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
