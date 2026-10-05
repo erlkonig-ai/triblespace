@@ -1,7 +1,7 @@
 //! Binary wire protocol primitives.
 //!
-//! One QUIC stream carries one operation. Establishing the TLS connection
-//! grants no collection authority: `COLLECTION_REPAIR` carries READ(C)
+//! One QUIC stream carries one operation behind its type tag. Establishing the
+//! TLS connection grants no collection authority: `repair/0` carries READ(C)
 //! evidence in its own request. Exact blob reads use only bearer-handle key
 //! confirmation. Collection identity and collection authority do not
 //! participate in exact discovery or transfer.
@@ -32,15 +32,27 @@ use crate::transport::PeerId;
 /// and an inventory with another meaning, so it is refused at the handshake.
 pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/28";
 
-// Operation types — first byte on each stream.
+// Stream type tags — first byte on each stream, read before any admission
+// permit is taken. An unknown tag resets only its own stream.
 // 0x01 was branch-list; 0x03 was blob-children; 0x04 was branch-head;
-// 0x05 was connection AUTH; 0x0D was record/AUTH-only collection repair.
-// None are accepted. Incompatible operation layouts require a fresh byte.
-pub const OP_GET_BLOB: u8 = 0x02;
+// 0x05 was connection AUTH; 0x0D was record/AUTH-only collection repair;
+// 0x06, 0x07 and 0x0C were the DHT operations, now under `dht/1`.
+// None are accepted. Incompatible stream layouts require a fresh byte, so the
+// two whose layout is unchanged keep theirs.
+/// `recon/1`: the long-lived stream the dialler opens on each connection.
+pub const TAG_RECON: u8 = 0x10;
+/// `dht/1`: one DHT operation byte follows.
+pub const TAG_DHT: u8 = 0x11;
+/// `blob/1`: one bearer exact-GET exchange.
+pub const TAG_BLOB: u8 = 0x02;
+/// `repair/0`: one collection repair session. Transitional: milestone M9
+/// replaces it with pull walks on `recon/1` and deletes this tag.
+pub const TAG_REPAIR: u8 = 0x0E;
+
+// `dht/1` operations — the byte after the tag.
 pub const OP_PROVIDER_PUT: u8 = 0x06;
 pub const OP_PROVIDER_GET: u8 = 0x07;
 pub const OP_FIND_NODE: u8 = 0x0C;
-// 0x0E is OP_COLLECTION_REPAIR, owned by collection_wire.
 
 pub const PROVIDER_PUT_OK: u8 = 0x00;
 pub const PROVIDER_PUT_FULL: u8 = 0x01;
@@ -238,7 +250,7 @@ pub(crate) async fn op_get_blob_with_limit<C: Conn>(
         .open_bi()
         .await
         .map_err(|error| anyhow!("open_bi: {error}"))?;
-    send_u8(&mut send, OP_GET_BLOB).await?;
+    send_u8(&mut send, TAG_BLOB).await?;
     fetch_get_blob_stream_with_limit(&mut send, &mut recv, requester, provider, hash, max_bytes)
         .await
 }
@@ -376,6 +388,7 @@ pub(crate) async fn op_provider_put<C: Conn>(
         .open_bi()
         .await
         .map_err(|error| anyhow!("open_bi: {error}"))?;
+    send_u8(&mut send, TAG_DHT).await?;
     send_u8(&mut send, OP_PROVIDER_PUT).await?;
     send_hash(&mut send, key).await?;
     send_hash(&mut send, token).await?;
@@ -397,6 +410,7 @@ pub async fn op_provider_get<C: Conn>(conn: &C, key: &RawHash) -> Result<Vec<(Ra
         .open_bi()
         .await
         .map_err(|error| anyhow!("open_bi: {error}"))?;
+    send_u8(&mut send, TAG_DHT).await?;
     send_u8(&mut send, OP_PROVIDER_GET).await?;
     send_hash(&mut send, key).await?;
     send.shutdown()
@@ -426,6 +440,7 @@ pub async fn op_find_node<C: Conn>(
         .open_bi()
         .await
         .map_err(|error| anyhow!("open_bi: {error}"))?;
+    send_u8(&mut send, TAG_DHT).await?;
     send_u8(&mut send, OP_FIND_NODE).await?;
     send_hash(&mut send, target).await?;
     send.shutdown()

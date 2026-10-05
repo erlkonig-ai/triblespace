@@ -1,5 +1,7 @@
 //! Saturated request slots must not kill unrelated streams on a shared connection.
 
+use crate::connection::{MAX_REQUESTS_GLOBAL, MAX_REQUESTS_PER_CONNECTION};
+use crate::protocol::TAG_DHT;
 use crate::transport::sim::SimConn;
 
 use super::*;
@@ -78,7 +80,6 @@ async fn saturated_requests_complete_without_closing_connection(connection_count
     let client_harness = net.join(&client_key);
     let (snapshot_tx, snapshot) = tokio::sync::watch::channel(None);
     let (events, _events_rx) = tokio::sync::mpsc::channel(1);
-    let requests = Arc::new(tokio::sync::Semaphore::new(MAX_REQUESTS_GLOBAL));
     let handler = SnapshotHandler {
         snapshot,
         health: Health::new(EndpointId::from_bytes(&provider).unwrap()),
@@ -87,10 +88,15 @@ async fn saturated_requests_complete_without_closing_connection(connection_count
         serve_collections: false,
         local_id: provider,
         events,
-        inbound_connections: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
-        inbound_requests: requests.clone(),
     };
     let (accepted_tx, mut accepted_rx) = tokio::sync::watch::channel(0usize);
+    let table = ConnectionTable::new(
+        AcceptedTransport {
+            inner: provider_harness.transport.clone(),
+            accepted: accepted_tx.clone(),
+        },
+        handler,
+    );
     let mut connections = Vec::new();
     let mut owners = Vec::new();
     for _ in 0..connection_count {
@@ -101,20 +107,9 @@ async fn saturated_requests_complete_without_closing_connection(connection_count
             .unwrap();
         let incoming = provider_harness.incoming.recv().await.unwrap();
         assert_eq!(incoming.alpn, PILE_SYNC_ALPN);
-        let permit = handler
-            .inbound_connections
-            .clone()
-            .try_acquire_owned()
-            .unwrap();
-        let server_connection = AcceptedConn {
+        owners.push(table.accept(AcceptedConn {
             inner: incoming.conn,
             accepted: accepted_tx.clone(),
-        };
-        let handler = handler.clone();
-        owners.push(tokio::spawn(async move {
-            handler
-                .handle::<AcceptedTransport>(server_connection, permit)
-                .await;
         }));
         connections.push(connection);
     }
@@ -127,6 +122,7 @@ async fn saturated_requests_complete_without_closing_connection(connection_count
     for connection in &connections {
         for _ in 0..per_connection {
             let (mut send, recv) = connection.open_bi().await.unwrap();
+            send_u8(&mut send, TAG_DHT).await.unwrap();
             send_u8(&mut send, OP_FIND_NODE).await.unwrap();
             send_hash(&mut send, &target).await.unwrap();
             // FIND_NODE waits for EOF before responding. These are legitimate
@@ -141,12 +137,13 @@ async fn saturated_requests_complete_without_closing_connection(connection_count
     .await
     .expect("handler did not accept the initial requests")
     .unwrap();
-    assert_eq!(requests.available_permits(), 0);
+    assert_eq!(table.available_requests(), 0);
 
     // The acceptance notification is the barrier: the production handler has
     // received this stream while all request slots are still occupied. No sleep
     // or scheduler-iteration count guesses when the overload branch ran.
     let (mut queued_send, mut queued_recv) = connections[0].open_bi().await.unwrap();
+    send_u8(&mut queued_send, TAG_DHT).await.unwrap();
     send_u8(&mut queued_send, OP_FIND_NODE).await.unwrap();
     send_hash(&mut queued_send, &target).await.unwrap();
     queued_send.shutdown().await.unwrap();
@@ -157,7 +154,7 @@ async fn saturated_requests_complete_without_closing_connection(connection_count
     .await
     .expect("handler did not accept the waiting request")
     .unwrap();
-    assert_eq!(requests.available_permits(), 0);
+    assert_eq!(table.available_requests(), 0);
     assert!(
         !owners[0].is_finished(),
         "a legitimate request at capacity terminated the entire connection"
@@ -176,6 +173,7 @@ async fn saturated_requests_complete_without_closing_connection(connection_count
     // Do not let a reconnect mask connection destruction. A further request
     // must use the exact same Conn object and complete normally.
     let (mut send, mut recv) = connections[0].open_bi().await.unwrap();
+    send_u8(&mut send, TAG_DHT).await.unwrap();
     send_u8(&mut send, OP_FIND_NODE).await.unwrap();
     send_hash(&mut send, &target).await.unwrap();
     send.shutdown().await.unwrap();

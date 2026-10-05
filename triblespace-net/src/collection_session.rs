@@ -283,7 +283,7 @@ where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
-    crate::protocol::send_u8(send, crate::collection_wire::OP_COLLECTION_REPAIR).await?;
+    crate::protocol::send_u8(send, crate::protocol::TAG_REPAIR).await?;
     crate::protocol::send_hash(send, &local.collection().raw).await?;
     send_repair_bootstrap(send, &read_bootstrap).await?;
     let remote = match recv_repair_admission(recv).await? {
@@ -762,7 +762,7 @@ pub(crate) mod tests {
         let server = tokio::spawn(async move {
             assert_eq!(
                 recv_u8(&mut server_recv).await.unwrap(),
-                crate::collection_wire::OP_COLLECTION_REPAIR
+                crate::protocol::TAG_REPAIR
             );
             let retained =
                 serve_collection_repair(&mut server_recv, &mut server_send, reader, |collection| {
@@ -1101,7 +1101,7 @@ pub(crate) mod tests {
             let server_task = tokio::spawn(async move {
                 assert_eq!(
                     recv_u8(&mut server_recv).await.unwrap(),
-                    crate::collection_wire::OP_COLLECTION_REPAIR
+                    crate::protocol::TAG_REPAIR
                 );
                 let retained = serve_collection_repair(
                     &mut server_recv,
@@ -1486,7 +1486,7 @@ pub(crate) mod tests {
             let server_task = tokio::spawn(async move {
                 assert_eq!(
                     recv_u8(&mut server_recv).await.unwrap(),
-                    crate::collection_wire::OP_COLLECTION_REPAIR
+                    crate::protocol::TAG_REPAIR
                 );
                 let bootstrap = serve_collection_repair(
                     &mut server_recv,
@@ -1615,7 +1615,7 @@ pub(crate) mod tests {
         let server_task = tokio::spawn(async move {
             assert_eq!(
                 recv_u8(&mut server_recv).await.unwrap(),
-                crate::collection_wire::OP_COLLECTION_REPAIR
+                crate::protocol::TAG_REPAIR
             );
             let bootstrap = serve_collection_repair(
                 &mut server_recv,
@@ -1673,7 +1673,7 @@ pub(crate) mod tests {
         let server_task = tokio::spawn(async move {
             assert_eq!(
                 recv_u8(&mut server_recv).await.unwrap(),
-                crate::collection_wire::OP_COLLECTION_REPAIR
+                crate::protocol::TAG_REPAIR
             );
             let bootstrap = serve_collection_repair(
                 &mut server_recv,
@@ -1733,7 +1733,7 @@ pub(crate) mod tests {
         let server_task = tokio::spawn(async move {
             assert_eq!(
                 recv_u8(&mut server_recv).await.unwrap(),
-                crate::collection_wire::OP_COLLECTION_REPAIR
+                crate::protocol::TAG_REPAIR
             );
             serve_collection_repair(
                 &mut server_recv,

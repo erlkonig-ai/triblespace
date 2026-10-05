@@ -60,8 +60,8 @@ pub trait RecvStream: AsyncRead + Unpin + Send + 'static {
 /// Mirrors the slice of iroh's `Connection` the protocol actually
 /// uses: open/accept bidirectional byte streams, learn the remote's
 /// TLS-verified identity, close with a code. Clone is shallow
-/// (`Arc`-like) — the pool and concurrent stream users share one
-/// connection.
+/// (`Arc`-like) — the connection table and concurrent stream users share
+/// one connection.
 pub trait Conn: Clone + Send + Sync + 'static {
     type SendHalf: SendStream;
     type RecvHalf: RecvStream;
