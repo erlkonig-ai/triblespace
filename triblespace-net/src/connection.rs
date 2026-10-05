@@ -160,6 +160,8 @@ struct State {
     last_frame: AtomicU64,
     /// Request streams open on the connection, in either direction.
     in_flight: AtomicUsize,
+    /// Callers holding a [`Connection`] handle to it.
+    handles: AtomicUsize,
     retired: AtomicBool,
     neighbour: AtomicBool,
     /// The accept order of the newest `recon/1` stream; a reader that is no
@@ -183,6 +185,7 @@ impl State {
             epoch: Instant::now(),
             last_frame: AtomicU64::new(0),
             in_flight: AtomicUsize::new(0),
+            handles: AtomicUsize::new(0),
             retired: AtomicBool::new(false),
             neighbour: AtomicBool::new(false),
             recon: AtomicU64::new(0),
@@ -213,6 +216,11 @@ impl State {
             } else {
                 CONNECTION_IDLE_DEADLINE
             }
+    }
+
+    /// Whether a request stream or a caller's handle uses the connection.
+    fn in_use(&self) -> bool {
+        self.in_flight.load(Ordering::SeqCst) > 0 || self.handles.load(Ordering::SeqCst) > 0
     }
 
     fn retire(&self) {
@@ -270,12 +278,18 @@ struct Handle {
     aborted: AtomicBool,
 }
 
+impl Drop for Handle {
+    fn drop(&mut self) {
+        self.state.handles.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// A connection handed out by a [`ConnectionTable`].
 ///
 /// Streams opened through it are request streams: each holds one of the
-/// connection's opener permits until both its halves drop. The table's
-/// accept loop is the only acceptor, so [`Conn::accept_bi`] on a handle
-/// yields nothing.
+/// connection's opener permits until both its halves drop. While a handle
+/// lives, eviction prefers other connections. The table's accept loop is
+/// the only acceptor, so [`Conn::accept_bi`] on a handle yields nothing.
 pub struct Connection<C> {
     conn: C,
     handle: Arc<Handle>,
@@ -301,6 +315,7 @@ impl<C> Eq for Connection<C> {}
 
 impl<C> Connection<C> {
     fn new(conn: C, state: Arc<State>) -> Self {
+        state.handles.fetch_add(1, Ordering::SeqCst);
         Self {
             conn,
             handle: Arc::new(Handle {
@@ -672,8 +687,8 @@ impl<C: Conn> Table<C> {
     }
 
     /// Above the cap in `state`'s direction, pick the connection to close:
-    /// least recently used, preferring draining and idle ones, never a
-    /// neighbour and never the newcomer itself.
+    /// least recently used, preferring draining ones and ones nobody uses,
+    /// never a neighbour and never the newcomer itself.
     fn evict(&mut self, state: &State) -> Option<C> {
         let candidates = || {
             self.connections.values().filter(|entry| {
@@ -689,7 +704,7 @@ impl<C: Conn> Table<C> {
             .min_by_key(|entry| {
                 (
                     !entry.state.retired.load(Ordering::SeqCst),
-                    entry.state.in_flight.load(Ordering::SeqCst) > 0,
+                    entry.state.in_use(),
                     entry.state.last_frame(),
                     entry.state.id,
                 )

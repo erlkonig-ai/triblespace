@@ -650,3 +650,22 @@ async fn outbound_eviction_spares_a_neighbour_and_stale_invalidation_is_harmless
     );
     assert_eq!(net.dial_count(client.peer, server.peer), 2);
 }
+
+#[tokio::test(start_paused = true)]
+async fn outbound_eviction_spares_a_connection_a_caller_holds() {
+    let net = network(Duration::from_millis(10));
+    let center = Node::join(&net, &key(100_000));
+    let others = (0..MAX_CONNECTIONS + 1)
+        .map(|index| Node::join(&net, &key(index)))
+        .collect::<Vec<_>>();
+    // The oldest connection is held by a caller that has not used it yet.
+    let held = center.table.connect(others[0].peer).await.unwrap();
+    for other in &others[1..] {
+        center.table.connect(other.peer).await.unwrap();
+        settle().await;
+    }
+    assert_eq!(center.table.len(), MAX_CONNECTIONS);
+    assert!(center.table.current(others[0].peer) == Some(held.clone()));
+    assert!(center.table.current(others[1].peer).is_none());
+    op_find_node(&held, &[0; 32]).await.unwrap();
+}
