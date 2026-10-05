@@ -603,6 +603,34 @@ pub enum QuorumOutcome {
     Undefined(Vec<CapabilityHandle>),
 }
 
+impl QuorumOutcome {
+    /// Decide alternatives: one met alternative admits, and otherwise every
+    /// definition an alternative stopped at could still change the answer.
+    /// Each definition is named once, however many alternatives stopped at
+    /// it. Alternatives after the first met one are not evaluated.
+    pub fn any(alternatives: impl IntoIterator<Item = QuorumOutcome>) -> QuorumOutcome {
+        let mut undefined = Vec::new();
+        for outcome in alternatives {
+            match outcome {
+                QuorumOutcome::Met => return QuorumOutcome::Met,
+                QuorumOutcome::Unmet => {}
+                QuorumOutcome::Undefined(handles) => {
+                    for handle in handles {
+                        if !undefined.contains(&handle) {
+                            undefined.push(handle);
+                        }
+                    }
+                }
+            }
+        }
+        if undefined.is_empty() {
+            QuorumOutcome::Unmet
+        } else {
+            QuorumOutcome::Undefined(undefined)
+        }
+    }
+}
+
 /// Decide an invocation and say what could still change the decision.
 pub fn capability_quorum_decide<'a, R: BlobStoreGet>(
     reader: &R,

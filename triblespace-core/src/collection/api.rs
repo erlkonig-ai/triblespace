@@ -737,13 +737,10 @@ pub(crate) enum AdmissionEvidence {
 }
 
 impl AdmissionEvidence {
-    pub(crate) fn authorizes<R: BlobStoreGet>(&self, reader: &R, subject: VerifyingKey) -> bool {
-        matches!(self.decide(reader, subject), QuorumOutcome::Met)
-    }
-
     /// Decide one subject, and say which arrival could change the decision:
     /// a proof, or the capability definitions a proof for the subject named
-    /// and this reader could not read.
+    /// and this reader could not read. Outside the crate this outcome is
+    /// reached through the `collection_*_is_admitted_by_*` functions.
     pub(crate) fn decide<R: BlobStoreGet>(
         &self,
         reader: &R,
@@ -751,21 +748,11 @@ impl AdmissionEvidence {
     ) -> QuorumOutcome {
         match self {
             Self::Open => QuorumOutcome::Met,
-            Self::Alternatives(alternatives) => {
-                let mut undefined = Vec::new();
-                for evidence in alternatives {
-                    match evidence.decide(reader, subject) {
-                        QuorumOutcome::Met => return QuorumOutcome::Met,
-                        QuorumOutcome::Unmet => {}
-                        QuorumOutcome::Undefined(handles) => undefined.extend(handles),
-                    }
-                }
-                if undefined.is_empty() {
-                    QuorumOutcome::Unmet
-                } else {
-                    QuorumOutcome::Undefined(undefined)
-                }
-            }
+            Self::Alternatives(alternatives) => QuorumOutcome::any(
+                alternatives
+                    .iter()
+                    .map(|evidence| evidence.decide(reader, subject)),
+            ),
             Self::Quorum {
                 roots,
                 invoke_threshold,
@@ -1030,24 +1017,56 @@ where
 /// before its member encoding is known. This boundary therefore queries the
 /// descriptor's READ policy without manufacturing a typed
 /// [`Collection`]. It neither enumerates nor persists ambient proof state.
+/// [`QuorumOutcome::Undefined`] names the definitions the caller can fetch
+/// before deciding again, as for [`collection_action_is_admitted_by_descriptor`].
 pub fn collection_reader_is_admitted_by<S>(
     snapshot: &S,
     collection: CollectionHandle,
     subject: VerifyingKey,
     proofs: &[CapabilityProof],
-) -> Result<bool, CollectionDescriptorError<S::GetError<Infallible>>>
+) -> Result<QuorumOutcome, CollectionDescriptorError<S::GetError<Infallible>>>
 where
     S: StoreSnapshot + BlobStoreGet,
 {
     let loaded = load_collection_descriptor(snapshot, collection)?;
-    let admitted =
-        descriptor::admission_policies(snapshot, loaded.fragment.facts(), super::ACTION_READ, None)
-            .any(|policy| {
-                collection_reader_is_admitted_by_policy(
-                    snapshot, collection, &policy, subject, proofs,
-                )
-            });
-    Ok(admitted)
+    Ok(collection_action_is_admitted_by_descriptor(
+        snapshot,
+        collection,
+        loaded.fragment.facts(),
+        None,
+        super::ACTION_READ,
+        subject,
+        proofs,
+    ))
+}
+
+/// Decide `action` admission against every policy the descriptor `facts`
+/// bind, from an explicitly supplied portable proof set.
+///
+/// This is the seam for a caller which already holds the descriptor facts,
+/// such as a network host's pinned repair evidence. One met policy admits.
+/// Otherwise [`QuorumOutcome::Undefined`] names every definition whose arrival
+/// could change the answer: a policy binding's definition this reader lacks,
+/// which may be the policy that admits, and the capability definitions a
+/// proof for `subject` stopped at.
+pub fn collection_action_is_admitted_by_descriptor<R: BlobStoreGet>(
+    reader: &R,
+    collection: CollectionHandle,
+    facts: &TribleSet,
+    representation: Option<Id>,
+    action: Id,
+    subject: VerifyingKey,
+    proofs: &[CapabilityProof],
+) -> QuorumOutcome {
+    let (policies, missing) =
+        descriptor::admission_policies_with_missing(reader, facts, action, representation);
+    let proofs: Arc<[CapabilityProof]> = proofs.into();
+    let decided = policies.iter().map(|policy| {
+        admission_evidence_from_proofs(policy, action, collection, Arc::clone(&proofs))
+            .decide(reader, subject)
+    });
+    let unread = (!missing.is_empty()).then_some(QuorumOutcome::Undefined(missing));
+    QuorumOutcome::any(decided.chain(unread))
 }
 
 /// Decide READ admission against one already validated collection policy.
@@ -1062,14 +1081,14 @@ pub fn collection_reader_is_admitted_by_policy<R: BlobStoreGet>(
     policy: &AdmissionPolicy,
     subject: VerifyingKey,
     proofs: &[CapabilityProof],
-) -> bool {
+) -> QuorumOutcome {
     let evidence = admission_evidence_from_proofs(
         policy,
         super::ACTION_READ,
         collection,
         proofs.to_vec().into(),
     );
-    evidence.authorizes(reader, subject)
+    evidence.decide(reader, subject)
 }
 
 /// Enumerate the READ audience from an already validated collection policy.
@@ -1145,14 +1164,14 @@ pub fn collection_writer_is_admitted_by_policy<R: BlobStoreGet>(
     policy: &AdmissionPolicy,
     subject: VerifyingKey,
     proofs: &[CapabilityProof],
-) -> bool {
+) -> QuorumOutcome {
     let evidence = admission_evidence_from_proofs(
         policy,
         super::ACTION_WRITE,
         collection,
         proofs.to_vec().into(),
     );
-    evidence.authorizes(reader, subject)
+    evidence.decide(reader, subject)
 }
 
 impl<L: CollectionEncoding> Collection<L> {
@@ -1235,7 +1254,10 @@ impl<L: CollectionEncoding> Collection<L> {
             self.handle(),
         )
         .map_err(CollectionAdmissionError::Evidence)?;
-        Ok(evidence.authorizes(snapshot, subject))
+        Ok(matches!(
+            evidence.decide(snapshot, subject),
+            QuorumOutcome::Met
+        ))
     }
 
     /// Command admission through an exact-byte reader. Frozen proof evidence
@@ -1288,7 +1310,7 @@ impl<L: CollectionEncoding> Collection<L> {
             self.handle(),
         )
         .map_err(CollectionAdmissionError::Evidence)?;
-        let admitted = evidence.authorizes(&attempt, subject);
+        let admitted = matches!(evidence.decide(&attempt, subject), QuorumOutcome::Met);
         attempt
             .finish()
             .map_err(CollectionAdmissionError::Definition)?;
@@ -1322,7 +1344,10 @@ impl<L: CollectionEncoding> Collection<L> {
             self.handle(),
         )
         .map_err(CollectionAdmissionError::Evidence)?;
-        Ok(evidence.authorizes(snapshot, subject))
+        Ok(matches!(
+            evidence.decide(snapshot, subject),
+            QuorumOutcome::Met
+        ))
     }
 
     /// Decide READ admission from one explicitly supplied portable proof set.
@@ -1331,33 +1356,28 @@ impl<L: CollectionEncoding> Collection<L> {
     /// It loads only the immutable collection descriptor from `snapshot`; it
     /// neither enumerates nor persists ambient proof-store state. An open READ
     /// policy therefore succeeds with an empty proof slice, while a quorum is
-    /// evaluated over the independently rooted supplied paths.
+    /// evaluated over the independently rooted supplied paths. An unmet
+    /// decision names the definitions whose arrival could change it, as
+    /// [`collection_action_is_admitted_by_descriptor`] does.
     pub fn reader_is_admitted_by<S>(
         self,
         snapshot: &S,
         subject: VerifyingKey,
         proofs: &[CapabilityProof],
-    ) -> Result<bool, CollectionDescriptorError<S::GetError<Infallible>>>
+    ) -> Result<QuorumOutcome, CollectionDescriptorError<S::GetError<Infallible>>>
     where
         S: StoreSnapshot + BlobStoreGet,
     {
         let loaded = load_collection_descriptor(snapshot, self.handle())?;
-        let admitted = descriptor::admission_policies(
+        Ok(collection_action_is_admitted_by_descriptor(
             snapshot,
+            self.handle(),
             loaded.fragment.facts(),
-            super::ACTION_READ,
             Some(L::id()),
-        )
-        .any(|policy| {
-            collection_reader_is_admitted_by_policy(
-                snapshot,
-                self.handle(),
-                &policy,
-                subject,
-                proofs,
-            )
-        });
-        Ok(admitted)
+            super::ACTION_READ,
+            subject,
+            proofs,
+        ))
     }
 
     /// What this collection stands for in this snapshot, from the coverage
@@ -2041,8 +2061,12 @@ impl<S> CollectionStoreExt for S where S: BlobStorePut + CollectionStore {}
 #[cfg(test)]
 mod grant_tests {
     use super::*;
+    use crate::blob::IntoBlob;
+    use crate::capability::policy::resource_policy;
     use crate::capability::{capability_action, capability_delegate_action};
+    use crate::collection::records::KIND_COLLECTION_DESCRIPTOR;
     use crate::collection::{ACTION_READ, ACTION_WRITE};
+    use crate::metadata;
     use crate::prelude::entity;
     use crate::repo::memoryrepo::MemoryRepo;
 
@@ -2238,6 +2262,148 @@ mod grant_tests {
             .unwrap());
         assert!(collection.reader_is_admitted(&snapshot, reader).unwrap());
         assert!(!collection.writer_is_admitted(&snapshot, reader).unwrap());
+    }
+
+    #[test]
+    fn a_grant_through_an_absent_definition_is_undefined_until_it_lands() {
+        let root = SigningKey::from_bytes(&[85; 32]);
+        let subject = SigningKey::from_bytes(&[86; 32]).verifying_key();
+        let stranger = SigningKey::from_bytes(&[87; 32]).verifying_key();
+        let collection = Inline::new([88; 32]);
+        let policy = AdmissionPolicy::direct(root.verifying_key());
+        let definition = entity! { capability_action*: [ACTION_READ, ACTION_WRITE] };
+        let capability =
+            IntoBlob::<SimpleArchive>::to_blob(definition.facts().clone()).get_handle();
+        let proofs = [CapabilityProof::new(
+            CapabilityResource::from(collection),
+            &root,
+            capability,
+            subject,
+        )];
+        let mut store = MemoryRepo::default();
+        let absent = store.snapshot().unwrap();
+        store
+            .put::<SimpleArchive, _>(definition.facts().clone())
+            .unwrap();
+        let landed = store.snapshot().unwrap();
+        // A proof that never names the subject cannot admit it however much
+        // of it becomes readable, so only its named subject is Undefined.
+        for (reader, subject, expected) in [
+            (&absent, subject, QuorumOutcome::Undefined(vec![capability])),
+            (&absent, stranger, QuorumOutcome::Unmet),
+            (&landed, subject, QuorumOutcome::Met),
+        ] {
+            assert_eq!(
+                collection_reader_is_admitted_by_policy(
+                    reader, collection, &policy, subject, &proofs,
+                ),
+                expected
+            );
+            assert_eq!(
+                collection_writer_is_admitted_by_policy(
+                    reader, collection, &policy, subject, &proofs,
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn an_absent_policy_definition_is_undefined_until_it_lands() {
+        let root = SigningKey::from_bytes(&[89; 32]);
+        let other = SigningKey::from_bytes(&[90; 32]).verifying_key();
+        let subject = SigningKey::from_bytes(&[91; 32]).verifying_key();
+        let stranger = SigningKey::from_bytes(&[92; 32]).verifying_key();
+        let collection = Inline::new([93; 32]);
+        let definition = entity! { capability_action*: [ACTION_READ, ACTION_WRITE] };
+        let capability =
+            IntoBlob::<SimpleArchive>::to_blob(definition.facts().clone()).get_handle();
+        // Both alternatives and the proof name one absent definition, which
+        // is named once.
+        let descriptor = entity! {
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            resource_policy*: AdmissionPolicy::direct(root.verifying_key()).binding(capability)
+                + AdmissionPolicy::direct(other).binding(capability),
+        };
+        let proofs = [CapabilityProof::new(
+            CapabilityResource::from(collection),
+            &root,
+            capability,
+            subject,
+        )];
+        let mut store = MemoryRepo::default();
+        let absent = store.snapshot().unwrap();
+        store
+            .put::<SimpleArchive, _>(definition.facts().clone())
+            .unwrap();
+        let landed = store.snapshot().unwrap();
+        // Until the policy is readable, nobody's answer is final.
+        for (reader, subject, expected) in [
+            (&absent, subject, QuorumOutcome::Undefined(vec![capability])),
+            (
+                &absent,
+                stranger,
+                QuorumOutcome::Undefined(vec![capability]),
+            ),
+            (&landed, subject, QuorumOutcome::Met),
+            (&landed, stranger, QuorumOutcome::Unmet),
+        ] {
+            for action in [ACTION_READ, ACTION_WRITE] {
+                assert_eq!(
+                    collection_action_is_admitted_by_descriptor(
+                        reader,
+                        collection,
+                        descriptor.facts(),
+                        None,
+                        action,
+                        subject,
+                        &proofs,
+                    ),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn alternatives_stopped_at_one_definition_name_it_once() {
+        let root = SigningKey::from_bytes(&[94; 32]);
+        let other = SigningKey::from_bytes(&[95; 32]).verifying_key();
+        let subject = SigningKey::from_bytes(&[96; 32]).verifying_key();
+        let collection = Inline::new([97; 32]);
+        let custom = Inline::new([98; 32]);
+        let mut store = MemoryRepo::default();
+        let read = store
+            .put::<SimpleArchive, _>(entity! { capability_action: ACTION_READ }.facts().clone())
+            .unwrap();
+        assert_eq!(read, read_capability());
+        // Two resident READ alternatives share a root, so the one proof walks
+        // to the same absent definition under each of them.
+        let descriptor = entity! {
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            resource_policy*: AdmissionPolicy::direct(root.verifying_key()).binding(read)
+                + AdmissionPolicy::quorum([root.verifying_key(), other], 1, None)
+                    .unwrap()
+                    .binding(read),
+        };
+        let proofs = [CapabilityProof::new(
+            CapabilityResource::from(collection),
+            &root,
+            custom,
+            subject,
+        )];
+        assert_eq!(
+            collection_action_is_admitted_by_descriptor(
+                &store.snapshot().unwrap(),
+                collection,
+                descriptor.facts(),
+                None,
+                ACTION_READ,
+                subject,
+                &proofs,
+            ),
+            QuorumOutcome::Undefined(vec![custom])
+        );
     }
 
     #[test]

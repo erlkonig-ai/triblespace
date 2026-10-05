@@ -67,7 +67,7 @@ use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::Blob;
-use triblespace_core::capability::CapabilityProof;
+use triblespace_core::capability::{CapabilityProof, QuorumOutcome};
 use triblespace_core::collection::records::{
     CollectionCommit, CollectionDerive, LegacyUnsignedCollectionEquation, SourceLocator,
 };
@@ -457,12 +457,15 @@ impl<'a> WriteAdmission<'a> {
         }
         let decided = match (self.policies(collection), VerifyingKey::from_bytes(&signer)) {
             (Some(policies), Ok(subject)) => policies.iter().any(|policy| {
-                collection_writer_is_admitted_by_policy(
-                    self.reader,
-                    Inline::new(collection),
-                    policy,
-                    subject,
-                    &self.proofs,
+                matches!(
+                    collection_writer_is_admitted_by_policy(
+                        self.reader,
+                        Inline::new(collection),
+                        policy,
+                        subject,
+                        &self.proofs,
+                    ),
+                    QuorumOutcome::Met
                 )
             }),
             _ => false,

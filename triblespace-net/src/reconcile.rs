@@ -2554,7 +2554,7 @@ mod tests {
         use crate::collection_activation::collection_repair_overlay;
         use crate::collection_session::manifest;
         use crate::peer::PeerSnapshotError;
-        use triblespace_core::capability::CapabilityResource;
+        use triblespace_core::capability::{CapabilityResource, QuorumOutcome};
         use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
         use triblespace_core::repo::CapabilityProofRead;
 
@@ -2607,10 +2607,11 @@ mod tests {
         let initial_overlay = collection_repair_overlay(&before, collection).unwrap();
         assert!(initial_overlay.records().is_empty());
         assert!(initial_overlay.authorization_evidence().is_empty());
-        assert!(
-            !initial_overlay
+        assert_eq!(
+            initial_overlay
                 .authorization_evidence()
-                .reader_is_admitted_by(reader, &[])
+                .reader_is_admitted_by(reader, &[]),
+            QuorumOutcome::Unmet
         );
         let initial_frontier = frontier().unwrap();
         assert_eq!(initial_frontier.records, manifest(&initial_overlay).records);
@@ -2685,10 +2686,11 @@ mod tests {
             expected.authorization_evidence().get(proof.id()),
             Some(&proof)
         );
-        assert!(
+        assert_eq!(
             expected
                 .authorization_evidence()
-                .reader_is_admitted_by(reader, std::slice::from_ref(&proof))
+                .reader_is_admitted_by(reader, std::slice::from_ref(&proof)),
+            QuorumOutcome::Met
         );
         // Health commits to the actual serving inventory as well as the
         // complete semantic record and AUTH PATCHes.
