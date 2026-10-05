@@ -3308,6 +3308,8 @@ impl PileFileSnapshot {
         BTreeSet<Inline<Handle<UnknownBlob>>>,
         BTreeSet<Inline<Handle<UnknownBlob>>>,
     ) {
+        #[cfg(test)]
+        RETENTION_WALK_COUNTS.with_borrow_mut(|counts| counts.expansions += 1);
         let mut keep = BTreeSet::new();
         let mut corrupt = BTreeSet::new();
         for handle in roots.direct() {
@@ -3316,12 +3318,17 @@ impl PileFileSnapshot {
                 _ => keep.insert(handle),
             };
         }
-        let mut seen: BTreeSet<[u8; 32]> = BTreeSet::new();
         let mut queue: std::collections::VecDeque<_> = roots.recursive().collect();
+        // Mark on discovery, not on dequeue: a large archive can repeat one
+        // child millions of times before that child reaches the queue's head.
+        // Direct roots are deliberately not marked; a recursive edge must
+        // still traverse their children.
+        let mut seen: BTreeSet<[u8; 32]> = queue.iter().map(|handle| handle.raw).collect();
+        #[cfg(test)]
+        RETENTION_WALK_COUNTS.with_borrow_mut(|counts| counts.queued += queue.len());
         while let Some(handle) = queue.pop_front() {
-            if !seen.insert(handle.raw) {
-                continue;
-            }
+            #[cfg(test)]
+            RETENTION_WALK_COUNTS.with_borrow_mut(|counts| counts.visited += 1);
             let read: Vec<Bytes> = match self.get::<Bytes, UnknownBlob>(handle) {
                 Ok(bytes) => {
                     keep.insert(handle);
@@ -3347,11 +3354,16 @@ impl PileFileSnapshot {
             };
             for bytes in read {
                 for word in bytes.chunks_exact(32) {
+                    #[cfg(test)]
+                    RETENTION_WALK_COUNTS.with_borrow_mut(|counts| counts.words += 1);
                     let child = Inline::<Handle<UnknownBlob>>::new(
                         word.try_into().expect("chunks are 32 bytes"),
                     );
                     if !seen.contains(&child.raw) && self.blobs.has_prefix(&child.raw) {
+                        seen.insert(child.raw);
                         queue.push_back(child);
+                        #[cfg(test)]
+                        RETENTION_WALK_COUNTS.with_borrow_mut(|counts| counts.queued += 1);
                     }
                 }
             }
@@ -6122,6 +6134,98 @@ struct Retention {
     preserved_wants: Vec<WantRequest>,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RetentionWalkCounts {
+    expansions: usize,
+    queued: usize,
+    visited: usize,
+    words: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static RETENTION_WALK_COUNTS: std::cell::RefCell<RetentionWalkCounts> =
+        std::cell::RefCell::new(RetentionWalkCounts::default());
+}
+
+/// A filtered rewrite's already-decided frames and blob closure, bound to the
+/// exact immutable source prefix that was inspected.
+///
+/// Created by [`PileFile::prepare_retained_rewrite`]. Inspecting its accounting
+/// and consuming it with [`Self::write_into`] does not evaluate the filter or
+/// traverse the closure again. It owns the source snapshot, not a reusable
+/// recipe: no other source, roots, WANT policy or filter can be substituted.
+/// Later source appends are outside this prefix. Callers requiring a whole-file
+/// result must quiesce writers and check the source length around the operation.
+pub struct PreparedRetainedRewrite {
+    selection: CollectionFrameSelection,
+    retention: Retention,
+}
+
+impl PreparedRetainedRewrite {
+    /// Number of selected blobs, including an explicit missing root whose copy
+    /// will fail, as with [`RetainedRewritePlan::retained_blobs`].
+    pub fn retained_blobs(&self) -> usize {
+        self.retention.keep.len()
+    }
+
+    /// Selected payload bytes from each blob's first valid occurrence. The
+    /// retention walk has already validated resident blobs; this uses its cache.
+    pub fn retained_bytes(&self) -> u64 {
+        self.retention
+            .keep
+            .iter()
+            .filter_map(|handle| {
+                self.selection
+                    .reader
+                    .get::<Bytes, UnknownBlob>(*handle)
+                    .ok()
+            })
+            .map(|bytes| bytes.len() as u64)
+            .sum()
+    }
+
+    /// Reached resident blobs for which no physical occurrence validates.
+    pub fn corrupt_blobs(&self) -> &BTreeSet<Inline<Handle<UnknownBlob>>> {
+        &self.retention.corrupt
+    }
+
+    /// Consume this exact decision, refusing corruption before any write unless
+    /// the caller explicitly chooses to set it aside. Transfer still performs
+    /// the ordinary validated reads from the owned source snapshot.
+    pub fn write_into(
+        self,
+        destination: &mut PileFile,
+        corrupt: CorruptBlobPolicy,
+    ) -> Result<PileRewriteStats, PileRewriteError> {
+        if corrupt == CorruptBlobPolicy::Refuse && !self.retention.corrupt.is_empty() {
+            return Err(PileRewriteError::Corrupt {
+                blobs: self.retention.corrupt,
+            });
+        }
+        PileFile::write_selection(destination, self.selection, self.retention)
+    }
+
+    fn into_plan(self) -> RetainedRewritePlan {
+        let retained_bytes = self.retained_bytes();
+        RetainedRewritePlan {
+            retained_blobs: self.retention.keep.len(),
+            retained: self.retention.keep,
+            retained_bytes,
+            capability_proofs: self.retention.capability_proofs.len(),
+            retired_capability_proofs: self.selection.retired_proofs.len(),
+            opaque_frames: self.selection.opaque_frames.len(),
+            superseded_equations: self.selection.superseded_equations,
+            drained_frames: self.selection.drained_frames,
+            retired_equations: self.selection.retired_equations.len(),
+            filtered_frames: self.selection.filtered_frames,
+            repeated_frames: self.selection.repeated_frames,
+            corrupt_blobs: self.retention.corrupt,
+        }
+    }
+}
+
 /// One retired generation and the generation its content was drained into.
 ///
 /// Naming a pair is an explicit statement: every distinct commit of
@@ -6468,29 +6572,29 @@ impl PileFile {
         drained_generations: &[DrainedGeneration],
         filter: &mut dyn CollectionFrameFilter,
     ) -> Result<RetainedRewritePlan, PileRewriteError> {
+        Ok(self
+            .prepare_retained_rewrite(explicit, wants, drained_generations, filter)?
+            .into_plan())
+    }
+
+    /// Decide one filtered rewrite without writing, retaining its immutable
+    /// source snapshot and selection so the caller may inspect and then copy
+    /// it without repeating the filter or reachability walk. Corruption is
+    /// reported by [`PreparedRetainedRewrite::corrupt_blobs`]; the caller chooses
+    /// its policy when consuming the decision with
+    /// [`PreparedRetainedRewrite::write_into`].
+    pub fn prepare_retained_rewrite(
+        &mut self,
+        explicit: &super::RetentionRoots,
+        wants: WantRewritePolicy,
+        drained_generations: &[DrainedGeneration],
+        filter: &mut dyn CollectionFrameFilter,
+    ) -> Result<PreparedRetainedRewrite, PileRewriteError> {
         let selection = self.select_collection_frames(drained_generations, filter)?;
         let retention = self.retention(&selection, explicit, wants, FrameRetention::CarriedFrames);
-        // The bytes the copy takes: each blob's first valid occurrence, which
-        // the walk has validated already, not its first occurrence.
-        let retained_bytes = retention
-            .keep
-            .iter()
-            .filter_map(|handle| selection.reader.get::<Bytes, UnknownBlob>(*handle).ok())
-            .map(|bytes| bytes.len() as u64)
-            .sum();
-        Ok(RetainedRewritePlan {
-            retained_blobs: retention.keep.len(),
-            retained: retention.keep,
-            retained_bytes,
-            capability_proofs: retention.capability_proofs.len(),
-            retired_capability_proofs: selection.retired_proofs.len(),
-            opaque_frames: selection.opaque_frames.len(),
-            superseded_equations: selection.superseded_equations,
-            drained_frames: selection.drained_frames,
-            retired_equations: selection.retired_equations.len(),
-            filtered_frames: selection.filtered_frames,
-            repeated_frames: selection.repeated_frames,
-            corrupt_blobs: retention.corrupt,
+        Ok(PreparedRetainedRewrite {
+            selection,
+            retention,
         })
     }
 
@@ -6533,14 +6637,8 @@ impl PileFile {
         filter: &mut dyn CollectionFrameFilter,
         corrupt: CorruptBlobPolicy,
     ) -> Result<PileRewriteStats, PileRewriteError> {
-        let selection = self.select_collection_frames(drained_generations, filter)?;
-        let retention = self.retention(&selection, explicit, wants, FrameRetention::CarriedFrames);
-        if corrupt == CorruptBlobPolicy::Refuse && !retention.corrupt.is_empty() {
-            return Err(PileRewriteError::Corrupt {
-                blobs: retention.corrupt,
-            });
-        }
-        Self::write_selection(destination, selection, retention)
+        self.prepare_retained_rewrite(explicit, wants, drained_generations, filter)?
+            .write_into(destination, corrupt)
     }
 
     /// The blobs a rewrite of `selection` keeps, with the proofs and WANTs it
@@ -6760,9 +6858,17 @@ impl PileFile {
         };
         let (mut keep, mut corrupt) = expand(&roots);
         let emits_blob = keep.iter().any(|handle| resident(*handle));
-        if emits_blob {
-            retain_record_kind_if_resident(&mut roots, reader, blob_record_kind());
-            (keep, corrupt) = expand(&roots);
+        let blob_kind = Inline::<Handle<UnknownBlob>>::new(blob_record_kind().raw);
+        if emits_blob && resident(blob_kind) && !roots.recursive().any(|handle| handle == blob_kind)
+        {
+            // Closure distributes over root union. Expand only the newly
+            // introduced kind, not the complete payload graph a second time.
+            // A direct root alone does not imply its children were traversed.
+            let mut kind_root = super::RetentionRoots::new();
+            kind_root.retain_recursive(blob_kind);
+            let (kind_keep, kind_corrupt) = expand(&kind_root);
+            keep.extend(kind_keep);
+            corrupt.extend(kind_corrupt);
         }
         Retention {
             keep,
@@ -14988,6 +15094,157 @@ mod tests {
         drop(reader);
         destination.close().unwrap();
         source.close().unwrap();
+    }
+
+    #[test]
+    fn retention_walk_queues_shared_children_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "shared-children.pile");
+        let mut source = Pile::open(&source_path).unwrap();
+        let child = source
+            .put::<UnknownBlob, _>(Bytes::from_source(b"shared leaf".to_vec()))
+            .unwrap();
+        let mut roots = RetentionRoots::new();
+        // A direct root must still be expanded when a recursive edge reaches
+        // it. Every parent repeats that edge before the child is dequeued.
+        roots.retain_direct(child);
+        for index in 0u64..32 {
+            let mut bytes = child.raw.repeat(1024);
+            bytes.extend_from_slice(&index.to_le_bytes());
+            let parent = source
+                .put::<UnknownBlob, _>(Bytes::from_source(bytes))
+                .unwrap();
+            roots.retain_recursive(parent);
+        }
+        let reader = source.snapshot().unwrap();
+
+        // The former mark-on-pop walk, on the same valid resident fixture.
+        let mut previous_keep: BTreeSet<_> = roots.direct().collect();
+        let mut seen = BTreeSet::new();
+        let mut queue: std::collections::VecDeque<_> = roots.recursive().collect();
+        let mut previous_queued = queue.len();
+        while let Some(handle) = queue.pop_front() {
+            if !seen.insert(handle) {
+                continue;
+            }
+            previous_keep.insert(handle);
+            let bytes: Bytes = reader.get(handle).unwrap();
+            for word in bytes.chunks_exact(32) {
+                let child = Inline::<Handle<UnknownBlob>>::new(word.try_into().unwrap());
+                if !seen.contains(&child) && reader.contains_blob(child).unwrap() {
+                    queue.push_back(child);
+                    previous_queued += 1;
+                }
+            }
+        }
+        RETENTION_WALK_COUNTS.with_borrow_mut(|counts| *counts = Default::default());
+        let (keep, corrupt) = reader.expanded_setting_aside_corrupt(&roots);
+        let counts = RETENTION_WALK_COUNTS.with_borrow(|counts| *counts);
+        assert_eq!(keep, previous_keep);
+        assert_eq!(keep, roots.expanded(&reader));
+        assert!(corrupt.is_empty());
+        assert_eq!(previous_queued, 32 + 32 * 1024);
+        assert_eq!(counts.queued, 33);
+        assert_eq!(counts.visited, 33);
+        assert_eq!(counts.words, 32 * 1024);
+        assert_eq!(counts.expansions, 1);
+        eprintln!(
+            "shared-child queues: {previous_queued} -> {}; visited {}; words {}",
+            counts.queued, counts.visited, counts.words
+        );
+        drop(reader);
+        source.close().unwrap();
+    }
+
+    #[test]
+    fn prepared_retention_walk_and_filter_run_once_and_keep_the_frozen_prefix() {
+        struct FirstFrameOnly(usize);
+        impl CollectionFrameFilter for FirstFrameOnly {
+            fn carries(&mut self, _frame: &CollectionFrame) -> bool {
+                self.0 += 1;
+                self.0 == 1
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "prepared-source.pile");
+        let destination_path = fresh_empty_pile_path(&dir, "prepared-destination.pile");
+        let mut source = Pile::open(&source_path).unwrap();
+        let key = SigningKey::from_bytes(&[93; 32]);
+        source.publish_record_kind_descriptions().unwrap();
+        let payload = source
+            .put::<UnknownBlob, _>(Bytes::from_source(b"selected payload".to_vec()))
+            .unwrap();
+        for collection in [
+            collection_test_collection(94),
+            collection_test_collection(95),
+        ] {
+            source
+                .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                    &key,
+                    collection,
+                    Inline::new(payload.raw),
+                    empty_metadata_handle(),
+                )))
+                .unwrap();
+        }
+        let mut filter = FirstFrameOnly(0);
+        RETENTION_WALK_COUNTS.with_borrow_mut(|counts| *counts = Default::default());
+        let prepared = source
+            .prepare_retained_rewrite(
+                &RetentionRoots::new(),
+                WantRewritePolicy::Preserve,
+                &[],
+                &mut filter,
+            )
+            .unwrap();
+        let expected = prepared.retention.keep.clone();
+        let expected_bytes = prepared.retained_bytes();
+        assert!(prepared.corrupt_blobs().is_empty());
+        assert_eq!(prepared.retained_blobs(), expected.len());
+        assert!(expected.contains(&payload));
+        assert!(expected.contains(&blob_record_kind().raw));
+        let after_prepare = RETENTION_WALK_COUNTS.with_borrow(|counts| *counts);
+        assert_eq!(
+            after_prepare.expansions, 1,
+            "the resident BLOB kind is already recursively rooted"
+        );
+        assert_eq!(after_prepare.queued, after_prepare.visited);
+        assert_eq!(filter.0, 2);
+
+        // Appending does not silently refresh the decision or change its WANT
+        // policy. The prepared value still owns the earlier exact snapshot.
+        let later = source
+            .put::<UnknownBlob, _>(Bytes::from_source(b"later unselected payload".to_vec()))
+            .unwrap();
+        source.want(WantRequest::blob(later)).unwrap();
+        source.close().unwrap();
+        let mut destination = Pile::open(&destination_path).unwrap();
+        let stats = prepared
+            .write_into(&mut destination, CorruptBlobPolicy::Refuse)
+            .unwrap();
+        assert_eq!(filter.0, 2);
+        assert_eq!(
+            RETENTION_WALK_COUNTS.with_borrow(|counts| *counts),
+            after_prepare
+        );
+        assert_eq!(stats.filtered_frames, 1);
+        assert_eq!(stats.wants, 0);
+        let reader = destination.snapshot().unwrap();
+        let held: BTreeSet<_> = reader.blobs().map(|info| info.unwrap().handle).collect();
+        assert_eq!(held, expected);
+        assert!(!held.contains(&later));
+        assert_eq!(reader.records().unwrap().count(), 1);
+        assert_eq!(
+            reader.blobs().map(|info| info.unwrap().length).sum::<u64>(),
+            expected_bytes
+        );
+        eprintln!(
+            "prepared rewrite: {} expansion, {} queued, {} visited; copy adds zero walks",
+            after_prepare.expansions, after_prepare.queued, after_prepare.visited
+        );
+        drop(reader);
+        destination.close().unwrap();
     }
 
     /// A corrupt blob named as a direct root is found too: never counted as

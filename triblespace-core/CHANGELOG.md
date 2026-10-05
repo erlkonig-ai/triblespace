@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add a consume-once prepared filtered rewrite bound to its exact source
+  snapshot. Planning and copying can share frame selection and retention;
+  corruption refusal and validated copying are unchanged. Enqueue each child
+  once and expand only a newly introduced BLOB-kind root, not every root again.
+
 ## [0.47.1] - 2026-10-03
 
 - Build SimpleArchive binary/k-way unions and portable Succinct archives in

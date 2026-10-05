@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Avoid repeated blob-closure walks during selected collection compaction;
+  consume the preflight's frozen rewrite selection once, deduplicate queued
+  children at discovery, and report selection/copy phases and retained payload bytes.
+
 - Add opt-in `trible pile compact --drop-collection` for exact local collection
   exclusion and resident descriptor descendants. Selected mode uses native
   reachability retention; ordinary compact still preserves all resident blobs.

@@ -32,7 +32,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use triblespace_core::collection::records::CollectionHandle;
 use triblespace_core::repo::pile::{
     CollectionFrame, CollectionFrameFilter, CorruptBlobPolicy, DrainedGeneration, Pile,
-    PileRecordContent, PileRecords, PileRewriteStats, WantRewritePolicy,
+    PileRecordContent, PileRecords, PileRewriteStats, PreparedRetainedRewrite, WantRewritePolicy,
 };
 use triblespace_core::repo::{BlobStoreList, RetentionRoots, SnapshotSource};
 
@@ -108,18 +108,17 @@ fn compact_into(
     destination: &mut Pile,
     stable_source_len: u64,
     drained: &[DrainedGeneration],
-    excluded: &BTreeSet<CollectionHandle>,
+    prepared: Option<PreparedRetainedRewrite>,
 ) -> Result<PileRewriteStats> {
-    let snapshot = source.snapshot().context("freeze source pile")?;
     let mut roots = RetentionRoots::new();
-    if excluded.is_empty() {
+    if prepared.is_none() {
+        let snapshot = source.snapshot().context("freeze source pile")?;
         for info in snapshot.blobs() {
             let info = info.map_err(|error| anyhow!("list source blobs: {error}"))?;
             // Default compact is conservative, not reachability GC.
             roots.retain_direct(info.handle);
         }
     }
-    drop(snapshot);
 
     let after_inventory = source
         .backing_file_metadata()
@@ -133,21 +132,14 @@ fn compact_into(
         );
     }
 
-    let stats = if excluded.is_empty() {
+    let stats = if let Some(prepared) = prepared {
+        prepared.write_into(destination, CorruptBlobPolicy::Refuse)
+    } else {
         source.rewrite_retained_into_leaving(
             destination,
             &roots,
             WantRewritePolicy::Preserve,
             drained,
-        )
-    } else {
-        source.rewrite_retained_into_filtered(
-            destination,
-            &roots,
-            WantRewritePolicy::Preserve,
-            drained,
-            &mut ExcludeCollections(excluded),
-            CorruptBlobPolicy::Refuse,
         )
     }
     .map_err(|error| anyhow!("compact pile: {error}"))?;
@@ -201,8 +193,13 @@ pub(super) fn run(
         );
     }
 
+    eprintln!("Compaction: scanning source record headers...");
     let source_census = census(&source_path)?;
 
+    eprintln!(
+        "Compaction: opening source indexes ({} bytes)...",
+        source_census.bytes
+    );
     let mut source = super::open_refreshed(&source_path)?;
     let source_metadata = source.backing_file_metadata().context("stat source pile")?;
     let stable_source_len = source_metadata.len();
@@ -217,25 +214,28 @@ pub(super) fn run(
     }
 
     // Resolve every selection and native rewrite refusal before even creating
-    // the destination directory/file. The planner is the writer's own walk.
+    // the destination directory/file. Keep that exact frozen selection for
+    // copying, so neither the filter nor the retention walk runs twice.
     let selection = (|| -> Result<_> {
         if drop_collection.is_empty() {
-            return Ok(BTreeSet::new());
+            return Ok((BTreeSet::new(), None));
         }
+        eprintln!("Compaction: resolving collection exclusions...");
         let snapshot = source.snapshot().context("freeze exclusion selection")?;
         let excluded = super::collection::resolve_exclusions(&snapshot, &drop_collection)?;
         drop(snapshot);
-        let plan = source
-            .plan_retained_rewrite(
+        eprintln!("Compaction: selecting retained frames and walking blob references...");
+        let prepared = source
+            .prepare_retained_rewrite(
                 &RetentionRoots::new(),
                 WantRewritePolicy::Preserve,
                 &drained,
                 &mut ExcludeCollections(&excluded),
             )
             .map_err(|error| anyhow!("plan collection exclusion: {error}"))?;
-        if !plan.corrupt_blobs.is_empty() {
+        if !prepared.corrupt_blobs().is_empty() {
             bail!("collection exclusion reaches {} corrupt blobs; refusing before destination creation",
-                plan.corrupt_blobs.len());
+                prepared.corrupt_blobs().len());
         }
         let planned_len = source
             .backing_file_metadata()
@@ -248,10 +248,15 @@ pub(super) fn run(
                 planned_len
             );
         }
-        Ok(excluded)
+        eprintln!(
+            "Compaction: retained {} blobs ({} payload bytes); selection complete.",
+            prepared.retained_blobs(),
+            prepared.retained_bytes(),
+        );
+        Ok((excluded, Some(prepared)))
     })();
-    let excluded = match selection {
-        Ok(excluded) => excluded,
+    let (excluded, prepared) = match selection {
+        Ok(selection) => selection,
         Err(error) => {
             let _ = source.close();
             return Err(error);
@@ -279,12 +284,13 @@ pub(super) fn run(
         }
     };
 
+    eprintln!("Compaction: copying retained state to fresh destination...");
     let operation = compact_into(
         &mut source,
         &mut destination,
         stable_source_len,
         &drained,
-        &excluded,
+        prepared,
     )
     .and_then(|stats| Ok((stats, census(&destination_path)?)));
     let destination_close = destination
@@ -361,6 +367,42 @@ pub(super) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_compaction_refuses_source_append_before_copying() {
+        use triblespace_core::repo::pile::CarryEveryFrame;
+        use triblespace_core::repo::{BlobStorePut, StorageClose};
+
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.pile");
+        let destination_path = dir.path().join("destination.pile");
+        create_fresh_destination(&source_path).unwrap();
+        create_fresh_destination(&destination_path).unwrap();
+        let mut source = Pile::open(&source_path).unwrap();
+        let stable_len = source.backing_file_metadata().unwrap().len();
+        let prepared = source
+            .prepare_retained_rewrite(
+                &RetentionRoots::new(),
+                WantRewritePolicy::Preserve,
+                &[],
+                &mut CarryEveryFrame,
+            )
+            .unwrap();
+        source.put("appended after preparation").unwrap();
+        let mut destination = Pile::open(&destination_path).unwrap();
+        let error = compact_into(
+            &mut source,
+            &mut destination,
+            stable_len,
+            &[],
+            Some(prepared),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("source pile changed"));
+        assert_eq!(destination.backing_file_metadata().unwrap().len(), 0);
+        destination.close().unwrap();
+        source.close().unwrap();
+    }
 
     #[test]
     fn cleanup_reports_removal_failure_without_losing_primary_error() {
