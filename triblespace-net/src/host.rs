@@ -42,7 +42,7 @@ use crate::collection_session::{
     serve_collection_repair,
 };
 use crate::collection_wire::MAX_COLLECTION_READ_BOOTSTRAP_PROOFS;
-use crate::connection::{ConnectionTable, Service};
+use crate::connection::{ConnectionTable, RESET_UNKNOWN, Service};
 use crate::health::{
     CollectionHealth, Health, HealthSnapshot, RepairComparison, RepairFailure, StoreHealth,
 };
@@ -58,7 +58,7 @@ use crate::provider::{
     ProviderPutResult, ProviderToken, PublicationResult, blob_provider_token,
 };
 use crate::routing::{ALPHA, IterativeLookup, K, RoutingKey, RoutingTable};
-use crate::transport::{Conn, Harness, PeerId, Transport};
+use crate::transport::{Conn, Harness, PeerId, RecvStream, SendStream, Transport};
 use crate::wake::{
     CollectionWakeEvent, CollectionWakeNetwork, CollectionWakePlane, CollectionWakeRoot,
     CollectionWakeSubscription, ReceivedCollectionWake,
@@ -2952,8 +2952,8 @@ impl Service for SnapshotHandler {
         recv: &mut R,
     ) -> anyhow::Result<()>
     where
-        W: tokio::io::AsyncWrite + Unpin + Send,
-        R: tokio::io::AsyncRead + Unpin + Send,
+        W: SendStream,
+        R: RecvStream,
     {
         let peer = VerifyingKey::from_bytes(&peer)
             .map_err(|error| anyhow::anyhow!("invalid transport peer key: {error}"))?;
@@ -3023,8 +3023,8 @@ impl SnapshotHandler {
         recv: &mut R,
     ) -> anyhow::Result<()>
     where
-        W: tokio::io::AsyncWrite + Unpin,
-        R: tokio::io::AsyncRead + Unpin,
+        W: SendStream,
+        R: RecvStream,
     {
         let op = recv_u8(recv).await?;
         tracing::trace!(target: "triblespace_net::handoff", op = op_name(op), "host received DHT operation");
@@ -3088,7 +3088,13 @@ impl SnapshotHandler {
                     send_hash(send, &peer).await?;
                 }
             }
-            _ => anyhow::bail!("unknown DHT operation {op:#x}"),
+            _ => {
+                // Like an unknown tag, an unknown operation resets only its
+                // own stream.
+                send.reset(RESET_UNKNOWN);
+                recv.stop(RESET_UNKNOWN);
+                anyhow::bail!("unknown DHT operation {op:#x}")
+            }
         }
         Ok(())
     }

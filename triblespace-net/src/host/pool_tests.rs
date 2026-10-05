@@ -8,7 +8,7 @@ use tokio::io::AsyncWriteExt as _;
 
 use crate::connection::{
     CONNECTION_IDLE_DEADLINE, DRAIN_GRACE, FRAME_OPEN, MAX_CONNECTIONS, MAX_RECON_FRAME_BYTES,
-    RESET_REPLACED, write_frame,
+    RESET_REPLACED, RESET_UNKNOWN, write_frame,
 };
 use crate::protocol::{TAG_DHT, TAG_RECON};
 use crate::transport::sim::{SimConfig, SimConn, SimNet, SimTransport};
@@ -276,28 +276,29 @@ async fn a_double_dial_from_one_side_keeps_the_higher_sequence() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn an_unknown_tag_resets_its_stream_and_the_connection_keeps_serving() {
+async fn an_unknown_tag_or_operation_resets_its_stream_and_the_connection_keeps_serving() {
     let net = network(Duration::from_secs(1));
     let client = Node::join(&net, &key(1));
     let server = Node::join(&net, &key(2));
     let connection = client.table.connect(server.peer).await.unwrap();
-    let (mut send, mut recv) = connection.open_bi().await.unwrap();
-    // No stream type uses this byte.
-    send_u8(&mut send, 0x7E).await.unwrap();
-    let error = recv.read(&mut [0; 1]).await.unwrap_err();
-    // A finish would read as a clean end of the stream instead.
-    assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset, "{error}");
-    let error = send.write_all(b"unread").await.unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset, "{error}");
-    drop((send, recv));
+    // No stream type uses the first byte, and no dht/1 operation the second.
+    for request in [&[0x7E][..], &[TAG_DHT, 0x7E]] {
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        send.write_all(request).await.unwrap();
+        // A finish would read as a clean end of the stream instead.
+        assert!(reads_reset(&mut recv, RESET_UNKNOWN).await, "{request:x?}");
+        let error = send.write_all(b"unread").await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset, "{error}");
+        drop((send, recv));
 
-    assert!(
-        op_find_node(&connection, &[0; 32])
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    assert!(client.table.current(server.peer) == Some(connection));
+        assert!(
+            op_find_node(&connection, &[0; 32])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(client.table.current(server.peer) == Some(connection.clone()));
+    }
     assert_eq!(net.dial_count(client.peer, server.peer), 1);
     assert_eq!(server.table.len(), 1);
 }

@@ -7,12 +7,12 @@ use std::time::Duration;
 
 use iroh::{Endpoint, endpoint::presets, test_utils::test_transport::TestNetwork};
 use iroh_base::SecretKey;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use triblespace_net::connection::{Connection, ConnectionTable, Service};
 use triblespace_net::host::PeerConfig;
 use triblespace_net::protocol::TAG_DHT;
 use triblespace_net::transport::iroh::{IrohConn, IrohTransport, bind_with_endpoint};
-use triblespace_net::transport::{Conn, Harness, PeerId, Transport};
+use triblespace_net::transport::{Conn, Harness, PeerId, RecvStream, SendStream, Transport};
 
 async fn endpoint(network: &TestNetwork) -> Endpoint {
     let key = SecretKey::generate();
@@ -42,8 +42,8 @@ impl Service for Echo {
         recv: &mut R,
     ) -> anyhow::Result<()>
     where
-        W: AsyncWrite + Unpin + Send,
-        R: AsyncRead + Unpin + Send,
+        W: SendStream,
+        R: RecvStream,
     {
         let mut request = Vec::new();
         recv.read_to_end(&mut request).await?;

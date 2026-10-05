@@ -71,8 +71,8 @@ pub(crate) const FRAME_OPEN: u8 = 0x01;
 // Connection close codes.
 const CLOSE_NORMAL: u32 = 0;
 const CLOSE_VIOLATION: u32 = 1;
-// Stream reset codes.
-const RESET_UNKNOWN_TAG: u32 = 1;
+/// Stream reset code: the stream's tag, or its `dht/1` operation, is unknown.
+pub const RESET_UNKNOWN: u32 = 1;
 /// Stream reset code: a newer `recon/1` stream replaced this one.
 pub const RESET_REPLACED: u32 = 2;
 
@@ -88,8 +88,8 @@ pub trait Service: Clone + Send + Sync + 'static {
         recv: &mut R,
     ) -> impl Future<Output = anyhow::Result<()>> + Send
     where
-        W: AsyncWrite + Unpin + Send,
-        R: AsyncRead + Unpin + Send;
+        W: SendStream,
+        R: RecvStream;
 }
 
 /// The connections of one node, of both directions, keyed by peer.
@@ -830,8 +830,8 @@ async fn stream<T: Transport, S: Service>(
         }
         unknown => {
             debug!(tag = unknown, "resetting a stream with an unknown tag");
-            send.reset(RESET_UNKNOWN_TAG);
-            recv.stop(RESET_UNKNOWN_TAG);
+            send.reset(RESET_UNKNOWN);
+            recv.stop(RESET_UNKNOWN);
         }
     }
 }
