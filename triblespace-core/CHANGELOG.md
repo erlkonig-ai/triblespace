@@ -10,11 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Admission from explicitly supplied proofs returns the `QuorumOutcome`
   instead of a bool: `collection_reader_is_admitted_by_policy`,
   `collection_writer_is_admitted_by_policy`, `collection_reader_is_admitted_by`
-  and `Collection::reader_is_admitted_by`. A network caller now sees
-  `Undefined(definitions)` and can fetch the named capability definitions
-  before deciding again. `QuorumOutcome::any` folds alternative policies.
-  Store-backed `reader_is_admitted` and `writer_is_admitted` still answer yes
-  or no, `Met` being yes.
+  and `Collection::reader_is_admitted_by`. The new
+  `collection_action_is_admitted_by_descriptor` decides one action over every
+  policy a descriptor binds. A caller now sees `Undefined(definitions)` and can
+  fetch them before deciding again: the capability definitions a proof
+  stopped at, and a bound policy's definition that is not resident, which
+  used to read as `Unmet`. `QuorumOutcome::any` folds alternatives and names
+  each definition once. Store-backed `reader_is_admitted` and
+  `writer_is_admitted` still answer yes or no, `Met` being yes.
 
 ## [0.47.1] - 2026-10-03
 

@@ -25,8 +25,7 @@ use triblespace_core::capability::{
 use triblespace_core::collection::{
     ACTION_READ, ACTION_WRITE, AdmissionPolicy, CollectionDescriptorError, CollectionHandle,
     CollectionPolicy, CollectionRead, CollectionReadAudience, RecordDecodeError,
-    collection_read_audience_by_policy, collection_reader_is_admitted_by_policy,
-    collection_writer_is_admitted_by_policy, descriptor,
+    collection_action_is_admitted_by_descriptor, collection_read_audience_by_policy, descriptor,
 };
 use triblespace_core::patch::{Blake3Merkle, Entry as PatchEntry, IdentitySchema, PATCH};
 use triblespace_core::repo::{BlobStoreGet, CapabilityProofRead};
@@ -137,21 +136,22 @@ impl CollectionAuthorizationEvidencePatch {
     }
 
     /// Decide READ admission of `subject` from the supplied proofs. An unmet
-    /// decision names the capability definitions those proofs stopped at.
+    /// decision names the definitions whose arrival could change it: a policy
+    /// definition this reader lacks, or one those proofs stopped at.
     pub fn reader_is_admitted_by(
         &self,
         subject: VerifyingKey,
         proofs: &[CapabilityProof],
     ) -> QuorumOutcome {
-        QuorumOutcome::any(self.read_policies().map(|policy| {
-            collection_reader_is_admitted_by_policy(
-                &self.reader,
-                self.collection,
-                &policy,
-                subject,
-                proofs,
-            )
-        }))
+        collection_action_is_admitted_by_descriptor(
+            &self.reader,
+            self.collection,
+            &self.descriptor,
+            None,
+            ACTION_READ,
+            subject,
+            proofs,
+        )
     }
 
     /// The WRITE counterpart of [`Self::reader_is_admitted_by`].
@@ -160,15 +160,15 @@ impl CollectionAuthorizationEvidencePatch {
         subject: VerifyingKey,
         proofs: &[CapabilityProof],
     ) -> QuorumOutcome {
-        QuorumOutcome::any(self.write_policies().map(|policy| {
-            collection_writer_is_admitted_by_policy(
-                &self.reader,
-                self.collection,
-                &policy,
-                subject,
-                proofs,
-            )
-        }))
+        collection_action_is_admitted_by_descriptor(
+            &self.reader,
+            self.collection,
+            &self.descriptor,
+            None,
+            ACTION_WRITE,
+            subject,
+            proofs,
+        )
     }
 
     /// Root and count of the immutable native-proof PATCH.
@@ -950,6 +950,17 @@ mod tests {
         store.insert_proof(proof).unwrap();
     }
 
+    /// The definitions an `Undefined` outcome names, in handle order.
+    fn undefined(outcome: QuorumOutcome) -> Vec<CapabilityHandle> {
+        match outcome {
+            QuorumOutcome::Undefined(mut handles) => {
+                handles.sort();
+                handles
+            }
+            other => panic!("expected Undefined, got {other:?}"),
+        }
+    }
+
     #[test]
     fn discovery_keeps_descriptor_roots_without_definitions_proofs_or_admission() {
         let first = key(110);
@@ -972,9 +983,13 @@ mod tests {
         let evidence = overlay.authorization_evidence();
         assert!(evidence.is_empty());
         assert_eq!(evidence.read_policies().count(), 0);
+        // Admission waits on the definitions the descriptor binds, not on the
+        // unbound entity's.
+        let mut bound = [missing_definition, write_capability()];
+        bound.sort();
         assert_eq!(
-            evidence.reader_is_admitted_by(first.verifying_key(), &[]),
-            QuorumOutcome::Unmet
+            undefined(evidence.reader_is_admitted_by(first.verifying_key(), &[])),
+            bound
         );
         let mut expected =
             [first.verifying_key(), second.verifying_key()].map(|key| key.to_bytes());
@@ -1033,9 +1048,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(evidence.len(), 1);
+        // No policy definition is resident, so the chain is not walked yet.
+        let mut bound = [read_capability(), write_capability()];
+        bound.sort();
         assert_eq!(
-            evidence.reader_is_admitted_by(leaf.verifying_key(), &[chain]),
-            QuorumOutcome::Unmet
+            undefined(evidence.reader_is_admitted_by(leaf.verifying_key(), &[chain])),
+            bound
         );
         let candidates = evidence.discovery_candidates().collect::<Vec<_>>();
         assert_eq!(
@@ -1084,7 +1102,7 @@ mod tests {
             assert_eq!(evidence.get(proof.id()), Some(&proof));
             assert_eq!(
                 evidence.reader_is_admitted_by(subject.verifying_key(), &[proof]),
-                QuorumOutcome::Unmet
+                QuorumOutcome::Undefined(vec![custom])
             );
         }
         for proof in invalid {
@@ -1617,7 +1635,7 @@ mod tests {
             before
                 .authorization_evidence()
                 .reader_is_admitted_by(reader.verifying_key(), &[proof.clone()]),
-            QuorumOutcome::Unmet
+            QuorumOutcome::Undefined(vec![read_capability()])
         );
         store
             .put::<SimpleArchive, _>(entity! { capability_action: ACTION_READ }.facts().clone())
@@ -1634,7 +1652,7 @@ mod tests {
             before
                 .authorization_evidence()
                 .reader_is_admitted_by(reader.verifying_key(), &[proof]),
-            QuorumOutcome::Unmet
+            QuorumOutcome::Undefined(vec![read_capability()])
         );
     }
 
@@ -1714,6 +1732,55 @@ mod tests {
         assert_eq!(
             landed.writer_is_admitted_by(subject, &proofs),
             QuorumOutcome::Met
+        );
+    }
+
+    #[test]
+    fn an_absent_policy_definition_is_named_for_read_and_write() {
+        let root = key(123);
+        let subject = key(124);
+        let collection = Inline::new([125; 32]);
+        let descriptor = policy_facts(CollectionPolicy::new(
+            AdmissionPolicy::direct(root.verifying_key()),
+            AdmissionPolicy::direct(root.verifying_key()),
+        ));
+        // Each proof names the standard definition its action's policy is
+        // bound to, so the policy and the proof wait on the same blob.
+        let proofs = [
+            root_proof(&root, &subject, scope(read_capability(), collection)),
+            root_proof(&root, &subject, write_scope(collection)),
+        ];
+        let read = entity! { capability_action: ACTION_READ }.facts().clone();
+        let write = entity! { capability_action: ACTION_WRITE }.facts().clone();
+        let evidence = |definition: &TribleSet| {
+            let mut blobs = MemoryBlobStore::new();
+            blobs.insert::<SimpleArchive>(definition.clone().to_blob());
+            canonical_authorization_evidence(
+                &blobs.snapshot().unwrap(),
+                collection,
+                descriptor.clone(),
+                proofs.clone(),
+            )
+            .unwrap()
+        };
+        let subject = subject.verifying_key();
+        let without_read = evidence(&write);
+        assert_eq!(
+            without_read.reader_is_admitted_by(subject, &proofs),
+            QuorumOutcome::Undefined(vec![read_capability()])
+        );
+        assert_eq!(
+            without_read.writer_is_admitted_by(subject, &proofs),
+            QuorumOutcome::Met
+        );
+        let without_write = evidence(&read);
+        assert_eq!(
+            without_write.reader_is_admitted_by(subject, &proofs),
+            QuorumOutcome::Met
+        );
+        assert_eq!(
+            without_write.writer_is_admitted_by(subject, &proofs),
+            QuorumOutcome::Undefined(vec![write_capability()])
         );
     }
 

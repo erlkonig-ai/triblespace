@@ -8,8 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 - `CollectionAuthorizationEvidencePatch::reader_is_admitted_by` returns the
-  `QuorumOutcome` and is public, beside a new `writer_is_admitted_by`. Serving
-  and the READ bootstrap still admit only on `Met`.
+  `QuorumOutcome` and is public, beside a new `writer_is_admitted_by`. Both
+  name a bound policy definition this reader lacks as `Undefined`, as well as
+  the definitions the supplied proofs stopped at. Serving and the READ
+  bootstrap still admit only on `Met`.
 
 ## [0.47.1] - 2026-10-03
 

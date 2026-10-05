@@ -860,7 +860,7 @@ fn arriving_read_definition_refreshes_admission_with_same_wake_root_and_record_l
         old.repair
             .authorization_evidence()
             .reader_is_admitted_by(reader, &[proof.clone()]),
-        QuorumOutcome::Unmet
+        QuorumOutcome::Undefined(vec![read_capability()])
     );
     assert_eq!(enumerations.swap(0, Ordering::Relaxed), 1);
 
@@ -906,7 +906,7 @@ fn arriving_read_definition_refreshes_admission_with_same_wake_root_and_record_l
         old.repair
             .authorization_evidence()
             .reader_is_admitted_by(reader, &[proof]),
-        QuorumOutcome::Unmet
+        QuorumOutcome::Undefined(vec![read_capability()])
     );
 }
 
@@ -1240,7 +1240,7 @@ fn scoped_missing_definition_landing_changes_bootstrap_without_rebuilding_record
         old.repair
             .authorization_evidence()
             .reader_is_admitted_by(fixture.local, &[proof.clone()]),
-        QuorumOutcome::Unmet
+        QuorumOutcome::Undefined(vec![capability])
     );
     fixture.take_counts();
 
@@ -1292,7 +1292,7 @@ fn scoped_missing_definition_landing_changes_bootstrap_without_rebuilding_record
         old.repair
             .authorization_evidence()
             .reader_is_admitted_by(fixture.local, &[proof]),
-        QuorumOutcome::Unmet
+        QuorumOutcome::Undefined(vec![capability])
     );
 }
 
