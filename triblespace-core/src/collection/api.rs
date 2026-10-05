@@ -739,8 +739,13 @@ pub(crate) enum AdmissionEvidence {
 impl AdmissionEvidence {
     /// Decide one subject, and say which arrival could change the decision:
     /// a proof, or the capability definitions a proof for the subject named
-    /// and this reader could not read.
-    pub fn decide<R: BlobStoreGet>(&self, reader: &R, subject: VerifyingKey) -> QuorumOutcome {
+    /// and this reader could not read. Outside the crate this outcome is
+    /// reached through the `collection_*_is_admitted_by_*` functions.
+    pub(crate) fn decide<R: BlobStoreGet>(
+        &self,
+        reader: &R,
+        subject: VerifyingKey,
+    ) -> QuorumOutcome {
         match self {
             Self::Open => QuorumOutcome::Met,
             Self::Alternatives(alternatives) => QuorumOutcome::any(
