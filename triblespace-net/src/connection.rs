@@ -37,6 +37,7 @@ use tokio::time::Instant;
 use tracing::{Instrument as _, debug, debug_span, info_span, warn};
 
 use crate::protocol::{PILE_SYNC_ALPN, TAG_BLOB, TAG_DHT, TAG_RECON, TAG_REPAIR, recv_u8, send_u8};
+pub(crate) use crate::recon::{FRAME_OPEN, MAX_RECON_FRAME_BYTES};
 use crate::transport::{Conn, PeerId, RecvStream, SendStream, Transport};
 
 /// Bound on a dial, including its opening `recon/1` frame.
@@ -65,14 +66,6 @@ pub(crate) const MAX_REQUESTS_PER_CONNECTION: usize = 16;
 pub(crate) const MAX_HELD_REQUESTS_PER_CONNECTION: usize = 2 * MAX_REQUESTS_PER_CONNECTION;
 /// Request streams served at once across every connection.
 pub(crate) const MAX_REQUESTS_GLOBAL: usize = 16;
-
-// A `recon/1` frame is its kind, a big-endian `u32` payload length and the
-// payload. Readers skip kinds they do not know, so later frames can be added
-// without breaking them; broken framing is a protocol violation.
-/// Largest `recon/1` frame payload.
-pub(crate) const MAX_RECON_FRAME_BYTES: u32 = 64 * 1024;
-/// The dialler's first frame: its sequence number as a big-endian `u64`.
-pub(crate) const FRAME_OPEN: u8 = 0x01;
 
 // Connection close codes.
 const CLOSE_NORMAL: u32 = 0;

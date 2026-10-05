@@ -46,6 +46,7 @@ pub mod patch_repair;
 pub mod peer;
 pub mod protocol;
 pub mod provider;
+pub mod recon;
 pub mod reconcile;
 pub(crate) mod routing;
 pub mod telemetry;
