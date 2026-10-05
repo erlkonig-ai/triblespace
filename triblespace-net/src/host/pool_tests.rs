@@ -11,7 +11,7 @@ use crate::connection::{
     MAX_HELD_REQUESTS_PER_CONNECTION, MAX_RECON_FRAME_BYTES, MAX_REQUESTS_GLOBAL, RESET_BUSY,
     RESET_REPLACED, RESET_UNKNOWN, write_frame,
 };
-use crate::protocol::{TAG_DHT, TAG_RECON};
+use crate::protocol::{OP_FIND_VALUE, TAG_DHT, TAG_RECON, recv_find_value_response};
 use crate::transport::sim::{SimConfig, SimConn, SimNet, SimTransport};
 
 use super::*;
@@ -306,6 +306,43 @@ async fn an_unknown_tag_or_operation_resets_its_stream_and_the_connection_keeps_
     }
     assert_eq!(net.dial_count(client.peer, server.peer), 1);
     assert_eq!(server.table.len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn find_value_and_provider_get_are_served_under_the_dht_tag() {
+    let net = network(Duration::from_secs(1));
+    let client = Node::join(&net, &key(1));
+    let server = Node::join(&net, &key(2));
+    let locator = [7; 32];
+    let lease = (key(3).verifying_key().to_bytes(), [3; 32]);
+    let route = key(4).verifying_key().to_bytes();
+    assert!(server.client.providers.lock().unwrap().put(
+        locator,
+        lease.0,
+        lease.1,
+        crate::clock::mono_now()
+    ));
+    server
+        .client
+        .candidates
+        .lock()
+        .unwrap()
+        .promote_authenticated(route);
+    let connection = client.table.connect(server.peer).await.unwrap();
+
+    // FIND_VALUE is a dht/1 operation: the table dispatches the tag and the
+    // handler the operation, as for FIND_NODE and PROVIDER_GET.
+    let (mut send, mut recv) = connection.open_bi().await.unwrap();
+    send_u8(&mut send, TAG_DHT).await.unwrap();
+    send_u8(&mut send, OP_FIND_VALUE).await.unwrap();
+    send_hash(&mut send, &locator).await.unwrap();
+    send.shutdown().await.unwrap();
+    let (routes, hints) = recv_find_value_response(&mut recv).await.unwrap();
+    assert_eq!(routes, [route]);
+    assert_eq!(routes, op_find_node(&connection, &locator).await.unwrap());
+    assert_eq!(hints, [lease]);
+    assert_eq!(hints, op_provider_get(&connection, &locator).await.unwrap());
+    assert_eq!(net.dial_count(client.peer, server.peer), 1);
 }
 
 #[tokio::test(start_paused = true)]
