@@ -13,7 +13,7 @@ use triblespace_core::blob::{BlobEncoding, IntoBlob};
 use triblespace_core::capability::policy::{capability_handle, resource_policy};
 use triblespace_core::capability::{
     capability_action, capability_delegate_action, CapabilityProof, CapabilityProofError,
-    CapabilityResource,
+    CapabilityResource, QuorumOutcome,
 };
 use triblespace_core::collection::descriptor;
 use triblespace_core::collection::records::{
@@ -396,9 +396,12 @@ fn unrecognized_policy_is_invisible_without_poisoning_other_collections() {
     assert!(!unknown
         .writer_is_admitted(&snapshot, authority.verifying_key())
         .unwrap());
-    assert!(!unknown
-        .reader_is_admitted_by(&snapshot, authority.verifying_key(), &[])
-        .unwrap());
+    assert_eq!(
+        unknown
+            .reader_is_admitted_by(&snapshot, authority.verifying_key(), &[])
+            .unwrap(),
+        QuorumOutcome::Unmet
+    );
     assert!(unknown.admitted(&snapshot).unwrap().is_empty());
     assert!(unknown.read::<TribleSet, _>(&snapshot).unwrap().is_empty());
     assert_eq!(
@@ -487,9 +490,12 @@ fn multiple_policy_alternatives_union_admission_without_combining_quorum_shares(
     assert!(collection
         .reader_is_admitted(&before, a.verifying_key())
         .unwrap());
-    assert!(collection
-        .reader_is_admitted_by(&before, c.verifying_key(), &[])
-        .unwrap());
+    assert_eq!(
+        collection
+            .reader_is_admitted_by(&before, c.verifying_key(), &[])
+            .unwrap(),
+        QuorumOutcome::Met
+    );
     let mut audience = vec![a.verifying_key(), c.verifying_key()];
     audience.sort_unstable_by_key(VerifyingKey::to_bytes);
     assert_eq!(
@@ -540,9 +546,12 @@ fn typed_admission_cannot_borrow_policy_from_another_descriptor_entity() {
     assert!(!collection
         .reader_is_admitted(&snapshot, authority.verifying_key())
         .unwrap());
-    assert!(!collection
-        .reader_is_admitted_by(&snapshot, authority.verifying_key(), &[])
-        .unwrap());
+    assert_eq!(
+        collection
+            .reader_is_admitted_by(&snapshot, authority.verifying_key(), &[])
+            .unwrap(),
+        QuorumOutcome::Unmet
+    );
     assert!(!collection
         .writer_is_admitted(&snapshot, authority.verifying_key())
         .unwrap());

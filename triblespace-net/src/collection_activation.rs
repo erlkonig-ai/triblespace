@@ -20,7 +20,7 @@ use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{Blob, TryFromBlob};
 use triblespace_core::capability::{
     CapabilityHandle, CapabilityProof, CapabilityProofError, CapabilityProofId, CapabilityRequest,
-    CapabilityResource,
+    CapabilityResource, QuorumOutcome,
 };
 use triblespace_core::collection::{
     ACTION_READ, ACTION_WRITE, AdmissionPolicy, CollectionDescriptorError, CollectionHandle,
@@ -141,12 +141,15 @@ impl CollectionAuthorizationEvidencePatch {
         proofs: &[CapabilityProof],
     ) -> bool {
         self.read_policies().any(|policy| {
-            collection_reader_is_admitted_by_policy(
-                &self.reader,
-                self.collection,
-                &policy,
-                subject,
-                proofs,
+            matches!(
+                collection_reader_is_admitted_by_policy(
+                    &self.reader,
+                    self.collection,
+                    &policy,
+                    subject,
+                    proofs,
+                ),
+                QuorumOutcome::Met
             )
         })
     }
@@ -1200,11 +1203,12 @@ mod tests {
         let proofs = evidence.proofs().cloned().collect::<Vec<_>>();
         for reader in [reader_a.verifying_key(), reader_b.verifying_key()] {
             assert!(evidence.reader_is_admitted_by(reader, &proofs));
-            assert!(
+            assert_eq!(
                 triblespace_core::collection::collection_reader_is_admitted_by(
                     &snapshot, collection, reader, &proofs,
                 )
-                .unwrap()
+                .unwrap(),
+                QuorumOutcome::Met
             );
         }
         assert!(!evidence.reader_is_admitted_by(key(44).verifying_key(), &proofs));
@@ -1263,14 +1267,15 @@ mod tests {
                 evidence.authorized_readers(),
                 CollectionReadAudience::Restricted(Vec::new())
             );
-            assert!(
-                !triblespace_core::collection::collection_reader_is_admitted_by(
+            assert_eq!(
+                triblespace_core::collection::collection_reader_is_admitted_by(
                     &snapshot,
                     collection,
                     key(44).verifying_key(),
                     &[],
                 )
-                .unwrap()
+                .unwrap(),
+                QuorumOutcome::Unmet
             );
         }
     }
