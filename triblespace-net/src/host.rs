@@ -17,7 +17,7 @@ use std::thread;
 use anybytes::Bytes;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use futures::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
-use iroh_base::{EndpointAddr, EndpointId};
+use iroh_base::{EndpointAddr, EndpointId, TransportAddr};
 use tokio::io::AsyncReadExt as _;
 use tracing::{debug, warn};
 use triblespace_core::blob::Blob;
@@ -65,11 +65,19 @@ pub(crate) type ActiveCollections = PATCH<32, IdentitySchema>;
 /// Collection authority is intentionally absent. A connection is ordinary
 /// mutually authenticated TLS; READ authority is supplied on each collection
 /// repair stream. Which collections a host syncs is the pile's sync
-/// selection, not configuration.
+/// selection, not configuration, and whom it syncs with comes from the
+/// pile too: the keys its records and grants name, then the DHT those peers
+/// seed.
 #[derive(Clone)]
 pub struct PeerConfig {
-    /// Bootstrap endpoint routes.
-    pub peers: Vec<EndpointAddr>,
+    /// The key of this pile's sync daemon: the key its configuration is
+    /// written under, which the daemon runs as. A process whose pile names
+    /// no peer reaches the DHT through it. Its first lookup dials the
+    /// daemon at the addresses the daemon recorded in that configuration
+    /// ([`sync_addresses`](triblespace_core::collection::selection::sync_addresses)),
+    /// or through discovery by key when there are none. The daemon itself
+    /// leaves this unset.
+    pub daemon: Option<VerifyingKey>,
     /// Maximum DHT provider-announcement attempts during this process.
     ///
     /// `None` preserves the ordinary unlimited scheduler. `Some(0)` disables
@@ -88,8 +96,14 @@ pub struct PeerConfig {
 /// What a started production host hands back from its thread.
 #[derive(Clone)]
 pub struct HostStarted {
-    /// The local sockets the endpoint bound.
-    pub bound: Vec<SocketAddr>,
+    endpoint: iroh::Endpoint,
+}
+
+impl HostStarted {
+    /// The local sockets the endpoint is bound to now.
+    pub fn bound(&self) -> Vec<SocketAddr> {
+        self.endpoint.bound_sockets()
+    }
 }
 
 trait BlobSnapshotReader: Send + Sync + 'static {
@@ -703,13 +717,16 @@ pub async fn run_host<T: Transport>(harness: Harness<T>, config: PeerConfig, wir
     host_loop(harness, config, wiring).await;
 }
 
+/// Start a production host. `daemon_addresses` are the addresses
+/// [`PeerConfig::daemon`] recorded in the pile's configuration.
 pub fn spawn(
     key: SigningKey,
     config: PeerConfig,
+    daemon_addresses: Vec<SocketAddr>,
 ) -> anyhow::Result<(NetSender, NetReceiver, HostStarted)> {
     let id: EndpointId = iroh_secret(&key).public().into();
     let (sender, receiver, wiring) = wire(id);
-    let started = start(key, config, wiring)?;
+    let started = start(key, config, daemon_addresses, wiring)?;
     Ok((sender, receiver, started))
 }
 
@@ -720,6 +737,7 @@ pub fn spawn(
 pub(crate) fn start(
     key: SigningKey,
     config: PeerConfig,
+    daemon_addresses: Vec<SocketAddr>,
     wiring: HostWiring,
 ) -> anyhow::Result<HostStarted> {
     let secret = iroh_secret(&key);
@@ -742,8 +760,16 @@ pub(crate) fn start(
                         return;
                     }
                 };
+                if let Some(key) = config.daemon.filter(|_| !daemon_addresses.is_empty()) {
+                    let id = EndpointId::from_bytes(&key.to_bytes())
+                        .expect("an Ed25519 key is an endpoint id");
+                    harness.transport.learn(EndpointAddr::from_parts(
+                        id,
+                        daemon_addresses.iter().copied().map(TransportAddr::Ip),
+                    ));
+                }
                 let started = HostStarted {
-                    bound: harness.transport.bound_sockets(),
+                    endpoint: harness.transport.endpoint().clone(),
                 };
                 if startup_tx.send(Ok(started)).is_ok() {
                     run_host(harness, config, wiring).await;
@@ -986,16 +1012,13 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
         health.started_at = Some(now);
         health.observed_at = Some(now);
     });
-    let configured: Vec<_> = config
-        .peers
-        .iter()
-        .map(|address| *address.id.as_bytes())
-        .filter(|peer| *peer != my_id)
-        .collect();
-    let candidates = Arc::new(Mutex::new(RoutingTable::new(
-        my_id,
-        configured.iter().copied(),
-    )));
+    // The pile's sync daemon is the first contact of a process whose pile
+    // names no peer; every connection a pile's content opens adds another.
+    let mut routes = RoutingTable::new(my_id);
+    if let Some(daemon) = config.daemon {
+        routes.note_candidate(daemon.to_bytes());
+    }
+    let candidates = Arc::new(Mutex::new(routes));
     let providers = Arc::new(Mutex::new(ProviderDirectory::new(my_id)));
     let (recon_tx, recon_rx) = tokio::sync::mpsc::channel(crate::peering::RECON_EVENTS);
     let (walks_tx, walks_rx) = tokio::sync::mpsc::channel(crate::walk::WALK_EVENTS);
@@ -2512,7 +2535,7 @@ mod tests {
         });
         let client = super::ProviderClient::for_test(
             requester_harness.transport,
-            super::RoutingTable::new(requester, [provider]),
+            super::RoutingTable::with_candidates(requester, [provider]),
         );
         let before = client.connections.connect(provider).await.unwrap();
         let (limited, ordinary) = tokio::join!(
@@ -2726,7 +2749,7 @@ mod tests {
         let second = SigningKey::from_bytes(&[103; 32])
             .verifying_key()
             .to_bytes();
-        let mut routes = RoutingTable::new(local, [first, second]);
+        let mut routes = RoutingTable::with_candidates(local, [first, second]);
         let mut lookup = ReplicaLookup::new(local, local, vec![first, second], None);
         assert!(lookup.deadline.is_none());
         assert_eq!(lookup.machine.next_batch().len(), 2);
@@ -2904,7 +2927,7 @@ mod tests {
         let peer = SigningKey::from_bytes(&[112; 32])
             .verifying_key()
             .to_bytes();
-        let handler = super::SnapshotHandler::for_test(local, RoutingTable::new(local, []));
+        let handler = super::SnapshotHandler::for_test(local, RoutingTable::new(local));
         let (link, _frames) = Link::detached(1, peer);
         handler.recon(ReconEvent::Opened(link)).await;
         assert_eq!(

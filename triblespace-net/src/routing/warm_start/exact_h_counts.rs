@@ -67,7 +67,7 @@ fn count_sequence(
 ) -> Vec<Counts> {
     let local = peers[0];
     let bootstrap = peers[1];
-    let mut retained = RoutingTable::new(local, [bootstrap]);
+    let mut retained = RoutingTable::with_candidates(local, [bootstrap]);
     targets
         .iter()
         .map(|&target| {
@@ -85,7 +85,7 @@ fn count_sequence(
                 // This fixture counts all routing work, not a winner's arrival.
                 winner: local,
             };
-            let mut fresh = RoutingTable::new(local, [bootstrap]);
+            let mut fresh = RoutingTable::with_candidates(local, [bootstrap]);
             let routes = if retain_routes {
                 &mut retained
             } else {
@@ -129,7 +129,7 @@ fn exact_h_routing_counts_fresh_and_retained_sequences() {
     let server_routes = peers[1..]
         .iter()
         .map(|&peer| {
-            let mut routes = RoutingTable::new(peer, []);
+            let mut routes = RoutingTable::new(peer);
             for candidate in &peers {
                 routes.promote_authenticated(*candidate);
             }

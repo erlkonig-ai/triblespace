@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anybytes::Bytes;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use iroh_base::EndpointId;
 use triblespace_core::blob::IntoBlob;
 use triblespace_core::blob::encodings::UnknownBlob;
@@ -91,20 +91,21 @@ fn select(store: &mut MemoryRepo, key: &SigningKey, collection: CollectionHandle
     write_sync_selection(store, config, key, collection, true).unwrap();
 }
 
+/// A host whose first contact, when its pile names nobody, is `daemon`.
 fn bring_up(
     net: &SimNet,
     endpoint: &SigningKey,
     store: MemoryRepo,
-    peers: Vec<[u8; 32]>,
+    daemon: Option<[u8; 32]>,
 ) -> Peer<MemoryRepo> {
-    bring_up_with_publication_budget(net, endpoint, store, peers, None)
+    bring_up_with_publication_budget(net, endpoint, store, daemon, None)
 }
 
 fn bring_up_with_publication_budget(
     net: &SimNet,
     endpoint: &SigningKey,
     store: MemoryRepo,
-    peers: Vec<[u8; 32]>,
+    daemon: Option<[u8; 32]>,
     provider_publication_budget: Option<u64>,
 ) -> Peer<MemoryRepo> {
     let id = endpoint.verifying_key().to_bytes();
@@ -114,14 +115,7 @@ fn bring_up_with_publication_budget(
     tokio::task::spawn_local(host::run_host(
         harness,
         PeerConfig {
-            peers: peers
-                .into_iter()
-                .map(|peer| {
-                    iroh_base::EndpointAddr::from(
-                        EndpointId::from_bytes(&peer).expect("valid configured peer"),
-                    )
-                })
-                .collect(),
+            daemon: daemon.map(|daemon| VerifyingKey::from_bytes(&daemon).unwrap()),
             provider_publication_budget,
             bind: None,
         },
@@ -213,8 +207,8 @@ fn demand_pull_selection_warms_an_empty_collection_without_a_want() {
             .unwrap()
             .unwrap();
         let source_id = source_key.verifying_key().to_bytes();
-        let mut source = bring_up(&net, &source_key, source_store, Vec::new());
-        let mut receiver = bring_up(&net, &receiver_key, MemoryRepo::default(), vec![source_id]);
+        let mut source = bring_up(&net, &source_key, source_store, None);
+        let mut receiver = bring_up(&net, &receiver_key, MemoryRepo::default(), Some(source_id));
         source.activate_collection(collection.handle());
         receiver.activate_collection(collection.handle());
         // Deliberately no Reconciler tick, acquire(), WANT, or COMMIT. Metadata
@@ -282,8 +276,8 @@ fn issuer_held_read_proof_reaches_a_handle_only_recipient_by_grant_exchange() {
             )))
             .unwrap();
         let issuer_id = issuer_key.verifying_key().to_bytes();
-        let mut issuer = bring_up(&net, &issuer_key, issuer_store, Vec::new());
-        let mut recipient = bring_up(&net, &recipient_key, MemoryRepo::default(), vec![issuer_id]);
+        let mut issuer = bring_up(&net, &issuer_key, issuer_store, None);
+        let mut recipient = bring_up(&net, &recipient_key, MemoryRepo::default(), Some(issuer_id));
         issuer.activate_collection(collection.handle());
 
         // The recipient begins with only C and one issuer endpoint. The issuer
@@ -525,8 +519,8 @@ fn write_proof_later_activates_repaired_commit_without_reaching_publisher() {
         select(&mut reader_store, &reader_key, collection.handle());
 
         let server_id = server_key.verifying_key().to_bytes();
-        let mut server = bring_up(&net, &server_key, server_store, Vec::new());
-        let mut reader = bring_up(&net, &reader_key, reader_store, vec![server_id]);
+        let mut server = bring_up(&net, &server_key, server_store, None);
+        let mut reader = bring_up(&net, &reader_key, reader_store, Some(server_id));
         server.activate_collection(collection.handle());
         reader.activate_collection(collection.handle());
 
@@ -660,19 +654,19 @@ fn native_read_credential_admits_on_retry_and_rejects_writer_only_peer() {
             &net,
             &server_key,
             server_store,
-            Vec::new(),
+            None,
         );
         let mut reader = bring_up(
             &net,
             &reader_key,
             reader_store,
-            vec![server_id],
+            Some(server_id),
         );
         let mut writer_only = bring_up(
             &net,
             &writer_key,
             writer_store,
-            vec![server_id],
+            Some(server_id),
         );
         for peer in [&mut server, &mut reader, &mut writer_only] {
             peer.activate_collection(collection.handle());
@@ -829,9 +823,9 @@ fn a_healed_partition_recovers_without_dht_or_restart() {
         // reader knows the server only as the root of C's WRITE policy,
         // which makes it the reader's peering candidate.
         let mut server =
-            bring_up_with_publication_budget(&net, &server_key, server_store, Vec::new(), Some(0));
+            bring_up_with_publication_budget(&net, &server_key, server_store, None, Some(0));
         let mut reader =
-            bring_up_with_publication_budget(&net, &reader_key, reader_store, Vec::new(), Some(0));
+            bring_up_with_publication_budget(&net, &reader_key, reader_store, None, Some(0));
         server.activate_collection(collection.handle());
         reader.activate_collection(collection.handle());
 
@@ -910,8 +904,8 @@ fn durable_bearer_want_materializes_without_any_collection() {
         reader_store.flush().unwrap();
 
         let server_id = server_key.verifying_key().to_bytes();
-        let mut server = bring_up(&net, &server_key, server_store, Vec::new());
-        let mut reader = bring_up(&net, &reader_key, reader_store, vec![server_id]);
+        let mut server = bring_up(&net, &server_key, server_store, None);
+        let mut reader = bring_up(&net, &reader_key, reader_store, Some(server_id));
         advance(&clock, &mut [&mut server, &mut reader], 4).await;
 
         let mut reconciler = Reconciler::with_backoff(
@@ -1052,18 +1046,13 @@ fn demand_shallow_full_preserve_exact_wants_and_only_hydrate_selected_roots_with
                 ))
                 .unwrap();
             reader_store.want(demand).unwrap();
-            let mut server = bring_up_with_publication_budget(
-                &net,
-                &server_key,
-                server_store,
-                Vec::new(),
-                Some(0),
-            );
+            let mut server =
+                bring_up_with_publication_budget(&net, &server_key, server_store, None, Some(0));
             let mut reader = bring_up_with_publication_budget(
                 &net,
                 &reader_key,
                 reader_store,
-                vec![server_key.verifying_key().to_bytes()],
+                Some(server_key.verifying_key().to_bytes()),
                 Some(0),
             );
             // Neither endpoint activates C or obtains READ(C). Ordinary H
@@ -1154,7 +1143,7 @@ fn a_previous_generation_peer_is_refused() {
     runtime.block_on(local.run_until(async {
         let net = SimNet::new(0xC011_EC8A, SimConfig::default());
         let server_key = key(95);
-        let mut server = bring_up(&net, &server_key, MemoryRepo::default(), Vec::new());
+        let mut server = bring_up(&net, &server_key, MemoryRepo::default(), None);
         advance(&clock, &mut [&mut server], 1).await;
         let client = net.join(&key(96));
         let server_id = server_key.verifying_key().to_bytes();

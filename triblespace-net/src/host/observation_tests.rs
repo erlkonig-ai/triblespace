@@ -425,7 +425,7 @@ async fn landing_publishes_one_observation_that_the_connection_table_serves() {
     let mut harness = net.join(&fixture.root);
     let handler = SnapshotHandler {
         snapshot: wiring.snapshot.clone(),
-        ..SnapshotHandler::for_test(local, RoutingTable::new(local, []))
+        ..SnapshotHandler::for_test(local, RoutingTable::new(local))
     };
     let table = ConnectionTable::new(harness.transport.clone(), handler);
     tokio::spawn(async move {
@@ -435,7 +435,7 @@ async fn landing_publishes_one_observation_that_the_connection_table_serves() {
     });
     let client = net.join(&SigningKey::from_bytes(&[103; 32])).transport;
     let client_id = client.local_id();
-    let routes = RoutingTable::new(client_id, []);
+    let routes = RoutingTable::new(client_id);
     let client = ConnectionTable::new(client, SnapshotHandler::for_test(client_id, routes));
     let connection = client.connect(local).await.unwrap();
     let bytes = Bytes::from_source(b"landed by a walk".to_vec());

@@ -11,7 +11,6 @@ use iroh::{Endpoint, test_utils::test_transport::TestNetwork};
 use iroh_base::SecretKey;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use triblespace_net::connection::{Connection, ConnectionTable, RESET_UNKNOWN, Service};
-use triblespace_net::host::PeerConfig;
 use triblespace_net::protocol::TAG_DHT;
 use triblespace_net::transport::iroh::{IrohConn, IrohTransport, bind_with_endpoint};
 use triblespace_net::transport::{Conn, Harness, PeerId, RecvStream, SendStream, Transport};
@@ -65,15 +64,7 @@ async fn node(network: &TestNetwork) -> Node {
     let Harness {
         transport,
         mut incoming,
-    } = bind_with_endpoint(
-        endpoint(network).await,
-        &PeerConfig {
-            peers: vec![],
-            provider_publication_budget: Some(0),
-            bind: None,
-        },
-    )
-    .await;
+    } = bind_with_endpoint(endpoint(network).await).await;
     let id = transport.local_id();
     let table = ConnectionTable::new(transport, Echo);
     let accepted = Arc::new(AtomicUsize::new(0));

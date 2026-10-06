@@ -612,7 +612,7 @@ fn leech_public_lazy_resident_snapshots_and_writes_remain_dormant() {
             },
             SigningKey::from_bytes(&[87; 32]),
             PeerConfig {
-                peers: Vec::new(),
+                daemon: None,
                 provider_publication_budget: Some(1),
                 bind: None,
             },

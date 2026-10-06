@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use anybytes::Bytes;
 use ed25519_dalek::SigningKey;
-use iroh_base::{EndpointAddr, EndpointId};
+use iroh_base::EndpointId;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::clock::{self, VirtualClock};
 use triblespace_core::collection::selection::{CONFIG_COLLECTION_NAME, write_sync_selection};
@@ -26,21 +26,14 @@ use triblespace_net::host::{self, PeerConfig};
 use triblespace_net::peer::Peer;
 use triblespace_net::transport::sim::{SimConfig, SimNet};
 
-fn bring_up(
-    net: &SimNet,
-    key: &SigningKey,
-    store: MemoryRepo,
-    peers: &[[u8; 32]],
-) -> Peer<MemoryRepo> {
+/// A host whose peers are the quorum roots its pile names.
+fn bring_up(net: &SimNet, key: &SigningKey, store: MemoryRepo) -> Peer<MemoryRepo> {
     let id = EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap();
     let (sender, receiver, wiring) = host::wire(id);
     tokio::task::spawn_local(host::run_host(
         net.join(key),
         PeerConfig {
-            peers: peers
-                .iter()
-                .map(|peer| EndpointAddr::from(EndpointId::from_bytes(peer).unwrap()))
-                .collect(),
+            daemon: None,
             // This test measures repair recovery, not the timing of provider
             // publication.
             provider_publication_budget: Some(0),
@@ -166,9 +159,9 @@ fn periodic_root_announcements_recover_a_healed_partition_beside_a_healthy_repli
         let control = b_store
             .put::<UnknownBlob, _>(control_bytes.clone())
             .unwrap();
-        let mut a = bring_up(&net, &a_key, a_store, &[c_id]);
-        let mut b = bring_up(&net, &b_key, b_store, &[c_id]);
-        let mut c = bring_up(&net, &c_key, c_store, &[a_id, b_id]);
+        let mut a = bring_up(&net, &a_key, a_store);
+        let mut b = bring_up(&net, &b_key, b_store);
+        let mut c = bring_up(&net, &c_key, c_store);
         for peer in [&mut a, &mut b, &mut c] {
             peer.activate_collection(collection);
         }

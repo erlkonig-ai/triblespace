@@ -476,7 +476,7 @@ impl Node {
         let peer = key.verifying_key().to_bytes();
         let mut harness = net.join(key);
         let trace = Trace::default();
-        let candidates = Arc::new(Mutex::new(RoutingTable::new(peer, [])));
+        let candidates = Arc::new(Mutex::new(RoutingTable::new(peer)));
         let directory = Arc::new(Mutex::new(ProviderDirectory::new(peer)));
         let handler = SnapshotHandler {
             snapshot: tokio::sync::watch::channel(snapshot).1,
@@ -596,7 +596,7 @@ impl ThreeNodes {
                 inner: transport,
                 trace: Trace::default(),
             },
-            RoutingTable::new(my_id, [holder.peer, other.peer]),
+            RoutingTable::with_candidates(my_id, [holder.peer, other.peer]),
         );
         Self {
             net,
@@ -839,7 +839,7 @@ async fn exact_h_empty_first_hop_waits_for_the_referred_holder() {
     let gate = Gate::new(OP_FIND_VALUE);
     let mut fixture = ThreeNodes::with_gates(false, Some(gate.clone()), None);
     *fixture.client.candidates.lock().unwrap() =
-        RoutingTable::new(fixture.client.my_id, [fixture.other.peer]);
+        RoutingTable::with_candidates(fixture.client.my_id, [fixture.other.peer]);
     fixture
         .other
         .candidates
@@ -987,7 +987,7 @@ async fn exact_h_stale_early_hints_leave_room_for_fresh_routing_and_final_holder
     }
     // An opened connection is a route, so the routes are set after.
     *fixture.client.candidates.lock().unwrap() =
-        RoutingTable::new(fixture.client.my_id, [fixture.other.peer]);
+        RoutingTable::with_candidates(fixture.client.my_id, [fixture.other.peer]);
     let trace = fixture.trace().clone();
     let started = Instant::now();
     let caller_deadline = started + Duration::from_secs(2);
@@ -1099,7 +1099,7 @@ async fn exact_h_routing_and_data_share_alpha_and_caller_cancellation_drops_both
         None,
         Some(late_gate),
     );
-    *fixture.client.candidates.lock().unwrap() = RoutingTable::new(
+    *fixture.client.candidates.lock().unwrap() = RoutingTable::with_candidates(
         fixture.client.my_id,
         [fixture.holder.peer, fixture.other.peer, third.peer],
     );
@@ -1237,7 +1237,7 @@ async fn a_provider_lookup_takes_one_find_value_per_hop() {
         // An opened connection is a route, so the routes are set after.
         fixture.warm_connections().await;
         *fixture.client.candidates.lock().unwrap() =
-            RoutingTable::new(fixture.client.my_id, [fixture.other.peer]);
+            RoutingTable::with_candidates(fixture.client.my_id, [fixture.other.peer]);
         let providers = fixture
             .client
             .find_key(

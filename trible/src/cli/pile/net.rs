@@ -9,8 +9,6 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 use clap::{Parser, ValueEnum};
 use ed25519_dalek::SigningKey;
-use iroh_base::{EndpointAddr, EndpointId};
-use iroh_tickets::endpoint::EndpointTicket;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::collection::selection::{
     config_facts, sync_collection, sync_selection, Selection,
@@ -30,23 +28,6 @@ use triblespace_net::reconcile::ReplicationMode;
 /// [`crate::cli::pile::open_refreshed`]).
 fn open_pile(path: &PathBuf, host: Option<ed25519_dalek::VerifyingKey>) -> Result<Pile> {
     crate::cli::pile::open_refreshed_with(path, host)
-}
-
-fn parse_peers(values: &[String]) -> Result<Vec<EndpointAddr>> {
-    values
-        .iter()
-        .map(|value| {
-            if let Ok(ticket) = value.parse::<EndpointTicket>() {
-                return Ok(ticket.into());
-            }
-            let public = value.parse::<iroh_base::PublicKey>().map_err(|_| {
-                anyhow!(
-                    "invalid peer {value:?}: expected an iroh endpoint ticket or 64-char endpoint id"
-                )
-            })?;
-            Ok(EndpointAddr::from(EndpointId::from(public)))
-        })
-        .collect()
 }
 
 fn parse_collection(value: &str) -> Result<CollectionHandle> {
@@ -94,10 +75,6 @@ pub enum Command {
         /// Path to the node's signing key.
         #[arg(long)]
         key: Option<PathBuf>,
-        /// Also print the ticket of a sync daemon started with this key and
-        /// `--bind <ADDR>`, so a peer can be given it before either starts.
-        #[arg(long, value_name = "IP:PORT")]
-        bind: Option<std::net::SocketAddr>,
     },
     /// Show locally recorded swarm health; never performs a network probe.
     ///
@@ -206,12 +183,11 @@ pub enum Command {
     ///
     /// The selection is the register in the pile's own configuration
     /// collection, under the key; the daemon follows changes to it while
-    /// it runs.
+    /// it runs. Peers come from the pile too: the keys that signed records
+    /// and grants of a selected collection, then the providers the DHT those
+    /// peers seed finds.
     Sync {
         pile: PathBuf,
-        /// Canonical iroh endpoint tickets or bare endpoint ids.
-        #[arg(long, value_delimiter = ',')]
-        peers: Vec<String>,
         /// Existing durable key for the endpoint, health and telemetry signatures.
         #[arg(long)]
         key: Option<PathBuf>,
@@ -254,7 +230,7 @@ pub enum Command {
 
 pub fn run(command: Command) -> Result<()> {
     match command {
-        Command::Identity { key, bind } => run_identity(key, bind),
+        Command::Identity { key } => run_identity(key),
         Command::Health {
             pile,
             key,
@@ -297,7 +273,6 @@ pub fn run(command: Command) -> Result<()> {
         }),
         Command::Sync {
             pile,
-            peers,
             key,
             replication,
             provider_publication_budget,
@@ -309,7 +284,6 @@ pub fn run(command: Command) -> Result<()> {
             bind,
         } => run_sync(
             pile,
-            peers,
             key,
             replication.into(),
             provider_publication_budget,
@@ -437,37 +411,14 @@ fn run_selection(pile_path: PathBuf, key_path: Option<PathBuf>) -> Result<()> {
     result.and(close)
 }
 
-fn run_identity(key: Option<PathBuf>, bind: Option<std::net::SocketAddr>) -> Result<()> {
+fn run_identity(key: Option<PathBuf>) -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let default_anchor = cwd.join("identity.pile");
     let path = triblespace_core::signing_key_file::resolve_path(key.as_deref(), &default_anchor);
     let key = triblespace_core::signing_key_file::init(&path)?;
     let public = triblespace_net::identity::iroh_secret(&key).public();
-    let addr = bind.map(ticket_address).transpose()?;
     println!("node: {public}");
-    if let Some(addr) = addr {
-        println!("ticket: {}", bound_ticket(public, addr));
-    }
     Ok(())
-}
-
-/// The address a ticket written before launch may name: the daemon binds it
-/// later, so it must be a concrete address a peer can reach and a fixed port.
-/// Port 0 and the unspecified addresses (0.0.0.0, ::) name no socket the
-/// daemon will have.
-fn ticket_address(addr: std::net::SocketAddr) -> Result<std::net::SocketAddr> {
-    if addr.port() == 0 || addr.ip().is_unspecified() {
-        return Err(anyhow!(
-            "--bind {addr}: a ticket written before launch needs a concrete reachable address and a nonzero port"
-        ));
-    }
-    Ok(addr)
-}
-
-/// The ticket of an endpoint reached at exactly `addr`.
-fn bound_ticket(id: EndpointId, addr: std::net::SocketAddr) -> String {
-    use iroh_tickets::Ticket;
-    EndpointTicket::new(EndpointAddr::new(id).with_ip_addr(addr)).encode_string()
 }
 
 /// The startup line naming the sockets the endpoint bound:
@@ -497,7 +448,6 @@ fn selected_collections(
 
 fn run_sync(
     pile_path: PathBuf,
-    peer_values: Vec<String>,
     key_path: Option<PathBuf>,
     replication: ReplicationMode,
     provider_publication_budget: Option<u64>,
@@ -509,7 +459,6 @@ fn run_sync(
     bind: Option<std::net::SocketAddr>,
 ) -> Result<()> {
     let key = load_existing_key(key_path, &pile_path)?;
-    let peers = parse_peers(&peer_values)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -573,7 +522,8 @@ fn run_sync(
         pile,
         key.clone(),
         PeerConfig {
-            peers,
+            // This is the daemon others contact first.
+            daemon: None,
             provider_publication_budget,
             bind,
         },
@@ -928,147 +878,14 @@ fn run_health(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn a_bound_ticket_names_exactly_the_bound_socket() {
-        use iroh_base::{EndpointId, SecretKey};
-        let id: EndpointId = SecretKey::from_bytes(&[7; 32]).public();
+    fn the_bound_line_names_every_bound_socket() {
         let addr: std::net::SocketAddr = "127.0.0.1:7001".parse().unwrap();
-        let ticket = super::bound_ticket(id, addr);
-        let peers = super::parse_peers(&[ticket]).unwrap();
-        assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].id, id);
-        assert_eq!(peers[0].ip_addrs().copied().collect::<Vec<_>>(), vec![addr]);
         assert_eq!(super::bound_line(&[addr]), "bound: 127.0.0.1:7001");
         let v6: std::net::SocketAddr = "[::1]:7002".parse().unwrap();
         assert_eq!(
             super::bound_line(&[addr, v6]),
             "bound: 127.0.0.1:7001 [::1]:7002"
         );
-    }
-
-    /// Two production peers, each bound to a chosen loopback port and given
-    /// the other's ticket, written before either starts, repair a collection
-    /// in both directions. This proves the bind, the tickets and collection
-    /// record repair between them, with synthetic commit handles; it says
-    /// nothing about payload residency.
-    #[test]
-    fn two_bound_peers_reach_each_other_from_tickets_written_before_launch() {
-        use ed25519_dalek::SigningKey;
-        use triblespace_core::collection::selection::{
-            write_sync_selection, CONFIG_COLLECTION_NAME,
-        };
-        use triblespace_core::collection::{
-            empty_metadata_handle, private_policy, AdmissionPolicy, CollectionCommit,
-            CollectionData, CollectionPolicy, CollectionRead, CollectionRecord, CollectionStore,
-            CollectionStoreExt,
-        };
-        use triblespace_core::repo::memoryrepo::MemoryRepo;
-        use triblespace_net::peer::{Peer, PeerConfig};
-
-        fn free_port() -> std::net::SocketAddr {
-            // Released at once; the peer binds it a moment later.
-            std::net::UdpSocket::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap()
-        }
-        let keys = [
-            SigningKey::from_bytes(&[0x51; 32]),
-            SigningKey::from_bytes(&[0x52; 32]),
-        ];
-        let addrs = [free_port(), free_port()];
-        let tickets: Vec<String> = keys
-            .iter()
-            .zip(addrs)
-            .map(|(key, addr)| {
-                super::bound_ticket(triblespace_net::identity::iroh_secret(key).public(), addr)
-            })
-            .collect();
-        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
-        let mut peers = Vec::new();
-        let mut collection = None;
-        for (index, key) in keys.iter().enumerate() {
-            let mut store = MemoryRepo::default();
-            let handle = store
-                .collection("bound loopback pair", policy.clone())
-                .unwrap()
-                .handle();
-            collection = Some(handle);
-            // Each selects the collection, so each peers for it with the
-            // other, which it finds as a provider of it.
-            let config = store
-                .collection(CONFIG_COLLECTION_NAME, private_policy(key.verifying_key()))
-                .unwrap();
-            write_sync_selection(&mut store, config, key, handle, true).unwrap();
-            let other = super::parse_peers(&[tickets[1 - index].clone()]).unwrap();
-            let mut peer = Peer::new(
-                store,
-                key.clone(),
-                PeerConfig {
-                    peers: other,
-                    provider_publication_budget: Some(0),
-                    bind: Some(addrs[index]),
-                },
-            )
-            .unwrap();
-            assert_eq!(peer.bound_sockets(), vec![addrs[index]]);
-            peer.activate_collection(handle);
-            peers.push(peer);
-        }
-        let collection = collection.unwrap();
-        for (index, key) in keys.iter().enumerate() {
-            peers[index]
-                .store()
-                .insert(CollectionRecord::Commit(CollectionCommit::sign(
-                    key,
-                    collection,
-                    CollectionData::new([0x60 + index as u8; 32]),
-                    empty_metadata_handle(),
-                )))
-                .unwrap();
-            peers[index].refresh();
-        }
-        let started = std::time::Instant::now();
-        loop {
-            let counts: Vec<usize> = peers
-                .iter_mut()
-                .map(|peer| {
-                    peer.refresh();
-                    peer.snapshot()
-                        .unwrap()
-                        .records()
-                        .unwrap()
-                        .filter(|record| record.as_ref().unwrap().collection() == collection)
-                        .count()
-                })
-                .collect();
-            if counts == [2, 2] {
-                break;
-            }
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(90),
-                "the bound peers did not repair each other: {counts:?} records"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        for peer in peers {
-            drop(peer.into_store());
-        }
-    }
-
-    #[test]
-    fn a_prelaunch_ticket_refuses_port_zero_and_unspecified_addresses() {
-        for refused in ["127.0.0.1:0", "0.0.0.0:7001", "[::]:7001", "0.0.0.0:0"] {
-            let addr: std::net::SocketAddr = refused.parse().unwrap();
-            let error = super::ticket_address(addr).unwrap_err().to_string();
-            assert!(
-                error.contains("concrete reachable address and a nonzero port"),
-                "{refused}: {error}"
-            );
-        }
-        for accepted in ["127.0.0.1:7001", "[::1]:7002", "192.0.2.7:7003"] {
-            let addr: std::net::SocketAddr = accepted.parse().unwrap();
-            assert_eq!(super::ticket_address(addr).unwrap(), addr);
-        }
     }
 
     #[test]
@@ -1122,19 +939,6 @@ mod tests {
     }
 
     use super::*;
-    use iroh_base::{SecretKey, TransportAddr};
-
-    #[test]
-    fn peers_accept_bare_ids_and_endpoint_tickets() {
-        let secret = SecretKey::from_bytes(&[7; 32]);
-        let id = EndpointId::from(secret.public());
-        let direct =
-            EndpointAddr::from_parts(id, [TransportAddr::Ip("10.55.0.2:49152".parse().unwrap())]);
-        let ticket = EndpointTicket::new(direct.clone()).to_string();
-        assert_eq!(parse_peers(&[id.to_string()]).unwrap(), vec![id.into()]);
-        assert_eq!(parse_peers(&[ticket]).unwrap(), vec![direct]);
-        assert!(parse_peers(&["not-a-peer".to_owned()]).is_err());
-    }
 
     #[test]
     fn collection_handles_are_explicit_exact_hashes() {

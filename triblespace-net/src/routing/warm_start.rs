@@ -63,7 +63,7 @@ fn endpoint(index: u64) -> PeerId {
 }
 
 fn restart(local: PeerId, configured: &[PeerId], cache: &Blob<RawBytes>) -> RoutingTable {
-    let mut routes = RoutingTable::new(local, configured.iter().copied());
+    let mut routes = RoutingTable::with_candidates(local, configured.iter().copied());
     restore(&mut routes, cache.bytes.as_ref()).unwrap();
     assert!(routes.closest_verified(local, ROUTING_CAPACITY).is_empty());
     routes
@@ -203,7 +203,7 @@ fn warm_start_roundtrip_is_bounded_candidate_only_and_not_a_lease() {
     let live = endpoint(2);
     let referral = endpoint(3);
     let failed = endpoint(4);
-    let mut before = RoutingTable::new(local, [configured]);
+    let mut before = RoutingTable::with_candidates(local, [configured]);
     before.promote_authenticated(live);
     before.note_candidate(referral);
     before.promote_authenticated(failed);
@@ -216,7 +216,7 @@ fn warm_start_roundtrip_is_bounded_candidate_only_and_not_a_lease() {
     file.write_all(&cache.bytes).unwrap();
     file.as_file().sync_all().unwrap();
     drop(before);
-    let mut after = RoutingTable::new(local, [configured]);
+    let mut after = RoutingTable::with_candidates(local, [configured]);
     restore(&mut after, file.reopen().unwrap()).unwrap();
     assert_eq!(after.state(live), Some(RouteState::Candidate));
     assert_eq!(after.state(referral), None);
@@ -246,7 +246,7 @@ fn warm_start_roundtrip_is_bounded_candidate_only_and_not_a_lease() {
 #[test]
 fn warm_start_invalid_cache_is_rejected_before_admission() {
     let peer = endpoint(1);
-    let mut routes = RoutingTable::new(endpoint(0), []);
+    let mut routes = RoutingTable::new(endpoint(0));
     for bytes in [
         peer[..31].to_vec(),
         [peer, peer].concat(),
@@ -278,7 +278,7 @@ fn warm_start_invalid_cache_is_rejected_before_admission() {
 #[test]
 fn warm_start_shortens_sparse_discovery_and_survives_dead_bootstrap() {
     let (local, bootstrap, mut network) = line(64);
-    let mut routes = RoutingTable::new(local, [bootstrap]);
+    let mut routes = RoutingTable::with_candidates(local, [bootstrap]);
     let cold = lookup(&mut routes, local, &network, Seeds::Closest);
     assert_eq!(cold.requests, 64);
     assert_eq!(cold.winner_round, Some(64));
@@ -295,7 +295,7 @@ fn warm_start_shortens_sparse_discovery_and_survives_dead_bootstrap() {
 
     network.links.remove(&bootstrap);
     let dead_cold = lookup(
-        &mut RoutingTable::new(local, [bootstrap]),
+        &mut RoutingTable::with_candidates(local, [bootstrap]),
         local,
         &network,
         Seeds::Closest,
@@ -322,7 +322,7 @@ fn hostile_fixture() -> (PeerId, PeerId, RoutingKey, Blob<RawBytes>, Network) {
     let winner = peers[0];
     let stale = &peers[1..=K];
     let bootstrap = *peers.last().unwrap();
-    let mut old_routes = RoutingTable::new(local, [bootstrap]);
+    let mut old_routes = RoutingTable::with_candidates(local, [bootstrap]);
     for peer in stale {
         old_routes.promote_authenticated(*peer);
     }
@@ -336,7 +336,7 @@ fn hostile_fixture() -> (PeerId, PeerId, RoutingKey, Blob<RawBytes>, Network) {
 fn warm_start_stale_cache_cannot_replace_configured_bootstrap_priority() {
     let (local, bootstrap, target, cache, network) = hostile_fixture();
     let cold = lookup(
-        &mut RoutingTable::new(local, [bootstrap]),
+        &mut RoutingTable::with_candidates(local, [bootstrap]),
         target,
         &network,
         Seeds::Closest,
@@ -409,13 +409,13 @@ fn warm_start_lookup_probe() {
         winner: peers[2],
     };
     for peer in &peers[1..] {
-        let mut routes = RoutingTable::new(*peer, []);
+        let mut routes = RoutingTable::new(*peer);
         for candidate in &peers[1..] {
             routes.note_candidate(*candidate);
         }
         network.links.insert(*peer, routes.all());
     }
-    let mut prior = RoutingTable::new(local, [bootstrap]);
+    let mut prior = RoutingTable::with_candidates(local, [bootstrap]);
     for target in &peers[2..34] {
         lookup(&mut prior, *target, &network, Seeds::Closest);
     }
@@ -465,7 +465,7 @@ fn warm_start_lookup_probe() {
             let mut routes = if warm {
                 restart(local, &[bootstrap], &cache)
             } else {
-                RoutingTable::new(local, [bootstrap])
+                RoutingTable::with_candidates(local, [bootstrap])
             };
             let result = lookup(&mut routes, *target, &network, policy);
             requests += result.requests;

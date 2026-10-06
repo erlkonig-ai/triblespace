@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, ensure};
-use iroh_base::{EndpointAddr, EndpointId, SecretKey};
+use iroh_base::{EndpointId, SecretKey};
 use tokio::time::timeout;
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::{BlobStoreList, SnapshotSource};
@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
 
     // Reuse production Iroh reachability, but never start the store host loop.
     let config = PeerConfig {
-        peers: peers.iter().copied().map(EndpointAddr::from).collect(),
+        daemon: None,
         provider_publication_budget: Some(0),
         bind: None,
     };

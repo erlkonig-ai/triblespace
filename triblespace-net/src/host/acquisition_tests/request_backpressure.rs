@@ -79,7 +79,7 @@ async fn saturated_requests_complete_without_closing_connection(connection_count
     let handler = SnapshotHandler {
         snapshot,
         health: Health::new(EndpointId::from_bytes(&provider).unwrap()),
-        candidates: Arc::new(Mutex::new(RoutingTable::new(provider, []))),
+        candidates: Arc::new(Mutex::new(RoutingTable::new(provider))),
         providers: Arc::new(Mutex::new(ProviderDirectory::new(provider))),
         local_id: provider,
         recon: None,

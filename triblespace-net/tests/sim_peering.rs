@@ -129,7 +129,7 @@ fn bring_up_with_publication_budget(
     tokio::task::spawn_local(host::run_host(
         harness,
         PeerConfig {
-            peers: Vec::new(),
+            daemon: None,
             provider_publication_budget,
             bind: None,
         },

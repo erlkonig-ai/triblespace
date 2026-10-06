@@ -77,7 +77,7 @@ impl Fixture {
         let client_harness = net.join(&client_key);
         let client = ProviderClient::for_test(
             client_harness.transport,
-            RoutingTable::new(my_id, [provider]),
+            RoutingTable::with_candidates(my_id, [provider]),
         );
         let (sender, _receiver, wiring) = wire(EndpointId::from_bytes(&my_id).unwrap());
         wiring.install_test_capability(Arc::new(NetCap {
@@ -109,7 +109,7 @@ impl Fixture {
                 crate::clock::mono_now(),
             ));
         }
-        let provider_routes = Arc::new(Mutex::new(RoutingTable::new(provider, [])));
+        let provider_routes = Arc::new(Mutex::new(RoutingTable::new(provider)));
         let (provider_snapshot, serving_snapshot) =
             tokio::sync::watch::channel(Some(Arc::new(snapshot)));
         let provider_directory = Arc::new(Mutex::new(providers));
@@ -177,7 +177,7 @@ impl RecoveryNode {
         let handler = SnapshotHandler {
             snapshot: tokio::sync::watch::channel(snapshot).1,
             health: Health::new(EndpointId::from_bytes(&peer).unwrap()),
-            candidates: Arc::new(Mutex::new(RoutingTable::new(peer, []))),
+            candidates: Arc::new(Mutex::new(RoutingTable::new(peer))),
             providers: directory.clone(),
             local_id: peer,
             recon: None,
@@ -297,7 +297,7 @@ async fn verified_provider_fetch_does_not_wait_for_a_stalled_lookup_reply() {
         None,
     );
     *fixture.client.candidates.lock().unwrap() =
-        RoutingTable::new(fixture.client.my_id, [slow.peer, fixture.provider]);
+        RoutingTable::with_candidates(fixture.client.my_id, [slow.peer, fixture.provider]);
     for peer in [slow.peer, fixture.provider] {
         fixture.client.connections.connect(peer).await.unwrap();
     }
@@ -365,7 +365,7 @@ async fn later_lookup_hint_case(stalled: bool) {
             .unwrap();
     }
     *fixture.client.candidates.lock().unwrap() =
-        RoutingTable::new(fixture.client.my_id, [first.peer, later.peer]);
+        RoutingTable::with_candidates(fixture.client.my_id, [first.peer, later.peer]);
     let started = tokio::time::Instant::now();
     assert_eq!(
         fixture
@@ -403,7 +403,7 @@ async fn progressive_fetch_distinguishes_an_empty_lookup_from_an_incomplete_one(
         Some(Duration::ZERO),
     );
     *fixture.client.candidates.lock().unwrap() =
-        RoutingTable::new(fixture.client.my_id, [empty.peer]);
+        RoutingTable::with_candidates(fixture.client.my_id, [empty.peer]);
     assert!(
         fixture
             .client
@@ -427,7 +427,7 @@ async fn progressive_fetch_distinguishes_an_empty_lookup_from_an_incomplete_one(
         .await
         .unwrap();
     *fixture.client.candidates.lock().unwrap() =
-        RoutingTable::new(fixture.client.my_id, [empty.peer, stalled.peer]);
+        RoutingTable::with_candidates(fixture.client.my_id, [empty.peer, stalled.peer]);
     let error = fixture
         .client
         .fetch_blob(fixture.hash, None)
@@ -452,7 +452,7 @@ async fn progressive_fetch_preserves_unavailable_and_failed_provider_outcomes() 
         Some(Duration::ZERO),
     );
     *fixture.client.candidates.lock().unwrap() =
-        RoutingTable::new(fixture.client.my_id, [directory.peer]);
+        RoutingTable::with_candidates(fixture.client.my_id, [directory.peer]);
     assert!(
         fixture
             .client
@@ -463,7 +463,7 @@ async fn progressive_fetch_preserves_unavailable_and_failed_provider_outcomes() 
     );
     fixture.net.crash(absent.peer);
     *fixture.client.candidates.lock().unwrap() =
-        RoutingTable::new(fixture.client.my_id, [directory.peer]);
+        RoutingTable::with_candidates(fixture.client.my_id, [directory.peer]);
     assert!(fixture.client.fetch_blob(fixture.hash, None).await.is_err());
     assert_eq!(fixture.blob_reads.load(Ordering::Relaxed), 0);
     fixture.assert_no_control_effects();
@@ -482,7 +482,7 @@ async fn progressive_fetch_does_not_dial_an_invalid_provider_hint() {
         Some(Duration::ZERO),
     );
     *fixture.client.candidates.lock().unwrap() =
-        RoutingTable::new(fixture.client.my_id, [directory.peer]);
+        RoutingTable::with_candidates(fixture.client.my_id, [directory.peer]);
     assert!(
         fixture
             .client
@@ -510,7 +510,7 @@ async fn stale_provider_lease_survives_loss_alternate_fetch_and_same_endpoint_re
     let alternate_key = SigningKey::from_bytes(&[102; 32]);
     let directory = RecoveryNode::new(&fixture.net, &directory_key, None);
     *fixture.client.candidates.lock().unwrap() =
-        RoutingTable::new(fixture.client.my_id, [directory.peer]);
+        RoutingTable::with_candidates(fixture.client.my_id, [directory.peer]);
     directory.advertise(fixture.hash, fixture.provider);
     assert_eq!(
         fixture
@@ -634,7 +634,7 @@ async fn cancelled_discovered_provider_dial_leaves_a_same_client_retry_usable() 
     let directory = RecoveryNode::new(&fixture.net, &directory_key, None);
     directory.advertise(fixture.hash, fixture.provider);
     *fixture.client.candidates.lock().unwrap() =
-        RoutingTable::new(fixture.client.my_id, [directory.peer]);
+        RoutingTable::with_candidates(fixture.client.my_id, [directory.peer]);
     // Warm only the directory, so cancellation lands in the discovered
     // provider's dial rather than the bootstrap lookup.
     fixture
@@ -699,7 +699,7 @@ async fn alternate_provider_success_cancels_a_stalled_discovered_dial() {
     directory.advertise(fixture.hash, stalled);
     directory.advertise(fixture.hash, fixture.provider);
     *fixture.client.candidates.lock().unwrap() =
-        RoutingTable::new(fixture.client.my_id, [directory.peer]);
+        RoutingTable::with_candidates(fixture.client.my_id, [directory.peer]);
     fixture
         .client
         .connections
@@ -906,7 +906,7 @@ async fn responsive_provider_is_not_held_behind_stalled_secondary_bootstrap() {
     let _learned_harness = fixture.net.join(&learned_key);
     fixture.net.stall_dials(learned);
     *fixture.client.candidates.lock().unwrap() =
-        RoutingTable::new(fixture.client.my_id, [fixture.provider, stalled]);
+        RoutingTable::with_candidates(fixture.client.my_id, [fixture.provider, stalled]);
     fixture
         .client
         .candidates
@@ -1384,7 +1384,7 @@ async fn known_resident_outside_selected_dht_replicas_is_not_directly_probed() {
         let handler = SnapshotHandler {
             snapshot: tokio::sync::watch::channel(None).1,
             health: Health::new(EndpointId::from_bytes(&peer).unwrap()),
-            candidates: Arc::new(Mutex::new(RoutingTable::new(peer, []))),
+            candidates: Arc::new(Mutex::new(RoutingTable::new(peer))),
             providers: Arc::new(Mutex::new(ProviderDirectory::new(peer))),
             local_id: peer,
             recon: None,
@@ -1409,7 +1409,7 @@ async fn known_resident_outside_selected_dht_replicas_is_not_directly_probed() {
     );
     // The closer peers answered too. Their verified routes outrank the
     // provider's candidate route where they share a bucket.
-    let mut routes = RoutingTable::new(fixture.client.my_id, [fixture.provider]);
+    let mut routes = RoutingTable::with_candidates(fixture.client.my_id, [fixture.provider]);
     for peer in &closer {
         routes.promote_authenticated(*peer);
     }
@@ -1467,9 +1467,8 @@ async fn zero_announcement_budget_still_answers_resident_self_hints() {
             let host = tokio::task::spawn_local(run_host(
                 server_harness,
                 PeerConfig {
-                    peers: vec![EndpointAddr::from(
-                        EndpointId::from_bytes(&client_id).unwrap(),
-                    )],
+                    // The server's one route: the client.
+                    daemon: Some(ed25519_dalek::VerifyingKey::from_bytes(&client_id).unwrap()),
                     provider_publication_budget: Some(0),
                     bind: None,
                 },
@@ -1477,7 +1476,7 @@ async fn zero_announcement_budget_still_answers_resident_self_hints() {
             ));
             let client = ProviderClient::for_test(
                 client_harness.transport,
-                RoutingTable::new(client_id, [server_id]),
+                RoutingTable::with_candidates(client_id, [server_id]),
             );
             assert_eq!(
                 client
@@ -1704,7 +1703,7 @@ async fn provider_lookup_keeps_only_hints_whose_token_proves_the_identity() {
     );
     for (replica, expected) in [(&mixed, vec![honest]), (&forged_only, Vec::new())] {
         *fixture.client.candidates.lock().unwrap() =
-            RoutingTable::new(fixture.client.my_id, [replica.peer]);
+            RoutingTable::with_candidates(fixture.client.my_id, [replica.peer]);
         assert_eq!(
             fixture
                 .client
@@ -1732,7 +1731,7 @@ async fn own_directory_answers_once_we_stand_among_the_replicas() {
     // The provider is no lookup candidate. Only the lease it installed here,
     // as at any other replica of its key, names it.
     *fixture.client.candidates.lock().unwrap() =
-        RoutingTable::new(fixture.client.my_id, [empty.peer]);
+        RoutingTable::with_candidates(fixture.client.my_id, [empty.peer]);
     let key = blob_locator(fixture.hash);
     assert!(fixture.client.providers.lock().unwrap().put(
         key,

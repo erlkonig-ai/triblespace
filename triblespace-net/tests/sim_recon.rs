@@ -19,7 +19,7 @@ use std::time::Duration;
 use anybytes::Bytes;
 use ed25519_dalek::SigningKey;
 use futures::FutureExt as _;
-use iroh_base::{EndpointAddr, EndpointId};
+use iroh_base::EndpointId;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::encodings::UnknownBlob;
@@ -81,22 +81,19 @@ fn run(test: impl AsyncFnOnce(Arc<VirtualClock>)) {
     runtime.block_on(tokio::task::LocalSet::new().run_until(test(clock)));
 }
 
-/// A host on `harness` over `store`, with `routes` for its DHT lookups. It
-/// publishes no provider records.
+/// A host on `harness` over `store`. Its DHT lookups go through the peers
+/// its pile names, once it has connected to them. It publishes no provider
+/// records.
 fn bring_up<T: Transport>(
     harness: Harness<T>,
     key: &SigningKey,
     store: MemoryRepo,
-    routes: &[PeerId],
 ) -> Peer<MemoryRepo> {
     let (sender, receiver, wiring) = host::wire(EndpointId::from_bytes(&id(key)).unwrap());
     tokio::task::spawn_local(host::run_host(
         harness,
         PeerConfig {
-            peers: routes
-                .iter()
-                .map(|route| EndpointAddr::from(EndpointId::from_bytes(route).unwrap()))
-                .collect(),
+            daemon: None,
             provider_publication_budget: Some(0),
             bind: None,
         },
@@ -523,9 +520,9 @@ fn one_hundred_thirty_collections_share_one_recon_within_the_announcement_estima
             collections.push(collection);
         }
         let (harness, heard_by_owner) = Tap::join(&net, &owner_key);
-        let mut owner = bring_up(harness, &owner_key, owner_store, &[]);
+        let mut owner = bring_up(harness, &owner_key, owner_store);
         let (harness, heard_by_reader) = Tap::join(&net, &reader_key);
-        let mut reader = bring_up(harness, &reader_key, reader_store, &[]);
+        let mut reader = bring_up(harness, &reader_key, reader_store);
         owner.activate_collections(collections.iter().copied());
         reader.activate_collections(collections.iter().copied());
 
@@ -644,7 +641,7 @@ fn recon_reopens_beside_blob_streams_at_their_cap_and_keeps_its_peerings() {
         let mut store = MemoryRepo::default();
         let collection = hold(&mut store, "beside blobs", &[&host_key, &peer_key]);
         select(&mut store, &host_key, collection);
-        let mut host = bring_up(net.join(&host_key), &host_key, store, &[peer_id]);
+        let mut host = bring_up(net.join(&host_key), &host_key, store);
 
         let blobs = (0..120_u32)
             .map(|number| {
@@ -755,7 +752,6 @@ fn seventeen_neighbours_hold_recon_while_blob_streams_run() {
     run(async |clock| {
         let net = SimNet::new(0x5EC0_0003, SimConfig::default());
         let hub_key = key(30);
-        let hub_id = id(&hub_key);
         let names = ["odd", "even"];
         let mut store = MemoryRepo::default();
         let collections = names.map(|name| hold(&mut store, name, &[&hub_key]));
@@ -764,7 +760,7 @@ fn seventeen_neighbours_hold_recon_while_blob_streams_run() {
         }
         let bytes = Bytes::from_source(b"only the hub holds this".to_vec());
         let blob = store.put::<UnknownBlob, _>(bytes.clone()).unwrap();
-        let mut hub = bring_up(net.join(&hub_key), &hub_key, store, &[]);
+        let mut hub = bring_up(net.join(&hub_key), &hub_key, store);
         hub.activate_collections(collections);
         let mut leaves = (0..17_u8)
             .map(|index| {
@@ -772,7 +768,7 @@ fn seventeen_neighbours_hold_recon_while_blob_streams_run() {
                 let mut store = MemoryRepo::default();
                 let collection = hold(&mut store, names[usize::from(index % 2)], &[&hub_key]);
                 select(&mut store, &key, collection);
-                let mut leaf = bring_up(net.join(&key), &key, store, &[hub_id]);
+                let mut leaf = bring_up(net.join(&key), &key, store);
                 leaf.activate_collection(collection);
                 leaf
             })
@@ -837,7 +833,7 @@ fn a_peer_that_stops_reading_recon_gets_it_reset_and_keeps_its_peering() {
             b"asked for over and over",
         );
         select(&mut store, &host_key, collection);
-        let mut host = bring_up(net.join(&host_key), &host_key, store, &[]);
+        let mut host = bring_up(net.join(&host_key), &host_key, store);
         host.activate_collection(collection);
         let peers: &mut [&mut Peer<MemoryRepo>] = &mut [&mut host];
         let reader = net.join(&key(11)).transport;
@@ -928,7 +924,7 @@ fn the_dialler_reopens_an_ended_recon_at_once() {
         let policy = CollectionPolicy::new(readers, writers);
         let collection = store.collection("written only", policy).unwrap().handle();
         select(&mut store, &reader_key, collection);
-        let mut reader = bring_up(net.join(&reader_key), &reader_key, store, &[]);
+        let mut reader = bring_up(net.join(&reader_key), &reader_key, store);
 
         let mut harness = net.join(&writer_key);
         let (recons, mut opened) = tokio::sync::mpsc::unbounded_channel();
@@ -1025,7 +1021,7 @@ fn a_request_whose_acceptance_was_lost_is_sent_again() {
         let carrier = hold(&mut store, "carrier", &[&host_key, &peer_key]);
         select(&mut store, &host_key, wedged);
         select(&mut store, &host_key, carrier);
-        let mut host = bring_up(net.join(&host_key), &host_key, store, &[]);
+        let mut host = bring_up(net.join(&host_key), &host_key, store);
 
         let mut harness = net.join(&peer_key);
         let (recons, mut opened) = tokio::sync::mpsc::unbounded_channel();
@@ -1070,8 +1066,10 @@ fn a_request_whose_acceptance_was_lost_is_sent_again() {
         recon.reset(RESET_STALLED);
         frames.recv.stop(RESET_STALLED);
 
-        let (mut recon, mut frames) =
-            until(&clock, peers, 10, "a new recon/1", |_| opened.try_recv().ok()).await;
+        let (mut recon, mut frames) = until(&clock, peers, 10, "a new recon/1", |_| {
+            opened.try_recv().ok()
+        })
+        .await;
         until(&clock, peers, 10, "the request for C again", |_| {
             loop {
                 if let Frame::PeerRequest { collection, .. } = frames.arrived()?

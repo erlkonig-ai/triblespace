@@ -8,11 +8,11 @@
 
 use std::time::Duration;
 
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use iroh::Endpoint;
 use iroh::endpoint::presets;
 use iroh::test_utils::test_transport::TestNetwork;
-use iroh_base::EndpointAddr;
+use iroh_base::EndpointId;
 use tokio::task::JoinHandle;
 use triblespace_core::collection::selection::{CONFIG_COLLECTION_NAME, write_sync_selection};
 use triblespace_core::collection::{
@@ -53,19 +53,20 @@ async fn endpoint(network: &TestNetwork, key: &SigningKey) -> Endpoint {
         .unwrap()
 }
 
+/// A host whose first contact, when its pile names nobody, is `daemon`.
 async fn bring_up(
     endpoint: Endpoint,
     store: MemoryRepo,
-    peers: Vec<EndpointAddr>,
+    daemon: Option<EndpointId>,
     provider_publication_budget: Option<u64>,
 ) -> (Peer<MemoryRepo>, JoinHandle<()>) {
     let id = endpoint.id();
     let config = PeerConfig {
-        peers,
+        daemon: daemon.map(|daemon| VerifyingKey::from_bytes(daemon.as_bytes()).unwrap()),
         provider_publication_budget,
         bind: None,
     };
-    let harness = triblespace_net::transport::iroh::bind_with_endpoint(endpoint, &config).await;
+    let harness = triblespace_net::transport::iroh::bind_with_endpoint(endpoint).await;
     let (sender, receiver, wiring) = host::wire(id);
     let owner = tokio::spawn(host::run_host(harness, config, wiring));
     (Peer::with_wiring(store, sender, receiver), owner)
@@ -117,7 +118,7 @@ async fn shutdown<const N: usize>(nodes: [(Peer<MemoryRepo>, JoinHandle<()>); N]
 async fn descriptor_provider_bootstraps_open_collection_through_directory_only() {
     let network = TestNetwork::new();
     let directory_endpoint = endpoint(&network, &key(0xE1)).await;
-    let directory_addr = directory_endpoint.addr();
+    let directory_id = directory_endpoint.id();
     let source_key = key(0xE2);
     let source_endpoint = endpoint(&network, &source_key).await;
     let source_id = source_endpoint.id();
@@ -147,20 +148,10 @@ async fn descriptor_provider_bootstraps_open_collection_through_directory_only()
         empty_metadata_handle(),
     ));
     source_store.insert(record).unwrap();
-    let (mut directory, directory_owner) = bring_up(
-        directory_endpoint,
-        MemoryRepo::default(),
-        Vec::new(),
-        Some(0),
-    )
-    .await;
-    let (mut source, source_owner) = bring_up(
-        source_endpoint,
-        source_store,
-        vec![directory_addr.clone()],
-        None,
-    )
-    .await;
+    let (mut directory, directory_owner) =
+        bring_up(directory_endpoint, MemoryRepo::default(), None, Some(0)).await;
+    let (mut source, source_owner) =
+        bring_up(source_endpoint, source_store, Some(directory_id), None).await;
     source.activate_collection(collection);
     drive_until(&mut [&mut directory, &mut source], |peers| {
         let health = peers[1].health();
@@ -172,7 +163,7 @@ async fn descriptor_provider_bootstraps_open_collection_through_directory_only()
     // Reader knows only the directory. The directory neither activates C nor
     // holds its descriptor, and the source does not know the reader endpoint.
     let (mut reader, reader_owner) =
-        bring_up(reader_endpoint, reader_store, vec![directory_addr], Some(0)).await;
+        bring_up(reader_endpoint, reader_store, Some(directory_id), Some(0)).await;
     reader.activate_collection(collection);
     drive_until(&mut [&mut directory, &mut source, &mut reader], |peers| {
         contains(peers[2], record)
@@ -212,7 +203,7 @@ async fn descriptor_provider_bootstraps_open_collection_through_directory_only()
 async fn inactive_descriptor_cache_is_discoverable_but_never_a_repair_participant() {
     let network = TestNetwork::new();
     let directory_endpoint = endpoint(&network, &key(0xF1)).await;
-    let directory_addr = directory_endpoint.addr();
+    let directory_id = directory_endpoint.id();
     let cache_endpoint = endpoint(&network, &key(0xF2)).await;
     let cache_id = cache_endpoint.id();
     let reader_endpoint = endpoint(&network, &key(0xF3)).await;
@@ -225,20 +216,10 @@ async fn inactive_descriptor_cache_is_discoverable_but_never_a_repair_participan
         )
         .unwrap()
         .handle();
-    let (mut directory, directory_owner) = bring_up(
-        directory_endpoint,
-        MemoryRepo::default(),
-        Vec::new(),
-        Some(0),
-    )
-    .await;
-    let (mut cache, cache_owner) = bring_up(
-        cache_endpoint,
-        cache_store,
-        vec![directory_addr.clone()],
-        None,
-    )
-    .await;
+    let (mut directory, directory_owner) =
+        bring_up(directory_endpoint, MemoryRepo::default(), None, Some(0)).await;
+    let (mut cache, cache_owner) =
+        bring_up(cache_endpoint, cache_store, Some(directory_id), None).await;
     // Resident blobs advertise normally without any active collection.
     cache.refresh();
     drive_until(&mut [&mut directory, &mut cache], |peers| {
@@ -252,7 +233,7 @@ async fn inactive_descriptor_cache_is_discoverable_but_never_a_repair_participan
     // C to peer; the cache does not select C.
     select(&mut reader_store, &key(0xF3), collection);
     let (mut reader, reader_owner) =
-        bring_up(reader_endpoint, reader_store, vec![directory_addr], Some(0)).await;
+        bring_up(reader_endpoint, reader_store, Some(directory_id), Some(0)).await;
     assert!(
         !reader
             .snapshot()

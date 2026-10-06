@@ -49,8 +49,7 @@ impl Node {
     fn join(net: &SimNet, key: &SigningKey) -> Self {
         let mut harness = net.join(key);
         let peer = harness.transport.local_id();
-        let client =
-            ProviderClient::for_test(harness.transport.clone(), RoutingTable::new(peer, []));
+        let client = ProviderClient::for_test(harness.transport.clone(), RoutingTable::new(peer));
         let table = client.connections.clone();
         let connections = table.clone();
         let server = tokio::spawn(async move {
@@ -779,7 +778,7 @@ fn listening(
     let handler = SnapshotHandler {
         walks: Some(walks),
         recon: Some(peering),
-        ..SnapshotHandler::for_test(peer, RoutingTable::new(peer, []))
+        ..SnapshotHandler::for_test(peer, RoutingTable::new(peer))
     };
     let table = ConnectionTable::new(harness.transport.clone(), handler);
     let accepting = table.clone();

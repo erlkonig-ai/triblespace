@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Removed
 
+- `pile net sync --peers`. The daemon's peers come from the pile: the keys
+  that signed a selected collection's records and its grant-chain keys, then
+  the providers the DHT those peers seed finds.
+- `pile net identity --bind`. The ticket it printed was for `--peers`, which
+  no longer exists; `identity` prints the node id.
 - `pile net sync --collection`. Sync reads the sync selection register from
   the pile's own configuration collection under its key, activates every
   selected collection at start, and activates newly selected ones while it

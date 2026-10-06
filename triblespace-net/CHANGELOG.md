@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Delete configured peers (JP's content bootstrap, 2026-10-06).
+  `PeerConfig::peers`, the routing table's configured seed
+  (`RoutingTable::new` takes only the local key), `IrohTransport`'s route map
+  and its memory lookup go. A host's peers come from its pile: the keys that
+  signed a selected collection's records and its grant-chain keys, then the
+  DHT those peers seed. `PeerConfig::daemon` names the key of the pile's sync
+  daemon, a process's first contact when its pile names no peer: it is a
+  candidate route, dialled at the addresses the daemon recorded in the
+  pile's configuration (`selection::sync_addresses`, read by `Peer::new` and
+  at a lazy peer's start) or through discovery by key.
+  `IrohTransport::learn` gives the endpoint an address, `bind_with_endpoint`
+  takes no configuration, `host::spawn` takes the daemon's addresses, and
+  `HostStarted::bound` and `Peer::bound_sockets` read the sockets the
+  endpoint is bound to now.
+
 - Seed the DHT from the peers a pile's content names (JP's content
   bootstrap, phase 2). Every opened `recon/1` connection, which TLS
   authenticated, makes its peer a verified route, so the provider lookup of a

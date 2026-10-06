@@ -39,7 +39,8 @@ let mut peer = Peer::new(
     pile,
     signing_key,
     PeerConfig {
-        peers: vec![bootstrap_endpoint],
+        // The sync daemon of this pile, when this process is not it.
+        daemon: None,
         provider_publication_budget: None,
         bind: None,
     },
@@ -150,10 +151,16 @@ when this side admits it to read, and a pile that selects no collection peers
 for none; it still publishes and serves resident exact blobs under bearer
 handle H and services durable `Blob(H)` WANTs through the ordinary KDF(H) path.
 
-Configured endpoint addresses bootstrap DHT routing only. Repair targets are a
-collection's neighbours: candidates that select it and admit the asker.
-Exact-content targets come from KDF(H) leases. Unrelated configured peers never
-receive C or its proofs.
+Peers come from the pile, never from configuration. The keys that signed a
+selected collection's records and its grant-chain keys are its first
+candidates, and every connection they open puts its peer in the DHT routing
+table, through which the collection's other providers are found. A process
+whose pile names no peer, such as a foreground reader, reaches the DHT
+through the pile's sync daemon (`PeerConfig::daemon`): it dials the addresses
+the daemon recorded in the pile's configuration collection, or finds the
+daemon by key. Repair targets are a collection's neighbours: candidates that
+select it and admit the asker. Exact-content targets come from KDF(H) leases.
+A DHT contact never receives C or its proofs.
 
 ## Resident inventory and hydration
 

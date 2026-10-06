@@ -1704,7 +1704,7 @@ mod tests {
             Pile::open(path.path()).unwrap(),
             SigningKey::from_bytes(&[7; 32]),
             crate::host::PeerConfig {
-                peers: Vec::new(),
+                daemon: None,
                 provider_publication_budget: Some(0),
                 bind: None,
             },

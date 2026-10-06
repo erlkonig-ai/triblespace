@@ -112,6 +112,32 @@ where
     }
 }
 
+/// The addresses the pile's configuration records for the sync daemon that
+/// runs as `daemon` ([`PeerConfig::daemon`]). A configuration that cannot be
+/// read records none, and the daemon is then found by key.
+fn daemon_addresses<S>(store: &mut S, daemon: Option<VerifyingKey>) -> Vec<std::net::SocketAddr>
+where
+    S: SnapshotSource,
+    S::Snapshot: StoreRead,
+{
+    use triblespace_core::collection::selection::{config_facts, sync_addresses};
+
+    let Some(daemon) = daemon else {
+        return Vec::new();
+    };
+    let facts = store
+        .snapshot()
+        .map_err(anyhow::Error::new)
+        .and_then(|snapshot| config_facts(&snapshot, daemon).map_err(anyhow::Error::new));
+    match facts {
+        Ok(facts) => sync_addresses(&facts, daemon).into_iter().collect(),
+        Err(error) => {
+            tracing::warn!(%error, "sync daemon addresses unreadable; finding the daemon by key");
+            Vec::new()
+        }
+    }
+}
+
 enum HostState {
     /// Allocating channels does not start any runtime or network activity.
     Dormant(Box<dyn FnOnce() -> Result<Option<HostStarted>, PeerOpenError> + Send>),
@@ -383,9 +409,10 @@ where
     S::Snapshot: StoreRead + BlobChildren + HeldRead,
 {
     /// Spawn a production host. No team scope or connection proof exists.
-    pub fn new(store: S, key: SigningKey, config: PeerConfig) -> Result<Self, PeerOpenError> {
+    pub fn new(mut store: S, key: SigningKey, config: PeerConfig) -> Result<Self, PeerOpenError> {
+        let daemon = daemon_addresses(&mut store, config.daemon);
         let (sender, receiver, started) =
-            host::spawn(key, config).map_err(PeerOpenError::HostStartup)?;
+            host::spawn(key, config, daemon).map_err(PeerOpenError::HostStartup)?;
         Ok(Self::assemble(
             store,
             sender,
@@ -406,12 +433,22 @@ where
     pub fn lazy(store: S, key: SigningKey, config: PeerConfig) -> Self {
         let id = crate::identity::iroh_secret(&key).public().into();
         let (sender, receiver, wiring) = host::wire(id);
+        let store = Arc::new(Mutex::new(Some(store)));
+        let pile = Arc::downgrade(&store);
         let startup = Box::new(move || {
-            host::start(key, config, wiring)
+            // Read when the network is first needed, not at construction.
+            let daemon = pile
+                .upgrade()
+                .and_then(|store| {
+                    let mut store = store.lock().expect("store mutex");
+                    Some(daemon_addresses(store.as_mut()?, config.daemon))
+                })
+                .unwrap_or_default();
+            host::start(key, config, daemon, wiring)
                 .map(Some)
                 .map_err(PeerOpenError::HostStartup)
         });
-        Self::assemble(store, sender, receiver, None, HostState::Dormant(startup))
+        Self::assemble_shared(store, sender, receiver, None, HostState::Dormant(startup))
     }
 
     /// Attach a store to a caller-owned host, most commonly the deterministic
@@ -428,6 +465,16 @@ where
         host: HostState,
     ) -> Self {
         let store = Arc::new(Mutex::new(Some(store)));
+        Self::assemble_shared(store, sender, receiver, started, host)
+    }
+
+    fn assemble_shared(
+        store: Arc<Mutex<Option<S>>>,
+        sender: NetSender,
+        receiver: NetReceiver,
+        started: Option<HostStarted>,
+        host: HostState,
+    ) -> Self {
         let serving = Arc::new(Serving {
             store: store.clone(),
             sender: sender.clone(),
@@ -535,7 +582,7 @@ where
         &self.reconciler
     }
 
-    /// The local sockets this peer's endpoint bound
+    /// The local sockets this peer's endpoint is bound to now
     /// ([`PeerConfig::bind`](crate::host::PeerConfig::bind)). Empty for
     /// caller-owned wiring and for a lazy peer whose host has not started.
     /// This accessor never starts a host.
@@ -545,7 +592,7 @@ where
             .expect("host mutex")
             .started
             .as_ref()
-            .map(|started| started.bound.clone())
+            .map(HostStarted::bound)
             .unwrap_or_default()
     }
 
@@ -1014,7 +1061,7 @@ mod tests {
 
     fn foreground_config() -> PeerConfig {
         PeerConfig {
-            peers: Vec::new(),
+            daemon: None,
             provider_publication_budget: Some(0),
             bind: None,
         }

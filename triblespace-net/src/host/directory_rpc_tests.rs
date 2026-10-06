@@ -151,7 +151,7 @@ async fn find_value_answers_routes_and_provider_hints_in_one_reply() {
         reads: blob_reads.clone(),
     });
     let (_publisher, snapshot) = tokio::sync::watch::channel(Some(Arc::new(snapshot)));
-    let routes = Arc::new(Mutex::new(RoutingTable::new(provider, [])));
+    let routes = Arc::new(Mutex::new(RoutingTable::new(provider)));
     let directory = Arc::new(Mutex::new(ProviderDirectory::new(provider)));
     let connection = PipeConn {
         handler: SnapshotHandler {

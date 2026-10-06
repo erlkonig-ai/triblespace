@@ -1,7 +1,7 @@
 //! One bounded normal DHT/bearer fetch into an empty in-memory client.
 //!
-//! Pass public bootstrap endpoint IDs as arguments and one exact 64-hex H on
-//! stdin. H and payload bytes are never printed or persisted. No collection is
+//! Pass the endpoint ID of a node to contact first, found through discovery,
+//! as the argument and one exact 64-hex H on stdin. H and payload bytes are never printed or persisted. No collection is
 //! activated, no WANT is inserted, and the provider-publication budget is zero.
 //! The caller should also impose a process timeout of at most 60 seconds.
 
@@ -9,8 +9,8 @@ use std::io::Read;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use ed25519_dalek::SigningKey;
-use iroh_base::{EndpointAddr, EndpointId, SecretKey};
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use iroh_base::{EndpointId, SecretKey};
 use tokio::time::timeout;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{SnapshotSource, StorageClose, WantRead};
@@ -20,18 +20,15 @@ use triblespace_net::transport::Transport;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let peers = std::env::args()
-        .skip(1)
-        .map(|arg| {
-            arg.parse::<EndpointId>()
-                .map(EndpointAddr::from)
-                .map_err(|_| anyhow!("invalid bootstrap endpoint ID"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    ensure!(
-        !peers.is_empty(),
-        "usage: blob_fetch_probe PEER_ID... < handle-input"
-    );
+    let mut args = std::env::args().skip(1);
+    let (Some(contact), None) = (args.next(), args.next()) else {
+        bail!("usage: blob_fetch_probe PEER_ID < handle-input");
+    };
+    let contact = contact
+        .parse::<EndpointId>()
+        .ok()
+        .and_then(|id| VerifyingKey::from_bytes(id.as_bytes()).ok())
+        .ok_or_else(|| anyhow!("invalid endpoint ID"))?;
     let mut input = String::new();
     std::io::stdin().take(129).read_to_string(&mut input)?;
     let mut handle = [0; 32];
@@ -43,7 +40,7 @@ async fn main() -> Result<()> {
     let signing_key = SigningKey::from_bytes(&entropy);
     let secret = SecretKey::from_bytes(&signing_key.to_bytes());
     let config = PeerConfig {
-        peers,
+        daemon: Some(contact),
         provider_publication_budget: Some(0),
         bind: None,
     };

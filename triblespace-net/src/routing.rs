@@ -24,7 +24,7 @@ const LEARNED_ROUTE_FAILURE_COOLDOWN: std::time::Duration = std::time::Duration:
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RouteState {
-    /// The identity was configured locally or named by another peer.
+    /// The identity was named locally or by another peer.
     Candidate,
     /// The peer answered a direct request whose transport and capability were
     /// authenticated by the caller.
@@ -53,19 +53,25 @@ pub(crate) struct RoutingTable {
 }
 
 impl RoutingTable {
-    /// Start with locally configured bootstrap identities as unverified
-    /// candidates, retained and failed like any other route. Configuration
-    /// does not manufacture proof of reachability.
-    pub(crate) fn new<I>(local: PeerId, configured: I) -> Self
+    /// Start empty. Routes come from authenticated connections, from the
+    /// identities lookups name, and from the host's pile daemon, never from
+    /// a configured list.
+    pub(crate) fn new(local: PeerId) -> Self {
+        Self {
+            local,
+            buckets: std::array::from_fn(|_| Bucket::default()),
+        }
+    }
+
+    /// A table holding `peers` as candidates.
+    #[cfg(test)]
+    pub(crate) fn with_candidates<I>(local: PeerId, peers: I) -> Self
     where
         I: IntoIterator<Item = PeerId>,
     {
-        let mut routes = Self {
-            local,
-            buckets: std::array::from_fn(|_| Bucket::default()),
-        };
-        for peer in configured {
-            routes.insert(peer, RouteState::Candidate);
+        let mut routes = Self::new(local);
+        for peer in peers {
+            routes.note_candidate(peer);
         }
         routes
     }
@@ -488,7 +494,7 @@ mod tests {
         seeds: Vec<PeerId>,
         network: &BTreeMap<PeerId, Vec<PeerId>>,
     ) -> (RoutingTable, Vec<PeerId>) {
-        let mut routes = RoutingTable::new(local, seeds.clone());
+        let mut routes = RoutingTable::with_candidates(local, seeds.clone());
         let mut lookup = IterativeLookup::new(local, target, seeds);
         let mut contacted = Vec::new();
         while !lookup.is_finished() {
@@ -560,7 +566,7 @@ mod tests {
                 ProbeTopology::XorBuckets => {
                     let mut links = BTreeMap::new();
                     for peer in peers.iter().copied() {
-                        let mut routes = RoutingTable::new(peer, []);
+                        let mut routes = RoutingTable::new(peer);
                         for candidate in peers.iter().copied() {
                             routes.note_candidate(candidate);
                         }
@@ -591,7 +597,7 @@ mod tests {
 
     fn probe_lookup(network: &ProbeNetwork, local: PeerId, target: RoutingKey) -> ProbeLookup {
         let seeds = network.reply(local, target);
-        let mut routes = RoutingTable::new(local, seeds.iter().copied());
+        let mut routes = RoutingTable::with_candidates(local, seeds.iter().copied());
         let mut lookup = IterativeLookup::new(local, target, seeds);
         let mut contacted = BTreeSet::new();
         let mut first_batch = BTreeSet::new();
@@ -683,9 +689,9 @@ mod tests {
     }
 
     #[test]
-    fn configured_routes_start_as_candidates_and_self_is_ignored() {
+    fn noted_routes_start_as_candidates_and_self_is_ignored() {
         let local = id(1);
-        let table = RoutingTable::new(local, [local, id(2), id(2)]);
+        let table = RoutingTable::with_candidates(local, [local, id(2), id(2)]);
         assert_eq!(table.len(), 1);
         assert_eq!(table.learned_len(), 1);
         assert_eq!(table.state(local), None);
@@ -699,7 +705,7 @@ mod tests {
         let local = id(0);
         let seed = id(1);
         let named = id(2);
-        let mut routes = RoutingTable::new(local, [seed]);
+        let mut routes = RoutingTable::with_candidates(local, [seed]);
         let mut lookup = IterativeLookup::new(local, named, [seed]);
         assert_eq!(lookup.next_batch(), vec![seed]);
         assert!(lookup.record_authenticated_response(seed, [named], &mut routes));
@@ -717,7 +723,7 @@ mod tests {
         let now = crate::clock::mono_now();
         let local = id(0);
         let peer = id(2);
-        let mut routes = RoutingTable::new(local, []);
+        let mut routes = RoutingTable::new(local);
         routes.promote_authenticated(peer);
         routes.note_failure(peer, now);
         let until = now + LEARNED_ROUTE_FAILURE_COOLDOWN;
@@ -739,7 +745,7 @@ mod tests {
     fn direct_authenticated_recovery_clears_learned_failure_cooldown() {
         let now = crate::clock::mono_now();
         let peer = id(2);
-        let mut routes = RoutingTable::new(id(0), []);
+        let mut routes = RoutingTable::new(id(0));
         routes.note_failure(peer, now);
         assert!(!routes.query_eligible(peer, now));
         assert!(routes.promote_authenticated(peer));
@@ -753,7 +759,7 @@ mod tests {
         let local = id(0);
         let seed = id(1);
         let named = id(0xFFFF);
-        let mut routes = RoutingTable::new(local, [seed]);
+        let mut routes = RoutingTable::with_candidates(local, [seed]);
         for n in 0x8000..0x8000 + K as u16 {
             routes.promote_authenticated(id(n));
         }
@@ -790,7 +796,7 @@ mod tests {
     fn learned_failure_memory_is_bounded_and_expiry_reclamation_is_bucket_local() {
         let now = crate::clock::mono_now();
         let local = id(0);
-        let mut routes = RoutingTable::new(local, []);
+        let mut routes = RoutingTable::new(local);
         let bucket = bucket_index(local, id(0x8000)).unwrap();
         for n in 0..(K * 3) as u16 {
             routes.note_failure(
@@ -831,8 +837,8 @@ mod tests {
         }
 
         let verified: Vec<_> = peers.iter().step_by(7).copied().collect();
-        let mut forward = RoutingTable::new(local, []);
-        let mut reverse = RoutingTable::new(local, []);
+        let mut forward = RoutingTable::new(local);
+        let mut reverse = RoutingTable::new(local);
         for peer in &peers {
             forward.note_candidate(*peer);
         }
@@ -862,8 +868,8 @@ mod tests {
         );
 
         // Candidate insertion alone is likewise independent of observation order.
-        let mut forward_candidates = RoutingTable::new(local, []);
-        let mut reverse_candidates = RoutingTable::new(local, []);
+        let mut forward_candidates = RoutingTable::new(local);
+        let mut reverse_candidates = RoutingTable::new(local);
         for peer in &peers {
             forward_candidates.note_candidate(*peer);
         }
@@ -883,7 +889,7 @@ mod tests {
 
     #[test]
     fn closest_is_deterministic_xor_order() {
-        let table = RoutingTable::new(id(0), [id(7), id(2), id(5), id(1)]);
+        let table = RoutingTable::with_candidates(id(0), [id(7), id(2), id(5), id(1)]);
         assert_eq!(table.closest(id(4), 3), vec![id(5), id(7), id(1)]);
         assert_eq!(table.closest(id(4), 3), table.closest(id(4), 3));
     }
@@ -895,7 +901,7 @@ mod tests {
         let target = id(600);
         let reply: Vec<_> = (2..=2_000).flat_map(|n| [id(n), id(n)]).collect();
 
-        let mut forward_routes = RoutingTable::new(local, [seed]);
+        let mut forward_routes = RoutingTable::with_candidates(local, [seed]);
         let mut forward = IterativeLookup::new(local, target, [seed]);
         assert_eq!(forward.next_batch(), vec![seed]);
         assert!(forward.record_authenticated_response(
@@ -904,7 +910,7 @@ mod tests {
             &mut forward_routes
         ));
 
-        let mut reverse_routes = RoutingTable::new(local, [seed]);
+        let mut reverse_routes = RoutingTable::with_candidates(local, [seed]);
         let mut reverse = IterativeLookup::new(local, target, [seed]);
         assert_eq!(reverse.next_batch(), vec![seed]);
         assert!(reverse.record_authenticated_response(
@@ -953,7 +959,7 @@ mod tests {
     fn batches_respect_alpha_and_failures_terminate() {
         let local = id(0);
         let seeds: Vec<_> = (1..=K as u16).map(id).collect();
-        let mut routes = RoutingTable::new(local, seeds.iter().copied());
+        let mut routes = RoutingTable::with_candidates(local, seeds.iter().copied());
         let mut lookup = IterativeLookup::new(local, id(100), seeds);
         let mut contacted = 0;
 
@@ -974,7 +980,7 @@ mod tests {
     #[test]
     fn lookup_zero_capacity_leaves_candidates_unissued() {
         let local = id(0);
-        let mut routes = RoutingTable::new(local, []);
+        let mut routes = RoutingTable::new(local);
         for n in 1..=4 {
             routes.promote_authenticated(id(n));
         }
@@ -991,7 +997,7 @@ mod tests {
     #[test]
     fn lookup_partial_capacity_never_times_out_unissued_peers() {
         let local = id(0);
-        let mut routes = RoutingTable::new(local, []);
+        let mut routes = RoutingTable::new(local);
         for n in 1..=5 {
             routes.promote_authenticated(id(n));
         }
@@ -1018,7 +1024,7 @@ mod tests {
     fn lookup_shared_capacity_preserves_alpha_across_refills() {
         let local = id(0);
         let seeds = (1..=6).map(id).collect::<Vec<_>>();
-        let mut routes = RoutingTable::new(local, seeds.iter().copied());
+        let mut routes = RoutingTable::with_candidates(local, seeds.iter().copied());
         let mut lookup = IterativeLookup::new(local, local, seeds);
 
         assert_eq!(lookup.next_batch_up_to(2), vec![id(1), id(2)]);
@@ -1038,7 +1044,7 @@ mod tests {
     fn lookup_shared_capacity_respects_remaining_query_budget() {
         let local = id(0);
         let seeds = [id(1), id(2), id(3)];
-        let mut routes = RoutingTable::new(local, seeds);
+        let mut routes = RoutingTable::with_candidates(local, seeds);
         let mut lookup = IterativeLookup::new(local, local, seeds);
         // Place the lookup at its hard budget boundary without thousands of
         // preliminary request/completion pairs unrelated to this regression.
@@ -1059,7 +1065,7 @@ mod tests {
     #[test]
     fn routing_timeout_fails_only_issued_unanswered_requests() {
         let local = id(0);
-        let mut routes = RoutingTable::new(local, []);
+        let mut routes = RoutingTable::new(local);
         for n in 1..=4 {
             routes.promote_authenticated(id(n));
         }
@@ -1082,7 +1088,7 @@ mod tests {
         let local = id(0);
         let responder = id(0xffff);
         let target: RoutingKey = responder;
-        let mut routes = RoutingTable::new(local, [responder]);
+        let mut routes = RoutingTable::with_candidates(local, [responder]);
         let mut lookup = IterativeLookup::new(local, target, [responder]);
 
         assert_eq!(lookup.next_batch(), vec![responder]);
@@ -1107,7 +1113,7 @@ mod tests {
     fn lookup_responder_result_is_bounded_and_target_ordered() {
         let local = id(0);
         let target = id(25);
-        let mut routes = RoutingTable::new(local, [id(1)]);
+        let mut routes = RoutingTable::with_candidates(local, [id(1)]);
         let mut lookup = IterativeLookup::new(local, target, [id(1)]);
 
         for n in 1..=25 {
@@ -1132,7 +1138,7 @@ mod tests {
         let local = id(0);
         let seed = id(1);
         let stranger = id(2);
-        let mut routes = RoutingTable::new(local, [seed]);
+        let mut routes = RoutingTable::with_candidates(local, [seed]);
         let mut lookup = IterativeLookup::new(local, stranger, [seed]);
 
         assert!(!lookup.record_authenticated_response(stranger, [], &mut routes));

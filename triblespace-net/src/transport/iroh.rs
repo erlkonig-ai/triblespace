@@ -5,7 +5,7 @@
 //! pkarr + mDNS address lookup) and protocol-handler registration — happens in [`bind`], which returns the
 //! transport-agnostic [`Harness`] the host loop runs against.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 use futures::StreamExt;
 use iroh_base::{EndpointAddr, EndpointId};
@@ -26,15 +26,6 @@ const FORWARDED_ALPNS: [Alpn; 1] = [crate::protocol::PILE_SYNC_ALPN];
 #[derive(Clone)]
 pub struct IrohTransport {
     ep: iroh::Endpoint,
-    /// Explicitly configured routes, keyed by endpoint identity.
-    ///
-    /// `Endpoint::connect(EndpointId, ..)` delegates route selection to
-    /// discovery.  That is useful for ordinary internet peers, but it silently
-    /// discards a caller-supplied direct address (notably the Spark cluster's
-    /// 200 Gbit fabric).  Retaining the full address here makes an explicit
-    /// route authoritative for outbound protocol connections while preserving
-    /// discovery as the fallback for address-less peers.
-    peers: Arc<BTreeMap<EndpointId, EndpointAddr>>,
     /// Keeps the router (and through it the registered protocol handlers)
     /// alive for the transport's lifetime. The host loop never touches these;
     /// they exist below the seam.
@@ -42,9 +33,22 @@ pub struct IrohTransport {
 }
 
 impl IrohTransport {
-    /// The local sockets this transport's endpoint bound.
-    pub fn bound_sockets(&self) -> Vec<std::net::SocketAddr> {
-        self.ep.bound_sockets()
+    /// The endpoint the transport runs on.
+    pub fn endpoint(&self) -> &iroh::Endpoint {
+        &self.ep
+    }
+
+    /// Tell the endpoint where `address`'s endpoint listens, beside what
+    /// discovery finds. A host learns its pile's sync daemon this way, and a
+    /// test can give a loopback peer's address the same way.
+    pub fn learn(&self, address: EndpointAddr) {
+        use iroh::address_lookup::{EndpointInfo, MemoryLookup};
+        match self.ep.address_lookup() {
+            Ok(services) => services.add(MemoryLookup::from_endpoint_info([EndpointInfo::from(
+                address,
+            )])),
+            Err(error) => warn!(%error, "endpoint closed; address not learned"),
+        }
     }
 }
 
@@ -106,15 +110,10 @@ impl Transport for IrohTransport {
 
     async fn dial(&self, peer: PeerId, alpn: Alpn) -> anyhow::Result<Self::Conn> {
         let id = EndpointId::from_bytes(&peer).map_err(|e| anyhow::anyhow!("peer id: {e}"))?;
-        let addr = self
-            .peers
-            .get(&id)
-            .cloned()
-            .unwrap_or_else(|| EndpointAddr::from(id));
         let ep = self.ep.clone();
         let connect = self._alive._runtime.spawn(async move {
             debug!(target: "triblespace_net::handoff", peer = %id, "iroh outbound connection started");
-            let result = ep.connect(addr, alpn).await;
+            let result = ep.connect(id, alpn).await;
             match &result {
                 Ok(connection) => debug!(
                     target: "triblespace_net::handoff",
@@ -325,7 +324,7 @@ pub async fn bind(
             .map_err(|error| anyhow::anyhow!("iroh bind address {addr}: {error}"))?;
     }
     let ep = bind_n0_endpoint(builder).await?;
-    Ok(bind_with_endpoint(ep, config).await)
+    Ok(bind_with_endpoint(ep).await)
 }
 
 /// Wire the protocol forwarder and router over an already-bound endpoint, then
@@ -335,30 +334,9 @@ pub async fn bind(
 /// notably an `iroh::test_utils` `TestNetwork` endpoint for integration
 /// tests that wire two real `Peer`s over a virtual transport (no relays,
 /// no DNS), the way the real-transport integration tests do.
-pub async fn bind_with_endpoint(ep: iroh::Endpoint, config: &PeerConfig) -> Harness<IrohTransport> {
-    use iroh::address_lookup::{EndpointInfo, MemoryLookup};
+pub async fn bind_with_endpoint(ep: iroh::Endpoint) -> Harness<IrohTransport> {
     use iroh::protocol::Router;
 
-    let peers = Arc::new(
-        config
-            .peers
-            .iter()
-            .cloned()
-            .map(|addr| (addr.id, addr))
-            .collect(),
-    );
-
-    // Make configured routes available to iroh's discovery services as well
-    // as `IrohTransport::dial`. A memory lookup bridges endpoint ids back to
-    // the exact direct/fabric addresses supplied by the caller.
-    if !config.peers.is_empty() {
-        let lookup =
-            MemoryLookup::from_endpoint_info(config.peers.iter().cloned().map(EndpointInfo::from));
-        match ep.address_lookup() {
-            Ok(services) => services.add(lookup),
-            Err(error) => warn!(%error, "configured peer routes unavailable to iroh sub-protocols"),
-        }
-    }
     let mut router_builder = Router::builder(ep.clone());
 
     // Protocol ALPNs forward into the harness channel; the host loop
@@ -378,7 +356,6 @@ pub async fn bind_with_endpoint(ep: iroh::Endpoint, config: &PeerConfig) -> Harn
 
     let transport = IrohTransport {
         ep,
-        peers,
         _alive: Arc::new(Anchors {
             _router: router,
             _runtime: tokio::runtime::Handle::current(),

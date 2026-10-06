@@ -4,11 +4,11 @@ use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use anybytes::Bytes;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use iroh::Endpoint;
 use iroh::endpoint::presets;
 use iroh::test_utils::test_transport::{TestNetwork, TestTransport};
-use iroh_base::{EndpointAddr, SecretKey};
+use iroh_base::{EndpointId, SecretKey};
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::collection::selection::{CONFIG_COLLECTION_NAME, write_sync_selection};
 use triblespace_core::collection::{
@@ -117,26 +117,27 @@ async fn test_endpoint_on_transport(
         .expect("bind test endpoint")
 }
 
+/// A host whose first contact, when its pile names nobody, is `daemon`.
 async fn bring_up(
     endpoint: Endpoint,
     store: MemoryRepo,
-    peers: Vec<EndpointAddr>,
+    daemon: Option<EndpointId>,
 ) -> Peer<MemoryRepo> {
-    bring_up_owned(endpoint, store, peers).await.0
+    bring_up_owned(endpoint, store, daemon).await.0
 }
 
 async fn bring_up_owned(
     endpoint: Endpoint,
     store: MemoryRepo,
-    peers: Vec<EndpointAddr>,
+    daemon: Option<EndpointId>,
 ) -> (Peer<MemoryRepo>, tokio::task::JoinHandle<()>) {
     let id = endpoint.id();
     let config = PeerConfig {
-        peers,
+        daemon: daemon.map(|daemon| VerifyingKey::from_bytes(daemon.as_bytes()).unwrap()),
         provider_publication_budget: None,
         bind: None,
     };
-    let harness = triblespace_net::transport::iroh::bind_with_endpoint(endpoint, &config).await;
+    let harness = triblespace_net::transport::iroh::bind_with_endpoint(endpoint).await;
     let (sender, receiver, wiring) = host::wire(id);
     let owner = tokio::spawn(host::run_host(harness, config, wiring));
     (Peer::with_wiring(store, sender, receiver), owner)
@@ -158,7 +159,7 @@ async fn an_announced_record_is_repaired_promptly() {
         triblespace_net::identity::iroh_secret(&reader_key),
     )
     .await;
-    let server_addr = server_endpoint.addr();
+    let server_id = server_endpoint.id();
 
     let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
     let mut server_store = MemoryRepo::default();
@@ -173,8 +174,8 @@ async fn an_announced_record_is_repaired_promptly() {
     select(&mut server_store, &server_key, collection.handle());
     select(&mut reader_store, &reader_key, collection.handle());
 
-    let mut server = bring_up(server_endpoint, server_store, Vec::new()).await;
-    let mut reader = bring_up(reader_endpoint, reader_store, vec![server_addr]).await;
+    let mut server = bring_up(server_endpoint, server_store, None).await;
+    let mut reader = bring_up(reader_endpoint, reader_store, Some(server_id)).await;
     server.activate_collection(collection.handle());
     reader.activate_collection(collection.handle());
 
@@ -247,9 +248,6 @@ async fn three_root_current_state_scenario(restart: bool) {
     .await;
     let other_endpoint =
         test_endpoint(&network, triblespace_net::identity::iroh_secret(&other_key)).await;
-    let source_addr = source_endpoint.addr();
-    let reader_addr = reader_endpoint.addr();
-    let other_addr = other_endpoint.addr();
     let admission = AdmissionPolicy::quorum(
         [
             source_key.verifying_key(),
@@ -284,24 +282,10 @@ async fn three_root_current_state_scenario(restart: bool) {
     ] {
         select(store, key, collection);
     }
-    let (mut source, source_owner) = bring_up_owned(
-        source_endpoint.clone(),
-        source_store,
-        vec![reader_addr.clone(), other_addr.clone()],
-    )
-    .await;
-    let mut reader = bring_up(
-        reader_endpoint,
-        reader_store,
-        vec![source_addr.clone(), other_addr.clone()],
-    )
-    .await;
-    let mut other = bring_up(
-        other_endpoint,
-        other_store,
-        vec![source_addr, reader_addr.clone()],
-    )
-    .await;
+    let (mut source, source_owner) =
+        bring_up_owned(source_endpoint.clone(), source_store, None).await;
+    let mut reader = bring_up(reader_endpoint, reader_store, None).await;
+    let mut other = bring_up(other_endpoint, other_store, None).await;
     for peer in [&mut source, &mut reader, &mut other] {
         peer.activate_collection(collection);
     }
@@ -388,12 +372,8 @@ async fn three_root_current_state_scenario(restart: bool) {
     drop(source_endpoint);
     let restarted_endpoint =
         test_endpoint_on_transport(&network, source_secret, source_transport).await;
-    let (mut source, restarted_owner) = bring_up_owned(
-        restarted_endpoint,
-        source_store,
-        vec![reader_addr, other_addr],
-    )
-    .await;
+    let (mut source, restarted_owner) =
+        bring_up_owned(restarted_endpoint, source_store, None).await;
     source.activate_collection(collection);
     let after_restart = CollectionRecord::Commit(CollectionCommit::sign(
         &source_key,
@@ -467,7 +447,7 @@ async fn exact_acquisition_finds_a_provider_through_a_directory_without_wants() 
     let network = TestNetwork::new();
     let directory_endpoint =
         test_endpoint(&network, triblespace_net::identity::iroh_secret(&key(0xA2))).await;
-    let directory_addr = directory_endpoint.addr();
+    let directory_id = directory_endpoint.id();
     let server_endpoint =
         test_endpoint(&network, triblespace_net::identity::iroh_secret(&key(0xB2))).await;
     let reader_endpoint =
@@ -479,11 +459,11 @@ async fn exact_acquisition_finds_a_provider_through_a_directory_without_wants() 
     let unrelated = server_store
         .put::<UnknownBlob, _>(Bytes::from_source(b"unselected attachment".to_vec()))
         .unwrap();
-    let mut directory = bring_up(directory_endpoint, MemoryRepo::default(), Vec::new()).await;
-    let mut server = bring_up(server_endpoint, server_store, vec![directory_addr.clone()]).await;
+    let mut directory = bring_up(directory_endpoint, MemoryRepo::default(), None).await;
+    let mut server = bring_up(server_endpoint, server_store, Some(directory_id)).await;
     // This process knows only the directory, not the provider. None of these
     // peers activates a collection: H acquisition is independent of repair.
-    let mut reader = bring_up(reader_endpoint, MemoryRepo::default(), vec![directory_addr]).await;
+    let mut reader = bring_up(reader_endpoint, MemoryRepo::default(), Some(directory_id)).await;
     let before = reader.snapshot().unwrap();
     directory.refresh();
     server.refresh();
