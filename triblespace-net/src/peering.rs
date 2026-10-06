@@ -32,9 +32,11 @@ use rand::seq::SliceRandom as _;
 use triblespace_core::capability::{CapabilityHandle, CapabilityProof, QuorumOutcome};
 use triblespace_core::collection::CollectionHandle;
 
+use crate::channel::NetEventBatch;
 use crate::clock::Mono;
 use crate::collection_activation::MAX_PROOFS_PER_EXCHANGE;
 use crate::connection::{ConnectionTable, Link, ReconEvent, Service};
+use crate::grants::{Effects, Fetch, Grants, Sink, sources};
 use crate::health::{Health, PeeringHealth};
 use crate::host::{CollectionSnapshot, StoreSnapshot};
 use crate::protocol::RawHash;
@@ -142,6 +144,8 @@ pub(crate) struct Peerings {
     links: HashMap<u64, Link>,
     meshes: HashMap<RawHash, Mesh>,
     changed: bool,
+    /// Definitions whose arrival could admit a refused request.
+    wanted: Vec<Fetch>,
 }
 
 /// Whether `peer` may READ (or WRITE) C under this side's evidence and the
@@ -204,6 +208,22 @@ fn decide(
         }
     }
     Err(undefined)
+}
+
+/// The fetch of the definitions a request from `peer` waits for, if any.
+fn wanted(
+    peer: PeerId,
+    undefined: &[CapabilityHandle],
+    presented: &[CapabilityProof],
+) -> Option<Fetch> {
+    let definitions = undefined
+        .iter()
+        .map(|handle| handle.raw)
+        .collect::<BTreeSet<_>>();
+    (!definitions.is_empty()).then(|| Fetch {
+        definitions: definitions.into_iter().collect(),
+        sources: sources(peer, presented),
+    })
 }
 
 /// The keys a node may ask to peer for C, in order: grant-chain keys and
@@ -277,7 +297,15 @@ impl Peerings {
             links: HashMap::new(),
             meshes: HashMap::new(),
             changed: false,
+            wanted: Vec::new(),
         }
+    }
+
+    /// The definitions refused requests wait for since the last call, each
+    /// to be fetched from the asker, then from its credentials' root and
+    /// delegated keys.
+    pub(crate) fn take_wanted(&mut self) -> Vec<Fetch> {
+        std::mem::take(&mut self.wanted)
     }
 
     pub(crate) fn event(&mut self, event: ReconEvent) {
@@ -649,7 +677,10 @@ impl Peerings {
                 if peering.peered() {
                     peering.side = Side::Idle;
                 }
-                peering.refused = Some((theirs, decision.err().unwrap_or_default()));
+                let undefined = decision.err().unwrap_or_default();
+                let wanted = wanted(link.peer(), &undefined, &peering.presented);
+                peering.refused = Some((theirs, undefined));
+                self.wanted.extend(wanted);
             }
         }
     }
@@ -713,7 +744,11 @@ impl Peerings {
                 match decide(local.as_deref(), link.peer(), theirs, &peering.presented) {
                     Ok(_) if room => self.ask(collection, &link, true),
                     Ok(_) => {}
-                    Err(undefined) => peering.refused = Some((theirs, undefined)),
+                    Err(undefined) => {
+                        let wanted = wanted(link.peer(), &undefined, &peering.presented);
+                        peering.refused = Some((theirs, undefined));
+                        self.wanted.extend(wanted);
+                    }
                 }
             }
             Side::Asked { .. } => {}
@@ -910,22 +945,28 @@ impl Peerings {
     }
 }
 
-/// Run one node's peerings until its store observations end: hear its
-/// connections' events, follow its observations, refill its neighbour sets
-/// every [`PEERING_TICK`], and publish what changed into `health`.
+/// Run one node's peerings and grant exchange until its store observations
+/// end: hear its connections' events, follow its observations, refill its
+/// neighbour sets every [`PEERING_TICK`], and publish what changed into
+/// `health`. Received proofs and fetched definitions land through
+/// `admissions`.
 pub(crate) async fn run<T: Transport, S: Service>(
     connections: ConnectionTable<T, S>,
     mut snapshots: tokio::sync::watch::Receiver<Option<Arc<StoreSnapshot>>>,
     mut events: tokio::sync::mpsc::Receiver<ReconEvent>,
     mut providers: tokio::sync::mpsc::UnboundedReceiver<(CollectionHandle, Vec<PeerId>)>,
     health: Health,
+    admissions: tokio::sync::mpsc::Sender<NetEventBatch>,
 ) {
     let mut peerings = Peerings::new(connections.transport().local_id());
+    let mut grants = Grants::new(connections.transport().local_id());
+    let sink = Sink::new(connections.clone(), admissions);
     let (dialled_tx, mut dialled) = tokio::sync::mpsc::unbounded_channel();
     let mut tick = tokio::time::interval(PEERING_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     if let Some(snapshot) = snapshots.borrow_and_update().clone() {
-        peerings.observe(snapshot);
+        peerings.observe(snapshot.clone());
+        sink.apply(grants.observe(snapshot));
     }
     loop {
         tokio::select! {
@@ -936,10 +977,14 @@ pub(crate) async fn run<T: Transport, S: Service>(
                 // A withdrawn observation is not an unselection; the next
                 // one is compared with the last one seen.
                 if let Some(snapshot) = snapshots.borrow_and_update().clone() {
-                    peerings.observe(snapshot);
+                    peerings.observe(snapshot.clone());
+                    sink.apply(grants.observe(snapshot));
                 }
             }
-            Some(event) = events.recv() => peerings.event(event),
+            Some(event) = events.recv() => {
+                sink.apply(grants.event(&event));
+                peerings.event(event);
+            }
             Some((peer, connected)) = dialled.recv() => peerings.dialled(peer, connected),
             Some((collection, found)) = providers.recv() => {
                 peerings.providers(collection, found);
@@ -955,7 +1000,12 @@ pub(crate) async fn run<T: Transport, S: Service>(
                 }
             }
         }
+        sink.apply(Effects {
+            fetch: peerings.take_wanted(),
+            ..Effects::default()
+        });
         peerings.publish(&health);
+        grants.publish(&health);
     }
 }
 
@@ -966,15 +1016,22 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use tokio::sync::mpsc::UnboundedReceiver;
     use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-    use triblespace_core::capability::CapabilityResource;
+    use triblespace_core::blob::{Blob, IntoBlob};
+    use triblespace_core::capability::policy::resource_policy;
+    use triblespace_core::capability::{CapabilityResource, capability_action};
     use triblespace_core::collection::selection::{CONFIG_COLLECTION_NAME, write_sync_selection};
     use triblespace_core::collection::{
-        AdmissionPolicy, Collection, CollectionPolicy, CollectionStoreExt, private_policy,
-        read_capability, write_capability,
+        ACTION_READ, AdmissionPolicy, Collection, CollectionPolicy, CollectionStoreExt,
+        KIND_COLLECTION_DESCRIPTOR, private_policy, read_capability, write_capability,
     };
+    use triblespace_core::metadata;
     use triblespace_core::patch::Entry as PatchEntry;
+    use triblespace_core::prelude::entity;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
-    use triblespace_core::repo::{CapabilityProofStore, SnapshotSource, StoreChanges};
+    use triblespace_core::repo::{
+        BlobStorePut, CapabilityProofStore, SnapshotSource, StoreChanges,
+    };
+    use triblespace_core::trible::TribleSet;
 
     use crate::host::ActiveCollections;
 
@@ -1031,6 +1088,14 @@ mod tests {
 
         fn hold_named(&mut self, name: &str, policy: CollectionPolicy) -> CollectionHandle {
             let collection = self.store.collection(name, policy).unwrap().handle();
+            self.active.insert(&PatchEntry::new(&collection.raw));
+            collection
+        }
+
+        /// Hold and activate the collection these descriptor facts declare,
+        /// without the definitions its policies bind.
+        fn hold_descriptor(&mut self, facts: TribleSet) -> CollectionHandle {
+            let collection = self.store.put::<SimpleArchive, _>(facts).unwrap();
             self.active.insert(&PatchEntry::new(&collection.raw));
             collection
         }
@@ -1392,6 +1457,69 @@ mod tests {
         assert!(invited.peered && invited.receives);
     }
 
+    /// A request refused for want of a definition the asker holds names it,
+    /// to be fetched from the asker, then from its credentials' root and
+    /// delegated keys. Its arrival admits the asker by invitation.
+    #[test]
+    fn a_request_refused_for_a_missing_definition_fetches_it() {
+        let mut owner = Node::new(14);
+        let mut asker = Node::new(15);
+        let definition: Blob<SimpleArchive> = entity! {
+            capability_action: ACTION_READ,
+            metadata::name: "custom read",
+        }
+        .facts()
+        .clone()
+        .to_blob();
+        let custom = definition.get_handle();
+        let descriptor = entity! {
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            resource_policy*: AdmissionPolicy::direct(owner.key.verifying_key()).binding(custom),
+        }
+        .facts()
+        .clone();
+        let collection = owner.pile.hold_descriptor(descriptor.clone());
+        assert_eq!(asker.pile.hold_descriptor(descriptor), collection);
+        asker
+            .pile
+            .store
+            .put::<SimpleArchive, _>(definition.clone())
+            .unwrap();
+        let read = grant(&owner.key, &asker.key, custom, collection);
+        asker.learn(read);
+        owner.select(collection, true);
+        asker.select(collection, true);
+        let mut wire = connect(&mut asker, &mut owner, 1);
+        assert!(asker.peerings.fill(crate::clock::mono_now()).is_empty());
+        let carried = carry(&mut asker, &mut owner, &mut wire);
+        assert_eq!(
+            kinds(&carried),
+            [("left", FRAME_PEER_REQUEST), ("right", FRAME_PEER_REFUSE)]
+        );
+        assert_eq!(
+            owner.peerings.take_wanted(),
+            [Fetch {
+                definitions: vec![custom.raw],
+                sources: vec![asker.id(), owner.id()],
+            }]
+        );
+        assert!(asker.peerings.take_wanted().is_empty());
+
+        owner
+            .pile
+            .store
+            .put::<SimpleArchive, _>(definition)
+            .unwrap();
+        owner.observe();
+        let carried = carry(&mut asker, &mut owner, &mut wire);
+        assert_eq!(
+            kinds(&carried),
+            [("right", FRAME_PEER_REQUEST), ("left", FRAME_PEER_ACCEPT)]
+        );
+        let invited = peering(&asker, owner.id()).unwrap();
+        assert!(invited.peered && invited.receives, "{invited:?}");
+    }
+
     /// Unselecting C ends its peerings with an UNPEER and drops them.
     #[test]
     fn unselecting_sends_unpeer_and_drops_the_peering() {
@@ -1537,8 +1665,15 @@ mod tests {
                 let (snapshots, observed) = watch::channel(None);
                 let health = Health::new(EndpointId::from_bytes(&pile.id()).unwrap());
                 let (_providers, found) = tokio::sync::mpsc::unbounded_channel();
-                let peering =
-                    tokio::spawn(run(table.clone(), observed, recon, found, health.clone()));
+                let (admissions, _) = tokio::sync::mpsc::channel(1);
+                let peering = tokio::spawn(run(
+                    table.clone(),
+                    observed,
+                    recon,
+                    found,
+                    health.clone(),
+                    admissions,
+                ));
                 Self {
                     pile,
                     table,

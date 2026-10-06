@@ -46,7 +46,7 @@ const COLLECTION_REPAIR_ROOT_VERSION: u32 = 3;
 
 type AuthorizationEvidencePatch = PATCH<64, IdentitySchema, CapabilityProof, Blake3Merkle>;
 /// Subject key | hash of the proof prefix that ends at that subject.
-type SubjectProofPatch = PATCH<64, IdentitySchema, CapabilityProof, Blake3Merkle>;
+pub(crate) type SubjectProofPatch = PATCH<64, IdentitySchema, CapabilityProof, Blake3Merkle>;
 
 /// Most subject-truncated proofs one proof exchange accepts.
 ///
@@ -78,7 +78,7 @@ fn evidence_key(collection: CollectionHandle, id: CapabilityProofId) -> [u8; 64]
     key
 }
 
-fn subject_proof_key(subject: VerifyingKey, id: CapabilityProofId) -> [u8; 64] {
+pub(crate) fn subject_proof_key(subject: VerifyingKey, id: CapabilityProofId) -> [u8; 64] {
     let mut key = [0; 64];
     key[..32].copy_from_slice(subject.as_bytes());
     key[32..].copy_from_slice(&id.raw);
@@ -89,7 +89,7 @@ fn subject_proof_key(subject: VerifyingKey, id: CapabilityProofId) -> [u8; 64] {
 /// chain that subject holds, without later delegates or their capability
 /// handles. Resource, root and the kept signatures are the proof's own, so a
 /// prefix of a valid evidence proof is valid evidence too.
-fn subject_prefixes(
+pub(crate) fn subject_prefixes(
     proof: &CapabilityProof,
 ) -> impl Iterator<Item = (VerifyingKey, CapabilityProof)> + '_ {
     proof
@@ -272,6 +272,11 @@ impl CollectionAuthorizationEvidencePatch {
                 .expect("a retained subject prefix is nonempty"),
             None => PatchSummary::new(None, 0).expect("an absent subject prefix is canonical"),
         }
+    }
+
+    /// The retained prefixes under the keys they name.
+    pub(crate) const fn subject_index(&self) -> &SubjectProofPatch {
+        &self.subjects
     }
 
     /// Enumerate the retained prefixes that end at `subject`, in hash order.

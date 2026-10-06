@@ -1569,6 +1569,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
         recon_rx,
         found_rx,
         wiring.health.clone(),
+        wiring.evt_tx.clone(),
     ));
     let provider_client = ProviderClient {
         connections: connections.clone(),

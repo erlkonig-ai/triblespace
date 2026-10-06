@@ -279,6 +279,9 @@ pub struct HealthSnapshot {
     /// Every collection peering on an open connection, by collection and
     /// peer. Written only by the peering task.
     pub peerings: Vec<PeeringHealth>,
+    /// Collections named by proofs naming this node that wait in memory for
+    /// their descriptor. Written only by the peering task.
+    pub available: Vec<CollectionHandle>,
 }
 
 fn fresh(at: Option<Mono>, now: Mono, max_age: Duration) -> bool {
@@ -356,6 +359,7 @@ impl Health {
             publication: PublicationHealth::default(),
             blob_serving: BlobServeHealth::default(),
             peerings: Vec::new(),
+            available: Vec::new(),
         })))
     }
 

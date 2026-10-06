@@ -563,6 +563,7 @@ mod tests {
             publication: crate::health::PublicationHealth::default(),
             blob_serving: crate::health::BlobServeHealth::default(),
             peerings: Vec::new(),
+            available: Vec::new(),
         }
     }
 
