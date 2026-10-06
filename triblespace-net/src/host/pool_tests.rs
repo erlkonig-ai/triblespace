@@ -954,3 +954,48 @@ async fn a_recon_ended_at_once_reopens_only_for_a_frame() {
     assert_eq!(*opens.borrow(), reopened);
     assert!(dialler.table.current(peer_id).is_none(), "never went idle");
 }
+
+/// A frame queued while the dialler's `recon/1` still looked live, and not
+/// yet written when it ended, is itself a reason for a new stream: it
+/// crosses one at once, with no further send.
+#[tokio::test(start_paused = true)]
+async fn a_frame_queued_as_recon_ends_crosses_a_new_stream() {
+    use crate::recon::Frame;
+
+    let net = network(Duration::from_millis(10));
+    let dialler = Node::join(&net, &key(1));
+    let mut peer = net.join(&key(2));
+    let link = dialler
+        .table
+        .connect(peer.transport.local_id())
+        .await
+        .unwrap()
+        .link();
+    let conn = peer.incoming.recv().await.unwrap().conn;
+    let (first_send, mut first_recv) = conn.accept_bi().await.unwrap();
+    assert_eq!(recv_u8(&mut first_recv).await.unwrap(), TAG_RECON);
+    settle().await;
+
+    // The peer ends the stream and a frame is queued before the dialler
+    // runs again: it reads the end first, so this stream carries nothing.
+    let unpeer = Frame::Unpeer {
+        collection: CollectionHandle::new([3; 32]),
+    };
+    drop(first_send);
+    link.send(unpeer.clone());
+
+    let (_send, mut recv) = tokio::time::timeout(Duration::from_secs(1), conn.accept_bi())
+        .await
+        .expect("the queued frame opened no stream")
+        .unwrap();
+    assert_eq!(recv_u8(&mut recv).await.unwrap(), TAG_RECON);
+    let mut opening = [0; 13];
+    recv.read_exact(&mut opening).await.unwrap();
+    assert_eq!(opening[0], FRAME_OPEN);
+    let (kind, payload) = unpeer.encode();
+    let mut expected = Vec::new();
+    write_frame(&mut expected, kind, &payload).await.unwrap();
+    let mut frame = vec![0; expected.len()];
+    recv.read_exact(&mut frame).await.unwrap();
+    assert_eq!(frame, expected);
+}

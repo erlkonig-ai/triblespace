@@ -27,8 +27,9 @@
 //! A writer that waits [`RECON_CREDIT_DEADLINE`] for stream credit resets
 //! `recon/1`: the peer stopped reading. The service hears that the stream
 //! ended. The dialler opens a new one at once if the one that ended carried
-//! a frame either way, and otherwise when a frame is next queued, so a peer
-//! that ends every stream as it arrives gets no loop of them.
+//! a frame either way or frames are still queued, and otherwise when a frame
+//! is next queued, so a peer that ends every stream as it arrives gets no
+//! loop of them.
 //!
 //! A connection closes after [`CONNECTION_IDLE_DEADLINE`] without a frame on
 //! any of its streams, sent or received. Above [`MAX_CONNECTIONS`] in one
@@ -148,9 +149,10 @@ pub enum ReconEvent {
     /// The connection's `recon/1` stream ended while the connection stays
     /// open, and whatever ran on it with it. The connection's peerings and
     /// queued frames outlive it: the dialler opens a new stream at once if
-    /// the ended one carried a frame, and otherwise for the next frame. On
-    /// the accepting side a stream the dialler replaced before this side saw
-    /// it end also counts, reported before the new stream's first frame.
+    /// the ended one carried a frame or frames are queued, and otherwise for
+    /// the next frame. On the accepting side a stream the dialler replaced
+    /// before this side saw it end also counts, reported before the new
+    /// stream's first frame.
     Ended(Link),
     /// The connection closed; frames queued on it go nowhere.
     Closed(Link),
@@ -307,8 +309,9 @@ struct State {
     /// A `recon/1` stream carries the connection's frames, or is being
     /// opened. A dialled connection opens one as it connects.
     recon_live: AtomicBool,
-    /// The dialler's `recon/1` ended after carrying a frame, or a frame was
-    /// queued while no stream was live: the accept loop opens a new one.
+    /// The dialler's `recon/1` ended after carrying a frame or with frames
+    /// queued, or a frame was queued while no stream was live: the accept
+    /// loop opens a new one.
     reopen: AtomicBool,
     /// Woken on retirement, on the last in-flight stream, on a new `recon/1`
     /// stream, and on a frame that asks for one.
@@ -1335,13 +1338,15 @@ async fn recon<T: Transport, S: Service>(
                 }
                 // The newest stream ended, and none replaces it yet. The
                 // dialler opens the next one at once if this one carried a
-                // frame: the acceptor cannot, and may have more queued. A
-                // stream that carried none waits for the dialler's next
-                // frame, so a peer that ends each one costs no loop.
+                // frame: the acceptor cannot, and may have more queued. So
+                // does a frame still queued, which asked for a stream while
+                // this one looked live. A stream that carried none, with
+                // none queued, waits for the dialler's next frame, so a peer
+                // that ends each one costs no loop.
                 if state.recon.load(Ordering::SeqCst) == order {
                     state.recon_live.store(false, Ordering::SeqCst);
                     ended_here = true;
-                    if state.dialled && carried.load(Ordering::SeqCst) {
+                    if state.dialled && (carried.load(Ordering::SeqCst) || link.queued() > 0) {
                         state.reopen.store(true, Ordering::SeqCst);
                         state.changed.notify_waiters();
                     }

@@ -295,9 +295,10 @@ connection the frame its side of each peering rests on: a request or
 invitation still waiting for its answer, or its flags. The acceptor answers a
 repeated request as it did the first. The dialler opens the next stream as
 soon as the last one ends if that one carried a frame either way, read or
-written whole; otherwise it opens one when it next queues a frame. A peer that
-ends every stream as it arrives therefore gets no loop of streams, and the
-connection goes idle like any other.
+written whole, or if frames still wait in the queue; otherwise it opens one
+when it next queues a frame. A peer that ends every stream as it arrives
+therefore gets no loop of streams, and the connection goes idle like any
+other.
 
 The queue refuses no frame, so what it holds is bounded by what is put on it.
 A walk responder, and a side asked to peer, leave a request unanswered while
