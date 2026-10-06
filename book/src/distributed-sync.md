@@ -592,15 +592,19 @@ crossed a newer digest already has the newer state. A received proof, like a
 peer's credential, is kept only if it names the receiver or the sender.
 It lands when its held descriptor validates it, waits in memory while the
 descriptor is missing (`HealthSnapshot::available` lists its collection), and
-is dropped otherwise. Waiting proofs are bounded: one sender keeps at most 256
-of them and every sender together at most 1,024, and the rest are dropped
-before their signatures are checked and fetch nothing. A sender's waiting
-proofs are dropped when its last connection closes, so keys that came and went
-do not keep the bound full. A proof that is
-evidence under a held descriptor never waits, so these bounds keep none of
-those out. A proof for a collection that is not active is validated against
-the resident blob at its resource, which is taken for a descriptor only up to
-1 MiB and decoded at most once per store observation, not once per proof.
+is dropped otherwise. A waiting proof waits for every sender that delivered
+it and is dropped when the last connection of the last of them closes, so
+keys that came and went do not keep the bound full. Waiting proofs are
+bounded: one sender keeps at most 256 waiting and every sender together at
+most 1,024, and the rest are dropped before their signatures are checked and
+fetch nothing. A proof counts against every sender it waits for, not only
+its first, so a sender that repeats others' proofs spends its own share on
+them and keeps no more waiting than its share once the others leave. A proof
+that is evidence under a held descriptor never waits, so these bounds keep
+none of those out. A proof for a collection that is not active is validated
+against the resident blob at its resource, which is taken for a descriptor
+only up to 1 MiB and decoded at most once per store observation, not once per
+proof.
 
 The definitions a proof names are fetched over `blob/1` from the sender, then
 from its root and delegated keys among connected peers, as are those a refused

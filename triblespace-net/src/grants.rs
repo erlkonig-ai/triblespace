@@ -16,13 +16,18 @@
 //! collection's held descriptor and is dropped when it is not. A proof naming
 //! this node whose descriptor is not held stays in memory if its signatures
 //! hold, lists its collection as available, and lands once the descriptor
-//! arrives. At most [`MAX_PENDING_PER_SENDER`] of these from one sender, and
-//! [`MAX_PENDING`] from all, stay; the rest are dropped, and so are a
-//! sender's when its last connection closes. A proof that is evidence under
-//! a held descriptor never waits, so these bounds keep none out. The
-//! definitions a kept proof names are fetched over `blob/1` from its sender,
-//! then from its root and delegated keys among connected peers. A peering
-//! refused for want of definitions fetches them the same way.
+//! arrives. It waits for every sender that delivered it, and leaves when the
+//! last connection of the last of them closes. At most
+//! [`MAX_PENDING_PER_SENDER`] of these wait for one sender, and
+//! [`MAX_PENDING`] for all; the rest are dropped. A proof counts against each
+//! sender it waits for, not only its first: a sender then keeps no more
+//! waiting than its share however the others come and go, where charging
+//! only the first would let a later one keep any number once the first left.
+//! A proof that is evidence under a held descriptor never waits, so these
+//! bounds keep none out. The definitions a kept proof names are fetched over
+//! `blob/1` from its sender, then from its root and delegated keys among
+//! connected peers. A peering refused for want of definitions fetches them
+//! the same way.
 //!
 //! The host also dials the subject of every grant its own key signed, so the
 //! exchange delivers it.
@@ -57,7 +62,8 @@ use crate::transport::{PeerId, Transport};
 
 /// Bound on fetching one definition from one key.
 const FETCH_DEADLINE: Duration = Duration::from_secs(30);
-/// Proofs one sender keeps waiting in memory for their descriptor.
+/// Proofs waiting in memory for their descriptor that one sender keeps,
+/// counting each proof against every sender it waits for.
 const MAX_PENDING_PER_SENDER: usize = 256;
 /// Proofs every sender together keeps waiting in memory.
 const MAX_PENDING: usize = 1024;
@@ -121,8 +127,9 @@ pub(crate) struct Grants {
     /// This node's own entries: `received` and those of `held`.
     own: SubjectProofPatch,
     /// Received proofs naming this node whose descriptor is not held, by
-    /// id, with the key they came from.
-    pending: BTreeMap<RawHash, (PeerId, CapabilityProof)>,
+    /// id, with the keys they wait for: those that delivered them, within
+    /// their shares.
+    pending: BTreeMap<RawHash, (BTreeSet<PeerId>, CapabilityProof)>,
     /// The capability policies of resident descriptors of collections that
     /// are not active, by handle, decoded once per observation; `None` for
     /// a blob that is no descriptor.
@@ -169,9 +176,9 @@ impl Grants {
                 }
                 Effects::default()
             }
-            // Keys are free, so a sender's proofs wait in memory only while
-            // it stays connected; otherwise keys that came and went would
-            // hold the bound until a restart.
+            // Keys are free, so a proof waits in memory only while one of its
+            // senders stays connected; otherwise keys that came and went
+            // would hold the bound until a restart.
             ReconEvent::Closed(link) => {
                 self.exchanges.remove(&link.id());
                 let sender = link.peer();
@@ -263,10 +270,19 @@ impl Grants {
                         effects.land.push(proof.clone());
                     }
                 }
-                None if mine && self.pending.contains_key(&proof.id().raw) => {}
+                // A proof another sender delivered waits for this one too,
+                // within its share.
+                None if mine && self.pending.contains_key(&proof.id().raw) => {
+                    if self.kept(sender) < MAX_PENDING_PER_SENDER {
+                        let (senders, _) = self.pending.get_mut(&proof.id().raw).unwrap();
+                        senders.insert(sender);
+                    }
+                }
                 // Only its signatures can be checked before the descriptor.
                 None if mine && self.room(sender) && proof.verify_signatures().is_ok() => {
-                    self.pending.insert(proof.id().raw, (sender, proof.clone()));
+                    let senders = BTreeSet::from([sender]);
+                    self.pending
+                        .insert(proof.id().raw, (senders, proof.clone()));
                     self.changed = true;
                 }
                 None => continue,
@@ -302,12 +318,15 @@ impl Grants {
         effects
     }
 
-    /// Drop the proofs `sender` left waiting in memory, and their entries
-    /// among this node's own.
+    /// Stop keeping proofs waiting in memory for `sender`, and drop those no
+    /// other sender keeps, with their entries among this node's own.
     fn forget(&mut self, sender: PeerId) {
         let mut left = self
             .pending
-            .extract_if(.., |_, (from, _)| *from == sender)
+            .extract_if(.., |_, (senders, _)| {
+                senders.remove(&sender);
+                senders.is_empty()
+            })
             .peekable();
         if left.peek().is_none() {
             return;
@@ -332,10 +351,17 @@ impl Grants {
         }
     }
 
+    /// Proofs waiting in memory for `sender`.
+    fn kept(&self, sender: PeerId) -> usize {
+        self.pending
+            .values()
+            .filter(|(senders, _)| senders.contains(&sender))
+            .count()
+    }
+
     /// Whether `sender` may keep one more proof waiting in memory.
     fn room(&self, sender: PeerId) -> bool {
-        let kept = self.pending.values().filter(|(from, _)| *from == sender);
-        self.pending.len() < MAX_PENDING && kept.count() < MAX_PENDING_PER_SENDER
+        self.pending.len() < MAX_PENDING && self.kept(sender) < MAX_PENDING_PER_SENDER
     }
 
     /// Whether `proof` is evidence under its collection's descriptor, or
@@ -407,10 +433,10 @@ impl Grants {
 
         let mut effects = Effects::default();
         let pending = std::mem::take(&mut self.pending);
-        for (id, (sender, proof)) in pending {
+        for (id, (senders, proof)) in pending {
             match self.validate(&proof) {
                 None => {
-                    self.pending.insert(id, (sender, proof));
+                    self.pending.insert(id, (senders, proof));
                 }
                 Some(true) => effects.land.push(proof),
                 Some(false) => {
@@ -1097,6 +1123,81 @@ mod tests {
         send(&mut node, &later, 1);
         assert_eq!(node.grants.pending.len(), 1);
         assert_eq!(own(&node), 1);
+    }
+
+    /// A waiting proof waits for every sender that delivered it: when the
+    /// first disconnects it stays for the second, and it leaves with the
+    /// second.
+    #[test]
+    fn a_waiting_proof_stays_while_any_sender_is_connected() {
+        let owner = key(90);
+        let mut node = Node::new(91);
+        let collection = node.hold(policy(&owner));
+        node.observe();
+        // A grant for a collection whose descriptor this node does not hold.
+        let elsewhere = CollectionHandle::new([92; 32]);
+        let proof = grant(&owner, &node.key, read_capability(), elsewhere);
+        let [first, second] = [93, 94].map(|byte| {
+            let sender = key(byte).verifying_key().to_bytes();
+            let (link, _sent) = Link::detached(u64::from(byte), sender);
+            node.grants.event(&ReconEvent::Opened(link.clone()));
+            let credentials = vec![proof.clone()];
+            let frame = Frame::Credential {
+                collection,
+                credentials,
+            };
+            node.grants.event(&ReconEvent::Frame(link.clone(), frame));
+            link
+        });
+        assert_eq!(node.grants.available(), [elsewhere]);
+        node.grants.event(&ReconEvent::Closed(first));
+        assert_eq!(node.grants.available(), [elsewhere]);
+        node.grants.event(&ReconEvent::Closed(second));
+        assert!(node.grants.available().is_empty());
+    }
+
+    /// A waiting proof counts against each sender it waits for: a sender
+    /// that delivered another's proofs has filled its own share with them,
+    /// and keeps them when the other leaves.
+    #[test]
+    fn a_waiting_proof_counts_against_each_sender() {
+        let owner = key(95);
+        let mut node = Node::new(96);
+        let collection = node.hold(policy(&owner));
+        node.observe();
+        let subject = node.key.clone();
+        let proofs = (0..=MAX_PENDING_PER_SENDER)
+            .map(|index| {
+                let mut resource = [97; 32];
+                resource[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                grant(
+                    &owner,
+                    &subject,
+                    read_capability(),
+                    CollectionHandle::new(resource),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (shared, own) = proofs.split_at(MAX_PENDING_PER_SENDER);
+        let mut deliver = |byte: u8, credentials: &[CapabilityProof]| {
+            let sender = key(byte).verifying_key().to_bytes();
+            let (link, _sent) = Link::detached(u64::from(byte), sender);
+            node.grants.event(&ReconEvent::Opened(link.clone()));
+            let frame = Frame::Credential {
+                collection,
+                credentials: credentials.to_vec(),
+            };
+            node.grants.event(&ReconEvent::Frame(link.clone(), frame));
+            link
+        };
+        let first = deliver(98, shared);
+        let second = deliver(99, shared);
+        drop(deliver(99, own));
+        assert_eq!(node.grants.pending.len(), MAX_PENDING_PER_SENDER);
+        node.grants.event(&ReconEvent::Closed(first));
+        assert_eq!(node.grants.pending.len(), MAX_PENDING_PER_SENDER);
+        node.grants.event(&ReconEvent::Closed(second));
+        assert!(node.grants.pending.is_empty());
     }
 
     /// A received proof is kept only if it names this node or its sender.

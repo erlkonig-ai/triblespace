@@ -32,6 +32,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   neighbour holding its requests open until their deadline took every
   permit, and another neighbour's FIND_VALUE timed out.
 
+- Keep a proof waiting for its descriptor while any key that delivered it
+  stays connected. ff5c0e8f recorded only its first sender, so the proof
+  was dropped when that sender left although a second sender of it was
+  still connected, and nothing asked for it again. A waiting proof now
+  records every sender and counts against each one's share of 256, so the
+  per-sender bound still holds once the others leave; the bound of 1,024
+  counts proofs.
+
 - Delete configured peers (JP's content bootstrap, 2026-10-06).
   `PeerConfig::peers`, the routing table's configured seed
   (`RoutingTable::new` takes only the local key), `IrohTransport`'s route map
