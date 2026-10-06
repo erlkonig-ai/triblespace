@@ -134,6 +134,43 @@ pub enum Command {
         )]
         max_age: u64,
     },
+    /// Select collections for sync.
+    ///
+    /// The sync daemon peers for a collection only while this pile's own
+    /// configuration selects it. Each handle gets one new register state that
+    /// supersedes every head, so a conflict between earlier writers is settled
+    /// here. A running daemon picks the change up from the pile.
+    Select {
+        pile: PathBuf,
+        /// Path to the pile's signing key; the configuration is private to it.
+        #[arg(long)]
+        key: Option<PathBuf>,
+        /// Collection descriptor handles. Repeat as needed.
+        #[arg(value_name = "HANDLE", required = true)]
+        collections: Vec<String>,
+    },
+    /// Stop syncing collections.
+    ///
+    /// Writes an unselect state rather than removing anything, so the
+    /// register's history stays readable and a later select supersedes it.
+    Unselect {
+        pile: PathBuf,
+        /// Path to the pile's signing key; the configuration is private to it.
+        #[arg(long)]
+        key: Option<PathBuf>,
+        /// Collection descriptor handles. Repeat as needed.
+        #[arg(value_name = "HANDLE", required = true)]
+        collections: Vec<String>,
+    },
+    /// List every collection this pile's configuration has a selection for.
+    ///
+    /// Reads the configuration only; it never writes or probes the network.
+    Selection {
+        pile: PathBuf,
+        /// Path to the pile's signing key; the configuration is private to it.
+        #[arg(long)]
+        key: Option<PathBuf>,
+    },
     /// Inspect current colony work from resident telemetry and local health.
     ///
     /// The terminal view is the default. `--gui` embeds a GORBIE notebook.
@@ -239,6 +276,17 @@ pub fn run(command: Command) -> Result<()> {
             collection,
             max_age,
         } => run_health(pile, key, collection, max_age),
+        Command::Select {
+            pile,
+            key,
+            collections,
+        } => run_select(pile, key, collections, true),
+        Command::Unselect {
+            pile,
+            key,
+            collections,
+        } => run_select(pile, key, collections, false),
+        Command::Selection { pile, key } => run_selection(pile, key),
         Command::Dashboard {
             pile,
             key,
@@ -294,6 +342,120 @@ pub fn run(command: Command) -> Result<()> {
             bind,
         ),
     }
+}
+
+/// The name a resident descriptor gives `collection`, if the snapshot holds it.
+///
+/// A selection may name a collection whose descriptor has not arrived yet,
+/// so an absent name is reported, never an error.
+fn resident_collection_name<S>(snapshot: &S, collection: CollectionHandle) -> Option<String>
+where
+    S: triblespace_core::repo::BlobStoreGet,
+{
+    use triblespace_core::blob::encodings::utf8string::UTF8String;
+    use triblespace_core::blob::Blob;
+    use triblespace_core::collection::descriptor;
+    use triblespace_core::trible::TribleSet;
+
+    let facts: TribleSet = snapshot.get(collection).ok()?;
+    let named = descriptor::name(&facts).ok().flatten()?;
+    let blob: Blob<UTF8String> = snapshot.get(named).ok()?;
+    std::str::from_utf8(&blob.bytes).ok().map(str::to_owned)
+}
+
+/// Write one sync selection state for each collection into this pile's own
+/// configuration; `selected == false` unselects.
+fn run_select(
+    pile_path: PathBuf,
+    key_path: Option<PathBuf>,
+    collections: Vec<String>,
+    selected: bool,
+) -> Result<()> {
+    use triblespace_core::collection::private_policy;
+    use triblespace_core::collection::selection::{write_sync_selection, CONFIG_COLLECTION_NAME};
+
+    let collections = collections
+        .iter()
+        .map(|value| parse_collection(value))
+        .collect::<Result<Vec<_>>>()?;
+    let signer = load_existing_key(key_path, &pile_path)?;
+    let authority = signer.verifying_key();
+    // The daemon reads the configuration as this key, so write it as this key.
+    let mut pile = open_pile(&pile_path, Some(authority))?;
+    let result = (|| -> Result<()> {
+        // Registering is idempotent: the handle is a function of the name
+        // and the key, the same one `selection::config_handle` derives.
+        let config = pile.collection(CONFIG_COLLECTION_NAME, private_policy(authority))?;
+        let verb = if selected { "selected" } else { "unselected" };
+        for collection in collections {
+            write_sync_selection(&mut pile, config, &signer, collection, selected)?;
+            let snapshot = pile.snapshot()?;
+            match resident_collection_name(&snapshot, collection) {
+                Some(name) => println!("{verb} {} ({name})", hex::encode(collection.raw)),
+                None => println!(
+                    "{verb} {} (no descriptor resident here yet; the selection stands and applies once it arrives)",
+                    hex::encode(collection.raw)
+                ),
+            }
+        }
+        Ok(())
+    })();
+    let close = pile.close().map_err(anyhow::Error::from);
+    result.and(close)
+}
+
+/// Print the register value of every collection the configuration names.
+fn run_selection(pile_path: PathBuf, key_path: Option<PathBuf>) -> Result<()> {
+    use triblespace_core::collection::selection::{
+        config_facts, sync_collection, sync_selection, Selection,
+    };
+    use triblespace_core::id::Id;
+    use triblespace_core::macros::{find, pattern};
+
+    let signer = load_existing_key(key_path, &pile_path)?;
+    let authority = signer.verifying_key();
+    let mut pile = open_pile(&pile_path, Some(authority))?;
+    let result = (|| -> Result<()> {
+        let snapshot = pile.snapshot()?;
+        let facts = config_facts(&snapshot, authority)?;
+        let mut collections: Vec<CollectionHandle> = find!(
+            (state: Id, collection: CollectionHandle),
+            pattern!(&facts, [{ ?state @ sync_collection: ?collection }])
+        )
+        .map(|(_, collection)| collection)
+        .collect();
+        collections.sort_by_key(|collection| collection.raw);
+        collections.dedup();
+        let (mut on, mut off) = (0usize, 0usize);
+        for collection in &collections {
+            let value = match sync_selection(&facts, *collection) {
+                // A collection named only by heads this reader cannot decode.
+                Selection::Unset => "unset".to_owned(),
+                Selection::Selected => {
+                    on += 1;
+                    "selected".to_owned()
+                }
+                Selection::Unselected => {
+                    off += 1;
+                    "unselected".to_owned()
+                }
+                Selection::Conflicted(heads) => format!(
+                    "conflicted between {} heads (select or unselect once to settle)",
+                    heads.len()
+                ),
+            };
+            let name = resident_collection_name(&snapshot, *collection)
+                .unwrap_or_else(|| "no descriptor resident".to_owned());
+            println!("{} {value:<10} {name}", hex::encode(collection.raw));
+        }
+        println!(
+            "{} collection(s) named in this pile's configuration: {on} selected, {off} unselected.",
+            collections.len()
+        );
+        Ok(())
+    })();
+    let close = pile.close().map_err(anyhow::Error::from);
+    result.and(close)
 }
 
 fn run_identity(key: Option<PathBuf>, bind: Option<std::net::SocketAddr>) -> Result<()> {
