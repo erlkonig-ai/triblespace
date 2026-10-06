@@ -1200,17 +1200,18 @@ guarantee.
 
 ## Wire surface
 
-The ALPN is `/triblespace/pile-sync/28`. Generation 27 replaced the bearer
+The ALPN is `/triblespace/pile-sync/29`. Generation 27 replaced the bearer
 locator, directory token and exact-GET proofs with one-block constructions, so
-a generation-26 peer cannot connect at all; generation 28 exports
-foundations only, so collection sync never carries a MERGE. Within the ALPN,
-each stream's first byte selects its layout (*One connection per peer*), and
-all collection sync runs on `recon/1`. Bytes that opened earlier layouts are
-not accepted: `0x0E` was the collection repair session that walks on
-`recon/1` replaced, `0x0D` its record/AUTH-only predecessor, and `0x06`,
-`0x07` and `0x0C` the DHT operations now under `dht/1`. A stream that opens
-with one of them is reset as an unknown tag. Mixed-version collection sync is
-not supported: deploy a cohort together.
+a generation-26 peer cannot connect at all; generation 28 exports foundations
+only, so collection sync never carries a MERGE; generation 29 replaces the
+gossip wake plane and the `repair/0` session with `recon/1`, so a generation-28
+peer is refused at the handshake. Within the ALPN, each stream's first byte
+selects its layout (*One connection per peer*), and all collection sync runs on
+`recon/1`. Bytes that opened earlier layouts are not accepted: `0x0E` was the
+collection repair session that walks on `recon/1` replaced, `0x0D` its
+record/AUTH-only predecessor, and `0x06`, `0x07` and `0x0C` the DHT operations
+now under `dht/1`. A stream that opens with one of them is reset as an unknown
+tag. Mixed-version collection sync is not supported: deploy a cohort together.
 
 | Operation | Stream | Byte | Meaning |
 |---|---|---:|---|

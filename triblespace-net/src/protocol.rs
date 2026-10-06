@@ -30,7 +30,12 @@ use crate::transport::PeerId;
 /// DERIVE, capability and authorization records and never a MERGE, and the
 /// blob component is the held set. A generation-27 peer would serve MERGEs
 /// and an inventory with another meaning, so it is refused at the handshake.
-pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/28";
+/// Generation 29 replaces the gossip wake plane and the `repair/0` session
+/// with one connection per peer and its typed streams: `recon/1` carries
+/// peerings, announcements, pull walks and the grant exchange, and `dht/1`
+/// answers `FIND_VALUE`. A generation-28 peer speaks none of them, so it is
+/// refused at the handshake too.
+pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/29";
 
 // Stream type tags — first byte on each stream, read before any admission
 // permit is taken. An unknown tag resets only its own stream.

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Transport generation `/triblespace/pile-sync/29` (sync redesign M13):
+  one connection per peer whose `recon/1` stream carries peerings,
+  announcements, pull walks and the grant exchange, with `FIND_VALUE` on
+  `dht/1`, in place of the gossip wake plane and the `repair/0` session.
+  Generation-28 peers are refused at the handshake; deploy a cohort together.
+
 - Delete configured peers (JP's content bootstrap, 2026-10-06).
   `PeerConfig::peers`, the routing table's configured seed
   (`RoutingTable::new` takes only the local key), `IrohTransport`'s route map

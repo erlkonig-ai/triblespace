@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+- `pile net sync` speaks transport generation `/triblespace/pile-sync/29`
+  and cannot sync with a 0.47 daemon, which speaks generation 28; upgrade
+  every daemon of a cohort together.
 - Selected collection compaction consumes its exact preflight selection without
   repeating the filter or blob walk. Report scan, selection and copy phases,
   plus retained blob payload bytes (not total framed output size).

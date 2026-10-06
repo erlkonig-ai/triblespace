@@ -97,13 +97,14 @@ Each overlay currently owns a repair-collection | proof-hash PATCH whose proof v
 share the raw record's byte ownership. This is a validated membership projection,
 not validation during Pile replay and not a shared global host index. Summaries
 and repair nodes expose only C's fixed prefix; hashes bind the full keys while
-wire keys and compressed paths omit that prefix. The three-component manifest
-uses repair opcode `0x0E` on `/triblespace/pile-sync/28`; old repair opcode
-`0x0D` is rejected before decoding. Generation 27 changed the blob locator,
-directory token and exact-GET proofs to one-block constructions; generation 28
-exports foundations only (COMMIT and DERIVE, never MERGE) and advertises each
-collection's held-blob set, so older peers cannot connect and all nodes switch
-together. No AUTH or collection-repair operation transfers
+wire keys and compressed paths omit that prefix. The three components are
+compared by pull walks on `recon/1` under `/triblespace/pile-sync/29`; the old
+repair opcodes `0x0E` and `0x0D` are reset as unknown stream tags. Generation 27
+changed the blob locator, directory token and exact-GET proofs to one-block
+constructions; generation 28 exports foundations only (COMMIT and DERIVE, never
+MERGE) and advertises each collection's held-blob set; generation 29 replaces
+gossip wakes and repair sessions with `recon/1`. Older peers cannot connect and
+all nodes switch together. No AUTH or collection-repair operation transfers
 blob bodies or creates WANT; exact H remains the blob read capability.
 
 DHT provider-directory operations use the ordinary blob-locator namespace,

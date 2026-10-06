@@ -1127,8 +1127,8 @@ fn demand_shallow_full_preserve_exact_wants_and_only_hydrate_selected_roots_with
     }
 }
 
-/// Transport generation 28 exports foundations only. A peer still speaking
-/// generation 27 is refused at the handshake; the current generation is served.
+/// Transport generation 29 syncs over `recon/1`. A peer still speaking
+/// generation 28 is refused at the handshake; the current generation is served.
 #[test]
 fn a_previous_generation_peer_is_refused() {
     let _guard = test_guard();
@@ -1149,7 +1149,7 @@ fn a_previous_generation_peer_is_refused() {
         let server_id = server_key.verifying_key().to_bytes();
         assert_eq!(
             triblespace_net::protocol::PILE_SYNC_ALPN,
-            b"/triblespace/pile-sync/28"
+            b"/triblespace/pile-sync/29"
         );
         let current = client
             .transport
@@ -1165,7 +1165,7 @@ fn a_previous_generation_peer_is_refused() {
         assert!(answer.is_ok(), "{answer:?}");
         let previous = client
             .transport
-            .dial(server_id, b"/triblespace/pile-sync/27")
+            .dial(server_id, b"/triblespace/pile-sync/28")
             .await
             .unwrap();
         let refused = tokio::time::timeout(
@@ -1174,6 +1174,6 @@ fn a_previous_generation_peer_is_refused() {
         )
         .await
         .expect("a refused connection fails promptly");
-        assert!(refused.is_err(), "generation 27 must not be served");
+        assert!(refused.is_err(), "generation 28 must not be served");
     }));
 }
