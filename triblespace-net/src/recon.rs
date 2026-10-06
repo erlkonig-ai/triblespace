@@ -17,13 +17,15 @@
 //! | 0x13 | PEER_FLAGS     | collection, flags                            | M7   |
 //! | 0x14 | CREDENTIAL     | collection, credentials                      | M7   |
 //! | 0x15 | UNPEER         | collection                                   | M7   |
-//! | 0x20 | ANNOUNCE       | reserved                                     | M8   |
+//! | 0x20 | ANNOUNCE       | collection, root, flags, held-set digest     | M8   |
 //! | 0x30 | WALK_REQUEST   | reserved                                     | M9   |
 //! | 0x31 | WALK_RESPONSE  | reserved                                     | M9   |
 //! | 0x32 | WALK_END       | reserved                                     | M9   |
 //!
 //! Flags are one byte: bit 0 is the send flag, bit 1 the full flag, and in a
-//! PEER_REQUEST bit 2 marks an invitation. Other bits are ignored.
+//! PEER_REQUEST bit 2 marks an invitation. An ANNOUNCE has its own flags
+//! byte after the root: bit 0 marks a reply, and bit 1 says the sender's
+//! 32-byte held-set digest follows. Other bits are ignored.
 //!
 //! Credentials are a big-endian `u16` count followed by that many proofs, each
 //! a big-endian `u16` length and the proof's bytes, ending exactly at the end
@@ -34,6 +36,8 @@
 
 use triblespace_core::capability::CapabilityProof;
 use triblespace_core::collection::CollectionHandle;
+
+use crate::protocol::RawHash;
 
 /// Largest `recon/1` frame payload.
 pub const MAX_RECON_FRAME_BYTES: u32 = 64 * 1024;
@@ -52,10 +56,14 @@ pub const FRAME_PEER_FLAGS: u8 = 0x13;
 pub const FRAME_CREDENTIAL: u8 = 0x14;
 /// End the peering for a collection.
 pub const FRAME_UNPEER: u8 = 0x15;
+/// The sender's root for a collection.
+pub const FRAME_ANNOUNCE: u8 = 0x20;
 
 const FLAG_SEND: u8 = 0x01;
 const FLAG_FULL: u8 = 0x02;
 const FLAG_INVITATION: u8 = 0x04;
+const ANNOUNCE_REPLY: u8 = 0x01;
+const ANNOUNCE_HELD: u8 = 0x02;
 
 /// Collection handle, flags byte and credential count.
 const REQUEST_HEADER_BYTES: usize = 32 + 1 + 2;
@@ -99,6 +107,15 @@ pub enum Frame {
     Unpeer {
         collection: CollectionHandle,
     },
+    /// The sender's root for the collection, to a neighbour it sends to.
+    /// Between two full neighbours it carries the sender's held-set digest.
+    /// A reply answers a different announcement and is never answered.
+    Announce {
+        collection: CollectionHandle,
+        root: RawHash,
+        held_digest: Option<RawHash>,
+        reply: bool,
+    },
 }
 
 /// A frame of a known kind whose payload does not parse.
@@ -114,7 +131,8 @@ impl Frame {
             | Self::PeerRefuse { collection }
             | Self::PeerFlags { collection, .. }
             | Self::Credential { collection, .. }
-            | Self::Unpeer { collection } => *collection,
+            | Self::Unpeer { collection }
+            | Self::Announce { collection, .. } => *collection,
         }
     }
 
@@ -147,6 +165,26 @@ impl Frame {
                 FRAME_CREDENTIAL
             }
             Self::Unpeer { .. } => FRAME_UNPEER,
+            Self::Announce {
+                root,
+                held_digest,
+                reply,
+                ..
+            } => {
+                payload.extend_from_slice(root);
+                payload.push(
+                    (if *reply { ANNOUNCE_REPLY } else { 0 })
+                        | (if held_digest.is_some() {
+                            ANNOUNCE_HELD
+                        } else {
+                            0
+                        }),
+                );
+                if let Some(held) = held_digest {
+                    payload.extend_from_slice(held);
+                }
+                FRAME_ANNOUNCE
+            }
         };
         (kind, payload)
     }
@@ -194,6 +232,18 @@ impl Frame {
             FRAME_UNPEER => Self::Unpeer {
                 collection: fixed(32)?,
             },
+            FRAME_ANNOUNCE => {
+                let flags = *payload
+                    .get(64)
+                    .ok_or(Malformed("announcement without flags"))?;
+                let held = flags & ANNOUNCE_HELD != 0;
+                Self::Announce {
+                    collection: fixed(if held { 97 } else { 65 })?,
+                    root: payload[32..64].try_into().unwrap(),
+                    held_digest: held.then(|| payload[65..].try_into().unwrap()),
+                    reply: flags & ANNOUNCE_REPLY != 0,
+                }
+            }
             _ => return Ok(None),
         }))
     }
@@ -377,6 +427,18 @@ mod tests {
         roundtrip(Frame::Unpeer {
             collection: handle(6),
         });
+        roundtrip(Frame::Announce {
+            collection: handle(7),
+            root: [8; 32],
+            held_digest: None,
+            reply: false,
+        });
+        roundtrip(Frame::Announce {
+            collection: handle(9),
+            root: [10; 32],
+            held_digest: Some([11; 32]),
+            reply: true,
+        });
     }
 
     #[test]
@@ -437,6 +499,37 @@ mod tests {
         }
         let trailing = [&request[..], &[0]].concat();
         assert!(Frame::decode(FRAME_PEER_REQUEST, &trailing).is_err());
+
+        // An announcement's length follows its held-digest flag.
+        let (_, announce) = Frame::Announce {
+            collection: handle(1),
+            root: [2; 32],
+            held_digest: Some([3; 32]),
+            reply: false,
+        }
+        .encode();
+        let without_held = [&announce[..64], &[ANNOUNCE_REPLY]].concat();
+        for payload in [
+            &announce[..64],
+            &announce[..65],
+            &announce[..96],
+            &[&announce[..], &[0]].concat()[..],
+            &[&without_held[..], &[0]].concat()[..],
+        ] {
+            assert!(
+                Frame::decode(FRAME_ANNOUNCE, payload).is_err(),
+                "{}",
+                payload.len()
+            );
+        }
+        assert!(matches!(
+            Frame::decode(FRAME_ANNOUNCE, &without_held),
+            Ok(Some(Frame::Announce {
+                held_digest: None,
+                reply: true,
+                ..
+            }))
+        ));
         assert_eq!(Frame::decode(0x7F, b"anything"), Ok(None));
 
         // A proof this reader cannot decode is skipped, not a violation.
