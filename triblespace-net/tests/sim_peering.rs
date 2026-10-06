@@ -114,6 +114,15 @@ fn select(pile: &mut Pile) {
 }
 
 fn bring_up(net: &SimNet, key: &SigningKey, store: MemoryRepo) -> Peer<MemoryRepo> {
+    bring_up_with_publication_budget(net, key, store, Some(0))
+}
+
+fn bring_up_with_publication_budget(
+    net: &SimNet,
+    key: &SigningKey,
+    store: MemoryRepo,
+    provider_publication_budget: Option<u64>,
+) -> Peer<MemoryRepo> {
     let id = EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap();
     let harness = net.join(key);
     let (sender, receiver, wiring) = host::wire(id);
@@ -121,7 +130,7 @@ fn bring_up(net: &SimNet, key: &SigningKey, store: MemoryRepo) -> Peer<MemoryRep
         harness,
         PeerConfig {
             peers: Vec::new(),
-            provider_publication_budget: Some(0),
+            provider_publication_budget,
             bind: None,
         },
         wiring,
@@ -657,5 +666,63 @@ fn two_neighbour_groups_merge_after_their_partition_heals() {
                 "reader {group} peers with nobody of the other group"
             );
         }
+    }));
+}
+
+/// JP's two-phase content bootstrap (2026-10-06) through whole hosts. A has
+/// no route at all; its pile holds a record of an Open collection that B
+/// signed, which makes B its one candidate (phase 1). The connection to B
+/// puts B in A's routing table (phase 2), so the provider lookup of A's next
+/// draw has a contact, and through B it finds C: a provider of the
+/// collection that nothing in A's pile names. C reached B the same way,
+/// through B's record in its own pile, and published to B.
+#[test]
+fn a_host_with_no_routes_finds_a_provider_through_the_signer_its_pile_names() {
+    let _guard = test_guard();
+    let clock = virtual_clock();
+    clock.reset();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    runtime.block_on(tokio::task::LocalSet::new().run_until(async {
+        let net = SimNet::new(0x9EE7_1006, SimConfig::default());
+        let [a_key, b_key, c_key] = [103, 104, 105].map(key);
+        let [a_id, b_id, c_id] = [&a_key, &b_key, &c_key].map(|key| key.verifying_key().to_bytes());
+        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+        let mut b_pile = Pile::new(b_key.clone(), policy.clone());
+        let collection = b_pile.collection;
+        let record = commit(&mut b_pile.store, &b_key, collection, b"B's");
+        let mut a_pile = Pile::new(a_key.clone(), policy.clone());
+        let mut c_pile = Pile::new(c_key.clone(), policy);
+        for pile in [&mut a_pile, &mut c_pile] {
+            pile.store.insert(record).unwrap();
+        }
+        for pile in [&mut a_pile, &mut b_pile, &mut c_pile] {
+            select(pile);
+        }
+        let mut b = bring_up(&net, &b_key, b_pile.store);
+        let mut c = bring_up_with_publication_budget(&net, &c_key, c_pile.store, None);
+        b.activate_collection(collection);
+        c.activate_collection(collection);
+        advance(&clock, &mut [&mut b, &mut c], 120).await;
+        assert!(
+            c.health().publication.acknowledged != 0,
+            "C published to B: {:?}",
+            c.health().publication
+        );
+
+        let mut a = bring_up(&net, &a_key, a_pile.store);
+        a.activate_collection(collection);
+        advance(&clock, &mut [&mut a, &mut b, &mut c], 150).await;
+        let peered = |with| {
+            peerings(&a).iter().any(|peering| {
+                peering.peer == with && peering.collection == collection && peering.peered
+            })
+        };
+        assert!(peered(b_id), "{:?}", peerings(&a));
+        assert!(peered(c_id), "A found C through B: {:?}", peerings(&a));
+        assert!(net.dial_count(a_id, c_id) >= 1);
     }));
 }

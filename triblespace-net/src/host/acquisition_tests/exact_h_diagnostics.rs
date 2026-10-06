@@ -969,8 +969,6 @@ async fn exact_h_stale_early_hints_leave_room_for_fresh_routing_and_final_holder
             crate::clock::mono_now(),
         ));
     }
-    *fixture.client.candidates.lock().unwrap() =
-        RoutingTable::new(fixture.client.my_id, [fixture.other.peer]);
     fixture
         .other
         .candidates
@@ -987,6 +985,9 @@ async fn exact_h_stale_early_hints_leave_room_for_fresh_routing_and_final_holder
     {
         fixture.client.connections.connect(peer).await.unwrap();
     }
+    // An opened connection is a route, so the routes are set after.
+    *fixture.client.candidates.lock().unwrap() =
+        RoutingTable::new(fixture.client.my_id, [fixture.other.peer]);
     let trace = fixture.trace().clone();
     let started = Instant::now();
     let caller_deadline = started + Duration::from_secs(2);
@@ -1227,15 +1228,16 @@ async fn a_provider_lookup_takes_one_find_value_per_hop() {
         // (and, when advertised, the other's lease for the holder), the second
         // the holder's own hint. No directory round follows the routing.
         let mut fixture = ThreeNodes::new(advertised, None);
-        *fixture.client.candidates.lock().unwrap() =
-            RoutingTable::new(fixture.client.my_id, [fixture.other.peer]);
         fixture
             .other
             .candidates
             .lock()
             .unwrap()
             .promote_authenticated(fixture.holder.peer);
+        // An opened connection is a route, so the routes are set after.
         fixture.warm_connections().await;
+        *fixture.client.candidates.lock().unwrap() =
+            RoutingTable::new(fixture.client.my_id, [fixture.other.peer]);
         let providers = fixture
             .client
             .find_key(

@@ -1920,6 +1920,14 @@ impl Service for SnapshotHandler {
     }
 
     async fn recon(&self, event: ReconEvent) {
+        // TLS authenticated the peer of an opened connection, so it routes
+        // lookups: the peers a pile's content names seed the DHT.
+        if let ReconEvent::Opened(link) = &event {
+            self.candidates
+                .lock()
+                .unwrap()
+                .promote_authenticated(link.peer());
+        }
         let (walks, peering) = match event {
             ReconEvent::Frame(_, Frame::Walk(_)) => (Some(event), None),
             // Both hear a stream end and a connection close.
@@ -2881,6 +2889,28 @@ mod tests {
             assert!(choice.iter().filter(|peer| nearest.contains(*peer)).count() < 16);
         }
         assert_ne!(choices[0], choices[1]);
+    }
+
+    /// Phase 2 of the content bootstrap: the peer of an opened `recon/1`
+    /// becomes a verified route, so the next DHT lookup has a contact.
+    #[tokio::test]
+    async fn an_opened_recon_promotes_its_peer_into_the_routing_table() {
+        use crate::connection::{Link, ReconEvent, Service as _};
+        use crate::routing::{RouteState, RoutingTable};
+
+        let local = SigningKey::from_bytes(&[111; 32])
+            .verifying_key()
+            .to_bytes();
+        let peer = SigningKey::from_bytes(&[112; 32])
+            .verifying_key()
+            .to_bytes();
+        let handler = super::SnapshotHandler::for_test(local, RoutingTable::new(local, []));
+        let (link, _frames) = Link::detached(1, peer);
+        handler.recon(ReconEvent::Opened(link)).await;
+        assert_eq!(
+            handler.candidates.lock().unwrap().state(peer),
+            Some(RouteState::Verified)
+        );
     }
 }
 

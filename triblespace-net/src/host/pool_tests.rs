@@ -628,7 +628,11 @@ async fn recon_frames_keep_a_connection_open_past_the_idle_deadline() {
     assert!(server.table.current(quiet_id).is_none());
     assert!(quiet.accept_bi().await.is_none());
     assert!(server.table.current(chatty_id).is_some());
-    assert!(answers_empty(&chatty).await);
+    // The server's routes keep quiet, whose opened connection promoted it.
+    assert_eq!(
+        op_find_value(&chatty, &[0; 32]).await.unwrap(),
+        (vec![quiet_id], vec![])
+    );
 
     tokio::time::sleep(CONNECTION_IDLE_DEADLINE - Duration::from_secs(1)).await;
     assert!(server.table.current(chatty_id).is_some());
