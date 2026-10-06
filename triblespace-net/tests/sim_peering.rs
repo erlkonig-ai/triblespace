@@ -25,7 +25,6 @@ use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{BlobStoreGet, BlobStorePut, CapabilityProofStore, SnapshotSource};
 use triblespace_net::health::PeeringHealth;
 use triblespace_net::host::{self, PeerConfig};
-use triblespace_net::inventory::{ReconcileDirection, ReconcileQos};
 use triblespace_net::peer::Peer;
 use triblespace_net::reconcile::ReplicationMode;
 use triblespace_net::transport::sim::{SimConfig, SimNet};
@@ -113,20 +112,16 @@ fn bring_up(net: &SimNet, key: &SigningKey, store: MemoryRepo) -> Peer<MemoryRep
     let id = EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap();
     let harness = net.join(key);
     let (sender, receiver, wiring) = host::wire(id);
-    let qos = ReconcileQos {
-        direction: ReconcileDirection::Bidirectional,
-    };
     tokio::task::spawn_local(host::run_host(
         harness,
         PeerConfig {
             peers: Vec::new(),
-            qos,
             provider_publication_budget: Some(0),
             bind: None,
         },
         wiring,
     ));
-    Peer::with_wiring(store, qos, sender, receiver)
+    Peer::with_wiring(store, sender, receiver)
 }
 
 async fn advance(clock: &Arc<VirtualClock>, peers: &mut [&mut Peer<MemoryRepo>], seconds: u64) {

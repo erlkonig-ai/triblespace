@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Delete `ReconcileQos` and `ReconcileDirection` with the `inventory` module
+  (sync redesign M13). `PeerConfig::qos`, the `qos` argument of
+  `Peer::with_wiring`, `Peer::qos`, `HealthSnapshot::direction` and
+  `ComparisonState::NotApplicable` go. Every host pulls what its neighbours
+  announce, serves what its peerings admit and warms its active collections'
+  descriptors; a pile that should not sync a collection does not select it,
+  which is what read-only used to approximate.
+
+- Delete the remaining retry machinery (sync redesign M13, design D7). The
+  routing table keeps no configured set: configured peers start as ordinary
+  candidate routes and are retained, evicted and failed like any other. The
+  provider publisher keeps no retry set: a publication a remote rejected
+  waits for its key's renewal, and `PublicationHealth::retry_pending`, the
+  health record's `publication_retry_pending` and its dashboard metric go
+  with it. The shared `RETRY_BACKOFF_*` constants go; the reconciler's WANT
+  backoff and the publisher's topology backoff keep their one-to-sixty-second
+  values as their own constants, and a failed route still cools down for 60 s.
+
+- Delete the gossip wake plane (sync redesign M13, design D3, D7). The
+  vendored `iroh-gossip` crate, the `wake` module and its relay,
+  `Transport::WakePlane` and `collection_wake_plane`, the simulator's
+  `SimWakePlane`, `HostStarted::wake_plane`, `Peer::wake_plane` and
+  `examples/collection_wake_probe.rs` go, and with them the repair queue the
+  wake path fed: signed-origin participants and their leases, per-target
+  failures and their backoff, the periodic re-enqueue of failed targets, and
+  the descriptor-holder rediscovery schedule. Announcements on `recon/1` are
+  the only trigger of a pull, so a host syncs a collection only while its pile
+  selects it. Drawing a collection's candidate order looks up its DHT
+  providers, at most `ALPHA` lookups at a time, and an answer that changed
+  them is drawn into the order once it is exhausted.
+
 - Announce each selected collection's root on `recon/1` (sync redesign M8).
   ANNOUNCE goes to the collection's neighbours this side sends to, on one
   timer per collection that waits two to sixty seconds: a local append

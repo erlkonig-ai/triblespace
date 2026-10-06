@@ -15,9 +15,6 @@
 //! that neighbour. It does not authorize content or establish repair
 //! completion. Failed sends receive later periodic opportunities rather than
 //! an immediate retry loop.
-//!
-//! The gossip wake loop uses the same timer with the single neighbour `()`
-//! until the wake plane is removed.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -108,19 +105,6 @@ impl<N: Copy + Ord> WakeSchedule<N> {
     pub(crate) fn local_changed(&mut self, now: Mono, random: u64) {
         self.expedite(now, random);
         self.heard_equal.clear();
-    }
-
-    /// A signed gossip notice differs from the caller's current root.
-    ///
-    /// Repeated mismatches at minimum interval never restart that interval:
-    /// traffic cannot indefinitely postpone its scheduled opportunity. Equal
-    /// notices already heard in this interval still suppress redundant local
-    /// emission; remote disagreement did not itself change our local root.
-    /// Only the gossip wake loop calls this: a different announcement on
-    /// `recon/1` gets a reply instead, and expediting would send the
-    /// pre-merge root to every other neighbour.
-    pub(crate) fn different_root(&mut self, now: Mono, random: u64) {
-        self.expedite(now, random);
     }
 
     /// Count `neighbour`'s equal-root announcement toward redundancy
@@ -222,12 +206,12 @@ mod tests {
     }
 
     #[test]
-    fn minimum_interval_mismatches_do_not_postpone_transmission() {
+    fn minimum_interval_changes_do_not_postpone_transmission() {
         let now = crate::clock::mono_now();
         let mut schedule = WakeSchedule::new(now, 0);
         let due = schedule.deadline();
         for milliseconds in 0..1_000 {
-            schedule.different_root(now + Duration::from_millis(milliseconds), u64::MAX);
+            schedule.local_changed(now + Duration::from_millis(milliseconds), u64::MAX);
             assert_eq!(schedule.deadline(), due);
         }
         assert_eq!(schedule.poll(due, 0, [A]), [A]);
@@ -237,11 +221,11 @@ mod tests {
     }
 
     #[test]
-    fn mismatch_expedites_a_long_interval() {
+    fn a_change_expedites_a_long_interval() {
         let now = crate::clock::mono_now();
         let mut schedule = WakeSchedule::<u8>::begin(now, MAX_INTERVAL, 0);
         let notice = now + Duration::from_secs(3);
-        schedule.different_root(notice, 0);
+        schedule.local_changed(notice, 0);
         assert_eq!(schedule.interval, MIN_INTERVAL);
         assert_eq!(schedule.deadline(), notice + Duration::from_secs(1));
     }

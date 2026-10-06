@@ -949,33 +949,31 @@ async fn configured_only_cold_background_lookup_keeps_its_short_bound() {
     let _guard = crate::protocol::exact_blob_receive_test_guard();
     let mut fixture = Fixture::new(true);
     // A configured-only four-second cold dial still cannot complete within
-    // the unchanged three-second background window. Failure must retain the
-    // configured route, but does not itself warm a cancelled SimNet dial.
-    for attempt in 1..=3 {
-        let started = tokio::time::Instant::now();
-        let error = fixture
+    // the unchanged three-second background window. The configured route
+    // then fails like any other: it leaves the table and cools down.
+    let started = tokio::time::Instant::now();
+    let error = fixture
+        .client
+        .fetch_blob(fixture.hash, Some(BACKGROUND_LOOKUP_DEADLINE))
+        .await
+        .unwrap_err();
+    assert_eq!(started.elapsed(), BACKGROUND_LOOKUP_DEADLINE);
+    assert!(error.to_string().contains("no remote replica"));
+    assert!(
+        fixture
             .client
-            .fetch_blob(fixture.hash, Some(BACKGROUND_LOOKUP_DEADLINE))
-            .await
-            .unwrap_err();
-        assert_eq!(started.elapsed(), BACKGROUND_LOOKUP_DEADLINE);
-        assert!(error.to_string().contains("no remote replica"));
-        assert_eq!(
-            fixture
-                .client
-                .candidates
-                .lock()
-                .unwrap()
-                .closest(fixture.hash, K),
-            vec![fixture.provider]
-        );
-        assert_eq!(
-            fixture
-                .net
-                .dial_count(fixture.client.my_id, fixture.provider),
-            attempt
-        );
-    }
+            .candidates
+            .lock()
+            .unwrap()
+            .closest(fixture.hash, K)
+            .is_empty()
+    );
+    assert_eq!(
+        fixture
+            .net
+            .dial_count(fixture.client.my_id, fixture.provider),
+        1
+    );
     fixture.assert_no_control_effects();
 }
 
@@ -1103,7 +1101,7 @@ async fn background_publication_retries_past_a_stale_issued_batch() {
     );
     assert_eq!(publisher.next(completed), None);
 
-    let retry_at = completed + crate::RETRY_BACKOFF_BASE;
+    let retry_at = completed + crate::provider::TOPOLOGY_BACKOFF_BASE;
     let retry = publisher.next(retry_at).expect("topology retry probe");
     assert_eq!((retry.key, retry.identity), (key, fixture.hash));
     let retry_started = tokio::time::Instant::now();
@@ -1400,10 +1398,6 @@ async fn known_resident_outside_selected_dht_replicas_is_not_directly_probed() {
         }));
         fixture.client.connections.connect(peer).await.unwrap();
     }
-    *fixture.client.candidates.lock().unwrap() = RoutingTable::new(
-        fixture.client.my_id,
-        closer.iter().copied().chain([fixture.provider]),
-    );
     // The holder is a known, connected, usable directory/provider. Only its
     // exclusion from the exact locator's replica set prevents its use below.
     assert_eq!(
@@ -1413,6 +1407,13 @@ async fn known_resident_outside_selected_dht_replicas_is_not_directly_probed() {
             blob_provider_token(fixture.hash, fixture.provider)
         )]
     );
+    // The closer peers answered too. Their verified routes outrank the
+    // provider's candidate route where they share a bucket.
+    let mut routes = RoutingTable::new(fixture.client.my_id, [fixture.provider]);
+    for peer in &closer {
+        routes.promote_authenticated(*peer);
+    }
+    *fixture.client.candidates.lock().unwrap() = routes;
     let replicas = fixture.client.lookup(key, None).await.0.replicas();
     assert_eq!(replicas.len(), K);
     assert!(!replicas.contains(&fixture.provider));
@@ -1469,7 +1470,6 @@ async fn zero_announcement_budget_still_answers_resident_self_hints() {
                     peers: vec![EndpointAddr::from(
                         EndpointId::from_bytes(&client_id).unwrap(),
                     )],
-                    qos: ReconcileQos::default(),
                     provider_publication_budget: Some(0),
                     bind: None,
                 },

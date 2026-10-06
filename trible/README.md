@@ -200,7 +200,8 @@ the index's realized support.
 ### Distributed pile sync
 
 Built on `triblespace-net` (authenticated iroh QUIC, collection-scoped PATCH
-anti-entropy, stock-gossip wakeups, and DHT provider lookup). Opening a
+anti-entropy, per-collection peering and root announcements, and DHT provider
+lookup). Opening a
 transport connection grants no collection authority. Each repair request names
 one exact collection and may carry bounded native READ(C) proofs for cold
 bootstrap. The server admits only from collection-scoped proof evidence in its
@@ -245,7 +246,7 @@ changes admission for the immutable current session or creates blob WANTs.
   process CPU, outer-hop work, successful equation-publication calls and
   successful passes with no such calls. Neither record census nor a skipped
   poll is counted as performed work. No telemetry source or grant is created.
-- `pile net sync <PILE> --collection HANDLE [--collection HANDLE ...] [--peers ID_OR_TICKET,...] [--key PATH] [--direction bidirectional|read-only|write-only]` — activate the named collections and run periodic repair. `read-only` pulls but does not serve collection repair, while `write-only` serves admitted readers but does not pull collection repair. Every direction still services ordinary exact-blob WANTs. `--duration SECS` and `--quiescent-for SECS` provide optional process-lifecycle bounds.
+- `pile net sync <PILE> [--peers ID_OR_TICKET,...] [--key PATH]` — sync the collections the pile selects. The selection is one register per collection in the pile's own configuration collection under the key (`selection::config_handle`), written with `selection::write_sync_selection`; sync activates every selected collection at start and follows the register while it runs, and peers for a collection only with nodes that select it too. A collection flows to a neighbour exactly when this side admits it to read, and ordinary exact-blob WANTs are serviced too. `--duration SECS` and `--quiescent-for SECS` provide optional process-lifecycle bounds.
 
   The one existing key resolves from `--key`, `TRIBLESPACE_KEY`, or `self.key`
   beside the pile's lexical path. It identifies the endpoint and signs local
@@ -267,10 +268,9 @@ every valid signed COMMIT(C), while each receiver derives WRITE admission
 locally; a later WRITE proof can therefore activate an older commit without
 inventing a second synchronization protocol or requiring the publisher to
 possess its grant.
-Production peers subscribe to stock `iroh-gossip` topics keyed by the
-domain-separated image of the collection handle; signed opaque-root
-mismatches accelerate ordinary repair, while periodic anti-entropy remains
-authoritative.
+Peers that both select a collection peer for it on their one connection and
+announce its root to each other; a different root starts a pull of what the
+receiver lacks, and the next announcement is the only retry.
 
 DHT routing, provider lookup, and direct GET by a known immutable handle are
 collection-independent bearer mechanisms. In every repair direction, each

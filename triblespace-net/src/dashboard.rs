@@ -147,7 +147,6 @@ pub struct ObservedEvidence {
     pub publication_keys: CountMetric,
     pub publication_startup_pending: CountMetric,
     pub publication_incremental_pending: CountMetric,
-    pub publication_retry_pending: CountMetric,
     pub publication_renewal_remaining: CountMetric,
     pub publication_in_flight: CountMetric,
     pub publication_attempts: CountMetric,
@@ -552,11 +551,6 @@ fn observe_condition(facts: &TribleSet, condition: Id) -> ObservedCondition {
                 facts,
                 condition,
                 &health_record::attrs::publication_incremental_pending,
-            ),
-            publication_retry_pending: count_metric(
-                facts,
-                condition,
-                &health_record::attrs::publication_retry_pending,
             ),
             publication_renewal_remaining: count_metric(
                 facts,

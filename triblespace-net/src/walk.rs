@@ -712,8 +712,6 @@ struct Served {
 /// fetch for a number that is not the running one is dropped: its walk
 /// ended, and its number retired with it.
 pub(crate) struct Walks {
-    /// Whether this node serves collections at all.
-    serves: bool,
     health: Health,
     snapshot: Option<Arc<StoreSnapshot>>,
     pulls: HashMap<PullKey, Pull>,
@@ -726,9 +724,8 @@ pub(crate) struct Walks {
 }
 
 impl Walks {
-    pub(crate) fn new(serves: bool, health: Health) -> Self {
+    pub(crate) fn new(health: Health) -> Self {
         Self {
-            serves,
             health,
             snapshot: None,
             pulls: HashMap::new(),
@@ -1084,7 +1081,7 @@ impl Walks {
                 .snapshot
                 .as_ref()
                 .and_then(|snapshot| snapshot.collection(walk.collection))
-                .filter(|pinned| self.serves && self.sends(link.peer(), pinned));
+                .filter(|pinned| self.sends(link.peer(), pinned));
             let Some(pinned) = pinned else {
                 return reply(ended(EndReason::Refused));
             };
@@ -1753,7 +1750,7 @@ pub(crate) mod tests {
                 let health =
                     Health::new(EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap());
                 Self {
-                    walks: Walks::new(true, health.clone()),
+                    walks: Walks::new(health.clone()),
                     health,
                     key,
                     store: MemoryRepo::default(),

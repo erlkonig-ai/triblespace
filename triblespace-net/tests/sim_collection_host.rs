@@ -28,7 +28,6 @@ use triblespace_core::repo::{
 };
 use triblespace_core::trible::TribleSet;
 use triblespace_net::host::{self, PeerConfig};
-use triblespace_net::inventory::{ReconcileDirection, ReconcileQos};
 use triblespace_net::peer::Peer;
 use triblespace_net::reconcile::{ReconcileStats, Reconciler, ReplicationMode};
 use triblespace_net::transport::Transport;
@@ -97,9 +96,8 @@ fn bring_up(
     endpoint: &SigningKey,
     store: MemoryRepo,
     peers: Vec<[u8; 32]>,
-    direction: ReconcileDirection,
 ) -> Peer<MemoryRepo> {
-    bring_up_with_publication_budget(net, endpoint, store, peers, direction, None)
+    bring_up_with_publication_budget(net, endpoint, store, peers, None)
 }
 
 fn bring_up_with_publication_budget(
@@ -107,14 +105,12 @@ fn bring_up_with_publication_budget(
     endpoint: &SigningKey,
     store: MemoryRepo,
     peers: Vec<[u8; 32]>,
-    direction: ReconcileDirection,
     provider_publication_budget: Option<u64>,
 ) -> Peer<MemoryRepo> {
     let id = endpoint.verifying_key().to_bytes();
     let harness = net.join(endpoint);
     let (sender, receiver, wiring) =
         host::wire(EndpointId::from_bytes(&id).expect("valid endpoint id"));
-    let qos = ReconcileQos { direction };
     tokio::task::spawn_local(host::run_host(
         harness,
         PeerConfig {
@@ -126,13 +122,12 @@ fn bring_up_with_publication_budget(
                     )
                 })
                 .collect(),
-            qos,
             provider_publication_budget,
             bind: None,
         },
         wiring,
     ));
-    Peer::with_wiring(store, qos, sender, receiver)
+    Peer::with_wiring(store, sender, receiver)
 }
 
 async fn advance(clock: &Arc<VirtualClock>, peers: &mut [&mut Peer<MemoryRepo>], seconds: u64) {
@@ -218,24 +213,12 @@ fn demand_pull_selection_warms_an_empty_collection_without_a_want() {
             .unwrap()
             .unwrap();
         let source_id = source_key.verifying_key().to_bytes();
-        let mut source = bring_up(
-            &net,
-            &source_key,
-            source_store,
-            Vec::new(),
-            ReconcileDirection::WriteOnly,
-        );
-        let mut receiver = bring_up(
-            &net,
-            &receiver_key,
-            MemoryRepo::default(),
-            vec![source_id],
-            ReconcileDirection::ReadOnly,
-        );
+        let mut source = bring_up(&net, &source_key, source_store, Vec::new());
+        let mut receiver = bring_up(&net, &receiver_key, MemoryRepo::default(), vec![source_id]);
         source.activate_collection(collection.handle());
         receiver.activate_collection(collection.handle());
         // Deliberately no Reconciler tick, acquire(), WANT, or COMMIT. Metadata
-        // preparation belongs to the one pull-selection host owner in Demand.
+        // preparation belongs to the host's warmup of its active collections.
         advance(&clock, &mut [&mut source, &mut receiver], 100).await;
         let snapshot = receiver.snapshot().unwrap();
         assert!(BlobStoreGet::get::<TribleSet, _>(&snapshot, collection.handle()).is_ok());
@@ -281,6 +264,7 @@ fn issuer_held_read_proof_reaches_a_handle_only_recipient_by_grant_exchange() {
             collection.handle(),
         );
         issuer_store.insert_proof(read_proof.clone()).unwrap();
+        select(&mut issuer_store, &issuer_key, collection.handle());
         let payload_facts = entity! {
             triblespace_core::metadata::tag: triblespace_core::metadata::KIND_MULTI,
         }
@@ -298,20 +282,8 @@ fn issuer_held_read_proof_reaches_a_handle_only_recipient_by_grant_exchange() {
             )))
             .unwrap();
         let issuer_id = issuer_key.verifying_key().to_bytes();
-        let mut issuer = bring_up(
-            &net,
-            &issuer_key,
-            issuer_store,
-            Vec::new(),
-            ReconcileDirection::WriteOnly,
-        );
-        let mut recipient = bring_up(
-            &net,
-            &recipient_key,
-            MemoryRepo::default(),
-            vec![issuer_id],
-            ReconcileDirection::ReadOnly,
-        );
+        let mut issuer = bring_up(&net, &issuer_key, issuer_store, Vec::new());
+        let mut recipient = bring_up(&net, &recipient_key, MemoryRepo::default(), vec![issuer_id]);
         issuer.activate_collection(collection.handle());
 
         // The recipient begins with only C and one issuer endpoint. The issuer
@@ -368,6 +340,9 @@ fn issuer_held_read_proof_reaches_a_handle_only_recipient_by_grant_exchange() {
                 .unwrap()
         );
         assert!(recipient.health().available.is_empty());
+        // Selecting C makes the recipient ask the issuer, a key of C's grant
+        // chain, to peer for it.
+        select(&mut recipient.store(), &recipient_key, collection.handle());
         recipient.activate_collection(collection.handle());
 
         // The issuer authorizes the endpoint using its resident READ
@@ -376,7 +351,7 @@ fn issuer_held_read_proof_reaches_a_handle_only_recipient_by_grant_exchange() {
         // the committed payload.
         advance(&clock, &mut [&mut issuer, &mut recipient], 32).await;
         let dangling = recipient.snapshot().unwrap();
-        assert_eq!(dangling.records().unwrap().count(), 1);
+        assert_eq!(records_of(&dangling, collection.handle()), 1);
         let received = dangling
             .proofs()
             .unwrap()
@@ -445,7 +420,7 @@ fn issuer_held_read_proof_reaches_a_handle_only_recipient_by_grant_exchange() {
                 .cover()
                 .is_empty()
         );
-        assert_eq!(admitted.records().unwrap().count(), 1);
+        assert_eq!(records_of(&admitted, collection.handle()), 1);
         assert_eq!(admitted.proofs().unwrap().count(), 1);
         assert_eq!(admitted.wants().unwrap().count(), 0);
 
@@ -550,20 +525,8 @@ fn write_proof_later_activates_repaired_commit_without_reaching_publisher() {
         select(&mut reader_store, &reader_key, collection.handle());
 
         let server_id = server_key.verifying_key().to_bytes();
-        let mut server = bring_up(
-            &net,
-            &server_key,
-            server_store,
-            Vec::new(),
-            ReconcileDirection::WriteOnly,
-        );
-        let mut reader = bring_up(
-            &net,
-            &reader_key,
-            reader_store,
-            vec![server_id],
-            ReconcileDirection::ReadOnly,
-        );
+        let mut server = bring_up(&net, &server_key, server_store, Vec::new());
+        let mut reader = bring_up(&net, &reader_key, reader_store, vec![server_id]);
         server.activate_collection(collection.handle());
         reader.activate_collection(collection.handle());
 
@@ -605,7 +568,8 @@ fn write_proof_later_activates_repaired_commit_without_reaching_publisher() {
         assert_eq!(reader.snapshot().unwrap().wants().unwrap().count(), 0);
 
         // The grant can arrive after the record at the receiver. The
-        // WriteOnly publisher never receives or presents it.
+        // publisher, which the reader does not admit to READ C, never
+        // receives or presents it.
         reader.store().insert_proof(write).unwrap();
         reader.refresh();
         let after = reader.snapshot().unwrap();
@@ -697,21 +661,18 @@ fn native_read_credential_admits_on_retry_and_rejects_writer_only_peer() {
             &server_key,
             server_store,
             Vec::new(),
-            ReconcileDirection::WriteOnly,
         );
         let mut reader = bring_up(
             &net,
             &reader_key,
             reader_store,
             vec![server_id],
-            ReconcileDirection::ReadOnly,
         );
         let mut writer_only = bring_up(
             &net,
             &writer_key,
             writer_store,
             vec![server_id],
-            ReconcileDirection::ReadOnly,
         );
         for peer in [&mut server, &mut reader, &mut writer_only] {
             peer.activate_collection(collection.handle());
@@ -736,7 +697,10 @@ fn native_read_credential_admits_on_retry_and_rejects_writer_only_peer() {
             32,
         )
         .await;
-        assert_eq!(records_of(&reader.snapshot().unwrap(), collection.handle()), 1);
+        assert_eq!(
+            records_of(&reader.snapshot().unwrap(), collection.handle()),
+            1
+        );
         let stats = reconcile_once(
             &clock,
             &mut Reconciler::default(),
@@ -812,7 +776,7 @@ fn native_read_credential_admits_on_retry_and_rejects_writer_only_peer() {
 }
 
 #[test]
-fn collection_wake_recovery_survives_a_partition_without_dht_or_restart() {
+fn a_healed_partition_recovers_without_dht_or_restart() {
     let _guard = test_guard();
     let clock = virtual_clock();
     clock.reset();
@@ -856,30 +820,28 @@ fn collection_wake_recovery_survives_a_partition_without_dht_or_restart() {
         let mut reader_store = MemoryRepo::default();
         let reader_collection = register(&mut reader_store, policy);
         assert_eq!(reader_collection.handle(), collection.handle());
+        select(&mut server_store, &server_key, collection.handle());
+        select(&mut reader_store, &reader_key, collection.handle());
 
         let server_id = server_key.verifying_key().to_bytes();
         let reader_id = reader_key.verifying_key().to_bytes();
-        let mut server = bring_up_with_publication_budget(
-            &net,
-            &server_key,
-            server_store,
-            Vec::new(),
-            ReconcileDirection::WriteOnly,
-            Some(0),
-        );
+        let mut server =
+            bring_up_with_publication_budget(&net, &server_key, server_store, Vec::new(), Some(0));
         let mut reader = bring_up_with_publication_budget(
             &net,
             &reader_key,
             reader_store,
             vec![server_id],
-            ReconcileDirection::ReadOnly,
             Some(0),
         );
         server.activate_collection(collection.handle());
         reader.activate_collection(collection.handle());
 
         advance(&clock, &mut [&mut server, &mut reader], 5).await;
-        assert_eq!(reader.snapshot().unwrap().records().unwrap().count(), 1);
+        assert_eq!(
+            records_of(&reader.snapshot().unwrap(), collection.handle()),
+            1
+        );
 
         net.partition(server_id, reader_id);
         let mut second_facts = TribleSet::new();
@@ -902,16 +864,23 @@ fn collection_wake_recovery_survives_a_partition_without_dht_or_restart() {
             .unwrap();
         server.refresh();
 
-        // Let the signed wake be lost, periodic repair fail, and at least one
-        // recovery resubscription happen while the partition is still closed.
+        // The partition ends the peering with its connection, and the
+        // server's announcement is lost while it stays closed.
         advance(&clock, &mut [&mut server, &mut reader], 40).await;
-        assert_eq!(reader.snapshot().unwrap().records().unwrap().count(), 1);
+        assert_eq!(
+            records_of(&reader.snapshot().unwrap(), collection.handle()),
+            1
+        );
 
-        // Healing alone must suffice: there is no DHT publication, new write,
-        // process restart, or direct collection repair to a configured route.
+        // Healing alone must suffice: there is no DHT publication, new write
+        // or process restart. The reader asks the server again when its
+        // candidate order is drawn again.
         net.heal(server_id, reader_id);
         advance(&clock, &mut [&mut server, &mut reader], 95).await;
-        assert_eq!(reader.snapshot().unwrap().records().unwrap().count(), 2);
+        assert_eq!(
+            records_of(&reader.snapshot().unwrap(), collection.handle()),
+            2
+        );
     }));
 }
 
@@ -943,20 +912,8 @@ fn durable_bearer_want_materializes_without_any_collection() {
         reader_store.flush().unwrap();
 
         let server_id = server_key.verifying_key().to_bytes();
-        let mut server = bring_up(
-            &net,
-            &server_key,
-            server_store,
-            Vec::new(),
-            ReconcileDirection::WriteOnly,
-        );
-        let mut reader = bring_up(
-            &net,
-            &reader_key,
-            reader_store,
-            vec![server_id],
-            ReconcileDirection::ReadOnly,
-        );
+        let mut server = bring_up(&net, &server_key, server_store, Vec::new());
+        let mut reader = bring_up(&net, &reader_key, reader_store, vec![server_id]);
         advance(&clock, &mut [&mut server, &mut reader], 4).await;
 
         let mut reconciler = Reconciler::with_backoff(
@@ -1102,7 +1059,6 @@ fn demand_shallow_full_preserve_exact_wants_and_only_hydrate_selected_roots_with
                 &server_key,
                 server_store,
                 Vec::new(),
-                ReconcileDirection::WriteOnly,
                 Some(0),
             );
             let mut reader = bring_up_with_publication_budget(
@@ -1110,7 +1066,6 @@ fn demand_shallow_full_preserve_exact_wants_and_only_hydrate_selected_roots_with
                 &reader_key,
                 reader_store,
                 vec![server_key.verifying_key().to_bytes()],
-                ReconcileDirection::ReadOnly,
                 Some(0),
             );
             // Neither endpoint activates C or obtains READ(C). Ordinary H
@@ -1201,13 +1156,7 @@ fn a_previous_generation_peer_is_refused() {
     runtime.block_on(local.run_until(async {
         let net = SimNet::new(0xC011_EC8A, SimConfig::default());
         let server_key = key(95);
-        let mut server = bring_up(
-            &net,
-            &server_key,
-            MemoryRepo::default(),
-            Vec::new(),
-            ReconcileDirection::Bidirectional,
-        );
+        let mut server = bring_up(&net, &server_key, MemoryRepo::default(), Vec::new());
         advance(&clock, &mut [&mut server], 1).await;
         let client = net.join(&key(96));
         let server_id = server_key.verifying_key().to_bytes();

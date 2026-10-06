@@ -43,7 +43,6 @@ struct AcceptedTransport {
 
 impl Transport for AcceptedTransport {
     type Conn = AcceptedConn;
-    type WakePlane = <SimTransport as Transport>::WakePlane;
 
     fn local_id(&self) -> PeerId {
         self.inner.local_id()
@@ -58,10 +57,6 @@ impl Transport for AcceptedTransport {
 
     async fn shutdown(&self) {
         self.inner.shutdown().await;
-    }
-
-    fn collection_wake_plane(&self) -> Self::WakePlane {
-        self.inner.collection_wake_plane()
     }
 }
 

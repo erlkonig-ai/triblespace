@@ -39,14 +39,12 @@ use std::future::Future;
 use std::io;
 use std::ops::Range;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use iroh_base::EndpointId;
-use iroh_gossip::proto::DeliveryScope;
 use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -54,10 +52,6 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use super::{Alpn, Conn, Harness, Incoming, PeerId, Transport};
-use crate::wake::{
-    CollectionWake, CollectionWakeEvent, CollectionWakeNetwork, CollectionWakeRoot,
-    CollectionWakeSubscription, ReceivedCollectionWake,
-};
 
 /// Bytes one direction of a stream holds unread before its writer blocks:
 /// the credit QUIC grants each stream, noq-proto 1.2.0's default
@@ -106,9 +100,6 @@ struct SimNetInner {
     /// pending, so an un-deadlined singleflight pool wedges every
     /// later walk to that peer behind one stalled attempt.
     stalled_dials: BTreeSet<PeerId>,
-    wake_topics:
-        BTreeMap<[u8; 32], BTreeMap<PeerId, (u64, mpsc::UnboundedSender<CollectionWakeEvent>)>>,
-    next_wake_subscription: u64,
     rng: StdRng,
     config: SimConfig,
 }
@@ -153,8 +144,6 @@ impl SimNet {
                 dials: Vec::new(),
                 partitions: BTreeSet::new(),
                 stalled_dials: BTreeSet::new(),
-                wake_topics: BTreeMap::new(),
-                next_wake_subscription: 0,
                 rng: StdRng::seed_from_u64(seed),
                 config,
             })),
@@ -180,7 +169,6 @@ impl SimNet {
         let transport = SimTransport {
             net: self.clone(),
             id,
-            signing_key: Arc::new(signing_key.clone()),
         };
         // The bounded receivers the host loop expects: bridge from our
         // unbounded internals. (Unbounded internally so fault-time
@@ -325,12 +313,10 @@ async fn bridge<T: Send + 'static>(mut rx: mpsc::UnboundedReceiver<T>, tx: mpsc:
 pub struct SimTransport {
     net: SimNet,
     id: PeerId,
-    signing_key: Arc<SigningKey>,
 }
 
 impl Transport for SimTransport {
     type Conn = SimConn;
-    type WakePlane = SimWakePlane;
 
     fn local_id(&self) -> PeerId {
         self.id
@@ -403,145 +389,6 @@ impl Transport for SimTransport {
     }
 
     async fn shutdown(&self) {}
-
-    fn collection_wake_plane(&self) -> Self::WakePlane {
-        SimWakePlane {
-            net: self.net.clone(),
-            signing_key: self.signing_key.clone(),
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct SimWakePlane {
-    net: SimNet,
-    signing_key: Arc<SigningKey>,
-}
-
-pub struct SimWakeTopic {
-    net: SimNet,
-    collection: triblespace_core::collection::CollectionHandle,
-    signing_key: Arc<SigningKey>,
-    id: PeerId,
-    subscription: u64,
-    sequence: AtomicU64,
-    rx: mpsc::UnboundedReceiver<CollectionWakeEvent>,
-}
-
-impl CollectionWakeNetwork for SimWakePlane {
-    type Topic = SimWakeTopic;
-
-    async fn subscribe_network(
-        &self,
-        collection: triblespace_core::collection::CollectionHandle,
-        _bootstrap: Vec<EndpointId>,
-    ) -> anyhow::Result<Self::Topic> {
-        let id = self.signing_key.verifying_key().to_bytes();
-        let (tx, rx) = mpsc::unbounded_channel();
-        let (subscription, existing) = {
-            let mut inner = self.net.inner.lock().unwrap();
-            let subscription = inner.next_wake_subscription;
-            inner.next_wake_subscription = subscription.wrapping_add(1);
-            let existing = inner
-                .wake_topics
-                .get(&collection.raw)
-                .map(|topics| {
-                    topics
-                        .iter()
-                        .map(|(peer, (_, tx))| (*peer, tx.clone()))
-                        .collect()
-                })
-                .unwrap_or_else(Vec::new);
-            inner
-                .wake_topics
-                .entry(collection.raw)
-                .or_default()
-                .insert(id, (subscription, tx.clone()));
-            (subscription, existing)
-        };
-        for (peer, existing_tx) in existing {
-            let peer_id = EndpointId::from_bytes(&peer)?;
-            let id_endpoint = EndpointId::from_bytes(&id)?;
-            let _ = existing_tx.send(CollectionWakeEvent::NeighborUp(id_endpoint));
-            let _ = tx.send(CollectionWakeEvent::NeighborUp(peer_id));
-        }
-        Ok(SimWakeTopic {
-            net: self.net.clone(),
-            collection,
-            signing_key: self.signing_key.clone(),
-            id,
-            subscription,
-            sequence: AtomicU64::new(0),
-            rx,
-        })
-    }
-}
-
-impl CollectionWakeSubscription for SimWakeTopic {
-    async fn join_wake_peers(&self, _peers: Vec<EndpointId>) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    async fn broadcast_wake(&self, root: CollectionWakeRoot) -> anyhow::Result<CollectionWake> {
-        let mut nonce = [0; 16];
-        nonce[..8].copy_from_slice(&self.subscription.to_be_bytes());
-        nonce[8..].copy_from_slice(&self.sequence.fetch_add(1, Ordering::Relaxed).to_be_bytes());
-        let wake = CollectionWake::sign(self.collection, root, nonce, &self.signing_key);
-        self.relay_wake(&wake).await?;
-        Ok(wake)
-    }
-
-    async fn relay_wake(&self, wake: &CollectionWake) -> anyhow::Result<()> {
-        wake.verify(self.collection)?;
-        let recipients = {
-            let inner = self.net.inner.lock().unwrap();
-            inner
-                .wake_topics
-                .get(&self.collection.raw)
-                .into_iter()
-                .flat_map(|topics| topics.iter())
-                .filter(|(peer, _)| **peer != self.id)
-                .filter(|(peer, _)| {
-                    inner.nodes.get(*peer).is_some_and(|slot| slot.up)
-                        && !inner.partitioned(&self.id, peer)
-                })
-                .map(|(_, (_, tx))| tx.clone())
-                .collect::<Vec<_>>()
-        };
-        let delivered_from = EndpointId::from_bytes(&self.id)?;
-        for tx in recipients {
-            let _ = tx.send(CollectionWakeEvent::Received(ReceivedCollectionWake {
-                wake: wake.clone(),
-                delivered_from,
-                scope: DeliveryScope::Neighbors,
-            }));
-        }
-        Ok(())
-    }
-
-    async fn next_wake_event(&mut self) -> anyhow::Result<Option<CollectionWakeEvent>> {
-        Ok(self.rx.recv().await)
-    }
-}
-
-impl Drop for SimWakeTopic {
-    fn drop(&mut self) {
-        let mut inner = self.net.inner.lock().unwrap();
-        let empty = if let Some(topics) = inner.wake_topics.get_mut(&self.collection.raw) {
-            if topics
-                .get(&self.id)
-                .is_some_and(|(subscription, _)| *subscription == self.subscription)
-            {
-                topics.remove(&self.id);
-            }
-            topics.is_empty()
-        } else {
-            false
-        };
-        if empty {
-            inner.wake_topics.remove(&self.collection.raw);
-        }
-    }
 }
 
 /// A simulated connection: two endpoints exchanging bidirectional
@@ -927,69 +774,6 @@ fn hex_prefix(id: &PeerId) -> String {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    #[tokio::test(start_paused = true)]
-    async fn wake_relay_preserves_signed_origin_and_rejects_another_collection() {
-        let net = SimNet::new(0x41, SimConfig::default());
-        let relay_key = SigningKey::from_bytes(&[0x42; 32]);
-        let reader_key = SigningKey::from_bytes(&[0x43; 32]);
-        let source_key = SigningKey::from_bytes(&[0x44; 32]);
-        let relay_harness = net.join(&relay_key);
-        let reader_harness = net.join(&reader_key);
-        let collection = triblespace_core::collection::CollectionHandle::new([0x45; 32]);
-        let mut relay = relay_harness
-            .transport
-            .collection_wake_plane()
-            .subscribe_network(collection, Vec::new())
-            .await
-            .unwrap();
-        let mut reader = reader_harness
-            .transport
-            .collection_wake_plane()
-            .subscribe_network(collection, Vec::new())
-            .await
-            .unwrap();
-        assert!(matches!(
-            relay.next_wake_event().await.unwrap(),
-            Some(CollectionWakeEvent::NeighborUp(_))
-        ));
-        assert!(matches!(
-            reader.next_wake_event().await.unwrap(),
-            Some(CollectionWakeEvent::NeighborUp(_))
-        ));
-
-        let offered = CollectionWake::sign(
-            collection,
-            CollectionWakeRoot::new([0x46; 32]),
-            [0x47; 16],
-            &source_key,
-        );
-        relay.relay_wake(&offered).await.unwrap();
-        let Some(CollectionWakeEvent::Received(received)) = reader.next_wake_event().await.unwrap()
-        else {
-            panic!("expected the unchanged signed offer");
-        };
-        assert_eq!(received.wake.to_bytes(), offered.to_bytes());
-        assert_eq!(
-            received.delivered_from.as_bytes(),
-            relay_key.verifying_key().as_bytes()
-        );
-        assert_ne!(received.wake.origin(), received.delivered_from);
-        assert_eq!(received.scope, DeliveryScope::Neighbors);
-
-        let other_collection = triblespace_core::collection::CollectionHandle::new([0x48; 32]);
-        let wrong_context =
-            CollectionWake::sign(other_collection, offered.root(), [0x49; 16], &source_key);
-        let error = relay.relay_wake(&wrong_context).await.unwrap_err();
-        assert_eq!(
-            error.downcast_ref::<crate::wake::CollectionWakeError>(),
-            Some(&crate::wake::CollectionWakeError::InvalidSignature)
-        );
-        assert!(matches!(
-            reader.rx.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
-    }
 
     #[derive(Default)]
     struct WakeCount(std::sync::atomic::AtomicUsize);

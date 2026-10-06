@@ -28,7 +28,6 @@ use triblespace_core::repo::{
 };
 use triblespace_core::trible::TribleSet;
 use triblespace_net::host::{self, PeerConfig};
-use triblespace_net::inventory::{ReconcileDirection, ReconcileQos};
 use triblespace_net::peer::Peer;
 use triblespace_net::transport::sim::{SimConfig, SimNet};
 
@@ -69,29 +68,23 @@ fn grant(
     )
 }
 
-/// A host on `net`. One that does not pull also does not warm its active
-/// collections' definitions, so what it holds came by the exchange.
-fn bring_up(
-    net: &SimNet,
-    key: &SigningKey,
-    store: MemoryRepo,
-    direction: ReconcileDirection,
-) -> Peer<MemoryRepo> {
+/// A host on `net`. No host publishes provider records or starts with a
+/// route, so the warmup of its active collections finds no holder of a
+/// definition it lacks, and what it holds came by the exchange.
+fn bring_up(net: &SimNet, key: &SigningKey, store: MemoryRepo) -> Peer<MemoryRepo> {
     let id = EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap();
     let harness = net.join(key);
     let (sender, receiver, wiring) = host::wire(id);
-    let qos = ReconcileQos { direction };
     tokio::task::spawn_local(host::run_host(
         harness,
         PeerConfig {
             peers: Vec::new(),
-            qos,
             provider_publication_budget: Some(0),
             bind: None,
         },
         wiring,
     ));
-    Peer::with_wiring(store, qos, sender, receiver)
+    Peer::with_wiring(store, sender, receiver)
 }
 
 async fn advance(clock: &Arc<VirtualClock>, peers: &mut [&mut Peer<MemoryRepo>], seconds: u64) {
@@ -148,18 +141,8 @@ fn a_signed_grant_dials_its_subject() {
             .collection("granted", policy.clone())
             .unwrap()
             .handle();
-        let mut owner = bring_up(
-            &net,
-            &owner_key,
-            owner_store,
-            ReconcileDirection::Bidirectional,
-        );
-        let mut subject = bring_up(
-            &net,
-            &subject_key,
-            MemoryRepo::default(),
-            ReconcileDirection::Bidirectional,
-        );
+        let mut owner = bring_up(&net, &owner_key, owner_store);
+        let mut subject = bring_up(&net, &subject_key, MemoryRepo::default());
         owner.activate_collection(collection);
         subject.refresh();
         advance(&clock, &mut [&mut owner, &mut subject], 5).await;
@@ -263,10 +246,9 @@ fn a_custom_definition_credential_is_admitted_after_its_definition_is_fetched() 
             // learns the definition from a request of its own.
             acceptor.select(collection);
             let reader_config = reader.config;
-            let serving = ReconcileDirection::WriteOnly;
-            let mut owner = bring_up(&net, &owner_key, owner.store, serving);
-            let mut acceptor = bring_up(&net, &acceptor_key, acceptor.store, serving);
-            let mut reader = bring_up(&net, &reader_key, reader.store, serving);
+            let mut owner = bring_up(&net, &owner_key, owner.store);
+            let mut acceptor = bring_up(&net, &acceptor_key, acceptor.store);
+            let mut reader = bring_up(&net, &reader_key, reader.store);
             for peer in [&mut owner, &mut acceptor, &mut reader] {
                 peer.activate_collection(collection);
             }

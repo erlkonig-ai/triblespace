@@ -14,9 +14,6 @@ hex-literal = "1.0.0"
 # Source builds apply the tested 10ab7b32 root patch to this exact version.
 # Registry consumers intentionally receive upstream 0.19.1 without that patch.
 netwatch = "=0.19.1"
-# Ordered, bounded-stream wire adapter over unchanged per-topic mesh semantics.
-# See vendor/iroh-gossip for exact upstream provenance and the private ALPN.
-iroh-gossip = { package = "triblespace-gossip", version = "=0.101.0", path = "../vendor/iroh-gossip", default-features = false, features = ["net"] }
 # mDNS (LAN) address lookup — moved out of `iroh` core in 1.0. pkarr-DHT
 # address discovery was also removed in 1.0 and we deliberately do NOT
 # re-add it (N0 pkarr+DNS preset + mDNS cover our local/LAN use; staying

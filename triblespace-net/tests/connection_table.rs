@@ -69,7 +69,6 @@ async fn node(network: &TestNetwork) -> Node {
         endpoint(network).await,
         &PeerConfig {
             peers: vec![],
-            qos: Default::default(),
             provider_publication_budget: Some(0),
             bind: None,
         },

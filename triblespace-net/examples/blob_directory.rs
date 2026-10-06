@@ -29,7 +29,6 @@ use tokio::time::timeout;
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::{BlobStoreList, SnapshotSource};
 use triblespace_net::host::PeerConfig;
-use triblespace_net::inventory::{ReconcileDirection, ReconcileQos};
 use triblespace_net::protocol::{PILE_SYNC_ALPN, op_find_value};
 use triblespace_net::provider::{blob_locator, blob_provider_token};
 use triblespace_net::transport::{Conn, Transport};
@@ -98,9 +97,6 @@ async fn main() -> Result<()> {
     // Reuse production Iroh reachability, but never start the store host loop.
     let config = PeerConfig {
         peers: peers.iter().copied().map(EndpointAddr::from).collect(),
-        qos: ReconcileQos {
-            direction: ReconcileDirection::ReadOnly,
-        },
         provider_publication_budget: Some(0),
         bind: None,
     };

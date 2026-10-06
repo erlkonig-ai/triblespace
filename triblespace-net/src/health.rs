@@ -16,7 +16,6 @@ use triblespace_core::collection::CollectionHandle;
 
 use crate::clock::Mono;
 use crate::collection_wire::CollectionRepairManifest;
-use crate::inventory::ReconcileDirection;
 use crate::patch_repair::PatchSummary;
 use crate::transport::PeerId;
 
@@ -197,7 +196,6 @@ pub struct PublicationHealth {
     pub resident: u64,
     pub startup_pending: u64,
     pub incremental_pending: u64,
-    pub retry_pending: u64,
     pub renewal_remaining: u64,
     pub in_flight: usize,
     pub topology_paused: bool,
@@ -258,8 +256,6 @@ pub enum ComparisonState {
     Unknown,
     Matching,
     Different,
-    /// The local scheduler is configured not to pull collections.
-    NotApplicable,
 }
 
 /// An immutable copy of bounded evidence recorded at actual runtime events.
@@ -267,7 +263,6 @@ pub enum ComparisonState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HealthSnapshot {
     pub node: EndpointId,
-    pub direction: Option<ReconcileDirection>,
     pub started_at: Option<Mono>,
     /// Written only by the host loop, never by a status reader or store refresh.
     pub observed_at: Option<Mono>,
@@ -304,9 +299,6 @@ impl HealthSnapshot {
         now: Mono,
         max_age: Duration,
     ) -> ComparisonState {
-        if self.direction.is_some_and(|direction| !direction.pulls()) {
-            return ComparisonState::NotApplicable;
-        }
         if !self.is_fresh(now, max_age)
             || !self.store.serving_snapshot
             || !fresh(self.store.last_snapshot_observed_at, now, max_age)
@@ -351,7 +343,6 @@ impl Health {
     pub(crate) fn new(node: EndpointId) -> Self {
         Self(Arc::new(Mutex::new(HealthSnapshot {
             node,
-            direction: None,
             started_at: None,
             observed_at: None,
             store: StoreHealth::default(),
@@ -505,7 +496,6 @@ mod tests {
         let peer = [4; 32];
         let now = crate::clock::mono_now();
         health.update(|health| {
-            health.direction = Some(ReconcileDirection::Bidirectional);
             health.started_at = Some(now);
             health.observed_at = Some(now);
             health.store.serving_snapshot = true;
@@ -741,18 +731,6 @@ mod tests {
         assert_eq!(
             health.snapshot().comparison(collection, peer, later, age),
             ComparisonState::Matching
-        );
-    }
-
-    #[test]
-    fn write_only_is_explicitly_not_applicable() {
-        let (health, collection, peer, now) = fixture();
-        health.update(|health| health.direction = Some(ReconcileDirection::WriteOnly));
-        assert_eq!(
-            health
-                .snapshot()
-                .comparison(collection, peer, now, Duration::from_secs(180)),
-            ComparisonState::NotApplicable,
         );
     }
 

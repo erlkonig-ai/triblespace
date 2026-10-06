@@ -3,6 +3,7 @@
 mod dashboard;
 mod telemetry;
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
@@ -11,6 +12,9 @@ use ed25519_dalek::SigningKey;
 use iroh_base::{EndpointAddr, EndpointId};
 use iroh_tickets::endpoint::EndpointTicket;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace_core::collection::selection::{
+    config_facts, sync_collection, sync_selection, Selection,
+};
 use triblespace_core::collection::CollectionHandle;
 use triblespace_core::collection::{
     AdmissionPolicy, Collection, CollectionPolicy, CollectionStoreExt,
@@ -18,7 +22,7 @@ use triblespace_core::collection::{
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::SnapshotSource;
 use triblespace_net::health_record::{self, Recorder, DEFAULT_MAX_AGE, REPORT_EVERY};
-use triblespace_net::peer::{Peer, PeerConfig, ReconcileDirection, ReconcileQos};
+use triblespace_net::peer::{Peer, PeerConfig};
 use triblespace_net::reconcile::ReplicationMode;
 
 /// Open the pile, as `host` when the command publishes or reads MERGEs or MAPs
@@ -61,23 +65,6 @@ fn parse_collection(value: &str) -> Result<CollectionHandle> {
 fn load_existing_key(path: Option<PathBuf>, pile_path: &PathBuf) -> Result<SigningKey> {
     let path = triblespace_core::signing_key_file::resolve_path(path.as_deref(), pile_path);
     triblespace_core::signing_key_file::load_existing(&path).map_err(Into::into)
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-pub(crate) enum DirectionArg {
-    Bidirectional,
-    ReadOnly,
-    WriteOnly,
-}
-
-impl From<DirectionArg> for ReconcileDirection {
-    fn from(direction: DirectionArg) -> Self {
-        match direction {
-            DirectionArg::Bidirectional => Self::Bidirectional,
-            DirectionArg::ReadOnly => Self::ReadOnly,
-            DirectionArg::WriteOnly => Self::WriteOnly,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -178,7 +165,11 @@ pub enum Command {
         #[arg(long)]
         lattice: bool,
     },
-    /// Repair explicitly named collections with peers.
+    /// Sync the collections this pile selects with peers.
+    ///
+    /// The selection is the register in the pile's own configuration
+    /// collection, under the key; the daemon follows changes to it while
+    /// it runs.
     Sync {
         pile: PathBuf,
         /// Canonical iroh endpoint tickets or bare endpoint ids.
@@ -187,13 +178,7 @@ pub enum Command {
         /// Existing durable key for the endpoint, health and telemetry signatures.
         #[arg(long)]
         key: Option<PathBuf>,
-        /// Exact collection descriptor handle to activate. Repeat as needed.
-        #[arg(long = "collection", value_name = "HANDLE", required = true)]
-        collections: Vec<String>,
-        /// Whether to pull collections, serve them, or do both.
-        #[arg(long, value_enum, default_value = "bidirectional")]
-        direction: DirectionArg,
-        /// Local blob acquisition for exactly the --collection selections.
+        /// Local blob acquisition for exactly the selected collections.
         /// READ grants alone never subscribe this process to hydration.
         /// Full mode also acquires positive resident-blob handles learned through
         /// READ-authorized collection repair; it never probes arbitrary payload words.
@@ -266,8 +251,6 @@ pub fn run(command: Command) -> Result<()> {
             pile,
             peers,
             key,
-            collections,
-            direction,
             replication,
             provider_publication_budget,
             health,
@@ -280,10 +263,6 @@ pub fn run(command: Command) -> Result<()> {
             pile,
             peers,
             key,
-            collections,
-            ReconcileQos {
-                direction: direction.into(),
-            },
             replication.into(),
             provider_publication_budget,
             health,
@@ -336,12 +315,28 @@ fn bound_line(sockets: &[std::net::SocketAddr]) -> String {
     format!("bound: {}", sockets.join(" "))
 }
 
+/// The collections the configuration of the pile `authority` signs for
+/// selects for sync.
+fn selected_collections(
+    pile: &mut Pile,
+    authority: ed25519_dalek::VerifyingKey,
+) -> Result<BTreeSet<CollectionHandle>> {
+    use triblespace_core::macros::{find, pattern};
+
+    let snapshot = pile.snapshot()?;
+    let facts = config_facts(&snapshot, authority)?;
+    Ok(find!(
+        collection: CollectionHandle,
+        pattern!(&facts, [{ _?state @ sync_collection: ?collection }])
+    )
+    .filter(|collection| sync_selection(&facts, *collection) == Selection::Selected)
+    .collect())
+}
+
 fn run_sync(
     pile_path: PathBuf,
     peer_values: Vec<String>,
     key_path: Option<PathBuf>,
-    collection_values: Vec<String>,
-    qos: ReconcileQos,
     replication: ReplicationMode,
     provider_publication_budget: Option<u64>,
     health: bool,
@@ -353,10 +348,6 @@ fn run_sync(
 ) -> Result<()> {
     let key = load_existing_key(key_path, &pile_path)?;
     let peers = parse_peers(&peer_values)?;
-    let collections = collection_values
-        .iter()
-        .map(|value| parse_collection(value))
-        .collect::<Result<Vec<_>>>()?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -368,6 +359,7 @@ fn run_sync(
     // Sync writes and serves records and never publishes or reads a MERGE,
     // so it opens with no host, whichever key signs its telemetry.
     let mut pile = open_pile(&pile_path, None)?;
+    let mut selected = selected_collections(&mut pile, key.verifying_key())?;
     let mut telemetry = telemetry::Publisher::open(&mut pile, &key, telemetry_options)?;
     let mut recorder = Recorder::new(key.verifying_key());
     let health_collection = if health || health_collection_value.is_some() {
@@ -420,30 +412,21 @@ fn run_sync(
         key.clone(),
         PeerConfig {
             peers,
-            qos,
             provider_publication_budget,
             bind,
         },
     )?;
-    peer.activate_collections(collections.iter().copied());
+    peer.activate_collections(selected.iter().copied());
 
     eprintln!("node: {}", peer.id());
     eprintln!("{}", bound_line(&peer.bound_sockets()));
-    eprintln!("active collections: {}", collections.len());
+    eprintln!("selected collections: {}", selected.len());
     eprintln!("local replication: {replication:?}");
     if health_collection.is_some() {
         eprintln!("local swarm health: every 60s; freshness is reader policy");
     } else {
         eprintln!("local swarm health: not recording (set --health or --health-collection)");
     }
-    eprintln!(
-        "direction: {}",
-        match qos.direction {
-            ReconcileDirection::Bidirectional => "bidirectional",
-            ReconcileDirection::ReadOnly => "read-only (no collection serve)",
-            ReconcileDirection::WriteOnly => "write-only (no collection pull)",
-        }
-    );
     match provider_publication_budget {
         None => eprintln!("provider publication budget: unlimited"),
         Some(0) => eprintln!(
@@ -464,7 +447,7 @@ fn run_sync(
     let started = std::time::Instant::now();
     let duration_limit = duration.map(std::time::Duration::from_secs);
     let quiescent_limit = quiescent_for.map(std::time::Duration::from_secs);
-    peer.set_replication(replication, collections);
+    peer.set_replication(replication, selected.iter().copied());
     let reconcile_every = std::time::Duration::from_secs(1);
     let mut next_reconcile = std::time::Instant::now();
     let mut next_health = std::time::Instant::now();
@@ -511,6 +494,16 @@ fn run_sync(
                 }
             }
             if next_reconcile <= std::time::Instant::now() {
+                // A selection written while the daemon runs takes effect
+                // here. An unselected collection stays active and is no
+                // longer peered.
+                let now_selected = selected_collections(&mut *peer.store(), key.verifying_key())?;
+                if now_selected != selected {
+                    selected = now_selected;
+                    peer.activate_collections(selected.iter().copied());
+                    peer.set_replication(replication, selected.iter().copied());
+                    eprintln!("selected collections: {}", selected.len());
+                }
                 let measured = telemetry.as_ref().map(|_| std::time::Instant::now());
                 let stats = peer.reconcile().await;
                 if let (Some(telemetry), Some(measured)) = (telemetry.as_mut(), measured) {
@@ -798,13 +791,16 @@ mod tests {
     #[test]
     fn two_bound_peers_reach_each_other_from_tickets_written_before_launch() {
         use ed25519_dalek::SigningKey;
+        use triblespace_core::collection::selection::{
+            write_sync_selection, CONFIG_COLLECTION_NAME,
+        };
         use triblespace_core::collection::{
-            empty_metadata_handle, AdmissionPolicy, CollectionCommit, CollectionData,
-            CollectionPolicy, CollectionRead, CollectionRecord, CollectionStore,
+            empty_metadata_handle, private_policy, AdmissionPolicy, CollectionCommit,
+            CollectionData, CollectionPolicy, CollectionRead, CollectionRecord, CollectionStore,
             CollectionStoreExt,
         };
         use triblespace_core::repo::memoryrepo::MemoryRepo;
-        use triblespace_net::peer::{Peer, PeerConfig, ReconcileQos};
+        use triblespace_net::peer::{Peer, PeerConfig};
 
         fn free_port() -> std::net::SocketAddr {
             // Released at once; the peer binds it a moment later.
@@ -835,13 +831,18 @@ mod tests {
                 .unwrap()
                 .handle();
             collection = Some(handle);
+            // Each selects the collection, so each peers for it with the
+            // other, which it finds as a provider of it.
+            let config = store
+                .collection(CONFIG_COLLECTION_NAME, private_policy(key.verifying_key()))
+                .unwrap();
+            write_sync_selection(&mut store, config, key, handle, true).unwrap();
             let other = super::parse_peers(&[tickets[1 - index].clone()]).unwrap();
             let mut peer = Peer::new(
                 store,
                 key.clone(),
                 PeerConfig {
                     peers: other,
-                    qos: ReconcileQos::default(),
                     provider_publication_budget: Some(0),
                     bind: Some(addrs[index]),
                 },
@@ -870,7 +871,12 @@ mod tests {
                 .iter_mut()
                 .map(|peer| {
                     peer.refresh();
-                    peer.snapshot().unwrap().records().unwrap().count()
+                    peer.snapshot()
+                        .unwrap()
+                        .records()
+                        .unwrap()
+                        .filter(|record| record.as_ref().unwrap().collection() == collection)
+                        .count()
                 })
                 .collect();
             if counts == [2, 2] {
@@ -905,19 +911,20 @@ mod tests {
 
     #[test]
     fn sync_takes_a_bind_address() {
-        let super::Command::Sync { bind, .. } = super::Command::try_parse_from([
-            "net",
-            "sync",
-            "pile",
-            "--collection",
-            "00",
-            "--bind",
-            "127.0.0.1:7001",
-        ])
-        .unwrap() else {
+        let super::Command::Sync { bind, .. } =
+            super::Command::try_parse_from(["net", "sync", "pile", "--bind", "127.0.0.1:7001"])
+                .unwrap()
+        else {
             panic!("sync");
         };
         assert_eq!(bind, Some("127.0.0.1:7001".parse().unwrap()));
+    }
+
+    #[test]
+    fn sync_takes_its_collections_from_the_selection_alone() {
+        assert!(
+            super::Command::try_parse_from(["net", "sync", "pile", "--collection", "00"]).is_err()
+        );
     }
 
     #[test]
@@ -976,9 +983,8 @@ mod tests {
 
     #[test]
     fn replication_is_explicit_and_defaults_to_demand() {
-        let handle = hex::encode([0xCD; 32]);
         let parse = |mode: Option<&str>| {
-            let mut args = vec!["net", "sync", "test.pile", "--collection", handle.as_str()];
+            let mut args = vec!["net", "sync", "test.pile"];
             if let Some(mode) = mode {
                 args.extend(["--replication", mode]);
             }
@@ -995,32 +1001,23 @@ mod tests {
             "net",
             "sync",
             "test.pile",
-            "--collection",
-            &handle,
             "--replication",
-            "everything",
+            "everything"
         ])
         .is_err());
     }
 
     #[test]
     fn health_reporting_is_opt_in_without_a_second_key() {
-        let handle = hex::encode([0xCD; 32]);
         let Command::Sync { health, .. } =
-            Command::try_parse_from(["net", "sync", "test.pile", "--collection", &handle]).unwrap()
+            Command::try_parse_from(["net", "sync", "test.pile"]).unwrap()
         else {
             panic!("sync expected")
         };
         assert!(!health);
-        let Command::Sync { health, .. } = Command::try_parse_from([
-            "net",
-            "sync",
-            "test.pile",
-            "--collection",
-            &handle,
-            "--health",
-        ])
-        .unwrap() else {
+        let Command::Sync { health, .. } =
+            Command::try_parse_from(["net", "sync", "test.pile", "--health"]).unwrap()
+        else {
             panic!("sync expected")
         };
         assert!(health);
@@ -1028,8 +1025,6 @@ mod tests {
             "net",
             "sync",
             "test.pile",
-            "--collection",
-            &handle,
             "--health-key",
             "observer.key",
         ])
@@ -1045,16 +1040,8 @@ mod tests {
         let handle = hex::encode([0xCD; 32]);
         let Command::Sync {
             health_collection, ..
-        } = Command::try_parse_from([
-            "net",
-            "sync",
-            "test.pile",
-            "--collection",
-            &handle,
-            "--health-collection",
-            &handle,
-        ])
-        .unwrap()
+        } = Command::try_parse_from(["net", "sync", "test.pile", "--health-collection", &handle])
+            .unwrap()
         else {
             panic!("sync expected")
         };
@@ -1129,9 +1116,8 @@ mod tests {
 
     #[test]
     fn provider_publication_budget_defaults_unlimited_and_accepts_zero_or_n() {
-        let handle = hex::encode([0xCD; 32]);
         let parse = |budget: Option<&str>| {
-            let mut args = vec!["net", "sync", "test.pile", "--collection", handle.as_str()];
+            let mut args = vec!["net", "sync", "test.pile"];
             if let Some(budget) = budget {
                 args.extend(["--provider-publication-budget", budget]);
             }

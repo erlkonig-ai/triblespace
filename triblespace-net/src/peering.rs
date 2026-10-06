@@ -20,6 +20,8 @@
 //! -- each tier ranked by `blake3(salt || key)`. The walk through that order
 //! is the only retry state: a refusal, a failed dial or an ended peering is
 //! replaced by the next candidate, and the end of the order draws a new salt.
+//! Drawing an order also looks up the collection's DHT providers again; their
+//! answer is drawn into the order once it is exhausted.
 //! Every [`SWAP_INTERVAL`] one healthy asked-for neighbour makes room for the
 //! next candidate, so groups formed during a partition meet again after it.
 //!
@@ -31,6 +33,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ed25519_dalek::VerifyingKey;
+use futures::future::BoxFuture;
+use futures::stream::FuturesUnordered;
+use futures::{FutureExt as _, StreamExt as _};
 use rand::seq::SliceRandom as _;
 use triblespace_core::capability::{CapabilityHandle, CapabilityProof, QuorumOutcome};
 use triblespace_core::collection::CollectionHandle;
@@ -139,6 +144,8 @@ struct Mesh {
     dialling: BTreeSet<PeerId>,
     /// The latest DHT providers of the collection's locator.
     providers: Vec<PeerId>,
+    /// A lookup of those providers is running.
+    looking_up: bool,
     next_swap: Option<Mono>,
 }
 
@@ -151,6 +158,8 @@ pub(crate) struct Peerings {
     changed: bool,
     /// Definitions whose arrival could admit a refused request.
     wanted: Vec<Fetch>,
+    /// Collections whose DHT providers to look up.
+    lookups: Vec<CollectionHandle>,
 }
 
 /// Whether `peer` may READ (or WRITE) C under this side's evidence and the
@@ -309,6 +318,7 @@ impl Peerings {
             meshes: HashMap::new(),
             changed: false,
             wanted: Vec::new(),
+            lookups: Vec::new(),
         }
     }
 
@@ -317,6 +327,11 @@ impl Peerings {
     /// delegated keys.
     pub(crate) fn take_wanted(&mut self) -> Vec<Fetch> {
         std::mem::take(&mut self.wanted)
+    }
+
+    /// The collections whose DHT providers to look up since the last call.
+    pub(crate) fn take_lookups(&mut self) -> Vec<CollectionHandle> {
+        std::mem::take(&mut self.lookups)
     }
 
     pub(crate) fn event(&mut self, event: ReconEvent) {
@@ -378,11 +393,15 @@ impl Peerings {
         }
     }
 
-    /// The latest DHT providers of a collection's locator.
+    /// The latest DHT providers of a collection's locator. Different ones
+    /// are drawn into its order once the order is exhausted.
     pub(crate) fn providers(&mut self, collection: CollectionHandle, providers: Vec<PeerId>) {
         let mesh = self.meshes.entry(collection.raw).or_default();
-        mesh.providers = providers;
-        mesh.order.stale = true;
+        mesh.looking_up = false;
+        if mesh.providers != providers {
+            mesh.providers = providers;
+            mesh.order.stale = true;
+        }
     }
 
     /// Take a new store observation: end the peerings of collections no
@@ -925,7 +944,8 @@ impl Peerings {
 
     /// The next candidate in C's order that is not already a neighbour, being
     /// dialled, or refusing this side. The end of the order draws it again,
-    /// if that is due.
+    /// if that is due, and a draw that is not merely of changed candidates
+    /// looks up C's DHT providers again.
     fn next_candidate(
         &mut self,
         collection: CollectionHandle,
@@ -953,6 +973,10 @@ impl Peerings {
                 .is_none_or(|drawn| order.stale || now >= drawn + MIN_RESHUFFLE_INTERVAL);
             if !due {
                 return None;
+            }
+            if !order.stale && !mesh.looking_up {
+                mesh.looking_up = true;
+                self.lookups.push(collection);
             }
             order.peers = candidate_order(local, &mesh.providers, self.local, &rand::random());
             order.next = 0;
@@ -1009,6 +1033,7 @@ impl Peerings {
 /// observations end: hear its connections' events, follow its observations,
 /// refill its neighbour sets every [`PEERING_TICK`], announce when a
 /// collection's schedule fires, and publish what changed into `health`.
+/// A collection's DHT providers are looked up through `find_providers`.
 /// Pulls start through `start_pull`, and their ends arrive on
 /// `pulls_ended`. Received proofs and fetched definitions land through
 /// `admissions`.
@@ -1016,7 +1041,7 @@ pub(crate) async fn run<T: Transport, S: Service>(
     connections: ConnectionTable<T, S>,
     mut snapshots: tokio::sync::watch::Receiver<Option<Arc<StoreSnapshot>>>,
     mut events: tokio::sync::mpsc::Receiver<ReconEvent>,
-    mut providers: tokio::sync::mpsc::UnboundedReceiver<(CollectionHandle, Vec<PeerId>)>,
+    mut find_providers: impl FnMut(CollectionHandle) -> BoxFuture<'static, Vec<PeerId>>,
     mut start_pull: impl FnMut(PeerId, CollectionHandle, PullKind),
     mut pulls_ended: tokio::sync::mpsc::UnboundedReceiver<PullDone>,
     health: Health,
@@ -1027,6 +1052,7 @@ pub(crate) async fn run<T: Transport, S: Service>(
     let sink = Sink::new(connections.clone(), admissions);
     let mut announcements = Announcements::default();
     let (dialled_tx, mut dialled) = tokio::sync::mpsc::unbounded_channel();
+    let mut lookups = FuturesUnordered::new();
     let mut tick = tokio::time::interval(PEERING_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     if let Some(snapshot) = snapshots.borrow_and_update().clone() {
@@ -1082,7 +1108,7 @@ pub(crate) async fn run<T: Transport, S: Service>(
             }
             () = announcement_due => announcements.poll(crate::clock::mono_now()),
             Some((peer, connected)) = dialled.recv() => peerings.dialled(peer, connected),
-            Some((collection, found)) = providers.recv() => {
+            Some((collection, found)) = lookups.next(), if !lookups.is_empty() => {
                 peerings.providers(collection, found);
             }
             _ = tick.tick() => {
@@ -1100,6 +1126,9 @@ pub(crate) async fn run<T: Transport, S: Service>(
             fetch: peerings.take_wanted(),
             ..Effects::default()
         });
+        for collection in peerings.take_lookups() {
+            lookups.push(find_providers(collection).map(move |found| (collection, found)));
+        }
         if peerings.publish(&health) {
             announcements.neighbours(peerings.neighbours(), crate::clock::mono_now());
         }
@@ -1757,6 +1786,39 @@ mod tests {
         assert_eq!(node.peerings.fill(now + MIN_RESHUFFLE_INTERVAL), [provider]);
     }
 
+    #[test]
+    fn a_drawn_order_looks_up_providers_and_draws_their_answer_in() {
+        let mut node = Node::new(30);
+        let collection = node.hold(CollectionPolicy::new(
+            AdmissionPolicy::Open,
+            AdmissionPolicy::Open,
+        ));
+        node.select(collection, true);
+        let provider = [31; 32];
+        let now = crate::clock::mono_now();
+        // Only the DHT names a candidate. The first draw is empty and looks
+        // its providers up; no draw looks them up again while that runs.
+        assert!(node.peerings.fill(now).is_empty());
+        assert_eq!(node.peerings.take_lookups(), [collection]);
+        assert!(node.peerings.fill(now + MIN_RESHUFFLE_INTERVAL).is_empty());
+        assert!(node.peerings.take_lookups().is_empty());
+        // The answer is drawn in at once, by a draw that looks up nothing.
+        let answered = now + MIN_RESHUFFLE_INTERVAL + PEERING_TICK;
+        node.peerings.providers(collection, vec![provider]);
+        assert_eq!(node.peerings.fill(answered), [provider]);
+        assert!(node.peerings.take_lookups().is_empty());
+        // The provider cannot be dialled. The exhausted order waits out the
+        // interval, and that draw looks up again.
+        node.peerings.dialled(provider, false);
+        assert!(node.peerings.fill(answered + PEERING_TICK).is_empty());
+        assert!(node.peerings.take_lookups().is_empty());
+        assert_eq!(
+            node.peerings.fill(answered + MIN_RESHUFFLE_INTERVAL),
+            [provider]
+        );
+        assert_eq!(node.peerings.take_lookups(), [collection]);
+    }
+
     /// Peerings over real connection tables on the simulated transport,
     /// each node driven by [`run`].
     #[cfg(feature = "sim")]
@@ -1816,15 +1878,14 @@ mod tests {
                 });
                 let (snapshots, observed) = watch::channel(None);
                 let health = Health::new(EndpointId::from_bytes(&pile.id()).unwrap());
-                let (_providers, found) = tokio::sync::mpsc::unbounded_channel();
                 let (admissions, _) = tokio::sync::mpsc::channel(1);
-                // These hosts run no pulls.
+                // These hosts have no DHT and run no pulls.
                 let (_ended, pulls_ended) = tokio::sync::mpsc::unbounded_channel();
                 let peering = tokio::spawn(run(
                     table.clone(),
                     observed,
                     recon,
-                    found,
+                    |_| futures::future::ready(Vec::new()).boxed(),
                     |_, _, _| {},
                     pulls_ended,
                     health.clone(),

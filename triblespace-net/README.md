@@ -32,9 +32,7 @@ triblespace-net = "0.47"
 ```
 
 ```rust,ignore
-use triblespace_net::peer::{
-    Peer, PeerConfig, ReconcileDirection, ReconcileQos,
-};
+use triblespace_net::peer::{Peer, PeerConfig};
 
 let pile = triblespace::core::repo::pile::Pile::open(path)?;
 let mut peer = Peer::new(
@@ -42,12 +40,11 @@ let mut peer = Peer::new(
     signing_key,
     PeerConfig {
         peers: vec![bootstrap_endpoint],
-        qos: ReconcileQos {
-            direction: ReconcileDirection::Bidirectional,
-            ..ReconcileQos::default()
-        },
+        provider_publication_budget: None,
+        bind: None,
     },
 )?;
+// The pile's sync selection decides whether the collection is peered.
 peer.activate_collection(collection_handle);
 
 loop {
@@ -109,13 +106,13 @@ together. No AUTH or collection-repair operation transfers
 blob bodies or creates WANT; exact H remains the blob read capability.
 
 DHT provider-directory operations use the ordinary blob-locator namespace,
-KDF(H). There is no separate collection-participant advertisement. Collection
-gossip bootstraps from descriptor policy roots, root/delegate endpoint keys in
-validated scoped AUTH evidence, configured/recent contacts, and providers of
-the descriptor blob H=C. A descriptor provider may only cache that blob: it is
-a possible gossip contact, not a repair source or an authority grant. Each
-exact-content lease carries a token derived from H and the provider endpoint,
-which a requester who knows H verifies before dialing.
+KDF(H). There is no separate collection-participant advertisement. Peering
+candidates for C are descriptor policy roots, root/delegate endpoint keys in
+validated scoped AUTH evidence, signers of C's records, and providers of the
+descriptor blob H=C. A descriptor provider may only cache that blob: it is a
+candidate, not a repair source or an authority grant. Each exact-content lease
+carries a token derived from H and the provider endpoint, which a requester
+who knows H verifies before dialing.
 
 The exact stream never sends H. The authenticated provider proves knowledge of
 H first, bound to both TLS endpoint identities; only then does the requester
@@ -124,77 +121,37 @@ therefore cannot make the requester disclose H or masquerade as a provider.
 Returned bytes are accepted only when they hash to H. READ(C) is not consulted
 by exact GET and remains exclusively the collection-repair disclosure boundary.
 
-## Repair and wake
+## Peering and announcements
 
-State-based pairwise repair is authoritative anti-entropy. For each active
-collection, the caller opens one bidirectional stream, establishes READ(C),
-pins the returned record, authorization-evidence and resident-blob roots, and
-walks differing PATCH nodes. Authorization leaves carry complete canonical
-proof bytes; resident-blob leaves contain only H with an empty value. Inventory
-walks have a separate 128-node allowance and retain a cursor across successful
-passes. A changing remote inventory starts fresh Merkle validation above the
-last visited handle, then wraps to earlier keys; continuous appends cannot keep
-resetting progress to the first leaf. Progress does not depend on downloading
-the hinted bodies first. Collection payloads never travel in this stream.
+Hosts reconcile a collection C only while both piles select it in the sync
+selection register of their own configuration collection. Each pair of
+endpoints keeps one connection, and the dialler's `recon/1` stream carries the
+peerings, announcements and pull walks of every collection, and the grant
+exchange.
 
-Production iroh peers use stock `iroh-gossip` membership with neighbor-only
-messages on a version-isolated per-C topic. A 145-byte
-nonce-v4 wake contains only version, signed origin endpoint, one opaque repair
-root, and a fresh nonce. A mismatch schedules ordinary READ-authorized repair
-from a fresh signed origin advertising that root. Several such origins share
-the repair load through randomized selection; the immediate forwarding hop
-is not presumed to hold the state. The wake itself grants no authority.
+A host asks up to five candidates to peer for each collection it selects:
+grant-chain keys and record signers that pass READ under local evidence, then
+the other grant-chain keys and signers, then DHT providers of the descriptor
+blob H=C, each tier in an order shuffled under a fresh salt. The order is the
+only retry state. A refusal, a failed dial or an ended peering is replaced by
+the next candidate, and an exhausted order is drawn again at most once a
+minute, which also looks up C's providers again. The acceptor admits a key that
+passes READ for C, or one that sends and passes WRITE.
 
-Each topic periodically offers its latest root with a randomized timer: the
-interval grows from two to sixty seconds, transmission is in its second half,
-and hearing an equal root suppresses that interval's redundant local offer.
-Application relaying is separate: `(C, R)` is state identity, while the signed
-repair contact and nonce are annotations. At most one latest observation per
-origin is retained, with equal roots sharing a forwarding deadline. A receiver
-allows repair up to five seconds, then relays the original signed offer if it
-cannot serve that root. A published serving snapshot can instead supply its
-own contact; a different resulting union root is advertised as that actual root.
-Read-only or unauthorized bridges can relay without pretending to serve.
+Neighbours announce C's root on a randomized timer that grows from two to sixty
+seconds and that a local append resets. An equal announcement spares its sender
+the next one. A different one starts a pull walk from the announcer and gets one
+reply, which starts the reverse pull. A pull walk descends where the two PATCH
+digests differ and lands what the store lacks as it goes. A lost announcement is
+followed by the next one; nothing else is retried.
 
-New neighbors force an offer. Retained hints have bounded replay opportunities;
-equal evidence suppresses those repeats only when every known direct neighbor
-has signed the same root itself. One upstream match cannot silence an unknown
-downstream link. Stock gossip does not forward neighbor-scope payloads for us.
-The opaque root covers all three PATCH summaries, including the partial resident
-inventory; matching it proves neither complete payload closure nor admission.
+There is no local direction policy. A collection flows to a neighbour exactly
+when this side admits it to read, and a pile that selects no collection peers
+for none; it still publishes and serves resident exact blobs under bearer
+handle H and services durable `Blob(H)` WANTs through the ordinary KDF(H) path.
 
-Signed wake origins receive five-minute leases, renewed by subsequent notices
-or successful repair. Healthy peers are not blindly pulled every thirty seconds;
-that cadence retries failed repairs under backoff. Equal-root hints skip
-unnecessary repair, but a prior failed exchange still gets a confirmation so
-its failure is not silently retained as an unrecoverable health alert.
-
-Bootstrap is retried even when a healthy subset remains: every five minutes,
-or with one-to-sixty-second backoff without a viable repair source. At most
-three descriptor lookups run, one per collection, with fair rotation among
-due collections. These are recovery opportunities, not a guaranteed global
-convergence deadline. Root keys need not be online; descriptor holders need
-not participate. Ordinary gossip and READ admission establish the next step.
-
-Stock `iroh-gossip` owns neighbor-loss healing and reports lag without closing
-the subscription. The host responds to lag by advancing recovery and offering its current root,
-not by replacing the mesh protocol. Configured endpoints and bounded recent
-signed or DHT-discovered origins remain bootstrap candidates if a topic stream
-does end and must be subscribed again. Configured iroh relays are transport
-paths, not collection participants or rendezvous identities.
-
-Direction is local policy:
-
-- `Bidirectional` pulls active collections and serves admitted readers.
-- `ReadOnly` pulls but does not serve local collection state.
-- `WriteOnly` serves admitted readers but does not initiate collection repair.
-
-This direction applies only to collection repair. Every mode may publish and
-serve resident exact blobs under bearer handle H, and every mode may service a
-durable `Blob(H)` WANT through the ordinary KDF(H) path.
-
-Configured endpoint addresses bootstrap gossip and DHT routing only. Repair
-targets come from signed wake origins, never from a descriptor-provider hint alone.
+Configured endpoint addresses bootstrap DHT routing only. Repair targets are a
+collection's neighbours: candidates that select it and admit the asker.
 Exact-content targets come from KDF(H) leases. Unrelated configured peers never
 receive C or its proofs.
 
@@ -273,7 +230,8 @@ visible without enabling broad packet-level tracing.
 - `reconcile` — durable WANT observation and reproducible-operation fulfillment
 - `provider` / `routing` — bounded bearer provider directory and XOR routing
 - `protocol` — public direct-operation framing
-- `host` — immutable overlays, connection pool, wake bridge, and scheduler
-- `wake` / `wake_relay` / `wake_schedule` — signed neighbor offers and state-based relay timing
+- `host` — immutable overlays, connection table, DHT client, and scheduler
+- `peering` / `announce` / `wake_schedule` — per-collection peering, root announcements and their timer
+- `grants` — the grant exchange on `recon/1`
 - `transport` — production iroh and deterministic simulation transports
 - `identity` — persistent network signing-key handling

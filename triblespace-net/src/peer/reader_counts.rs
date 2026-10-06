@@ -414,16 +414,7 @@ impl Fixture {
                 Ok(None)
             }))
         };
-        let peer = Peer::assemble(
-            store,
-            ReconcileQos {
-                direction: ReconcileDirection::ReadOnly,
-            },
-            sender,
-            receiver,
-            None,
-            state,
-        );
+        let peer = Peer::assemble(store, sender, receiver, None, state);
         Self {
             peer,
             counts,
@@ -544,7 +535,7 @@ async fn second_peer_acquire_triggers_inventory_even_for_the_same_resident_handl
 }
 
 #[test]
-fn eager_read_only_peer_constructs_a_serving_inventory() {
+fn eager_peer_constructs_a_serving_inventory() {
     for resident in [0, 8, 128] {
         let Fixture {
             peer,
@@ -552,7 +543,6 @@ fn eager_read_only_peer_constructs_a_serving_inventory() {
             _file,
             ..
         } = Fixture::new(resident, true);
-        assert_eq!(peer.qos().direction, ReconcileDirection::ReadOnly);
         assert_eq!(counts.inventory(), [1, resident, 0, 0]);
         assert_eq!(counts.get_calls.load(Ordering::Relaxed), 0);
         assert_eq!(counts.requests.load(Ordering::Relaxed), 0);
@@ -614,7 +604,7 @@ fn leech_public_lazy_resident_snapshots_and_writes_remain_dormant() {
                 .put::<UnknownBlob, _>(Bytes::from_source((index as u64).to_le_bytes().to_vec()))
                 .unwrap();
         }
-        // No zero-budget or read-only policy is needed for this boundary.
+        // No zero budget is needed for this boundary.
         let mut leech = Leech::lazy(
             Counted {
                 inner,
@@ -623,14 +613,9 @@ fn leech_public_lazy_resident_snapshots_and_writes_remain_dormant() {
             SigningKey::from_bytes(&[87; 32]),
             PeerConfig {
                 peers: Vec::new(),
-                qos: ReconcileQos::default(),
                 provider_publication_budget: Some(1),
                 bind: None,
             },
-        );
-        assert_eq!(
-            leech.peer.qos().direction,
-            ReconcileDirection::Bidirectional
         );
         assert!(matches!(
             leech.peer.host.lock().unwrap().state,

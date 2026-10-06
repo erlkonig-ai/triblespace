@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Removed
 
+- `pile net sync --collection`. Sync reads the sync selection register from
+  the pile's own configuration collection under its key, activates every
+  selected collection at start, and activates newly selected ones while it
+  runs; it prints `selected collections: N` at start and when the set
+  changes.
+- `pile net sync --direction`. A collection flows to a neighbour exactly when
+  this side admits it to read; a pile that should not sync a collection does
+  not select it.
 - `pile net sync --held-walk-interval` and `--held-walk-threads`, with the
   held-set walker they configured.
 
