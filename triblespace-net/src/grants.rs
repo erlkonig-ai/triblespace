@@ -9,7 +9,7 @@
 //! peer, at most [`MAX_PROOFS_PER_EXCHANGE`] of them, and a receiver takes no
 //! more than that from one answer. A receiver asks once per digest and
 //! connection, so a proof it drops is asked for again only after the
-//! sender's digest changes.
+//! sender's digest changes, and a sender answers once per digest it sent.
 //!
 //! A received proof, in an answer or as a peer's credential, is kept only if
 //! it names this node or its sender. It lands when it is evidence under its
@@ -60,6 +60,8 @@ struct Exchange {
     link: Link,
     /// The digest last sent on this connection.
     sent: Option<PatchSummary>,
+    /// The digest last sent when the peer's last request was answered.
+    answered: Option<PatchSummary>,
     /// The peer's digest last asked for on this connection.
     fetched: Option<PatchSummary>,
     /// Requests whose answer has not ended.
@@ -149,6 +151,7 @@ impl Grants {
                     let exchange = Exchange {
                         link: link.clone(),
                         sent: None,
+                        answered: None,
                         fetched: None,
                         outstanding: 0,
                         taken: 0,
@@ -188,10 +191,15 @@ impl Grants {
                 }
             }
             // The request names nobody: the answer is for the connection's
-            // authenticated peer.
+            // authenticated peer. A peer that asks again before the digest
+            // changes gets nothing more.
             Frame::ProofRequest => {
-                for frame in proof_frames(&Self::naming(&self.held, link.peer())) {
-                    link.send(frame);
+                let exchange = self.exchanges.get_mut(&id).unwrap();
+                if exchange.sent.is_some() && exchange.answered != exchange.sent {
+                    exchange.answered = exchange.sent;
+                    for frame in proof_frames(&Self::naming(&self.held, link.peer())) {
+                        link.send(frame);
+                    }
                 }
             }
             Frame::Proofs(proofs) => {
@@ -828,6 +836,39 @@ mod tests {
         assert_eq!(asked, [Frame::ProofRequest]);
         let (effects, _) = hear(&mut reader, Frame::Proofs(vec![forged, valid.clone()]));
         assert_eq!(effects.land, [valid]);
+    }
+
+    /// A peer that asks again before the digest it was sent changes queues
+    /// no second answer here; a changed digest is answered again.
+    #[test]
+    fn a_proof_request_is_answered_once_per_digest_sent() {
+        let mut owner = Node::new(13);
+        let reader = key(14);
+        let collection = owner.hold(policy(&owner.key));
+        owner.learn(grant(&owner.key, &reader, read_capability(), collection));
+        let (link, mut sent) = Link::detached(1, reader.verifying_key().to_bytes());
+        owner.grants.event(&ReconEvent::Opened(link.clone()));
+        let mut ask = |owner: &mut Node| {
+            owner
+                .grants
+                .event(&ReconEvent::Frame(link.clone(), Frame::ProofRequest));
+            std::iter::from_fn(|| sent.try_recv().ok())
+                .map(|frame| frame.encode().0)
+                .collect::<Vec<_>>()
+        };
+        let answer = [FRAME_PROOFS, FRAME_PROOFS_END];
+        assert_eq!(
+            ask(&mut owner),
+            [&[FRAME_PROOF_DIGEST][..], &answer].concat()
+        );
+        for _ in 0..3 {
+            assert!(ask(&mut owner).is_empty());
+        }
+        owner.learn(grant(&owner.key, &reader, write_capability(), collection));
+        assert_eq!(
+            ask(&mut owner),
+            [&[FRAME_PROOF_DIGEST][..], &answer].concat()
+        );
     }
 
     /// Without its descriptor, a proof naming this node waits in memory: it
