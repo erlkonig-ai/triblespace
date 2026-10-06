@@ -7,6 +7,9 @@
 //! flag says whether it admits the other side, and C flows only in a
 //! direction whose sender set it. Peerings belong to their connection: a
 //! replaced `recon/1` stream keeps them and a closed connection ends them.
+//! An ended stream loses the frames its reader had not read, so each side
+//! then sends again the frame its side of each peering rests on: a request
+//! still waiting for its answer, or its flags.
 //!
 //! A side that refuses a request remembers it for the connection. When a
 //! credential, an arriving definition, a new proof or its own selection
@@ -352,8 +355,9 @@ impl Peerings {
                 self.links.entry(link.id()).or_insert_with(|| link.clone());
                 self.frame(&link, frame);
             }
-            // Peerings belong to the connection and outlive its streams.
-            ReconEvent::Ended(_) => {}
+            // Peerings belong to the connection and outlive its streams, but
+            // the frames an ended stream carried may be lost.
+            ReconEvent::Ended(link) => self.resend(&link),
             ReconEvent::Closed(link) => {
                 self.links.remove(&link.id());
                 let successor = self.link_to(link.peer());
@@ -874,6 +878,41 @@ impl Peerings {
             peering.refused = None;
         }
         self.changed = true;
+    }
+
+    /// Send again on `link` the frame each of its peerings rests on, on this
+    /// side: a request or invitation still waiting for its answer, or this
+    /// side's flags. Its `recon/1` ended, and with it the frames the peer had
+    /// not read. The peer answers a repeated request as it did the first.
+    fn resend(&mut self, link: &Link) {
+        let sides = self
+            .meshes
+            .iter()
+            .filter_map(|(raw, mesh)| {
+                let peering = mesh.peerings.get(&link.id())?;
+                Some((CollectionHandle::new(*raw), peering.side))
+            })
+            .collect::<Vec<_>>();
+        for (collection, side) in sides {
+            match side {
+                Side::Asked { asked, mine } => {
+                    let credentials = self
+                        .snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.selected(collection))
+                        .map(|local| self.credentials(&local))
+                        .unwrap_or_default();
+                    for frame in request_frames(collection, mine, !asked, &credentials) {
+                        link.send(frame);
+                    }
+                }
+                Side::Peered { mine, .. } => link.send(Frame::PeerFlags {
+                    collection,
+                    flags: mine,
+                }),
+                Side::Idle => {}
+            }
+        }
     }
 
     /// This side's credentials for C: its proofs naming itself, truncated

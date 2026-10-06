@@ -3,9 +3,9 @@
 //! within the announcement estimate, it takes none of the request permits
 //! blob streams wait for, a peer that stops reading it gets it reset, it
 //! reopens beside blob streams at their cap, and the dialler reopens it at
-//! once when it ends. A peer that speaks `recon/1` by hand encodes its frames
-//! with [`Frame`], and walk requests by the frame table of
-//! `triblespace_net::walk`.
+//! once when it ends, when each side sends again the peering frames it may
+//! have lost. A peer that speaks `recon/1` by hand encodes its frames with
+//! [`Frame`], and walk requests by the frame table of `triblespace_net::walk`.
 #![cfg(feature = "sim")]
 
 use std::collections::{BTreeSet, HashMap};
@@ -983,12 +983,14 @@ fn the_dialler_reopens_an_ended_recon_at_once() {
             if steps % 300 == 0 {
                 let conn = conn.clone();
                 tokio::task::spawn_local(async move {
-                    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+                    let Ok((mut send, mut recv)) = conn.open_bi().await else {
+                        return;
+                    };
                     let mut request = vec![TAG_DHT, OP_FIND_VALUE];
                     request.extend([7; 32]);
-                    send.write_all(&request).await.unwrap();
-                    send.shutdown().await.unwrap();
-                    recv.read_to_end(&mut Vec::new()).await.unwrap();
+                    let _ = send.write_all(&request).await;
+                    let _ = send.shutdown().await;
+                    let _ = recv.read_to_end(&mut Vec::new()).await;
                 });
             }
             steps += 1;
@@ -996,5 +998,107 @@ fn the_dialler_reopens_an_ended_recon_at_once() {
         })
         .await;
         assert_eq!(net.dial_count(id(&reader_key), writer_id), 1);
+    });
+}
+
+/// A host selects C and D, both writable by a key it dials, and the key,
+/// driven by hand, accepts both peerings. Its acceptance of C is lost the way
+/// an ended `recon/1` loses what its reader had not read: written, then the
+/// stream reset with [`RESET_STALLED`] before the host read it, as a writer
+/// that waited 60 s for credit does. The key is peered for C and the host
+/// still waits for the answer, so the host sends its request for C again on
+/// the next `recon/1`; once that is accepted, the key's announcement of a
+/// root of C the host lacks starts a pull.
+#[test]
+fn a_request_whose_acceptance_was_lost_is_sent_again() {
+    run(async |clock| {
+        let net = SimNet::new(0x5EC0_0006, SimConfig::default());
+        let host_key = key(14);
+        let peer_key = key(15);
+        let peer_id = id(&peer_key);
+        let mut store = MemoryRepo::default();
+        let wedged = hold(&mut store, "wedged", &[&host_key, &peer_key]);
+        let carrier = hold(&mut store, "carrier", &[&host_key, &peer_key]);
+        select(&mut store, &host_key, wedged);
+        select(&mut store, &host_key, carrier);
+        let mut host = bring_up(net.join(&host_key), &host_key, store, &[]);
+
+        let mut harness = net.join(&peer_key);
+        let (recons, mut opened) = tokio::sync::mpsc::unbounded_channel();
+        tokio::task::spawn_local(async move {
+            let conn = harness.incoming.recv().await.unwrap().conn;
+            while let Some((send, mut recv)) = conn.accept_bi().await {
+                if let Ok(TAG_RECON) = recv.read_u8().await {
+                    let _ = recons.send((send, Frames::new(recv)));
+                }
+            }
+        });
+        host.activate_collections([wedged, carrier]);
+        let peers: &mut [&mut Peer<MemoryRepo>] = &mut [&mut host];
+        let peered_for = |peer: &Peer<MemoryRepo>, collection| {
+            peer.health().peerings.iter().any(|peering| {
+                peering.peer == peer_id && peering.collection == collection && peering.peered
+            })
+        };
+        let (mut recon, mut frames) =
+            until(&clock, peers, 10, "recon/1", |_| opened.try_recv().ok()).await;
+        let mut asked = BTreeSet::new();
+        until(&clock, peers, 10, "both requests", |_| {
+            while let Some(frame) = frames.arrived() {
+                if let Frame::PeerRequest { collection, .. } = frame {
+                    asked.insert(collection);
+                }
+            }
+            (asked == BTreeSet::from([wedged, carrier])).then_some(())
+        })
+        .await;
+        let flags = Flags {
+            send: true,
+            full: false,
+        };
+        let accept = |collection| Frame::PeerAccept { collection, flags };
+        send_frame(&mut recon, &accept(carrier)).await;
+        until(&clock, peers, 10, "the peering for D", |peers| {
+            peered_for(&peers[0], carrier).then_some(())
+        })
+        .await;
+        send_frame(&mut recon, &accept(wedged)).await;
+        recon.reset(RESET_STALLED);
+        frames.recv.stop(RESET_STALLED);
+
+        let (mut recon, mut frames) =
+            until(&clock, peers, 10, "a new recon/1", |_| opened.try_recv().ok()).await;
+        until(&clock, peers, 10, "the request for C again", |_| {
+            loop {
+                if let Frame::PeerRequest { collection, .. } = frames.arrived()?
+                    && collection == wedged
+                {
+                    return Some(());
+                }
+            }
+        })
+        .await;
+        send_frame(&mut recon, &accept(wedged)).await;
+        until(&clock, peers, 10, "the peering for C", |peers| {
+            peered_for(&peers[0], wedged).then_some(())
+        })
+        .await;
+        let announcement = Frame::Announce {
+            collection: wedged,
+            root: [7; 32],
+            held_digest: None,
+            reply: false,
+        };
+        send_frame(&mut recon, &announcement).await;
+        until(&clock, peers, 10, "a pull of C", |_| {
+            loop {
+                if let frame @ Frame::Walk(_) = frames.arrived()?
+                    && frame.collection() == Some(wedged)
+                {
+                    return Some(());
+                }
+            }
+        })
+        .await;
     });
 }

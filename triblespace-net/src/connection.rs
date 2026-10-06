@@ -138,8 +138,9 @@ pub enum ReconEvent {
 }
 
 /// One connection's `recon/1`, as a service sees it. Frames sent through it
-/// are written in order on whichever `recon/1` stream the connection holds,
-/// so a replaced stream loses at most the frame it was writing.
+/// are written in order on whichever `recon/1` stream the connection holds.
+/// A stream that ends or is replaced loses what it wrote that the peer had
+/// not read; a frame still queued goes out on the next stream.
 #[derive(Clone)]
 pub struct Link {
     state: Arc<State>,

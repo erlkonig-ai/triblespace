@@ -1921,8 +1921,12 @@ impl Service for SnapshotHandler {
 
     async fn recon(&self, event: ReconEvent) {
         let (walks, peering) = match event {
-            ReconEvent::Frame(_, Frame::Walk(_)) | ReconEvent::Ended(_) => (Some(event), None),
-            // Both hear a connection close.
+            ReconEvent::Frame(_, Frame::Walk(_)) => (Some(event), None),
+            // Both hear a stream end and a connection close.
+            ReconEvent::Ended(link) => (
+                Some(ReconEvent::Ended(link.clone())),
+                Some(ReconEvent::Ended(link)),
+            ),
             ReconEvent::Closed(link) => (
                 Some(ReconEvent::Closed(link.clone())),
                 Some(ReconEvent::Closed(link)),
