@@ -61,7 +61,6 @@ pub mod attrs {
         "7ECCF364F3C49A7F14341786D9D4C601" as publication_keys: inlineencodings::U256BE;
         "C5FB5EBD91865A4FE7BA0AA9601CE165" as publication_startup_pending: inlineencodings::U256BE;
         "99D3AC84E6C66D7948323A5FBD23E36B" as publication_incremental_pending: inlineencodings::U256BE;
-        "6FD08FDE74BFEB2EA616D0DE69924272" as publication_retry_pending: inlineencodings::U256BE;
         "2EE8D9BB92F63B7E4DD85DE5DB28ED0F" as publication_renewal_remaining: inlineencodings::U256BE;
         "B261CB11C1221C0C730BA3261A7C8F7B" as publication_in_flight: inlineencodings::U256BE;
         "EB66C8D9ED7BE171C14B4F89527F7722" as publication_attempts: inlineencodings::U256BE;
@@ -135,7 +134,6 @@ pub struct Evidence {
     pub publication_keys: Option<u64>,
     pub publication_startup_pending: Option<u64>,
     pub publication_incremental_pending: Option<u64>,
-    pub publication_retry_pending: Option<u64>,
     pub publication_renewal_remaining: Option<u64>,
     pub publication_in_flight: Option<u64>,
     pub publication_attempts: Option<u64>,
@@ -258,8 +256,7 @@ pub fn conditions(
 
     let publication = &health.publication;
     let acknowledged = within(publication.last_acknowledged_at, PROGRESS_GRACE);
-    let pending =
-        publication.startup_pending + publication.incremental_pending + publication.retry_pending;
+    let pending = publication.startup_pending + publication.incremental_pending;
     let expected = publication.resident > 0 && !publication.budget_exhausted;
     // Renewal is paced over hours. Silence while idle is not a failed probe;
     // only a continuous observed failure episode earns a stall warning.
@@ -343,7 +340,6 @@ pub fn measurements(
                         publication_keys: Some(publication.resident),
                         publication_startup_pending: Some(publication.startup_pending),
                         publication_incremental_pending: Some(publication.incremental_pending),
-                        publication_retry_pending: Some(publication.retry_pending),
                         publication_renewal_remaining: Some(publication.renewal_remaining),
                         publication_in_flight: Some(
                             u64::try_from(publication.in_flight).unwrap_or(u64::MAX),
@@ -486,7 +482,6 @@ impl Recorder {
                             attrs::publication_keys?: evidence.publication_keys,
                             attrs::publication_startup_pending?: evidence.publication_startup_pending,
                             attrs::publication_incremental_pending?: evidence.publication_incremental_pending,
-                            attrs::publication_retry_pending?: evidence.publication_retry_pending,
                             attrs::publication_renewal_remaining?: evidence.publication_renewal_remaining,
                             attrs::publication_in_flight?: evidence.publication_in_flight,
                             attrs::publication_attempts?: evidence.publication_attempts,
@@ -843,7 +838,7 @@ mod tests {
         let at = crate::clock::mono_now();
         let mut health = observed(at);
         health.publication.resident = 1;
-        health.publication.retry_pending = 1;
+        health.publication.startup_pending = 1;
         health.publication.unacknowledged_since = Some(at);
         let soon = super::conditions(&health, at + Duration::from_secs(10));
         assert!(
@@ -860,7 +855,7 @@ mod tests {
         assert!(dht.alert);
         health.publication.last_acknowledged_at = Some(now);
         health.publication.unacknowledged_since = None;
-        health.publication.retry_pending = 0;
+        health.publication.startup_pending = 0;
         let recovered = super::conditions(&health, now);
         let dht = recovered
             .iter()

@@ -76,7 +76,7 @@ enum Seeds {
     /// candidates. Admit the deferred closest-K set after that wave completes.
     /// The fixture has one configured seed; this is not a general multi-seed
     /// scheduling policy or a claim about async deadline fairness.
-    BootstrapWave,
+    BootstrapWave(PeerId),
 }
 
 #[derive(Default)]
@@ -119,24 +119,16 @@ fn lookup(
     let mut deferred = routes.closest(target, K);
     let initial = match policy {
         Seeds::Closest => std::mem::take(&mut deferred),
-        Seeds::BootstrapWave => {
-            assert!(
-                routes.configured.len() <= 1,
-                "fixture policy supports one bootstrap"
+        Seeds::BootstrapWave(bootstrap) => {
+            let mut initial = vec![bootstrap];
+            initial.extend(
+                deferred
+                    .iter()
+                    .copied()
+                    .filter(|peer| *peer != bootstrap)
+                    .take(ALPHA - 1),
             );
-            if let Some(bootstrap) = routes.configured.first().copied() {
-                let mut initial = vec![bootstrap];
-                initial.extend(
-                    deferred
-                        .iter()
-                        .copied()
-                        .filter(|peer| *peer != bootstrap)
-                        .take(ALPHA - 1),
-                );
-                initial
-            } else {
-                std::mem::take(&mut deferred)
-            }
+            initial
         }
     };
     let mut machine = IterativeLookup::new(routes.local, target, initial);
@@ -229,7 +221,7 @@ fn warm_start_roundtrip_is_bounded_candidate_only_and_not_a_lease() {
     assert_eq!(after.state(live), Some(RouteState::Candidate));
     assert_eq!(after.state(referral), None);
     assert_eq!(after.state(failed), None);
-    assert_eq!(after.configured_len(), 1);
+    assert_eq!(after.state(configured), Some(RouteState::Candidate));
     assert!(
         freeze(&after).bytes.is_empty(),
         "disk hints are not self-refreshing liveness"
@@ -312,7 +304,7 @@ fn warm_start_shortens_sparse_discovery_and_survives_dead_bootstrap() {
         &mut restart(local, &[bootstrap], &cache),
         local,
         &network,
-        Seeds::BootstrapWave,
+        Seeds::BootstrapWave(bootstrap),
     );
     assert_eq!(dead_cold.winner_round, None);
     assert_eq!(dead_warm.winner_round, Some(1));
@@ -363,7 +355,7 @@ fn warm_start_stale_cache_cannot_replace_configured_bootstrap_priority() {
         &mut restart(local, &[bootstrap], &cache),
         target,
         &network,
-        Seeds::BootstrapWave,
+        Seeds::BootstrapWave(bootstrap),
     );
     assert!(fair.first_batch.contains(&bootstrap));
     assert!(fair.winner_round.is_some());
@@ -396,7 +388,7 @@ fn warm_start_authenticated_poison_is_still_not_an_independent_bootstrap() {
         &mut restart(local, &[bootstrap], &cache),
         target,
         &network,
-        Seeds::BootstrapWave,
+        Seeds::BootstrapWave(bootstrap),
     );
     assert!(fair.first_batch.contains(&bootstrap));
     assert!(fair.winner_round.is_some());
@@ -444,9 +436,19 @@ fn warm_start_lookup_probe() {
     for (name, warm, policy, dead_bootstrap) in [
         ("cold", false, Seeds::Closest, false),
         ("warm", true, Seeds::Closest, false),
-        ("warm_bootstrap_wave", true, Seeds::BootstrapWave, false),
+        (
+            "warm_bootstrap_wave",
+            true,
+            Seeds::BootstrapWave(bootstrap),
+            false,
+        ),
         ("cold_dead_bootstrap", false, Seeds::Closest, true),
-        ("warm_dead_bootstrap", true, Seeds::BootstrapWave, true),
+        (
+            "warm_dead_bootstrap",
+            true,
+            Seeds::BootstrapWave(bootstrap),
+            true,
+        ),
     ] {
         let saved = if dead_bootstrap {
             network.links.remove(&bootstrap)

@@ -197,7 +197,6 @@ pub struct PublicationHealth {
     pub resident: u64,
     pub startup_pending: u64,
     pub incremental_pending: u64,
-    pub retry_pending: u64,
     pub renewal_remaining: u64,
     pub in_flight: usize,
     pub topology_paused: bool,

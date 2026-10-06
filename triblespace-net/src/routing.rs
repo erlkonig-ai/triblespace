@@ -20,7 +20,7 @@ pub(crate) const ALPHA: usize = 3;
 const BUCKET_COUNT: usize = std::mem::size_of::<PeerId>() * 8;
 const ROUTING_CAPACITY: usize = BUCKET_COUNT * K;
 const MAX_LOOKUP_QUERIES: usize = ROUTING_CAPACITY;
-const LEARNED_ROUTE_FAILURE_COOLDOWN: std::time::Duration = crate::RETRY_BACKOFF_CAP;
+const LEARNED_ROUTE_FAILURE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RouteState {
@@ -46,34 +46,28 @@ struct Bucket {
 /// and independently at most [`K`] recent learned-route failure deadlines.
 /// Verified peers take precedence over candidates; ties are resolved by XOR
 /// distance from the local peer and then by identity.  Consequently inserting
-/// the same evidence in a different order produces the same table. Explicit
-/// local configuration is retained separately and is expected to be bounded
-/// by the caller rather than by rules for hostile learned state.
+/// the same evidence in a different order produces the same table.
 pub(crate) struct RoutingTable {
     local: PeerId,
-    /// Explicit local configuration is trusted provenance, not hostile learned
-    /// state. It remains available even if the corresponding learned route is
-    /// evicted or a connection attempt fails.
-    configured: BTreeSet<PeerId>,
     buckets: [Bucket; BUCKET_COUNT],
 }
 
 impl RoutingTable {
     /// Start with locally configured bootstrap identities as unverified
-    /// candidates.  Configuration does not manufacture proof of reachability.
+    /// candidates, retained and failed like any other route. Configuration
+    /// does not manufacture proof of reachability.
     pub(crate) fn new<I>(local: PeerId, configured: I) -> Self
     where
         I: IntoIterator<Item = PeerId>,
     {
-        let configured = configured
-            .into_iter()
-            .filter(|peer| *peer != local)
-            .collect();
-        Self {
+        let mut routes = Self {
             local,
-            configured,
             buckets: std::array::from_fn(|_| Bucket::default()),
+        };
+        for peer in configured {
+            routes.insert(peer, RouteState::Candidate);
         }
+        routes
     }
 
     /// Remember an unverified identity without demoting an already verified
@@ -82,9 +76,6 @@ impl RoutingTable {
     pub(crate) fn note_candidate(&mut self, peer: PeerId) -> bool {
         if !self.query_eligible(peer, crate::clock::mono_now()) {
             return false;
-        }
-        if self.configured.contains(&peer) {
-            return true;
         }
         self.insert(peer, RouteState::Candidate)
     }
@@ -99,20 +90,15 @@ impl RoutingTable {
     }
 
     /// A local failed request outweighs unverified gossip for a finite window.
-    /// Explicit configuration remains eligible, including cold bootstraps.
     /// This predicate is independent of positive-route bucket admission.
     fn query_eligible(&self, peer: PeerId, now: Mono) -> bool {
-        self.configured.contains(&peer)
-            || bucket_index(self.local, peer)
-                .and_then(|bucket| self.buckets[bucket].failed_until.get(&peer))
-                .is_none_or(|until| now >= *until)
+        bucket_index(self.local, peer)
+            .and_then(|bucket| self.buckets[bucket].failed_until.get(&peer))
+            .is_none_or(|until| now >= *until)
     }
 
     fn note_failure(&mut self, peer: PeerId, now: Mono) {
         self.remove(peer);
-        if self.configured.contains(&peer) {
-            return;
-        }
         let Some(bucket) = bucket_index(self.local, peer) else {
             return;
         };
@@ -132,8 +118,7 @@ impl RoutingTable {
         }
     }
 
-    /// Remove failed learned evidence. Explicit local configuration survives
-    /// and becomes an unverified candidate again.
+    /// Remove failed route evidence.
     pub(crate) fn remove(&mut self, peer: PeerId) -> bool {
         let Some(bucket) = bucket_index(self.local, peer) else {
             return false;
@@ -143,17 +128,12 @@ impl RoutingTable {
 
     #[cfg(test)]
     pub(crate) fn state(&self, peer: PeerId) -> Option<RouteState> {
-        let learned = bucket_index(self.local, peer)
-            .and_then(|bucket| self.buckets[bucket].entries.get(&peer).copied());
-        learned.or_else(|| {
-            self.configured
-                .contains(&peer)
-                .then_some(RouteState::Candidate)
-        })
+        bucket_index(self.local, peer)
+            .and_then(|bucket| self.buckets[bucket].entries.get(&peer).copied())
     }
 
     #[cfg(test)]
-    /// Number of unique configured and learned identities.
+    /// Number of unique eligible identities.
     pub(crate) fn len(&self) -> usize {
         self.all().len()
     }
@@ -161,11 +141,6 @@ impl RoutingTable {
     #[cfg(test)]
     pub(crate) fn learned_len(&self) -> usize {
         self.buckets.iter().map(|bucket| bucket.entries.len()).sum()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn configured_len(&self) -> usize {
-        self.configured.len()
     }
 
     /// Return at most `limit` known identities ordered by XOR distance from
@@ -195,17 +170,10 @@ impl RoutingTable {
     }
 
     fn all(&self) -> Vec<PeerId> {
-        let mut peers = self.configured.clone();
-        for peer in self
-            .buckets
+        let now = crate::clock::mono_now();
+        self.buckets
             .iter()
             .flat_map(|bucket| bucket.entries.keys().copied())
-        {
-            peers.insert(peer);
-        }
-        let now = crate::clock::mono_now();
-        peers
-            .into_iter()
             .filter(|peer| self.query_eligible(*peer, now))
             .collect()
     }
@@ -414,8 +382,7 @@ impl IterativeLookup {
     }
 
     /// Fail issued requests still pending when the routing deadline expires.
-    /// Unissued candidates and authenticated responders retain their evidence;
-    /// failed configured peers remain available through explicit configuration.
+    /// Unissued candidates and authenticated responders retain their evidence.
     pub(crate) fn record_timeouts(&mut self, routes: &mut RoutingTable) -> usize {
         let in_flight: Vec<_> = self
             .shortlist
@@ -720,8 +687,7 @@ mod tests {
         let local = id(1);
         let table = RoutingTable::new(local, [local, id(2), id(2)]);
         assert_eq!(table.len(), 1);
-        assert_eq!(table.configured_len(), 1);
-        assert_eq!(table.learned_len(), 0);
+        assert_eq!(table.learned_len(), 1);
         assert_eq!(table.state(local), None);
         assert_eq!(table.state(id(2)), Some(RouteState::Candidate));
         assert!(table.closest_verified(id(2), K).is_empty());
@@ -780,25 +746,6 @@ mod tests {
         assert!(routes.query_eligible(peer, now));
         assert_eq!(routes.state(peer), Some(RouteState::Verified));
         assert_eq!(routes.closest(peer, K), vec![peer]);
-    }
-
-    #[test]
-    fn explicit_configuration_remains_eligible_after_local_failure() {
-        let now = crate::clock::mono_now();
-        let peer = id(2);
-        let mut routes = RoutingTable::new(id(0), [peer]);
-        routes.promote_authenticated(peer);
-        routes.note_failure(peer, now);
-        assert!(routes.query_eligible(peer, now));
-        assert!(routes.note_candidate(peer));
-        assert_eq!(routes.state(peer), Some(RouteState::Candidate));
-        assert_eq!(routes.closest(peer, K), vec![peer]);
-        assert!(
-            routes
-                .buckets
-                .iter()
-                .all(|bucket| bucket.failed_until.is_empty())
-        );
     }
 
     #[test]
@@ -1021,9 +968,7 @@ mod tests {
         }
         assert_eq!(contacted, K);
         assert_eq!(routes.learned_len(), 0);
-        assert_eq!(routes.configured_len(), K);
-        assert_eq!(routes.len(), K);
-        assert!((1..=K as u16).all(|n| routes.state(id(n)) == Some(RouteState::Candidate)));
+        assert_eq!(routes.len(), 0);
     }
 
     #[test]
@@ -1114,7 +1059,7 @@ mod tests {
     #[test]
     fn routing_timeout_fails_only_issued_unanswered_requests() {
         let local = id(0);
-        let mut routes = RoutingTable::new(local, [id(2)]);
+        let mut routes = RoutingTable::new(local, []);
         for n in 1..=4 {
             routes.promote_authenticated(id(n));
         }
@@ -1124,41 +1069,12 @@ mod tests {
 
         assert_eq!(lookup.record_timeouts(&mut routes), 2);
         assert_eq!(routes.state(id(1)), Some(RouteState::Verified));
-        assert_eq!(routes.state(id(2)), Some(RouteState::Candidate));
+        assert_eq!(routes.state(id(2)), None);
         assert_eq!(routes.state(id(3)), None);
         assert_eq!(routes.state(id(4)), Some(RouteState::Verified));
         assert_eq!(lookup.closest_authenticated_responders(), &[id(1)]);
         assert_eq!(lookup.record_timeouts(&mut routes), 0);
         assert_eq!(lookup.next_batch(), vec![id(4)]);
-    }
-
-    #[test]
-    fn configured_seed_survives_learned_eviction_and_failure() {
-        let local = id(0);
-        let configured = id(0xffff);
-        let mut routes = RoutingTable::new(local, [configured]);
-
-        routes.promote_authenticated(configured);
-        assert_eq!(routes.state(configured), Some(RouteState::Verified));
-        for n in 0x8000..0x8000 + K as u16 {
-            routes.promote_authenticated(id(n));
-        }
-        assert!(
-            !routes
-                .closest_verified(configured, ROUTING_CAPACITY)
-                .contains(&configured)
-        );
-        assert_eq!(routes.state(configured), Some(RouteState::Candidate));
-        assert!(routes.closest(configured, K).contains(&configured));
-
-        // A later failed retry can remove learned liveness evidence, but not
-        // the explicit local instruction to use this peer as a bootstrap.
-        assert!(routes.remove(id(0x8000)));
-        assert!(routes.promote_authenticated(configured));
-        assert_eq!(routes.state(configured), Some(RouteState::Verified));
-        assert!(routes.remove(configured));
-        assert_eq!(routes.state(configured), Some(RouteState::Candidate));
-        assert!(routes.closest(configured, K).contains(&configured));
     }
 
     #[test]

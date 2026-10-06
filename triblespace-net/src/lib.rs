@@ -22,19 +22,10 @@
 pub(crate) mod announce;
 pub(crate) mod bearer;
 mod channel;
+pub mod clock;
 pub mod collection_activation;
 pub mod collection_delta;
 pub(crate) mod collection_wire;
-
-/// Base backoff for failed WANT fulfillment in [`reconcile::Reconciler`];
-/// doubles per attempt up to
-/// [`RETRY_BACKOFF_CAP`]. Values chosen so a transient fault (peer
-/// restarting, partition healing) is retried promptly while a
-/// persistently-dead source costs at most one attempt per cap period.
-pub(crate) const RETRY_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs(1);
-/// Upper bound the exponential retry backoff saturates at.
-pub(crate) const RETRY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(60);
-pub mod clock;
 pub mod connection;
 pub mod dashboard;
 pub(crate) mod grants;

@@ -187,6 +187,14 @@ pub struct Reconciler {
 
 pub const RECONCILE_FETCH_DEADLINE: Duration = Duration::from_secs(30);
 
+/// Base backoff for a failed WANT fulfillment; it doubles per attempt up to
+/// [`WANT_BACKOFF_CAP`]. A transient fault (peer restarting, partition
+/// healing) is retried promptly while a persistently dead source costs at
+/// most one attempt per cap period.
+const WANT_BACKOFF_BASE: Duration = Duration::from_secs(1);
+/// Upper bound the exponential WANT backoff saturates at.
+const WANT_BACKOFF_CAP: Duration = Duration::from_secs(60);
+
 /// Shared exact-demand and direct-root request window. Eight leaves
 /// nominal headroom below the sixteen process-wide exact body receivers; this
 /// is neither a reserved slot allocation nor a throughput or memory guarantee.
@@ -200,7 +208,7 @@ impl Default for Reconciler {
 
 impl Reconciler {
     pub fn new() -> Self {
-        Self::with_backoff(crate::RETRY_BACKOFF_BASE, crate::RETRY_BACKOFF_CAP)
+        Self::with_backoff(WANT_BACKOFF_BASE, WANT_BACKOFF_CAP)
     }
 
     pub fn with_backoff(initial: Duration, max: Duration) -> Self {

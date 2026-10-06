@@ -1189,11 +1189,6 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
             if effect.topology_recovered {
                 debug!("authenticated remote DHT replica reached; provider publication resumed");
             }
-            if effect.retry_budget_full {
-                warn!(
-                    "provider retry budget full after an authenticated remote rejected the announcement; exact discovery is degraded until the renewal cursor returns"
-                );
-            }
         }
 
         let now = crate::clock::mono_now();
@@ -1249,8 +1244,8 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
                 break;
             };
             let key = work.key;
+            // The attempt in flight publishes this key too.
             if !publications_in_flight.insert(key) {
-                let _ = publisher.retry(key, now);
                 break;
             }
             publication_budget.consume_attempt();
@@ -1290,7 +1285,6 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
                 resident = progress.resident,
                 startup_pending = progress.startup_pending,
                 incremental_pending = progress.incremental_pending,
-                retry_pending = progress.retry_pending,
                 renewal_remaining = progress.renewal_remaining,
                 in_flight = publications_in_flight.len(),
                 topology_paused = progress.topology_paused,
@@ -1313,7 +1307,6 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
             publication.resident = progress.resident;
             publication.startup_pending = progress.startup_pending;
             publication.incremental_pending = progress.incremental_pending;
-            publication.retry_pending = progress.retry_pending;
             publication.renewal_remaining = progress.renewal_remaining;
             publication.in_flight = publications_in_flight.len();
             publication.topology_paused = progress.topology_paused;

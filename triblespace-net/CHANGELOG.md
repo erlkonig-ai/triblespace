@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Delete the remaining retry machinery (sync redesign M13, design D7). The
+  routing table keeps no configured set: configured peers start as ordinary
+  candidate routes and are retained, evicted and failed like any other. The
+  provider publisher keeps no retry set: a publication a remote rejected
+  waits for its key's renewal, and `PublicationHealth::retry_pending`, the
+  health record's `publication_retry_pending` and its dashboard metric go
+  with it. The shared `RETRY_BACKOFF_*` constants go; the reconciler's WANT
+  backoff and the publisher's topology backoff keep their one-to-sixty-second
+  values as their own constants, and a failed route still cools down for 60 s.
+
 - Delete the gossip wake plane (sync redesign M13, design D3, D7). The
   vendored `iroh-gossip` crate, the `wake` module and its relay,
   `Transport::WakePlane` and `collection_wake_plane`, the simulator's
