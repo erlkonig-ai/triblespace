@@ -308,13 +308,15 @@ representations are useful locally.
 
 ## Routing is soft state, not semantic evidence
 
-Bootstrap peers are process configuration. Peerings, candidate orders, DHT
-referrals, connection liveness, and provider leases are bounded process-local
-state. Restarting may forget them without changing a collection, and none of
-them authorize a peer, promise content residency, or retain a blob. Historical
-PEER and STORE_SCOPE records remain physically decodable for old piles but do
-not participate in current synchronization or repository snapshots; semantic
-rewrites drop them.
+First contacts come from the pile, not from configuration: the keys a selected
+collection's records and grants name, and for a process beside the pile's sync
+daemon, the addresses that daemon recorded in the pile's configuration.
+Peerings, candidate orders, DHT referrals, connection liveness, and provider
+leases are bounded process-local state. Restarting may forget them without
+changing a collection, and none of them authorize a peer, promise content
+residency, or retain a blob. Historical PEER and STORE_SCOPE records remain
+physically decodable for old piles but do not participate in current
+synchronization or repository snapshots; semantic rewrites drop them.
 
 ## Storage and synchronization compose by union
 

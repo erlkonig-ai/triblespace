@@ -279,17 +279,20 @@ evidence can activate them without retracting bytes.
 A `recon/1` frame saying "my record root for C is R", sent on a per-collection
 timer of two to sixty seconds to each peered neighbour the sender sends C to.
 The record root commits to C's records and authorization evidence and reveals
-neither. Between two neighbours that both replicate C in full it also carries
-the held digest. A different root starts a pull walk; an announcement is a
-trigger, never forwarded, and not the source of truth.
+neither. Between two Full neighbours, which both replicate C in full and may
+each read or write it, it also carries the held digest. A different root starts
+a pull walk; an announcement is a trigger, never forwarded, and not the source
+of truth.
 
 ### Peering
 Two keys' agreement, on the one connection between them, to sync one
 collection. Each side asks only for collections its pile selects. The asked
 side accepts when it selects the collection too and the asker passes READ(C),
 or passes WRITE(C) with its send flag set. Each side's send flag says whether
-the collection flows from it to the other. Peerings belong to their connection
-and form no roster.
+the collection flows from it to the other. The keys asked are the ones the
+collection's records and grants name, then the DHT's providers of its
+descriptor; no configured list of peers exists. Peerings belong to their
+connection and form no roster.
 
 ### Pull Walk
 A Merkle walk over `recon/1` of one peer's PATCH of one collection's records,
@@ -310,7 +313,8 @@ differences by reference pull. It is a local observation, not membership.
 The register in a pile's own configuration collection that says, for each
 collection, whether the pile syncs it. `trible pile net select` and `unselect`
 write it and `selection` lists it; an unset or conflicted register selects
-nothing.
+nothing. The same configuration records where the pile's sync daemon listens,
+so a process that opens the pile reaches the daemon first.
 
 ### Trible
 A three-part tuple of entity, attribute, and value stored in a fixed 64-byte

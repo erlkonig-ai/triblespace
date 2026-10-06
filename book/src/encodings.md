@@ -127,6 +127,9 @@ The crate provides the following inline encodings out of the box:
 - `LineLocation` &ndash; a `(start_line, start_col, end_line, end_col)` span encoded as four big-endian u64 values.
 - `RangeU128` &ndash; a half-open `(start, end)` range of two big-endian u128 values.
 - `RangeInclusiveU128` &ndash; an inclusive `(start, end)` range of two big-endian u128 values.
+- `SocketAddress` &ndash; an IP address and port: the IPv6 address (IPv4 in its
+  IPv4-mapped form), then the big-endian port and IPv6 scope id, then ten zero
+  bytes. It records where a sync daemon listens.
 - `UnknownInline` as a fallback when no specific encoding is known.
 
 ```rust

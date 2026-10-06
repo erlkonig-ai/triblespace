@@ -18,11 +18,12 @@ model:
    protocol.
 
 No global team, mutable roster, gossip topic, durable OFFER/GOSSIP bit, or
-second replicated inventory is needed. Which collections a host syncs is a
-register in its own pile. Held sets are local observations, not durable claims
-merged into a collection. The descriptor already states independent READ and
-WRITE policy, and iroh authenticates the endpoint key on each direct
-connection.
+second replicated inventory is needed, and no list of peers. Which collections
+a host syncs is a register in its own pile, and whom it syncs them with comes
+from the same pile: the keys its records and grants name. Held sets are local
+observations, not durable claims merged into a collection. The descriptor
+already states independent READ and WRITE policy, and iroh authenticates the
+endpoint key on each direct connection.
 
 ## Four independent capabilities
 
@@ -213,6 +214,29 @@ through the DHT (the descriptor warmup under *Live request scheduling*), and
 peering for it begins once the descriptor validates. A node that does not
 select C never asks to peer for C and refuses every request for it.
 
+### Where the sync daemon listens
+
+The same configuration holds one more register per endpoint key: the
+addresses the sync daemon running as that key is bound to. A state names the
+endpoint (`sync_endpoint`) and lists every address (`sync_address`, a
+`SocketAddress`); a state that lists none says the endpoint is bound to
+nothing. States supersede each other like selection states, with a fresh id
+per write. `pile net sync` writes the register
+(`selection::write_sync_addresses`) on its first pass and whenever the sockets
+its endpoint is bound to change, unless the register already holds exactly
+them. A socket bound on every interface is recorded as loopback, because the
+reader is a process on the same machine that opens the same pile. A reader
+(`selection::sync_addresses`) takes every head's addresses: they are hints for
+a dial, so heads that disagree are tried together rather than reported as a
+conflict. The anchors were minted with `trible genid` on 2026-10-06:
+`0F1FE7641D8246229EDAB3C2FF3E152C` for `sync_endpoint` and
+`55C20BF071C57CAA74D0481ED4C3077A` for `sync_address`.
+
+This register is where the daemon's endpoint ticket went. Nothing copies a
+ticket from one daemon into another's command line any more: a process reaches
+its own pile's daemon through the pile, and every other peer through the
+pile's content (*Where peers come from*).
+
 ## One connection per peer
 
 A `ConnectionTable` holds the connections of both directions, keyed by the
@@ -231,8 +255,11 @@ An unknown tag, or an unknown `dht/1` operation, resets only its own stream
 dropped. `recon/1` takes no permit. A request stream (`dht/1` or `blob/1`)
 does: an opener keeps at most 16 open per connection, the accepting side holds
 at most 32 per connection and resets the rest (`RESET_BUSY`), and at most 16
-are served at once across the host, each within 300 seconds. QUIC allows 100
-open bidirectional streams per direction, so `recon/1` can always be reopened
+are served at once across the host, each within 300 seconds. A stream first
+takes one of its connection's 8 permits and then one of the host's, so a peer
+that holds its requests open until their deadline occupies at most half the
+host and leaves the other half to the rest. QUIC allows 100 open
+bidirectional streams per direction, so `recon/1` can always be reopened
 beside a full set of request streams.
 
 The dialler opens `recon/1`, and its first frame, OPEN, carries the dialler's
@@ -258,8 +285,21 @@ the peerings they serve, belong to the connection rather than to the stream: a
 later `recon/1` from the dialler replaces the current one (`RESET_REPLACED`)
 and takes over its queue, and a writer that waits 60 seconds for stream credit
 resets the stream (`RESET_STALLED`), because the peer stopped reading. Every
-walk on an ended stream ends with it. Peerings survive, and the dialler opens a
-new stream once it has a frame to send.
+walk on an ended stream ends with it. Peerings survive, but an ended stream
+may have lost frames the peer never read, so each side sends again on that
+connection the frame its side of each peering rests on: a request or
+invitation still waiting for its answer, or its flags. The acceptor answers a
+repeated request as it did the first. The dialler opens the next stream as
+soon as the last one ends, but no sooner than one second after it opened the
+last, so a peer that ends every stream at once costs one stream a second
+rather than a loop.
+
+The queue refuses no frame, so what it holds is bounded by what is put on it.
+A walk responder leaves a request unanswered while the connection already
+queues 1,024 frames, at most 64 KiB each, and the grant exchange answers one
+proof request per digest it sent; a peer that asks faster than it reads
+therefore stops being answered rather than growing the queue, and the walk it
+asked for ends at its own deadline.
 
 A `recon/1` frame is its kind (one byte), a big-endian `u32` payload length,
 and a payload of at most 64 KiB. Every frame about a collection starts with the
@@ -334,6 +374,14 @@ C change, it sends CREDENTIAL frames to C's neighbours and to keys that refused
 it. Credentials a peer presents are kept only if they name the peer and are
 evidence for C. Unselecting C sends UNPEER to each of C's neighbours, and a
 closed connection ends its peerings.
+
+Two Full neighbours are the two sides of a peering in which both set the full
+flag and each counts the other as a reader or writer of C: this side sends C
+to the peer, or the peer passes WRITE under this side's evidence. Only they
+compare held sets. A DHT provider that may neither read nor write C is never
+a Full neighbour, whatever its flag says, so it cannot make this side fetch
+the blobs it names and pass them on; changed evidence re-evaluates which
+peerings count.
 
 A side remembers, per connection, the requests it refused and the capability
 definitions whose arrival could admit them: admission names missing
@@ -465,7 +513,9 @@ root and leaf count, or ends the walk as refused. A new open replaces the
 puller's earlier walk of that kind. Every node and value then comes from the
 pinned snapshot, so responses cannot splice two moments together and need no
 historical-root cache; a requested prefix or value absent from it ends the
-walk as failed.
+walk as failed. The responder leaves a request unanswered while the
+connection already queues 1,024 frames for the puller (*One connection per
+peer*); a puller that reads again is answered again.
 
 The puller compares each child digest with its own PATCH at that prefix, fixed
 when the walk starts, and requests only the children that differ. Whether a
@@ -522,15 +572,28 @@ other side: the subject-truncated prefixes its collections' evidence indexes
 under that key. A side whose own proofs naming itself differ sends one
 PROOF_REQUEST per digest and connection; the answer is PROOFS frames closed by
 PROOFS_END and holds only the proofs naming the asker's TLS-authenticated key,
-at most `MAX_PROOFS_PER_EXCHANGE` (1,024). A received proof, like a peer's
-credential, is kept only if it names the receiver or the sender.
+at most `MAX_PROOFS_PER_EXCHANGE` (1,024). The sender answers once per digest
+it sent on that connection, and a request before any digest goes unanswered.
+The answer reflects what is held when it is sent, so an asker whose request
+crossed a newer digest already has the newer state. A received proof, like a
+peer's credential, is kept only if it names the receiver or the sender.
 It lands when its held descriptor validates it, waits in memory while the
 descriptor is missing (`HealthSnapshot::available` lists its collection), and
-is dropped otherwise. The definitions it names are fetched over `blob/1` from
-the sender, then from its root and delegated keys among connected peers, as
-are those a refused peering request waits for. A host also dials the subject
-of every grant its own key signed, once per grant and process, so a grant
-written while the subject is unknown still reaches it.
+is dropped otherwise. Waiting proofs are bounded: one sender keeps at most 256
+of them and every sender together at most 1,024, and the rest are dropped
+before their signatures are checked and fetch nothing. A proof that is
+evidence under a held descriptor never waits, so these bounds keep none of
+those out. A proof for a collection that is not active is validated against
+the resident blob at its resource, which is taken for a descriptor only up to
+1 MiB and decoded at most once per store observation, not once per proof.
+
+The definitions a proof names are fetched over `blob/1` from the sender, then
+from its root and delegated keys among connected peers, as are those a refused
+peering request waits for. Definitions are policy metadata and are fetched
+under the same 1 MiB bound as descriptors, so a key cannot make a node store a
+blob of its choosing by signing a proof whose capability handle names it. A
+host also dials the subject of every grant its own key signed, once per grant
+and process, so a grant written while the subject is unknown still reaches it.
 
 ## Blob transfer is lazy and bearer-addressed
 
@@ -775,41 +838,66 @@ and a host startup failure leaves resident operations usable. Startup is attempt
 once per peer; opening a new peer is an explicit retry. Activation logs startup
 failures without activating the collection, while acquisition returns the error.
 
-A foreground H-only reader need not activate any collection. It can use a distinct
-ephemeral transport key, bootstrap endpoint routes, and a zero provider-publication
-budget without borrowing its authorship signer's or a running daemon's endpoint
-identity. Network acquisition requires an enabled Tokio runtime at the calling
-async boundary; local-only operations need no runtime. Puts and landed walk
-values become visible in a fresh local observation without an automatic disk
-flush. Explicit `close` withdraws host snapshots and closes the backend at the
-final persistence boundary; manual `flush` remains available at an application's
-chosen durability boundary. Neither operation starts networking or authors WANT.
-Failure to obtain a fresh store snapshot is returned by `try_refresh` and
-withdraws the previous serving observation; existing frozen readers stay frozen.
+A foreground H-only reader need not activate any collection. It can use a
+distinct ephemeral transport key, its pile daemon's key as its first contact
+(`PeerConfig::daemon`), and a zero provider-publication budget without
+borrowing its authorship signer's or the running daemon's endpoint identity.
+Network acquisition requires an enabled Tokio runtime at the calling async
+boundary; local-only operations need no runtime. Puts and landed walk values
+become visible in a fresh local observation without an automatic disk flush.
+Explicit `close` withdraws host snapshots and closes the backend at the final
+persistence boundary; manual `flush` remains available at an application's
+chosen durability boundary. Neither operation starts networking or authors
+WANT. Failure to obtain a fresh store snapshot is returned by `try_refresh` and
+withdraws the previous serving observation; existing frozen readers stay
+frozen.
 
-Bootstrap endpoints come from `PeerConfig::peers` or the CLI's `--peers`.
-Their addresses become the dial routes for those identities, and the
-identities seed the DHT routing table as unverified candidates, retained and
-failed like any other route. Endpoint addresses and relay URLs only provide
-iroh transport paths; they are not peering candidates, collection participants
-or collection rendezvous identities. DHT referrals and authenticated callers
-may become live routing candidates, but there is no synchronized PEER roster
-and no durable peer record in the current protocol. Liveness, connections,
-peerings, candidate orders, DHT buckets, and provider leases are operational
-soft state; restarting may forget them without losing semantic data, and each
-selected collection draws its candidate order afresh.
+### Where peers come from
+
+A host's peers come from its pile, never from configuration; there is no list
+of peers to give it. The keys a selected collection's content names, the
+signers of its records and its grant-chain keys, are its first peering
+candidates (tiers 1 and 2 under *Neighbours*), dialled by key through iroh's
+address discovery. TLS authenticates every connection, so each `recon/1` that
+opens makes its peer a verified DHT route, and the provider lookup at the
+collection's next draw has a contact: a host whose only route is the signer of
+a record it holds finds the collection's other providers, tier 3, through that
+signer.
+
+A process whose pile names no peer, such as a foreground reader, has one first
+contact: the pile's sync daemon. `PeerConfig::daemon` names it by its key, the
+key the pile's configuration is written under; the daemon itself leaves it
+unset. The host notes that key as a candidate route and teaches its endpoint
+the addresses the daemon recorded (*Where the sync daemon listens*), which
+`Peer::new` reads at once and a lazy peer reads when its host starts; with no
+addresses recorded, iroh's discovery finds the daemon by key. From there the
+daemon's DHT replies lead on.
+
+Endpoint addresses and relay URLs only provide iroh transport paths; they are
+not peering candidates, collection participants or collection rendezvous
+identities. DHT referrals and authenticated callers may become live routing
+candidates, but there is no synchronized PEER roster and no durable peer
+record in the current protocol. Liveness, connections, peerings, candidate
+orders, DHT buckets, and provider leases are operational soft state; restarting
+may forget them without losing semantic data, and each selected collection
+draws its candidate order afresh. The pile already holds what a restart needs
+to find its peers again: the keys its content names and, for a process beside
+the daemon, the daemon's addresses.
 
 ### Restart contact experiment
 
-`routing/warm_start.rs` is a test-only experiment, not enabled host persistence.
-It runs the real `RoutingTable` and `IterativeLookup` with synthetic lookup
-responses. Its one durable relation is a bounded set of previously authenticated
-endpoint identities, canonicalized with `PATCH<32>` and packed into ordinary
-`RawBytes`. A temporary-file write, sync, reopen and restore exercise the byte
-boundary. The test makes no new pile record, replicated roster, schema identity,
-JSON catalog, or provider advertisement. The host currently has no learned-peer
-persistence to reuse: configured endpoint addresses seed a fresh route table and
-iroh memory lookup; retired PEER records remain inert.
+`routing/warm_start.rs` is a test-only experiment, not enabled host
+persistence. It runs the real `RoutingTable` and `IterativeLookup` with
+synthetic lookup responses. Its one durable relation is a bounded set of
+previously authenticated endpoint identities, canonicalized with `PATCH<32>`
+and packed into ordinary `RawBytes`. A temporary-file write, sync, reopen and
+restore exercise the byte boundary. The test makes no new pile record,
+replicated roster, schema identity, JSON catalog, or provider advertisement.
+The host currently has no learned-peer persistence to reuse: a fresh route
+table holds at most the pile daemon's key and grows from the connections the
+pile's content opens; retired PEER records remain inert. The experiment's
+fixtures still seed the table with a fixed bootstrap identity, which stands for
+whichever first contact a restart has.
 
 The maximum payload is `256 * K * 32 = 163,840` bytes, before any filesystem
 overhead. Parsing reads at most that bound plus one byte and validates the whole
@@ -942,33 +1030,33 @@ exact-H acquisition retains its existing larger byte allowance and deadline,
 and passive snapshots and resident-only stores do not acquire anything.
 
 Foreground exact-H acquisition has one end-to-end deadline, normally ten
-seconds, including capability readiness, cold bootstrap dialing, DHT lookup,
-and bearer GET. Its three-second routing window begins with the first
-authenticated replica response, not before the cold bootstrap dial. This lets
-a healthy delayed bootstrap connect while a stalled secondary route cannot
-consume the whole remaining budget before GET. Background publication,
-collection provider lookups and descriptor warmups start their three-second
-lookup window immediately. A
-caller's shorter deadline still wins; progress does not reset either deadline,
-and no failed lookup starts an unbounded retry loop.
-When the routing window expires, issued requests still awaiting a reply count
-as failed learned routes. They cannot occupy every slot again on the next
-background attempt merely because cancellation preceded the dial deadline.
-Unissued candidates and partial authenticated responders are preserved;
-configured bootstrap routes fail like any other. Each routing bucket
-also retains at most K local learned-route failures for sixty seconds, separately
-from its positive routes. Repeated third-party referrals cannot erase or extend
-that cooldown: it gates both seeds and reply candidates even when positive
-bucket retention differs from the lookup-local shortlist. Direct authenticated
-success clears a cooldown immediately; expiry permits a new probe. This is
-bounded, disposable liveness state, not authority or a permanent blacklist.
-This does not make a configured-only cold dial longer than three seconds fit
-the background window: if each attempt starts equally cold, background retries
-can still miss that endpoint. Foreground acquisition retains its separate end-to-end bound.
-Diagnostics distinguish a successful lookup with no provider hint from
-failure to reach a replica, a provider transport/protocol failure, or exhaustion
-of the end-to-end budget. A directory miss is an observation, not proof that H
-does not exist. Diagnostics do not log the bearer handle.
+seconds, including capability readiness, the cold dial of a first contact such
+as the pile's daemon, DHT lookup, and bearer GET. Its three-second routing
+window begins with the first authenticated replica response, not before that
+cold dial. This lets a healthy delayed first contact connect while a stalled
+secondary route cannot consume the whole remaining budget before GET.
+Background publication, collection provider lookups and descriptor warmups
+start their three-second lookup window immediately. A caller's shorter deadline
+still wins; progress does not reset either deadline, and no failed lookup
+starts an unbounded retry loop. When the routing window expires, issued
+requests still awaiting a reply count as failed learned routes. They cannot
+occupy every slot again on the next background attempt merely because
+cancellation preceded the dial deadline. Unissued candidates and partial
+authenticated responders are preserved; the daemon's route fails like any
+other. Each routing bucket also retains at most K local learned-route failures
+for sixty seconds, separately from its positive routes. Repeated third-party
+referrals cannot erase or extend that cooldown: it gates both seeds and reply
+candidates even when positive bucket retention differs from the lookup-local
+shortlist. Direct authenticated success clears a cooldown immediately; expiry
+permits a new probe. This is bounded, disposable liveness state, not authority
+or a permanent blacklist. This does not make a cold dial to a sole first
+contact that takes longer than three seconds fit the background window: if each
+attempt starts equally cold, background retries can still miss that endpoint.
+Foreground acquisition retains its separate end-to-end bound. Diagnostics
+distinguish a successful lookup with no provider hint from failure to reach a
+replica, a provider transport/protocol failure, or exhaustion of the end-to-end
+budget. A directory miss is an observation, not proof that H does not exist.
+Diagnostics do not log the bearer handle.
 
 ## Lattice-aware sparse replication
 
@@ -1137,12 +1225,13 @@ frames, is listed in *One connection per peer*.
 There is deliberately no store manifest, global inventory authorization,
 push-broadcast record, receipt RPC, remote mutable head, or unpublish operation.
 
-The CLI names bootstrap peers and local policy; the collections come from the
-pile's selection (*Choosing what to sync*):
+The CLI names local policy only. The collections come from the pile's
+selection (*Choosing what to sync*) and the peers from the pile's content
+(*Where peers come from*):
 
 ```text
 trible pile net sync DATA.pile \
-    [--key EXISTING_SELF_KEY] [--peers ENDPOINT_TICKET ...] \
+    [--key EXISTING_SELF_KEY] \
     [--replication demand|shallow|full] [--bind IP:PORT] \
     [--provider-publication-budget ATTEMPTS] \
     [--health] [--health-collection HANDLE] \
@@ -1150,31 +1239,33 @@ trible pile net sync DATA.pile \
     [--duration SECS] [--quiescent-for SECS]
 ```
 
-There is no `--collection` flag and no direction flag: which way a collection
-flows between two keys follows the send flags of their peering, which follow
-admission. At startup the daemon prints its node id, its bound sockets and the
-number of selected collections, and prints that number again whenever the
-selection changes.
+There is no `--peers` or `--collection` flag, and no direction flag: which way
+a collection flows between two keys follows the send flags of their peering,
+which follow admission. At startup the daemon prints its node id, its bound
+sockets and the number of selected collections, and prints that number again
+whenever the selection changes.
 
 `--bind` binds the endpoint to exactly that local socket instead of iroh's
 default sockets. At startup the daemon prints `bound: <ip:port>[ <ip:port>...]`
-on stderr, the sockets it actually bound. A peer's ticket can then be written
-before it starts: `trible pile net identity --key KEY --bind IP:PORT` prints
-`node: <endpoint id>` and `ticket: <endpoint ticket>` naming exactly that
-address, which the other daemon takes in `--peers`. After each pass the daemon
-prints one plain line on stderr per peer with which at least one record pull
-ended without a failed or timed-out walk since the previous pass:
+on stderr, the sockets it actually bound, and prints the line again whenever
+they change. It records the same sockets in the pile's configuration (*Where
+the sync daemon listens*) on its first pass and after every change, so a
+process that opens the pile and names the daemon's key reaches it with nothing
+copied by hand. `trible pile net identity --key KEY` prints `node: <endpoint
+id>`; there is no ticket to print, since nothing takes one. After each pass the
+daemon prints one plain line on stderr per peer with which at least one record
+pull ended without a failed or timed-out walk since the previous pass:
 `reconciled with peer <endpoint id hex>: <n> collections`.
 
 The long-running daemon uses one existing durable key for its authenticated
-endpoint, the configuration that holds its sync selection, health reports and
-telemetry. Key resolution is `--key`, then `TRIBLESPACE_KEY`, then `self.key`
-beside the pile's lexical path; `select`, `unselect` and `selection` resolve
-the key the same way. There is no independently configured network or
-reporting key. Maintenance uses that same local key for its work and
-telemetry; worker labels distinguish processes, not identities. This CLI
-convention does not change the separate ephemeral H-only foreground-reader use
-described above or grant any authority.
+endpoint, the configuration that holds its sync selection and its addresses,
+health reports and telemetry. Key resolution is `--key`, then
+`TRIBLESPACE_KEY`, then `self.key` beside the pile's lexical path; `select`,
+`unselect` and `selection` resolve the key the same way. There is no
+independently configured network or reporting key. Maintenance uses that same
+local key for its work and telemetry; worker labels distinguish processes, not
+identities. This CLI convention does not change the separate ephemeral H-only
+foreground-reader use described above or grant any authority.
 
 Whatever a node selects, it may publish provider leases for and serve resident
 exact blobs under bearer handle H, and may service durable `Blob(H)` WANTs

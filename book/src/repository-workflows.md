@@ -435,12 +435,13 @@ the same local store and exact-acquisition traits and returns the same
 `PeerSnapshot<S>`, but neither a snapshot nor a later acquisition refreshes a
 serving inventory. It cannot activate collection replication or advertise its
 resident handles. Local puts, commits, proof insertion and close remain
-available; not serving the pile does not mean a read-only local store.
-Its lazy host can still participate in discovery and DHT routing. H remains
-the read capability, the serving L-to-H map remains private to serving peers,
-and the provider-first endpoint-bound bearer exchange is unchanged. An ordinary
-Peer with a zero publication budget or ReadOnly reconciliation still serves
-its inventory; those settings are not aliases for Leech.
+available; not serving the pile does not mean a read-only local store. Its lazy
+host can still participate in discovery and DHT routing, through its pile's
+sync daemon (`PeerConfig::daemon`) when its pile names no peer. H remains the
+read capability, the serving L-to-H map remains private to serving peers, and
+the provider-first endpoint-bound bearer exchange is unchanged. An ordinary
+Peer with a zero publication budget or ReadOnly reconciliation still serves its
+inventory; those settings are not aliases for Leech.
 
 Record retention is a separate lifetime rule: a retained non-blob
 record strongly retains every directly referenced blob which is resident, but

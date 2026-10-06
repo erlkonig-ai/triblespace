@@ -832,8 +832,10 @@ The same generation also wrote a fixed STORE_SCOPE record:
 Current replay validates both layouts and exposes dedicated retired record
 variants to raw inspection, but builds no index or repository state from
 either. Current collection-scoped networking does not create, synchronize, or
-route from them: bootstrap endpoints, DHT referrals, liveness, and provider
-leases are process-local soft state, while collection policy is the sole
+route from them: DHT referrals, liveness, and provider leases are
+process-local soft state, first contacts come from the keys a collection's
+records and grants name and from the addresses the pile's own sync daemon
+records in its configuration collection, and collection policy is the sole
 admission and disclosure authority. Semantic reframe, retained rewrite, Yard
 reclaim, and `trible pile compact` deliberately drop both retired kinds.
 Genuinely unknown records remain opaque. Retained Pile copying preserves them
