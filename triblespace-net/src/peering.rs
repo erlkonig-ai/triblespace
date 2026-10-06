@@ -436,6 +436,8 @@ impl Peerings {
             let full_changed = previous
                 .as_ref()
                 .is_none_or(|previous| previous.full(collection) != snapshot.full(collection));
+            // Changed evidence can change which neighbours count as full.
+            self.changed |= changed;
             let mesh = self.meshes.get_mut(&raw).unwrap();
             if changed {
                 mesh.order.stale = true;
@@ -536,18 +538,29 @@ impl Peerings {
 
     /// Every peering, with its collection and its connection, whether this
     /// side sends on it, and whether both sides replicate the collection in
-    /// full.
+    /// full. Only a peer that may READ or WRITE C here counts as full: held
+    /// sets are compared with no other key.
     pub(crate) fn neighbours(&self) -> impl Iterator<Item = (CollectionHandle, &Link, bool, bool)> {
         self.meshes.iter().flat_map(move |(raw, mesh)| {
+            let collection = CollectionHandle::new(*raw);
             mesh.peerings
                 .iter()
                 .filter_map(move |(id, peering)| match peering.side {
-                    Side::Peered { mine, theirs, .. } => Some((
-                        CollectionHandle::new(*raw),
-                        self.links.get(id)?,
-                        mine.send,
-                        mine.full && theirs.full,
-                    )),
+                    Side::Peered { mine, theirs, .. } => {
+                        let link = self.links.get(id)?;
+                        let writes = || {
+                            self.snapshot
+                                .as_ref()
+                                .and_then(|snapshot| snapshot.collection(collection))
+                                .is_some_and(|local| {
+                                    let presented = &peering.presented;
+                                    let admitted = admits(&local, link.peer(), presented, true);
+                                    matches!(admitted, QuorumOutcome::Met)
+                                })
+                        };
+                        let full = mine.full && theirs.full && (mine.send || writes());
+                        Some((collection, link, mine.send, full))
+                    }
                     _ => None,
                 })
         })
@@ -1727,6 +1740,35 @@ mod tests {
         let carried = carry(&mut owner, &mut reader, &mut wire);
         assert_eq!(kinds(&carried), [("left", FRAME_PEER_FLAGS)]);
         assert!(!full(&owner) && !full(&reader));
+    }
+
+    /// A DHT provider that may neither read nor write C accepts this side's
+    /// request and says it replicates C in full. The peering stands, but it
+    /// is not full here, so the provider's held digest starts no reference
+    /// pull.
+    #[test]
+    fn a_full_peer_that_may_neither_read_nor_write_is_no_full_neighbour() {
+        let mut node = Node::new(16);
+        let mut provider = Node::new(17);
+        let policy = CollectionPolicy::new(
+            AdmissionPolicy::direct(node.key.verifying_key()),
+            AdmissionPolicy::direct(node.key.verifying_key()),
+        );
+        let collection = node.hold(policy.clone());
+        assert_eq!(provider.hold(policy), collection);
+        for side in [&mut node, &mut provider] {
+            side.pile.full.insert(&PatchEntry::new(&collection.raw));
+            side.select(collection, true);
+        }
+        let mut wire = connect(&mut node, &mut provider, 1);
+        let now = crate::clock::mono_now();
+        assert!(node.peerings.fill(now).is_empty());
+        node.peerings.providers(collection, vec![provider.id()]);
+        assert!(node.peerings.fill(now).is_empty(), "asked on the connection");
+        carry(&mut node, &mut provider, &mut wire);
+        assert!(peering(&node, provider.id()).unwrap().peered);
+        let full = node.peerings.neighbours().map(|(.., full)| full);
+        assert_eq!(full.collect::<Vec<_>>(), [false]);
     }
 
     /// Tiers order the candidates whatever the salt, a failed dial is not
