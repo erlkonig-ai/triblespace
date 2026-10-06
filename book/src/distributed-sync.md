@@ -255,13 +255,16 @@ An unknown tag, or an unknown `dht/1` operation, resets only its own stream
 dropped. `recon/1` takes no permit. A request stream (`dht/1` or `blob/1`)
 does: an opener keeps at most 16 open per connection, the accepting side holds
 at most 32 per connection and resets the rest (`RESET_BUSY`), and at most 16
-are served at once across the host, each within 300 seconds. A stream on a
-connection that carries no peering first takes one of 8 permits that every
-such connection shares, and then one of the host's; a stream on a neighbour
-connection takes only the host's. Keys cost nothing, so a share per key or
-per connection would bound nothing: strangers that hold their requests open
-until their deadline, on however many connections, occupy at most half the
-host, and the other half stays for the peers it syncs a collection with.
+are served at once across the host, each within 300 seconds. A stream first
+takes one of 8 permits its connection has. On a connection that carries no
+peering it then takes one of 8 permits that every such connection shares,
+and then one of the host's; a stream on a neighbour connection then takes
+only the host's. Keys cost nothing, so for strangers a share per key or per
+connection would bound nothing: strangers that hold their requests open until
+their deadline, on however many connections, occupy at most half the host, and
+the other half stays for the peers it syncs a collection with. Those take
+nothing from the strangers' share, so the connection's own share is what keeps
+one neighbour that holds its requests open from occupying the whole host.
 
 The dialler opens `recon/1` as it connects, and its first frame, OPEN, carries
 the dialler's sequence number. The counter starts at the wall clock in

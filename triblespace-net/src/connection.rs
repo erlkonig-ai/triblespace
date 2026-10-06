@@ -6,8 +6,9 @@
 //! tag ([`TAG_RECON`], [`TAG_DHT`] or [`TAG_BLOB`]). The loop reads the tag
 //! before it takes any permit: `recon/1` takes none, a request stream takes
 //! one of its connection's (or is reset when none is left) and waits for one
-//! of the table's, on a connection that is no neighbour's within the share
-//! strangers have, and an unknown tag resets only its own stream.
+//! of the table's, within its connection's share and, on a connection that is
+//! no neighbour's, within the share strangers have, and an unknown tag resets
+//! only its own stream.
 //!
 //! The dialler opens `recon/1` as it connects, and its first frame carries
 //! the dialler's sequence number. When a pair holds two connections, both
@@ -84,13 +85,18 @@ pub(crate) const MAX_REQUESTS_PER_CONNECTION: usize = 16;
 pub(crate) const MAX_HELD_REQUESTS_PER_CONNECTION: usize = 2 * MAX_REQUESTS_PER_CONNECTION;
 /// Request streams served at once across every connection.
 pub(crate) const MAX_REQUESTS_GLOBAL: usize = 16;
+/// Request streams served at once on one connection: half the table's, so a
+/// neighbour that holds its requests open until their deadline leaves the
+/// other half to the rest. Neighbour connections take nothing from the
+/// strangers' share, so only this bounds what one of them holds.
+pub(crate) const MAX_SERVED_PER_CONNECTION: usize = MAX_REQUESTS_GLOBAL / 2;
 /// Request streams served at once on connections that are not neighbour
 /// connections: half the table's. Keys cost nothing, so a stranger (a DHT
 /// caller, a first contact) can hold requests open until their deadline on
 /// as many connections as it makes keys, and a share per key or per
 /// connection would bound nothing. The other half is kept for the peers
-/// this node syncs a collection with, which can use every permit. Half
-/// rather than less, because the DHT this node serves strangers is how
+/// this node syncs a collection with, which together can use every permit.
+/// Half rather than less, because the DHT this node serves strangers is how
 /// they find a collection's providers at all.
 pub(crate) const MAX_STRANGER_REQUESTS: usize = MAX_REQUESTS_GLOBAL / 2;
 
@@ -287,6 +293,8 @@ struct State {
     changed: Notify,
     opened: Arc<Semaphore>,
     held: Arc<Semaphore>,
+    /// Request streams served at once on the connection.
+    served: Semaphore,
     /// Frames waiting for the connection's `recon/1` writer, which takes the
     /// receiver and drops it when the stream ends.
     outbox: mpsc::Sender<Frame>,
@@ -316,6 +324,7 @@ impl State {
             changed: Notify::new(),
             opened: Arc::new(Semaphore::new(MAX_REQUESTS_PER_CONNECTION)),
             held: Arc::new(Semaphore::new(MAX_HELD_REQUESTS_PER_CONNECTION)),
+            served: Semaphore::new(MAX_SERVED_PER_CONNECTION),
             outbox,
             outbox_frames: Mutex::new(Some(outbox_frames)),
             announced: AtomicBool::new(false),
@@ -1050,6 +1059,9 @@ async fn stream<T: Transport, S: Service>(
                 return;
             };
             let _request = InFlight::new(&state, None, None);
+            let Ok(_share) = state.served.acquire().await else {
+                return;
+            };
             let _stranger = if state.neighbour.load(Ordering::SeqCst) {
                 None
             } else {

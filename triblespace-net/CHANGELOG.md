@@ -25,6 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RESET_STALLED`, the per-stream order, and the peering frames resent when
   a stream ended.
 
+- Serve at most `MAX_SERVED_PER_CONNECTION` (8, half the host's 16) request
+  streams at once on one connection, as before af5f28e5, and keep the
+  strangers' reservation that commit added. Neighbour connections take
+  nothing from the strangers' share, so without a share of its own one
+  neighbour holding its requests open until their deadline took every
+  permit, and another neighbour's FIND_VALUE timed out.
+
 - Delete configured peers (JP's content bootstrap, 2026-10-06).
   `PeerConfig::peers`, the routing table's configured seed
   (`RoutingTable::new` takes only the local key), `IrohTransport`'s route map

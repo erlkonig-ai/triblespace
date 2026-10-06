@@ -9,7 +9,7 @@ use tokio::io::AsyncWriteExt as _;
 use crate::connection::{
     CONNECTION_IDLE_DEADLINE, DRAIN_GRACE, FRAME_OPEN, MAX_CONNECTIONS,
     MAX_HELD_REQUESTS_PER_CONNECTION, MAX_RECON_FRAME_BYTES, MAX_REQUESTS_GLOBAL,
-    MAX_STRANGER_REQUESTS, RESET_BUSY, RESET_UNKNOWN, write_frame,
+    MAX_SERVED_PER_CONNECTION, MAX_STRANGER_REQUESTS, RESET_BUSY, RESET_UNKNOWN, write_frame,
 };
 use crate::protocol::{OP_FIND_VALUE, TAG_DHT, TAG_RECON, op_find_value, send_hash};
 use crate::recon::FRAME_PEER_REQUEST;
@@ -480,6 +480,35 @@ async fn strangers_leave_request_slots_to_neighbours() {
         .find_value(server.peer, [0; 32])
         .await
         .unwrap();
+}
+
+/// A neighbour connection is served at most its share of the request slots,
+/// so a neighbour that holds its requests open until their deadline leaves
+/// slots to another, whose FIND_VALUE is answered within its deadline.
+#[tokio::test(start_paused = true)]
+async fn one_neighbour_leaves_request_slots_to_another() {
+    let net = network(Duration::from_secs(1));
+    let server = Node::join(&net, &key(1));
+    let greedy = Node::join(&net, &key(2));
+    let other = Node::join(&net, &key(3));
+    let connection = greedy.table.connect(server.peer).await.unwrap();
+    other.table.connect(server.peer).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    for neighbour in [&greedy, &other] {
+        let current = server.table.current(neighbour.peer).unwrap();
+        current.set_neighbour(true);
+    }
+    let mut holding = Vec::new();
+    for _ in 0..MAX_REQUESTS_GLOBAL {
+        holding.push(held_find_value(&connection).await);
+    }
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    other.client.find_value(server.peer, [0; 32]).await.unwrap();
+    assert_eq!(
+        server.table.available_requests(),
+        MAX_REQUESTS_GLOBAL - MAX_SERVED_PER_CONNECTION
+    );
 }
 
 /// A connection carries one `recon/1`: a second one is a protocol violation
