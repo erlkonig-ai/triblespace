@@ -52,6 +52,7 @@ pub mod reconcile;
 pub(crate) mod routing;
 pub mod telemetry;
 pub mod transport;
+pub mod walk;
 pub mod wake;
 mod wake_relay;
 mod wake_schedule;

@@ -18,9 +18,9 @@
 //! | 0x14 | CREDENTIAL     | collection, credentials                      | M7   |
 //! | 0x15 | UNPEER         | collection                                   | M7   |
 //! | 0x20 | ANNOUNCE       | reserved                                     | M8   |
-//! | 0x30 | WALK_REQUEST   | reserved                                     | M9   |
-//! | 0x31 | WALK_RESPONSE  | reserved                                     | M9   |
-//! | 0x32 | WALK_END       | reserved                                     | M9   |
+//! | 0x30 | WALK_REQUEST   | collection, walk, request ([`crate::walk`])  | M9   |
+//! | 0x31 | WALK_RESPONSE  | collection, walk, response                   | M9   |
+//! | 0x32 | WALK_END       | collection, walk, side, reason               | M9   |
 //!
 //! Flags are one byte: bit 0 is the send flag, bit 1 the full flag, and in a
 //! PEER_REQUEST bit 2 marks an invitation. Other bits are ignored.
@@ -34,6 +34,8 @@
 
 use triblespace_core::capability::CapabilityProof;
 use triblespace_core::collection::CollectionHandle;
+
+use crate::walk::WalkFrame;
 
 /// Largest `recon/1` frame payload.
 pub const MAX_RECON_FRAME_BYTES: u32 = 64 * 1024;
@@ -52,6 +54,12 @@ pub const FRAME_PEER_FLAGS: u8 = 0x13;
 pub const FRAME_CREDENTIAL: u8 = 0x14;
 /// End the peering for a collection.
 pub const FRAME_UNPEER: u8 = 0x15;
+/// A pull walk's request: open, one node, or one value.
+pub const FRAME_WALK_REQUEST: u8 = 0x30;
+/// A pull walk's response: its summary, one node, or one value.
+pub const FRAME_WALK_RESPONSE: u8 = 0x31;
+/// A pull walk ended; its number retires.
+pub const FRAME_WALK_END: u8 = 0x32;
 
 const FLAG_SEND: u8 = 0x01;
 const FLAG_FULL: u8 = 0x02;
@@ -99,6 +107,8 @@ pub enum Frame {
     Unpeer {
         collection: CollectionHandle,
     },
+    /// One frame of a pull walk, encoded by [`crate::walk`].
+    Walk(WalkFrame),
 }
 
 /// A frame of a known kind whose payload does not parse.
@@ -115,6 +125,7 @@ impl Frame {
             | Self::PeerFlags { collection, .. }
             | Self::Credential { collection, .. }
             | Self::Unpeer { collection } => *collection,
+            Self::Walk(walk) => walk.collection(),
         }
     }
 
@@ -147,6 +158,7 @@ impl Frame {
                 FRAME_CREDENTIAL
             }
             Self::Unpeer { .. } => FRAME_UNPEER,
+            Self::Walk(walk) => walk.encode(&mut payload),
         };
         (kind, payload)
     }
@@ -194,6 +206,9 @@ impl Frame {
             FRAME_UNPEER => Self::Unpeer {
                 collection: fixed(32)?,
             },
+            FRAME_WALK_REQUEST | FRAME_WALK_RESPONSE | FRAME_WALK_END => {
+                return Ok(WalkFrame::decode(kind, payload)?.map(Self::Walk));
+            }
             _ => return Ok(None),
         }))
     }
