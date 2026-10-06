@@ -576,19 +576,16 @@ where
                         }
                     },
                     // Proof repair carries complete inline evidence, not blob
-                    // demand. No content closure is implied by admission.
-                    NetEvent::CapabilityProof(proof) => match store.insert_proof(proof) {
-                        Ok(()) => {}
-                        Err(error) => {
+                    // demand. No content closure is implied by admission. A
+                    // proof that fails is dropped; the rest still land.
+                    NetEvent::CapabilityProof(proof) => {
+                        if let Err(error) = store.insert_proof(proof) {
                             tracing::warn!(
                                 ?error,
                                 "admitting collection authorization proof failed"
-                            );
-                            return Err(PeerSnapshotError::Overlay(anyhow::anyhow!(
-                                "admitting collection authorization proof failed: {error:?}"
-                            )));
+                            )
                         }
-                    },
+                    }
                 }
             }
         }
