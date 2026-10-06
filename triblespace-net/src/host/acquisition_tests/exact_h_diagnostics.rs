@@ -467,7 +467,6 @@ struct Node {
     trace: Trace,
     candidates: Arc<Mutex<RoutingTable>>,
     directory: Arc<Mutex<ProviderDirectory>>,
-    events: tokio::sync::mpsc::Receiver<NetEventBatch>,
     gate: Option<Arc<Gate>>,
     server: tokio::task::JoinHandle<()>,
 }
@@ -484,15 +483,12 @@ impl Node {
         let trace = Trace::default();
         let candidates = Arc::new(Mutex::new(RoutingTable::new(peer, [])));
         let directory = Arc::new(Mutex::new(ProviderDirectory::new(peer)));
-        let (events_tx, events) = tokio::sync::mpsc::channel(16);
         let handler = SnapshotHandler {
             snapshot: tokio::sync::watch::channel(snapshot).1,
             health: Health::new(EndpointId::from_bytes(&peer).unwrap()),
             candidates: candidates.clone(),
             providers: directory.clone(),
-            serve_collections: false,
             local_id: peer,
-            events: events_tx,
             recon: None,
             walks: None,
         };
@@ -521,7 +517,6 @@ impl Node {
             trace,
             candidates,
             directory,
-            events,
             gate,
             server,
         }
@@ -631,8 +626,6 @@ impl ThreeNodes {
         let snapshot = self.store.snapshot().unwrap();
         assert_eq!(snapshot.records().unwrap().count(), 0);
         assert_eq!(snapshot.wants().unwrap().count(), 0);
-        assert!(self.holder.events.try_recv().is_err());
-        assert!(self.other.events.try_recv().is_err());
     }
 
     fn trace(&self) -> &Trace {
@@ -916,7 +909,7 @@ async fn exact_h_stale_early_hints_leave_room_for_fresh_routing_and_final_holder
     let holder_gate = Gate::new(OP_FIND_VALUE);
     let relay_gate = Gate::new(OP_FIND_VALUE);
     let mut fixture = ThreeNodes::with_gates(false, Some(holder_gate.clone()), None);
-    let mut relay = Node::new(
+    let relay = Node::new(
         &fixture.net,
         &SigningKey::from_bytes(&[159; 32]),
         None,
@@ -952,7 +945,7 @@ async fn exact_h_stale_early_hints_leave_room_for_fresh_routing_and_final_holder
             crate::routing::distance_cmp(key, peer, fixture.holder.peer).is_gt()
         })
         .expect("bounded fixture must supply a farther replica");
-    let mut later = Node::new(&fixture.net, &later, None, None);
+    let later = Node::new(&fixture.net, &later, None, None);
     let stale: Vec<_> = identities
         .filter(|signing| rank(signing.verifying_key().to_bytes()) > rank(fixture.holder.peer))
         .take(3)
@@ -1087,11 +1080,6 @@ async fn exact_h_stale_early_hints_leave_room_for_fresh_routing_and_final_holder
     );
     assert_eq!(fixture.reads.load(Ordering::Relaxed), 1);
     fixture.assert_no_control_effects();
-    assert!(relay.events.try_recv().is_err());
-    assert!(later.events.try_recv().is_err());
-    for (node, _) in &mut slow {
-        assert!(node.events.try_recv().is_err());
-    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -1103,13 +1091,13 @@ async fn exact_h_routing_and_data_share_alpha_and_caller_cancellation_drops_both
     let late_gate = Gate::new(OP_FIND_VALUE);
     let mut fixture =
         ThreeNodes::with_gates(false, Some(holder_gate.clone()), Some(other_gate.clone()));
-    let mut third = Node::new(
+    let third = Node::new(
         &fixture.net,
         &SigningKey::from_bytes(&[154; 32]),
         None,
         Some(third_gate.clone()),
     );
-    let mut late = Node::new(
+    let late = Node::new(
         &fixture.net,
         &SigningKey::from_bytes(&[155; 32]),
         None,
@@ -1173,8 +1161,6 @@ async fn exact_h_routing_and_data_share_alpha_and_caller_cancellation_drops_both
     }
     assert_eq!(fixture.reads.load(Ordering::Relaxed), 0);
     fixture.assert_no_control_effects();
-    assert!(third.events.try_recv().is_err());
-    assert!(late.events.try_recv().is_err());
 }
 
 #[tokio::test(start_paused = true)]

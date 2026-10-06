@@ -42,8 +42,9 @@ impl TransferCost {
     }
 }
 
-// Concrete native-field byte count, following collection_wire's node response
-// layout with the actual key/representative width and an empty leaf value:
+// Concrete native-field byte count, following the node response layout of
+// the retired repair/0 stream with the actual key/representative width and an
+// empty leaf value:
 // found + kind:u8, digest:32; leaf key + value length:u32; or count:u64,
 // representative, depth:u8, child count:u32, (edge:u8,digest:32,count:u64)*.
 // This is NOT deployed provider wire traffic. Common root/member/lease bodies,
@@ -215,32 +216,6 @@ fn compare(
         cache.len(),
     );
     (inline_bytes, shared_bytes)
-}
-
-#[test]
-fn byte_count_matches_existing_node_codec_fields() {
-    use crate::collection_wire::{CollectionRepairComponent, send_repair_node_response};
-
-    // The live codec is fixed to 32-byte collection keys, not this experiment's
-    // 64-byte inventory keys. Check its actual emitted branch/leaf bytes; only
-    // the directly counted key/representative length differs in the model.
-    let patch = PATCH::<32, IdentitySchema, (), Blake3Merkle>::from_keys([[0; 32], [1; 32]]);
-    for prefix in [&[][..], &[0][..], &[1][..]] {
-        let PatchNodeResponse::Found(node) =
-            patch_node_response(&patch, &[], prefix, |_, ()| Ok(())).unwrap()
-        else {
-            panic!("fixture node absent");
-        };
-        let response = patch_node_response(&patch, &[], prefix, |_, ()| Ok(Vec::new())).unwrap();
-        let mut bytes = Vec::new();
-        futures::executor::block_on(send_repair_node_response(
-            &mut bytes,
-            &response,
-            CollectionRepairComponent::Record,
-        ))
-        .unwrap();
-        assert_eq!(node_bytes(&node), bytes.len());
-    }
 }
 
 #[test]

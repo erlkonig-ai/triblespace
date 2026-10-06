@@ -2552,7 +2552,7 @@ mod tests {
     async fn check_incoming_admission_without_flush(fail_first_snapshot: bool) {
         use crate::channel::{NetEvent, NetEventBatch};
         use crate::collection_activation::collection_repair_overlay;
-        use crate::collection_session::manifest;
+        use crate::collection_wire::manifest;
         use crate::peer::PeerSnapshotError;
         use triblespace_core::capability::{CapabilityResource, QuorumOutcome};
         use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};

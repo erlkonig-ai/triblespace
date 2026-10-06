@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Pull walks on `recon/1` replace the `repair/0` session (sync redesign M9).
+  Each side pulls what it lacks in its own walk of one collection's records,
+  authorization evidence or held references: the responder pins a snapshot
+  at the walk's open, the puller descends where digests differ, leaves carry
+  key and digest, and the puller fetches only the values its live store
+  lacks. Values land through one landing task per host, which publishes the
+  serving snapshot and acknowledges each walk; a walk completes when its
+  count proof closes, all its values landed and no proof stayed deferred,
+  and a deferred proof fetches its resource's descriptor inside the walk. A
+  walk is numbered per peer, collection and kind, and frames or
+  acknowledgements of an ended walk are dropped. A walk ends after 60 s
+  without progress; a `recon/1` writer that gets no credit for 60 s resets
+  the stream, and the dialler reopens it for its next frame. The landing
+  task also reobserves the store every 2 s. The repair session's pass caps,
+  inventory cursor, buffered delta and in-session READ bootstrap go with it.
 - Peer per collection on `recon/1` (sync redesign M7). A host asks up to five
   candidates for each collection its pile selects and accepts a request only
   for a collection it selects, from a key that passes READ or that sends and

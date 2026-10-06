@@ -110,10 +110,6 @@ pub(crate) struct NetEventBatch {
 }
 
 impl NetEventBatch {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.events.is_empty()
-    }
-
     pub(crate) fn len(&self) -> usize {
         self.events.len()
     }
@@ -138,10 +134,6 @@ impl NetEventBatch {
         self.bytes = self.bytes.saturating_add(event_bytes);
         self.events.push(event);
         Ok(())
-    }
-
-    pub(crate) fn is_full(&self) -> bool {
-        self.events.len() >= MAX_ADMISSION_BATCH_ITEMS || self.bytes >= MAX_ADMISSION_BATCH_BYTES
     }
 }
 
@@ -169,7 +161,6 @@ mod tests {
         for byte in 0..MAX_ADMISSION_BATCH_ITEMS {
             count_bounded.try_push(record(byte as u8)).unwrap();
         }
-        assert!(count_bounded.is_full());
         assert!(count_bounded.try_push(record(0xFF)).is_err());
     }
 

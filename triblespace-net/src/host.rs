@@ -39,8 +39,7 @@ use crate::bearer::{BearerLocatorIndex, blob_locator, locator_index, update_loca
 use crate::channel::{NetEvent, NetEventBatch};
 use crate::collection_activation::{CollectionRepairOverlay, CollectionRepairOverlayError};
 use crate::collection_delta::update_collection_record_patch;
-use crate::collection_session::{manifest, serve_collection_repair};
-use crate::collection_wire::MAX_COLLECTION_READ_BOOTSTRAP_PROOFS;
+use crate::collection_wire::{MAX_COLLECTION_READ_BOOTSTRAP_PROOFS, manifest};
 use crate::connection::{ConnectionTable, RESET_UNKNOWN, ReconEvent, Service};
 use crate::health::{CollectionHealth, Health, HealthSnapshot, StoreHealth};
 use crate::identity::iroh_secret;
@@ -48,8 +47,8 @@ use crate::inventory::ReconcileQos;
 use crate::landing::{Land, LandSlot};
 use crate::protocol::{
     OP_FIND_VALUE, OP_PROVIDER_PUT, PILE_SYNC_ALPN, PROVIDER_PUT_FULL, PROVIDER_PUT_OK, RawHash,
-    TAG_BLOB, TAG_DHT, TAG_REPAIR, op_find_value, op_get_blob_with_limit, op_provider_put,
-    recv_hash, recv_u8, send_u8, serve_find_value, serve_get_blob,
+    TAG_BLOB, TAG_DHT, op_find_value, op_get_blob_with_limit, op_provider_put, recv_hash, recv_u8,
+    send_u8, serve_find_value, serve_get_blob,
 };
 use crate::provider::{
     ProviderDirectory, ProviderKey, ProviderObservation, ProviderPublication, ProviderPublisher,
@@ -1525,9 +1524,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
         health: wiring.health.clone(),
         candidates: candidates.clone(),
         providers: providers.clone(),
-        serve_collections: config.qos.direction.serves(),
         local_id: my_id,
-        events: wiring.evt_tx.clone(),
         recon: Some(recon_tx),
         walks: Some(walks_tx),
     };
@@ -2177,43 +2174,6 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
     }
 }
 
-struct AdmissionBatcher {
-    events: tokio::sync::mpsc::Sender<NetEventBatch>,
-    pending: NetEventBatch,
-}
-
-impl AdmissionBatcher {
-    fn new(events: &tokio::sync::mpsc::Sender<NetEventBatch>) -> Self {
-        Self {
-            events: events.clone(),
-            pending: NetEventBatch::default(),
-        }
-    }
-
-    async fn push(&mut self, event: NetEvent) -> anyhow::Result<()> {
-        if let Err(event) = self.pending.try_push(event) {
-            self.flush().await?;
-            self.pending
-                .try_push(event)
-                .expect("an empty admission batch accepts one indivisible event");
-        }
-        if self.pending.is_full() {
-            self.flush().await?;
-        }
-        Ok(())
-    }
-
-    async fn flush(&mut self) -> anyhow::Result<()> {
-        if self.pending.is_empty() {
-            return Ok(());
-        }
-        self.events
-            .send(std::mem::take(&mut self.pending))
-            .await
-            .map_err(|_| anyhow::anyhow!("store side stopped during collection admission"))
-    }
-}
-
 /// One `FIND_VALUE` reply: the replica's routes nearer the key and its
 /// provider hints, whose tokens only the requester can check.
 type FoundValue = (Vec<PeerId>, Vec<(PeerId, ProviderToken)>);
@@ -2752,9 +2712,7 @@ struct SnapshotHandler {
     health: Health,
     candidates: RoutingCandidates,
     providers: Arc<Mutex<ProviderDirectory>>,
-    serve_collections: bool,
     local_id: PeerId,
-    events: tokio::sync::mpsc::Sender<NetEventBatch>,
     /// Where `recon/1` events go: the host's peering task.
     recon: Option<tokio::sync::mpsc::Sender<ReconEvent>>,
     /// Where walk frames and ended streams go: the host's walk task.
@@ -2770,9 +2728,7 @@ impl SnapshotHandler {
             health: Health::new(EndpointId::from_bytes(&local_id).unwrap()),
             candidates: Arc::new(Mutex::new(routes)),
             providers: Arc::new(Mutex::new(ProviderDirectory::new(local_id))),
-            serve_collections: false,
             local_id,
-            events: tokio::sync::mpsc::channel(1).0,
             recon: None,
             walks: None,
         }
@@ -2796,25 +2752,6 @@ impl Service for SnapshotHandler {
         let peer = VerifyingKey::from_bytes(&peer)
             .map_err(|error| anyhow::anyhow!("invalid transport peer key: {error}"))?;
         match tag {
-            TAG_REPAIR => {
-                if !self.serve_collections {
-                    let _ = serve_collection_repair(recv, send, peer, |_| None).await?;
-                } else {
-                    let snapshot = self.snapshot.borrow().clone();
-                    let bootstrap = serve_collection_repair(recv, send, peer, move |collection| {
-                        snapshot
-                            .as_ref()
-                            .and_then(|snapshot| snapshot.collection(collection))
-                            .map(|collection| collection.repair.clone())
-                    })
-                    .await?;
-                    let mut admissions = AdmissionBatcher::new(&self.events);
-                    for proof in bootstrap {
-                        admissions.push(NetEvent::CapabilityProof(proof)).await?;
-                    }
-                    admissions.flush().await?;
-                }
-            }
             TAG_BLOB => {
                 let activity = self.health.begin_blob_serve();
                 let snapshot = self.snapshot.borrow().clone();
@@ -3136,7 +3073,7 @@ mod tests {
         }
         assert_eq!(attempts.load(Ordering::Relaxed), 1);
 
-        assert!(received.recv().await.unwrap().is_empty());
+        assert_eq!(received.recv().await.unwrap().len(), 0);
         fetches.poll(|raw| active.contains_key(raw));
         assert!(fetches.pending.is_empty());
         assert_eq!(received.recv().await.unwrap().len(), 1);
@@ -3432,7 +3369,7 @@ mod tests {
             observer.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Closed)
         );
-        assert!(received.try_recv().unwrap().is_empty());
+        assert_eq!(received.try_recv().unwrap().len(), 0);
         assert!(
             received.try_recv().is_err(),
             "cancelled metadata must not land later"

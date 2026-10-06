@@ -48,7 +48,6 @@ struct Fixture {
     hash: RawHash,
     bytes: Bytes,
     store: MemoryRepo,
-    events: tokio::sync::mpsc::Receiver<NetEventBatch>,
     server: tokio::task::JoinHandle<()>,
 }
 
@@ -110,7 +109,6 @@ impl Fixture {
                 crate::clock::mono_now(),
             ));
         }
-        let (events_tx, events) = tokio::sync::mpsc::channel(16);
         let provider_routes = Arc::new(Mutex::new(RoutingTable::new(provider, [])));
         let (provider_snapshot, serving_snapshot) =
             tokio::sync::watch::channel(Some(Arc::new(snapshot)));
@@ -121,9 +119,7 @@ impl Fixture {
             health: provider_health.clone(),
             candidates: provider_routes.clone(),
             providers: provider_directory.clone(),
-            serve_collections: false,
             local_id: provider,
-            events: events_tx,
             recon: None,
             walks: None,
         };
@@ -147,7 +143,6 @@ impl Fixture {
             hash,
             bytes,
             store,
-            events,
             server,
         }
     }
@@ -156,10 +151,6 @@ impl Fixture {
         let snapshot = self.store.snapshot().unwrap();
         assert_eq!(snapshot.records().unwrap().count(), 0);
         assert_eq!(snapshot.wants().unwrap().count(), 0);
-        assert!(matches!(
-            self.events.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ));
     }
 }
 
@@ -170,12 +161,11 @@ impl Drop for Fixture {
 }
 
 /// An independent directory or restarted provider using the production RPC
-/// handler. Its control events remain observable, and dropping it stops its
-/// accept loop. Each restart installs fresh provider-side operational state.
+/// handler. Dropping it stops its accept loop. Each restart installs fresh
+/// provider-side operational state.
 struct RecoveryNode {
     peer: PeerId,
     directory: Arc<Mutex<ProviderDirectory>>,
-    events: tokio::sync::mpsc::Receiver<NetEventBatch>,
     server: tokio::task::JoinHandle<()>,
 }
 
@@ -184,15 +174,12 @@ impl RecoveryNode {
         let peer = key.verifying_key().to_bytes();
         let mut harness = net.join(key);
         let directory = Arc::new(Mutex::new(ProviderDirectory::new(peer)));
-        let (events_tx, events) = tokio::sync::mpsc::channel(16);
         let handler = SnapshotHandler {
             snapshot: tokio::sync::watch::channel(snapshot).1,
             health: Health::new(EndpointId::from_bytes(&peer).unwrap()),
             candidates: Arc::new(Mutex::new(RoutingTable::new(peer, []))),
             providers: directory.clone(),
-            serve_collections: false,
             local_id: peer,
-            events: events_tx,
             recon: None,
             walks: None,
         };
@@ -206,7 +193,6 @@ impl RecoveryNode {
         Self {
             peer,
             directory,
-            events,
             server,
         }
     }
@@ -222,10 +208,6 @@ impl RecoveryNode {
             now,
         ));
         now
-    }
-
-    fn assert_no_events(&mut self) {
-        assert!(self.events.try_recv().is_err());
     }
 }
 
@@ -350,7 +332,7 @@ async fn later_lookup_hint_recovers_from_a_stalled_first_provider() {
 async fn later_lookup_hint_case(stalled: bool) {
     let _guard = crate::protocol::exact_blob_receive_test_guard();
     let mut fixture = Fixture::new(false);
-    let mut missing = RecoveryNode::new(&fixture.net, &SigningKey::from_bytes(&[134; 32]), None);
+    let missing = RecoveryNode::new(&fixture.net, &SigningKey::from_bytes(&[134; 32]), None);
     let first = ScriptedReplica::new(
         &fixture.net,
         &SigningKey::from_bytes(&[135; 32]),
@@ -408,7 +390,6 @@ async fn later_lookup_hint_case(stalled: bool) {
     }
     assert_eq!(fixture.blob_reads.load(Ordering::Relaxed), 1);
     fixture.assert_no_control_effects();
-    missing.assert_no_events();
 }
 
 #[tokio::test(start_paused = true)]
@@ -463,7 +444,7 @@ async fn progressive_fetch_distinguishes_an_empty_lookup_from_an_incomplete_one(
 async fn progressive_fetch_preserves_unavailable_and_failed_provider_outcomes() {
     let _guard = crate::protocol::exact_blob_receive_test_guard();
     let mut fixture = Fixture::new(false);
-    let mut absent = RecoveryNode::new(&fixture.net, &SigningKey::from_bytes(&[139; 32]), None);
+    let absent = RecoveryNode::new(&fixture.net, &SigningKey::from_bytes(&[139; 32]), None);
     let directory = ScriptedReplica::new(
         &fixture.net,
         &SigningKey::from_bytes(&[140; 32]),
@@ -486,7 +467,6 @@ async fn progressive_fetch_preserves_unavailable_and_failed_provider_outcomes() 
     assert!(fixture.client.fetch_blob(fixture.hash, None).await.is_err());
     assert_eq!(fixture.blob_reads.load(Ordering::Relaxed), 0);
     fixture.assert_no_control_effects();
-    absent.assert_no_events();
 }
 
 #[tokio::test(start_paused = true)]
@@ -528,7 +508,7 @@ async fn stale_provider_lease_survives_loss_alternate_fetch_and_same_endpoint_re
     // These deterministic endpoint seeds are test-only, not protocol IDs.
     let directory_key = SigningKey::from_bytes(&[101; 32]);
     let alternate_key = SigningKey::from_bytes(&[102; 32]);
-    let mut directory = RecoveryNode::new(&fixture.net, &directory_key, None);
+    let directory = RecoveryNode::new(&fixture.net, &directory_key, None);
     *fixture.client.candidates.lock().unwrap() =
         RoutingTable::new(fixture.client.my_id, [directory.peer]);
     directory.advertise(fixture.hash, fixture.provider);
@@ -552,7 +532,7 @@ async fn stale_provider_lease_survives_loss_alternate_fetch_and_same_endpoint_re
     fixture.net.crash(fixture.provider);
     fixture.server.abort();
     let serving = fixture.provider_snapshot.borrow().clone();
-    let mut alternate = RecoveryNode::new(&fixture.net, &alternate_key, serving);
+    let alternate = RecoveryNode::new(&fixture.net, &alternate_key, serving);
     let last_advertised = directory.advertise(fixture.hash, alternate.peer);
     let before = directory
         .directory
@@ -600,7 +580,7 @@ async fn stale_provider_lease_survives_loss_alternate_fetch_and_same_endpoint_re
         StoreChanges::ALL,
     )
     .unwrap();
-    let mut restarted = RecoveryNode::new(&fixture.net, &provider_key, Some(Arc::new(restored)));
+    let restarted = RecoveryNode::new(&fixture.net, &provider_key, Some(Arc::new(restored)));
     assert_eq!(restarted.peer, fixture.provider);
     assert_eq!(
         restarted.directory.lock().unwrap().retained_counts(),
@@ -644,10 +624,6 @@ async fn stale_provider_lease_survives_loss_alternate_fetch_and_same_endpoint_re
     let snapshot = fixture.store.snapshot().unwrap();
     assert_eq!(snapshot.records().unwrap().count(), 0);
     assert_eq!(snapshot.wants().unwrap().count(), 0);
-    assert!(fixture.events.try_recv().is_err());
-    directory.assert_no_events();
-    alternate.assert_no_events();
-    restarted.assert_no_events();
 }
 
 #[tokio::test(start_paused = true)]
@@ -655,7 +631,7 @@ async fn cancelled_discovered_provider_dial_leaves_a_same_client_retry_usable() 
     let _guard = crate::protocol::exact_blob_receive_test_guard();
     let mut fixture = Fixture::new(false);
     let directory_key = SigningKey::from_bytes(&[103; 32]);
-    let mut directory = RecoveryNode::new(&fixture.net, &directory_key, None);
+    let directory = RecoveryNode::new(&fixture.net, &directory_key, None);
     directory.advertise(fixture.hash, fixture.provider);
     *fixture.client.candidates.lock().unwrap() =
         RoutingTable::new(fixture.client.my_id, [directory.peer]);
@@ -708,7 +684,6 @@ async fn cancelled_discovered_provider_dial_leaves_a_same_client_retry_usable() 
         1
     );
     fixture.assert_no_control_effects();
-    directory.assert_no_events();
 }
 
 #[tokio::test(start_paused = true)]
@@ -717,7 +692,7 @@ async fn alternate_provider_success_cancels_a_stalled_discovered_dial() {
     let mut fixture = Fixture::new(false);
     let directory_key = SigningKey::from_bytes(&[104; 32]);
     let stalled_key = SigningKey::from_bytes(&[105; 32]);
-    let mut directory = RecoveryNode::new(&fixture.net, &directory_key, None);
+    let directory = RecoveryNode::new(&fixture.net, &directory_key, None);
     let stalled = stalled_key.verifying_key().to_bytes();
     let _stalled_harness = fixture.net.join(&stalled_key);
     fixture.net.stall_dials(stalled);
@@ -748,7 +723,6 @@ async fn alternate_provider_success_cancels_a_stalled_discovered_dial() {
     assert_eq!(peers.len(), 2);
     assert_eq!(fixture.blob_reads.load(Ordering::Relaxed), 1);
     fixture.assert_no_control_effects();
-    directory.assert_no_events();
 }
 
 struct SignallingBlobReader {
@@ -804,7 +778,7 @@ async fn mid_transfer_crash_rejects_old_bytes_after_restart_and_allows_fresh_ret
         StoreChanges::ALL,
     )
     .unwrap();
-    let mut restarted = RecoveryNode::new(&fixture.net, &provider_key, Some(Arc::new(restored)));
+    let _restarted = RecoveryNode::new(&fixture.net, &provider_key, Some(Arc::new(restored)));
     let failed_at = tokio::time::Instant::now();
     assert!(
         fetch.await.unwrap().is_none(),
@@ -839,8 +813,6 @@ async fn mid_transfer_crash_rejects_old_bytes_after_restart_and_allows_fresh_ret
     let snapshot = fixture.store.snapshot().unwrap();
     assert_eq!(snapshot.records().unwrap().count(), 0);
     assert_eq!(snapshot.wants().unwrap().count(), 0);
-    assert!(fixture.events.try_recv().is_err());
-    restarted.assert_no_events();
 }
 
 #[tokio::test(start_paused = true)]
@@ -1416,12 +1388,7 @@ async fn known_resident_outside_selected_dht_replicas_is_not_directly_probed() {
             health: Health::new(EndpointId::from_bytes(&peer).unwrap()),
             candidates: Arc::new(Mutex::new(RoutingTable::new(peer, []))),
             providers: Arc::new(Mutex::new(ProviderDirectory::new(peer))),
-            serve_collections: false,
             local_id: peer,
-            events: {
-                let (sender, _receiver) = tokio::sync::mpsc::channel(1);
-                sender
-            },
             recon: None,
             walks: None,
         };

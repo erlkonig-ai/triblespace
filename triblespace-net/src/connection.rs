@@ -3,11 +3,10 @@
 //! A [`ConnectionTable`] holds the connections of both directions, keyed by
 //! the remote's TLS-authenticated [`PeerId`]. Every connection, dialled or
 //! accepted, runs one accept loop. The first byte of each stream is its type
-//! tag ([`TAG_RECON`], [`TAG_DHT`], [`TAG_BLOB`] and the transitional
-//! [`TAG_REPAIR`]). The loop reads the tag before it takes any permit:
-//! `recon/1` takes none, a request stream takes one of its connection's (or
-//! is reset when none is left) and waits for one of the table's, and an
-//! unknown tag resets only its own stream.
+//! tag ([`TAG_RECON`], [`TAG_DHT`] or [`TAG_BLOB`]). The loop reads the tag
+//! before it takes any permit: `recon/1` takes none, a request stream takes
+//! one of its connection's (or is reset when none is left) and waits for one
+//! of the table's, and an unknown tag resets only its own stream.
 //!
 //! The dialler opens `recon/1`, and its first frame carries the dialler's
 //! sequence number. When a pair holds two connections, both sides keep the
@@ -47,7 +46,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::Instant;
 use tracing::{Instrument as _, debug, debug_span, info_span, warn};
 
-use crate::protocol::{PILE_SYNC_ALPN, TAG_BLOB, TAG_DHT, TAG_RECON, TAG_REPAIR, recv_u8, send_u8};
+use crate::protocol::{PILE_SYNC_ALPN, TAG_BLOB, TAG_DHT, TAG_RECON, recv_u8, send_u8};
 pub(crate) use crate::recon::{FRAME_OPEN, MAX_RECON_FRAME_BYTES};
 use crate::recon::{Frame, Malformed};
 use crate::transport::{Conn, PeerId, RecvStream, SendStream, Transport};
@@ -100,7 +99,7 @@ pub const RESET_STALLED: u32 = 4;
 /// service and holds their permits; the service answers them, and hears what
 /// happens on each connection's `recon/1`.
 pub trait Service: Clone + Send + Sync + 'static {
-    /// Serve one `dht/1`, `blob/1` or `repair/0` stream after its tag.
+    /// Serve one `dht/1` or `blob/1` stream after its tag.
     fn serve<W, R>(
         &self,
         peer: PeerId,
@@ -1066,7 +1065,7 @@ async fn stream<T: Transport, S: Service>(
             )
             .await
         }
-        TAG_DHT | TAG_BLOB | TAG_REPAIR => {
+        TAG_DHT | TAG_BLOB => {
             // A held stream keeps the opener's stream credit even after the
             // opener gave up on it, so the connection holds a bounded number
             // and resets the rest. Within the bound, a burst waits for its
@@ -1107,7 +1106,6 @@ fn tag_name(tag: u8) -> &'static str {
         TAG_RECON => "recon/1",
         TAG_DHT => "dht/1",
         TAG_BLOB => "blob/1",
-        TAG_REPAIR => "repair/0",
         _ => "unknown",
     }
 }

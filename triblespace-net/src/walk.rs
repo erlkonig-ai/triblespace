@@ -1,5 +1,21 @@
 //! Pull walks on `recon/1` (design 2.4, 2.5, D8).
 //!
+//! Each side pulls what it lacks in its own walk. A walk enumerates one
+//! peer's PATCH of one collection and kind, pinned at the walk's first
+//! request, and the puller descends only where its digests differ from the
+//! peer's. It requests the values its live store lacks and hands them to the
+//! landing task ([`crate::landing`]) as they arrive. A walk completes when its
+//! count proof closes, every value it requested landed without a failed
+//! insert, and no authorization proof stayed deferred; one that fails or is
+//! abandoned keeps what landed. A record pull is a records walk and an
+//! authorization walk, and completes when both do.
+//!
+//! A side runs at most one walk per peer, collection and kind. A walk ends
+//! after [`WALK_DEADLINE`] without progress, by failing, or by completing,
+//! and its number retires: a frame, landing acknowledgement or descriptor
+//! fetch of an ended walk is dropped and touches no successor. A responder
+//! serves a peer it sends the collection to.
+//!
 //! A walk frame names its collection, its kind and its number. The kind is
 //! the PATCH walked: records, authorization evidence or held blob references.
 //! The number is the puller's, counted per peer, collection and kind, so a
@@ -43,7 +59,7 @@ use crate::collection_activation::{
     CollectionAuthorizationEvidenceError, CollectionRepairOverlay, record_root,
 };
 use crate::collection_delta::{decode_record, encode_record};
-use crate::collection_wire::MAX_COLLECTION_LEAF_BYTES;
+use crate::collection_wire::{MAX_COLLECTION_LEAF_BYTES, manifest};
 use crate::connection::{ConnectionTable, Link, ReconEvent, Service};
 use crate::health::{Health, RepairComparison, RepairFailure, RepairFrontier};
 use crate::host::{CollectionSnapshot, METADATA_BLOB_BYTES, StoreSnapshot};
@@ -719,7 +735,7 @@ impl Walks {
             running: 0,
             completed: local.is_some(),
             failure: local.is_none().then_some(RepairFailure::Failed),
-            local: local.as_ref().map(|local| frontier(local.repair())),
+            local: local.as_ref().map(|local| manifest(local.repair()).into()),
             compared_at: None,
             records: None,
             authorization: None,
@@ -1234,14 +1250,6 @@ fn answer(kind: WalkKind, overlay: &CollectionRepairOverlay, request: Request) -
             }?;
             Some(Response::Value { key, bytes })
         }
-    }
-}
-
-fn frontier(overlay: &CollectionRepairOverlay) -> RepairFrontier {
-    RepairFrontier {
-        wake_root: overlay.wake_root(),
-        records: overlay.records().summary(),
-        authorization_evidence: overlay.authorization_evidence().summary(),
     }
 }
 
