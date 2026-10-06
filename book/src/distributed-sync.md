@@ -255,10 +255,14 @@ An unknown tag, or an unknown `dht/1` operation, resets only its own stream
 dropped. `recon/1` takes no permit. A request stream (`dht/1` or `blob/1`)
 does: an opener keeps at most 16 open per connection, the accepting side holds
 at most 32 per connection and resets the rest (`RESET_BUSY`), and at most 16
-are served at once across the host, each within 300 seconds. A stream first
-takes one of its connection's 8 permits and then one of the host's, so a peer
-that holds its requests open until their deadline occupies at most half the
-host and leaves the other half to the rest. QUIC allows 100 open
+are served at once across the host, each within 300 seconds. A stream on a
+connection that carries no peering first takes one of 8 permits that every
+such connection shares, and then one of the host's; a stream on a neighbour
+connection takes only the host's. Keys cost nothing, so a share per key or
+per connection would bound nothing: strangers that hold their requests open
+until their deadline, on however many connections, occupy at most half the
+host, and the other half stays for the peers it syncs a collection with.
+QUIC allows 100 open
 bidirectional streams per direction, so `recon/1` can always be reopened
 beside a full set of request streams.
 
@@ -290,16 +294,21 @@ may have lost frames the peer never read, so each side sends again on that
 connection the frame its side of each peering rests on: a request or
 invitation still waiting for its answer, or its flags. The acceptor answers a
 repeated request as it did the first. The dialler opens the next stream as
-soon as the last one ends, but no sooner than one second after it opened the
-last, so a peer that ends every stream at once costs one stream a second
-rather than a loop.
+soon as the last one ends if that one carried a frame either way, read or
+written whole; otherwise it opens one when it next queues a frame. A peer that
+ends every stream as it arrives therefore gets no loop of streams, and the
+connection goes idle like any other.
 
 The queue refuses no frame, so what it holds is bounded by what is put on it.
-A walk responder leaves a request unanswered while the connection already
-queues 1,024 frames, at most 64 KiB each, and the grant exchange answers one
-proof request per digest it sent; a peer that asks faster than it reads
-therefore stops being answered rather than growing the queue, and the walk it
-asked for ends at its own deadline.
+A walk responder, and a side asked to peer, leave a request unanswered while
+the connection already queues 1,024 frames, at most 64 KiB each, and the grant
+exchange answers one proof request per digest it sent; a peer that asks faster
+than it reads therefore stops being answered rather than growing the queue.
+The walk it asked for ends at its own deadline, and an unanswered peering
+request is asked again when the stalled stream ends. A puller keeps at most
+256 walk requests in flight per connection, a quarter of that bound, since
+the responder's queue also holds its own requests and other frames, so a
+puller that reads is always answered.
 
 A `recon/1` frame is its kind (one byte), a big-endian `u32` payload length,
 and a payload of at most 64 KiB. Every frame about a collection starts with the
@@ -490,7 +499,8 @@ between two Full neighbours, is one walk of the peer's held set of C.
 A walk is named by its collection, its kind (records `0`, authorization `1`,
 references `2`) and a `u16` number the puller counts per peer, collection and
 kind. A side runs at most one walk per peer, collection and kind. A walk ends
-by completing, by failing, or after 60 seconds without progress, and its number
+by completing, by failing, or after 60 seconds without progress while something
+is owed to it, and its number
 retires: a frame, landing acknowledgement or blob fetch of an ended walk is
 dropped and touches no successor.
 
@@ -524,6 +534,10 @@ another walk landed meanwhile is not fetched again; a duplicate fetch is
 harmless under union. A walk keeps at most 64 node requests, value requests and
 blob fetches in flight and hands at most 1,024 values to landing ahead of their
 acknowledgement; while that queue is full it requests no further nodes. The
+walks on one connection keep at most 256 requests in flight together, opens
+included, and the walk with the fewest in flight gets the next one that frees.
+A walk waiting for that budget is owed nothing, so its 60-second deadline
+starts only when it sends. The
 puller validates node summaries against the requests they answer, so every node
 hash-chains to the pinned root. A record value must decode, with its
 signature, to a COMMIT or DERIVE naming C under the fingerprint it was
@@ -581,7 +595,9 @@ It lands when its held descriptor validates it, waits in memory while the
 descriptor is missing (`HealthSnapshot::available` lists its collection), and
 is dropped otherwise. Waiting proofs are bounded: one sender keeps at most 256
 of them and every sender together at most 1,024, and the rest are dropped
-before their signatures are checked and fetch nothing. A proof that is
+before their signatures are checked and fetch nothing. A sender's waiting
+proofs are dropped when its last connection closes, so keys that came and went
+do not keep the bound full. A proof that is
 evidence under a held descriptor never waits, so these bounds keep none of
 those out. A proof for a collection that is not active is validated against
 the resident blob at its resource, which is taken for a descriptor only up to
@@ -858,11 +874,13 @@ A host's peers come from its pile, never from configuration; there is no list
 of peers to give it. The keys a selected collection's content names, the
 signers of its records and its grant-chain keys, are its first peering
 candidates (tiers 1 and 2 under *Neighbours*), dialled by key through iroh's
-address discovery. TLS authenticates every connection, so each `recon/1` that
-opens makes its peer a verified DHT route, and the provider lookup at the
-collection's next draw has a contact: a host whose only route is the signer of
-a record it holds finds the collection's other providers, tier 3, through that
-signer.
+address discovery. TLS authenticates every connection, so each connection a
+host dials makes the key it dialled a verified DHT route, and the provider
+lookup at the collection's next draw has a contact: a host whose only route is
+the signer of a record it holds finds the collection's other providers, tier
+3, through that signer. A connection a host accepts makes no route by opening:
+anybody can dial with a fresh key, as a process that dials its pile's daemon
+with a key per call does.
 
 A process whose pile names no peer, such as a foreground reader, has one first
 contact: the pile's sync daemon. `PeerConfig::daemon` names it by its key, the
