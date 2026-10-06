@@ -185,6 +185,9 @@ struct Serving<S: SnapshotSource> {
     store: Arc<Mutex<Option<S>>>,
     sender: NetSender,
     publication: Mutex<Publication<S::Snapshot>>,
+    /// When evidence passed outside walks was last drained, or values a
+    /// walk received last landed.
+    last_event_at: Mutex<crate::clock::Mono>,
 }
 
 struct Publication<T> {
@@ -287,6 +290,7 @@ where
         let Some(serving) = self.0.upgrade() else {
             return vec![false; events.len()];
         };
+        *serving.last_event_at.lock().expect("event clock mutex") = crate::clock::mono_now();
         let mut publication = serving.publication.lock().expect("publication mutex");
         let mut guard = serving.store.lock().expect("store mutex");
         let Some(store) = guard.as_mut() else {
@@ -364,7 +368,6 @@ where
     serving: Arc<Serving<S>>,
     /// Local retry/cursor state; demand and residency are observed in the store.
     reconciler: Reconciler,
-    last_event_at: crate::clock::Mono,
 }
 
 impl<S> Peer<S>
@@ -436,6 +439,7 @@ where
                 #[cfg(test)]
                 rebuilds: 0,
             }),
+            last_event_at: Mutex::new(crate::clock::mono_now()),
         });
         sender.install_lander(Arc::new(Lander(Arc::downgrade(&serving))));
         let mut peer = Self {
@@ -449,7 +453,6 @@ where
             receiver,
             serving,
             reconciler: Reconciler::new(),
-            last_event_at: crate::clock::mono_now(),
         };
         if peer.host_is_running() {
             peer.refresh();
@@ -546,8 +549,14 @@ where
             .unwrap_or_default()
     }
 
+    /// When this peer last received anything: evidence the host passed
+    /// outside walks, drained by [`Self::refresh`], or values a walk landed.
     pub fn last_event_at(&self) -> crate::clock::Mono {
-        self.last_event_at
+        *self
+            .serving
+            .last_event_at
+            .lock()
+            .expect("event clock mutex")
     }
 
     /// Activate one collection for serving, repair, and peering.
@@ -678,7 +687,11 @@ where
             let Some(event) = self.receiver.try_recv() else {
                 break;
             };
-            self.last_event_at = crate::clock::mono_now();
+            *self
+                .serving
+                .last_event_at
+                .lock()
+                .expect("event clock mutex") = crate::clock::mono_now();
             incoming.push(event);
         }
 
@@ -1122,6 +1135,23 @@ mod tests {
         assert!(never_started.await.is_none());
         assert_eq!(starts.load(Ordering::SeqCst), 1);
         assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    /// Values a walk lands are events, as evidence passed outside walks is:
+    /// `trible pile net sync --quiescent-for` keeps running while walks
+    /// repair records.
+    #[tokio::test]
+    async fn values_a_walk_lands_are_events() {
+        let key = SigningKey::from_bytes(&[84; 32]);
+        let (sender, receiver, _wiring) =
+            host::wire(crate::identity::iroh_secret(&key).public().into());
+        let peer = Peer::with_wiring(MemoryRepo::default(), sender, receiver);
+        let before = peer.last_event_at();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let blob = Blob::<UnknownBlob>::new(Bytes::from_source(b"landed by a walk".to_vec()));
+        let lander = Lander(Arc::downgrade(&peer.serving));
+        assert_eq!(lander.land(vec![NetEvent::Blob(blob)]), [true]);
+        assert!(peer.last_event_at() > before);
     }
 
     #[tokio::test]
