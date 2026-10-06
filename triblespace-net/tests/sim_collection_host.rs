@@ -496,6 +496,16 @@ fn write_proof_later_activates_repaired_commit_without_reaching_publisher() {
             write_capability(),
             collection.handle(),
         );
+        // The server holds the reader's grant: no repair session carries
+        // a reader's proofs to the server any more.
+        server_store
+            .insert_proof(proof(
+                &read_root,
+                &reader_key,
+                read_capability(),
+                collection.handle(),
+            ))
+            .unwrap();
 
         let mut reader_store = MemoryRepo::default();
         let reader_collection = register(&mut reader_store, policy);
@@ -579,7 +589,7 @@ fn write_proof_later_activates_repaired_commit_without_reaching_publisher() {
 }
 
 #[test]
-fn native_read_proof_bootstraps_on_retry_and_rejects_writer_only_peer() {
+fn a_reader_repairs_records_and_proofs_and_a_writer_only_peer_learns_nothing() {
     let _guard = test_guard();
     let clock = virtual_clock();
     clock.reset();
@@ -610,6 +620,16 @@ fn native_read_proof_bootstraps_on_retry_and_rejects_writer_only_peer() {
             collection.handle(),
         );
         server_store.insert_proof(write.clone()).unwrap();
+        // The server holds the reader's grant: no repair session carries
+        // a reader's proofs to the server any more.
+        server_store
+            .insert_proof(proof(
+                &read_root,
+                &reader_key,
+                read_capability(),
+                collection.handle(),
+            ))
+            .unwrap();
         let payload_facts = entity! {
             triblespace_core::metadata::tag: triblespace_core::metadata::KIND_MULTI,
         }

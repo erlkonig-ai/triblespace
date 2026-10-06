@@ -164,6 +164,7 @@ async fn find_value_answers_routes_and_provider_hints_in_one_reply() {
             local_id: provider,
             events,
             recon: None,
+            walks: None,
         },
         requester: requester_key.verifying_key(),
     };

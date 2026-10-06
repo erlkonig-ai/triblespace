@@ -298,6 +298,8 @@ impl Peerings {
                 self.links.entry(link.id()).or_insert_with(|| link.clone());
                 self.frame(&link, frame);
             }
+            // Peerings belong to the connection and outlive its streams.
+            ReconEvent::Ended(_) => {}
             ReconEvent::Closed(link) => {
                 self.links.remove(&link.id());
                 let successor = self.link_to(link.peer());

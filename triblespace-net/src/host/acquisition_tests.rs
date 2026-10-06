@@ -21,7 +21,6 @@ use crate::transport::sim::{SimConfig, SimNet, SimTransport};
 use super::*;
 
 mod exact_h_diagnostics;
-mod repair_refusal;
 mod request_backpressure;
 
 struct CountedBlobReader {
@@ -126,6 +125,7 @@ impl Fixture {
             local_id: provider,
             events: events_tx,
             recon: None,
+            walks: None,
         };
         let connections = ConnectionTable::new(server_harness.transport.clone(), handler);
         let server = tokio::spawn(async move {
@@ -194,6 +194,7 @@ impl RecoveryNode {
             local_id: peer,
             events: events_tx,
             recon: None,
+            walks: None,
         };
         let connections = ConnectionTable::new(harness.transport.clone(), handler);
         let server = tokio::spawn(async move {
@@ -1422,6 +1423,7 @@ async fn known_resident_outside_selected_dht_replicas_is_not_directly_probed() {
                 sender
             },
             recon: None,
+            walks: None,
         };
         let connections = ConnectionTable::new(harness.transport.clone(), handler);
         servers.push(tokio::spawn(async move {

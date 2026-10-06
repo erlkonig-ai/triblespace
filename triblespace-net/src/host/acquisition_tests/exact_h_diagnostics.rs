@@ -494,6 +494,7 @@ impl Node {
             local_id: peer,
             events: events_tx,
             recon: None,
+            walks: None,
         };
         let server_trace = trace.clone();
         let server_gate = gate.clone();

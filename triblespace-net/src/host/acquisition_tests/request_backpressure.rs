@@ -89,6 +89,7 @@ async fn saturated_requests_complete_without_closing_connection(connection_count
         local_id: provider,
         events,
         recon: None,
+        walks: None,
     };
     let (accepted_tx, mut accepted_rx) = tokio::sync::watch::channel(0usize);
     let table = ConnectionTable::new(

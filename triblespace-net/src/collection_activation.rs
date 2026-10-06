@@ -43,6 +43,8 @@ const COLLECTION_REPAIR_ROOT_DOMAIN: &[u8] = b"triblespace.collection.repair-ove
 /// Version 3: the record component holds foundations only (COMMIT and DERIVE)
 /// and the blob component is the held set of the core index.
 const COLLECTION_REPAIR_ROOT_VERSION: u32 = 3;
+/// Version 4: records and authorization evidence only, without held blobs.
+const COLLECTION_RECORD_ROOT_VERSION: u32 = 4;
 
 type AuthorizationEvidencePatch = PATCH<64, IdentitySchema, CapabilityProof, Blake3Merkle>;
 /// Subject key | hash of the proof prefix that ends at that subject.
@@ -517,6 +519,23 @@ impl CollectionRepairOverlay {
         self.authorization_evidence.reader = reader;
         self
     }
+}
+
+/// The root of a collection's records and authorization evidence: what a
+/// record pull walks, and what an announcement of that state carries. Unlike
+/// [`CollectionRepairOverlay::wake_root`] it leaves held blobs out.
+pub fn record_root(
+    collection: CollectionHandle,
+    records: PatchSummary,
+    authorization: PatchSummary,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(COLLECTION_REPAIR_ROOT_DOMAIN);
+    hasher.update(&COLLECTION_RECORD_ROOT_VERSION.to_be_bytes());
+    hasher.update(&collection.raw);
+    update_summary(&mut hasher, records);
+    update_summary(&mut hasher, authorization);
+    *hasher.finalize().as_bytes()
 }
 
 fn update_summary(hasher: &mut blake3::Hasher, summary: PatchSummary) {
