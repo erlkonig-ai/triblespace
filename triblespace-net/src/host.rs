@@ -1417,7 +1417,7 @@ fn spawn_wake_topic<P: CollectionWakeNetwork>(
                 }
             };
             let _ = root_rx.borrow_and_update();
-            let mut schedule = WakeSchedule::new(crate::clock::mono_now(), rand::random());
+            let mut schedule = WakeSchedule::<()>::new(crate::clock::mono_now(), rand::random());
             let mut relay = crate::wake_relay::WakeRelay::default();
             'events: loop {
                 let deadline = relay
@@ -1431,7 +1431,7 @@ fn spawn_wake_topic<P: CollectionWakeNetwork>(
                         schedule.local_changed(now, rand::random());
                         // A changed union root is an honest new local offer,
                         // not a claim to serve the exact upstream root.
-                        schedule.neighbor_joined(now, rand::random());
+                        schedule.neighbor_joined(now, rand::random(), ());
                         relay.refreshed(current.filter(|_| advertise), now);
                     },
                     () = tokio::time::sleep(deadline.duration_since(crate::clock::mono_now())) => {
@@ -1450,7 +1450,7 @@ fn spawn_wake_topic<P: CollectionWakeNetwork>(
                                 debug!(%error, "collection state hint relay failed");
                             }
                         }
-                        if schedule.poll(now, rand::random()) && !offered_local
+                        if !schedule.poll(now, rand::random(), [()]).is_empty() && !offered_local
                             && let Some(root) = serving
                             && let Err(error) = topic.broadcast_wake(root).await
                         {
@@ -1481,7 +1481,7 @@ fn spawn_wake_topic<P: CollectionWakeNetwork>(
                         relay.observe(&received.wake, current.filter(|_| advertise), now);
                         if let Some(root) = current {
                             if root == received.wake.root() {
-                                schedule.consistent_root(now);
+                                schedule.consistent_root(now, ());
                             } else {
                                 schedule.different_root(now, rand::random());
                             }
@@ -1494,7 +1494,7 @@ fn spawn_wake_topic<P: CollectionWakeNetwork>(
                         Ok(Some(CollectionWakeEvent::Lagged)) => {
                             let _ = notices.try_send(WakeNotice::Lagged { collection });
                             let now = crate::clock::mono_now();
-                            schedule.neighbor_joined(now, rand::random());
+                            schedule.neighbor_joined(now, rand::random(), ());
                             relay.neighbor_joined(now);
                         }
                         Ok(Some(CollectionWakeEvent::Rejected { error, .. })) => {
@@ -1502,7 +1502,7 @@ fn spawn_wake_topic<P: CollectionWakeNetwork>(
                         }
                         Ok(Some(CollectionWakeEvent::NeighborUp(peer))) => {
                             let now = crate::clock::mono_now();
-                            schedule.neighbor_joined(now, rand::random());
+                            schedule.neighbor_joined(now, rand::random(), ());
                             relay.neighbor_up(peer, now);
                         }
                         Ok(Some(CollectionWakeEvent::NeighborDown(peer))) => { relay.neighbor_down(peer); }
