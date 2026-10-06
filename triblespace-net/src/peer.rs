@@ -277,7 +277,7 @@ struct Lander<S: SnapshotSource>(Weak<Serving<S>>);
 
 impl<S> Land for Lander<S>
 where
-    S: BlobStore + CollectionStore + CapabilityProofStore + Send + 'static,
+    S: BlobStore + CollectionStore + CapabilityProofStore + HeldStore + Send + 'static,
     S::Snapshot: StoreRead + HeldRead,
 {
     fn land(&self, events: Vec<NetEvent>) -> Vec<bool> {
@@ -295,8 +295,10 @@ where
                 NetEvent::CollectionRecord(record) => store.insert(record).is_ok(),
                 NetEvent::CapabilityProof(proof) => store.insert_proof(proof).is_ok(),
                 NetEvent::Blob(blob) => store.put::<UnknownBlob, _>(blob).is_ok(),
-                // Hints reach the store through refresh, never through a walk.
-                NetEvent::BlobHint { .. } | NetEvent::BlobInventoryPassCompleted { .. } => false,
+                NetEvent::Held { collection, handle } => {
+                    store.note_held(collection, Inline::new(handle));
+                    true
+                }
             })
             .collect::<Vec<_>>();
         let snapshot = store.snapshot();
@@ -526,10 +528,6 @@ where
         &self.reconciler
     }
 
-    pub(crate) fn reconciler_mut(&mut self) -> &mut Reconciler {
-        &mut self.reconciler
-    }
-
     /// Stock gossip wake plane for a production iroh peer.
     ///
     /// Caller-owned wiring and a dormant lazy peer have no implicit wake handle
@@ -650,7 +648,7 @@ where
     }
 
     /// Drain the evidence the host passed outside walks (descriptor warmups
-    /// and held-blob hints) and replace the immutable active-collection
+    /// and grants) and replace the immutable active-collection
     /// snapshot without flushing the backend. Walks land through the host's
     /// landing task, which also reobserves external appends on its own timer;
     /// calling this reobserves them at once.
@@ -710,22 +708,8 @@ where
         for batch in incoming {
             for event in batch.into_events() {
                 match event {
-                    NetEvent::BlobHint {
-                        collection,
-                        source,
-                        handle,
-                    } => {
-                        // A peer holds H in C. If H is resident at the next
-                        // snapshot it is held in C here too, in every
-                        // replication mode and whether or not the hint
-                        // window below retains the hint for acquisition.
+                    NetEvent::Held { collection, handle } => {
                         store.note_held(collection, Inline::new(handle));
-                        self.reconciler
-                            .observe_blob_hint_from(collection, source, handle);
-                    }
-                    NetEvent::BlobInventoryPassCompleted { collection, source } => {
-                        self.reconciler
-                            .finish_blob_inventory_pass(collection, source);
                     }
                     NetEvent::Blob(verified) => {
                         // Verified on the wire against the handle it was fetched
@@ -767,11 +751,6 @@ where
             );
         }
         let snapshot = store.snapshot().map_err(PeerSnapshotError::Store)?;
-        // Hints resident by now, however they arrived, are held in their
-        // collection from the next snapshot on.
-        for (collection, handle) in self.reconciler.prune_blob_hints(&snapshot) {
-            store.note_held(collection, Inline::new(handle));
-        }
         // Publication reads only the frozen snapshot; landing and reconcile
         // need not wait for it.
         drop(guard);

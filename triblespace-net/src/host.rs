@@ -61,6 +61,7 @@ use crate::wake::{
     CollectionWakeSubscription, ReceivedCollectionWake,
 };
 use crate::wake_schedule::WakeSchedule;
+use crate::walk::PullKind;
 
 /// Ephemeral local collection interest. It is deliberately not a durable
 /// marker or ambient registry.
@@ -1511,7 +1512,6 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
         crate::walk::Walks::new(config.qos.direction.serves(), wiring.health.clone()),
         walks_rx,
         wiring.lander.clone(),
-        wiring.evt_tx.clone(),
     );
     // Peerings and announcements ride the connections' recon/1 streams
     // beside the wake path below. Announcements start record pulls, and hear
@@ -1524,7 +1524,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
         wiring.snapshot.clone(),
         recon_rx,
         found_rx,
-        move |peer, collection| record_pulls.start_record_pull(peer, collection),
+        move |peer, collection| record_pulls.start(peer, collection, PullKind::Records),
         ended_rx,
         wiring.health.clone(),
         wiring.evt_tx.clone(),
@@ -1769,6 +1769,9 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
         }
         while let Ok(pulled) = pulled.try_recv() {
             let _ = ended_tx.send(pulled);
+            if pulled.kind == PullKind::References {
+                continue;
+            }
             // The walks keep the pair's health; this keeps its retry state.
             let outcome = RepairOutcome {
                 target: RepairTarget {
@@ -2063,10 +2066,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
                     continue;
                 }
                 in_flight.insert(target);
-                // The repair repeats the old session's components: records
-                // and authorization, then held references as hints.
-                pulls.start_record_pull(target.peer, target.collection);
-                pulls.start_reference_pull(target.peer, target.collection);
+                pulls.start(target.peer, target.collection, PullKind::Records);
             }
         }
 

@@ -483,6 +483,12 @@ pub fn record_root(
     *hasher.finalize().as_bytes()
 }
 
+/// The digest of a collection's held set that two Full neighbours compare
+/// (design 2.9): the set's Merkle root, all zeros for the empty set.
+pub(crate) fn held_digest(held: PatchSummary) -> [u8; 32] {
+    held.root().unwrap_or_default()
+}
+
 fn update_summary(hasher: &mut blake3::Hasher, summary: PatchSummary) {
     match summary.root() {
         Some(root) => {

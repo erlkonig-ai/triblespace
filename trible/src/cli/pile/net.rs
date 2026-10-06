@@ -553,13 +553,11 @@ fn run_sync(
                 if stats.fulfilled > 0 || stats.replication.acquired > 0 {
                     last_want_progress = std::time::Instant::now();
                 }
-                if stats.replication.acquired > 0 || stats.replication.inventory > 0 {
+                if stats.replication.acquired > 0 {
                     eprintln!(
-                        "  hydration: {} direct roots, {} pending; {} positive inventory hints, {} still missing; {} acquired",
+                        "  hydration: {} direct roots, {} pending; {} acquired",
                         stats.replication.roots,
                         stats.replication.pending,
-                        stats.replication.inventory,
-                        stats.replication.inventory_pending,
                         stats.replication.acquired,
                     );
                 }

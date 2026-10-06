@@ -32,7 +32,7 @@ use crate::protocol::RawHash;
 use crate::recon::Frame;
 use crate::transport::PeerId;
 use crate::wake_schedule::WakeSchedule;
-use crate::walk::RecordPullDone;
+use crate::walk::{PullDone, PullKind};
 
 /// A record pull of a collection from a peer.
 pub(crate) type Pull = (PeerId, CollectionHandle);
@@ -199,13 +199,17 @@ impl Announcements {
     /// completed one of its neighbour, and resets the timer once. An
     /// announcement heard during the pull is heard now. Returns the record
     /// pull to start, if any.
-    pub(crate) fn ended(&mut self, done: RecordPullDone, now: Mono) -> Option<Pull> {
-        let RecordPullDone {
+    pub(crate) fn ended(&mut self, done: PullDone, now: Mono) -> Option<Pull> {
+        let PullDone {
             peer,
             collection,
+            kind,
             root,
             completed,
         } = done;
+        if kind == PullKind::References {
+            return None;
+        }
         let pending = self.pulls.remove(&(collection.raw, peer)).flatten();
         let announcing = self.collections.get_mut(&collection.raw)?;
         if completed {
@@ -442,7 +446,8 @@ mod tests {
         assert!(during.len() <= 1, "{during:?}");
 
         let merged = root(50);
-        let ended = RecordPullDone {
+        let ended = PullDone {
+            kind: PullKind::Records,
             peer: A,
             collection: c,
             root: root(100),
@@ -465,7 +470,8 @@ mod tests {
         node.observe([(c, root(0))], now);
         let a = wire(1, A);
         node.neighbours([(c, &a.link, true)], now);
-        let walked = |number| RecordPullDone {
+        let walked = |number| PullDone {
+            kind: PullKind::Records,
             peer: A,
             collection: c,
             root: root(number),
@@ -482,7 +488,7 @@ mod tests {
         assert_eq!(node.heard(A, c, root(4), true, now), None);
         assert_eq!(node.ended(walked(3), now), Some((A, c)));
         // A pull that did not complete leaves no walked root behind.
-        let failed = RecordPullDone {
+        let failed = PullDone {
             completed: false,
             ..walked(4)
         };

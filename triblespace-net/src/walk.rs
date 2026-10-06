@@ -10,10 +10,16 @@
 //! abandoned keeps what landed. A record pull is a records walk and an
 //! authorization walk, and completes when both do.
 //!
+//! A reference pull walks the blobs a collection holds at the peer (design
+//! 2.9). A held blob the local held set lacks joins it: one resident here is
+//! noted held as it is, another is fetched by hash from the peer first. A
+//! failed fetch leaves the pull incomplete, and the blob stays in the next
+//! difference.
+//!
 //! A side runs at most one walk per peer, collection and kind. A walk ends
 //! after [`WALK_DEADLINE`] without progress, by failing, or by completing,
-//! and its number retires: a frame, landing acknowledgement or descriptor
-//! fetch of an ended walk is dropped and touches no successor. A responder
+//! and its number retires: a frame, landing acknowledgement or blob fetch of
+//! an ended walk is dropped and touches no successor. A responder
 //! serves a peer it sends the collection to.
 //!
 //! A walk frame names its collection, its kind and its number. The kind is
@@ -53,10 +59,10 @@ use triblespace_core::patch::{Blake3Merkle, IdentitySchema, PATCH};
 use triblespace_core::repo::SnapshotSource;
 use triblespace_core::trible::TribleSet;
 
-use crate::channel::{NetEvent, NetEventBatch};
+use crate::channel::NetEvent;
 use crate::clock::Mono;
 use crate::collection_activation::{
-    CollectionAuthorizationEvidenceError, CollectionRepairOverlay, record_root,
+    CollectionAuthorizationEvidenceError, CollectionRepairOverlay, held_digest, record_root,
 };
 use crate::collection_delta::{decode_record, encode_record};
 use crate::collection_wire::{MAX_COLLECTION_LEAF_BYTES, manifest};
@@ -68,7 +74,7 @@ use crate::patch_repair::{
     PatchBranch, PatchChild, PatchLeaf, PatchNode, PatchNodeResponse, PatchRepairRequest,
     PatchRepairWalker, PatchSummary, patch_node_response, validate_patch_node,
 };
-use crate::protocol::{RawHash, op_get_blob_with_limit};
+use crate::protocol::{MAX_EXACT_BLOB_BYTES, RawHash, op_get_blob_with_limit};
 use crate::recon::{FRAME_WALK_END, FRAME_WALK_REQUEST, FRAME_WALK_RESPONSE, Frame, Malformed};
 use crate::transport::{PeerId, Transport};
 
@@ -400,7 +406,7 @@ impl Reader<'_> {
 /// ended waits for something owed, a response, a landing acknowledgement or
 /// a descriptor.
 pub(crate) const WALK_DEADLINE: Duration = Duration::from_secs(60);
-/// Node and value requests one walk keeps in flight.
+/// Node and value requests and blob fetches one walk keeps in flight.
 const MAX_WALK_REQUESTS: usize = 64;
 /// Values one walk hands to landing before they are acknowledged. A walk
 /// whose landing queue is full requests no further nodes.
@@ -410,24 +416,35 @@ const WALK_TICK: Duration = Duration::from_secs(1);
 /// Frame events waiting for the walk task.
 pub(crate) const WALK_EVENTS: usize = 256;
 
-/// One walk of this side's, as landing and descriptor fetches name it.
+/// One walk of this side's, as landing and blob fetches name it.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct WalkRef {
     pub(crate) peer: PeerId,
     pub(crate) walk: WalkId,
 }
 
-/// A record pull ended: its records walk and its authorization walk both
-/// did.
+/// What a pull from one peer walks.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum PullKind {
+    /// A collection's records and authorization evidence: a records walk and
+    /// an authorization walk.
+    Records,
+    /// The blobs it holds: one references walk.
+    References,
+}
+
+/// A pull ended: a record pull once both of its walks did.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RecordPullDone {
+pub(crate) struct PullDone {
     pub(crate) peer: PeerId,
     pub(crate) collection: CollectionHandle,
-    /// The [`record_root`] of the summaries the walks pinned at the peer; a
-    /// walk that ended before its summary counts as empty.
+    pub(crate) kind: PullKind,
+    /// What the walks pinned at the peer: a record pull's [`record_root`], a
+    /// reference pull's [`held_digest`]. A walk that ended before its
+    /// summary counts as empty.
     pub(crate) root: [u8; 32],
-    /// Both walks completed: their count proofs closed, every value they
-    /// requested landed without a failed insert, and no proof stayed
+    /// Every walk completed: its count proof closed, every value it requested
+    /// or blob it fetched landed without a failed insert, and no proof stayed
     /// deferred.
     pub(crate) completed: bool,
 }
@@ -436,15 +453,14 @@ pub(crate) struct RecordPullDone {
 pub(crate) enum Output {
     /// Values for the landing task, acknowledged under their walk.
     Land(WalkRef, Vec<NetEvent>),
-    /// A held-blob hint for the store side, which nothing acknowledges.
-    Hint(NetEvent),
-    /// Fetch the routing descriptor a deferred proof names, from the peer.
+    /// Fetch a blob by hash from the walk's peer: a held reference, or the
+    /// routing descriptor a deferred `proof` names.
     Fetch {
         walk: WalkRef,
-        proof: CapabilityProof,
-        descriptor: RawHash,
+        handle: RawHash,
+        proof: Option<CapabilityProof>,
     },
-    Done(RecordPullDone),
+    Done(PullDone),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -475,7 +491,8 @@ struct Pull {
     values: HashSet<[u8; KEY_BYTES]>,
     /// Values handed to landing and not acknowledged yet.
     unlanded: usize,
-    /// Descriptor fetches in flight for deferred proofs.
+    /// Blob fetches in flight: held references and the descriptors of
+    /// deferred proofs.
     fetching: usize,
     landed: u64,
     failed: u64,
@@ -485,12 +502,13 @@ struct Pull {
 }
 
 impl Pull {
-    /// Take one response. A missing leaf becomes a value request, or a hint
-    /// for a held reference; an arriving value goes to landing.
+    /// Take one response. A missing leaf becomes a value request, or for a
+    /// held reference a held note or a fetch; an arriving value goes to
+    /// landing.
     fn accept(
         &mut self,
         response: Response,
-        live: Option<&CollectionSnapshot>,
+        snapshot: Option<&StoreSnapshot>,
         peer: PeerId,
         now: Mono,
         outputs: &mut Vec<Output>,
@@ -499,6 +517,8 @@ impl Pull {
         let WalkId {
             collection, kind, ..
         } = self.walk;
+        let live = snapshot.and_then(|snapshot| snapshot.collection(collection));
+        let live = live.as_deref();
         match response {
             Response::Summary(summary) => {
                 if self.summary.is_some() {
@@ -526,11 +546,23 @@ impl Pull {
                     let key = <[u8; KEY_BYTES]>::try_from(leaf.key)
                         .map_err(|_| anyhow!("a walk leaf key of the wrong length"))?;
                     if kind == WalkKind::References {
-                        outputs.push(Output::Hint(NetEvent::BlobHint {
+                        let held = NetEvent::Held {
                             collection,
-                            source: peer,
                             handle: key,
-                        }));
+                        };
+                        if snapshot.is_some_and(|snapshot| snapshot.get_blob(&key).is_some()) {
+                            self.land(peer, vec![held], outputs);
+                        } else {
+                            self.fetching += 1;
+                            outputs.push(Output::Fetch {
+                                walk: WalkRef {
+                                    peer,
+                                    walk: self.walk,
+                                },
+                                handle: key,
+                                proof: None,
+                            });
+                        }
                     } else {
                         self.link
                             .send(frame(self.walk, WalkBody::Request(Request::Value(key))));
@@ -578,8 +610,8 @@ impl Pull {
                                         peer,
                                         walk: self.walk,
                                     },
-                                    proof,
-                                    descriptor: descriptor.raw,
+                                    handle: descriptor.raw,
+                                    proof: Some(proof),
                                 });
                             }
                             Err(CollectionAuthorizationEvidenceError::WrongRoot) if routed => {
@@ -612,7 +644,7 @@ impl Pull {
             return Ok(());
         };
         let (kind, local) = (self.walk.kind, self.local.repair());
-        while self.nodes.len() + self.values.len() < MAX_WALK_REQUESTS
+        while self.nodes.len() + self.values.len() + self.fetching < MAX_WALK_REQUESTS
             && self.unlanded < MAX_WALK_UNLANDED
         {
             let Some(request) =
@@ -753,8 +785,8 @@ impl Walks {
         }
     }
 
-    /// Start a walk of C's held references from the peer on `link`, unless
-    /// one runs. Missing references become hints for the store side.
+    /// Start a pull of the blobs C holds at the peer on `link`, unless one
+    /// runs.
     pub(crate) fn start_reference_pull(
         &mut self,
         link: &Link,
@@ -765,13 +797,29 @@ impl Walks {
         if self.pulls.contains_key(&key) {
             return;
         }
-        if let Some(local) = self.local(collection) {
-            self.open(link, collection, WalkKind::References, local, now);
+        match self.local(collection) {
+            Some(local) => self.open(link, collection, WalkKind::References, local, now),
+            None => self.references_done(link.peer(), collection, None, false),
         }
     }
 
-    /// A record pull of C from `peer` could not start: no connection.
-    pub(crate) fn unreachable(&mut self, peer: PeerId, collection: CollectionHandle, now: Mono) {
+    /// A pull of C from `peer` could not start: no connection.
+    pub(crate) fn unreachable(
+        &mut self,
+        peer: PeerId,
+        collection: CollectionHandle,
+        kind: PullKind,
+        now: Mono,
+    ) {
+        if kind == PullKind::References {
+            if !self
+                .pulls
+                .contains_key(&(peer, collection.raw, WalkKind::References))
+            {
+                self.references_done(peer, collection, None, false);
+            }
+            return;
+        }
         if self.record_pulls.contains_key(&(peer, collection.raw)) {
             return;
         }
@@ -876,13 +924,9 @@ impl Walks {
         let Some(response) = response else {
             return self.end(key, Ending::Failed, false, now);
         };
-        let live = self
-            .snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.collection(walk.collection));
         let accepted = pull.accept(
             response,
-            live.as_deref(),
+            self.snapshot.as_deref(),
             link.peer(),
             now,
             &mut self.outputs,
@@ -928,14 +972,12 @@ impl Walks {
             ));
         }
         if kind == WalkKind::References {
-            if ending == Ending::Completed {
-                self.outputs
-                    .push(Output::Hint(NetEvent::BlobInventoryPassCompleted {
-                        collection,
-                        source: peer,
-                    }));
-            }
-            return;
+            return self.references_done(
+                peer,
+                collection,
+                pull.summary,
+                ending == Ending::Completed,
+            );
         }
         let Some(record_pull) = self.record_pulls.get_mut(&(peer, collection.raw)) else {
             return;
@@ -962,6 +1004,24 @@ impl Walks {
             let record_pull = self.record_pulls.remove(&(peer, collection.raw)).unwrap();
             self.finish(peer, collection, record_pull, now);
         }
+    }
+
+    /// Report an ended reference pull, which walked `summary`.
+    fn references_done(
+        &mut self,
+        peer: PeerId,
+        collection: CollectionHandle,
+        summary: Option<PatchSummary>,
+        completed: bool,
+    ) {
+        let empty = PatchSummary::new(None, 0).expect("the empty summary");
+        self.outputs.push(Output::Done(PullDone {
+            peer,
+            collection,
+            kind: PullKind::References,
+            root: held_digest(summary.unwrap_or(empty)),
+            completed,
+        }));
     }
 
     /// Report an ended record pull.
@@ -1000,9 +1060,10 @@ impl Walks {
                 );
             }
         });
-        self.outputs.push(Output::Done(RecordPullDone {
+        self.outputs.push(Output::Done(PullDone {
             peer,
             collection,
+            kind: PullKind::Records,
             root,
             completed: pull.completed,
         }));
@@ -1100,13 +1161,16 @@ impl Walks {
         self.advance(key, Ok(()), now);
     }
 
-    /// A deferred proof's descriptor fetch ended. A descriptor that routes
-    /// the proof to C lands with it; otherwise the proof stays deferred.
+    /// A blob fetch of `walk` ended. A fetched held reference lands, noted
+    /// held in C; one that could not be fetched leaves the walk incomplete.
+    /// A deferred `proof`'s descriptor that routes it to C lands with it;
+    /// otherwise the proof stays deferred.
     pub(crate) fn fetched(
         &mut self,
         walk: WalkRef,
-        proof: CapabilityProof,
-        descriptor: Option<Blob<UnknownBlob>>,
+        handle: RawHash,
+        proof: Option<CapabilityProof>,
+        blob: Option<Blob<UnknownBlob>>,
         now: Mono,
     ) {
         let key = (walk.peer, walk.walk.collection.raw, walk.walk.kind);
@@ -1119,13 +1183,24 @@ impl Walks {
         };
         pull.fetching -= 1;
         pull.progress = now;
-        match descriptor.filter(|descriptor| routes(walk.walk.collection, &proof, descriptor)) {
-            Some(descriptor) => pull.land(
+        let collection = walk.walk.collection;
+        match (proof, blob) {
+            (None, Some(blob)) => pull.land(
                 walk.peer,
-                vec![NetEvent::Blob(descriptor), NetEvent::CapabilityProof(proof)],
+                vec![NetEvent::Blob(blob), NetEvent::Held { collection, handle }],
                 &mut self.outputs,
             ),
-            None => pull.deferred = true,
+            (None, None) => pull.failed += 1,
+            (Some(proof), descriptor) => {
+                match descriptor.filter(|descriptor| routes(collection, &proof, descriptor)) {
+                    Some(descriptor) => pull.land(
+                        walk.peer,
+                        vec![NetEvent::Blob(descriptor), NetEvent::CapabilityProof(proof)],
+                        &mut self.outputs,
+                    ),
+                    None => pull.deferred = true,
+                }
+            }
         }
         self.advance(key, Ok(()), now);
     }
@@ -1277,73 +1352,59 @@ fn routes(
 pub(crate) struct Pulls(mpsc::UnboundedSender<Command>);
 
 impl Pulls {
-    /// Pull C's records and authorization evidence from `peer`, dialling it
-    /// if need be. A [`RecordPullDone`] reports the end; while a record pull
-    /// from the peer runs, it stands for this one.
-    pub(crate) fn start_record_pull(&self, peer: PeerId, collection: CollectionHandle) {
+    /// Pull C from `peer`, dialling it if need be. A [`PullDone`] reports
+    /// the end; while a pull of this kind from the peer runs, it stands for
+    /// this one.
+    pub(crate) fn start(&self, peer: PeerId, collection: CollectionHandle, kind: PullKind) {
         let _ = self.0.send(Command::Start {
             peer,
             collection,
-            records: true,
-        });
-    }
-
-    /// Pull the blobs C holds at `peer`, as hints for the store side.
-    pub(crate) fn start_reference_pull(&self, peer: PeerId, collection: CollectionHandle) {
-        let _ = self.0.send(Command::Start {
-            peer,
-            collection,
-            records: false,
+            kind,
         });
     }
 }
 
 enum Command {
-    /// Start a record pull, or with `records` unset a reference pull.
     Start {
         peer: PeerId,
         collection: CollectionHandle,
-        records: bool,
+        kind: PullKind,
     },
     /// A dial for a start ended.
     Connected {
         peer: PeerId,
         collection: CollectionHandle,
-        records: bool,
+        kind: PullKind,
         link: Option<Link>,
     },
     Fetched {
         walk: WalkRef,
-        proof: CapabilityProof,
-        descriptor: Option<Blob<UnknownBlob>>,
+        handle: RawHash,
+        proof: Option<CapabilityProof>,
+        blob: Option<Blob<UnknownBlob>>,
     },
 }
 
 /// Run one node's walks: its landing task, and a task that hears `events`
-/// from its connections, follows `snapshots` and passes held-blob hints to
-/// `store`. Returns what starts pulls and where record pulls report their
-/// ends.
+/// from its connections and follows `snapshots`. Returns what starts pulls
+/// and where pulls report their ends.
 pub(crate) fn spawn<T: Transport, S: Service>(
     connections: ConnectionTable<T, S>,
     snapshots: tokio::sync::watch::Receiver<Option<Arc<StoreSnapshot>>>,
     walks: Walks,
     events: mpsc::Receiver<ReconEvent>,
     lander: LandSlot,
-    store: mpsc::Sender<NetEventBatch>,
-) -> (Pulls, mpsc::UnboundedReceiver<RecordPullDone>) {
+) -> (Pulls, mpsc::UnboundedReceiver<PullDone>) {
     let (commands, commanded) = mpsc::unbounded_channel();
     let (landing, items) = mpsc::unbounded_channel();
     let (acks, landed) = mpsc::unbounded_channel();
-    let (hints, hinted) = mpsc::unbounded_channel();
     let (done, reports) = mpsc::unbounded_channel();
     tokio::spawn(crate::landing::run(lander, items, acks));
-    tokio::spawn(forward(hinted, store));
     let task = Task {
         connections,
         walks,
         commands: Pulls(commands.clone()),
         landing,
-        hints,
         done,
     };
     tokio::spawn(task.run(snapshots, events, commanded, landed));
@@ -1356,8 +1417,7 @@ struct Task<T: Transport, S> {
     /// Where dials and fetches report back.
     commands: Pulls,
     landing: mpsc::UnboundedSender<(WalkRef, Vec<NetEvent>)>,
-    hints: mpsc::UnboundedSender<NetEvent>,
-    done: mpsc::UnboundedSender<RecordPullDone>,
+    done: mpsc::UnboundedSender<PullDone>,
 }
 
 impl<T: Transport, S: Service> Task<T, S> {
@@ -1410,9 +1470,9 @@ impl<T: Transport, S: Service> Task<T, S> {
             Command::Start {
                 peer,
                 collection,
-                records,
+                kind,
             } => match self.connections.current(peer) {
-                Some(connection) => self.start(&connection.link(), collection, records, now),
+                Some(connection) => self.start(&connection.link(), collection, kind, now),
                 None => {
                     let connections = self.connections.clone();
                     let commands = self.commands.0.clone();
@@ -1421,7 +1481,7 @@ impl<T: Transport, S: Service> Task<T, S> {
                         let _ = commands.send(Command::Connected {
                             peer,
                             collection,
-                            records,
+                            kind,
                             link: connected.ok().map(|connection| connection.link()),
                         });
                     });
@@ -1430,26 +1490,25 @@ impl<T: Transport, S: Service> Task<T, S> {
             Command::Connected {
                 peer,
                 collection,
-                records,
+                kind,
                 link,
             } => match link {
-                Some(link) => self.start(&link, collection, records, now),
-                None if records => self.walks.unreachable(peer, collection, now),
-                None => {}
+                Some(link) => self.start(&link, collection, kind, now),
+                None => self.walks.unreachable(peer, collection, kind, now),
             },
             Command::Fetched {
                 walk,
+                handle,
                 proof,
-                descriptor,
-            } => self.walks.fetched(walk, proof, descriptor, now),
+                blob,
+            } => self.walks.fetched(walk, handle, proof, blob, now),
         }
     }
 
-    fn start(&mut self, link: &Link, collection: CollectionHandle, records: bool, now: Mono) {
-        if records {
-            self.walks.start_record_pull(link, collection, now);
-        } else {
-            self.walks.start_reference_pull(link, collection, now);
+    fn start(&mut self, link: &Link, collection: CollectionHandle, kind: PullKind, now: Mono) {
+        match kind {
+            PullKind::Records => self.walks.start_record_pull(link, collection, now),
+            PullKind::References => self.walks.start_reference_pull(link, collection, now),
         }
     }
 
@@ -1458,36 +1517,40 @@ impl<T: Transport, S: Service> Task<T, S> {
             Output::Land(walk, events) => {
                 let _ = self.landing.send((walk, events));
             }
-            Output::Hint(event) => {
-                let _ = self.hints.send(event);
-            }
             Output::Done(done) => {
                 let _ = self.done.send(done);
             }
             Output::Fetch {
                 walk,
+                handle,
                 proof,
-                descriptor,
             } => {
+                // A descriptor is metadata; a held reference may be any blob.
+                let limit = if proof.is_some() {
+                    METADATA_BLOB_BYTES
+                } else {
+                    MAX_EXACT_BLOB_BYTES
+                };
                 let connections = self.connections.clone();
                 let commands = self.commands.0.clone();
                 tokio::spawn(async move {
                     let fetch = async {
                         let connection = connections.current(walk.peer)?;
                         let local = connections.transport().local_id();
-                        op_get_blob_with_limit(&connection, local, &descriptor, METADATA_BLOB_BYTES)
+                        op_get_blob_with_limit(&connection, local, &handle, limit)
                             .await
                             .ok()
                             .flatten()
                     };
-                    let descriptor = tokio::time::timeout(WALK_DEADLINE, fetch)
+                    let blob = tokio::time::timeout(WALK_DEADLINE, fetch)
                         .await
                         .ok()
                         .flatten();
                     let _ = commands.send(Command::Fetched {
                         walk,
+                        handle,
                         proof,
-                        descriptor,
+                        blob,
                     });
                 });
             }
@@ -1495,30 +1558,8 @@ impl<T: Transport, S: Service> Task<T, S> {
     }
 }
 
-/// Pass held-blob hints to the store side in batches, waiting there for room
-/// so that the walks never do.
-async fn forward(mut hints: mpsc::UnboundedReceiver<NetEvent>, store: mpsc::Sender<NetEventBatch>) {
-    while let Some(first) = hints.recv().await {
-        let mut batch = NetEventBatch::default();
-        let mut next = Some(first);
-        while let Some(event) = next.take() {
-            if let Err(event) = batch.try_push(event) {
-                if store.send(std::mem::take(&mut batch)).await.is_err() {
-                    return;
-                }
-                next = Some(event);
-                continue;
-            }
-            next = hints.try_recv().ok();
-        }
-        if store.send(batch).await.is_err() {
-            return;
-        }
-    }
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     use crate::recon::Frame;
@@ -1656,7 +1697,7 @@ mod tests {
 
     /// Walks driven by hand: two nodes' [`Walks`] over a fake connection
     /// whose frames the test carries, landing into each node's store.
-    mod walking {
+    pub(crate) mod walking {
         use super::*;
 
         use std::collections::BTreeSet;
@@ -1669,7 +1710,7 @@ mod tests {
         use triblespace_core::capability::policy::{resource_collection, resource_policy};
         use triblespace_core::collection::{
             AdmissionPolicy, CollectionCommit, CollectionData, CollectionMerge, CollectionPolicy,
-            CollectionRead, CollectionRecord, CollectionStore, CollectionStoreExt,
+            CollectionRead, CollectionRecord, CollectionStore, CollectionStoreExt, HeldStore,
             empty_metadata_handle,
         };
         use triblespace_core::macros::entity;
@@ -1682,34 +1723,32 @@ mod tests {
         use crate::health::PeeringHealth;
         use crate::host::ActiveCollections;
 
-        fn key(byte: u8) -> SigningKey {
+        pub(crate) fn key(byte: u8) -> SigningKey {
             SigningKey::from_bytes(&[byte; 32])
         }
 
-        fn open() -> CollectionPolicy {
+        pub(crate) fn open() -> CollectionPolicy {
             CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open)
         }
 
         /// One node: its store, its active collections and its walks.
-        struct Node {
-            key: SigningKey,
-            store: MemoryRepo,
-            active: ActiveCollections,
-            walks: Walks,
-            health: Health,
-            /// Record pulls that ended here.
-            done: Vec<RecordPullDone>,
-            /// Hints for the store side.
-            hints: Vec<NetEvent>,
+        pub(crate) struct Node {
+            pub(crate) key: SigningKey,
+            pub(crate) store: MemoryRepo,
+            pub(crate) active: ActiveCollections,
+            pub(crate) walks: Walks,
+            pub(crate) health: Health,
+            /// Pulls that ended here.
+            pub(crate) done: Vec<PullDone>,
             /// Landings not yet carried out, when the test holds them back.
-            held: Vec<(WalkRef, Vec<NetEvent>)>,
-            hold: bool,
-            /// Descriptor fetches the test answers.
-            fetches: Vec<(WalkRef, CapabilityProof, RawHash)>,
+            pub(crate) held: Vec<(WalkRef, Vec<NetEvent>)>,
+            pub(crate) hold: bool,
+            /// Blob fetches the test answers.
+            pub(crate) fetches: Vec<(WalkRef, RawHash, Option<CapabilityProof>)>,
         }
 
         impl Node {
-            fn new(byte: u8) -> Self {
+            pub(crate) fn new(byte: u8) -> Self {
                 let key = key(byte);
                 let health =
                     Health::new(EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap());
@@ -1720,25 +1759,32 @@ mod tests {
                     store: MemoryRepo::default(),
                     active: ActiveCollections::new(),
                     done: Vec::new(),
-                    hints: Vec::new(),
                     held: Vec::new(),
                     hold: false,
                     fetches: Vec::new(),
                 }
             }
 
-            fn id(&self) -> PeerId {
+            pub(crate) fn id(&self) -> PeerId {
                 self.key.verifying_key().to_bytes()
             }
 
-            fn hold(&mut self, name: &str, policy: CollectionPolicy) -> CollectionHandle {
+            pub(crate) fn hold(
+                &mut self,
+                name: &str,
+                policy: CollectionPolicy,
+            ) -> CollectionHandle {
                 let collection = self.store.collection(name, policy).unwrap().handle();
                 self.active.insert(&PatchEntry::new(&collection.raw));
                 self.observe();
                 collection
             }
 
-            fn commit(&mut self, collection: CollectionHandle, data: u64) -> CollectionRecord {
+            pub(crate) fn commit(
+                &mut self,
+                collection: CollectionHandle,
+                data: u64,
+            ) -> CollectionRecord {
                 let record = CollectionRecord::Commit(CollectionCommit::sign(
                     &self.key,
                     collection,
@@ -1749,7 +1795,7 @@ mod tests {
                 record
             }
 
-            fn observe(&mut self) {
+            pub(crate) fn observe(&mut self) {
                 let snapshot = StoreSnapshot::from_store_changes(
                     self.store.snapshot().unwrap(),
                     &self.active,
@@ -1762,7 +1808,15 @@ mod tests {
                 self.walks.observe(Arc::new(snapshot));
             }
 
-            fn records(&mut self, collection: CollectionHandle) -> BTreeSet<CollectionRecord> {
+            /// The serving snapshot the walks last observed.
+            pub(crate) fn serving(&self) -> &StoreSnapshot {
+                self.walks.snapshot.as_deref().unwrap()
+            }
+
+            pub(crate) fn records(
+                &mut self,
+                collection: CollectionHandle,
+            ) -> BTreeSet<CollectionRecord> {
                 self.store
                     .snapshot()
                     .unwrap()
@@ -1775,7 +1829,7 @@ mod tests {
 
             /// Carry out the walks' outputs: land (unless held back), and
             /// keep the rest for the test.
-            fn outputs(&mut self, now: Mono) {
+            pub(crate) fn outputs(&mut self, now: Mono) {
                 loop {
                     let outputs = self.walks.take();
                     if outputs.is_empty() {
@@ -1788,12 +1842,11 @@ mod tests {
                                 self.held.push((walk, events))
                             }
                             Output::Land(walk, events) => lands.push((walk, events)),
-                            Output::Hint(hint) => self.hints.push(hint),
                             Output::Fetch {
                                 walk,
+                                handle,
                                 proof,
-                                descriptor,
-                            } => self.fetches.push((walk, proof, descriptor)),
+                            } => self.fetches.push((walk, handle, proof)),
                             Output::Done(done) => self.done.push(done),
                         }
                     }
@@ -1803,7 +1856,7 @@ mod tests {
 
             /// Insert, publish once and acknowledge each walk, as the
             /// landing task does.
-            fn land(&mut self, lands: Vec<(WalkRef, Vec<NetEvent>)>, now: Mono) {
+            pub(crate) fn land(&mut self, lands: Vec<(WalkRef, Vec<NetEvent>)>, now: Mono) {
                 let mut acks = Vec::new();
                 for (walk, events) in lands {
                     let (mut landed, mut failed) = (0, 0);
@@ -1814,7 +1867,13 @@ mod tests {
                                 self.store.insert_proof(proof).is_ok()
                             }
                             NetEvent::Blob(blob) => self.store.put::<UnknownBlob, _>(blob).is_ok(),
-                            _ => false,
+                            NetEvent::Held { collection, handle } => {
+                                self.store.note_held(
+                                    collection,
+                                    triblespace_core::inline::Inline::new(handle),
+                                );
+                                true
+                            }
                         };
                         if ok {
                             landed += 1;
@@ -1834,7 +1893,7 @@ mod tests {
             }
 
             /// Land what was held back, in order.
-            fn release(&mut self, now: Mono) {
+            pub(crate) fn release(&mut self, now: Mono) {
                 self.hold = false;
                 let held = std::mem::take(&mut self.held);
                 self.land(held, now);
@@ -1844,14 +1903,14 @@ mod tests {
 
         /// A connection between two nodes: each side's link and the frames
         /// queued on it.
-        struct Wire {
-            to_right: Link,
-            from_left: UnboundedReceiver<Frame>,
-            to_left: Link,
-            from_right: UnboundedReceiver<Frame>,
+        pub(crate) struct Wire {
+            pub(crate) to_right: Link,
+            pub(crate) from_left: UnboundedReceiver<Frame>,
+            pub(crate) to_left: Link,
+            pub(crate) from_right: UnboundedReceiver<Frame>,
         }
 
-        fn connect(left: &Node, right: &Node, id: u64) -> Wire {
+        pub(crate) fn connect(left: &Node, right: &Node, id: u64) -> Wire {
             let (to_right, from_left) = Link::detached(id, right.id());
             let (to_left, from_right) = Link::detached(id, left.id());
             Wire {
@@ -1862,7 +1921,7 @@ mod tests {
             }
         }
 
-        fn walk_frame(frame: Frame) -> WalkFrame {
+        pub(crate) fn walk_frame(frame: Frame) -> WalkFrame {
             match frame {
                 Frame::Walk(frame) => frame,
                 other => panic!("not a walk frame: {other:?}"),
@@ -1871,7 +1930,7 @@ mod tests {
 
         /// Carry frames both ways until neither side sends, dropping those
         /// `keep` refuses; returns how many crossed.
-        fn carry_while(
+        pub(crate) fn carry_while(
             left: &mut Node,
             right: &mut Node,
             wire: &mut Wire,
@@ -1901,7 +1960,7 @@ mod tests {
         }
 
         /// Carry one frame, the left side's first; whether there was one.
-        fn step(left: &mut Node, right: &mut Node, wire: &mut Wire, now: Mono) -> bool {
+        pub(crate) fn step(left: &mut Node, right: &mut Node, wire: &mut Wire, now: Mono) -> bool {
             left.outputs(now);
             right.outputs(now);
             if let Ok(frame) = wire.from_left.try_recv() {
@@ -1914,7 +1973,12 @@ mod tests {
             true
         }
 
-        fn carry(left: &mut Node, right: &mut Node, wire: &mut Wire, now: Mono) -> usize {
+        pub(crate) fn carry(
+            left: &mut Node,
+            right: &mut Node,
+            wire: &mut Wire,
+            now: Mono,
+        ) -> usize {
             carry_while(left, right, wire, now, |_| true)
         }
 
@@ -1967,9 +2031,10 @@ mod tests {
                 };
                 assert_eq!(
                     node.done,
-                    [RecordPullDone {
+                    [PullDone {
                         peer,
                         collection,
+                        kind: PullKind::Records,
                         root: walked,
                         completed: true,
                     }]
@@ -2143,8 +2208,8 @@ mod tests {
                     .walks
                     .start_record_pull(&wire.to_right, collection, now);
                 carry(&mut puller, &mut responder, &mut wire, now);
-                let (walk, fetched, descriptor) = puller.fetches.pop().unwrap();
-                assert_eq!((fetched, descriptor), (proof.clone(), resource.raw));
+                let (walk, descriptor, fetched) = puller.fetches.pop().unwrap();
+                assert_eq!((fetched, descriptor), (Some(proof.clone()), resource.raw));
                 // The first fetch fails; the second gets the descriptor.
                 let blob = (attempt == 1).then(|| {
                     BlobStoreGet::get::<Blob<UnknownBlob>, UnknownBlob>(
@@ -2153,7 +2218,9 @@ mod tests {
                     )
                     .unwrap()
                 });
-                puller.walks.fetched(walk, proof.clone(), blob, now);
+                puller
+                    .walks
+                    .fetched(walk, resource.raw, Some(proof.clone()), blob, now);
                 carry(&mut puller, &mut responder, &mut wire, now);
                 assert_eq!(puller.records(collection), BTreeSet::from([record]));
                 assert_eq!(puller.done[attempt].completed, attempt == 1);

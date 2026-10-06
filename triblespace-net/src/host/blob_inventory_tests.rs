@@ -1,9 +1,12 @@
-//! Held sets at the real immutable store/host boundary.
+//! Held sets at the real immutable store/host boundary, and the reference
+//! pull that compares them (design 2.9).
 //!
 //! The host publishes the store's held set of each active collection; it
 //! scans nothing itself. These tests pin what that means for the serving
 //! overlay: scan-once (a late child is not found by an arrival), rule-3
-//! reports and the walk backstop, and reset on removal.
+//! reports and the walk backstop, and reset on removal. A reference pull
+//! brings a peer's held set here: what is resident joins as it is, what is
+//! not is fetched by hash first.
 
 use anybytes::Bytes;
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -302,5 +305,181 @@ fn a_new_records_closure_is_served_by_the_observation_that_carries_it() {
     assert!(served.repair.records().get(record.fingerprint()).is_some());
     for handle in [data, child, grandchild] {
         assert!(held(&new, fixture.collection, &handle.raw));
+    }
+}
+
+mod reference_pull {
+    use triblespace_core::collection::{CollectionData, empty_metadata_handle};
+    use triblespace_core::repo::SnapshotSource;
+
+    use super::*;
+    use crate::collection_activation::held_digest;
+    use crate::patch_repair::PatchSummary;
+    use crate::walk::tests::walking::{Node, carry, connect, open};
+    use crate::walk::{PullDone, PullKind};
+
+    /// The held set the node's walks observe for C.
+    fn held_set(node: &Node, collection: CollectionHandle) -> PatchSummary {
+        PatchSummary::from_patch(
+            node.serving()
+                .collection(collection)
+                .unwrap()
+                .repair()
+                .blob_inventory(),
+        )
+    }
+
+    fn holds(node: &Node, collection: CollectionHandle, handle: &[u8; 32]) -> bool {
+        let collection = node.serving().collection(collection).unwrap();
+        collection.repair().blob_inventory().has_prefix(handle)
+    }
+
+    /// Two nodes holding one collection with the responder's record, whose
+    /// data D names two blob-only children. The responder holds all three.
+    /// The puller holds D, scanned before either child was resident, so no
+    /// later arrival of a child makes it held there.
+    struct Pair {
+        puller: Node,
+        responder: Node,
+        collection: CollectionHandle,
+        children: [Blob<UnknownBlob>; 2],
+    }
+
+    fn pair(first: u8) -> Pair {
+        let mut puller = Node::new(first);
+        let mut responder = Node::new(first + 1);
+        let collection = puller.hold("references", open());
+        assert_eq!(responder.hold("references", open()), collection);
+        let children = [b"first child".as_slice(), b"second child".as_slice()]
+            .map(|bytes| Blob::<UnknownBlob>::new(Bytes::from_source(bytes.to_vec())));
+        let data = Blob::<UnknownBlob>::new(Bytes::from_source(
+            children
+                .iter()
+                .flat_map(|child| child.get_handle().raw)
+                .collect::<Vec<_>>(),
+        ));
+        for child in &children {
+            responder
+                .store
+                .put::<UnknownBlob, _>(child.clone())
+                .unwrap();
+        }
+        let record = CollectionRecord::Commit(CollectionCommit::sign(
+            &responder.key,
+            collection,
+            CollectionData::new(data.get_handle().raw),
+            empty_metadata_handle(),
+        ));
+        for node in [&mut puller, &mut responder] {
+            node.store.put::<UnknownBlob, _>(data.clone()).unwrap();
+            node.store.insert(record).unwrap();
+            node.store.track_held([collection]);
+            node.observe();
+            assert!(holds(node, collection, &data.get_handle().raw));
+        }
+        for child in &children {
+            assert!(holds(&responder, collection, &child.get_handle().raw));
+            assert!(!holds(&puller, collection, &child.get_handle().raw));
+        }
+        Pair {
+            puller,
+            responder,
+            collection,
+            children,
+        }
+    }
+
+    impl Pair {
+        /// Answer the puller's fetches from the responder's store, failing
+        /// those `fail` names. Returns the handles fetched.
+        fn answer(&mut self, fail: &[[u8; 32]]) -> Vec<[u8; 32]> {
+            let now = crate::clock::mono_now();
+            let store = self.responder.store.snapshot().unwrap();
+            let mut handles = Vec::new();
+            for (walk, handle, proof) in std::mem::take(&mut self.puller.fetches) {
+                assert!(proof.is_none());
+                let blob = (!fail.contains(&handle)).then(|| {
+                    BlobStoreGet::get::<Blob<UnknownBlob>, UnknownBlob>(&store, Inline::new(handle))
+                        .unwrap()
+                });
+                self.puller.walks.fetched(walk, handle, None, blob, now);
+                handles.push(handle);
+            }
+            handles.sort_unstable();
+            handles
+        }
+    }
+
+    /// The puller lacks both children. It fetches them by hash from the
+    /// responder and holds them in C only because the responder holds them
+    /// there: D, which names them, was scanned before they arrived.
+    #[test]
+    fn a_reference_pull_fetches_what_the_peer_holds_and_holds_it_in_c() {
+        let now = crate::clock::mono_now();
+        let mut pair = pair(41);
+        let collection = pair.collection;
+        let mut wire = connect(&pair.puller, &pair.responder, 1);
+        pair.puller
+            .walks
+            .start_reference_pull(&wire.to_right, collection, now);
+        carry(&mut pair.puller, &mut pair.responder, &mut wire, now);
+        let mut children = pair.children.clone().map(|child| child.get_handle().raw);
+        children.sort_unstable();
+        assert_eq!(pair.answer(&[]), children);
+        carry(&mut pair.puller, &mut pair.responder, &mut wire, now);
+
+        let walked = held_set(&pair.responder, collection);
+        assert_eq!(
+            pair.puller.done,
+            [PullDone {
+                peer: pair.responder.id(),
+                collection,
+                kind: PullKind::References,
+                root: held_digest(walked),
+                completed: true,
+            }]
+        );
+        for child in &children {
+            assert!(holds(&pair.puller, collection, child));
+        }
+        assert_eq!(held_set(&pair.puller, collection), walked);
+    }
+
+    /// The first child is resident at the puller without being held there,
+    /// and joins without a fetch. The fetch of the second fails, so the pull
+    /// does not complete and the next one fetches it again.
+    #[test]
+    fn a_resident_blob_joins_without_a_fetch_and_a_failed_fetch_is_retried() {
+        let now = crate::clock::mono_now();
+        let mut pair = pair(43);
+        let collection = pair.collection;
+        let [resident, fetched] = pair.children.clone().map(|child| child.get_handle().raw);
+        pair.puller
+            .store
+            .put::<UnknownBlob, _>(pair.children[0].clone())
+            .unwrap();
+        pair.puller.observe();
+        assert!(!holds(&pair.puller, collection, &resident));
+        let mut wire = connect(&pair.puller, &pair.responder, 1);
+        for attempt in 0..2 {
+            pair.puller
+                .walks
+                .start_reference_pull(&wire.to_right, collection, now);
+            carry(&mut pair.puller, &mut pair.responder, &mut wire, now);
+            let fail = if attempt == 0 {
+                vec![fetched]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(pair.answer(&fail), [fetched]);
+            carry(&mut pair.puller, &mut pair.responder, &mut wire, now);
+            assert!(holds(&pair.puller, collection, &resident));
+            assert_eq!(holds(&pair.puller, collection, &fetched), attempt == 1);
+            assert_eq!(pair.puller.done[attempt].completed, attempt == 1);
+        }
+        assert_eq!(
+            held_set(&pair.puller, collection),
+            held_set(&pair.responder, collection)
+        );
     }
 }

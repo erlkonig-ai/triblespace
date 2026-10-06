@@ -46,7 +46,7 @@ use crate::host::{CollectionSnapshot, StoreSnapshot};
 use crate::protocol::RawHash;
 use crate::recon::{Flags, Frame, credential_frames, request_frames};
 use crate::transport::{PeerId, Transport};
-use crate::walk::RecordPullDone;
+use crate::walk::PullDone;
 
 /// Neighbours per collection this side asks for.
 pub(crate) const MAX_ASKED: usize = 5;
@@ -981,7 +981,7 @@ pub(crate) async fn run<T: Transport, S: Service>(
     mut events: tokio::sync::mpsc::Receiver<ReconEvent>,
     mut providers: tokio::sync::mpsc::UnboundedReceiver<(CollectionHandle, Vec<PeerId>)>,
     mut start_record_pull: impl FnMut(PeerId, CollectionHandle),
-    mut pulls_ended: tokio::sync::mpsc::UnboundedReceiver<RecordPullDone>,
+    mut pulls_ended: tokio::sync::mpsc::UnboundedReceiver<PullDone>,
     health: Health,
     admissions: tokio::sync::mpsc::Sender<NetEventBatch>,
 ) {

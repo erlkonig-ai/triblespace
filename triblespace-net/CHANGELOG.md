@@ -46,6 +46,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   delegated keys among connected peers, and so are those a refused peering
   waits for. A proof waits in memory only if its signatures hold. The host
   dials the subject of every grant its key signed.
+- A reference pull fetches what it walks (sync redesign M11). A blob the
+  peer holds in the collection and this side's held set lacks joins that
+  set: one already resident is noted held as it is, another is first fetched
+  by hash from that peer over `blob/1`. A failed fetch leaves the pull
+  incomplete. The reconciler's hint windows go, and with them
+  `ReplicationStats::inventory` and `inventory_pending`; in Full mode the
+  reconciler fetches direct roots as in Shallow mode. The wake path no longer
+  starts reference pulls.
 - A proof whose insert fails no longer aborts the drain of network evidence.
 - `collection_read_bootstrap_proofs` and its `CollectionReadBootstrapError`
   are removed with the in-session READ bootstrap. A reader's proofs reach a
