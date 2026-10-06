@@ -1059,6 +1059,33 @@ mod tests {
 
     use super::*;
 
+    /// A process that opens a pile with its key reads where the pile's sync
+    /// daemon listens from the pile's configuration, and nothing for a key
+    /// whose daemon recorded nothing.
+    #[test]
+    fn the_daemon_addresses_are_read_from_the_pile_configuration() {
+        use triblespace_core::collection::private_policy;
+        use triblespace_core::collection::selection::{
+            CONFIG_COLLECTION_NAME, write_sync_addresses,
+        };
+
+        let key = SigningKey::from_bytes(&[0x61; 32]);
+        let daemon = key.verifying_key();
+        let other = SigningKey::from_bytes(&[0x62; 32]).verifying_key();
+        let addresses: Vec<std::net::SocketAddr> = ["127.0.0.1:7001", "[::1]:7001"]
+            .map(|text| text.parse().unwrap())
+            .into();
+        let mut store = MemoryRepo::default();
+        assert!(daemon_addresses(&mut store, Some(daemon)).is_empty());
+        let config = store
+            .collection(CONFIG_COLLECTION_NAME, private_policy(daemon))
+            .unwrap();
+        write_sync_addresses(&mut store, config, &key, daemon, addresses.clone()).unwrap();
+        assert_eq!(daemon_addresses(&mut store, Some(daemon)), addresses);
+        assert!(daemon_addresses(&mut store, None).is_empty());
+        assert!(daemon_addresses(&mut store, Some(other)).is_empty());
+    }
+
     fn foreground_config() -> PeerConfig {
         PeerConfig {
             daemon: None,

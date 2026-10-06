@@ -367,3 +367,61 @@ pub async fn bind_with_endpoint(ep: iroh::Endpoint) -> Harness<IrohTransport> {
         incoming: inc_rx,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use iroh_base::{SecretKey, TransportAddr};
+
+    use super::*;
+    use crate::protocol::PILE_SYNC_ALPN;
+
+    /// An endpoint on one loopback socket that finds no address by itself:
+    /// no relay and no address lookup.
+    async fn loopback(byte: u8) -> iroh::Endpoint {
+        iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+            .secret_key(SecretKey::from_bytes(&[byte; 32]))
+            .relay_mode(iroh::RelayMode::Disabled)
+            .ca_tls_config(iroh::tls::CaTlsConfig::insecure_skip_verify())
+            .clear_address_lookup()
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+            .unwrap()
+            .bind()
+            .await
+            .unwrap()
+    }
+
+    /// A dial by key goes where the transport learned the key listens: the
+    /// addresses a daemon recorded in its pile, or a test's loopback socket.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dial_by_key_goes_to_the_learned_address() {
+        let listener = bind_with_endpoint(loopback(1).await).await;
+        let dialler = bind_with_endpoint(loopback(2).await).await;
+        let id = listener.transport.local_id();
+        let deadline = Duration::from_secs(5);
+        let unknown =
+            tokio::time::timeout(deadline, dialler.transport.dial(id, PILE_SYNC_ALPN)).await;
+        assert!(
+            !matches!(unknown, Ok(Ok(_))),
+            "nothing told the dialler where the listener is"
+        );
+        dialler.transport.learn(EndpointAddr::from_parts(
+            EndpointId::from_bytes(&id).unwrap(),
+            listener
+                .transport
+                .endpoint()
+                .bound_sockets()
+                .into_iter()
+                .map(TransportAddr::Ip),
+        ));
+        let conn = tokio::time::timeout(deadline, dialler.transport.dial(id, PILE_SYNC_ALPN))
+            .await
+            .expect("the learned address answers")
+            .unwrap();
+        assert_eq!(conn.remote_id(), id);
+        dialler.transport.shutdown().await;
+        listener.transport.shutdown().await;
+    }
+}
