@@ -66,7 +66,6 @@ mod tests {
     fn health(node: VerifyingKey) -> HealthSnapshot {
         HealthSnapshot {
             node: iroh_base::EndpointId::from_bytes(node.as_bytes()).unwrap(),
-            direction: None,
             started_at: None,
             observed_at: None,
             store: Default::default(),

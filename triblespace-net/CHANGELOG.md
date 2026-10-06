@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Delete `ReconcileQos` and `ReconcileDirection` with the `inventory` module
+  (sync redesign M13). `PeerConfig::qos`, the `qos` argument of
+  `Peer::with_wiring`, `Peer::qos`, `HealthSnapshot::direction` and
+  `ComparisonState::NotApplicable` go. Every host pulls what its neighbours
+  announce, serves what its peerings admit and warms its active collections'
+  descriptors; a pile that should not sync a collection does not select it,
+  which is what read-only used to approximate.
+
 - Delete the remaining retry machinery (sync redesign M13, design D7). The
   routing table keeps no configured set: configured peers start as ordinary
   candidate routes and are retained, evicted and failed like any other. The

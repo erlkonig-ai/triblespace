@@ -23,7 +23,6 @@ use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{BlobStorePut, SnapshotSource};
 use triblespace_net::health::RepairFrontier;
 use triblespace_net::host::{self, PeerConfig};
-use triblespace_net::inventory::{ReconcileDirection, ReconcileQos};
 use triblespace_net::peer::Peer;
 use triblespace_net::transport::sim::{SimConfig, SimNet};
 
@@ -32,11 +31,9 @@ fn bring_up(
     key: &SigningKey,
     store: MemoryRepo,
     peers: &[[u8; 32]],
-    direction: ReconcileDirection,
 ) -> Peer<MemoryRepo> {
     let id = EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap();
     let (sender, receiver, wiring) = host::wire(id);
-    let qos = ReconcileQos { direction };
     tokio::task::spawn_local(host::run_host(
         net.join(key),
         PeerConfig {
@@ -44,7 +41,6 @@ fn bring_up(
                 .iter()
                 .map(|peer| EndpointAddr::from(EndpointId::from_bytes(peer).unwrap()))
                 .collect(),
-            qos,
             // This test measures repair recovery, not the timing of provider
             // publication.
             provider_publication_budget: Some(0),
@@ -52,7 +48,7 @@ fn bring_up(
         },
         wiring,
     ));
-    Peer::with_wiring(store, qos, sender, receiver)
+    Peer::with_wiring(store, sender, receiver)
 }
 
 /// Select `collection` for sync in the pile `key` configures.
@@ -160,8 +156,8 @@ fn periodic_root_announcements_recover_a_healed_partition_beside_a_healthy_repli
             select(store, key, collection);
         }
         let original = append(&mut a_store, &a_key, collection, b"initial shared record");
-        // Both sources begin with the exact same signed record. B is not a
-        // relay for later A writes: WriteOnly is an explicit supported mode.
+        // Both sources begin with the exact same signed record. B could relay
+        // a later A write only after C has it: the A-B cut stays closed.
         b_store.insert(original).unwrap();
         // An exact blob read will prove B's connection stays usable without
         // making a new collection root or forcing a gratuitous repair pull.
@@ -170,27 +166,9 @@ fn periodic_root_announcements_recover_a_healed_partition_beside_a_healthy_repli
         let control = b_store
             .put::<UnknownBlob, _>(control_bytes.clone())
             .unwrap();
-        let mut a = bring_up(
-            &net,
-            &a_key,
-            a_store,
-            &[c_id],
-            ReconcileDirection::WriteOnly,
-        );
-        let mut b = bring_up(
-            &net,
-            &b_key,
-            b_store,
-            &[c_id],
-            ReconcileDirection::WriteOnly,
-        );
-        let mut c = bring_up(
-            &net,
-            &c_key,
-            c_store,
-            &[a_id, b_id],
-            ReconcileDirection::ReadOnly,
-        );
+        let mut a = bring_up(&net, &a_key, a_store, &[c_id]);
+        let mut b = bring_up(&net, &b_key, b_store, &[c_id]);
+        let mut c = bring_up(&net, &c_key, c_store, &[a_id, b_id]);
         for peer in [&mut a, &mut b, &mut c] {
             peer.activate_collection(collection);
         }
@@ -293,6 +271,7 @@ fn periodic_root_announcements_recover_a_healed_partition_beside_a_healthy_repli
         assert!(clock::mono_now().duration_since(healed_at) <= Duration::from_secs(100));
         assert!(clock::mono_now().duration_since(cut_at) < Duration::from_secs(300));
         assert!(contains(&mut c, original));
+        // C has just landed it and B has not heard C's new root yet.
         assert!(
             !contains(&mut b, fresh),
             "B cannot supply A's missing record"

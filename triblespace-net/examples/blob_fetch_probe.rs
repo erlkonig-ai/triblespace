@@ -15,7 +15,6 @@ use tokio::time::timeout;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{SnapshotSource, StorageClose, WantRead};
 use triblespace_net::host::{self, PeerConfig};
-use triblespace_net::inventory::{ReconcileDirection, ReconcileQos};
 use triblespace_net::peer::Peer;
 use triblespace_net::transport::Transport;
 
@@ -43,12 +42,8 @@ async fn main() -> Result<()> {
     getrandom::fill(&mut entropy).map_err(|_| anyhow!("ephemeral key entropy unavailable"))?;
     let signing_key = SigningKey::from_bytes(&entropy);
     let secret = SecretKey::from_bytes(&signing_key.to_bytes());
-    let qos = ReconcileQos {
-        direction: ReconcileDirection::ReadOnly,
-    };
     let config = PeerConfig {
         peers,
-        qos,
         provider_publication_budget: Some(0),
         bind: None,
     };
@@ -63,7 +58,7 @@ async fn main() -> Result<()> {
     .context("endpoint bind deadline")??;
     let transport = harness.transport.clone();
     let mut host_task = tokio::spawn(host::run_host(harness, config, wiring));
-    let mut peer = Peer::with_wiring(MemoryRepo::default(), qos, sender, receiver);
+    let mut peer = Peer::with_wiring(MemoryRepo::default(), sender, receiver);
     let started = Instant::now();
     let fetched = peer
         .fetch_blob_with_deadline(handle, Duration::from_secs(20))

@@ -1069,7 +1069,6 @@ mod tests {
                 inner: store,
                 trace: landings.clone(),
             },
-            crate::inventory::ReconcileQos::default(),
             sender,
             receiver,
         );
@@ -1536,7 +1535,6 @@ mod tests {
                 inner: store,
                 trace: trace.clone(),
             },
-            crate::inventory::ReconcileQos::default(),
             sender,
             receiver,
         );
@@ -1707,7 +1705,6 @@ mod tests {
             SigningKey::from_bytes(&[7; 32]),
             crate::host::PeerConfig {
                 peers: Vec::new(),
-                qos: crate::inventory::ReconcileQos::default(),
                 provider_publication_budget: Some(0),
                 bind: None,
             },
@@ -1775,12 +1772,7 @@ mod tests {
                 trace: Arc::new(Mutex::new(FetchTrace::default())),
             });
             wiring.install_test_capability(fetches.clone());
-            let mut peer = Peer::with_wiring(
-                Pile::open(path.path()).unwrap(),
-                crate::inventory::ReconcileQos::default(),
-                sender,
-                receiver,
-            );
+            let mut peer = Peer::with_wiring(Pile::open(path.path()).unwrap(), sender, receiver);
             let frozen = peer.snapshot().unwrap();
             assert!(
                 frozen.contains_blob(handle).unwrap(),

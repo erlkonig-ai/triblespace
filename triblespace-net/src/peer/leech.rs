@@ -17,7 +17,7 @@ use super::*;
 ///
 /// Construction is deliberately dormant, with no conversion from an arbitrary
 /// running peer and no mutable access to its serving controls. A zero publication
-/// budget or [`ReconcileDirection::ReadOnly`] on an ordinary peer is not this
+/// budget on an ordinary peer, or a pile that selects no collection, is not this
 /// boundary: those peers still serve their resident inventory.
 pub struct Leech<S>
 where

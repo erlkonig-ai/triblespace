@@ -246,7 +246,7 @@ changes admission for the immutable current session or creates blob WANTs.
   process CPU, outer-hop work, successful equation-publication calls and
   successful passes with no such calls. Neither record census nor a skipped
   poll is counted as performed work. No telemetry source or grant is created.
-- `pile net sync <PILE> --collection HANDLE [--collection HANDLE ...] [--peers ID_OR_TICKET,...] [--key PATH] [--direction bidirectional|read-only|write-only]` — activate the named collections and run periodic repair. `read-only` pulls but does not serve collection repair, while `write-only` serves admitted readers but does not pull collection repair. Every direction still services ordinary exact-blob WANTs. `--duration SECS` and `--quiescent-for SECS` provide optional process-lifecycle bounds.
+- `pile net sync <PILE> --collection HANDLE [--collection HANDLE ...] [--peers ID_OR_TICKET,...] [--key PATH]` — activate the named collections and run periodic repair. A collection flows to a neighbour exactly when this side admits it to read, and ordinary exact-blob WANTs are serviced too. `--duration SECS` and `--quiescent-for SECS` provide optional process-lifecycle bounds.
 
   The one existing key resolves from `--key`, `TRIBLESPACE_KEY`, or `self.key`
   beside the pile's lexical path. It identifies the endpoint and signs local

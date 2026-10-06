@@ -19,7 +19,6 @@ use triblespace_core::collection::{
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{BlobStoreList, BlobStorePut, SnapshotSource, WantRead};
 use triblespace_net::host::{self, PeerConfig};
-use triblespace_net::inventory::ReconcileQos;
 use triblespace_net::peer::Peer;
 
 fn key(byte: u8) -> SigningKey {
@@ -134,17 +133,13 @@ async fn bring_up_owned(
     let id = endpoint.id();
     let config = PeerConfig {
         peers,
-        qos: ReconcileQos::default(),
         provider_publication_budget: None,
         bind: None,
     };
     let harness = triblespace_net::transport::iroh::bind_with_endpoint(endpoint, &config).await;
     let (sender, receiver, wiring) = host::wire(id);
     let owner = tokio::spawn(host::run_host(harness, config, wiring));
-    (
-        Peer::with_wiring(store, ReconcileQos::default(), sender, receiver),
-        owner,
-    )
+    (Peer::with_wiring(store, sender, receiver), owner)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

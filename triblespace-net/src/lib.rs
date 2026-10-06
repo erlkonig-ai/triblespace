@@ -33,7 +33,6 @@ pub mod health;
 pub mod health_record;
 pub mod host;
 pub mod identity;
-pub mod inventory;
 pub(crate) mod landing;
 pub mod patch_repair;
 pub mod peer;

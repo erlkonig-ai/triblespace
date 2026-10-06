@@ -42,7 +42,6 @@ use crate::collection_wire::manifest;
 use crate::connection::{ConnectionTable, RESET_UNKNOWN, ReconEvent, Service};
 use crate::health::{CollectionHealth, Health, HealthSnapshot, StoreHealth};
 use crate::identity::iroh_secret;
-use crate::inventory::ReconcileQos;
 use crate::landing::{Land, LandSlot};
 use crate::protocol::{
     OP_FIND_VALUE, OP_PROVIDER_PUT, PILE_SYNC_ALPN, PROVIDER_PUT_FULL, PROVIDER_PUT_OK, RawHash,
@@ -65,13 +64,12 @@ pub(crate) type ActiveCollections = PATCH<32, IdentitySchema>;
 ///
 /// Collection authority is intentionally absent. A connection is ordinary
 /// mutually authenticated TLS; READ authority is supplied on each collection
-/// repair stream.
+/// repair stream. Which collections a host syncs is the pile's sync
+/// selection, not configuration.
 #[derive(Clone)]
 pub struct PeerConfig {
     /// Bootstrap endpoint routes.
     pub peers: Vec<EndpointAddr>,
-    /// Local pull/serve scheduling choices. Never sent as authority.
-    pub qos: ReconcileQos,
     /// Maximum DHT provider-announcement attempts during this process.
     ///
     /// `None` preserves the ordinary unlimited scheduler. `Some(0)` disables
@@ -515,11 +513,6 @@ impl NetSender {
         self.health.update(|health| update(&mut health.store));
     }
 
-    pub(crate) fn observe_direction(&self, direction: crate::inventory::ReconcileDirection) {
-        self.health
-            .update(|health| health.direction = Some(direction));
-    }
-
     pub(crate) fn observe_active_collections(&self, active: &ActiveCollections) {
         self.health.update(|health| {
             health
@@ -785,7 +778,7 @@ const METADATA_CHILDREN_IN_FLIGHT: usize = 4;
 const METADATA_FETCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 const METADATA_CHILD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// One owned warmup per pull-selected collection, including pending admission.
+/// One owned warmup per active collection, including pending admission.
 /// No detached fetch survives removal, host shutdown, or the attempt deadline.
 #[derive(Default)]
 struct DescriptorFetches {
@@ -835,14 +828,7 @@ impl DescriptorFetches {
         }
     }
 
-    fn selected_round<V>(
-        &self,
-        active: &PATCH<32, IdentitySchema, V>,
-        pulls: bool,
-    ) -> Vec<RawHash> {
-        if !pulls {
-            return Vec::new();
-        }
+    fn selected_round<V>(&self, active: &PATCH<32, IdentitySchema, V>) -> Vec<RawHash> {
         // A bounded observation of the selected relation, not a second
         // collection catalogue. Resume after the last admitted attempt.
         active
@@ -997,7 +983,6 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
     let my_id = transport.local_id();
     wiring.health.update(|health| {
         let now = crate::clock::mono_now();
-        health.direction = Some(config.qos.direction);
         health.started_at = Some(now);
         health.observed_at = Some(now);
     });
@@ -1031,7 +1016,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
     let (pulls, pulled) = crate::walk::spawn(
         connections.clone(),
         wiring.snapshot.clone(),
-        crate::walk::Walks::new(config.qos.direction.serves(), wiring.health.clone()),
+        crate::walk::Walks::new(wiring.health.clone()),
         walks_rx,
         wiring.lander.clone(),
     );
@@ -1195,7 +1180,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
         if now >= next_warmup {
             next_warmup = now + WARMUP_PERIOD;
             for raw in descriptor_fetches
-                .selected_round(current_collections, config.qos.direction.pulls())
+                .selected_round(current_collections)
                 .into_iter()
                 .take(METADATA_SELECTIONS_PER_ROUND)
             {
@@ -2294,27 +2279,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metadata_owners_bound_fanout_rotate_and_skip_push_only() {
+    async fn metadata_owners_bound_fanout_and_rotate() {
         let mut active = super::PATCH::<32, super::IdentitySchema>::new();
         for byte in 1..=9 {
             active.insert(&super::PatchEntry::new(&[byte; 32]));
         }
         let mut owners = DescriptorFetches::default();
-        assert!(owners.selected_round(&active, false).is_empty());
-        for raw in owners.selected_round(&active, true) {
+        for raw in owners.selected_round(&active) {
             owners.start(raw, std::future::pending());
         }
         assert_eq!(
             owners.pending.len(),
             super::METADATA_COLLECTIONS_IN_FLIGHT as u64
         );
-        assert_eq!(owners.selected_round(&active, true)[0], [5; 32]);
+        assert_eq!(owners.selected_round(&active)[0], [5; 32]);
         owners.poll(|_| false);
         assert!(owners.pending.is_empty());
-        for raw in owners.selected_round(&active, true) {
+        for raw in owners.selected_round(&active) {
             owners.start(raw, std::future::pending());
         }
-        assert_eq!(owners.selected_round(&active, true)[0], [9; 32]);
+        assert_eq!(owners.selected_round(&active)[0], [9; 32]);
     }
 
     #[tokio::test]
@@ -2341,7 +2325,7 @@ mod tests {
         let (events, _received) = tokio::sync::mpsc::channel(16);
         let mut owners = DescriptorFetches::default();
         for raw in owners
-            .selected_round(&active, true)
+            .selected_round(&active)
             .into_iter()
             .take(super::METADATA_SELECTIONS_PER_ROUND)
         {

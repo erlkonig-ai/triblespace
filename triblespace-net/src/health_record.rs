@@ -204,15 +204,13 @@ pub fn conditions(
     });
 
     for collection in &health.collections {
-        if collection.peers.is_empty()
-            || health.direction.is_some_and(|direction| !direction.pulls())
-        {
+        if collection.peers.is_empty() {
             conditions.push(Condition {
                 component: Component::Collection,
                 collection: Some(collection.collection),
                 peer: None,
                 state: State::Unknown,
-                alert: !starting && health.direction.is_some_and(|direction| direction.pulls()),
+                alert: !starting,
             });
         }
         for peer in &collection.peers {
@@ -226,7 +224,7 @@ pub fn conditions(
                     State::Progressing
                 }
                 ComparisonState::Different => State::Stalled,
-                ComparisonState::Unknown | ComparisonState::NotApplicable => State::Unknown,
+                ComparisonState::Unknown => State::Unknown,
             };
             let measured_recently = within(
                 peer.comparison.map(|comparison| comparison.observed_at),
@@ -238,8 +236,7 @@ pub fn conditions(
             let latest_repair_failed =
                 peer.last_failure_at.is_some() && peer.last_failure_at == peer.last_completed_at;
             // Unrelated local writes cannot disguise persistent divergence.
-            let alert = comparison != ComparisonState::NotApplicable
-                && !peer_starting
+            let alert = !peer_starting
                 && (state == State::Stalled || (!measured_recently && latest_repair_failed));
             conditions.push(Condition {
                 component: Component::Collection,
@@ -546,7 +543,6 @@ mod tests {
     fn observed(at: crate::clock::Mono) -> crate::health::HealthSnapshot {
         crate::health::HealthSnapshot {
             node: iroh_base::SecretKey::from_bytes(&[5; 32]).public().into(),
-            direction: Some(crate::inventory::ReconcileDirection::Bidirectional),
             started_at: Some(at),
             observed_at: Some(at),
             store: crate::health::StoreHealth {

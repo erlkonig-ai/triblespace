@@ -32,9 +32,7 @@ triblespace-net = "0.47"
 ```
 
 ```rust,ignore
-use triblespace_net::peer::{
-    Peer, PeerConfig, ReconcileDirection, ReconcileQos,
-};
+use triblespace_net::peer::{Peer, PeerConfig};
 
 let pile = triblespace::core::repo::pile::Pile::open(path)?;
 let mut peer = Peer::new(
@@ -42,12 +40,11 @@ let mut peer = Peer::new(
     signing_key,
     PeerConfig {
         peers: vec![bootstrap_endpoint],
-        qos: ReconcileQos {
-            direction: ReconcileDirection::Bidirectional,
-            ..ReconcileQos::default()
-        },
+        provider_publication_budget: None,
+        bind: None,
     },
 )?;
+// The pile's sync selection decides whether the collection is peered.
 peer.activate_collection(collection_handle);
 
 loop {
@@ -148,15 +145,10 @@ reply, which starts the reverse pull. A pull walk descends where the two PATCH
 digests differ and lands what the store lacks as it goes. A lost announcement is
 followed by the next one; nothing else is retried.
 
-Direction is local policy:
-
-- `Bidirectional` pulls active collections and serves admitted readers.
-- `ReadOnly` pulls but does not serve local collection state.
-- `WriteOnly` serves admitted readers but does not initiate collection repair.
-
-This direction applies only to collection repair. Every mode may publish and
-serve resident exact blobs under bearer handle H, and every mode may service a
-durable `Blob(H)` WANT through the ordinary KDF(H) path.
+There is no local direction policy. A collection flows to a neighbour exactly
+when this side admits it to read, and a pile that selects no collection peers
+for none; it still publishes and serves resident exact blobs under bearer
+handle H and services durable `Blob(H)` WANTs through the ordinary KDF(H) path.
 
 Configured endpoint addresses bootstrap DHT routing only. Repair targets are a
 collection's neighbours: candidates that select it and admit the asker.

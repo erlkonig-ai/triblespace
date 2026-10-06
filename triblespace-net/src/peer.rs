@@ -36,7 +36,6 @@ use crate::protocol::RawHash;
 use crate::reconcile::{ReconcileStats, Reconciler, ReplicationMode};
 
 pub use crate::host::PeerConfig;
-pub use crate::inventory::{ReconcileDirection, ReconcileQos};
 
 mod snapshot;
 pub use snapshot::{PeerGetError, PeerSnapshot};
@@ -362,7 +361,6 @@ where
     sender: NetSender,
     receiver: NetReceiver,
     host: Arc<Mutex<SharedHost>>,
-    qos: ReconcileQos,
     serving: Arc<Serving<S>>,
     /// Local retry/cursor state; demand and residency are observed in the store.
     reconciler: Reconciler,
@@ -383,12 +381,10 @@ where
 {
     /// Spawn a production host. No team scope or connection proof exists.
     pub fn new(store: S, key: SigningKey, config: PeerConfig) -> Result<Self, PeerOpenError> {
-        let qos = config.qos;
         let (sender, receiver, started) =
             host::spawn(key, config).map_err(PeerOpenError::HostStartup)?;
         Ok(Self::assemble(
             store,
-            qos,
             sender,
             receiver,
             Some(started),
@@ -407,42 +403,27 @@ where
     pub fn lazy(store: S, key: SigningKey, config: PeerConfig) -> Self {
         let id = crate::identity::iroh_secret(&key).public().into();
         let (sender, receiver, wiring) = host::wire(id);
-        let qos = config.qos;
         let startup = Box::new(move || {
             host::start(key, config, wiring)
                 .map(Some)
                 .map_err(PeerOpenError::HostStartup)
         });
-        Self::assemble(
-            store,
-            qos,
-            sender,
-            receiver,
-            None,
-            HostState::Dormant(startup),
-        )
+        Self::assemble(store, sender, receiver, None, HostState::Dormant(startup))
     }
 
     /// Attach a store to a caller-owned host, most commonly the deterministic
     /// simulator.
-    pub fn with_wiring(
-        store: S,
-        qos: ReconcileQos,
-        sender: NetSender,
-        receiver: NetReceiver,
-    ) -> Self {
-        Self::assemble(store, qos, sender, receiver, None, HostState::Running)
+    pub fn with_wiring(store: S, sender: NetSender, receiver: NetReceiver) -> Self {
+        Self::assemble(store, sender, receiver, None, HostState::Running)
     }
 
     fn assemble(
         store: S,
-        qos: ReconcileQos,
         sender: NetSender,
         receiver: NetReceiver,
         started: Option<HostStarted>,
         host: HostState,
     ) -> Self {
-        sender.observe_direction(qos.direction);
         let store = Arc::new(Mutex::new(Some(store)));
         let serving = Arc::new(Serving {
             store: store.clone(),
@@ -466,7 +447,6 @@ where
             })),
             sender,
             receiver,
-            qos,
             serving,
             reconciler: Reconciler::new(),
             last_event_at: crate::clock::mono_now(),
@@ -564,10 +544,6 @@ where
             .as_ref()
             .map(|started| started.bound.clone())
             .unwrap_or_default()
-    }
-
-    pub const fn qos(&self) -> ReconcileQos {
-        self.qos
     }
 
     pub fn last_event_at(&self) -> crate::clock::Mono {
@@ -1026,9 +1002,6 @@ mod tests {
     fn foreground_config() -> PeerConfig {
         PeerConfig {
             peers: Vec::new(),
-            qos: ReconcileQos {
-                direction: ReconcileDirection::ReadOnly,
-            },
             provider_publication_budget: Some(0),
             bind: None,
         }
@@ -1074,7 +1047,6 @@ mod tests {
         let mut peer = Peer::lazy(store, key, foreground_config());
         let health = peer.health();
         assert_eq!(health.observed_at, None);
-        assert_eq!(health.direction, Some(ReconcileDirection::ReadOnly));
         let before = peer.snapshot().unwrap();
 
         assert_eq!(
@@ -1120,7 +1092,6 @@ mod tests {
         });
         let mut peer = Peer::assemble(
             MemoryRepo::default(),
-            foreground_config().qos,
             sender,
             receiver,
             None,
@@ -1176,7 +1147,6 @@ mod tests {
         });
         let mut peer = Peer::assemble(
             MemoryRepo::default(),
-            foreground_config().qos,
             sender,
             receiver,
             None,
@@ -1226,7 +1196,6 @@ mod tests {
         });
         let mut peer = Peer::assemble(
             store,
-            foreground_config().qos,
             sender,
             receiver,
             None,
@@ -1330,12 +1299,7 @@ mod tests {
             finish: finish.clone(),
             bytes,
         }));
-        let mut peer = Peer::with_wiring(
-            MemoryRepo::default(),
-            foreground_config().qos,
-            sender,
-            receiver,
-        );
+        let mut peer = Peer::with_wiring(MemoryRepo::default(), sender, receiver);
         let resident = peer
             .put::<UnknownBlob, _>(Bytes::from_source(b"captured".to_vec()))
             .unwrap();
@@ -1386,12 +1350,7 @@ mod tests {
             bytes: Bytes::from_source(b"not the requested content".to_vec()),
             requests: Arc::new(AtomicUsize::new(0)),
         }));
-        let mut peer = Peer::with_wiring(
-            MemoryRepo::default(),
-            foreground_config().qos,
-            sender,
-            receiver,
-        );
+        let mut peer = Peer::with_wiring(MemoryRepo::default(), sender, receiver);
         let snapshot = peer.snapshot().unwrap();
         // This capability verifies against the requested handle, so these
         // mismatched bytes cannot become a verified payload. The next test
@@ -1425,12 +1384,7 @@ mod tests {
         let own = Inline::<Handle<UnknownBlob>>::new(*blake3::hash(&bytes[..]).as_bytes());
         wiring.install_test_capability(Arc::new(AnyBlob { bytes }));
         let requested = Inline::<Handle<UnknownBlob>>::new([0x5f; 32]);
-        let mut peer = Peer::with_wiring(
-            MemoryRepo::default(),
-            foreground_config().qos,
-            sender,
-            receiver,
-        );
+        let mut peer = Peer::with_wiring(MemoryRepo::default(), sender, receiver);
         let snapshot = peer.snapshot().unwrap();
         assert!(snapshot.get::<Bytes, UnknownBlob>(requested).await.is_err());
         let after = peer.snapshot().unwrap();
@@ -1456,7 +1410,6 @@ mod tests {
         });
         let mut peer = Peer::assemble(
             MemoryRepo::default(),
-            foreground_config().qos,
             sender,
             receiver,
             None,
@@ -1533,14 +1486,7 @@ mod tests {
             start_count.fetch_add(1, Ordering::SeqCst);
             Ok(None)
         });
-        let mut peer = Peer::assemble(
-            store,
-            foreground_config().qos,
-            sender,
-            receiver,
-            None,
-            HostState::Dormant(startup),
-        );
+        let mut peer = Peer::assemble(store, sender, receiver, None, HostState::Dormant(startup));
 
         peer.activate_collection(collection);
         peer.activate_collection(collection);
@@ -1565,12 +1511,7 @@ mod tests {
         let (sender, receiver, _wiring) =
             host::wire(crate::identity::iroh_secret(&key).public().into());
         let observer = sender.clone();
-        let mut peer = Peer::with_wiring(
-            Pile::open(path.path()).unwrap(),
-            ReconcileQos::default(),
-            sender,
-            receiver,
-        );
+        let mut peer = Peer::with_wiring(Pile::open(path.path()).unwrap(), sender, receiver);
         let bytes = Bytes::from_source(vec![13_u8, 14, 15]);
         let handle = peer.put::<UnknownBlob, _>(bytes.clone()).unwrap();
         let frozen = peer.snapshot().unwrap();
@@ -1607,12 +1548,7 @@ mod tests {
         let (sender, receiver, _wiring) =
             host::wire(crate::identity::iroh_secret(&key).public().into());
         let observer = sender.clone();
-        let mut peer = Peer::with_wiring(
-            Pile::open(path.path()).unwrap(),
-            ReconcileQos::default(),
-            sender,
-            receiver,
-        );
+        let mut peer = Peer::with_wiring(Pile::open(path.path()).unwrap(), sender, receiver);
         let previous = peer.snapshot().unwrap();
         assert!(observer.current_snapshot().is_some());
         // A new incomplete external tail cannot change the already frozen
@@ -1644,12 +1580,7 @@ mod tests {
         let id = EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap();
         let (sender, receiver, _wiring) = host::wire(id);
         let observer = sender.clone();
-        let mut peer = Peer::with_wiring(
-            MemoryRepo::default(),
-            ReconcileQos::default(),
-            sender,
-            receiver,
-        );
+        let mut peer = Peer::with_wiring(MemoryRepo::default(), sender, receiver);
         let snapshot = peer.snapshot().unwrap();
         assert_eq!(
             snapshot.clone().changes_since(&snapshot),
@@ -1667,12 +1598,7 @@ mod tests {
         let key = SigningKey::from_bytes(&[90; 32]);
         let id = EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap();
         let (sender, receiver, _wiring) = host::wire(id);
-        let mut peer = Peer::with_wiring(
-            MemoryRepo::default(),
-            ReconcileQos::default(),
-            sender,
-            receiver,
-        );
+        let mut peer = Peer::with_wiring(MemoryRepo::default(), sender, receiver);
         let missing = Inline::<Handle<UnknownBlob>>::new([0x5a; 32]);
 
         assert!(peer.acquire(missing).await.unwrap().is_none());
@@ -1685,12 +1611,7 @@ mod tests {
         let id = EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap();
         let (sender, receiver, _wiring) = host::wire(id);
         let observer = sender.clone();
-        let mut peer = Peer::with_wiring(
-            MemoryRepo::default(),
-            ReconcileQos::default(),
-            sender,
-            receiver,
-        );
+        let mut peer = Peer::with_wiring(MemoryRepo::default(), sender, receiver);
         let before = observer.current_snapshot().unwrap();
 
         for _ in 0..100 {
@@ -1725,7 +1646,7 @@ mod tests {
             .collect::<Vec<_>>();
         let (sender, receiver, _wiring) = host::wire(id);
         let observer = sender.clone();
-        let mut peer = Peer::with_wiring(store, ReconcileQos::default(), sender, receiver);
+        let mut peer = Peer::with_wiring(store, sender, receiver);
         let rebuilds_before = peer.serving_snapshot_rebuilds();
 
         peer.activate_collections(collections.iter().copied());
@@ -1752,12 +1673,7 @@ mod tests {
         let key = SigningKey::from_bytes(&[93; 32]);
         let id = EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap();
         let (sender, receiver, _wiring) = host::wire(id);
-        let mut peer = Peer::with_wiring(
-            MemoryRepo::default(),
-            ReconcileQos::default(),
-            sender,
-            receiver,
-        );
+        let mut peer = Peer::with_wiring(MemoryRepo::default(), sender, receiver);
         let missing = CollectionHandle::new([0x53; 32]);
         peer.activate_collection(missing);
         let health = peer.health();
@@ -1772,12 +1688,7 @@ mod tests {
         let key = SigningKey::from_bytes(&[94; 32]);
         let id = EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap();
         let (sender, receiver, wiring) = host::wire(id);
-        let mut peer = Peer::with_wiring(
-            MemoryRepo::default(),
-            ReconcileQos::default(),
-            sender,
-            receiver,
-        );
+        let mut peer = Peer::with_wiring(MemoryRepo::default(), sender, receiver);
         let proof = CapabilityProof::new(
             CapabilityResource::new([95; 32]),
             &key,

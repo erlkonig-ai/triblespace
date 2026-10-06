@@ -18,7 +18,7 @@ use triblespace_core::collection::{
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::SnapshotSource;
 use triblespace_net::health_record::{self, Recorder, DEFAULT_MAX_AGE, REPORT_EVERY};
-use triblespace_net::peer::{Peer, PeerConfig, ReconcileDirection, ReconcileQos};
+use triblespace_net::peer::{Peer, PeerConfig};
 use triblespace_net::reconcile::ReplicationMode;
 
 /// Open the pile, as `host` when the command publishes or reads MERGEs or MAPs
@@ -61,23 +61,6 @@ fn parse_collection(value: &str) -> Result<CollectionHandle> {
 fn load_existing_key(path: Option<PathBuf>, pile_path: &PathBuf) -> Result<SigningKey> {
     let path = triblespace_core::signing_key_file::resolve_path(path.as_deref(), pile_path);
     triblespace_core::signing_key_file::load_existing(&path).map_err(Into::into)
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-pub(crate) enum DirectionArg {
-    Bidirectional,
-    ReadOnly,
-    WriteOnly,
-}
-
-impl From<DirectionArg> for ReconcileDirection {
-    fn from(direction: DirectionArg) -> Self {
-        match direction {
-            DirectionArg::Bidirectional => Self::Bidirectional,
-            DirectionArg::ReadOnly => Self::ReadOnly,
-            DirectionArg::WriteOnly => Self::WriteOnly,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -190,9 +173,6 @@ pub enum Command {
         /// Exact collection descriptor handle to activate. Repeat as needed.
         #[arg(long = "collection", value_name = "HANDLE", required = true)]
         collections: Vec<String>,
-        /// Whether to pull collections, serve them, or do both.
-        #[arg(long, value_enum, default_value = "bidirectional")]
-        direction: DirectionArg,
         /// Local blob acquisition for exactly the --collection selections.
         /// READ grants alone never subscribe this process to hydration.
         /// Full mode also acquires positive resident-blob handles learned through
@@ -267,7 +247,6 @@ pub fn run(command: Command) -> Result<()> {
             peers,
             key,
             collections,
-            direction,
             replication,
             provider_publication_budget,
             health,
@@ -281,9 +260,6 @@ pub fn run(command: Command) -> Result<()> {
             peers,
             key,
             collections,
-            ReconcileQos {
-                direction: direction.into(),
-            },
             replication.into(),
             provider_publication_budget,
             health,
@@ -341,7 +317,6 @@ fn run_sync(
     peer_values: Vec<String>,
     key_path: Option<PathBuf>,
     collection_values: Vec<String>,
-    qos: ReconcileQos,
     replication: ReplicationMode,
     provider_publication_budget: Option<u64>,
     health: bool,
@@ -420,7 +395,6 @@ fn run_sync(
         key.clone(),
         PeerConfig {
             peers,
-            qos,
             provider_publication_budget,
             bind,
         },
@@ -436,14 +410,6 @@ fn run_sync(
     } else {
         eprintln!("local swarm health: not recording (set --health or --health-collection)");
     }
-    eprintln!(
-        "direction: {}",
-        match qos.direction {
-            ReconcileDirection::Bidirectional => "bidirectional",
-            ReconcileDirection::ReadOnly => "read-only (no collection serve)",
-            ReconcileDirection::WriteOnly => "write-only (no collection pull)",
-        }
-    );
     match provider_publication_budget {
         None => eprintln!("provider publication budget: unlimited"),
         Some(0) => eprintln!(
@@ -807,7 +773,7 @@ mod tests {
             CollectionStoreExt,
         };
         use triblespace_core::repo::memoryrepo::MemoryRepo;
-        use triblespace_net::peer::{Peer, PeerConfig, ReconcileQos};
+        use triblespace_net::peer::{Peer, PeerConfig};
 
         fn free_port() -> std::net::SocketAddr {
             // Released at once; the peer binds it a moment later.
@@ -850,7 +816,6 @@ mod tests {
                 key.clone(),
                 PeerConfig {
                     peers: other,
-                    qos: ReconcileQos::default(),
                     provider_publication_budget: Some(0),
                     bind: Some(addrs[index]),
                 },

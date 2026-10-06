@@ -23,7 +23,6 @@ use triblespace_core::collection::{
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{BlobStoreList, SnapshotSource};
 use triblespace_net::host::{self, PeerConfig};
-use triblespace_net::inventory::ReconcileQos;
 use triblespace_net::peer::Peer;
 
 fn key(byte: u8) -> SigningKey {
@@ -61,17 +60,15 @@ async fn bring_up(
     provider_publication_budget: Option<u64>,
 ) -> (Peer<MemoryRepo>, JoinHandle<()>) {
     let id = endpoint.id();
-    let qos = ReconcileQos::default();
     let config = PeerConfig {
         peers,
-        qos,
         provider_publication_budget,
         bind: None,
     };
     let harness = triblespace_net::transport::iroh::bind_with_endpoint(endpoint, &config).await;
     let (sender, receiver, wiring) = host::wire(id);
     let owner = tokio::spawn(host::run_host(harness, config, wiring));
-    (Peer::with_wiring(store, qos, sender, receiver), owner)
+    (Peer::with_wiring(store, sender, receiver), owner)
 }
 
 fn contains(peer: &mut Peer<MemoryRepo>, expected: CollectionRecord) -> bool {

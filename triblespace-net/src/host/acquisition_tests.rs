@@ -1470,7 +1470,6 @@ async fn zero_announcement_budget_still_answers_resident_self_hints() {
                     peers: vec![EndpointAddr::from(
                         EndpointId::from_bytes(&client_id).unwrap(),
                     )],
-                    qos: ReconcileQos::default(),
                     provider_publication_budget: Some(0),
                     bind: None,
                 },
