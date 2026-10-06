@@ -428,6 +428,48 @@ fn bound_line(sockets: &[std::net::SocketAddr]) -> String {
     format!("bound: {}", sockets.join(" "))
 }
 
+/// Where a process on this machine reaches an endpoint bound to `bound`. A
+/// socket bound on every interface (0.0.0.0, ::) is reached at loopback.
+fn local_addresses(bound: &[std::net::SocketAddr]) -> BTreeSet<std::net::SocketAddr> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    bound
+        .iter()
+        .map(|socket| {
+            let ip = match socket.ip() {
+                IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+                IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+                ip => ip,
+            };
+            SocketAddr::new(ip, socket.port())
+        })
+        .collect()
+}
+
+/// Record in the configuration of the pile `key` signs for that its sync
+/// daemon, which runs as `key`, listens on `addresses`, unless it already
+/// says exactly that. Returns whether it wrote. A process that opens the
+/// pile with the key reads them to reach the daemon first
+/// (`PeerConfig::daemon`).
+fn record_addresses(
+    pile: &mut Pile,
+    key: &SigningKey,
+    addresses: &BTreeSet<std::net::SocketAddr>,
+) -> Result<bool> {
+    use triblespace_core::collection::private_policy;
+    use triblespace_core::collection::selection::{
+        sync_addresses, write_sync_addresses, CONFIG_COLLECTION_NAME,
+    };
+
+    let endpoint = key.verifying_key();
+    let facts = config_facts(&pile.snapshot()?, endpoint)?;
+    if sync_addresses(&facts, endpoint) == *addresses {
+        return Ok(false);
+    }
+    let config = pile.collection(CONFIG_COLLECTION_NAME, private_policy(endpoint))?;
+    write_sync_addresses(pile, config, key, endpoint, addresses.iter().copied())?;
+    Ok(true)
+}
+
 /// The collections the configuration of the pile `authority` signs for
 /// selects for sync.
 fn selected_collections(
@@ -555,6 +597,7 @@ fn run_sync(
     eprintln!("live collection repair active. (Ctrl-C to stop; also SIGTERM on Unix)\n");
     let node = *peer.id().as_bytes();
     let mut rounds_seen = RoundsSeen::new();
+    let mut recorded = None;
 
     let started = std::time::Instant::now();
     let duration_limit = duration.map(std::time::Duration::from_secs);
@@ -606,6 +649,17 @@ fn run_sync(
                 }
             }
             if next_reconcile <= std::time::Instant::now() {
+                // Where this daemon listens, for a process that opens the
+                // pile with its key: recorded at start and whenever the
+                // endpoint is bound elsewhere.
+                let listening = local_addresses(&peer.bound_sockets());
+                if recorded.as_ref() != Some(&listening) {
+                    if recorded.is_some() {
+                        eprintln!("{}", bound_line(&peer.bound_sockets()));
+                    }
+                    record_addresses(&mut *peer.store(), &key, &listening)?;
+                    recorded = Some(listening);
+                }
                 // A selection written while the daemon runs takes effect
                 // here. An unselected collection stays active and is no
                 // longer peered.
@@ -886,6 +940,88 @@ mod tests {
             super::bound_line(&[addr, v6]),
             "bound: 127.0.0.1:7001 [::1]:7002"
         );
+    }
+
+    #[test]
+    fn a_socket_bound_on_every_interface_is_reached_at_loopback() {
+        let parse = |text: &str| text.parse::<std::net::SocketAddr>().unwrap();
+        assert_eq!(
+            super::local_addresses(&[
+                parse("0.0.0.0:7001"),
+                parse("[::]:7002"),
+                parse("192.0.2.7:7003")
+            ]),
+            std::collections::BTreeSet::from([
+                parse("127.0.0.1:7001"),
+                parse("[::1]:7002"),
+                parse("192.0.2.7:7003")
+            ])
+        );
+    }
+
+    /// The first contact of JP's content bootstrap. A daemon records where
+    /// it listens in its pile's configuration. Another process opens a copy
+    /// of that pile with the pile's key, under a transport key of its own
+    /// and with no peer configured, and fetches through the daemon a blob
+    /// its copy lacks. Where discovery finds the daemon by key, as it can on
+    /// one machine, the recorded addresses are not what makes this pass:
+    /// `peer::tests` and `transport::iroh::tests` check those halves.
+    #[test]
+    fn a_process_with_the_pile_key_reaches_the_daemon_its_pile_records() {
+        use anybytes::Bytes;
+        use ed25519_dalek::SigningKey;
+        use triblespace_core::blob::encodings::UnknownBlob;
+        use triblespace_core::repo::BlobStorePut;
+        use triblespace_net::peer::{Leech, Peer, PeerConfig};
+
+        let directory = tempfile::tempdir().unwrap();
+        let daemon_path = directory.path().join("daemon.pile");
+        let reader_path = directory.path().join("reader.pile");
+        std::fs::File::create(&daemon_path).unwrap();
+        let key = SigningKey::from_bytes(&[0x51; 32]);
+        let mut daemon = Peer::new(
+            super::open_pile(&daemon_path, None).unwrap(),
+            key.clone(),
+            PeerConfig {
+                daemon: None,
+                provider_publication_budget: Some(0),
+                // One loopback socket on a port the system picks.
+                bind: Some("127.0.0.1:0".parse().unwrap()),
+            },
+        )
+        .unwrap();
+        let listening = super::local_addresses(&daemon.bound_sockets());
+        assert!(super::record_addresses(&mut *daemon.store(), &key, &listening).unwrap());
+        assert!(
+            !super::record_addresses(&mut *daemon.store(), &key, &listening).unwrap(),
+            "addresses the register already holds are not written again"
+        );
+        // The other process's pile: the daemon's as it is now.
+        std::fs::copy(&daemon_path, &reader_path).unwrap();
+        let payload = Bytes::from_source(b"only the daemon holds this".to_vec());
+        let handle = daemon
+            .store()
+            .put::<UnknownBlob, _>(payload.clone())
+            .unwrap();
+        daemon.refresh();
+
+        let mut reader = Leech::lazy(
+            super::open_pile(&reader_path, None).unwrap(),
+            SigningKey::from_bytes(&[0x52; 32]),
+            PeerConfig {
+                daemon: Some(key.verifying_key()),
+                provider_publication_budget: Some(0),
+                bind: None,
+            },
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let fetched = runtime.block_on(reader.acquire(handle)).unwrap();
+        assert_eq!(fetched, Some(payload));
+        reader.into_store().close().unwrap();
+        daemon.into_store().close().unwrap();
     }
 
     #[test]

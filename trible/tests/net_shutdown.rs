@@ -6,7 +6,9 @@
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
-use triblespace_core::collection::selection::{write_sync_selection, CONFIG_COLLECTION_NAME};
+use triblespace_core::collection::selection::{
+    config_facts, sync_addresses, write_sync_selection, CONFIG_COLLECTION_NAME,
+};
 use triblespace_core::collection::{
     private_policy, AdmissionPolicy, CollectionPolicy, CollectionRead, CollectionRecord,
     CollectionStoreExt,
@@ -177,6 +179,15 @@ fn sync_closes_on_signal(signal: &str, explicit_health_collection: bool) {
         }
     }
     assert!(observers > 0, "a real signed report must name its observer");
+    // Where the daemon listened, for a process that opens this pile with its
+    // key: sockets bound on every interface, recorded as loopback.
+    let facts = config_facts(&snapshot, key.verifying_key()).unwrap();
+    let recorded = sync_addresses(&facts, key.verifying_key());
+    assert!(!recorded.is_empty(), "{log}");
+    assert!(
+        recorded.iter().all(|address| address.ip().is_loopback()),
+        "{recorded:?}"
+    );
     pile.close().unwrap();
 }
 

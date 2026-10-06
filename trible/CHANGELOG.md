@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `pile net sync` records where it listens in the pile's own configuration
+  collection, under its key (`selection::write_sync_addresses`), at start
+  and whenever its endpoint is bound elsewhere; a socket bound on every
+  interface is recorded as loopback. A process that opens the pile with the
+  key, such as a foreground reader, reads it (`PeerConfig::daemon`) and
+  reaches the daemon with no peer configured.
+
 ### Removed
 
 - `pile net sync --peers`. The daemon's peers come from the pile: the keys
