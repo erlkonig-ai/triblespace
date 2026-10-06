@@ -13,17 +13,18 @@
 //! timer once when it completes, so the merged root goes out once (D4). A
 //! changed held set resets nothing: the next announcement carries it.
 //!
-//! An announcement ends the comparison when its root and any held digest it
-//! carries equal this side's. Otherwise a root that differs, and is not the
-//! root of the last record pull from its sender that completed, starts a
-//! record pull from the sender; a held digest that differs, and is not the
-//! one the last completed reference pull from it walked, starts a reference
-//! pull. If this side sends to the sender and the announcement is not
-//! itself a reply, a pull also gets an immediate reply with this side's
-//! state, from which the sender pulls in turn. The reply counts as the
-//! interval's announcement to that neighbour and is never answered. An
-//! announcement heard while a pull from its sender runs waits for every
-//! pull from it to end, the latest replacing earlier ones.
+//! An announcement ends the comparison when its root equals this side's, and
+//! so does its held digest where both sides replicate C in full; a held
+//! digest from any other neighbour is ignored. Otherwise a root that differs,
+//! and is not the root of the last record pull from its sender that
+//! completed, starts a record pull from the sender; a held digest that
+//! differs, and is not the one the last completed reference pull from it
+//! walked, starts a reference pull. If this side sends to the sender and the
+//! announcement is not itself a reply, a pull also gets an immediate reply
+//! with this side's state, from which the sender pulls in turn. The reply
+//! counts as the interval's announcement to that neighbour and is never
+//! answered. An announcement heard while a pull from its sender runs waits
+//! for every pull from it to end, the latest replacing earlier ones.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -227,10 +228,11 @@ impl Announcements {
             }
             Entry::Vacant(pulls) => pulls,
         };
-        // Held digests compare only where both sides hold one: between two
-        // neighbours that replicate the collection in full.
+        // Held digests compare only between two neighbours that replicate
+        // the collection in full.
         let held = state
             .held
+            .filter(|_| neighbour.full)
             .zip(announcing.state.held)
             .filter(|(theirs, mine)| theirs != mine)
             .map(|(theirs, _)| theirs);
@@ -655,6 +657,20 @@ mod tests {
             let held = (peer == A).then_some(root(2));
             assert_eq!(announced(wire), [(root(1), held, true)]);
         }
+    }
+
+    /// A held digest from a neighbour whose peering is not Full on both
+    /// sides starts no reference pull: the comparison runs only between two
+    /// Full neighbours.
+    #[test]
+    fn a_demand_neighbour_cannot_start_a_reference_pull() {
+        let c = collection(9);
+        let now = crate::clock::mono_now();
+        let mut node = Announcements::default();
+        node.observe([(c, full(1, 1))], now);
+        let a = wire(1, A);
+        node.neighbours([(c, &a.link, false, false)], now);
+        assert_eq!(node.heard(A, c, full(1, 2), false, now), []);
     }
 
     /// Quiet Full neighbours with equal records: a different held digest
