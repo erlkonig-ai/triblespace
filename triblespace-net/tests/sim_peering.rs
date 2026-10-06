@@ -1,5 +1,6 @@
 //! Per-collection peering through whole hosts over the deterministic
-//! transport: a host peers for a collection only while its pile selects it.
+//! transport: a host peers for a collection only while its pile selects it,
+//! and a writer that cannot read delivers without receiving.
 #![cfg(feature = "sim")]
 
 use std::sync::{Arc, Mutex, OnceLock};
@@ -10,20 +11,22 @@ use iroh_base::EndpointId;
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace_core::capability::{CapabilityProof, CapabilityResource};
+use triblespace_core::capability::{CapabilityHandle, CapabilityProof, CapabilityResource};
 use triblespace_core::clock::{self, VirtualClock};
 use triblespace_core::collection::selection::{CONFIG_COLLECTION_NAME, write_sync_selection};
 use triblespace_core::collection::{
     AdmissionPolicy, Collection, CollectionHandle, CollectionPolicy, CollectionStoreExt,
-    private_policy, read_capability,
+    private_policy, read_capability, write_capability,
 };
 use triblespace_core::collection::{
-    CollectionCommit, CollectionData, CollectionRecord, CollectionStore, HeldRead,
+    CollectionCommit, CollectionData, CollectionRead, CollectionRecord, CollectionStore, HeldRead,
     empty_metadata_handle,
 };
 use triblespace_core::repo::memoryrepo::MemoryRepo;
-use triblespace_core::repo::{BlobStoreGet, BlobStorePut, CapabilityProofStore, SnapshotSource};
-use triblespace_net::health::PeeringHealth;
+use triblespace_core::repo::{
+    BlobStoreGet, BlobStorePut, CapabilityProofRead, CapabilityProofStore, SnapshotSource,
+};
+use triblespace_net::health::{PeeringHealth, RepairHealth};
 use triblespace_net::host::{self, PeerConfig};
 use triblespace_net::peer::Peer;
 use triblespace_net::reconcile::ReplicationMode;
@@ -135,6 +138,66 @@ async fn advance(clock: &Arc<VirtualClock>, peers: &mut [&mut Peer<MemoryRepo>],
 
 fn peerings(peer: &Peer<MemoryRepo>) -> Vec<PeeringHealth> {
     peer.health().peerings.clone()
+}
+
+/// `root` grants `subject` the `action` on `collection`.
+fn grant(
+    root: &SigningKey,
+    action: CapabilityHandle,
+    subject: &SigningKey,
+    collection: CollectionHandle,
+) -> CapabilityProof {
+    CapabilityProof::new(
+        CapabilityResource::from(collection),
+        root,
+        action,
+        subject.verifying_key(),
+    )
+}
+
+/// A record of `collection` that `key` signs over fresh data, kept in `store`
+/// with its data.
+fn commit(
+    store: &mut MemoryRepo,
+    key: &SigningKey,
+    collection: CollectionHandle,
+    body: &[u8],
+) -> CollectionRecord {
+    let data = store
+        .put::<UnknownBlob, _>(Bytes::from_source(body.to_vec()))
+        .unwrap();
+    let record = CollectionRecord::Commit(CollectionCommit::sign(
+        key,
+        collection,
+        CollectionData::new(data.raw),
+        empty_metadata_handle(),
+    ));
+    store.insert(record).unwrap();
+    record
+}
+
+fn holds(peer: &mut Peer<MemoryRepo>, record: CollectionRecord) -> bool {
+    peer.snapshot()
+        .unwrap()
+        .records()
+        .unwrap()
+        .any(|held| held.unwrap() == record)
+}
+
+/// What `peer` recorded of its record pulls of `collection` from `from`.
+fn pulls(
+    peer: &Peer<MemoryRepo>,
+    collection: CollectionHandle,
+    from: [u8; 32],
+) -> Option<RepairHealth> {
+    peer.health()
+        .collections
+        .iter()
+        .find(|health| health.collection == collection)?
+        .peers
+        .iter()
+        .find(|pulls| pulls.peer == from)
+        .cloned()
 }
 
 #[test]
@@ -322,4 +385,94 @@ fn full_hosts_with_equal_records_converge_on_their_held_blobs() {
 #[test]
 fn a_demand_host_and_a_full_host_compare_no_held_blobs() {
     assert_eq!(held_blobs_after_peering(false), [false, false]);
+}
+
+/// Astra's R3 through whole hosts. A writer that cannot read asks the
+/// collection's owner to peer with its send flag set, presenting its WRITE
+/// grant. The owner accepts without sending: it pulls the writer's record and
+/// grant and sends nothing back. The owner keeps a record of its own, so the
+/// two roots stay different, and every later announcement of the writer's
+/// unchanged root equals the last pull from it that completed: it starts no
+/// second walk.
+#[test]
+fn a_writer_that_cannot_read_delivers_receives_nothing_and_walks_once() {
+    let _guard = test_guard();
+    let clock = virtual_clock();
+    clock.reset();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    runtime.block_on(tokio::task::LocalSet::new().run_until(async {
+        let net = SimNet::new(0x9EE7_1004, SimConfig::default());
+        let owner_key = key(97);
+        let writer_key = key(98);
+        let policy = CollectionPolicy::new(
+            AdmissionPolicy::direct(owner_key.verifying_key()),
+            AdmissionPolicy::direct(owner_key.verifying_key()),
+        );
+        let mut owner_pile = Pile::new(owner_key.clone(), policy.clone());
+        let mut writer_pile = Pile::new(writer_key.clone(), policy);
+        let collection = owner_pile.collection;
+        let write = grant(&owner_key, write_capability(), &writer_key, collection);
+        writer_pile.store.insert_proof(write.clone()).unwrap();
+        let owned = commit(
+            &mut owner_pile.store,
+            &owner_key,
+            collection,
+            b"the owner's",
+        );
+        let written = commit(
+            &mut writer_pile.store,
+            &writer_key,
+            collection,
+            b"the writer's",
+        );
+        select(&mut owner_pile);
+        select(&mut writer_pile);
+        let (owner_id, writer_id) = (
+            owner_key.verifying_key().to_bytes(),
+            writer_key.verifying_key().to_bytes(),
+        );
+        let mut owner = bring_up(&net, &owner_key, owner_pile.store);
+        let mut writer = bring_up(&net, &writer_key, writer_pile.store);
+        owner.activate_collection(collection);
+        writer.activate_collection(collection);
+
+        advance(&clock, &mut [&mut owner, &mut writer], 30).await;
+        assert!(holds(&mut owner, written));
+        let delivered = owner.snapshot().unwrap();
+        assert!(
+            delivered
+                .proofs()
+                .unwrap()
+                .any(|proof| proof.unwrap() == write)
+        );
+        let peering = |peer: &Peer<MemoryRepo>, other| {
+            let peerings = peerings(peer);
+            assert!(
+                peerings.len() == 1 && peerings[0].peer == other && peerings[0].peered,
+                "{peerings:?}"
+            );
+            peerings[0]
+        };
+        let at_owner = peering(&owner, writer_id);
+        assert!(!at_owner.sends && at_owner.receives, "{at_owner:?}");
+        let at_writer = peering(&writer, owner_id);
+        assert!(at_writer.sends && !at_writer.receives, "{at_writer:?}");
+        let walked = pulls(&owner, collection, writer_id).expect("the owner pulled");
+        assert!(walked.last_completed_at.is_some() && !walked.in_flight);
+        assert_eq!(walked.first_started_at, walked.last_started_at);
+
+        // Five announcement intervals at their sixty-second cap.
+        advance(&clock, &mut [&mut owner, &mut writer], 300).await;
+        let later = pulls(&owner, collection, writer_id).unwrap();
+        assert_eq!(
+            later.last_started_at, walked.last_started_at,
+            "the writer's unchanged root started a second walk"
+        );
+        assert!(!holds(&mut writer, owned));
+        assert!(pulls(&writer, collection, owner_id).is_none());
+    }));
 }
