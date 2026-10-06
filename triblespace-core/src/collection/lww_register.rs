@@ -552,6 +552,19 @@ impl LwwIndex {
         })
     }
 
+    /// The join of this observation and `other`: the rows of both, paired
+    /// and ranked together when a query is prepared.
+    ///
+    /// This is how one register spans several collections: a state written
+    /// in one competes with the states of the same register written in
+    /// another. Shallow, like
+    /// [`UnionArchive::union`](crate::blob::encodings::succinctarchive::UnionArchive::union).
+    pub fn union(&self, other: &Self) -> Self {
+        Self {
+            members: self.members.iter().chain(&other.members).cloned().collect(),
+        }
+    }
+
     fn identity_rows(&self) -> impl Iterator<Item = &[u8; IDENTITY_ROW_LEN]> {
         self.members
             .iter()
@@ -1035,6 +1048,25 @@ mod tests {
         }
         let reversed = members.into_iter().rev().collect::<Vec<_>>();
         assert_eq!(attach(&reversed).query().unwrap(), expected);
+    }
+
+    /// Two collections' registers: the later write wins across them, and a
+    /// state whose halves sit in different collections pairs in the union.
+    #[test]
+    fn a_union_ranks_both_sides_together() {
+        let register = ufoid();
+        let earlier = ufoid();
+        let later = ufoid();
+        let split = ufoid();
+        let first = attach(&[project(
+            &(coordinate(&earlier, &register, 1) + identity(&split, &register)),
+        )]);
+        let second = attach(&[project(&(coordinate(&later, &register, 2) + order(&split, 3)))]);
+        assert_eq!(first.query().unwrap().winner(*register), Some(*earlier));
+        let union = first.union(&second).query().unwrap();
+        assert_eq!(union.winner(*register), Some(*split));
+        assert_eq!(union.len(), 3);
+        assert_eq!(union, second.union(&first).query().unwrap());
     }
 
     #[test]
