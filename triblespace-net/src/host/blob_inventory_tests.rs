@@ -298,7 +298,7 @@ fn a_new_records_closure_is_served_by_the_observation_that_carries_it() {
 }
 
 mod reference_pull {
-    use tokio::sync::mpsc::UnboundedReceiver;
+    use tokio::sync::mpsc::Receiver;
     use triblespace_core::collection::{CollectionData, empty_metadata_handle};
     use triblespace_core::repo::SnapshotSource;
 
@@ -505,7 +505,7 @@ mod reference_pull {
     }
 
     /// The announcements sent on a link: state and reply flag.
-    fn announced(frames: &mut UnboundedReceiver<Frame>) -> Vec<(State, bool)> {
+    fn announced(frames: &mut Receiver<Frame>) -> Vec<(State, bool)> {
         std::iter::from_fn(|| frames.try_recv().ok())
             .map(|frame| match frame {
                 Frame::Announce {

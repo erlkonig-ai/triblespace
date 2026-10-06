@@ -344,7 +344,7 @@ mod tests {
 
     use std::time::Duration;
 
-    use tokio::sync::mpsc::UnboundedReceiver;
+    use tokio::sync::mpsc::Receiver;
 
     const STEP: Duration = Duration::from_millis(100);
     const A: PeerId = [0xA; 32];
@@ -371,7 +371,7 @@ mod tests {
     /// A link to `peer` and the frames sent on it.
     struct Wire {
         link: Link,
-        frames: UnboundedReceiver<Frame>,
+        frames: Receiver<Frame>,
     }
 
     fn wire(id: u64, peer: PeerId) -> Wire {

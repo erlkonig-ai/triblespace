@@ -816,7 +816,8 @@ fn seventeen_neighbours_hold_recon_while_blob_streams_run() {
 
 /// A peer that stops reading `recon/1` gets it reset. It peers with a host
 /// for a collection and then asks for the collection's one record thousands
-/// of times over, reading nothing more. The answers fill the stream's credit,
+/// of times over, a thousand a second, reading nothing more: fewer at a time
+/// than the host leaves unanswered. The answers fill the stream's credit,
 /// and the 60 s a writer waits for credit later the host resets the stream
 /// with [`RESET_STALLED`] and stops reading it. The connection and the peering
 /// stay: the peer's next `recon/1` carries the host's frames again, among
@@ -862,11 +863,14 @@ fn a_peer_that_stops_reading_recon_gets_it_reset_and_keeps_its_peering() {
         .await;
         assert!(peered(&peers[0], reader_id));
 
-        let mut requests = walk_request(collection, None);
-        for _ in 0..12_000 {
-            requests.extend(walk_request(collection, Some(record.fingerprint().raw())));
+        send.write_all(&walk_request(collection, None))
+            .await
+            .unwrap();
+        let request = walk_request(collection, Some(record.fingerprint().raw()));
+        for _ in 0..12 {
+            send.write_all(&request.repeat(1000)).await.unwrap();
+            advance(&clock, peers, 1).await;
         }
-        send.write_all(&requests).await.unwrap();
         // Past the 60 s a writer waits for credit.
         advance(&clock, peers, 70).await;
         let reset = loop {
@@ -878,7 +882,7 @@ fn a_peer_that_stops_reading_recon_gets_it_reset_and_keeps_its_peering() {
         };
         let stalled = format!("code {RESET_STALLED}");
         assert!(reset.to_string().contains(&stalled), "{reset}");
-        let stopped = send.write_all(&requests[..1]).now_or_never();
+        let stopped = send.write_all(&request[..1]).now_or_never();
         let stopped = stopped
             .expect("a write after stop fails at once")
             .unwrap_err();

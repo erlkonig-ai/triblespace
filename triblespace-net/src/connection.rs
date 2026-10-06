@@ -160,7 +160,7 @@ impl Link {
     /// connection this node dialled whose `recon/1` ended, it also asks for
     /// a new stream.
     pub fn send(&self, frame: Frame) {
-        let _ = self.state.outbox.send(frame);
+        let _ = self.state.outbox.try_send(frame);
         if self.state.dialled && !self.state.recon_live.load(Ordering::SeqCst) {
             self.state.reopen.store(true, Ordering::SeqCst);
             self.state.changed.notify_waiters();
@@ -170,6 +170,11 @@ impl Link {
     /// Mark or unmark this as a neighbour connection, which eviction spares.
     pub fn set_neighbour(&self, neighbour: bool) {
         self.state.neighbour.store(neighbour, Ordering::SeqCst);
+    }
+
+    /// Frames queued and not yet taken by a `recon/1` writer.
+    pub(crate) fn queued(&self) -> usize {
+        self.state.outbox.max_capacity() - self.state.outbox.capacity()
     }
 
     /// Whether the tie-break retired the connection: it drains and closes.
@@ -184,9 +189,9 @@ impl Link {
 
     /// A link to no connection, whose queued frames the test reads back.
     #[cfg(test)]
-    pub(crate) fn detached(id: u64, peer: PeerId) -> (Self, mpsc::UnboundedReceiver<Frame>) {
+    pub(crate) fn detached(id: u64, peer: PeerId) -> (Self, mpsc::Receiver<Frame>) {
         let state = State::new(id, peer, [0; 32], true);
-        let (outbox, frames) = mpsc::unbounded_channel();
+        let (outbox, frames) = outbox();
         let state = Arc::new(State {
             outbox,
             ..Arc::into_inner(state).unwrap()
@@ -285,8 +290,8 @@ struct State {
     held: Arc<Semaphore>,
     /// Frames waiting for the connection's `recon/1` writer. The current
     /// stream's writer holds the receiver; its replacement takes it over.
-    outbox: mpsc::UnboundedSender<Frame>,
-    outbox_frames: tokio::sync::Mutex<mpsc::UnboundedReceiver<Frame>>,
+    outbox: mpsc::Sender<Frame>,
+    outbox_frames: tokio::sync::Mutex<mpsc::Receiver<Frame>>,
     /// The service heard `ReconEvent::Opened` for this connection.
     announced: AtomicBool,
     /// The accept loop ended.
@@ -295,7 +300,7 @@ struct State {
 
 impl State {
     fn new(id: u64, peer: PeerId, local: PeerId, dialled: bool) -> Arc<Self> {
-        let (outbox, outbox_frames) = mpsc::unbounded_channel();
+        let (outbox, outbox_frames) = outbox();
         Arc::new(Self {
             id,
             peer,
@@ -362,6 +367,12 @@ impl State {
         };
         self.dialler < other.dialler || (self.dialler == other.dialler && mine > theirs)
     }
+}
+
+/// A connection's frame queue. It refuses no frame: its capacity is the
+/// most a channel counts, so that what it holds can be read off it.
+fn outbox() -> (mpsc::Sender<Frame>, mpsc::Receiver<Frame>) {
+    mpsc::channel(Semaphore::MAX_PERMITS)
 }
 
 /// Counts one request stream as in flight until dropped.

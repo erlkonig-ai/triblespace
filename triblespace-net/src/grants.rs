@@ -562,7 +562,7 @@ mod tests {
     use super::*;
 
     use ed25519_dalek::SigningKey;
-    use tokio::sync::mpsc::UnboundedReceiver;
+    use tokio::sync::mpsc::Receiver;
     use triblespace_core::capability::{CapabilityHandle, CapabilityResource};
     use triblespace_core::collection::{
         AdmissionPolicy, CollectionPolicy, CollectionStoreExt, read_capability, write_capability,
@@ -655,9 +655,9 @@ mod tests {
     /// queued on it.
     struct Wire {
         to_right: Link,
-        from_left: UnboundedReceiver<Frame>,
+        from_left: Receiver<Frame>,
         to_left: Link,
-        from_right: UnboundedReceiver<Frame>,
+        from_right: Receiver<Frame>,
     }
 
     fn connect(left: &mut Node, right: &mut Node, id: u64) -> Wire {

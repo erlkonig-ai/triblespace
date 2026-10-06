@@ -20,7 +20,9 @@
 //! after [`WALK_DEADLINE`] without progress, by failing, or by completing,
 //! and its number retires: a frame, landing acknowledgement or blob fetch of
 //! an ended walk is dropped and touches no successor. A responder
-//! serves a peer it sends the collection to.
+//! serves a peer it sends the collection to, and leaves a request
+//! unanswered while [`MAX_QUEUED_REPLIES`] frames wait on the connection: a
+//! peer that asks faster than it reads gets no more until it reads.
 //!
 //! A walk frame names its collection, its kind and its number. The kind is
 //! the PATCH walked: records, authorization evidence or held blob references.
@@ -408,6 +410,10 @@ impl Reader<'_> {
 pub(crate) const WALK_DEADLINE: Duration = Duration::from_secs(60);
 /// Node and value requests and blob fetches one walk keeps in flight.
 const MAX_WALK_REQUESTS: usize = 64;
+/// Frames a connection may hold queued, at most a 64 KiB frame each, before
+/// a request on it goes unanswered. The walk it belongs to ends at its
+/// puller's deadline.
+const MAX_QUEUED_REPLIES: usize = 1024;
 /// Values one walk hands to landing before they are acknowledged. A walk
 /// whose landing queue is full requests no further nodes.
 const MAX_WALK_UNLANDED: usize = 1024;
@@ -1068,6 +1074,9 @@ impl Walks {
 
     /// Answer one request of a walk the peer on `link` pulls from this side.
     fn serve(&mut self, link: &Link, walk: WalkId, request: Request) {
+        if link.queued() >= MAX_QUEUED_REPLIES {
+            return debug!("a walk request left unanswered: the peer reads too slowly");
+        }
         let key = (link.id(), walk.collection.raw, walk.kind);
         let reply = |body| link.send(frame(walk, body));
         let ended = |reason| WalkBody::End {
@@ -1701,7 +1710,7 @@ pub(crate) mod tests {
 
         use ed25519_dalek::SigningKey;
         use iroh_base::EndpointId;
-        use tokio::sync::mpsc::UnboundedReceiver;
+        use tokio::sync::mpsc::Receiver;
         use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
         use triblespace_core::capability::CapabilityResource;
         use triblespace_core::capability::policy::{resource_collection, resource_policy};
@@ -1902,9 +1911,9 @@ pub(crate) mod tests {
         /// queued on it.
         pub(crate) struct Wire {
             pub(crate) to_right: Link,
-            pub(crate) from_left: UnboundedReceiver<Frame>,
+            pub(crate) from_left: Receiver<Frame>,
             pub(crate) to_left: Link,
-            pub(crate) from_right: UnboundedReceiver<Frame>,
+            pub(crate) from_right: Receiver<Frame>,
         }
 
         pub(crate) fn connect(left: &Node, right: &Node, id: u64) -> Wire {
@@ -2273,6 +2282,37 @@ pub(crate) mod tests {
             assert_eq!(puller.records(flowing).len(), 100);
             assert!(puller.records(stalled).is_empty());
             assert!(puller.walks.pulls.is_empty());
+        }
+
+        /// A peer that asks faster than it reads finds no more than
+        /// [`MAX_QUEUED_REPLIES`] frames waiting for it, and is answered
+        /// again once it reads.
+        #[test]
+        fn a_peer_that_does_not_read_is_answered_no_further() {
+            let now = crate::clock::mono_now();
+            let puller = Node::new(18);
+            let mut responder = Node::new(19);
+            let collection = responder.hold("unread", open());
+            let mut wire = connect(&puller, &responder, 1);
+            let open = WalkFrame {
+                walk: WalkId {
+                    collection,
+                    kind: WalkKind::Records,
+                    number: 0,
+                },
+                body: WalkBody::Request(Request::Open),
+            };
+            for _ in 0..2 * MAX_QUEUED_REPLIES {
+                responder.walks.frame(&wire.to_left, open.clone(), now);
+            }
+            let queued = std::iter::from_fn(|| wire.from_right.try_recv().ok()).count();
+            assert_eq!(queued, MAX_QUEUED_REPLIES);
+            responder.walks.frame(&wire.to_left, open, now);
+            let answer = wire.from_right.try_recv().map(walk_frame).unwrap();
+            assert!(matches!(
+                answer.body,
+                WalkBody::Response(Response::Summary(_))
+            ));
         }
 
         /// Astra's regression: a walk that timed out has a response and a
