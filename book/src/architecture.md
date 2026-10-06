@@ -308,8 +308,8 @@ representations are useful locally.
 
 ## Routing is soft state, not semantic evidence
 
-Bootstrap peers are process configuration. Gossip origins, DHT referrals,
-connection liveness, provider leases, and backoff are bounded process-local
+Bootstrap peers are process configuration. Peerings, candidate orders, DHT
+referrals, connection liveness, and provider leases are bounded process-local
 state. Restarting may forget them without changing a collection, and none of
 them authorize a peer, promise content residency, or retain a blob. Historical
 PEER and STORE_SCOPE records remain physically decodable for old piles but do
@@ -321,9 +321,10 @@ rewrites drop them.
 `Pile` stores blobs, native collection records, capability proofs, and WANT
 records in one
 append-only log. `ObjectStoreRemote` places immutable collection records under
-content-derived object keys. The network layer uses an opaque collection-topic
-wake and READ(C)-authorized Merkle walks to union that collection's records and
-structurally relevant native READ(C)/WRITE(C) proof records. Each proof record
+content-derived object keys. The network layer uses per-collection root
+announcements between peered neighbours and READ(C)-gated Merkle pull walks to
+union that collection's records and structurally relevant native
+READ(C)/WRITE(C) proof records. Each proof record
 is the complete authorization value and has no referenced blob closure.
 Independently, every resident blob may
 publish an opaque XOR-DHT lease under KDF(H); knowing H is the bearer capability
