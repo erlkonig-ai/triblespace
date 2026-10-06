@@ -825,15 +825,13 @@ fn a_healed_partition_recovers_without_dht_or_restart() {
 
         let server_id = server_key.verifying_key().to_bytes();
         let reader_id = reader_key.verifying_key().to_bytes();
+        // Neither host has a DHT route or publishes a provider record: the
+        // reader knows the server only as the root of C's WRITE policy,
+        // which makes it the reader's peering candidate.
         let mut server =
             bring_up_with_publication_budget(&net, &server_key, server_store, Vec::new(), Some(0));
-        let mut reader = bring_up_with_publication_budget(
-            &net,
-            &reader_key,
-            reader_store,
-            vec![server_id],
-            Some(0),
-        );
+        let mut reader =
+            bring_up_with_publication_budget(&net, &reader_key, reader_store, Vec::new(), Some(0));
         server.activate_collection(collection.handle());
         reader.activate_collection(collection.handle());
 
@@ -872,8 +870,8 @@ fn a_healed_partition_recovers_without_dht_or_restart() {
             1
         );
 
-        // Healing alone must suffice: there is no DHT publication, new write
-        // or process restart. The reader asks the server again when its
+        // Healing alone must suffice: there is no DHT, gossip, new write or
+        // process restart. The reader asks the server again when its
         // candidate order is drawn again.
         net.heal(server_id, reader_id);
         advance(&clock, &mut [&mut server, &mut reader], 95).await;
