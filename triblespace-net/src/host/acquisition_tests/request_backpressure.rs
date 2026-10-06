@@ -1,6 +1,8 @@
 //! Saturated request slots must not kill unrelated streams on a shared connection.
 
-use crate::connection::{MAX_REQUESTS_GLOBAL, MAX_REQUESTS_PER_CONNECTION};
+use crate::connection::{
+    MAX_REQUESTS_GLOBAL, MAX_REQUESTS_PER_CONNECTION, MAX_SERVED_PER_CONNECTION,
+};
 use crate::protocol::{TAG_DHT, recv_find_value_response};
 use crate::transport::sim::SimConn;
 
@@ -108,9 +110,10 @@ async fn saturated_requests_complete_without_closing_connection(connection_count
         connections.push(connection);
     }
 
-    assert_eq!(MAX_REQUESTS_GLOBAL % connection_count, 0);
-    let per_connection = MAX_REQUESTS_GLOBAL / connection_count;
+    // Each connection fills the slots it may be served at once.
+    let per_connection = MAX_SERVED_PER_CONNECTION.min(MAX_REQUESTS_GLOBAL / connection_count);
     assert!(per_connection <= MAX_REQUESTS_PER_CONNECTION);
+    let serving = per_connection * connection_count;
     let target = *blake3::hash(b"request saturation control").as_bytes();
     let mut held_streams = Vec::new();
     for connection in &connections {
@@ -126,15 +129,15 @@ async fn saturated_requests_complete_without_closing_connection(connection_count
     }
     tokio::time::timeout(
         Duration::from_secs(1),
-        accepted_rx.wait_for(|count| *count == MAX_REQUESTS_GLOBAL),
+        accepted_rx.wait_for(|count| *count == serving),
     )
     .await
     .expect("handler did not accept the initial requests")
     .unwrap();
-    assert_eq!(table.available_requests(), 0);
+    assert_eq!(table.available_requests(), MAX_REQUESTS_GLOBAL - serving);
 
     // The acceptance notification is the barrier: the production handler has
-    // received this stream while all request slots are still occupied. No sleep
+    // received this stream while its slots are still occupied. No sleep
     // or scheduler-iteration count guesses when the overload branch ran.
     let (mut queued_send, mut queued_recv) = connections[0].open_bi().await.unwrap();
     send_u8(&mut queued_send, TAG_DHT).await.unwrap();
@@ -143,12 +146,12 @@ async fn saturated_requests_complete_without_closing_connection(connection_count
     queued_send.shutdown().await.unwrap();
     tokio::time::timeout(
         Duration::from_secs(1),
-        accepted_rx.wait_for(|count| *count == MAX_REQUESTS_GLOBAL + 1),
+        accepted_rx.wait_for(|count| *count == serving + 1),
     )
     .await
     .expect("handler did not accept the waiting request")
     .unwrap();
-    assert_eq!(table.available_requests(), 0);
+    assert_eq!(table.available_requests(), MAX_REQUESTS_GLOBAL - serving);
     assert!(
         !owners[0].is_finished(),
         "a legitimate request at capacity terminated the entire connection"
@@ -198,8 +201,9 @@ async fn per_connection_saturation_backpressures_without_closing_active_streams(
 
 #[tokio::test(start_paused = true)]
 async fn global_saturation_backpressures_without_closing_active_streams() {
-    // Eight held requests on each connection exhaust the global sixteen while
-    // leaving room under either connection's own sixteen-request limit.
-    assert!(MAX_REQUESTS_GLOBAL / 2 < MAX_REQUESTS_PER_CONNECTION);
+    // Each connection's share of held requests exhausts the global sixteen
+    // while leaving room under either connection's own sixteen-request limit.
+    assert_eq!(2 * MAX_SERVED_PER_CONNECTION, MAX_REQUESTS_GLOBAL);
+    assert!(MAX_SERVED_PER_CONNECTION < MAX_REQUESTS_PER_CONNECTION);
     saturated_requests_complete_without_closing_connection(2).await;
 }
