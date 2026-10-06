@@ -489,6 +489,20 @@ impl LatestIndex {
         self.raw_states().filter_map(Id::new)
     }
 
+    /// The join of this observation and `other`: the known live states of
+    /// both, minus every state either one saw superseded.
+    ///
+    /// This is how one frontier spans several collections. A state live in
+    /// one collection and superseded in another is not live in their union,
+    /// which no combination of the two live sets could say. Shallow, like
+    /// [`UnionArchive::union`](crate::blob::encodings::succinctarchive::UnionArchive::union):
+    /// the members keep their shared rows and are merged when queried.
+    pub fn union(&self, other: &Self) -> Self {
+        Self {
+            members: self.members.iter().chain(&other.members).cloned().collect(),
+        }
+    }
+
     /// Positive membership; unknown and superseded states both return false.
     pub fn contains(&self, state: Id) -> bool {
         let raw = state.raw();
@@ -712,6 +726,31 @@ mod tests {
                 validate_element(&blob).unwrap_err()
             );
         }
+    }
+
+    /// Two collections' frontiers: a revision one of them supersedes is not
+    /// live in their union, though the other still holds it live.
+    #[test]
+    fn a_union_retires_what_either_side_superseded() {
+        let old = ufoid();
+        let new = ufoid();
+        let other = ufoid();
+        let first = attach(&[project(&(state(&old) + state(&other)))]);
+        let second = attach(&[project(&edge(&new, &old))]);
+        assert!(first.contains(*old));
+        let union = first.union(&second);
+        assert_eq!(
+            union.states().collect::<BTreeSet<_>>(),
+            BTreeSet::from([*new, *other])
+        );
+        assert!(!union.contains(*old));
+        assert_eq!(union, second.union(&first));
+        let joined = join(
+            &project(&(state(&old) + state(&other))),
+            &project(&edge(&new, &old)),
+        )
+        .unwrap();
+        assert_eq!(union, LatestIndex::decode(&joined).unwrap());
     }
 
     #[test]
