@@ -1,8 +1,8 @@
 //! Lost root announcements recover after a partition, beside a healthy replica.
 //!
-//! SimNet directly delivers topic wakes to unpartitioned subscribers. It models
-//! packet loss and periodic-announcement recovery here, not stock gossip mesh
-//! membership, forwarding, discovery, or partition reconnection.
+//! The three replicas are the roots of the collection's quorum, so each is a
+//! peering candidate of the others. A partition ends the peerings it cuts, and
+//! a replica asks again when its candidate order is drawn again.
 #![cfg(feature = "sim")]
 
 use std::sync::Arc;
@@ -13,9 +13,11 @@ use ed25519_dalek::SigningKey;
 use iroh_base::{EndpointAddr, EndpointId};
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::clock::{self, VirtualClock};
+use triblespace_core::collection::selection::{CONFIG_COLLECTION_NAME, write_sync_selection};
 use triblespace_core::collection::{
     AdmissionPolicy, CollectionCommit, CollectionData, CollectionHandle, CollectionPolicy,
     CollectionRead, CollectionRecord, CollectionStore, CollectionStoreExt, empty_metadata_handle,
+    private_policy,
 };
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{BlobStorePut, SnapshotSource};
@@ -43,14 +45,22 @@ fn bring_up(
                 .map(|peer| EndpointAddr::from(EndpointId::from_bytes(peer).unwrap()))
                 .collect(),
             qos,
-            // Gossip discovers the initial participants. This test measures
-            // repair recovery, not the timing of provider publication.
+            // This test measures repair recovery, not the timing of provider
+            // publication.
             provider_publication_budget: Some(0),
             bind: None,
         },
         wiring,
     ));
     Peer::with_wiring(store, qos, sender, receiver)
+}
+
+/// Select `collection` for sync in the pile `key` configures.
+fn select(store: &mut MemoryRepo, key: &SigningKey, collection: CollectionHandle) {
+    let config = store
+        .collection(CONFIG_COLLECTION_NAME, private_policy(key.verifying_key()))
+        .unwrap();
+    write_sync_selection(store, config, key, collection, true).unwrap();
 }
 
 fn append(
@@ -142,6 +152,13 @@ fn periodic_root_announcements_recover_a_healed_partition_beside_a_healthy_repli
                 collection,
             );
         }
+        for (store, key) in [
+            (&mut a_store, &a_key),
+            (&mut b_store, &b_key),
+            (&mut c_store, &c_key),
+        ] {
+            select(store, key, collection);
+        }
         let original = append(&mut a_store, &a_key, collection, b"initial shared record");
         // Both sources begin with the exact same signed record. B is not a
         // relay for later A writes: WriteOnly is an explicit supported mode.
@@ -211,8 +228,8 @@ fn periodic_root_announcements_recover_a_healed_partition_beside_a_healthy_repli
             b"only A has this later record",
         );
         a.refresh();
-        // A's first changed-root wake, and later announcements while isolated,
-        // cannot cross either cut. There should be no blind repair request to
+        // A's announcements of its changed root, while isolated, cannot cross
+        // either cut. There should be no blind repair request to
         // manufacture an error for a root that C has not heard about.
         for _ in 0..400 {
             step(&clock, &mut [&mut a, &mut b, &mut c]).await;
@@ -254,10 +271,11 @@ fn periodic_root_announcements_recover_a_healed_partition_beside_a_healthy_repli
         assert_eq!(frontier(&c, collection), Some(initial_c));
         assert!(!contains(&mut c, fresh));
 
-        // Healing SimNet only restores dialing; it emits no gossip wake or
-        // NeighborUp. A's root does not change again. Its next periodic
-        // announcement must rescue C while B remains healthy at R0. The A-B
-        // cut stays in place, preventing B from masking the direct recovery.
+        // Healing SimNet only restores dialing. A's root does not change
+        // again. A and C peer again when one of them draws its candidate
+        // order again, and A's announcement then rescues C while B remains
+        // healthy at R0. The A-B cut stays in place, preventing B from
+        // masking the direct recovery.
         let healed_at = clock::mono_now();
         net.heal(a_id, c_id);
         let mut recovered = false;
@@ -270,7 +288,7 @@ fn periodic_root_announcements_recover_a_healed_partition_beside_a_healthy_repli
         }
         assert!(
             recovered,
-            "A's lost root wake did not recover periodically beside healthy B",
+            "A's lost root announcement did not recover beside healthy B",
         );
         assert!(clock::mono_now().duration_since(healed_at) <= Duration::from_secs(100));
         assert!(clock::mono_now().duration_since(cut_at) < Duration::from_secs(300));

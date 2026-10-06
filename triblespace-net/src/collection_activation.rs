@@ -393,7 +393,7 @@ impl CollectionRepairOverlay {
         self.authorization_evidence.discovery_candidates()
     }
 
-    /// The collection's [`record_root`], which a gossip wake carries too.
+    /// The collection's [`record_root`], which its announcements carry.
     /// Held blobs are not part of it.
     pub fn wake_root(&self) -> [u8; 32] {
         record_root(

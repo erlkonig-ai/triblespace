@@ -2,12 +2,12 @@
 //!
 //! [`Peer<S>`](peer::Peer) wraps one store. Root-driven, per-request authorized
 //! PATCH walks converge one explicitly active collection's records and
-//! collection-scoped native evidence for descriptor-declared capabilities. A separate
-//! stock-gossip wake plane periodically offers a signed endpoint origin and
-//! opaque per-collection anti-entropy root, suppressing redundant local offers.
-//! Policy roots, scoped AUTH keys and ordinary descriptor-blob providers supply
-//! candidate contacts, never authority; every useful collection byte remains
-//! capability-gated.
+//! collection-scoped native evidence for descriptor-declared capabilities.
+//! Neighbours that peer for a selected collection announce its root to each
+//! other on the one `recon/1` stream of their connection, and a different
+//! root starts a pull. Policy roots, scoped AUTH keys and ordinary
+//! descriptor-blob providers supply candidate contacts, never authority;
+//! every useful collection byte remains capability-gated.
 //! Exact content reads are independent: every served resident blob may publish
 //! a full-width opaque locator derived from its bearer handle H. The selected
 //! endpoint proves H before the requester proves H, both proofs bind their
@@ -54,7 +54,5 @@ pub mod reconcile;
 pub(crate) mod routing;
 pub mod telemetry;
 pub mod transport;
-pub mod walk;
-pub mod wake;
-mod wake_relay;
 mod wake_schedule;
+pub mod walk;

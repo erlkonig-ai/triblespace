@@ -798,9 +798,12 @@ mod tests {
     #[test]
     fn two_bound_peers_reach_each_other_from_tickets_written_before_launch() {
         use ed25519_dalek::SigningKey;
+        use triblespace_core::collection::selection::{
+            write_sync_selection, CONFIG_COLLECTION_NAME,
+        };
         use triblespace_core::collection::{
-            empty_metadata_handle, AdmissionPolicy, CollectionCommit, CollectionData,
-            CollectionPolicy, CollectionRead, CollectionRecord, CollectionStore,
+            empty_metadata_handle, private_policy, AdmissionPolicy, CollectionCommit,
+            CollectionData, CollectionPolicy, CollectionRead, CollectionRecord, CollectionStore,
             CollectionStoreExt,
         };
         use triblespace_core::repo::memoryrepo::MemoryRepo;
@@ -835,6 +838,12 @@ mod tests {
                 .unwrap()
                 .handle();
             collection = Some(handle);
+            // Each selects the collection, so each peers for it with the
+            // other, which it finds as a provider of it.
+            let config = store
+                .collection(CONFIG_COLLECTION_NAME, private_policy(key.verifying_key()))
+                .unwrap();
+            write_sync_selection(&mut store, config, key, handle, true).unwrap();
             let other = super::parse_peers(&[tickets[1 - index].clone()]).unwrap();
             let mut peer = Peer::new(
                 store,
@@ -870,7 +879,12 @@ mod tests {
                 .iter_mut()
                 .map(|peer| {
                     peer.refresh();
-                    peer.snapshot().unwrap().records().unwrap().count()
+                    peer.snapshot()
+                        .unwrap()
+                        .records()
+                        .unwrap()
+                        .filter(|record| record.as_ref().unwrap().collection() == collection)
+                        .count()
                 })
                 .collect();
             if counts == [2, 2] {

@@ -14,7 +14,6 @@ use tracing::{Instrument as _, debug, warn};
 
 use super::{Alpn, Conn, Harness, Incoming, PeerId, Transport};
 use crate::host::PeerConfig;
-use crate::wake::CollectionWakePlane;
 
 /// Capacity for the inbound-connection channel. Inbound connection forwarding
 /// fails closed when this queue is full so
@@ -27,7 +26,6 @@ const FORWARDED_ALPNS: [Alpn; 1] = [crate::protocol::PILE_SYNC_ALPN];
 #[derive(Clone)]
 pub struct IrohTransport {
     ep: iroh::Endpoint,
-    wake_plane: CollectionWakePlane,
     /// Explicitly configured routes, keyed by endpoint identity.
     ///
     /// `Endpoint::connect(EndpointId, ..)` delegates route selection to
@@ -44,11 +42,6 @@ pub struct IrohTransport {
 }
 
 impl IrohTransport {
-    /// Collection wake plane sharing this transport's endpoint and router.
-    pub fn wake_plane(&self) -> CollectionWakePlane {
-        self.wake_plane.clone()
-    }
-
     /// The local sockets this transport's endpoint bound.
     pub fn bound_sockets(&self) -> Vec<std::net::SocketAddr> {
         self.ep.bound_sockets()
@@ -106,7 +99,6 @@ impl Conn for IrohConn {
 
 impl Transport for IrohTransport {
     type Conn = IrohConn;
-    type WakePlane = CollectionWakePlane;
 
     fn local_id(&self) -> PeerId {
         *self.ep.id().as_bytes()
@@ -187,10 +179,6 @@ impl Transport for IrohTransport {
         if let Err(error) = self._alive._router.shutdown().await {
             warn!(%error, "iroh router shutdown failed");
         }
-    }
-
-    fn collection_wake_plane(&self) -> CollectionWakePlane {
-        self.wake_plane.clone()
     }
 }
 
@@ -373,11 +361,6 @@ pub async fn bind_with_endpoint(ep: iroh::Endpoint, config: &PeerConfig) -> Harn
     }
     let mut router_builder = Router::builder(ep.clone());
 
-    // Stock iroh-gossip owns membership and wake dissemination on the same
-    // endpoint. Its typed facade exposes no general application payload path.
-    let wake_plane = CollectionWakePlane::spawn(&ep);
-    router_builder = router_builder.accept(iroh_gossip::ALPN, wake_plane.protocol_handler());
-
     // Protocol ALPNs forward into the harness channel; the host loop
     // dispatches them to the protocol handlers above the seam.
     let (inc_tx, inc_rx) = mpsc::channel::<Incoming<IrohConn>>(CHANNEL_CAP);
@@ -395,7 +378,6 @@ pub async fn bind_with_endpoint(ep: iroh::Endpoint, config: &PeerConfig) -> Harn
 
     let transport = IrohTransport {
         ep,
-        wake_plane,
         peers,
         _alive: Arc::new(Anchors {
             _router: router,

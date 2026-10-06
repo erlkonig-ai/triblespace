@@ -99,7 +99,6 @@ pub trait Conn: Clone + Send + Sync + 'static {
 /// loop.
 pub trait Transport: Clone + Send + Sync + 'static {
     type Conn: Conn;
-    type WakePlane: crate::wake::CollectionWakeNetwork;
 
     /// Our own identity (= the pubkey of the signing key the node
     /// runs as).
@@ -118,10 +117,6 @@ pub trait Transport: Clone + Send + Sync + 'static {
     /// loses every owner. Production QUIC needs an awaited close so peers do
     /// not mistake a clean daemon stop for a failed connection.
     fn shutdown(&self) -> impl std::future::Future<Output = ()> + Send;
-
-    /// Collection wake plane used to discover exact per-collection
-    /// participants. It is transport state, never collection authority.
-    fn collection_wake_plane(&self) -> Self::WakePlane;
 }
 
 /// An accepted inbound connection, tagged with the ALPN it arrived on.

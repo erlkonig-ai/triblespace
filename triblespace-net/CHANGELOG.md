@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Delete the gossip wake plane (sync redesign M13, design D3, D7). The
+  vendored `iroh-gossip` crate, the `wake` module and its relay,
+  `Transport::WakePlane` and `collection_wake_plane`, the simulator's
+  `SimWakePlane`, `HostStarted::wake_plane`, `Peer::wake_plane` and
+  `examples/collection_wake_probe.rs` go, and with them the repair queue the
+  wake path fed: signed-origin participants and their leases, per-target
+  failures and their backoff, the periodic re-enqueue of failed targets, and
+  the descriptor-holder rediscovery schedule. Announcements on `recon/1` are
+  the only trigger of a pull, so a host syncs a collection only while its pile
+  selects it. Drawing a collection's candidate order looks up its DHT
+  providers, at most `ALPHA` lookups at a time, and an answer that changed
+  them is drawn into the order once it is exhausted.
+
 - Announce each selected collection's root on `recon/1` (sync redesign M8).
   ANNOUNCE goes to the collection's neighbours this side sends to, on one
   timer per collection that waits two to sixty seconds: a local append

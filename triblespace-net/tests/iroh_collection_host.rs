@@ -1,4 +1,4 @@
-//! Real-Iroh collection wake and repair coverage.
+//! Real-Iroh collection peering and repair coverage.
 
 use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
@@ -10,9 +10,11 @@ use iroh::endpoint::presets;
 use iroh::test_utils::test_transport::{TestNetwork, TestTransport};
 use iroh_base::{EndpointAddr, SecretKey};
 use triblespace_core::blob::encodings::UnknownBlob;
+use triblespace_core::collection::selection::{CONFIG_COLLECTION_NAME, write_sync_selection};
 use triblespace_core::collection::{
-    AdmissionPolicy, CollectionCommit, CollectionData, CollectionPolicy, CollectionRead,
-    CollectionRecord, CollectionStore, CollectionStoreExt, empty_metadata_handle,
+    AdmissionPolicy, CollectionCommit, CollectionData, CollectionHandle, CollectionPolicy,
+    CollectionRead, CollectionRecord, CollectionStore, CollectionStoreExt, empty_metadata_handle,
+    private_policy,
 };
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{BlobStoreList, BlobStorePut, SnapshotSource, WantRead};
@@ -22,6 +24,14 @@ use triblespace_net::peer::Peer;
 
 fn key(byte: u8) -> SigningKey {
     SigningKey::from_bytes(&[byte; 32])
+}
+
+/// Select `collection` for sync in the pile `key` configures.
+fn select(store: &mut MemoryRepo, key: &SigningKey, collection: CollectionHandle) {
+    let config = store
+        .collection(CONFIG_COLLECTION_NAME, private_policy(key.verifying_key()))
+        .unwrap();
+    write_sync_selection(store, config, key, collection, true).unwrap();
 }
 
 fn init_tracing() {
@@ -138,7 +148,7 @@ async fn bring_up_owned(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn signed_collection_wake_repairs_before_periodic_fallback() {
+async fn an_announced_record_is_repaired_promptly() {
     init_tracing();
     let network = TestNetwork::new();
     let server_key = key(0xA1);
@@ -165,13 +175,15 @@ async fn signed_collection_wake_repairs_before_periodic_fallback() {
         .collection("real-iroh-collection-wake", policy)
         .unwrap();
     assert_eq!(reader_collection.handle(), collection.handle());
+    select(&mut server_store, &server_key, collection.handle());
+    select(&mut reader_store, &reader_key, collection.handle());
 
     let mut server = bring_up(server_endpoint, server_store, Vec::new()).await;
     let mut reader = bring_up(reader_endpoint, reader_store, vec![server_addr]).await;
     server.activate_collection(collection.handle());
     reader.activate_collection(collection.handle());
 
-    // Let initial empty repair and the exact-handle gossip subscriptions settle.
+    // Let the reader find the server and peer with it.
     tokio::time::sleep(Duration::from_secs(2)).await;
     server.refresh();
     reader.refresh();
@@ -187,7 +199,6 @@ async fn signed_collection_wake_repairs_before_periodic_fallback() {
         .unwrap();
     server.refresh();
 
-    let started = Instant::now();
     let repaired = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             reader.refresh();
@@ -196,8 +207,7 @@ async fn signed_collection_wake_repairs_before_periodic_fallback() {
                 .unwrap()
                 .records()
                 .unwrap()
-                .next()
-                .is_some()
+                .any(|record| record.unwrap().collection() == collection.handle())
             {
                 break;
             }
@@ -207,11 +217,7 @@ async fn signed_collection_wake_repairs_before_periodic_fallback() {
     .await;
     assert!(
         repaired.is_ok(),
-        "signed wake did not trigger collection repair"
-    );
-    assert!(
-        started.elapsed() < Duration::from_secs(20),
-        "repair must precede the 30-second periodic fallback"
+        "the server's announcement did not start a pull"
     );
 
     drop((server.into_store(), reader.into_store()));
@@ -275,6 +281,13 @@ async fn three_root_current_state_scenario(restart: bool) {
                 .handle(),
             collection
         );
+    }
+    for (store, key) in [
+        (&mut source_store, &source_key),
+        (&mut reader_store, &reader_key),
+        (&mut other_store, &other_key),
+    ] {
+        select(store, key, collection);
     }
     let (mut source, source_owner) = bring_up_owned(
         source_endpoint.clone(),

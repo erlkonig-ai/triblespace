@@ -1,9 +1,10 @@
 //! Collection bootstrap through ordinary descriptor providers in the DHT.
 //!
-//! These tests run stock iroh-gossip over Iroh's in-memory packet transport,
-//! with endpoint lookup restricted to that transport: no DNS, relay, or external
-//! DHT service is involved. The provider directory is our real host protocol,
-//! and every peer the reader finds, it finds through a FIND_VALUE lookup.
+//! These tests run over Iroh's in-memory packet transport, with endpoint
+//! lookup restricted to that transport: no DNS, relay, or external DHT service
+//! is involved. The provider directory is our real host protocol, and every
+//! peer the reader finds, it finds through a FIND_VALUE lookup: DHT providers
+//! are the last tier of a collection's peering candidates.
 
 use std::time::Duration;
 
@@ -13,9 +14,11 @@ use iroh::endpoint::presets;
 use iroh::test_utils::test_transport::TestNetwork;
 use iroh_base::EndpointAddr;
 use tokio::task::JoinHandle;
+use triblespace_core::collection::selection::{CONFIG_COLLECTION_NAME, write_sync_selection};
 use triblespace_core::collection::{
-    AdmissionPolicy, CollectionCommit, CollectionData, CollectionPolicy, CollectionRead,
-    CollectionRecord, CollectionStore, CollectionStoreExt, empty_metadata_handle,
+    AdmissionPolicy, CollectionCommit, CollectionData, CollectionHandle, CollectionPolicy,
+    CollectionRead, CollectionRecord, CollectionStore, CollectionStoreExt, empty_metadata_handle,
+    private_policy,
 };
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{BlobStoreList, SnapshotSource};
@@ -25,6 +28,14 @@ use triblespace_net::peer::Peer;
 
 fn key(byte: u8) -> SigningKey {
     SigningKey::from_bytes(&[byte; 32])
+}
+
+/// Select `collection` for sync in the pile `key` configures.
+fn select(store: &mut MemoryRepo, key: &SigningKey, collection: CollectionHandle) {
+    let config = store
+        .collection(CONFIG_COLLECTION_NAME, private_policy(key.verifying_key()))
+        .unwrap();
+    write_sync_selection(store, config, key, collection, true).unwrap();
 }
 
 async fn endpoint(network: &TestNetwork, key: &SigningKey) -> Endpoint {
@@ -119,16 +130,19 @@ async fn descriptor_provider_bootstraps_open_collection_through_directory_only()
     let mut source_store = MemoryRepo::default();
     let mut reader_store = MemoryRepo::default();
     let collection = source_store
-        .collection("descriptor-provider-gossip-bootstrap", policy.clone())
+        .collection("descriptor-provider-bootstrap", policy.clone())
         .unwrap()
         .handle();
     assert_eq!(
         reader_store
-            .collection("descriptor-provider-gossip-bootstrap", policy)
+            .collection("descriptor-provider-bootstrap", policy)
             .unwrap()
             .handle(),
         collection
     );
+    // Both select C, so the reader asks the source it finds to peer for it.
+    select(&mut source_store, &source_key, collection);
+    select(&mut reader_store, &key(0xE3), collection);
     let record = CollectionRecord::Commit(CollectionCommit::sign(
         &source_key,
         collection,
@@ -205,6 +219,7 @@ async fn inactive_descriptor_cache_is_discoverable_but_never_a_repair_participan
     let cache_endpoint = endpoint(&network, &key(0xF2)).await;
     let cache_id = cache_endpoint.id();
     let reader_endpoint = endpoint(&network, &key(0xF3)).await;
+    let mut reader_store = MemoryRepo::default();
     let mut cache_store = MemoryRepo::default();
     let collection = cache_store
         .collection(
@@ -236,13 +251,11 @@ async fn inactive_descriptor_cache_is_discoverable_but_never_a_repair_participan
             && health.publication.in_flight == 0
     })
     .await;
-    let (mut reader, reader_owner) = bring_up(
-        reader_endpoint,
-        MemoryRepo::default(),
-        vec![directory_addr],
-        Some(0),
-    )
-    .await;
+    // The reader selects C, so it asks the cache it finds as a provider of
+    // C to peer; the cache does not select C.
+    select(&mut reader_store, &key(0xF3), collection);
+    let (mut reader, reader_owner) =
+        bring_up(reader_endpoint, reader_store, vec![directory_addr], Some(0)).await;
     assert!(
         !reader
             .snapshot()
@@ -269,6 +282,11 @@ async fn inactive_descriptor_cache_is_discoverable_but_never_a_repair_participan
                 .unwrap()
                 .contains_blob(collection)
                 .unwrap()
+            && peers[2]
+                .health()
+                .peerings
+                .iter()
+                .any(|peering| peering.peer == *cache_id.as_bytes() && peering.refused_by_them)
     })
     .await;
     assert!(
@@ -285,6 +303,13 @@ async fn inactive_descriptor_cache_is_discoverable_but_never_a_repair_participan
             peer.refresh();
         }
         assert!(cache.health().collections.is_empty());
+        assert!(
+            reader
+                .health()
+                .peerings
+                .iter()
+                .all(|peering| !peering.peered)
+        );
         assert!(reader.health().collections.iter().all(|state| {
             state
                 .peers
@@ -299,8 +324,7 @@ async fn inactive_descriptor_cache_is_discoverable_but_never_a_repair_participan
             .unwrap()
             .records()
             .unwrap()
-            .next()
-            .is_none()
+            .all(|record| record.unwrap().collection() != collection)
     );
     shutdown([
         (directory, directory_owner),

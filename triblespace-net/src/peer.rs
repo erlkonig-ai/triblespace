@@ -34,7 +34,6 @@ use crate::host::{self, ActiveCollections, HostStarted, NetReceiver, NetSender, 
 use crate::landing::Land;
 use crate::protocol::RawHash;
 use crate::reconcile::{ReconcileStats, Reconciler, ReplicationMode};
-use crate::wake::CollectionWakePlane;
 
 pub use crate::host::PeerConfig;
 pub use crate::inventory::{ReconcileDirection, ReconcileQos};
@@ -553,21 +552,6 @@ where
         &self.reconciler
     }
 
-    /// Stock gossip wake plane for a production iroh peer.
-    ///
-    /// Caller-owned wiring and a dormant lazy peer have no implicit wake handle
-    /// and return `None`. This accessor never starts a host.
-    /// Collection possession is enough to join a production topic; following a
-    /// wake into anti-entropy remains separately authorized.
-    pub fn wake_plane(&self) -> Option<CollectionWakePlane> {
-        self.host
-            .lock()
-            .expect("host mutex")
-            .started
-            .as_ref()
-            .map(|started| started.wake_plane.clone())
-    }
-
     /// The local sockets this peer's endpoint bound
     /// ([`PeerConfig::bind`](crate::host::PeerConfig::bind)). Empty for
     /// caller-owned wiring and for a lazy peer whose host has not started.
@@ -590,7 +574,7 @@ where
         self.last_event_at
     }
 
-    /// Activate one collection for serving, repair, and wake subscription.
+    /// Activate one collection for serving, repair, and peering.
     ///
     /// This is ephemeral process state. It writes no OFFER/GOSSIP marker and
     /// creates no global collection registry.
@@ -1111,7 +1095,7 @@ mod tests {
             peer.host.lock().unwrap().state,
             HostState::Dormant(_)
         ));
-        assert!(peer.wake_plane().is_none());
+        assert!(peer.bound_sockets().is_empty());
         assert!(peer.sender.current_snapshot().is_none());
         assert!(!peer.observed());
         assert_eq!(peer.serving_snapshot_rebuilds(), 0);

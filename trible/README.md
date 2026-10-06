@@ -200,7 +200,8 @@ the index's realized support.
 ### Distributed pile sync
 
 Built on `triblespace-net` (authenticated iroh QUIC, collection-scoped PATCH
-anti-entropy, stock-gossip wakeups, and DHT provider lookup). Opening a
+anti-entropy, per-collection peering and root announcements, and DHT provider
+lookup). Opening a
 transport connection grants no collection authority. Each repair request names
 one exact collection and may carry bounded native READ(C) proofs for cold
 bootstrap. The server admits only from collection-scoped proof evidence in its
@@ -267,10 +268,9 @@ every valid signed COMMIT(C), while each receiver derives WRITE admission
 locally; a later WRITE proof can therefore activate an older commit without
 inventing a second synchronization protocol or requiring the publisher to
 possess its grant.
-Production peers subscribe to stock `iroh-gossip` topics keyed by the
-domain-separated image of the collection handle; signed opaque-root
-mismatches accelerate ordinary repair, while periodic anti-entropy remains
-authoritative.
+Peers that both select a collection peer for it on their one connection and
+announce its root to each other; a different root starts a pull of what the
+receiver lacks, and the next announcement is the only retry.
 
 DHT routing, provider lookup, and direct GET by a known immutable handle are
 collection-independent bearer mechanisms. In every repair direction, each

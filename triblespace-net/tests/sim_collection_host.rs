@@ -281,6 +281,7 @@ fn issuer_held_read_proof_reaches_a_handle_only_recipient_by_grant_exchange() {
             collection.handle(),
         );
         issuer_store.insert_proof(read_proof.clone()).unwrap();
+        select(&mut issuer_store, &issuer_key, collection.handle());
         let payload_facts = entity! {
             triblespace_core::metadata::tag: triblespace_core::metadata::KIND_MULTI,
         }
@@ -368,6 +369,9 @@ fn issuer_held_read_proof_reaches_a_handle_only_recipient_by_grant_exchange() {
                 .unwrap()
         );
         assert!(recipient.health().available.is_empty());
+        // Selecting C makes the recipient ask the issuer, a key of C's grant
+        // chain, to peer for it.
+        select(&mut recipient.store(), &recipient_key, collection.handle());
         recipient.activate_collection(collection.handle());
 
         // The issuer authorizes the endpoint using its resident READ
@@ -376,7 +380,7 @@ fn issuer_held_read_proof_reaches_a_handle_only_recipient_by_grant_exchange() {
         // the committed payload.
         advance(&clock, &mut [&mut issuer, &mut recipient], 32).await;
         let dangling = recipient.snapshot().unwrap();
-        assert_eq!(dangling.records().unwrap().count(), 1);
+        assert_eq!(records_of(&dangling, collection.handle()), 1);
         let received = dangling
             .proofs()
             .unwrap()
@@ -445,7 +449,7 @@ fn issuer_held_read_proof_reaches_a_handle_only_recipient_by_grant_exchange() {
                 .cover()
                 .is_empty()
         );
-        assert_eq!(admitted.records().unwrap().count(), 1);
+        assert_eq!(records_of(&admitted, collection.handle()), 1);
         assert_eq!(admitted.proofs().unwrap().count(), 1);
         assert_eq!(admitted.wants().unwrap().count(), 0);
 
@@ -736,7 +740,10 @@ fn native_read_credential_admits_on_retry_and_rejects_writer_only_peer() {
             32,
         )
         .await;
-        assert_eq!(records_of(&reader.snapshot().unwrap(), collection.handle()), 1);
+        assert_eq!(
+            records_of(&reader.snapshot().unwrap(), collection.handle()),
+            1
+        );
         let stats = reconcile_once(
             &clock,
             &mut Reconciler::default(),
@@ -812,7 +819,7 @@ fn native_read_credential_admits_on_retry_and_rejects_writer_only_peer() {
 }
 
 #[test]
-fn collection_wake_recovery_survives_a_partition_without_dht_or_restart() {
+fn a_healed_partition_recovers_without_dht_or_restart() {
     let _guard = test_guard();
     let clock = virtual_clock();
     clock.reset();
@@ -856,6 +863,8 @@ fn collection_wake_recovery_survives_a_partition_without_dht_or_restart() {
         let mut reader_store = MemoryRepo::default();
         let reader_collection = register(&mut reader_store, policy);
         assert_eq!(reader_collection.handle(), collection.handle());
+        select(&mut server_store, &server_key, collection.handle());
+        select(&mut reader_store, &reader_key, collection.handle());
 
         let server_id = server_key.verifying_key().to_bytes();
         let reader_id = reader_key.verifying_key().to_bytes();
@@ -879,7 +888,10 @@ fn collection_wake_recovery_survives_a_partition_without_dht_or_restart() {
         reader.activate_collection(collection.handle());
 
         advance(&clock, &mut [&mut server, &mut reader], 5).await;
-        assert_eq!(reader.snapshot().unwrap().records().unwrap().count(), 1);
+        assert_eq!(
+            records_of(&reader.snapshot().unwrap(), collection.handle()),
+            1
+        );
 
         net.partition(server_id, reader_id);
         let mut second_facts = TribleSet::new();
@@ -902,16 +914,23 @@ fn collection_wake_recovery_survives_a_partition_without_dht_or_restart() {
             .unwrap();
         server.refresh();
 
-        // Let the signed wake be lost, periodic repair fail, and at least one
-        // recovery resubscription happen while the partition is still closed.
+        // The partition ends the peering with its connection, and the
+        // server's announcement is lost while it stays closed.
         advance(&clock, &mut [&mut server, &mut reader], 40).await;
-        assert_eq!(reader.snapshot().unwrap().records().unwrap().count(), 1);
+        assert_eq!(
+            records_of(&reader.snapshot().unwrap(), collection.handle()),
+            1
+        );
 
-        // Healing alone must suffice: there is no DHT publication, new write,
-        // process restart, or direct collection repair to a configured route.
+        // Healing alone must suffice: there is no DHT publication, new write
+        // or process restart. The reader asks the server again when its
+        // candidate order is drawn again.
         net.heal(server_id, reader_id);
         advance(&clock, &mut [&mut server, &mut reader], 95).await;
-        assert_eq!(reader.snapshot().unwrap().records().unwrap().count(), 2);
+        assert_eq!(
+            records_of(&reader.snapshot().unwrap(), collection.handle()),
+            2
+        );
     }));
 }
 
