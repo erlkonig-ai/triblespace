@@ -14,8 +14,9 @@
 //! A received proof, in an answer or as a peer's credential, is kept only if
 //! it names this node or its sender. It lands when it is evidence under its
 //! collection's held descriptor and is dropped when it is not. A proof naming
-//! this node whose descriptor is not held stays in memory, lists its
-//! collection as available, and lands once the descriptor arrives. The
+//! this node whose descriptor is not held stays in memory if its signatures
+//! hold, lists its collection as available, and lands once the descriptor
+//! arrives. The
 //! definitions a kept proof names are fetched over `blob/1` from its sender,
 //! then from its root and delegated keys among connected peers. A peering
 //! refused for want of definitions fetches them the same way.
@@ -230,7 +231,8 @@ impl Grants {
                         effects.land.push(proof.clone());
                     }
                 }
-                None if mine => {
+                // Only its signatures can be checked before the descriptor.
+                None if mine && proof.verify_signatures().is_ok() => {
                     self.changed |= self.pending.insert(proof.id().raw, proof.clone()).is_none();
                 }
                 None => continue,
@@ -844,6 +846,29 @@ mod tests {
         let effects = subject.observe();
         assert_eq!(effects.land, [read]);
         assert!(subject.grants.available().is_empty());
+    }
+
+    /// A proof whose descriptor is not held waits in memory only if its
+    /// signatures hold; a forged one lists nothing as available.
+    #[test]
+    fn a_forged_proof_does_not_wait_in_memory() {
+        let owner = key(34);
+        let mut node = Node::new(35);
+        node.observe();
+        let collection = CollectionHandle::new([36; 32]);
+        let mut bytes = grant(&owner, &node.key, read_capability(), collection).into_bytes();
+        *bytes.last_mut().unwrap() ^= 1;
+        let forged = CapabilityProof::from_bytes(&bytes).unwrap();
+        let (link, _sent) = Link::detached(1, owner.verifying_key().to_bytes());
+        node.grants.event(&ReconEvent::Opened(link.clone()));
+        let digest = PatchSummary::new(Some([1; 32]), 1).unwrap();
+        node.grants
+            .event(&ReconEvent::Frame(link.clone(), Frame::ProofDigest(digest)));
+        let effects = node
+            .grants
+            .event(&ReconEvent::Frame(link, Frame::Proofs(vec![forged])));
+        assert!(effects.land.is_empty() && effects.fetch.is_empty());
+        assert!(node.grants.available().is_empty());
     }
 
     /// A received proof is kept only if it names this node or its sender.
