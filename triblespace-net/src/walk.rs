@@ -2348,5 +2348,71 @@ mod tests {
             assert!(!puller.done[0].completed);
             assert!(puller.records(collection).is_empty());
         }
+
+        /// A responder announces the root a completed record pull from it
+        /// walks, so its next announcement of the same state, compared with
+        /// that pull's root, starts no second pull.
+        #[test]
+        fn an_announcement_of_the_walked_state_starts_no_second_pull() {
+            use crate::announce::{Announcements, roots};
+            use triblespace_core::collection::private_policy;
+            use triblespace_core::collection::selection::{
+                CONFIG_COLLECTION_NAME, write_sync_selection,
+            };
+
+            let now = crate::clock::mono_now();
+            let mut puller = Node::new(18);
+            let mut responder = Node::new(19);
+            let collection = puller.hold("announced", open());
+            responder.hold("announced", open());
+            puller.commit(collection, 1);
+            responder.commit(collection, 2);
+            let config = responder
+                .store
+                .collection(
+                    CONFIG_COLLECTION_NAME,
+                    private_policy(responder.key.verifying_key()),
+                )
+                .unwrap();
+            write_sync_selection(
+                &mut responder.store,
+                config,
+                &responder.key,
+                collection,
+                true,
+            )
+            .unwrap();
+            puller.observe();
+            responder.observe();
+            let announced = roots(responder.walks.snapshot.as_ref().unwrap())
+                .map(|(_, root)| root)
+                .collect::<Vec<_>>();
+            assert_eq!(announced.len(), 1);
+
+            let mut wire = connect(&puller, &responder, 1);
+            let mut announcements = Announcements::default();
+            announcements.observe([(collection, root(&puller, collection))], now);
+            // The puller does not send C back, so it never replies.
+            announcements.neighbours([(collection, &wire.to_right, false)], now);
+            assert_eq!(
+                announcements.heard(responder.id(), collection, announced[0], false, now),
+                Some((responder.id(), collection))
+            );
+            puller
+                .walks
+                .start_record_pull(&wire.to_right, collection, now);
+            carry(&mut puller, &mut responder, &mut wire, now);
+            assert!(puller.done[0].completed);
+            assert_eq!(announcements.ended(puller.done[0], now), None);
+
+            // The puller now holds the union, whose root differs from the
+            // responder's.
+            announcements.observe([(collection, root(&puller, collection))], now);
+            assert_ne!(root(&puller, collection), announced[0]);
+            assert_eq!(
+                announcements.heard(responder.id(), collection, announced[0], false, now),
+                None
+            );
+        }
     }
 }

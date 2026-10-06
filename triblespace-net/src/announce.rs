@@ -1,12 +1,14 @@
 //! Per-collection announcements on `recon/1` (design 2.3, 2.5).
 //!
-//! An announcement says "my root for C is R". Each selected collection has
-//! one [`WakeSchedule`]: when it fires, this side announces C to each
-//! neighbour for C it sends to, except one that announced an equal root
-//! during the interval. A local append resets the timer to its shortest
-//! interval. A root that changes while a pull of C runs is that pull landing
-//! and resets nothing; the pull resets the timer once when it completes, so
-//! the merged root goes out once (D4).
+//! An announcement says "my root for C is R", where R is C's [`record_root`]:
+//! the root of what a record pull walks, so the root a completed pull walked
+//! compares with later announcements. Each selected collection has one
+//! [`WakeSchedule`]: when it fires, this side announces C to each neighbour
+//! for C it sends to, except one that announced an equal root during the
+//! interval. A local append resets the timer to its shortest interval. A
+//! root that changes while a pull of C runs is that pull landing and resets
+//! nothing; the pull resets the timer once when it completes, so the merged
+//! root goes out once (D4).
 //!
 //! An announcement ends the comparison when it equals this side's root, or
 //! the root of the last pull from its sender that completed. Otherwise it
@@ -23,24 +25,17 @@ use std::collections::hash_map::Entry;
 use triblespace_core::collection::CollectionHandle;
 
 use crate::clock::Mono;
+use crate::collection_activation::record_root;
 use crate::connection::Link;
 use crate::host::StoreSnapshot;
 use crate::protocol::RawHash;
 use crate::recon::Frame;
 use crate::transport::PeerId;
 use crate::wake_schedule::WakeSchedule;
+use crate::walk::RecordPullDone;
 
 /// A record pull of a collection from a peer.
 pub(crate) type Pull = (PeerId, CollectionHandle);
-
-/// A record pull ended. `walked` is the root it walked, if it completed: it
-/// walked to the end, deferred no proof, and every insert succeeded.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct PullEnded {
-    pub(crate) peer: PeerId,
-    pub(crate) collection: CollectionHandle,
-    pub(crate) walked: Option<RawHash>,
-}
 
 struct Neighbour {
     link: Link,
@@ -66,11 +61,17 @@ pub(crate) struct Announcements {
     pulls: HashMap<(RawHash, PeerId), Option<(RawHash, bool)>>,
 }
 
-/// The selected collections of `snapshot` and their roots.
+/// The selected collections of `snapshot` and their record roots.
 pub(crate) fn roots(snapshot: &StoreSnapshot) -> impl Iterator<Item = (CollectionHandle, RawHash)> {
     snapshot.active().filter_map(|collection| {
         let selected = snapshot.selected(collection)?;
-        Some((collection, selected.repair().wake_root()))
+        let repair = selected.repair();
+        let root = record_root(
+            collection,
+            repair.records().summary(),
+            repair.authorization_evidence().summary(),
+        );
+        Some((collection, root))
     })
 }
 
@@ -198,17 +199,18 @@ impl Announcements {
     /// completed one of its neighbour, and resets the timer once. An
     /// announcement heard during the pull is heard now. Returns the record
     /// pull to start, if any.
-    pub(crate) fn ended(&mut self, ended: PullEnded, now: Mono) -> Option<Pull> {
-        let PullEnded {
+    pub(crate) fn ended(&mut self, done: RecordPullDone, now: Mono) -> Option<Pull> {
+        let RecordPullDone {
             peer,
             collection,
-            walked,
-        } = ended;
+            root,
+            completed,
+        } = done;
         let pending = self.pulls.remove(&(collection.raw, peer)).flatten();
         let announcing = self.collections.get_mut(&collection.raw)?;
-        if let Some(walked) = walked {
+        if completed {
             if let Some(neighbour) = announcing.neighbours.get_mut(&peer) {
-                neighbour.completed = Some(walked);
+                neighbour.completed = Some(root);
             }
             announcing.schedule.local_changed(now, rand::random());
         }
@@ -440,10 +442,11 @@ mod tests {
         assert!(during.len() <= 1, "{during:?}");
 
         let merged = root(50);
-        let ended = PullEnded {
+        let ended = RecordPullDone {
             peer: A,
             collection: c,
-            walked: Some(root(100)),
+            root: root(100),
+            completed: true,
         };
         assert_eq!(node.ended(ended, now), None);
         advance(&mut node, &mut now, Duration::from_secs(2));
@@ -462,10 +465,11 @@ mod tests {
         node.observe([(c, root(0))], now);
         let a = wire(1, A);
         node.neighbours([(c, &a.link, true)], now);
-        let walked = |number| PullEnded {
+        let walked = |number| RecordPullDone {
             peer: A,
             collection: c,
-            walked: Some(root(number)),
+            root: root(number),
+            completed: true,
         };
 
         assert_eq!(node.heard(A, c, root(1), false, now), Some((A, c)));
@@ -478,8 +482,8 @@ mod tests {
         assert_eq!(node.heard(A, c, root(4), true, now), None);
         assert_eq!(node.ended(walked(3), now), Some((A, c)));
         // A pull that did not complete leaves no walked root behind.
-        let failed = PullEnded {
-            walked: None,
+        let failed = RecordPullDone {
+            completed: false,
             ..walked(4)
         };
         assert_eq!(node.ended(failed, now), None);

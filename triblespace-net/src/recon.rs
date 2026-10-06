@@ -143,7 +143,8 @@ pub enum Frame {
     ProofsEnd,
     /// One frame of a pull walk, encoded by [`crate::walk`].
     Walk(WalkFrame),
-    /// The sender's root for the collection, to a neighbour it sends to.
+    /// The sender's record root for the collection, to a neighbour it sends
+    /// to.
     /// Between two full neighbours it carries the sender's held-set digest.
     /// A reply answers a different announcement and is never answered.
     Announce {

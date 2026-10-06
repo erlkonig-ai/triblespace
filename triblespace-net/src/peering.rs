@@ -35,7 +35,7 @@ use rand::seq::SliceRandom as _;
 use triblespace_core::capability::{CapabilityHandle, CapabilityProof, QuorumOutcome};
 use triblespace_core::collection::CollectionHandle;
 
-use crate::announce::{self, Announcements, PullEnded};
+use crate::announce::{self, Announcements};
 use crate::channel::NetEventBatch;
 use crate::clock::Mono;
 use crate::collection_activation::MAX_PROOFS_PER_EXCHANGE;
@@ -46,6 +46,7 @@ use crate::host::{CollectionSnapshot, StoreSnapshot};
 use crate::protocol::RawHash;
 use crate::recon::{Flags, Frame, credential_frames, request_frames};
 use crate::transport::{PeerId, Transport};
+use crate::walk::RecordPullDone;
 
 /// Neighbours per collection this side asks for.
 pub(crate) const MAX_ASKED: usize = 5;
@@ -980,7 +981,7 @@ pub(crate) async fn run<T: Transport, S: Service>(
     mut events: tokio::sync::mpsc::Receiver<ReconEvent>,
     mut providers: tokio::sync::mpsc::UnboundedReceiver<(CollectionHandle, Vec<PeerId>)>,
     mut start_record_pull: impl FnMut(PeerId, CollectionHandle),
-    mut pulls_ended: tokio::sync::mpsc::UnboundedReceiver<PullEnded>,
+    mut pulls_ended: tokio::sync::mpsc::UnboundedReceiver<RecordPullDone>,
     health: Health,
     admissions: tokio::sync::mpsc::Sender<NetEventBatch>,
 ) {
