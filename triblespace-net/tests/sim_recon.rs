@@ -1,10 +1,11 @@
 //! The one `recon/1` stream of a connection, through whole hosts on the
 //! deterministic transport: 130 collections share it between two neighbours
 //! within the announcement estimate, it takes none of the request permits
-//! blob streams wait for, a peer that stops reading it gets it reset, and it
-//! reopens beside blob streams at their cap. A peer that speaks `recon/1` by
-//! hand encodes its frames with [`Frame`], and walk requests by the frame
-//! table of `triblespace_net::walk`.
+//! blob streams wait for, a peer that stops reading it gets it reset, it
+//! reopens beside blob streams at their cap, and the dialler reopens it at
+//! once when it ends. A peer that speaks `recon/1` by hand encodes its frames
+//! with [`Frame`], and walk requests by the frame table of
+//! `triblespace_net::walk`.
 #![cfg(feature = "sim")]
 
 use std::collections::{BTreeSet, HashMap};
@@ -899,5 +900,101 @@ fn a_peer_that_stops_reading_recon_gets_it_reset_and_keeps_its_peering() {
         .await;
         assert!(peered(&peers[0], reader_id));
         assert_eq!(net.dial_count(reader_id, host_id), 1);
+    });
+}
+
+/// A reader dials a key that may write a collection it selects but may not
+/// read it, and peers with it: the writer sends and the reader sends nothing
+/// (design 2.3, Astra R3). The writer, driven by hand, resets `recon/1` with
+/// [`RESET_STALLED`], as a writer that waited 60 s for credit does, and keeps
+/// the connection in use with a `FIND_VALUE` every 30 s. Only the dialler can
+/// open `recon/1`, and the writer's frames wait for one, so the reader opens
+/// a new one at once, though it has nothing to send.
+#[test]
+fn the_dialler_reopens_an_ended_recon_at_once() {
+    run(async |clock| {
+        let net = SimNet::new(0x5EC0_0005, SimConfig::default());
+        let reader_key = key(12);
+        let writer_key = key(13);
+        let writer_id = id(&writer_key);
+        let mut store = MemoryRepo::default();
+        let keys = [reader_key.verifying_key(), writer_key.verifying_key()];
+        let writers = AdmissionPolicy::quorum(keys, 1, None).unwrap();
+        let readers = AdmissionPolicy::direct(reader_key.verifying_key());
+        let policy = CollectionPolicy::new(readers, writers);
+        let collection = store.collection("written only", policy).unwrap().handle();
+        select(&mut store, &reader_key, collection);
+        let mut reader = bring_up(net.join(&reader_key), &reader_key, store, &[]);
+
+        let mut harness = net.join(&writer_key);
+        let (recons, mut opened) = tokio::sync::mpsc::unbounded_channel();
+        let (conns, mut accepted) = tokio::sync::mpsc::unbounded_channel();
+        tokio::task::spawn_local(async move {
+            let conn = harness.incoming.recv().await.unwrap().conn;
+            let _ = conns.send(conn.clone());
+            while let Some((send, mut recv)) = conn.accept_bi().await {
+                match recv.read_u8().await {
+                    Ok(TAG_RECON) => {
+                        let _ = recons.send((send, Frames::new(recv)));
+                    }
+                    Ok(TAG_DHT) => {
+                        let none = Arc::default();
+                        tokio::task::spawn_local(find_value(send, recv, writer_id, none));
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        reader.activate_collection(collection);
+        let peers: &mut [&mut Peer<MemoryRepo>] = &mut [&mut reader];
+        let (mut recon, mut frames) =
+            until(&clock, peers, 10, "recon/1", |_| opened.try_recv().ok()).await;
+        let conn = accepted.try_recv().unwrap();
+        let theirs = until(&clock, peers, 10, "peering request", |_| {
+            loop {
+                if let Frame::PeerRequest {
+                    collection: c,
+                    flags,
+                    ..
+                } = frames.arrived()?
+                    && c == collection
+                {
+                    return Some(flags);
+                }
+            }
+        })
+        .await;
+        assert!(!theirs.send, "the reader sends nothing");
+        let flags = Flags {
+            send: true,
+            full: false,
+        };
+        send_frame(&mut recon, &Frame::PeerAccept { collection, flags }).await;
+        until(&clock, peers, 10, "peering", |peers| {
+            peered(&peers[0], writer_id).then_some(())
+        })
+        .await;
+
+        recon.reset(RESET_STALLED);
+        frames.recv.stop(RESET_STALLED);
+        let mut steps = 0;
+        until(&clock, peers, 600, "a new recon/1", |_| {
+            if steps % 300 == 0 {
+                let conn = conn.clone();
+                tokio::task::spawn_local(async move {
+                    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+                    let mut request = vec![TAG_DHT, OP_FIND_VALUE];
+                    request.extend([7; 32]);
+                    send.write_all(&request).await.unwrap();
+                    send.shutdown().await.unwrap();
+                    recv.read_to_end(&mut Vec::new()).await.unwrap();
+                });
+            }
+            steps += 1;
+            opened.try_recv().ok()
+        })
+        .await;
+        assert_eq!(net.dial_count(id(&reader_key), writer_id), 1);
     });
 }

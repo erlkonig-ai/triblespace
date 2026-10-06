@@ -25,7 +25,7 @@
 //!
 //! A writer that waits [`RECON_CREDIT_DEADLINE`] for stream credit resets
 //! `recon/1`: the peer stopped reading. The service hears that the stream
-//! ended, and the dialler opens a new one once it has a frame to send.
+//! ended, and the dialler opens a new one at once.
 //!
 //! A connection closes after [`CONNECTION_IDLE_DEADLINE`] without a frame on
 //! any of its streams, sent or received. Above [`MAX_CONNECTIONS`] in one
@@ -131,8 +131,7 @@ pub enum ReconEvent {
     Frame(Link, Frame),
     /// The connection's `recon/1` stream ended while the connection stays
     /// open, and whatever ran on it with it. The connection's peerings and
-    /// queued frames outlive it: the dialler opens a new stream once it has
-    /// a frame to send.
+    /// queued frames outlive it: the dialler opens a new stream at once.
     Ended(Link),
     /// The connection closed; frames queued on it go nowhere.
     Closed(Link),
@@ -275,7 +274,8 @@ struct State {
     /// A `recon/1` stream carries the connection's frames, or is being
     /// opened. A dialled connection opens one as it connects.
     recon_live: AtomicBool,
-    /// A frame was queued while no `recon/1` stream was live.
+    /// The dialler's `recon/1` ended, or a frame was queued while no stream
+    /// was live: the accept loop opens a new one.
     reopen: AtomicBool,
     /// Woken on retirement, on the last in-flight stream, on a new `recon/1`
     /// stream, and on a frame that asks for one.
@@ -1272,10 +1272,16 @@ async fn recon<T: Transport, S: Service>(
                     send.reset(RESET_STALLED);
                     recv.stop(RESET_STALLED);
                 }
-                // The newest stream ended, and none replaces it yet.
+                // The newest stream ended, and none replaces it yet. The
+                // dialler opens the next one at once: the acceptor cannot,
+                // and may have frames queued for it.
                 if state.recon.load(Ordering::SeqCst) == order {
                     state.recon_live.store(false, Ordering::SeqCst);
                     ended_here = true;
+                    if state.dialled {
+                        state.reopen.store(true, Ordering::SeqCst);
+                        state.changed.notify_waiters();
+                    }
                 }
                 outcome
             }
