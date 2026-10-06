@@ -34,7 +34,7 @@ use triblespace_core::blob::Blob;
 use triblespace_core::blob::TryFromBlob as _;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::capability::CapabilityProof;
-use triblespace_core::collection::CollectionHandle;
+use triblespace_core::collection::{AdmissionPolicy, CollectionHandle};
 use triblespace_core::collection::descriptor::{capability_policies, validate_proof_for_policies};
 use triblespace_core::inline::Inline;
 use triblespace_core::patch::Entry as PatchEntry;
@@ -46,7 +46,7 @@ use crate::collection_activation::{
 };
 use crate::connection::{ConnectionTable, Link, ReconEvent, Service};
 use crate::health::Health;
-use crate::host::StoreSnapshot;
+use crate::host::{METADATA_BLOB_BYTES, StoreSnapshot};
 use crate::patch_repair::PatchSummary;
 use crate::protocol::{RawHash, op_get_blob};
 use crate::recon::{Frame, proof_frames};
@@ -113,6 +113,10 @@ pub(crate) struct Grants {
     own: SubjectProofPatch,
     /// Received proofs naming this node whose descriptor is not held, by id.
     pending: BTreeMap<RawHash, CapabilityProof>,
+    /// The capability policies of resident descriptors of collections that
+    /// are not active, by handle, decoded once per observation; `None` for
+    /// a blob that is no descriptor.
+    descriptors: HashMap<RawHash, Option<Vec<AdmissionPolicy>>>,
     exchanges: HashMap<u64, Exchange>,
     /// Grants this key signed whose subject was dialled, by id.
     dialled: HashSet<RawHash>,
@@ -129,6 +133,7 @@ impl Grants {
             received: SubjectProofPatch::new(),
             own: SubjectProofPatch::new(),
             pending: BTreeMap::new(),
+            descriptors: HashMap::new(),
             exchanges: HashMap::new(),
             dialled: HashSet::new(),
             changed: false,
@@ -272,21 +277,33 @@ impl Grants {
 
     /// Whether `proof` is evidence under its collection's descriptor, or
     /// `None` when that descriptor is not held. An active collection uses its
-    /// pinned evidence, which also routes subordinate resources.
-    fn validate(&self, proof: &CapabilityProof) -> Option<bool> {
-        let snapshot = self.snapshot.as_ref()?;
+    /// pinned evidence, which also routes subordinate resources. A resident
+    /// blob larger than any descriptor this node fetches is not taken for
+    /// one.
+    fn validate(&mut self, proof: &CapabilityProof) -> Option<bool> {
+        let snapshot = self.snapshot.clone()?;
         let collection = CollectionHandle::new(proof.resource().into_bytes());
         if let Some(local) = snapshot.collection(collection) {
             let evidence = local.repair().authorization_evidence();
             return Some(evidence.validate_proof(proof).is_ok());
         }
-        let bytes = snapshot.get_blob(&collection.raw)?;
-        let blob = Blob::<SimpleArchive>::with_handle(bytes, Inline::new(collection.raw));
-        let Ok(facts) = TribleSet::try_from_blob(blob) else {
-            return Some(false);
-        };
-        let policies = capability_policies(&facts, None).map(|(_, policy)| policy);
-        Some(validate_proof_for_policies(collection, policies, proof).is_ok())
+        if !self.descriptors.contains_key(&collection.raw) {
+            let bytes = snapshot.get_blob(&collection.raw)?;
+            if bytes.len() as u64 > METADATA_BLOB_BYTES {
+                return None;
+            }
+            let blob = Blob::<SimpleArchive>::with_handle(bytes, Inline::new(collection.raw));
+            let policies = TribleSet::try_from_blob(blob).ok().map(|facts| {
+                capability_policies(&facts, None)
+                    .map(|(_, policy)| policy)
+                    .collect()
+            });
+            self.descriptors.insert(collection.raw, policies);
+        }
+        let policies = self.descriptors[&collection.raw].as_ref();
+        Some(policies.is_some_and(|policies| {
+            validate_proof_for_policies(collection, policies.iter().cloned(), proof).is_ok()
+        }))
     }
 
     /// Whether an active collection already holds `proof`.
@@ -323,6 +340,7 @@ impl Grants {
         let grew = held.merkle_root() != self.held.merkle_root();
         self.held = held;
         self.snapshot = Some(snapshot);
+        self.descriptors.clear();
 
         let mut effects = Effects::default();
         let pending = std::mem::take(&mut self.pending);
@@ -895,6 +913,71 @@ mod tests {
             },
         ));
         assert_eq!(ids(&effects.land), ids(&[senders, mine]));
+    }
+
+    /// A resident archive of `count` tribles in `node`'s pile, and how long
+    /// one decode of it takes.
+    fn archive(node: &mut Node, count: u64) -> (CollectionHandle, Duration) {
+        use triblespace_core::blob::IntoBlob as _;
+        use triblespace_core::repo::BlobStorePut as _;
+        use triblespace_core::trible::Trible;
+        let mut archive = TribleSet::new();
+        for index in 0..count {
+            let mut raw = [1_u8; 64];
+            raw[..8].copy_from_slice(&index.to_be_bytes());
+            archive.insert(&Trible::force_raw(raw).unwrap());
+        }
+        let blob: Blob<SimpleArchive> = archive.to_blob();
+        let handle = CollectionHandle::new(blob.get_handle().raw);
+        node.store.put::<SimpleArchive, _>(blob.clone()).unwrap();
+        node.observe();
+        let started = std::time::Instant::now();
+        TribleSet::try_from_blob(blob).unwrap();
+        (handle, started.elapsed())
+    }
+
+    /// How long `node` takes over one CREDENTIAL frame of 32 proofs a
+    /// stranger signed for itself over `resource`.
+    fn credentials_over(node: &mut Node, resource: CollectionHandle) -> Duration {
+        let stranger = key(59);
+        let (link, _sent) = Link::detached(1, stranger.verifying_key().to_bytes());
+        node.grants.event(&ReconEvent::Opened(link.clone()));
+        let credentials = (0..32)
+            .map(|_| grant(&stranger, &stranger, read_capability(), resource))
+            .collect();
+        let frame = Frame::Credential {
+            collection: CollectionHandle::new([0xEE; 32]),
+            credentials,
+        };
+        let started = std::time::Instant::now();
+        node.grants.event(&ReconEvent::Frame(link, frame));
+        started.elapsed()
+    }
+
+    /// Credentials over a resident blob larger than any descriptor make this
+    /// node decode none of it.
+    #[test]
+    fn a_stranger_cannot_make_this_node_decode_a_large_blob() {
+        let mut node = Node::new(52);
+        let (large, one_decode) = archive(&mut node, 1 << 15);
+        let frame = credentials_over(&mut node, large);
+        assert!(
+            frame < one_decode,
+            "32 credentials took {frame:?}; one decode of the 2 MiB archive takes {one_decode:?}"
+        );
+    }
+
+    /// Credentials over a resident archive within the descriptor bound make
+    /// this node decode it once, not once per proof.
+    #[test]
+    fn a_stranger_cannot_make_this_node_decode_a_blob_per_proof() {
+        let mut node = Node::new(53);
+        let (resident, one_decode) = archive(&mut node, 1 << 12);
+        let frame = credentials_over(&mut node, resident);
+        assert!(
+            frame < 4 * one_decode,
+            "32 credentials took {frame:?}; one decode of the 256 KiB archive takes {one_decode:?}"
+        );
     }
 
     /// The host dials the subject of each grant its key signed, once, and
