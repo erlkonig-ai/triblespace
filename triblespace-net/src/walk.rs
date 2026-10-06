@@ -2262,12 +2262,18 @@ mod tests {
             let pull = &puller.walks.pulls[&(responder.id(), collection.raw, WalkKind::Records)];
             let (nodes_before, unlanded_before) = (pull.nodes.len(), pull.unlanded);
 
-            // The late response and the late acknowledgements arrive.
+            // The late response and the late acknowledgements arrive, one of
+            // them reporting a failed insert.
+            let retired = WalkRef {
+                peer: responder.id(),
+                walk: late.walk,
+            };
             puller.walks.frame(&wire.to_right, late, expired);
             let held = std::mem::take(&mut puller.held);
             assert!(held.iter().all(|(walk, _)| walk.walk != successor));
             puller.hold = false;
             puller.land(held, expired);
+            puller.walks.landed(retired, 0, 1, expired);
             puller.outputs(expired);
             assert_eq!(wire.from_left.len(), sent_before, "no request followed");
             let pull = &puller.walks.pulls[&(responder.id(), collection.raw, WalkKind::Records)];
