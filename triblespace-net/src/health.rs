@@ -24,9 +24,9 @@ use crate::transport::PeerId;
 pub const MAX_HEALTH_PEERS_PER_COLLECTION: usize = 128;
 
 /// Semantic evidence from an immutable manifest received after READ(C)
-/// admission, plus its composite wake root for diagnostics. The wake root also
-/// includes a partial resident-blob inventory; cache equality is deliberately
-/// not required for record/AUTH health.
+/// admission, plus its composite root for diagnostics. Held blobs are in
+/// neither: cache equality is deliberately not required for record/AUTH
+/// health.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RepairFrontier {
     pub wake_root: [u8; 32],

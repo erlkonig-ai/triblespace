@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- The held-set walker is removed: `HeldWalker`, `HeldWalkConfig`,
+  `Covered::start_held_walker`, `Covered::walk_held`, `held_walker_threads`
+  and `held_threads_spawned`, with the start-up and periodic walks. A newly
+  tracked collection's closure is computed by the next snapshot, and the
+  index starts no thread. A late child that no seed reaches and no peer
+  reports stays out of the held set until the index resets or the store is
+  reopened, though it stays readable by its hash (sync design 2.9, Astra's
+  R2). Proofs judged against a resident descriptor that cannot be read are
+  not judged again.
 - Admission from explicitly supplied proofs returns the `QuorumOutcome`
   instead of a bool: `collection_reader_is_admitted_by_policy`,
   `collection_writer_is_admitted_by_policy`, `collection_reader_is_admitted_by`

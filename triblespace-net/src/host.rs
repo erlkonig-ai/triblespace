@@ -61,6 +61,7 @@ use crate::wake::{
     CollectionWakeSubscription, ReceivedCollectionWake,
 };
 use crate::wake_schedule::WakeSchedule;
+use crate::walk::PullKind;
 
 /// Ephemeral local collection interest. It is deliberately not a durable
 /// marker or ambient registry.
@@ -245,6 +246,9 @@ pub(crate) struct StoreSnapshot {
     bearer_locators: Arc<BearerLocatorIndex>,
     /// This pile's configuration collection, where its sync selection lives.
     config: Arc<TribleSet>,
+    /// The collections this side replicates in full
+    /// ([`ReplicationMode::Full`](crate::reconcile::ReplicationMode::Full)).
+    full: ActiveCollections,
 }
 
 impl StoreSnapshot {
@@ -292,8 +296,8 @@ impl StoreSnapshot {
         let reader = ResidentBlobReader::new(&snapshot);
         for raw in active.iter_ordered() {
             let collection = CollectionHandle::new(*raw);
-            // Positive, possibly incomplete while a start-up walk runs; an
-            // untracked collection holds nothing.
+            // Positive; a collection replicated on demand is untracked and
+            // holds nothing.
             let held = snapshot.held(collection).unwrap_or_default();
             let prior = previous.and_then(|prior| prior.collections.get(&collection.raw));
             let relevant = match (previous_store, prior) {
@@ -390,7 +394,20 @@ impl StoreSnapshot {
             blobs: reader.0,
             bearer_locators,
             config,
+            full: ActiveCollections::new(),
         })
+    }
+
+    /// Replicate `full`'s collections in full: their peerings say so, and
+    /// announcements to full neighbours carry their held digests.
+    pub(crate) fn with_full(mut self, full: ActiveCollections) -> Self {
+        self.full = full;
+        self
+    }
+
+    /// Whether this side replicates the collection in full.
+    pub(crate) fn full(&self, collection: CollectionHandle) -> bool {
+        self.full.get(&collection.raw).is_some()
     }
 
     pub(crate) fn collection(
@@ -1511,20 +1528,19 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
         crate::walk::Walks::new(config.qos.direction.serves(), wiring.health.clone()),
         walks_rx,
         wiring.lander.clone(),
-        wiring.evt_tx.clone(),
     );
     // Peerings and announcements ride the connections' recon/1 streams
-    // beside the wake path below. Announcements start record pulls, and hear
-    // every record pull end, whoever started it.
+    // beside the wake path below. Announcements start record and reference
+    // pulls, and hear every pull end, whoever started it.
     let (found_tx, found_rx) = tokio::sync::mpsc::unbounded_channel();
     let (ended_tx, ended_rx) = tokio::sync::mpsc::unbounded_channel();
-    let record_pulls = pulls.clone();
+    let starts = pulls.clone();
     tokio::spawn(crate::peering::run(
         connections.clone(),
         wiring.snapshot.clone(),
         recon_rx,
         found_rx,
-        move |peer, collection| record_pulls.start_record_pull(peer, collection),
+        move |peer, collection, kind| starts.start(peer, collection, kind),
         ended_rx,
         wiring.health.clone(),
         wiring.evt_tx.clone(),
@@ -1769,6 +1785,9 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
         }
         while let Ok(pulled) = pulled.try_recv() {
             let _ = ended_tx.send(pulled);
+            if pulled.kind == PullKind::References {
+                continue;
+            }
             // The walks keep the pair's health; this keeps its retry state.
             let outcome = RepairOutcome {
                 target: RepairTarget {
@@ -2063,10 +2082,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
                     continue;
                 }
                 in_flight.insert(target);
-                // The repair repeats the old session's components: records
-                // and authorization, then held references as hints.
-                pulls.start_record_pull(target.peer, target.collection);
-                pulls.start_reference_pull(target.peer, target.collection);
+                pulls.start(target.peer, target.collection, PullKind::Records);
             }
         }
 
@@ -3570,7 +3586,8 @@ mod tests {
             after_collection.repair.authorization_evidence().summary(),
             before_collection.repair.authorization_evidence().summary()
         );
-        assert_ne!(after_collection.wake_root(), before_collection.wake_root());
+        // The definition joined the held set; the root leaves held blobs out.
+        assert_eq!(after_collection.wake_root(), before_collection.wake_root());
         assert!(
             after_collection
                 .repair

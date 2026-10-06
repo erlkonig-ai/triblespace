@@ -16,12 +16,10 @@
 //! the sync host applies: over C from one of C's policy roots, or over a
 //! resource whose descriptor entity routes to C and declares the root,
 //! whether or not that resource is tracked too; a proof whose descriptors
-//! arrive later is judged on their arrival, and one judged while a
-//! descriptor was resident but unreadable is judged again after the next
-//! walk). A valid proof irrelevant to C seeds nothing. A MERGE never
-//! replicates, so
-//! its result is never a seed, and a blob no record names (an attachment, a
-//! scratch archive) is never one either.
+//! arrive later is judged on their arrival). A valid proof irrelevant to C
+//! seeds nothing. A MERGE never replicates, so its result is never a seed,
+//! and a blob no record names (an attachment, a scratch archive) is never
+//! one either.
 //!
 //! Reachability is the conservative closure: an aligned 32-byte word of a
 //! blob is a child when it names a resident blob. Nothing here knows schemas.
@@ -35,20 +33,19 @@
 //! already scanned for one collection joins another without being read again.
 //!
 //! The price of scanning once is the late child: a child that becomes
-//! resident after its parent was scanned is not an edge. Three things catch
-//! it:
+//! resident after its parent was scanned is not an edge. Two things catch it:
 //!
 //! - it is itself a seed (a record names it): seeds are scanned on arrival;
 //! - a peer holding it advertises it in C ([`HeldStore::note_held`]): a
 //!   resident blob a peer reports in C joins `held(C)` however it arrived.
 //!   This is routing evidence, kept in memory only; a reopened store forgets
-//!   it unless one of C's own records reaches the blob by then;
-//! - the periodic full walk ([`HeldWalker`]) rescans every blob reachable
-//!   from the seeds and refreshes the edge cache. A late child nobody
-//!   advertised therefore joins `held(C)` only once a walk that *started*
-//!   after it arrived has *finished*: the delay is bounded by the walk
-//!   interval plus one walk's duration plus scheduling delay, and is only
-//!   eventual under CPU saturation.
+//!   it unless one of C's own records reaches the blob by then.
+//!
+//! Otherwise it stays out of `held(C)` until the index resets or the store is
+//! reopened, though it stays readable by its hash. Sync states this as a
+//! limitation (design 2.9, Astra's R2): between two neighbours that replicate
+//! C in full, the one holding the late child through a seed or a report
+//! reports it to the other.
 //!
 //! # Snapshots
 //!
@@ -56,45 +53,29 @@
 //! they never change afterwards. Taking a snapshot first extends the sets by
 //! the closures of what arrived since the previous one -- every seed of a new
 //! record (one another record already named included), seeds whose bytes
-//! arrived, memberships peers reported -- computed against
-//! that snapshot. That is the publication barrier: an observation is never
-//! handed out ahead of its new records' closures. Background walks only
-//! enter later snapshots; a changed [`HeldRead::held_generation`] says one did.
+//! arrived, memberships peers reported -- computed against that snapshot.
+//! That is the publication barrier: an observation is never handed out ahead
+//! of its new records' closures. A changed [`HeldRead::held_generation`] says
+//! the sets grew although the store may not have changed, as a report does.
 //!
 //! A held set is *closed* under the edge cache for readable children: a blob
-//! joins only once every child the cache names for it has joined, and when
-//! a walk learns a new readable child of a held blob, the child joins with
-//! the edge. So every closure computed later stops at a held blob without
-//! missing anything readable the cache knows below it. A blob that cannot be
-//! read -- absent, or resident and failing to read -- is unknown on every
-//! path: nothing above it joins until a walk reads it, and the reports and
-//! seeds above it stay roots of the periodic walk, which tries again. The
-//! boundary: a blob already held whose newly learned child cannot be read
-//! stays held without that child until a periodic walk reads it (taking the
-//! blob out would mean taking out every held blob above it).
+//! joins only once every child the cache names for it has joined. So every
+//! closure computed later stops at a held blob without missing anything
+//! readable the cache knows below it. A blob that cannot be read -- absent,
+//! or resident and failing to read -- is unknown on every path: nothing above
+//! it joins. A seed is read again when its bytes arrive, a reported blob when
+//! a peer reports it again.
 //!
-//! When a collection is first tracked, its existing closure is computed
-//! synchronously if no walker is attached, and otherwise by a start-up walk
-//! of that collection in the background. The walk reads a batch of roots to
-//! the end and publishes it children before parents (a positive set is safe
-//! to publish incomplete). The start-up walk and the periodic walk never gate
-//! a snapshot. While a collection's start-up walk is owed, peer reports for
-//! it -- observed or only noted -- wait for that walk, which reads those its
-//! records do not reach, against the latest observation, rather than being
-//! read while a snapshot is taken: after a restart peers report their whole
-//! held sets, and resolving those reports at once would be the full walk
-//! again, on the publication path. A walk takes at most 16 rounds of such
-//! reports; later ones wait for the walker's next turn. Only a caller that owns a long-running host starts a
-//! walker; nothing here starts a thread by itself.
+//! When a collection is first tracked, its existing closure is computed by
+//! the next snapshot, which reads every blob it reaches once. Nothing here
+//! starts a thread.
 //!
 //! A snapshot that lost a blob its predecessor had (a store that forgets
 //! blobs) resets the index: the edges are forgotten and every collection is
-//! recomputed as if newly tracked. A walk that started before the reset stops.
+//! recomputed as if newly tracked.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use anybytes::Bytes;
 
@@ -174,7 +155,7 @@ pub trait HeldRead {
     fn held(&self, collection: CollectionHandle) -> Option<HeldBlobs>;
 
     /// Differs between two observations of one store whenever their held sets
-    /// may differ, including when only a background walk added to them.
+    /// may differ, including when only a peer's report added to them.
     fn held_generation(&self) -> u64;
 }
 
@@ -185,9 +166,8 @@ pub trait HeldStore {
 
     /// A peer reported `handle` in its held set of `collection`. If the blob
     /// is resident when the next snapshot is taken, it and everything it
-    /// reaches join `held(collection)`; while the collection's start-up walk
-    /// is owed, the report waits for that walk, which reads it. Kept in
-    /// memory only.
+    /// reaches join `held(collection)`; a report of a blob that is not
+    /// resident is dropped. Kept in memory only.
     fn note_held(&mut self, collection: CollectionHandle, handle: Inline<Handle<UnknownBlob>>);
 }
 
@@ -205,52 +185,6 @@ impl<T> HeldSource for T where
         + BlobStoreList
         + CapabilityProofRead
 {
-}
-
-/// How often and how widely the background walk runs.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HeldWalkConfig {
-    /// Time from one periodic walk's start to the next one's. A walk that
-    /// takes longer is followed immediately by the next. Start-up walks of
-    /// newly tracked collections run when they are owed and do not move this
-    /// schedule.
-    pub interval: Duration,
-    /// Blocking threads that read blobs during one walk.
-    pub threads: usize,
-}
-
-impl Default for HeldWalkConfig {
-    /// Thirty minutes on four threads. A periodic walk covers every tracked
-    /// collection. Measured on a 41 GB pile copy with a warm page cache, per
-    /// collection on 4 threads: about 60 s for the largest (about 108,000
-    /// blobs, 16 GB, 500 M aligned words), about 27 s for the next (which
-    /// then still seeded MERGE results, so less now), under 1 s for the
-    /// rest. The late-child bound is therefore about 30 minutes plus about
-    /// 1.5 minutes of walk plus scheduling delay.
-    fn default() -> Self {
-        Self {
-            interval: Duration::from_secs(30 * 60),
-            threads: 4,
-        }
-    }
-}
-
-/// Live walker threads in this process.
-static WALKER_THREADS: AtomicUsize = AtomicUsize::new(0);
-
-/// Every thread the held-blob index ever spawned in this process: walker
-/// threads and the scan threads of multi-threaded walks.
-static SPAWNED_THREADS: AtomicUsize = AtomicUsize::new(0);
-
-/// Number of walker threads currently running in this process.
-pub fn held_walker_threads() -> usize {
-    WALKER_THREADS.load(Ordering::SeqCst)
-}
-
-/// Number of threads the held-blob index has spawned in this process so far,
-/// walker and scan threads alike, for tests that a reader starts none.
-pub fn held_threads_spawned() -> usize {
-    SPAWNED_THREADS.load(Ordering::SeqCst)
 }
 
 /// The held sets as one snapshot sees them.
@@ -304,37 +238,21 @@ impl HeldView {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-struct Walker {
-    /// Collections whose start-up walk is owed.
-    requested: Handles,
-    /// Walker threads attached; the last to stop detaches the walker.
-    threads: usize,
-}
-
 /// Everything the index keeps across observations. A tracked collection is
 /// *settled* once its seeds are selected: then it has a held set, until a
-/// reset or a stopped walker makes it unsettled again.
+/// reset makes it unsettled again.
 #[derive(Clone)]
 struct State<T> {
     /// The collections held sets are kept for.
     tracked: Handles,
     /// The held set of every settled collection.
     held: HeldSets,
-    /// Settled collections whose existing closure is left to a start-up
-    /// walk that has not finished.
-    warming: Handles,
     /// `collection || blob`: every blob C's records and proofs name,
     /// resident or not.
     seeds: Pairs,
     /// `collection || blob`: resident blobs peers reported in C that were not
     /// already held.
     routes: Pairs,
-    /// `collection || blob`: peer reports of resident blobs that arrived
-    /// while C was unsettled or warming. With a walker, the walk that ends
-    /// the warming reads those it did not reach and makes them routes;
-    /// without one, the next observation resolves them.
-    deferred: Pairs,
     /// Every blob scanned since the last reset, whether it has children or
     /// not.
     scanned: Handles,
@@ -344,41 +262,24 @@ struct State<T> {
     /// `blob || collection`: seeds whose bytes were not readable yet, and the
     /// collections waiting for them.
     pending: Pairs,
-    /// `collection || blob`: seeds a walk could not read that were resident
-    /// by the time it published, reached at the next observation.
-    ready: Pairs,
     /// Collection and resource descriptors that were not resident when
     /// proofs were judged; the arrival of one judges the proofs again.
     unrouted: Handles,
     /// Proof seeds are recomputed at the next observation: reading the proofs
     /// failed, or a descriptor arrived.
     proofs_stale: bool,
-    /// A descriptor the proofs were judged against was resident but could not
-    /// be read: the next completed walk makes the proofs stale.
-    proofs_retry: bool,
-    /// `collection || blob`: peer reports since the last observation.
+    /// `collection || blob`: peer reports not resolved yet.
     candidates: Pairs,
     /// The last observation fed in.
     fed: Option<T>,
     generation: u64,
-    /// Bumped by a reset, so a walk started before it stops and publishes
-    /// nothing.
-    epoch: u64,
     view: Arc<HeldView>,
-    walker: Option<Walker>,
 }
 
 /// The shared held-blob index of one store. Its own lock: holding it never
-/// blocks a coverage read.
+/// blocks a coverage read. A clone is an independent copy.
 pub(crate) struct HeldIndex<T> {
     state: Mutex<State<T>>,
-    wake: Condvar,
-    /// The state's epoch, readable by a walk without taking the lock.
-    epoch: AtomicU64,
-    /// Test hook: run once by the next walk after it has taken what it
-    /// walks, before it reads anything.
-    #[cfg(test)]
-    walk_taken: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl<T> Default for HeldIndex<T> {
@@ -387,46 +288,26 @@ impl<T> Default for HeldIndex<T> {
             state: Mutex::new(State {
                 tracked: Handles::new(),
                 held: HeldSets::new(),
-                warming: Handles::new(),
                 seeds: Pairs::new(),
                 routes: Pairs::new(),
-                deferred: Pairs::new(),
                 scanned: Handles::new(),
                 edges: Pairs::new(),
                 pending: Pairs::new(),
-                ready: Pairs::new(),
                 unrouted: Handles::new(),
                 proofs_stale: false,
-                proofs_retry: false,
                 candidates: Pairs::new(),
                 fed: None,
                 generation: 0,
-                epoch: 0,
                 view: Arc::new(HeldView::default()),
-                walker: None,
             }),
-            wake: Condvar::new(),
-            epoch: AtomicU64::new(0),
-            #[cfg(test)]
-            walk_taken: Mutex::new(None),
         }
     }
 }
 
-impl<T: Clone> HeldIndex<T> {
-    /// An independent copy of this index, with no walker attached. A start-up
-    /// walk the original owed is owed by the copy as a synchronous closure.
-    pub(crate) fn detached_clone(&self) -> Self {
-        let mut state = self.lock().clone();
-        state.walker = None;
-        state.release_warming();
-        let epoch = state.epoch;
+impl<T: Clone> Clone for HeldIndex<T> {
+    fn clone(&self) -> Self {
         Self {
-            state: Mutex::new(state),
-            wake: Condvar::new(),
-            epoch: AtomicU64::new(epoch),
-            #[cfg(test)]
-            walk_taken: Mutex::new(None),
+            state: Mutex::new(self.lock().clone()),
         }
     }
 }
@@ -450,22 +331,6 @@ impl<T> HeldIndex<T> {
                 .candidates
                 .insert(&Entry::new(&pair(&collection.raw, &handle)));
         }
-    }
-
-    /// Run the test hook, if one is set.
-    fn walk_taken(&self) {
-        #[cfg(test)]
-        if let Some(hook) = self.walk_taken.lock().unwrap().take() {
-            hook();
-        }
-    }
-
-    /// The walk that started in `epoch` should stop: its own walker is being
-    /// stopped (`stop`, owned by that walker alone; an explicit walk has
-    /// none), or a reset made its results stale. Both only ever turn true.
-    fn abandoned(&self, epoch: u64, stop: Option<&AtomicBool>) -> bool {
-        stop.is_some_and(|stop| stop.load(Ordering::Relaxed))
-            || self.epoch.load(Ordering::Relaxed) != epoch
     }
 }
 
@@ -496,11 +361,10 @@ fn seeds_of(record: &CollectionRecord) -> Option<Vec<Raw>> {
 struct ProofSeeds {
     seeds: Vec<(CollectionHandle, Raw)>,
     /// Collection and resource descriptors that are not resident: their
-    /// arrival may let a proof be judged for one of the collections.
+    /// arrival may let a proof be judged for one of the collections. One
+    /// that is resident and cannot be read judges nothing, and nothing
+    /// arrives to judge it again.
     unrouted: Vec<Raw>,
-    /// A descriptor was resident but could not be read: nothing will arrive,
-    /// so the proofs are judged again after the next walk.
-    retry: bool,
 }
 
 /// Capability definitions named by the proofs each of `collections` keeps as
@@ -513,7 +377,6 @@ fn proof_seeds<T: HeldSource>(
     let mut found = ProofSeeds {
         seeds: Vec::new(),
         unrouted: Vec::new(),
-        retry: false,
     };
     if collections.is_empty() {
         return Ok(found);
@@ -541,20 +404,14 @@ fn proof_seeds<T: HeldSource>(
                     candidates.insert(collection);
                 }
             }
-        } else if snapshot.contains_blob(resource).unwrap_or(false) {
-            found.retry = true;
-        } else {
+        } else if !snapshot.contains_blob(resource).unwrap_or(false) {
             found.unrouted.push(resource.raw);
         }
         for collection in candidates {
             let descriptor = descriptors.entry(collection).or_insert_with(|| {
                 let facts = snapshot.get::<TribleSet, SimpleArchive>(collection).ok();
-                if facts.is_none() {
-                    if snapshot.contains_blob(collection).unwrap_or(false) {
-                        found.retry = true;
-                    } else {
-                        found.unrouted.push(collection.raw);
-                    }
+                if facts.is_none() && !snapshot.contains_blob(collection).unwrap_or(false) {
+                    found.unrouted.push(collection.raw);
                 }
                 facts
             });
@@ -599,20 +456,7 @@ impl<T> State<T> {
         self.scanned = Handles::new();
         self.edges = Pairs::new();
         self.pending = Pairs::new();
-        self.ready = Pairs::new();
-        self.epoch += 1;
         self.held = HeldSets::new();
-        self.warming = Handles::new();
-    }
-
-    /// No walker will finish the start-up walks still owed: those
-    /// collections are unsettled again and recomputed synchronously at the
-    /// next observation.
-    fn release_warming(&mut self) {
-        for collection in self.warming.iter() {
-            self.held.remove(collection);
-        }
-        self.warming = Handles::new();
     }
 
     fn publish_view(&mut self) {
@@ -623,43 +467,12 @@ impl<T> State<T> {
         });
     }
 
-    /// Roots of one walk over `only` (every settled collection when `None`):
-    /// the seeds and peer reports of each.
-    fn walk_roots(&self, only: Option<&Handles>) -> Vec<(CollectionHandle, Vec<Raw>)> {
-        self.held
-            .iter()
-            .filter(|collection| only.is_none_or(|only| only.get(collection).is_some()))
-            .map(|collection| {
-                let mut roots = related(&self.seeds, collection);
-                roots.extend(related(&self.routes, collection));
-                roots.sort_unstable();
-                roots.dedup();
-                (Inline::new(*collection), roots)
-            })
-            .collect()
-    }
-
-    /// A walk completed: judge the proofs again if a descriptor could not be
-    /// read when they were last judged.
-    fn walked(&mut self) {
-        if std::mem::take(&mut self.proofs_retry) {
-            self.proofs_stale = true;
-        }
-    }
-
     /// Record one scan: the blob, and an edge to each resident child.
-    /// Returns the children the cache did not name yet.
-    fn record_scan(&mut self, handle: Raw, children: &[Raw]) -> Vec<Raw> {
+    fn record_scan(&mut self, handle: Raw, children: &[Raw]) {
         self.scanned.insert(&Entry::new(&handle));
-        let mut learned = Vec::new();
         for child in children {
-            let key = pair(&handle, child);
-            if self.edges.get(&key).is_none() {
-                self.edges.insert(&Entry::new(&key));
-                learned.push(*child);
-            }
+            self.edges.insert(&Entry::new(&pair(&handle, child)));
         }
-        learned
     }
 }
 
@@ -667,13 +480,12 @@ impl<T: HeldSource> State<T> {
     /// Add everything reachable from `roots` to `collection`'s held set.
     ///
     /// A blob joins only after every resident child it has joined, so a held
-    /// blob's whole closure is held and a later closure stops at it. With a
-    /// snapshot, a blob never scanned is read now. Without one it is unknown:
-    /// it and everything above it wait for the walk that will scan it. A
-    /// blob that cannot be read is unknown on both paths, resident or not.
+    /// blob's whole closure is held and a later closure stops at it. A blob
+    /// never scanned is read now; one that cannot be read, resident or not,
+    /// is unknown, and so is everything above it.
     fn reach(
         &mut self,
-        snapshot: Option<&T>,
+        snapshot: &T,
         collection: CollectionHandle,
         roots: impl IntoIterator<Item = Raw>,
     ) -> bool {
@@ -701,7 +513,7 @@ impl<T: HeldSource> State<T> {
             }
             let children = if self.scanned.get(&handle).is_some() {
                 related(&self.edges, &handle)
-            } else if let Some(snapshot) = snapshot {
+            } else {
                 match scan(snapshot, &handle) {
                     Some(children) => {
                         self.record_scan(handle, &children);
@@ -713,15 +525,11 @@ impl<T: HeldSource> State<T> {
                                 .insert(&Entry::new(&pair(&handle, &collection.raw)));
                         }
                         // Not readable: absent, or resident and failing to
-                        // read. Either way nothing above it joins, on this
-                        // path as on the walk's; the periodic walk tries again.
+                        // read. Either way nothing above it joins.
                         unknown.insert(handle);
                         continue;
                     }
                 }
-            } else {
-                unknown.insert(handle);
-                continue;
             };
             let unheld: Vec<(Raw, Option<Vec<Raw>>)> = children
                 .iter()
@@ -783,19 +591,11 @@ impl<T: HeldSource> HeldIndex<T> {
             });
         if lost {
             state.reset();
-            self.epoch.store(state.epoch, Ordering::Relaxed);
             changed = true;
         }
 
         // Scratch for this observation: what to reach, per collection.
         let mut roots: BTreeMap<CollectionHandle, Vec<Raw>> = BTreeMap::new();
-        for key in std::mem::take(&mut state.ready).iter() {
-            let (collection, handle) = split(key);
-            roots
-                .entry(Inline::new(collection))
-                .or_default()
-                .push(handle);
-        }
         if let Some(fed) = state.fed.take() {
             if changes.contains(StoreChanges::COLLECTION_RECORDS) {
                 let State { held, seeds, .. } = &mut *state;
@@ -809,9 +609,8 @@ impl<T: HeldSource> HeldIndex<T> {
                         return;
                     };
                     // Every seed of a new record is a root, known or not: the
-                    // record is published with its whole closure even when a
-                    // start-up walk still owes a seed another record named.
-                    // A held seed costs one lookup.
+                    // record is published with its whole closure. A held seed
+                    // costs one lookup.
                     for seed in named {
                         seeds.insert(&Entry::new(&pair(&collection.raw, &seed)));
                         roots.entry(collection).or_default().push(seed);
@@ -844,7 +643,6 @@ impl<T: HeldSource> HeldIndex<T> {
                 match proof_seeds(now, &settled) {
                     Ok(found) => {
                         state.proofs_stale = false;
-                        state.proofs_retry = found.retry;
                         state.add_proof_seeds(found, &mut roots);
                     }
                     // Retried at the next observation.
@@ -885,11 +683,9 @@ impl<T: HeldSource> HeldIndex<T> {
                 for descriptor in proofs.unrouted {
                     state.unrouted.insert(&Entry::new(&descriptor));
                 }
-                state.proofs_retry |= proofs.retry;
                 for (collection, seed) in proofs.seeds {
                     seeds.get_mut(&collection).expect("fresh").push(seed);
                 }
-                let background = state.walker.is_some();
                 for (collection, mut list) in seeds {
                     for seed in &list {
                         state
@@ -900,87 +696,51 @@ impl<T: HeldSource> HeldIndex<T> {
                     state
                         .held
                         .replace(&Entry::with_value(&collection.raw, HeldBlobs::new()));
-                    if background {
-                        // Its start-up walk reads these; only closures already
-                        // scanned join now.
-                        state.warming.insert(&Entry::new(&collection.raw));
-                        state.reach(None, collection, list);
-                    } else {
-                        roots.entry(collection).or_default().extend(list);
-                    }
+                    roots.entry(collection).or_default().extend(list);
                 }
                 changed = true;
-                if let Some(walker) = &mut state.walker {
-                    for collection in &fresh {
-                        walker.requested.insert(&Entry::new(&collection.raw));
-                    }
-                    self.wake.notify_all();
-                }
             }
         }
 
         for (collection, list) in roots {
-            changed |= state.reach(Some(now), collection, list);
+            changed |= state.reach(now, collection, list);
         }
 
         // Scratch for this observation: the reports to resolve.
-        let mut candidates: Vec<(CollectionHandle, Raw)> = std::mem::take(&mut state.candidates)
+        let candidates: Vec<(CollectionHandle, Raw)> = std::mem::take(&mut state.candidates)
             .iter()
             .map(|key| {
                 let (collection, handle) = split(key);
                 (Inline::new(collection), handle)
             })
             .collect();
-        // Reports kept for a start-up walk that no walker will run (none is
-        // attached, or it stopped): resolved here, as any report is then.
-        if !state.deferred.is_empty() {
-            let cold: Vec<Raw> = state
-                .held
-                .iter()
-                .filter(|collection| state.warming.get(collection).is_none())
-                .copied()
-                .collect();
-            for collection in cold {
-                for handle in take_related(&mut state.deferred, &collection) {
-                    candidates.push((Inline::new(collection), handle));
-                }
-            }
-        }
         for (collection, handle) in candidates {
             if state.tracked.get(&collection.raw).is_none() {
                 continue;
             }
-            let settled = state.held.get(&collection.raw);
-            if settled.is_some_and(|held| held.has_prefix(&handle)) {
-                continue;
-            }
-            if settled.is_none() || state.warming.get(&collection.raw).is_some() {
-                // Resolving it now could read a whole unscanned subtree while
-                // this snapshot is taken; the start-up walk reads it instead.
-                // A report of a blob that is not resident is dropped, as
-                // below, so only resident blobs wait.
-                if now
+            let settled = state
+                .held
+                .get(&collection.raw)
+                .map(|held| held.has_prefix(&handle));
+            // A report of a blob that is not resident is dropped, so a failed
+            // fetch stays in the next difference.
+            if settled == Some(true)
+                || !now
                     .contains_blob(Inline::<Handle<UnknownBlob>>::new(handle))
                     .unwrap_or(false)
-                {
-                    state
-                        .deferred
-                        .insert(&Entry::new(&pair(&collection.raw, &handle)));
-                }
-                continue;
-            }
-            if !now
-                .contains_blob(Inline::<Handle<UnknownBlob>>::new(handle))
-                .unwrap_or(false)
             {
                 continue;
             }
-            // A route even if something under it cannot be read yet: the
-            // periodic walk tries it again.
-            state
-                .routes
-                .insert(&Entry::new(&pair(&collection.raw, &handle)));
-            changed |= state.reach(Some(now), collection, [handle]);
+            let key = pair(&collection.raw, &handle);
+            if settled.is_none() {
+                // The observation that settles the collection resolves it.
+                state.candidates.insert(&Entry::new(&key));
+                continue;
+            }
+            // A route even if something under it cannot be read yet: a later
+            // report of it reads it again.
+            state.routes.insert(&Entry::new(&key));
+            changed |= state.reach(now, collection, [handle]);
         }
         state.fed = Some(now.clone());
         if changed {
@@ -988,547 +748,14 @@ impl<T: HeldSource> HeldIndex<T> {
         }
         state.view.clone()
     }
-
-    /// Publish the seeds a walk could not read.
-    fn publish_unreadable(&self, epoch: u64, unreadable: Vec<(CollectionHandle, Raw)>) {
-        let mut state = self.lock();
-        if state.epoch != epoch {
-            return;
-        }
-        for (collection, handle) in unreadable {
-            let Some(held) = state.held.get(&collection.raw) else {
-                continue;
-            };
-            if held.has_prefix(&handle)
-                || state.seeds.get(&pair(&collection.raw, &handle)).is_none()
-            {
-                continue;
-            }
-            // The walk read an older observation. A seed that arrived since
-            // is in no later difference, so it is reached from the latest
-            // observation instead of waiting for one.
-            let resident = state.fed.as_ref().is_some_and(|fed| {
-                fed.contains_blob(Inline::<Handle<UnknownBlob>>::new(handle))
-                    .unwrap_or(false)
-            });
-            if resident {
-                state
-                    .ready
-                    .insert(&Entry::new(&pair(&collection.raw, &handle)));
-            } else {
-                state
-                    .pending
-                    .insert(&Entry::new(&pair(&handle, &collection.raw)));
-            }
-        }
-    }
-
-    /// Publish one piece of a walk, children before parents: each blob's
-    /// edges, then its membership in the collections that reached it, then
-    /// the membership its newly learned children owe the collections that
-    /// already hold it. A held blob is thus never left with a cached child
-    /// that is not held.
-    fn publish_piece(&self, epoch: u64, piece: Vec<(Raw, Arc<[Raw]>, Vec<CollectionHandle>)>) {
-        let mut state = self.lock();
-        if state.epoch != epoch {
-            return;
-        }
-        let mut changed = false;
-        for (handle, children, reached) in piece {
-            let learned = state.record_scan(handle, &children);
-            for collection in reached {
-                changed |= state.reach(None, collection, [handle]);
-            }
-            if learned.is_empty() {
-                continue;
-            }
-            let holders: Vec<CollectionHandle> = state
-                .held
-                .iter()
-                .filter(|collection| {
-                    state
-                        .held
-                        .get(collection)
-                        .is_some_and(|held| held.has_prefix(&handle))
-                })
-                .map(|collection| Inline::new(*collection))
-                .collect();
-            for collection in holders {
-                changed |= state.reach(None, collection, learned.iter().copied());
-            }
-        }
-        if changed {
-            state.publish_view();
-        }
-    }
-
-    /// One walk against the latest observation over `only` (every tracked
-    /// collection when `None`): rescan every blob reachable from their seeds
-    /// and peer reports, and refresh the edge cache. A walk that completes
-    /// ends the start-up walks it covered. The observation, the roots and the
-    /// epoch the results belong to are taken in one lock hold, so a reset
-    /// after it abandons the walk and a reset before it is already seen.
-    ///
-    /// The roots are walked in batches. Each batch is read to the end and
-    /// then published children before parents -- each blob's edges with its
-    /// membership -- so a blob joins a held set only once its whole resident
-    /// closure has, and a held blob never has a cached child that is not
-    /// held: a positive set published incomplete, never one that is not
-    /// closed. Reports
-    /// that waited for the walk and that it did not reach are walked last,
-    /// against the latest observation, and become routes; the walk ends only
-    /// when none is waiting, so none is left for a snapshot to read.
-    ///
-    /// `false` when the walk was abandoned before it finished.
-    pub(crate) fn walk(
-        &self,
-        threads: usize,
-        only: Option<&Handles>,
-        stop: Option<&AtomicBool>,
-    ) -> bool {
-        let (first, mut queue, epoch) = {
-            let state = self.lock();
-            let Some(first) = state.fed.clone() else {
-                return true;
-            };
-            (first, state.walk_roots(only), state.epoch)
-        };
-        self.walk_taken();
-        let covered: Vec<CollectionHandle> =
-            queue.iter().map(|(collection, _)| *collection).collect();
-        let threads = threads.max(1);
-        let abandoned = || self.abandoned(epoch, stop);
-        // Scratch for this walk: what it read, and what it reached per
-        // collection, so no blob is read twice by one walk.
-        let mut known: HashMap<Raw, Option<Arc<[Raw]>>> = HashMap::new();
-        let mut seen: BTreeMap<CollectionHandle, HashSet<Raw>> = BTreeMap::new();
-        let mut latest: Option<T> = None;
-        let mut rounds = 0;
-        loop {
-            let snapshot = latest.as_ref().unwrap_or(&first);
-            while let Some(batch) = next_batch(&mut queue) {
-                if !self.walk_batch(
-                    snapshot, epoch, threads, &abandoned, batch, &mut known, &mut seen,
-                ) {
-                    return false;
-                }
-            }
-            let mut state = self.lock();
-            if state.epoch != epoch || abandoned() {
-                return false;
-            }
-            if rounds == MAX_REPORT_ROUNDS {
-                // Reports keep arriving: the collections still owing some
-                // stay warming and are walked again by the walker's next turn.
-                let owing: Vec<CollectionHandle> = covered
-                    .iter()
-                    .copied()
-                    .filter(|collection| {
-                        !related(&state.deferred, &collection.raw).is_empty()
-                            || (state.warming.get(&collection.raw).is_some()
-                                && !related(&state.candidates, &collection.raw).is_empty())
-                    })
-                    .collect();
-                for collection in &covered {
-                    if !owing.contains(collection) {
-                        state.warming.remove(&collection.raw);
-                    }
-                }
-                if let Some(walker) = &mut state.walker {
-                    for collection in &owing {
-                        walker.requested.insert(&Entry::new(&collection.raw));
-                    }
-                    self.wake.notify_all();
-                }
-                state.walked();
-                return true;
-            }
-            let mut reports = Vec::new();
-            for collection in &covered {
-                if state.warming.get(&collection.raw).is_some() {
-                    // Reports noted since the last observation wait for this
-                    // walk too, if that observation had their blobs; the
-                    // others arrived after it and are ordinary reports.
-                    for handle in take_related(&mut state.candidates, &collection.raw) {
-                        let resident = state.fed.as_ref().is_some_and(|fed| {
-                            fed.contains_blob(Inline::<Handle<UnknownBlob>>::new(handle))
-                                .unwrap_or(false)
-                        });
-                        let key = pair(&collection.raw, &handle);
-                        if resident {
-                            state.deferred.insert(&Entry::new(&key));
-                        } else {
-                            state.candidates.insert(&Entry::new(&key));
-                        }
-                    }
-                }
-                let reached = seen.entry(*collection).or_default();
-                let mut unreached = Vec::new();
-                for handle in take_related(&mut state.deferred, &collection.raw) {
-                    if !reached.contains(&handle) {
-                        state
-                            .routes
-                            .insert(&Entry::new(&pair(&collection.raw, &handle)));
-                        unreached.push(handle);
-                    }
-                }
-                if !unreached.is_empty() {
-                    reports.push((*collection, unreached));
-                }
-            }
-            if reports.is_empty() {
-                for collection in &covered {
-                    state.warming.remove(&collection.raw);
-                }
-                state.walked();
-                return true;
-            }
-            // Reported blobs were resident when their reports were taken,
-            // possibly only after this walk's snapshot.
-            latest = state.fed.clone();
-            drop(state);
-            // A blob the walk could not read holds only for the snapshot it
-            // tried: forget it, so the round reads it again.
-            rounds += 1;
-            known.retain(|handle, children| {
-                if children.is_none() {
-                    for seen in seen.values_mut() {
-                        seen.remove(handle);
-                    }
-                }
-                children.is_some()
-            });
-            queue = reports;
-        }
-    }
-
-    /// Walk one batch of roots to the end, level by level, publishing the
-    /// unreadable seeds as they come; then publish what it read and reached,
-    /// children before parents, in bounded pieces. `false` when the walk was
-    /// abandoned.
-    #[allow(clippy::too_many_arguments)]
-    fn walk_batch(
-        &self,
-        snapshot: &T,
-        epoch: u64,
-        threads: usize,
-        abandoned: &(dyn Fn() -> bool + Sync),
-        mut frontier: Vec<(CollectionHandle, Vec<Raw>)>,
-        known: &mut HashMap<Raw, Option<Arc<[Raw]>>>,
-        seen: &mut BTreeMap<CollectionHandle, HashSet<Raw>>,
-    ) -> bool {
-        // Scratch for this batch: the collections that reached each readable
-        // blob.
-        let mut reached: HashMap<Raw, Vec<CollectionHandle>> = HashMap::new();
-        while frontier.iter().any(|(_, nodes)| !nodes.is_empty()) {
-            if abandoned() {
-                return false;
-            }
-            let mut need: Vec<Raw> = frontier
-                .iter()
-                .flat_map(|(_, nodes)| nodes.iter().copied())
-                .filter(|handle| !known.contains_key(handle))
-                .collect();
-            need.sort_unstable();
-            need.dedup();
-            let scanned: Vec<(Raw, Option<Arc<[Raw]>>)> =
-                scan_all(snapshot, &need, threads, abandoned);
-            if abandoned() {
-                // A partial level is not published.
-                return false;
-            }
-            for (handle, children) in scanned {
-                known.insert(handle, children);
-            }
-            let mut unreadable = Vec::new();
-            let mut next = Vec::with_capacity(frontier.len());
-            for (collection, nodes) in frontier {
-                let seen = seen.entry(collection).or_default();
-                let mut after = Vec::new();
-                for handle in nodes {
-                    if !seen.insert(handle) {
-                        continue;
-                    }
-                    match &known[&handle] {
-                        Some(children) => {
-                            reached.entry(handle).or_default().push(collection);
-                            after.extend(
-                                children
-                                    .iter()
-                                    .copied()
-                                    .filter(|child| !seen.contains(child)),
-                            );
-                        }
-                        None => unreadable.push((collection, handle)),
-                    }
-                }
-                next.push((collection, after));
-            }
-            self.publish_unreadable(epoch, unreadable);
-            frontier = next;
-        }
-        // Published in bounded pieces, so a snapshot taken meanwhile waits
-        // for one piece, never for a whole batch.
-        let order = children_first(reached.keys().copied(), known);
-        for piece in order.chunks(PUBLISH_PIECE) {
-            let piece = piece
-                .iter()
-                .map(|handle| {
-                    let children = known[handle].clone().expect("a reached blob was read");
-                    (
-                        *handle,
-                        children,
-                        reached.remove(handle).unwrap_or_default(),
-                    )
-                })
-                .collect();
-            self.publish_piece(epoch, piece);
-        }
-        true
-    }
-}
-
-/// `nodes` ordered so that each comes after those of its children that are
-/// among them.
-fn children_first(
-    nodes: impl IntoIterator<Item = Raw>,
-    known: &HashMap<Raw, Option<Arc<[Raw]>>>,
-) -> Vec<Raw> {
-    let nodes: HashSet<Raw> = nodes.into_iter().collect();
-    let mut order = Vec::with_capacity(nodes.len());
-    let mut entered: HashSet<Raw> = HashSet::new();
-    for start in &nodes {
-        let mut stack = vec![(*start, false)];
-        while let Some((node, exit)) = stack.pop() {
-            if exit {
-                order.push(node);
-                continue;
-            }
-            if !entered.insert(node) {
-                continue;
-            }
-            stack.push((node, true));
-            if let Some(Some(children)) = known.get(&node) {
-                stack.extend(
-                    children
-                        .iter()
-                        .filter(|child| nodes.contains(*child) && !entered.contains(*child))
-                        .map(|child| (*child, false)),
-                );
-            }
-        }
-    }
-    order
-}
-
-/// Up to [`WALK_BATCH`] roots from the front of `queue`.
-fn next_batch(
-    queue: &mut Vec<(CollectionHandle, Vec<Raw>)>,
-) -> Option<Vec<(CollectionHandle, Vec<Raw>)>> {
-    let mut batch = Vec::new();
-    let mut budget = WALK_BATCH;
-    while budget > 0 {
-        let Some((collection, roots)) = queue.last_mut() else {
-            break;
-        };
-        let take = roots.len().min(budget);
-        let taken = roots.split_off(roots.len() - take);
-        budget -= take;
-        batch.push((*collection, taken));
-        if roots.is_empty() {
-            queue.pop();
-        }
-    }
-    (!batch.is_empty()).then_some(batch)
-}
-
-/// Roots walked to the end before the next ones start: a start-up walk
-/// publishes a whole batch's closure at a time, so its held sets fill in
-/// progressively rather than only when it ends.
-const WALK_BATCH: usize = 4_096;
-
-/// Rounds of waiting reports one walk takes after its roots; reports that
-/// keep arriving beyond them are left for the walker's next turn.
-const MAX_REPORT_ROUNDS: usize = 16;
-
-/// Blobs published per lock hold by a walk.
-const PUBLISH_PIECE: usize = 16_384;
-
-/// Scan `handles` on `threads` blocking threads, stopping early once
-/// `abandoned` says so.
-fn scan_all<T: HeldSource>(
-    snapshot: &T,
-    handles: &[Raw],
-    threads: usize,
-    abandoned: &(dyn Fn() -> bool + Sync),
-) -> Vec<(Raw, Option<Arc<[Raw]>>)> {
-    let scan_part = |part: &[Raw]| {
-        part.iter()
-            .take_while(|_| !abandoned())
-            .map(|handle| (*handle, scan(snapshot, handle).map(Arc::from)))
-            .collect::<Vec<_>>()
-    };
-    if threads <= 1 || handles.len() < 2 {
-        return scan_part(handles);
-    }
-    let chunk = handles.len().div_ceil(threads);
-    std::thread::scope(|scope| {
-        let workers: Vec<_> = handles
-            .chunks(chunk)
-            .map(|part| {
-                SPAWNED_THREADS.fetch_add(1, Ordering::SeqCst);
-                scope.spawn(move || scan_part(part))
-            })
-            .collect();
-        workers
-            .into_iter()
-            .flat_map(|worker| worker.join().expect("held-blob scan thread panicked"))
-            .collect()
-    })
-}
-
-/// The background walker of one store: the start-up walk of newly tracked
-/// collections and the periodic full walk. Dropping it stops the thread
-/// (after the blob it is reading) and waits for it.
-pub struct HeldWalker {
-    stop: Option<Box<dyn FnOnce() + Send>>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
-impl std::fmt::Debug for HeldWalker {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HeldWalker").finish_non_exhaustive()
-    }
-}
-
-impl Drop for HeldWalker {
-    fn drop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            stop();
-        }
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-impl<T: HeldSource> HeldIndex<T> {
-    /// Attach a background walker. A second call starts another thread that
-    /// shares the work; each is stopped by its own handle alone, and the
-    /// last one stopped detaches the walker.
-    pub(crate) fn start_walker(self: &Arc<Self>, config: HeldWalkConfig) -> HeldWalker {
-        {
-            let mut state = self.lock();
-            // Collections already settled were computed in full; the
-            // interval decides their next walk.
-            state.walker.get_or_insert_with(Walker::default).threads += 1;
-        }
-        // This walker's own stop: only its handle sets it, and nothing ever
-        // clears it, so no other walk can see it or lose it.
-        let stop = Arc::new(AtomicBool::new(false));
-        WALKER_THREADS.fetch_add(1, Ordering::SeqCst);
-        SPAWNED_THREADS.fetch_add(1, Ordering::SeqCst);
-        let index = Arc::clone(self);
-        let thread = std::thread::Builder::new()
-            .name("held-blob-walk".into())
-            .spawn({
-                let stop = Arc::clone(&stop);
-                move || {
-                    index.run_walker(config, &stop);
-                    WALKER_THREADS.fetch_sub(1, Ordering::SeqCst);
-                }
-            })
-            .expect("spawn the held-blob walker thread");
-        let index = Arc::clone(self);
-        HeldWalker {
-            stop: Some(Box::new(move || {
-                stop.store(true, Ordering::Relaxed);
-                // Under the lock, so a walker about to wait sees the stop or
-                // is woken by this.
-                let _state = index.lock();
-                index.wake.notify_all();
-            })),
-            thread: Some(thread),
-        }
-    }
-
-    fn run_walker(&self, config: HeldWalkConfig, stop: &AtomicBool) {
-        let mut due = Instant::now() + config.interval;
-        // The start-up walks this walker took and has not finished.
-        let mut owed = Handles::new();
-        loop {
-            let only = {
-                let mut state = self.lock();
-                loop {
-                    if stop.load(Ordering::Relaxed) {
-                        // Hand back what a cancelled walk took and left
-                        // warming, in the lock hold that records the stop.
-                        let back: Vec<Raw> = owed
-                            .iter()
-                            .filter(|collection| state.warming.get(collection).is_some())
-                            .copied()
-                            .collect();
-                        let Some(walker) = &mut state.walker else {
-                            return;
-                        };
-                        for collection in &back {
-                            walker.requested.insert(&Entry::new(collection));
-                        }
-                        walker.threads -= 1;
-                        if walker.threads == 0 {
-                            state.walker = None;
-                            state.release_warming();
-                        } else if !back.is_empty() {
-                            self.wake.notify_all();
-                        }
-                        return;
-                    }
-                    let Some(walker) = &mut state.walker else {
-                        return;
-                    };
-                    let requested = !walker.requested.is_empty();
-                    let now = Instant::now();
-                    if requested || now >= due {
-                        break;
-                    }
-                    state = self
-                        .wake
-                        .wait_timeout(state, due - now)
-                        .expect("held-blob index is not poisoned")
-                        .0;
-                }
-                let requested = std::mem::take(
-                    &mut state
-                        .walker
-                        .as_mut()
-                        .expect("the walker is attached")
-                        .requested,
-                );
-                owed = requested.clone();
-                let only = if Instant::now() >= due {
-                    // The periodic walk covers every collection, the
-                    // requested ones too.
-                    due = Instant::now() + config.interval;
-                    None
-                } else {
-                    Some(requested)
-                };
-                only
-            };
-            if self.walk(config.threads, only.as_ref(), Some(stop)) {
-                owed = Handles::new();
-            }
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeSet, HashMap};
     use std::convert::Infallible;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Condvar, Mutex};
-    use std::time::{Duration, Instant};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use anybytes::Bytes;
     use ed25519_dalek::SigningKey;
@@ -1547,76 +774,6 @@ mod tests {
     use crate::repo::{BlobInfo, BlobStorePut, CapabilityProofStore, SnapshotSource};
 
     type Reads = Arc<Mutex<HashMap<Raw, usize>>>;
-
-    /// While closed, holds the walker thread at its next blob read (or only
-    /// at its read of one named blob), before the read is counted. Every
-    /// other thread passes.
-    #[derive(Default)]
-    struct Gate {
-        closed: Mutex<bool>,
-        at: Mutex<Option<Raw>>,
-        opened: Condvar,
-        waiting: AtomicUsize,
-    }
-
-    /// Opens its gate when dropped, so a failing test never leaves the
-    /// walker held while its handle waits to join it. Declare it after the
-    /// walker, so it drops first.
-    struct Opener(Arc<Gate>);
-
-    impl Drop for Opener {
-        fn drop(&mut self) {
-            self.0.open();
-        }
-    }
-
-    impl Gate {
-        /// Close the gate until the returned opener drops.
-        fn hold(self: &Arc<Self>) -> Opener {
-            *self.closed.lock().unwrap() = true;
-            Opener(Arc::clone(self))
-        }
-
-        /// Close the gate for the walker's read of `handle` only.
-        fn hold_at(self: &Arc<Self>, handle: Raw) -> Opener {
-            *self.at.lock().unwrap() = Some(handle);
-            self.hold()
-        }
-
-        fn open(&self) {
-            *self.closed.lock().unwrap() = false;
-            self.opened.notify_all();
-        }
-
-        fn pass(&self, handle: &Raw) {
-            if std::thread::current().name() != Some("held-blob-walk") {
-                return;
-            }
-            if self.at.lock().unwrap().is_some_and(|at| at != *handle) {
-                return;
-            }
-            let mut closed = self.closed.lock().unwrap();
-            if *closed {
-                self.waiting.fetch_add(1, Ordering::SeqCst);
-                while *closed {
-                    closed = self.opened.wait(closed).unwrap();
-                }
-                self.waiting.fetch_sub(1, Ordering::SeqCst);
-            }
-        }
-
-        /// Wait until the walker is held at the gate, inside a walk.
-        fn await_walker(&self) {
-            let start = Instant::now();
-            while self.waiting.load(Ordering::SeqCst) == 0 {
-                assert!(
-                    start.elapsed() < Duration::from_secs(30),
-                    "the walker never reached the gate"
-                );
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
-    }
 
     /// Makes a snapshot's record selection or proof enumeration fail.
     #[derive(Default)]
@@ -1648,9 +805,6 @@ mod tests {
     struct Counting {
         inner: MemoryStore,
         reads: Reads,
-        /// The reads made by any thread but the walker's.
-        foreground: Reads,
-        gate: Arc<Gate>,
         faults: Arc<Faults>,
     }
 
@@ -1658,8 +812,6 @@ mod tests {
     struct CountingSnapshot {
         inner: MemoryStoreSnapshot,
         reads: Reads,
-        foreground: Reads,
-        gate: Arc<Gate>,
         faults: Arc<Faults>,
     }
 
@@ -1671,8 +823,6 @@ mod tests {
             Ok(CountingSnapshot {
                 inner: self.inner.snapshot()?,
                 reads: self.reads.clone(),
-                foreground: self.foreground.clone(),
-                gate: self.gate.clone(),
                 faults: self.faults.clone(),
             })
         }
@@ -1726,7 +876,6 @@ mod tests {
             V: TryFromBlob<S>,
             Handle<S>: InlineEncoding,
         {
-            self.gate.pass(&handle.raw);
             if self.faults.unreadable.lock().unwrap().contains(&handle.raw) {
                 return Err(crate::blob::MemoryStoreGetError::NotFound(
                     crate::repo::MissingBlob {
@@ -1735,14 +884,6 @@ mod tests {
                 ));
             }
             *self.reads.lock().unwrap().entry(handle.raw).or_default() += 1;
-            if std::thread::current().name() != Some("held-blob-walk") {
-                *self
-                    .foreground
-                    .lock()
-                    .unwrap()
-                    .entry(handle.raw)
-                    .or_default() += 1;
-            }
             self.inner.get(handle)
         }
     }
@@ -1838,16 +979,6 @@ mod tests {
     }
 
     type Store = Covered<Counting>;
-
-    /// Tests that spawn held-index threads run one at a time, so the
-    /// process-wide thread counters are theirs to read.
-    static WALKER_TESTS: Mutex<()> = Mutex::new(());
-
-    fn walker_guard() -> std::sync::MutexGuard<'static, ()> {
-        WALKER_TESTS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
 
     fn key() -> SigningKey {
         SigningKey::from_bytes(&[41; 32])
@@ -1952,33 +1083,6 @@ mod tests {
                     );
                 }
             }
-        }
-    }
-
-    /// Take snapshots until `done` holds for one; fail after 30 s.
-    fn until(
-        store: &mut Store,
-        what: &str,
-        mut done: impl FnMut(&<Store as SnapshotSource>::Snapshot) -> bool,
-    ) -> <Store as SnapshotSource>::Snapshot {
-        let start = Instant::now();
-        loop {
-            let snapshot = store.snapshot().unwrap();
-            if done(&snapshot) {
-                return snapshot;
-            }
-            assert!(
-                start.elapsed() < Duration::from_secs(30),
-                "timed out waiting for {what}"
-            );
-            std::thread::sleep(Duration::from_millis(2));
-        }
-    }
-
-    fn walker_config(interval: Duration) -> HeldWalkConfig {
-        HeldWalkConfig {
-            interval,
-            threads: 1,
         }
     }
 
@@ -2145,7 +1249,7 @@ mod tests {
 
     /// C1 holds P, which names H before H is resident. H then arrives as a
     /// seed of C2. Scanning once, P gains no edge; H joins held(C1) when a
-    /// peer reports it there, or at the next walk.
+    /// peer reports it there.
     #[test]
     fn a_late_child_resident_through_another_collection_joins_by_report() {
         let mut store = Store::default();
@@ -2179,15 +1283,17 @@ mod tests {
         assert_eq!(reads(&store, &p), 1);
     }
 
-    /// Root R names an opaque P that names H; H is absent when P is scanned
-    /// and later put locally, with no record naming it and no report. Only a
-    /// walk that starts after H arrived finds it.
+    /// Astra's R2, a stated limitation: root R names an opaque P that names
+    /// H, and H is put locally after P was scanned, with no record naming it
+    /// and no report. No later snapshot holds H, though H stays readable by
+    /// its hash, until a reset of the index (here, a lost blob) recomputes
+    /// P's closure.
     #[test]
-    fn a_nested_late_local_child_is_caught_by_the_walk_and_not_before() {
-        let _guard = walker_guard();
+    fn a_nested_late_local_child_stays_out_until_a_reset() {
         let mut store = Store::default();
         let c = collection(&mut store, "nested");
         let metadata = blob(&mut store, b"metadata");
+        let forgotten = blob(&mut store, b"forgotten by the store");
         let h_bytes = unresident_naming(b"nested late child", &[]);
         let h = handle_of(&h_bytes);
         let p = blob_naming(&mut store, b"opaque intermediate", &[h]);
@@ -2197,23 +1303,26 @@ mod tests {
         let first = store.snapshot().unwrap();
         assert!(held_set(&first, c).contains(&p));
         store.put::<UnknownBlob, _>(h_bytes).unwrap();
-        let mut last = None;
         for _ in 0..3 {
             let snapshot = store.snapshot().unwrap();
             assert!(!held_set(&snapshot, c).contains(&h), "no arrival rescans P");
-            last = Some(snapshot);
+            assert!(BlobStoreGet::get::<Bytes, UnknownBlob>(&snapshot, Inline::new(h)).is_ok());
         }
-        let before_walk = last.unwrap();
-        let generation = before_walk.held_generation();
-        store.walk_held(2).unwrap();
-        let walked = store.snapshot().unwrap();
-        assert!(held_set(&walked, c).contains(&h));
-        assert_ne!(walked.held_generation(), generation);
+        let kept: Vec<_> = store
+            .snapshot()
+            .unwrap()
+            .inner()
+            .blobs()
+            .map(|info| info.unwrap().handle)
+            .filter(|handle| handle.raw != forgotten)
+            .collect();
+        (*store).inner.blobs.keep(kept);
+        let reset = store.snapshot().unwrap();
+        assert!(held_set(&reset, c).contains(&h));
         assert!(
-            !held_set(&before_walk, c).contains(&h),
+            !held_set(&first, c).contains(&h),
             "an existing snapshot never changes"
         );
-        assert_eq!(before_walk.held_generation(), generation);
     }
 
     #[test]
@@ -2239,11 +1348,9 @@ mod tests {
         assert_eq!(reads(&store, &second_payload), 1);
     }
 
-    /// Between walks no blob body is read twice, whatever arrives; a walk
-    /// reads every reachable blob once more.
+    /// No blob body is read twice, whatever arrives.
     #[test]
-    fn each_blob_is_read_at_most_once_between_walks() {
-        let _guard = walker_guard();
+    fn each_blob_is_read_at_most_once() {
         let mut store = Store::default();
         let collections: Vec<_> = (0..3)
             .map(|index| collection(&mut store, &format!("scan-once {index}")))
@@ -2265,16 +1372,6 @@ mod tests {
         }
         let counts = store.reads.lock().unwrap().clone();
         assert!(counts.values().all(|count| *count == 1), "{counts:?}");
-        let snapshot = store.snapshot().unwrap();
-        let reachable: BTreeSet<Raw> = collections
-            .iter()
-            .flat_map(|collection| held_set(&snapshot, *collection))
-            .collect();
-        store.walk_held(3).unwrap();
-        let counts = store.reads.lock().unwrap().clone();
-        for handle in &reachable {
-            assert_eq!(counts[handle], 2, "a walk rereads each reachable blob once");
-        }
     }
 
     #[test]
@@ -2360,167 +1457,6 @@ mod tests {
             "a record reaches it now"
         );
         pile.close().unwrap();
-    }
-
-    /// Opening, reading, tracking and a one-thread walk spawn no thread at
-    /// all; a multi-threaded walk's scan threads and an explicit walker do,
-    /// and dropping the walker stops it.
-    #[test]
-    fn short_lived_opens_start_no_thread() {
-        let _guard = walker_guard();
-        let spawned = held_threads_spawned();
-        assert_eq!(held_walker_threads(), 0);
-        let file = tempfile::NamedTempFile::new().unwrap();
-        let mut pile = crate::repo::pile::Pile::open(file.path()).unwrap();
-        let c = collection(&mut pile, "short-lived");
-        let data = blob(&mut pile, b"payload");
-        let metadata = blob(&mut pile, b"metadata");
-        commit(&mut pile, c, data, metadata);
-        pile.snapshot().unwrap();
-        pile.track_held([c]);
-        pile.snapshot().unwrap();
-        pile.walk_held(1).unwrap();
-        assert_eq!(held_threads_spawned(), spawned, "nothing was spawned");
-        // The counter sees scan threads, not only walkers.
-        pile.walk_held(2).unwrap();
-        assert_eq!(held_threads_spawned(), spawned + 2);
-        let walker = pile.start_held_walker(HeldWalkConfig::default());
-        assert_eq!(held_walker_threads(), 1);
-        assert_eq!(held_threads_spawned(), spawned + 3);
-        drop(walker);
-        assert_eq!(held_walker_threads(), 0);
-        pile.close().unwrap();
-    }
-
-    /// With a walker attached, the existing closure of a newly tracked
-    /// collection is left to the background: the first snapshot is handed
-    /// out without it and keeps its answer, later ones fill in. Records new
-    /// in an observation are published with their closures regardless.
-    #[test]
-    fn the_start_up_walk_never_gates_and_new_records_publish_with_their_closures() {
-        let _guard = walker_guard();
-        let mut store = Store::default();
-        let c = collection(&mut store, "background");
-        let metadata = blob(&mut store, b"metadata");
-        let mut expected = BTreeSet::from([c.raw, metadata]);
-        for index in 0..64_u32 {
-            let leaf = blob(&mut store, &index.to_be_bytes());
-            let data = blob_naming(&mut store, &index.to_le_bytes(), &[leaf]);
-            commit(&mut store, c, data, metadata);
-            expected.extend([leaf, data]);
-        }
-        let walker = store.start_held_walker(HeldWalkConfig {
-            interval: Duration::from_secs(3600),
-            threads: 2,
-        });
-        store.track_held([c]);
-        let first = store.snapshot().unwrap();
-        let first_answer = held_set(&first, c);
-        assert!(
-            first_answer.is_empty(),
-            "nothing was scanned before the walk"
-        );
-        let mut settled = None;
-        for _ in 0..2000 {
-            let snapshot = store.snapshot().unwrap();
-            if held_set(&snapshot, c) == expected {
-                settled = Some(snapshot);
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        let settled = settled.expect("the start-up walk publishes the whole closure");
-        assert_ne!(settled.held_generation(), first.held_generation());
-        assert_eq!(held_set(&first, c), first_answer);
-
-        let deep = blob(&mut store, b"deep under a new record");
-        let middle = blob_naming(&mut store, b"middle", &[deep]);
-        let payload = blob_naming(&mut store, b"new payload", &[middle]);
-        commit(&mut store, c, payload, metadata);
-        let next = store.snapshot().unwrap();
-        assert!(held_set(&next, c).is_superset(&BTreeSet::from([payload, middle, deep])));
-        drop(walker);
-    }
-
-    /// After a restart, peers report their whole held sets while the
-    /// start-up walk runs. Those reports wait for the walk: taking a
-    /// snapshot reads none of them, and every blob is read once in all.
-    #[test]
-    fn peer_reports_wait_for_the_start_up_walk_instead_of_reading_in_the_snapshot() {
-        let _guard = walker_guard();
-        let mut store = Store::default();
-        let c = collection(&mut store, "restart");
-        let metadata = blob(&mut store, b"metadata");
-        let mut expected = BTreeSet::from([c.raw, metadata]);
-        let mut reported = Vec::new();
-        for index in 0..32_u32 {
-            let leaf = blob(&mut store, &index.to_be_bytes());
-            let data = blob_naming(&mut store, &index.to_le_bytes(), &[leaf]);
-            commit(&mut store, c, data, metadata);
-            expected.extend([leaf, data]);
-            reported.extend([leaf, data]);
-        }
-        // Resident, but reached by no record here: only a report holds it.
-        let fetched_leaf = blob(&mut store, b"fetched leaf");
-        let fetched = blob_naming(&mut store, b"fetched by an exact read", &[fetched_leaf]);
-        let walker = store.start_held_walker(walker_config(Duration::from_secs(3600)));
-        let _opener = store.gate.hold();
-        store.track_held([c]);
-        let first = store.snapshot().unwrap();
-        store.gate.await_walker();
-        for handle in reported.iter().chain([&fetched, &[6; 32]]) {
-            store.note_held(c, Inline::new(*handle));
-        }
-        let during = store.snapshot().unwrap();
-        assert!(
-            store.reads.lock().unwrap().is_empty(),
-            "a snapshot read reported blobs while the start-up walk was owed"
-        );
-        assert!(held_set(&during, c).is_empty(), "the reports wait");
-        store.gate.open();
-        expected.extend([fetched, fetched_leaf]);
-        until(
-            &mut store,
-            "the walk and the deferred reports",
-            |snapshot| held_set(snapshot, c) == expected,
-        );
-        let counts = store.reads.lock().unwrap().clone();
-        assert_eq!(
-            counts.keys().copied().collect::<BTreeSet<_>>(),
-            expected,
-            "an absent report is never read"
-        );
-        assert!(counts.values().all(|count| *count == 1), "{counts:?}");
-        assert!(held_set(&first, c).is_empty());
-        drop(walker);
-    }
-
-    /// A seed the start-up walk could not read, arriving while that walk
-    /// runs, is in no later difference; it is reached once the walk
-    /// publishes, not at the next periodic walk.
-    #[test]
-    fn a_seed_arriving_during_the_start_up_walk_is_reached_when_it_publishes() {
-        let _guard = walker_guard();
-        let mut store = Store::default();
-        let c = collection(&mut store, "seed during walk");
-        let metadata = blob(&mut store, b"metadata");
-        let child = blob(&mut store, b"late payload child");
-        let late = unresident_naming(b"late payload", &[child]);
-        let late_handle = handle_of(&late);
-        commit(&mut store, c, late_handle, metadata);
-        let walker = store.start_held_walker(walker_config(Duration::from_secs(3600)));
-        let _opener = store.gate.hold();
-        store.track_held([c]);
-        store.snapshot().unwrap();
-        store.gate.await_walker();
-        store.put::<UnknownBlob, _>(late).unwrap();
-        let arrived = store.snapshot().unwrap();
-        assert!(!held_set(&arrived, c).contains(&late_handle));
-        store.gate.open();
-        until(&mut store, "the late seed and its child", |snapshot| {
-            held_set(snapshot, c) == BTreeSet::from([c.raw, metadata, late_handle, child])
-        });
-        drop(walker);
     }
 
     /// A proof over a resource whose descriptor routes to C seeds C only
@@ -2653,189 +1589,6 @@ mod tests {
         assert_eq!(*store.reads.lock().unwrap(), before);
     }
 
-    /// The walker's own timer, with no request and no report, catches a
-    /// nested late child within one interval plus one walk.
-    #[test]
-    fn the_periodic_walk_catches_a_nested_late_child_nobody_reports() {
-        let _guard = walker_guard();
-        let mut store = Store::default();
-        let c = collection(&mut store, "periodic");
-        let metadata = blob(&mut store, b"metadata");
-        let h_bytes = unresident_naming(b"periodic late child", &[]);
-        let h = handle_of(&h_bytes);
-        let p = blob_naming(&mut store, b"periodic intermediate", &[h]);
-        let r = blob_naming(&mut store, b"periodic root", &[p]);
-        commit(&mut store, c, r, metadata);
-        let interval = Duration::from_millis(200);
-        let walker = store.start_held_walker(walker_config(interval));
-        store.track_held([c]);
-        // The start-up walk read P while H was absent.
-        until(&mut store, "the start-up walk", |snapshot| {
-            held_set(snapshot, c).contains(&p)
-        });
-        store.put::<UnknownBlob, _>(h_bytes).unwrap();
-        let arrived = Instant::now();
-        until(&mut store, "a periodic walk", |snapshot| {
-            held_set(snapshot, c).contains(&h)
-        });
-        // Interval plus one (tiny) walk plus scheduling; generous for a
-        // loaded test host.
-        assert!(arrived.elapsed() < interval + Duration::from_secs(20));
-        drop(walker);
-    }
-
-    /// Tracking a new collection walks that collection, not every tracked
-    /// one again.
-    #[test]
-    fn a_newly_tracked_collection_is_walked_alone() {
-        let _guard = walker_guard();
-        let mut store = Store::default();
-        let mut sets = Vec::new();
-        for name in ["walked first", "walked second"] {
-            let c = collection(&mut store, name);
-            let metadata = blob(&mut store, format!("{name} metadata").as_bytes());
-            let leaf = blob(&mut store, format!("{name} leaf").as_bytes());
-            let data = blob_naming(&mut store, name.as_bytes(), &[leaf]);
-            commit(&mut store, c, data, metadata);
-            sets.push((c, BTreeSet::from([c.raw, metadata, leaf, data])));
-        }
-        let walker = store.start_held_walker(walker_config(Duration::from_secs(3600)));
-        for (c, expected) in &sets {
-            store.track_held([*c]);
-            until(&mut store, "the start-up walk", |snapshot| {
-                snapshot.held(*c).is_some() && held_set(snapshot, *c) == *expected
-            });
-        }
-        let counts = store.reads.lock().unwrap().clone();
-        for handle in &sets[0].1 {
-            assert_eq!(
-                counts[handle], 1,
-                "the first collection was not walked again"
-            );
-        }
-        drop(walker);
-    }
-
-    /// A reset makes a walk in progress stale; it stops after the blob it is
-    /// reading instead of running to its end.
-    #[test]
-    fn a_reset_stops_the_walk_it_made_stale() {
-        let _guard = walker_guard();
-        let mut store = Store::default();
-        let c = collection(&mut store, "stale walk");
-        let metadata = blob(&mut store, b"metadata");
-        let mut expected = BTreeSet::from([c.raw, metadata]);
-        for index in 0..32_u32 {
-            let leaf = blob(&mut store, &index.to_be_bytes());
-            let data = blob_naming(&mut store, &index.to_le_bytes(), &[leaf]);
-            commit(&mut store, c, data, metadata);
-            expected.extend([leaf, data]);
-        }
-        let forgotten = blob(&mut store, b"forgotten");
-        let walker = store.start_held_walker(walker_config(Duration::from_secs(3600)));
-        let _opener = store.gate.hold();
-        store.track_held([c]);
-        let before = store.snapshot().unwrap();
-        store.gate.await_walker();
-        let kept: Vec<_> = before
-            .inner()
-            .blobs()
-            .map(|info| info.unwrap().handle)
-            .filter(|handle| handle.raw != forgotten)
-            .collect();
-        (*store).inner.blobs.keep(kept);
-        store.snapshot().unwrap();
-        store.gate.open();
-        until(&mut store, "the walk after the reset", |snapshot| {
-            held_set(snapshot, c) == expected
-        });
-        let total: usize = store.reads.lock().unwrap().values().sum();
-        assert!(
-            total <= expected.len() + 1,
-            "{total} reads for {} blobs",
-            expected.len()
-        );
-        drop(walker);
-    }
-
-    /// The start-up walk has scanned A but not yet A's resident child B. A
-    /// new foundation P naming A is published with P's whole closure, B
-    /// included, and no snapshot holds A without B.
-    #[test]
-    fn a_new_foundation_over_a_blob_the_walk_has_not_finished_holds_its_whole_closure() {
-        let _guard = walker_guard();
-        let mut store = Store::default();
-        let c = collection(&mut store, "closure during walk");
-        let metadata = blob(&mut store, b"metadata");
-        let b = blob(&mut store, b"child the walk reads last");
-        let a = blob_naming(&mut store, b"scanned before its child", &[b]);
-        let root = blob_naming(&mut store, b"walked root", &[a]);
-        commit(&mut store, c, root, metadata);
-        let walker = store.start_held_walker(walker_config(Duration::from_secs(3600)));
-        let _opener = store.gate.hold_at(b);
-        store.track_held([c]);
-        store.snapshot().unwrap();
-        store.gate.await_walker();
-        let during = store.snapshot().unwrap();
-        let p = blob_naming(&mut store, b"new foundation over A", &[a]);
-        commit(&mut store, c, p, metadata);
-        let after = store.snapshot().unwrap();
-        let held = held_set(&after, c);
-        assert!(held.contains(&p), "a new record publishes with its closure");
-        assert!(
-            held.contains(&b),
-            "P's closure was published without B, the resident child of A"
-        );
-        assert_closed(&after, c);
-        assert_closed(&during, c);
-        store.gate.open();
-        until(&mut store, "the start-up walk", |snapshot| {
-            held_set(snapshot, c) == BTreeSet::from([c.raw, metadata, root, a, b, p])
-        });
-        drop(walker);
-    }
-
-    /// A report that waited for the start-up walk and that no record here
-    /// reaches is read by the walker, never by whoever takes the next
-    /// snapshot once the walk is done.
-    #[test]
-    fn deferred_reports_are_read_by_the_walker_and_never_in_a_snapshot() {
-        let _guard = walker_guard();
-        let mut store = Store::default();
-        let c = collection(&mut store, "deferred walk");
-        let metadata = blob(&mut store, b"metadata");
-        let data = blob(&mut store, b"payload");
-        commit(&mut store, c, data, metadata);
-        // Resident, reached by no record here: only the report holds it.
-        let leaf = blob(&mut store, b"fetched leaf");
-        let middle = blob_naming(&mut store, b"fetched middle", &[leaf]);
-        let fetched = blob_naming(&mut store, b"fetched by an exact read", &[middle]);
-        let walker = store.start_held_walker(walker_config(Duration::from_secs(3600)));
-        let _opener = store.gate.hold();
-        store.track_held([c]);
-        store.snapshot().unwrap();
-        store.gate.await_walker();
-        store.note_held(c, Inline::new(fetched));
-        store.snapshot().unwrap();
-        store.gate.open();
-        let expected = BTreeSet::from([c.raw, metadata, data, fetched, middle, leaf]);
-        until(&mut store, "the walk and the deferred report", |snapshot| {
-            held_set(snapshot, c) == expected
-        });
-        for _ in 0..3 {
-            store.snapshot().unwrap();
-        }
-        let foreground = store.foreground.lock().unwrap().clone();
-        assert!(
-            foreground.is_empty(),
-            "a snapshot read {} blobs the walker owed",
-            foreground.len()
-        );
-        let counts = store.reads.lock().unwrap().clone();
-        assert!(counts.values().all(|count| *count == 1), "{counts:?}");
-        drop(walker);
-    }
-
     /// A proof seeds C only when C's authorization evidence keeps it: over C
     /// itself from one of C's policy roots, or over a subordinate resource
     /// whose own descriptor entity both routes to C and declares the root.
@@ -2946,353 +1699,28 @@ mod tests {
         assert_ne!(view([2; 32]), view([3; 32]));
     }
 
-    /// While the start-up walk still owes A and M, a new COMMIT that repeats
-    /// A with new metadata M2 is published with A's closure too, not only
-    /// with M2's.
+    /// A resident blob that cannot be read holds back everything above it,
+    /// so no held set lacks a resident child. Once it reads again, nothing
+    /// reads it by itself; a peer's report of the blob above it holds both.
     #[test]
-    fn a_new_commit_repeating_owed_seeds_publishes_their_closure() {
-        let _guard = walker_guard();
+    fn an_unreadable_resident_child_holds_back_its_parent_until_a_report() {
         let mut store = Store::default();
-        let c = collection(&mut store, "repeated seeds");
+        let c = collection(&mut store, "unreadable child");
         let metadata = blob(&mut store, b"metadata");
-        let leaf = blob(&mut store, b"under A");
-        let a = blob_naming(&mut store, b"A", &[leaf]);
-        commit(&mut store, c, a, metadata);
-        let walker = store.start_held_walker(walker_config(Duration::from_secs(3600)));
-        let _opener = store.gate.hold();
-        store.track_held([c]);
-        store.snapshot().unwrap();
-        store.gate.await_walker();
-        let fresh_metadata = blob(&mut store, b"new metadata M2");
-        commit(&mut store, c, a, fresh_metadata);
-        let after = store.snapshot().unwrap();
-        let held = held_set(&after, c);
-        assert!(held.contains(&fresh_metadata));
-        assert!(
-            held.contains(&a) && held.contains(&leaf),
-            "a new COMMIT repeating A was published without A's closure"
-        );
-        assert_closed(&after, c);
-        store.gate.open();
-        until(&mut store, "the start-up walk", |snapshot| {
-            held_set(snapshot, c) == BTreeSet::from([c.raw, metadata, fresh_metadata, a, leaf])
-        });
-        drop(walker);
-    }
-
-    /// A report noted while the start-up walk runs, but not yet moved by an
-    /// observation when the walk ends, is still read by the walker.
-    #[test]
-    fn a_report_noted_as_the_start_up_walk_ends_is_read_by_the_walker() {
-        let _guard = walker_guard();
-        let mut store = Store::default();
-        let c = collection(&mut store, "report at the end");
-        let metadata = blob(&mut store, b"metadata");
-        let data = blob(&mut store, b"payload");
+        let z = blob(&mut store, b"indexed, every copy invalid");
+        let data = blob_naming(&mut store, b"names Z", &[z]);
         commit(&mut store, c, data, metadata);
-        let leaf = blob(&mut store, b"late report leaf");
-        let middle = blob_naming(&mut store, b"late report middle", &[leaf]);
-        let fetched = blob_naming(&mut store, b"late report root", &[middle]);
-        let walker = store.start_held_walker(walker_config(Duration::from_secs(3600)));
-        let _opener = store.gate.hold();
+        store.faults.unreadable.lock().unwrap().insert(z);
         store.track_held([c]);
-        store.snapshot().unwrap();
-        store.gate.await_walker();
-        // No observation between the report and the end of the walk.
-        store.note_held(c, Inline::new(fetched));
-        store.gate.open();
-        let start = Instant::now();
-        while [c.raw, metadata, data]
-            .iter()
-            .any(|handle| reads(&store, handle) == 0)
-        {
-            assert!(
-                start.elapsed() < Duration::from_secs(30),
-                "the walk never ran"
-            );
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        std::thread::sleep(Duration::from_millis(300));
-        let expected = BTreeSet::from([c.raw, metadata, data, fetched, middle, leaf]);
-        until(&mut store, "the report", |snapshot| {
-            held_set(snapshot, c) == expected
-        });
-        let foreground = store.foreground.lock().unwrap().clone();
-        assert!(
-            foreground.is_empty(),
-            "a snapshot read {} blobs of a report the walk owed",
-            foreground.len()
-        );
-        drop(walker);
-    }
-
-    /// One walk covers C1 and C2. It finds C1's payload R absent; R then
-    /// arrives and is reported for C2, where no record names it. The round
-    /// that walks C2's reports reads R against the newer observation instead
-    /// of reusing the older one's negative answer.
-    #[test]
-    fn a_report_round_rereads_a_blob_the_older_snapshot_lacked() {
-        let _guard = walker_guard();
-        let mut store = Store::default();
-        let c1 = collection(&mut store, "negative first");
-        let c2 = collection(&mut store, "reported second");
-        let metadata = blob(&mut store, b"metadata");
-        let r_bytes = unresident_naming(b"absent at the walk's start", &[]);
-        let r = handle_of(&r_bytes);
-        commit(&mut store, c1, r, metadata);
-        let leaf = blob(&mut store, b"second leaf");
-        let data = blob_naming(&mut store, b"second payload", &[leaf]);
-        commit(&mut store, c2, data, metadata);
-        let walker = store.start_held_walker(walker_config(Duration::from_secs(3600)));
-        let _opener = store.gate.hold_at(leaf);
-        store.track_held([c1, c2]);
-        store.snapshot().unwrap();
-        store.gate.await_walker();
-        store.put::<UnknownBlob, _>(r_bytes).unwrap();
-        store.snapshot().unwrap();
-        store.note_held(c2, Inline::new(r));
-        store.snapshot().unwrap();
-        store.gate.open();
-        until(&mut store, "C2 to hold the reported R", |snapshot| {
-            held_set(snapshot, c2).contains(&r)
-        });
-        drop(walker);
-    }
-
-    /// A walk rescans a held blob A and learns a child B that arrived after
-    /// A was first scanned. No observation holds A while the edge cache
-    /// names a child of A that is not held: a closure stopping at A must not
-    /// miss a child the cache knows.
-    #[test]
-    fn a_held_blob_is_closed_under_the_edges_a_walk_learns() {
-        let _guard = walker_guard();
-        let mut store = Counting::default();
-        let c = collection(&mut store, "edge growth");
-        let metadata = blob(&mut store, b"metadata");
-        let b_bytes = unresident_naming(b"late child B", &[]);
-        let b = handle_of(&b_bytes);
-        let a = blob_naming(&mut store, b"A names B", &[b]);
-        let root = blob_naming(&mut store, b"root names A", &[a]);
-        commit(&mut store, c, root, metadata);
-        let index: Arc<HeldIndex<CountingSnapshot>> = Arc::new(HeldIndex::default());
-        index.track([c]);
-        index.observe(&store.snapshot().unwrap());
-        store.put::<UnknownBlob, _>(b_bytes).unwrap();
-        let now = store.snapshot().unwrap();
-        index.observe(&now);
-        let closed = |index: &HeldIndex<CountingSnapshot>| {
-            let state = index.lock();
-            let held = state.held.get(&c.raw).cloned().unwrap_or_default();
-            for parent in held.iter_ordered() {
-                for child in related(&state.edges, parent) {
-                    assert!(
-                        held.has_prefix(&child),
-                        "a held blob has a cached child that is not held"
-                    );
-                }
-            }
-        };
-        let _opener = store.gate.hold_at(b);
-        let walk = std::thread::Builder::new()
-            .name("held-blob-walk".into())
-            .spawn({
-                let index = Arc::clone(&index);
-                move || index.walk(1, None, None)
-            })
-            .unwrap();
-        store.gate.await_walker();
-        let p = blob_naming(&mut store, b"new foundation over A", &[a]);
-        commit(&mut store, c, p, metadata);
-        index.observe(&store.snapshot().unwrap());
-        closed(&index);
-        store.gate.open();
-        walk.join().unwrap();
-        let view = index.observe(&store.snapshot().unwrap());
-        closed(&index);
-        let held = view.held(c).unwrap();
-        assert!(held.has_prefix(&b) && held.has_prefix(&p));
-    }
-
-    /// A resident blob that cannot be read holds back everything above it
-    /// on both paths, so no held set lacks a resident child; the walk after
-    /// it becomes readable holds them.
-    #[test]
-    fn an_unreadable_resident_child_holds_back_its_parent_on_both_paths() {
-        let _guard = walker_guard();
-        for with_walker in [false, true] {
-            let mut store = Store::default();
-            let c = collection(&mut store, "unreadable child");
-            let metadata = blob(&mut store, b"metadata");
-            let z = blob(&mut store, b"indexed, every copy invalid");
-            let data = blob_naming(&mut store, b"names Z", &[z]);
-            commit(&mut store, c, data, metadata);
-            store.faults.unreadable.lock().unwrap().insert(z);
-            let walker = with_walker
-                .then(|| store.start_held_walker(walker_config(Duration::from_secs(3600))));
-            store.track_held([c]);
-            let settled = until(&mut store, "the collection to settle", |snapshot| {
-                snapshot.held(c).is_some()
-                    && held_set(snapshot, c).is_superset(&BTreeSet::from([c.raw, metadata]))
-            });
-            // Let a walker finish its start-up walk.
-            std::thread::sleep(Duration::from_millis(100));
-            let settled = if with_walker {
-                store.snapshot().unwrap()
-            } else {
-                settled
-            };
-            assert_closed(&settled, c);
-            assert!(!held_set(&settled, c).contains(&data));
-            drop(walker);
-            store.faults.unreadable.lock().unwrap().remove(&z);
-            store.walk_held(1).unwrap();
-            let walked = store.snapshot().unwrap();
-            assert!(held_set(&walked, c).is_superset(&BTreeSet::from([data, z])));
-        }
-    }
-
-    /// Proofs judged while C's own descriptor was resident but unreadable are
-    /// judged again after the next walk, although nothing arrives.
-    #[test]
-    fn proofs_judged_against_an_unreadable_descriptor_are_judged_again() {
-        let mut store = Store::default();
-        let root = SigningKey::from_bytes(&[48; 32]);
-        let c = governed(&mut store, "descriptor unreadable", &root);
-        let definition: Inline<Handle<SimpleArchive>> =
-            Inline::new(blob(&mut store, b"definition behind a bad read"));
-        store
-            .insert_proof(CapabilityProof::new(
-                CapabilityResource::from(c),
-                &root,
-                definition,
-                SigningKey::from_bytes(&[49; 32]).verifying_key(),
-            ))
-            .unwrap();
-        store.faults.unreadable.lock().unwrap().insert(c.raw);
-        store.track_held([c]);
-        let first = store.snapshot().unwrap();
-        assert!(!held_set(&first, c).contains(&definition.raw));
-        store.faults.unreadable.lock().unwrap().remove(&c.raw);
-        store.walk_held(1).unwrap();
-        let walked = store.snapshot().unwrap();
-        assert!(
-            held_set(&walked, c).contains(&definition.raw),
-            "a proof judged against an unreadable descriptor was never judged again"
-        );
-    }
-
-    /// A walk takes the observation it reads and the epoch its results
-    /// belong to together: a reset between the two cannot make it publish,
-    /// as current, a blob the store lost before the walk began.
-    #[test]
-    fn a_walk_never_publishes_a_blob_lost_before_it_began() {
-        let _guard = walker_guard();
-        let mut store = Counting::default();
-        let c = collection(&mut store, "lost before the walk");
-        let metadata = blob(&mut store, b"metadata");
-        let lost = blob(&mut store, b"forgotten by the store");
-        let data = blob_naming(&mut store, b"names the lost blob", &[lost]);
-        commit(&mut store, c, data, metadata);
-        let index: Arc<HeldIndex<CountingSnapshot>> = Arc::new(HeldIndex::default());
-        index.track([c]);
-        let before = store.snapshot().unwrap();
-        index.observe(&before);
-        let (arrived, taken) = std::sync::mpsc::channel();
-        let (go, resume) = std::sync::mpsc::channel::<()>();
-        *index.walk_taken.lock().unwrap() = Some(Box::new(move || {
-            arrived.send(()).unwrap();
-            resume.recv().unwrap();
-        }));
-        // The periodic walk is due at once.
-        let walker = index.start_walker(walker_config(Duration::from_millis(10)));
-        taken
-            .recv_timeout(Duration::from_secs(30))
-            .expect("the walker took a walk");
-        let kept: Vec<_> = before
-            .blobs()
-            .map(|info| info.unwrap().handle)
-            .filter(|handle| handle.raw != lost)
-            .collect();
-        store.inner.blobs.keep(kept);
-        index.observe(&store.snapshot().unwrap());
-        go.send(()).unwrap();
-        let start = Instant::now();
-        loop {
-            let view = index.observe(&store.snapshot().unwrap());
-            if let Some(held) = view.held(c).filter(|held| held.has_prefix(&data)) {
-                assert!(
-                    !held.has_prefix(&lost),
-                    "a walk published a blob the store lost before it began"
-                );
-                break;
-            }
-            assert!(
-                start.elapsed() < Duration::from_secs(30),
-                "no walk held the data"
-            );
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        drop(walker);
-    }
-
-    /// A stop belongs to the walker it stops. Stopping one of two walkers,
-    /// and then the other, leaves nothing that stops a later explicit walk.
-    #[test]
-    fn a_stopped_walker_leaves_no_stop_for_other_walks() {
-        let _guard = walker_guard();
-        let mut store = Store::default();
-        let c = collection(&mut store, "stop owner");
-        let metadata = blob(&mut store, b"metadata");
-        let h_bytes = unresident_naming(b"late child", &[]);
-        let h = handle_of(&h_bytes);
-        let p = blob_naming(&mut store, b"parent of a late child", &[h]);
-        commit(&mut store, c, p, metadata);
-        store.track_held([c]);
-        store.snapshot().unwrap();
-        let first = store.start_held_walker(walker_config(Duration::from_secs(3600)));
-        let second = store.start_held_walker(walker_config(Duration::from_secs(3600)));
-        drop(first);
-        let start = Instant::now();
-        while held_walker_threads() != 0 && start.elapsed() < Duration::from_secs(1) {
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        drop(second);
-        assert_eq!(held_walker_threads(), 0);
-        store.put::<UnknownBlob, _>(h_bytes).unwrap();
-        store.walk_held(1).unwrap();
-        assert!(
-            held_set(&store.snapshot().unwrap(), c).contains(&h),
-            "an explicit walk after the walkers stopped did nothing"
-        );
-    }
-
-    /// A walker stopped in the middle of a start-up walk hands that walk back:
-    /// another attached walker takes it at once, not at its periodic pass.
-    #[test]
-    fn a_stopped_walker_hands_back_the_start_up_walk_it_took() {
-        let _guard = walker_guard();
-        let mut store = Store::default();
-        let c = collection(&mut store, "handed back");
-        let metadata = blob(&mut store, b"metadata");
-        let leaf = blob(&mut store, b"leaf");
-        let data = blob_naming(&mut store, b"data", &[leaf]);
-        commit(&mut store, c, data, metadata);
-        let mut first = store.start_held_walker(walker_config(Duration::from_secs(3600)));
-        let opener = store.gate.hold();
-        store.track_held([c]);
-        store.snapshot().unwrap();
-        // The first walker took C's start-up walk and is inside its scan.
-        store.gate.await_walker();
-        let second = store.start_held_walker(walker_config(Duration::from_secs(3600)));
-        (first.stop.take().expect("the first walker is running"))();
-        drop(opener);
-        drop(first);
-        until(
-            &mut store,
-            "the second walker to take the start-up walk",
-            |snapshot| held_set(snapshot, c) == BTreeSet::from([c.raw, metadata, data, leaf]),
-        );
-        drop(second);
+        let settled = store.snapshot().unwrap();
+        assert!(held_set(&settled, c).is_superset(&BTreeSet::from([c.raw, metadata])));
+        assert_closed(&settled, c);
+        assert!(!held_set(&settled, c).contains(&data));
+        store.faults.unreadable.lock().unwrap().remove(&z);
+        assert!(!held_set(&store.snapshot().unwrap(), c).contains(&data));
+        store.note_held(c, Inline::new(data));
+        let reported = store.snapshot().unwrap();
+        assert!(held_set(&reported, c).is_superset(&BTreeSet::from([data, z])));
     }
 
     #[test]

@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Removed
+
+- `pile net sync --held-walk-interval` and `--held-walk-threads`, with the
+  held-set walker they configured.
+
 ### Added
 
 - `pile compact --drop-collection NAME_OR_FULL_HANDLE` leaves selected collections

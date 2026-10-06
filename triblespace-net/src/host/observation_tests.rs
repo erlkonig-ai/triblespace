@@ -889,8 +889,9 @@ fn arriving_read_definition_refreshes_admission_with_same_wake_root_and_record_l
         new.repair.authorization_evidence().summary()
     );
     // The proof bytes are unchanged, but its now-resident definition is a
-    // newly available blob, independently visible in the product wake root.
-    assert_ne!(old.wake_root(), new.wake_root());
+    // newly available blob: it joins the held set, which the root leaves out.
+    assert_eq!(old.wake_root(), new.wake_root());
+    assert!(new.repair.blob_inventory().get(&definition.raw).is_some());
     assert!(!Arc::ptr_eq(&old.repair, &new.repair));
     assert_eq!(
         new.repair
@@ -1283,7 +1284,7 @@ fn scoped_missing_definition_landing_changes_admission_without_rebuilding_record
         old.repair.authorization_evidence().summary(),
         new.repair.authorization_evidence().summary()
     );
-    assert_ne!(old.wake_root(), new.wake_root());
+    assert_eq!(old.wake_root(), new.wake_root());
     assert!(new.repair.blob_inventory().get(&capability.raw).is_some());
     assert_eq!(
         new.repair

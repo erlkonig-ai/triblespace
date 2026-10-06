@@ -10,7 +10,7 @@
 //! Optional shallow/full hydration is local acquisition policy over selected
 //! structural records, not semantic admission or another Peer protocol.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 use anybytes::Bytes;
@@ -29,7 +29,6 @@ use triblespace_core::repo::{
 
 use crate::peer::{Peer, PeerSnapshot};
 use crate::protocol::RawHash;
-use crate::transport::PeerId;
 
 /// How much content an explicit collection selection asks this process to obtain.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -40,7 +39,8 @@ pub enum ReplicationMode {
     /// Obtain every direct reference of the selected collections' foundations:
     /// descriptor, COMMIT data and metadata, and DERIVE outputs.
     Shallow,
-    /// Also obtain positive resident-blob hints received through selected READ repair.
+    /// Also hold what a Full neighbour holds in each selected collection: the
+    /// reference pull ([`crate::walk`]) fetches it from that neighbour.
     Full,
 }
 
@@ -53,10 +53,6 @@ pub struct ReplicationStats {
     pub pending: usize,
     /// Blobs fetched and locally landed for hydration during this tick.
     pub acquired: usize,
-    /// Distinct nonresident positive inventory hints retained for this tick.
-    pub inventory: usize,
-    /// Offered handles still unreadable after this tick's exact acquisition window.
-    pub inventory_pending: usize,
     /// Compatibility counter; speculative scanning was removed and this stays zero.
     pub candidates: usize,
     /// Compatibility counter; candidate filtering was removed and this stays zero.
@@ -75,12 +71,11 @@ pub struct ReconcileStats {
     pub fulfilled: usize,
     pub pending: usize,
     pub replication: ReplicationStats,
-    /// Verified network payloads successfully put during this completed tick,
-    /// including positive inventory acquisitions. A payload shared by a WANT and a root
-    /// counts once. Neither local hits nor failed puts contribute.
+    /// Verified network payloads successfully put during this completed tick.
+    /// A payload shared by a WANT and a root counts once. Neither local hits nor failed puts contribute.
     pub landed: usize,
     pub received_bytes: u64,
-    /// Distinct unreadable exact blob WANTs, selected direct roots and retained hints at the
+    /// Distinct unreadable exact blob WANTs and selected direct roots at the
     /// end of this tick's exact acquisition window. None means that exact-set
     /// observation failed.
     /// This excludes operation WANTs and unknown recursive descendants, not a
@@ -119,22 +114,6 @@ impl WantState {
 struct ExactRound {
     generation: u64,
     after: Option<RawHash>,
-}
-
-/// One source's share of a bounded hint cohort. Repeated offers cannot displace work which has
-/// never had an actual acquisition attempt. The lexical cursor advances only
-/// after service, and an explicit completed inventory pass supplies wrapping.
-#[derive(Default)]
-struct BlobHintRound {
-    after: Option<RawHash>,
-    unattempted: PATCH<32, IdentitySchema, ()>,
-    serviced_through: Option<RawHash>,
-    saw_forward: bool,
-    /// A cursor advanced partway through a pass cannot wrap at that pass's end:
-    /// earlier suffix offers may have been dropped while the window was full.
-    advanced_in_pass: bool,
-    completed_passes: u64,
-    last_observed: u64,
 }
 
 impl ExactRound {
@@ -204,26 +183,11 @@ pub struct Reconciler {
     want_round: ExactRound,
     root_round: ExactRound,
     next_service: ServiceTurn,
-    blob_hints: BTreeMap<CollectionHandle, PATCH<32, IdentitySchema, PeerId>>,
-    hint_rounds: BTreeMap<CollectionHandle, BTreeMap<PeerId, BlobHintRound>>,
-    hint_observation_generation: u64,
-    hint_pass_generation: u64,
 }
 
 pub const RECONCILE_FETCH_DEADLINE: Duration = Duration::from_secs(30);
 
-/// Best-effort positive window per selected collection, not a complete inventory.
-/// Completed, serviced cohorts rotate; an unavailable prefix cannot pin it.
-const MAX_BLOB_HINTS_PER_COLLECTION: u64 = 4096;
-
-/// Scheduling provenance only. Least-recently observed, fully serviced sources
-/// may be evicted; new sources wait when every retained source protects work.
-const MAX_BLOB_HINT_SOURCES_PER_COLLECTION: usize = 128;
-
-#[cfg(test)]
-const TEST_BLOB_HINT_SOURCE: PeerId = [249; 32];
-
-/// Shared exact-demand and positive-inventory request window. Eight leaves
+/// Shared exact-demand and direct-root request window. Eight leaves
 /// nominal headroom below the sixteen process-wide exact body receivers; this
 /// is neither a reserved slot allocation nor a throughput or memory guarantee.
 const EXACT_FETCHES_IN_FLIGHT: usize = 8;
@@ -251,10 +215,6 @@ impl Reconciler {
             want_round: ExactRound::default(),
             root_round: ExactRound::default(),
             next_service: ServiceTurn::default(),
-            blob_hints: BTreeMap::new(),
-            hint_rounds: BTreeMap::new(),
-            hint_observation_generation: 0,
-            hint_pass_generation: 0,
         }
     }
 
@@ -290,12 +250,6 @@ impl Reconciler {
         for collection in collections {
             self.collections.insert(&PatchEntry::new(&collection.raw));
         }
-        let selected = |collection: &CollectionHandle| {
-            mode == ReplicationMode::Full && self.collections.get(&collection.raw).is_some()
-        };
-        self.blob_hints.retain(|collection, _| selected(collection));
-        self.hint_rounds
-            .retain(|collection, _| selected(collection));
         self.root_round = ExactRound::default();
         self.next_service = ServiceTurn::default();
         for state in self.states.values_mut() {
@@ -304,304 +258,11 @@ impl Reconciler {
         }
     }
 
-    /// Whether `collection` is selected for replication.
-    fn selects(&self, collection: &CollectionHandle) -> bool {
-        self.collections.get(&collection.raw).is_some()
-    }
-
     /// The selected collections, in ascending handle order.
     fn selected(&self) -> impl Iterator<Item = CollectionHandle> + '_ {
         self.collections
             .iter_ordered()
             .map(|raw| CollectionHandle::new(*raw))
-    }
-
-    #[cfg(test)]
-    fn observe_blob_hint(&mut self, collection: CollectionHandle, handle: RawHash) {
-        self.observe_blob_hint_from(collection, TEST_BLOB_HINT_SOURCE, handle);
-    }
-
-    /// Retain a positive hint already received through READ-authorized repair.
-    /// Selection is local acquisition policy, not additional authority. A full
-    /// window protects unattempted work. After service it advances to the next
-    /// lexical cohort; a completed remote pass eventually wraps the cursor.
-    /// Nothing here creates a durable WANT or a negative fact.
-    pub(crate) fn observe_blob_hint_from(
-        &mut self,
-        collection: CollectionHandle,
-        source: PeerId,
-        handle: RawHash,
-    ) {
-        if self.mode != ReplicationMode::Full || !self.selects(&collection) {
-            return;
-        }
-        if !self.observe_hint_source(collection, source) {
-            return;
-        }
-        if self
-            .blob_hints
-            .get(&collection)
-            .is_some_and(|hints| hints.len() == MAX_BLOB_HINTS_PER_COLLECTION)
-        {
-            let serviced: Vec<_> = self.hint_rounds[&collection]
-                .iter()
-                .filter(|(_, round)| {
-                    round.unattempted.is_empty() && round.serviced_through.is_some()
-                })
-                .map(|(source, _)| *source)
-                .collect();
-            for source in serviced {
-                self.retire_hint_cohort(collection, source);
-                self.hint_rounds
-                    .get_mut(&collection)
-                    .unwrap()
-                    .get_mut(&source)
-                    .unwrap()
-                    .advanced_in_pass = true;
-            }
-        }
-        let round = self
-            .hint_rounds
-            .get_mut(&collection)
-            .unwrap()
-            .get_mut(&source)
-            .unwrap();
-        if round.after.is_some_and(|after| handle <= after) {
-            return;
-        }
-        round.saw_forward = true;
-        let hints = self.blob_hints.entry(collection).or_default();
-        if hints.has_prefix(&handle) {
-            // An immutable H needs one attempt, not a duplicate per supplier.
-            // Keep the first supplier's ownership and unattempted protection.
-            return;
-        }
-        if hints.len() < MAX_BLOB_HINTS_PER_COLLECTION {
-            hints.insert(&PatchEntry::with_value(&handle, source));
-            round
-                .unattempted
-                .insert(&PatchEntry::with_value(&handle, ()));
-        }
-    }
-
-    fn observe_hint_source(&mut self, collection: CollectionHandle, source: PeerId) -> bool {
-        let rounds = self.hint_rounds.entry(collection).or_default();
-        if !rounds.contains_key(&source) && rounds.len() == MAX_BLOB_HINT_SOURCES_PER_COLLECTION {
-            let replace = rounds
-                .iter()
-                .filter(|(_, round)| round.unattempted.is_empty())
-                .min_by_key(|(_, round)| round.last_observed)
-                .map(|(source, _)| *source);
-            let Some(replace) = replace else {
-                return false;
-            };
-            // Only actual service can make a source replaceable. Losing an
-            // idle cursor under churn may repeat attempts, never erase work
-            // which has not yet had one.
-            self.retire_hint_cohort(collection, replace);
-            self.hint_rounds
-                .get_mut(&collection)
-                .unwrap()
-                .remove(&replace);
-        }
-        self.hint_observation_generation = self
-            .hint_observation_generation
-            .checked_add(1)
-            .expect("blob hint observation counter exhausted");
-        self.hint_rounds
-            .get_mut(&collection)
-            .unwrap()
-            .entry(source)
-            .or_default()
-            .last_observed = self.hint_observation_generation;
-        true
-    }
-
-    /// The sender finished walking one pinned inventory, not a global absence
-    /// claim. A shrinking inventory can therefore release a stale cursor too.
-    pub(crate) fn finish_blob_inventory_pass(
-        &mut self,
-        collection: CollectionHandle,
-        source: PeerId,
-    ) {
-        if self.mode != ReplicationMode::Full || !self.selects(&collection) {
-            return;
-        }
-        let Some(round) = self
-            .hint_rounds
-            .get_mut(&collection)
-            .and_then(|rounds| rounds.get_mut(&source))
-        else {
-            // Empty inventories and sources beyond the provenance cap cannot
-            // spend state or alter another source's cursor.
-            return;
-        };
-        // Global within this reconciler so evicting and readmitting a source
-        // cannot make an external worker mistake its new pass for an old one.
-        self.hint_pass_generation = self
-            .hint_pass_generation
-            .checked_add(1)
-            .expect("blob inventory pass counter exhausted");
-        round.completed_passes = self.hint_pass_generation;
-        self.finish_hint_round(collection, source);
-    }
-
-    fn retire_hint_cohort(&mut self, collection: CollectionHandle, source: PeerId) {
-        let round = self
-            .hint_rounds
-            .get_mut(&collection)
-            .and_then(|rounds| rounds.get_mut(&source))
-            .expect("observed hint round");
-        debug_assert!(round.unattempted.is_empty());
-        round.after = round.serviced_through.take().or(round.after);
-        if let Some(hints) = self.blob_hints.get_mut(&collection) {
-            let retired: Vec<_> = hints
-                .iter_ordered()
-                .filter(|handle| hints.get(handle) == Some(&source))
-                .copied()
-                .collect();
-            for handle in retired {
-                hints.remove(&handle);
-            }
-        }
-    }
-
-    fn finish_hint_round(&mut self, collection: CollectionHandle, source: PeerId) {
-        let round = self
-            .hint_rounds
-            .get_mut(&collection)
-            .unwrap()
-            .get_mut(&source)
-            .unwrap();
-        let retire = round.unattempted.is_empty() && round.serviced_through.is_some();
-        if round.unattempted.is_empty() && !retire && !round.saw_forward && !round.advanced_in_pass
-        {
-            // Only an actual end marker permits wrapping. Partial prefix
-            // batches cannot keep refilling a failed early cohort.
-            round.after = None;
-        }
-        round.saw_forward = false;
-        round.advanced_in_pass = false;
-        if retire {
-            self.retire_hint_cohort(collection, source);
-        }
-    }
-
-    fn mark_hint_attempt(&mut self, collection: CollectionHandle, handle: RawHash) {
-        if let Some(source) = self
-            .blob_hints
-            .get(&collection)
-            .and_then(|hints| hints.get(&handle))
-            .copied()
-        {
-            let round = self
-                .hint_rounds
-                .get_mut(&collection)
-                .and_then(|rounds| rounds.get_mut(&source))
-                .expect("hint has a round");
-            round.unattempted.remove(&handle);
-            round.serviced_through =
-                Some(round.serviced_through.map_or(handle, |old| old.max(handle)));
-        }
-    }
-
-    /// Copy only positive evidence relevant to this reconciler's own selection.
-    /// External `tick(peer)` uses this after the peer admits its queued events.
-    pub(crate) fn merge_blob_hints_from(&mut self, other: &Self) {
-        for (collection, hints) in &other.blob_hints {
-            for handle in hints.iter_ordered() {
-                self.observe_blob_hint_from(*collection, *hints.get(handle).unwrap(), *handle);
-            }
-        }
-        for (collection, sources) in &other.hint_rounds {
-            if self.mode != ReplicationMode::Full || !self.selects(collection) {
-                continue;
-            }
-            for (source, progress) in sources {
-                let Some(round) = self
-                    .hint_rounds
-                    .get_mut(collection)
-                    .and_then(|rounds| rounds.get_mut(source))
-                else {
-                    continue;
-                };
-                if progress.completed_passes > round.completed_passes {
-                    round.completed_passes = progress.completed_passes;
-                    self.hint_pass_generation =
-                        self.hint_pass_generation.max(progress.completed_passes);
-                    self.finish_hint_round(*collection, *source);
-                }
-            }
-        }
-    }
-
-    /// External acquisition reports actual service back to the Peer-owned
-    /// admission window. Merely copying or selecting a hint is not service.
-    pub(crate) fn merge_blob_hint_progress_from(&mut self, other: &Self) {
-        for (collection, hints) in &other.blob_hints {
-            for handle in hints.iter_ordered() {
-                let source = hints.get(handle).unwrap();
-                if !other.hint_rounds[collection][source]
-                    .unattempted
-                    .has_prefix(handle)
-                    && self
-                        .blob_hints
-                        .get(collection)
-                        .and_then(|hints| hints.get(handle))
-                        == Some(source)
-                {
-                    self.mark_hint_attempt(*collection, *handle);
-                }
-            }
-        }
-    }
-
-    /// Forget hints already readable in one passive store observation. This is
-    /// also used by peer refresh when an external reconciler owns acquisition.
-    /// Returns the forgotten hints: resident blobs a peer reported in their
-    /// collection, which the caller records as held there.
-    pub(crate) fn prune_blob_hints<R: BlobStoreGet>(
-        &mut self,
-        snapshot: &R,
-    ) -> Vec<(CollectionHandle, RawHash)> {
-        let resident = self
-            .blob_hints
-            .values()
-            .flat_map(|hints| hints.iter_ordered().copied())
-            .filter(|handle| {
-                BlobStoreGet::get::<Bytes, UnknownBlob>(snapshot, Inline::new(*handle)).is_ok()
-            })
-            .collect();
-        self.prune_resident_hints(&resident)
-    }
-
-    fn prune_resident_hints(
-        &mut self,
-        resident: &HashSet<RawHash>,
-    ) -> Vec<(CollectionHandle, RawHash)> {
-        let mut pruned = Vec::new();
-        self.blob_hints.retain(|collection, hints| {
-            let landed: Vec<_> = hints
-                .iter_ordered()
-                .filter(|handle| resident.contains(*handle))
-                .copied()
-                .collect();
-            for handle in landed {
-                let source = *hints.get(&handle).expect("retained hint");
-                let round = self
-                    .hint_rounds
-                    .get_mut(collection)
-                    .and_then(|rounds| rounds.get_mut(&source))
-                    .expect("hint has a round");
-                round.unattempted.remove(&handle);
-                round.serviced_through =
-                    Some(round.serviced_through.map_or(handle, |old| old.max(handle)));
-                hints.remove(&handle);
-                pruned.push((*collection, handle));
-            }
-            !hints.is_empty()
-        });
-        pruned
     }
 
     fn observe_missing(&mut self, wanted: &BTreeSet<RawHash>, roots: &BTreeSet<RawHash>) {
@@ -681,18 +342,6 @@ impl Reconciler {
     }
 
     fn begin_attempt(&mut self, turn: ServiceTurn, handle: RawHash) {
-        for (collection, hints) in &self.blob_hints {
-            if let Some(source) = hints.get(&handle) {
-                let round = self
-                    .hint_rounds
-                    .get_mut(collection)
-                    .and_then(|rounds| rounds.get_mut(source))
-                    .expect("hint has a round");
-                round.unattempted.remove(&handle);
-                round.serviced_through =
-                    Some(round.serviced_through.map_or(handle, |old| old.max(handle)));
-            }
-        }
         match turn {
             ServiceTurn::Wants => self.want_round.after = Some(handle),
             ServiceTurn::Roots => self.root_round.after = Some(handle),
@@ -704,8 +353,8 @@ impl Reconciler {
             .first_root_attempt = false;
     }
 
-    /// Apply this reconciler's explicit hydration selection before admitting
-    /// queued peer hints, then service one quantum. This configures local policy
+    /// Apply this reconciler's explicit hydration selection, then service one
+    /// quantum. This configures local policy
     /// only: it neither activates collections nor starts a lazy host.
     pub async fn tick<S>(&mut self, peer: &mut Peer<S>) -> ReconcileStats
     where
@@ -723,8 +372,7 @@ impl Reconciler {
         {
             peer.set_replication(self.mode, self.selected());
         }
-        // This is also the explicit external-Pile reobservation and inventory
-        // admission boundary.
+        // This is also the explicit external-Pile reobservation boundary.
         let snapshot = match peer.snapshot() {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -735,9 +383,7 @@ impl Reconciler {
                 return ReconcileStats::default();
             }
         };
-        self.merge_blob_hints_from(peer.reconciler());
         let stats = self.tick_snapshot(snapshot).await;
-        peer.reconciler_mut().merge_blob_hint_progress_from(self);
         if stats.landed != 0 {
             peer.refresh();
         }
@@ -790,13 +436,7 @@ impl Reconciler {
         };
         let roots: BTreeSet<_> = selected_roots.iter().flatten().copied().collect();
         stats.replication.roots = roots.len();
-        let hints: BTreeSet<_> = self
-            .blob_hints
-            .values()
-            .flat_map(|hints| hints.iter_ordered().copied())
-            .collect();
-        let hydration: BTreeSet<_> = roots.union(&hints).copied().collect();
-        let exact_handles: BTreeSet<_> = wanted_blob_handles.union(&hydration).copied().collect();
+        let exact_handles: BTreeSet<_> = wanted_blob_handles.union(&roots).copied().collect();
         // This is a pure observation of the selected inputs for this tick,
         // not a retained answer catalogue. A physical occurrence alone can be
         // corrupt, so keep the existing readable-blob test rather than treating
@@ -814,22 +454,15 @@ impl Reconciler {
             .filter(|handle| !visible_blobs.contains(*handle))
             .copied()
             .collect();
-        let missing_roots: BTreeSet<_> = hydration
+        let missing_roots: BTreeSet<_> = roots
             .iter()
             .filter(|handle| !visible_blobs.contains(*handle))
             .copied()
             .collect();
         stats.missing = missing_wanted.len();
-        stats.replication.inventory = hints
-            .iter()
-            .filter(|handle| !visible_blobs.contains(*handle))
-            .count();
         self.states
             .retain(|handle, _| exact_handles.contains(handle) && !visible_blobs.contains(handle));
         self.observe_missing(&missing_wanted, &missing_roots);
-        // A hinted blob already resident: the peer's report makes it held in
-        // that collection, however it arrived.
-        snapshot.note_held(self.prune_resident_hints(&visible_blobs));
 
         let started = crate::clock::mono_now();
         let deadline = tokio::time::Instant::now() + self.fetch_budget;
@@ -896,7 +529,7 @@ impl Reconciler {
                 if is_want {
                     stats.fulfilled += 1;
                 }
-                if hydration.contains(&handle) {
+                if roots.contains(&handle) {
                     stats.replication.acquired += 1;
                 }
             }
@@ -917,19 +550,12 @@ impl Reconciler {
             .iter()
             .filter(|handle| !visible_blobs.contains(*handle))
             .count();
-        stats.replication.inventory_pending = hints
-            .iter()
-            .filter(|handle| !visible_blobs.contains(*handle))
-            .count();
         stats.pending_blobs = roots_observed.then(|| {
             exact_handles
                 .iter()
                 .filter(|handle| !visible_blobs.contains(*handle))
                 .count()
         });
-
-        // Hints landed by this tick are held in the collection that offered them.
-        snapshot.note_held(self.prune_resident_hints(&visible_blobs));
         stats
     }
 
@@ -1041,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn service_turns_preserve_old_rounds_and_wants_during_continuous_hint_arrival() {
+    fn service_turns_preserve_old_rounds_and_wants_during_continuous_root_arrival() {
         let mut reconciler = Reconciler::with_backoff(Duration::ZERO, Duration::ZERO)
             .with_replication(
                 ReplicationMode::Full,
@@ -1062,16 +688,7 @@ mod tests {
         let mut want_attempts = Vec::new();
         let mut fresh = 0;
         for quantum in 0..64 * 3 {
-            reconciler.observe_blob_hint(
-                Inline::new(scheduled_handle(30, 0)),
-                scheduled_handle(9, quantum),
-            );
-            roots.extend(
-                reconciler
-                    .blob_hints
-                    .values()
-                    .flat_map(|hints| hints.iter_ordered().copied()),
-            );
+            roots.insert(scheduled_handle(9, quantum));
             wanted.insert(scheduled_handle(19, quantum));
             reconciler.observe_missing(&wanted, &roots);
             let (turn, candidates) = reconciler
@@ -1198,407 +815,6 @@ mod tests {
                 .is_empty()
         );
         assert!(direct_roots(&FailingCollectionRead, collection).is_err());
-    }
-
-    #[test]
-    fn positive_hints_are_selected_full_only_bounded_and_reopen_after_landing() {
-        let selected = Inline::new([61; 32]);
-        let other = Inline::new([62; 32]);
-        for mode in [ReplicationMode::Demand, ReplicationMode::Shallow] {
-            let mut reconciler = Reconciler::new().with_replication(mode, [selected]);
-            reconciler.observe_blob_hint(selected, [1; 32]);
-            assert!(reconciler.blob_hints.is_empty());
-        }
-        let mut reconciler = Reconciler::new().with_replication(ReplicationMode::Full, [selected]);
-        reconciler.observe_blob_hint(other, [1; 32]);
-        assert!(reconciler.blob_hints.is_empty());
-        for index in 0..MAX_BLOB_HINTS_PER_COLLECTION as u32 {
-            reconciler.observe_blob_hint(selected, scheduled_handle(1, index));
-        }
-        let overflow = scheduled_handle(2, 0);
-        reconciler.observe_blob_hint(selected, overflow);
-        assert_eq!(
-            reconciler.blob_hints[&selected].len(),
-            MAX_BLOB_HINTS_PER_COLLECTION
-        );
-        assert!(reconciler.blob_hints[&selected].get(&overflow).is_none());
-        reconciler.prune_resident_hints(&HashSet::from([scheduled_handle(1, 0)]));
-        reconciler.observe_blob_hint(selected, overflow);
-        assert!(reconciler.blob_hints[&selected].get(&overflow).is_some());
-        assert_eq!(
-            reconciler.blob_hints[&selected].len(),
-            MAX_BLOB_HINTS_PER_COLLECTION
-        );
-        reconciler.set_replication(ReplicationMode::Full, [other]);
-        assert!(reconciler.blob_hints.is_empty());
-    }
-
-    #[test]
-    fn merging_positive_hints_does_not_expand_the_receivers_selection() {
-        let selected = Inline::new([63; 32]);
-        let other = Inline::new([64; 32]);
-        let mut source =
-            Reconciler::new().with_replication(ReplicationMode::Full, [selected, other]);
-        source.observe_blob_hint(selected, [1; 32]);
-        source.observe_blob_hint(other, [2; 32]);
-        let mut receiver = Reconciler::new().with_replication(ReplicationMode::Full, [selected]);
-        receiver.merge_blob_hints_from(&source);
-        assert_eq!(receiver.blob_hints.len(), 1);
-        assert_eq!(receiver.blob_hints[&selected].len(), 1);
-        assert!(receiver.blob_hints[&selected].get(&[1; 32]).is_some());
-        assert!(
-            receiver.states.is_empty(),
-            "hints do not author demand or an attempt"
-        );
-    }
-
-    #[test]
-    fn completed_hint_passes_rotate_past_failed_cohorts_without_losing_unattempted_work() {
-        let collection = Inline::new([65; 32]);
-        let mut reconciler = Reconciler::with_backoff(Duration::ZERO, Duration::ZERO)
-            .with_replication(ReplicationMode::Full, [collection]);
-        let total = MAX_BLOB_HINTS_PER_COLLECTION as u32 * 2 + 17;
-        let offered: Vec<_> = (0..total).map(|index| scheduled_handle(1, index)).collect();
-        let mut attempted = BTreeSet::new();
-        for _ in 0..3 {
-            for &handle in &offered {
-                reconciler.observe_blob_hint(collection, handle);
-            }
-            reconciler.finish_blob_inventory_pass(collection, TEST_BLOB_HINT_SOURCE);
-            let retained: BTreeSet<_> = reconciler
-                .blob_hints
-                .values()
-                .flat_map(|hints| hints.iter_ordered().copied())
-                .collect();
-            assert!(retained.len() <= MAX_BLOB_HINTS_PER_COLLECTION as usize);
-            reconciler
-                .states
-                .retain(|handle, _| retained.contains(handle));
-            reconciler.observe_missing(&BTreeSet::new(), &retained);
-            for handle in retained {
-                reconciler.begin_attempt(ServiceTurn::FreshRoots, handle);
-                reconciler.record_unavailable(handle);
-                attempted.insert(handle);
-            }
-        }
-        assert_eq!(attempted, offered.into_iter().collect());
-    }
-
-    #[test]
-    fn repeated_hint_passes_cannot_evict_the_unattempted_part_of_a_cohort() {
-        let collection = Inline::new([66; 32]);
-        let mut reconciler =
-            Reconciler::new().with_replication(ReplicationMode::Full, [collection]);
-        let original: BTreeSet<_> = (0..MAX_BLOB_HINTS_PER_COLLECTION as u32)
-            .map(|index| scheduled_handle(1, index))
-            .collect();
-        for &handle in &original {
-            reconciler.observe_blob_hint(collection, handle);
-        }
-        reconciler.observe_missing(&BTreeSet::new(), &original);
-        reconciler.begin_attempt(ServiceTurn::FreshRoots, *original.first().unwrap());
-        let later = scheduled_handle(2, 0);
-        for _ in 0..4 {
-            for &handle in &original {
-                reconciler.observe_blob_hint(collection, handle);
-            }
-            reconciler.observe_blob_hint(collection, later);
-            reconciler.finish_blob_inventory_pass(collection, TEST_BLOB_HINT_SOURCE);
-        }
-        assert_eq!(
-            reconciler.blob_hints[&collection]
-                .iter_ordered()
-                .copied()
-                .collect::<BTreeSet<_>>(),
-            original
-        );
-        assert!(!reconciler.blob_hints[&collection].has_prefix(&later));
-        assert_eq!(
-            reconciler.hint_rounds[&collection][&TEST_BLOB_HINT_SOURCE]
-                .unattempted
-                .len(),
-            MAX_BLOB_HINTS_PER_COLLECTION - 1
-        );
-    }
-
-    #[test]
-    fn completed_shrunk_inventory_wraps_a_serviced_watermark() {
-        let collection = Inline::new([67; 32]);
-        let low = scheduled_handle(1, 0);
-        let high = scheduled_handle(2, 0);
-        let mut reconciler =
-            Reconciler::new().with_replication(ReplicationMode::Full, [collection]);
-        for handle in [low, high] {
-            reconciler.observe_blob_hint(collection, handle);
-        }
-        reconciler.observe_missing(&BTreeSet::new(), &BTreeSet::from([low, high]));
-        for handle in [low, high] {
-            reconciler.begin_attempt(ServiceTurn::FreshRoots, handle);
-        }
-        reconciler.finish_blob_inventory_pass(collection, TEST_BLOB_HINT_SOURCE);
-        assert_eq!(
-            reconciler.hint_rounds[&collection][&TEST_BLOB_HINT_SOURCE].after,
-            Some(high)
-        );
-        // The next pinned inventory no longer contains the former high key.
-        reconciler.observe_blob_hint(collection, low);
-        reconciler.finish_blob_inventory_pass(collection, TEST_BLOB_HINT_SOURCE);
-        assert_eq!(
-            reconciler.hint_rounds[&collection][&TEST_BLOB_HINT_SOURCE].after,
-            None
-        );
-        reconciler.observe_blob_hint(collection, low);
-        assert!(reconciler.blob_hints[&collection].has_prefix(&low));
-        assert!(
-            reconciler.hint_rounds[&collection][&TEST_BLOB_HINT_SOURCE]
-                .unattempted
-                .has_prefix(&low)
-        );
-    }
-
-    #[test]
-    fn external_hint_service_is_reported_back_to_the_peer_admission_window() {
-        let collection = Inline::new([68; 32]);
-        let mut owner = Reconciler::new().with_replication(ReplicationMode::Full, [collection]);
-        let mut worker = Reconciler::new().with_replication(ReplicationMode::Full, [collection]);
-        let original: BTreeSet<_> = (0..MAX_BLOB_HINTS_PER_COLLECTION as u32)
-            .map(|index| scheduled_handle(1, index))
-            .collect();
-        for &handle in &original {
-            owner.observe_blob_hint(collection, handle);
-        }
-        owner.finish_blob_inventory_pass(collection, TEST_BLOB_HINT_SOURCE);
-        worker.merge_blob_hints_from(&owner);
-        worker.observe_missing(&BTreeSet::new(), &original);
-        for &handle in &original {
-            worker.begin_attempt(ServiceTurn::FreshRoots, handle);
-        }
-        owner.merge_blob_hint_progress_from(&worker);
-        let later = scheduled_handle(2, 0);
-        for &handle in &original {
-            owner.observe_blob_hint(collection, handle);
-        }
-        owner.observe_blob_hint(collection, later);
-        owner.finish_blob_inventory_pass(collection, TEST_BLOB_HINT_SOURCE);
-        worker.merge_blob_hints_from(&owner);
-        assert!(owner.blob_hints[&collection].has_prefix(&later));
-        assert!(worker.blob_hints[&collection].has_prefix(&later));
-        assert!(
-            worker.hint_rounds[&collection][&TEST_BLOB_HINT_SOURCE]
-                .unattempted
-                .has_prefix(&later)
-        );
-    }
-
-    #[test]
-    fn another_sources_small_pass_cannot_reset_a_large_inventory_cursor() {
-        let collection = Inline::new([69; 32]);
-        let source_a = [1; 32];
-        let source_b = [2; 32];
-        let total = MAX_BLOB_HINTS_PER_COLLECTION as u32 * 2 + 17;
-        let offered: Vec<_> = (0..total).map(|index| scheduled_handle(1, index)).collect();
-        // Exercise both Peer-owned acquisition and the external tick handoff.
-        for external in [false, true] {
-            let mut owner = Reconciler::new().with_replication(ReplicationMode::Full, [collection]);
-            let mut worker =
-                Reconciler::new().with_replication(ReplicationMode::Full, [collection]);
-            let mut attempted = BTreeSet::new();
-            for _ in 0..3 {
-                for &handle in &offered {
-                    owner.observe_blob_hint_from(collection, source_a, handle);
-                }
-                owner.finish_blob_inventory_pass(collection, source_a);
-                let executor = if external {
-                    worker.merge_blob_hints_from(&owner);
-                    &mut worker
-                } else {
-                    &mut owner
-                };
-                let retained: BTreeSet<_> = executor.blob_hints[&collection]
-                    .iter_ordered()
-                    .copied()
-                    .collect();
-                assert!(retained.len() <= MAX_BLOB_HINTS_PER_COLLECTION as usize);
-                executor.observe_missing(&BTreeSet::new(), &retained);
-                for handle in retained {
-                    executor.begin_attempt(ServiceTurn::FreshRoots, handle);
-                    executor.record_unavailable(handle);
-                    attempted.insert(handle);
-                }
-                if external {
-                    owner.merge_blob_hint_progress_from(&worker);
-                }
-                // B's low-H inventory arrives after A's serviced window. It
-                // may trigger retirement but its completion belongs only to B.
-                owner.observe_blob_hint_from(collection, source_b, offered[0]);
-                let after_a = owner.hint_rounds[&collection][&source_a].after;
-                owner.finish_blob_inventory_pass(collection, source_b);
-                assert_eq!(owner.hint_rounds[&collection][&source_a].after, after_a);
-                assert!(owner.blob_hints[&collection].len() <= MAX_BLOB_HINTS_PER_COLLECTION);
-            }
-            assert_eq!(
-                attempted,
-                offered.iter().copied().collect(),
-                "external={external}"
-            );
-        }
-    }
-
-    #[test]
-    fn duplicate_hint_has_one_owner_and_other_completion_cannot_retire_it() {
-        let collection = Inline::new([70; 32]);
-        let source_a = [1; 32];
-        let source_b = [2; 32];
-        let handle = scheduled_handle(1, 0);
-        let mut reconciler =
-            Reconciler::new().with_replication(ReplicationMode::Full, [collection]);
-        reconciler.observe_blob_hint_from(collection, source_a, handle);
-        for _ in 0..4 {
-            reconciler.observe_blob_hint_from(collection, source_b, handle);
-            reconciler.finish_blob_inventory_pass(collection, source_b);
-        }
-        assert_eq!(reconciler.blob_hints[&collection].len(), 1);
-        assert_eq!(
-            reconciler.blob_hints[&collection].get(&handle),
-            Some(&source_a)
-        );
-        assert!(
-            reconciler.hint_rounds[&collection][&source_a]
-                .unattempted
-                .has_prefix(&handle)
-        );
-        assert!(
-            reconciler.hint_rounds[&collection][&source_b]
-                .unattempted
-                .is_empty()
-        );
-        reconciler.observe_missing(&BTreeSet::new(), &BTreeSet::from([handle]));
-        reconciler.begin_attempt(ServiceTurn::FreshRoots, handle);
-        reconciler.finish_blob_inventory_pass(collection, source_b);
-        assert!(reconciler.blob_hints[&collection].has_prefix(&handle));
-        reconciler.finish_blob_inventory_pass(collection, source_a);
-        assert!(!reconciler.blob_hints[&collection].has_prefix(&handle));
-        reconciler.observe_blob_hint_from(collection, source_b, handle);
-        assert_eq!(
-            reconciler.blob_hints[&collection].get(&handle),
-            Some(&source_b)
-        );
-    }
-
-    #[test]
-    fn source_churn_replaces_serviced_state_but_never_unattempted_work() {
-        let collection = Inline::new([71; 32]);
-        let mut reconciler =
-            Reconciler::new().with_replication(ReplicationMode::Full, [collection]);
-        for index in 0..MAX_BLOB_HINT_SOURCES_PER_COLLECTION as u32 {
-            reconciler.observe_blob_hint_from(
-                collection,
-                scheduled_handle(9, index),
-                scheduled_handle(1, index),
-            );
-        }
-        let newcomer = scheduled_handle(9, MAX_BLOB_HINT_SOURCES_PER_COLLECTION as u32);
-        let new_handle = scheduled_handle(2, 0);
-        reconciler.observe_blob_hint_from(collection, newcomer, new_handle);
-        reconciler.finish_blob_inventory_pass(collection, newcomer);
-        assert_eq!(
-            reconciler.hint_rounds[&collection].len(),
-            MAX_BLOB_HINT_SOURCES_PER_COLLECTION
-        );
-        assert!(!reconciler.hint_rounds[&collection].contains_key(&newcomer));
-        let serviced = scheduled_handle(1, 0);
-        reconciler.observe_missing(&BTreeSet::new(), &BTreeSet::from([serviced]));
-        reconciler.begin_attempt(ServiceTurn::FreshRoots, serviced);
-        reconciler.observe_blob_hint_from(collection, newcomer, new_handle);
-        assert!(!reconciler.hint_rounds[&collection].contains_key(&scheduled_handle(9, 0)));
-        assert!(reconciler.blob_hints[&collection].has_prefix(&new_handle));
-        // The sole replaceable slot can keep following actual peer churn.
-        for index in 1..256 {
-            let old = scheduled_handle(2, index - 1);
-            reconciler.observe_missing(&BTreeSet::new(), &BTreeSet::from([old]));
-            reconciler.begin_attempt(ServiceTurn::FreshRoots, old);
-            reconciler.observe_blob_hint_from(
-                collection,
-                scheduled_handle(10, index),
-                scheduled_handle(2, index),
-            );
-            assert_eq!(
-                reconciler.hint_rounds[&collection].len(),
-                MAX_BLOB_HINT_SOURCES_PER_COLLECTION
-            );
-            assert_eq!(
-                reconciler.blob_hints[&collection].len(),
-                MAX_BLOB_HINT_SOURCES_PER_COLLECTION as u64
-            );
-            assert!(reconciler.blob_hints[&collection].has_prefix(&scheduled_handle(1, 1)));
-        }
-    }
-
-    #[test]
-    fn external_completion_receipt_survives_source_eviction_and_readmission() {
-        let collection = Inline::new([73; 32]);
-        let source = scheduled_handle(9, 0);
-        let first = scheduled_handle(10, 0);
-        let next = scheduled_handle(10, 1);
-        let mut owner = Reconciler::new().with_replication(ReplicationMode::Full, [collection]);
-        let mut worker = Reconciler::new().with_replication(ReplicationMode::Full, [collection]);
-        owner.observe_blob_hint_from(collection, source, first);
-        owner.finish_blob_inventory_pass(collection, source);
-        worker.merge_blob_hints_from(&owner);
-        worker.mark_hint_attempt(collection, first);
-        owner.merge_blob_hint_progress_from(&worker);
-        owner.finish_blob_inventory_pass(collection, source);
-        worker.merge_blob_hints_from(&owner);
-        let previous = worker.hint_rounds[&collection][&source].completed_passes;
-        for index in 1..=MAX_BLOB_HINT_SOURCES_PER_COLLECTION as u32 {
-            let peer = scheduled_handle(9, index);
-            let handle = scheduled_handle(2, index);
-            owner.observe_blob_hint_from(collection, peer, handle);
-            owner.mark_hint_attempt(collection, handle);
-            owner.finish_blob_inventory_pass(collection, peer);
-        }
-        assert!(!owner.hint_rounds[&collection].contains_key(&source));
-        owner.observe_blob_hint_from(collection, source, next);
-        owner.finish_blob_inventory_pass(collection, source);
-        worker.merge_blob_hints_from(&owner);
-        assert!(owner.hint_rounds[&collection][&source].completed_passes > previous);
-        assert_eq!(
-            worker.hint_rounds[&collection][&source].completed_passes,
-            owner.hint_rounds[&collection][&source].completed_passes
-        );
-        assert!(
-            worker.hint_rounds[&collection][&source]
-                .unattempted
-                .has_prefix(&next)
-        );
-    }
-
-    #[test]
-    fn mid_pass_retirement_cannot_wrap_before_a_new_complete_pass() {
-        let collection = Inline::new([72; 32]);
-        let source_a = [1; 32];
-        let source_b = [2; 32];
-        let mut reconciler =
-            Reconciler::new().with_replication(ReplicationMode::Full, [collection]);
-        let original: BTreeSet<_> = (0..MAX_BLOB_HINTS_PER_COLLECTION as u32)
-            .map(|index| scheduled_handle(1, index))
-            .collect();
-        for &handle in &original {
-            reconciler.observe_blob_hint_from(collection, source_a, handle);
-        }
-        reconciler.observe_blob_hint_from(collection, source_a, scheduled_handle(2, 0));
-        reconciler.observe_missing(&BTreeSet::new(), &original);
-        for &handle in &original {
-            reconciler.begin_attempt(ServiceTurn::FreshRoots, handle);
-        }
-        reconciler.observe_blob_hint_from(collection, source_b, scheduled_handle(0, 0));
-        reconciler.finish_blob_inventory_pass(collection, source_a);
-        assert_eq!(
-            reconciler.hint_rounds[&collection][&source_a].after,
-            original.last().copied()
-        );
-        reconciler.observe_blob_hint_from(collection, source_a, scheduled_handle(2, 0));
-        assert!(reconciler.blob_hints[&collection].has_prefix(&scheduled_handle(2, 0)));
     }
 
     fn put(store: &mut MemoryRepo, bytes: impl Into<Vec<u8>>) -> RawHash {
@@ -1892,137 +1108,10 @@ mod tests {
         }
     }
 
-    /// Rule 3: a peer reporting H in C's held set makes a resident H held in
-    /// C here. The report is recorded when the hint arrives, before the
-    /// acquisition window filters it, so it holds in Demand mode and when a
-    /// full window drops the hint. A report of a blob that is not resident is
-    /// not kept.
-    #[tokio::test]
-    async fn a_resident_hint_is_held_in_demand_mode_and_with_a_full_hint_window() {
-        use crate::channel::{NetEvent, NetEventBatch};
-
-        for full_window in [false, true] {
-            let key = SigningKey::from_bytes(&[7; 32]);
-            let (sender, receiver, wiring) =
-                crate::host::wire(crate::identity::iroh_secret(&key).public().into());
-            let mut store = MemoryRepo::default();
-            let collection: CollectionHandle =
-                Inline::new(put(&mut store, b"reported collection".to_vec()));
-            let resident = put(&mut store, b"resident, named by no record".to_vec());
-            let mut peer = Peer::with_wiring(
-                store,
-                crate::inventory::ReconcileQos::default(),
-                sender,
-                receiver,
-            );
-            peer.activate_collection(collection);
-            if full_window {
-                peer.set_replication(ReplicationMode::Full, [collection]);
-                for index in 0..MAX_BLOB_HINTS_PER_COLLECTION as u32 {
-                    peer.reconciler_mut().observe_blob_hint_from(
-                        collection,
-                        TEST_BLOB_HINT_SOURCE,
-                        scheduled_handle(1, index),
-                    );
-                }
-                assert_eq!(
-                    peer.reconciler().blob_hints[&collection].len(),
-                    MAX_BLOB_HINTS_PER_COLLECTION
-                );
-            } else {
-                assert_eq!(peer.reconciler().mode, ReplicationMode::Demand);
-            }
-            let before = peer.snapshot().unwrap().held(collection).unwrap();
-            assert!(!before.has_prefix(&resident));
-            let mut batch = NetEventBatch::default();
-            for handle in [resident, [68; 32]] {
-                batch
-                    .try_push(NetEvent::BlobHint {
-                        collection,
-                        source: TEST_BLOB_HINT_SOURCE,
-                        handle,
-                    })
-                    .unwrap();
-            }
-            wiring.send_admission(batch).await;
-            peer.refresh();
-            let held = peer.snapshot().unwrap().held(collection).unwrap();
-            assert!(held.has_prefix(&resident), "full window: {full_window}");
-            assert!(!held.has_prefix(&[68; 32]));
-            assert!(
-                peer.reconciler()
-                    .blob_hints
-                    .get(&collection)
-                    .is_none_or(|hints| !hints.has_prefix(&resident)),
-                "the acquisition window did not carry the report"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn external_tick_applies_selection_before_admitting_peer_hints_without_activation() {
-        use crate::channel::{NetEvent, NetEventBatch};
-
-        let key = SigningKey::from_bytes(&[7; 32]);
-        let (sender, receiver, wiring) =
-            crate::host::wire(crate::identity::iroh_secret(&key).public().into());
-        let observer = sender.clone();
-        let collection = Inline::new([65; 32]);
-        let bytes = Bytes::from_source(b"offered through peer event".to_vec());
-        let handle = Blob::<UnknownBlob>::new(bytes.clone()).get_handle().raw;
-        let fetches = Arc::new(ControlledFetches {
-            answers: BTreeMap::from([(handle, bytes)]),
-            blocked: BTreeSet::new(),
-            delay: Mutex::new(Duration::ZERO),
-            released: Arc::new(AtomicBool::new(false)),
-            wake: Arc::new(tokio::sync::Notify::new()),
-            trace: Arc::new(Mutex::new(FetchTrace::default())),
-        });
-        wiring.install_test_capability(fetches.clone());
-        let mut peer = Peer::with_wiring(
-            MemoryRepo::default(),
-            crate::inventory::ReconcileQos::default(),
-            sender,
-            receiver,
-        );
-        assert_eq!(peer.reconciler().mode, ReplicationMode::Demand);
-        let mut batch = NetEventBatch::default();
-        batch
-            .try_push(NetEvent::BlobHint {
-                collection,
-                source: TEST_BLOB_HINT_SOURCE,
-                handle,
-            })
-            .unwrap();
-        batch
-            .try_push(NetEvent::BlobHint {
-                collection: Inline::new([66; 32]),
-                source: TEST_BLOB_HINT_SOURCE,
-                handle: [67; 32],
-            })
-            .unwrap();
-        wiring.send_admission(batch).await;
-        let mut reconciler =
-            Reconciler::new().with_replication(ReplicationMode::Full, [collection]);
-        let stats = reconciler.tick(&mut peer).await;
-        assert_eq!(stats.landed, 1);
-        assert_eq!(stats.replication.inventory, 1);
-        assert_eq!(stats.replication.roots, 0);
-        assert_eq!(fetches.trace.lock().unwrap().calls, [handle]);
-        assert!(peer.snapshot().unwrap().wants().unwrap().next().is_none());
-        assert_eq!(
-            observer.current_snapshot().unwrap().collections().count(),
-            0
-        );
-        let again = reconciler.tick(&mut peer).await;
-        assert_eq!(again.landed, 0);
-        assert_eq!(fetches.trace.lock().unwrap().calls, [handle]);
-    }
-
     #[tokio::test]
     async fn full_false_payload_words_cause_no_network_requests() {
         let mut store = MemoryRepo::default();
-        let descriptor = put(&mut store, b"positive-inventory descriptor".to_vec());
+        let descriptor = put(&mut store, b"false-word descriptor".to_vec());
         let metadata = put(&mut store, Vec::new());
         let words: Vec<_> = (0..1024)
             .flat_map(|word| *blake3::hash(format!("false word {word}").as_bytes()).as_bytes())
@@ -2036,7 +1125,6 @@ mod tests {
             let stats = reconciler.tick(&mut peer).await;
             assert_eq!(stats.replication.roots, 3);
             assert_eq!(stats.replication.pending, 0);
-            assert_eq!(stats.replication.inventory, 0);
             assert_eq!(stats.replication.candidates, 0);
             assert_eq!(stats.replication.filtered, 0);
             assert_eq!(stats.replication.speculative_attempted, 0);
@@ -2044,149 +1132,6 @@ mod tests {
         }
         assert!(fetches.trace.lock().unwrap().calls.is_empty());
         assert_eq!(peer.snapshot().unwrap().wants().unwrap().count(), 0);
-    }
-
-    fn nested_hint_fixture(blocked: usize) -> ExactFixture {
-        let grandchild_bytes = Bytes::from_source(b"offered nested body".to_vec());
-        let grandchild = Blob::<UnknownBlob>::new(grandchild_bytes.clone())
-            .get_handle()
-            .raw;
-        let child_bytes = Bytes::from_source(grandchild.to_vec());
-        let child = Blob::<UnknownBlob>::new(child_bytes.clone())
-            .get_handle()
-            .raw;
-        let mut answers = BTreeMap::from([(grandchild, grandchild_bytes), (child, child_bytes)]);
-        for ordinal in 0..7 {
-            let bytes = Bytes::from_source(format!("offered sibling {ordinal}").into_bytes());
-            answers.insert(
-                Blob::<UnknownBlob>::new(bytes.clone()).get_handle().raw,
-                bytes,
-            );
-        }
-        let hints: Vec<_> = answers.keys().copied().collect();
-        let mut store = MemoryRepo::default();
-        let collection = put(&mut store, b"nested-hint descriptor".to_vec());
-        let metadata = put(&mut store, Vec::new());
-        let data = put(
-            &mut store,
-            hints
-                .iter()
-                .filter(|&&handle| handle != grandchild)
-                .flat_map(|handle| *handle)
-                .collect::<Vec<_>>(),
-        );
-        raw_commit(&mut store, collection, data, metadata);
-        let (peer, fetches, landings) = controlled_peer(
-            store,
-            answers,
-            hints.iter().take(blocked).copied().collect(),
-        );
-        ExactFixture {
-            peer,
-            fetches,
-            landings,
-            roots: hints,
-            collection: Inline::new(collection),
-        }
-    }
-
-    #[tokio::test]
-    async fn full_offered_nested_handles_share_the_bounded_parallel_window() {
-        let mut fixture = nested_hint_fixture(1);
-        let mut reconciler =
-            Reconciler::new().with_replication(ReplicationMode::Full, [fixture.collection]);
-        for &handle in &fixture.roots {
-            reconciler.observe_blob_hint(fixture.collection, handle);
-        }
-        let mut tick = Box::pin(reconciler.tick(&mut fixture.peer));
-        assert!(futures::poll!(tick.as_mut()).is_pending());
-        assert_eq!(fixture.landings.lock().unwrap().put.len(), 8);
-        assert!(fixture.fetches.trace.lock().unwrap().peak <= EXACT_FETCHES_IN_FLIGHT);
-        fixture.fetches.release();
-        let stats = tick.await;
-        assert_eq!(stats.replication.roots, 3);
-        assert_eq!(stats.replication.inventory, 9);
-        assert_eq!(stats.replication.inventory_pending, 0);
-        assert_eq!(stats.replication.acquired, 9);
-        assert_eq!(stats.landed, 9);
-        assert_eq!(stats.pending_blobs, Some(0));
-        assert_eq!(stats.replication.speculative_attempted, 0);
-        assert!(reconciler.blob_hints.is_empty());
-        assert_eq!(fixture.peer.snapshot().unwrap().wants().unwrap().count(), 0);
-    }
-
-    #[tokio::test]
-    async fn failed_inventory_prefix_cannot_permanently_hide_a_later_reachable_blob() {
-        let (good, bytes) = (0..256)
-            .find_map(|ordinal| {
-                let bytes = Bytes::from_source(
-                    format!("late reachable inventory blob {ordinal}").into_bytes(),
-                );
-                let handle = Blob::<UnknownBlob>::new(bytes.clone()).get_handle().raw;
-                (handle[0] != 0).then_some((handle, bytes))
-            })
-            .unwrap();
-        let collection = Inline::new([69; 32]);
-        let (mut peer, fetches, _) = controlled_peer(
-            MemoryRepo::default(),
-            BTreeMap::from([(good, bytes)]),
-            BTreeSet::new(),
-        );
-        let mut reconciler = Reconciler::with_backoff(Duration::ZERO, Duration::ZERO)
-            .with_replication(ReplicationMode::Full, [collection]);
-        let mut offered: Vec<_> = (0..MAX_BLOB_HINTS_PER_COLLECTION as u32)
-            .map(|index| scheduled_handle(0, index))
-            .collect();
-        assert!(offered.iter().all(|handle| *handle < good));
-        offered.push(good);
-        for pass in 0..2 {
-            for &handle in &offered {
-                reconciler.observe_blob_hint(collection, handle);
-            }
-            reconciler.finish_blob_inventory_pass(collection, TEST_BLOB_HINT_SOURCE);
-            let stats = reconciler.tick(&mut peer).await;
-            assert_eq!(stats.replication.speculative_attempted, 0);
-            if pass == 0 {
-                assert_eq!(stats.landed, 0);
-            }
-        }
-        assert!(fetches.trace.lock().unwrap().calls.contains(&good));
-        let snapshot = peer.snapshot().unwrap();
-        assert!(BlobStoreGet::get::<Bytes, UnknownBlob>(&snapshot, Inline::new(good)).is_ok());
-        assert_eq!(snapshot.wants().unwrap().count(), 0);
-    }
-
-    #[tokio::test]
-    async fn cancelling_full_hint_acquisition_keeps_unstarted_hints_and_drops_owned_fetches() {
-        let mut fixture = nested_hint_fixture(9);
-        let mut reconciler =
-            Reconciler::new().with_replication(ReplicationMode::Full, [fixture.collection]);
-        for &handle in &fixture.roots {
-            reconciler.observe_blob_hint(fixture.collection, handle);
-        }
-        let mut tick = Box::pin(reconciler.tick(&mut fixture.peer));
-        assert!(futures::poll!(tick.as_mut()).is_pending());
-        assert_eq!(
-            fixture.fetches.trace.lock().unwrap().active,
-            EXACT_FETCHES_IN_FLIGHT
-        );
-        drop(tick);
-        assert_eq!(fixture.fetches.trace.lock().unwrap().active, 0);
-        assert_eq!(
-            fixture.fetches.trace.lock().unwrap().cancelled,
-            EXACT_FETCHES_IN_FLIGHT
-        );
-        assert_eq!(
-            fixture.fetches.trace.lock().unwrap().calls.len(),
-            EXACT_FETCHES_IN_FLIGHT
-        );
-        assert_eq!(reconciler.blob_hints[&fixture.collection].len(), 9);
-        fixture.fetches.release();
-        let stats = reconciler.tick(&mut fixture.peer).await;
-        assert_eq!(stats.landed, 9);
-        assert_eq!(stats.replication.inventory_pending, 0);
-        assert!(reconciler.blob_hints.is_empty());
-        assert_eq!(fixture.peer.snapshot().unwrap().wants().unwrap().count(), 0);
     }
 
     #[tokio::test]
@@ -2692,17 +1637,16 @@ mod tests {
                 .reader_is_admitted_by(reader, std::slice::from_ref(&proof)),
             QuorumOutcome::Met
         );
-        // Health commits to the actual serving inventory as well as the
-        // complete semantic record and AUTH PATCHes.
+        // Health commits to the complete semantic record and AUTH PATCHes.
         let published = frontier_after_refresh.unwrap();
         assert_eq!(published.records, manifest(&expected).records);
         assert_eq!(
             published.authorization_evidence,
             manifest(&expected).authorization_evidence
         );
-        // A bare semantic overlay has no resident inventory. The serving
-        // product root also commits to the readable descriptor and payload.
-        assert_ne!(published.wake_root, manifest(&expected).wake_root);
+        // The root leaves held blobs out, so a bare semantic overlay and the
+        // serving one share it.
+        assert_eq!(published.wake_root, manifest(&expected).wake_root);
         assert_ne!(initial_frontier.wake_root, published.wake_root);
         assert_ne!(
             manifest(&initial_overlay).wake_root,

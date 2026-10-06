@@ -25,18 +25,11 @@ pub(crate) enum NetEvent {
     /// One native authorization proof. Named claims remain ordinary immutable
     /// dependencies and are fetched only when a consumer follows them.
     CapabilityProof(CapabilityProof),
-    /// READ-gated positive availability observation, not a durable WANT,
-    /// membership assertion, or evidence that this process has the bytes.
-    BlobHint {
+    /// A peer holds the blob in the collection. If it is resident at the
+    /// next snapshot, it joins the collection's held set here too.
+    Held {
         collection: CollectionHandle,
-        source: crate::transport::PeerId,
         handle: [u8; 32],
-    },
-    /// The preceding positive walk reached its pinned inventory's end. Only
-    /// a local scheduling boundary: not a remote residency/completeness claim.
-    BlobInventoryPassCompleted {
-        collection: CollectionHandle,
-        source: crate::transport::PeerId,
     },
 }
 
@@ -48,8 +41,7 @@ impl NetEvent {
             // arity.
             Self::CollectionRecord(record) => 1 + record.dense_len(),
             Self::CapabilityProof(proof) => proof.as_bytes().len(),
-            Self::BlobHint { .. } => 96,
-            Self::BlobInventoryPassCompleted { .. } => 64,
+            Self::Held { .. } => 64,
         }
     }
 }
@@ -70,20 +62,10 @@ impl std::fmt::Debug for NetEvent {
                 .debug_tuple("CapabilityProof")
                 .field(proof)
                 .finish(),
-            Self::BlobHint {
-                collection,
-                source,
-                handle,
-            } => formatter
-                .debug_struct("BlobHint")
+            Self::Held { collection, handle } => formatter
+                .debug_struct("Held")
                 .field("collection", collection)
-                .field("source", source)
                 .field("handle", handle)
-                .finish(),
-            Self::BlobInventoryPassCompleted { collection, source } => formatter
-                .debug_struct("BlobInventoryPassCompleted")
-                .field("collection", collection)
-                .field("source", source)
                 .finish(),
         }
     }

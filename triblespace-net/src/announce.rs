@@ -1,23 +1,29 @@
-//! Per-collection announcements on `recon/1` (design 2.3, 2.5).
+//! Per-collection announcements on `recon/1` (design 2.3, 2.5, 2.9).
 //!
 //! An announcement says "my root for C is R", where R is C's [`record_root`]:
 //! the root of what a record pull walks, so the root a completed pull walked
-//! compares with later announcements. Each selected collection has one
-//! [`WakeSchedule`]: when it fires, this side announces C to each neighbour
-//! for C it sends to, except one that announced an equal root during the
-//! interval. A local append resets the timer to its shortest interval. A
-//! root that changes while a pull of C runs is that pull landing and resets
-//! nothing; the pull resets the timer once when it completes, so the merged
-//! root goes out once (D4).
+//! compares with later announcements. Between two neighbours that both
+//! replicate C in full it also carries the sender's held digest, the
+//! [`held_digest`] of the blobs it holds in C; other neighbours get none.
+//! Each selected collection has one [`WakeSchedule`]: when it fires, this
+//! side announces C to each neighbour for C it sends to, except one that
+//! announced an equal state during the interval. A local append resets the
+//! timer to its shortest interval. A root that changes while a record pull
+//! of C runs is that pull landing and resets nothing; the pull resets the
+//! timer once when it completes, so the merged root goes out once (D4). A
+//! changed held set resets nothing: the next announcement carries it.
 //!
-//! An announcement ends the comparison when it equals this side's root, or
-//! the root of the last pull from its sender that completed. Otherwise it
-//! starts a record pull from the sender and, if this side sends to it and
-//! the announcement is not itself a reply, an immediate reply with this
-//! side's root, from which the sender pulls in turn. The reply counts as the
+//! An announcement ends the comparison when its root and any held digest it
+//! carries equal this side's. Otherwise a root that differs, and is not the
+//! root of the last record pull from its sender that completed, starts a
+//! record pull from the sender; a held digest that differs, and is not the
+//! one the last completed reference pull from it walked, starts a reference
+//! pull. If this side sends to the sender and the announcement is not
+//! itself a reply, a pull also gets an immediate reply with this side's
+//! state, from which the sender pulls in turn. The reply counts as the
 //! interval's announcement to that neighbour and is never answered. An
-//! announcement heard while a pull from its sender runs waits for that pull
-//! to end, the latest replacing earlier ones.
+//! announcement heard while a pull from its sender runs waits for every
+//! pull from it to end, the latest replacing earlier ones.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -25,44 +31,78 @@ use std::collections::hash_map::Entry;
 use triblespace_core::collection::CollectionHandle;
 
 use crate::clock::Mono;
-use crate::collection_activation::record_root;
+use crate::collection_activation::{held_digest, record_root};
 use crate::connection::Link;
 use crate::host::StoreSnapshot;
+use crate::patch_repair::PatchSummary;
 use crate::protocol::RawHash;
 use crate::recon::Frame;
 use crate::transport::PeerId;
 use crate::wake_schedule::WakeSchedule;
-use crate::walk::RecordPullDone;
+use crate::walk::{PullDone, PullKind};
 
-/// A record pull of a collection from a peer.
-pub(crate) type Pull = (PeerId, CollectionHandle);
+/// A pull of a collection from a peer.
+pub(crate) type Pull = (PeerId, CollectionHandle, PullKind);
+
+/// One collection's state as an announcement carries it: the record root,
+/// and the held digest when the collection is replicated in full.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct State {
+    pub(crate) root: RawHash,
+    pub(crate) held: Option<RawHash>,
+}
 
 struct Neighbour {
     link: Link,
     /// This side sends the collection to the neighbour.
     sends: bool,
-    /// The root of the last pull from the neighbour that completed.
+    /// Both sides replicate the collection in full.
+    full: bool,
+    /// The root of the last record pull from the neighbour that completed.
     completed: Option<RawHash>,
+    /// The held digest of the last reference pull from the neighbour that
+    /// completed.
+    completed_held: Option<RawHash>,
 }
 
 struct Announcing {
-    root: RawHash,
+    state: State,
     schedule: WakeSchedule<PeerId>,
     neighbours: HashMap<PeerId, Neighbour>,
+}
+
+impl Announcing {
+    /// This side's announcement to a neighbour; `full` says both sides
+    /// replicate the collection in full, and only then is the held digest
+    /// in it.
+    fn announcement(&self, collection: CollectionHandle, full: bool, reply: bool) -> Frame {
+        Frame::Announce {
+            collection,
+            root: self.state.root,
+            held_digest: self.state.held.filter(|_| full),
+            reply,
+        }
+    }
+}
+
+/// The pulls from one peer of one collection that run, and the latest
+/// announcement heard from that peer meanwhile, with whether it was a
+/// reply.
+struct Running {
+    kinds: Vec<PullKind>,
+    pending: Option<(State, bool)>,
 }
 
 /// The announcements of every selected collection of one node.
 #[derive(Default)]
 pub(crate) struct Announcements {
     collections: HashMap<RawHash, Announcing>,
-    /// Record pulls running, by collection and peer, each with the latest
-    /// announcement heard from that peer meanwhile: its root and whether it
-    /// was a reply.
-    pulls: HashMap<(RawHash, PeerId), Option<(RawHash, bool)>>,
+    /// By collection and peer.
+    pulls: HashMap<(RawHash, PeerId), Running>,
 }
 
-/// The selected collections of `snapshot` and their record roots.
-pub(crate) fn roots(snapshot: &StoreSnapshot) -> impl Iterator<Item = (CollectionHandle, RawHash)> {
+/// The selected collections of `snapshot` and their states.
+pub(crate) fn states(snapshot: &StoreSnapshot) -> impl Iterator<Item = (CollectionHandle, State)> {
     snapshot.active().filter_map(|collection| {
         let selected = snapshot.selected(collection)?;
         let repair = selected.repair();
@@ -71,64 +111,69 @@ pub(crate) fn roots(snapshot: &StoreSnapshot) -> impl Iterator<Item = (Collectio
             repair.records().summary(),
             repair.authorization_evidence().summary(),
         );
-        Some((collection, root))
+        let held = snapshot
+            .full(collection)
+            .then(|| held_digest(PatchSummary::from_patch(repair.blob_inventory())));
+        Some((collection, State { root, held }))
     })
 }
 
 impl Announcements {
-    /// Follow the selected collections and their roots: start and stop
+    /// Follow the selected collections and their states: start and stop
     /// announcing collections, and reset the timer of one whose root changed
-    /// while no pull of it runs.
+    /// while no record pull of it runs.
     pub(crate) fn observe(
         &mut self,
-        selected: impl IntoIterator<Item = (CollectionHandle, RawHash)>,
+        selected: impl IntoIterator<Item = (CollectionHandle, State)>,
         now: Mono,
     ) {
         let selected = selected
             .into_iter()
-            .map(|(collection, root)| (collection.raw, root))
+            .map(|(collection, state)| (collection.raw, state))
             .collect::<HashMap<_, _>>();
         self.collections.retain(|raw, _| selected.contains_key(raw));
-        for (raw, root) in selected {
+        for (raw, state) in selected {
             match self.collections.entry(raw) {
                 Entry::Vacant(entry) => {
                     entry.insert(Announcing {
-                        root,
+                        state,
                         schedule: WakeSchedule::new(now, rand::random()),
                         neighbours: HashMap::new(),
                     });
                 }
                 Entry::Occupied(mut entry) => {
                     let announcing = entry.get_mut();
-                    if announcing.root != root {
-                        announcing.root = root;
-                        if !self.pulls.keys().any(|(pulled, _)| *pulled == raw) {
-                            announcing.schedule.local_changed(now, rand::random());
-                        }
+                    let landing = self.pulls.iter().any(|((pulled, _), running)| {
+                        *pulled == raw && running.kinds.contains(&PullKind::Records)
+                    });
+                    if announcing.state.root != state.root && !landing {
+                        announcing.schedule.local_changed(now, rand::random());
                     }
+                    announcing.state = state;
                 }
             }
         }
     }
 
-    /// Follow the peerings: each with its collection, its connection and
-    /// whether this side sends on it. A neighbour this side starts sending to
-    /// is offered the root within two minimum intervals.
+    /// Follow the peerings: each with its collection and its connection,
+    /// whether this side sends on it, and whether both sides replicate the
+    /// collection in full. A neighbour this side starts sending to is offered
+    /// the state within two minimum intervals.
     pub(crate) fn neighbours<'a>(
         &mut self,
-        peerings: impl IntoIterator<Item = (CollectionHandle, &'a Link, bool)>,
+        peerings: impl IntoIterator<Item = (CollectionHandle, &'a Link, bool, bool)>,
         now: Mono,
     ) {
-        let mut current = HashMap::<RawHash, HashMap<PeerId, (Link, bool)>>::new();
-        for (collection, link, sends) in peerings {
+        let mut current = HashMap::<RawHash, HashMap<PeerId, (Link, bool, bool)>>::new();
+        for (collection, link, sends, full) in peerings {
             let peers = current.entry(collection.raw).or_default();
             // While a tie-break settles, a peer can be peered on two
             // connections; the newer one carries the announcements.
             if peers
                 .get(&link.peer())
-                .is_none_or(|(kept, _)| kept.id() < link.id())
+                .is_none_or(|(kept, _, _)| kept.id() < link.id())
             {
-                peers.insert(link.peer(), (link.clone(), sends));
+                peers.insert(link.peer(), (link.clone(), sends, full));
             }
         }
         for (raw, announcing) in &mut self.collections {
@@ -136,14 +181,16 @@ impl Announcements {
             announcing
                 .neighbours
                 .retain(|peer, _| peers.contains_key(peer));
-            for (peer, (link, sends)) in peers {
+            for (peer, (link, sends, full)) in peers {
                 let neighbour = announcing
                     .neighbours
                     .entry(peer)
                     .or_insert_with(|| Neighbour {
                         link: link.clone(),
                         sends: false,
+                        full,
                         completed: None,
+                        completed_held: None,
                     });
                 if sends && !neighbour.sends {
                     announcing
@@ -152,70 +199,108 @@ impl Announcements {
                 }
                 neighbour.link = link;
                 neighbour.sends = sends;
+                neighbour.full = full;
             }
         }
     }
 
-    /// Hear `peer` announce `root` for `collection`. Returns the record pull
-    /// to start, if any.
+    /// Hear `peer` announce `state` for `collection`. Returns the pulls to
+    /// start.
     pub(crate) fn heard(
         &mut self,
         peer: PeerId,
         collection: CollectionHandle,
-        root: RawHash,
+        state: State,
         reply: bool,
         now: Mono,
-    ) -> Option<Pull> {
-        let announcing = self.collections.get_mut(&collection.raw)?;
-        let neighbour = announcing.neighbours.get(&peer)?;
-        let pull = match self.pulls.entry((collection.raw, peer)) {
-            Entry::Occupied(mut running) => {
-                running.insert(Some((root, reply)));
-                return None;
-            }
-            Entry::Vacant(pull) => pull,
+    ) -> Vec<Pull> {
+        let Some(announcing) = self.collections.get_mut(&collection.raw) else {
+            return Vec::new();
         };
-        if root == announcing.root {
+        let Some(neighbour) = announcing.neighbours.get(&peer) else {
+            return Vec::new();
+        };
+        let pulls = match self.pulls.entry((collection.raw, peer)) {
+            Entry::Occupied(mut running) => {
+                running.get_mut().pending = Some((state, reply));
+                return Vec::new();
+            }
+            Entry::Vacant(pulls) => pulls,
+        };
+        // Held digests compare only where both sides hold one: between two
+        // neighbours that replicate the collection in full.
+        let held = state
+            .held
+            .zip(announcing.state.held)
+            .filter(|(theirs, mine)| theirs != mine)
+            .map(|(theirs, _)| theirs);
+        if state.root == announcing.state.root && held.is_none() {
             announcing.schedule.consistent_root(now, peer);
-            return None;
+            return Vec::new();
         }
-        if neighbour.completed == Some(root) {
-            return None;
+        let mut kinds = Vec::new();
+        if state.root != announcing.state.root && neighbour.completed != Some(state.root) {
+            kinds.push(PullKind::Records);
         }
-        pull.insert(None);
+        if held.is_some() && neighbour.completed_held != held {
+            kinds.push(PullKind::References);
+        }
+        if kinds.is_empty() {
+            return Vec::new();
+        }
         if neighbour.sends && !reply {
-            neighbour.link.send(Frame::Announce {
-                collection,
-                root: announcing.root,
-                held_digest: None,
-                reply: true,
-            });
+            neighbour
+                .link
+                .send(announcing.announcement(collection, neighbour.full, true));
             announcing.schedule.replied(now, peer);
         }
-        Some((peer, collection))
+        pulls.insert(Running {
+            kinds: kinds.clone(),
+            pending: None,
+        });
+        kinds
+            .into_iter()
+            .map(|kind| (peer, collection, kind))
+            .collect()
     }
 
-    /// A record pull ended. A completed pull's root becomes the last
-    /// completed one of its neighbour, and resets the timer once. An
-    /// announcement heard during the pull is heard now. Returns the record
-    /// pull to start, if any.
-    pub(crate) fn ended(&mut self, done: RecordPullDone, now: Mono) -> Option<Pull> {
-        let RecordPullDone {
+    /// A pull ended. A completed pull's root becomes the last completed one
+    /// of its kind from its neighbour, and a completed record pull resets the
+    /// timer once. Once no pull from the neighbour runs, an announcement
+    /// heard meanwhile is heard now. Returns the pulls to start.
+    pub(crate) fn ended(&mut self, done: PullDone, now: Mono) -> Vec<Pull> {
+        let PullDone {
             peer,
             collection,
+            kind,
             root,
             completed,
         } = done;
-        let pending = self.pulls.remove(&(collection.raw, peer)).flatten();
-        let announcing = self.collections.get_mut(&collection.raw)?;
+        let mut pending = None;
+        if let Entry::Occupied(mut running) = self.pulls.entry((collection.raw, peer)) {
+            running.get_mut().kinds.retain(|running| *running != kind);
+            if running.get().kinds.is_empty() {
+                pending = running.remove().pending;
+            }
+        }
+        let Some(announcing) = self.collections.get_mut(&collection.raw) else {
+            return Vec::new();
+        };
         if completed {
             if let Some(neighbour) = announcing.neighbours.get_mut(&peer) {
-                neighbour.completed = Some(root);
+                match kind {
+                    PullKind::Records => neighbour.completed = Some(root),
+                    PullKind::References => neighbour.completed_held = Some(root),
+                }
             }
-            announcing.schedule.local_changed(now, rand::random());
+            if kind == PullKind::Records {
+                announcing.schedule.local_changed(now, rand::random());
+            }
         }
-        let (root, reply) = pending?;
-        self.heard(peer, collection, root, reply, now)
+        let Some((state, reply)) = pending else {
+            return Vec::new();
+        };
+        self.heard(peer, collection, state, reply, now)
     }
 
     /// When [`Self::poll`] next has work.
@@ -240,12 +325,12 @@ impl Announcements {
                 .map(|(peer, _)| *peer)
                 .collect::<Vec<_>>();
             for peer in announcing.schedule.poll(now, rand::random(), sends) {
-                announcing.neighbours[&peer].link.send(Frame::Announce {
-                    collection: CollectionHandle::new(*raw),
-                    root: announcing.root,
-                    held_digest: None,
-                    reply: false,
-                });
+                let neighbour = &announcing.neighbours[&peer];
+                neighbour.link.send(announcing.announcement(
+                    CollectionHandle::new(*raw),
+                    neighbour.full,
+                    false,
+                ));
             }
         }
     }
@@ -271,6 +356,14 @@ mod tests {
         let mut root = [0; 32];
         root[..4].copy_from_slice(&number.to_be_bytes());
         root
+    }
+
+    /// The state of a collection replicated on demand: no held digest.
+    fn state(number: u32) -> State {
+        State {
+            root: root(number),
+            held: None,
+        }
     }
 
     /// A link to `peer` and the frames sent on it.
@@ -300,6 +393,30 @@ mod tests {
             .collect()
     }
 
+    /// The state of a collection replicated in full.
+    fn full(number: u32, held: u32) -> State {
+        State {
+            root: root(number),
+            held: Some(root(held)),
+        }
+    }
+
+    /// The announcements sent on `wire` since the last call: root, held
+    /// digest and reply flag.
+    fn announced(wire: &mut Wire) -> Vec<(RawHash, Option<RawHash>, bool)> {
+        std::iter::from_fn(|| wire.frames.try_recv().ok())
+            .map(|frame| match frame {
+                Frame::Announce {
+                    root,
+                    held_digest,
+                    reply,
+                    ..
+                } => (root, held_digest, reply),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect()
+    }
+
     /// Poll `node` every step for `by`.
     fn advance(node: &mut Announcements, now: &mut Mono, by: Duration) {
         let until = *now + by;
@@ -314,15 +431,15 @@ mod tests {
         let c = collection(1);
         let mut now = crate::clock::mono_now();
         let mut node = Announcements::default();
-        node.observe([(c, root(1))], now);
+        node.observe([(c, state(1))], now);
         let (mut a, mut b) = (wire(1, A), wire(2, B));
-        node.neighbours([(c, &a.link, true), (c, &b.link, true)], now);
+        node.neighbours([(c, &a.link, true, false), (c, &b.link, true, false)], now);
         // The first interval offers the root to both new neighbours.
         advance(&mut node, &mut now, Duration::from_secs(2));
         assert_eq!(sent(&mut a), [(c, root(1), false)]);
         assert_eq!(sent(&mut b), [(c, root(1), false)]);
 
-        assert_eq!(node.heard(A, c, root(1), false, now), None);
+        assert!(node.heard(A, c, state(1), false, now).is_empty());
         assert!(sent(&mut a).is_empty());
         // The joins asked for a second short interval, two to four seconds,
         // and it skips A only.
@@ -344,25 +461,31 @@ mod tests {
         let (mut x, mut y) = (Announcements::default(), Announcements::default());
         let (x_id, y_id) = ([1; 32], [2; 32]);
         let (mut to_x, mut to_y) = (wire(1, x_id), wire(1, y_id));
-        y.observe([(c, root(20))], start);
-        y.neighbours([(c, &to_x.link, true)], start);
+        y.observe([(c, state(20))], start);
+        y.neighbours([(c, &to_x.link, true, false)], start);
         let mut now = start;
         advance(&mut y, &mut now, Duration::from_secs(2));
         assert_eq!(sent(&mut to_x), [(c, root(20), false)]);
 
         // X's first opportunity comes later, between 2.5 and 3.5 seconds.
         let joined = start + Duration::from_millis(1_500);
-        x.observe([(c, root(10))], joined);
-        x.neighbours([(c, &to_y.link, true)], joined);
-        assert_eq!(x.heard(y_id, c, root(20), false, now), Some((y_id, c)));
+        x.observe([(c, state(10))], joined);
+        x.neighbours([(c, &to_y.link, true, false)], joined);
+        assert_eq!(
+            x.heard(y_id, c, state(20), false, now),
+            [(y_id, c, PullKind::Records)]
+        );
         assert_eq!(sent(&mut to_y), [(c, root(10), true)]);
         advance(&mut x, &mut now, Duration::from_millis(1_500));
         assert!(sent(&mut to_y).is_empty(), "the reply was the announcement");
         // While its pull runs, X answers Y's announcements no more.
-        assert_eq!(x.heard(y_id, c, root(21), false, now), None);
+        assert!(x.heard(y_id, c, state(21), false, now).is_empty());
         assert!(sent(&mut to_y).is_empty());
 
-        assert_eq!(y.heard(x_id, c, root(10), true, now), Some((x_id, c)));
+        assert_eq!(
+            y.heard(x_id, c, state(10), true, now),
+            [(x_id, c, PullKind::Records)]
+        );
         assert!(sent(&mut to_x).is_empty());
     }
 
@@ -371,9 +494,15 @@ mod tests {
         let (busy, quiet) = (collection(3), collection(4));
         let start = crate::clock::mono_now();
         let mut node = Announcements::default();
-        node.observe([(busy, root(0)), (quiet, root(0))], start);
+        node.observe([(busy, state(0)), (quiet, state(0))], start);
         let mut peer = wire(1, A);
-        node.neighbours([(busy, &peer.link, true), (quiet, &peer.link, true)], start);
+        node.neighbours(
+            [
+                (busy, &peer.link, true, false),
+                (quiet, &peer.link, true, false),
+            ],
+            start,
+        );
         let mut announced = HashMap::<CollectionHandle, Vec<Duration>>::new();
         let mut now = start;
         for step in 1..=2_400_u32 {
@@ -381,7 +510,7 @@ mod tests {
             node.poll(now);
             // A local append to the busy collection every second.
             if step % 10 == 0 {
-                node.observe([(busy, root(step)), (quiet, root(0))], now);
+                node.observe([(busy, state(step)), (quiet, state(0))], now);
             }
             for (collection, _, _) in sent(&mut peer) {
                 announced
@@ -423,37 +552,41 @@ mod tests {
         let c = collection(5);
         let mut now = crate::clock::mono_now();
         let mut node = Announcements::default();
-        node.observe([(c, root(0))], now);
+        node.observe([(c, state(0))], now);
         let (mut a, mut b) = (wire(1, A), wire(2, B));
-        node.neighbours([(c, &a.link, true), (c, &b.link, true)], now);
+        node.neighbours([(c, &a.link, true, false), (c, &b.link, true, false)], now);
         // Quiet long enough to reach sixty-second intervals.
         advance(&mut node, &mut now, Duration::from_secs(200));
         sent(&mut a);
         sent(&mut b);
 
-        assert_eq!(node.heard(A, c, root(100), false, now), Some((A, c)));
+        assert_eq!(
+            node.heard(A, c, state(100), false, now),
+            [(A, c, PullKind::Records)]
+        );
         assert_eq!(sent(&mut a), [(c, root(0), true)]);
         let mut during = Vec::new();
         for landed in 1..=50 {
             advance(&mut node, &mut now, Duration::from_secs(1));
-            node.observe([(c, root(landed))], now);
+            node.observe([(c, state(landed))], now);
             during.extend(sent(&mut b));
         }
         assert!(during.len() <= 1, "{during:?}");
 
         let merged = root(50);
-        let ended = RecordPullDone {
+        let ended = PullDone {
+            kind: PullKind::Records,
             peer: A,
             collection: c,
             root: root(100),
             completed: true,
         };
-        assert_eq!(node.ended(ended, now), None);
+        assert!(node.ended(ended, now).is_empty());
         advance(&mut node, &mut now, Duration::from_secs(2));
         assert_eq!(sent(&mut b), [(c, merged, false)]);
         // A's walked root now ends a comparison as an equal one would.
         sent(&mut a);
-        assert_eq!(node.heard(A, c, root(100), false, now), None);
+        assert!(node.heard(A, c, state(100), false, now).is_empty());
         assert!(sent(&mut a).is_empty());
     }
 
@@ -462,31 +595,108 @@ mod tests {
         let c = collection(6);
         let now = crate::clock::mono_now();
         let mut node = Announcements::default();
-        node.observe([(c, root(0))], now);
+        node.observe([(c, state(0))], now);
         let a = wire(1, A);
-        node.neighbours([(c, &a.link, true)], now);
-        let walked = |number| RecordPullDone {
+        node.neighbours([(c, &a.link, true, false)], now);
+        let walked = |number| PullDone {
+            kind: PullKind::Records,
             peer: A,
             collection: c,
             root: root(number),
             completed: true,
         };
 
-        assert_eq!(node.heard(A, c, root(1), false, now), Some((A, c)));
-        assert_eq!(node.heard(A, c, root(2), false, now), None);
-        assert_eq!(node.heard(A, c, root(1), true, now), None);
+        assert_eq!(
+            node.heard(A, c, state(1), false, now),
+            [(A, c, PullKind::Records)]
+        );
+        assert!(node.heard(A, c, state(2), false, now).is_empty());
+        assert!(node.heard(A, c, state(1), true, now).is_empty());
         // The latest one equals the walked root.
-        assert_eq!(node.ended(walked(1), now), None);
+        assert!(node.ended(walked(1), now).is_empty());
 
-        assert_eq!(node.heard(A, c, root(3), false, now), Some((A, c)));
-        assert_eq!(node.heard(A, c, root(4), true, now), None);
-        assert_eq!(node.ended(walked(3), now), Some((A, c)));
+        assert_eq!(
+            node.heard(A, c, state(3), false, now),
+            [(A, c, PullKind::Records)]
+        );
+        assert!(node.heard(A, c, state(4), true, now).is_empty());
+        assert_eq!(node.ended(walked(3), now), [(A, c, PullKind::Records)]);
         // A pull that did not complete leaves no walked root behind.
-        let failed = RecordPullDone {
+        let failed = PullDone {
             completed: false,
             ..walked(4)
         };
-        assert_eq!(node.ended(failed, now), None);
-        assert_eq!(node.heard(A, c, root(4), true, now), Some((A, c)));
+        assert!(node.ended(failed, now).is_empty());
+        assert_eq!(
+            node.heard(A, c, state(4), true, now),
+            [(A, c, PullKind::Records)]
+        );
+    }
+
+    /// A side that replicates C in full announces its held digest only to
+    /// neighbours that do too, periodically and in replies.
+    #[test]
+    fn demand_neighbours_get_no_held_digest() {
+        let c = collection(7);
+        let mut now = crate::clock::mono_now();
+        let mut node = Announcements::default();
+        node.observe([(c, full(1, 2))], now);
+        let (mut a, mut b) = (wire(1, A), wire(2, B));
+        node.neighbours([(c, &a.link, true, true), (c, &b.link, true, false)], now);
+        advance(&mut node, &mut now, Duration::from_secs(2));
+        assert_eq!(announced(&mut a), [(root(1), Some(root(2)), false)]);
+        assert_eq!(announced(&mut b), [(root(1), None, false)]);
+
+        for (peer, wire) in [(A, &mut a), (B, &mut b)] {
+            assert_eq!(
+                node.heard(peer, c, state(3), false, now),
+                [(peer, c, PullKind::Records)]
+            );
+            let held = (peer == A).then_some(root(2));
+            assert_eq!(announced(wire), [(root(1), held, true)]);
+        }
+    }
+
+    /// Quiet Full neighbours with equal records: a different held digest
+    /// starts a reference pull and one reply, and the reply starts the
+    /// reverse pull. The digest a completed reference pull walked then ends a
+    /// comparison, and once both hold the union, announcements are equal.
+    #[test]
+    fn a_different_held_digest_starts_a_reference_pull_and_one_reply() {
+        let c = collection(8);
+        let now = crate::clock::mono_now();
+        let (mut x, mut y) = (Announcements::default(), Announcements::default());
+        let (x_id, y_id) = ([1; 32], [2; 32]);
+        let (mut to_x, mut to_y) = (wire(1, x_id), wire(1, y_id));
+        x.observe([(c, full(1, 10))], now);
+        y.observe([(c, full(1, 20))], now);
+        x.neighbours([(c, &to_y.link, true, true)], now);
+        y.neighbours([(c, &to_x.link, true, true)], now);
+
+        let references = |peer| [(peer, c, PullKind::References)];
+        assert_eq!(x.heard(y_id, c, full(1, 20), false, now), references(y_id));
+        assert_eq!(announced(&mut to_y), [(root(1), Some(root(10)), true)]);
+        assert_eq!(y.heard(x_id, c, full(1, 10), true, now), references(x_id));
+        assert!(announced(&mut to_x).is_empty(), "a reply is never answered");
+
+        let walked = |peer, held| PullDone {
+            peer,
+            collection: c,
+            kind: PullKind::References,
+            root: root(held),
+            completed: true,
+        };
+        assert!(x.ended(walked(y_id, 20), now).is_empty());
+        assert!(y.ended(walked(x_id, 10), now).is_empty());
+        // An announcement without a digest compares the root alone.
+        assert!(y.heard(x_id, c, state(1), false, now).is_empty());
+        // Before the union lands, the walked digest ends a comparison.
+        assert!(x.heard(y_id, c, full(1, 20), false, now).is_empty());
+        assert!(announced(&mut to_y).is_empty());
+        x.observe([(c, full(1, 30))], now);
+        y.observe([(c, full(1, 30))], now);
+        assert!(x.heard(y_id, c, full(1, 30), false, now).is_empty());
+        assert!(y.heard(x_id, c, full(1, 30), false, now).is_empty());
+        assert!(announced(&mut to_x).is_empty() && announced(&mut to_y).is_empty());
     }
 }

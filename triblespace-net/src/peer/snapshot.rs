@@ -12,7 +12,7 @@ use triblespace_core::blob::{Blob, BlobEncoding, TryFromBlob};
 use triblespace_core::capability::{CapabilityProof, CapabilityProofId};
 use triblespace_core::collection::{
     CollectionHandle, CollectionRead, CollectionRecord, CollectionRecordSelector, HeldBlobs,
-    HeldRead, HeldStore,
+    HeldRead,
 };
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{Inline, InlineEncoding};
@@ -119,24 +119,6 @@ where
                 host.sender.clone()
             };
             sender.fetch_blob(hash, budget).await
-        }
-    }
-
-    /// Record blobs peers reported in their collections' held sets; each is
-    /// held there from the store's next snapshot on if it is resident.
-    pub(crate) fn note_held(&self, reports: Vec<(CollectionHandle, RawHash)>)
-    where
-        S: HeldStore,
-    {
-        if reports.is_empty() {
-            return;
-        }
-        let mut guard = self.store.lock().expect("store mutex");
-        let Some(store) = guard.as_mut() else {
-            return;
-        };
-        for (collection, handle) in reports {
-            store.note_held(collection, Inline::new(handle));
         }
     }
 
