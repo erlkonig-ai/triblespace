@@ -140,7 +140,9 @@ pub enum ReconEvent {
     Frame(Link, Frame),
     /// The connection's `recon/1` stream ended while the connection stays
     /// open, and whatever ran on it with it. The connection's peerings and
-    /// queued frames outlive it: the dialler opens a new stream at once.
+    /// queued frames outlive it: the dialler opens a new stream at once. On
+    /// the accepting side a stream the dialler replaced before this side saw
+    /// it end also counts, reported before the new stream's first frame.
     Ended(Link),
     /// The connection closed; frames queued on it go nowhere.
     Closed(Link),
@@ -1224,7 +1226,9 @@ async fn recon<T: Transport, S: Service>(
         ))
     } else {
         state.recon.fetch_max(order, Ordering::SeqCst);
-        state.recon_live.store(true, Ordering::SeqCst);
+        // On the accepting side nothing else sets this flag, so a stream
+        // that finds it already set replaces one that never saw its end.
+        let replaces_live = state.recon_live.swap(true, Ordering::SeqCst);
         state.changed.notify_waiters();
         let ended = {
             let frames = async {
@@ -1247,7 +1251,13 @@ async fn recon<T: Transport, S: Service>(
                             service.recon(ReconEvent::Opened(link.clone())).await;
                         }
                         // A reopened `recon/1` repeats the connection's sequence.
-                        Err(_) if state.sequence.get() == Some(&sequence) => {}
+                        // If it replaced a stream still live here, that stream
+                        // ended unseen: say so before this one's first frame.
+                        Err(_) if state.sequence.get() == Some(&sequence) => {
+                            if replaces_live && state.announced.load(Ordering::SeqCst) {
+                                service.recon(ReconEvent::Ended(link.clone())).await;
+                            }
+                        }
                         Err(_) => {
                             return Err(FrameError::Violation(
                                 "recon/1 reopened with another sequence",
