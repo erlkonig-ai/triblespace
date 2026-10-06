@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, DuplexStream, ReadBuf
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{BlobStorePut, SnapshotSource};
 
-use crate::protocol::{OP_FIND_VALUE, TAG_DHT, recv_find_value_response};
+use crate::protocol::{OP_FIND_VALUE, TAG_DHT, recv_find_value_response, send_hash};
 use crate::provider::MAX_PROVIDERS_PER_REPLY;
 
 use super::*;
@@ -125,7 +125,7 @@ async fn find_value(
 }
 
 #[tokio::test]
-async fn find_value_answers_find_node_routes_and_provider_hints_in_one_reply() {
+async fn find_value_answers_routes_and_provider_hints_in_one_reply() {
     let provider_key = SigningKey::from_bytes(&[91; 32]);
     let requester_key = SigningKey::from_bytes(&[92; 32]);
     let provider = provider_key.verifying_key().to_bytes();
@@ -182,6 +182,8 @@ async fn find_value_answers_find_node_routes_and_provider_hints_in_one_reply() {
         }
         assert!(routes.closest_verified(unheld, K + 1).len() > K);
     }
+    let mut nearest = routes.lock().unwrap().closest_verified(unheld, K);
+    nearest.retain(|route| *route != requester);
     let resident = blob_locator(hash);
     let foreign = (100..200_u8)
         .map(|byte| {
@@ -206,35 +208,34 @@ async fn find_value_answers_find_node_routes_and_provider_hints_in_one_reply() {
 
     let (routes, hints) = find_value(&connection, unheld).await;
     assert_eq!(routes.len(), K - 1, "the K closest, less the requester");
-    assert!(!routes.contains(&requester));
-    assert_eq!(routes, op_find_node(&connection, &unheld).await.unwrap());
-    assert_eq!(hints.len(), 10);
-    assert_eq!(hints, op_provider_get(&connection, &unheld).await.unwrap());
+    assert_eq!(routes, nearest);
+    assert_eq!(
+        hints,
+        foreign
+            .iter()
+            .take(10)
+            .map(|(peer, token)| (*peer, *token))
+            .collect::<Vec<_>>()
+    );
 
-    // Above the reply limit both lookups sample the stored leases behind
-    // this node's own resident hint, and repeated requests reach every lease,
-    // the highest peer id included. A lease is missed by one reply with
+    // Above the reply limit a reply samples the stored leases behind this
+    // node's own resident hint, and repeated requests reach every lease, the
+    // highest peer id included. A lease is missed by one reply with
     // probability 37/100, so by 64 replies with probability below 1e-27.
     let own = (provider, blob_provider_token(hash, provider));
-    for provider_get in [false, true] {
-        let mut seen = BTreeMap::new();
-        for _ in 0..64 {
-            let hints = if provider_get {
-                op_provider_get(&connection, &resident).await.unwrap()
-            } else {
-                find_value(&connection, resident).await.1
-            };
-            assert_eq!(hints.len(), MAX_PROVIDERS_PER_REPLY);
-            assert_eq!(hints[0], own);
-            assert!(hints[1..].windows(2).all(|pair| pair[0].0 < pair[1].0));
-            assert!(
-                hints[1..]
-                    .iter()
-                    .all(|(peer, token)| foreign.get(peer) == Some(token))
-            );
-            seen.extend(hints[1..].iter().copied());
-        }
-        assert_eq!(seen, foreign, "PROVIDER_GET: {provider_get}");
+    let mut seen = BTreeMap::new();
+    for _ in 0..64 {
+        let hints = find_value(&connection, resident).await.1;
+        assert_eq!(hints.len(), MAX_PROVIDERS_PER_REPLY);
+        assert_eq!(hints[0], own);
+        assert!(hints[1..].windows(2).all(|pair| pair[0].0 < pair[1].0));
+        assert!(
+            hints[1..]
+                .iter()
+                .all(|(peer, token)| foreign.get(peer) == Some(token))
+        );
+        seen.extend(hints[1..].iter().copied());
     }
+    assert_eq!(seen, foreign);
     assert_eq!(blob_reads.load(Ordering::Relaxed), 0);
 }

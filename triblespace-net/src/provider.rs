@@ -69,7 +69,7 @@ const MAX_EXPIRED_PROVIDER_MEMBERSHIPS_PER_CALL: usize = 64;
 ///
 /// `identity` is H for a blob lease or the collection handle for a collection
 /// lease. A reader who knows H can compare this value with a
-/// `protocol::op_provider_get` reply without fetching the blob or sending the
+/// `protocol::op_find_value` reply without fetching the blob or sending the
 /// handle; directory nodes, which see only the locator, can neither check nor
 /// forge it. The token need not name the locator: a token copied under another
 /// locator fails the requester's check, which uses its own H. It cannot equal

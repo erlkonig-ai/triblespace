@@ -1,8 +1,9 @@
-//! Collection bootstrap uses authority hints and ordinary descriptor providers.
+//! Collection bootstrap through ordinary descriptor providers in the DHT.
 //!
 //! These tests run stock iroh-gossip over Iroh's in-memory packet transport,
 //! with endpoint lookup restricted to that transport: no DNS, relay, or external
-//! DHT service is involved. The provider directory is our real host protocol.
+//! DHT service is involved. The provider directory is our real host protocol,
+//! and every peer the reader finds, it finds through a FIND_VALUE lookup.
 
 use std::time::Duration;
 
@@ -109,71 +110,6 @@ async fn shutdown<const N: usize>(nodes: [(Peer<MemoryRepo>, JoinHandle<()>); N]
             .expect("host did not shut down")
             .expect("host panicked");
     }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cold_policy_roots_bootstrap_gossip_without_provider_publication_or_configured_peers() {
-    let network = TestNetwork::new();
-    let source_key = key(0xD1);
-    let reader_key = key(0xD2);
-    let source_endpoint = endpoint(&network, &source_key).await;
-    let reader_endpoint = endpoint(&network, &reader_key).await;
-    let source_id = source_endpoint.id();
-    let admission = AdmissionPolicy::quorum(
-        [source_key.verifying_key(), reader_key.verifying_key()],
-        1,
-        None,
-    )
-    .unwrap();
-    let policy = CollectionPolicy::new(admission.clone(), admission);
-    let mut source_store = MemoryRepo::default();
-    let mut reader_store = MemoryRepo::default();
-    let collection = source_store
-        .collection("cold-root-gossip-bootstrap", policy.clone())
-        .unwrap()
-        .handle();
-    assert_eq!(
-        reader_store
-            .collection("cold-root-gossip-bootstrap", policy)
-            .unwrap()
-            .handle(),
-        collection
-    );
-    let record = CollectionRecord::Commit(CollectionCommit::sign(
-        &source_key,
-        collection,
-        CollectionData::new([0xD3; 32]),
-        empty_metadata_handle(),
-    ));
-    source_store.insert(record).unwrap();
-    let (mut source, source_owner) =
-        bring_up(source_endpoint, source_store, Vec::new(), Some(0)).await;
-    let (mut reader, reader_owner) =
-        bring_up(reader_endpoint, reader_store, Vec::new(), Some(0)).await;
-    source.activate_collection(collection);
-    reader.activate_collection(collection);
-
-    drive_until(&mut [&mut source, &mut reader], |peers| {
-        contains(peers[1], record)
-            && peers[1].health().collections.iter().any(|state| {
-                state.collection == collection
-                    && state
-                        .peers
-                        .iter()
-                        .any(|peer| peer.peer == *source_id.as_bytes() && peer.comparison.is_some())
-            })
-    })
-    .await;
-    assert_eq!(source.health().publication.attempts, 0);
-    assert_eq!(reader.health().publication.attempts, 0);
-    assert!(reader.health().collections.iter().any(|state| {
-        state.collection == collection
-            && state
-                .peers
-                .iter()
-                .any(|peer| peer.peer == *source_id.as_bytes() && peer.comparison.is_some())
-    }));
-    shutdown([(source, source_owner), (reader, reader_owner)]).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

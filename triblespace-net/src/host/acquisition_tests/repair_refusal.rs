@@ -7,7 +7,7 @@ use triblespace_core::collection::{
 
 use crate::collection_session::CollectionRepairRefusal;
 use crate::collection_wire::{recv_repair_collection, recv_repair_hello};
-use crate::protocol::{TAG_DHT, TAG_REPAIR};
+use crate::protocol::{TAG_DHT, TAG_REPAIR, recv_find_value_response};
 
 use super::*;
 
@@ -195,7 +195,7 @@ async fn refusal_preserves_other_streams(expected: CollectionRepairRefusal) {
         .unwrap();
     let (mut held_send, mut held_recv) = connection.open_bi().await.unwrap();
     send_u8(&mut held_send, TAG_DHT).await.unwrap();
-    send_u8(&mut held_send, OP_FIND_NODE).await.unwrap();
+    send_u8(&mut held_send, OP_FIND_VALUE).await.unwrap();
     send_hash(&mut held_send, &[0; 32]).await.unwrap();
     // Withhold EOF: a real served stream and its permit remain live across
     // the collection refusal, not merely an unused client handle.
@@ -207,7 +207,7 @@ async fn refusal_preserves_other_streams(expected: CollectionRepairRefusal) {
         }
     })
     .await
-    .expect("unrelated FIND_NODE did not reach the server");
+    .expect("unrelated FIND_VALUE did not reach the server");
     let collection = match expected {
         CollectionRepairRefusal::Rejected => fixture.rejected,
         CollectionRepairRefusal::Unavailable => fixture.unavailable,
@@ -233,9 +233,10 @@ async fn refusal_preserves_other_streams(expected: CollectionRepairRefusal) {
         .shutdown()
         .await
         .expect("refusal closed an unrelated request");
-    assert_eq!(recv_u8(&mut held_recv).await.unwrap(), 0);
-    let mut trailing = [0; 1];
-    assert_eq!(held_recv.read(&mut trailing).await.unwrap(), 0);
+    assert_eq!(
+        recv_find_value_response(&mut held_recv).await.unwrap(),
+        (vec![], vec![])
+    );
     assert!(
         !fixture
             .repair(fixture.allowed)

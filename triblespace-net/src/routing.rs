@@ -355,7 +355,8 @@ impl IterativeLookup {
         pending
     }
 
-    /// Accept a bounded FIND_NODE reply from a peer in the current batch.
+    /// Accept the bounded routes of a FIND_VALUE reply from a peer in the
+    /// current batch.
     ///
     /// `candidates` may itself be oversized or duplicate-heavy; only its
     /// deterministic [`K`] closest distinct identities are retained. The
@@ -1248,7 +1249,7 @@ mod tests {
 
     /// Deterministic, opt-in capacity probe for the private iterative XOR
     /// lookup. All work is in-process: elapsed time measures local lookup plus
-    /// synthetic FIND_NODE reply selection, never transport latency.
+    /// synthetic lookup reply selection, never transport latency.
     ///
     /// Run with `cargo test -p triblespace-net --release
     /// iterative_lookup_scale_probe -- --ignored --nocapture`.

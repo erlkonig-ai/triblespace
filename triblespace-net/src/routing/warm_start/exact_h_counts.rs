@@ -1,5 +1,5 @@
 //! Bounded operation counts through the real routing machine, with synthetic
-//! authenticated FIND_NODE replies. Keys are already in rendezvous space:
+//! authenticated FIND_VALUE routes. Keys are already in rendezvous space:
 //! adjacency here makes no claim about adjacency between raw blob handles.
 //! Logical rounds drain one batch at a time; they are not elapsed time or the
 //! host's asynchronous completion order. No connection, provider PUT, directory
@@ -75,7 +75,7 @@ fn count_sequence(
                 links: server_routes
                     .iter()
                     .map(|(&peer, routes)| {
-                        // Match the host's FIND_NODE reply: verified nearest K,
+                        // Match the routes of the host's FIND_VALUE reply: verified nearest K,
                         // then remove the requesting client's own identity.
                         let mut referrals = routes.closest_verified(target, K);
                         referrals.retain(|candidate| *candidate != local);
@@ -104,7 +104,7 @@ fn count_sequence(
                     .all(|peer| network.links.contains_key(peer))
             );
 
-            // Exact host lookup_replicas selection rule. The local directory
+            // Exact host ReplicaLookup::replicas selection rule. The local directory
             // placement is not a remote PUT and must not contribute to R.
             let mut replicas = observed.responders;
             replicas.push(local);

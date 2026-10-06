@@ -121,8 +121,7 @@ impl Trace {
         for call in self.requests() {
             let call = call.lock().unwrap();
             match call.op {
-                Some(OP_FIND_NODE) => counts.find += 1,
-                Some(OP_PROVIDER_GET) => counts.directory += 1,
+                Some(OP_FIND_VALUE) => counts.find += 1,
                 Some(OP_PROVIDER_PUT) => counts.put += 1,
                 Some(TAG_BLOB) => counts.body += 1,
                 None => counts.no_opcode += 1,
@@ -182,34 +181,7 @@ impl Trace {
         self.assert_request_bound();
     }
 
-    fn assert_authenticated_directories(&self) {
-        let calls = self.requests();
-        let mut queried = BTreeSet::new();
-        for call in calls.iter() {
-            let call = call.lock().unwrap();
-            if call.op != Some(OP_PROVIDER_GET) {
-                continue;
-            }
-            let peer = call.peer;
-            let opened = call.opened;
-            drop(call);
-            assert!(queried.insert(peer), "directory targets are deduplicated");
-            assert!(
-                calls.iter().any(|find| {
-                    let find = find.lock().unwrap();
-                    find.peer == peer
-                        && find.op == Some(OP_FIND_NODE)
-                        && find
-                            .response_eof
-                            .is_some_and(|end| end.order < opened.order)
-                }),
-                "a directory target must first answer FIND directly; referrals are not authentication"
-            );
-        }
-    }
-
     fn assert_stage_order(&self, holder: PeerId, returned: Event) {
-        self.assert_authenticated_directories();
         self.assert_closed_before(returned);
         let calls = self.requests();
         let body = calls
@@ -226,10 +198,12 @@ impl Trace {
         let first_body = body.first_body_byte.unwrap();
         let body_eof = body.response_eof.unwrap();
         drop(body);
+        // A reply carrying a hint has at least its two counts and one
+        // 64-byte hint. The fixtures' routes alone never reach that size.
         let hint_completed = calls.iter().any(|call| {
             let call = call.lock().unwrap();
-            call.op == Some(OP_PROVIDER_GET)
-                && call.response_bytes >= 65
+            call.op == Some(OP_FIND_VALUE)
+                && call.response_bytes >= 66
                 && call
                     .response_eof
                     .is_some_and(|end| end.order < opened.order)
@@ -248,8 +222,8 @@ impl Trace {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Counts {
+    /// FIND_VALUE requests: one per lookup hop, routes and hints together.
     find: usize,
-    directory: usize,
     put: usize,
     body: usize,
     no_opcode: usize,
@@ -702,24 +676,21 @@ async fn exact_h_repeated_fetches_count_rpcs_not_simulator_throughput() {
                     (counts.find, counts.body, counts.put, counts.no_opcode),
                     (2, 1, 0, 0)
                 );
-                // Success may cancel an unrelated reply, or return before its
-                // directory query starts. Audit every observed RPC's framing
-                // instead of requiring a particular completion race.
-                assert!((1..=2).contains(&counts.directory));
+                // Success may cancel the other replica's reply. Audit every
+                // observed RPC's framing instead of requiring a particular
+                // completion race.
                 assert_eq!(
                     counts.completed + counts.dropped_without_eof,
-                    counts.find + counts.directory + counts.body
+                    counts.find + counts.body
                 );
-                assert_eq!(
-                    counts.request_bytes,
-                    (counts.find + counts.directory) * 34 + 65
-                );
+                assert_eq!(counts.request_bytes, counts.find * 34 + 65);
                 for call in trace.requests() {
                     let call = call.lock().unwrap();
                     let response_bytes = match call.op.unwrap() {
-                        OP_FIND_NODE => 1,
-                        OP_PROVIDER_GET => {
-                            1 + 64 * usize::from(call.peer == fixture.holder.peer || advertised)
+                        // Two counts and no routes: neither replica knows
+                        // another node. The holder answers its own hint.
+                        OP_FIND_VALUE => {
+                            2 + 64 * usize::from(call.peer == fixture.holder.peer || advertised)
                         }
                         TAG_BLOB => 41 + BODY_BYTES,
                         op => panic!("unexpected fetch opcode {op:#x}"),
@@ -751,70 +722,59 @@ async fn exact_h_repeated_fetches_count_rpcs_not_simulator_throughput() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn exact_h_responsive_body_precedes_stalled_routing_or_directory_drop() {
+async fn exact_h_responsive_body_precedes_a_stalled_lookup_reply_and_drops_it() {
     let _guard = crate::protocol::exact_blob_receive_test_guard();
-    for opcode in [OP_FIND_NODE, OP_PROVIDER_GET] {
-        let gate = Gate::new(opcode);
-        let mut fixture = ThreeNodes::new(false, Some(gate.clone()));
-        fixture.warm_connections().await;
-        let started = Instant::now();
-        {
-            let fetch = fixture.client.fetch_blob(fixture.hash, None);
-            tokio::pin!(fetch);
-            tokio::select! {
-                _ = gate.entered.notified() => {},
-                result = &mut fetch => panic!("fetch completed before controlled stage was reached: {result:?}"),
-                _ = tokio::time::sleep(Duration::from_secs(1)) => panic!("fixture did not reach controlled stage"),
-            }
-            let entered = fixture.other.trace.counts();
-            assert_eq!(entered.find, 1);
-            if opcode == OP_PROVIDER_GET {
-                assert_eq!(entered.directory, 1);
-            }
-            let bytes = tokio::time::timeout(Duration::from_secs(1), &mut fetch)
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
-            assert_eq!(bytes.bytes, fixture.bytes);
+    let gate = Gate::new(OP_FIND_VALUE);
+    let mut fixture = ThreeNodes::new(false, Some(gate.clone()));
+    fixture.warm_connections().await;
+    let started = Instant::now();
+    {
+        let fetch = fixture.client.fetch_blob(fixture.hash, None);
+        tokio::pin!(fetch);
+        tokio::select! {
+            _ = gate.entered.notified() => {},
+            result = &mut fetch => panic!("fetch completed before controlled stage was reached: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_secs(1)) => panic!("fixture did not reach controlled stage"),
         }
-        let returned = fixture.trace().mark();
-        let counts = fixture.trace().counts();
-        fixture
-            .trace()
-            .assert_stage_order(fixture.holder.peer, returned);
-        assert_eq!(
-            (counts.find, counts.body, counts.put, counts.no_opcode),
-            (2, 1, 0, 0)
-        );
-        assert_eq!(counts.dropped_without_eof, 1);
-        assert!(returned.at.duration_since(started) < Duration::from_secs(1));
-        let body = fixture.trace().call(fixture.holder.peer, TAG_BLOB);
-        let body_eof = body.lock().unwrap().response_eof.unwrap();
-        let stalled = fixture.trace().call(fixture.other.peer, opcode);
-        let stalled = stalled.lock().unwrap();
-        assert!(stalled.response_eof.is_none());
-        assert_eq!(stalled.response_bytes, 0);
-        assert!(stalled.opened.order < body_eof.order);
-        assert!(body_eof.order < stalled.receiver_dropped.unwrap().order);
-        if opcode == OP_FIND_NODE {
-            assert_eq!((counts.directory, counts.completed), (1, 3));
-        } else {
-            assert_eq!((counts.directory, counts.completed), (2, 4));
-        }
-        println!(
-            "exact_h_stall opcode={opcode:#x} virtual_us={} {counts:?}",
-            returned.at.duration_since(started).as_micros()
-        );
-        fixture.assert_no_control_effects();
+        assert_eq!(fixture.other.trace.counts().find, 1);
+        let bytes = tokio::time::timeout(Duration::from_secs(1), &mut fetch)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(bytes.bytes, fixture.bytes);
     }
+    let returned = fixture.trace().mark();
+    let counts = fixture.trace().counts();
+    fixture
+        .trace()
+        .assert_stage_order(fixture.holder.peer, returned);
+    assert_eq!(
+        (counts.find, counts.body, counts.put, counts.no_opcode),
+        (2, 1, 0, 0)
+    );
+    assert_eq!((counts.completed, counts.dropped_without_eof), (2, 1));
+    assert!(returned.at.duration_since(started) < Duration::from_secs(1));
+    let body = fixture.trace().call(fixture.holder.peer, TAG_BLOB);
+    let body_eof = body.lock().unwrap().response_eof.unwrap();
+    let stalled = fixture.trace().call(fixture.other.peer, OP_FIND_VALUE);
+    let stalled = stalled.lock().unwrap();
+    assert!(stalled.response_eof.is_none());
+    assert_eq!(stalled.response_bytes, 0);
+    assert!(stalled.opened.order < body_eof.order);
+    assert!(body_eof.order < stalled.receiver_dropped.unwrap().order);
+    println!(
+        "exact_h_stall virtual_us={} {counts:?}",
+        returned.at.duration_since(started).as_micros()
+    );
+    fixture.assert_no_control_effects();
 }
 
 #[tokio::test(start_paused = true)]
 async fn exact_h_routing_expiry_keeps_a_pending_body_within_the_caller_deadline() {
     let _guard = crate::protocol::exact_blob_receive_test_guard();
     let body_gate = Gate::new(TAG_BLOB);
-    let find_gate = Gate::new(OP_FIND_NODE);
+    let find_gate = Gate::new(OP_FIND_VALUE);
     let mut fixture =
         ThreeNodes::with_gates(false, Some(body_gate.clone()), Some(find_gate.clone()));
     fixture.warm_connections().await;
@@ -837,7 +797,7 @@ async fn exact_h_routing_expiry_keeps_a_pending_body_within_the_caller_deadline(
             _ = tokio::time::sleep(Duration::from_secs(1)) => panic!("controlled streams were not reached"),
         }
         let authenticated = trace
-            .call(fixture.holder.peer, OP_FIND_NODE)
+            .call(fixture.holder.peer, OP_FIND_VALUE)
             .lock()
             .unwrap()
             .response_eof
@@ -847,7 +807,7 @@ async fn exact_h_routing_expiry_keeps_a_pending_body_within_the_caller_deadline(
             result = &mut fetch => panic!("routing expiry ended a live provider request: {result:?}"),
             _ = tokio::time::sleep_until(routing_deadline + Duration::from_secs(1)) => {},
         }
-        let find = trace.call(fixture.other.peer, OP_FIND_NODE);
+        let find = trace.call(fixture.other.peer, OP_FIND_VALUE);
         let find = find.lock().unwrap();
         assert!(find.response_eof.is_none());
         routing_dropped = find.receiver_dropped.unwrap();
@@ -860,12 +820,8 @@ async fn exact_h_routing_expiry_keeps_a_pending_body_within_the_caller_deadline(
         assert!(body.receiver_dropped.is_none());
         drop(body);
         let counts = trace.counts();
-        assert_eq!(
-            (counts.find, counts.directory, counts.body, counts.completed),
-            (2, 1, 1, 2)
-        );
+        assert_eq!((counts.find, counts.body, counts.completed), (2, 1, 1));
         assert_eq!(counts.dropped_without_eof, 1);
-        trace.assert_authenticated_directories();
         trace.assert_request_bound();
         released = trace.mark();
         assert!(routing_dropped.order < released.order);
@@ -882,15 +838,15 @@ async fn exact_h_routing_expiry_keeps_a_pending_body_within_the_caller_deadline(
     assert!(returned.at < caller_deadline);
     assert_eq!(returned.at.duration_since(started), Duration::from_secs(4));
     let counts = trace.counts();
-    assert_eq!((counts.completed, counts.dropped_without_eof), (3, 1));
+    assert_eq!((counts.completed, counts.dropped_without_eof), (2, 1));
     assert_eq!(fixture.reads.load(Ordering::Relaxed), 1);
     fixture.assert_no_control_effects();
 }
 
 #[tokio::test(start_paused = true)]
-async fn exact_h_empty_early_directory_waits_for_referred_holder_authentication() {
+async fn exact_h_empty_first_hop_waits_for_the_referred_holder() {
     let _guard = crate::protocol::exact_blob_receive_test_guard();
-    let gate = Gate::new(OP_FIND_NODE);
+    let gate = Gate::new(OP_FIND_VALUE);
     let mut fixture = ThreeNodes::with_gates(false, Some(gate.clone()), None);
     *fixture.client.candidates.lock().unwrap() =
         RoutingTable::new(fixture.client.my_id, [fixture.other.peer]);
@@ -909,28 +865,25 @@ async fn exact_h_empty_early_directory_waits_for_referred_holder_authentication(
         tokio::select! {
             _ = gate.entered.notified() => {},
             result = &mut fetch => panic!("fetch ended before the referred holder answered: {result:?}"),
-            _ = tokio::time::sleep(Duration::from_secs(1)) => panic!("holder FIND was not reached"),
+            _ = tokio::time::sleep(Duration::from_secs(1)) => panic!("holder FIND_VALUE was not reached"),
         }
-        // Allow ready empty-directory work to drain while the holder's FIND
-        // remains suspended. The ordinals below, not this paused-clock delay,
-        // prove that the empty answer was consumed before authentication.
+        // Allow ready work to drain while the holder's FIND_VALUE remains
+        // suspended. The ordinals below, not this paused-clock delay, prove
+        // that the first hop's hintless answer was consumed before it.
         tokio::select! {
-            result = &mut fetch => panic!("an early empty directory ended live routing: {result:?}"),
+            result = &mut fetch => panic!("a hintless first hop ended live routing: {result:?}"),
             _ = tokio::time::sleep(Duration::from_millis(1)) => {},
         }
         let counts = trace.counts();
-        assert_eq!(
-            (counts.find, counts.directory, counts.body, counts.completed),
-            (2, 1, 0, 2)
-        );
-        trace.assert_authenticated_directories();
+        assert_eq!((counts.find, counts.body, counts.completed), (2, 0, 1));
         trace.assert_request_bound();
-        let empty = trace.call(fixture.other.peer, OP_PROVIDER_GET);
+        let empty = trace.call(fixture.other.peer, OP_FIND_VALUE);
         let empty = empty.lock().unwrap();
-        assert_eq!(empty.response_bytes, 1);
+        // Two counts and one route, the holder; no hint.
+        assert_eq!(empty.response_bytes, 2 + 32);
         let empty_eof = empty.response_eof.unwrap();
         drop(empty);
-        let holder_find = trace.call(fixture.holder.peer, OP_FIND_NODE);
+        let holder_find = trace.call(fixture.holder.peer, OP_FIND_VALUE);
         assert!(holder_find.lock().unwrap().response_eof.is_none());
         released = trace.mark();
         assert!(empty_eof.order < released.order);
@@ -946,13 +899,10 @@ async fn exact_h_empty_early_directory_waits_for_referred_holder_authentication(
     }
     let returned = trace.mark();
     trace.assert_stage_order(fixture.holder.peer, returned);
-    let holder_find = trace.call(fixture.holder.peer, OP_FIND_NODE);
+    let holder_find = trace.call(fixture.holder.peer, OP_FIND_VALUE);
     assert!(released.order < holder_find.lock().unwrap().response_eof.unwrap().order);
     let counts = trace.counts();
-    assert_eq!(
-        (counts.find, counts.directory, counts.body, counts.completed),
-        (2, 2, 1, 5)
-    );
+    assert_eq!((counts.find, counts.body, counts.completed), (2, 1, 3));
     assert_eq!(counts.dropped_without_eof, 0);
     assert_eq!(fixture.reads.load(Ordering::Relaxed), 1);
     fixture.assert_no_control_effects();
@@ -961,8 +911,8 @@ async fn exact_h_empty_early_directory_waits_for_referred_holder_authentication(
 #[tokio::test(start_paused = true)]
 async fn exact_h_stale_early_hints_leave_room_for_fresh_routing_and_final_holder() {
     let _guard = crate::protocol::exact_blob_receive_test_guard();
-    let holder_gate = Gate::new(OP_FIND_NODE);
-    let relay_gate = Gate::new(OP_FIND_NODE);
+    let holder_gate = Gate::new(OP_FIND_VALUE);
+    let relay_gate = Gate::new(OP_FIND_VALUE);
     let mut fixture = ThreeNodes::with_gates(false, Some(holder_gate.clone()), None);
     let mut relay = Node::new(
         &fixture.net,
@@ -972,39 +922,40 @@ async fn exact_h_stale_early_hints_leave_room_for_fresh_routing_and_final_holder
     );
     let key = blob_locator(fixture.hash);
     // Deterministic fixture identities, bounded independently of routing.
-    // Every stale hint and the later directory are farther than the holder:
-    // routing reaches the holder first, its directory precedes the later one,
-    // and its useful hint outranks the third still-pending stale provider.
-    let mut farther: Vec<_> = (0_u16..4096)
-        .filter_map(|seed| {
+    // The later replica is farther than the holder, so routing reaches the
+    // holder first. Every stale hint ranks behind the holder for this
+    // requester, so the holder's useful hint outranks the third, still
+    // pending, stale provider. A fixed salt keeps the selection fixed.
+    fixture.client.salt = [156; 32];
+    let rank = |peer| provider_rank(&fixture.client.salt, key, peer);
+    let mut identities = (0_u16..4096)
+        .map(|seed| {
             let mut secret = [156; 32];
             secret[..2].copy_from_slice(&seed.to_le_bytes());
-            let signing = SigningKey::from_bytes(&secret);
-            let peer = signing.verifying_key().to_bytes();
-            (![
+            SigningKey::from_bytes(&secret)
+        })
+        .filter(|signing| {
+            ![
                 fixture.client.my_id,
                 fixture.holder.peer,
                 fixture.other.peer,
                 relay.peer,
             ]
-            .contains(&peer)
-                && crate::routing::distance_cmp(key, peer, fixture.holder.peer).is_gt())
-            .then_some(signing)
+            .contains(&signing.verifying_key().to_bytes())
+        });
+    let later = identities
+        .by_ref()
+        .find(|signing| {
+            let peer = signing.verifying_key().to_bytes();
+            crate::routing::distance_cmp(key, peer, fixture.holder.peer).is_gt()
         })
-        .take(4)
+        .expect("bounded fixture must supply a farther replica");
+    let mut later = Node::new(&fixture.net, &later, None, None);
+    let stale: Vec<_> = identities
+        .filter(|signing| rank(signing.verifying_key().to_bytes()) > rank(fixture.holder.peer))
+        .take(3)
         .collect();
-    assert_eq!(
-        farther.len(),
-        4,
-        "bounded fixture must supply four farther peers"
-    );
-    let mut later_directory = Node::new(
-        &fixture.net,
-        &farther.pop().unwrap(),
-        None,
-        Some(Gate::new(OP_PROVIDER_GET)),
-    );
-    let mut slow: Vec<_> = farther
+    let mut slow: Vec<_> = stale
         .into_iter()
         .map(|signing| {
             let gate = Gate::new(TAG_BLOB);
@@ -1017,11 +968,9 @@ async fn exact_h_stale_early_hints_leave_room_for_fresh_routing_and_final_holder
     assert_eq!(
         slow.len(),
         3,
-        "bounded fixture must supply three farther hints"
+        "bounded fixture must supply three lower-ranked hints"
     );
-    slow.sort_unstable_by(|(left, _), (right, _)| {
-        crate::routing::distance_cmp(key, left.peer, right.peer)
-    });
+    slow.sort_unstable_by_key(|(node, _)| rank(node.peer));
     for (node, _) in &slow {
         assert!(fixture.other.directory.lock().unwrap().put(
             key,
@@ -1038,11 +987,11 @@ async fn exact_h_stale_early_hints_leave_room_for_fresh_routing_and_final_holder
         .lock()
         .unwrap()
         .promote_authenticated(relay.peer);
-    for peer in [fixture.holder.peer, later_directory.peer] {
+    for peer in [fixture.holder.peer, later.peer] {
         relay.candidates.lock().unwrap().promote_authenticated(peer);
     }
     fixture.warm_connections().await;
-    for peer in [relay.peer, later_directory.peer]
+    for peer in [relay.peer, later.peer]
         .into_iter()
         .chain(slow.iter().map(|(node, _)| node.peer))
     {
@@ -1084,11 +1033,11 @@ async fn exact_h_stale_early_hints_leave_room_for_fresh_routing_and_final_holder
             result = &mut fetch => panic!("fetch ended before fresh holder routing: {result:?}"),
             _ = tokio::time::sleep(Duration::from_secs(1)) => panic!("stale providers occupied the reserved routing slot"),
         }
-        let holder_find = trace.call(fixture.holder.peer, OP_FIND_NODE);
+        let holder_find = trace.call(fixture.holder.peer, OP_FIND_VALUE);
         assert!(relay_released.order < holder_find.lock().unwrap().opened.order);
         assert_eq!(trace.counts().body, 2);
         assert_eq!(slow[2].0.trace.counts(), Counts::default());
-        assert_eq!(later_directory.trace.counts(), Counts::default());
+        assert_eq!(later.trace.counts(), Counts::default());
         trace.assert_request_bound();
         holder_gate.release();
         assert_eq!(
@@ -1099,16 +1048,17 @@ async fn exact_h_stale_early_hints_leave_room_for_fresh_routing_and_final_holder
     let returned = trace.mark();
     trace.assert_stage_order(fixture.holder.peer, returned);
     assert!(returned.at < caller_deadline);
-    let later_find = trace.call(later_directory.peer, OP_FIND_NODE);
+    // The holder's own reply carried its hint. With both data slots held by
+    // stale bodies, its body waited for the reserved routing slot to finish
+    // the lookup at the later replica.
+    let holder_find = trace.call(fixture.holder.peer, OP_FIND_VALUE);
+    let holder_find_eof = holder_find.lock().unwrap().response_eof.unwrap();
+    let later_find = trace.call(later.peer, OP_FIND_VALUE);
     let later_find_eof = later_find.lock().unwrap().response_eof.unwrap();
-    let directory = trace.call(fixture.holder.peer, OP_PROVIDER_GET);
-    let directory = directory.lock().unwrap();
-    assert!(later_find_eof.order < directory.opened.order);
-    let directory_eof = directory.response_eof.unwrap();
-    drop(directory);
+    assert!(holder_find_eof.order < later_find_eof.order);
     let body = trace.call(fixture.holder.peer, TAG_BLOB);
     let body = body.lock().unwrap();
-    assert!(directory_eof.order < body.opened.order);
+    assert!(later_find_eof.order < body.opened.order);
     let body_eof = body.response_eof.unwrap();
     drop(body);
     for (node, _) in slow.iter().take(2) {
@@ -1118,16 +1068,15 @@ async fn exact_h_stale_early_hints_leave_room_for_fresh_routing_and_final_holder
         assert!(body_eof.order < stale.receiver_dropped.unwrap().order);
     }
     assert_eq!(slow[2].0.trace.counts(), Counts::default());
-    let later_counts = later_directory.trace.counts();
-    assert_eq!((later_counts.find, later_counts.directory), (1, 0));
+    assert_eq!(later.trace.counts().find, 1);
     assert_eq!(
         trace
             .requests()
             .iter()
-            .filter(|call| call.lock().unwrap().peer == later_directory.peer)
+            .filter(|call| call.lock().unwrap().peer == later.peer)
             .count(),
         1,
-        "the later directory has only its completed FIND; its GET must remain unstarted"
+        "the later replica answers one FIND_VALUE and nothing else"
     );
     let counts = trace.counts();
     assert_eq!(
@@ -1137,7 +1086,7 @@ async fn exact_h_stale_early_hints_leave_room_for_fresh_routing_and_final_holder
     assert_eq!(fixture.reads.load(Ordering::Relaxed), 1);
     fixture.assert_no_control_effects();
     assert!(relay.events.try_recv().is_err());
-    assert!(later_directory.events.try_recv().is_err());
+    assert!(later.events.try_recv().is_err());
     for (node, _) in &mut slow {
         assert!(node.events.try_recv().is_err());
     }
@@ -1146,10 +1095,10 @@ async fn exact_h_stale_early_hints_leave_room_for_fresh_routing_and_final_holder
 #[tokio::test(start_paused = true)]
 async fn exact_h_routing_and_data_share_alpha_and_caller_cancellation_drops_both() {
     let _guard = crate::protocol::exact_blob_receive_test_guard();
-    let holder_gate = Gate::new(OP_PROVIDER_GET);
-    let other_gate = Gate::new(OP_FIND_NODE);
-    let third_gate = Gate::new(OP_FIND_NODE);
-    let late_gate = Gate::new(OP_FIND_NODE);
+    let holder_gate = Gate::new(TAG_BLOB);
+    let other_gate = Gate::new(OP_FIND_VALUE);
+    let third_gate = Gate::new(OP_FIND_VALUE);
+    let late_gate = Gate::new(OP_FIND_VALUE);
     let mut fixture =
         ThreeNodes::with_gates(false, Some(holder_gate.clone()), Some(other_gate.clone()));
     let mut third = Node::new(
@@ -1197,18 +1146,17 @@ async fn exact_h_routing_and_data_share_alpha_and_caller_cancellation_drops_both
             result = &mut fetch => panic!("fetch ended with three deliberately suspended requests: {result:?}"),
             _ = tokio::time::sleep(Duration::from_secs(1)) => panic!("combined routing/data window was not filled"),
         }
+        // The holder answered with its hint and a referral to the late node:
+        // its body and the two routing requests fill ALPHA, so the referral
+        // waits.
         let counts = trace.counts();
-        assert_eq!(
-            (counts.find, counts.directory, counts.body, counts.completed),
-            (3, 1, 0, 1)
-        );
+        assert_eq!((counts.find, counts.body, counts.completed), (3, 1, 1));
         assert_eq!(trace.assert_request_bound(), ALPHA);
-        trace.assert_authenticated_directories();
         assert_eq!(late.trace.counts(), Counts::default());
         assert_eq!(fixture.net.dial_count(fixture.client.my_id, late.peer), 0);
         cancelled = trace.mark();
         // Dropping the caller owns cancellation of both future sets. No
-        // background task may retain these routing or directory receivers.
+        // background task may retain these routing or body receivers.
     }
     let returned = trace.mark();
     trace.assert_closed_before(returned);
@@ -1241,10 +1189,7 @@ async fn exact_h_direct_bearer_control_has_one_rpc_and_329_application_bytes() {
     assert_eq!(returned.get_handle().raw, fixture.hash);
     assert_eq!(returned.bytes, fixture.bytes);
     let counts = fixture.trace().counts();
-    assert_eq!(
-        (counts.find, counts.directory, counts.put, counts.body),
-        (0, 0, 0, 1)
-    );
+    assert_eq!((counts.find, counts.put, counts.body), (0, 0, 1));
     assert_eq!(
         (counts.request_bytes, counts.response_bytes),
         (65, 41 + BODY_BYTES)
@@ -1274,13 +1219,14 @@ async fn exact_h_warm_publication_repeats_routing_and_remote_puts() {
             PublicationResult::Published
         );
         let counts = fixture.trace().counts();
-        assert_eq!(
-            (counts.find, counts.put, counts.directory, counts.body),
-            (2, 2, 0, 0)
-        );
+        assert_eq!((counts.find, counts.put, counts.body), (2, 2, 0));
+        // A publication's lookup replies carry hints it does not use: the
+        // holder's own, and from the second round the lease each replica
+        // keeps for us. Each reply has two count bytes, each PUT one.
+        let hints = if iteration == 0 { 1 } else { 3 };
         assert_eq!(
             (counts.request_bytes, counts.response_bytes),
-            (2 * 34 + 2 * 66, 4)
+            (2 * 34 + 2 * 66, 2 * 2 + hints * 64 + 2)
         );
         assert_eq!(counts.completed, 4);
         assert_eq!(fixture.dials(), 2);
@@ -1288,4 +1234,50 @@ async fn exact_h_warm_publication_repeats_routing_and_remote_puts() {
     }
     assert_eq!(fixture.reads.load(Ordering::Relaxed), 0);
     fixture.assert_no_control_effects();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_provider_lookup_takes_one_find_value_per_hop() {
+    for advertised in [false, true] {
+        // The client knows only the other node, which refers it to the
+        // holder. Each hop is one FIND_VALUE: the first returns the referral
+        // (and, when advertised, the other's lease for the holder), the second
+        // the holder's own hint. No directory round follows the routing.
+        let mut fixture = ThreeNodes::new(advertised, None);
+        *fixture.client.candidates.lock().unwrap() =
+            RoutingTable::new(fixture.client.my_id, [fixture.other.peer]);
+        fixture
+            .other
+            .candidates
+            .lock()
+            .unwrap()
+            .promote_authenticated(fixture.holder.peer);
+        fixture.warm_connections().await;
+        let providers = fixture
+            .client
+            .find_key(
+                blob_locator(fixture.hash),
+                blob_provider_token,
+                fixture.hash,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(providers, [fixture.holder.peer]);
+        let counts = fixture.trace().counts();
+        assert_eq!(
+            (counts.find, counts.put, counts.body, counts.no_opcode),
+            (2, 0, 0, 0)
+        );
+        assert_eq!((counts.completed, counts.dropped_without_eof), (2, 0));
+        let first = fixture.trace().call(fixture.other.peer, OP_FIND_VALUE);
+        let second = fixture.trace().call(fixture.holder.peer, OP_FIND_VALUE);
+        let (first, second) = (first.lock().unwrap(), second.lock().unwrap());
+        assert_eq!(first.response_bytes, 2 + 32 + 64 * usize::from(advertised));
+        assert_eq!(second.response_bytes, 2 + 64);
+        assert!(first.response_eof.unwrap().order < second.opened.order);
+        drop((first, second));
+        assert_eq!(fixture.reads.load(Ordering::Relaxed), 0);
+        fixture.assert_no_control_effects();
+    }
 }
