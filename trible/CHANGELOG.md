@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- Selected collection compaction consumes its exact preflight selection without
+  repeating the filter or blob walk. Report scan, selection and copy phases,
+  plus retained blob payload bytes (not total framed output size).
+
 ### Added
 
 - `pile net sync` records where it listens in the pile's own configuration

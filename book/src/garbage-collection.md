@@ -159,6 +159,11 @@ bytes are still read for what they name, but a valid blob named only by a
 damaged word cannot be reached and is left behind.
 `PileFile::plan_retained_rewrite` runs the same selection pass and retention
 walk without writing, so a dry run reports exactly what the rewrite will do.
+`PileFile::prepare_retained_rewrite` retains that decided selection and its
+immutable source snapshot for a subsequent consume-once `write_into`, without
+evaluating a stateful filter or walking the blob closure again. Later source
+appends are outside that prefix. Whole-file tools must still quiesce writers
+and check source length; this is a frozen observation, not a reusable recipe.
 The lattice v3 cutover (`trible pile migrate SRC lattice-v3`) is this rewrite
 with only the roots its operator names: it drops every MERGE, since each host
 folds and rebuilds only its own, the DERIVEs of mappings that became attached

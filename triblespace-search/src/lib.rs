@@ -105,6 +105,8 @@
 
 pub mod bm25;
 pub mod constraint;
+#[cfg(any(feature = "semantic", feature = "semantic-wemm"))]
+mod content_text;
 pub mod hnsw;
 #[cfg(feature = "nvfp4")]
 pub mod nvfp4;
