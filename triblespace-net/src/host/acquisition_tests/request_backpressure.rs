@@ -1,8 +1,6 @@
 //! Saturated request slots must not kill unrelated streams on a shared connection.
 
-use crate::connection::{
-    MAX_REQUESTS_GLOBAL, MAX_REQUESTS_PER_CONNECTION, MAX_SERVED_PER_CONNECTION,
-};
+use crate::connection::{MAX_REQUESTS_GLOBAL, MAX_REQUESTS_PER_CONNECTION, MAX_STRANGER_REQUESTS};
 use crate::protocol::{TAG_DHT, recv_find_value_response};
 use crate::transport::sim::SimConn;
 
@@ -110,10 +108,12 @@ async fn saturated_requests_complete_without_closing_connection(connection_count
         connections.push(connection);
     }
 
-    // Each connection fills the slots it may be served at once.
-    let per_connection = MAX_SERVED_PER_CONNECTION.min(MAX_REQUESTS_GLOBAL / connection_count);
+    // The connections, none of them a neighbour's, fill the slots strangers
+    // may be served at once.
+    assert_eq!(MAX_STRANGER_REQUESTS % connection_count, 0);
+    let per_connection = MAX_STRANGER_REQUESTS / connection_count;
     assert!(per_connection <= MAX_REQUESTS_PER_CONNECTION);
-    let serving = per_connection * connection_count;
+    let serving = MAX_STRANGER_REQUESTS;
     let target = *blake3::hash(b"request saturation control").as_bytes();
     let mut held_streams = Vec::new();
     for connection in &connections {
@@ -201,9 +201,7 @@ async fn per_connection_saturation_backpressures_without_closing_active_streams(
 
 #[tokio::test(start_paused = true)]
 async fn global_saturation_backpressures_without_closing_active_streams() {
-    // Each connection's share of held requests exhausts the global sixteen
-    // while leaving room under either connection's own sixteen-request limit.
-    assert_eq!(2 * MAX_SERVED_PER_CONNECTION, MAX_REQUESTS_GLOBAL);
-    assert!(MAX_SERVED_PER_CONNECTION < MAX_REQUESTS_PER_CONNECTION);
+    // Two connections together exhaust the strangers' slots while each stays
+    // well under its own sixteen-request limit.
     saturated_requests_complete_without_closing_connection(2).await;
 }

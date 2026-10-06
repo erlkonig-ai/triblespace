@@ -9,7 +9,7 @@ use tokio::io::AsyncWriteExt as _;
 use crate::connection::{
     CONNECTION_IDLE_DEADLINE, DRAIN_GRACE, FRAME_OPEN, MAX_CONNECTIONS,
     MAX_HELD_REQUESTS_PER_CONNECTION, MAX_RECON_FRAME_BYTES, MAX_REQUESTS_GLOBAL,
-    MAX_SERVED_PER_CONNECTION, RESET_BUSY, RESET_REPLACED, RESET_UNKNOWN, write_frame,
+    MAX_STRANGER_REQUESTS, RESET_BUSY, RESET_REPLACED, RESET_UNKNOWN, write_frame,
 };
 use crate::protocol::{OP_FIND_VALUE, TAG_DHT, TAG_RECON, op_find_value, send_hash};
 use crate::recon::FRAME_PEER_REQUEST;
@@ -356,25 +356,24 @@ async fn a_request_deadline_keeps_the_connection_the_peer_is_using() {
     let on_right = right.table.current(left.peer).unwrap();
     let (mut own_send, mut own_recv) = held_find_value(&on_right).await;
 
-    // Other peers occupy every request slot on the right, each its
-    // connection's share, so a request from the left waits there until its
-    // deadline.
+    // Another stranger occupies every request slot strangers have on the
+    // right, so a request from the left, no neighbour either, waits there
+    // until its deadline.
+    let harness = net.join(&key(3));
+    let other = harness
+        .transport
+        .dial(right.peer, PILE_SYNC_ALPN)
+        .await
+        .unwrap();
     let mut occupying = Vec::new();
-    let mut others = Vec::new();
-    for index in 0..MAX_REQUESTS_GLOBAL / MAX_SERVED_PER_CONNECTION {
-        let harness = net.join(&key(3 + index));
-        let other = harness
-            .transport
-            .dial(right.peer, PILE_SYNC_ALPN)
-            .await
-            .unwrap();
-        for _ in 0..MAX_SERVED_PER_CONNECTION {
-            occupying.push(held_find_value(&other).await);
-        }
-        others.push((harness, other));
+    for _ in 0..MAX_STRANGER_REQUESTS {
+        occupying.push(held_find_value(&other).await);
     }
     settle().await;
-    assert_eq!(right.table.available_requests(), 0);
+    assert_eq!(
+        right.table.available_requests(),
+        MAX_REQUESTS_GLOBAL - MAX_STRANGER_REQUESTS
+    );
     let error = left
         .client
         .find_value(right.peer, [7; 32])
@@ -423,7 +422,7 @@ async fn request_streams_beyond_the_held_bound_are_reset() {
     settle().await;
     assert_eq!(
         server.table.available_requests(),
-        MAX_REQUESTS_GLOBAL - MAX_SERVED_PER_CONNECTION
+        MAX_REQUESTS_GLOBAL - MAX_STRANGER_REQUESTS
     );
 
     // The connection holds no more: the next request is reset at once, so the
@@ -441,40 +440,47 @@ async fn request_streams_beyond_the_held_bound_are_reset() {
     assert!(answers_empty(&conn).await);
 }
 
-/// A connection whose requests stay open until their deadline is served
-/// only its share of the request slots, and a request on another
-/// connection is answered meanwhile.
+/// Strangers, connections that carry no peering, are served at most their
+/// share of the request slots however many connections they open. Two of
+/// them hold all of it, and a neighbour's FIND_VALUE is answered within its
+/// deadline.
 #[tokio::test(start_paused = true)]
-async fn one_connection_leaves_request_slots_to_the_others() {
+async fn strangers_leave_request_slots_to_neighbours() {
     let net = network(Duration::from_secs(1));
     let server = Node::join(&net, &key(1));
-    let greedy = net.join(&key(2));
-    let conn = greedy
-        .transport
-        .dial(server.peer, PILE_SYNC_ALPN)
-        .await
-        .unwrap();
     let mut holding = Vec::new();
-    for _ in 0..MAX_REQUESTS_GLOBAL {
-        holding.push(held_find_value(&conn).await);
+    let mut strangers = Vec::new();
+    for index in 2..4 {
+        let stranger = net.join(&key(index));
+        let conn = stranger
+            .transport
+            .dial(server.peer, PILE_SYNC_ALPN)
+            .await
+            .unwrap();
+        for _ in 0..MAX_REQUESTS_GLOBAL {
+            holding.push(held_find_value(&conn).await);
+        }
+        strangers.push((stranger, conn));
     }
     tokio::time::sleep(Duration::from_secs(5)).await;
-
-    let other = net.join(&key(3));
-    let conn = other
-        .transport
-        .dial(server.peer, PILE_SYNC_ALPN)
-        .await
-        .unwrap();
-    let answered = tokio::time::timeout(Duration::from_secs(60), answers_empty(&conn)).await;
-    assert!(
-        answered.is_ok_and(|empty| empty),
-        "the other connection waited"
-    );
     assert_eq!(
         server.table.available_requests(),
-        MAX_REQUESTS_GLOBAL - MAX_SERVED_PER_CONNECTION
+        MAX_REQUESTS_GLOBAL - MAX_STRANGER_REQUESTS
     );
+
+    let neighbour = Node::join(&net, &key(4));
+    neighbour.table.connect(server.peer).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    server
+        .table
+        .current(neighbour.peer)
+        .unwrap()
+        .set_neighbour(true);
+    neighbour
+        .client
+        .find_value(server.peer, [0; 32])
+        .await
+        .unwrap();
 }
 
 #[tokio::test(start_paused = true)]

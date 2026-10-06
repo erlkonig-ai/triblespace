@@ -6,8 +6,8 @@
 //! tag ([`TAG_RECON`], [`TAG_DHT`] or [`TAG_BLOB`]). The loop reads the tag
 //! before it takes any permit: `recon/1` takes none, a request stream takes
 //! one of its connection's (or is reset when none is left) and waits for one
-//! of the table's within its connection's share, and an unknown tag resets
-//! only its own stream.
+//! of the table's, on a connection that is no neighbour's within the share
+//! strangers have, and an unknown tag resets only its own stream.
 //!
 //! The dialler opens `recon/1`, and its first frame carries the dialler's
 //! sequence number. When a pair holds two connections, both sides keep the
@@ -85,10 +85,15 @@ pub(crate) const MAX_REQUESTS_PER_CONNECTION: usize = 16;
 pub(crate) const MAX_HELD_REQUESTS_PER_CONNECTION: usize = 2 * MAX_REQUESTS_PER_CONNECTION;
 /// Request streams served at once across every connection.
 pub(crate) const MAX_REQUESTS_GLOBAL: usize = 16;
-/// Request streams served at once on one connection: half the table's, so
-/// a peer that holds its requests open until their deadline leaves the
-/// other half to the rest.
-pub(crate) const MAX_SERVED_PER_CONNECTION: usize = MAX_REQUESTS_GLOBAL / 2;
+/// Request streams served at once on connections that are not neighbour
+/// connections: half the table's. Keys cost nothing, so a stranger (a DHT
+/// caller, a first contact) can hold requests open until their deadline on
+/// as many connections as it makes keys, and a share per key or per
+/// connection would bound nothing. The other half is kept for the peers
+/// this node syncs a collection with, which can use every permit. Half
+/// rather than less, because the DHT this node serves strangers is how
+/// they find a collection's providers at all.
+pub(crate) const MAX_STRANGER_REQUESTS: usize = MAX_REQUESTS_GLOBAL / 2;
 
 // Connection close codes.
 const CLOSE_NORMAL: u32 = 0;
@@ -243,6 +248,9 @@ struct Shared<T: Transport, S> {
     transport: T,
     service: S,
     requests: Arc<Semaphore>,
+    /// The share of `requests` that connections other than neighbour
+    /// connections may hold.
+    strangers: Arc<Semaphore>,
     /// This node's dial counter. It starts at the wall clock in nanoseconds,
     /// so a restarted node's dials outrank the ones it made before.
     sequence: AtomicU64,
@@ -306,8 +314,6 @@ struct State {
     changed: Notify,
     opened: Arc<Semaphore>,
     held: Arc<Semaphore>,
-    /// Request streams served at once on the connection.
-    served: Semaphore,
     /// Frames waiting for the connection's `recon/1` writer. The current
     /// stream's writer holds the receiver; its replacement takes it over.
     outbox: mpsc::Sender<Frame>,
@@ -340,7 +346,6 @@ impl State {
             changed: Notify::new(),
             opened: Arc::new(Semaphore::new(MAX_REQUESTS_PER_CONNECTION)),
             held: Arc::new(Semaphore::new(MAX_HELD_REQUESTS_PER_CONNECTION)),
-            served: Semaphore::new(MAX_SERVED_PER_CONNECTION),
             outbox,
             outbox_frames: tokio::sync::Mutex::new(outbox_frames),
             announced: AtomicBool::new(false),
@@ -653,6 +658,7 @@ impl<T: Transport, S: Service> ConnectionTable<T, S> {
                 transport,
                 service,
                 requests: Arc::new(Semaphore::new(MAX_REQUESTS_GLOBAL)),
+                strangers: Arc::new(Semaphore::new(MAX_STRANGER_REQUESTS)),
                 sequence: AtomicU64::new(now.total_nanoseconds() as u64),
                 next_id: AtomicU64::new(0),
                 table: Mutex::new(Table {
@@ -1026,7 +1032,8 @@ async fn accept_loop<T: Transport, S: Service>(
                 let Some(table) = shared.upgrade() else {
                     break None;
                 };
-                let (service, requests) = (table.service.clone(), table.requests.clone());
+                let service = table.service.clone();
+                let permits = (table.requests.clone(), table.strangers.clone());
                 drop(table);
                 accepted_streams += 1;
                 let accepted = Accepted {
@@ -1035,7 +1042,7 @@ async fn accept_loop<T: Transport, S: Service>(
                     recv: Tracked::new(recv, &state, None),
                 };
                 tokio::spawn(
-                    stream(shared.clone(), conn.clone(), state.clone(), service, requests, accepted)
+                    stream(shared.clone(), conn.clone(), state.clone(), service, permits, accepted)
                         .instrument(debug_span!("stream", tag = tracing::field::Empty).or_current()),
                 );
             }
@@ -1080,7 +1087,7 @@ async fn stream<T: Transport, S: Service>(
     conn: T::Conn,
     state: Arc<State>,
     service: S,
-    requests: Arc<Semaphore>,
+    (requests, strangers): (Arc<Semaphore>, Arc<Semaphore>),
     accepted: Accepted<T::Conn>,
 ) {
     let Accepted {
@@ -1119,8 +1126,13 @@ async fn stream<T: Transport, S: Service>(
                 return;
             };
             let _request = InFlight::new(&state, None, None);
-            let Ok(_share) = state.served.acquire().await else {
-                return;
+            let _stranger = if state.neighbour.load(Ordering::SeqCst) {
+                None
+            } else {
+                let Ok(stranger) = strangers.acquire_owned().await else {
+                    return;
+                };
+                Some(stranger)
             };
             let Ok(_global) = requests.acquire_owned().await else {
                 return;
