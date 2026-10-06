@@ -79,7 +79,6 @@ async fn saturated_requests_complete_without_closing_connection(connection_count
     let mut provider_harness = net.join(&provider_key);
     let client_harness = net.join(&client_key);
     let (snapshot_tx, snapshot) = tokio::sync::watch::channel(None);
-    let (events, _events_rx) = tokio::sync::mpsc::channel(1);
     let handler = SnapshotHandler {
         snapshot,
         health: Health::new(EndpointId::from_bytes(&provider).unwrap()),
@@ -87,7 +86,6 @@ async fn saturated_requests_complete_without_closing_connection(connection_count
         providers: Arc::new(Mutex::new(ProviderDirectory::new(provider))),
         serve_collections: false,
         local_id: provider,
-        events,
         recon: None,
     };
     let (accepted_tx, mut accepted_rx) = tokio::sync::watch::channel(0usize);

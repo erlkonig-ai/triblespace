@@ -6,7 +6,7 @@ use triblespace_core::collection::{
 };
 
 use crate::collection_session::CollectionRepairRefusal;
-use crate::collection_wire::{recv_repair_collection, recv_repair_hello};
+use crate::collection_wire::recv_repair_collection;
 use crate::protocol::{TAG_DHT, TAG_REPAIR, recv_find_value_response};
 
 use super::*;
@@ -113,7 +113,6 @@ impl RepairFixture {
             StoreChanges::ALL,
         )
         .unwrap();
-        let (server_events, _server_received) = tokio::sync::mpsc::channel(16);
         let handler = SnapshotHandler {
             snapshot: tokio::sync::watch::channel(Some(Arc::new(remote_snapshot))).1,
             health: Health::new(EndpointId::from_bytes(&provider).unwrap()),
@@ -121,7 +120,6 @@ impl RepairFixture {
             providers: Arc::new(Mutex::new(ProviderDirectory::new(provider))),
             serve_collections: true,
             local_id: provider,
-            events: server_events,
             recon: None,
         };
         let server_connections = ConnectionTable::new(provider_harness.transport.clone(), handler);
@@ -139,7 +137,6 @@ impl RepairFixture {
                     let (mut send, mut recv) = incoming.conn.accept_bi().await.unwrap();
                     assert_eq!(recv_u8(&mut recv).await.unwrap(), TAG_REPAIR);
                     recv_repair_collection(&mut recv).await.unwrap();
-                    recv_repair_hello(&mut recv).await.unwrap();
                     send_u8(&mut send, 0xff).await.unwrap();
                     send.shutdown().await.unwrap();
                 });

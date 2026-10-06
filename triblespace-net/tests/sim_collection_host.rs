@@ -12,10 +12,11 @@ use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::capability::{CapabilityHandle, CapabilityProof, CapabilityResource};
 use triblespace_core::clock::{self, VirtualClock};
+use triblespace_core::collection::selection::{CONFIG_COLLECTION_NAME, write_sync_selection};
 use triblespace_core::collection::{
     AdmissionPolicy, Collection, CollectionCommit, CollectionHandle, CollectionPolicy,
     CollectionRead, CollectionRecord, CollectionSnapshotExt, CollectionStore, CollectionStoreExt,
-    HeldRead, read_capability, write_capability,
+    HeldRead, private_policy, read_capability, write_capability,
 };
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
@@ -72,6 +73,23 @@ fn proof(
 
 fn register(store: &mut MemoryRepo, policy: CollectionPolicy) -> Collection<SimpleArchive> {
     store.collection("collection-host-e2e", policy).unwrap()
+}
+
+/// The records naming `collection`, leaving out the pile's configuration.
+fn records_of(snapshot: &impl CollectionRead, collection: CollectionHandle) -> usize {
+    snapshot
+        .records()
+        .unwrap()
+        .filter(|record| record.as_ref().unwrap().collection() == collection)
+        .count()
+}
+
+/// Select `collection` for sync in the pile `key` configures.
+fn select(store: &mut MemoryRepo, key: &SigningKey, collection: CollectionHandle) {
+    let config = store
+        .collection(CONFIG_COLLECTION_NAME, private_policy(key.verifying_key()))
+        .unwrap();
+    write_sync_selection(store, config, key, collection, true).unwrap();
 }
 
 fn bring_up(
@@ -235,7 +253,7 @@ fn demand_pull_selection_warms_an_empty_collection_without_a_want() {
 }
 
 #[test]
-fn issuer_held_read_proof_bootstraps_a_handle_only_recipient() {
+fn issuer_held_read_proof_reaches_a_handle_only_recipient_by_grant_exchange() {
     let _guard = test_guard();
     let clock = virtual_clock();
     clock.reset();
@@ -296,9 +314,12 @@ fn issuer_held_read_proof_bootstraps_a_handle_only_recipient() {
         );
         issuer.activate_collection(collection.handle());
 
-        // The recipient begins with only C and one issuer endpoint. An initial
-        // exact-H lookup also gives the issuer's provider leases a reachable
-        // DHT replica; a retry then obtains the self-describing C bytes.
+        // The recipient begins with only C and one issuer endpoint. The issuer
+        // dials the subject of the grant it signed, and the grant exchange
+        // delivers it with the definition it names; it waits in memory for
+        // its descriptor. An initial exact-H lookup also gives the issuer's
+        // provider leases a reachable DHT replica; a retry then obtains the
+        // self-describing C bytes.
         let descriptor = acquire_once(
             &clock,
             &mut recipient,
@@ -323,15 +344,36 @@ fn issuer_held_read_proof_bootstraps_a_handle_only_recipient() {
             let snapshot = recipient.snapshot().unwrap();
             Collection::<SimpleArchive>::open(&snapshot, collection.handle()).unwrap()
         };
+        // With C resident, the waiting grant lands. Nothing was selected or
+        // repaired: no record arrived, and of the definitions only the one
+        // the grant names.
+        advance(&clock, &mut [&mut issuer, &mut recipient], 2).await;
         let before_selection = recipient.snapshot().unwrap();
-        assert!(!before_selection.contains_blob(read_capability()).unwrap());
+        let recipient_id = recipient_key.verifying_key().to_bytes();
+        assert_eq!(net.dial_count(issuer_id, recipient_id), 1);
+        assert_eq!(
+            before_selection
+                .proofs()
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>(),
+            [read_proof.clone()]
+        );
+        assert!(before_selection.contains_blob(read_capability()).unwrap());
         assert!(!before_selection.contains_blob(write_capability()).unwrap());
+        assert_eq!(before_selection.records().unwrap().count(), 0);
+        assert!(
+            recipient_collection
+                .reader_is_admitted(&before_selection, recipient_key.verifying_key())
+                .unwrap()
+        );
+        assert!(recipient.health().available.is_empty());
         recipient.activate_collection(collection.handle());
 
-        // With C resident, the issuer can authorize the endpoint using its
-        // resident READ definition. Repair sends only proof/collection records;
-        // the separate selected metadata owner obtains definitions, not grants
-        // or the committed payload. This makes the received valid proof usable.
+        // The issuer authorizes the endpoint using its resident READ
+        // definition. Repair sends only proof/collection records; the
+        // separate selected metadata owner obtains definitions, not grants or
+        // the committed payload.
         advance(&clock, &mut [&mut issuer, &mut recipient], 32).await;
         let dangling = recipient.snapshot().unwrap();
         assert_eq!(dangling.records().unwrap().count(), 1);
@@ -377,12 +419,6 @@ fn issuer_held_read_proof_bootstraps_a_handle_only_recipient() {
                 .reader_is_admitted(&read_ready, recipient_key.verifying_key())
                 .unwrap()
         );
-        assert!(
-            !recipient_collection
-                .reader_is_admitted(&before_selection, recipient_key.verifying_key())
-                .unwrap()
-        );
-        assert!(!before_selection.contains_blob(read_capability()).unwrap());
         assert!(read_ready.contains_blob(write_capability()).unwrap());
         assert_eq!(recipient_collection.admitted(&read_ready).unwrap().len(), 1);
         assert!(!read_ready.contains_blob(payload_handle).unwrap());
@@ -508,6 +544,10 @@ fn write_proof_later_activates_repaired_commit_without_reaching_publisher() {
                 collection.handle(),
             ))
             .unwrap();
+        // Both select C: the reader's READ proof reaches the server as the
+        // credential of its peering request.
+        select(&mut server_store, &server_key, collection.handle());
+        select(&mut reader_store, &reader_key, collection.handle());
 
         let server_id = server_key.verifying_key().to_bytes();
         let mut server = bring_up(
@@ -548,7 +588,7 @@ fn write_proof_later_activates_repaired_commit_without_reaching_publisher() {
 
         advance(&clock, &mut [&mut server, &mut reader], 32).await;
         let repaired = reader.snapshot().unwrap();
-        assert_eq!(repaired.records().unwrap().count(), 1);
+        assert_eq!(records_of(&repaired, collection.handle()), 1);
         assert!(reader_collection.admitted(&repaired).unwrap().is_empty());
 
         assert!(
@@ -569,7 +609,7 @@ fn write_proof_later_activates_repaired_commit_without_reaching_publisher() {
         reader.store().insert_proof(write).unwrap();
         reader.refresh();
         let after = reader.snapshot().unwrap();
-        assert_eq!(after.records().unwrap().count(), 1);
+        assert_eq!(records_of(&after, collection.handle()), 1);
         assert_eq!(after.proofs().unwrap().count(), 2);
         assert_eq!(reader_collection.admitted(&after).unwrap().len(), 1);
         let publisher = server.snapshot().unwrap();
@@ -579,7 +619,7 @@ fn write_proof_later_activates_repaired_commit_without_reaching_publisher() {
 }
 
 #[test]
-fn native_read_proof_bootstraps_on_retry_and_rejects_writer_only_peer() {
+fn native_read_credential_admits_on_retry_and_rejects_writer_only_peer() {
     let _guard = test_guard();
     let clock = virtual_clock();
     clock.reset();
@@ -629,17 +669,27 @@ fn native_read_proof_bootstraps_on_retry_and_rejects_writer_only_peer() {
 
         let mut reader_store = MemoryRepo::default();
         let reader_collection = register(&mut reader_store, policy.clone());
-        reader_store
-            .insert_proof(proof(
-                &read_root,
-                &reader_key,
-                read_capability(),
-                collection.handle(),
-            ))
-            .unwrap();
+        let read = proof(
+            &read_root,
+            &reader_key,
+            read_capability(),
+            collection.handle(),
+        );
+        reader_store.insert_proof(read.clone()).unwrap();
         let mut writer_store = MemoryRepo::default();
         register(&mut writer_store, policy);
-        writer_store.insert_proof(write).unwrap();
+        writer_store.insert_proof(write.clone()).unwrap();
+        // Each selects C. The readers find the server as a DHT provider of C
+        // and ask it to peer, presenting their proofs naming themselves. The
+        // server keeps the reader's valid READ proof, which admits the
+        // reader's next repair.
+        for (store, key) in [
+            (&mut server_store, &server_key),
+            (&mut reader_store, &reader_key),
+            (&mut writer_store, &writer_key),
+        ] {
+            select(store, key, collection.handle());
+        }
 
         let server_id = server_key.verifying_key().to_bytes();
         let mut server = bring_up(
@@ -686,7 +736,7 @@ fn native_read_proof_bootstraps_on_retry_and_rejects_writer_only_peer() {
             32,
         )
         .await;
-        assert_eq!(reader.snapshot().unwrap().records().unwrap().count(), 1);
+        assert_eq!(records_of(&reader.snapshot().unwrap(), collection.handle()), 1);
         let stats = reconcile_once(
             &clock,
             &mut Reconciler::default(),
@@ -740,11 +790,19 @@ fn native_read_proof_bootstraps_on_retry_and_rejects_writer_only_peer() {
         assert!(dangling.collection(reader_collection).unwrap().cover().is_empty());
         let writer_snapshot = writer_only.snapshot().unwrap();
         assert_eq!(
-            writer_snapshot.records().unwrap().count(),
+            records_of(&writer_snapshot, collection.handle()),
             0,
             "WRITE(C) without READ(C) must not learn even the collection manifest"
         );
-        assert_eq!(writer_snapshot.proofs().unwrap().count(), 1);
+        // Besides its own grant it may hold the reader's credential, which
+        // the reader presented when it asked the writer to peer.
+        let held = writer_snapshot
+            .proofs()
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        assert!(held.contains(&write));
+        assert!(held.iter().all(|proof| *proof == write || *proof == read));
         assert!(!reader_collection
             .reader_is_admitted(&writer_snapshot, writer_key.verifying_key())
             .unwrap());

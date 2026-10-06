@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Exchange grants on `recon/1` (sync redesign M10). On every connection, and
+  whenever it changes, each side sends the digest of the proofs it holds
+  naming the other. A side whose own proofs naming itself differ asks, and
+  the sender answers with the proofs naming the connection's authenticated
+  peer, at most `MAX_PROOFS_PER_EXCHANGE`, once per digest and connection.
+  Received proofs, peers' credentials among them, are kept only if they name
+  the receiver or the sender: they land when their held descriptor validates
+  them, wait in memory while it is not held (`HealthSnapshot::available`
+  lists their collections), and are dropped otherwise. The definitions they
+  name are fetched over `blob/1` from the sender, then from their root and
+  delegated keys among connected peers, and so are those a refused peering
+  waits for. A proof waits in memory only if its signatures hold. The host
+  dials the subject of every grant its key signed.
+- A proof whose insert fails no longer aborts the drain of network evidence.
+- The in-session READ bootstrap is gone: a repair hello names only the
+  collection, the server admits from its own evidence and keeps nothing the
+  client sent, and `collection_read_bootstrap_proofs` with its
+  `CollectionReadBootstrapError` is removed. A reader's proofs reach a server
+  as the credentials of its peering request, which the server keeps when
+  they validate.
 - Peer per collection on `recon/1` (sync redesign M7). A host asks up to five
   candidates for each collection its pile selects and accepts a request only
   for a collection it selects, from a key that passes READ or that sends and

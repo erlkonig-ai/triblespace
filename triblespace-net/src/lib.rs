@@ -37,6 +37,7 @@ pub(crate) const RETRY_BACKOFF_CAP: std::time::Duration = std::time::Duration::f
 pub mod clock;
 pub mod connection;
 pub mod dashboard;
+pub(crate) mod grants;
 pub mod health;
 pub mod health_record;
 pub mod host;

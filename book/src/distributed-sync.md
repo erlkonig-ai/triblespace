@@ -262,20 +262,34 @@ algorithm. If the topic stream itself ends, configured endpoints plus a bounded
 recent set of signed and DHT-discovered origins seed the replacement
 subscription.
 
+## Grant exchange
+
+A grant notifies its subject. On every connection, and whenever it changes,
+each side sends on `recon/1` the digest of the proofs it holds naming the
+other side: the subject-truncated prefixes its collections' evidence indexes
+under that key. A side whose own proofs naming itself differ asks once per
+digest and connection; the answer holds only the proofs naming the asker's
+TLS-authenticated key, at most `MAX_PROOFS_PER_EXCHANGE`. A received proof,
+like a peer's credential, is kept only if it names the receiver or the sender.
+It lands when its held descriptor validates it, waits in memory while the
+descriptor is missing (`HealthSnapshot::available` lists its collection), and
+is dropped otherwise. The definitions it names are fetched over `blob/1` from
+the sender, then from its root and delegated keys among connected peers, as
+are those a refused peering request waits for. A host also dials the subject
+of every grant its own key signed, so a grant written while the subject is
+unknown still reaches it.
+
 ## READ(C)-authorized exact repair
 
 After observing a different wake root, a node selects a fresh signed origin
 advertising that root and opens one bidirectional collection-repair stream.
 Random selection among equivalent advertised roots spreads repair load; it
-does not yet prefer low-latency paths. Its hello names C and may carry a bounded set of self-contained READ
-proofs for cold bootstrap. The server admits the TLS-authenticated client only
-from READ(C) evidence in its pinned local projection before returning any
-manifest. Unknown hello proofs are signature/root checked and stored inertly.
-The current session remains rejected; a new coherent snapshot and session can
-admit the proof once its capability definitions are also resident. This stream
-does not acquire those blobs. For `Open`
-READ the bootstrap is empty. A WRITE-only publisher needs no READ authority
-merely to serve an authorized replica.
+does not yet prefer low-latency paths. Its hello names only C. The server
+admits the TLS-authenticated client only from READ(C) evidence in its pinned
+local projection before returning any manifest. A client's own proofs reach
+the server earlier, as the credentials of its peering request, and grants
+reach their subjects by the grant exchange below. A WRITE-only publisher
+needs no READ authority merely to serve an authorized replica.
 
 The server loads one immutable repair overlay for C and applies the
 descriptor's READ action policy against that frozen evidence. Rejection returns

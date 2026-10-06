@@ -21,8 +21,7 @@ use ed25519_dalek::VerifyingKey;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{Blob, TryFromBlob};
 use triblespace_core::capability::{
-    CapabilityHandle, CapabilityProof, CapabilityProofError, CapabilityProofId, CapabilityRequest,
-    CapabilityResource, QuorumOutcome,
+    CapabilityHandle, CapabilityProof, CapabilityProofError, CapabilityProofId, QuorumOutcome,
 };
 use triblespace_core::collection::{
     ACTION_READ, ACTION_WRITE, AdmissionPolicy, CollectionDescriptorError, CollectionHandle,
@@ -46,7 +45,7 @@ const COLLECTION_REPAIR_ROOT_VERSION: u32 = 3;
 
 type AuthorizationEvidencePatch = PATCH<64, IdentitySchema, CapabilityProof, Blake3Merkle>;
 /// Subject key | hash of the proof prefix that ends at that subject.
-type SubjectProofPatch = PATCH<64, IdentitySchema, CapabilityProof, Blake3Merkle>;
+pub(crate) type SubjectProofPatch = PATCH<64, IdentitySchema, CapabilityProof, Blake3Merkle>;
 
 /// Most subject-truncated proofs one proof exchange accepts.
 ///
@@ -78,7 +77,7 @@ fn evidence_key(collection: CollectionHandle, id: CapabilityProofId) -> [u8; 64]
     key
 }
 
-fn subject_proof_key(subject: VerifyingKey, id: CapabilityProofId) -> [u8; 64] {
+pub(crate) fn subject_proof_key(subject: VerifyingKey, id: CapabilityProofId) -> [u8; 64] {
     let mut key = [0; 64];
     key[..32].copy_from_slice(subject.as_bytes());
     key[32..].copy_from_slice(&id.raw);
@@ -89,7 +88,7 @@ fn subject_proof_key(subject: VerifyingKey, id: CapabilityProofId) -> [u8; 64] {
 /// chain that subject holds, without later delegates or their capability
 /// handles. Resource, root and the kept signatures are the proof's own, so a
 /// prefix of a valid evidence proof is valid evidence too.
-fn subject_prefixes(
+pub(crate) fn subject_prefixes(
     proof: &CapabilityProof,
 ) -> impl Iterator<Item = (VerifyingKey, CapabilityProof)> + '_ {
     proof
@@ -274,6 +273,11 @@ impl CollectionAuthorizationEvidencePatch {
         }
     }
 
+    /// The retained prefixes under the keys they name.
+    pub(crate) const fn subject_index(&self) -> &SubjectProofPatch {
+        &self.subjects
+    }
+
     /// Enumerate the retained prefixes that end at `subject`, in hash order.
     pub fn proofs_naming(&self, subject: VerifyingKey) -> impl Iterator<Item = &CapabilityProof> {
         let subject = subject.to_bytes();
@@ -325,65 +329,6 @@ impl CollectionAuthorizationEvidencePatch {
             }
         }
         CollectionReadAudience::Restricted(readers.into_values().collect())
-    }
-
-    /// Select the local READ witness from this already constructed evidence.
-    /// The caller applies its transport bound after quorum minimization.
-    pub(crate) fn read_bootstrap_proofs(&self, subject: VerifyingKey) -> Vec<CapabilityProof> {
-        if self
-            .read_policies()
-            .any(|policy| matches!(policy, AdmissionPolicy::Open))
-        {
-            return Vec::new();
-        }
-        let mut selected = self
-            .proofs()
-            .filter(|proof| {
-                proof.resource() == CapabilityResource::from(self.collection)
-                    && self
-                        .read_policies()
-                        .any(|policy| policy.has_root(proof.root_key()))
-            })
-            .filter_map(|proof| {
-                subject_prefixes(proof)
-                    .filter(|(named, _)| *named == subject)
-                    .find_map(|(_, witness)| {
-                        witness
-                            .verify(
-                                &self.reader,
-                                proof.root_key(),
-                                subject,
-                                CapabilityRequest::new(
-                                    CapabilityResource::from(self.collection),
-                                    ACTION_READ,
-                                ),
-                            )
-                            .is_ok()
-                            .then_some(witness)
-                    })
-            })
-            .collect::<Vec<_>>();
-        if !matches!(
-            self.reader_is_admitted_by(subject, &selected),
-            QuorumOutcome::Met
-        ) {
-            return Vec::new();
-        }
-        // Each witness ends at the earliest valid READ prefix for this subject;
-        // later delegates and their capability handles never enter bootstrap.
-        // Delete only proofs not required by the independently rooted quorum.
-        let mut index = selected.len();
-        while index > 0 {
-            index -= 1;
-            let removed = selected.remove(index);
-            if !matches!(
-                self.reader_is_admitted_by(subject, &selected),
-                QuorumOutcome::Met
-            ) {
-                selected.insert(index, removed);
-            }
-        }
-        selected
     }
 }
 
@@ -650,57 +595,6 @@ where
     }
 }
 
-/// Failure while selecting bounded native READ proofs for `C`.
-#[derive(Debug)]
-pub enum CollectionReadBootstrapError<ProofsError, GetError> {
-    /// The descriptor is absent or structurally invalid.
-    Descriptor(CollectionDescriptorError<GetError>),
-    /// The coherent proof-store observation failed.
-    Proofs(ProofsError),
-    /// More relevant proofs exist than the caller's transport bound permits.
-    TooMany {
-        /// Exact number of canonical relevant proofs.
-        count: usize,
-        /// Caller-supplied maximum.
-        limit: usize,
-    },
-    /// Collection-scoped authorization evidence discovery failed.
-    Authorization(CollectionAuthorizationEvidenceError),
-}
-
-impl<ProofsError, GetError> fmt::Display for CollectionReadBootstrapError<ProofsError, GetError>
-where
-    ProofsError: fmt::Display,
-    GetError: fmt::Display,
-{
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Descriptor(source) => source.fmt(formatter),
-            Self::Proofs(source) => write!(formatter, "enumerate capability proofs: {source}"),
-            Self::TooMany { count, limit } => write!(
-                formatter,
-                "collection READ bootstrap has {count} proofs; limit is {limit}",
-            ),
-            Self::Authorization(source) => source.fmt(formatter),
-        }
-    }
-}
-
-impl<ProofsError, GetError> Error for CollectionReadBootstrapError<ProofsError, GetError>
-where
-    ProofsError: Error + 'static,
-    GetError: Error + 'static,
-{
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Descriptor(source) => Some(source),
-            Self::Proofs(source) => Some(source),
-            Self::TooMany { .. } => None,
-            Self::Authorization(source) => Some(source),
-        }
-    }
-}
-
 /// Failure while freezing the repair overlay of one collection.
 #[derive(Debug)]
 pub enum CollectionRepairOverlayError<RecordsError, ProofsError, GetError> {
@@ -812,49 +706,6 @@ where
         })
 }
 
-/// Select deterministic bounded native proofs for exact READ(C).
-///
-/// The descriptor's recognized READ alternatives shape the result. Each returned
-/// self-contained proof has a valid signature path over the exact resource.
-/// Selection and deletion minimization interpret resident definitions for READ;
-/// transport membership itself never depends on definition residency.
-/// Invalid, irrelevant, and duplicate ambient proofs are inert. The caller
-/// chooses `max_proofs`; a larger independent-root witness fails rather than
-/// silently dropping paths required by quorum.
-pub fn collection_read_bootstrap_proofs<R>(
-    snapshot: &R,
-    collection: CollectionHandle,
-    subject: VerifyingKey,
-    max_proofs: usize,
-) -> Result<
-    Vec<CapabilityProof>,
-    CollectionReadBootstrapError<R::ProofsError, R::GetError<Infallible>>,
->
-where
-    R: BlobStoreGet + CapabilityProofRead + Clone + Send + 'static,
-{
-    let evidence =
-        collection_authorization_evidence(snapshot, collection).map_err(|error| match error {
-            CollectionAuthorizationEvidenceDiscoveryError::Descriptor(source) => {
-                CollectionReadBootstrapError::Descriptor(source)
-            }
-            CollectionAuthorizationEvidenceDiscoveryError::Proofs(source) => {
-                CollectionReadBootstrapError::Proofs(source)
-            }
-            CollectionAuthorizationEvidenceDiscoveryError::Evidence(source) => {
-                CollectionReadBootstrapError::Authorization(source)
-            }
-        })?;
-    let selected = evidence.read_bootstrap_proofs(subject);
-    if selected.len() > max_proofs {
-        return Err(CollectionReadBootstrapError::TooMany {
-            count: selected.len(),
-            limit: max_proofs,
-        });
-    }
-    Ok(selected)
-}
-
 fn collection_authorization_evidence_patch_for_descriptor<R>(
     snapshot: &R,
     collection: CollectionHandle,
@@ -950,7 +801,7 @@ mod tests {
         capability_handle, resource_collection, resource_policy,
     };
     use triblespace_core::capability::{
-        CapabilityRequest, capability_action, capability_delegate_action,
+        CapabilityRequest, CapabilityResource, capability_action, capability_delegate_action,
         capability_quorum_authorizes,
     };
     use triblespace_core::collection::{
@@ -1327,7 +1178,7 @@ mod tests {
         let proof_a = root_proof(&root_a, &reader_a, scope(read_capability(), collection));
         let proof_b = root_proof(&root_b, &reader_b, scope(read_capability(), collection));
         let wrong_action = root_proof(&root_a, &reader_a, write_scope(collection));
-        for proof in [proof_a.clone(), proof_b.clone(), wrong_action] {
+        for proof in [proof_a, proof_b, wrong_action] {
             store_proof(&mut store, proof);
         }
         let snapshot = store.snapshot().unwrap();
@@ -1362,11 +1213,6 @@ mod tests {
         };
         assert!(audience.contains(&reader_a.verifying_key()));
         assert!(audience.contains(&reader_b.verifying_key()));
-        assert_eq!(
-            collection_read_bootstrap_proofs(&snapshot, collection, reader_b.verifying_key(), 1)
-                .unwrap(),
-            [proof_b],
-        );
     }
 
     #[test]
@@ -1455,11 +1301,6 @@ mod tests {
             QuorumOutcome::Met
         );
         assert_eq!(evidence.authorized_readers(), CollectionReadAudience::Open);
-        assert!(
-            collection_read_bootstrap_proofs(&snapshot, collection, key(44).verifying_key(), 0)
-                .unwrap()
-                .is_empty()
-        );
     }
 
     #[test]
@@ -1992,16 +1833,6 @@ mod tests {
             candidates, expected,
             "only routed R evidence contributes; wrong roots, other audiences, split routes and missing R descriptors do not"
         );
-        assert!(
-            collection_read_bootstrap_proofs(
-                &snapshot,
-                collection.handle(),
-                reader.verifying_key(),
-                16
-            )
-            .unwrap()
-            .is_empty()
-        );
     }
 
     #[test]
@@ -2206,218 +2037,7 @@ mod tests {
     }
 
     #[test]
-    fn read_bootstrap_is_exact_deterministic_and_transport_bounded() {
-        let root = key(24);
-        let other_root = key(25);
-        let reader = key(26);
-        let mut store = MemoryRepo::default();
-        store
-            .put::<SimpleArchive, _>(entity! { capability_action: ACTION_READ }.facts().clone())
-            .unwrap();
-        store
-            .put::<SimpleArchive, _>(entity! { capability_action: ACTION_WRITE }.facts().clone())
-            .unwrap();
-        let collection = store
-            .collection(
-                "read-evidence",
-                CollectionPolicy::new(
-                    AdmissionPolicy::direct(root.verifying_key()),
-                    AdmissionPolicy::Open,
-                ),
-            )
-            .unwrap();
-        let relevant = root_proof(
-            &root,
-            &reader,
-            scope(read_capability(), collection.handle()),
-        );
-        let wrong_action = root_proof(&root, &reader, write_scope(collection.handle()));
-        let wrong_root = root_proof(
-            &other_root,
-            &reader,
-            scope(read_capability(), collection.handle()),
-        );
-        let unrelated_reader = root_proof(
-            &root,
-            &key(28),
-            scope(read_capability(), collection.handle()),
-        );
-        store_proof(&mut store, wrong_root);
-        store_proof(&mut store, unrelated_reader);
-        store_proof(&mut store, relevant.clone());
-        store_proof(&mut store, wrong_action);
-
-        let snapshot = store.snapshot().unwrap();
-        let selected = collection_read_bootstrap_proofs(
-            &snapshot,
-            collection.handle(),
-            reader.verifying_key(),
-            1,
-        )
-        .unwrap();
-        assert_eq!(selected, [relevant.clone()]);
-        let overlay = collection_repair_overlay(&snapshot, collection.handle()).unwrap();
-        assert_eq!(
-            overlay
-                .authorization_evidence()
-                .reader_is_admitted_by(reader.verifying_key(), &[relevant]),
-            QuorumOutcome::Met
-        );
-        assert!(matches!(
-            collection_read_bootstrap_proofs(
-                &snapshot,
-                collection.handle(),
-                reader.verifying_key(),
-                0
-            ),
-            Err(CollectionReadBootstrapError::TooMany { count: 1, limit: 0 })
-        ));
-    }
-
-    #[test]
-    fn read_bootstrap_trims_suffixes_without_losing_independent_root_shares() {
-        let roots = [key(80), key(81)];
-        let reader = key(82);
-        let later = key(83);
-        let mut store = MemoryRepo::default();
-        store
-            .put::<SimpleArchive, _>(entity! { capability_action: ACTION_READ }.facts().clone())
-            .unwrap();
-        store
-            .put::<SimpleArchive, _>(entity! { capability_action: ACTION_WRITE }.facts().clone())
-            .unwrap();
-        let delegating = store
-            .put::<SimpleArchive, _>(
-                entity! {
-                    capability_action: ACTION_READ,
-                    capability_delegate_action: ACTION_READ,
-                }
-                .facts()
-                .clone(),
-            )
-            .unwrap();
-        let collection = store
-            .collection(
-                "prefix-bootstrap-quorum",
-                CollectionPolicy::new(
-                    AdmissionPolicy::quorum(roots.iter().map(SigningKey::verifying_key), 2, None)
-                        .unwrap(),
-                    AdmissionPolicy::Open,
-                ),
-            )
-            .unwrap();
-        let witnesses = roots.map(|root| {
-            let parent = root_proof(&root, &reader, scope(delegating, collection.handle()));
-            // Store only longer paths. One suffix is a legal READ grant and
-            // another is signed but exceeds its parent's delegated action.
-            for capability in [read_capability(), write_capability()] {
-                store_proof(
-                    &mut store,
-                    parent
-                        .delegate(&reader, capability, later.verifying_key())
-                        .unwrap(),
-                );
-            }
-            parent
-        });
-        let snapshot = store.snapshot().unwrap();
-        let selected = collection_read_bootstrap_proofs(
-            &snapshot,
-            collection.handle(),
-            reader.verifying_key(),
-            2,
-        )
-        .unwrap();
-        assert_eq!(selected.len(), 2, "duplicate suffixes are not extra shares");
-        for witness in &witnesses {
-            assert!(selected.contains(witness));
-        }
-        for witness in &selected {
-            assert_eq!(witness.leaf_key(), reader.verifying_key());
-            assert_eq!(witness.capabilities().collect::<Vec<_>>(), [delegating]);
-        }
-        let overlay = collection_repair_overlay(&snapshot, collection.handle()).unwrap();
-        assert_eq!(
-            overlay
-                .authorization_evidence()
-                .reader_is_admitted_by(reader.verifying_key(), &selected),
-            QuorumOutcome::Met
-        );
-        assert_eq!(
-            overlay
-                .authorization_evidence()
-                .reader_is_admitted_by(reader.verifying_key(), &selected[..1]),
-            QuorumOutcome::Unmet
-        );
-        assert!(matches!(
-            collection_read_bootstrap_proofs(
-                &snapshot,
-                collection.handle(),
-                reader.verifying_key(),
-                1
-            ),
-            Err(CollectionReadBootstrapError::TooMany { count: 2, limit: 1 })
-        ));
-    }
-
-    #[test]
-    fn read_bootstrap_skips_an_earlier_delegation_only_occurrence_of_the_subject() {
-        let root = key(84);
-        let reader = key(85);
-        let later = key(86);
-        let mut store = MemoryRepo::default();
-        store
-            .put::<SimpleArchive, _>(entity! { capability_action: ACTION_READ }.facts().clone())
-            .unwrap();
-        let delegate_only = store
-            .put::<SimpleArchive, _>(
-                entity! { capability_delegate_action: ACTION_READ }
-                    .facts()
-                    .clone(),
-            )
-            .unwrap();
-        let delegating = store
-            .put::<SimpleArchive, _>(
-                entity! {
-                    capability_action: ACTION_READ,
-                    capability_delegate_action: ACTION_READ,
-                }
-                .facts()
-                .clone(),
-            )
-            .unwrap();
-        let collection = store
-            .collection(
-                "prefix-bootstrap-self-delegation",
-                CollectionPolicy::new(
-                    AdmissionPolicy::direct(root.verifying_key()),
-                    AdmissionPolicy::Open,
-                ),
-            )
-            .unwrap();
-        let delegation = root_proof(&root, &reader, scope(delegate_only, collection.handle()));
-        let witness = delegation
-            .delegate(&reader, delegating, reader.verifying_key())
-            .unwrap();
-        store_proof(
-            &mut store,
-            witness
-                .delegate(&reader, read_capability(), later.verifying_key())
-                .unwrap(),
-        );
-        let snapshot = store.snapshot().unwrap();
-        let selected = collection_read_bootstrap_proofs(
-            &snapshot,
-            collection.handle(),
-            reader.verifying_key(),
-            1,
-        )
-        .unwrap();
-        assert_eq!(selected, [witness]);
-    }
-
-    #[test]
-    fn open_read_policy_needs_no_bootstrap_evidence() {
+    fn open_read_policy_admits_without_evidence() {
         let mut store = MemoryRepo::default();
         store
             .put::<SimpleArchive, _>(entity! { capability_action: ACTION_READ }.facts().clone())
@@ -2432,14 +2052,6 @@ mod tests {
             )
             .unwrap();
         let snapshot = store.snapshot().unwrap();
-        let selected = collection_read_bootstrap_proofs(
-            &snapshot,
-            collection.handle(),
-            key(27).verifying_key(),
-            0,
-        )
-        .unwrap();
-        assert!(selected.is_empty());
         assert_eq!(
             collection_repair_overlay(&snapshot, collection.handle())
                 .unwrap()

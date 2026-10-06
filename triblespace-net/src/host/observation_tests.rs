@@ -597,7 +597,7 @@ fn unrelated_blob_arrivals_reuse_records_without_enumeration() {
 }
 
 #[test]
-fn proof_arrival_refreshes_read_bootstrap_without_record_enumeration() {
+fn proof_arrival_refreshes_authorization_without_record_enumeration() {
     let mut fixture = Fixture::new();
     let reader = SigningKey::from_bytes(&[102; 32]).verifying_key();
     let active = active(fixture.collection.handle());
@@ -614,7 +614,6 @@ fn proof_arrival_refreshes_read_bootstrap_without_record_enumeration() {
     let old = serving_before
         .collection(fixture.collection.handle())
         .unwrap();
-    assert!(old.read_bootstrap.is_empty());
     assert_eq!(fixture.enumerations.swap(0, Ordering::Relaxed), 1);
 
     let proof = CapabilityProof::new(
@@ -642,7 +641,6 @@ fn proof_arrival_refreshes_read_bootstrap_without_record_enumeration() {
     assert_eq!(fixture.enumerations.load(Ordering::Relaxed), 0);
     assert_same_record_leaves(&old, &new, &fixture.records);
     assert_ne!(old.wake_root(), new.wake_root());
-    assert_eq!(new.read_bootstrap.as_ref(), &[proof.clone()]);
     assert_eq!(
         new.repair
             .authorization_evidence()
@@ -855,7 +853,6 @@ fn arriving_read_definition_refreshes_admission_with_same_wake_root_and_record_l
     )
     .unwrap();
     let old = serving_before.collection(collection).unwrap();
-    assert!(old.read_bootstrap.is_empty());
     assert_eq!(
         old.repair
             .authorization_evidence()
@@ -895,7 +892,6 @@ fn arriving_read_definition_refreshes_admission_with_same_wake_root_and_record_l
     // newly available blob, independently visible in the product wake root.
     assert_ne!(old.wake_root(), new.wake_root());
     assert!(!Arc::ptr_eq(&old.repair, &new.repair));
-    assert_eq!(new.read_bootstrap.as_ref(), &[proof.clone()]);
     assert_eq!(
         new.repair
             .authorization_evidence()
@@ -1015,7 +1011,7 @@ impl ScopedFixture {
 }
 
 #[test]
-fn scoped_unrelated_blobs_reuse_proofs_bootstrap_and_records_without_blob_reads() {
+fn scoped_unrelated_blobs_reuse_proofs_and_records_without_blob_reads() {
     let mut fixture = ScopedFixture::new();
     let selected = fixture.active();
     // Tracked as a serving peer tracks them, so the inventory served is a
@@ -1060,7 +1056,6 @@ fn scoped_unrelated_blobs_reuse_proofs_bootstrap_and_records_without_blob_reads(
                 "the served inventory is the held set"
             );
             assert_same_record_leaves(&old, &new, &[fixture.records[index]]);
-            assert!(Arc::ptr_eq(&old.read_bootstrap, &new.read_bootstrap));
             let id = fixture.proofs[index].id();
             assert!(std::ptr::eq(
                 old.repair.authorization_evidence().get(id).unwrap(),
@@ -1111,17 +1106,12 @@ fn scoped_record_changes_update_only_the_selected_c_and_keep_authorization() {
         assert_ne!(old.wake_root(), new.wake_root());
         assert!(new.repair.records().get(record.fingerprint()).is_some());
         assert_shared_record_leaves(&old, &new, &[fixture.records[0]]);
-        assert!(Arc::ptr_eq(&old.read_bootstrap, &new.read_bootstrap));
         let old_other = before
             .1
             .collection(fixture.collections[1].handle())
             .unwrap();
         let new_other = after.1.collection(fixture.collections[1].handle()).unwrap();
         assert_same_record_leaves(&old_other, &new_other, &[fixture.records[1]]);
-        assert!(Arc::ptr_eq(
-            &old_other.read_bootstrap,
-            &new_other.read_bootstrap
-        ));
         before = after;
     }
 }
@@ -1230,7 +1220,7 @@ fn scoped_missing_descriptor_stays_pending_until_its_exact_blob_arrives() {
 }
 
 #[test]
-fn scoped_missing_definition_landing_changes_bootstrap_without_rebuilding_records() {
+fn scoped_missing_definition_landing_changes_admission_without_rebuilding_records() {
     let mut fixture = ScopedFixture::new();
     let definition: Blob<SimpleArchive> = entity! {
         capability_action: ACTION_READ,
@@ -1256,7 +1246,6 @@ fn scoped_missing_definition_landing_changes_bootstrap_without_rebuilding_record
     let selected = active(collection);
     let before = fixture.observe(&selected, None);
     let old = before.1.collection(collection).unwrap();
-    assert!(old.read_bootstrap.is_empty());
     assert_eq!(
         old.repair
             .authorization_evidence()
@@ -1277,20 +1266,14 @@ fn scoped_missing_definition_landing_changes_bootstrap_without_rebuilding_record
     let (records, proofs, reads) = fixture.take_counts();
     assert_eq!((records, proofs), (0, 0));
     assert!(reads <= 1024 + 64);
-    assert!(
-        unrelated
-            .1
-            .collection(collection)
-            .unwrap()
-            .read_bootstrap
-            .is_empty()
-    );
 
+    // The definition changes no evidence: admission reads it through the
+    // rebound reader.
     fixture.store.put::<SimpleArchive, _>(definition).unwrap();
     let arrived = fixture.observe(&selected, Some(&unrelated));
     let (records, proofs, reads) = fixture.take_counts();
-    assert_eq!((records, proofs), (0, 1));
-    assert!(reads > 0);
+    assert_eq!((records, proofs), (0, 0));
+    assert!(reads <= 1024 + 64);
     let new = arrived.1.collection(collection).unwrap();
     assert_eq!(
         old.repair.records().summary(),
@@ -1302,7 +1285,6 @@ fn scoped_missing_definition_landing_changes_bootstrap_without_rebuilding_record
     );
     assert_ne!(old.wake_root(), new.wake_root());
     assert!(new.repair.blob_inventory().get(&capability.raw).is_some());
-    assert_eq!(new.read_bootstrap.as_ref(), &[proof.clone()]);
     assert_eq!(
         new.repair
             .authorization_evidence()
@@ -1361,7 +1343,6 @@ fn scoped_reuse_rebinds_novel_request_resource_and_definition_reads() {
     assert!(reads <= 1024 + 64);
     let old = before.1.collection(collection).unwrap();
     let new = after.1.collection(collection).unwrap();
-    assert!(Arc::ptr_eq(&old.read_bootstrap, &new.read_bootstrap));
     assert_eq!(old.wake_root(), new.wake_root());
     assert!(matches!(
         old.repair
@@ -1392,34 +1373,4 @@ fn scoped_reuse_rebinds_novel_request_resource_and_definition_reads() {
             .get(incoming_resource.id())
             .is_none()
     );
-}
-
-#[test]
-fn scoped_bootstrap_is_bound_to_the_local_subject_as_well_as_store_inputs() {
-    let mut fixture = ScopedFixture::new();
-    let selected = active(fixture.collections[0].handle());
-    let before = fixture.observe(&selected, None);
-    assert!(
-        !before
-            .1
-            .collection(fixture.collections[0].handle())
-            .unwrap()
-            .read_bootstrap
-            .is_empty()
-    );
-    fixture.take_counts();
-    fixture.local = SigningKey::from_bytes(&[116; 32]).verifying_key();
-    let after = fixture.observe(&selected, Some(&before));
-    assert_eq!(after.0.changes_since(&before.0), StoreChanges::NONE);
-    assert!(
-        after
-            .1
-            .collection(fixture.collections[0].handle())
-            .unwrap()
-            .read_bootstrap
-            .is_empty()
-    );
-    let (records, proofs, _) = fixture.take_counts();
-    // Subject changes invalidate authorization, not the underlying records.
-    assert_eq!((records, proofs), (0, 1));
 }
