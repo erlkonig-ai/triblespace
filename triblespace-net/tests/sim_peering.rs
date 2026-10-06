@@ -1,8 +1,11 @@
 //! Per-collection peering through whole hosts over the deterministic
-//! transport: a host peers for a collection only while its pile selects it.
+//! transport: a host peers for a collection only while its pile selects it,
+//! a writer that cannot read delivers without receiving, and neighbour groups
+//! split by a partition merge at a swap once it heals.
 #![cfg(feature = "sim")]
 
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use anybytes::Bytes;
 use ed25519_dalek::SigningKey;
@@ -10,20 +13,22 @@ use iroh_base::EndpointId;
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace_core::capability::{CapabilityProof, CapabilityResource};
+use triblespace_core::capability::{CapabilityHandle, CapabilityProof, CapabilityResource};
 use triblespace_core::clock::{self, VirtualClock};
 use triblespace_core::collection::selection::{CONFIG_COLLECTION_NAME, write_sync_selection};
 use triblespace_core::collection::{
     AdmissionPolicy, Collection, CollectionHandle, CollectionPolicy, CollectionStoreExt,
-    private_policy, read_capability,
+    private_policy, read_capability, write_capability,
 };
 use triblespace_core::collection::{
-    CollectionCommit, CollectionData, CollectionRecord, CollectionStore, HeldRead,
+    CollectionCommit, CollectionData, CollectionRead, CollectionRecord, CollectionStore, HeldRead,
     empty_metadata_handle,
 };
 use triblespace_core::repo::memoryrepo::MemoryRepo;
-use triblespace_core::repo::{BlobStoreGet, BlobStorePut, CapabilityProofStore, SnapshotSource};
-use triblespace_net::health::PeeringHealth;
+use triblespace_core::repo::{
+    BlobStoreGet, BlobStorePut, CapabilityProofRead, CapabilityProofStore, SnapshotSource,
+};
+use triblespace_net::health::{PeeringHealth, RepairHealth};
 use triblespace_net::host::{self, PeerConfig};
 use triblespace_net::peer::Peer;
 use triblespace_net::reconcile::ReplicationMode;
@@ -135,6 +140,66 @@ async fn advance(clock: &Arc<VirtualClock>, peers: &mut [&mut Peer<MemoryRepo>],
 
 fn peerings(peer: &Peer<MemoryRepo>) -> Vec<PeeringHealth> {
     peer.health().peerings.clone()
+}
+
+/// `root` grants `subject` the `action` on `collection`.
+fn grant(
+    root: &SigningKey,
+    action: CapabilityHandle,
+    subject: &SigningKey,
+    collection: CollectionHandle,
+) -> CapabilityProof {
+    CapabilityProof::new(
+        CapabilityResource::from(collection),
+        root,
+        action,
+        subject.verifying_key(),
+    )
+}
+
+/// A record of `collection` that `key` signs over fresh data, kept in `store`
+/// with its data.
+fn commit(
+    store: &mut MemoryRepo,
+    key: &SigningKey,
+    collection: CollectionHandle,
+    body: &[u8],
+) -> CollectionRecord {
+    let data = store
+        .put::<UnknownBlob, _>(Bytes::from_source(body.to_vec()))
+        .unwrap();
+    let record = CollectionRecord::Commit(CollectionCommit::sign(
+        key,
+        collection,
+        CollectionData::new(data.raw),
+        empty_metadata_handle(),
+    ));
+    store.insert(record).unwrap();
+    record
+}
+
+fn holds(peer: &mut Peer<MemoryRepo>, record: CollectionRecord) -> bool {
+    peer.snapshot()
+        .unwrap()
+        .records()
+        .unwrap()
+        .any(|held| held.unwrap() == record)
+}
+
+/// What `peer` recorded of its record pulls of `collection` from `from`.
+fn pulls(
+    peer: &Peer<MemoryRepo>,
+    collection: CollectionHandle,
+    from: [u8; 32],
+) -> Option<RepairHealth> {
+    peer.health()
+        .collections
+        .iter()
+        .find(|health| health.collection == collection)?
+        .peers
+        .iter()
+        .find(|pulls| pulls.peer == from)
+        .cloned()
 }
 
 #[test]
@@ -322,4 +387,275 @@ fn full_hosts_with_equal_records_converge_on_their_held_blobs() {
 #[test]
 fn a_demand_host_and_a_full_host_compare_no_held_blobs() {
     assert_eq!(held_blobs_after_peering(false), [false, false]);
+}
+
+/// Astra's R3 through whole hosts. A writer that cannot read asks the
+/// collection's owner to peer with its send flag set, presenting its WRITE
+/// grant. The owner accepts without sending: it pulls the writer's record and
+/// grant and sends nothing back. The owner keeps a record of its own, so the
+/// two roots stay different, and every later announcement of the writer's
+/// unchanged root equals the last pull from it that completed: it starts no
+/// second walk.
+#[test]
+fn a_writer_that_cannot_read_delivers_receives_nothing_and_walks_once() {
+    let _guard = test_guard();
+    let clock = virtual_clock();
+    clock.reset();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    runtime.block_on(tokio::task::LocalSet::new().run_until(async {
+        let net = SimNet::new(0x9EE7_1004, SimConfig::default());
+        let owner_key = key(97);
+        let writer_key = key(98);
+        let policy = CollectionPolicy::new(
+            AdmissionPolicy::direct(owner_key.verifying_key()),
+            AdmissionPolicy::direct(owner_key.verifying_key()),
+        );
+        let mut owner_pile = Pile::new(owner_key.clone(), policy.clone());
+        let mut writer_pile = Pile::new(writer_key.clone(), policy);
+        let collection = owner_pile.collection;
+        let write = grant(&owner_key, write_capability(), &writer_key, collection);
+        writer_pile.store.insert_proof(write.clone()).unwrap();
+        let owned = commit(
+            &mut owner_pile.store,
+            &owner_key,
+            collection,
+            b"the owner's",
+        );
+        let written = commit(
+            &mut writer_pile.store,
+            &writer_key,
+            collection,
+            b"the writer's",
+        );
+        select(&mut owner_pile);
+        select(&mut writer_pile);
+        let (owner_id, writer_id) = (
+            owner_key.verifying_key().to_bytes(),
+            writer_key.verifying_key().to_bytes(),
+        );
+        let mut owner = bring_up(&net, &owner_key, owner_pile.store);
+        let mut writer = bring_up(&net, &writer_key, writer_pile.store);
+        owner.activate_collection(collection);
+        writer.activate_collection(collection);
+
+        advance(&clock, &mut [&mut owner, &mut writer], 30).await;
+        assert!(holds(&mut owner, written));
+        let delivered = owner.snapshot().unwrap();
+        assert!(
+            delivered
+                .proofs()
+                .unwrap()
+                .any(|proof| proof.unwrap() == write)
+        );
+        let peering = |peer: &Peer<MemoryRepo>, other| {
+            let peerings = peerings(peer);
+            assert!(
+                peerings.len() == 1 && peerings[0].peer == other && peerings[0].peered,
+                "{peerings:?}"
+            );
+            peerings[0]
+        };
+        let at_owner = peering(&owner, writer_id);
+        assert!(!at_owner.sends && at_owner.receives, "{at_owner:?}");
+        let at_writer = peering(&writer, owner_id);
+        assert!(at_writer.sends && !at_writer.receives, "{at_writer:?}");
+        let walked = pulls(&owner, collection, writer_id).expect("the owner pulled");
+        assert!(walked.last_completed_at.is_some() && !walked.in_flight);
+        assert_eq!(walked.first_started_at, walked.last_started_at);
+
+        // Five announcement intervals at their sixty-second cap.
+        advance(&clock, &mut [&mut owner, &mut writer], 300).await;
+        let later = pulls(&owner, collection, writer_id).unwrap();
+        assert_eq!(
+            later.last_started_at, walked.last_started_at,
+            "the writer's unchanged root started a second walk"
+        );
+        assert!(!holds(&mut writer, owned));
+        assert!(pulls(&writer, collection, owner_id).is_none());
+    }));
+}
+
+/// Astra's R6 through whole hosts: two neighbour groups formed during a
+/// partition merge once it heals, after each side's candidate order was
+/// walked to its end and drawn again.
+///
+/// Each of two readers asks for five of ten servers. Servers write but
+/// cannot read: nothing reaches them but the credentials of the readers that
+/// ask them, so a server's candidates are the policy root, which is never on
+/// the network, and its own group's reader. The partition puts each reader
+/// with five servers from the start, and its five asked-for neighbours are
+/// healthy servers of its own group. Its swaps walk its order to the end and
+/// draw it again, dialling every server of the other group at least twice.
+/// Once the partition heals, a reader's walk or its next swap brings in a
+/// server of the other group, and with it that group's new record.
+/// Credentials the readers present make them candidates of each other once
+/// they reach a common server, so the groups may also join reader to reader.
+#[test]
+fn two_neighbour_groups_merge_after_their_partition_heals() {
+    // SWAP_INTERVAL, which the peering task counts from its first tick with
+    // the collection selected.
+    const SWAP: u64 = 600;
+    let _guard = test_guard();
+    let clock = virtual_clock();
+    clock.reset();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    runtime.block_on(tokio::task::LocalSet::new().run_until(async {
+        let net = SimNet::new(0x9EE7_1005, SimConfig::default());
+        let root = key(100);
+        let policy = CollectionPolicy::new(
+            AdmissionPolicy::direct(root.verifying_key()),
+            AdmissionPolicy::direct(root.verifying_key()),
+        );
+        let readers = [key(101), key(102)];
+        let servers = [110..115, 120..125].map(|keys| keys.map(key).collect::<Vec<_>>());
+        let mut server_piles = servers
+            .iter()
+            .flatten()
+            .map(|server| Pile::new(server.clone(), policy.clone()))
+            .collect::<Vec<_>>();
+        let collection = server_piles[0].collection;
+        let mut reader_piles = readers
+            .iter()
+            .map(|reader| {
+                let mut pile = Pile::new(reader.clone(), policy.clone());
+                let read = grant(&root, read_capability(), reader, collection);
+                pile.store.insert_proof(read).unwrap();
+                pile
+            })
+            .collect::<Vec<_>>();
+        // Each server's WRITE grant and a record it signed. The readers hold
+        // them all, which makes every server a candidate of theirs.
+        for pile in &mut server_piles {
+            let write = grant(&root, write_capability(), &pile.key, collection);
+            pile.store.insert_proof(write.clone()).unwrap();
+            let record = commit(&mut pile.store, &pile.key, collection, b"a server's");
+            for reader in &mut reader_piles {
+                reader.store.insert_proof(write.clone()).unwrap();
+                reader.store.insert(record).unwrap();
+            }
+        }
+        let id = |key: &SigningKey| key.verifying_key().to_bytes();
+        let groups = [0, 1].map(|group| {
+            std::iter::once(id(&readers[group]))
+                .chain(servers[group].iter().map(id))
+                .collect::<Vec<_>>()
+        });
+        for a in &groups[0] {
+            for b in &groups[1] {
+                net.partition(*a, *b);
+            }
+        }
+        let mut hosts = reader_piles
+            .into_iter()
+            .chain(server_piles)
+            .map(|mut pile| {
+                select(&mut pile);
+                let key = pile.key.clone();
+                bring_up(&net, &key, pile.store)
+            })
+            .collect::<Vec<_>>();
+        // Servers select first, so that none refuses a reader for want of
+        // its own observation and then invites it: an invited peering is not
+        // one the reader asked for, and would leave it a slot to fill.
+        for host in &mut hosts[2..] {
+            host.activate_collection(collection);
+        }
+        let mut all = hosts.iter_mut().collect::<Vec<_>>();
+        advance(&clock, &mut all, 5).await;
+        let started = clock::mono_now();
+        for host in &mut hosts[..2] {
+            host.activate_collection(collection);
+        }
+        // Readers first, then the servers of group 0 and of group 1.
+        let server = |group: usize, index: usize| 2 + 5 * group + index;
+        let until = |seconds: u64| {
+            (started + Duration::from_secs(seconds))
+                .duration_since(clock::mono_now())
+                .as_secs()
+        };
+        let mut all = hosts.iter_mut().collect::<Vec<_>>();
+        advance(&clock, &mut all, 60).await;
+        for group in 0..2 {
+            let mut asked = peerings(&hosts[group])
+                .into_iter()
+                .filter(|peering| peering.peered && peering.asked)
+                .map(|peering| peering.peer)
+                .collect::<Vec<_>>();
+            asked.sort_unstable();
+            let mut own = servers[group].iter().map(id).collect::<Vec<_>>();
+            own.sort_unstable();
+            assert_eq!(asked, own, "reader {group} asks the servers of its group");
+        }
+
+        // A new record in each group, which every server of the group holds.
+        let fresh = [0, 1].map(|group| {
+            let first = server(group, 0);
+            let record = commit(
+                &mut *hosts[first].store(),
+                &servers[group][0],
+                collection,
+                b"new in its group",
+            );
+            for index in 1..5 {
+                hosts[server(group, index)].store().insert(record).unwrap();
+            }
+            record
+        });
+        let mut all = hosts.iter_mut().collect::<Vec<_>>();
+        advance(&clock, &mut all, until(2 * SWAP + 90)).await;
+        for group in 0..2 {
+            // Each reached the end of its first draw and drew again: it
+            // dialled every server of the other group, and one of them twice,
+            // which a failed key never is within one draw.
+            let dials = servers[1 - group]
+                .iter()
+                .map(|other| net.dial_count(id(&readers[group]), id(other)))
+                .collect::<Vec<_>>();
+            assert!(
+                dials.iter().all(|dials| *dials >= 1) && dials.iter().any(|dials| *dials >= 2),
+                "reader {group} dialled the other group's servers {dials:?} times"
+            );
+            assert!(holds(&mut hosts[group], fresh[group]));
+            assert!(!holds(&mut hosts[group], fresh[1 - group]));
+        }
+
+        for a in &groups[0] {
+            for b in &groups[1] {
+                net.heal(*a, *b);
+            }
+        }
+        // A swap whose replacement fails refills the slot from the order,
+        // which can give it back to the neighbour it swapped out: the
+        // unreachable root heads every fresh draw, so here about one swap in
+        // six merges nothing.
+        let healed = clock::mono_now();
+        let merged = |hosts: &mut [Peer<MemoryRepo>]| {
+            (0..2).all(|group| holds(&mut hosts[group], fresh[1 - group]))
+        };
+        while !merged(&mut hosts) {
+            assert!(
+                clock::mono_now().duration_since(healed) < Duration::from_secs(6 * SWAP),
+                "the groups did not merge within six swap intervals"
+            );
+            let mut all = hosts.iter_mut().collect::<Vec<_>>();
+            advance(&clock, &mut all, 10).await;
+        }
+        for group in 0..2 {
+            let others = &groups[1 - group];
+            assert!(
+                peerings(&hosts[group])
+                    .iter()
+                    .any(|peering| peering.peered && others.contains(&peering.peer)),
+                "reader {group} peers with nobody of the other group"
+            );
+        }
+    }));
 }

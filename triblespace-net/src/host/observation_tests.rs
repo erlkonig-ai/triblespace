@@ -2,7 +2,9 @@
 //!
 //! Counts are per snapshot family, not global instrumentation. Comparing the
 //! retained leaf addresses additionally distinguishes reuse from rebuilding an
-//! equal record PATCH and merely obtaining the same Merkle summary.
+//! equal record PATCH and merely obtaining the same Merkle summary. The
+//! landing task publishes these observations as walks land, and the
+//! connection table serves the latest one.
 
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -387,6 +389,97 @@ fn serving_handoff_withdrawal_recovery_and_last_owner_drop_are_observable() {
     assert!(!wiring.snapshot.has_changed().unwrap());
     drop(clone);
     assert!(wiring.snapshot.has_changed().is_err());
+}
+
+/// Values reach the serving observation through the landing task, and the
+/// connection table serves the latest observation only. One walk's landed
+/// group publishes one observation, which keeps the record leaves it did not
+/// change; nobody retains the observation before it; and a blob that landed
+/// is served over `blob/1` at once, without a refresh.
+#[cfg(feature = "sim")]
+#[tokio::test(start_paused = true)]
+async fn landing_publishes_one_observation_that_the_connection_table_serves() {
+    use super::SnapshotHandler;
+    use crate::channel::NetEvent;
+    use crate::connection::ConnectionTable;
+    use crate::protocol::op_get_blob;
+    use crate::routing::RoutingTable;
+    use crate::transport::Transport as _;
+    use crate::transport::sim::{SimConfig, SimNet};
+    use anybytes::Bytes;
+    use triblespace_core::blob::encodings::UnknownBlob;
+
+    let mut fixture = Fixture::new();
+    let collection = fixture.collection.handle();
+    let local = fixture.root.verifying_key().to_bytes();
+    let (sender, receiver, wiring) =
+        super::wire(iroh_base::EndpointId::from_bytes(&local).unwrap());
+    let store = std::mem::take(&mut fixture.store);
+    let mut peer = crate::peer::Peer::with_wiring(store, sender, receiver);
+    peer.activate_collection(collection);
+    let mut published = wiring.snapshot.clone();
+    let before = published.borrow_and_update().clone().unwrap();
+
+    // The table serves what the watch holds.
+    let net = SimNet::new(0x0B5E_0001, SimConfig::default());
+    let mut harness = net.join(&fixture.root);
+    let handler = SnapshotHandler {
+        snapshot: wiring.snapshot.clone(),
+        ..SnapshotHandler::for_test(local, RoutingTable::new(local, []))
+    };
+    let table = ConnectionTable::new(harness.transport.clone(), handler);
+    tokio::spawn(async move {
+        while let Some(incoming) = harness.incoming.recv().await {
+            table.accept(incoming.conn);
+        }
+    });
+    let client = net.join(&SigningKey::from_bytes(&[103; 32])).transport;
+    let client_id = client.local_id();
+    let routes = RoutingTable::new(client_id, []);
+    let client = ConnectionTable::new(client, SnapshotHandler::for_test(client_id, routes));
+    let connection = client.connect(local).await.unwrap();
+    let bytes = Bytes::from_source(b"landed by a walk".to_vec());
+    let blob = Blob::<UnknownBlob>::new(bytes.clone());
+    let hash = blob.get_handle().raw;
+    assert!(
+        op_get_blob(&connection, client_id, &hash)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let (items, queued) = tokio::sync::mpsc::unbounded_channel();
+    let (acks, mut acknowledged) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(crate::landing::run(wiring.lander.clone(), queued, acks));
+    let events = vec![
+        NetEvent::Blob(blob),
+        NetEvent::CollectionRecord(fixture.pending),
+    ];
+    items.send((1_u8, events)).unwrap();
+    let landed = acknowledged.recv().await.unwrap();
+    assert_eq!((landed.key, landed.landed, landed.failed), (1, 2, 0));
+    let after = published.borrow_and_update().clone().unwrap();
+    assert!(
+        !published.has_changed().unwrap(),
+        "one group, one observation"
+    );
+    let [old, new] = [&before, &after].map(|snapshot| snapshot.collection(collection).unwrap());
+    assert_shared_record_leaves(&old, &new, &fixture.records);
+    assert!(
+        new.repair
+            .records()
+            .get(fixture.pending.fingerprint())
+            .is_some()
+    );
+    let retired = Arc::downgrade(&before);
+    drop((before, old));
+    assert!(
+        retired.upgrade().is_none(),
+        "an older observation is retained"
+    );
+
+    let served = op_get_blob(&connection, client_id, &hash).await.unwrap();
+    assert_eq!(served.map(|blob| blob.bytes), Some(bytes));
 }
 
 fn assert_same_record_leaves(
