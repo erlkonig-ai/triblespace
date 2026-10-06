@@ -47,9 +47,7 @@ use crate::repo::{
 };
 
 use super::coverage::{Coverage, CoverageIndex, StoreWriters};
-use super::held::{
-    HeldBlobs, HeldIndex, HeldRead, HeldSource, HeldStore, HeldView, HeldWalkConfig, HeldWalker,
-};
+use super::held::{HeldBlobs, HeldIndex, HeldRead, HeldSource, HeldStore, HeldView};
 use super::{
     CollectionHandle, CollectionRead, CollectionRecord,
     CollectionRecordSelector, CollectionStore, CoverageRead,
@@ -149,9 +147,8 @@ where
             inner: self.inner.clone(),
             host: self.host,
             last: self.last.clone(),
-            // A clone diverges from here on: it keeps what was learned, and
-            // no walker.
-            held: std::sync::Arc::new(self.held.detached_clone()),
+            // A clone diverges from here on, keeping what was learned.
+            held: std::sync::Arc::new((*self.held).clone()),
         }
     }
 }
@@ -269,30 +266,6 @@ impl<S: SnapshotSource> HeldStore for Covered<S> {
 
     fn note_held(&mut self, collection: CollectionHandle, handle: Inline<Handle<UnknownBlob>>) {
         self.held.note(collection, handle.raw);
-    }
-}
-
-impl<S> Covered<S>
-where
-    S: SnapshotSource,
-    S::Snapshot: HeldSource,
-{
-    /// Start the background walker of this store's held sets: the start-up
-    /// walk of each newly tracked collection and the periodic full walk.
-    /// Only a long-running host starts one; the thread lives until the
-    /// returned handle is dropped.
-    pub fn start_held_walker(&self, config: HeldWalkConfig) -> HeldWalker {
-        self.held.start_walker(config)
-    }
-
-    /// Run one full walk now, on the calling thread and `threads` readers,
-    /// against a fresh observation: the backstop the walker runs
-    /// periodically. Its results enter the next snapshot.
-    pub fn walk_held(&mut self, threads: usize) -> Result<(), S::SnapshotError> {
-        let now = self.inner.snapshot()?;
-        self.held.observe(&now);
-        self.held.walk(threads, None, None);
-        Ok(())
     }
 }
 

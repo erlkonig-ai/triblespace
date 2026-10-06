@@ -296,8 +296,8 @@ impl StoreSnapshot {
         let reader = ResidentBlobReader::new(&snapshot);
         for raw in active.iter_ordered() {
             let collection = CollectionHandle::new(*raw);
-            // Positive, possibly incomplete while a start-up walk runs; an
-            // untracked collection holds nothing.
+            // Positive; a collection replicated on demand is untracked and
+            // holds nothing.
             let held = snapshot.held(collection).unwrap_or_default();
             let prior = previous.and_then(|prior| prior.collections.get(&collection.raw));
             let relevant = match (previous_store, prior) {

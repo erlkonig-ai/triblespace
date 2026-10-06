@@ -231,7 +231,7 @@ where
                     snapshot.changes_since(previous)
                 })
         };
-        // A background walk changes held sets without changing the store.
+        // A peer's report changes held sets without changing the store.
         let held_unchanged = publication
             .last_store_snapshot
             .as_ref()

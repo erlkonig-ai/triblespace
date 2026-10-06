@@ -4,7 +4,7 @@
 //! The host publishes the store's held set of each active collection; it
 //! scans nothing itself. These tests pin what that means for the serving
 //! overlay: scan-once (a late child is not found by an arrival), rule-3
-//! reports and the walk backstop, and reset on removal. A reference pull
+//! reports, and reset on removal. A reference pull
 //! brings a peer's held set here: what is resident joins as it is, what is
 //! not is fetched by hash first.
 
@@ -167,26 +167,6 @@ fn a_blob_only_child_is_held_after_a_report_not_by_its_arrival() {
     assert!(held(&new, fixture.collection, &child_handle.raw));
     // The retained immutable observation does not learn a future arrival.
     assert!(!held(&old, fixture.collection, &child_handle.raw));
-}
-
-/// The walk backstop finds the same late child with no report at all.
-#[test]
-fn a_walk_finds_a_blob_only_child_nobody_reported() {
-    let child = Blob::<UnknownBlob>::new(Bytes::from_source(b"found by the walk".to_vec()));
-    let child_handle = child.get_handle();
-    let mut fixture = Fixture::new(Bytes::from_source(child_handle.raw.to_vec()));
-    let active = fixture.active();
-    let before = fixture.store.snapshot().unwrap();
-    let old = observe(&before, &active, fixture.local, None);
-    fixture.store.put::<UnknownBlob, _>(child).unwrap();
-    fixture.store.walk_held(1).unwrap();
-    let after = fixture.store.snapshot().unwrap();
-    let new = observe(&after, &active, fixture.local, Some((&before, &old)));
-    assert!(held(&new, fixture.collection, &child_handle.raw));
-    assert_ne!(
-        digest(&old, fixture.collection),
-        digest(&new, fixture.collection)
-    );
 }
 
 /// No budget: a body of any size is held with its children in the first
