@@ -176,7 +176,7 @@ impl RepairFixture {
             None,
         )
         .await
-        .map(|(retry, _)| retry)
+        .map(|(retry, _, _)| retry)
     }
 }
 

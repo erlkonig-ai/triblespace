@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Announce each selected collection's root on `recon/1` (sync redesign M8).
+  ANNOUNCE goes to the collection's neighbours this side sends to, on one
+  timer per collection that waits two to sixty seconds: a local append
+  resets it, a pull landing does not, and a completed pull resets it once.
+  An equal announcement spares its sender that interval. A different one
+  starts a record pull from its sender and gets one immediate reply, which
+  is never answered; the root of the last completed pull from a neighbour
+  ends a comparison like an equal one. A record pull is one pass of the
+  repair session until pull walks replace it. Announcements keep a peered
+  connection from going idle.
 - Peer per collection on `recon/1` (sync redesign M7). A host asks up to five
   candidates for each collection its pile selects and accepts a request only
   for a collection it selects, from a key that passes READ or that sends and

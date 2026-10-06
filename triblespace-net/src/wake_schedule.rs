@@ -40,7 +40,7 @@ pub(crate) struct WakeSchedule<N> {
     interval_end: Mono,
     transmit_at: Option<Mono>,
     /// Neighbours this interval's opportunity skips: each announced the root
-    /// the caller holds.
+    /// the caller holds, or got the caller's reply.
     heard_equal: BTreeSet<N>,
     /// Neighbours owed an announcement despite `heard_equal`: they joined
     /// since the last opportunity.
@@ -133,6 +133,13 @@ impl<N: Copy + Ord> WakeSchedule<N> {
         if now < self.interval_end {
             self.heard_equal.insert(neighbour);
         }
+    }
+
+    /// The caller answered `neighbour` with its current root at once. The
+    /// answer counts as this interval's announcement to it.
+    pub(crate) fn replied(&mut self, now: Mono, neighbour: N) {
+        self.force_offer.remove(&neighbour);
+        self.consistent_root(now, neighbour);
     }
 
     /// Offer our current root to a new neighbour, even if it announced an
@@ -322,6 +329,20 @@ mod tests {
         schedule.consistent_root(boundary, A);
         schedule.consistent_root(boundary, B);
         assert!(schedule.poll(schedule.deadline(), 0, BOTH).is_empty());
+    }
+
+    #[test]
+    fn a_reply_counts_as_the_interval_announcement_until_the_root_changes() {
+        let now = crate::clock::mono_now();
+        let mut schedule = WakeSchedule::new(now, 0);
+        schedule.neighbor_joined(now, 0, A);
+        schedule.replied(now, A);
+        assert_eq!(schedule.poll(schedule.deadline(), 0, BOTH), [B]);
+
+        let mut schedule = WakeSchedule::new(now, 0);
+        schedule.replied(now, A);
+        schedule.local_changed(now, 0);
+        assert_eq!(schedule.poll(schedule.deadline(), 0, BOTH), BOTH);
     }
 
     #[test]

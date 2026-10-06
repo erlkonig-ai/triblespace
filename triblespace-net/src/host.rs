@@ -35,6 +35,7 @@ use triblespace_core::repo::{
 };
 use triblespace_core::trible::TribleSet;
 
+use crate::announce::PullEnded;
 use crate::bearer::{BearerLocatorIndex, blob_locator, locator_index, update_locator_index};
 use crate::channel::{NetEvent, NetEventBatch};
 use crate::collection_activation::{CollectionRepairOverlay, CollectionRepairOverlayError};
@@ -1560,14 +1561,24 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
     // One table holds the connections of both directions; each serves the
     // same handler, whichever side dialled it.
     let connections = ConnectionTable::new(transport.clone(), handler);
-    // Peerings ride the connections' recon/1 streams beside the wake and
-    // repair paths below.
+    // Peerings and announcements ride the connections' recon/1 streams
+    // beside the wake and repair paths below.
     let (found_tx, found_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (ended_tx, ended_rx) = tokio::sync::mpsc::unbounded_channel();
+    let pulls = RecordPulls {
+        connections: connections.clone(),
+        snapshot: wiring.snapshot.clone(),
+        events: wiring.evt_tx.clone(),
+        health: wiring.health.clone(),
+        ended: ended_tx,
+    };
     tokio::spawn(crate::peering::run(
         connections.clone(),
         wiring.snapshot.clone(),
         recon_rx,
         found_rx,
+        move |peer, collection| pulls.start_record_pull(peer, collection),
+        ended_rx,
         wiring.health.clone(),
     ));
     let provider_client = ProviderClient {
@@ -2142,7 +2153,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
                     )
                     .await;
                     let (success, retry_immediately, failure, inventory_cursor) = match result {
-                        Ok(Ok((retry_immediately, cursor))) => {
+                        Ok(Ok((retry_immediately, cursor, _))) => {
                             (true, retry_immediately, None, cursor)
                         }
                         Ok(Err(error)) => {
@@ -2283,6 +2294,9 @@ impl AdmissionBatcher {
     }
 }
 
+/// One repair pass of `target`. Returns whether to repeat it at once, the
+/// inventory cursor to resume, and the peer's root if the pass left no
+/// record or proof behind.
 async fn reconcile_collection_peer<T: Transport>(
     connections: &ConnectionTable<T, SnapshotHandler>,
     target: RepairTarget,
@@ -2290,7 +2304,7 @@ async fn reconcile_collection_peer<T: Transport>(
     events: &tokio::sync::mpsc::Sender<NetEventBatch>,
     health: &Health,
     inventory_cursor: Option<InventoryRepairCursor>,
-) -> anyhow::Result<(bool, Option<InventoryRepairCursor>)> {
+) -> anyhow::Result<(bool, Option<InventoryRepairCursor>, Option<RawHash>)> {
     let connection = connections.connect(target.peer).await?;
     let delta = match pull_collection(
         &connection,
@@ -2330,6 +2344,7 @@ async fn reconcile_collection_peer<T: Transport>(
     // zero-progress pass over deferred AUTH. Periodic repair retries it after
     // ordinary blob arrival without a second queue or an eager fetch.
     let retry_immediately = delta.retry_immediately();
+    let walked = (!delta.more).then_some(delta.remote.wake_root);
     let mut admissions = AdmissionBatcher::new(events);
     for proof in delta.authorization_evidence {
         admissions.push(NetEvent::CapabilityProof(proof)).await?;
@@ -2355,7 +2370,52 @@ async fn reconcile_collection_peer<T: Transport>(
             .await?;
     }
     admissions.flush().await?;
-    Ok((retry_immediately, delta.inventory_cursor))
+    Ok((retry_immediately, delta.inventory_cursor, walked))
+}
+
+/// Starts the record pulls announcements ask for, and reports each one's
+/// end to the peering task.
+struct RecordPulls<T: Transport> {
+    connections: ConnectionTable<T, SnapshotHandler>,
+    snapshot: SnapshotSlot,
+    events: tokio::sync::mpsc::Sender<NetEventBatch>,
+    health: Health,
+    ended: tokio::sync::mpsc::UnboundedSender<PullEnded>,
+}
+
+impl<T: Transport> RecordPulls<T> {
+    /// Pull `collection`'s records from `peer`: for now one pass of the
+    /// repair session, which completes when it leaves nothing behind. Its
+    /// delta lands at the store's next refresh.
+    fn start_record_pull(&self, peer: PeerId, collection: CollectionHandle) {
+        let local = self
+            .snapshot
+            .borrow()
+            .as_ref()
+            .and_then(|snapshot| snapshot.collection(collection));
+        let connections = self.connections.clone();
+        let events = self.events.clone();
+        let health = self.health.clone();
+        let ended = self.ended.clone();
+        tokio::spawn(async move {
+            let mut walked = None;
+            if let Some(local) = local {
+                let target = RepairTarget { collection, peer };
+                let pass =
+                    reconcile_collection_peer(&connections, target, local, &events, &health, None);
+                match tokio::time::timeout(REPAIR_DEADLINE, pass).await {
+                    Ok(Ok((_, _, root))) => walked = root,
+                    Ok(Err(error)) => debug!(%error, "record pull failed"),
+                    Err(_) => debug!("record pull deadline exceeded"),
+                }
+            }
+            let _ = ended.send(PullEnded {
+                peer,
+                collection,
+                walked,
+            });
+        });
+    }
 }
 
 /// One `FIND_VALUE` reply: the replica's routes nearer the key and its
