@@ -125,6 +125,7 @@ impl Fixture {
             serve_collections: false,
             local_id: provider,
             events: events_tx,
+            recon: None,
         };
         let connections = ConnectionTable::new(server_harness.transport.clone(), handler);
         let server = tokio::spawn(async move {
@@ -192,6 +193,7 @@ impl RecoveryNode {
             serve_collections: false,
             local_id: peer,
             events: events_tx,
+            recon: None,
         };
         let connections = ConnectionTable::new(harness.transport.clone(), handler);
         let server = tokio::spawn(async move {
@@ -1419,6 +1421,7 @@ async fn known_resident_outside_selected_dht_replicas_is_not_directly_probed() {
                 let (sender, _receiver) = tokio::sync::mpsc::channel(1);
                 sender
             },
+            recon: None,
         };
         let connections = ConnectionTable::new(harness.transport.clone(), handler);
         servers.push(tokio::spawn(async move {

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Peer per collection on `recon/1` (sync redesign M7). A host asks up to five
+  candidates for each collection its pile selects and accepts a request only
+  for a collection it selects, from a key that passes READ or that sends and
+  passes WRITE. Refused requests are remembered per connection and invited
+  once a credential, a definition, a proof or the selection admits them.
+  Candidates are grant-chain keys and owners, READ-passing ones first, then
+  DHT providers, in an order shuffled by a fresh salt at each pass. Peerings
+  appear in `HealthSnapshot::peerings`. Wake and repair still move the data.
 - `CollectionAuthorizationEvidencePatch::reader_is_admitted_by` returns the
   `QuorumOutcome` and is public, beside a new `writer_is_admitted_by`. Both
   name a bound policy definition this reader lacks as `Undefined`, as well as
