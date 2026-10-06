@@ -898,18 +898,19 @@ async fn recon_without_credit_is_reset_and_reopens_for_the_next_frame() {
     assert_eq!(dialler.len(), 1);
 }
 
-/// A dialler whose peer ends every `recon/1` at once opens the next one no
-/// sooner than [`RECON_REOPEN_INTERVAL`] after the last, rather than in a
-/// loop in which no time passes.
+/// A dialler whose peer ends every `recon/1` as it arrives opens the next
+/// one only for a frame to send, not in a loop, and the connection goes
+/// idle like any other: only a stream that carried a frame is reopened at
+/// once.
 #[tokio::test(start_paused = true)]
-async fn a_recon_ended_at_once_reopens_once_per_interval() {
-    use crate::connection::RECON_REOPEN_INTERVAL;
+async fn a_recon_ended_at_once_reopens_only_for_a_frame() {
+    use crate::recon::Frame;
 
     let net = network(Duration::from_millis(10));
     let dialler = Node::join(&net, &key(1));
     let mut peer = net.join(&key(2));
     let peer_id = peer.transport.local_id();
-    let (opened, mut opens) = tokio::sync::watch::channel(0_u32);
+    let (opened, opens) = tokio::sync::watch::channel(0_u32);
     tokio::spawn(async move {
         let conn = peer.incoming.recv().await.unwrap().conn;
         while let Some((_send, mut recv)) = conn.accept_bi().await {
@@ -918,13 +919,19 @@ async fn a_recon_ended_at_once_reopens_once_per_interval() {
             }
         }
     });
-    let _connection = dialler.table.connect(peer_id).await.unwrap();
-    let intervals = 10;
-    tokio::select! {
-        _ = opens.wait_for(|opens| *opens > 2 * intervals) => {
-            panic!("recon/1 reopened in a loop in which no time passed");
-        }
-        () = tokio::time::sleep(RECON_REOPEN_INTERVAL * intervals) => {}
-    }
-    assert!(*opens.borrow() > intervals / 2, "the dialler reopened");
+    let link = dialler.table.connect(peer_id).await.unwrap().link();
+    tokio::time::sleep(CONNECTION_IDLE_DEADLINE / 2).await;
+    assert_eq!(*opens.borrow(), 1, "recon/1 reopened with nothing to carry");
+
+    // A queued frame opens a stream, and the one after the stream that
+    // carried it carries nothing.
+    link.send(Frame::Unpeer {
+        collection: CollectionHandle::new([3; 32]),
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let reopened = *opens.borrow();
+    assert!((2..=3).contains(&reopened), "{reopened} opens");
+    tokio::time::sleep(CONNECTION_IDLE_DEADLINE + Duration::from_secs(1)).await;
+    assert_eq!(*opens.borrow(), reopened);
+    assert!(dialler.table.current(peer_id).is_none(), "never went idle");
 }

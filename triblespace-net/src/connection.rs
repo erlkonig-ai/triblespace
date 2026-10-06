@@ -26,8 +26,9 @@
 //!
 //! A writer that waits [`RECON_CREDIT_DEADLINE`] for stream credit resets
 //! `recon/1`: the peer stopped reading. The service hears that the stream
-//! ended, and the dialler opens a new one at once, though no sooner than
-//! [`RECON_REOPEN_INTERVAL`] after it opened the last.
+//! ended. The dialler opens a new one at once if the one that ended carried
+//! a frame either way, and otherwise when a frame is next queued, so a peer
+//! that ends every stream as it arrives gets no loop of them.
 //!
 //! A connection closes after [`CONNECTION_IDLE_DEADLINE`] without a frame on
 //! any of its streams, sent or received. Above [`MAX_CONNECTIONS`] in one
@@ -60,9 +61,6 @@ pub(crate) const CONNECTION_IDLE_DEADLINE: Duration = Duration::from_secs(120);
 /// A `recon/1` writer that waited this long for stream credit resets the
 /// stream: the peer stopped reading it.
 pub(crate) const RECON_CREDIT_DEADLINE: Duration = Duration::from_secs(60);
-/// The dialler opens `recon/1` at most once per this interval, so a peer
-/// that ends each one at once costs a stream per interval, not a loop.
-pub(crate) const RECON_REOPEN_INTERVAL: Duration = Duration::from_secs(1);
 /// A retired connection closes after this long without a frame once no
 /// request stream is in flight on it. The peer keeps using it only until it
 /// has seen the winner too.
@@ -145,7 +143,8 @@ pub enum ReconEvent {
     Frame(Link, Frame),
     /// The connection's `recon/1` stream ended while the connection stays
     /// open, and whatever ran on it with it. The connection's peerings and
-    /// queued frames outlive it: the dialler opens a new stream at once. On
+    /// queued frames outlive it: the dialler opens a new stream at once if
+    /// the ended one carried a frame, and otherwise for the next frame. On
     /// the accepting side a stream the dialler replaced before this side saw
     /// it end also counts, reported before the new stream's first frame.
     Ended(Link),
@@ -291,8 +290,6 @@ struct State {
     epoch: Instant,
     /// Nanoseconds after `epoch` of the last frame sent or received.
     last_frame: AtomicU64,
-    /// Nanoseconds after `epoch` at which the dialler last opened `recon/1`.
-    recon_opened: AtomicU64,
     /// Request streams open on the connection, in either direction.
     in_flight: AtomicUsize,
     /// Callers holding a [`Connection`] handle to it.
@@ -306,8 +303,8 @@ struct State {
     /// A `recon/1` stream carries the connection's frames, or is being
     /// opened. A dialled connection opens one as it connects.
     recon_live: AtomicBool,
-    /// The dialler's `recon/1` ended, or a frame was queued while no stream
-    /// was live: the accept loop opens a new one.
+    /// The dialler's `recon/1` ended after carrying a frame, or a frame was
+    /// queued while no stream was live: the accept loop opens a new one.
     reopen: AtomicBool,
     /// Woken on retirement, on the last in-flight stream, on a new `recon/1`
     /// stream, and on a frame that asks for one.
@@ -335,7 +332,6 @@ impl State {
             sequence: OnceLock::new(),
             epoch: Instant::now(),
             last_frame: AtomicU64::new(0),
-            recon_opened: AtomicU64::new(0),
             in_flight: AtomicUsize::new(0),
             handles: AtomicUsize::new(0),
             retired: AtomicBool::new(false),
@@ -1010,19 +1006,13 @@ async fn accept_loop<T: Transport, S: Service>(
         let changed = state.changed.notified();
         tokio::pin!(changed);
         changed.as_mut().enable();
-        let opened = Duration::from_nanos(state.recon_opened.load(Ordering::SeqCst));
-        let reopen_at = state.epoch + opened + RECON_REOPEN_INTERVAL;
-        if Instant::now() >= reopen_at
-            && state.reopen.swap(false, Ordering::SeqCst)
+        if state.reopen.swap(false, Ordering::SeqCst)
             && !state.retired.load(Ordering::SeqCst)
             && !state.recon_live.swap(true, Ordering::SeqCst)
         {
-            let now = state.epoch.elapsed().as_nanos() as u64;
-            state.recon_opened.store(now, Ordering::SeqCst);
             tokio::spawn(reopen(shared.clone(), conn.clone(), state.clone()));
         }
         let deadline = state.deadline();
-        let reopening = state.reopen.load(Ordering::SeqCst);
         tokio::select! {
             accepted = conn.accept_bi() => {
                 let Some((send, recv)) = accepted else {
@@ -1055,7 +1045,6 @@ async fn accept_loop<T: Transport, S: Service>(
                     });
                 }
             }
-            () = tokio::time::sleep_until(reopen_at), if reopening => {}
             () = &mut changed => {}
         }
     };
@@ -1237,6 +1226,8 @@ async fn recon<T: Transport, S: Service>(
         ReconStream::Accepted(order) => (order, true),
     };
     let mut ended_here = false;
+    // A frame crossed this stream, read or written whole.
+    let carried = AtomicBool::new(false);
     let outcome = if accepted && state.dialled {
         Err(FrameError::Violation(
             "recon/1 opened by the side that did not dial",
@@ -1286,6 +1277,7 @@ async fn recon<T: Transport, S: Service>(
                     if kind == FRAME_OPEN {
                         return Err(FrameError::Violation("recon/1 opened twice"));
                     }
+                    carried.store(true, Ordering::SeqCst);
                     match Frame::decode(kind, &payload) {
                         Ok(Some(frame)) => {
                             service.recon(ReconEvent::Frame(link.clone(), frame)).await
@@ -1308,6 +1300,7 @@ async fn recon<T: Transport, S: Service>(
                             .map_err(|error| FrameError::Transport(io::Error::other(error)))?,
                         Err(_) => return Err(FrameError::Stalled),
                     }
+                    carried.store(true, Ordering::SeqCst);
                 }
                 Ok(())
             };
@@ -1337,12 +1330,14 @@ async fn recon<T: Transport, S: Service>(
                     recv.stop(RESET_STALLED);
                 }
                 // The newest stream ended, and none replaces it yet. The
-                // dialler opens the next one at once: the acceptor cannot,
-                // and may have frames queued for it.
+                // dialler opens the next one at once if this one carried a
+                // frame: the acceptor cannot, and may have more queued. A
+                // stream that carried none waits for the dialler's next
+                // frame, so a peer that ends each one costs no loop.
                 if state.recon.load(Ordering::SeqCst) == order {
                     state.recon_live.store(false, Ordering::SeqCst);
                     ended_here = true;
-                    if state.dialled {
+                    if state.dialled && carried.load(Ordering::SeqCst) {
                         state.reopen.store(true, Ordering::SeqCst);
                         state.changed.notify_waiters();
                     }
