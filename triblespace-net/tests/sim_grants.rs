@@ -1,10 +1,12 @@
 //! The grant exchange through whole hosts over the deterministic transport:
-//! a grant reaches its subject, and a peering waits for the definitions a
-//! credential names.
+//! a grant reaches its subject, a peering waits for the definitions a
+//! credential names, and a definition is fetched no larger than policy
+//! metadata.
 #![cfg(feature = "sim")]
 
 use std::sync::{Arc, Mutex, OnceLock};
 
+use anybytes::Bytes;
 use ed25519_dalek::SigningKey;
 use iroh_base::EndpointId;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
@@ -168,6 +170,41 @@ fn a_signed_grant_dials_its_subject() {
         advance(&clock, &mut [&mut owner, &mut subject], 2).await;
         assert_eq!(proofs(&mut subject), [read]);
         assert!(subject.health().available.is_empty());
+    });
+}
+
+/// A stranger grants the subject a capability whose definition handle names
+/// a 4 MiB blob of its choosing. The grant reaches the subject, which fetches
+/// the definitions a proof naming it names, but no more than policy metadata
+/// can take: the blob is not stored.
+#[test]
+fn a_stranger_cannot_make_the_subject_store_a_large_definition() {
+    run(async || {
+        let net = SimNet::new(0x6EA7_0003, SimConfig::default());
+        let clock = virtual_clock();
+        let stranger_key = key(81);
+        let subject_key = key(82);
+        let policy = CollectionPolicy::new(
+            AdmissionPolicy::direct(stranger_key.verifying_key()),
+            AdmissionPolicy::direct(stranger_key.verifying_key()),
+        );
+        let mut stranger_store = MemoryRepo::default();
+        let collection = stranger_store.collection("bait", policy).unwrap().handle();
+        let junk = Blob::<SimpleArchive>::new(Bytes::from_source(vec![0x5A_u8; 4 << 20]));
+        let junk_handle = junk.get_handle();
+        stranger_store.put::<SimpleArchive, _>(junk).unwrap();
+        let bait = grant(&stranger_key, &subject_key, junk_handle, collection);
+        stranger_store.insert_proof(bait).unwrap();
+        let mut stranger = bring_up(&net, &stranger_key, stranger_store);
+        let mut subject = bring_up(&net, &subject_key, MemoryRepo::default());
+        stranger.activate_collection(collection);
+        subject.refresh();
+        advance(&clock, &mut [&mut stranger, &mut subject], 10).await;
+        assert_eq!(subject.health().available, [collection], "the grant arrived");
+        assert!(
+            !holds_blob(&mut subject, junk_handle),
+            "the subject stored the stranger's 4 MiB definition"
+        );
     });
 }
 

@@ -48,7 +48,7 @@ use crate::connection::{ConnectionTable, Link, ReconEvent, Service};
 use crate::health::Health;
 use crate::host::{METADATA_BLOB_BYTES, StoreSnapshot};
 use crate::patch_repair::PatchSummary;
-use crate::protocol::{RawHash, op_get_blob};
+use crate::protocol::{RawHash, op_get_blob_with_limit};
 use crate::recon::{Frame, proof_frames};
 use crate::transport::{PeerId, Transport};
 
@@ -530,7 +530,8 @@ async fn land(
     }
 }
 
-/// Fetch each definition from the first connected source that has it.
+/// Fetch each definition from the first connected source that has it. A
+/// definition is policy metadata, bounded like a descriptor.
 async fn fetch_definitions<T: Transport, S: Service>(
     connections: ConnectionTable<T, S>,
     admissions: tokio::sync::mpsc::Sender<NetEventBatch>,
@@ -544,9 +545,9 @@ async fn fetch_definitions<T: Transport, S: Service>(
             let Some(connection) = connections.current(*source) else {
                 continue;
             };
-            let fetched =
-                tokio::time::timeout(FETCH_DEADLINE, op_get_blob(&connection, local, &definition))
-                    .await;
+            let fetch =
+                op_get_blob_with_limit(&connection, local, &definition, METADATA_BLOB_BYTES);
+            let fetched = tokio::time::timeout(FETCH_DEADLINE, fetch).await;
             if let Ok(Ok(Some(blob))) = fetched {
                 land(&admissions, std::iter::once(NetEvent::Blob(blob))).await;
                 break;
