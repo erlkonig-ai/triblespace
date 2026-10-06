@@ -662,6 +662,25 @@ async fn only_a_dialled_connection_makes_its_peer_a_route() {
     assert_eq!(routes.state(dialled.peer), Some(RouteState::Verified));
 }
 
+/// A key that only sends this node requests is no route either, as a
+/// process that asks its pile's daemon with a fresh key per call is not.
+#[tokio::test(start_paused = true)]
+async fn a_key_that_only_sends_requests_is_no_route() {
+    let net = network(Duration::from_secs(1));
+    let node = Node::join(&net, &key(1));
+    let caller = Node::join(&net, &key(2));
+    let connection = caller.table.connect(node.peer).await.unwrap();
+    assert!(answers_empty(&connection).await);
+    assert!(
+        crate::protocol::op_get_blob(&connection, caller.peer, &[7; 32])
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let routes = node.client.candidates.lock().unwrap();
+    assert_eq!(routes.state(caller.peer), None);
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_retired_connection_with_a_stalled_request_still_goes_idle() {
     let net = network(Duration::from_secs(1));

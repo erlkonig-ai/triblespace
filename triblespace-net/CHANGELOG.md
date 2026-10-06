@@ -34,7 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   route, so the provider lookup of a collection's next candidate draw has a
   contact: a host whose only route is the signer of a record it holds finds
   the collection's other providers through that signer. An accepted
-  connection makes no route: any process can dial with a fresh key.
+  connection makes no route, nor do the requests that arrive on it: any
+  process can dial with a fresh key.
 
 - Delete `ReconcileQos` and `ReconcileDirection` with the `inventory` module
   (sync redesign M13). `PeerConfig::qos`, the `qos` argument of

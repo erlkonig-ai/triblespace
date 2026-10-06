@@ -878,9 +878,9 @@ address discovery. TLS authenticates every connection, so each connection a
 host dials makes the key it dialled a verified DHT route, and the provider
 lookup at the collection's next draw has a contact: a host whose only route is
 the signer of a record it holds finds the collection's other providers, tier
-3, through that signer. A connection a host accepts makes no route by opening:
-anybody can dial with a fresh key, as a process that dials its pile's daemon
-with a key per call does.
+3, through that signer. A connection a host accepts makes no route, by
+opening or by the requests it carries: anybody can dial with a fresh key, as a
+process that asks its pile's daemon with a key per call does.
 
 A process whose pile names no peer, such as a foreground reader, has one first
 contact: the pile's sync daemon. `PeerConfig::daemon` names it by its key, the
@@ -893,8 +893,8 @@ daemon's DHT replies lead on.
 
 Endpoint addresses and relay URLs only provide iroh transport paths; they are
 not peering candidates, collection participants or collection rendezvous
-identities. DHT referrals and authenticated callers may become live routing
-candidates, but there is no synchronized PEER roster and no durable peer
+identities. DHT referrals and the peers a host reaches itself may become live
+routing candidates, but there is no synchronized PEER roster and no durable peer
 record in the current protocol. Liveness, connections, peerings, candidate
 orders, DHT buckets, and provider leases are operational soft state; restarting
 may forget them without losing semantic data, and each selected collection
@@ -928,10 +928,10 @@ not re-export themselves as fresh evidence. No H, locator, token, lease deadline
 or process-local monotonic timestamp appears in the packed relation.
 
 Here, "authenticated" follows the table's existing `Verified` state, not a new
-serving-longevity claim. The production host also promotes successful inbound
-RPC callers, including ephemeral foreground clients. An inbound caller need not
-be a useful long-lived DHT server. The experiment does not change that provenance
-or silently reinterpret it as evidence that a peer answered our outbound probe.
+serving-longevity claim. The production host promotes only peers it reached
+itself, a key it dialled or one that answered its request, and never an inbound
+caller such as an ephemeral foreground client. The experiment does not change
+that provenance.
 
 The adverse fixtures distinguish three things: a dead configured bootstrap can
 make cold discovery impossible while surviving hints still find a route; stale

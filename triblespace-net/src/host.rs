@@ -1935,10 +1935,8 @@ impl Service for SnapshotHandler {
             TAG_DHT => self.serve_dht(peer, send, recv).await?,
             other => anyhow::bail!("not a request stream tag {other:#x}"),
         }
-        self.candidates
-            .lock()
-            .unwrap()
-            .promote_authenticated(peer.to_bytes());
+        // A caller is no route: anyone can ask with a fresh key, so only a
+        // peer this node reached itself becomes one (see `recon`).
         Ok(())
     }
 
