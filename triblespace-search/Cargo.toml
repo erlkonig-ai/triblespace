@@ -42,8 +42,8 @@ triblespace-core = { version = "0.47.0", path = "../triblespace-core", default-f
 # rest of the crate are plain CPU code over triblespace-core, so a host
 # without a model still builds every attached text index.
 mary = { package = "maryml", version = "0.1.0", path = "../../mary", optional = true }
-# PDF text layers for the semantic index (`semantic` feature only): a typed
-# document carries its text; a scanned one does not, and needs an OCR model.
+# PDF text layers for the semantic indexes (`semantic`, `semantic-wemm`): a
+# typed document carries its text; a scanned one does not, and needs OCR.
 lopdf = { version = "0.44", default-features = false, optional = true }
 # Image format probing for the same classification; the decoders themselves
 # live in mary's embedder.
@@ -74,8 +74,9 @@ nvfp4 = ["dep:mary"]
 # The semantic index: rows embedded straight from source facts through the
 # nomic models in the same pile (`semantic` module). Pulls mary's embedders.
 semantic = ["nvfp4", "mary/embed", "dep:lopdf", "dep:image"]
-# WeMM descriptor binding and image carry require no GPU or Nomic loader.
-semantic-wemm = ["nvfp4"]
+# WeMM descriptor binding and image carry require no GPU or Nomic loader;
+# lopdf reads the text layer the windows are cut from.
+semantic-wemm = ["nvfp4", "dep:lopdf"]
 # Explicit native computation only; model/pile binding remains caller-owned.
 semantic-wemm-cuda = ["semantic-wemm", "nvfp4-score-cuda", "mary/wemm-input"]
 # The production execution path targets the provisioned GB10/Spark appliance.

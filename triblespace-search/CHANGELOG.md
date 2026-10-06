@@ -6,6 +6,24 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## Unreleased
 
+- `semantic_wemm::WemmIndex` maps content windows: mapping
+  `WEMM_CONTENT_WINDOWS_TO_NVFP4` (`3D288D450426ABD3FFF0D2C05887C09D`, minted
+  with `trible genid` 2026-10-06) replaces `C2218047C697B76F657619C33B0B560D`,
+  which refused the whole source image for anything one forward could not
+  read and was never maintained outside scratch piles. UTF-8 text (an HTML
+  page reduced to its text) and a PDF's text layer are cut by the pinned
+  tokenizer into windows of at most 248 framed IDs, whole lines first, then
+  words, then characters; each of the first `window_cap` windows is one row
+  under the content handle, and readers already score a handle at the
+  maximum over its rows. A PNG/JPEG the fixed preparation decodes is one row.
+  Anything else is no row instead of a refused foundation. The window cap is
+  a descriptor argument, `wemm_window_cap` (`B999AF3E65C457A9DFD54EBA05C211B7`,
+  minted 2026-10-06), so another cap is another index; `DEFAULT_WINDOW_CAP`
+  is 16. `WemmIndex::new` takes the cap and `WemmRuntime::from_native` takes
+  the pinned `InputCodec` that cuts the windows. The kernel/input profile
+  `56AA6AA4…` is unchanged. HTML stripping and PDF text extraction moved to a
+  module the Nomic mapping shares; `semantic-wemm` now depends on lopdf.
+
 ## 0.47.0 - 2026-10-01
 
 - `semantic_wemm::WemmIndex` describes one native text/image model, a selected
