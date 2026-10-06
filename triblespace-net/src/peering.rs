@@ -497,7 +497,9 @@ impl Peerings {
     }
 
     fn frame(&mut self, link: &Link, frame: Frame) {
-        let collection = frame.collection();
+        let Some(collection) = frame.collection() else {
+            return;
+        };
         let known = self
             .snapshot
             .as_ref()
