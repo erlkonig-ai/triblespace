@@ -835,6 +835,11 @@ impl Walks {
 
     /// Take one walk frame from the peer on `link`.
     pub(crate) fn frame(&mut self, link: &Link, frame: WalkFrame, now: Mono) {
+        // A connection's close can overtake its last frames; they would pin
+        // what its close already released.
+        if link.closed() {
+            return;
+        }
         let WalkFrame { walk, body } = frame;
         match body {
             WalkBody::Request(request) => self.serve(link, walk, request),
