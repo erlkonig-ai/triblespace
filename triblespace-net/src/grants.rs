@@ -16,7 +16,10 @@
 //! collection's held descriptor and is dropped when it is not. A proof naming
 //! this node whose descriptor is not held stays in memory if its signatures
 //! hold, lists its collection as available, and lands once the descriptor
-//! arrives. The
+//! arrives. At most [`MAX_PENDING_PER_SENDER`] of these from one sender, and
+//! [`MAX_PENDING`] from all, stay; the rest are dropped. A proof that is
+//! evidence under a held descriptor never waits, so these bounds keep none
+//! out. The
 //! definitions a kept proof names are fetched over `blob/1` from its sender,
 //! then from its root and delegated keys among connected peers. A peering
 //! refused for want of definitions fetches them the same way.
@@ -54,6 +57,10 @@ use crate::transport::{PeerId, Transport};
 
 /// Bound on fetching one definition from one key.
 const FETCH_DEADLINE: Duration = Duration::from_secs(30);
+/// Proofs one sender keeps waiting in memory for their descriptor.
+const MAX_PENDING_PER_SENDER: usize = 256;
+/// Proofs every sender together keeps waiting in memory.
+const MAX_PENDING: usize = 1024;
 
 /// One connection's exchange.
 struct Exchange {
@@ -113,8 +120,9 @@ pub(crate) struct Grants {
     received: SubjectProofPatch,
     /// This node's own entries: `received` and those of `held`.
     own: SubjectProofPatch,
-    /// Received proofs naming this node whose descriptor is not held, by id.
-    pending: BTreeMap<RawHash, CapabilityProof>,
+    /// Received proofs naming this node whose descriptor is not held, by
+    /// id, with the key they came from.
+    pending: BTreeMap<RawHash, (PeerId, CapabilityProof)>,
     /// The capability policies of resident descriptors of collections that
     /// are not active, by handle, decoded once per observation; `None` for
     /// a blob that is no descriptor.
@@ -246,9 +254,11 @@ impl Grants {
                         effects.land.push(proof.clone());
                     }
                 }
+                None if mine && self.pending.contains_key(&proof.id().raw) => {}
                 // Only its signatures can be checked before the descriptor.
-                None if mine && proof.verify_signatures().is_ok() => {
-                    self.changed |= self.pending.insert(proof.id().raw, proof.clone()).is_none();
+                None if mine && self.room(sender) && proof.verify_signatures().is_ok() => {
+                    self.pending.insert(proof.id().raw, (sender, proof.clone()));
+                    self.changed = true;
                 }
                 None => continue,
             }
@@ -281,6 +291,12 @@ impl Grants {
             }
         }
         effects
+    }
+
+    /// Whether `sender` may keep one more proof waiting in memory.
+    fn room(&self, sender: PeerId) -> bool {
+        let kept = self.pending.values().filter(|(from, _)| *from == sender);
+        self.pending.len() < MAX_PENDING && kept.count() < MAX_PENDING_PER_SENDER
     }
 
     /// Whether `proof` is evidence under its collection's descriptor, or
@@ -352,10 +368,10 @@ impl Grants {
 
         let mut effects = Effects::default();
         let pending = std::mem::take(&mut self.pending);
-        for (id, proof) in pending {
+        for (id, (sender, proof)) in pending {
             match self.validate(&proof) {
                 None => {
-                    self.pending.insert(id, proof);
+                    self.pending.insert(id, (sender, proof));
                 }
                 Some(true) => effects.land.push(proof),
                 Some(false) => {
@@ -401,7 +417,7 @@ impl Grants {
     pub(crate) fn available(&self) -> Vec<CollectionHandle> {
         self.pending
             .values()
-            .map(|proof| CollectionHandle::new(proof.resource().into_bytes()))
+            .map(|(_, proof)| CollectionHandle::new(proof.resource().into_bytes()))
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
@@ -931,6 +947,59 @@ mod tests {
             .event(&ReconEvent::Frame(link, Frame::Proofs(vec![forged])));
         assert!(effects.land.is_empty() && effects.fetch.is_empty());
         assert!(node.grants.available().is_empty());
+    }
+
+    /// Keys that sign proofs naming this node over resources nobody holds
+    /// keep at most their share each, and the total over all, in memory. A
+    /// proof that is evidence under a held descriptor still lands from a key
+    /// whose share is full.
+    #[test]
+    fn proofs_waiting_in_memory_are_bounded_per_sender_and_in_all() {
+        let owner = key(60);
+        let mut node = Node::new(61);
+        let collection = node.hold(policy(&owner));
+        node.observe();
+        let subject = node.key.clone();
+        let credentials = |node: &mut Node, sender: &SigningKey| {
+            let (link, _sent) = Link::detached(1, sender.verifying_key().to_bytes());
+            node.grants.event(&ReconEvent::Opened(link.clone()));
+            let credentials = (0..=MAX_PENDING_PER_SENDER)
+                .map(|index| {
+                    let mut resource = sender.verifying_key().to_bytes();
+                    resource[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                    let resource = CollectionHandle::new(resource);
+                    grant(sender, &subject, read_capability(), resource)
+                })
+                .collect();
+            let frame = Frame::Credential {
+                collection,
+                credentials,
+            };
+            node.grants.event(&ReconEvent::Frame(link, frame))
+        };
+        let senders = (0..=MAX_PENDING / MAX_PENDING_PER_SENDER)
+            .map(|index| key(62 + index as u8))
+            .collect::<Vec<_>>();
+        credentials(&mut node, &senders[0]);
+        assert_eq!(node.grants.available().len(), MAX_PENDING_PER_SENDER);
+        for sender in &senders[1..] {
+            credentials(&mut node, sender);
+        }
+        assert_eq!(node.grants.available().len(), MAX_PENDING);
+        let own = Grants::digest(&node.grants.own, node.id()).leaf_count();
+        assert_eq!(own, MAX_PENDING as u64);
+
+        let (link, _sent) = Link::detached(2, senders[0].verifying_key().to_bytes());
+        node.grants.event(&ReconEvent::Opened(link.clone()));
+        let valid = grant(&owner, &node.key, read_capability(), collection);
+        let effects = node.grants.event(&ReconEvent::Frame(
+            link,
+            Frame::Credential {
+                collection,
+                credentials: vec![valid.clone()],
+            },
+        ));
+        assert_eq!(effects.land, [valid]);
     }
 
     /// A received proof is kept only if it names this node or its sender.
