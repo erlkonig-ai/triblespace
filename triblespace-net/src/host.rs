@@ -50,6 +50,7 @@ use crate::health::{
 };
 use crate::identity::iroh_secret;
 use crate::inventory::ReconcileQos;
+use crate::landing::{Land, LandSlot};
 use crate::protocol::{
     OP_FIND_VALUE, OP_PROVIDER_PUT, PILE_SYNC_ALPN, PROVIDER_PUT_FULL, PROVIDER_PUT_OK, RawHash,
     TAG_BLOB, TAG_DHT, TAG_REPAIR, op_find_value, op_get_blob_with_limit, op_provider_put,
@@ -721,6 +722,8 @@ pub const INTERACTIVE_FETCH_DEADLINE: std::time::Duration = std::time::Duration:
 pub struct NetSender {
     snapshot: tokio::sync::watch::Sender<Option<SharedSnapshot>>,
     cap: tokio::sync::watch::Receiver<Option<Arc<dyn NetCapability>>>,
+    /// Where the store side installs the landing of what walks receive.
+    lander: tokio::sync::watch::Sender<Option<Arc<dyn Land>>>,
     id: EndpointId,
     health: Health,
 }
@@ -771,6 +774,11 @@ impl NetSender {
 
     pub(crate) fn current_snapshot(&self) -> Option<SharedSnapshot> {
         self.snapshot.borrow().clone()
+    }
+
+    /// Hand the host's landing task the store side's [`Land`].
+    pub(crate) fn install_lander(&self, lander: Arc<dyn Land>) {
+        self.lander.send_replace(Some(lander));
     }
 
     pub(crate) fn update_snapshot(&self, snapshot: StoreSnapshot, active: &ActiveCollections) {
@@ -885,6 +893,7 @@ pub struct HostWiring {
     evt_tx: tokio::sync::mpsc::Sender<NetEventBatch>,
     snapshot: SnapshotSlot,
     cap_tx: tokio::sync::watch::Sender<Option<Arc<dyn NetCapability>>>,
+    lander: LandSlot,
     health: Health,
 }
 
@@ -903,11 +912,13 @@ pub fn wire(id: EndpointId) -> (NetSender, NetReceiver, HostWiring) {
     let (evt_tx, evt_rx) = tokio::sync::mpsc::channel(crate::channel::MAX_ADMISSION_BRIDGE_BATCHES);
     let (snapshot_tx, snapshot) = tokio::sync::watch::channel(None);
     let (cap_tx, cap_rx) = tokio::sync::watch::channel(None);
+    let (lander_tx, lander) = tokio::sync::watch::channel(None);
     let health = Health::new(id);
     (
         NetSender {
             snapshot: snapshot_tx,
             cap: cap_rx,
+            lander: lander_tx,
             id,
             health: health.clone(),
         },
@@ -916,6 +927,7 @@ pub fn wire(id: EndpointId) -> (NetSender, NetReceiver, HostWiring) {
             evt_tx,
             snapshot,
             cap_tx,
+            lander,
             health,
         },
     )
@@ -1581,6 +1593,15 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
         client: provider_client.clone(),
     });
     let _ = wiring.cap_tx.send(Some(cap as Arc<dyn NetCapability>));
+    // What walks receive lands through one task, which also reobserves the
+    // store for appends made elsewhere.
+    let (_landing, landing_items) = tokio::sync::mpsc::unbounded_channel::<((), Vec<NetEvent>)>();
+    let (landed, _landed) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(crate::landing::run(
+        wiring.lander.clone(),
+        landing_items,
+        landed,
+    ));
 
     tokio::spawn(async move {
         while let Some(accepted) = incoming.recv().await {

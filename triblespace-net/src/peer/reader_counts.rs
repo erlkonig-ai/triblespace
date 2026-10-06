@@ -464,7 +464,7 @@ async fn frozen_get_and_bare_reader_refresh_do_not_enumerate_inventory() {
         assert_eq!(counts.requests.load(Ordering::Relaxed), 1);
         assert_eq!(counts.inventory(), [0, 0, 0, 0]);
         assert!(peer.sender.current_snapshot().is_none());
-        assert_eq!(peer.serving_snapshot_rebuilds, 0);
+        assert_eq!(peer.serving_snapshot_rebuilds(), 0);
         assert_eq!(reader.wants().unwrap().count(), 0);
         peer.close().unwrap();
         assert_eq!(counts.inventory(), [0, 0, 0, 0]);
@@ -494,7 +494,7 @@ async fn first_peer_resnapshot_enumerates_all_handles_then_only_deltas() {
             reads,
             "inventory construction reads no payloads"
         );
-        assert_eq!(peer.serving_snapshot_rebuilds, 1);
+        assert_eq!(peer.serving_snapshot_rebuilds(), 1);
         let serving = peer.sender.current_snapshot().unwrap();
         assert_eq!(serving.bearer_locators().len(), (resident + 1) as u64);
         assert_eq!(
@@ -514,7 +514,7 @@ async fn first_peer_resnapshot_enumerates_all_handles_then_only_deltas() {
         peer.snapshot().unwrap();
         assert_eq!(counts.inventory(), [1, resident + 1, 2, 1]);
         assert_eq!(counts.get_calls.load(Ordering::Relaxed), reads);
-        assert_eq!(peer.serving_snapshot_rebuilds, 2);
+        assert_eq!(peer.serving_snapshot_rebuilds(), 2);
         counts.report("later-delta-refresh", resident);
         peer.close().unwrap();
     }
@@ -557,7 +557,7 @@ fn eager_read_only_peer_constructs_a_serving_inventory() {
         assert_eq!(counts.get_calls.load(Ordering::Relaxed), 0);
         assert_eq!(counts.requests.load(Ordering::Relaxed), 0);
         assert!(peer.sender.current_snapshot().is_some());
-        assert_eq!(peer.serving_snapshot_rebuilds, 1);
+        assert_eq!(peer.serving_snapshot_rebuilds(), 1);
         counts.report("eager-serving", resident);
         peer.close().unwrap();
     }
@@ -602,9 +602,9 @@ fn assert_leech_has_no_serving_inventory(leech: &Leech<Counted<Pile>>, counts: &
         triblespace_core::collection::held::held_threads_spawned(),
         0
     );
-    assert!(leech.peer.last_store_snapshot.is_none());
+    assert!(!leech.peer.observed());
     assert!(leech.peer.sender.current_snapshot().is_none());
-    assert_eq!(leech.peer.serving_snapshot_rebuilds, 0);
+    assert_eq!(leech.peer.serving_snapshot_rebuilds(), 0);
     let health = leech.health();
     assert!(!health.store.serving_snapshot);
     assert!(health.store.last_snapshot_published_at.is_none());
