@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add the endpoint register to `collection::selection`: where the sync
+  daemon that runs as a key listens, one register per endpoint in the pile's
+  own configuration collection. `write_sync_addresses` records the addresses
+  the daemon is bound to, superseding every head with a fresh id;
+  `sync_addresses` reads every head's addresses, since they are hints for a
+  dial rather than a value to agree on. Attributes `sync_endpoint`
+  (`0F1FE7641D8246229EDAB3C2FF3E152C`) and `sync_address`
+  (`55C20BF071C57CAA74D0481ED4C3077A`), minted with `trible genid`.
+  `SelectionWriteError` now speaks of the configuration rather than the
+  selection.
+- Add the `SocketAddress` inline encoding (`inline::encodings::socketaddr`,
+  id `03C71A039027879514FB845C7D0C6B28`): an IPv6 address, IPv4 mapped, a
+  big-endian port and IPv6 scope id.
 - The held-set walker is removed: `HeldWalker`, `HeldWalkConfig`,
   `Covered::start_held_walker`, `Covered::walk_held`, `held_walker_threads`
   and `held_threads_spawned`, with the start-up and periodic walks. A newly

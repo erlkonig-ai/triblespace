@@ -52,18 +52,32 @@
 //! cannot model is, so every outcome speaks for the heads it can decode. The
 //! state that head superseded stays superseded: skipping a head never brings
 //! back an older value.
+//!
+//! # Where the sync daemon listens
+//!
+//! The configuration also holds one register per endpoint: the addresses
+//! the sync daemon running as that key is bound to. The daemon writes it at
+//! start and whenever its addresses change ([`write_sync_addresses`]), with
+//! the same supersession and fresh ids as a selection. A process that opens
+//! the pile with its key reads it ([`sync_addresses`]) to reach the daemon
+//! first, before any peer its content names. The addresses are hints for a
+//! dial, so heads that disagree are not a conflict: a reader takes every
+//! head's addresses.
 
 use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
+use std::net::SocketAddr;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::id::{genid, Id};
 use crate::inline::encodings::boolean::Boolean;
+use crate::inline::encodings::ed25519::ED25519PublicKey;
 use crate::inline::encodings::hash::Handle;
+use crate::inline::encodings::socketaddr::SocketAddress;
 use crate::macros::{attributes, entity};
 use crate::metadata;
 use crate::prelude::{and, find, pattern};
@@ -140,6 +154,18 @@ attributes! {
     /// Anchor minted with `trible genid` on 2026-10-05:
     /// `24EB46425226C0025A3C85D34F8919CE`.
     "24EB46425226C0025A3C85D34F8919CE" as pub sync_selected: Boolean;
+    /// The endpoint whose addresses this state lists: the key the sync
+    /// daemon runs as.
+    ///
+    /// The anchor of the endpoint register. Anchor minted with
+    /// `trible genid` on 2026-10-06: `0F1FE7641D8246229EDAB3C2FF3E152C`.
+    "0F1FE7641D8246229EDAB3C2FF3E152C" as pub sync_endpoint: ED25519PublicKey;
+    /// One address the endpoint is bound to. A state lists all of them, and
+    /// a state listing none says the endpoint is bound to nothing.
+    ///
+    /// Anchor minted with `trible genid` on 2026-10-06:
+    /// `55C20BF071C57CAA74D0481ED4C3077A`.
+    "55C20BF071C57CAA74D0481ED4C3077A" as pub sync_address: SocketAddress;
 }
 
 /// What the decodable heads of one collection's register say.
@@ -240,7 +266,80 @@ where
         .map_err(SelectionWriteError::Commit)
 }
 
-/// Failure to write one sync selection state.
+/// The addresses the heads of `endpoint`'s register in `facts` list.
+///
+/// `facts` is the configuration collection, as [`config_facts`] reads it.
+/// Every head's addresses are returned; an address this reader cannot
+/// decode is skipped.
+pub fn sync_addresses<P>(facts: &P, endpoint: VerifyingKey) -> BTreeSet<SocketAddr>
+where
+    P: TriblePattern + Sync,
+{
+    let order = ObservationOrder::new(facts, metadata::supersedes.id());
+    find!(
+        (state: Id, address: SocketAddr),
+        and!(
+            pattern!(facts, [{ ?state @
+                sync_endpoint: endpoint,
+                sync_address: ?address,
+            }]),
+            maximal(state, &order),
+        )
+    )
+    .map(|(_, address)| address)
+    .collect()
+}
+
+/// Record in `config` that `endpoint` is bound to `addresses`, superseding
+/// every head of its register.
+///
+/// Committed under `signing_key` with a fresh id, like
+/// [`write_sync_selection`].
+pub fn write_sync_addresses<S>(
+    store: &mut S,
+    config: Collection<SimpleArchive>,
+    signing_key: &SigningKey,
+    endpoint: VerifyingKey,
+    addresses: impl IntoIterator<Item = SocketAddr>,
+) -> Result<
+    CollectionCommit,
+    SelectionWriteError<
+        <S as SnapshotSource>::SnapshotError,
+        <<S as SnapshotSource>::Snapshot as BlobStoreGet>::GetError<Infallible>,
+        <S as BlobStorePut>::PutError,
+        <S as CollectionStore>::InsertError,
+    >,
+>
+where
+    S: CollectionStoreExt + SnapshotSource,
+    <S as SnapshotSource>::Snapshot: StoreRead,
+{
+    let snapshot = store.snapshot().map_err(SelectionWriteError::Snapshot)?;
+    let facts = config
+        .read::<TribleSet, _>(&snapshot)
+        .map_err(SelectionWriteError::Read)?;
+    let order = ObservationOrder::new(&facts, metadata::supersedes.id());
+    let heads: BTreeSet<Id> = find!(
+        state: Id,
+        and!(
+            pattern!(&facts, [{ ?state @ sync_endpoint: endpoint }]),
+            maximal(state, &order),
+        )
+    )
+    .collect();
+    drop(snapshot);
+
+    let state = entity! { &genid() @
+        sync_endpoint: endpoint,
+        sync_address*: addresses,
+        metadata::supersedes*: heads,
+    };
+    store
+        .commit(config, signing_key, state)
+        .map_err(SelectionWriteError::Commit)
+}
+
+/// Failure to write one register state of the configuration.
 #[derive(Debug)]
 pub enum SelectionWriteError<SnapshotError, GetError, PutError, InsertError> {
     /// The store could not freeze the observation the heads are read from.
@@ -265,10 +364,10 @@ where
                 write!(formatter, "failed to freeze store snapshot: {source}")
             }
             Self::Read(source) => {
-                write!(formatter, "failed to read the sync selection: {source}")
+                write!(formatter, "failed to read the configuration: {source}")
             }
             Self::Commit(source) => {
-                write!(formatter, "failed to commit the sync selection: {source}")
+                write!(formatter, "failed to commit to the configuration: {source}")
             }
         }
     }
@@ -652,6 +751,72 @@ mod tests {
                 pattern!(&facts, [{ ?later @ metadata::supersedes: undecodable_id }])
             ),
             "the write supersedes the head it could not decode"
+        );
+    }
+
+    /// A reader finds the addresses the daemon wrote last, and one
+    /// endpoint's register is not another's.
+    #[test]
+    fn the_last_addresses_written_are_read() {
+        let key = signer(1);
+        let endpoint = key.verifying_key();
+        let address = |text: &str| text.parse::<SocketAddr>().unwrap();
+        let mut store = MemoryRepo::default();
+        let read_back = |store: &mut MemoryRepo| {
+            let facts = config_facts(&store.snapshot().unwrap(), endpoint).unwrap();
+            sync_addresses(&facts, endpoint)
+        };
+        assert!(read_back(&mut store).is_empty());
+
+        let config = config(&mut store, &key);
+        let first = [address("127.0.0.1:7001"), address("[::1]:7001")];
+        write_sync_addresses(&mut store, config, &key, endpoint, first).unwrap();
+        assert_eq!(read_back(&mut store), BTreeSet::from(first));
+
+        write_sync_addresses(
+            &mut store,
+            config,
+            &key,
+            endpoint,
+            [address("127.0.0.1:7002")],
+        )
+        .unwrap();
+        assert_eq!(
+            read_back(&mut store),
+            BTreeSet::from([address("127.0.0.1:7002")])
+        );
+        let facts = read(&mut store, config);
+        assert!(sync_addresses(&facts, signer(2).verifying_key()).is_empty());
+
+        write_sync_addresses(&mut store, config, &key, endpoint, []).unwrap();
+        assert!(
+            read_back(&mut store).is_empty(),
+            "a state listing nothing supersedes the addresses before it"
+        );
+    }
+
+    /// Concurrent heads are not a conflict here: a reader takes every head's
+    /// addresses, which are hints for a dial.
+    #[test]
+    fn concurrent_heads_give_every_address() {
+        let endpoint = signer(1).verifying_key();
+        let address = |text: &str| text.parse::<SocketAddr>().unwrap();
+        let state = |id: Id, at: &str, supersedes: &[Id]| {
+            entity! { ExclusiveId::force_ref(&id) @
+                sync_endpoint: endpoint,
+                sync_address: address(at),
+                metadata::supersedes*: supersedes.iter().copied(),
+            }
+            .facts()
+            .clone()
+        };
+        let original = genid().id;
+        let mut facts = state(original, "127.0.0.1:7000", &[]);
+        facts += state(genid().id, "127.0.0.1:7001", &[original]);
+        facts += state(genid().id, "127.0.0.1:7002", &[original]);
+        assert_eq!(
+            sync_addresses(&facts, endpoint),
+            BTreeSet::from([address("127.0.0.1:7001"), address("127.0.0.1:7002")])
         );
     }
 

@@ -26,6 +26,8 @@ pub mod range;
 pub mod rord256;
 /// Inline UTF-8 short string encoding (up to 32 bytes).
 pub mod shortstring;
+/// Socket address (IP address and port) encoding.
+pub mod socketaddr;
 /// TAI nanosecond interval encoding.
 pub mod time;
 
