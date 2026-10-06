@@ -19,6 +19,7 @@
 //! [`Leech<S>`](peer::Leech) provides the same local store and exact-acquisition
 //! operations without constructing or advertising a serving inventory.
 
+pub(crate) mod announce;
 pub(crate) mod bearer;
 mod channel;
 pub mod collection_activation;

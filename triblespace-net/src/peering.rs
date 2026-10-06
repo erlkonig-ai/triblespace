@@ -22,6 +22,9 @@
 //! replaced by the next candidate, and the end of the order draws a new salt.
 //! Every [`SWAP_INTERVAL`] one healthy asked-for neighbour makes room for the
 //! next candidate, so groups formed during a partition meet again after it.
+//!
+//! The peering task also carries each collection's announcements
+//! ([`crate::announce`]) to the neighbours its peerings make.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -32,6 +35,7 @@ use rand::seq::SliceRandom as _;
 use triblespace_core::capability::{CapabilityHandle, CapabilityProof, QuorumOutcome};
 use triblespace_core::collection::CollectionHandle;
 
+use crate::announce::{self, Announcements, PullEnded};
 use crate::channel::NetEventBatch;
 use crate::clock::Mono;
 use crate::collection_activation::MAX_PROOFS_PER_EXCHANGE;
@@ -483,10 +487,10 @@ impl Peerings {
     }
 
     /// Set each connection's neighbour flag and publish the peerings, if
-    /// anything changed since the last call.
-    pub(crate) fn publish(&mut self, health: &Health) {
+    /// anything changed since the last call. Returns whether it did.
+    pub(crate) fn publish(&mut self, health: &Health) -> bool {
         if !std::mem::take(&mut self.changed) {
-            return;
+            return false;
         }
         for (id, link) in &self.links {
             link.set_neighbour(self.meshes.values().any(|mesh| {
@@ -497,6 +501,22 @@ impl Peerings {
         }
         let peerings = self.health();
         health.update(|health| health.peerings = peerings);
+        true
+    }
+
+    /// Every peering, with its collection, its connection and whether this
+    /// side sends on it.
+    pub(crate) fn neighbours(&self) -> impl Iterator<Item = (CollectionHandle, &Link, bool)> {
+        self.meshes.iter().flat_map(move |(raw, mesh)| {
+            mesh.peerings
+                .iter()
+                .filter_map(move |(id, peering)| match peering.side {
+                    Side::Peered { mine, .. } => {
+                        Some((CollectionHandle::new(*raw), self.links.get(id)?, mine.send))
+                    }
+                    _ => None,
+                })
+        })
     }
 
     fn health(&self) -> Vec<PeeringHealth> {
@@ -947,30 +967,43 @@ impl Peerings {
     }
 }
 
-/// Run one node's peerings and grant exchange until its store observations
-/// end: hear its connections' events, follow its observations, refill its
-/// neighbour sets every [`PEERING_TICK`], and publish what changed into
-/// `health`. Received proofs and fetched definitions land through
+/// Run one node's peerings, grant exchange and announcements until its store
+/// observations end: hear its connections' events, follow its observations,
+/// refill its neighbour sets every [`PEERING_TICK`], announce when a
+/// collection's schedule fires, and publish what changed into `health`.
+/// Record pulls start through `start_record_pull`, and their ends arrive on
+/// `pulls_ended`. Received proofs and fetched definitions land through
 /// `admissions`.
 pub(crate) async fn run<T: Transport, S: Service>(
     connections: ConnectionTable<T, S>,
     mut snapshots: tokio::sync::watch::Receiver<Option<Arc<StoreSnapshot>>>,
     mut events: tokio::sync::mpsc::Receiver<ReconEvent>,
     mut providers: tokio::sync::mpsc::UnboundedReceiver<(CollectionHandle, Vec<PeerId>)>,
+    mut start_record_pull: impl FnMut(PeerId, CollectionHandle),
+    mut pulls_ended: tokio::sync::mpsc::UnboundedReceiver<PullEnded>,
     health: Health,
     admissions: tokio::sync::mpsc::Sender<NetEventBatch>,
 ) {
     let mut peerings = Peerings::new(connections.transport().local_id());
     let mut grants = Grants::new(connections.transport().local_id());
     let sink = Sink::new(connections.clone(), admissions);
+    let mut announcements = Announcements::default();
     let (dialled_tx, mut dialled) = tokio::sync::mpsc::unbounded_channel();
     let mut tick = tokio::time::interval(PEERING_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     if let Some(snapshot) = snapshots.borrow_and_update().clone() {
+        announcements.observe(announce::roots(&snapshot), crate::clock::mono_now());
         peerings.observe(snapshot.clone());
         sink.apply(grants.observe(snapshot));
     }
     loop {
+        let announce_at = announcements.deadline();
+        let announcement_due = async {
+            match announce_at {
+                Some(at) => tokio::time::sleep(at.duration_since(crate::clock::mono_now())).await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             changed = snapshots.changed() => {
                 if changed.is_err() {
@@ -979,14 +1012,33 @@ pub(crate) async fn run<T: Transport, S: Service>(
                 // A withdrawn observation is not an unselection; the next
                 // one is compared with the last one seen.
                 if let Some(snapshot) = snapshots.borrow_and_update().clone() {
+                    announcements.observe(announce::roots(&snapshot), crate::clock::mono_now());
                     peerings.observe(snapshot.clone());
                     sink.apply(grants.observe(snapshot));
                 }
             }
             Some(event) = events.recv() => {
                 sink.apply(grants.event(&event));
-                peerings.event(event);
+                match event {
+                    ReconEvent::Frame(link, Frame::Announce { collection, root, reply, .. }) => {
+                        let now = crate::clock::mono_now();
+                        if let Some((peer, collection)) =
+                            announcements.heard(link.peer(), collection, root, reply, now)
+                        {
+                            start_record_pull(peer, collection);
+                        }
+                    }
+                    event => peerings.event(event),
+                }
             }
+            Some(ended) = pulls_ended.recv() => {
+                if let Some((peer, collection)) =
+                    announcements.ended(ended, crate::clock::mono_now())
+                {
+                    start_record_pull(peer, collection);
+                }
+            }
+            () = announcement_due => announcements.poll(crate::clock::mono_now()),
             Some((peer, connected)) = dialled.recv() => peerings.dialled(peer, connected),
             Some((collection, found)) = providers.recv() => {
                 peerings.providers(collection, found);
@@ -1006,7 +1058,9 @@ pub(crate) async fn run<T: Transport, S: Service>(
             fetch: peerings.take_wanted(),
             ..Effects::default()
         });
-        peerings.publish(&health);
+        if peerings.publish(&health) {
+            announcements.neighbours(peerings.neighbours(), crate::clock::mono_now());
+        }
         grants.publish(&health);
     }
 }
@@ -1668,11 +1722,15 @@ mod tests {
                 let health = Health::new(EndpointId::from_bytes(&pile.id()).unwrap());
                 let (_providers, found) = tokio::sync::mpsc::unbounded_channel();
                 let (admissions, _) = tokio::sync::mpsc::channel(1);
+                // These hosts run no record pulls.
+                let (_ended, pulls_ended) = tokio::sync::mpsc::unbounded_channel();
                 let peering = tokio::spawn(run(
                     table.clone(),
                     observed,
                     recon,
                     found,
+                    |_, _| {},
+                    pulls_ended,
                     health.clone(),
                     admissions,
                 ));

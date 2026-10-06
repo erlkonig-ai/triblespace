@@ -69,6 +69,38 @@ impl Pile {
     }
 }
 
+/// An owner's and a reader's piles of one collection, both holding the
+/// reader's READ grant, so each finds the other a candidate.
+fn granted_pair(owner_key: &SigningKey, reader_key: &SigningKey) -> (Pile, Pile) {
+    let policy = CollectionPolicy::new(
+        AdmissionPolicy::direct(owner_key.verifying_key()),
+        AdmissionPolicy::direct(owner_key.verifying_key()),
+    );
+    let mut owner = Pile::new(owner_key.clone(), policy.clone());
+    let mut reader = Pile::new(reader_key.clone(), policy);
+    assert_eq!(reader.collection, owner.collection);
+    let grant = CapabilityProof::new(
+        CapabilityResource::from(owner.collection),
+        owner_key,
+        read_capability(),
+        reader_key.verifying_key(),
+    );
+    owner.store.insert_proof(grant.clone()).unwrap();
+    reader.store.insert_proof(grant).unwrap();
+    (owner, reader)
+}
+
+fn select(pile: &mut Pile) {
+    write_sync_selection(
+        &mut pile.store,
+        pile.config,
+        &pile.key,
+        pile.collection,
+        true,
+    )
+    .unwrap();
+}
+
 fn bring_up(net: &SimNet, key: &SigningKey, store: MemoryRepo) -> Peer<MemoryRepo> {
     let id = EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap();
     let harness = net.join(key);
@@ -116,31 +148,9 @@ fn a_host_peers_for_a_collection_only_while_its_pile_selects_it() {
         let net = SimNet::new(0x9EE7_1001, SimConfig::default());
         let owner_key = key(91);
         let reader_key = key(92);
-        let policy = CollectionPolicy::new(
-            AdmissionPolicy::direct(owner_key.verifying_key()),
-            AdmissionPolicy::direct(owner_key.verifying_key()),
-        );
-        let mut owner_pile = Pile::new(owner_key.clone(), policy.clone());
-        let mut reader_pile = Pile::new(reader_key.clone(), policy);
+        let (mut owner_pile, reader_pile) = granted_pair(&owner_key, &reader_key);
         let collection = owner_pile.collection;
-        assert_eq!(reader_pile.collection, collection);
-        // Both hold the reader's grant, so each finds the other a candidate.
-        let grant = CapabilityProof::new(
-            CapabilityResource::from(collection),
-            &owner_key,
-            read_capability(),
-            reader_key.verifying_key(),
-        );
-        owner_pile.store.insert_proof(grant.clone()).unwrap();
-        reader_pile.store.insert_proof(grant).unwrap();
-        write_sync_selection(
-            &mut owner_pile.store,
-            owner_pile.config,
-            &owner_pile.key,
-            collection,
-            true,
-        )
-        .unwrap();
+        select(&mut owner_pile);
         let (owner_id, reader_id) = (
             owner_key.verifying_key().to_bytes(),
             reader_key.verifying_key().to_bytes(),
@@ -184,5 +194,54 @@ fn a_host_peers_for_a_collection_only_while_its_pile_selects_it() {
         }
         assert_eq!(net.dial_count(reader_id, owner_id), 0);
         assert_eq!(net.dial_count(owner_id, reader_id), 1);
+    }));
+}
+
+/// Two hosts peer for a collection neither changes, so only announcements
+/// cross their connection. They keep it open far past the 120-second idle
+/// deadline: nobody dials again.
+#[test]
+fn announcements_alone_keep_a_peered_connection_open() {
+    let _guard = test_guard();
+    let clock = virtual_clock();
+    clock.reset();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    runtime.block_on(tokio::task::LocalSet::new().run_until(async {
+        let net = SimNet::new(0x9EE7_1002, SimConfig::default());
+        let owner_key = key(93);
+        let reader_key = key(94);
+        let (mut owner_pile, mut reader_pile) = granted_pair(&owner_key, &reader_key);
+        let collection = owner_pile.collection;
+        select(&mut owner_pile);
+        select(&mut reader_pile);
+        let mut owner = bring_up(&net, &owner_key, owner_pile.store);
+        let mut reader = bring_up(&net, &reader_key, reader_pile.store);
+        owner.activate_collection(collection);
+        reader.activate_collection(collection);
+        let peered = |peer: &Peer<MemoryRepo>| {
+            let peerings = peerings(peer);
+            peerings.len() == 1 && peerings[0].peered && peerings[0].sends && peerings[0].receives
+        };
+        advance(&clock, &mut [&mut owner, &mut reader], 5).await;
+        assert!(peered(&owner) && peered(&reader));
+        let (owner_id, reader_id) = (
+            owner_key.verifying_key().to_bytes(),
+            reader_key.verifying_key().to_bytes(),
+        );
+        let dials = || {
+            (
+                net.dial_count(owner_id, reader_id),
+                net.dial_count(reader_id, owner_id),
+            )
+        };
+        let settled = dials();
+
+        advance(&clock, &mut [&mut owner, &mut reader], 300).await;
+        assert!(peered(&owner) && peered(&reader));
+        assert_eq!(dials(), settled);
     }));
 }
