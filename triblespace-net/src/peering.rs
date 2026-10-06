@@ -35,7 +35,7 @@ use rand::seq::SliceRandom as _;
 use triblespace_core::capability::{CapabilityHandle, CapabilityProof, QuorumOutcome};
 use triblespace_core::collection::CollectionHandle;
 
-use crate::announce::{self, Announcements};
+use crate::announce::{self, Announcements, State};
 use crate::channel::NetEventBatch;
 use crate::clock::Mono;
 use crate::collection_activation::MAX_PROOFS_PER_EXCHANGE;
@@ -46,7 +46,7 @@ use crate::host::{CollectionSnapshot, StoreSnapshot};
 use crate::protocol::RawHash;
 use crate::recon::{Flags, Frame, credential_frames, request_frames};
 use crate::transport::{PeerId, Transport};
-use crate::walk::PullDone;
+use crate::walk::{PullDone, PullKind};
 
 /// Neighbours per collection this side asks for.
 pub(crate) const MAX_ASKED: usize = 5;
@@ -177,15 +177,20 @@ fn admits(
     }
 }
 
-/// This side's flags towards `peer`: it sends exactly when `peer` reads.
-fn flags(collection: &CollectionSnapshot, peer: PeerId, presented: &[CapabilityProof]) -> Flags {
+/// This side's flags towards `peer`: it sends exactly when `peer` reads, and
+/// is full when it replicates the collection in full.
+fn flags(
+    collection: &CollectionSnapshot,
+    full: bool,
+    peer: PeerId,
+    presented: &[CapabilityProof],
+) -> Flags {
     Flags {
         send: matches!(
             admits(collection, peer, presented, false),
             QuorumOutcome::Met
         ),
-        // Replication mode reaches the host with the reference comparison.
-        full: false,
+        full,
     }
 }
 
@@ -193,6 +198,7 @@ fn flags(collection: &CollectionSnapshot, peer: PeerId, presented: &[CapabilityP
 /// if it admits the peering, else the definitions whose arrival could.
 fn decide(
     collection: Option<&CollectionSnapshot>,
+    full: bool,
     peer: PeerId,
     theirs: Flags,
     presented: &[CapabilityProof],
@@ -207,7 +213,7 @@ fn decide(
     }
     for outcome in outcomes {
         match outcome {
-            QuorumOutcome::Met => return Ok(flags(collection, peer, presented)),
+            QuorumOutcome::Met => return Ok(flags(collection, full, peer, presented)),
             QuorumOutcome::Unmet => {}
             QuorumOutcome::Undefined(handles) => undefined.extend(handles),
         }
@@ -408,6 +414,9 @@ impl Peerings {
             let changed = before
                 .as_ref()
                 .is_none_or(|before| evidence(before) != evidence(&after));
+            let full_changed = previous
+                .as_ref()
+                .is_none_or(|previous| previous.full(collection) != snapshot.full(collection));
             let mesh = self.meshes.get_mut(&raw).unwrap();
             if changed {
                 mesh.order.stale = true;
@@ -417,6 +426,7 @@ impl Peerings {
                 .iter()
                 .filter(|(_, peering)| {
                     changed
+                        || (full_changed && peering.peered())
                         || peering.refused.as_ref().is_some_and(|(_, undefined)| {
                             undefined
                                 .iter()
@@ -505,19 +515,30 @@ impl Peerings {
         true
     }
 
-    /// Every peering, with its collection, its connection and whether this
-    /// side sends on it.
-    pub(crate) fn neighbours(&self) -> impl Iterator<Item = (CollectionHandle, &Link, bool)> {
+    /// Every peering, with its collection and its connection, whether this
+    /// side sends on it, and whether both sides replicate the collection in
+    /// full.
+    pub(crate) fn neighbours(&self) -> impl Iterator<Item = (CollectionHandle, &Link, bool, bool)> {
         self.meshes.iter().flat_map(move |(raw, mesh)| {
             mesh.peerings
                 .iter()
                 .filter_map(move |(id, peering)| match peering.side {
-                    Side::Peered { mine, .. } => {
-                        Some((CollectionHandle::new(*raw), self.links.get(id)?, mine.send))
-                    }
+                    Side::Peered { mine, theirs, .. } => Some((
+                        CollectionHandle::new(*raw),
+                        self.links.get(id)?,
+                        mine.send,
+                        mine.full && theirs.full,
+                    )),
                     _ => None,
                 })
         })
+    }
+
+    /// Whether this side replicates C in full.
+    fn full(&self, collection: CollectionHandle) -> bool {
+        self.snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.full(collection))
     }
 
     fn health(&self) -> Vec<PeeringHealth> {
@@ -673,8 +694,15 @@ impl Peerings {
             .as_ref()
             .and_then(|snapshot| snapshot.selected(collection));
         let room = self.inbound(collection, link.id()) < MAX_INBOUND_PEERINGS;
+        let full = self.full(collection);
         let peering = self.peering(collection, link.id());
-        let decision = decide(local.as_deref(), link.peer(), theirs, &peering.presented);
+        let decision = decide(
+            local.as_deref(),
+            full,
+            link.peer(),
+            theirs,
+            &peering.presented,
+        );
         match decision {
             Ok(mine) if room || peering.peered() => {
                 link.send(Frame::PeerAccept {
@@ -720,8 +748,9 @@ impl Peerings {
     }
 
     /// Re-evaluate one connection's peering for C after its evidence, its
-    /// credentials or the selection changed: a peering's send flag follows
-    /// admission, and a refused request that is now admitted is invited.
+    /// credentials, the selection or the replication mode changed: a
+    /// peering's send flag follows admission and its full flag the mode, and
+    /// a refused request that is now admitted is invited.
     fn revisit(&mut self, collection: CollectionHandle, id: u64) {
         let Some(link) = self.links.get(&id).cloned() else {
             return;
@@ -731,6 +760,7 @@ impl Peerings {
             .as_ref()
             .and_then(|snapshot| snapshot.selected(collection));
         let room = self.inbound(collection, id) < MAX_INBOUND_PEERINGS;
+        let full = self.full(collection);
         let peering = self.peering(collection, id);
         match peering.side {
             Side::Peered {
@@ -741,9 +771,9 @@ impl Peerings {
                 let Some(local) = &local else {
                     return;
                 };
-                let send = flags(local, link.peer(), &peering.presented).send;
-                if send != mine.send {
-                    mine.send = send;
+                let current = flags(local, full, link.peer(), &peering.presented);
+                if current != mine {
+                    mine = current;
                     link.send(Frame::PeerFlags {
                         collection,
                         flags: mine,
@@ -764,7 +794,13 @@ impl Peerings {
                 let Some((theirs, _)) = peering.refused else {
                     return;
                 };
-                match decide(local.as_deref(), link.peer(), theirs, &peering.presented) {
+                match decide(
+                    local.as_deref(),
+                    full,
+                    link.peer(),
+                    theirs,
+                    &peering.presented,
+                ) {
                     Ok(_) if room => self.ask(collection, &link, true),
                     Ok(_) => {}
                     Err(undefined) => {
@@ -788,12 +824,13 @@ impl Peerings {
             return;
         };
         let credentials = self.credentials(&local);
+        let full = self.full(collection);
         let peering = self.peering(collection, link.id());
         // A peering or request already on this connection stands.
         if !matches!(peering.side, Side::Idle) {
             return;
         }
-        let mine = flags(&local, link.peer(), &peering.presented);
+        let mine = flags(&local, full, link.peer(), &peering.presented);
         for frame in request_frames(collection, mine, invitation, &credentials) {
             link.send(frame);
         }
@@ -972,7 +1009,7 @@ impl Peerings {
 /// observations end: hear its connections' events, follow its observations,
 /// refill its neighbour sets every [`PEERING_TICK`], announce when a
 /// collection's schedule fires, and publish what changed into `health`.
-/// Record pulls start through `start_record_pull`, and their ends arrive on
+/// Pulls start through `start_pull`, and their ends arrive on
 /// `pulls_ended`. Received proofs and fetched definitions land through
 /// `admissions`.
 pub(crate) async fn run<T: Transport, S: Service>(
@@ -980,7 +1017,7 @@ pub(crate) async fn run<T: Transport, S: Service>(
     mut snapshots: tokio::sync::watch::Receiver<Option<Arc<StoreSnapshot>>>,
     mut events: tokio::sync::mpsc::Receiver<ReconEvent>,
     mut providers: tokio::sync::mpsc::UnboundedReceiver<(CollectionHandle, Vec<PeerId>)>,
-    mut start_record_pull: impl FnMut(PeerId, CollectionHandle),
+    mut start_pull: impl FnMut(PeerId, CollectionHandle, PullKind),
     mut pulls_ended: tokio::sync::mpsc::UnboundedReceiver<PullDone>,
     health: Health,
     admissions: tokio::sync::mpsc::Sender<NetEventBatch>,
@@ -993,7 +1030,7 @@ pub(crate) async fn run<T: Transport, S: Service>(
     let mut tick = tokio::time::interval(PEERING_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     if let Some(snapshot) = snapshots.borrow_and_update().clone() {
-        announcements.observe(announce::roots(&snapshot), crate::clock::mono_now());
+        announcements.observe(announce::states(&snapshot), crate::clock::mono_now());
         peerings.observe(snapshot.clone());
         sink.apply(grants.observe(snapshot));
     }
@@ -1013,7 +1050,7 @@ pub(crate) async fn run<T: Transport, S: Service>(
                 // A withdrawn observation is not an unselection; the next
                 // one is compared with the last one seen.
                 if let Some(snapshot) = snapshots.borrow_and_update().clone() {
-                    announcements.observe(announce::roots(&snapshot), crate::clock::mono_now());
+                    announcements.observe(announce::states(&snapshot), crate::clock::mono_now());
                     peerings.observe(snapshot.clone());
                     sink.apply(grants.observe(snapshot));
                 }
@@ -1021,22 +1058,26 @@ pub(crate) async fn run<T: Transport, S: Service>(
             Some(event) = events.recv() => {
                 sink.apply(grants.event(&event));
                 match event {
-                    ReconEvent::Frame(link, Frame::Announce { collection, root, reply, .. }) => {
+                    ReconEvent::Frame(
+                        link,
+                        Frame::Announce { collection, root, held_digest: held, reply },
+                    ) => {
                         let now = crate::clock::mono_now();
-                        if let Some((peer, collection)) =
-                            announcements.heard(link.peer(), collection, root, reply, now)
+                        let state = State { root, held };
+                        for (peer, collection, kind) in
+                            announcements.heard(link.peer(), collection, state, reply, now)
                         {
-                            start_record_pull(peer, collection);
+                            start_pull(peer, collection, kind);
                         }
                     }
                     event => peerings.event(event),
                 }
             }
             Some(ended) = pulls_ended.recv() => {
-                if let Some((peer, collection)) =
+                for (peer, collection, kind) in
                     announcements.ended(ended, crate::clock::mono_now())
                 {
-                    start_record_pull(peer, collection);
+                    start_pull(peer, collection, kind);
                 }
             }
             () = announcement_due => announcements.poll(crate::clock::mono_now()),
@@ -1110,13 +1151,14 @@ mod tests {
         )
     }
 
-    /// One node's pile: its store, its configuration and its active
-    /// collections.
+    /// One node's pile: its store, its configuration, its active
+    /// collections and those it replicates in full.
     struct Pile {
         key: SigningKey,
         store: MemoryRepo,
         config: Collection<SimpleArchive>,
         active: ActiveCollections,
+        full: ActiveCollections,
     }
 
     impl Pile {
@@ -1131,6 +1173,7 @@ mod tests {
                 store,
                 config,
                 active: ActiveCollections::new(),
+                full: ActiveCollections::new(),
             }
         }
 
@@ -1178,7 +1221,8 @@ mod tests {
                     None,
                     StoreChanges::ALL,
                 )
-                .unwrap(),
+                .unwrap()
+                .with_full(self.full.clone()),
             )
         }
     }
@@ -1605,6 +1649,57 @@ mod tests {
         assert!(reader.health().is_empty());
     }
 
+    /// A side's full flag follows its replication mode: it rides the
+    /// request, a change goes out as PEER_FLAGS, and a peering is full for
+    /// announcements only while both sides are.
+    #[test]
+    fn the_full_flag_follows_the_replication_mode() {
+        let mut owner = Node::new(14);
+        let mut reader = Node::new(15);
+        let policy = CollectionPolicy::new(
+            AdmissionPolicy::direct(owner.key.verifying_key()),
+            AdmissionPolicy::direct(owner.key.verifying_key()),
+        );
+        let collection = owner.hold(policy.clone());
+        reader.hold(policy);
+        let read = grant(&owner.key, &reader.key, read_capability(), collection);
+        owner.learn(read.clone());
+        reader.learn(read);
+        owner.select(collection, true);
+        reader.select(collection, true);
+        let set_full = |node: &mut Node, full: bool| {
+            node.pile.full = ActiveCollections::new();
+            if full {
+                node.pile.full.insert(&PatchEntry::new(&collection.raw));
+            }
+            node.observe();
+        };
+        let full = |node: &Node| {
+            let neighbours = node.peerings.neighbours().collect::<Vec<_>>();
+            assert_eq!(neighbours.len(), 1);
+            neighbours[0].3
+        };
+        set_full(&mut owner, true);
+        let mut wire = connect(&mut owner, &mut reader, 1);
+        owner.peerings.fill(crate::clock::mono_now());
+        let carried = carry(&mut owner, &mut reader, &mut wire);
+        let Frame::PeerRequest { flags, .. } = &carried[0].1 else {
+            panic!("{carried:?}");
+        };
+        assert!(flags.full);
+        assert!(!full(&owner) && !full(&reader));
+
+        set_full(&mut reader, true);
+        let carried = carry(&mut owner, &mut reader, &mut wire);
+        assert_eq!(kinds(&carried), [("right", FRAME_PEER_FLAGS)]);
+        assert!(full(&owner) && full(&reader));
+
+        set_full(&mut owner, false);
+        let carried = carry(&mut owner, &mut reader, &mut wire);
+        assert_eq!(kinds(&carried), [("left", FRAME_PEER_FLAGS)]);
+        assert!(!full(&owner) && !full(&reader));
+    }
+
     /// Tiers order the candidates whatever the salt, a failed dial is not
     /// retried before the order is drawn again, and the end of the order
     /// draws it again once that is due.
@@ -1723,14 +1818,14 @@ mod tests {
                 let health = Health::new(EndpointId::from_bytes(&pile.id()).unwrap());
                 let (_providers, found) = tokio::sync::mpsc::unbounded_channel();
                 let (admissions, _) = tokio::sync::mpsc::channel(1);
-                // These hosts run no record pulls.
+                // These hosts run no pulls.
                 let (_ended, pulls_ended) = tokio::sync::mpsc::unbounded_channel();
                 let peering = tokio::spawn(run(
                     table.clone(),
                     observed,
                     recon,
                     found,
-                    |_, _| {},
+                    |_, _, _| {},
                     pulls_ended,
                     health.clone(),
                     admissions,

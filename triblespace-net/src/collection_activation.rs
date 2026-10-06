@@ -4,8 +4,9 @@
 //! sets. The records are the collection's foundations -- COMMITs and DERIVEs;
 //! a MERGE is its signer's own lattice node and never replicates. A newly
 //! arrived proof may activate an old COMMIT or admit a new reader without
-//! changing the record PATCH. A collection wake commits to both and to the
-//! collection's held-blob set, without disclosing those handles.
+//! changing the record PATCH. A collection's root commits to both, without
+//! disclosing a record or proof; its held-blob set is compared apart, and
+//! only between two neighbours that replicate it in full.
 //! The authorization projection contains byte-valid proofs for exact C and its
 //! configured roots. Definition residency determines authority, not membership.
 //! It also indexes each proof's prefixes under the keys they name, so a
@@ -39,11 +40,10 @@ use crate::host::ResidentBlobReader;
 use crate::patch_repair::PatchSummary;
 
 const COLLECTION_REPAIR_ROOT_DOMAIN: &[u8] = b"triblespace.collection.repair-overlay\0";
-/// Version 3: the record component holds foundations only (COMMIT and DERIVE)
-/// and the blob component is the held set of the core index.
-const COLLECTION_REPAIR_ROOT_VERSION: u32 = 3;
-/// Version 4: records and authorization evidence only, without held blobs.
-const COLLECTION_RECORD_ROOT_VERSION: u32 = 4;
+/// Version 4: records (foundations only, COMMIT and DERIVE) and
+/// authorization evidence, without held blobs. Version 3 also hashed the held
+/// set.
+const COLLECTION_REPAIR_ROOT_VERSION: u32 = 4;
 
 type AuthorizationEvidencePatch = PATCH<64, IdentitySchema, CapabilityProof, Blake3Merkle>;
 /// Subject key | hash of the proof prefix that ends at that subject.
@@ -393,21 +393,14 @@ impl CollectionRepairOverlay {
         self.authorization_evidence.discovery_candidates()
     }
 
-    /// Opaque digest suitable for the collection gossip wake root.
-    ///
-    /// Counts participate alongside roots so the digest commits to the same
-    /// authenticated component summaries used by PATCH repair. Neither a
-    /// proof, record, blob handle, count, nor component root is disclosed by
-    /// this value.
+    /// The collection's [`record_root`], which a gossip wake carries too.
+    /// Held blobs are not part of it.
     pub fn wake_root(&self) -> [u8; 32] {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(COLLECTION_REPAIR_ROOT_DOMAIN);
-        hasher.update(&COLLECTION_REPAIR_ROOT_VERSION.to_be_bytes());
-        hasher.update(&self.collection.raw);
-        update_summary(&mut hasher, self.records.summary());
-        update_summary(&mut hasher, self.authorization_evidence.summary());
-        update_summary(&mut hasher, PatchSummary::from_patch(self.blob_inventory()));
-        *hasher.finalize().as_bytes()
+        record_root(
+            self.collection,
+            self.records.summary(),
+            self.authorization_evidence.summary(),
+        )
     }
 
     /// Keep fixed components whose raw inputs the store certifies unchanged.
@@ -467,8 +460,11 @@ impl CollectionRepairOverlay {
 }
 
 /// The root of a collection's records and authorization evidence: what a
-/// record pull walks, and what an announcement of that state carries. Unlike
-/// [`CollectionRepairOverlay::wake_root`] it leaves held blobs out.
+/// record pull walks, and what an announcement of that state carries.
+///
+/// Counts participate alongside roots so the digest commits to the same
+/// authenticated component summaries used by PATCH repair. Neither a proof,
+/// record, count, nor component root is disclosed by this value.
 pub fn record_root(
     collection: CollectionHandle,
     records: PatchSummary,
@@ -476,7 +472,7 @@ pub fn record_root(
 ) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(COLLECTION_REPAIR_ROOT_DOMAIN);
-    hasher.update(&COLLECTION_RECORD_ROOT_VERSION.to_be_bytes());
+    hasher.update(&COLLECTION_REPAIR_ROOT_VERSION.to_be_bytes());
     hasher.update(&collection.raw);
     update_summary(&mut hasher, records);
     update_summary(&mut hasher, authorization);

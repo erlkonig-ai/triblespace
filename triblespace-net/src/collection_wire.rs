@@ -19,7 +19,6 @@ pub(crate) struct CollectionRepairManifest {
     pub(crate) wake_root: [u8; 32],
     pub(crate) records: PatchSummary,
     pub(crate) authorization_evidence: PatchSummary,
-    pub(crate) resident_blobs: PatchSummary,
 }
 
 pub(crate) fn manifest(overlay: &CollectionRepairOverlay) -> CollectionRepairManifest {
@@ -27,6 +26,5 @@ pub(crate) fn manifest(overlay: &CollectionRepairOverlay) -> CollectionRepairMan
         wake_root: overlay.wake_root(),
         records: overlay.records().summary(),
         authorization_evidence: overlay.authorization_evidence().summary(),
-        resident_blobs: PatchSummary::from_patch(overlay.blob_inventory()),
     }
 }

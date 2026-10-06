@@ -246,6 +246,9 @@ pub(crate) struct StoreSnapshot {
     bearer_locators: Arc<BearerLocatorIndex>,
     /// This pile's configuration collection, where its sync selection lives.
     config: Arc<TribleSet>,
+    /// The collections this side replicates in full
+    /// ([`ReplicationMode::Full`](crate::reconcile::ReplicationMode::Full)).
+    full: ActiveCollections,
 }
 
 impl StoreSnapshot {
@@ -391,7 +394,20 @@ impl StoreSnapshot {
             blobs: reader.0,
             bearer_locators,
             config,
+            full: ActiveCollections::new(),
         })
+    }
+
+    /// Replicate `full`'s collections in full: their peerings say so, and
+    /// announcements to full neighbours carry their held digests.
+    pub(crate) fn with_full(mut self, full: ActiveCollections) -> Self {
+        self.full = full;
+        self
+    }
+
+    /// Whether this side replicates the collection in full.
+    pub(crate) fn full(&self, collection: CollectionHandle) -> bool {
+        self.full.get(&collection.raw).is_some()
     }
 
     pub(crate) fn collection(
@@ -1514,17 +1530,17 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
         wiring.lander.clone(),
     );
     // Peerings and announcements ride the connections' recon/1 streams
-    // beside the wake path below. Announcements start record pulls, and hear
-    // every record pull end, whoever started it.
+    // beside the wake path below. Announcements start record and reference
+    // pulls, and hear every pull end, whoever started it.
     let (found_tx, found_rx) = tokio::sync::mpsc::unbounded_channel();
     let (ended_tx, ended_rx) = tokio::sync::mpsc::unbounded_channel();
-    let record_pulls = pulls.clone();
+    let starts = pulls.clone();
     tokio::spawn(crate::peering::run(
         connections.clone(),
         wiring.snapshot.clone(),
         recon_rx,
         found_rx,
-        move |peer, collection| record_pulls.start(peer, collection, PullKind::Records),
+        move |peer, collection, kind| starts.start(peer, collection, kind),
         ended_rx,
         wiring.health.clone(),
         wiring.evt_tx.clone(),
@@ -3570,7 +3586,8 @@ mod tests {
             after_collection.repair.authorization_evidence().summary(),
             before_collection.repair.authorization_evidence().summary()
         );
-        assert_ne!(after_collection.wake_root(), before_collection.wake_root());
+        // The definition joined the held set; the root leaves held blobs out.
+        assert_eq!(after_collection.wake_root(), before_collection.wake_root());
         assert!(
             after_collection
                 .repair

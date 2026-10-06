@@ -4,8 +4,11 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
+use anybytes::Bytes;
 use ed25519_dalek::SigningKey;
 use iroh_base::EndpointId;
+use triblespace_core::blob::Blob;
+use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::capability::{CapabilityProof, CapabilityResource};
 use triblespace_core::clock::{self, VirtualClock};
@@ -14,12 +17,17 @@ use triblespace_core::collection::{
     AdmissionPolicy, Collection, CollectionHandle, CollectionPolicy, CollectionStoreExt,
     private_policy, read_capability,
 };
-use triblespace_core::repo::CapabilityProofStore;
+use triblespace_core::collection::{
+    CollectionCommit, CollectionData, CollectionRecord, CollectionStore, HeldRead,
+    empty_metadata_handle,
+};
 use triblespace_core::repo::memoryrepo::MemoryRepo;
+use triblespace_core::repo::{BlobStoreGet, BlobStorePut, CapabilityProofStore, SnapshotSource};
 use triblespace_net::health::PeeringHealth;
 use triblespace_net::host::{self, PeerConfig};
 use triblespace_net::inventory::{ReconcileDirection, ReconcileQos};
 use triblespace_net::peer::Peer;
+use triblespace_net::reconcile::ReplicationMode;
 use triblespace_net::transport::sim::{SimConfig, SimNet};
 
 fn key(byte: u8) -> SigningKey {
@@ -244,4 +252,79 @@ fn announcements_alone_keep_a_peered_connection_open() {
         assert!(peered(&owner) && peered(&reader));
         assert_eq!(dials(), settled);
     }));
+}
+
+/// The owner and the reader hold one record whose data names two blobs, each
+/// holding one of them. With `reader_full` both replicate the collection in
+/// full, and returns whether each ends up holding both blobs in it.
+fn held_blobs_after_peering(reader_full: bool) -> [bool; 2] {
+    let _guard = test_guard();
+    let clock = virtual_clock();
+    clock.reset();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    runtime.block_on(tokio::task::LocalSet::new().run_until(async {
+        let net = SimNet::new(0x9EE7_1003, SimConfig::default());
+        let owner_key = key(95);
+        let reader_key = key(96);
+        let (mut owner_pile, mut reader_pile) = granted_pair(&owner_key, &reader_key);
+        let collection = owner_pile.collection;
+        select(&mut owner_pile);
+        select(&mut reader_pile);
+        let blobs = [b"the owner holds this".as_slice(), b"the reader holds this"]
+            .map(|bytes| Blob::<UnknownBlob>::new(Bytes::from_source(bytes.to_vec())));
+        let data = Blob::<UnknownBlob>::new(Bytes::from_source(
+            blobs
+                .iter()
+                .flat_map(|blob| blob.get_handle().raw)
+                .collect::<Vec<_>>(),
+        ));
+        let record = CollectionRecord::Commit(CollectionCommit::sign(
+            &owner_key,
+            collection,
+            CollectionData::new(data.get_handle().raw),
+            empty_metadata_handle(),
+        ));
+        for (pile, blob) in [(&mut owner_pile, &blobs[0]), (&mut reader_pile, &blobs[1])] {
+            pile.store.put::<UnknownBlob, _>(blob.clone()).unwrap();
+            pile.store.put::<UnknownBlob, _>(data.clone()).unwrap();
+            pile.store.insert(record).unwrap();
+        }
+        let mut owner = bring_up(&net, &owner_key, owner_pile.store);
+        let mut reader = bring_up(&net, &reader_key, reader_pile.store);
+        owner.activate_collection(collection);
+        reader.activate_collection(collection);
+        owner.set_replication(ReplicationMode::Full, [collection]);
+        if reader_full {
+            reader.set_replication(ReplicationMode::Full, [collection]);
+        }
+        advance(&clock, &mut [&mut owner, &mut reader], 180).await;
+        [&mut owner, &mut reader].map(|peer| {
+            let snapshot = peer.snapshot().unwrap();
+            let held = snapshot.held(collection).unwrap_or_default();
+            blobs.iter().all(|blob| {
+                let handle = blob.get_handle();
+                held.has_prefix(&handle.raw)
+                    && BlobStoreGet::get::<Bytes, UnknownBlob>(&snapshot, handle).is_ok()
+            })
+        })
+    }))
+}
+
+/// Astra's R1 through whole hosts: two Full hosts with equal records and
+/// different blobs held in a collection announce their held digests, pull
+/// each other's references over `blob/1`, and both hold the union.
+#[test]
+fn full_hosts_with_equal_records_converge_on_their_held_blobs() {
+    assert_eq!(held_blobs_after_peering(true), [true, true]);
+}
+
+/// A Demand host neither sends nor receives a held digest, so neither side
+/// pulls the other's references: only Full neighbours compare held sets.
+#[test]
+fn a_demand_host_and_a_full_host_compare_no_held_blobs() {
+    assert_eq!(held_blobs_after_peering(false), [false, false]);
 }

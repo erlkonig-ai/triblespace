@@ -1637,17 +1637,16 @@ mod tests {
                 .reader_is_admitted_by(reader, std::slice::from_ref(&proof)),
             QuorumOutcome::Met
         );
-        // Health commits to the actual serving inventory as well as the
-        // complete semantic record and AUTH PATCHes.
+        // Health commits to the complete semantic record and AUTH PATCHes.
         let published = frontier_after_refresh.unwrap();
         assert_eq!(published.records, manifest(&expected).records);
         assert_eq!(
             published.authorization_evidence,
             manifest(&expected).authorization_evidence
         );
-        // A bare semantic overlay has no resident inventory. The serving
-        // product root also commits to the readable descriptor and payload.
-        assert_ne!(published.wake_root, manifest(&expected).wake_root);
+        // The root leaves held blobs out, so a bare semantic overlay and the
+        // serving one share it.
+        assert_eq!(published.wake_root, manifest(&expected).wake_root);
         assert_ne!(initial_frontier.wake_root, published.wake_root);
         assert_ne!(
             manifest(&initial_overlay).wake_root,

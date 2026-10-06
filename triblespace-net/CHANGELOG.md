@@ -46,6 +46,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   delegated keys among connected peers, and so are those a refused peering
   waits for. A proof waits in memory only if its signatures hold. The host
   dials the subject of every grant its key signed.
+- Full neighbours compare held sets (sync redesign M11, design 2.9).
+  `Peer::set_replication` in Full mode keeps held sets for its collections
+  (activation no longer does) and sets the full flag of their peerings; a
+  changed mode goes out as PEER_FLAGS. Between two neighbours that both set
+  it, an announcement also carries the sender's held digest, the Merkle root
+  of the blobs it holds in the collection, and equality includes it. A
+  different digest starts a reference pull, and the reply to it the reverse
+  one; the digest a completed reference pull walked ends a comparison as an
+  equal one does. Demand and Shallow neighbours get no digest. The
+  collection root (`wake_root`, version 4) leaves held blobs out, and so
+  does the health manifest.
 - A reference pull fetches what it walks (sync redesign M11). A blob the
   peer holds in the collection and this side's held set lacks joins that
   set: one already resident is noted held as it is, another is first fetched

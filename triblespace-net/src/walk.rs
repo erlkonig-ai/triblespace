@@ -2421,7 +2421,7 @@ pub(crate) mod tests {
         /// that pull's root, starts no second pull.
         #[test]
         fn an_announcement_of_the_walked_state_starts_no_second_pull() {
-            use crate::announce::{Announcements, roots};
+            use crate::announce::{Announcements, State, states};
             use triblespace_core::collection::private_policy;
             use triblespace_core::collection::selection::{
                 CONFIG_COLLECTION_NAME, write_sync_selection,
@@ -2451,34 +2451,39 @@ pub(crate) mod tests {
             .unwrap();
             puller.observe();
             responder.observe();
-            let announced = roots(responder.walks.snapshot.as_ref().unwrap())
-                .map(|(_, root)| root)
+            let announced = states(responder.walks.snapshot.as_ref().unwrap())
+                .map(|(_, state)| state)
                 .collect::<Vec<_>>();
             assert_eq!(announced.len(), 1);
+            let state = |node: &Node| State {
+                root: root(node, collection),
+                held: None,
+            };
 
             let mut wire = connect(&puller, &responder, 1);
             let mut announcements = Announcements::default();
-            announcements.observe([(collection, root(&puller, collection))], now);
+            announcements.observe([(collection, state(&puller))], now);
             // The puller does not send C back, so it never replies.
-            announcements.neighbours([(collection, &wire.to_right, false)], now);
+            announcements.neighbours([(collection, &wire.to_right, false, false)], now);
             assert_eq!(
                 announcements.heard(responder.id(), collection, announced[0], false, now),
-                Some((responder.id(), collection))
+                [(responder.id(), collection, PullKind::Records)]
             );
             puller
                 .walks
                 .start_record_pull(&wire.to_right, collection, now);
             carry(&mut puller, &mut responder, &mut wire, now);
             assert!(puller.done[0].completed);
-            assert_eq!(announcements.ended(puller.done[0], now), None);
+            assert!(announcements.ended(puller.done[0], now).is_empty());
 
             // The puller now holds the union, whose root differs from the
             // responder's.
-            announcements.observe([(collection, root(&puller, collection))], now);
-            assert_ne!(root(&puller, collection), announced[0]);
-            assert_eq!(
-                announcements.heard(responder.id(), collection, announced[0], false, now),
-                None
+            announcements.observe([(collection, state(&puller))], now);
+            assert_ne!(state(&puller), announced[0]);
+            assert!(
+                announcements
+                    .heard(responder.id(), collection, announced[0], false, now)
+                    .is_empty()
             );
         }
     }

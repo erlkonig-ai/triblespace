@@ -97,6 +97,17 @@ fn observe(
     .unwrap()
 }
 
+/// The held digest a Full neighbour would compare.
+fn digest(serving: &StoreSnapshot, collection: CollectionHandle) -> [u8; 32] {
+    crate::collection_activation::held_digest(crate::patch_repair::PatchSummary::from_patch(
+        serving
+            .collection(collection)
+            .unwrap()
+            .repair
+            .blob_inventory(),
+    ))
+}
+
 fn held(serving: &StoreSnapshot, collection: CollectionHandle, handle: &[u8; 32]) -> bool {
     serving
         .collection(collection)
@@ -108,7 +119,7 @@ fn held(serving: &StoreSnapshot, collection: CollectionHandle, handle: &[u8; 32]
 
 /// A child put after its parent was scanned is not found by the arrival:
 /// each blob is scanned once. A peer's report of it in C makes it held, and
-/// only the blob component and the wake root change.
+/// only the held digest changes: the root leaves held blobs out.
 #[test]
 fn a_blob_only_child_is_held_after_a_report_not_by_its_arrival() {
     let child =
@@ -126,10 +137,8 @@ fn a_blob_only_child_is_held_after_a_report_not_by_its_arrival() {
     let unreported = observe(&arrived, &active, fixture.local, Some((&before, &old)));
     assert!(!held(&unreported, fixture.collection, &child_handle.raw));
     assert_eq!(
-        crate::collection_wire::manifest(&old.collection(fixture.collection).unwrap().repair),
-        crate::collection_wire::manifest(
-            &unreported.collection(fixture.collection).unwrap().repair
-        ),
+        digest(&old, fixture.collection),
+        digest(&unreported, fixture.collection),
         "an arrival nobody reported changes nothing that is served"
     );
 
@@ -150,8 +159,11 @@ fn a_blob_only_child_is_held_after_a_report_not_by_its_arrival() {
         old_manifest.authorization_evidence,
         new_manifest.authorization_evidence
     );
-    assert_ne!(old_manifest.resident_blobs, new_manifest.resident_blobs);
-    assert_ne!(old_manifest.wake_root, new_manifest.wake_root);
+    assert_eq!(old_manifest.wake_root, new_manifest.wake_root);
+    assert_ne!(
+        digest(&old, fixture.collection),
+        digest(&new, fixture.collection)
+    );
     assert!(held(&new, fixture.collection, &child_handle.raw));
     // The retained immutable observation does not learn a future arrival.
     assert!(!held(&old, fixture.collection, &child_handle.raw));
@@ -172,8 +184,8 @@ fn a_walk_finds_a_blob_only_child_nobody_reported() {
     let new = observe(&after, &active, fixture.local, Some((&before, &old)));
     assert!(held(&new, fixture.collection, &child_handle.raw));
     assert_ne!(
-        old.collection(fixture.collection).unwrap().wake_root(),
-        new.collection(fixture.collection).unwrap().wake_root()
+        digest(&old, fixture.collection),
+        digest(&new, fixture.collection)
     );
 }
 
@@ -195,11 +207,8 @@ fn a_large_body_is_held_whole_in_the_first_observation() {
     assert_eq!(again.changes_since(&snapshot), StoreChanges::NONE);
     let unchanged = observe(&again, &active, fixture.local, Some((&snapshot, &serving)));
     assert_eq!(
-        serving.collection(fixture.collection).unwrap().wake_root(),
-        unchanged
-            .collection(fixture.collection)
-            .unwrap()
-            .wake_root()
+        digest(&serving, fixture.collection),
+        digest(&unchanged, fixture.collection)
     );
 }
 
@@ -309,12 +318,16 @@ fn a_new_records_closure_is_served_by_the_observation_that_carries_it() {
 }
 
 mod reference_pull {
+    use tokio::sync::mpsc::UnboundedReceiver;
     use triblespace_core::collection::{CollectionData, empty_metadata_handle};
     use triblespace_core::repo::SnapshotSource;
 
     use super::*;
-    use crate::collection_activation::held_digest;
+    use crate::announce::{Announcements, State};
+    use crate::collection_activation::{held_digest, record_root};
+    use crate::connection::Link;
     use crate::patch_repair::PatchSummary;
+    use crate::recon::Frame;
     use crate::walk::tests::walking::{Node, carry, connect, open};
     use crate::walk::{PullDone, PullKind};
 
@@ -481,5 +494,146 @@ mod reference_pull {
             held_set(&pair.puller, collection),
             held_set(&pair.responder, collection)
         );
+    }
+
+    /// Answer `node`'s fetches from `holder`'s store.
+    fn serve_fetches(node: &mut Node, holder: &mut Node) {
+        let now = crate::clock::mono_now();
+        let store = holder.store.snapshot().unwrap();
+        for (walk, handle, _) in std::mem::take(&mut node.fetches) {
+            let blob =
+                BlobStoreGet::get::<Blob<UnknownBlob>, UnknownBlob>(&store, Inline::new(handle))
+                    .ok();
+            node.walks.fetched(walk, handle, None, blob, now);
+        }
+    }
+
+    /// What `node` announces for C as a Full neighbour.
+    fn state(node: &Node, collection: CollectionHandle) -> State {
+        let repair = node.serving().collection(collection).unwrap();
+        let repair = repair.repair();
+        State {
+            root: record_root(
+                collection,
+                repair.records().summary(),
+                repair.authorization_evidence().summary(),
+            ),
+            held: Some(held_digest(PatchSummary::from_patch(
+                repair.blob_inventory(),
+            ))),
+        }
+    }
+
+    /// The announcements sent on a link: state and reply flag.
+    fn announced(frames: &mut UnboundedReceiver<Frame>) -> Vec<(State, bool)> {
+        std::iter::from_fn(|| frames.try_recv().ok())
+            .map(|frame| match frame {
+                Frame::Announce {
+                    root,
+                    held_digest,
+                    reply,
+                    ..
+                } => (
+                    State {
+                        root,
+                        held: held_digest,
+                    },
+                    reply,
+                ),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Astra's R1: two quiet Full neighbours with equal records hold
+    /// different blobs in C. One announcement and its reply start a
+    /// reference pull each way, and both end with the union: the next
+    /// announcement is equal and starts nothing.
+    #[test]
+    fn quiet_full_neighbours_converge_after_one_announcement_and_reply() {
+        let mut now = crate::clock::mono_now();
+        let mut x = Node::new(51);
+        let mut y = Node::new(52);
+        let collection = x.hold("held apart", open());
+        assert_eq!(y.hold("held apart", open()), collection);
+        let children = [b"x holds this".as_slice(), b"y holds this".as_slice()]
+            .map(|bytes| Blob::<UnknownBlob>::new(Bytes::from_source(bytes.to_vec())));
+        let data = Blob::<UnknownBlob>::new(Bytes::from_source(
+            children
+                .iter()
+                .flat_map(|child| child.get_handle().raw)
+                .collect::<Vec<_>>(),
+        ));
+        let record = CollectionRecord::Commit(CollectionCommit::sign(
+            &x.key,
+            collection,
+            CollectionData::new(data.get_handle().raw),
+            empty_metadata_handle(),
+        ));
+        for (node, child) in [(&mut x, &children[0]), (&mut y, &children[1])] {
+            node.store.put::<UnknownBlob, _>(child.clone()).unwrap();
+            node.store.put::<UnknownBlob, _>(data.clone()).unwrap();
+            node.store.insert(record).unwrap();
+            node.store.track_held([collection]);
+            node.observe();
+        }
+        let (x_state, y_state) = (state(&x, collection), state(&y, collection));
+        assert_eq!(x_state.root, y_state.root);
+        assert_ne!(x_state.held, y_state.held);
+
+        // Announcements and walks ride separate fake links here.
+        let (x_to_y, mut from_x) = Link::detached(2, y.id());
+        let (y_to_x, mut from_y) = Link::detached(2, x.id());
+        let (mut x_says, mut y_says) = (Announcements::default(), Announcements::default());
+        x_says.observe([(collection, x_state)], now);
+        y_says.observe([(collection, y_state)], now);
+        x_says.neighbours([(collection, &x_to_y, true, true)], now);
+        y_says.neighbours([(collection, &y_to_x, true, true)], now);
+        // X's first opportunity comes first.
+        while from_x.is_empty() {
+            now = now + std::time::Duration::from_millis(100);
+            x_says.poll(now);
+        }
+        let mut wire = connect(&x, &y, 1);
+        let [(announcement, false)] = announced(&mut from_x)[..] else {
+            panic!("one periodic announcement");
+        };
+        assert_eq!(announcement, x_state);
+        let pulls = y_says.heard(x.id(), collection, announcement, false, now);
+        assert_eq!(pulls, [(x.id(), collection, PullKind::References)]);
+        y.walks.start_reference_pull(&wire.to_left, collection, now);
+        let [(reply, true)] = announced(&mut from_y)[..] else {
+            panic!("one reply");
+        };
+        assert_eq!(reply, y_state);
+        let pulls = x_says.heard(y.id(), collection, reply, true, now);
+        assert_eq!(pulls, [(y.id(), collection, PullKind::References)]);
+        x.walks
+            .start_reference_pull(&wire.to_right, collection, now);
+
+        carry(&mut x, &mut y, &mut wire, now);
+        serve_fetches(&mut x, &mut y);
+        serve_fetches(&mut y, &mut x);
+        carry(&mut x, &mut y, &mut wire, now);
+        for (node, says) in [(&x, &mut x_says), (&y, &mut y_says)] {
+            assert_eq!(node.done.len(), 1);
+            assert!(node.done[0].completed);
+            assert!(says.ended(node.done[0], now).is_empty());
+        }
+        let union = state(&x, collection);
+        assert_eq!(union, state(&y, collection));
+        for child in &children {
+            assert!(holds(&x, collection, &child.get_handle().raw));
+        }
+        assert!(announced(&mut from_x).is_empty() && announced(&mut from_y).is_empty());
+
+        x_says.observe([(collection, union)], now);
+        y_says.observe([(collection, union)], now);
+        assert!(
+            y_says
+                .heard(x.id(), collection, union, false, now)
+                .is_empty()
+        );
+        assert!(announced(&mut from_y).is_empty());
     }
 }

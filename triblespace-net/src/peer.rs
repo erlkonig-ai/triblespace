@@ -191,7 +191,11 @@ struct Serving<S: SnapshotSource> {
 
 struct Publication<T> {
     active: ActiveCollections,
-    active_dirty: bool,
+    /// The collections replicated in full, a subset of what
+    /// [`Peer::set_replication`] selected.
+    full: ActiveCollections,
+    /// `active` or `full` changed since the last publication.
+    dirty: bool,
     /// Last local observation used to build the installed immutable inventory.
     /// Equality is a cheap invalidation check supplied by the store; it is not
     /// a portable generation or a semantic version.
@@ -235,7 +239,7 @@ where
         if !received
             && changes == StoreChanges::NONE
             && held_unchanged
-            && !publication.active_dirty
+            && !publication.dirty
             && previous_snapshot.is_some()
         {
             publication.last_store_snapshot = Some(snapshot);
@@ -252,13 +256,14 @@ where
             publication.last_store_snapshot.as_ref(),
             previous_snapshot.as_deref(),
             changes,
-        )?;
+        )?
+        .with_full(publication.full.clone());
         self.sender.update_snapshot(serving, &publication.active);
         #[cfg(test)]
         {
             publication.rebuilds += 1;
         }
-        publication.active_dirty = false;
+        publication.dirty = false;
         publication.last_store_snapshot = Some(snapshot);
         Ok(())
     }
@@ -445,7 +450,8 @@ where
             sender: sender.clone(),
             publication: Mutex::new(Publication {
                 active: PATCH::new(),
-                active_dirty: true,
+                full: PATCH::new(),
+                dirty: true,
                 last_store_snapshot: None,
                 #[cfg(test)]
                 rebuilds: 0,
@@ -489,12 +495,31 @@ where
 
     /// Select optional payload replication, independently of collection READ
     /// admission or activation. The default remains explicit demand only.
+    ///
+    /// In Full mode the store keeps held sets for `collections` from the next
+    /// snapshot on, and this side's peerings for them say it replicates them
+    /// in full, so that Full neighbours compare and pull held sets (design
+    /// 2.9). Other modes keep none, and peer with the full flag unset.
     pub fn set_replication(
         &mut self,
         mode: ReplicationMode,
         collections: impl IntoIterator<Item = CollectionHandle>,
     ) {
+        let collections: Vec<_> = collections.into_iter().collect();
+        let mut full = ActiveCollections::new();
+        if mode == ReplicationMode::Full {
+            self.store().track_held(collections.iter().copied());
+            for collection in &collections {
+                full.insert(&PatchEntry::new(&collection.raw));
+            }
+        }
+        {
+            let mut publication = self.serving.publication.lock().expect("publication mutex");
+            publication.dirty |= publication.full != full;
+            publication.full = full;
+        }
         self.reconciler.set_replication(mode, collections);
+        self.refresh();
     }
 
     /// Service one bounded hydration quantum from a coherent local snapshot.
@@ -589,14 +614,10 @@ where
             tracing::warn!(%error, "cannot activate collections on network host");
             return;
         }
-        let collections: Vec<_> = collections.into_iter().collect();
-        // Held sets are kept for every collection this peer serves, from the
-        // next snapshot on.
-        self.store().track_held(collections.iter().copied());
         {
             let mut publication = self.serving.publication.lock().expect("publication mutex");
             for collection in collections {
-                publication.active_dirty |= publication.active.get(&collection.raw).is_none();
+                publication.dirty |= publication.active.get(&collection.raw).is_none();
                 publication.active.insert(&PatchEntry::new(&collection.raw));
             }
             self.sender.observe_active_collections(&publication.active);
