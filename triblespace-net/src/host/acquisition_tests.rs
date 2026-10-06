@@ -245,9 +245,14 @@ impl ScriptedReplica {
                         let hints = hints.clone();
                         let queries = queries.clone();
                         tokio::spawn(async move {
-                            // The dialler's own recon/1 stream carries no request.
+                            // The dialler's own recon/1 stream carries no
+                            // request. It is held, as its end would close the
+                            // connection.
                             match recv_u8(&mut recv).await.unwrap() {
-                                TAG_RECON => return,
+                                TAG_RECON => {
+                                    let _ = recv.read_to_end(&mut Vec::new()).await;
+                                    return;
+                                }
                                 tag => assert_eq!(tag, TAG_DHT),
                             }
                             assert_eq!(recv_u8(&mut recv).await.unwrap(), OP_FIND_VALUE);

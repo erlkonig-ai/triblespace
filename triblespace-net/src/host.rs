@@ -1869,7 +1869,7 @@ struct SnapshotHandler {
     local_id: PeerId,
     /// Where `recon/1` events go: the host's peering task.
     recon: Option<tokio::sync::mpsc::Sender<ReconEvent>>,
-    /// Where walk frames and ended streams go: the host's walk task.
+    /// Where walk frames and closed connections go: the host's walk task.
     walks: Option<tokio::sync::mpsc::Sender<ReconEvent>>,
 }
 
@@ -1955,11 +1955,7 @@ impl Service for SnapshotHandler {
         }
         let (walks, peering) = match event {
             ReconEvent::Frame(_, Frame::Walk(_)) => (Some(event), None),
-            // Both hear a stream end and a connection close.
-            ReconEvent::Ended(link) => (
-                Some(ReconEvent::Ended(link.clone())),
-                Some(ReconEvent::Ended(link)),
-            ),
+            // Both hear a connection close.
             ReconEvent::Closed(link) => (
                 Some(ReconEvent::Closed(link.clone())),
                 Some(ReconEvent::Closed(link)),
@@ -2500,6 +2496,7 @@ mod tests {
     {
         use crate::transport::Conn;
         use crate::transport::sim::{SimConfig, SimNet};
+        use tokio::io::AsyncReadExt as _;
         // Its two ordinary receives hold process-wide receive credit that
         // other tests' budget assertions would otherwise observe.
         let _guard = crate::protocol::exact_blob_receive_test_guard();
@@ -2518,9 +2515,13 @@ mod tests {
             while let Some((mut send, mut recv)) = connection.accept_bi().await {
                 let bytes = bytes.clone();
                 tokio::spawn(async move {
-                    // The dialler's own recon/1 stream carries no request.
+                    // The dialler's own recon/1 stream carries no request. It
+                    // is held, as its end would close the connection.
                     match crate::protocol::recv_u8(&mut recv).await.unwrap() {
-                        crate::protocol::TAG_RECON => return,
+                        crate::protocol::TAG_RECON => {
+                            let _ = recv.read_to_end(&mut Vec::new()).await;
+                            return;
+                        }
                         tag => assert_eq!(tag, crate::protocol::TAG_BLOB),
                     }
                     let _ = crate::protocol::serve_get_blob(

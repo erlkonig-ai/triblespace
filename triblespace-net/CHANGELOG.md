@@ -13,6 +13,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `dht/1`, in place of the gossip wake plane and the `repair/0` session.
   Generation-28 peers are refused at the handshake; deploy a cohort together.
 
+- Close a connection when its `recon/1` ends (JP's design question,
+  2026-10-06). A connection carries exactly one `recon/1`, the dialler's,
+  and a second one is a protocol violation. When it ends, because the peer
+  ended it, it failed, or a writer waited 60 s for credit, the connection
+  closes and its peerings and walks end with it. The candidate order picks
+  the next neighbour, the same peer included, through a fresh dial no sooner
+  than the order's next draw, so a peer that ends every stream costs one dial
+  per draw instead of a loop of streams. The reopen machinery goes:
+  `ConnectionTable::reopen_recon`, `ReconEvent::Ended`, `RESET_REPLACED`,
+  `RESET_STALLED`, the per-stream order, and the peering frames resent when
+  a stream ended.
+
 - Delete configured peers (JP's content bootstrap, 2026-10-06).
   `PeerConfig::peers`, the routing table's configured seed
   (`RoutingTable::new` takes only the local key), `IrohTransport`'s route map
@@ -90,8 +102,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a deferred proof fetches its resource's descriptor inside the walk. A
   walk is numbered per peer, collection and kind, and frames or
   acknowledgements of an ended walk are dropped. A walk ends after 60 s
-  without progress; a `recon/1` writer that gets no credit for 60 s resets
-  the stream, and the dialler reopens it for its next frame. The landing
+  without progress; a `recon/1` writer that gets no credit for 60 s ends
+  the stream, which closes its connection. The landing
   task also reobserves the store every 2 s. The repair session's pass caps,
   inventory cursor, buffered delta and in-session READ bootstrap go with it.
 - Exchange grants on `recon/1` (sync redesign M10). On every connection, and

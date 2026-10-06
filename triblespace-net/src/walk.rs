@@ -1282,8 +1282,8 @@ impl Walks {
         self.advance(key, Ok(()), now);
     }
 
-    /// The `recon/1` stream or the connection of `link` ended, and every walk
-    /// on it with it, in both roles.
+    /// The connection of `link` closed, and every walk on it with it, in both
+    /// roles.
     pub(crate) fn ended(&mut self, link: &Link, now: Mono) {
         self.served.retain(|(id, _, _), _| *id != link.id());
         let keys = self
@@ -1532,7 +1532,7 @@ impl<T: Transport, S: Service> Task<T, S> {
                     ReconEvent::Frame(link, Frame::Walk(frame)) => {
                         self.walks.frame(&link, frame, crate::clock::mono_now());
                     }
-                    ReconEvent::Ended(link) | ReconEvent::Closed(link) => {
+                    ReconEvent::Closed(link) => {
                         self.walks.ended(&link, crate::clock::mono_now());
                     }
                     _ => {}

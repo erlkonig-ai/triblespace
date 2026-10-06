@@ -1,11 +1,12 @@
 //! The one `recon/1` stream of a connection, through whole hosts on the
 //! deterministic transport: 130 collections share it between two neighbours
-//! within the announcement estimate, it takes none of the request permits
-//! blob streams wait for, a peer that stops reading it gets it reset, it
-//! reopens beside blob streams at their cap, and the dialler reopens it at
-//! once when it ends, when each side sends again the peering frames it may
-//! have lost. A peer that speaks `recon/1` by hand encodes its frames with
-//! [`Frame`], and walk requests by the frame table of `triblespace_net::walk`.
+//! within the announcement estimate, and it takes none of the request permits
+//! blob streams wait for. When it ends the connection closes: a peer that
+//! stops reading it loses the connection, a neighbour whose stream ends comes
+//! back through a fresh dial, and a key that ends every stream is dialled no
+//! more than once per reshuffle interval. A peer that speaks `recon/1` by
+//! hand encodes its frames with [`Frame`], and walk requests by the frame
+//! table of `triblespace_net::walk`.
 #![cfg(feature = "sim")]
 
 use std::collections::{BTreeSet, HashMap};
@@ -21,9 +22,7 @@ use ed25519_dalek::SigningKey;
 use futures::FutureExt as _;
 use iroh_base::EndpointId;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
-use triblespace_core::blob::Blob;
 use triblespace_core::blob::encodings::UnknownBlob;
-use triblespace_core::blob::locator::blob_locator;
 use triblespace_core::clock::{self, VirtualClock};
 use triblespace_core::collection::selection::{CONFIG_COLLECTION_NAME, write_sync_selection};
 use triblespace_core::collection::{
@@ -33,11 +32,9 @@ use triblespace_core::collection::{
 };
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{BlobStorePut, SnapshotSource};
-use triblespace_net::connection::RESET_STALLED;
 use triblespace_net::host::{self, PeerConfig};
 use triblespace_net::peer::Peer;
-use triblespace_net::protocol::{OP_FIND_VALUE, PILE_SYNC_ALPN, TAG_BLOB, TAG_DHT, TAG_RECON};
-use triblespace_net::provider::blob_provider_token;
+use triblespace_net::protocol::{OP_FIND_VALUE, PILE_SYNC_ALPN, TAG_DHT, TAG_RECON};
 use triblespace_net::recon::{FRAME_OPEN, FRAME_WALK_REQUEST, Flags, Frame};
 use triblespace_net::transport::sim::{
     SimConfig, SimConn, SimNet, SimRecvStream, SimSendStream, SimTransport,
@@ -611,137 +608,6 @@ async fn find_value(
     let _ = send.shutdown().await;
 }
 
-/// Whether the peer still holds the stream: it has neither finished nor
-/// abandoned it.
-fn open(recv: &mut SimRecvStream) -> bool {
-    loop {
-        match recv.read(&mut [0; 64]).now_or_never() {
-            None => return true,
-            Some(Ok(0) | Err(_)) => return false,
-            Some(Ok(_)) => {}
-        }
-    }
-}
-
-/// `recon/1` reopens beside blob streams at their cap, and the connection's
-/// peerings stay. A host dials a key that may write a collection the host
-/// selects, and they peer on that connection. The host then wants 120
-/// blobs, and every lookup names that key their provider; the key answers
-/// none of the blob requests. The host opens 16 of them on the connection,
-/// its cap, below the 100 streams a QUIC peer allows, so when the key resets
-/// `recon/1` the host's next announcement opens a new one at once beside
-/// them, with no new request for the collection.
-#[test]
-fn recon_reopens_beside_blob_streams_at_their_cap_and_keeps_its_peerings() {
-    run(async |clock| {
-        let net = SimNet::new(0x5EC0_0002, SimConfig::default());
-        let host_key = key(20);
-        let peer_key = key(21);
-        let peer_id = id(&peer_key);
-        let mut store = MemoryRepo::default();
-        let collection = hold(&mut store, "beside blobs", &[&host_key, &peer_key]);
-        select(&mut store, &host_key, collection);
-        let mut host = bring_up(net.join(&host_key), &host_key, store);
-
-        let blobs = (0..120_u32)
-            .map(|number| {
-                let bytes = Bytes::from_source(number.to_be_bytes().to_vec());
-                Blob::<UnknownBlob>::new(bytes).get_handle().raw
-            })
-            .collect::<Vec<_>>();
-        let tokens = Arc::new(
-            blobs
-                .iter()
-                .map(|hash| (blob_locator(*hash), blob_provider_token(*hash, peer_id)))
-                .collect::<HashMap<_, _>>(),
-        );
-        let mut harness = net.join(&peer_key);
-        let (recons, mut opened) = tokio::sync::mpsc::unbounded_channel();
-        let held = Arc::new(Mutex::new(Vec::new()));
-        let holding = held.clone();
-        tokio::task::spawn_local(async move {
-            let conn = harness.incoming.recv().await.unwrap().conn;
-            while let Some((send, mut recv)) = conn.accept_bi().await {
-                match recv.read_u8().await {
-                    Ok(TAG_RECON) => {
-                        let _ = recons.send((send, Frames::new(recv)));
-                    }
-                    Ok(TAG_DHT) => {
-                        tokio::task::spawn_local(find_value(send, recv, peer_id, tokens.clone()));
-                    }
-                    Ok(TAG_BLOB) => holding.lock().unwrap().push((send, recv)),
-                    _ => {}
-                }
-            }
-        });
-
-        host.activate_collection(collection);
-        let peers: &mut [&mut Peer<MemoryRepo>] = &mut [&mut host];
-        let (mut recon, mut frames) =
-            until(&clock, peers, 10, "recon/1", |_| opened.try_recv().ok()).await;
-        let sequence = until(&clock, peers, 1, "opening frame", |_| frames.opening()).await;
-        until(&clock, peers, 10, "peering request", |_| {
-            loop {
-                if let Frame::PeerRequest { collection: c, .. } = frames.arrived()?
-                    && c == collection
-                {
-                    return Some(());
-                }
-            }
-        })
-        .await;
-        let flags = Flags {
-            send: true,
-            full: false,
-        };
-        send_frame(&mut recon, &Frame::PeerAccept { collection, flags }).await;
-        until(&clock, peers, 10, "peering", |peers| {
-            peered(&peers[0], peer_id).then_some(())
-        })
-        .await;
-
-        let fetches = blobs
-            .iter()
-            .map(|hash| {
-                let fetch = peers[0].fetch_blob_with_deadline(*hash, Duration::from_secs(600));
-                tokio::task::spawn_local(fetch)
-            })
-            .collect::<Vec<_>>();
-        advance(&clock, peers, 5).await;
-        assert_eq!(
-            held.lock().unwrap().len(),
-            16,
-            "blob streams on one connection"
-        );
-
-        recon.reset(7);
-        frames.recv.stop(7);
-        // A change the host announces within two seconds.
-        commit(&mut *peers[0].store(), &host_key, collection, b"announced");
-        let (_recon, mut frames) =
-            until(&clock, peers, 10, "new recon/1", |_| opened.try_recv().ok()).await;
-        let reopened = until(&clock, peers, 1, "opening frame", |_| frames.opening()).await;
-        assert_eq!(reopened, sequence);
-        until(&clock, peers, 10, "announcement on the new stream", |_| {
-            loop {
-                match frames.arrived()? {
-                    Frame::Announce { collection: c, .. } if c == collection => return Some(()),
-                    Frame::PeerRequest { .. } => panic!("the host asked again"),
-                    _ => {}
-                }
-            }
-        })
-        .await;
-        let mut held = held.lock().unwrap();
-        assert_eq!(held.len(), 16);
-        assert!(held.iter_mut().all(|(_, recv)| open(recv)));
-        assert!(peered(&peers[0], peer_id));
-        for fetch in fetches {
-            fetch.abort();
-        }
-    });
-}
-
 /// Seventeen neighbour connections each hold `recon/1` while blob streams
 /// run: `recon/1` takes none of the 16 request permits a host serves at once.
 /// Seventeen hosts peer with one hub, nine for one collection and eight for
@@ -810,16 +676,14 @@ fn seventeen_neighbours_hold_recon_while_blob_streams_run() {
     });
 }
 
-/// A peer that stops reading `recon/1` gets it reset. It peers with a host
-/// for a collection and then asks for the collection's one record thousands
-/// of times over, a thousand a second, reading nothing more: fewer at a time
-/// than the host leaves unanswered. The answers fill the stream's credit,
-/// and the 60 s a writer waits for credit later the host resets the stream
-/// with [`RESET_STALLED`] and stops reading it. The connection and the peering
-/// stay: the peer's next `recon/1` carries the host's frames again, among
-/// them an announcement of the collection, with no new request.
+/// A peer that stops reading `recon/1` loses its connection. It peers with a
+/// host for a collection and then asks for the collection's one record
+/// thousands of times over, a thousand a second, reading nothing more: fewer
+/// at a time than the host leaves unanswered. The answers fill the stream's
+/// credit, and the 60 s a writer waits for credit later the host closes the
+/// connection, which ends the peering.
 #[test]
-fn a_peer_that_stops_reading_recon_gets_it_reset_and_keeps_its_peering() {
+fn a_peer_that_stops_reading_recon_loses_its_connection() {
     run(async |clock| {
         let net = SimNet::new(0x5EC0_0004, SimConfig::default());
         let host_key = key(10);
@@ -867,240 +731,200 @@ fn a_peer_that_stops_reading_recon_gets_it_reset_and_keeps_its_peering() {
             send.write_all(&request.repeat(1000)).await.unwrap();
             advance(&clock, peers, 1).await;
         }
+        assert!(conn.accept_bi().now_or_never().is_none(), "closed early");
         // Past the 60 s a writer waits for credit.
         advance(&clock, peers, 70).await;
-        let reset = loop {
-            match frames.next().now_or_never().expect("recon/1 was not reset") {
-                Ok(Some(_)) => {}
-                Ok(None) => panic!("recon/1 was finished, not reset"),
-                Err(error) => break error,
-            }
-        };
-        let stalled = format!("code {RESET_STALLED}");
-        assert!(reset.to_string().contains(&stalled), "{reset}");
-        let stopped = send.write_all(&request[..1]).now_or_never();
-        let stopped = stopped
-            .expect("a write after stop fails at once")
-            .unwrap_err();
-        assert!(stopped.to_string().contains(&stalled), "{stopped}");
-        assert!(peered(&peers[0], reader_id));
-
-        let (_send, mut frames) = open_recon(&conn, 1).await;
-        until(&clock, peers, 120, "announcement on the new stream", |_| {
-            loop {
-                match frames.arrived()? {
-                    Frame::Announce { collection: c, .. } if c == collection => return Some(()),
-                    Frame::PeerRequest { .. } | Frame::PeerAccept { .. } | Frame::Unpeer { .. } => {
-                        panic!("the peering was renegotiated")
-                    }
-                    _ => {}
-                }
-            }
-        })
-        .await;
-        assert!(peered(&peers[0], reader_id));
-        assert_eq!(net.dial_count(reader_id, host_id), 1);
+        assert!(conn.accept_bi().now_or_never().unwrap().is_none());
+        let closed = frames.next().now_or_never().unwrap().unwrap_err();
+        assert!(closed.to_string().contains("connection reset"), "{closed}");
+        assert!(
+            peers[0]
+                .health()
+                .peerings
+                .iter()
+                .all(|peering| peering.peer != reader_id),
+            "the peering outlived its connection"
+        );
     });
 }
 
-/// A reader dials a key that may write a collection it selects but may not
-/// read it, and peers with it: the writer sends and the reader sends nothing
-/// (design 2.3, Astra R3). The writer, driven by hand, resets `recon/1` with
-/// [`RESET_STALLED`], as a writer that waited 60 s for credit does, and keeps
-/// the connection in use with a `FIND_VALUE` every 30 s. Only the dialler can
-/// open `recon/1`, and the writer's frames wait for one, so the reader opens
-/// a new one at once, though it has nothing to send.
+/// A key driven by hand. It numbers the connections it accepts, from one,
+/// and hands each `recon/1` stream to the test with its connection's number;
+/// a connection's number arrives on the second channel once it closes. It
+/// answers FIND_VALUE with nothing.
+#[allow(clippy::type_complexity)]
+fn driven(
+    net: &SimNet,
+    key: &SigningKey,
+) -> (
+    tokio::sync::mpsc::UnboundedReceiver<(usize, SimSendStream, Frames)>,
+    tokio::sync::mpsc::UnboundedReceiver<usize>,
+) {
+    let mut harness = net.join(key);
+    let id = harness.transport.local_id();
+    let (recons, opened) = tokio::sync::mpsc::unbounded_channel();
+    let (closes, closed) = tokio::sync::mpsc::unbounded_channel();
+    tokio::task::spawn_local(async move {
+        let mut number = 0;
+        while let Some(incoming) = harness.incoming.recv().await {
+            number += 1;
+            let (recons, closes) = (recons.clone(), closes.clone());
+            tokio::task::spawn_local(async move {
+                while let Some((send, mut recv)) = incoming.conn.accept_bi().await {
+                    match recv.read_u8().await {
+                        Ok(TAG_RECON) => {
+                            let _ = recons.send((number, send, Frames::new(recv)));
+                        }
+                        Ok(TAG_DHT) => {
+                            let none = Arc::default();
+                            tokio::task::spawn_local(find_value(send, recv, id, none));
+                        }
+                        _ => {}
+                    }
+                }
+                let _ = closes.send(number);
+            });
+        }
+    });
+    (opened, closed)
+}
+
+/// A neighbour whose `recon/1` ends is lost with its connection and comes
+/// back through a fresh dial. A host selects C and D, both writable by a key
+/// it dials, and the key, driven by hand, accepts both peerings. Then it
+/// resets `recon/1`. The host closes the connection at once and the
+/// peerings end with it. The key is the host's one candidate, so once the
+/// exhausted candidate order is drawn again, 60 s after the last draw
+/// (`MIN_RESHUFFLE_INTERVAL`), the host dials it again and asks for both on
+/// the new connection's one `recon/1`.
 #[test]
-fn the_dialler_reopens_an_ended_recon_at_once() {
+fn a_neighbour_whose_recon_ends_comes_back_through_a_fresh_dial() {
     run(async |clock| {
         let net = SimNet::new(0x5EC0_0005, SimConfig::default());
-        let reader_key = key(12);
-        let writer_key = key(13);
-        let writer_id = id(&writer_key);
-        let mut store = MemoryRepo::default();
-        let keys = [reader_key.verifying_key(), writer_key.verifying_key()];
-        let writers = AdmissionPolicy::quorum(keys, 1, None).unwrap();
-        let readers = AdmissionPolicy::direct(reader_key.verifying_key());
-        let policy = CollectionPolicy::new(readers, writers);
-        let collection = store.collection("written only", policy).unwrap().handle();
-        select(&mut store, &reader_key, collection);
-        let mut reader = bring_up(net.join(&reader_key), &reader_key, store);
-
-        let mut harness = net.join(&writer_key);
-        let (recons, mut opened) = tokio::sync::mpsc::unbounded_channel();
-        let (conns, mut accepted) = tokio::sync::mpsc::unbounded_channel();
-        tokio::task::spawn_local(async move {
-            let conn = harness.incoming.recv().await.unwrap().conn;
-            let _ = conns.send(conn.clone());
-            while let Some((send, mut recv)) = conn.accept_bi().await {
-                match recv.read_u8().await {
-                    Ok(TAG_RECON) => {
-                        let _ = recons.send((send, Frames::new(recv)));
-                    }
-                    Ok(TAG_DHT) => {
-                        let none = Arc::default();
-                        tokio::task::spawn_local(find_value(send, recv, writer_id, none));
-                    }
-                    _ => {}
-                }
-            }
-        });
-
-        reader.activate_collection(collection);
-        let peers: &mut [&mut Peer<MemoryRepo>] = &mut [&mut reader];
-        let (mut recon, mut frames) =
-            until(&clock, peers, 10, "recon/1", |_| opened.try_recv().ok()).await;
-        let conn = accepted.try_recv().unwrap();
-        let theirs = until(&clock, peers, 10, "peering request", |_| {
-            loop {
-                if let Frame::PeerRequest {
-                    collection: c,
-                    flags,
-                    ..
-                } = frames.arrived()?
-                    && c == collection
-                {
-                    return Some(flags);
-                }
-            }
-        })
-        .await;
-        assert!(!theirs.send, "the reader sends nothing");
-        let flags = Flags {
-            send: true,
-            full: false,
-        };
-        send_frame(&mut recon, &Frame::PeerAccept { collection, flags }).await;
-        until(&clock, peers, 10, "peering", |peers| {
-            peered(&peers[0], writer_id).then_some(())
-        })
-        .await;
-
-        recon.reset(RESET_STALLED);
-        frames.recv.stop(RESET_STALLED);
-        let mut steps = 0;
-        until(&clock, peers, 600, "a new recon/1", |_| {
-            if steps % 300 == 0 {
-                let conn = conn.clone();
-                tokio::task::spawn_local(async move {
-                    let Ok((mut send, mut recv)) = conn.open_bi().await else {
-                        return;
-                    };
-                    let mut request = vec![TAG_DHT, OP_FIND_VALUE];
-                    request.extend([7; 32]);
-                    let _ = send.write_all(&request).await;
-                    let _ = send.shutdown().await;
-                    let _ = recv.read_to_end(&mut Vec::new()).await;
-                });
-            }
-            steps += 1;
-            opened.try_recv().ok()
-        })
-        .await;
-        assert_eq!(net.dial_count(id(&reader_key), writer_id), 1);
-    });
-}
-
-/// A host selects C and D, both writable by a key it dials, and the key,
-/// driven by hand, accepts both peerings. Its acceptance of C is lost the way
-/// an ended `recon/1` loses what its reader had not read: written, then the
-/// stream reset with [`RESET_STALLED`] before the host read it, as a writer
-/// that waited 60 s for credit does. The key is peered for C and the host
-/// still waits for the answer, so the host sends its request for C again on
-/// the next `recon/1`; once that is accepted, the key's announcement of a
-/// root of C the host lacks starts a pull.
-#[test]
-fn a_request_whose_acceptance_was_lost_is_sent_again() {
-    run(async |clock| {
-        let net = SimNet::new(0x5EC0_0006, SimConfig::default());
         let host_key = key(14);
         let peer_key = key(15);
-        let peer_id = id(&peer_key);
+        let (host_id, peer_id) = (id(&host_key), id(&peer_key));
         let mut store = MemoryRepo::default();
-        let wedged = hold(&mut store, "wedged", &[&host_key, &peer_key]);
-        let carrier = hold(&mut store, "carrier", &[&host_key, &peer_key]);
-        select(&mut store, &host_key, wedged);
-        select(&mut store, &host_key, carrier);
-        let mut host = bring_up(net.join(&host_key), &host_key, store);
-
-        let mut harness = net.join(&peer_key);
-        let (recons, mut opened) = tokio::sync::mpsc::unbounded_channel();
-        tokio::task::spawn_local(async move {
-            let conn = harness.incoming.recv().await.unwrap().conn;
-            while let Some((send, mut recv)) = conn.accept_bi().await {
-                if let Ok(TAG_RECON) = recv.read_u8().await {
-                    let _ = recons.send((send, Frames::new(recv)));
-                }
-            }
+        let collections = ["first", "second"].map(|name| {
+            let collection = hold(&mut store, name, &[&host_key, &peer_key]);
+            select(&mut store, &host_key, collection);
+            collection
         });
-        host.activate_collections([wedged, carrier]);
+        let mut host = bring_up(net.join(&host_key), &host_key, store);
+        let (mut opened, mut closed) = driven(&net, &peer_key);
+        host.activate_collections(collections);
         let peers: &mut [&mut Peer<MemoryRepo>] = &mut [&mut host];
         let peered_for = |peer: &Peer<MemoryRepo>, collection| {
             peer.health().peerings.iter().any(|peering| {
                 peering.peer == peer_id && peering.collection == collection && peering.peered
             })
         };
-        let (mut recon, mut frames) =
-            until(&clock, peers, 10, "recon/1", |_| opened.try_recv().ok()).await;
-        let mut asked = BTreeSet::new();
-        until(&clock, peers, 10, "both requests", |_| {
-            while let Some(frame) = frames.arrived() {
-                if let Frame::PeerRequest { collection, .. } = frame {
-                    asked.insert(collection);
-                }
-            }
-            (asked == BTreeSet::from([wedged, carrier])).then_some(())
-        })
-        .await;
         let flags = Flags {
             send: true,
             full: false,
         };
-        let accept = |collection| Frame::PeerAccept { collection, flags };
-        send_frame(&mut recon, &accept(carrier)).await;
-        until(&clock, peers, 10, "the peering for D", |peers| {
-            peered_for(&peers[0], carrier).then_some(())
-        })
-        .await;
-        send_frame(&mut recon, &accept(wedged)).await;
-        recon.reset(RESET_STALLED);
-        frames.recv.stop(RESET_STALLED);
 
-        let (mut recon, mut frames) = until(&clock, peers, 10, "a new recon/1", |_| {
-            opened.try_recv().ok()
-        })
-        .await;
-        until(&clock, peers, 10, "the request for C again", |_| {
-            loop {
-                if let Frame::PeerRequest { collection, .. } = frames.arrived()?
-                    && collection == wedged
-                {
-                    return Some(());
+        let mut sequences = Vec::new();
+        for connection in 1..=2 {
+            let (number, mut recon, mut frames) =
+                until(&clock, peers, 70, "recon/1", |_| opened.try_recv().ok()).await;
+            assert_eq!(number, connection, "a recon/1 on an earlier connection");
+            assert_eq!(net.dial_count(host_id, peer_id), connection);
+            sequences.push(until(&clock, peers, 1, "opening frame", |_| frames.opening()).await);
+            let mut asked = BTreeSet::new();
+            until(&clock, peers, 10, "both requests", |_| {
+                while let Some(frame) = frames.arrived() {
+                    if let Frame::PeerRequest { collection, .. } = frame {
+                        asked.insert(collection);
+                    }
                 }
+                (asked == BTreeSet::from(collections)).then_some(())
+            })
+            .await;
+            for collection in collections {
+                send_frame(&mut recon, &Frame::PeerAccept { collection, flags }).await;
             }
-        })
-        .await;
-        send_frame(&mut recon, &accept(wedged)).await;
-        until(&clock, peers, 10, "the peering for C", |peers| {
-            peered_for(&peers[0], wedged).then_some(())
-        })
-        .await;
-        let announcement = Frame::Announce {
-            collection: wedged,
-            root: [7; 32],
-            held_digest: None,
-            reply: false,
-        };
-        send_frame(&mut recon, &announcement).await;
-        until(&clock, peers, 10, "a pull of C", |_| {
-            loop {
-                if let frame @ Frame::Walk(_) = frames.arrived()?
-                    && frame.collection() == Some(wedged)
-                {
-                    return Some(());
-                }
+            until(&clock, peers, 10, "both peerings", |peers| {
+                collections
+                    .iter()
+                    .all(|collection| peered_for(&peers[0], *collection))
+                    .then_some(())
+            })
+            .await;
+            if connection == 2 {
+                break;
             }
-        })
-        .await;
+
+            recon.reset(7);
+            frames.recv.stop(7);
+            let gone = until(&clock, peers, 1, "the connection's close", |_| {
+                closed.try_recv().ok()
+            })
+            .await;
+            assert_eq!(gone, connection);
+            assert!(
+                collections
+                    .iter()
+                    .all(|collection| !peered_for(&peers[0], *collection))
+            );
+        }
+        assert!(opened.try_recv().is_err(), "a second recon/1");
+        assert!(
+            sequences[0] < sequences[1],
+            "the second dial outranks the first"
+        );
+    });
+}
+
+/// A key that ends every `recon/1` as it arrives is dialled at most once per
+/// reshuffle interval, with no loop of streams or dials. A host selects a
+/// collection the key may write, so the key is its one candidate. Each dial
+/// carries one `recon/1`, whose end closes its connection, and the host's
+/// exhausted candidate order draws the key again only 60 s
+/// (`MIN_RESHUFFLE_INTERVAL`) after the last draw. Over ten minutes that is
+/// one dial at the start and one per interval after it.
+#[test]
+fn a_key_that_ends_every_recon_is_dialled_once_per_reshuffle_interval() {
+    const WINDOW: u64 = 10 * 60;
+    const MIN_RESHUFFLE_INTERVAL: u64 = 60;
+    run(async |clock| {
+        let net = SimNet::new(0x5EC0_0007, SimConfig::default());
+        let host_key = key(12);
+        let peer_key = key(13);
+        let (host_id, peer_id) = (id(&host_key), id(&peer_key));
+        let mut store = MemoryRepo::default();
+        let collection = hold(&mut store, "ended", &[&host_key, &peer_key]);
+        select(&mut store, &host_key, collection);
+        let mut host = bring_up(net.join(&host_key), &host_key, store);
+        let (mut opened, _closed) = driven(&net, &peer_key);
+        host.activate_collection(collection);
+        let peers: &mut [&mut Peer<MemoryRepo>] = &mut [&mut host];
+
+        let mut opens = Vec::new();
+        for _ in 0..WINDOW * 10 {
+            while let Ok((number, mut recon, mut frames)) = opened.try_recv() {
+                recon.reset(7);
+                frames.recv.stop(7);
+                opens.push(number);
+            }
+            step(&clock, peers).await;
+        }
+        let dials = net.dial_count(host_id, peer_id);
+        println!(
+            "{dials} dials and {} recon/1 streams in {WINDOW} s",
+            opens.len()
+        );
+        let connections = opens.iter().collect::<BTreeSet<_>>().len();
+        assert_eq!(
+            opens.len(),
+            connections,
+            "recon/1 streams on {connections} connections"
+        );
+        assert!(
+            (WINDOW / MIN_RESHUFFLE_INTERVAL - 1..=WINDOW / MIN_RESHUFFLE_INTERVAL + 1)
+                .contains(&(dials as u64)),
+            "{dials} dials in {WINDOW} s"
+        );
+        assert!(opens.len() <= dials && opens.len() + 1 >= dials);
     });
 }

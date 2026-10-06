@@ -9,7 +9,7 @@ use tokio::io::AsyncWriteExt as _;
 use crate::connection::{
     CONNECTION_IDLE_DEADLINE, DRAIN_GRACE, FRAME_OPEN, MAX_CONNECTIONS,
     MAX_HELD_REQUESTS_PER_CONNECTION, MAX_RECON_FRAME_BYTES, MAX_REQUESTS_GLOBAL,
-    MAX_STRANGER_REQUESTS, RESET_BUSY, RESET_REPLACED, RESET_UNKNOWN, write_frame,
+    MAX_STRANGER_REQUESTS, RESET_BUSY, RESET_UNKNOWN, write_frame,
 };
 use crate::protocol::{OP_FIND_VALUE, TAG_DHT, TAG_RECON, op_find_value, send_hash};
 use crate::recon::FRAME_PEER_REQUEST;
@@ -425,12 +425,11 @@ async fn request_streams_beyond_the_held_bound_are_reset() {
         MAX_REQUESTS_GLOBAL - MAX_STRANGER_REQUESTS
     );
 
-    // The connection holds no more: the next request is reset at once, so the
-    // abandoned ones cannot take the opener's stream credit from recon/1.
+    // The connection holds no more: the next request is reset at once, and
+    // only that stream.
     let (mut send, mut recv) = held_find_value(&conn).await;
     send.shutdown().await.unwrap();
     assert!(reads_reset(&mut recv, RESET_BUSY).await);
-    let _reopened = open_recon(&conn, 1).await;
     settle().await;
     assert!(server.table.current(client_id).is_some());
 
@@ -483,8 +482,10 @@ async fn strangers_leave_request_slots_to_neighbours() {
         .unwrap();
 }
 
+/// A connection carries one `recon/1`: a second one is a protocol violation
+/// and closes the connection.
 #[tokio::test(start_paused = true)]
-async fn a_recon_stream_opened_later_replaces_one_whose_tag_arrives_later() {
+async fn a_second_recon_stream_closes_the_connection() {
     let net = network(Duration::from_secs(1));
     let server = Node::join(&net, &key(1));
     let client = net.join(&key(2));
@@ -494,22 +495,18 @@ async fn a_recon_stream_opened_later_replaces_one_whose_tag_arrives_later() {
         .dial(server.peer, PILE_SYNC_ALPN)
         .await
         .unwrap();
-    let (mut earlier, mut earlier_recv) = conn.open_bi().await.unwrap();
-    let (mut later, mut later_recv) = conn.open_bi().await.unwrap();
-    let mut open = vec![TAG_RECON];
-    open.extend_from_slice(&[FRAME_OPEN, 0, 0, 0, 8]);
-    open.extend_from_slice(&5_u64.to_be_bytes());
-    // The later stream's tag arrives first.
-    later.write_all(&open).await.unwrap();
-    settle().await;
-    earlier.write_all(&open).await.unwrap();
-    settle().await;
-
-    assert!(reads_reset(&mut earlier_recv, RESET_REPLACED).await);
-    assert!(poll!(Box::pin(later_recv.read(&mut [0; 1]))).is_pending());
-    write_frame(&mut later, 0x7F, b"still read").await.unwrap();
+    let _first = open_recon(&conn, 5).await;
     settle().await;
     assert!(server.table.current(client_id).is_some());
+
+    let _second = open_recon(&conn, 5).await;
+    let closed = tokio::time::timeout(Duration::from_secs(1), conn.accept_bi()).await;
+    assert!(
+        closed.expect("the connection stayed open").is_none(),
+        "a stream arrived instead"
+    );
+    settle().await;
+    assert!(server.table.current(client_id).is_none());
 }
 
 #[tokio::test(start_paused = true)]
@@ -800,8 +797,8 @@ async fn outbound_eviction_spares_a_connection_a_caller_holds() {
     assert!(answers_empty(&held).await);
 }
 
-/// A node whose `recon/1` events reach the test: walk frames and ended
-/// streams on `walks`, every other event on `peering`.
+/// A node whose `recon/1` events reach the test: walk frames and closed
+/// connections on `walks`, every other event on `peering`.
 fn listening(
     net: &SimNet,
     key: &SigningKey,
@@ -832,10 +829,11 @@ fn listening(
 }
 
 /// An idle `recon/1` outlives the credit deadline. One whose peer stops
-/// reading is reset after it, which ends the walks on it at both ends, and
-/// the dialler's next frame opens a new stream on the same connection.
+/// reading ends after it, and its connection closes with it at both ends,
+/// which ends the walks on it.
 #[tokio::test(start_paused = true)]
-async fn recon_without_credit_is_reset_and_reopens_for_the_next_frame() {
+async fn a_peer_that_stops_reading_recon_loses_the_connection() {
+    use crate::connection::RECON_CREDIT_DEADLINE;
     use crate::recon::Frame;
     use crate::walk::{Response, WalkBody, WalkFrame, WalkId, WalkKind};
 
@@ -852,11 +850,14 @@ async fn recon_without_credit_is_reset_and_reopens_for_the_next_frame() {
     settle().await;
     assert!(matches!(peered.try_recv(), Ok(ReconEvent::Opened(_))));
 
-    tokio::time::sleep(crate::connection::RECON_CREDIT_DEADLINE + Duration::from_secs(30)).await;
+    tokio::time::sleep(RECON_CREDIT_DEADLINE + Duration::from_secs(30)).await;
     link.send(unpeer.clone());
     settle().await;
     assert!(matches!(peered.try_recv(), Ok(ReconEvent::Frame(_, frame)) if frame == unpeer));
-    assert!(dialler_walked.try_recv().is_err(), "the idle stream ended");
+    assert!(
+        dialler_walked.try_recv().is_err(),
+        "the idle connection closed"
+    );
 
     // The acceptor's walk task stops taking frames, so its recon/1 reader
     // stops reading: about forty values exhaust the stream's credit.
@@ -874,128 +875,66 @@ async fn recon_without_credit_is_reset_and_reopens_for_the_next_frame() {
     for _ in 0..60 {
         link.send(value.clone());
     }
-    tokio::time::sleep(crate::connection::RECON_CREDIT_DEADLINE - Duration::from_secs(1)).await;
+    tokio::time::sleep(RECON_CREDIT_DEADLINE - Duration::from_secs(1)).await;
     assert!(dialler_walked.try_recv().is_err());
+    assert_eq!(dialler.len(), 1);
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(
-        matches!(dialler_walked.try_recv(), Ok(ReconEvent::Ended(ended)) if ended.id() == link.id())
+        matches!(dialler_walked.try_recv(), Ok(ReconEvent::Closed(closed)) if closed.id() == link.id())
     );
+    assert!(link.closed());
+    assert!(dialler.is_empty());
 
-    // The acceptor takes frames again and hears its stream end.
+    // The acceptor takes frames again and hears its connection close.
     let heard = tokio::time::timeout(Duration::from_secs(30), async {
         while let Some(event) = walked.recv().await {
-            if matches!(event, ReconEvent::Ended(_)) {
+            if matches!(event, ReconEvent::Closed(_)) {
                 return;
             }
         }
     })
     .await;
-    assert!(heard.is_ok(), "the acceptor never heard its stream end");
-
-    // The dialler's next frame crosses a new stream on the same connection,
-    // behind the values still queued.
-    link.send(unpeer.clone());
-    let reopened = tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            tokio::select! {
-                Some(_) = walked.recv() => {}
-                Some(event) = peered.recv() => {
-                    if matches!(event, ReconEvent::Frame(_, ref frame) if *frame == unpeer) {
-                        return;
-                    }
-                }
-            }
-        }
-    })
-    .await;
-    assert!(reopened.is_ok(), "the next frame crossed no stream");
     assert!(
-        dialler
-            .current(acceptor.transport().local_id())
-            .is_some_and(|current| current.link().id() == link.id())
+        heard.is_ok(),
+        "the acceptor never heard its connection close"
     );
-    assert_eq!(dialler.len(), 1);
+    assert!(acceptor.is_empty());
 }
 
-/// A dialler whose peer ends every `recon/1` as it arrives opens the next
-/// one only for a frame to send, not in a loop, and the connection goes
-/// idle like any other: only a stream that carried a frame is reopened at
-/// once.
+/// A peer that ends `recon/1`, here after one frame, loses the connection:
+/// the dialler closes it at once and opens no further `recon/1` on it, not
+/// even for a frame it queues afterwards.
 #[tokio::test(start_paused = true)]
-async fn a_recon_ended_at_once_reopens_only_for_a_frame() {
+async fn a_peer_that_ends_recon_loses_the_connection() {
     use crate::recon::Frame;
 
     let net = network(Duration::from_millis(10));
     let dialler = Node::join(&net, &key(1));
     let mut peer = net.join(&key(2));
     let peer_id = peer.transport.local_id();
-    let (opened, opens) = tokio::sync::watch::channel(0_u32);
-    tokio::spawn(async move {
-        let conn = peer.incoming.recv().await.unwrap().conn;
-        while let Some((_send, mut recv)) = conn.accept_bi().await {
-            if recv_u8(&mut recv).await.ok() == Some(TAG_RECON) {
-                opened.send_modify(|opens| *opens += 1);
-            }
-        }
-    });
     let link = dialler.table.connect(peer_id).await.unwrap().link();
-    tokio::time::sleep(CONNECTION_IDLE_DEADLINE / 2).await;
-    assert_eq!(*opens.borrow(), 1, "recon/1 reopened with nothing to carry");
+    let conn = peer.incoming.recv().await.unwrap().conn;
+    let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+    assert_eq!(recv_u8(&mut recv).await.unwrap(), TAG_RECON);
+    write_frame(&mut send, 0x7F, b"a later frame kind")
+        .await
+        .unwrap();
+    send.shutdown().await.unwrap();
 
-    // A queued frame opens a stream, and the one after the stream that
-    // carried it carries nothing.
+    let next = tokio::time::timeout(Duration::from_secs(1), conn.accept_bi()).await;
+    assert!(
+        next.expect("the connection stayed open").is_none(),
+        "a new stream crossed the connection"
+    );
+    settle().await;
+    assert!(link.closed());
+    assert!(dialler.table.current(peer_id).is_none());
+    assert!(dialler.table.is_empty());
+
     link.send(Frame::Unpeer {
         collection: CollectionHandle::new([3; 32]),
     });
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    let reopened = *opens.borrow();
-    assert!((2..=3).contains(&reopened), "{reopened} opens");
-    tokio::time::sleep(CONNECTION_IDLE_DEADLINE + Duration::from_secs(1)).await;
-    assert_eq!(*opens.borrow(), reopened);
-    assert!(dialler.table.current(peer_id).is_none(), "never went idle");
-}
-
-/// A frame queued while the dialler's `recon/1` still looked live, and not
-/// yet written when it ended, is itself a reason for a new stream: it
-/// crosses one at once, with no further send.
-#[tokio::test(start_paused = true)]
-async fn a_frame_queued_as_recon_ends_crosses_a_new_stream() {
-    use crate::recon::Frame;
-
-    let net = network(Duration::from_millis(10));
-    let dialler = Node::join(&net, &key(1));
-    let mut peer = net.join(&key(2));
-    let link = dialler
-        .table
-        .connect(peer.transport.local_id())
-        .await
-        .unwrap()
-        .link();
-    let conn = peer.incoming.recv().await.unwrap().conn;
-    let (first_send, mut first_recv) = conn.accept_bi().await.unwrap();
-    assert_eq!(recv_u8(&mut first_recv).await.unwrap(), TAG_RECON);
-    settle().await;
-
-    // The peer ends the stream and a frame is queued before the dialler
-    // runs again: it reads the end first, so this stream carries nothing.
-    let unpeer = Frame::Unpeer {
-        collection: CollectionHandle::new([3; 32]),
-    };
-    drop(first_send);
-    link.send(unpeer.clone());
-
-    let (_send, mut recv) = tokio::time::timeout(Duration::from_secs(1), conn.accept_bi())
-        .await
-        .expect("the queued frame opened no stream")
-        .unwrap();
-    assert_eq!(recv_u8(&mut recv).await.unwrap(), TAG_RECON);
-    let mut opening = [0; 13];
-    recv.read_exact(&mut opening).await.unwrap();
-    assert_eq!(opening[0], FRAME_OPEN);
-    let (kind, payload) = unpeer.encode();
-    let mut expected = Vec::new();
-    write_frame(&mut expected, kind, &payload).await.unwrap();
-    let mut frame = vec![0; expected.len()];
-    recv.read_exact(&mut frame).await.unwrap();
-    assert_eq!(frame, expected);
+    tokio::time::sleep(CONNECTION_IDLE_DEADLINE).await;
+    assert!(dialler.table.is_empty());
+    assert_eq!(net.dial_count(dialler.peer, peer_id), 1);
 }

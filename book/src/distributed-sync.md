@@ -262,19 +262,16 @@ connection takes only the host's. Keys cost nothing, so a share per key or
 per connection would bound nothing: strangers that hold their requests open
 until their deadline, on however many connections, occupy at most half the
 host, and the other half stays for the peers it syncs a collection with.
-QUIC allows 100 open
-bidirectional streams per direction, so `recon/1` can always be reopened
-beside a full set of request streams.
 
-The dialler opens `recon/1`, and its first frame, OPEN, carries the dialler's
-sequence number. The counter starts at the wall clock in nanoseconds, so a
-restarted node's dials outrank the ones it made before. When a pair holds two
-connections, both sides keep the same one: of crossed dials, the one dialled by
-the lower key; of two dials by one side, the one with the higher sequence
-number. The loser drains: nothing new is opened on it, and it closes once no
-request stream is in flight on it and no frame has crossed it for two seconds.
-What this side had asked to peer for on it, it asks for again on the
-connection kept.
+The dialler opens `recon/1` as it connects, and its first frame, OPEN, carries
+the dialler's sequence number. The counter starts at the wall clock in
+nanoseconds, so a restarted node's dials outrank the ones it made before. When
+a pair holds two connections, both sides keep the same one: of crossed dials,
+the one dialled by the lower key; of two dials by one side, the one with the
+higher sequence number. The loser drains: nothing new is opened on it, and it
+closes once no request stream is in flight on it and no frame has crossed it
+for two seconds. What this side had asked to peer for on it, it asks for again
+on the connection kept.
 
 A connection closes after 120 seconds without a frame on any of its streams,
 sent or received. Announcement timers cap at 60 seconds, so a connection that
@@ -282,34 +279,31 @@ carries a peering does not go idle. Above 64 connections in one direction the
 least recently used one is evicted, draining and unused connections first. A
 neighbour connection, one that carries a peering, is never evicted.
 
-Only the dialler opens `recon/1`; one opened by the accepting side is a
-protocol violation and closes the connection. Frames go both ways at once, and
-both directions are read concurrently. The frames queued for the peer, like
-the peerings they serve, belong to the connection rather than to the stream: a
-later `recon/1` from the dialler replaces the current one (`RESET_REPLACED`)
-and takes over its queue, and a writer that waits 60 seconds for stream credit
-resets the stream (`RESET_STALLED`), because the peer stopped reading. Every
-walk on an ended stream ends with it. Peerings survive, but an ended stream
-may have lost frames the peer never read, so each side sends again on that
-connection the frame its side of each peering rests on: a request or
-invitation still waiting for its answer, or its flags. The acceptor answers a
-repeated request as it did the first. The dialler opens the next stream as
-soon as the last one ends if that one carried a frame either way, read or
-written whole, or if frames still wait in the queue; otherwise it opens one
-when it next queues a frame. A peer that ends every stream as it arrives
-therefore gets no loop of streams, and the connection goes idle like any
-other.
+A connection carries exactly one `recon/1` stream, the dialler's. One opened
+by the accepting side, or a second one, is a protocol violation and closes
+the connection. Frames go both ways at once, and both directions are read
+concurrently. When the stream ends, for any reason, the connection closes with
+it: the peer finished or reset it, it failed, or a writer waited 60 seconds
+for stream credit because the peer stopped reading. Every walk and every
+peering on the connection ends, frames still queued for it are dropped, and
+nothing is reopened on it. What replaces it is a later dial, which the
+candidate order governs (see *Neighbours*): a peer whose stream ended comes
+back only through a fresh dial when a collection's order next reaches it. A
+peer that ends every stream as it arrives therefore costs a collection one
+dial per redraw of its order, at most one a minute, rather than a loop of
+streams.
 
-The queue refuses no frame, so what it holds is bounded by what is put on it.
-A walk responder, and a side asked to peer, leave a request unanswered while
-the connection already queues 1,024 frames, at most 64 KiB each, and the grant
-exchange answers one proof request per digest it sent; a peer that asks faster
-than it reads therefore stops being answered rather than growing the queue.
+A connection's frame queue refuses no frame, so what it holds is bounded by
+what is put on it. A walk responder, and a side asked to peer, leave a request
+unanswered while the connection already queues 1,024 frames, at most 64 KiB
+each, and the grant exchange answers one proof request per digest it sent; a
+peer that asks faster than it reads therefore stops being answered rather than
+growing the queue.
 The walk it asked for ends at its own deadline, and an unanswered peering
-request is asked again when the stalled stream ends. A puller keeps at most
-256 walk requests in flight per connection, a quarter of that bound, since
-the responder's queue also holds its own requests and other frames, so a
-puller that reads is always answered.
+request waits until the stalled stream's end closes the connection. A puller
+keeps at most 256 walk requests in flight per connection, a quarter of that
+bound, since the responder's queue also holds its own requests and other
+frames, so a puller that reads is always answered.
 
 A `recon/1` frame is its kind (one byte), a big-endian `u32` payload length,
 and a payload of at most 64 KiB. Every frame about a collection starts with the
@@ -417,8 +411,9 @@ the peerings others asked for. The candidates come in three tiers:
 Within a tier keys are ranked by `blake3(salt || key)` under a salt drawn
 fresh for each order. Readers come first because a signer that cannot read
 does not relay; free DHT keys come last. The position in that order is the
-only retry state: a refusal, a failed dial or an ended peering moves on to the
-next candidate. A key that refused is not asked again on that connection, and
+only retry state: a refusal, a failed dial or an ended peering (its
+connection closed, as it does when its `recon/1` ends) moves on to the next
+candidate. A key that refused is not asked again on that connection, and
 the others come round again only when the order is redrawn. Reaching the end
 redraws it with a new salt, no sooner than 60 seconds after the last draw
 unless the candidates changed. A redraw that is not merely of changed

@@ -5,11 +5,8 @@
 //! accepts only if it selects C and the asker passes READ for C under its
 //! evidence, or the asker set its send flag and passes WRITE. A side's send
 //! flag says whether it admits the other side, and C flows only in a
-//! direction whose sender set it. Peerings belong to their connection: a
-//! replaced `recon/1` stream keeps them and a closed connection ends them.
-//! An ended stream loses the frames its reader had not read, so each side
-//! then sends again the frame its side of each peering rests on: a request
-//! still waiting for its answer, or its flags.
+//! direction whose sender set it. Peerings belong to their connection and
+//! end when it closes, as it does when its one `recon/1` stream ends.
 //!
 //! A side that refuses a request remembers it for the connection. When a
 //! credential, an arriving definition, a new proof or its own selection
@@ -355,9 +352,6 @@ impl Peerings {
                 self.links.entry(link.id()).or_insert_with(|| link.clone());
                 self.frame(&link, frame);
             }
-            // Peerings belong to the connection and outlive its streams, but
-            // the frames an ended stream carried may be lost.
-            ReconEvent::Ended(link) => self.resend(&link),
             ReconEvent::Closed(link) => {
                 self.links.remove(&link.id());
                 let successor = self.link_to(link.peer());
@@ -611,7 +605,8 @@ impl Peerings {
         // Like a walk request, a peering request gets no answer while the
         // connection already queues MAX_QUEUED_REPLIES frames, so a peer that
         // asks faster than it reads cannot grow the queue. The asker's side
-        // stays asked, and it asks again when the stalled stream ends.
+        // stays asked until the connection closes, as the stalled stream's
+        // end closes it.
         if let Frame::PeerRequest { .. } = frame
             && link.queued() >= MAX_QUEUED_REPLIES
         {
@@ -887,41 +882,6 @@ impl Peerings {
             peering.refused = None;
         }
         self.changed = true;
-    }
-
-    /// Send again on `link` the frame each of its peerings rests on, on this
-    /// side: a request or invitation still waiting for its answer, or this
-    /// side's flags. Its `recon/1` ended, and with it the frames the peer had
-    /// not read. The peer answers a repeated request as it did the first.
-    fn resend(&mut self, link: &Link) {
-        let sides = self
-            .meshes
-            .iter()
-            .filter_map(|(raw, mesh)| {
-                let peering = mesh.peerings.get(&link.id())?;
-                Some((CollectionHandle::new(*raw), peering.side))
-            })
-            .collect::<Vec<_>>();
-        for (collection, side) in sides {
-            match side {
-                Side::Asked { asked, mine } => {
-                    let credentials = self
-                        .snapshot
-                        .as_ref()
-                        .and_then(|snapshot| snapshot.selected(collection))
-                        .map(|local| self.credentials(&local))
-                        .unwrap_or_default();
-                    for frame in request_frames(collection, mine, !asked, &credentials) {
-                        link.send(frame);
-                    }
-                }
-                Side::Peered { mine, .. } => link.send(Frame::PeerFlags {
-                    collection,
-                    flags: mine,
-                }),
-                Side::Idle => {}
-            }
-        }
     }
 
     /// This side's credentials for C: its proofs naming itself, truncated
@@ -2175,8 +2135,11 @@ mod tests {
             assert_eq!(owner.table.len(), 1);
         }
 
+        /// Crossed dials leave one connection, and both peerings live on it:
+        /// what a side asked for on the connection the tie-break closed, it
+        /// asks for again on the one kept. Frames cross it both ways.
         #[tokio::test(start_paused = true)]
-        async fn peerings_survive_a_recon_replacement() {
+        async fn peerings_move_to_the_connection_the_tie_break_keeps() {
             let net = SimNet::new(0x9EE7_0002, SimConfig::default());
             let (mut owner, mut reader, collections) = pair(&net, &["first", "second"]);
             for collection in &collections {
@@ -2197,32 +2160,19 @@ mod tests {
             })
             .await;
             assert!(
-                owner.table.len() + reader.table.len() == 2
-                    && net.dial_count(owner.id(), reader.id()) == 1
+                net.dial_count(owner.id(), reader.id()) == 1
                     && net.dial_count(reader.id(), owner.id()) == 1,
                 "the dials crossed"
             );
 
-            let (dialler, acceptor) = if current(&owner, &reader).dialler() == owner.id() {
-                (&mut owner, &mut reader)
-            } else {
-                (&mut reader, &mut owner)
-            };
-            let connection = current(dialler, acceptor);
-            dialler.table.reopen_recon(&connection).await.unwrap();
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            for collection in &collections {
-                assert!(dialler.peered(*collection) && acceptor.peered(*collection));
-            }
-
-            // Frames cross the new stream both ways: each side ends one
-            // peering, and the other hears it.
-            dialler.select(collections[0], false);
-            until("the dialler's unpeer", || !acceptor.peered(collections[0])).await;
-            assert!(acceptor.peered(collections[1]));
-            acceptor.select(collections[1], false);
-            until("the acceptor's unpeer", || !dialler.peered(collections[1])).await;
-            assert!(current(dialler, acceptor) == connection);
+            // Each side ends one peering, and the other hears it.
+            let connection = current(&owner, &reader);
+            owner.select(collections[0], false);
+            until("the owner's unpeer", || !reader.peered(collections[0])).await;
+            assert!(reader.peered(collections[1]));
+            reader.select(collections[1], false);
+            until("the reader's unpeer", || !owner.peered(collections[1])).await;
+            assert!(current(&owner, &reader) == connection);
         }
     }
 }
