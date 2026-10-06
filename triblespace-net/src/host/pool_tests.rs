@@ -627,17 +627,33 @@ async fn recon_frames_keep_a_connection_open_past_the_idle_deadline() {
     assert!(server.table.current(quiet_id).is_none());
     assert!(quiet.accept_bi().await.is_none());
     assert!(server.table.current(chatty_id).is_some());
-    // The server's routes keep quiet, whose opened connection promoted it.
-    assert_eq!(
-        op_find_value(&chatty, &[0; 32]).await.unwrap(),
-        (vec![quiet_id], vec![])
-    );
+    assert!(answers_empty(&chatty).await);
 
     tokio::time::sleep(CONNECTION_IDLE_DEADLINE - Duration::from_secs(1)).await;
     assert!(server.table.current(chatty_id).is_some());
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(server.table.current(chatty_id).is_none());
     assert!(chatty.accept_bi().await.is_none());
+}
+
+/// Only a connection this node dialled makes its peer a route. An accepted
+/// one authenticates a key anybody can make, as a process that dials with a
+/// fresh key per call does.
+#[tokio::test(start_paused = true)]
+async fn only_a_dialled_connection_makes_its_peer_a_route() {
+    use crate::routing::RouteState;
+
+    let net = network(Duration::from_secs(1));
+    let node = Node::join(&net, &key(1));
+    let stranger = Node::join(&net, &key(2));
+    let dialled = Node::join(&net, &key(3));
+    stranger.table.connect(node.peer).await.unwrap();
+    node.table.connect(dialled.peer).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(node.table.current(stranger.peer).is_some());
+    let routes = node.client.candidates.lock().unwrap();
+    assert_eq!(routes.state(stranger.peer), None);
+    assert_eq!(routes.state(dialled.peer), Some(RouteState::Verified));
 }
 
 #[tokio::test(start_paused = true)]

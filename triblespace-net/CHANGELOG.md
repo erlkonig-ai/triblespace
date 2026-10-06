@@ -29,11 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   endpoint is bound to now.
 
 - Seed the DHT from the peers a pile's content names (JP's content
-  bootstrap, phase 2). Every opened `recon/1` connection, which TLS
-  authenticated, makes its peer a verified route, so the provider lookup of a
-  collection's next candidate draw has a contact: a host whose only route is
-  the signer of a record it holds finds the collection's other providers
-  through that signer.
+  bootstrap, phase 2). Every `recon/1` connection this node dialled, whose
+  peer TLS authenticated as the key dialled, makes that peer a verified
+  route, so the provider lookup of a collection's next candidate draw has a
+  contact: a host whose only route is the signer of a record it holds finds
+  the collection's other providers through that signer. An accepted
+  connection makes no route: any process can dial with a fresh key.
 
 - Delete `ReconcileQos` and `ReconcileDirection` with the `inventory` module
   (sync redesign M13). `PeerConfig::qos`, the `qos` argument of

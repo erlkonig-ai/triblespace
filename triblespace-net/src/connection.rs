@@ -167,6 +167,11 @@ impl Link {
         self.state.peer
     }
 
+    /// Whether this node dialled the connection.
+    pub(crate) fn dialled(&self) -> bool {
+        self.state.dialled
+    }
+
     /// Queue one frame. It is dropped if the connection has closed. On a
     /// connection this node dialled whose `recon/1` ended, it also asks for
     /// a new stream.
