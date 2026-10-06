@@ -6,8 +6,10 @@
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+use triblespace_core::collection::selection::{write_sync_selection, CONFIG_COLLECTION_NAME};
 use triblespace_core::collection::{
-    AdmissionPolicy, CollectionPolicy, CollectionRead, CollectionRecord, CollectionStoreExt,
+    private_policy, AdmissionPolicy, CollectionPolicy, CollectionRead, CollectionRecord,
+    CollectionStoreExt,
 };
 use triblespace_core::prelude::inlineencodings::Handle;
 use triblespace_core::prelude::*;
@@ -70,8 +72,6 @@ fn sync_closes_on_signal(signal: &str, explicit_health_collection: bool) {
         .arg(&path)
         .arg("--key")
         .arg(&key_path)
-        .arg("--collection")
-        .arg(format!("blake3:{}", hex::encode(collection.handle().raw)))
         // No peer is configured and provider announcements are disabled. The
         // normal transport may still use discovery/relay infrastructure.
         .args(["--provider-publication-budget", "0"]);
@@ -96,9 +96,30 @@ fn sync_closes_on_signal(signal: &str, explicit_health_collection: bool) {
         // The initial health COMMIT precedes this message. There is an actual
         // unclosed mutation when we stop, even though no remote peer is used.
         if log.contains("live collection repair active.") {
+            assert!(log.contains("selected collections: 0"), "{log}");
             break;
         }
         assert!(Instant::now() < startup_deadline, "sync did not arm: {log}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // The pile's configuration selects the fixture while sync runs, from
+    // another writer as the faculties would, and sync follows it.
+    let mut pile = Pile::open(&path).unwrap();
+    let config = pile
+        .collection(CONFIG_COLLECTION_NAME, private_policy(key.verifying_key()))
+        .unwrap();
+    write_sync_selection(&mut pile, config, &key, collection.handle(), true).unwrap();
+    pile.close().unwrap();
+    let selection_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let log = std::fs::read_to_string(&log_path).unwrap();
+        if log.contains("selected collections: 1") {
+            break;
+        }
+        assert!(
+            Instant::now() < selection_deadline,
+            "sync did not follow the selection: {log}"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(Command::new("kill")
@@ -223,7 +244,6 @@ fn health_preflight_rejects_unadmitted_and_derived_destinations_without_appendin
             .arg(&path)
             .arg("--key")
             .arg(&key_path)
-            .args(["--collection", &hex::encode(wrong.handle().raw)])
             .args([
                 "--health-collection",
                 &hex::encode(destination.handle().raw),

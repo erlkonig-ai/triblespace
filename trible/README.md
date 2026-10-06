@@ -246,7 +246,7 @@ changes admission for the immutable current session or creates blob WANTs.
   process CPU, outer-hop work, successful equation-publication calls and
   successful passes with no such calls. Neither record census nor a skipped
   poll is counted as performed work. No telemetry source or grant is created.
-- `pile net sync <PILE> --collection HANDLE [--collection HANDLE ...] [--peers ID_OR_TICKET,...] [--key PATH]` — activate the named collections and run periodic repair. A collection flows to a neighbour exactly when this side admits it to read, and ordinary exact-blob WANTs are serviced too. `--duration SECS` and `--quiescent-for SECS` provide optional process-lifecycle bounds.
+- `pile net sync <PILE> [--peers ID_OR_TICKET,...] [--key PATH]` — sync the collections the pile selects. The selection is one register per collection in the pile's own configuration collection under the key (`selection::config_handle`), written with `selection::write_sync_selection`; sync activates every selected collection at start and follows the register while it runs, and peers for a collection only with nodes that select it too. A collection flows to a neighbour exactly when this side admits it to read, and ordinary exact-blob WANTs are serviced too. `--duration SECS` and `--quiescent-for SECS` provide optional process-lifecycle bounds.
 
   The one existing key resolves from `--key`, `TRIBLESPACE_KEY`, or `self.key`
   beside the pile's lexical path. It identifies the endpoint and signs local

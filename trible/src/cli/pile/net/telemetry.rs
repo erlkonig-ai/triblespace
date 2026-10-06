@@ -80,7 +80,7 @@ mod tests {
     #[test]
     fn telemetry_is_opt_in_and_has_no_independent_writer() {
         let handle = hex::encode([0xAC; 32]);
-        let args = ["net", "sync", "test.pile", "--collection", handle.as_str()];
+        let args = ["net", "sync", "test.pile"];
         let super::super::Command::Sync { telemetry, .. } =
             super::super::Command::try_parse_from(args).unwrap()
         else {
