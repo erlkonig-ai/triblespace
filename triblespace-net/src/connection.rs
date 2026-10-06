@@ -26,7 +26,8 @@
 //!
 //! A writer that waits [`RECON_CREDIT_DEADLINE`] for stream credit resets
 //! `recon/1`: the peer stopped reading. The service hears that the stream
-//! ended, and the dialler opens a new one at once.
+//! ended, and the dialler opens a new one at once, though no sooner than
+//! [`RECON_REOPEN_INTERVAL`] after it opened the last.
 //!
 //! A connection closes after [`CONNECTION_IDLE_DEADLINE`] without a frame on
 //! any of its streams, sent or received. Above [`MAX_CONNECTIONS`] in one
@@ -59,6 +60,9 @@ pub(crate) const CONNECTION_IDLE_DEADLINE: Duration = Duration::from_secs(120);
 /// A `recon/1` writer that waited this long for stream credit resets the
 /// stream: the peer stopped reading it.
 pub(crate) const RECON_CREDIT_DEADLINE: Duration = Duration::from_secs(60);
+/// The dialler opens `recon/1` at most once per this interval, so a peer
+/// that ends each one at once costs a stream per interval, not a loop.
+pub(crate) const RECON_REOPEN_INTERVAL: Duration = Duration::from_secs(1);
 /// A retired connection closes after this long without a frame once no
 /// request stream is in flight on it. The peer keeps using it only until it
 /// has seen the winner too.
@@ -272,6 +276,8 @@ struct State {
     epoch: Instant,
     /// Nanoseconds after `epoch` of the last frame sent or received.
     last_frame: AtomicU64,
+    /// Nanoseconds after `epoch` at which the dialler last opened `recon/1`.
+    recon_opened: AtomicU64,
     /// Request streams open on the connection, in either direction.
     in_flight: AtomicUsize,
     /// Callers holding a [`Connection`] handle to it.
@@ -316,6 +322,7 @@ impl State {
             sequence: OnceLock::new(),
             epoch: Instant::now(),
             last_frame: AtomicU64::new(0),
+            recon_opened: AtomicU64::new(0),
             in_flight: AtomicUsize::new(0),
             handles: AtomicUsize::new(0),
             retired: AtomicBool::new(false),
@@ -990,13 +997,19 @@ async fn accept_loop<T: Transport, S: Service>(
         let changed = state.changed.notified();
         tokio::pin!(changed);
         changed.as_mut().enable();
-        if state.reopen.swap(false, Ordering::SeqCst)
+        let opened = Duration::from_nanos(state.recon_opened.load(Ordering::SeqCst));
+        let reopen_at = state.epoch + opened + RECON_REOPEN_INTERVAL;
+        if Instant::now() >= reopen_at
+            && state.reopen.swap(false, Ordering::SeqCst)
             && !state.retired.load(Ordering::SeqCst)
             && !state.recon_live.swap(true, Ordering::SeqCst)
         {
+            let now = state.epoch.elapsed().as_nanos() as u64;
+            state.recon_opened.store(now, Ordering::SeqCst);
             tokio::spawn(reopen(shared.clone(), conn.clone(), state.clone()));
         }
         let deadline = state.deadline();
+        let reopening = state.reopen.load(Ordering::SeqCst);
         tokio::select! {
             accepted = conn.accept_bi() => {
                 let Some((send, recv)) = accepted else {
@@ -1028,6 +1041,7 @@ async fn accept_loop<T: Transport, S: Service>(
                     });
                 }
             }
+            () = tokio::time::sleep_until(reopen_at), if reopening => {}
             () = &mut changed => {}
         }
     };

@@ -872,3 +872,34 @@ async fn recon_without_credit_is_reset_and_reopens_for_the_next_frame() {
     );
     assert_eq!(dialler.len(), 1);
 }
+
+/// A dialler whose peer ends every `recon/1` at once opens the next one no
+/// sooner than [`RECON_REOPEN_INTERVAL`] after the last, rather than in a
+/// loop in which no time passes.
+#[tokio::test(start_paused = true)]
+async fn a_recon_ended_at_once_reopens_once_per_interval() {
+    use crate::connection::RECON_REOPEN_INTERVAL;
+
+    let net = network(Duration::from_millis(10));
+    let dialler = Node::join(&net, &key(1));
+    let mut peer = net.join(&key(2));
+    let peer_id = peer.transport.local_id();
+    let (opened, mut opens) = tokio::sync::watch::channel(0_u32);
+    tokio::spawn(async move {
+        let conn = peer.incoming.recv().await.unwrap().conn;
+        while let Some((_send, mut recv)) = conn.accept_bi().await {
+            if recv_u8(&mut recv).await.ok() == Some(TAG_RECON) {
+                opened.send_modify(|opens| *opens += 1);
+            }
+        }
+    });
+    let _connection = dialler.table.connect(peer_id).await.unwrap();
+    let intervals = 10;
+    tokio::select! {
+        _ = opens.wait_for(|opens| *opens > 2 * intervals) => {
+            panic!("recon/1 reopened in a loop in which no time passed");
+        }
+        () = tokio::time::sleep(RECON_REOPEN_INTERVAL * intervals) => {}
+    }
+    assert!(*opens.borrow() > intervals / 2, "the dialler reopened");
+}
