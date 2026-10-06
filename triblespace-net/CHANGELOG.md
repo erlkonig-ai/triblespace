@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Pull walks on `recon/1` replace the `repair/0` session (sync redesign M9).
+  Each side pulls what it lacks in its own walk of one collection's records,
+  authorization evidence or held references: the responder pins a snapshot
+  at the walk's open, the puller descends where digests differ, leaves carry
+  key and digest, and the puller fetches only the values its live store
+  lacks. Values land through one landing task per host, which publishes the
+  serving snapshot and acknowledges each walk; a walk completes when its
+  count proof closes, all its values landed and no proof stayed deferred,
+  and a deferred proof fetches its resource's descriptor inside the walk. A
+  walk is numbered per peer, collection and kind, and frames or
+  acknowledgements of an ended walk are dropped. A walk ends after 60 s
+  without progress; a `recon/1` writer that gets no credit for 60 s resets
+  the stream, and the dialler reopens it for its next frame. The landing
+  task also reobserves the store every 2 s. The repair session's pass caps,
+  inventory cursor, buffered delta and in-session READ bootstrap go with it.
 - Exchange grants on `recon/1` (sync redesign M10). On every connection, and
   whenever it changes, each side sends the digest of the proofs it holds
   naming the other. A side whose own proofs naming itself differ asks, and
@@ -21,12 +36,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   waits for. A proof waits in memory only if its signatures hold. The host
   dials the subject of every grant its key signed.
 - A proof whose insert fails no longer aborts the drain of network evidence.
-- The in-session READ bootstrap is gone: a repair hello names only the
-  collection, the server admits from its own evidence and keeps nothing the
-  client sent, and `collection_read_bootstrap_proofs` with its
-  `CollectionReadBootstrapError` is removed. A reader's proofs reach a server
-  as the credentials of its peering request, which the server keeps when
-  they validate.
+- `collection_read_bootstrap_proofs` and its `CollectionReadBootstrapError`
+  are removed with the in-session READ bootstrap. A reader's proofs reach a
+  server as the credentials of its peering request, which the server keeps
+  when they validate.
 - Peer per collection on `recon/1` (sync redesign M7). A host asks up to five
   candidates for each collection its pile selects and accepts a request only
   for a collection it selects, from a key that passes READ or that sends and

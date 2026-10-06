@@ -267,7 +267,7 @@ visible without enabling broad packet-level tracing.
 ## Crate layout
 
 - `collection_activation` — per-collection record and authorization-evidence PATCHes
-- `collection_session` / `collection_wire` — one READ-authorized repair stream
+- `walk` / `landing` — pull walks on `recon/1` and the task that lands their values
 - `patch_repair` — root-pinned Merkle difference walker
 - `peer` — synchronous store wrapper, monotone admission, and local WANT intent
 - `reconcile` — durable WANT observation and reproducible-operation fulfillment

@@ -488,9 +488,9 @@ impl Node {
             health: Health::new(EndpointId::from_bytes(&peer).unwrap()),
             candidates: candidates.clone(),
             providers: directory.clone(),
-            serve_collections: false,
             local_id: peer,
             recon: None,
+            walks: None,
         };
         let server_trace = trace.clone();
         let server_gate = gate.clone();

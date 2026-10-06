@@ -10,7 +10,7 @@ use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::ops::{Deref, DerefMut};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use anybytes::Bytes;
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -31,6 +31,7 @@ use triblespace_core::repo::{
 
 use crate::channel::{MAX_ADMISSION_BRIDGE_BATCHES, NetEvent};
 use crate::host::{self, ActiveCollections, HostStarted, NetReceiver, NetSender, StoreSnapshot};
+use crate::landing::Land;
 use crate::protocol::RawHash;
 use crate::reconcile::{ReconcileStats, Reconciler, ReplicationMode};
 use crate::wake::CollectionWakePlane;
@@ -179,6 +180,165 @@ impl<S> DerefMut for StoreGuard<'_, S> {
     }
 }
 
+/// What a peer's serving snapshot is built from. [`Peer::refresh`] and the
+/// host's landing task both publish through it, one at a time: whoever holds
+/// the publication observes the store and publishes.
+struct Serving<S: SnapshotSource> {
+    store: Arc<Mutex<Option<S>>>,
+    sender: NetSender,
+    publication: Mutex<Publication<S::Snapshot>>,
+}
+
+struct Publication<T> {
+    active: ActiveCollections,
+    active_dirty: bool,
+    /// Last local observation used to build the installed immutable inventory.
+    /// Equality is a cheap invalidation check supplied by the store; it is not
+    /// a portable generation or a semantic version.
+    last_store_snapshot: Option<T>,
+    #[cfg(test)]
+    rebuilds: usize,
+}
+
+impl<S> Serving<S>
+where
+    S: SnapshotSource,
+    S::Snapshot: StoreRead + HeldRead,
+{
+    /// Publish one serving snapshot of `snapshot`, unless nothing it is built
+    /// from changed since the last one and nothing was `received`.
+    fn publish(
+        &self,
+        publication: &mut Publication<S::Snapshot>,
+        snapshot: S::Snapshot,
+        received: bool,
+    ) -> anyhow::Result<()> {
+        self.sender.observe_store(|health| {
+            health.last_snapshot_observed_at = Some(crate::clock::mono_now());
+        });
+        let previous_snapshot = self.sender.current_snapshot();
+        let changes = if previous_snapshot.is_none() {
+            StoreChanges::ALL
+        } else {
+            publication
+                .last_store_snapshot
+                .as_ref()
+                .map_or(StoreChanges::ALL, |previous| {
+                    snapshot.changes_since(previous)
+                })
+        };
+        // A background walk changes held sets without changing the store.
+        let held_unchanged = publication
+            .last_store_snapshot
+            .as_ref()
+            .is_some_and(|previous| previous.held_generation() == snapshot.held_generation());
+        if !received
+            && changes == StoreChanges::NONE
+            && held_unchanged
+            && !publication.active_dirty
+            && previous_snapshot.is_some()
+        {
+            publication.last_store_snapshot = Some(snapshot);
+            return Ok(());
+        }
+        // Unchanged semantic repair PATCHes retain their Arc while exact-GET
+        // advances to the new immutable store observation. No flush is needed
+        // to make a successful local append part of that observation.
+        let serving = StoreSnapshot::from_store_changes(
+            snapshot.clone(),
+            &publication.active,
+            VerifyingKey::from_bytes(self.sender.id().as_bytes())
+                .expect("endpoint id is an Ed25519 key"),
+            publication.last_store_snapshot.as_ref(),
+            previous_snapshot.as_deref(),
+            changes,
+        )?;
+        self.sender.update_snapshot(serving, &publication.active);
+        #[cfg(test)]
+        {
+            publication.rebuilds += 1;
+        }
+        publication.active_dirty = false;
+        publication.last_store_snapshot = Some(snapshot);
+        Ok(())
+    }
+
+    /// Withdraw the serving snapshot after a failed observation.
+    fn withdraw(&self, publication: &mut Publication<S::Snapshot>) {
+        self.sender.clear_snapshot();
+        publication.last_store_snapshot = None;
+    }
+}
+
+/// The landing task's handle on a peer: it lands into the peer's store and
+/// publishes through [`Serving`]. It holds the peer weakly, so a dropped peer
+/// keeps no store, host or snapshot alive through it.
+struct Lander<S: SnapshotSource>(Weak<Serving<S>>);
+
+impl<S> Land for Lander<S>
+where
+    S: BlobStore + CollectionStore + CapabilityProofStore + Send + 'static,
+    S::Snapshot: StoreRead + HeldRead,
+{
+    fn land(&self, events: Vec<NetEvent>) -> Vec<bool> {
+        let Some(serving) = self.0.upgrade() else {
+            return vec![false; events.len()];
+        };
+        let mut publication = serving.publication.lock().expect("publication mutex");
+        let mut guard = serving.store.lock().expect("store mutex");
+        let Some(store) = guard.as_mut() else {
+            return vec![false; events.len()];
+        };
+        let mut landed = events
+            .into_iter()
+            .map(|event| match event {
+                NetEvent::CollectionRecord(record) => store.insert(record).is_ok(),
+                NetEvent::CapabilityProof(proof) => store.insert_proof(proof).is_ok(),
+                NetEvent::Blob(blob) => store.put::<UnknownBlob, _>(blob).is_ok(),
+                // Hints reach the store through refresh, never through a walk.
+                NetEvent::BlobHint { .. } | NetEvent::BlobInventoryPassCompleted { .. } => false,
+            })
+            .collect::<Vec<_>>();
+        let snapshot = store.snapshot();
+        drop(guard);
+        let published = snapshot
+            .map_err(anyhow::Error::new)
+            .and_then(|snapshot| serving.publish(&mut publication, snapshot, false));
+        if let Err(error) = published {
+            // What landed stays in the store, but nobody can see it yet.
+            tracing::warn!(%error, "collection serving snapshot unavailable after landing");
+            serving.withdraw(&mut publication);
+            landed.fill(false);
+        }
+        landed
+    }
+
+    fn reobserve(&self) {
+        let Some(serving) = self.0.upgrade() else {
+            return;
+        };
+        // Only a peer that serves reobserves: a leech or a peer that never
+        // refreshed publishes nothing.
+        if serving.sender.current_snapshot().is_none() {
+            return;
+        }
+        let mut publication = serving.publication.lock().expect("publication mutex");
+        let mut guard = serving.store.lock().expect("store mutex");
+        let Some(store) = guard.as_mut() else {
+            return;
+        };
+        let snapshot = store.snapshot();
+        drop(guard);
+        let published = snapshot
+            .map_err(anyhow::Error::new)
+            .and_then(|snapshot| serving.publish(&mut publication, snapshot, false));
+        if let Err(error) = published {
+            tracing::warn!(%error, "collection serving snapshot unavailable");
+            serving.withdraw(&mut publication);
+        }
+    }
+}
+
 /// A store with an eager or acquisition-triggered collection network host.
 pub struct Peer<S>
 where
@@ -197,17 +357,10 @@ where
     receiver: NetReceiver,
     host: Arc<Mutex<SharedHost>>,
     qos: ReconcileQos,
-    active: ActiveCollections,
-    active_dirty: bool,
+    serving: Arc<Serving<S>>,
     /// Local retry/cursor state; demand and residency are observed in the store.
     reconciler: Reconciler,
-    /// Last local observation used to build the installed immutable inventory.
-    /// Equality is a cheap invalidation check supplied by the store; it is not
-    /// a portable generation or a semantic version.
-    last_store_snapshot: Option<S::Snapshot>,
     last_event_at: crate::clock::Mono,
-    #[cfg(test)]
-    serving_snapshot_rebuilds: usize,
 }
 
 impl<S> Peer<S>
@@ -284,8 +437,21 @@ where
         host: HostState,
     ) -> Self {
         sender.observe_direction(qos.direction);
+        let store = Arc::new(Mutex::new(Some(store)));
+        let serving = Arc::new(Serving {
+            store: store.clone(),
+            sender: sender.clone(),
+            publication: Mutex::new(Publication {
+                active: PATCH::new(),
+                active_dirty: true,
+                last_store_snapshot: None,
+                #[cfg(test)]
+                rebuilds: 0,
+            }),
+        });
+        sender.install_lander(Arc::new(Lander(Arc::downgrade(&serving))));
         let mut peer = Self {
-            store: Arc::new(Mutex::new(Some(store))),
+            store,
             host: Arc::new(Mutex::new(SharedHost {
                 state: host,
                 sender: sender.clone(),
@@ -294,13 +460,9 @@ where
             sender,
             receiver,
             qos,
-            active: PATCH::new(),
-            active_dirty: true,
+            serving,
             reconciler: Reconciler::new(),
-            last_store_snapshot: None,
             last_event_at: crate::clock::mono_now(),
-            #[cfg(test)]
-            serving_snapshot_rebuilds: 0,
         };
         if peer.host_is_running() {
             peer.refresh();
@@ -433,11 +595,14 @@ where
         // Held sets are kept for every collection this peer serves, from the
         // next snapshot on.
         self.store().track_held(collections.iter().copied());
-        for collection in collections {
-            self.active_dirty |= self.active.get(&collection.raw).is_none();
-            self.active.insert(&PatchEntry::new(&collection.raw));
+        {
+            let mut publication = self.serving.publication.lock().expect("publication mutex");
+            for collection in collections {
+                publication.active_dirty |= publication.active.get(&collection.raw).is_none();
+                publication.active.insert(&PatchEntry::new(&collection.raw));
+            }
+            self.sender.observe_active_collections(&publication.active);
         }
-        self.sender.observe_active_collections(&self.active);
         self.refresh();
     }
 
@@ -484,10 +649,11 @@ where
         }
     }
 
-    /// Drain authenticated collection progress and replace the immutable
-    /// active-collection snapshot without flushing the backend. Calling this
-    /// with no events is still meaningful: file-backed stores reobserve
-    /// external appends before periodic repair uses them.
+    /// Drain the evidence the host passed outside walks (descriptor warmups
+    /// and held-blob hints) and replace the immutable active-collection
+    /// snapshot without flushing the backend. Walks land through the host's
+    /// landing task, which also reobserves external appends on its own timer;
+    /// calling this reobserves them at once.
     pub fn refresh(&mut self) {
         if let Err(error) = self.try_refresh() {
             tracing::warn!(%error, "collection serving snapshot unavailable");
@@ -504,7 +670,9 @@ where
         self.sender.observe_store(|health| {
             health.last_refresh_started_at = Some(crate::clock::mono_now());
         });
-        let result = self.refresh_checked();
+        let serving = self.serving.clone();
+        let mut publication = serving.publication.lock().expect("publication mutex");
+        let result = self.refresh_checked(&mut publication);
         self.sender.observe_store(|health| {
             let now = crate::clock::mono_now();
             health.last_refresh_completed_at = Some(now);
@@ -517,13 +685,15 @@ where
             }
         });
         if result.is_err() {
-            self.sender.clear_snapshot();
-            self.last_store_snapshot = None;
+            serving.withdraw(&mut publication);
         }
         result
     }
 
-    fn refresh_checked(&mut self) -> Result<(), PeerSnapshotError<S::SnapshotError>> {
+    fn refresh_checked(
+        &mut self,
+        publication: &mut Publication<S::Snapshot>,
+    ) -> Result<(), PeerSnapshotError<S::SnapshotError>> {
         let mut incoming = Vec::new();
         for _ in 0..MAX_ADMISSION_BRIDGE_BATCHES {
             let Some(event) = self.receiver.try_recv() else {
@@ -605,54 +775,26 @@ where
         // Publication reads only the frozen snapshot; landing and reconcile
         // need not wait for it.
         drop(guard);
-        self.sender.observe_store(|health| {
-            health.last_snapshot_observed_at = Some(crate::clock::mono_now());
-        });
-        let previous_snapshot = self.sender.current_snapshot();
-        let changes = if previous_snapshot.is_none() {
-            StoreChanges::ALL
-        } else {
-            self.last_store_snapshot
-                .as_ref()
-                .map_or(StoreChanges::ALL, |previous| {
-                    snapshot.changes_since(previous)
-                })
-        };
-        // A background walk changes held sets without changing the store.
-        let held_unchanged = self
+        self.serving
+            .publish(publication, snapshot, received != 0)
+            .map_err(PeerSnapshotError::Overlay)
+    }
+
+    /// Serving snapshots built so far.
+    #[cfg(test)]
+    fn serving_snapshot_rebuilds(&self) -> usize {
+        self.serving.publication.lock().unwrap().rebuilds
+    }
+
+    /// Whether a store observation underlies the serving snapshot.
+    #[cfg(test)]
+    fn observed(&self) -> bool {
+        self.serving
+            .publication
+            .lock()
+            .unwrap()
             .last_store_snapshot
-            .as_ref()
-            .is_some_and(|previous| previous.held_generation() == snapshot.held_generation());
-        if received == 0
-            && changes == StoreChanges::NONE
-            && held_unchanged
-            && !self.active_dirty
-            && previous_snapshot.is_some()
-        {
-            self.last_store_snapshot = Some(snapshot);
-            return Ok(());
-        }
-        // Unchanged semantic repair PATCHes retain their Arc while exact-GET
-        // advances to the new immutable store observation. No flush is needed
-        // to make a successful local append part of that observation.
-        let serving = StoreSnapshot::from_store_changes(
-            snapshot.clone(),
-            &self.active,
-            VerifyingKey::from_bytes(self.sender.id().as_bytes())
-                .expect("endpoint id is an Ed25519 key"),
-            self.last_store_snapshot.as_ref(),
-            previous_snapshot.as_deref(),
-            changes,
-        )
-        .map_err(PeerSnapshotError::Overlay)?;
-        self.sender.update_snapshot(serving, &self.active);
-        #[cfg(test)]
-        {
-            self.serving_snapshot_rebuilds += 1;
-        }
-        self.active_dirty = false;
-        self.last_store_snapshot = Some(snapshot);
-        Ok(())
+            .is_some()
     }
 
     /// Borrow the local backend without starting the host.
@@ -663,9 +805,9 @@ where
 
     /// Withdraw serving snapshots and release host ownership before returning
     /// the local backend. This does not itself flush or close the backend.
-    pub fn into_store(mut self) -> S {
-        self.sender.clear_snapshot();
-        self.last_store_snapshot = None;
+    pub fn into_store(self) -> S {
+        self.serving
+            .withdraw(&mut self.serving.publication.lock().expect("publication mutex"));
         {
             let mut host = self.host.lock().expect("host mutex");
             host.state = HostState::Closed;
@@ -971,8 +1113,8 @@ mod tests {
         ));
         assert!(peer.wake_plane().is_none());
         assert!(peer.sender.current_snapshot().is_none());
-        assert!(peer.last_store_snapshot.is_none());
-        assert_eq!(peer.serving_snapshot_rebuilds, 0);
+        assert!(!peer.observed());
+        assert_eq!(peer.serving_snapshot_rebuilds(), 0);
         peer.close().unwrap();
     }
 
@@ -1383,7 +1525,7 @@ mod tests {
             HostState::Dormant(_)
         ));
         assert!(peer.sender.current_snapshot().is_none());
-        assert_eq!(peer.serving_snapshot_rebuilds, 0);
+        assert_eq!(peer.serving_snapshot_rebuilds(), 0);
         peer.close().unwrap();
     }
 
@@ -1420,7 +1562,7 @@ mod tests {
         peer.activate_collection(collection);
 
         assert_eq!(starts.load(Ordering::SeqCst), 1);
-        assert_eq!(peer.serving_snapshot_rebuilds, 1);
+        assert_eq!(peer.serving_snapshot_rebuilds(), 1);
         assert_eq!(
             peer.sender
                 .current_snapshot()
@@ -1502,7 +1644,7 @@ mod tests {
             Err(PeerSnapshotError::Store(_))
         ));
         assert!(observer.current_snapshot().is_none());
-        assert!(peer.last_store_snapshot.is_none());
+        assert!(!peer.observed());
         assert_eq!(
             observer.health().store.last_failure,
             Some(crate::health::StoreFailure::Snapshot)
@@ -1600,11 +1742,11 @@ mod tests {
         let (sender, receiver, _wiring) = host::wire(id);
         let observer = sender.clone();
         let mut peer = Peer::with_wiring(store, ReconcileQos::default(), sender, receiver);
-        let rebuilds_before = peer.serving_snapshot_rebuilds;
+        let rebuilds_before = peer.serving_snapshot_rebuilds();
 
         peer.activate_collections(collections.iter().copied());
 
-        assert_eq!(peer.serving_snapshot_rebuilds - rebuilds_before, 1);
+        assert_eq!(peer.serving_snapshot_rebuilds() - rebuilds_before, 1);
         let snapshot = observer.current_snapshot().unwrap();
         let active = snapshot
             .collections()

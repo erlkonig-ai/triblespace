@@ -38,25 +38,22 @@ use crate::bearer::{BearerLocatorIndex, blob_locator, locator_index, update_loca
 use crate::channel::{NetEvent, NetEventBatch};
 use crate::collection_activation::{CollectionRepairOverlay, CollectionRepairOverlayError};
 use crate::collection_delta::update_collection_record_patch;
-use crate::collection_session::{
-    CollectionRepairRefusal, InventoryRepairCursor, manifest, pull_collection,
-    serve_collection_repair,
-};
+use crate::collection_wire::manifest;
 use crate::connection::{ConnectionTable, RESET_UNKNOWN, ReconEvent, Service};
-use crate::health::{
-    CollectionHealth, Health, HealthSnapshot, RepairComparison, RepairFailure, StoreHealth,
-};
+use crate::health::{CollectionHealth, Health, HealthSnapshot, StoreHealth};
 use crate::identity::iroh_secret;
 use crate::inventory::ReconcileQos;
+use crate::landing::{Land, LandSlot};
 use crate::protocol::{
     OP_FIND_VALUE, OP_PROVIDER_PUT, PILE_SYNC_ALPN, PROVIDER_PUT_FULL, PROVIDER_PUT_OK, RawHash,
-    TAG_BLOB, TAG_DHT, TAG_REPAIR, op_find_value, op_get_blob_with_limit, op_provider_put,
-    recv_hash, recv_u8, send_u8, serve_find_value, serve_get_blob,
+    TAG_BLOB, TAG_DHT, op_find_value, op_get_blob_with_limit, op_provider_put, recv_hash, recv_u8,
+    send_u8, serve_find_value, serve_get_blob,
 };
 use crate::provider::{
     ProviderDirectory, ProviderKey, ProviderObservation, ProviderPublication, ProviderPublisher,
     ProviderPutResult, ProviderToken, PublicationResult, blob_provider_token,
 };
+use crate::recon::Frame;
 use crate::routing::{ALPHA, IterativeLookup, K, RoutingKey, RoutingTable};
 use crate::transport::{Conn, Harness, PeerId, RecvStream, SendStream, Transport};
 use crate::wake::{
@@ -692,6 +689,8 @@ pub const INTERACTIVE_FETCH_DEADLINE: std::time::Duration = std::time::Duration:
 pub struct NetSender {
     snapshot: tokio::sync::watch::Sender<Option<SharedSnapshot>>,
     cap: tokio::sync::watch::Receiver<Option<Arc<dyn NetCapability>>>,
+    /// Where the store side installs the landing of what walks receive.
+    lander: tokio::sync::watch::Sender<Option<Arc<dyn Land>>>,
     id: EndpointId,
     health: Health,
 }
@@ -742,6 +741,11 @@ impl NetSender {
 
     pub(crate) fn current_snapshot(&self) -> Option<SharedSnapshot> {
         self.snapshot.borrow().clone()
+    }
+
+    /// Hand the host's landing task the store side's [`Land`].
+    pub(crate) fn install_lander(&self, lander: Arc<dyn Land>) {
+        self.lander.send_replace(Some(lander));
     }
 
     pub(crate) fn update_snapshot(&self, snapshot: StoreSnapshot, active: &ActiveCollections) {
@@ -856,6 +860,7 @@ pub struct HostWiring {
     evt_tx: tokio::sync::mpsc::Sender<NetEventBatch>,
     snapshot: SnapshotSlot,
     cap_tx: tokio::sync::watch::Sender<Option<Arc<dyn NetCapability>>>,
+    lander: LandSlot,
     health: Health,
 }
 
@@ -874,11 +879,13 @@ pub fn wire(id: EndpointId) -> (NetSender, NetReceiver, HostWiring) {
     let (evt_tx, evt_rx) = tokio::sync::mpsc::channel(crate::channel::MAX_ADMISSION_BRIDGE_BATCHES);
     let (snapshot_tx, snapshot) = tokio::sync::watch::channel(None);
     let (cap_tx, cap_rx) = tokio::sync::watch::channel(None);
+    let (lander_tx, lander) = tokio::sync::watch::channel(None);
     let health = Health::new(id);
     (
         NetSender {
             snapshot: snapshot_tx,
             cap: cap_rx,
+            lander: lander_tx,
             id,
             health: health.clone(),
         },
@@ -887,6 +894,7 @@ pub fn wire(id: EndpointId) -> (NetSender, NetReceiver, HostWiring) {
             evt_tx,
             snapshot,
             cap_tx,
+            lander,
             health,
         },
     )
@@ -951,7 +959,6 @@ pub(crate) fn start(
 
 const BACKGROUND_LOOKUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
 const OP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
-const REPAIR_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
 const REPAIR_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
 const COLLECTION_RECONNECT_PERIOD: std::time::Duration = std::time::Duration::from_secs(300);
 const HOST_POLL_PERIOD: std::time::Duration = std::time::Duration::from_millis(10);
@@ -968,10 +975,6 @@ struct RepairTarget {
 struct RepairOutcome {
     target: RepairTarget,
     success: bool,
-    retry_immediately: bool,
-    completed_at: crate::clock::Mono,
-    failure: Option<RepairFailure>,
-    inventory_cursor: Option<InventoryRepairCursor>,
 }
 
 struct PublicationOutcome {
@@ -1282,37 +1285,6 @@ fn retain_active_repair_state<T>(
     state.retain(|target, _| is_active(&target.collection.raw));
 }
 
-fn resume_inventory_repair(
-    cursors: &HashMap<RepairTarget, InventoryRepairCursor>,
-    target: RepairTarget,
-) -> Option<InventoryRepairCursor> {
-    // The attempt owns a working copy. Only a completed authenticated exchange
-    // can replace the checkpoint; transport failure and cancellation cannot.
-    cursors.get(&target).cloned()
-}
-
-fn complete_inventory_repair(
-    cursors: &mut HashMap<RepairTarget, InventoryRepairCursor>,
-    outcome: &mut RepairOutcome,
-    active: bool,
-) {
-    if !active {
-        cursors.remove(&outcome.target);
-    } else if outcome.success {
-        match outcome.inventory_cursor.take() {
-            Some(cursor)
-                if cursors.len() < MAX_PENDING_REPAIRS || cursors.contains_key(&outcome.target) =>
-            {
-                cursors.insert(outcome.target, cursor);
-            }
-            None => {
-                cursors.remove(&outcome.target);
-            }
-            Some(_) => {}
-        }
-    }
-}
-
 enum WakeCommand {
     Join(Vec<EndpointId>),
     Resubscribe,
@@ -1518,14 +1490,15 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
     let participants = Arc::new(Mutex::new(HashMap::new()));
     let providers = Arc::new(Mutex::new(ProviderDirectory::new(my_id)));
     let (recon_tx, recon_rx) = tokio::sync::mpsc::channel(crate::peering::RECON_EVENTS);
+    let (walks_tx, walks_rx) = tokio::sync::mpsc::channel(crate::walk::WALK_EVENTS);
     let handler = SnapshotHandler {
         snapshot: wiring.snapshot.clone(),
         health: wiring.health.clone(),
         candidates: candidates.clone(),
         providers: providers.clone(),
-        serve_collections: config.qos.direction.serves(),
         local_id: my_id,
         recon: Some(recon_tx),
+        walks: Some(walks_tx),
     };
     // One table holds the connections of both directions; each serves the
     // same handler, whichever side dialled it.
@@ -1552,6 +1525,16 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
         client: provider_client.clone(),
     });
     let _ = wiring.cap_tx.send(Some(cap as Arc<dyn NetCapability>));
+    // Walks pull what this node lacks over recon/1 and land it through one
+    // task, which also reobserves the store for appends made elsewhere.
+    let (pulls, mut pulled) = crate::walk::spawn(
+        connections.clone(),
+        wiring.snapshot.clone(),
+        crate::walk::Walks::new(config.qos.direction.serves(), wiring.health.clone()),
+        walks_rx,
+        wiring.lander.clone(),
+        wiring.evt_tx.clone(),
+    );
 
     tokio::spawn(async move {
         while let Some(accepted) = incoming.recv().await {
@@ -1572,9 +1555,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
     let wake_plane = transport.collection_wake_plane();
     let bootstrap_ids = config.peers.iter().map(|peer| peer.id).collect::<Vec<_>>();
     let (wake_tx, mut wake_rx) = tokio::sync::mpsc::channel::<WakeNotice>(256);
-    let mut inventory_cursors: HashMap<RepairTarget, InventoryRepairCursor> = HashMap::new();
     let mut wake_topics: HashMap<[u8; 32], WakeTopic> = HashMap::new();
-    let (repair_tx, mut repair_rx) = tokio::sync::mpsc::unbounded_channel::<RepairOutcome>();
     let mut discovery_attempts = CollectionDiscoveries::default();
     let mut immediate = VecDeque::<RepairTarget>::new();
     let mut pending = HashSet::<RepairTarget>::new();
@@ -1676,7 +1657,6 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
                 }
                 discovery.retain(|collection, _| after.get(collection).is_some());
                 retain_active_repair_state(&mut failures, |raw| after.get(raw).is_some());
-                retain_active_repair_state(&mut inventory_cursors, |raw| after.get(raw).is_some());
                 participants
                     .lock()
                     .unwrap()
@@ -1782,23 +1762,16 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
                 );
             }
         }
-        while let Ok(mut outcome) = repair_rx.try_recv() {
+        while let Ok(pulled) = pulled.try_recv() {
+            // The walks keep the pair's health; this keeps its retry state.
+            let outcome = RepairOutcome {
+                target: RepairTarget {
+                    collection: pulled.collection,
+                    peer: pulled.peer,
+                },
+                success: pulled.completed,
+            };
             in_flight.remove(&outcome.target);
-            wiring
-                .health
-                .with_peer(outcome.target.collection, outcome.target.peer, |health| {
-                    health.in_flight = false;
-                    health.last_completed_at = Some(outcome.completed_at);
-                    if let Some(failure) = outcome.failure {
-                        health.last_failure_at = Some(outcome.completed_at);
-                        health.last_failure = Some(failure);
-                    }
-                });
-            let active = current_collections
-                .get(&outcome.target.collection.raw)
-                .is_some()
-                && outcome.target.peer != my_id;
-            complete_inventory_repair(&mut inventory_cursors, &mut outcome, active);
             if current_collections
                 .get(&outcome.target.collection.raw)
                 .is_none()
@@ -1823,9 +1796,6 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
                     .entry(outcome.target.collection.raw)
                     .or_insert_with(|| DiscoveryState::new(now))
                     .observe_success(now);
-                if outcome.retry_immediately {
-                    enqueue_repair(&mut immediate, &mut pending, outcome.target);
-                }
             } else {
                 let now = crate::clock::mono_now();
                 let peers = live_participants(
@@ -1998,7 +1968,6 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
                         if failures
                             .get(&target)
                             .is_some_and(|(_, retry_at)| now >= *retry_at)
-                            || inventory_cursors.contains_key(&target)
                         {
                             enqueue_repair(&mut immediate, &mut pending, target);
                         }
@@ -2084,53 +2053,14 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
                     local.wake_root(),
                     advertised_root,
                     failures.contains_key(&target),
-                ) && !inventory_cursors.contains_key(&target)
-                {
+                ) {
                     continue;
                 }
                 in_flight.insert(target);
-                wiring
-                    .health
-                    .with_peer(target.collection, target.peer, |health| {
-                        health.started(now);
-                    });
-                let connections = provider_client.connections.clone();
-                let events = wiring.evt_tx.clone();
-                let repair_tx = repair_tx.clone();
-                let health = wiring.health.clone();
-                let inventory_cursor = resume_inventory_repair(&inventory_cursors, target);
-                tokio::spawn(async move {
-                    let result = tokio::time::timeout(
-                        REPAIR_DEADLINE,
-                        reconcile_collection_peer(
-                            &connections,
-                            target,
-                            local,
-                            &events,
-                            &health,
-                            inventory_cursor,
-                        ),
-                    )
-                    .await;
-                    let (success, retry_immediately, failure, inventory_cursor) = match result {
-                        Ok(Ok((retry_immediately, cursor))) => {
-                            (true, retry_immediately, None, cursor)
-                        }
-                        Ok(Err(error)) => {
-                            debug!(%error, "collection repair failed");
-                            (false, false, Some(RepairFailure::Failed), None)
-                        }
-                        Err(_) => (false, false, Some(RepairFailure::Deadline), None),
-                    };
-                    let _ = repair_tx.send(RepairOutcome {
-                        target,
-                        success,
-                        retry_immediately,
-                        completed_at: crate::clock::mono_now(),
-                        failure,
-                        inventory_cursor,
-                    });
-                });
+                // The repair repeats the old session's components: records
+                // and authorization, then held references as hints.
+                pulls.start_record_pull(target.peer, target.collection);
+                pulls.start_reference_pull(target.peer, target.collection);
             }
         }
 
@@ -2215,111 +2145,6 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
         });
         tokio::time::sleep(HOST_POLL_PERIOD).await;
     }
-}
-
-struct AdmissionBatcher {
-    events: tokio::sync::mpsc::Sender<NetEventBatch>,
-    pending: NetEventBatch,
-}
-
-impl AdmissionBatcher {
-    fn new(events: &tokio::sync::mpsc::Sender<NetEventBatch>) -> Self {
-        Self {
-            events: events.clone(),
-            pending: NetEventBatch::default(),
-        }
-    }
-
-    async fn push(&mut self, event: NetEvent) -> anyhow::Result<()> {
-        if let Err(event) = self.pending.try_push(event) {
-            self.flush().await?;
-            self.pending
-                .try_push(event)
-                .expect("an empty admission batch accepts one indivisible event");
-        }
-        if self.pending.is_full() {
-            self.flush().await?;
-        }
-        Ok(())
-    }
-
-    async fn flush(&mut self) -> anyhow::Result<()> {
-        if self.pending.is_empty() {
-            return Ok(());
-        }
-        self.events
-            .send(std::mem::take(&mut self.pending))
-            .await
-            .map_err(|_| anyhow::anyhow!("store side stopped during collection admission"))
-    }
-}
-
-async fn reconcile_collection_peer<T: Transport>(
-    connections: &ConnectionTable<T, SnapshotHandler>,
-    target: RepairTarget,
-    local: Arc<CollectionSnapshot>,
-    events: &tokio::sync::mpsc::Sender<NetEventBatch>,
-    health: &Health,
-    inventory_cursor: Option<InventoryRepairCursor>,
-) -> anyhow::Result<(bool, Option<InventoryRepairCursor>)> {
-    let connection = connections.connect(target.peer).await?;
-    let delta = match pull_collection(&connection, &local.repair, inventory_cursor).await {
-        Ok(delta) => delta,
-        Err(error) => {
-            // READ refusal or absent C is a valid answer on this stream.
-            // Other collections may be repairing over this same connection.
-            if !error.is::<CollectionRepairRefusal>() {
-                connections.invalidate(&connection);
-            }
-            return Err(error);
-        }
-    };
-    health.with_peer(target.collection, target.peer, |health| {
-        let now = crate::clock::mono_now();
-        let records_received = delta.records.len() as u64;
-        let proofs_received = delta.authorization_evidence.len() as u64;
-        health.compared(
-            RepairComparison {
-                observed_at: delta.compared_at,
-                local: delta.local.into(),
-                remote: delta.remote.into(),
-                records_received,
-                proofs_received,
-                more: delta.more,
-            },
-            now,
-        );
-    });
-    // Preserve `delta.more` in health above, but do not hot-loop a successful
-    // zero-progress pass over deferred AUTH. Periodic repair retries it after
-    // ordinary blob arrival without a second queue or an eager fetch.
-    let retry_immediately = delta.retry_immediately();
-    let mut admissions = AdmissionBatcher::new(events);
-    for proof in delta.authorization_evidence {
-        admissions.push(NetEvent::CapabilityProof(proof)).await?;
-    }
-    for record in delta.records {
-        admissions.push(NetEvent::CollectionRecord(record)).await?;
-    }
-    for handle in delta.blob_handles {
-        admissions
-            .push(NetEvent::BlobHint {
-                collection: target.collection,
-                source: target.peer,
-                handle,
-            })
-            .await?;
-    }
-    if delta.inventory_cursor.is_none() {
-        admissions
-            .push(NetEvent::BlobInventoryPassCompleted {
-                collection: target.collection,
-                source: target.peer,
-            })
-            .await?;
-    }
-    admissions.flush().await?;
-    Ok((retry_immediately, delta.inventory_cursor))
 }
 
 /// One `FIND_VALUE` reply: the replica's routes nearer the key and its
@@ -2860,10 +2685,11 @@ struct SnapshotHandler {
     health: Health,
     candidates: RoutingCandidates,
     providers: Arc<Mutex<ProviderDirectory>>,
-    serve_collections: bool,
     local_id: PeerId,
     /// Where `recon/1` events go: the host's peering task.
     recon: Option<tokio::sync::mpsc::Sender<ReconEvent>>,
+    /// Where walk frames and ended streams go: the host's walk task.
+    walks: Option<tokio::sync::mpsc::Sender<ReconEvent>>,
 }
 
 #[cfg(test)]
@@ -2875,9 +2701,9 @@ impl SnapshotHandler {
             health: Health::new(EndpointId::from_bytes(&local_id).unwrap()),
             candidates: Arc::new(Mutex::new(routes)),
             providers: Arc::new(Mutex::new(ProviderDirectory::new(local_id))),
-            serve_collections: false,
             local_id,
             recon: None,
+            walks: None,
         }
     }
 }
@@ -2899,19 +2725,6 @@ impl Service for SnapshotHandler {
         let peer = VerifyingKey::from_bytes(&peer)
             .map_err(|error| anyhow::anyhow!("invalid transport peer key: {error}"))?;
         match tag {
-            TAG_REPAIR => {
-                let snapshot = self
-                    .serve_collections
-                    .then(|| self.snapshot.borrow().clone())
-                    .flatten();
-                serve_collection_repair(recv, send, peer, move |collection| {
-                    snapshot
-                        .as_ref()
-                        .and_then(|snapshot| snapshot.collection(collection))
-                        .map(|collection| collection.repair.clone())
-                })
-                .await?;
-            }
             TAG_BLOB => {
                 let activity = self.health.begin_blob_serve();
                 let snapshot = self.snapshot.borrow().clone();
@@ -2949,7 +2762,19 @@ impl Service for SnapshotHandler {
     }
 
     async fn recon(&self, event: ReconEvent) {
-        if let Some(recon) = &self.recon {
+        let (walks, peering) = match event {
+            ReconEvent::Frame(_, Frame::Walk(_)) | ReconEvent::Ended(_) => (Some(event), None),
+            // Both hear a connection close.
+            ReconEvent::Closed(link) => (
+                Some(ReconEvent::Closed(link.clone())),
+                Some(ReconEvent::Closed(link)),
+            ),
+            event => (None, Some(event)),
+        };
+        if let (Some(walks), Some(event)) = (&self.walks, walks) {
+            let _ = walks.send(event).await;
+        }
+        if let (Some(recon), Some(event)) = (&self.recon, peering) {
             let _ = recon.send(event).await;
         }
     }
@@ -3221,7 +3046,7 @@ mod tests {
         }
         assert_eq!(attempts.load(Ordering::Relaxed), 1);
 
-        assert!(received.recv().await.unwrap().is_empty());
+        assert_eq!(received.recv().await.unwrap().len(), 0);
         fetches.poll(|raw| active.contains_key(raw));
         assert!(fetches.pending.is_empty());
         assert_eq!(received.recv().await.unwrap().len(), 1);
@@ -3517,7 +3342,7 @@ mod tests {
             observer.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Closed)
         );
-        assert!(received.try_recv().unwrap().is_empty());
+        assert_eq!(received.try_recv().unwrap().len(), 0);
         assert!(
             received.try_recv().is_err(),
             "cancelled metadata must not land later"
@@ -4241,153 +4066,6 @@ mod tests {
         retain_active_repair_state(&mut state, |raw| active.contains(raw));
 
         assert_eq!(state, HashMap::from([(retained, 1u8)]));
-    }
-
-    async fn inventory_checkpoint_resumes_after_failed_page(
-        ending: crate::collection_session::tests::TestEnding,
-        failure: crate::health::RepairFailure,
-    ) {
-        use crate::collection_session::tests::{TestEnding, inventory, pull_with_cursor_ending};
-        use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
-        use triblespace_core::repo::{SnapshotSource, memoryrepo::MemoryRepo};
-
-        let mut store = MemoryRepo::default();
-        let collection = store
-            .collection(
-                "inventory-repair-checkpoint",
-                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
-            )
-            .unwrap()
-            .handle();
-        let local = crate::collection_activation::collection_repair_overlay(
-            &store.snapshot().unwrap(),
-            collection,
-        )
-        .unwrap();
-        let handles = (0_u32..2048)
-            .map(|index| *blake3::hash(&index.to_be_bytes()).as_bytes())
-            .collect::<BTreeSet<_>>();
-        let remote = std::sync::Arc::new(
-            local
-                .clone()
-                .with_blob_inventory(inventory(handles.iter().copied())),
-        );
-        let target = RepairTarget {
-            collection,
-            peer: [0x56; 32],
-        };
-        let reader = SigningKey::from_bytes(&[0x57; 32]).verifying_key();
-        let mut cursors = HashMap::new();
-        let mut received = BTreeSet::new();
-        let mut completed = false;
-        for attempt in 0..64 {
-            let interrupted = attempt == 1;
-            let delta = pull_with_cursor_ending(
-                &local,
-                remote.clone(),
-                reader,
-                super::resume_inventory_repair(&cursors, target),
-                if interrupted {
-                    ending
-                } else {
-                    TestEnding::Complete
-                },
-            )
-            .await;
-            let (success, cursor) = if interrupted {
-                let error = delta.unwrap_err();
-                match ending {
-                    TestEnding::ReadError => {
-                        assert!(error.downcast_ref::<std::io::Error>().is_some())
-                    }
-                    TestEnding::Timeout => {
-                        assert!(
-                            error
-                                .downcast_ref::<tokio::time::error::Elapsed>()
-                                .is_some()
-                        )
-                    }
-                    TestEnding::Complete => unreachable!(),
-                }
-                assert!(
-                    !received.is_empty(),
-                    "the first bounded page must have advanced"
-                );
-                (false, None)
-            } else {
-                let delta = delta.unwrap();
-                assert!(!delta.more);
-                for handle in delta.blob_handles {
-                    assert!(
-                        received.insert(handle),
-                        "failed repair must not restart the accepted prefix"
-                    );
-                }
-                (true, delta.inventory_cursor)
-            };
-            let mut outcome = super::RepairOutcome {
-                target,
-                success,
-                retry_immediately: false,
-                completed_at: crate::clock::mono_now(),
-                failure: interrupted.then_some(failure),
-                inventory_cursor: cursor,
-            };
-            super::complete_inventory_repair(&mut cursors, &mut outcome, true);
-            if interrupted {
-                assert!(cursors.contains_key(&target));
-            } else if !cursors.contains_key(&target) {
-                completed = true;
-                break;
-            }
-        }
-        assert!(completed, "late inventory suffix must remain reachable");
-        assert_eq!(received, handles);
-        assert!(
-            cursors.is_empty(),
-            "completed success releases the checkpoint"
-        );
-        assert!(
-            local.blob_inventory().is_empty(),
-            "no hinted payload landed"
-        );
-
-        // Deactivation discards the saved cursor and an already-running
-        // successful attempt cannot put it back while C remains inactive.
-        let delta = pull_with_cursor_ending(&local, remote, reader, None, TestEnding::Complete)
-            .await
-            .unwrap();
-        let mut outcome = super::RepairOutcome {
-            target,
-            success: true,
-            retry_immediately: false,
-            completed_at: crate::clock::mono_now(),
-            failure: None,
-            inventory_cursor: delta.inventory_cursor,
-        };
-        assert!(outcome.inventory_cursor.is_some());
-        cursors.insert(target, outcome.inventory_cursor.clone().unwrap());
-        retain_active_repair_state(&mut cursors, |_| false);
-        super::complete_inventory_repair(&mut cursors, &mut outcome, false);
-        assert!(cursors.is_empty());
-    }
-
-    #[tokio::test]
-    async fn inventory_checkpoint_survives_transport_failure_and_reaches_late_handles() {
-        inventory_checkpoint_resumes_after_failed_page(
-            crate::collection_session::tests::TestEnding::ReadError,
-            crate::health::RepairFailure::Failed,
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn inventory_checkpoint_survives_timeout_and_reaches_late_handles() {
-        inventory_checkpoint_resumes_after_failed_page(
-            crate::collection_session::tests::TestEnding::Timeout,
-            crate::health::RepairFailure::Deadline,
-        )
-        .await;
     }
 
     #[test]

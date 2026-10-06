@@ -1,10 +1,10 @@
 //! Binary wire protocol primitives.
 //!
 //! One QUIC stream carries one operation behind its type tag. Establishing the
-//! TLS connection grants no collection authority: `repair/0` carries READ(C)
-//! evidence in its own request. Exact blob reads use only bearer-handle key
-//! confirmation. Collection identity and collection authority do not
-//! participate in exact discovery or transfer.
+//! TLS connection grants no collection authority: a `recon/1` walk is served
+//! only to a peer the collection may be sent to. Exact blob reads use only
+//! bearer-handle key confirmation. Collection identity and collection
+//! authority do not participate in exact discovery or transfer.
 
 use anybytes::Bytes;
 use anyhow::{Result, anyhow};
@@ -36,7 +36,8 @@ pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/28";
 // permit is taken. An unknown tag resets only its own stream.
 // 0x01 was branch-list; 0x03 was blob-children; 0x04 was branch-head;
 // 0x05 was connection AUTH; 0x0D was record/AUTH-only collection repair;
-// 0x06, 0x07 and 0x0C were the DHT operations, now under `dht/1`.
+// 0x0E was `repair/0`, the collection repair session that walks on `recon/1`
+// replaced; 0x06, 0x07 and 0x0C were the DHT operations, now under `dht/1`.
 // None are accepted. Incompatible stream layouts require a fresh byte, so the
 // two whose layout is unchanged keep theirs.
 /// `recon/1`: the long-lived stream the dialler opens on each connection.
@@ -45,9 +46,6 @@ pub const TAG_RECON: u8 = 0x10;
 pub const TAG_DHT: u8 = 0x11;
 /// `blob/1`: one bearer exact-GET exchange.
 pub const TAG_BLOB: u8 = 0x02;
-/// `repair/0`: one collection repair session. Transitional: milestone M9
-/// replaces it with pull walks on `recon/1` and deletes this tag.
-pub const TAG_REPAIR: u8 = 0x0E;
 
 // `dht/1` operations — the byte after the tag. 0x07 was PROVIDER_GET and
 // 0x0C was FIND_NODE; FIND_VALUE answers both in one reply.

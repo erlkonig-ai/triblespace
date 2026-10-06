@@ -159,9 +159,9 @@ async fn find_value_answers_routes_and_provider_hints_in_one_reply() {
             health: Health::new(EndpointId::from_bytes(&provider).unwrap()),
             candidates: routes.clone(),
             providers: directory.clone(),
-            serve_collections: false,
             local_id: provider,
             recon: None,
+            walks: None,
         },
         requester: requester_key.verifying_key(),
     };

@@ -711,3 +711,120 @@ async fn outbound_eviction_spares_a_connection_a_caller_holds() {
     assert!(center.table.current(others[1].peer).is_none());
     assert!(answers_empty(&held).await);
 }
+
+/// A node whose `recon/1` events reach the test: walk frames and ended
+/// streams on `walks`, every other event on `peering`.
+fn listening(
+    net: &SimNet,
+    key: &SigningKey,
+    walks: usize,
+) -> (
+    ConnectionTable<SimTransport, SnapshotHandler>,
+    tokio::sync::mpsc::Receiver<ReconEvent>,
+    tokio::sync::mpsc::Receiver<ReconEvent>,
+    tokio::task::JoinHandle<()>,
+) {
+    let mut harness = net.join(key);
+    let peer = harness.transport.local_id();
+    let (walks, walked) = tokio::sync::mpsc::channel(walks);
+    let (peering, peered) = tokio::sync::mpsc::channel(64);
+    let handler = SnapshotHandler {
+        walks: Some(walks),
+        recon: Some(peering),
+        ..SnapshotHandler::for_test(peer, RoutingTable::new(peer, []))
+    };
+    let table = ConnectionTable::new(harness.transport.clone(), handler);
+    let accepting = table.clone();
+    let server = tokio::spawn(async move {
+        while let Some(incoming) = harness.incoming.recv().await {
+            accepting.accept(incoming.conn);
+        }
+    });
+    (table, walked, peered, server)
+}
+
+/// An idle `recon/1` outlives the credit deadline. One whose peer stops
+/// reading is reset after it, which ends the walks on it at both ends, and
+/// the dialler's next frame opens a new stream on the same connection.
+#[tokio::test(start_paused = true)]
+async fn recon_without_credit_is_reset_and_reopens_for_the_next_frame() {
+    use crate::recon::Frame;
+    use crate::walk::{Response, WalkBody, WalkFrame, WalkId, WalkKind};
+
+    let net = network(Duration::from_millis(10));
+    let (acceptor, mut walked, mut peered, _accepting) = listening(&net, &key(1), 1);
+    let (dialler, mut dialler_walked, _dialler_peered, _dialling) = listening(&net, &key(2), 64);
+    let collection = CollectionHandle::new([3; 32]);
+    let unpeer = Frame::Unpeer { collection };
+    let link = dialler
+        .connect(acceptor.transport().local_id())
+        .await
+        .unwrap()
+        .link();
+    settle().await;
+    assert!(matches!(peered.try_recv(), Ok(ReconEvent::Opened(_))));
+
+    tokio::time::sleep(crate::connection::RECON_CREDIT_DEADLINE + Duration::from_secs(30)).await;
+    link.send(unpeer.clone());
+    settle().await;
+    assert!(matches!(peered.try_recv(), Ok(ReconEvent::Frame(_, frame)) if frame == unpeer));
+    assert!(dialler_walked.try_recv().is_err(), "the idle stream ended");
+
+    // The acceptor's walk task stops taking frames, so its recon/1 reader
+    // stops reading: about forty values exhaust the stream's credit.
+    let value = Frame::Walk(WalkFrame {
+        walk: WalkId {
+            collection,
+            kind: WalkKind::Records,
+            number: 0,
+        },
+        body: WalkBody::Response(Response::Value {
+            key: [4; 32],
+            bytes: vec![5; crate::collection_wire::MAX_COLLECTION_LEAF_BYTES],
+        }),
+    });
+    for _ in 0..60 {
+        link.send(value.clone());
+    }
+    tokio::time::sleep(crate::connection::RECON_CREDIT_DEADLINE - Duration::from_secs(1)).await;
+    assert!(dialler_walked.try_recv().is_err());
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        matches!(dialler_walked.try_recv(), Ok(ReconEvent::Ended(ended)) if ended.id() == link.id())
+    );
+
+    // The acceptor takes frames again and hears its stream end.
+    let heard = tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(event) = walked.recv().await {
+            if matches!(event, ReconEvent::Ended(_)) {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(heard.is_ok(), "the acceptor never heard its stream end");
+
+    // The dialler's next frame crosses a new stream on the same connection,
+    // behind the values still queued.
+    link.send(unpeer.clone());
+    let reopened = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            tokio::select! {
+                Some(_) = walked.recv() => {}
+                Some(event) = peered.recv() => {
+                    if matches!(event, ReconEvent::Frame(_, ref frame) if *frame == unpeer) {
+                        return;
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    assert!(reopened.is_ok(), "the next frame crossed no stream");
+    assert!(
+        dialler
+            .current(acceptor.transport().local_id())
+            .is_some_and(|current| current.link().id() == link.id())
+    );
+    assert_eq!(dialler.len(), 1);
+}

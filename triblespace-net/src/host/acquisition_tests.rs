@@ -21,7 +21,6 @@ use crate::transport::sim::{SimConfig, SimNet, SimTransport};
 use super::*;
 
 mod exact_h_diagnostics;
-mod repair_refusal;
 mod request_backpressure;
 
 struct CountedBlobReader {
@@ -120,9 +119,9 @@ impl Fixture {
             health: provider_health.clone(),
             candidates: provider_routes.clone(),
             providers: provider_directory.clone(),
-            serve_collections: false,
             local_id: provider,
             recon: None,
+            walks: None,
         };
         let connections = ConnectionTable::new(server_harness.transport.clone(), handler);
         let server = tokio::spawn(async move {
@@ -162,7 +161,8 @@ impl Drop for Fixture {
 }
 
 /// An independent directory or restarted provider using the production RPC
-/// handler. Dropping it stops its accept loop. Each restart installs fresh provider-side operational state.
+/// handler. Dropping it stops its accept loop. Each restart installs fresh
+/// provider-side operational state.
 struct RecoveryNode {
     peer: PeerId,
     directory: Arc<Mutex<ProviderDirectory>>,
@@ -179,9 +179,9 @@ impl RecoveryNode {
             health: Health::new(EndpointId::from_bytes(&peer).unwrap()),
             candidates: Arc::new(Mutex::new(RoutingTable::new(peer, []))),
             providers: directory.clone(),
-            serve_collections: false,
             local_id: peer,
             recon: None,
+            walks: None,
         };
         let connections = ConnectionTable::new(harness.transport.clone(), handler);
         let server = tokio::spawn(async move {
@@ -1388,9 +1388,9 @@ async fn known_resident_outside_selected_dht_replicas_is_not_directly_probed() {
             health: Health::new(EndpointId::from_bytes(&peer).unwrap()),
             candidates: Arc::new(Mutex::new(RoutingTable::new(peer, []))),
             providers: Arc::new(Mutex::new(ProviderDirectory::new(peer))),
-            serve_collections: false,
             local_id: peer,
             recon: None,
+            walks: None,
         };
         let connections = ConnectionTable::new(harness.transport.clone(), handler);
         servers.push(tokio::spawn(async move {

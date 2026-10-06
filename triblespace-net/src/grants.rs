@@ -158,6 +158,8 @@ impl Grants {
                 Effects::default()
             }
             ReconEvent::Frame(link, frame) => self.frame(link, frame),
+            // The exchange belongs to the connection and outlives its streams.
+            ReconEvent::Ended(_) => Effects::default(),
         }
     }
 

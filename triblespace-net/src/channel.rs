@@ -139,10 +139,6 @@ impl NetEventBatch {
         self.events.push(event);
         Ok(())
     }
-
-    pub(crate) fn is_full(&self) -> bool {
-        self.events.len() >= MAX_ADMISSION_BATCH_ITEMS || self.bytes >= MAX_ADMISSION_BATCH_BYTES
-    }
 }
 
 #[cfg(test)]
@@ -169,7 +165,6 @@ mod tests {
         for byte in 0..MAX_ADMISSION_BATCH_ITEMS {
             count_bounded.try_push(record(byte as u8)).unwrap();
         }
-        assert!(count_bounded.is_full());
         assert!(count_bounded.try_push(record(0xFF)).is_err());
     }
 

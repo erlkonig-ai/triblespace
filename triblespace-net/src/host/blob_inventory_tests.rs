@@ -123,8 +123,8 @@ fn a_blob_only_child_is_held_after_a_report_not_by_its_arrival() {
     let unreported = observe(&arrived, &active, fixture.local, Some((&before, &old)));
     assert!(!held(&unreported, fixture.collection, &child_handle.raw));
     assert_eq!(
-        crate::collection_session::manifest(&old.collection(fixture.collection).unwrap().repair),
-        crate::collection_session::manifest(
+        crate::collection_wire::manifest(&old.collection(fixture.collection).unwrap().repair),
+        crate::collection_wire::manifest(
             &unreported.collection(fixture.collection).unwrap().repair
         ),
         "an arrival nobody reported changes nothing that is served"
@@ -140,8 +140,8 @@ fn a_blob_only_child_is_held_after_a_report_not_by_its_arrival() {
     );
     let old_collection = old.collection(fixture.collection).unwrap();
     let new_collection = new.collection(fixture.collection).unwrap();
-    let old_manifest = crate::collection_session::manifest(&old_collection.repair);
-    let new_manifest = crate::collection_session::manifest(&new_collection.repair);
+    let old_manifest = crate::collection_wire::manifest(&old_collection.repair);
+    let new_manifest = crate::collection_wire::manifest(&new_collection.repair);
     assert_eq!(old_manifest.records, new_manifest.records);
     assert_eq!(
         old_manifest.authorization_evidence,

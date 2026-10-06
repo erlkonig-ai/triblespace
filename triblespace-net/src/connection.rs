@@ -3,11 +3,10 @@
 //! A [`ConnectionTable`] holds the connections of both directions, keyed by
 //! the remote's TLS-authenticated [`PeerId`]. Every connection, dialled or
 //! accepted, runs one accept loop. The first byte of each stream is its type
-//! tag ([`TAG_RECON`], [`TAG_DHT`], [`TAG_BLOB`] and the transitional
-//! [`TAG_REPAIR`]). The loop reads the tag before it takes any permit:
-//! `recon/1` takes none, a request stream takes one of its connection's (or
-//! is reset when none is left) and waits for one of the table's, and an
-//! unknown tag resets only its own stream.
+//! tag ([`TAG_RECON`], [`TAG_DHT`] or [`TAG_BLOB`]). The loop reads the tag
+//! before it takes any permit: `recon/1` takes none, a request stream takes
+//! one of its connection's (or is reset when none is left) and waits for one
+//! of the table's, and an unknown tag resets only its own stream.
 //!
 //! The dialler opens `recon/1`, and its first frame carries the dialler's
 //! sequence number. When a pair holds two connections, both sides keep the
@@ -23,6 +22,10 @@
 //! written in order on whichever `recon/1` stream it holds. The queue, like
 //! the peerings it carries, belongs to the connection and outlives a
 //! replaced stream.
+//!
+//! A writer that waits [`RECON_CREDIT_DEADLINE`] for stream credit resets
+//! `recon/1`: the peer stopped reading. The service hears that the stream
+//! ended, and the dialler opens a new one once it has a frame to send.
 //!
 //! A connection closes after [`CONNECTION_IDLE_DEADLINE`] without a frame on
 //! any of its streams, sent or received. Above [`MAX_CONNECTIONS`] in one
@@ -43,7 +46,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::Instant;
 use tracing::{Instrument as _, debug, debug_span, info_span, warn};
 
-use crate::protocol::{PILE_SYNC_ALPN, TAG_BLOB, TAG_DHT, TAG_RECON, TAG_REPAIR, recv_u8, send_u8};
+use crate::protocol::{PILE_SYNC_ALPN, TAG_BLOB, TAG_DHT, TAG_RECON, recv_u8, send_u8};
 pub(crate) use crate::recon::{FRAME_OPEN, MAX_RECON_FRAME_BYTES};
 use crate::recon::{Frame, Malformed};
 use crate::transport::{Conn, PeerId, RecvStream, SendStream, Transport};
@@ -52,6 +55,9 @@ use crate::transport::{Conn, PeerId, RecvStream, SendStream, Transport};
 const DIAL_DEADLINE: Duration = Duration::from_secs(10);
 /// A connection closes after this long without a frame on any stream.
 pub(crate) const CONNECTION_IDLE_DEADLINE: Duration = Duration::from_secs(120);
+/// A `recon/1` writer that waited this long for stream credit resets the
+/// stream: the peer stopped reading it.
+pub(crate) const RECON_CREDIT_DEADLINE: Duration = Duration::from_secs(60);
 /// A retired connection closes after this long without a frame once no
 /// request stream is in flight on it. The peer keeps using it only until it
 /// has seen the winner too.
@@ -85,12 +91,15 @@ pub const RESET_REPLACED: u32 = 2;
 /// Stream reset code: the connection already holds
 /// [`MAX_HELD_REQUESTS_PER_CONNECTION`] request streams.
 pub const RESET_BUSY: u32 = 3;
+/// Stream reset code: the peer granted `recon/1` no credit for
+/// [`RECON_CREDIT_DEADLINE`].
+pub const RESET_STALLED: u32 = 4;
 
 /// What streams mean. The table decides which request streams reach the
 /// service and holds their permits; the service answers them, and hears what
 /// happens on each connection's `recon/1`.
 pub trait Service: Clone + Send + Sync + 'static {
-    /// Serve one `dht/1`, `blob/1` or `repair/0` stream after its tag.
+    /// Serve one `dht/1` or `blob/1` stream after its tag.
     fn serve<W, R>(
         &self,
         peer: PeerId,
@@ -120,6 +129,11 @@ pub enum ReconEvent {
     Opened(Link),
     /// A frame arrived on the connection's `recon/1`.
     Frame(Link, Frame),
+    /// The connection's `recon/1` stream ended while the connection stays
+    /// open, and whatever ran on it with it. The connection's peerings and
+    /// queued frames outlive it: the dialler opens a new stream once it has
+    /// a frame to send.
+    Ended(Link),
     /// The connection closed; frames queued on it go nowhere.
     Closed(Link),
 }
@@ -142,9 +156,15 @@ impl Link {
         self.state.peer
     }
 
-    /// Queue one frame. It is dropped if the connection has closed.
+    /// Queue one frame. It is dropped if the connection has closed. On a
+    /// connection this node dialled whose `recon/1` ended, it also asks for
+    /// a new stream.
     pub fn send(&self, frame: Frame) {
         let _ = self.state.outbox.send(frame);
+        if self.state.dialled && !self.state.recon_live.load(Ordering::SeqCst) {
+            self.state.reopen.store(true, Ordering::SeqCst);
+            self.state.changed.notify_waiters();
+        }
     }
 
     /// Mark or unmark this as a neighbour connection, which eviction spares.
@@ -252,8 +272,13 @@ struct State {
     /// dialler's opening order); a stream that is no longer the newest
     /// yields to its replacement.
     recon: AtomicU64,
-    /// Woken on retirement, on the last in-flight stream, and on a new
-    /// `recon/1` stream.
+    /// A `recon/1` stream carries the connection's frames, or is being
+    /// opened. A dialled connection opens one as it connects.
+    recon_live: AtomicBool,
+    /// A frame was queued while no `recon/1` stream was live.
+    reopen: AtomicBool,
+    /// Woken on retirement, on the last in-flight stream, on a new `recon/1`
+    /// stream, and on a frame that asks for one.
     changed: Notify,
     opened: Arc<Semaphore>,
     held: Arc<Semaphore>,
@@ -283,6 +308,8 @@ impl State {
             retired: AtomicBool::new(false),
             neighbour: AtomicBool::new(false),
             recon: AtomicU64::new(0),
+            recon_live: AtomicBool::new(dialled),
+            reopen: AtomicBool::new(false),
             changed: Notify::new(),
             opened: Arc::new(Semaphore::new(MAX_REQUESTS_PER_CONNECTION)),
             held: Arc::new(Semaphore::new(MAX_HELD_REQUESTS_PER_CONNECTION)),
@@ -699,15 +726,7 @@ impl<T: Transport, S: Service> ConnectionTable<T, S> {
         if !state.dialled {
             anyhow::bail!("only the dialler opens recon/1");
         }
-        let sequence = *state
-            .sequence
-            .get()
-            .expect("a dialled connection knows its sequence");
-        let (send, recv) = connection.conn.open_bi().await?;
-        let mut send = Tracked::new(send, state, None);
-        send_u8(&mut send, TAG_RECON).await?;
-        write_frame(&mut send, FRAME_OPEN, &sequence.to_be_bytes()).await?;
-        let recv = Tracked::new(recv, state, None);
+        let (send, recv) = open_recon(&connection.conn, state).await?;
         let order = state.recon.load(Ordering::SeqCst) + 1;
         tokio::spawn(recon(
             Arc::downgrade(&self.shared),
@@ -867,12 +886,7 @@ impl<T: Transport, S: Service> Shared<T, S> {
             let state = self.state(peer, true);
             let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
             state.sequence.set(sequence).unwrap();
-            // The dialler's first recon frame carries its sequence number.
-            let (send, recv) = conn.open_bi().await?;
-            let mut send = Tracked::new(send, &state, None);
-            send_u8(&mut send, TAG_RECON).await?;
-            write_frame(&mut send, FRAME_OPEN, &sequence.to_be_bytes()).await?;
-            let recv = Tracked::new(recv, &state, None);
+            let (send, recv) = open_recon(&conn, &state).await?;
             Ok((conn, state, send, recv))
         })
         .await
@@ -956,6 +970,12 @@ async fn accept_loop<T: Transport, S: Service>(
         let changed = state.changed.notified();
         tokio::pin!(changed);
         changed.as_mut().enable();
+        if state.reopen.swap(false, Ordering::SeqCst)
+            && !state.retired.load(Ordering::SeqCst)
+            && !state.recon_live.swap(true, Ordering::SeqCst)
+        {
+            tokio::spawn(reopen(shared.clone(), conn.clone(), state.clone()));
+        }
         let deadline = state.deadline();
         tokio::select! {
             accepted = conn.accept_bi() => {
@@ -1045,7 +1065,7 @@ async fn stream<T: Transport, S: Service>(
             )
             .await
         }
-        TAG_DHT | TAG_BLOB | TAG_REPAIR => {
+        TAG_DHT | TAG_BLOB => {
             // A held stream keeps the opener's stream credit even after the
             // opener gave up on it, so the connection holds a bounded number
             // and resets the rest. Within the bound, a burst waits for its
@@ -1086,8 +1106,43 @@ fn tag_name(tag: u8) -> &'static str {
         TAG_RECON => "recon/1",
         TAG_DHT => "dht/1",
         TAG_BLOB => "blob/1",
-        TAG_REPAIR => "repair/0",
         _ => "unknown",
+    }
+}
+
+/// Open a `recon/1` stream on a connection this node dialled, with the
+/// opening frame that carries its sequence number.
+async fn open_recon<C: Conn>(
+    conn: &C,
+    state: &Arc<State>,
+) -> anyhow::Result<(Tracked<C::SendHalf>, Tracked<C::RecvHalf>)> {
+    let sequence = *state
+        .sequence
+        .get()
+        .expect("a dialled connection knows its sequence");
+    let (send, recv) = conn.open_bi().await?;
+    let mut send = Tracked::new(send, state, None);
+    send_u8(&mut send, TAG_RECON).await?;
+    write_frame(&mut send, FRAME_OPEN, &sequence.to_be_bytes()).await?;
+    Ok((send, Tracked::new(recv, state, None)))
+}
+
+/// Open a new `recon/1` stream after the last one ended; the frames queued
+/// since go out on it.
+async fn reopen<T: Transport, S: Service>(
+    shared: Weak<Shared<T, S>>,
+    conn: T::Conn,
+    state: Arc<State>,
+) {
+    match open_recon(&conn, &state).await {
+        Ok((send, recv)) => {
+            let order = state.recon.load(Ordering::SeqCst) + 1;
+            recon(shared, conn, state, ReconStream::Dialled(order), send, recv).await;
+        }
+        Err(error) => {
+            debug!(%error, "reopening recon/1 failed");
+            state.recon_live.store(false, Ordering::SeqCst);
+        }
     }
 }
 
@@ -1105,7 +1160,8 @@ enum ReconStream {
 /// connection replaces this one.
 ///
 /// Both directions run at once: each frame read goes to the service as it
-/// arrives, and the connection's queued frames are written as they come.
+/// arrives, and the connection's queued frames are written as they come. A
+/// frame that waits [`RECON_CREDIT_DEADLINE`] for credit resets the stream.
 async fn recon<T: Transport, S: Service>(
     shared: Weak<Shared<T, S>>,
     conn: T::Conn,
@@ -1124,12 +1180,14 @@ async fn recon<T: Transport, S: Service>(
         ReconStream::Dialled(order) => (order, false),
         ReconStream::Accepted(order) => (order, true),
     };
+    let mut ended_here = false;
     let outcome = if accepted && state.dialled {
         Err(FrameError::Violation(
             "recon/1 opened by the side that did not dial",
         ))
     } else {
         state.recon.fetch_max(order, Ordering::SeqCst);
+        state.recon_live.store(true, Ordering::SeqCst);
         state.changed.notify_waiters();
         let ended = {
             let frames = async {
@@ -1180,9 +1238,14 @@ async fn recon<T: Transport, S: Service>(
                 // when a write fails.
                 while let Some(frame) = outbox.recv().await {
                     let (kind, payload) = frame.encode();
-                    write_frame(&mut send, kind, &payload).await?;
+                    let written = write_frame(&mut send, kind, &payload);
+                    match tokio::time::timeout(RECON_CREDIT_DEADLINE, written).await {
+                        Ok(written) => written
+                            .map_err(|error| FrameError::Transport(io::Error::other(error)))?,
+                        Err(_) => return Err(FrameError::Stalled),
+                    }
                 }
-                anyhow::Ok(())
+                Ok(())
             };
             let superseded = async {
                 loop {
@@ -1200,13 +1263,22 @@ async fn recon<T: Transport, S: Service>(
                 biased;
                 () = superseded => None,
                 outcome = frames => Some(outcome),
-                written = writer => {
-                    Some(written.map_err(|error| FrameError::Transport(io::Error::other(error))))
-                }
+                written = writer => Some(written),
             }
         };
         match ended {
-            Some(outcome) => outcome,
+            Some(outcome) => {
+                if let Err(FrameError::Stalled) = outcome {
+                    send.reset(RESET_STALLED);
+                    recv.stop(RESET_STALLED);
+                }
+                // The newest stream ended, and none replaces it yet.
+                if state.recon.load(Ordering::SeqCst) == order {
+                    state.recon_live.store(false, Ordering::SeqCst);
+                    ended_here = true;
+                }
+                outcome
+            }
             None => {
                 send.reset(RESET_REPLACED);
                 recv.stop(RESET_REPLACED);
@@ -1224,6 +1296,10 @@ async fn recon<T: Transport, S: Service>(
             conn.close(CLOSE_VIOLATION, violation.as_bytes());
         }
         Err(FrameError::Transport(error)) => debug!(%error, "recon/1 stream ended"),
+        Err(FrameError::Stalled) => debug!("recon/1 got no credit; reset"),
+    }
+    if ended_here && state.announced.load(Ordering::SeqCst) {
+        service.recon(ReconEvent::Ended(link)).await;
     }
 }
 
@@ -1234,6 +1310,8 @@ enum FrameError {
     Violation(&'static str),
     /// The stream or its connection ended under the reader.
     Transport(io::Error),
+    /// The peer granted no credit for [`RECON_CREDIT_DEADLINE`].
+    Stalled,
 }
 
 impl From<io::Error> for FrameError {
