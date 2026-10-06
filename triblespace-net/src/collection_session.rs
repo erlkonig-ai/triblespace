@@ -14,8 +14,8 @@ use crate::collection_delta::{decode_record, encode_record};
 use crate::collection_wire::{
     CollectionRepairAdmission, CollectionRepairCommand, CollectionRepairComponent,
     CollectionRepairManifest, recv_repair_admission, recv_repair_collection, recv_repair_command,
-    recv_repair_hello, recv_repair_node_response, send_repair_admission, send_repair_bootstrap,
-    send_repair_done, send_repair_node_request, send_repair_node_response,
+    recv_repair_node_response, send_repair_admission, send_repair_done, send_repair_node_request,
+    send_repair_node_response,
 };
 use crate::patch_repair::{
     PatchNode, PatchNodeResponse, PatchRepairRequest, PatchRepairWalker, PatchSummary,
@@ -104,15 +104,14 @@ const MAX_AUTHORIZATION_REPAIR_NODE_REQUESTS: usize = MAX_SEMANTIC_REPAIR_NODE_R
 ///
 /// `lookup` must return an immutable overlay. Its lifetime is the stream's
 /// snapshot lease: every manifest and node response comes from the exact same
-/// semantic and inventory PATCH roots, so no historical-root cache is needed. Returned
-/// bootstrap proofs are inert inputs for a later coherent authorization
-/// observation; they never authorize this pinned session.
+/// semantic and inventory PATCH roots, so no historical-root cache is needed.
+/// READ(C) comes from that overlay's evidence alone.
 pub(crate) async fn serve_collection_repair<R, W>(
     recv: &mut R,
     send: &mut W,
     remote: VerifyingKey,
     lookup: impl FnOnce(CollectionHandle) -> Option<Arc<CollectionRepairOverlay>>,
-) -> Result<Vec<CapabilityProof>>
+) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -121,20 +120,9 @@ where
     let Some(overlay) = lookup(collection) else {
         send_repair_admission(send, CollectionRepairAdmission::Unavailable).await?;
         send.shutdown().await?;
-        return Ok(Vec::new());
+        return Ok(());
     };
-    let hello = recv_repair_hello(recv).await?;
     let evidence = overlay.authorization_evidence();
-    let bootstrap = hello
-        .bootstrap_proofs
-        .into_iter()
-        .filter(|proof| {
-            evidence.get(proof.id()).is_none()
-                && proof.resource().into_bytes() == collection.raw
-                && proof.prefixes().any(|prefix| prefix.subject() == remote)
-                && evidence.validate_proof(proof).is_ok()
-        })
-        .collect::<Vec<_>>();
     let read_evidence = overlay
         .authorization_evidence()
         .proofs()
@@ -147,7 +135,7 @@ where
     if !admitted {
         send_repair_admission(send, CollectionRepairAdmission::Rejected).await?;
         send.shutdown().await?;
-        return Ok(bootstrap);
+        return Ok(());
     }
 
     let manifest = manifest(&overlay);
@@ -163,7 +151,7 @@ where
             CollectionRepairCommand::Done => {
                 require_eof(recv).await?;
                 send.shutdown().await?;
-                return Ok(bootstrap);
+                return Ok(());
             }
             CollectionRepairCommand::Node {
                 component,
@@ -251,9 +239,8 @@ fn node_response(
 }
 
 /// Pull one exact collection overlay over an already authenticated iroh
-/// connection. TLS binds `conn.remote_id()`; the supplied native proof forest
-/// can bootstrap a cold server, while same-session READ(C) comes only from its
-/// already pinned local evidence.
+/// connection. TLS binds `conn.remote_id()`; the server decides READ(C) from
+/// its own pinned evidence.
 /// An inventory cursor resumes the same summary's authenticated DFS, or starts
 /// a fresh root-validated suffix after a summary change. The caller retains its
 /// last successful cursor across failed exchanges; no progress from a failed
@@ -261,25 +248,16 @@ fn node_response(
 pub(crate) async fn pull_collection<C: Conn>(
     conn: &C,
     local: &CollectionRepairOverlay,
-    read_bootstrap: Vec<CapabilityProof>,
     inventory_cursor: Option<InventoryRepairCursor>,
 ) -> Result<CollectionRepairDelta> {
     let (mut send, mut recv) = conn.open_bi().await?;
-    pull_collection_stream(
-        &mut send,
-        &mut recv,
-        local,
-        read_bootstrap,
-        inventory_cursor,
-    )
-    .await
+    pull_collection_stream(&mut send, &mut recv, local, inventory_cursor).await
 }
 
 async fn pull_collection_stream<W, R>(
     send: &mut W,
     recv: &mut R,
     local: &CollectionRepairOverlay,
-    read_bootstrap: Vec<CapabilityProof>,
     inventory_cursor: Option<InventoryRepairCursor>,
 ) -> Result<CollectionRepairDelta>
 where
@@ -288,7 +266,6 @@ where
 {
     crate::protocol::send_u8(send, crate::protocol::TAG_REPAIR).await?;
     crate::protocol::send_hash(send, &local.collection().raw).await?;
-    send_repair_bootstrap(send, &read_bootstrap).await?;
     let remote = match recv_repair_admission(recv).await? {
         CollectionRepairAdmission::Admitted(manifest) => manifest,
         CollectionRepairAdmission::Rejected => return Err(CollectionRepairRefusal::Rejected.into()),
@@ -767,16 +744,13 @@ pub(crate) mod tests {
                 recv_u8(&mut server_recv).await.unwrap(),
                 crate::protocol::TAG_REPAIR
             );
-            let retained =
-                serve_collection_repair(&mut server_recv, &mut server_send, reader, |collection| {
-                    (collection == remote.collection()).then_some(remote)
-                })
-                .await
-                .unwrap();
-            assert!(retained.is_empty());
+            serve_collection_repair(&mut server_recv, &mut server_send, reader, |collection| {
+                (collection == remote.collection()).then_some(remote)
+            })
+            .await
+            .unwrap();
         });
-        let pull =
-            pull_collection_stream(&mut client_send, &mut client_recv, local, vec![], cursor);
+        let pull = pull_collection_stream(&mut client_send, &mut client_recv, local, cursor);
         let result = match ending {
             TestEnding::Timeout => tokio::time::timeout(std::time::Duration::from_secs(1), pull)
                 .await
@@ -1106,7 +1080,7 @@ pub(crate) mod tests {
                     recv_u8(&mut server_recv).await.unwrap(),
                     crate::protocol::TAG_REPAIR
                 );
-                let retained = serve_collection_repair(
+                serve_collection_repair(
                     &mut server_recv,
                     &mut server_send,
                     reader.verifying_key(),
@@ -1114,16 +1088,9 @@ pub(crate) mod tests {
                 )
                 .await
                 .unwrap();
-                assert!(retained.is_empty(), "custom evidence is not READ bootstrap");
             });
-            let result = pull_collection_stream(
-                &mut client_send,
-                &mut client_recv,
-                &client,
-                vec![proof.clone()],
-                None,
-            )
-            .await;
+            let result =
+                pull_collection_stream(&mut client_send, &mut client_recv, &client, None).await;
             if open_read {
                 let delta = result.unwrap();
                 assert_eq!(delta.authorization_evidence, [proof]);
@@ -1491,7 +1458,7 @@ pub(crate) mod tests {
                     recv_u8(&mut server_recv).await.unwrap(),
                     crate::protocol::TAG_REPAIR
                 );
-                let bootstrap = serve_collection_repair(
+                serve_collection_repair(
                     &mut server_recv,
                     &mut server_send,
                     reader.verifying_key(),
@@ -1499,11 +1466,9 @@ pub(crate) mod tests {
                 )
                 .await
                 .unwrap();
-                assert!(bootstrap.is_empty());
             });
             let result =
-                pull_collection_stream(&mut client_send, &mut client_recv, &client, vec![], None)
-                    .await;
+                pull_collection_stream(&mut client_send, &mut client_recv, &client, None).await;
             if allowed {
                 assert_eq!(result.unwrap().records.len(), 1);
             } else {
@@ -1620,7 +1585,7 @@ pub(crate) mod tests {
                 recv_u8(&mut server_recv).await.unwrap(),
                 crate::protocol::TAG_REPAIR
             );
-            let bootstrap = serve_collection_repair(
+            serve_collection_repair(
                 &mut server_recv,
                 &mut server_send,
                 SigningKey::from_bytes(&[8; 32]).verifying_key(),
@@ -1628,13 +1593,11 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-            assert!(bootstrap.is_empty());
         });
 
-        let delta =
-            pull_collection_stream(&mut client_send, &mut client_recv, &client, vec![], None)
-                .await
-                .unwrap();
+        let delta = pull_collection_stream(&mut client_send, &mut client_recv, &client, None)
+            .await
+            .unwrap();
         assert_eq!(delta.records.len(), 1);
         assert!(delta.authorization_evidence.is_empty());
         assert_eq!(delta.local, expected_local);
@@ -1678,66 +1641,6 @@ pub(crate) mod tests {
                 recv_u8(&mut server_recv).await.unwrap(),
                 crate::protocol::TAG_REPAIR
             );
-            let bootstrap = serve_collection_repair(
-                &mut server_recv,
-                &mut server_send,
-                reader.verifying_key(),
-                |collection| (collection == server.collection()).then_some(server),
-            )
-            .await
-            .unwrap();
-            assert!(bootstrap.is_empty());
-        });
-
-        let delta =
-            pull_collection_stream(&mut client_send, &mut client_recv, &client, vec![], None)
-                .await
-                .unwrap();
-        assert_eq!(delta.authorization_evidence, [proof]);
-        assert!(delta.records.is_empty());
-        server_task.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn cold_native_read_proof_is_returned_for_ingest_and_current_session_is_rejected() {
-        let root = SigningKey::from_bytes(&[12; 32]);
-        let reader = SigningKey::from_bytes(&[13; 32]);
-        let other_reader = SigningKey::from_bytes(&[14; 32]);
-        let policy = CollectionPolicy::new(
-            AdmissionPolicy::direct(root.verifying_key()),
-            AdmissionPolicy::Open,
-        );
-        let mut server_store = MemoryRepo::default();
-        let server_collection = server_store.collection("cold", policy.clone()).unwrap();
-        let proof = CapabilityProof::new(
-            CapabilityResource::from(server_collection.handle()),
-            &root,
-            triblespace_core::collection::read_capability(),
-            reader.verifying_key(),
-        );
-        let other_proof = CapabilityProof::new(
-            CapabilityResource::from(server_collection.handle()),
-            &root,
-            triblespace_core::collection::read_capability(),
-            other_reader.verifying_key(),
-        );
-        let server_snapshot = server_store.snapshot().unwrap();
-        let server = Arc::new(
-            collection_repair_overlay(&server_snapshot, server_collection.handle()).unwrap(),
-        );
-        let mut client_store = MemoryRepo::default();
-        let client_collection = client_store.collection("cold", policy).unwrap();
-        let client_snapshot = client_store.snapshot().unwrap();
-        let client =
-            collection_repair_overlay(&client_snapshot, client_collection.handle()).unwrap();
-        let (server_io, client_io) = tokio::io::duplex(1 << 20);
-        let (mut server_recv, mut server_send) = tokio::io::split(server_io);
-        let (mut client_recv, mut client_send) = tokio::io::split(client_io);
-        let server_task = tokio::spawn(async move {
-            assert_eq!(
-                recv_u8(&mut server_recv).await.unwrap(),
-                crate::protocol::TAG_REPAIR
-            );
             serve_collection_repair(
                 &mut server_recv,
                 &mut server_send,
@@ -1745,19 +1648,14 @@ pub(crate) mod tests {
                 |collection| (collection == server.collection()).then_some(server),
             )
             .await
-            .unwrap()
+            .unwrap();
         });
 
-        let error = pull_collection_stream(
-            &mut client_send,
-            &mut client_recv,
-            &client,
-            vec![proof.clone(), other_proof],
-            None,
-        )
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("rejected READ(C)"));
-        assert_eq!(server_task.await.unwrap(), [proof]);
+        let delta = pull_collection_stream(&mut client_send, &mut client_recv, &client, None)
+            .await
+            .unwrap();
+        assert_eq!(delta.authorization_evidence, [proof]);
+        assert!(delta.records.is_empty());
+        server_task.await.unwrap();
     }
 }

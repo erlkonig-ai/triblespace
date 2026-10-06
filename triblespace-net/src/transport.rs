@@ -68,7 +68,7 @@ pub trait Conn: Clone + Send + Sync + 'static {
 
     /// The remote peer's verified identity. In production this is
     /// iroh's TLS-level `remote_id` — the subject checked by pinned local
-    /// READ(C) admission and by every cold-bootstrap proof leaf.
+    /// READ(C) admission and the only key the grant exchange serves.
     /// The simulator forges nothing: it returns the actual id of the
     /// node that dialed, so identity-dependent protocol logic is
     /// exercised honestly.

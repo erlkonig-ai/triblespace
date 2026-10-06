@@ -153,7 +153,6 @@ async fn find_value_answers_routes_and_provider_hints_in_one_reply() {
     let (_publisher, snapshot) = tokio::sync::watch::channel(Some(Arc::new(snapshot)));
     let routes = Arc::new(Mutex::new(RoutingTable::new(provider, [])));
     let directory = Arc::new(Mutex::new(ProviderDirectory::new(provider)));
-    let (events, _events) = tokio::sync::mpsc::channel(16);
     let connection = PipeConn {
         handler: SnapshotHandler {
             snapshot,
@@ -162,7 +161,6 @@ async fn find_value_answers_routes_and_provider_hints_in_one_reply() {
             providers: directory.clone(),
             serve_collections: false,
             local_id: provider,
-            events,
             recon: None,
         },
         requester: requester_key.verifying_key(),

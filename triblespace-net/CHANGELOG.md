@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   delegated keys among connected peers, and so are those a refused peering
   waits for. The host dials the subject of every grant its key signed.
 - A proof whose insert fails no longer aborts the drain of network evidence.
+- The in-session READ bootstrap is gone: a repair hello names only the
+  collection, the server admits from its own evidence and keeps nothing the
+  client sent, and `collection_read_bootstrap_proofs` with its
+  `CollectionReadBootstrapError` is removed. A reader's proofs reach a server
+  as the credentials of its peering request, which the server keeps when
+  they validate.
 
 - Peer per collection on `recon/1` (sync redesign M7). A host asks up to five
   candidates for each collection its pile selects and accepts a request only

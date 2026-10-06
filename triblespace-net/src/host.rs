@@ -2,9 +2,9 @@
 //!
 //! TLS authenticates endpoint identities, but establishing a transport
 //! connection grants no team or collection authority. Each semantic repair is
-//! one stream admitted from the server's complete local READ(C) closure. A
-//! client's bounded native-proof bootstrap is retained as inert authorization
-//! evidence for later coherent observations. DHT routing and provider-directory
+//! one stream admitted from the server's complete local READ(C) closure.
+//! Grants reach their subjects by the grant exchange on `recon/1`
+//! ([`crate::grants`]). DHT routing and provider-directory
 //! operations discover exact blob holders through opaque KDF(H) locators.
 //! Descriptor holders and scoped authority keys are collection gossip bootstrap
 //! hints, never declarations of membership or authority.
@@ -22,7 +22,6 @@ use tokio::io::AsyncReadExt as _;
 use tracing::{debug, warn};
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::encodings::UnknownBlob;
-use triblespace_core::capability::CapabilityProof;
 use triblespace_core::collection::selection::{Selection, config_facts, sync_selection};
 use triblespace_core::collection::{
     CollectionHandle, CollectionRecordSelector, HeldBlobs, HeldRead,
@@ -43,7 +42,6 @@ use crate::collection_session::{
     CollectionRepairRefusal, InventoryRepairCursor, manifest, pull_collection,
     serve_collection_repair,
 };
-use crate::collection_wire::MAX_COLLECTION_READ_BOOTSTRAP_PROOFS;
 use crate::connection::{ConnectionTable, RESET_UNKNOWN, ReconEvent, Service};
 use crate::health::{
     CollectionHealth, Health, HealthSnapshot, RepairComparison, RepairFailure, StoreHealth,
@@ -174,11 +172,9 @@ impl BlobStoreGet for ResidentBlobReader {
     }
 }
 
-/// One collection's immutable server overlay plus the request evidence this
-/// endpoint will present when it pulls the same collection.
+/// One collection's immutable server overlay.
 pub(crate) struct CollectionSnapshot {
     repair: Arc<CollectionRepairOverlay>,
-    read_bootstrap: Arc<[CapabilityProof]>,
 }
 
 impl CollectionSnapshot {
@@ -199,14 +195,9 @@ impl CollectionSnapshot {
     /// Bind the collection's held set, fixed by the same store observation
     /// as the repair evidence. The store's held-blob index computed it: no
     /// blob is scanned while publishing.
-    fn with_held(
-        repair: CollectionRepairOverlay,
-        read_bootstrap: Arc<[CapabilityProof]>,
-        held: HeldBlobs,
-    ) -> Self {
+    fn with_held(repair: CollectionRepairOverlay, held: HeldBlobs) -> Self {
         Self {
             repair: Arc::new(repair.with_blob_inventory(Arc::new(held))),
-            read_bootstrap,
         }
     }
 }
@@ -308,17 +299,14 @@ impl StoreSnapshot {
             // untracked collection holds nothing.
             let held = snapshot.held(collection).unwrap_or_default();
             let prior = previous.and_then(|prior| prior.collections.get(&collection.raw));
-            let relevant = match (previous_store, previous, prior) {
-                (Some(before), Some(previous), Some(prior)) if previous.local == local => {
-                    snapshot.changes_for(before, &prior.dependencies)
-                }
+            let relevant = match (previous_store, prior) {
+                (Some(before), Some(prior)) => snapshot.changes_for(before, &prior.dependencies),
                 _ => StoreChanges::ALL,
             };
             if let Some(prior) = prior.filter(|_| relevant.is_empty()) {
                 let value = prior.value.as_ref().map(|prior| {
                     Arc::new(CollectionSnapshot::with_held(
                         prior.repair.as_ref().clone().with_reader(reader.clone()),
-                        prior.read_bootstrap.clone(),
                         held.clone(),
                     ))
                 });
@@ -376,22 +364,6 @@ impl StoreSnapshot {
                 }
                 Err(error) => return Err(anyhow::Error::new(error)),
             };
-            let read_bootstrap = if authorization.is_some() {
-                prior_value.unwrap().read_bootstrap.clone()
-            } else {
-                let evidence = repair.authorization_evidence().read_bootstrap_proofs(local);
-                if evidence.len() > MAX_COLLECTION_READ_BOOTSTRAP_PROOFS {
-                    warn!(
-                        collection = %hex::encode(&collection.raw[..4]),
-                        count = evidence.len(),
-                        limit = MAX_COLLECTION_READ_BOOTSTRAP_PROOFS,
-                        "collection READ bootstrap exceeds network bound; collection remains locally active but cannot bootstrap a cold remote"
-                    );
-                    Arc::from([])
-                } else {
-                    evidence.into()
-                }
-            };
             // Reused components keep their interests. In particular, reusing
             // the record PATCH must not lose its foundations selector merely
             // because this pass read only authority inputs.
@@ -405,7 +377,6 @@ impl StoreSnapshot {
                 .insert(CollectionRecordSelector::Foundations(collection));
             let value = Arc::new(CollectionSnapshot::with_held(
                 repair.with_reader(reader.clone()),
-                read_bootstrap,
                 held,
             ));
             collections.insert(&PatchEntry::with_value(
@@ -1554,7 +1525,6 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
         providers: providers.clone(),
         serve_collections: config.qos.direction.serves(),
         local_id: my_id,
-        events: wiring.evt_tx.clone(),
         recon: Some(recon_tx),
     };
     // One table holds the connections of both directions; each serves the
@@ -2293,14 +2263,7 @@ async fn reconcile_collection_peer<T: Transport>(
     inventory_cursor: Option<InventoryRepairCursor>,
 ) -> anyhow::Result<(bool, Option<InventoryRepairCursor>)> {
     let connection = connections.connect(target.peer).await?;
-    let delta = match pull_collection(
-        &connection,
-        &local.repair,
-        local.read_bootstrap.iter().cloned().collect(),
-        inventory_cursor,
-    )
-    .await
-    {
+    let delta = match pull_collection(&connection, &local.repair, inventory_cursor).await {
         Ok(delta) => delta,
         Err(error) => {
             // READ refusal or absent C is a valid answer on this stream.
@@ -2899,7 +2862,6 @@ struct SnapshotHandler {
     providers: Arc<Mutex<ProviderDirectory>>,
     serve_collections: bool,
     local_id: PeerId,
-    events: tokio::sync::mpsc::Sender<NetEventBatch>,
     /// Where `recon/1` events go: the host's peering task.
     recon: Option<tokio::sync::mpsc::Sender<ReconEvent>>,
 }
@@ -2915,7 +2877,6 @@ impl SnapshotHandler {
             providers: Arc::new(Mutex::new(ProviderDirectory::new(local_id))),
             serve_collections: false,
             local_id,
-            events: tokio::sync::mpsc::channel(1).0,
             recon: None,
         }
     }
@@ -2939,23 +2900,17 @@ impl Service for SnapshotHandler {
             .map_err(|error| anyhow::anyhow!("invalid transport peer key: {error}"))?;
         match tag {
             TAG_REPAIR => {
-                if !self.serve_collections {
-                    let _ = serve_collection_repair(recv, send, peer, |_| None).await?;
-                } else {
-                    let snapshot = self.snapshot.borrow().clone();
-                    let bootstrap = serve_collection_repair(recv, send, peer, move |collection| {
-                        snapshot
-                            .as_ref()
-                            .and_then(|snapshot| snapshot.collection(collection))
-                            .map(|collection| collection.repair.clone())
-                    })
-                    .await?;
-                    let mut admissions = AdmissionBatcher::new(&self.events);
-                    for proof in bootstrap {
-                        admissions.push(NetEvent::CapabilityProof(proof)).await?;
-                    }
-                    admissions.flush().await?;
-                }
+                let snapshot = self
+                    .serve_collections
+                    .then(|| self.snapshot.borrow().clone())
+                    .flatten();
+                serve_collection_repair(recv, send, peer, move |collection| {
+                    snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.collection(collection))
+                        .map(|collection| collection.repair.clone())
+                })
+                .await?;
             }
             TAG_BLOB => {
                 let activity = self.health.begin_blob_serve();
@@ -3709,72 +3664,6 @@ mod tests {
     }
 
     #[test]
-    fn authorization_bootstrap_is_reused_across_unchanged_observations() {
-        use std::sync::Arc;
-        use triblespace_core::capability::{CapabilityProof, CapabilityResource};
-        use triblespace_core::collection::{
-            AdmissionPolicy, CollectionPolicy, CollectionStoreExt, read_capability,
-        };
-        use triblespace_core::repo::memoryrepo::MemoryRepo;
-        use triblespace_core::repo::{
-            CapabilityProofStore, SnapshotSource, StoreChanges, StoreSnapshot as _,
-        };
-
-        let root = SigningKey::from_bytes(&[97; 32]);
-        let reader = SigningKey::from_bytes(&[98; 32]).verifying_key();
-        let mut store = MemoryRepo::default();
-        let collection = store
-            .collection(
-                "snapshot-bootstrap",
-                CollectionPolicy::new(
-                    AdmissionPolicy::direct(root.verifying_key()),
-                    AdmissionPolicy::Open,
-                ),
-            )
-            .unwrap();
-        let proof = CapabilityProof::new(
-            CapabilityResource::from(collection.handle()),
-            &root,
-            read_capability(),
-            reader,
-        );
-        store.insert_proof(proof.clone()).unwrap();
-        let mut active = super::ActiveCollections::new();
-        active.insert(&super::PatchEntry::new(&collection.handle().raw));
-        let before = store.snapshot().unwrap();
-        let serving_before = super::StoreSnapshot::from_store_changes(
-            before.clone(),
-            &active,
-            reader,
-            None,
-            None,
-            StoreChanges::ALL,
-        )
-        .unwrap();
-        let before_collection = serving_before.collection(collection.handle()).unwrap();
-        assert_eq!(before_collection.read_bootstrap.as_ref(), &[proof.clone()]);
-        for _ in 0..2 {
-            let after = store.snapshot().unwrap();
-            assert_eq!(after.changes_since(&before), StoreChanges::NONE);
-            let serving_after = super::StoreSnapshot::from_store_changes(
-                after,
-                &active,
-                reader,
-                Some(&before),
-                Some(&serving_before),
-                StoreChanges::NONE,
-            )
-            .unwrap();
-            let after_collection = serving_after.collection(collection.handle()).unwrap();
-            assert!(Arc::ptr_eq(
-                &before_collection.read_bootstrap,
-                &after_collection.read_bootstrap
-            ));
-            assert_eq!(after_collection.read_bootstrap.as_ref(), &[proof.clone()]);
-        }
-    }
-
-    #[test]
     fn arriving_definition_refreshes_admission_and_inventory_without_semantic_changes() {
         use std::sync::Arc;
         use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
@@ -3811,7 +3700,7 @@ mod tests {
             read_capability(),
             reader,
         );
-        store.insert_proof(proof.clone()).unwrap();
+        store.insert_proof(proof).unwrap();
         let mut active = super::ActiveCollections::new();
         active.insert(&super::PatchEntry::new(&collection.raw));
         let before = store.snapshot().unwrap();
@@ -3825,7 +3714,6 @@ mod tests {
         )
         .unwrap();
         let before_collection = serving_before.collection(collection).unwrap();
-        assert!(before_collection.read_bootstrap.is_empty());
 
         store
             .put::<SimpleArchive, _>(entity! { capability_action: ACTION_READ }.facts().clone())
@@ -3863,7 +3751,6 @@ mod tests {
             &before_collection.repair,
             &after_collection.repair
         ));
-        assert_eq!(after_collection.read_bootstrap.as_ref(), &[proof]);
     }
 
     #[test]
