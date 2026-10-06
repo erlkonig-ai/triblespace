@@ -17,9 +17,9 @@
 //! this node whose descriptor is not held stays in memory if its signatures
 //! hold, lists its collection as available, and lands once the descriptor
 //! arrives. At most [`MAX_PENDING_PER_SENDER`] of these from one sender, and
-//! [`MAX_PENDING`] from all, stay; the rest are dropped. A proof that is
-//! evidence under a held descriptor never waits, so these bounds keep none
-//! out. The
+//! [`MAX_PENDING`] from all, stay; the rest are dropped, and so are a
+//! sender's when its last connection closes. A proof that is evidence under
+//! a held descriptor never waits, so these bounds keep none out. The
 //! definitions a kept proof names are fetched over `blob/1` from its sender,
 //! then from its root and delegated keys among connected peers. A peering
 //! refused for want of definitions fetches them the same way.
@@ -169,8 +169,19 @@ impl Grants {
                 }
                 Effects::default()
             }
+            // Keys are free, so a sender's proofs wait in memory only while
+            // it stays connected; otherwise keys that came and went would
+            // hold the bound until a restart.
             ReconEvent::Closed(link) => {
                 self.exchanges.remove(&link.id());
+                let sender = link.peer();
+                if !self
+                    .exchanges
+                    .values()
+                    .any(|exchange| exchange.link.peer() == sender)
+                {
+                    self.forget(sender);
+                }
                 Effects::default()
             }
             ReconEvent::Frame(link, frame) => self.frame(link, frame),
@@ -293,6 +304,36 @@ impl Grants {
         effects
     }
 
+    /// Drop the proofs `sender` left waiting in memory, and their entries
+    /// among this node's own.
+    fn forget(&mut self, sender: PeerId) {
+        let mut left = self
+            .pending
+            .extract_if(.., |_, (from, _)| *from == sender)
+            .peekable();
+        if left.peek().is_none() {
+            return;
+        }
+        for (_, (_, proof)) in left {
+            for (subject, prefix) in subject_prefixes(&proof) {
+                self.received
+                    .remove(&subject_proof_key(subject, prefix.id()));
+            }
+        }
+        self.own_from_received();
+        self.changed = true;
+    }
+
+    /// This node's own entries: those received and those held.
+    fn own_from_received(&mut self) {
+        self.own = self.received.clone();
+        for key in Self::keys(&self.held, self.local, usize::MAX) {
+            let prefix = self.held.get(&key).expect("an index key holds its prefix");
+            self.own
+                .insert(&PatchEntry::with_value(&key, prefix.clone()));
+        }
+    }
+
     /// Whether `sender` may keep one more proof waiting in memory.
     fn room(&self, sender: PeerId) -> bool {
         let kept = self.pending.values().filter(|(from, _)| *from == sender);
@@ -383,12 +424,7 @@ impl Grants {
             }
             self.changed |= !self.pending.contains_key(&id);
         }
-        self.own = self.received.clone();
-        for key in Self::keys(&self.held, self.local, usize::MAX) {
-            let prefix = self.held.get(&key).expect("an index key holds its prefix");
-            self.own
-                .insert(&PatchEntry::with_value(&key, prefix.clone()));
-        }
+        self.own_from_received();
 
         let exchanges = self.exchanges.keys().copied().collect::<Vec<_>>();
         for id in exchanges {
@@ -1000,6 +1036,69 @@ mod tests {
             },
         ));
         assert_eq!(effects.land, [valid]);
+    }
+
+    /// Proofs waiting in memory leave with their sender's last connection,
+    /// so keys that came and went do not hold the bound, and a later grant
+    /// still waits for its descriptor.
+    #[test]
+    fn proofs_waiting_in_memory_leave_with_their_sender() {
+        let owner = key(70);
+        let mut node = Node::new(71);
+        let collection = node.hold(policy(&owner));
+        node.observe();
+        let subject = node.key.clone();
+        let mut ids = 0;
+        let mut send = |node: &mut Node, sender: &SigningKey, count: usize| {
+            ids += 1;
+            let (link, _sent) = Link::detached(ids, sender.verifying_key().to_bytes());
+            node.grants.event(&ReconEvent::Opened(link.clone()));
+            let credentials = (0..count)
+                .map(|index| {
+                    let mut resource = sender.verifying_key().to_bytes();
+                    resource[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                    let resource = CollectionHandle::new(resource);
+                    grant(sender, &subject, read_capability(), resource)
+                })
+                .collect();
+            let frame = Frame::Credential {
+                collection,
+                credentials,
+            };
+            node.grants.event(&ReconEvent::Frame(link.clone(), frame));
+            link
+        };
+        let own = |node: &Node| Grants::digest(&node.grants.own, node.id()).leaf_count();
+        let senders = (0..MAX_PENDING / MAX_PENDING_PER_SENDER)
+            .map(|index| key(72 + index as u8))
+            .collect::<Vec<_>>();
+        let mut links = senders
+            .iter()
+            .map(|sender| send(&mut node, sender, MAX_PENDING_PER_SENDER))
+            .collect::<Vec<_>>();
+        assert_eq!(node.grants.pending.len(), MAX_PENDING);
+
+        // A sender's second connection keeps its proofs when the first
+        // closes; its last one takes them.
+        let second = send(&mut node, &senders[0], 0);
+        node.grants.event(&ReconEvent::Closed(links.remove(0)));
+        assert_eq!(node.grants.pending.len(), MAX_PENDING);
+        node.grants.event(&ReconEvent::Closed(second));
+        assert_eq!(
+            node.grants.pending.len(),
+            MAX_PENDING - MAX_PENDING_PER_SENDER
+        );
+        for link in links {
+            node.grants.event(&ReconEvent::Closed(link));
+        }
+        assert!(node.grants.pending.is_empty());
+        assert!(node.grants.available().is_empty());
+        assert_eq!(own(&node), 0);
+
+        let later = key(80);
+        send(&mut node, &later, 1);
+        assert_eq!(node.grants.pending.len(), 1);
+        assert_eq!(own(&node), 1);
     }
 
     /// A received proof is kept only if it names this node or its sender.
