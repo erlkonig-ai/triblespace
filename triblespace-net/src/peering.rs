@@ -995,9 +995,10 @@ impl Peerings {
     }
 
     /// The next candidate in C's order that is not already a neighbour, being
-    /// dialled, or refusing this side. The end of the order draws it again,
-    /// if that is due, and a draw that is not merely of changed candidates
-    /// looks up C's DHT providers again.
+    /// dialled, or refusing this side. The end of the order draws it again
+    /// once [`MIN_RESHUFFLE_INTERVAL`] has passed, or sooner if its
+    /// candidates changed, and a draw that was due looks up C's DHT providers
+    /// again.
     fn next_candidate(
         &mut self,
         collection: CollectionHandle,
@@ -1022,18 +1023,27 @@ impl Peerings {
             }
             let due = order
                 .drawn_at
-                .is_none_or(|drawn| order.stale || now >= drawn + MIN_RESHUFFLE_INTERVAL);
-            if !due {
+                .is_none_or(|drawn| now >= drawn + MIN_RESHUFFLE_INTERVAL);
+            if !due && !order.stale {
                 return None;
             }
-            if !order.stale && !mesh.looking_up {
+            let peers = candidate_order(local, &mesh.providers, self.local, &rand::random());
+            // Any change to C's records or evidence makes the order stale;
+            // only a change of its candidates draws it before it is due.
+            let changed = order.stale
+                && peers.iter().collect::<BTreeSet<_>>()
+                    != order.peers.iter().collect::<BTreeSet<_>>();
+            order.stale = false;
+            if !due && !changed {
+                return None;
+            }
+            if due && !mesh.looking_up {
                 mesh.looking_up = true;
                 self.lookups.push(collection);
             }
-            order.peers = candidate_order(local, &mesh.providers, self.local, &rand::random());
+            order.peers = peers;
             order.next = 0;
             order.drawn_at = Some(now);
-            order.stale = false;
         }
     }
 
@@ -1898,6 +1908,52 @@ mod tests {
             [provider]
         );
         assert_eq!(node.peerings.take_lookups(), [collection]);
+    }
+
+    /// A collection that changes every second, whose one candidate cannot
+    /// be dialled: a change of its records leaves its candidates as they
+    /// were, so the exhausted order waits out [`MIN_RESHUFFLE_INTERVAL`] like
+    /// a quiet one, and each draw that waited looks up providers again.
+    #[test]
+    fn a_busy_collection_waits_out_the_reshuffle_interval() {
+        use triblespace_core::blob::encodings::UnknownBlob;
+        use triblespace_core::collection::{
+            CollectionCommit, CollectionData, CollectionRecord, CollectionStore,
+            empty_metadata_handle,
+        };
+        let mut node = Node::new(70);
+        let root = key(71);
+        let policy = CollectionPolicy::new(
+            AdmissionPolicy::direct(root.verifying_key()),
+            AdmissionPolicy::direct(root.verifying_key()),
+        );
+        let collection = node.hold(policy);
+        node.select(collection, true);
+        let root = root.verifying_key().to_bytes();
+        let now = crate::clock::mono_now();
+        assert_eq!(node.peerings.fill(now), [root]);
+        assert_eq!(node.peerings.take_lookups(), [collection]);
+        node.peerings.providers(collection, Vec::new());
+        let (mut redials, mut lookups) = (0, 0);
+        for second in 1..=120_u64 {
+            node.peerings.dialled(root, false);
+            let bytes = anybytes::Bytes::from_source(second.to_be_bytes().to_vec());
+            let data = node.pile.store.put::<UnknownBlob, _>(bytes).unwrap();
+            let record = CollectionRecord::Commit(CollectionCommit::sign(
+                &node.key,
+                collection,
+                CollectionData::new(data.raw),
+                empty_metadata_handle(),
+            ));
+            node.pile.store.insert(record).unwrap();
+            node.observe();
+            redials += node.peerings.fill(now + Duration::from_secs(second)).len();
+            for looked_up in node.peerings.take_lookups() {
+                lookups += 1;
+                node.peerings.providers(looked_up, Vec::new());
+            }
+        }
+        assert_eq!((redials, lookups), (2, 2), "redials and lookups in two minutes");
     }
 
     /// Peerings over real connection tables on the simulated transport,
