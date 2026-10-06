@@ -47,7 +47,7 @@ use crate::announce::{self, Announcements, State};
 use crate::channel::NetEventBatch;
 use crate::clock::Mono;
 use crate::collection_activation::MAX_PROOFS_PER_EXCHANGE;
-use crate::connection::{ConnectionTable, Link, ReconEvent, Service};
+use crate::connection::{ConnectionTable, Link, MAX_QUEUED_REPLIES, ReconEvent, Service};
 use crate::grants::{Effects, Fetch, Grants, Sink, sources};
 use crate::health::{Health, PeeringHealth};
 use crate::host::{CollectionSnapshot, StoreSnapshot};
@@ -608,6 +608,15 @@ impl Peerings {
         let Some(collection) = frame.collection() else {
             return;
         };
+        // Like a walk request, a peering request gets no answer while the
+        // connection already queues MAX_QUEUED_REPLIES frames, so a peer that
+        // asks faster than it reads cannot grow the queue. The asker's side
+        // stays asked, and it asks again when the stalled stream ends.
+        if let Frame::PeerRequest { .. } = frame
+            && link.queued() >= MAX_QUEUED_REPLIES
+        {
+            return;
+        }
         let known = self
             .snapshot
             .as_ref()
@@ -1908,6 +1917,38 @@ mod tests {
             [provider]
         );
         assert_eq!(node.peerings.take_lookups(), [collection]);
+    }
+
+    /// A peer that sends peering requests without reading gets no answer
+    /// once its connection queues [`MAX_QUEUED_REPLIES`] frames, for a
+    /// collection held here or not, so it cannot grow the queue past that.
+    #[test]
+    fn a_peer_that_asks_without_reading_stops_being_answered() {
+        let mut node = Node::new(30);
+        let held = node.hold(CollectionPolicy::new(
+            AdmissionPolicy::Open,
+            AdmissionPolicy::Open,
+        ));
+        node.select(held, true);
+        let (link, _unread) = Link::detached(1, key(31).verifying_key().to_bytes());
+        node.peerings.event(ReconEvent::Opened(link.clone()));
+        let flags = Flags {
+            send: false,
+            full: false,
+        };
+        for index in 0..MAX_QUEUED_REPLIES {
+            for collection in [held, CollectionHandle::new([index as u8; 32])] {
+                let request = Frame::PeerRequest {
+                    collection,
+                    flags,
+                    invitation: false,
+                    credentials: Vec::new(),
+                };
+                node.peerings
+                    .event(ReconEvent::Frame(link.clone(), request));
+            }
+        }
+        assert_eq!(link.queued(), MAX_QUEUED_REPLIES);
     }
 
     /// A collection that changes every second, whose one candidate cannot

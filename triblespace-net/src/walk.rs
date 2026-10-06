@@ -17,12 +17,15 @@
 //! difference.
 //!
 //! A side runs at most one walk per peer, collection and kind. A walk ends
-//! after [`WALK_DEADLINE`] without progress, by failing, or by completing,
-//! and its number retires: a frame, landing acknowledgement or blob fetch of
-//! an ended walk is dropped and touches no successor. A responder
-//! serves a peer it sends the collection to, and leaves a request
-//! unanswered while [`MAX_QUEUED_REPLIES`] frames wait on the connection: a
-//! peer that asks faster than it reads gets no more until it reads.
+//! after [`WALK_DEADLINE`] without progress while something is owed to it,
+//! by failing, or by completing, and its number retires: a frame, landing
+//! acknowledgement or blob fetch of an ended walk is dropped and touches no
+//! successor. A responder serves a peer it sends the collection to, and
+//! leaves a request unanswered while [`MAX_QUEUED_REPLIES`] frames wait on
+//! the connection: a peer that asks faster than it reads gets no more until
+//! it reads. The walks a puller runs on one connection keep at most
+//! [`MAX_CONNECTION_WALK_REQUESTS`] requests in flight together, so a puller
+//! that reads is always answered; a walk with none in flight goes first.
 //!
 //! A walk frame names its collection, its kind and its number. The kind is
 //! the PATCH walked: records, authorization evidence or held blob references.
@@ -68,7 +71,7 @@ use crate::collection_activation::{
 };
 use crate::collection_delta::{decode_record, encode_record};
 use crate::collection_wire::{MAX_COLLECTION_LEAF_BYTES, manifest};
-use crate::connection::{ConnectionTable, Link, ReconEvent, Service};
+use crate::connection::{ConnectionTable, Link, MAX_QUEUED_REPLIES, ReconEvent, Service};
 use crate::health::{Health, RepairComparison, RepairFailure, RepairFrontier};
 use crate::host::{CollectionSnapshot, METADATA_BLOB_BYTES, StoreSnapshot};
 use crate::landing::{LandSlot, Landed};
@@ -404,16 +407,18 @@ impl Reader<'_> {
     }
 }
 
-/// A walk ends after this long without progress: every walk that has not
-/// ended waits for something owed, a response, a landing acknowledgement or
-/// a descriptor.
+/// A walk ends after this long without progress while something is owed to
+/// it: a response, a landing acknowledgement or a blob fetch. A walk waiting
+/// for its connection's request budget is owed nothing.
 pub(crate) const WALK_DEADLINE: Duration = Duration::from_secs(60);
 /// Node and value requests and blob fetches one walk keeps in flight.
 const MAX_WALK_REQUESTS: usize = 64;
-/// Frames a connection may hold queued, at most a 64 KiB frame each, before
-/// a request on it goes unanswered. The walk it belongs to ends at its
-/// puller's deadline.
-const MAX_QUEUED_REPLIES: usize = 1024;
+/// Walk requests (opens, nodes and values) the walks on one connection keep
+/// in flight together. Each is answered by one frame, so a responder queues
+/// at most this many replies for them, beside its own walks' requests (at
+/// most as many again) and its other frames: a quarter of what it queues
+/// before it leaves requests unanswered.
+const MAX_CONNECTION_WALK_REQUESTS: usize = MAX_QUEUED_REPLIES / 4;
 /// Values one walk hands to landing before they are acknowledged. A walk
 /// whose landing queue is full requests no further nodes.
 const MAX_WALK_UNLANDED: usize = 1024;
@@ -485,6 +490,8 @@ type PullKey = (PeerId, RawHash, WalkKind);
 struct Pull {
     link: Link,
     walk: WalkId,
+    /// The open request went out.
+    opened: bool,
     /// The local observation subtrees are compared with, fixed at the start.
     local: Arc<CollectionSnapshot>,
     /// Present from the summary until the walk ends.
@@ -644,20 +651,52 @@ impl Pull {
         ));
     }
 
-    /// Request nodes while both windows have room.
-    fn pump(&mut self) -> anyhow::Result<()> {
+    /// Requests in flight on the connection.
+    fn requests(&self) -> usize {
+        self.nodes.len() + self.values.len() + usize::from(self.opened && self.summary.is_none())
+    }
+
+    /// Whether the walk waits for something owed to it.
+    fn owed(&self) -> bool {
+        self.requests() + self.unlanded + self.fetching > 0
+    }
+
+    /// Open the walk, or request nodes while both windows and the
+    /// connection's `budget` have room. Returns whether it stopped for want
+    /// of budget. A walk that starts to wait for something owed starts its
+    /// deadline then.
+    fn pump(&mut self, budget: &mut usize, now: Mono) -> anyhow::Result<bool> {
+        if !self.opened {
+            if *budget == 0 {
+                return Ok(true);
+            }
+            *budget -= 1;
+            self.opened = true;
+            self.progress = now;
+            self.link
+                .send(frame(self.walk, WalkBody::Request(Request::Open)));
+            return Ok(false);
+        }
+        let owed = self.owed();
         let Some(walker) = self.walker.as_mut() else {
-            return Ok(());
+            return Ok(false);
         };
         let (kind, local) = (self.walk.kind, self.local.repair());
         while self.nodes.len() + self.values.len() + self.fetching < MAX_WALK_REQUESTS
             && self.unlanded < MAX_WALK_UNLANDED
         {
+            if *budget == 0 {
+                return Ok(true);
+            }
             let Some(request) =
                 walker.next_request(|_, prefix| local_summary(kind, local, prefix))?
             else {
                 break;
             };
+            *budget -= 1;
+            if !owed {
+                self.progress = now;
+            }
             let prefix = request.prefix().to_vec();
             self.link.send(frame(
                 self.walk,
@@ -665,7 +704,7 @@ impl Pull {
             ));
             self.nodes.insert(prefix, request);
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Whether the walk ended, and whether it completed. It ends when nothing
@@ -862,12 +901,12 @@ impl Walks {
             number: *next,
         };
         *next = next.wrapping_add(1);
-        link.send(frame(walk, WalkBody::Request(Request::Open)));
         self.pulls.insert(
             key,
             Pull {
                 link: link.clone(),
                 walk,
+                opened: false,
                 local,
                 walker: None,
                 summary: None,
@@ -882,6 +921,7 @@ impl Walks {
                 progress: now,
             },
         );
+        self.pump(link.id(), now);
     }
 
     /// Take one walk frame from the peer on `link`.
@@ -925,7 +965,8 @@ impl Walks {
             return;
         };
         let Some(response) = response else {
-            return self.end(key, Ending::Failed, false, now);
+            self.end(key, Ending::Failed, false, now);
+            return self.pump(link.id(), now);
         };
         let accepted = pull.accept(
             response,
@@ -937,20 +978,50 @@ impl Walks {
         self.advance(key, accepted, now);
     }
 
-    /// Pump a walk after `result` and end it if it finished or failed.
+    /// End a walk if `result` failed it, then pump the walks on its
+    /// connection.
     fn advance(&mut self, key: PullKey, result: anyhow::Result<()>, now: Mono) {
-        let pull = self.pulls.get_mut(&key).expect("an advancing walk runs");
-        match result
-            .and_then(|()| pull.pump())
-            .and_then(|()| pull.finished())
-        {
-            Ok(None) => {}
-            Ok(Some(true)) => self.end(key, Ending::Completed, true, now),
-            Ok(Some(false)) => self.end(key, Ending::Incomplete, true, now),
-            Err(error) => {
-                debug!(%error, "walk failed");
-                self.end(key, Ending::Failed, true, now);
+        let link = self.pulls[&key].link.id();
+        if let Err(error) = result {
+            debug!(%error, "walk failed");
+            self.end(key, Ending::Failed, true, now);
+        }
+        self.pump(link, now);
+    }
+
+    /// Let the walks on connection `link` send what their windows and the
+    /// connection's budget allow, those with the fewest requests in flight
+    /// first, and end those that finished or failed. The budget a failed
+    /// walk frees goes round again.
+    fn pump(&mut self, link: u64, now: Mono) {
+        let mut walks = self
+            .pulls
+            .iter()
+            .filter(|(_, pull)| pull.link.id() == link)
+            .map(|(key, pull)| (pull.requests(), *key))
+            .collect::<Vec<_>>();
+        let in_flight = walks.iter().map(|(requests, _)| requests).sum::<usize>();
+        let mut budget = MAX_CONNECTION_WALK_REQUESTS.saturating_sub(in_flight);
+        walks.sort_unstable();
+        let mut freed = false;
+        for (_, key) in walks {
+            let pull = self.pulls.get_mut(&key).expect("a pumped walk runs");
+            let ended = pull
+                .pump(&mut budget, now)
+                .and_then(|waiting| if waiting { Ok(None) } else { pull.finished() });
+            match ended {
+                Ok(None) => {}
+                Ok(Some(true)) => self.end(key, Ending::Completed, true, now),
+                Ok(Some(false)) => self.end(key, Ending::Incomplete, true, now),
+                Err(error) => {
+                    debug!(%error, "walk failed");
+                    self.end(key, Ending::Failed, true, now);
+                    freed = true;
+                }
             }
+        }
+        if freed {
+            self.pump(link, now);
         }
     }
 
@@ -1226,16 +1297,24 @@ impl Walks {
         }
     }
 
-    /// End the walks that made no progress for [`WALK_DEADLINE`].
+    /// End the walks owed something that made no progress for
+    /// [`WALK_DEADLINE`], and let others on their connections go on.
     pub(crate) fn expire(&mut self, now: Mono) {
-        let keys = self
+        let expired = self
             .pulls
             .iter()
-            .filter(|(_, pull)| now >= pull.progress + WALK_DEADLINE)
-            .map(|(key, _)| *key)
+            .filter(|(_, pull)| pull.owed() && now >= pull.progress + WALK_DEADLINE)
+            .map(|(key, pull)| (*key, pull.link.id()))
             .collect::<Vec<_>>();
-        for key in keys {
+        for &(key, _) in &expired {
             self.end(key, Ending::TimedOut, true, now);
+        }
+        let links = expired
+            .into_iter()
+            .map(|(_, link)| link)
+            .collect::<HashSet<_>>();
+        for link in links {
+            self.pump(link, now);
         }
     }
 }
@@ -2282,6 +2361,60 @@ pub(crate) mod tests {
             assert_eq!(puller.records(flowing).len(), 100);
             assert!(puller.records(stalled).is_empty());
             assert!(puller.walks.pulls.is_empty());
+        }
+
+        /// Twenty record pulls on one connection, whose records walks would
+        /// each ask for 64 nodes at once, keep no more than
+        /// [`MAX_CONNECTION_WALK_REQUESTS`] requests in flight together, so
+        /// the responder answers every one and every pull completes.
+        #[test]
+        fn the_walks_on_one_connection_share_its_request_budget() {
+            let now = crate::clock::mono_now();
+            let mut puller = Node::new(20);
+            let mut responder = Node::new(21);
+            let collections = (0..20)
+                .map(|index| {
+                    let name = format!("budget {index}");
+                    let collection = puller.hold(&name, open());
+                    responder.hold(&name, open());
+                    for data in 0..100 {
+                        responder.commit(collection, data);
+                    }
+                    collection
+                })
+                .collect::<Vec<_>>();
+            responder.observe();
+            let mut wire = connect(&puller, &responder, 1);
+            for collection in &collections {
+                puller
+                    .walks
+                    .start_record_pull(&wire.to_right, *collection, now);
+            }
+            // Requests the responder got less answers the puller got. The
+            // carrier takes every queued request before the next answer, so
+            // its peak is the most the puller had in flight. Landing waits
+            // until the walks have asked for everything, which makes the
+            // test fast and changes nothing it counts.
+            let (mut in_flight, mut most) = (0_usize, 0);
+            let mut count = |frame: &WalkFrame| {
+                match frame.body {
+                    WalkBody::Request(_) => in_flight += 1,
+                    WalkBody::Response(_) => in_flight -= 1,
+                    WalkBody::End { by_puller, .. } => in_flight -= usize::from(!by_puller),
+                }
+                most = most.max(in_flight);
+                true
+            };
+            puller.hold = true;
+            carry_while(&mut puller, &mut responder, &mut wire, now, &mut count);
+            puller.release(now);
+            carry_while(&mut puller, &mut responder, &mut wire, now, &mut count);
+            assert!(most <= MAX_CONNECTION_WALK_REQUESTS, "{most} in flight");
+            assert_eq!(puller.done.len(), collections.len());
+            assert!(puller.done.iter().all(|done| done.completed));
+            for collection in collections {
+                assert_eq!(puller.records(collection).len(), 100);
+            }
         }
 
         /// A peer that asks faster than it reads finds no more than

@@ -61,6 +61,10 @@ pub(crate) const CONNECTION_IDLE_DEADLINE: Duration = Duration::from_secs(120);
 /// A `recon/1` writer that waited this long for stream credit resets the
 /// stream: the peer stopped reading it.
 pub(crate) const RECON_CREDIT_DEADLINE: Duration = Duration::from_secs(60);
+/// Frames a connection may hold queued, at most a 64 KiB frame each, before
+/// a request that arrives on it, a walk's or a peering's, goes unanswered: a
+/// peer that asks faster than it reads gets no more until it reads.
+pub(crate) const MAX_QUEUED_REPLIES: usize = 1024;
 /// A retired connection closes after this long without a frame once no
 /// request stream is in flight on it. The peer keeps using it only until it
 /// has seen the winner too.
