@@ -1,8 +1,9 @@
-//! Lost root announcements recover after a partition, beside a healthy replica.
+//! Pushes lost to a partition recover after it, beside a healthy replica.
 //!
 //! The three replicas are the roots of the collection's quorum, so each is a
 //! peering candidate of the others. A partition ends the peerings it cuts, and
-//! a replica asks again when its candidate order is drawn again.
+//! a replica asks again when its candidate order is drawn again; the new
+//! peering is pushed to at once.
 #![cfg(feature = "sim")]
 
 use std::sync::Arc;
@@ -95,7 +96,7 @@ async fn step(clock: &Arc<VirtualClock>, peers: &mut [&mut Peer<MemoryRepo>]) {
 }
 
 #[test]
-fn periodic_root_announcements_recover_a_healed_partition_beside_a_healthy_replica() {
+fn periodic_pushes_recover_a_healed_partition_beside_a_healthy_replica() {
     // This integration-test binary has one independent virtual timeline.
     let clock = VirtualClock::new(hifitime::Epoch::from_gregorian_utc_at_midnight(2026, 1, 1));
     clock::install_virtual(clock.clone()).expect("install virtual clock before any store use");
@@ -153,7 +154,7 @@ fn periodic_root_announcements_recover_a_healed_partition_beside_a_healthy_repli
         // a later A write only after C has it: the A-B cut stays closed.
         b_store.insert(original).unwrap();
         // An exact blob read will prove B's connection stays usable without
-        // making a new collection root or forcing a gratuitous repair pull.
+        // making a new collection root or forcing a gratuitous push.
         let control_bytes =
             Bytes::from_source(b"B remains reachable during A's partition".to_vec());
         let control = b_store
@@ -199,9 +200,9 @@ fn periodic_root_announcements_recover_a_healed_partition_beside_a_healthy_repli
             b"only A has this later record",
         );
         a.refresh();
-        // A's announcements of its changed root, while isolated, cannot cross
-        // either cut. There should be no blind repair request to
-        // manufacture an error for a root that C has not heard about.
+        // A's pushes of its changed root, while isolated, cannot cross either
+        // cut: its peerings ended with their connections, and nothing is
+        // pushed to a peer with no connection.
         for _ in 0..400 {
             step(&clock, &mut [&mut a, &mut b, &mut c]).await;
         }
@@ -244,9 +245,9 @@ fn periodic_root_announcements_recover_a_healed_partition_beside_a_healthy_repli
 
         // Healing SimNet only restores dialing. A's root does not change
         // again. A and C peer again when one of them draws its candidate
-        // order again, and A's announcement then rescues C while B remains
-        // healthy at R0. The A-B cut stays in place, preventing B from
-        // masking the direct recovery.
+        // order again, and A's push to the new peering then rescues C while
+        // B remains healthy at R0. The A-B cut stays in place, preventing B
+        // from masking the direct recovery.
         let healed_at = clock::mono_now();
         net.heal(a_id, c_id);
         let mut recovered = false;
@@ -257,10 +258,7 @@ fn periodic_root_announcements_recover_a_healed_partition_beside_a_healthy_repli
                 break;
             }
         }
-        assert!(
-            recovered,
-            "A's lost root announcement did not recover beside healthy B",
-        );
+        assert!(recovered, "A's lost push did not recover beside healthy B");
         assert!(clock::mono_now().duration_since(healed_at) <= Duration::from_secs(100));
         assert!(clock::mono_now().duration_since(cut_at) < Duration::from_secs(300));
         assert!(contains(&mut c, original));

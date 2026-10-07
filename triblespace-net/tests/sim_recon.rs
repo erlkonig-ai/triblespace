@@ -1,27 +1,28 @@
-//! The one `recon/1` stream of a connection, through whole hosts on the
-//! deterministic transport: 130 collections share it between two neighbours
-//! within the announcement estimate, and it takes none of the request permits
-//! blob streams wait for. When it ends the connection closes: a peer that
-//! stops reading it loses the connection, a neighbour whose stream ends comes
-//! back through a fresh dial, and a key that ends every stream is dialled no
-//! more than once per reshuffle interval. A peer that speaks `recon/1` by
-//! hand encodes its frames with [`Frame`], and walk requests by the frame
-//! table of `triblespace_net::walk`.
+//! The one `recon/1` stream of a connection and the `walk/1` streams beside
+//! it, through whole hosts on the deterministic transport: 130 collections
+//! converge both ways between two neighbours within the push estimate, a
+//! partition ends the peering and the push after it asks only for what was
+//! appended meanwhile, a receiver that already holds part of a tree from a
+//! third peer is pushed less, and `recon/1` takes none of the request
+//! permits blob streams
+//! wait for. When `recon/1` ends the connection closes: a peer that stops
+//! reading it loses the connection, a neighbour whose stream ends comes back
+//! through a fresh dial, and a key that ends every stream is dialled no more
+//! than once per reshuffle interval. A peer that speaks `recon/1` by hand
+//! encodes its frames with [`Frame`]; what crosses a tapped host's streams
+//! is counted by frame kind.
 #![cfg(feature = "sim")]
 
 use std::collections::{BTreeSet, HashMap};
 use std::io;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use anybytes::Bytes;
 use ed25519_dalek::SigningKey;
 use futures::FutureExt as _;
 use iroh_base::EndpointId;
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::clock::{self, VirtualClock};
 use triblespace_core::collection::selection::{CONFIG_COLLECTION_NAME, write_sync_selection};
@@ -32,15 +33,17 @@ use triblespace_core::collection::{
 };
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{BlobStorePut, SnapshotSource};
+use triblespace_net::health::PeerHealth;
 use triblespace_net::host::{self, PeerConfig};
 use triblespace_net::peer::Peer;
-use triblespace_net::protocol::{OP_FIND_VALUE, PILE_SYNC_ALPN, TAG_DHT, TAG_RECON};
-use triblespace_net::recon::{FRAME_OPEN, FRAME_WALK_REQUEST, Flags, Frame};
+use triblespace_net::protocol::{OP_FIND_VALUE, PILE_SYNC_ALPN, TAG_DHT, TAG_RECON, TAG_WALK};
+use triblespace_net::recon::{FRAME_OPEN, Flags, Frame};
 use triblespace_net::transport::sim::{
-    SimConfig, SimConn, SimNet, SimRecvStream, SimSendStream, SimTransport,
+    Crossed, SimConfig, SimConn, SimNet, SimRecvStream, SimSendStream, Taps,
 };
-use triblespace_net::transport::{
-    Alpn, Conn, Harness, Incoming, PeerId, RecvStream, SendStream, Transport,
+use triblespace_net::transport::{Conn, Harness, PeerId, RecvStream, SendStream, Transport};
+use triblespace_net::walk_stream::{
+    FRAME_LEAF, FRAME_OPEN as FRAME_WALK_OPEN, FRAME_VALUE_REQUEST,
 };
 
 fn key(byte: u8) -> SigningKey {
@@ -173,6 +176,50 @@ fn peered(peer: &Peer<MemoryRepo>, other: PeerId) -> bool {
         .any(|peering| peering.peer == other && peering.peered)
 }
 
+/// What `peer` recorded of its pushes to and receives from `other` for
+/// `collection`.
+fn pair(
+    peer: &Peer<MemoryRepo>,
+    collection: CollectionHandle,
+    other: PeerId,
+) -> Option<PeerHealth> {
+    peer.health()
+        .collections
+        .iter()
+        .find(|health| health.collection == collection)?
+        .peers
+        .iter()
+        .find(|pair| pair.peer == other)
+        .cloned()
+}
+
+fn records_of(peer: &mut Peer<MemoryRepo>, collection: CollectionHandle) -> usize {
+    peer.snapshot()
+        .unwrap()
+        .records()
+        .unwrap()
+        .filter(|record| record.as_ref().unwrap().collection() == collection)
+        .count()
+}
+
+/// The frames that crossed `taps` on walk streams to `peer` since the first
+/// `from`: those this side sent, and those it heard, by kind.
+fn walked(taps: &Taps, from: usize, peer: PeerId) -> (Vec<u8>, Vec<u8>) {
+    let crossed = taps.since(from, peer, TAG_WALK);
+    let kinds = |sent: bool| {
+        crossed
+            .iter()
+            .filter(|crossed: &&Crossed| crossed.sent == sent)
+            .map(|crossed| crossed.kind)
+            .collect::<Vec<_>>()
+    };
+    (kinds(true), kinds(false))
+}
+
+fn count(kinds: &[u8], kind: u8) -> usize {
+    kinds.iter().filter(|crossed| **crossed == kind).count()
+}
+
 /// One `recon/1` frame as written: kind, big-endian length, payload.
 fn encoded(kind: u8, payload: &[u8]) -> Vec<u8> {
     let mut frame = vec![kind];
@@ -184,22 +231,6 @@ fn encoded(kind: u8, payload: &[u8]) -> Vec<u8> {
 async fn send_frame(send: &mut SimSendStream, frame: &Frame) {
     let (kind, payload) = frame.encode();
     send.write_all(&encoded(kind, &payload)).await.unwrap();
-}
-
-/// A request of walk number 0 over the records of `collection`: to open it,
-/// or for the value under `key`.
-fn walk_request(collection: CollectionHandle, key: Option<[u8; 32]>) -> Vec<u8> {
-    let mut payload = collection.raw.to_vec();
-    // The records kind, then the walk number.
-    payload.extend([0, 0, 0]);
-    match key {
-        None => payload.push(0),
-        Some(key) => {
-            payload.push(2);
-            payload.extend(key);
-        }
-    }
-    encoded(FRAME_WALK_REQUEST, &payload)
 }
 
 /// Open `recon/1` on a connection this side dialled: its tag, and the
@@ -267,237 +298,20 @@ impl Frames {
     }
 }
 
-/// The announcements one node hears on `recon/1`: the stream each came on,
-/// numbered across the test, and its collection.
-type Heard = Arc<Mutex<Vec<(u64, CollectionHandle)>>>;
-
-static STREAMS: AtomicU64 = AtomicU64::new(0);
-
-/// A node's simulated transport, noting each announcement it receives.
-#[derive(Clone)]
-struct Tap {
-    inner: SimTransport,
-    heard: Heard,
-}
-
-impl Tap {
-    fn join(net: &SimNet, key: &SigningKey) -> (Harness<Tap>, Heard) {
-        let Harness {
-            transport,
-            mut incoming,
-        } = net.join(key);
-        let tap = Tap {
-            inner: transport,
-            heard: Heard::default(),
-        };
-        let (forward, accepted) = tokio::sync::mpsc::channel(1024);
-        let wrapping = tap.clone();
-        tokio::task::spawn_local(async move {
-            while let Some(Incoming { alpn, conn }) = incoming.recv().await {
-                let conn = wrapping.conn(conn);
-                if forward.send(Incoming { alpn, conn }).await.is_err() {
-                    return;
-                }
-            }
-        });
-        let heard = tap.heard.clone();
-        let harness = Harness {
-            transport: tap,
-            incoming: accepted,
-        };
-        (harness, heard)
-    }
-
-    fn conn(&self, inner: SimConn) -> TapConn {
-        TapConn {
-            inner,
-            heard: self.heard.clone(),
-        }
-    }
-}
-
-impl Transport for Tap {
-    type Conn = TapConn;
-
-    fn local_id(&self) -> PeerId {
-        self.inner.local_id()
-    }
-
-    async fn dial(&self, peer: PeerId, alpn: Alpn) -> anyhow::Result<TapConn> {
-        Ok(self.conn(self.inner.dial(peer, alpn).await?))
-    }
-
-    async fn shutdown(&self) {
-        self.inner.shutdown().await
-    }
-}
-
-#[derive(Clone)]
-struct TapConn {
-    inner: SimConn,
-    heard: Heard,
-}
-
-impl Conn for TapConn {
-    type SendHalf = TapSend;
-    type RecvHalf = TapRecv;
-
-    fn remote_id(&self) -> PeerId {
-        self.inner.remote_id()
-    }
-
-    async fn open_bi(&self) -> anyhow::Result<(TapSend, TapRecv)> {
-        let (send, recv) = self.inner.open_bi().await?;
-        let tag = Arc::new(OnceLock::new());
-        let recv = TapRecv::new(recv, Some(tag.clone()), &self.heard);
-        Ok((TapSend { inner: send, tag }, recv))
-    }
-
-    async fn accept_bi(&self) -> Option<(TapSend, TapRecv)> {
-        let (send, recv) = self.inner.accept_bi().await?;
-        let tag = Arc::new(OnceLock::new());
-        Some((
-            TapSend { inner: send, tag },
-            TapRecv::new(recv, None, &self.heard),
-        ))
-    }
-
-    fn close(&self, code: u32, reason: &[u8]) {
-        self.inner.close(code, reason)
-    }
-}
-
-/// A sending half. On a stream this side opened, its first byte is the tag.
-struct TapSend {
-    inner: SimSendStream,
-    tag: Arc<OnceLock<u8>>,
-}
-
-impl AsyncWrite for TapSend {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        if let Some(first) = buf.first() {
-            let _ = this.tag.set(*first);
-        }
-        Pin::new(&mut this.inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
-    }
-}
-
-impl SendStream for TapSend {
-    fn reset(&mut self, code: u32) {
-        self.inner.reset(code)
-    }
-}
-
-/// A receiving half that parses the frames of a `recon/1` stream as they
-/// are read.
-struct TapRecv {
-    inner: SimRecvStream,
-    /// The tag this side wrote, on a stream it opened; on an accepted one the
-    /// tag is the first byte read.
-    opened: Option<Arc<OnceLock<u8>>>,
-    /// Whether the stream is `recon/1`, once its tag is known.
-    recon: Option<bool>,
-    stream: u64,
-    read: Vec<u8>,
-    heard: Heard,
-}
-
-impl TapRecv {
-    fn new(inner: SimRecvStream, opened: Option<Arc<OnceLock<u8>>>, heard: &Heard) -> Self {
-        Self {
-            inner,
-            opened,
-            recon: None,
-            stream: STREAMS.fetch_add(1, Ordering::Relaxed),
-            read: Vec::new(),
-            heard: heard.clone(),
-        }
-    }
-
-    fn parse(&mut self, mut bytes: &[u8]) {
-        if self.recon.is_none() {
-            let tag = match &self.opened {
-                Some(tag) => tag.get().copied(),
-                None => {
-                    let Some((&tag, rest)) = bytes.split_first() else {
-                        return;
-                    };
-                    bytes = rest;
-                    Some(tag)
-                }
-            };
-            self.recon = Some(tag == Some(TAG_RECON));
-        }
-        if self.recon != Some(true) {
-            return;
-        }
-        self.read.extend_from_slice(bytes);
-        while let Some(length) = self.read.get(1..5) {
-            let length = 5 + u32::from_be_bytes(length.try_into().unwrap()) as usize;
-            if self.read.len() < length {
-                break;
-            }
-            let frame = self.read.drain(..length).collect::<Vec<_>>();
-            if let Ok(Some(Frame::Announce { collection, .. })) =
-                Frame::decode(frame[0], &frame[5..])
-            {
-                self.heard.lock().unwrap().push((self.stream, collection));
-            }
-        }
-    }
-}
-
-impl AsyncRead for TapRecv {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        let before = buf.filled().len();
-        let polled = Pin::new(&mut this.inner).poll_read(cx, buf);
-        if let Poll::Ready(Ok(())) = polled {
-            this.parse(&buf.filled()[before..]);
-        }
-        polled
-    }
-}
-
-impl RecvStream for TapRecv {
-    fn stop(&mut self, code: u32) {
-        self.inner.stop(code)
-    }
-}
-
-/// 130 collections share the one `recon/1` between two neighbours, and their
-/// announcements stay within the design's estimate (section 6: 130
-/// collections, ten neighbours each, the 60 s cap: about 22 per second).
-/// Each side counts the announcements it hears on the wire. After the first
-/// pull of each collection both sides hold equal records, so every later
-/// announcement is a periodic one, and one heard equal suppresses the next
-/// one to its sender.
+/// 130 collections, each with a record on either side, converge both ways
+/// between two neighbours on one connection, and the pushes that follow
+/// stay within the design's estimate (section 6: 130 collections, ten
+/// neighbours each, the 60 s cap: about 22 roots per second, which is two
+/// `walk/1` streams per root here, one per tree). Each side counts the walk
+/// streams it opens on the wire. After the first push of each collection
+/// both sides hold equal records, so every later push is a periodic one of
+/// the confirmed root: ROOT then DONE, answered with LANDED.
 ///
 /// The rate is per node and per neighbour, over 20 quiet minutes of virtual
 /// time on the simulated transport, scaled by ten to compare with the
-/// estimate; the assertion message prints it. One run heard 2598 in 20
-/// minutes, 1.08 per second per node and neighbour: one per collection and
-/// minute between the two, 10.8 at ten neighbours against the estimate's
-/// 21.7.
+/// estimate; the assertion message prints it.
 #[test]
-fn one_hundred_thirty_collections_share_one_recon_within_the_announcement_estimate() {
+fn one_hundred_thirty_collections_converge_both_ways_within_the_push_estimate() {
     const COLLECTIONS: usize = 130;
     const WINDOW: u64 = 20 * 60;
     run(async |clock| {
@@ -509,21 +323,25 @@ fn one_hundred_thirty_collections_share_one_recon_within_the_announcement_estima
         let mut collections = Vec::new();
         for index in 0..COLLECTIONS {
             let name = format!("collection {index}");
-            let collection = hold(&mut owner_store, &name, &[&owner_key]);
-            assert_eq!(hold(&mut reader_store, &name, &[&owner_key]), collection);
+            let collection = hold(&mut owner_store, &name, &[&owner_key, &reader_key]);
+            assert_eq!(
+                hold(&mut reader_store, &name, &[&owner_key, &reader_key]),
+                collection
+            );
             commit(&mut owner_store, &owner_key, collection, name.as_bytes());
+            commit(&mut reader_store, &reader_key, collection, name.as_bytes());
             select(&mut owner_store, &owner_key, collection);
             select(&mut reader_store, &reader_key, collection);
             collections.push(collection);
         }
-        let (harness, heard_by_owner) = Tap::join(&net, &owner_key);
+        let (harness, owner_taps) = net.tap(&owner_key);
         let mut owner = bring_up(harness, &owner_key, owner_store);
-        let (harness, heard_by_reader) = Tap::join(&net, &reader_key);
+        let (harness, reader_taps) = net.tap(&reader_key);
         let mut reader = bring_up(harness, &reader_key, reader_store);
         owner.activate_collections(collections.iter().copied());
         reader.activate_collections(collections.iter().copied());
 
-        // The owner, which may write each collection, is the reader's one
+        // Each may write every collection, so each is the other's one
         // candidate for all of them, and they peer on one connection.
         advance(&clock, &mut [&mut owner, &mut reader], 300).await;
         for peer in [&owner, &reader] {
@@ -535,51 +353,223 @@ fn one_hundred_thirty_collections_share_one_recon_within_the_announcement_estima
                 .count();
             assert_eq!(peered, COLLECTIONS);
         }
-        let pulled = reader
-            .snapshot()
-            .unwrap()
-            .records()
-            .unwrap()
-            .filter(|record| collections.contains(&record.as_ref().unwrap().collection()))
-            .count();
-        assert_eq!(pulled, COLLECTIONS);
+        for peer in [&mut owner, &mut reader] {
+            for collection in &collections {
+                assert_eq!(records_of(peer, *collection), 2);
+            }
+        }
         let (owner_id, reader_id) = (id(&owner_key), id(&reader_key));
+        for (peer, other) in [(&owner, reader_id), (&reader, owner_id)] {
+            for collection in &collections {
+                let pair = pair(peer, *collection, other).unwrap();
+                assert!(pair.pushes.last_ok && pair.receives.last_ok, "{pair:?}");
+            }
+        }
+        let dials = (
+            net.dial_count(reader_id, owner_id),
+            net.dial_count(owner_id, reader_id),
+        );
+        assert!(dials.0 + dials.1 >= 1, "{dials:?}");
+
+        let from = [&owner_taps, &reader_taps].map(Taps::len);
+        advance(&clock, &mut [&mut owner, &mut reader], WINDOW).await;
+        let mut opened = 0;
+        let mut values = 0;
+        for ((taps, from), other) in [(&owner_taps, from[0]), (&reader_taps, from[1])]
+            .into_iter()
+            .zip([reader_id, owner_id])
+        {
+            let (sent, heard) = walked(taps, from, other);
+            opened += count(&sent, FRAME_WALK_OPEN);
+            values += count(&heard, FRAME_VALUE_REQUEST);
+        }
+        assert_eq!(values, 0, "a quiet pair pushed values");
         assert_eq!(
             (
                 net.dial_count(reader_id, owner_id),
                 net.dial_count(owner_id, reader_id)
             ),
-            (1, 0)
+            dials
         );
-
-        let from = [&heard_by_owner, &heard_by_reader].map(|heard| heard.lock().unwrap().len());
-        advance(&clock, &mut [&mut owner, &mut reader], WINDOW).await;
-        let mut announced = BTreeSet::new();
-        let mut heard = 0;
-        for (side, from) in [&heard_by_owner, &heard_by_reader].into_iter().zip(from) {
-            let side = &side.lock().unwrap()[from..];
-            let streams = side
-                .iter()
-                .map(|(stream, _)| stream)
-                .collect::<BTreeSet<_>>();
-            assert_eq!(streams.len(), 1, "announcements came on several streams");
-            announced.extend(side.iter().map(|(_, collection)| collection.raw));
-            heard += side.len();
-        }
-        assert_eq!(announced.len(), COLLECTIONS);
-        let per_neighbour = heard as f64 / 2.0 / WINDOW as f64;
-        let estimate = COLLECTIONS as f64 * 10.0 / 60.0;
+        let per_neighbour = opened as f64 / 2.0 / WINDOW as f64;
+        let estimate = COLLECTIONS as f64 * 10.0 / 60.0 * 2.0;
         assert!(
-            per_neighbour * 10.0 <= estimate,
-            "{heard} announcements in {WINDOW} s: {per_neighbour:.2} per second per node and \
+            per_neighbour * 10.0 <= estimate * 1.1,
+            "{opened} walk streams in {WINDOW} s: {per_neighbour:.2} per second per node and \
              neighbour, {:.1} at ten neighbours against the estimate of {estimate:.1}",
             per_neighbour * 10.0,
         );
         println!(
-            "{heard} announcements in {WINDOW} s: {per_neighbour:.2} per second per node and \
+            "{opened} walk streams in {WINDOW} s: {per_neighbour:.2} per second per node and \
              neighbour, {:.1} at ten neighbours against the estimate of {estimate:.1}",
             per_neighbour * 10.0,
         );
+    });
+}
+
+/// A partition ends the peering with its connection, and nothing is pushed
+/// to a peer without one: the confirmed root stays as the last landed push
+/// left it, with no failed push. Records appended meanwhile go out when the
+/// pair peers again after the heal, and that push asks only for them: the
+/// receiver's HELD prunes everything it landed before.
+#[test]
+fn a_partition_ends_the_peering_and_the_push_after_the_heal_asks_only_for_what_was_appended() {
+    const BEFORE: usize = 400;
+    const APPENDED: usize = 100;
+    run(async |clock| {
+        let net = SimNet::new(0x5EC0_0008, SimConfig::default());
+        let owner_key = key(60);
+        let reader_key = key(61);
+        let (owner_id, reader_id) = (id(&owner_key), id(&reader_key));
+        let mut owner_store = MemoryRepo::default();
+        let mut reader_store = MemoryRepo::default();
+        let collection = hold(&mut owner_store, "cut", &[&owner_key]);
+        assert_eq!(hold(&mut reader_store, "cut", &[&owner_key]), collection);
+        for index in 0..BEFORE {
+            commit(
+                &mut owner_store,
+                &owner_key,
+                collection,
+                &(index as u64).to_be_bytes(),
+            );
+        }
+        select(&mut owner_store, &owner_key, collection);
+        select(&mut reader_store, &reader_key, collection);
+        let (harness, taps) = net.tap(&owner_key);
+        let mut owner = bring_up(harness, &owner_key, owner_store);
+        let mut reader = bring_up(net.join(&reader_key), &reader_key, reader_store);
+        owner.activate_collection(collection);
+        reader.activate_collection(collection);
+        until(
+            &clock,
+            &mut [&mut owner, &mut reader],
+            120,
+            "the records",
+            |peers| (records_of(peers[1], collection) == BEFORE).then_some(()),
+        )
+        .await;
+        advance(&clock, &mut [&mut owner, &mut reader], 5).await;
+        let confirmed = pair(&owner, collection, reader_id).unwrap();
+        assert!(confirmed.pushes.last_ok, "{confirmed:?}");
+        let (sent, heard) = walked(&taps, 0, reader_id);
+        assert_eq!(count(&heard, FRAME_VALUE_REQUEST), BEFORE);
+        assert_eq!(count(&sent, FRAME_LEAF), BEFORE);
+
+        // Cut, and appended while cut: no push runs, none fails.
+        net.partition(owner_id, reader_id);
+        advance(&clock, &mut [&mut owner, &mut reader], 10).await;
+        assert!(!peered(&owner, reader_id));
+        for index in BEFORE..BEFORE + APPENDED {
+            commit(
+                &mut *owner.store(),
+                &owner_key,
+                collection,
+                &(index as u64).to_be_bytes(),
+            );
+        }
+        owner.refresh();
+        advance(&clock, &mut [&mut owner, &mut reader], 70).await;
+        let cut = pair(&owner, collection, reader_id).unwrap();
+        assert_eq!(
+            cut.pushes, confirmed.pushes,
+            "a push ran without a connection"
+        );
+        assert_eq!(cut.confirmed, confirmed.confirmed);
+        assert_eq!(records_of(&mut reader, collection), BEFORE);
+
+        // Healed, the pair peers again at the next draw, and the push that
+        // follows asks only for what was appended.
+        let from = taps.len();
+        net.heal(owner_id, reader_id);
+        until(
+            &clock,
+            &mut [&mut owner, &mut reader],
+            200,
+            "the rest",
+            |peers| (records_of(peers[1], collection) == BEFORE + APPENDED).then_some(()),
+        )
+        .await;
+        advance(&clock, &mut [&mut owner, &mut reader], 5).await;
+        let (sent, heard) = walked(&taps, from, reader_id);
+        assert_eq!(count(&heard, FRAME_VALUE_REQUEST), APPENDED);
+        assert!(count(&sent, FRAME_LEAF) < BEFORE + APPENDED);
+        let healed = pair(&owner, collection, reader_id).unwrap();
+        assert!(healed.pushes.last_ok && healed.pushes.ok > confirmed.pushes.ok);
+        assert_eq!(healed.pushes.failed, 0);
+        assert_ne!(healed.confirmed.records, confirmed.confirmed.records);
+        println!(
+            "the first push asked for {BEFORE} values; after the partition the next asked for \
+             {APPENDED}"
+        );
+    });
+}
+
+/// Three roots of one collection. Y holds three hundred records and X those
+/// and three hundred more; Z holds nothing and reaches Y first, which
+/// pushes it Y's three hundred. When Z then peers with X, X's push is pruned
+/// by what Z already holds: Z asks for exactly X's own three hundred, and
+/// fewer leaves than the whole tree cross.
+#[test]
+fn a_receiver_holding_a_subtree_from_a_third_peer_prunes_it() {
+    run(async |clock| {
+        let net = SimNet::new(0x5EC0_0009, SimConfig::default());
+        let [x_key, y_key, z_key] = [70, 71, 72].map(key);
+        let [x_id, y_id, z_id] = [&x_key, &y_key, &z_key].map(id);
+        let roots = [&x_key, &y_key, &z_key];
+        let mut x_store = MemoryRepo::default();
+        let mut y_store = MemoryRepo::default();
+        let mut z_store = MemoryRepo::default();
+        let collection = hold(&mut x_store, "shared", &roots);
+        assert_eq!(hold(&mut y_store, "shared", &roots), collection);
+        assert_eq!(hold(&mut z_store, "shared", &roots), collection);
+        let shared = (0..300_u64)
+            .map(|index| commit(&mut y_store, &y_key, collection, &index.to_be_bytes()))
+            .collect::<Vec<_>>();
+        for record in &shared {
+            x_store.insert(*record).unwrap();
+        }
+        for index in 300..600_u64 {
+            commit(&mut x_store, &x_key, collection, &index.to_be_bytes());
+        }
+        select(&mut x_store, &x_key, collection);
+        select(&mut y_store, &y_key, collection);
+        select(&mut z_store, &z_key, collection);
+        // Z reaches Y alone; X reaches nobody until the cuts heal.
+        net.partition(x_id, z_id);
+        net.partition(x_id, y_id);
+        let (harness, taps) = net.tap(&x_key);
+        let mut x = bring_up(harness, &x_key, x_store);
+        let mut y = bring_up(net.join(&y_key), &y_key, y_store);
+        let mut z = bring_up(net.join(&z_key), &z_key, z_store);
+        for host in [&mut x, &mut y, &mut z] {
+            host.activate_collection(collection);
+        }
+        until(
+            &clock,
+            &mut [&mut x, &mut y, &mut z],
+            60,
+            "Y's records at Z",
+            |peers| (records_of(peers[2], collection) == 300).then_some(()),
+        )
+        .await;
+        assert_eq!(records_of(&mut x, collection), 600);
+        assert!(taps.since(0, z_id, TAG_WALK).is_empty());
+
+        net.heal(x_id, z_id);
+        until(
+            &clock,
+            &mut [&mut x, &mut y, &mut z],
+            200,
+            "X's records at Z",
+            |peers| (records_of(peers[2], collection) == 600).then_some(()),
+        )
+        .await;
+        advance(&clock, &mut [&mut x, &mut y, &mut z], 5).await;
+        let (sent, heard) = walked(&taps, 0, z_id);
+        assert_eq!(count(&heard, FRAME_VALUE_REQUEST), 300);
+        let leaves = count(&sent, FRAME_LEAF);
+        assert!((300..600).contains(&leaves), "{leaves} leaves crossed");
+        println!("X pushed {leaves} leaves to Z, which asked for 300 values");
     });
 }
 
@@ -677,11 +667,11 @@ fn seventeen_neighbours_hold_recon_while_blob_streams_run() {
 }
 
 /// A peer that stops reading `recon/1` loses its connection. It peers with a
-/// host for a collection and then asks for the collection's one record
-/// thousands of times over, a thousand a second, reading nothing more: fewer
-/// at a time than the host leaves unanswered. The answers fill the stream's
-/// credit, and the 60 s a writer waits for credit later the host closes the
-/// connection, which ends the peering.
+/// host for a collection and then asks to peer for a collection the host
+/// does not hold, thousands of times over, a thousand a second, reading
+/// nothing more: fewer at a time than the host leaves unanswered. The
+/// refusals fill the stream's credit, and the 60 s a writer waits for credit
+/// later the host closes the connection, which ends the peering.
 #[test]
 fn a_peer_that_stops_reading_recon_loses_its_connection() {
     run(async |clock| {
@@ -690,12 +680,6 @@ fn a_peer_that_stops_reading_recon_loses_its_connection() {
         let host_id = id(&host_key);
         let mut store = MemoryRepo::default();
         let collection = hold(&mut store, "stalled", &[&host_key]);
-        let record = commit(
-            &mut store,
-            &host_key,
-            collection,
-            b"asked for over and over",
-        );
         select(&mut store, &host_key, collection);
         let mut host = bring_up(net.join(&host_key), &host_key, store);
         host.activate_collection(collection);
@@ -723,18 +707,22 @@ fn a_peer_that_stops_reading_recon_loses_its_connection() {
         .await;
         assert!(peered(&peers[0], reader_id));
 
-        send.write_all(&walk_request(collection, None))
-            .await
-            .unwrap();
-        let request = walk_request(collection, Some(record.fingerprint().raw()));
-        for _ in 0..12 {
+        let (kind, payload) = Frame::PeerRequest {
+            collection: CollectionHandle::new([0xEE; 32]),
+            flags: Flags::default(),
+            invitation: false,
+            credentials: Vec::new(),
+        }
+        .encode();
+        let request = encoded(kind, &payload);
+        for _ in 0..40 {
             send.write_all(&request.repeat(1000)).await.unwrap();
             advance(&clock, peers, 1).await;
         }
-        assert!(conn.accept_bi().now_or_never().is_none(), "closed early");
+        assert!(!closed(&conn), "closed early");
         // Past the 60 s a writer waits for credit.
         advance(&clock, peers, 70).await;
-        assert!(conn.accept_bi().now_or_never().unwrap().is_none());
+        assert!(closed(&conn));
         let closed = frames.next().now_or_never().unwrap().unwrap_err();
         assert!(closed.to_string().contains("connection reset"), "{closed}");
         assert!(
@@ -746,6 +734,18 @@ fn a_peer_that_stops_reading_recon_loses_its_connection() {
             "the peering outlived its connection"
         );
     });
+}
+
+/// Whether `conn` has closed, taking the streams the host opens on it, its
+/// pushes, as they come: a stream that arrives is not a close.
+fn closed(conn: &SimConn) -> bool {
+    loop {
+        match conn.accept_bi().now_or_never() {
+            None => return false,
+            Some(None) => return true,
+            Some(Some(_)) => {}
+        }
+    }
 }
 
 /// A key driven by hand. It numbers the connections it accepts, from one,

@@ -857,7 +857,7 @@ fn a_healed_partition_recovers_without_dht_or_restart() {
         server.refresh();
 
         // The partition ends the peering with its connection, and the
-        // server's announcement is lost while it stays closed.
+        // server's push is lost while it stays closed.
         advance(&clock, &mut [&mut server, &mut reader], 40).await;
         assert_eq!(
             records_of(&reader.snapshot().unwrap(), collection.handle()),

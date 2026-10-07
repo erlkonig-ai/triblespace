@@ -68,24 +68,13 @@ fn restart_health(phase: &str, peers: &[(&str, &Peer<MemoryRepo>)]) {
             );
             for remote in &collection.peers {
                 eprintln!(
-                    "    peer={} in_flight={} first_started={:?} started={:?} completed={:?} failure_at={:?} failure={:?} progress={:?} remote_change={:?} comparison={:?}",
+                    "    peer={} first={:?} pushes={:?} confirmed={:?} receives={:?} received={:?}",
                     hex::encode(remote.peer),
-                    remote.in_flight,
-                    remote.first_started_at,
-                    remote.last_started_at,
-                    remote.last_completed_at,
-                    remote.last_failure_at,
-                    remote.last_failure,
-                    remote.last_progress_at,
-                    remote.last_remote_change_at,
-                    remote.comparison.map(|comparison| (
-                        comparison.observed_at,
-                        hex::encode(comparison.local.wake_root),
-                        hex::encode(comparison.remote.wake_root),
-                        comparison.records_received,
-                        comparison.proofs_received,
-                        comparison.more,
-                    )),
+                    remote.first_at,
+                    remote.pushes,
+                    remote.confirmed,
+                    remote.receives,
+                    remote.received,
                 );
             }
         }
@@ -144,7 +133,7 @@ async fn bring_up_owned(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_announced_record_is_repaired_promptly() {
+async fn an_appended_record_is_pushed_promptly() {
     init_tracing();
     let network = TestNetwork::new();
     let server_key = key(0xA1);
@@ -211,10 +200,7 @@ async fn an_announced_record_is_repaired_promptly() {
         }
     })
     .await;
-    assert!(
-        repaired.is_ok(),
-        "the server's announcement did not start a pull"
-    );
+    assert!(repaired.is_ok(), "the server's push did not land");
 
     drop((server.into_store(), reader.into_store()));
 }

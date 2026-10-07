@@ -1,7 +1,9 @@
 //! Per-collection peering through whole hosts over the deterministic
-//! transport: a host peers for a collection only while its pile selects it,
-//! a writer that cannot read delivers without receiving, and neighbour groups
-//! split by a partition merge at a swap once it heals.
+//! transport: a host peers for a collection only while its pile selects it
+//! and is pushed to within two minimum intervals of peering, a local append
+//! goes out within the timer, a writer that cannot read delivers without
+//! receiving, and neighbour groups split by a partition merge at a swap once
+//! it heals.
 #![cfg(feature = "sim")]
 
 use std::sync::{Arc, Mutex, OnceLock};
@@ -28,7 +30,7 @@ use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{
     BlobStoreGet, BlobStorePut, CapabilityProofRead, CapabilityProofStore, SnapshotSource,
 };
-use triblespace_net::health::{PeeringHealth, RepairHealth};
+use triblespace_net::health::{PeerHealth, PeeringHealth};
 use triblespace_net::host::{self, PeerConfig};
 use triblespace_net::peer::Peer;
 use triblespace_net::reconcile::ReplicationMode;
@@ -147,6 +149,27 @@ async fn advance(clock: &Arc<VirtualClock>, peers: &mut [&mut Peer<MemoryRepo>],
     }
 }
 
+/// Step until `done`, for at most `seconds`; how long it took.
+async fn until(
+    clock: &Arc<VirtualClock>,
+    peers: &mut [&mut Peer<MemoryRepo>],
+    seconds: u64,
+    what: &str,
+    mut done: impl FnMut(&mut [&mut Peer<MemoryRepo>]) -> bool,
+) -> Duration {
+    let started = clock::mono_now();
+    for _ in 0..seconds * 10 {
+        if done(peers) {
+            return clock::mono_now().duration_since(started);
+        }
+        SimNet::step(clock, Duration::from_millis(100)).await;
+        for peer in peers.iter_mut() {
+            peer.refresh();
+        }
+    }
+    panic!("no {what} within {seconds} s");
+}
+
 fn peerings(peer: &Peer<MemoryRepo>) -> Vec<PeeringHealth> {
     peer.health().peerings.clone()
 }
@@ -195,19 +218,20 @@ fn holds(peer: &mut Peer<MemoryRepo>, record: CollectionRecord) -> bool {
         .any(|held| held.unwrap() == record)
 }
 
-/// What `peer` recorded of its record pulls of `collection` from `from`.
-fn pulls(
+/// What `peer` recorded of its pushes to and receives from `other` for
+/// `collection`.
+fn pair(
     peer: &Peer<MemoryRepo>,
     collection: CollectionHandle,
-    from: [u8; 32],
-) -> Option<RepairHealth> {
+    other: [u8; 32],
+) -> Option<PeerHealth> {
     peer.health()
         .collections
         .iter()
         .find(|health| health.collection == collection)?
         .peers
         .iter()
-        .find(|pulls| pulls.peer == from)
+        .find(|pair| pair.peer == other)
         .cloned()
 }
 
@@ -233,12 +257,19 @@ fn a_host_peers_for_a_collection_only_while_its_pile_selects_it() {
             reader_key.verifying_key().to_bytes(),
         );
         let reader_config = reader_pile.config;
+        let owned = commit(
+            &mut owner_pile.store,
+            &owner_key,
+            collection,
+            b"the owner's",
+        );
         let mut owner = bring_up(&net, &owner_key, owner_pile.store);
         let mut reader = bring_up(&net, &reader_key, reader_pile.store);
         owner.activate_collection(collection);
         reader.activate_collection(collection);
 
-        // The reader holds C but has not selected it, so it refuses.
+        // The reader holds C but has not selected it, so it refuses, and
+        // nothing is pushed to it.
         advance(&clock, &mut [&mut owner, &mut reader], 5).await;
         let refused = peerings(&owner);
         assert_eq!(refused.len(), 1, "{refused:?}");
@@ -246,9 +277,12 @@ fn a_host_peers_for_a_collection_only_while_its_pile_selects_it() {
         let refusing = peerings(&reader);
         assert_eq!(refusing.len(), 1, "{refusing:?}");
         assert!(refusing[0].peer == owner_id && refusing[0].refused_by_me);
+        assert!(!holds(&mut reader, owned));
+        assert!(pair(&owner, collection, reader_id).is_none());
 
         // Selecting it invites the owner over the connection the refusal
-        // left open.
+        // left open, and the new peering is pushed to within two minimum
+        // intervals.
         write_sync_selection(
             &mut *reader.store(),
             reader_config,
@@ -258,27 +292,92 @@ fn a_host_peers_for_a_collection_only_while_its_pile_selects_it() {
         )
         .unwrap();
         reader.refresh();
-        advance(&clock, &mut [&mut owner, &mut reader], 5).await;
-        for (peer, other) in [(&owner, reader_id), (&reader, owner_id)] {
-            let peered = peerings(peer);
-            assert_eq!(peered.len(), 1, "{peered:?}");
-            let peering = peered[0];
-            assert!(peering.peer == other && peering.collection == collection);
-            assert!(
-                peering.peered && peering.sends && peering.receives,
-                "{peering:?}"
-            );
-        }
+        let peered = |peer: &Peer<MemoryRepo>, other| {
+            peerings(peer).iter().any(|peering| {
+                peering.peer == other
+                    && peering.collection == collection
+                    && peering.peered
+                    && peering.sends
+                    && peering.receives
+            })
+        };
+        until(
+            &clock,
+            &mut [&mut owner, &mut reader],
+            10,
+            "peering",
+            |peers| peered(peers[0], reader_id) && peered(peers[1], owner_id),
+        )
+        .await;
+        let pushed = until(
+            &clock,
+            &mut [&mut owner, &mut reader],
+            10,
+            "the owner's record",
+            |peers| holds(peers[1], owned),
+        )
+        .await;
+        assert!(pushed <= Duration::from_secs(4), "{pushed:?}");
+        let confirmed = pair(&owner, collection, reader_id).unwrap();
+        assert!(confirmed.pushes.last_ok && confirmed.confirmed.records.is_some());
         assert_eq!(net.dial_count(reader_id, owner_id), 0);
         assert_eq!(net.dial_count(owner_id, reader_id), 1);
     }));
 }
 
-/// Two hosts peer for a collection neither changes, so only announcements
-/// cross their connection. They keep it open far past the 120-second idle
-/// deadline: nobody dials again.
+/// Two quiet hosts peered for a collection reach the timer's sixty-second
+/// cap. An append at the owner then resets its timer, and the reader holds
+/// the record within two minimum intervals.
 #[test]
-fn announcements_alone_keep_a_peered_connection_open() {
+fn a_local_append_reaches_the_peer_within_the_timer() {
+    let _guard = test_guard();
+    let clock = virtual_clock();
+    clock.reset();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    runtime.block_on(tokio::task::LocalSet::new().run_until(async {
+        let net = SimNet::new(0x9EE7_1007, SimConfig::default());
+        let owner_key = key(106);
+        let reader_key = key(107);
+        let (mut owner_pile, mut reader_pile) = granted_pair(&owner_key, &reader_key);
+        let collection = owner_pile.collection;
+        select(&mut owner_pile);
+        select(&mut reader_pile);
+        let reader_id = reader_key.verifying_key().to_bytes();
+        let mut owner = bring_up(&net, &owner_key, owner_pile.store);
+        let mut reader = bring_up(&net, &reader_key, reader_pile.store);
+        owner.activate_collection(collection);
+        reader.activate_collection(collection);
+        // Quiet long enough for the timer to reach its cap.
+        advance(&clock, &mut [&mut owner, &mut reader], 200).await;
+        let before = pair(&owner, collection, reader_id).unwrap();
+        assert!(before.pushes.last_ok, "{before:?}");
+
+        let appended = commit(&mut *owner.store(), &owner_key, collection, b"appended");
+        owner.refresh();
+        let landed = until(
+            &clock,
+            &mut [&mut owner, &mut reader],
+            10,
+            "the appended record",
+            |peers| holds(peers[1], appended),
+        )
+        .await;
+        assert!(landed <= Duration::from_secs(4), "{landed:?}");
+        let after = pair(&owner, collection, reader_id).unwrap();
+        assert!(after.pushes.ok > before.pushes.ok);
+        assert_ne!(after.confirmed.records, before.confirmed.records);
+    }));
+}
+
+/// Two hosts peer for a collection neither changes, so only pushes of the
+/// confirmed roots cross their connection. They keep it open far past the
+/// 120-second idle deadline: nobody dials again.
+#[test]
+fn pushes_alone_keep_a_peered_connection_open() {
     let _guard = test_guard();
     let clock = virtual_clock();
     clock.reset();
@@ -320,6 +419,14 @@ fn announcements_alone_keep_a_peered_connection_open() {
         advance(&clock, &mut [&mut owner, &mut reader], 300).await;
         assert!(peered(&owner) && peered(&reader));
         assert_eq!(dials(), settled);
+        for (peer, other) in [(&owner, reader_id), (&reader, owner_id)] {
+            let pair = pair(peer, collection, other).unwrap();
+            assert!(pair.pushes.ok >= 5 && pair.pushes.failed == 0, "{pair:?}");
+            assert!(
+                pair.receives.ok >= 5 && pair.receives.failed == 0,
+                "{pair:?}"
+            );
+        }
     }));
 }
 
@@ -384,15 +491,15 @@ fn held_blobs_after_peering(reader_full: bool) -> [bool; 2] {
 }
 
 /// Astra's R1 through whole hosts: two Full hosts with equal records and
-/// different blobs held in a collection announce their held digests, pull
-/// each other's references over `blob/1`, and both hold the union.
+/// different blobs held in a collection push their references trees to each
+/// other, fetch the blobs over `blob/1`, and both hold the union.
 #[test]
 fn full_hosts_with_equal_records_converge_on_their_held_blobs() {
     assert_eq!(held_blobs_after_peering(true), [true, true]);
 }
 
-/// A Demand host neither sends nor receives a held digest, so neither side
-/// pulls the other's references: only Full neighbours compare held sets.
+/// A Demand host is pushed no references tree and pushes none, so neither
+/// side fetches the other's blobs: only Full neighbours share held sets.
 #[test]
 fn a_demand_host_and_a_full_host_compare_no_held_blobs() {
     assert_eq!(held_blobs_after_peering(false), [false, false]);
@@ -400,13 +507,12 @@ fn a_demand_host_and_a_full_host_compare_no_held_blobs() {
 
 /// Astra's R3 through whole hosts. A writer that cannot read asks the
 /// collection's owner to peer with its send flag set, presenting its WRITE
-/// grant. The owner accepts without sending: it pulls the writer's record and
-/// grant and sends nothing back. The owner keeps a record of its own, so the
-/// two roots stay different, and every later announcement of the writer's
-/// unchanged root equals the last pull from it that completed: it starts no
-/// second walk.
+/// grant. The owner accepts without sending: the writer's pushes land its
+/// record and grant, and the owner starts no push back, so its confirmed
+/// root for the writer stays empty and the writer holds nothing of the
+/// owner's, however long the peering stands.
 #[test]
-fn a_writer_that_cannot_read_delivers_receives_nothing_and_walks_once() {
+fn a_writer_that_cannot_read_delivers_and_receives_nothing() {
     let _guard = test_guard();
     let clock = virtual_clock();
     clock.reset();
@@ -472,19 +578,24 @@ fn a_writer_that_cannot_read_delivers_receives_nothing_and_walks_once() {
         assert!(!at_owner.sends && at_owner.receives, "{at_owner:?}");
         let at_writer = peering(&writer, owner_id);
         assert!(at_writer.sends && !at_writer.receives, "{at_writer:?}");
-        let walked = pulls(&owner, collection, writer_id).expect("the owner pulled");
-        assert!(walked.last_completed_at.is_some() && !walked.in_flight);
-        assert_eq!(walked.first_started_at, walked.last_started_at);
+        let received = pair(&owner, collection, writer_id).expect("the owner received");
+        assert!(received.receives.last_ok && received.receives.ok >= 1);
+        assert_eq!((received.pushes.ok, received.pushes.failed), (0, 0));
+        assert!(received.confirmed.records.is_none(), "{received:?}");
+        let delivered = pair(&writer, collection, owner_id).expect("the writer pushed");
+        assert!(delivered.pushes.last_ok && delivered.pushes.ok >= 1);
+        assert_eq!((delivered.receives.ok, delivered.receives.failed), (0, 0));
 
-        // Five announcement intervals at their sixty-second cap.
+        // Five intervals at their sixty-second cap: the writer's unchanged
+        // root goes out as ROOT then DONE each time, and nothing comes back.
         advance(&clock, &mut [&mut owner, &mut writer], 300).await;
-        let later = pulls(&owner, collection, writer_id).unwrap();
-        assert_eq!(
-            later.last_started_at, walked.last_started_at,
-            "the writer's unchanged root started a second walk"
-        );
+        let later = pair(&owner, collection, writer_id).unwrap();
+        assert!(later.receives.ok > received.receives.ok && later.receives.failed == 0);
+        assert_eq!((later.pushes.ok, later.pushes.failed), (0, 0));
+        assert!(later.confirmed.records.is_none());
         assert!(!holds(&mut writer, owned));
-        assert!(pulls(&writer, collection, owner_id).is_none());
+        let later = pair(&writer, collection, owner_id).unwrap();
+        assert_eq!((later.receives.ok, later.receives.failed), (0, 0));
     }));
 }
 

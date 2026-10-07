@@ -172,7 +172,7 @@ async fn descriptor_provider_bootstraps_open_collection_through_directory_only()
                     && state
                         .peers
                         .iter()
-                        .any(|peer| peer.peer == *source_id.as_bytes() && peer.comparison.is_some())
+                        .any(|peer| peer.peer == *source_id.as_bytes() && peer.receives.last_ok)
             })
     })
     .await;
@@ -189,7 +189,7 @@ async fn descriptor_provider_bootstraps_open_collection_through_directory_only()
             && state
                 .peers
                 .iter()
-                .any(|peer| peer.peer == *source_id.as_bytes() && peer.comparison.is_some())
+                .any(|peer| peer.peer == *source_id.as_bytes() && peer.receives.last_ok)
     }));
     shutdown([
         (directory, directory_owner),
