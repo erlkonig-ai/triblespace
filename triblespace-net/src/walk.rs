@@ -71,7 +71,9 @@ use crate::collection_activation::{
 };
 use crate::collection_delta::{decode_record, encode_record};
 use crate::collection_wire::{MAX_COLLECTION_LEAF_BYTES, manifest};
-use crate::connection::{ConnectionTable, Link, MAX_QUEUED_REPLIES, ReconEvent, Service};
+use crate::connection::{
+    ConnectionTable, Link, MAX_QUEUED_REPLIES, RESET_WALK_FAILED, ReconEvent, Service, Tracked,
+};
 use crate::health::{Health, RepairComparison, RepairFailure, RepairFrontier};
 use crate::host::{CollectionSnapshot, METADATA_BLOB_BYTES, StoreSnapshot};
 use crate::landing::{LandSlot, Landed};
@@ -81,10 +83,10 @@ use crate::patch_repair::{
 };
 use crate::protocol::{MAX_EXACT_BLOB_BYTES, RawHash, op_get_blob_with_limit};
 use crate::recon::{FRAME_WALK_END, FRAME_WALK_REQUEST, FRAME_WALK_RESPONSE, Frame, Malformed};
-use crate::transport::{PeerId, Transport};
+use crate::transport::{Conn, PeerId, RecvStream as _, SendStream as _, Transport};
 
 /// Bytes of every key a walk enumerates, relative to its kind's base.
-const KEY_BYTES: usize = 32;
+pub(crate) const KEY_BYTES: usize = 32;
 /// Collection handle, kind, number and operation.
 const HEADER_BYTES: usize = 32 + 1 + 2 + 1;
 /// One child of a branch: edge, digest and leaf count.
@@ -111,7 +113,7 @@ pub(crate) enum WalkKind {
 }
 
 impl WalkKind {
-    const fn wire(self) -> u8 {
+    pub(crate) const fn wire(self) -> u8 {
         match self {
             Self::Records => 0,
             Self::Authorization => 1,
@@ -119,7 +121,7 @@ impl WalkKind {
         }
     }
 
-    const fn from_wire(byte: u8) -> Option<Self> {
+    pub(crate) const fn from_wire(byte: u8) -> Option<Self> {
         match byte {
             0 => Some(Self::Records),
             1 => Some(Self::Authorization),
@@ -222,33 +224,11 @@ impl WalkFrame {
                 match response {
                     Response::Summary(summary) => {
                         payload.push(SUMMARY);
-                        payload.extend_from_slice(&summary.root().unwrap_or_default());
-                        payload.extend_from_slice(&summary.leaf_count().to_be_bytes());
+                        push_summary(payload, *summary);
                     }
                     Response::Node { prefix, node } => {
-                        payload.push(match node {
-                            PatchNode::Branch { .. } => BRANCH,
-                            PatchNode::Leaf { .. } => LEAF,
-                        });
-                        let length = u8::try_from(prefix.len()).expect("a prefix fits its key");
-                        payload.push(length);
-                        payload.extend_from_slice(prefix);
-                        payload.extend_from_slice(&node.digest());
-                        match node {
-                            PatchNode::Branch {
-                                leaf_count, branch, ..
-                            } => {
-                                payload.extend_from_slice(&leaf_count.to_be_bytes());
-                                payload.extend_from_slice(&branch.representative);
-                                payload.push(branch.end_depth);
-                                for child in &branch.children {
-                                    payload.push(child.edge);
-                                    payload.extend_from_slice(&child.digest);
-                                    payload.extend_from_slice(&child.leaf_count.to_be_bytes());
-                                }
-                            }
-                            PatchNode::Leaf { leaf, .. } => payload.extend_from_slice(&leaf.key),
-                        }
+                        payload.push(node_tag(node));
+                        push_node(payload, prefix, node);
                     }
                     Response::Value { key, bytes } => {
                         payload.push(VALUED);
@@ -297,54 +277,10 @@ impl WalkFrame {
             }
             (FRAME_WALK_REQUEST, VALUE) => WalkBody::Request(Request::Value(rest.hash()?)),
             (FRAME_WALK_RESPONSE, SUMMARY) => {
-                let root = rest.hash()?;
-                let count = rest.u64()?;
-                // A real root is a digest; all zeros stands for the empty set.
-                let root = (root != [0; 32]).then_some(root);
-                let summary = PatchSummary::new(root, count)
-                    .map_err(|_| Malformed("walk summary root and count disagree"))?;
-                WalkBody::Response(Response::Summary(summary))
+                WalkBody::Response(Response::Summary(rest.summary()?))
             }
             (FRAME_WALK_RESPONSE, BRANCH | LEAF) => {
-                let length = usize::from(rest.byte()?);
-                if length > KEY_BYTES {
-                    return Err(Malformed("walk node prefix longer than its key"));
-                }
-                let prefix = rest.take(length)?;
-                let digest = rest.hash()?;
-                let node = if operation == LEAF {
-                    PatchNode::Leaf {
-                        digest,
-                        leaf: PatchLeaf {
-                            key: rest.take(KEY_BYTES)?,
-                            value: (),
-                        },
-                    }
-                } else {
-                    let leaf_count = rest.u64()?;
-                    let representative = rest.take(KEY_BYTES)?;
-                    let end_depth = rest.byte()?;
-                    if rest.0.len() % CHILD_BYTES != 0 {
-                        return Err(Malformed("walk branch children overrun their frame"));
-                    }
-                    let mut children = Vec::with_capacity(rest.0.len() / CHILD_BYTES);
-                    while !rest.0.is_empty() {
-                        children.push(PatchChild {
-                            edge: rest.byte()?,
-                            digest: rest.hash()?,
-                            leaf_count: rest.u64()?,
-                        });
-                    }
-                    PatchNode::Branch {
-                        digest,
-                        leaf_count,
-                        branch: PatchBranch {
-                            representative,
-                            end_depth,
-                            children,
-                        },
-                    }
-                };
+                let (prefix, node) = rest.node(operation)?;
                 WalkBody::Response(Response::Node { prefix, node })
             }
             (FRAME_WALK_RESPONSE, VALUED) => {
@@ -381,11 +317,57 @@ impl WalkFrame {
     }
 }
 
+/// Append a summary: its root, all zeros for the empty set, and its leaf
+/// count.
+pub(crate) fn push_summary(payload: &mut Vec<u8>, summary: PatchSummary) {
+    payload.extend_from_slice(&summary.root().unwrap_or_default());
+    payload.extend_from_slice(&summary.leaf_count().to_be_bytes());
+}
+
+/// Append a prefix: a length byte and the bytes.
+pub(crate) fn push_prefix(payload: &mut Vec<u8>, prefix: &[u8]) {
+    let length = u8::try_from(prefix.len()).expect("a prefix fits its key");
+    payload.push(length);
+    payload.extend_from_slice(prefix);
+}
+
+/// The tag [`Reader::node`] reads a node back under: whether it is a branch
+/// or a leaf.
+pub(crate) fn node_tag(node: &PatchNode<()>) -> u8 {
+    match node {
+        PatchNode::Branch { .. } => BRANCH,
+        PatchNode::Leaf { .. } => LEAF,
+    }
+}
+
+/// Append a node after its tag: its prefix, its digest, and a branch's leaf
+/// count, representative, end depth and children, or a leaf's key. The
+/// children run to the end of the frame, so a node is the last thing in it.
+pub(crate) fn push_node(payload: &mut Vec<u8>, prefix: &[u8], node: &PatchNode<()>) {
+    push_prefix(payload, prefix);
+    payload.extend_from_slice(&node.digest());
+    match node {
+        PatchNode::Branch {
+            leaf_count, branch, ..
+        } => {
+            payload.extend_from_slice(&leaf_count.to_be_bytes());
+            payload.extend_from_slice(&branch.representative);
+            payload.push(branch.end_depth);
+            for child in &branch.children {
+                payload.push(child.edge);
+                payload.extend_from_slice(&child.digest);
+                payload.extend_from_slice(&child.leaf_count.to_be_bytes());
+            }
+        }
+        PatchNode::Leaf { leaf, .. } => payload.extend_from_slice(&leaf.key),
+    }
+}
+
 /// The unread rest of a walk frame.
-struct Reader<'a>(&'a [u8]);
+pub(crate) struct Reader<'a>(pub(crate) &'a [u8]);
 
 impl Reader<'_> {
-    fn take(&mut self, length: usize) -> Result<Vec<u8>, Malformed> {
+    pub(crate) fn take(&mut self, length: usize) -> Result<Vec<u8>, Malformed> {
         if self.0.len() < length {
             return Err(Malformed("walk frame shorter than its fields"));
         }
@@ -394,16 +376,81 @@ impl Reader<'_> {
         Ok(taken.to_vec())
     }
 
-    fn byte(&mut self) -> Result<u8, Malformed> {
+    pub(crate) fn byte(&mut self) -> Result<u8, Malformed> {
         Ok(self.take(1)?[0])
     }
 
-    fn hash(&mut self) -> Result<[u8; 32], Malformed> {
+    pub(crate) fn hash(&mut self) -> Result<[u8; 32], Malformed> {
         Ok(self.take(32)?.try_into().unwrap())
     }
 
-    fn u64(&mut self) -> Result<u64, Malformed> {
+    pub(crate) fn u64(&mut self) -> Result<u64, Malformed> {
         Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
+    /// A prefix as [`push_prefix`] writes it, at most a key long.
+    pub(crate) fn prefix(&mut self) -> Result<Vec<u8>, Malformed> {
+        let length = usize::from(self.byte()?);
+        if length > KEY_BYTES {
+            return Err(Malformed("walk node prefix longer than its key"));
+        }
+        self.take(length)
+    }
+
+    /// A summary as [`push_summary`] writes it.
+    pub(crate) fn summary(&mut self) -> Result<PatchSummary, Malformed> {
+        let root = self.hash()?;
+        let count = self.u64()?;
+        // A real root is a digest; all zeros stands for the empty set.
+        let root = (root != [0; 32]).then_some(root);
+        PatchSummary::new(root, count)
+            .map_err(|_| Malformed("walk summary root and count disagree"))
+    }
+
+    /// A node as [`push_node`] writes it after `tag`, its prefix first. It
+    /// takes the rest of the frame.
+    pub(crate) fn node(&mut self, tag: u8) -> Result<(Vec<u8>, PatchNode<()>), Malformed> {
+        let leaf = match tag {
+            LEAF => true,
+            BRANCH => false,
+            _ => return Err(Malformed("walk node neither branch nor leaf")),
+        };
+        let prefix = self.prefix()?;
+        let digest = self.hash()?;
+        let node = if leaf {
+            PatchNode::Leaf {
+                digest,
+                leaf: PatchLeaf {
+                    key: self.take(KEY_BYTES)?,
+                    value: (),
+                },
+            }
+        } else {
+            let leaf_count = self.u64()?;
+            let representative = self.take(KEY_BYTES)?;
+            let end_depth = self.byte()?;
+            if self.0.len() % CHILD_BYTES != 0 {
+                return Err(Malformed("walk branch children overrun their frame"));
+            }
+            let mut children = Vec::with_capacity(self.0.len() / CHILD_BYTES);
+            while !self.0.is_empty() {
+                children.push(PatchChild {
+                    edge: self.byte()?,
+                    digest: self.hash()?,
+                    leaf_count: self.u64()?,
+                });
+            }
+            PatchNode::Branch {
+                digest,
+                leaf_count,
+                branch: PatchBranch {
+                    representative,
+                    end_depth,
+                    children,
+                },
+            }
+        };
+        Ok((prefix, node))
     }
 }
 
@@ -1432,11 +1479,12 @@ fn routes(
     descriptor::validate_proof_evidence(&reader, collection, &TribleSet::new(), proof).is_ok()
 }
 
-/// Starts pulls through the walk task.
+/// Starts pulls through the walk task, and hands it the `walk/1` streams
+/// peers open.
 #[derive(Clone)]
-pub(crate) struct Pulls(mpsc::UnboundedSender<Command>);
+pub(crate) struct Pulls<C: Conn>(pub(crate) mpsc::UnboundedSender<Command<C>>);
 
-impl Pulls {
+impl<C: Conn> Pulls<C> {
     /// Pull C from `peer`, dialling it if need be. A [`PullDone`] reports
     /// the end; while a pull of this kind from the peer runs, it stands for
     /// this one.
@@ -1447,9 +1495,35 @@ impl Pulls {
             kind,
         });
     }
+
+    /// A `walk/1` stream `peer` opened, after its Open frame. It is reset
+    /// when the walk task is gone.
+    pub(crate) fn incoming(
+        &self,
+        peer: PeerId,
+        collection: CollectionHandle,
+        kind: WalkKind,
+        send: Tracked<C::SendHalf>,
+        recv: Tracked<C::RecvHalf>,
+    ) {
+        let incoming = Command::Incoming {
+            peer,
+            collection,
+            kind,
+            send,
+            recv,
+        };
+        if let Err(mpsc::error::SendError(Command::Incoming {
+            mut send, mut recv, ..
+        })) = self.0.send(incoming)
+        {
+            send.reset(RESET_WALK_FAILED);
+            recv.stop(RESET_WALK_FAILED);
+        }
+    }
 }
 
-enum Command {
+pub(crate) enum Command<C: Conn> {
     Start {
         peer: PeerId,
         collection: CollectionHandle,
@@ -1468,6 +1542,15 @@ enum Command {
         proof: Option<CapabilityProof>,
         blob: Option<Blob<UnknownBlob>>,
     },
+    /// A `walk/1` stream `peer` opened on its connection: a push of C's
+    /// tree of `kind`, read from `recv` and answered on `send`.
+    Incoming {
+        peer: PeerId,
+        collection: CollectionHandle,
+        kind: WalkKind,
+        send: Tracked<C::SendHalf>,
+        recv: Tracked<C::RecvHalf>,
+    },
 }
 
 /// Run one node's walks: its landing task, and a task that hears `events`
@@ -1479,12 +1562,14 @@ pub(crate) fn spawn<T: Transport, S: Service>(
     walks: Walks,
     events: mpsc::Receiver<ReconEvent>,
     lander: LandSlot,
-) -> (Pulls, mpsc::UnboundedReceiver<PullDone>) {
+) -> (Pulls<T::Conn>, mpsc::UnboundedReceiver<PullDone>) {
     let (commands, commanded) = mpsc::unbounded_channel();
     let (landing, items) = mpsc::unbounded_channel();
     let (acks, landed) = mpsc::unbounded_channel();
     let (done, reports) = mpsc::unbounded_channel();
     tokio::spawn(crate::landing::run(lander, items, acks));
+    // The connections hand the walk/1 streams peers open to this task.
+    connections.walks(Pulls(commands.clone()));
     let task = Task {
         connections,
         walks,
@@ -1500,7 +1585,7 @@ struct Task<T: Transport, S> {
     connections: ConnectionTable<T, S>,
     walks: Walks,
     /// Where dials and fetches report back.
-    commands: Pulls,
+    commands: Pulls<T::Conn>,
     landing: mpsc::UnboundedSender<(WalkRef, Vec<NetEvent>)>,
     done: mpsc::UnboundedSender<PullDone>,
 }
@@ -1510,7 +1595,7 @@ impl<T: Transport, S: Service> Task<T, S> {
         mut self,
         mut snapshots: tokio::sync::watch::Receiver<Option<Arc<StoreSnapshot>>>,
         mut events: mpsc::Receiver<ReconEvent>,
-        mut commands: mpsc::UnboundedReceiver<Command>,
+        mut commands: mpsc::UnboundedReceiver<Command<T::Conn>>,
         mut landed: mpsc::UnboundedReceiver<Landed<WalkRef>>,
     ) {
         let mut tick = tokio::time::interval(WALK_TICK);
@@ -1549,7 +1634,7 @@ impl<T: Transport, S: Service> Task<T, S> {
         }
     }
 
-    fn command(&mut self, command: Command) {
+    fn command(&mut self, command: Command<T::Conn>) {
         let now = crate::clock::mono_now();
         match command {
             Command::Start {
@@ -1587,6 +1672,23 @@ impl<T: Transport, S: Service> Task<T, S> {
                 proof,
                 blob,
             } => self.walks.fetched(walk, handle, proof, blob, now),
+            // Nothing serves a pushed walk yet; the stream is reset.
+            Command::Incoming {
+                peer,
+                collection,
+                kind,
+                mut send,
+                mut recv,
+            } => {
+                debug!(
+                    peer = %hex::encode(&peer[..4]),
+                    collection = %hex::encode(&collection.raw[..4]),
+                    ?kind,
+                    "a walk/1 stream arrived; pushes are not served yet"
+                );
+                send.reset(RESET_WALK_FAILED);
+                recv.stop(RESET_WALK_FAILED);
+            }
         }
     }
 
