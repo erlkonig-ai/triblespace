@@ -766,4 +766,82 @@ mod tests {
         carry(&mut push, &mut receiver, frames).unwrap();
         assert_eq!(receiver.leaves(), [key]);
     }
+
+    /// The receiver builds its HELD bitmap through [`hold`] and the sender
+    /// reads it through [`held`]: a receiver holding the sender's subtrees
+    /// at branch bytes 0, 7, 8 and 255 answers the root NODE with exactly
+    /// those bits, and the sender prunes exactly those children.
+    #[test]
+    fn the_sender_prunes_exactly_the_children_the_receiver_holds() {
+        use crate::receive::{Out, Receive};
+
+        let mut sender = Node::new(40);
+        let collection = sender.hold("bitmap", open());
+        let records = (0..3000)
+            .map(|data| sender.commit(collection, data))
+            .collect::<Vec<_>>();
+        sender.observe();
+        let pinned = snapshot(&sender, collection);
+        let Some(PatchNode::Branch { branch, .. }) = node(WalkKind::Records, pinned.repair(), &[])
+        else {
+            panic!("3000 records branch at the root");
+        };
+        assert_eq!(branch.end_depth, 0);
+        assert_eq!(
+            branch.children.len(),
+            256,
+            "3000 keys fill every branch byte"
+        );
+        let edges = [0, 7, 8, 255];
+        let mut receiver = Node::new(41);
+        receiver.hold("bitmap", open());
+        for record in &records {
+            if edges.contains(&record.fingerprint().raw()[0]) {
+                receiver.store.insert(*record).unwrap();
+            }
+        }
+        receiver.observe();
+
+        // The receiver takes the ROOT and the root NODE; its one reply is
+        // the HELD it built through `hold`.
+        let mut receive =
+            Receive::on_open(sender.id(), collection, WalkKind::Records, true).unwrap();
+        let (mut push, frames) = Push::start(WalkKind::Records, pinned, None);
+        let mut replies = Vec::new();
+        for frame in frames {
+            for out in receive.on_frame(roundtrip(frame), Some(receiver.snapshot())) {
+                match out {
+                    Out::Send(reply) => replies.push(reply),
+                    other => panic!("the receiver lands or fetches nothing yet: {other:?}"),
+                }
+            }
+        }
+        let [Frame::Held { prefix, children }] = &replies[..] else {
+            panic!("one HELD for the root NODE: {replies:?}");
+        };
+        assert!(prefix.is_empty());
+        let mut expected = [0; 32];
+        for edge in edges {
+            hold(&mut expected, edge);
+        }
+        assert_eq!(*children, expected);
+
+        // The sender reads it through `held`: the walk goes on below every
+        // other child, visited now or pending.
+        let answers = push.on_frame(roundtrip(replies.pop().unwrap())).unwrap();
+        let mut below = answers
+            .iter()
+            .filter_map(|frame| match frame {
+                Frame::Node { prefix, .. } => Some(prefix[0]),
+                Frame::Leaf { key } => Some(key[0]),
+                _ => None,
+            })
+            .collect::<BTreeSet<u8>>();
+        assert_eq!(below.len(), MAX_OUTSTANDING_NODES.min(answers.len()));
+        below.extend(push.pending.iter().map(|prefix| prefix[0]));
+        assert_eq!(below.len(), 256 - edges.len());
+        for edge in edges {
+            assert!(!below.contains(&edge), "child {edge} was pruned");
+        }
+    }
 }

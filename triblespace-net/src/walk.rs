@@ -3105,7 +3105,8 @@ pub(crate) mod tests {
 
     /// Incoming walk streams driven through the walk task: a scripted
     /// sender pushes over a duplex pipe, and the task admits, receives,
-    /// lands through the landing task, and ends the stream.
+    /// lands through the landing task, and ends the stream; and a push
+    /// sender driven over a simulated connection into the same task.
     #[cfg(feature = "sim")]
     mod receiving {
         use super::walking::{Node, open};
@@ -3122,8 +3123,10 @@ pub(crate) mod tests {
             AdmissionPolicy, CollectionPolicy, CollectionRecord, CollectionStore,
         };
 
+        use crate::connection::{Connection, open_walk};
         use crate::landing::Land;
-        use crate::transport::sim::{SimConfig, SimNet};
+        use crate::transport::Conn;
+        use crate::transport::sim::{SimConfig, SimNet, SimTransport};
         use crate::walk_stream::held;
 
         #[derive(Clone)]
@@ -3215,17 +3218,26 @@ pub(crate) mod tests {
             fn reobserve(&self) {}
         }
 
-        /// A receiving node behind a running walk task, and a stream opened
-        /// to it.
+        /// A receiving node on `net` behind a running walk task: its table
+        /// accepts, and the walk streams peers open reach the task.
         struct Receiving {
+            peer: PeerId,
             lander: Arc<Lander>,
             pulls: Pulls,
+            server: tokio::task::JoinHandle<()>,
         }
 
         impl Receiving {
-            fn new(receiver: Node, seed: u64) -> Self {
-                let harness = SimNet::new(seed, SimConfig::default()).join(&receiver.key);
+            fn new(receiver: Node, net: &SimNet) -> Self {
+                let mut harness = net.join(&receiver.key);
+                let peer = harness.transport.local_id();
                 let connections = ConnectionTable::new(harness.transport, NoRequests);
+                let accepting = connections.clone();
+                let server = tokio::spawn(async move {
+                    while let Some(incoming) = harness.incoming.recv().await {
+                        accepting.accept(incoming.conn);
+                    }
+                });
                 let (snapshots, snapshot) = watch::channel(Some(receiver.snapshot()));
                 let walks = Walks::new(receiver.health.clone());
                 let (_, events) = mpsc::channel(WALK_EVENTS);
@@ -3236,7 +3248,12 @@ pub(crate) mod tests {
                 let (slot, lands) = watch::channel(Some(lander.clone() as Arc<dyn Land>));
                 std::mem::forget(slot);
                 let (pulls, _) = spawn(connections, snapshot, walks, events, lands);
-                Self { lander, pulls }
+                Self {
+                    peer,
+                    lander,
+                    pulls,
+                    server,
+                }
             }
 
             /// Open a stream for C's records from `peer`; the opener's
@@ -3269,14 +3286,121 @@ pub(crate) mod tests {
             }
         }
 
-        async fn write(send: &mut WriteHalf<DuplexStream>, frame: StreamFrame) {
+        impl Drop for Receiving {
+            fn drop(&mut self) {
+                self.server.abort();
+            }
+        }
+
+        /// A sending node on `net`: the store its pushes pin, and a table
+        /// that dials.
+        struct Sending {
+            node: Node,
+            table: ConnectionTable<SimTransport, NoRequests>,
+            server: tokio::task::JoinHandle<()>,
+        }
+
+        impl Sending {
+            fn new(node: Node, net: &SimNet) -> Self {
+                let mut harness = net.join(&node.key);
+                let table = ConnectionTable::new(harness.transport, NoRequests);
+                let accepting = table.clone();
+                let server = tokio::spawn(async move {
+                    while let Some(incoming) = harness.incoming.recv().await {
+                        accepting.accept(incoming.conn);
+                    }
+                });
+                Self {
+                    node,
+                    table,
+                    server,
+                }
+            }
+        }
+
+        impl Drop for Sending {
+            fn drop(&mut self) {
+                self.server.abort();
+            }
+        }
+
+        async fn write<W: AsyncWrite + Unpin>(send: &mut W, frame: StreamFrame) {
             let (kind, payload) = frame.encode();
             write_frame(send, kind, &payload).await.unwrap();
         }
 
-        async fn read(recv: &mut ReadHalf<DuplexStream>) -> Option<StreamFrame> {
+        async fn read<R: AsyncRead + Unpin>(recv: &mut R) -> Option<StreamFrame> {
             let (kind, payload) = read_frame(recv).await.ok()??;
             StreamFrame::decode(kind, &payload).unwrap()
+        }
+
+        /// What one push's stream carried, as its sender saw it.
+        struct Pushed {
+            outcome: push::Outcome,
+            /// Every frame the sender wrote after the Open.
+            sent: Vec<StreamFrame>,
+            /// Every frame the receiver answered.
+            heard: Vec<StreamFrame>,
+        }
+
+        fn count(frames: &[StreamFrame], same: impl Fn(&StreamFrame) -> bool) -> usize {
+            frames.iter().filter(|frame| same(frame)).count()
+        }
+
+        /// Drive one push over a `walk/1` stream opened on `connection`, as
+        /// the walks task will: the tag and Open, the push's first frames,
+        /// then each of the receiver's frames through the push and its
+        /// answers back, until Landed, a failure, or the end of the stream.
+        async fn drive<C: Conn>(
+            connection: &Connection<C>,
+            collection: CollectionHandle,
+            kind: WalkKind,
+            (mut push, frames): (Push, Vec<StreamFrame>),
+        ) -> Pushed {
+            let (mut send, mut recv) = open_walk(connection, collection, kind).await.unwrap();
+            let mut sent = Vec::new();
+            let mut heard = Vec::new();
+            for frame in frames {
+                write(&mut send, frame.clone()).await;
+                sent.push(frame);
+            }
+            loop {
+                let frame = match read_frame(&mut recv).await {
+                    Ok(Some((kind, payload))) => match StreamFrame::decode(kind, &payload) {
+                        Ok(Some(frame)) => frame,
+                        Ok(None) => continue,
+                        Err(_) => {
+                            send.reset(RESET_WALK_FAILED);
+                            break;
+                        }
+                    },
+                    // The receiver finished or reset the stream.
+                    Ok(None) | Err(_) => break,
+                };
+                let landed = frame == StreamFrame::Landed;
+                heard.push(frame.clone());
+                match push.on_frame(frame) {
+                    Ok(answers) => {
+                        for answer in answers {
+                            write(&mut send, answer.clone()).await;
+                            sent.push(answer);
+                        }
+                    }
+                    Err(_) => {
+                        send.reset(RESET_WALK_FAILED);
+                        break;
+                    }
+                }
+                if landed {
+                    let _ = send.shutdown().await;
+                    break;
+                }
+            }
+            Pushed {
+                outcome: push.outcome(),
+                sent,
+                heard,
+            }
         }
 
         /// Wait for the receiver to reset or stop the stream.
@@ -3400,7 +3524,7 @@ pub(crate) mod tests {
             }
             sender.observe();
             receiver.observe();
-            let receiving = Receiving::new(receiver, 1);
+            let receiving = Receiving::new(receiver, &SimNet::new(1, SimConfig::default()));
 
             let (mut send, mut recv, landed) = receiving.open(sender.id(), collection);
             assert!(push(&sender, collection, &mut send, &mut recv).await);
@@ -3429,7 +3553,7 @@ pub(crate) mod tests {
                 .collect::<Vec<_>>();
             sender.observe();
             receiver.observe();
-            let receiving = Receiving::new(receiver, 2);
+            let receiving = Receiving::new(receiver, &SimNet::new(2, SimConfig::default()));
             let overlay = sender.serving().collection(collection).unwrap();
             let root = summary(WalkKind::Records, overlay.repair());
 
@@ -3458,6 +3582,151 @@ pub(crate) mod tests {
                 requested += 1;
             }
             assert_eq!(requested, 19);
+        }
+
+        /// The push sender driven over a simulated connection into the walk
+        /// task's receiver. (a) Fifty records to an empty receiver: all land,
+        /// Landed comes back, and the push is confirmed. (b) The confirmed
+        /// tree again: Root then Done, confirmed in one exchange. (c) A
+        /// receiver holding forty of the fifty from elsewhere: its HELD
+        /// prunes, so fewer than fifty leaves and exactly the ten missing
+        /// values cross, and the ten land.
+        #[tokio::test(start_paused = true)]
+        async fn a_push_over_a_connection_lands_confirms_and_prunes() {
+            let net = SimNet::new(
+                0x3A1E,
+                SimConfig {
+                    latency: Duration::from_millis(10)..Duration::from_millis(10),
+                },
+            );
+            let kind = WalkKind::Records;
+            let mut sender = Node::new(55);
+            let collection = sender.hold("pushed", open());
+            let records = (0..50)
+                .map(|data| sender.commit(collection, data))
+                .collect::<Vec<_>>();
+            sender.observe();
+            let all = records.iter().copied().collect::<BTreeSet<_>>();
+            let mut sender = Sending::new(sender, &net);
+            let mut empty = Node::new(56);
+            empty.hold("pushed", open());
+            empty.observe();
+            let empty = Receiving::new(empty, &net);
+            let connection = sender.table.connect(empty.peer).await.unwrap();
+
+            // (a) Everything lands, and the push is confirmed.
+            let started = sender
+                .node
+                .walks
+                .push(empty.peer, collection, kind)
+                .expect("an open collection is sent to any peer");
+            let Pushed {
+                outcome,
+                sent,
+                heard,
+            } = drive(&connection, collection, kind, started).await;
+            assert!(matches!(outcome, push::Outcome::Confirmed(_)));
+            assert_eq!(heard.last(), Some(&StreamFrame::Landed));
+            assert_eq!(
+                count(&heard, |frame| matches!(
+                    frame,
+                    StreamFrame::ValueRequest { .. }
+                )),
+                50
+            );
+            assert_eq!(
+                count(&sent, |frame| matches!(frame, StreamFrame::Leaf { .. })),
+                50
+            );
+            assert_eq!(empty.records(collection), all);
+            sender
+                .node
+                .walks
+                .pushed(empty.peer, collection, kind, outcome);
+
+            // (b) The confirmed tree is Root then Done, answered with the
+            // root held whole and Landed.
+            let started = sender
+                .node
+                .walks
+                .push(empty.peer, collection, kind)
+                .unwrap();
+            let root = StreamFrame::Root {
+                summary: summary(
+                    kind,
+                    sender
+                        .node
+                        .serving()
+                        .collection(collection)
+                        .unwrap()
+                        .repair(),
+                ),
+            };
+            assert_eq!(started.1, [root.clone(), StreamFrame::Done]);
+            let Pushed {
+                outcome,
+                sent,
+                heard,
+            } = drive(&connection, collection, kind, started).await;
+            assert!(matches!(outcome, push::Outcome::Confirmed(_)));
+            assert_eq!(sent, [root, StreamFrame::Done]);
+            assert_eq!(
+                heard,
+                [
+                    StreamFrame::Held {
+                        prefix: Vec::new(),
+                        children: [0xFF; 32],
+                    },
+                    StreamFrame::Landed,
+                ]
+            );
+            sender
+                .node
+                .walks
+                .pushed(empty.peer, collection, kind, outcome);
+
+            // (c) A receiver that holds forty of the fifty prunes.
+            let mut partial = Node::new(57);
+            partial.hold("pushed", open());
+            for record in &records[..40] {
+                partial.store.insert(*record).unwrap();
+            }
+            partial.observe();
+            let partial = Receiving::new(partial, &net);
+            let connection = sender.table.connect(partial.peer).await.unwrap();
+            let started = sender
+                .node
+                .walks
+                .push(partial.peer, collection, kind)
+                .unwrap();
+            let Pushed {
+                outcome,
+                sent,
+                heard,
+            } = drive(&connection, collection, kind, started).await;
+            assert!(matches!(outcome, push::Outcome::Confirmed(_)));
+            let requested = heard
+                .iter()
+                .filter_map(|frame| match frame {
+                    StreamFrame::ValueRequest { key } => Some(*key),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>();
+            let missing = records[40..]
+                .iter()
+                .map(|record| record.fingerprint().raw())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(requested, missing);
+            assert!(requested.len() < 50);
+            let leaves = count(&sent, |frame| matches!(frame, StreamFrame::Leaf { .. }));
+            assert!(leaves < 50, "{leaves} leaves crossed: nothing was pruned");
+            assert!(leaves >= 10);
+            eprintln!(
+                "push to a receiver holding 40 of 50: {leaves} leaves, {} value requests, {} nodes",
+                requested.len(),
+                count(&sent, |frame| matches!(frame, StreamFrame::Node { .. }))
+            );
+            assert_eq!(partial.records(collection), all);
         }
     }
 }
