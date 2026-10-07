@@ -238,11 +238,11 @@ For proofs naming exact resource C, collection AUTH repair uses C's declared
 policy roots. It no longer filters by grant-handle equality:
 different definitions can delegate the same action. This byte-local relevance
 check does not interpret the definitions or confer READ. Peering admission and
-walk serving separately interpret the requested READ action using resident
+push admission separately interpret the requested READ action using resident
 definitions, the pinned proof set and the credentials a peer presented, before
 any record or proof is sent.
 
-Walks transfer records and proofs, not capability-definition blobs, payload
+Pushes transfer records and proofs, not capability-definition blobs, payload
 closure, or WANT bookkeeping. Definition bytes travel by hash over the bearer
 blob protocol: for a proof received through the grant exchange or as a peer's
 credential, a node fetches the definitions it names from its sender, then from
@@ -250,12 +250,12 @@ the proof's root and delegated keys.
 
 Subordinate-resource transport also routes proofs naming R when
 R's immutable descriptor contains `resource_collection: C` and `resource_policy`
-on the same entity. It checks R's policy roots and signatures, while the walk
+on the same entity. It checks R's policy roots and signatures, while the push
 remains gated by READ(C). No mutable fact in C can create or revoke the route.
-A missing R descriptor is fetched by hash from the peer the authorization walk
-pulls from; if it does not route the proof to C, the proof stays deferred
-without blocking C's record walk, and the pull does not count as completed, so
-the next announcement of the same root pulls again. Its repair PATCH prefix
+A missing R descriptor is fetched by hash from the peer that pushed the proof;
+if it does not route the proof to C, the proof stays deferred without blocking
+C's records push, and the authorization push does not land, so the peer's next
+push of that tree carries the proof again. Its repair PATCH prefix
 names the routing audience C, not necessarily the proof's signed resource R.
 
 ## Explicit protocol cutover
@@ -275,5 +275,5 @@ before deciding what the appropriate owners may reissue. Neither a descriptor
 being selected for sync nor a blob being resident authorizes a broader grant.
 
 The boundaries remain independent: proof presence is not authority; routing,
-announcements, and DHT presence are not authority; WANT records durable local
+pushes, and DHT presence are not authority; WANT records durable local
 demand; and blob residency is not semantic validity.

@@ -6,13 +6,13 @@ model:
 
 1. one QUIC connection per peer pair carries typed streams: one long-lived
    `recon/1` stream for the grant exchange and for every collection's
-   peering, announcements and pull walks, and short `dht/1` and `blob/1`
-   request streams;
-2. for each collection both sides select, peered neighbours announce the
-   collection's record root to each other, and a side that hears a different
-   root pulls what it lacks with Merkle walks over the collection's foundation
-   records and scoped AUTH (and, between two Full neighbours, its held blobs),
-   landing what arrives as it goes; and
+   peering, a `walk/1` stream for each push of a collection's tree, and
+   short `dht/1` and `blob/1` request streams;
+2. for each collection both sides select, each peered neighbour pushes the
+   other the collection's trees, its foundation records and scoped AUTH
+   (and, between two Full neighbours, its held blobs), as Merkle walks pruned
+   by what the receiver already holds; the receiver pulls the values it lacks
+   and lands them as they arrive; and
 3. exact blob handles fetch only the immutable bytes a resolver actually
    chooses through a collection-independent, mutually authenticated bearer
    protocol.
@@ -31,7 +31,7 @@ The boundaries are deliberately small:
 
 ```text
 know C           -> find holders of C's descriptor and ask them to peer for C
-prove READ(C)    -> be sent C's announcements, records, scoped proofs and held set
+prove READ(C)    -> be pushed C's records, scoped proofs and held set
 know H           -> derive its opaque locator, discover providers, and fetch H
 satisfy WRITE(C) -> make a signed COMMIT or DERIVE active in C, and send C to a reader
 ```
@@ -67,7 +67,7 @@ For one collection, sync compares three PATCH components:
 - every structurally valid foundation record naming exact C: signed `COMMIT`
   and `DERIVE` records independent of current WRITE(C) admission. A collection
   is a set of foundations; a `MERGE` is its signing host's own lattice node,
-  is never served, and a `MERGE` value fails the walk that received it;
+  is never served, and a `MERGE` value fails the push that received it;
 - every signature-valid native proof scoped to exact resource C and beginning
   at a root named by C's supported policy bindings, without requiring its grant
   handles to match those bindings. Subordinate-resource transport
@@ -91,8 +91,8 @@ The record root (`record_root`) commits to C and to the record and
 authorization-evidence summaries, including their leaf counts, under a
 versioned domain (version 4). It discloses no record, proof, count or
 component root. The held set is not part of it: the held set's Merkle root,
-all zeros when the set is empty, is the held digest, which only two neighbours
-that both replicate C in full exchange.
+all zeros when the set is empty, is the root of its own tree, which only two
+neighbours that both replicate C in full push each other.
 
 The authorization projection authenticates proof bytes rather than taking a
 snapshot of who is admitted. Unavailable definitions, delegate-only grants,
@@ -108,7 +108,7 @@ signed a grant dials its subject. That is the capability delivery boundary,
 not a Secrets-specific channel. Once one collection participant has the proof,
 the authorization walk distributes that one record to READ(C) peers.
 Interpretation needs any referenced capability definitions to be resident;
-walks carry proof bytes, never definition bodies, which travel by hash over
+pushes carry proof bytes, never definition bodies, which travel by hash over
 `blob/1`. An application may use the same proof kernel for another resource,
 such as Secrets key delivery, without treating collection READ as decryption
 authority.
@@ -116,13 +116,13 @@ authority.
 Subordinate-resource transport reads R's `resource_collection: C`
 and its policy bindings from the same descriptor entity, without requiring a
 mutable referencing fact in C. When R's descriptor is not resident, the
-authorization walk fetches it by hash from the peer it pulls from, over
+receiver of an authorization push fetches it by hash from the sender, over
 `blob/1` and at most 1 MiB. If that descriptor routes the proof to C, both
-land; otherwise the proof stays deferred and the pull does not count as
-completed, so the next announcement of the same root pulls again. C's record
-walk continues either way, and no WANT is emitted. The walk is still served by
-the responder's decision to send C to the puller, not by R's action. Open
-action policies remain explicitly non-enumerable.
+land; otherwise the proof stays deferred and the push does not land, so the
+sender's next push of the same tree carries the proof again. C's records push
+continues either way, and no WANT is emitted. A push is still gated by the
+sender's decision to send C to the receiver, not by R's action. Open action
+policies remain explicitly non-enumerable.
 
 This product matters. Synchronizing only collection records would miss the
 case where a newly arrived proof activates an old COMMIT. Synchronizing a whole
@@ -143,9 +143,9 @@ still constructs the initial full overlay. Blob arrival
 still refreshes the authorization observation: a newly resident capability or
 subordinate-resource descriptor can enable admission or proof routing without
 changing any record. The held set comes from the store's own index, fixed by
-the same snapshot; it can change the held digest, never the record root.
+the same snapshot; it can change the held set's root, never the record root.
 
-A DERIVE is a foundation of its derived collection and is pulled like a COMMIT.
+A DERIVE is a foundation of its derived collection and is pushed like a COMMIT.
 A MERGE never replicates: each host builds its own merge lattice over the
 foundations it holds, and believes only the MERGEs its own key signed.
 Another host's MERGE records may sit inert in a pile, but they are neither
@@ -155,7 +155,7 @@ rebuilding the local PATCH or observing the local store again. Dense record
 tag 7 carries a 224-byte DERIVE body; each wire value has one additional tag
 byte. COMMIT's 192-byte body and signature transcript are unchanged.
 
-A record pull still transfers only records naming exact C. A DERIVE's source
+A records push still carries only records naming exact C. A DERIVE's source
 witness does not authorize disclosing another collection's records to a
 READ(C)-only recipient. The witness fingerprint is not a blob handle and is not
 fetched through the blob DHT. A replica lacking that record closure cannot
@@ -208,7 +208,7 @@ The host reads the register from each serving snapshot, so peering follows a
 change at the next store observation. `pile net sync` also reads it at startup
 and before each reconcile pass, about once a second, to activate newly selected
 collections. An unselected collection stays active until the process exits,
-but its peerings end with UNPEER frames and it is no longer announced. A
+but its peerings end with UNPEER frames and it is no longer pushed. A
 selected collection whose descriptor is not resident is fetched by its handle
 through the DHT (the descriptor warmup under *Live request scheduling*), and
 peering for it begins once the descriptor validates. A node that does not
@@ -246,13 +246,14 @@ tag, read before any permit is taken:
 
 | Tag | Stream | Carries |
 |---:|---|---|
-| `0x10` | `recon/1` | the connection's one long-lived stream: grant exchange, and every collection's peering, announcements and pull walks |
+| `0x10` | `recon/1` | the connection's one long-lived stream: grant exchange, and every collection's peering |
+| `0x12` | `walk/1` | one push of one collection tree, opened by its sender |
 | `0x11` | `dht/1` | one DHT operation byte and its exchange: `FIND_VALUE` or `PROVIDER_PUT` |
 | `0x02` | `blob/1` | one locator-addressed bearer exact GET |
 
 An unknown tag, or an unknown `dht/1` operation, resets only its own stream
 (`RESET_UNKNOWN`), and a stream that sends no tag within ten seconds is
-dropped. `recon/1` takes no permit. A request stream (`dht/1` or `blob/1`)
+dropped. `recon/1` and `walk/1` take no permit. A request stream (`dht/1` or `blob/1`)
 does: an opener keeps at most 16 open per connection, the accepting side holds
 at most 32 per connection and resets the rest (`RESET_BUSY`), and at most 16
 are served at once across the host, each within 300 seconds. A stream first
@@ -277,7 +278,7 @@ for two seconds. What this side had asked to peer for on it, it asks for again
 on the connection kept.
 
 A connection closes after 120 seconds without a frame on any of its streams,
-sent or received. Announcement timers cap at 60 seconds, so a connection that
+sent or received. Push timers cap at 60 seconds, so a connection that
 carries a peering does not go idle. Above 64 connections in one direction the
 least recently used one is evicted, draining and unused connections first. A
 neighbour connection, one that carries a peering, is never evicted.
@@ -287,9 +288,9 @@ by the accepting side, or a second one, is a protocol violation and closes
 the connection. Frames go both ways at once, and both directions are read
 concurrently. When the stream ends, for any reason, the connection closes with
 it: the peer finished or reset it, it failed, or a writer waited 60 seconds
-for stream credit because the peer stopped reading. Every walk and every
-peering on the connection ends, frames still queued for it are dropped, and
-nothing is reopened on it. What replaces it is a later dial, which the
+for stream credit because the peer stopped reading. Every push on the
+connection, sent or received, and every peering ends, frames still queued for
+it are dropped, and nothing is reopened on it. What replaces it is a later dial, which the
 candidate order governs (see *Neighbours*): a peer whose stream ended comes
 back only through a fresh dial when a collection's order next reaches it. A
 peer that ends every stream as it arrives therefore costs a collection one
@@ -297,16 +298,14 @@ dial per redraw of its order, at most one a minute, rather than a loop of
 streams.
 
 A connection's frame queue refuses no frame, so what it holds is bounded by
-what is put on it. A walk responder, and a side asked to peer, leave a request
-unanswered while the connection already queues 1,024 frames, at most 64 KiB
-each, and the grant exchange answers one proof request per digest it sent; a
-peer that asks faster than it reads therefore stops being answered rather than
-growing the queue.
-The walk it asked for ends at its own deadline, and an unanswered peering
-request waits until the stalled stream's end closes the connection. A puller
-keeps at most 256 walk requests in flight per connection, a quarter of that
-bound, since the responder's queue also holds its own requests and other
-frames, so a puller that reads is always answered.
+what is put on it. A side asked to peer leaves the request unanswered while
+the connection already queues 1,024 frames, at most 64 KiB each, and the
+grant exchange answers one proof request per digest it sent; a peer that asks
+faster than it reads therefore stops being answered rather than growing the
+queue, and an unanswered peering request waits until the stalled stream's end
+closes the connection. A push is not on this queue: it has a stream of its
+own, and QUIC's flow control holds a sender whose receiver stops reading
+(*Walk streams*).
 
 A `recon/1` frame is its kind (one byte), a big-endian `u32` payload length,
 and a payload of at most 64 KiB. Every frame about a collection starts with the
@@ -326,15 +325,9 @@ stream:
 | `0x13` | PEER_FLAGS | collection, flags |
 | `0x14` | CREDENTIAL | collection, credentials |
 | `0x15` | UNPEER | collection |
-| `0x20` | ANNOUNCE | collection, root, flags, held digest |
-| `0x30` | WALK_REQUEST | collection, walk, request |
-| `0x31` | WALK_RESPONSE | collection, walk, response |
-| `0x32` | WALK_END | collection, walk, side, reason |
 
 Peering flags are one byte: bit 0 is the send flag, bit 1 the full flag, and
-in a PEER_REQUEST bit 2 marks an invitation. An ANNOUNCE has its own flags byte
-after the root: bit 0 marks a reply, and bit 1 says the sender's 32-byte held
-digest follows. A proof digest is a presence byte, a Merkle root (zeros for
+in a PEER_REQUEST bit 2 marks an invitation. A proof digest is a presence byte, a Merkle root (zeros for
 the empty set) and a big-endian `u64` count. Credentials, like the proofs of a
 PROOFS frame, are a big-endian `u16` count followed by that many proofs, each a
 big-endian `u16` length and its bytes. A reader skips a frame kind it does not
@@ -345,7 +338,7 @@ not parse is a protocol violation and closes the connection.
 
 Peering for C is two keys' wish to sync C over the one connection between
 them, and C is the unit of everything that follows: each collection has its
-own neighbours, announcements and timer, multiplexed on the connection. A
+own neighbours, pushes and timer, multiplexed on the connection. A
 side asks a key to peer for C only if it selects C. The PEER_REQUEST names C
 and carries the asker's flags and credentials:
 
@@ -385,7 +378,7 @@ closed connection ends its peerings.
 Two Full neighbours are the two sides of a peering in which both set the full
 flag and each counts the other as a reader or writer of C: this side sends C
 to the peer, or the peer passes WRITE under this side's evidence. Only they
-compare held sets. A DHT provider that may neither read nor write C is never
+push each other their held sets. A DHT provider that may neither read nor write C is never
 a Full neighbour, whatever its flag says, so it cannot make this side fetch
 the blobs it names and pass them on; changed evidence re-evaluates which
 peerings count.
@@ -433,147 +426,197 @@ formed separately during a partition meet again after it heals.
 collection and peer, whether this side asked for it, whether both sides
 accepted, which way C flows, and which side refused the other.
 
-## Announcements
+## Pushes
 
-An announcement says "my root for C is R", where R is C's record root. It goes
-only to C's neighbours, and only to those this side sends C to. Between two
-neighbours that both replicate C in full it also carries the sender's held
-digest; other neighbours get none.
+A push says "here is my tree of C" and carries the part of it the receiver
+lacks. Each side pushes its own trees: a collection's records, its
+authorization evidence and, between two Full neighbours, its held set, each
+as one push to one neighbour on a `walk/1` stream the sender opens (*Walk
+streams*). A push goes only to C's neighbours, and only to those this side
+sends C to; the references tree goes only to a neighbour with which this side
+replicates C in full. Two neighbours that both send therefore push each other,
+and the two pushes of a tree on one connection, one each way, reconcile both
+sides. Nothing is forwarded: each side pushes only its own state, and a pushed
+root is a trigger, never the source of truth.
 
-Each selected collection has one announcement timer (`WakeSchedule`), in the
-style of Trickle: intervals of two to sixty seconds, doubling while C is quiet,
-with one transmit opportunity in each interval's second half. At that
-opportunity the side announces C to each neighbour it sends to, except one that
-announced an equal state during the interval. Announcements are unicast and
-nobody overhears them, so this suppression is per neighbour. A neighbour that
-this side newly sends to is offered the state within two minimum intervals.
+Each selected collection has one push timer (`WakeSchedule`), in the style of
+Trickle: intervals of two to sixty seconds, doubling while C is quiet, with
+one transmit opportunity in each interval's second half. At that opportunity
+the side starts a push of C's records tree and of its authorization tree to
+each neighbour it sends to, and of its references tree to each of those it
+replicates C in full with. A push already running to a neighbour for that
+tree is skipped, not queued. A neighbour this side newly sends to is pushed
+to within two minimum intervals.
 
-When C's root changes while no record pull of C runs, as after a local append,
-C's timer restarts at its two-second interval. A root that changes while a
-record pull of C runs is that pull landing and resets nothing; the pull resets
-the timer once when it completes, so the merged root goes out once instead of
-every intermediate root of a long pull. An announcement already due during the
-pull may still carry the earlier root. A changed held set resets nothing
-either: the next announcement carries it, so it reaches a Full neighbour within
-about two maximum intervals.
+When C's root changes while no push of C's records or evidence is being
+received here, as after a local append, C's timer restarts at its two-second
+interval. A root that changes while such a push is received is that push
+landing and resets nothing; the receive resets the timer once when it lands,
+so the merged root goes out once instead of every intermediate root of a long
+push. A receive that lands without changing the root, the common case of an
+unchanged tree pushed again, resets nothing either: otherwise two neighbours
+would push each other every two seconds forever. A changed held set resets
+nothing: the next push carries it, so it reaches a Full neighbour within about
+two maximum intervals. A push whose tree changed while it ran, because a
+record was committed meanwhile, is followed by another at once from the root
+just confirmed; the timer does not see pushes end.
 
-An announcement whose root, and held digest where both sides carry one, equal
-this side's ends the comparison and suppresses this interval's announcement to
-its sender. Otherwise:
+A push runs only on the current connection to its neighbour, and the walks
+task never dials: a neighbour without a connection is pushed to once the
+candidate order next dials it (*Neighbours*). At most one push per peer,
+collection and tree runs at a time, and at most one push of each tree is
+received from a peer at a time: a second push of the same tree from a peer
+replaces the first, whose stream is reset. The sender pins its serving
+snapshot of C when the push starts, provided it sends C to the receiver (its
+peering for C sends to the receiver, or the receiver passes READ under the
+pinned evidence), and every node and value of the push comes from that
+snapshot, so a push cannot splice two moments together. The receiver admits a
+push only from a peer it receives C from: its peering for C receives from the
+peer, or the peer passes WRITE under the live evidence. A push it does not
+admit, or of a collection that is not active here, is refused by resetting
+the stream (`RESET_WALK_REFUSED`); `recon/1` and the connection stay.
 
-- a root that differs, and is not the root of the last record pull from that
-  neighbour that completed, starts a record pull from it;
-- a held digest that differs, and is not the one the last completed reference
-  pull from that neighbour walked, starts a reference pull; and
-- if a pull starts, this side sends C to the announcer, and the announcement is
-  not itself a reply, this side answers at once with its own state, flagged as
-  a reply, from which the announcer pulls in turn. The reply counts as this
-  interval's announcement to that neighbour and is never answered.
+The sender remembers, per neighbour and tree, the confirmed root: the root of
+the last push the neighbour confirmed landed. A tree whose root is still the
+confirmed one is pushed as ROOT then DONE, and the neighbour answers LANDED
+without a node crossing. A push that ends any other way, failed, reset or
+timed out, forgets the confirmed root: keeping it would repeat ROOT then DONE
+to a neighbour that cannot land it, such as one that restarted and holds no
+landed roots, until this side's tree moved. Forgetting costs the next push one
+root NODE, which the neighbour's HELD prunes. The receiver remembers the same
+thing from its side, the root of the last push of each tree from each peer
+that landed here, so a root it landed is held whole however its own tree grew
+since. Neither memory is persisted: a restarted side pushes everything again,
+and its neighbours hold it.
 
-An announcement heard while a pull of C from its sender runs waits: the latest
-replaces earlier ones, and it is heard once every pull of C from that sender
-has ended. A heard root is never forwarded: each side announces only its own
-state.
+What a quiet collection costs is two `walk/1` streams a minute per neighbour
+this side sends to, its records and its evidence, and three to a Full
+neighbour, each ROOT, DONE and LANDED; the same two or three come back from a
+neighbour that sends. Those frames are what keeps a peered connection from
+going idle. The load is per collection and neighbour. A test runs 130
+collections between two quiet neighbours on one connection over 20 minutes of
+virtual time on the simulated transport and counts the streams each side
+opens on the wire, which must stay within a tenth above the design's
+estimate: 130 collections times ten neighbours at the sixty-second cap and
+two streams per root, about 43 streams a second per node at ten neighbours,
+or 4.3 per second per node and neighbour. One run opened 10,420 streams in
+those 20 minutes, 4.34 a second per node and neighbour, 43.4 at ten
+neighbours against the estimate of 43.3, and asked for no value.
 
-The last completed pull per neighbour is what keeps a one-way peering quiet.
-A writer that cannot read keeps announcing a root the reader never equals; the
-reader pulls it once and then treats it as equal. A pull counts as completed
-only when it landed everything it requested without a failed insert and left no
-proof deferred, so an incomplete pull is retried by the next announcement of
-the same root.
+## Walk streams
 
-The load is per collection and neighbour. A test runs 130 collections between
-two quiet neighbours on one `recon/1` stream over 20 minutes of virtual time on
-the simulated transport; one run heard 2,598 announcements in both directions
-together, about one per collection and minute between the two.
+A `walk/1` stream carries one push: one tree of one collection, one way, from
+the side that opened the stream, the sender, to the side that accepted it,
+the receiver. The sender writes the stream's tag and an OPEN frame naming the
+collection and the tree (records `0`, authorization `1`, references `2`); the
+accept loop reads both and hands the stream to the walks task, which serves
+it from there. A stream that sends no OPEN within ten seconds, or arrives
+while no walks task runs, is reset (`RESET_WALK_FAILED`). Frames are laid out
+as on `recon/1`, a kind, a big-endian `u32` length and a payload of at most
+64 KiB; every key is 32 bytes relative to its tree's base (the collection
+handle, for authorization evidence), and integers are big-endian.
 
-## Pull walks
+| Kind | Frame | Payload | From |
+|---:|---|---|---|
+| `0x01` | OPEN | collection, tree (`u8`) | sender |
+| `0x02` | ROOT | root (zeros for the empty tree), leaf count | sender |
+| `0x03` | NODE | tag, prefix, node | sender |
+| `0x04` | LEAF | key | sender |
+| `0x05` | HELD | prefix, 256-bit child bitmap | receiver |
+| `0x06` | VALUE_REQUEST | key | receiver |
+| `0x07` | VALUE | key, bytes (at least one) | sender |
+| `0x08` | DONE | empty | sender |
+| `0x09` | LANDED | empty | receiver |
 
-Each side pulls what it lacks with its own walks, so two pulls on one
-`recon/1`, one in each direction whose sender sends, reconcile both sides. A
-record pull is two walks of one peer's PATCHes of C, its records and its
-authorization evidence, and completes when both do. A reference pull, only
-between two Full neighbours, is one walk of the peer's held set of C.
+A prefix is a length byte and at most 32 bytes. A node's tag says whether it
+is a branch (`1`) or a leaf (`2`); after the prefix comes its digest, then for
+a branch its leaf count, 32-byte representative, end depth and children, each
+an edge byte, a digest and a leaf count, running to the end of the frame, and
+for a leaf its key. A value is the bytes under a key, an encoded record or a
+proof, at most a leaf's size and never empty. A kind the reader does not
+know, or an OPEN of a tree it does not know, is skipped; a known kind whose
+payload does not parse is malformed and ends the push, not the connection.
 
-A walk is named by its collection, its kind (records `0`, authorization `1`,
-references `2`) and a `u16` number the puller counts per peer, collection and
-kind. A side runs at most one walk per peer, collection and kind. A walk ends
-by completing, by failing, or after 60 seconds without progress while something
-is owed to it, and its number
-retires: a frame, landing acknowledgement or blob fetch of an ended walk is
-dropped and touches no successor.
+The order is ROOT, then NODEs and LEAFs, then DONE; HELDs answer NODEs,
+VALUE_REQUESTs ask for leaves and VALUEs answer them, and LANDED ends the
+push. A ROOT is never answered. The sender walks its pinned tree depth first:
+every branch it reaches goes out as a NODE at its prefix, and every leaf as a
+LEAF naming its key, with no value. The receiver answers each NODE with a
+HELD for the same prefix whose bit `i` (byte `i / 8`, bit `i % 8`, least
+significant first) says it holds the child at branch byte `i` with the same
+digest and leaf count; the sender skips those subtrees and descends into the
+others, in ascending edge order. A child is compared by its locator, the
+branch's representative up to its end depth followed by the child's edge: the
+receiver looks up its own node at that locator and compares digest and count,
+so compressed paths need not line up, and a receiver whose tree branches
+elsewhere still holds such a child whole. The sender keeps at most 64 NODEs
+outstanding, sent with no HELD yet, and pauses its walk while that window is
+full. DONE follows the last answered NODE. Values stay pull: the receiver asks
+with VALUE_REQUEST for the leaves its live store lacks, checked against the
+newest snapshot as each LEAF arrives, so a value another push landed meanwhile
+is not asked for again, and the sender answers each from its pinned tree. A
+duplicate is harmless under union.
 
-| Frame | Payload after the collection, kind (`u8`) and number (`u16`) |
-|---|---|
-| WALK_REQUEST | `0` open; `1` node: prefix; `2` value: key |
-| WALK_RESPONSE | `0` summary: root, count; `1` branch; `2` leaf; `3` value: key, bytes |
-| WALK_END | side (`0` puller, `1` responder), reason (`0` done, `1` refused, `2` failed) |
+A push lands when its count proof closes, the leaves pushed plus the leaf
+counts of every child marked held being exactly the root's count, every value
+asked for landed without a failed insert, no fetch failed and no proof stayed
+deferred: the receiver sends LANDED, and the sender's pinned root becomes the
+confirmed one. A receiver whose own tree equals the pushed root, or that
+landed that root from the same sender before, holds everything: it answers
+every NODE with every child held, ignores every LEAF and counts the root's
+leaves at once, so ROOT then DONE lands with nothing in between, at a receiver
+that holds the tree or a superset of it. Anything else fails the push: a frame
+out of its place (a NODE, LEAF or DONE before the ROOT, a second ROOT, a VALUE
+nobody asked for, a frame after the end, or a frame only the other side
+sends), a NODE that is not canonical or whose root node does not match the
+ROOT, a VALUE that does not decode, is not under its key or is not evidence
+for C, a count that does not add up, a failed insert or fetch, a deferred
+proof, a HELD for no outstanding NODE, a VALUE_REQUEST for a key the pinned
+tree lacks, or a LANDED before DONE. The failing side resets the stream
+(`RESET_WALK_FAILED`); what landed stays, and the next push skips the subtrees
+that now match. A push or a receive also ends after 60 seconds without a frame
+from the other side. Every node hash-chains to the pushed root, and the
+receiver's answers disclose where it differs from the sender, which is one
+more reason pushes are served only to peers the sender sends C to.
 
-A branch is its prefix (a length byte and the bytes), digest, leaf count,
-representative, end depth and children, each an edge byte, a digest and a leaf
-count. A leaf is its prefix, digest and key: a value travels only when the
-puller asks for it. Every key is 32 bytes relative to its kind's base, and
-integers are big-endian.
+A record value must decode, with its signature, to a COMMIT or DERIVE naming
+C under the fingerprint it was asked for by. A proof value must match its id,
+verify its signatures and be evidence for C before it lands; a proof over a
+subordinate resource whose descriptor is missing fetches that descriptor from
+the sender, as described above, and lands with it if it routes the proof to
+C, or stays deferred. A references push carries no values: a held handle
+missing from the local held set joins it, one resident here noted held as it
+is, and another fetched by hash from the sender over `blob/1` within the same
+60 seconds and landed with its note. A failed fetch fails the push, and the
+blob stays in the next difference. Because a held set is a flat closure, one
+references push exposes the missing frontier at every depth.
 
-At the walk's open the responder pins its current serving snapshot of C,
-provided it sends C to the puller: its peering for C sends to the puller, or
-the puller passes READ under the pinned evidence. It answers with that PATCH's
-root and leaf count, or ends the walk as refused. A new open replaces the
-puller's earlier walk of that kind. Every node and value then comes from the
-pinned snapshot, so responses cannot splice two moments together and need no
-historical-root cache; a requested prefix or value absent from it ends the
-walk as failed. The responder leaves a request unanswered while the
-connection already queues 1,024 frames for the puller (*One connection per
-peer*); a puller that reads again is answered again.
-
-The puller compares each child digest with its own PATCH at that prefix, fixed
-when the walk starts, and requests only the children that differ. Whether a
-leaf's value is needed is checked against the live store instead, so a value
-another walk landed meanwhile is not fetched again; a duplicate fetch is
-harmless under union. A walk keeps at most 64 node requests, value requests and
-blob fetches in flight and hands at most 1,024 values to landing ahead of their
-acknowledgement; while that queue is full it requests no further nodes. The
-walks on one connection keep at most 256 requests in flight together, opens
-included, and the walk with the fewest in flight gets the next one that frees.
-A walk waiting for that budget is owed nothing, so its 60-second deadline
-starts only when it sends. The
-puller validates node summaries against the requests they answer, so every node
-hash-chains to the pinned root. A record value must decode, with its
-signature, to a COMMIT or DERIVE naming C under the fingerprint it was
-requested by. A proof value must match its id, verify its signatures and be
-evidence for C before it lands; a proof over a subordinate resource whose
-descriptor is missing waits for that descriptor, as described above.
-
-A reference walk's leaves are held handles. A handle missing from the local
-held set joins it: one resident here is noted held as it is, and another is
-fetched by hash from the same peer over `blob/1` and lands with its note. A
-failed fetch leaves the pull incomplete, and the blob stays in the next
-difference. Because a held set is a flat closure, one reference pull exposes
-the missing frontier at every depth.
-
-A walk completes when its count proof closes, every value it requested and
-every blob it fetched landed without a failed insert, and no proof stayed
-deferred. Only then does the pull's root become the neighbour's last completed
-one. A failed or abandoned walk keeps what landed, and the next walk skips the
-subtrees that now match. The puller's requests disclose where it differs from
-the responder, which is one more reason walks are served only to peers the
-responder sends C to.
+Three bounds keep what a push costs the receiver. It asks for values 64 at a
+time, value requests and blob fetches together, and the leaves beyond that
+wait their turn. It answers NODEs only while fewer than 1,024 leaves wait to
+be asked for, so the sender's window of unanswered NODEs holds its push. And
+it hands at most 1,024 values to landing ahead of their acknowledgement; while
+that many are with the landing task it reads no further, so QUIC's flow
+control holds the sender, and a sender whose receiver stops reading stalls
+instead of queueing without bound. A walk stream takes no request permit on
+either side, but it counts as in use on its connection: a draining connection
+waits for it, and so does eviction.
 
 ### Landing
 
-One landing task per host lands the values of every walk in arrival order. It
+One landing task per host lands the values of every push in arrival order. It
 takes up to 4,096 waiting values at a time, inserts them in one pass, publishes
-one serving snapshot, and then tells each walk how many of its values landed
+one serving snapshot, and then tells each push how many of its values landed
 and how many inserts failed. A group whose snapshot cannot be published counts
-as failed and withdraws serving. Later leaves of every walk are therefore
+as failed and withdraws serving. Later leaves of every push are therefore
 checked against what already landed. The task also reobserves the store every
 two seconds, so appends by other processes reach the serving snapshot, and
-from there announcements. Landing does not flush: explicit close remains the
+from there pushes. Landing does not flush: explicit close remains the
 persistence boundary.
 
-Serving snapshots are a latest-value handoff. The peering, announcement and
-walk tasks each read the newest observation, never a queue of them. Evidence
-that arrives outside walks (proofs from the grant exchange, fetched
+Serving snapshots are a latest-value handoff. The peering, scheduling and
+walks tasks each read the newest observation, never a queue of them. Evidence
+that arrives outside pushes (proofs from the grant exchange, fetched
 definitions, descriptor warmups) crosses the bounded admission bridge and lands
 at the next `Peer::refresh`, which also reobserves the store at once.
 
@@ -616,11 +659,11 @@ and process, so a grant written while the subject is unknown still reaches it.
 
 ## Blob transfer is lazy and bearer-addressed
 
-A record pull does not fetch descriptor dependencies, payloads, metadata,
+A records push does not carry descriptor dependencies, payloads, metadata,
 attachments, or derived artifacts. It transfers lattice evidence, not those
-bytes; only a reference pull between two Full neighbours fetches blobs, and
-only those the peer holds in that collection. The separate bounded host
-metadata warmup described below is not part of a walk. A resolver can then
+bytes; only a references push between two Full neighbours fetches blobs, and
+only those the sender holds in that collection. The separate bounded host
+metadata warmup described below is not part of a push. A resolver can then
 select the cheapest resident support-equivalent cover and request only the
 missing immutable handles that matter to that computation.
 
@@ -1001,9 +1044,10 @@ only to a peer that passes READ(C) under the sender's evidence, and WRITE(C)
 only lets a writer that cannot read have its peering accepted so it can
 deliver. Exact bytes are gated only by the endpoint-bound mutual proof of H.
 
-A refused peering or a refused walk is a frame. It ends only that request or
-walk, not the connection, and cancels nothing unrelated. A malformed `recon/1`
-frame closes the connection. A failed request stream invalidates the
+A refused peering is a frame, and a refused push is a reset of its `walk/1`
+stream. Either ends only that request or push, not the connection, and
+cancels nothing unrelated. A malformed `recon/1` frame closes the connection;
+a malformed `walk/1` frame ends its push. A failed request stream invalidates the
 connection unless the failure stayed on that stream: the peer reset or stopped
 it, or the connection was already lost.
 
@@ -1081,8 +1125,8 @@ Diagnostics do not log the bearer handle.
 
 ## Lattice-aware sparse replication
 
-The network does not force every replica to mirror every blob. Record pulls
-carry foundations only; each host joins them into its own lattice:
+The network does not force every replica to mirror every blob. Pushes of
+records carry foundations only; each host joins them into its own lattice:
 
 ```text
 COMMIT(C, a)       COMMIT(C, b)       replicated
@@ -1092,7 +1136,7 @@ COMMIT(C, a)       COMMIT(C, b)       replicated
 DERIVE(D, x, d)                       replicated: a foundation of D
 ```
 
-A node pulls the small semantic overlay and plans covers over its own
+A node receives the small semantic overlay and plans covers over its own
 resident merge results. Missing derived results are computed by the ordinary
 live `ensure` path, which may acquire exact missing dependencies and publishes
 missing `DERIVE` work only. `maintain` additionally writes this host's
@@ -1140,9 +1184,9 @@ seed whose bytes arrive after its record is scanned on arrival. The late
 child -- resident only after its parent was scanned -- is caught two ways:
 
 - it is itself a seed of some collection; or
-- a Full neighbour holds it in C: the reference pull notes it held in C here
-  too, however it arrived, and fetches it first when it is not resident. A
-  note is routing evidence kept in memory: a reopened store forgets it unless
+- a Full neighbour holds it in C: its references push notes it held in C
+  here too, however it arrived, and the receiver fetches it first when it is
+  not resident. A note is routing evidence kept in memory: a reopened store forgets it unless
   one of C's records reaches H, and a note of a blob that is not resident when
   the next snapshot is taken is dropped.
 
@@ -1150,13 +1194,13 @@ Otherwise it stays out of held(C) until the index resets or the store is
 reopened, though it stays readable by its hash. That is a stated limitation:
 there is no periodic rescan. Between two Full neighbours, a late child that
 one side holds through a seed or a note reaches the other side's held set by
-its next reference pull.
+its next references push.
 
 Every snapshot carries the held sets as they stood when it was taken, and they
 never change afterwards. Taking a snapshot first extends the sets by the
 closures of what arrived since the previous one -- every seed of a new record
 (one another record already named included), seeds whose bytes arrived, notes
-from reference pulls -- computed against that snapshot. That is the
+from references pushes -- computed against that snapshot. That is the
 publication barrier: an observation is never handed out ahead of its new
 records' closures. A held set is closed under the edge cache for readable
 children: a blob joins only once every child the cache names for it has
@@ -1170,9 +1214,9 @@ snapshot that lost a blob its predecessor had resets the index, and every
 collection is recomputed as if newly tracked. Short-lived readers of the same
 pile track nothing.
 
-Two Full neighbours compare like with like: the held digests in their
-announcements, and on a difference, a reference pull of the remote held set
-against the local one under Merkle pruning.
+Two Full neighbours push each other their held sets like any other tree
+(*Walk streams*): the receiver's HELD bitmaps prune what both hold, and an
+unchanged set is ROOT then DONE.
 
 This set is partial and conservative. A readable aligned word is not a
 typed semantic reference; an absent word says nothing about global residency.
@@ -1187,7 +1231,7 @@ every selected collection:
 |---|---|
 | `Demand` (default) | Explicit WANTs only. No held sets are kept, and peerings carry an unset full flag. |
 | `Shallow` | Also direct blob references of the named collections' foundations. |
-| `Full` | Also everything a Full neighbour holds in each named collection, by reference pull. This side keeps held sets for them and peers with the full flag set. |
+| `Full` | Also everything a Full neighbour holds in each named collection, by its references pushes. This side keeps held sets for them and peers with the full flag set. |
 
 These reconciler modes are separate from the bounded metadata warmup of
 active descriptors described above. Demand still does not hydrate record
@@ -1197,10 +1241,10 @@ Naming a collection for replication does not grant READ or WRITE and does not
 activate it. Structurally valid but WRITE-inert records can name direct roots;
 acquiring their bytes does not admit those records. Full mode never sends
 aligned payload words to the DHT to choose speculative requests. Local
-aligned-word scanning builds the positive held set only, and a reference pull
-fetches only handles a Full neighbour holds, directly from that neighbour.
-Unavailable neighbours and failed fetches prevent a promise that `Full` has
-reached complete closure, and an equal held digest says only that two
+aligned-word scanning builds the positive held set only, and a references
+push brings only handles a Full neighbour holds, fetched directly from that
+neighbour. Unavailable neighbours and failed fetches prevent a promise that
+`Full` has reached complete closure, and an equal held root says only that two
 neighbours hold the same set.
 
 Exact WANTs and direct roots use the existing KDF(H) discovery, mutual
@@ -1221,17 +1265,20 @@ guarantee.
 
 ## Wire surface
 
-The ALPN is `/triblespace/pile-sync/29`. Generation 27 replaced the bearer
+The ALPN is `/triblespace/pile-sync/30`. Generation 27 replaced the bearer
 locator, directory token and exact-GET proofs with one-block constructions, so
 a generation-26 peer cannot connect at all; generation 28 exports foundations
-only, so collection sync never carries a MERGE; generation 29 replaces the
-gossip wake plane and the `repair/0` session with `recon/1`, so a generation-28
-peer is refused at the handshake. Within the ALPN, each stream's first byte
-selects its layout (*One connection per peer*), and all collection sync runs on
-`recon/1`. Bytes that opened earlier layouts are not accepted: `0x0E` was the
-collection repair session that walks on `recon/1` replaced, `0x0D` its
-record/AUTH-only predecessor, and `0x06`, `0x07` and `0x0C` the DHT operations
-now under `dht/1`. A stream that opens with one of them is reset as an unknown
+only, so collection sync never carries a MERGE; generation 29 replaced the
+gossip wake plane and the `repair/0` session with one connection per peer and
+its `recon/1` stream; generation 30 moves collection sync off `recon/1` onto
+`walk/1` pushes, so a generation-29 peer, which announces and pulls on
+`recon/1`, is refused at the handshake like every older one. Within the ALPN,
+each stream's first byte selects its layout (*One connection per peer*):
+peerings and the grant exchange run on `recon/1`, and every collection tree
+travels on a `walk/1` stream. Bytes that opened earlier layouts are not
+accepted: `0x0E` was the collection repair session that pushes on `walk/1`
+replaced, `0x0D` its record/AUTH-only predecessor, and `0x06`, `0x07` and
+`0x0C` the DHT operations now under `dht/1`. A stream that opens with one of them is reset as an unknown
 tag. Mixed-version collection sync is not supported: deploy a cohort together.
 
 | Operation | Stream | Byte | Meaning |
@@ -1239,10 +1286,11 @@ tag. Mixed-version collection sync is not supported: deploy a cohort together.
 | `FIND_VALUE` | `dht/1` | `0x0F` | one iterative XOR-DHT lookup step: the K closest verified routes and bounded provider hints for one opaque key |
 | `PROVIDER_PUT` | `dht/1` | `0x06` | renew this endpoint's opaque provider lease; the answer says stored (`0x00`) or not stored (`0x01`) |
 | exact GET | `blob/1` | | locator-addressed, mutual-proof exact bearer transport |
+| push | `walk/1` | | one collection tree, pruned by the receiver's HELD bitmaps |
 
 `FIND_VALUE` answers in one reply what `FIND_NODE` and `PROVIDER_GET` (`0x0C`
-and `0x07`) answered in two rounds. Every `recon/1` frame, including the walk
-frames, is listed in *One connection per peer*.
+and `0x07`) answered in two rounds. Every `recon/1` frame is listed in *One
+connection per peer*, and every `walk/1` frame in *Walk streams*.
 
 There is deliberately no store manifest, global inventory authorization,
 push-broadcast record, receipt RPC, remote mutable head, or unpublish operation.
@@ -1275,9 +1323,9 @@ the sync daemon listens*) on its first pass and after every change, so a
 process that opens the pile and names the daemon's key reaches it with nothing
 copied by hand. `trible pile net identity --key KEY` prints `node: <endpoint
 id>`; there is no ticket to print, since nothing takes one. After each pass the
-daemon prints one plain line on stderr per peer with which at least one record
-pull ended without a failed or timed-out walk since the previous pass:
-`reconciled with peer <endpoint id hex>: <n> collections`.
+daemon prints one plain line on stderr per peer with which at least one
+collection's last push was confirmed or last receive landed whole since the
+previous pass: `reconciled with peer <endpoint id hex>: <n> collections`.
 
 The long-running daemon uses one existing durable key for its authenticated
 endpoint, the configuration that holds its sync selection and its addresses,
@@ -1304,21 +1352,21 @@ are not preemptible, so this cooperative boundary is not a shutdown-time bound.
 
 ## Convergence and failure model
 
-- Concatenation, local insertion, and landing from pull walks perform set
+- Concatenation, local insertion, and landing from pushes perform set
   union; held sets remain replaceable local observations.
 - Duplicate records collapse by their complete canonical value; fixed-width
   indexes and the wire use a full-width BLAKE3 fingerprint of that value.
   Native capability proofs continue to collapse by their cryptographic
   identity.
-- A missed announcement does not consume the only opportunity: in every
-  interval of at most a minute, each collection's timer offers its current
-  root to each neighbour it sends to that did not announce the same state, and
-  a pull that did not complete is retried by the next announcement of the
-  same root. A neighbour lost to a failure is replaced by the next candidate
-  in the collection's order.
-- An invalid record, proof, PATCH node, or blob fails its walk or fetch and
+- A lost push does not consume the only opportunity: in every interval of at
+  most a minute, each collection's timer pushes its trees again to each
+  neighbour it sends to, and a push that did not land forgets its confirmed
+  root, so the next one walks the tree again and the receiver's bitmaps prune
+  what already landed. A neighbour lost to a failure is replaced by the next
+  candidate in the collection's order.
+- An invalid record, proof, PATCH node, or blob fails its push or fetch and
   cannot retract previously accepted evidence; a malformed `recon/1` frame
-  closes its connection.
+  closes its connection, and a malformed `walk/1` frame ends its push.
 - Missing selected output/dependency blobs leave that realization unavailable;
   complete finer members remain usable. Missing witness records leave support
   unknown, not empty, and do not authorize cross-collection disclosure.
@@ -1327,8 +1375,8 @@ are not preemptible, so this cooperative boundary is not a shutdown-time bound.
 - Concurrent writers and offline replicas reconverge without preserving pile
   byte order.
 
-The result is two orthogonal elemental loops: per-collection announcements
-plus admission-gated pull walks say *what changed in a collection* and,
+The result is two orthogonal elemental loops: per-collection timers plus
+admission-gated pushes say *what changed in a collection* and,
 between two Full neighbours, which blobs a peer holds in it, while KDF(H)
 discovery plus mutual bearer proof retrieves only the immutable bytes the local
 lattice resolver decides to use.
@@ -1337,15 +1385,22 @@ lattice resolver decides to use.
 
 `Peer::health()` and `NetSender::health()` expose a bounded immutable sample of
 work the host already performs. Sampling does not run a probe or advance the
-host's observation clock. Each record pull retains, as its comparison, the
-local record/AUTH frontier when it started and the remote frontier and record
-root its walks pinned. Semantic health compares record and AUTH evidence, not
-blob cache equality: Demand and Full peers can legitimately cache different
-bytes, and held sets are not part of the record root. Held-set churn neither
-creates semantic stalls nor extends their progress grace.
-A comparison stops implying convergence when that sample is stale, the local
-semantic frontier has changed, or the serving snapshot has been withdrawn. Receiving
-records is progress evidence, not proof they have already become admitted.
+host's observation clock. For each collection and peer the sample keeps the
+ends of both directions, the pushes of this side's trees and the pushes of
+the peer's trees received here (when the last one ended, whether it ended
+well, and how many did either way), with the roots of the records and
+authorization trees the peer confirmed and the roots that landed whole here.
+Semantic health compares record and AUTH evidence, not blob cache equality:
+Demand and Full peers can legitimately cache different bytes, held sets are
+not part of the record root, and the references tree is in neither set of
+roots. Held-set churn neither creates semantic stalls nor extends their
+progress grace. `HealthSnapshot::pair` reads a pair as `Current` when the
+peer confirmed the records and evidence this side serves now, where this side
+sends, and the last push from the peer landed whole, where it receives;
+`Behind` names the direction that is not; and a stale sample, a changed local
+frontier, a withdrawn serving snapshot, an ended peering or no end within the
+age limit leaves it `Unknown`. Receiving records is progress evidence, not
+proof they have already become admitted.
 `HealthSnapshot::peerings` lists every peering on an open connection, and
 `HealthSnapshot::available` the collections named by proofs naming this node
 that wait in memory for their descriptor.
@@ -1502,7 +1557,7 @@ existing sync-loop boundary. Five subjects distinguish the measurements:
 
 - `hydration`: successful verified reconciler puts and their payload bytes;
   one landing shared by a WANT and a selected root counts once. Blobs a
-  reference pull lands are not reconciler puts and are not counted. Local hits
+  references push lands are not reconciler puts and are not counted. Local hits
   and failed puts add no received bytes. `queued` counts distinct unreadable
   known handles from exact WANTs and selected direct roots at the end of that
   tick's acquisition window. It excludes unknown descendants and is not a
@@ -1511,8 +1566,9 @@ existing sync-loop boundary. Five subjects distinguish the measurements:
   sent payloads/bytes and interrupted or failed exchanges. A payload counts
   only after its write and stream shutdown succeed, not merely after lookup.
   This is not a remote landing or persistence acknowledgement.
-- `repair`: record pulls currently in flight, as host health already records
-  them, not configured concurrency.
+- `repair`: no active count yet. Host health records the ends of pushes and
+  receives, not the ones in flight, so the measurement stays absent rather
+  than estimated.
 - `publication`: active and completed provider-advertisement operations,
   separate from body transfer; acknowledgement is not blob availability.
 - `process`: one cumulative user-plus-system CPU observation across all

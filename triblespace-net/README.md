@@ -98,13 +98,15 @@ share the raw record's byte ownership. This is a validated membership projection
 not validation during Pile replay and not a shared global host index. Summaries
 and repair nodes expose only C's fixed prefix; hashes bind the full keys while
 wire keys and compressed paths omit that prefix. The three components are
-compared by pull walks on `recon/1` under `/triblespace/pile-sync/29`; the old
-repair opcodes `0x0E` and `0x0D` are reset as unknown stream tags. Generation 27
+pushed on `walk/1` streams under `/triblespace/pile-sync/30`; the old repair
+opcodes `0x0E` and `0x0D` are reset as unknown stream tags. Generation 27
 changed the blob locator, directory token and exact-GET proofs to one-block
 constructions; generation 28 exports foundations only (COMMIT and DERIVE, never
-MERGE) and advertises each collection's held-blob set; generation 29 replaces
-gossip wakes and repair sessions with `recon/1`. Older peers cannot connect and
-all nodes switch together. No AUTH or collection-repair operation transfers
+MERGE) and syncs each collection's held-blob set; generation 29 replaced
+gossip wakes and repair sessions with one connection per peer and its
+`recon/1` stream; generation 30 moves the trees from pull walks on `recon/1`
+to pushes on `walk/1`. Older peers cannot connect and all nodes switch
+together. No AUTH or collection-repair operation transfers
 blob bodies or creates WANT; exact H remains the blob read capability.
 
 DHT provider-directory operations use the ordinary blob-locator namespace,
@@ -123,13 +125,13 @@ therefore cannot make the requester disclose H or masquerade as a provider.
 Returned bytes are accepted only when they hash to H. READ(C) is not consulted
 by exact GET and remains exclusively the collection-repair disclosure boundary.
 
-## Peering and announcements
+## Peering and pushes
 
 Hosts reconcile a collection C only while both piles select it in the sync
 selection register of their own configuration collection. Each pair of
-endpoints keeps one connection, and the dialler's `recon/1` stream carries the
-peerings, announcements and pull walks of every collection, and the grant
-exchange.
+endpoints keeps one connection; the dialler's `recon/1` stream carries the
+peerings of every collection and the grant exchange, and each push of a
+collection tree opens a `walk/1` stream of its own.
 
 A host asks up to five candidates to peer for each collection it selects:
 grant-chain keys and record signers that pass READ under local evidence, then
@@ -140,12 +142,14 @@ the next candidate, and an exhausted order is drawn again at most once a
 minute, which also looks up C's providers again. The acceptor admits a key that
 passes READ for C, or one that sends and passes WRITE.
 
-Neighbours announce C's root on a randomized timer that grows from two to sixty
-seconds and that a local append resets. An equal announcement spares its sender
-the next one. A different one starts a pull walk from the announcer and gets one
-reply, which starts the reverse pull. A pull walk descends where the two PATCH
-digests differ and lands what the store lacks as it goes. A lost announcement is
-followed by the next one; nothing else is retried.
+Each neighbour pushes C's trees, its records and authorization evidence and,
+between two Full neighbours, its held set, on a randomized timer that grows
+from two to sixty seconds and that a local append resets. A push walks the
+sender's pinned tree depth first and skips the subtrees the receiver says it
+holds; the receiver asks for the values it lacks and lands them as they
+arrive, and its LANDED confirms the root, so an unchanged tree costs one frame
+each way next time. A push that fails forgets that confirmed root and is
+walked again at the next opportunity; nothing else is retried.
 
 There is no local direction policy. A collection flows to a neighbour exactly
 when this side admits it to read, and a pile that selects no collection peers
@@ -232,14 +236,14 @@ visible without enabling broad packet-level tracing.
 ## Crate layout
 
 - `collection_activation` — per-collection record and authorization-evidence PATCHes
-- `walk` / `landing` — pull walks on `recon/1` and the task that lands their values
-- `patch_repair` — root-pinned Merkle difference walker
+- `walk` / `walk_stream` / `push` / `receive` / `landing` — pushes on `walk/1` streams: their frames, the sender, the receiver and the task that lands their values
+- `patch_repair` — Merkle node summaries and their validation for the walks
 - `peer` — synchronous store wrapper, monotone admission, and local WANT intent
 - `reconcile` — durable WANT observation and reproducible-operation fulfillment
 - `provider` / `routing` — bounded bearer provider directory and XOR routing
 - `protocol` — public direct-operation framing
 - `host` — immutable overlays, connection table, DHT client, and scheduler
-- `peering` / `announce` / `wake_schedule` — per-collection peering, root announcements and their timer
+- `peering` / `schedule` / `wake_schedule` — per-collection peering, the push scheduler and its timer
 - `grants` — the grant exchange on `recon/1`
 - `transport` — production iroh and deterministic simulation transports
 - `identity` — persistent network signing-key handling

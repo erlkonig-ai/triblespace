@@ -200,7 +200,7 @@ the index's realized support.
 ### Distributed pile sync
 
 Built on `triblespace-net` (authenticated iroh QUIC, collection-scoped PATCH
-anti-entropy, per-collection peering and root announcements, and DHT provider
+anti-entropy, per-collection peering and tree pushes, and DHT provider
 lookup). Opening a
 transport connection grants no collection authority. Each repair request names
 one exact collection and may carry bounded native READ(C) proofs for cold

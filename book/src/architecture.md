@@ -323,10 +323,10 @@ synchronization or repository snapshots; semantic rewrites drop them.
 `Pile` stores blobs, native collection records, capability proofs, and WANT
 records in one
 append-only log. `ObjectStoreRemote` places immutable collection records under
-content-derived object keys. The network layer uses per-collection root
-announcements between peered neighbours and READ(C)-gated Merkle pull walks to
-union that collection's records and structurally relevant native
-READ(C)/WRITE(C) proof records. Each proof record
+content-derived object keys. The network layer uses READ(C)-gated Merkle
+pushes between peered neighbours, each side pushing its own collection trees
+on a timer, to union that collection's records and structurally relevant
+native READ(C)/WRITE(C) proof records. Each proof record
 is the complete authorization value and has no referenced blob closure.
 Independently, every resident blob may
 publish an opaque XOR-DHT lease under KDF(H); knowing H is the bearer capability

@@ -170,9 +170,9 @@ whose bytes are resident, through the same snapshot.
 
 ### Collection READ
 The exact `ACTION_READ` capability over one collection descriptor handle. A
-node sends a collection's announcements, records, proofs and held set only to
-a peer that passes READ(C) under its own evidence and the credentials the peer
-presented when it asked to peer. Knowing the collection handle permits finding
+node pushes a collection's records, proofs and held set only to a peer that
+passes READ(C) under its own evidence and the credentials the peer presented
+when it asked to peer. Knowing the collection handle permits finding
 holders of its descriptor and asking them to peer, but does not reveal records,
 proofs, counts, or blobs. `Open` READ needs no proof. Exact immutable content
 is a separate bearer system: every served resident H may be advertised under
@@ -275,14 +275,15 @@ WRITE policy in the observed proof set. Local stores may retain inactive
 commits; synchronization and concatenation remain monotone because later proof
 evidence can activate them without retracting bytes.
 
-### Announcement
-A `recon/1` frame saying "my record root for C is R", sent on a per-collection
-timer of two to sixty seconds to each peered neighbour the sender sends C to.
-The record root commits to C's records and authorization evidence and reveals
-neither. Between two Full neighbours, which both replicate C in full and may
-each read or write it, it also carries the held digest. A different root starts
-a pull walk; an announcement is a trigger, never forwarded, and not the source
-of truth.
+### Push
+One collection tree, its records, its authorization evidence or its held set,
+sent to one peered neighbour the sender sends C to, on a `walk/1` stream the
+sender opens and on a per-collection timer of two to sixty seconds. The sender
+walks its pinned tree; the receiver prunes it with HELD bitmaps, asks for the
+values it lacks and lands them as they arrive, and its LANDED confirms the
+root, so an unchanged tree is ROOT then DONE next time. The held set travels
+only between two Full neighbours. A push is never forwarded and is not the
+source of truth.
 
 ### Peering
 Two keys' agreement, on the one connection between them, to sync one
@@ -294,20 +295,12 @@ collection's records and grants name, then the DHT's providers of its
 descriptor; no configured list of peers exists. Peerings belong to their
 connection and form no roster.
 
-### Pull Walk
-A Merkle walk over `recon/1` of one peer's PATCH of one collection's records,
-authorization evidence or held set. The responder pins a snapshot when the walk
-opens; the puller requests only the subtrees that differ and the values it
-lacks, and lands what arrives as it goes. A record pull is a records walk and
-an authorization walk; it counts as completed only when everything it requested
-landed and no proof stayed deferred.
-
 ### Held Set
 The resident blobs reachable from a collection's seeds -- its descriptor, its
 foundations' direct references and its proofs' capability definitions -- as a
 positive PATCH kept by the store for collections replicated in full. Two Full
-neighbours compare its Merkle root, the held digest, and pull each other's
-differences by reference pull. It is a local observation, not membership.
+neighbours push it to each other like any other tree, pruned by what both
+hold. It is a local observation, not membership.
 
 ### Sync Selection
 The register in a pile's own configuration collection that says, for each
