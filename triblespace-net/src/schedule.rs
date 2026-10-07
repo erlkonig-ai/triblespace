@@ -16,9 +16,11 @@
 //! set resets nothing: the next push carries it. A neighbour this side
 //! starts sending to is pushed to within two minimum intervals.
 //!
-//! When a push ends, the walks task compares the tree with the one pushed
-//! and pushes again at once if they differ ([`crate::walk::Walks::pushed`]);
-//! the scheduler does not see pushes end.
+//! When a push is confirmed, the walks task compares the tree with the one
+//! pushed and pushes again at once if they differ
+//! ([`crate::walk::Walks::pushed`]); a push that ends any other way waits
+//! for the timer, so retries to a neighbour that cannot land it are paced
+//! like any push. The scheduler does not see pushes end.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;

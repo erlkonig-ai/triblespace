@@ -745,11 +745,12 @@ mod tests {
 
         // A confirmed end pins the root: the unchanged tree is root then
         // done, and a new record walks only its path at a receiver holding
-        // the rest. A record committed while a push runs makes its end ask
-        // for the next push at once.
-        let (push, frames) = owner.walks.push(peer, collection, kind).unwrap();
+        // the rest. A record committed while a confirmed push runs makes
+        // its end ask for the next push at once.
+        let (mut push, frames) = owner.walks.push(peer, collection, kind).unwrap();
         assert!(matches!(frames[..], [Frame::Root { .. }, Frame::Done]));
         let before = snapshot(&owner, collection);
+        carry(&mut push, &mut Receiver::new(kind, None), frames).unwrap();
         let key = owner.commit(collection, 2).fingerprint().raw();
         owner.observe();
         assert!(
@@ -767,15 +768,53 @@ mod tests {
                 .pushed(peer, collection, kind, push.outcome(), now)
         );
 
-        // Health saw every end: two confirmed, two not, and the confirmed
+        // Health saw every end: three confirmed, one not, and the confirmed
         // records root is the tree as it is now.
         let health = owner.health.snapshot();
         let pair = &health.collections[0].peers[0];
         assert_eq!(pair.peer, peer);
-        assert_eq!((pair.pushes.ok, pair.pushes.failed), (2, 2));
+        assert_eq!((pair.pushes.ok, pair.pushes.failed), (3, 1));
         assert_eq!(
             pair.confirmed.records,
             Some(summary(kind, snapshot(&owner, collection).repair()))
+        );
+    }
+
+    /// A push that ended unconfirmed is not repeated at once however the
+    /// tree moved meanwhile: it is left to the collection's timer, which
+    /// paces retries to a neighbour that cannot land it. Only a confirmed
+    /// push of a tree that changed while it ran is followed at once.
+    #[test]
+    fn a_failed_push_of_a_tree_that_changed_meanwhile_waits_for_the_timer() {
+        let mut owner = Node::new(42);
+        let collection = owner.hold("timer", open());
+        owner.commit(collection, 1);
+        owner.observe();
+        let peer = Node::new(43).id();
+        let kind = WalkKind::Records;
+        let now = crate::clock::mono_now();
+
+        // A record lands while the push runs, and the push fails.
+        let (push, _) = owner.walks.push(peer, collection, kind).unwrap();
+        owner.commit(collection, 2);
+        owner.observe();
+        let outcome = push.outcome();
+        assert!(!outcome.confirmed);
+        assert!(
+            !owner.walks.pushed(peer, collection, kind, outcome, now),
+            "a failed push waits for the timer"
+        );
+
+        // The same change under a confirmed push is followed at once.
+        let (mut push, frames) = owner.walks.push(peer, collection, kind).unwrap();
+        let mut receiver = Receiver::new(kind, None);
+        carry(&mut push, &mut receiver, frames).unwrap();
+        owner.commit(collection, 3);
+        owner.observe();
+        assert!(
+            owner
+                .walks
+                .pushed(peer, collection, kind, push.outcome(), now)
         );
     }
 

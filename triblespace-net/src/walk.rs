@@ -317,9 +317,12 @@ impl Walks {
         Some(Push::start(kind, pinned, self.confirmed.root(key)))
     }
 
-    /// The push of C's `kind` tree to `peer` ended, confirmed or not. Returns
-    /// whether the tree here differs from the one pushed: the caller then
-    /// pushes again at once.
+    /// The push of C's `kind` tree to `peer` ended. Returns whether it was
+    /// confirmed and the tree here differs from the one pushed: the caller
+    /// then pushes again at once, from the root just confirmed. A push that
+    /// ended any other way is left to C's timer however the tree moved:
+    /// repeating it at once would retry a neighbour that cannot land it as
+    /// fast as the attempts fail.
     pub(crate) fn pushed(
         &mut self,
         peer: PeerId,
@@ -331,14 +334,15 @@ impl Walks {
         let key = (peer, collection.raw, kind);
         self.pushes.remove(&key);
         let root = outcome.root;
+        let confirmed = outcome.confirmed;
         self.health.with_peer(collection, peer, |health| {
-            health.pushed(now, kind, root, outcome.confirmed)
+            health.pushed(now, kind, root, confirmed)
         });
         let changed = self
             .local(collection)
             .is_some_and(|current| summary(kind, current.repair()) != root);
         self.confirmed.settle(key, outcome);
-        changed
+        changed && confirmed
     }
 
     /// Admit a push of C's `kind` tree from `peer`, if this side receives
@@ -848,8 +852,9 @@ impl<T: Transport, S: Service> Task<T, S> {
                 kind,
                 outcome,
             } => {
-                // The tree changed while the push ran: the next push goes
-                // out at once, from the root just confirmed.
+                // A confirmed push of a tree that changed while it ran is
+                // followed at once, from the root just confirmed; a failed
+                // one waits for the timer.
                 if self.walks.pushed(peer, collection, kind, outcome, now) {
                     self.push(peer, collection, kind);
                 }
