@@ -30,11 +30,13 @@
 //! Three bounds keep what a push costs here. Values are asked for
 //! [`MAX_WALK_REQUESTS`] at a time, and the leaves beyond that wait their
 //! turn. Nodes are answered only while fewer than [`MAX_WANTED`] leaves wait,
-//! so the sender's window of unanswered nodes holds its push. And
-//! [`Receive::want_read`] is false while [`MAX_WALK_UNLANDED`] values are
-//! with the landing task, so the driver stops reading and QUIC flow control
-//! holds the sender. The stream is read on while a value is owed to it: only
-//! reading brings the value, so stopping for owed values would wait forever.
+//! so the sender's window of unanswered nodes holds its push, and a push
+//! with [`FLOOD_WANTED`] leaves waiting, more than that window can push, is
+//! a flood and fails. And [`Receive::want_read`] is false while
+//! [`MAX_WALK_UNLANDED`] values are with the landing task, so the driver
+//! stops reading and QUIC flow control holds the sender. The stream is read
+//! on while a value is owed to it: only reading brings the value, so
+//! stopping for owed values would wait forever.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -58,6 +60,11 @@ use crate::walk_stream::{Frame, hold};
 
 /// Leaves waiting to be asked for before pushed nodes go unanswered.
 pub(crate) const MAX_WANTED: usize = 1024;
+/// Leaves waiting to be asked for beyond which the push is a flood and
+/// fails. A sender whose HELDs are withheld can push at most the children
+/// of the nodes answered before, a window of 64 nodes of 256 each on top
+/// of [`MAX_WANTED`], so twice that is out of any honest sender's reach.
+pub(crate) const FLOOD_WANTED: usize = 32 * MAX_WANTED;
 
 /// What a receive asks of its driver.
 #[derive(Debug)]
@@ -90,8 +97,9 @@ pub(crate) enum Failure {
     Unavailable,
     /// A frame out of its place: a node, leaf or end before the root, a
     /// second root, a node or leaf at a locator the sender does not owe or
-    /// owes no more, a value nobody asked for, a frame after the end, or
-    /// one only a receiver sends.
+    /// owes no more, a leaf beyond what a sender's window can push, a value
+    /// nobody asked for, a frame after the end, or one only a receiver
+    /// sends.
     Protocol,
     /// A pushed node is not canonical, or is not the node its parent (or
     /// the root) declared at its locator.
@@ -377,13 +385,16 @@ impl Receive {
     }
 
     /// Count one pushed leaf, and want its value unless the live tree has
-    /// it.
+    /// it. More leaves wanted than a sender's window can push is a flood.
     fn leaf(&mut self, key: [u8; KEY_BYTES], live: &CollectionSnapshot) -> Result<(), Failure> {
         self.accounted = self
             .accounted
             .checked_add(1)
             .ok_or(Failure::CountMismatch)?;
         if !crate::walk::contains(self.kind, live.repair(), &key) {
+            if self.wanted.len() >= FLOOD_WANTED {
+                return Err(Failure::Protocol);
+            }
             self.wanted.push_back(key);
         }
         Ok(())
@@ -683,6 +694,84 @@ mod tests {
         replies
             .into_iter()
             .filter(|reply| matches!(reply, Frame::ValueRequest { .. }))
+    }
+
+    /// A tree the receiver takes as pushed, fabricated without a PATCH:
+    /// `wide` branches under the root, each of `deep` leaves, every digest
+    /// as the PATCH hashes it. The root and its NODE, then each branch's
+    /// NODE with its LEAFs.
+    fn fabricated(wide: usize, deep: usize) -> (PatchSummary, Frame, Vec<(Frame, Vec<Frame>)>) {
+        use crate::patch_repair::{PatchBranch, PatchChild};
+        let tree_to_key = (0..KEY_BYTES).collect::<Vec<_>>();
+        let branch = |representative: Vec<u8>, end_depth: usize, children: Vec<PatchChild>| {
+            let leaf_count = children.iter().map(|child| child.leaf_count).sum();
+            let mut state = <Blake3Merkle as PatchHash>::begin_branch(
+                &representative,
+                &tree_to_key,
+                end_depth,
+                children.len(),
+                leaf_count,
+            );
+            for child in &children {
+                <Blake3Merkle as PatchHash>::push_child(
+                    &mut state,
+                    child.edge,
+                    child.leaf_count,
+                    child.digest,
+                );
+            }
+            PatchNode::Branch {
+                digest: <Blake3Merkle as PatchHash>::finish_branch(state),
+                leaf_count,
+                branch: PatchBranch {
+                    representative,
+                    end_depth: end_depth as u8,
+                    children,
+                },
+            }
+        };
+        let mut branches = Vec::new();
+        let mut children = Vec::new();
+        for edge in 0..wide {
+            let edge = u8::try_from(edge).unwrap();
+            let (mut leaves, mut under) = (Vec::new(), Vec::new());
+            for leaf in 0..deep {
+                let mut key = [0; KEY_BYTES];
+                key[0] = edge;
+                key[1] = u8::try_from(leaf).unwrap();
+                under.push(PatchChild {
+                    edge: key[1],
+                    digest: <Blake3Merkle as PatchHash>::leaf(&key),
+                    leaf_count: 1,
+                });
+                leaves.push(Frame::Leaf { key });
+            }
+            let mut representative = vec![0; KEY_BYTES];
+            representative[0] = edge;
+            let node = branch(representative, 1, under);
+            children.push(PatchChild {
+                edge,
+                digest: node.digest(),
+                leaf_count: node.leaf_count(),
+            });
+            branches.push((
+                Frame::Node {
+                    prefix: vec![edge],
+                    node,
+                },
+                leaves,
+            ));
+        }
+        let node = branch(vec![0; KEY_BYTES], 0, children);
+        let root = PatchSummary::new(Some(node.digest()), node.leaf_count()).unwrap();
+        (
+            root,
+            Frame::Node {
+                prefix: Vec::new(),
+                node,
+            },
+            branches,
+        )
     }
 
     fn leaves(frames: &[Frame]) -> BTreeSet<[u8; 32]> {
@@ -1417,5 +1506,71 @@ mod tests {
             .received(sender.id(), collection, WalkKind::Records, root, false, now);
         let health = node.health.snapshot();
         assert_eq!(health.collections[0].peers[0].received.records, None);
+    }
+
+    /// A sender that pushes leaves and withholds their values makes the
+    /// receiver queue what it wants to ask for. The stream stays read, since
+    /// only reading brings the values owed, and the queue fails the push
+    /// once it holds more than a window of answered nodes could have pushed:
+    /// a flood. A sixty-first leaf against a root of sixty fails at once,
+    /// before DONE.
+    #[test]
+    fn a_leaf_flood_with_withheld_values_fails_the_push_and_an_overcount_fails_at_once() {
+        let mut receiver = Node::new(59);
+        let collection = receiver.hold("flood", open());
+        receiver.observe();
+        let (root, root_node, branches) = fabricated(256, FLOOD_WANTED / 256 + 2);
+        assert!(root.leaf_count() as usize > FLOOD_WANTED + MAX_WALK_REQUESTS);
+        let mut harness = Harness::new(receiver, collection, WalkKind::Records);
+        harness.feed(Frame::Root { summary: root });
+        assert!(matches!(&harness.feed(root_node)[..], [Frame::Held { .. }]));
+        let mut fed = 0;
+        'flood: for (node, leaves) in branches {
+            harness.feed(node);
+            for leaf in leaves {
+                assert!(harness.receive.want_read(), "values are owed");
+                harness.feed(leaf);
+                fed += 1;
+                if harness.receive.outcome().is_some() {
+                    break 'flood;
+                }
+            }
+        }
+        assert_eq!(
+            harness.receive.outcome(),
+            Some(Outcome::Failed(Failure::Protocol))
+        );
+        assert_eq!(harness.receive.wanted.len(), FLOOD_WANTED);
+        assert_eq!(fed, FLOOD_WANTED + MAX_WALK_REQUESTS + 1);
+        assert_eq!(harness.requested().len(), MAX_WALK_REQUESTS);
+
+        // A sixty-first leaf against a root of sixty fails at once.
+        let mut sender = Node::new(60);
+        let collection = sender.hold("overcount", open());
+        let mut receiver = Node::new(61);
+        receiver.hold("overcount", open());
+        for data in 0..60 {
+            sender.commit(collection, data);
+        }
+        sender.observe();
+        receiver.observe();
+        let mut harness = Harness::new(receiver, collection, WalkKind::Records);
+        let frames = tree(&sender, collection, WalkKind::Records);
+        let again = frames
+            .iter()
+            .find(|frame| matches!(frame, Frame::Leaf { .. }))
+            .unwrap()
+            .clone();
+        for frame in frames {
+            harness.feed(frame);
+        }
+        assert_eq!(harness.receive.outcome(), None);
+        harness.feed(again);
+        assert!(
+            matches!(harness.receive.outcome(), Some(Outcome::Failed(_))),
+            "{:?}",
+            harness.receive.outcome()
+        );
+        assert!(!harness.sent.contains(&Frame::Landed));
     }
 }
