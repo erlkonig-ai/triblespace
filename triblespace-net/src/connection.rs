@@ -3,12 +3,12 @@
 //! A [`ConnectionTable`] holds the connections of both directions, keyed by
 //! the remote's TLS-authenticated [`PeerId`]. Every connection, dialled or
 //! accepted, runs one accept loop. The first byte of each stream is its type
-//! tag ([`TAG_RECON`], [`TAG_DHT`] or [`TAG_BLOB`]). The loop reads the tag
-//! before it takes any permit: `recon/1` takes none, a request stream takes
-//! one of its connection's (or is reset when none is left) and waits for one
-//! of the table's, within its connection's share and, on a connection that is
-//! no neighbour's, within the share strangers have, and an unknown tag resets
-//! only its own stream.
+//! tag ([`TAG_RECON`], [`TAG_DHT`], [`TAG_BLOB`] or [`TAG_WALK`]). The loop
+//! reads the tag before it takes any permit: `recon/1` and `walk/1` take
+//! none, a request stream takes one of its connection's (or is reset when
+//! none is left) and waits for one of the table's, within its connection's
+//! share and, on a connection that is no neighbour's, within the share
+//! strangers have, and an unknown tag resets only its own stream.
 //!
 //! The dialler opens `recon/1` as it connects, and its first frame carries
 //! the dialler's sequence number. When a pair holds two connections, both
@@ -29,6 +29,12 @@
 //! replaces it is a later dial, which the peering layer's candidate order
 //! governs.
 //!
+//! A `walk/1` stream carries one push of a collection's tree, in the frames
+//! of `walk_stream`. Its opener sends the tag and an Open frame naming the
+//! collection and kind, and the accept loop hands the stream to the walk
+//! task, which serves it from there. One that sends no Open within
+//! [`TAG_DEADLINE`], or arrives while no walk task runs, is reset.
+//!
 //! A connection closes after [`CONNECTION_IDLE_DEADLINE`] without a frame on
 //! any of its streams, sent or received. Above [`MAX_CONNECTIONS`] in one
 //! direction, the least recently used connection is evicted. A neighbour
@@ -48,10 +54,14 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::Instant;
 use tracing::{Instrument as _, debug, debug_span, info_span, warn};
 
-use crate::protocol::{PILE_SYNC_ALPN, TAG_BLOB, TAG_DHT, TAG_RECON, recv_u8, send_u8};
+use triblespace_core::collection::CollectionHandle;
+
+use crate::protocol::{PILE_SYNC_ALPN, TAG_BLOB, TAG_DHT, TAG_RECON, TAG_WALK, recv_u8, send_u8};
 pub(crate) use crate::recon::{FRAME_OPEN, MAX_RECON_FRAME_BYTES};
 use crate::recon::{Frame, Malformed};
 use crate::transport::{Conn, PeerId, RecvStream, SendStream, Transport};
+use crate::walk::{Pulls, WalkKind};
+use crate::walk_stream;
 
 /// Bound on a dial, including its opening `recon/1` frame.
 const DIAL_DEADLINE: Duration = Duration::from_secs(10);
@@ -108,6 +118,11 @@ pub const RESET_UNKNOWN: u32 = 1;
 /// Stream reset code: the connection already holds
 /// [`MAX_HELD_REQUESTS_PER_CONNECTION`] request streams.
 pub const RESET_BUSY: u32 = 3;
+/// Stream reset code: the `walk/1` opener is not sent the collection.
+pub const RESET_WALK_REFUSED: u32 = 4;
+/// Stream reset code: the `walk/1` stream could not be served: it did not
+/// open with an Open frame, no walk task runs, or the walk failed.
+pub const RESET_WALK_FAILED: u32 = 5;
 
 /// What streams mean. The table decides which request streams reach the
 /// service and holds their permits; the service answers them, and hears what
@@ -246,6 +261,9 @@ struct Shared<T: Transport, S> {
     sequence: AtomicU64,
     next_id: AtomicU64,
     table: Mutex<Table<T::Conn>>,
+    /// The walk task, once it runs: it takes the `walk/1` streams peers
+    /// open.
+    walks: OnceLock<Pulls<T::Conn>>,
 }
 
 struct Table<C> {
@@ -645,12 +663,19 @@ impl<T: Transport, S: Service> ConnectionTable<T, S> {
                     current: HashMap::new(),
                     dials: HashMap::new(),
                 }),
+                walks: OnceLock::new(),
             }),
         }
     }
 
     pub fn transport(&self) -> &T {
         &self.shared.transport
+    }
+
+    /// Hand the `walk/1` streams peers open to `walks`. Until a walk task is
+    /// named, such a stream is reset.
+    pub(crate) fn walks(&self, walks: Pulls<T::Conn>) {
+        let _ = self.shared.walks.set(walks);
     }
 
     /// The connection streams to `peer` are opened on, if there is one.
@@ -1085,6 +1110,33 @@ async fn stream<T: Transport, S: Service>(
             }
             let _ = send.shutdown().await;
         }
+        // A walk/1 opens with the collection and kind it pushes, and the walk
+        // task serves it from there. It takes no permit: its own windows
+        // bound it, and stream credit holds a sender whose receiver stops
+        // reading.
+        TAG_WALK => {
+            let open = match tokio::time::timeout(TAG_DEADLINE, read_frame(&mut recv)).await {
+                Ok(Ok(Some((kind, payload)))) => walk_stream::Frame::decode(kind, &payload),
+                _ => Ok(None),
+            };
+            let walks = shared
+                .upgrade()
+                .and_then(|table| table.walks.get().cloned());
+            match (open, walks) {
+                (Ok(Some(walk_stream::Frame::Open { collection, kind })), Some(walks)) => {
+                    walks.incoming(state.peer, collection, kind, send, recv);
+                }
+                (open, walks) => {
+                    debug!(
+                        opened = matches!(open, Ok(Some(_))),
+                        served = walks.is_some(),
+                        "resetting a walk/1 stream"
+                    );
+                    send.reset(RESET_WALK_FAILED);
+                    recv.stop(RESET_WALK_FAILED);
+                }
+            }
+        }
         unknown => {
             debug!(tag = unknown, "resetting a stream with an unknown tag");
             send.reset(RESET_UNKNOWN);
@@ -1098,6 +1150,7 @@ fn tag_name(tag: u8) -> &'static str {
         TAG_RECON => "recon/1",
         TAG_DHT => "dht/1",
         TAG_BLOB => "blob/1",
+        TAG_WALK => "walk/1",
         _ => "unknown",
     }
 }
@@ -1116,6 +1169,23 @@ async fn open_recon<C: Conn>(
     let mut send = Tracked::new(send, state, None);
     send_u8(&mut send, TAG_RECON).await?;
     write_frame(&mut send, FRAME_OPEN, &sequence.to_be_bytes()).await?;
+    Ok((send, Tracked::new(recv, state, None)))
+}
+
+/// Open a `walk/1` stream on `connection` for a push of C's tree of `kind`:
+/// the tag, then the Open frame. It takes no request permit; its frames
+/// keep the connection from going idle.
+pub(crate) async fn open_walk<C: Conn>(
+    connection: &Connection<C>,
+    collection: CollectionHandle,
+    kind: WalkKind,
+) -> anyhow::Result<(Tracked<C::SendHalf>, Tracked<C::RecvHalf>)> {
+    let state = connection.state();
+    let (send, recv) = connection.conn.open_bi().await?;
+    let mut send = Tracked::new(send, state, None);
+    send_u8(&mut send, TAG_WALK).await?;
+    let (frame, payload) = walk_stream::Frame::Open { collection, kind }.encode();
+    write_frame(&mut send, frame, &payload).await?;
     Ok((send, Tracked::new(recv, state, None)))
 }
 
@@ -1218,9 +1288,9 @@ async fn recon<T: Transport, S: Service>(
     conn.close(CLOSE_NORMAL, reason.as_bytes());
 }
 
-/// A `recon/1` framing failure.
+/// A framing failure on `recon/1` or `walk/1`.
 #[derive(Debug)]
-enum FrameError {
+pub(crate) enum FrameError {
     /// The peer broke the framing; the connection closes.
     Violation(&'static str),
     /// The stream or its connection ended under the reader.
@@ -1240,7 +1310,7 @@ impl From<io::Error> for FrameError {
 }
 
 /// Read one frame, or `None` when the stream ends between frames.
-async fn read_frame<R: AsyncRead + Unpin>(
+pub(crate) async fn read_frame<R: AsyncRead + Unpin>(
     recv: &mut R,
 ) -> Result<Option<(u8, Vec<u8>)>, FrameError> {
     let mut kind = [0; 1];

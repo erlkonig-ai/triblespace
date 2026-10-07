@@ -51,6 +51,8 @@ pub const TAG_RECON: u8 = 0x10;
 pub const TAG_DHT: u8 = 0x11;
 /// `blob/1`: one bearer exact-GET exchange.
 pub const TAG_BLOB: u8 = 0x02;
+/// `walk/1`: one push of a collection's tree, opened by its sender.
+pub const TAG_WALK: u8 = 0x12;
 
 // `dht/1` operations — the byte after the tag. 0x07 was PROVIDER_GET and
 // 0x0C was FIND_NODE; FIND_VALUE answers both in one reply.

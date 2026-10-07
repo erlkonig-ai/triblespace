@@ -46,3 +46,4 @@ pub mod telemetry;
 pub mod transport;
 mod wake_schedule;
 pub mod walk;
+pub(crate) mod walk_stream;
