@@ -108,6 +108,13 @@ pub const RESET_UNKNOWN: u32 = 1;
 /// Stream reset code: the connection already holds
 /// [`MAX_HELD_REQUESTS_PER_CONNECTION`] request streams.
 pub const RESET_BUSY: u32 = 3;
+/// Stream reset code: the receiver does not receive the collection a
+/// `walk/1` stream pushes from its opener.
+pub const RESET_WALK_REFUSED: u32 = 4;
+/// Stream reset code: a `walk/1` stream ended without everything it pushed
+/// landing: a frame out of place, a count proof that did not close, a value
+/// that failed to land, or a newer stream for the same tree.
+pub const RESET_WALK_FAILED: u32 = 5;
 
 /// What streams mean. The table decides which request streams reach the
 /// service and holds their permits; the service answers them, and hears what
@@ -1220,7 +1227,7 @@ async fn recon<T: Transport, S: Service>(
 
 /// A `recon/1` framing failure.
 #[derive(Debug)]
-enum FrameError {
+pub(crate) enum FrameError {
     /// The peer broke the framing; the connection closes.
     Violation(&'static str),
     /// The stream or its connection ended under the reader.
@@ -1240,7 +1247,7 @@ impl From<io::Error> for FrameError {
 }
 
 /// Read one frame, or `None` when the stream ends between frames.
-async fn read_frame<R: AsyncRead + Unpin>(
+pub(crate) async fn read_frame<R: AsyncRead + Unpin>(
     recv: &mut R,
 ) -> Result<Option<(u8, Vec<u8>)>, FrameError> {
     let mut kind = [0; 1];
