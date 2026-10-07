@@ -32,7 +32,9 @@
 //! turn. Nodes are answered only while fewer than [`MAX_WANTED`] leaves wait,
 //! so the sender's window of unanswered nodes holds its push, and a push
 //! with [`FLOOD_WANTED`] leaves waiting, more than that window can push, is
-//! a flood and fails. And [`Receive::want_read`] is false while
+//! a flood and fails; so is one with that many locators owed or replies
+//! withheld, which only a sender that waits for no reply can push. And
+//! [`Receive::want_read`] is false while
 //! [`MAX_WALK_UNLANDED`] values are with the landing task, so the driver
 //! stops reading and QUIC flow control holds the sender. The stream is read
 //! on while a value is owed to it: only reading brings the value, so
@@ -63,10 +65,13 @@ use crate::walk_stream::{Frame, hold};
 
 /// Leaves waiting to be asked for before pushed nodes go unanswered.
 pub(crate) const MAX_WANTED: usize = 1024;
-/// Leaves waiting to be asked for beyond which the push is a flood and
-/// fails. A sender whose HELDs are withheld can push at most the children
-/// of the nodes answered before, a window of 64 nodes of 256 each on top
-/// of [`MAX_WANTED`], so twice that is out of any honest sender's reach.
+/// Leaves waiting to be asked for, locators owed or replies withheld
+/// beyond which the push is a flood and fails. A sender whose HELDs are
+/// withheld can push at most the children of the nodes answered before, a
+/// window of [`crate::push::MAX_OUTSTANDING_NODES`] nodes of 256 each on
+/// top of [`MAX_WANTED`], so twice that is out of any honest sender's
+/// reach; and it leaves at most that window's children owed and that
+/// window of replies waiting.
 pub(crate) const FLOOD_WANTED: usize = 32 * MAX_WANTED;
 
 /// What a receive asks of its driver.
@@ -100,9 +105,9 @@ pub(crate) enum Failure {
     Unavailable,
     /// A frame out of its place: a node, leaf or end before the root, a
     /// second root, a node or leaf at a locator the sender does not owe or
-    /// owes no more, a leaf beyond what a sender's window can push, a value
-    /// nobody asked for, a frame after the end, or one only a receiver
-    /// sends.
+    /// owes no more, a leaf or node beyond what a sender's window can push,
+    /// a value nobody asked for, a frame after the end, or one only a
+    /// receiver sends.
     Protocol,
     /// A pushed node is not canonical, or is not the node its parent (or
     /// the root) declared at its locator.
@@ -138,8 +143,10 @@ pub(crate) struct Receive {
     /// The nodes the sender owes, by locator: the digest and leaf count
     /// declared for each by its parent, or by ROOT for the root. Consumed
     /// by the node or leaf pushed at each; DONE needs every one consumed.
+    /// Never more than [`FLOOD_WANTED`].
     expected: HashMap<Vec<u8>, ([u8; 32], u64)>,
-    /// Replies to pushed nodes, sent while few leaves wait.
+    /// Replies to pushed nodes, sent while few leaves wait. Never more
+    /// than [`FLOOD_WANTED`].
     held: VecDeque<Frame>,
     /// Missing leaves not yet asked for, in the order pushed.
     wanted: VecDeque<[u8; KEY_BYTES]>,
@@ -293,6 +300,12 @@ impl Receive {
                     });
                     return Ok(());
                 }
+                // A sender that waits for no reply could push nodes without
+                // end: more replies waiting than a window of them is a
+                // flood.
+                if self.held.len() >= FLOOD_WANTED {
+                    return Err(Failure::Protocol);
+                }
                 // The node declared at this locator, owed once.
                 let (digest, leaf_count) =
                     self.expected.remove(&prefix).ok_or(Failure::Protocol)?;
@@ -318,8 +331,11 @@ impl Receive {
                         // locator is the same set: compressed paths need not
                         // line up, so the live node at `prefix` may branch
                         // elsewhere and still hold the child whole. The
-                        // others are owed at their locators.
+                        // others are owed at their locators, unless that
+                        // would leave more owed than a window of nodes can:
+                        // a flood, and the map stays as it was.
                         let end = usize::from(branch.end_depth);
+                        let mut owed = Vec::new();
                         for child in &branch.children {
                             let mut locator = branch.representative[..end].to_vec();
                             locator.push(child.edge);
@@ -332,11 +348,15 @@ impl Receive {
                                     .accounted
                                     .checked_add(child.leaf_count)
                                     .ok_or(Failure::CountMismatch)?;
-                            } else if self
-                                .expected
-                                .insert(locator, (child.digest, child.leaf_count))
-                                .is_some()
-                            {
+                            } else {
+                                owed.push((locator, (child.digest, child.leaf_count)));
+                            }
+                        }
+                        if self.expected.len() + owed.len() > FLOOD_WANTED {
+                            return Err(Failure::Protocol);
+                        }
+                        for (locator, declared) in owed {
+                            if self.expected.insert(locator, declared).is_some() {
                                 return Err(Failure::BadNode);
                             }
                         }
@@ -1586,6 +1606,89 @@ mod tests {
             "{:?}",
             harness.receive.outcome()
         );
+        assert!(!harness.sent.contains(&Frame::Landed));
+    }
+
+    /// A sender that waits for no HELD and withholds its values can push
+    /// hash-chained NODEs without end, each accepted one leaving up to 255
+    /// more locators owed and one more reply withheld. Neither outgrows
+    /// [`FLOOD_WANTED`]: a NODE whose children would leave more locators
+    /// owed fails the push before any is, and so does one pushed while
+    /// that many replies wait. A fabricated tree of 256 branches of 256
+    /// reaches the first bound at its 128th branch. Only a receiver whose
+    /// own tree supplied children to hold could be pushed enough NODEs
+    /// within it to reach the second, so that one is tried with the queue
+    /// filled by hand, once the leaves of five branches, their values
+    /// withheld, leave replies waiting.
+    #[test]
+    fn a_node_flood_without_waiting_for_held_fails_the_push() {
+        let mut receiver = Node::new(62);
+        let collection = receiver.hold("nodes", open());
+        receiver.observe();
+        let (root, root_node, branches) = fabricated(256, 256);
+        let mut harness = Harness::new(receiver, collection, WalkKind::Records);
+        harness.feed(Frame::Root { summary: root });
+        assert!(matches!(&harness.feed(root_node)[..], [Frame::Held { .. }]));
+        assert_eq!(harness.receive.expected.len(), 256);
+        let mut failed_at = None;
+        for (index, (node, _)) in branches.iter().enumerate() {
+            // The branch's own locator is consumed, its 256 children owed.
+            let after = harness.receive.expected.len() - 1 + 256;
+            harness.feed(node.clone());
+            assert!(harness.receive.expected.len() <= FLOOD_WANTED);
+            if after > FLOOD_WANTED {
+                assert_eq!(
+                    harness.receive.outcome(),
+                    Some(Outcome::Failed(Failure::Protocol))
+                );
+                failed_at = Some(index);
+                break;
+            }
+            assert_eq!(harness.receive.outcome(), None);
+            assert_eq!(harness.receive.expected.len(), after);
+        }
+        // 256 owed by the root and 255 more per branch: the 128th branch
+        // would leave 32,896 owed.
+        assert_eq!(failed_at, Some(127));
+        assert!(!harness.sent.contains(&Frame::Landed));
+
+        let mut receiver = Node::new(63);
+        let collection = receiver.hold("nodes", open());
+        receiver.observe();
+        let (root, root_node, branches) = fabricated(256, 256);
+        let mut harness = Harness::new(receiver, collection, WalkKind::Records);
+        harness.feed(Frame::Root { summary: root });
+        harness.feed(root_node);
+        let mut branches = branches.into_iter();
+        for (node, leaves) in branches.by_ref().take(5) {
+            harness.feed(node);
+            for leaf in leaves {
+                harness.feed(leaf);
+            }
+        }
+        assert!(harness.receive.wanted.len() >= MAX_WANTED);
+        assert!(harness.receive.held.is_empty());
+        let (node, _) = branches.next().unwrap();
+        assert!(harness.feed(node).is_empty(), "the reply is withheld");
+        assert_eq!(harness.receive.held.len(), 1);
+        harness.receive.held.extend(std::iter::repeat_n(
+            Frame::Held {
+                prefix: Vec::new(),
+                children: [0; 32],
+            },
+            FLOOD_WANTED - 2,
+        ));
+        let (node, _) = branches.next().unwrap();
+        assert!(harness.feed(node).is_empty());
+        assert_eq!(harness.receive.outcome(), None);
+        assert_eq!(harness.receive.held.len(), FLOOD_WANTED);
+        let (node, _) = branches.next().unwrap();
+        assert!(harness.feed(node).is_empty());
+        assert_eq!(
+            harness.receive.outcome(),
+            Some(Outcome::Failed(Failure::Protocol))
+        );
+        assert_eq!(harness.receive.held.len(), FLOOD_WANTED);
         assert!(!harness.sent.contains(&Frame::Landed));
     }
 }

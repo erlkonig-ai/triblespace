@@ -615,7 +615,10 @@ time, value requests and blob fetches together, and the leaves beyond that
 wait their turn. It answers NODEs only while fewer than 1,024 leaves wait to
 be asked for, so the sender's window of unanswered NODEs holds its push; a
 push with 32,768 leaves waiting, more than that window can push, is a flood
-and fails. And it hands at most 1,024 values to landing ahead of their
+and fails. So is one that leaves 32,768 locators owed or that many HELDs
+waiting to be sent, which only a sender pushing NODEs without waiting for
+their HELDs can reach: the NODE that would is refused before its children
+are owed. And it hands at most 1,024 values to landing ahead of their
 acknowledgement; while that many are with the landing task it reads no
 further, so QUIC's flow
 control holds the sender, and a sender whose receiver stops reading stalls
