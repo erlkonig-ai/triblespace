@@ -6,8 +6,10 @@
 //! tree and the neighbour's confirmed root depth first: every branch it
 //! reaches goes out as a NODE, and the neighbour answers each with the
 //! children it already holds with the same digest, which the sender skips as
-//! it skips those the confirmed tree holds with the same digest. A leaf goes
-//! out as a LEAF, and the neighbour asks for the values it lacks. At most
+//! it skips those the confirmed tree holds with the same digest. A ROOT the
+//! neighbour's own tree equals is answered with the root held whole, before
+//! any NODE, and nothing below it is owed. A leaf goes out as a LEAF, and
+//! the neighbour asks for the values it lacks. At most
 //! [`MAX_OUTSTANDING_NODES`] NODEs wait for their HELD, and the walk pauses
 //! while that window is full. DONE follows the last answered NODE, and once
 //! the neighbour's LANDED arrives the pinned snapshot is its confirmed root,
@@ -31,12 +33,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::collection_activation::CollectionRepairOverlay;
 use crate::host::CollectionSnapshot;
 use crate::patch_repair::PatchNode;
 use crate::protocol::RawHash;
 use crate::transport::PeerId;
-use crate::walk::{Request, Response, WalkKind, answer, summary};
+use crate::walk::{Request, Response, WalkKind, answer, node, summary};
 use crate::walk_stream::{Frame, held};
 
 /// NODE frames one push keeps outstanding: sent, with no HELD yet.
@@ -139,15 +140,22 @@ impl Push {
         let mut frames = Vec::new();
         match frame {
             Frame::Held { prefix, children } => {
-                let unheld = self
-                    .outstanding
-                    .remove(&prefix)
-                    .ok_or(Failed("a HELD for no outstanding NODE"))?;
-                // Pushed in reverse, so the walk takes ascending edges first.
-                for (edge, child) in unheld.into_iter().rev() {
-                    if !held(&children, edge) {
-                        self.pending.push(child);
+                match self.outstanding.remove(&prefix) {
+                    Some(unheld) => {
+                        // Pushed in reverse, so the walk takes ascending
+                        // edges first.
+                        for (edge, child) in unheld.into_iter().rev() {
+                            if !held(&children, edge) {
+                                self.pending.push(child);
+                            }
+                        }
                     }
+                    // The receiver answers a ROOT equal to its own tree with
+                    // the root held whole, before any NODE (and the root NODE,
+                    // if one went out, the same way): nothing below it is
+                    // owed.
+                    None if prefix.is_empty() && children == [0xFF; 32] => self.pending.clear(),
+                    None => return Err(Failed("a HELD for no outstanding NODE")),
                 }
                 self.pump(&mut frames);
             }
@@ -234,15 +242,6 @@ impl Push {
             prefix,
             node: visited,
         });
-    }
-}
-
-/// The node at `prefix` of the `kind` tree of `overlay`, as a pull walk
-/// serves it.
-fn node(kind: WalkKind, overlay: &CollectionRepairOverlay, prefix: &[u8]) -> Option<PatchNode<()>> {
-    match answer(kind, overlay, Request::Node(prefix.to_vec()))? {
-        Response::Node { node, .. } => Some(node),
-        _ => None,
     }
 }
 

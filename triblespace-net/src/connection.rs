@@ -263,7 +263,7 @@ struct Shared<T: Transport, S> {
     table: Mutex<Table<T::Conn>>,
     /// The walk task, once it runs: it takes the `walk/1` streams peers
     /// open.
-    walks: OnceLock<Pulls<T::Conn>>,
+    walks: OnceLock<Pulls>,
 }
 
 struct Table<C> {
@@ -674,7 +674,7 @@ impl<T: Transport, S: Service> ConnectionTable<T, S> {
 
     /// Hand the `walk/1` streams peers open to `walks`. Until a walk task is
     /// named, such a stream is reset.
-    pub(crate) fn walks(&self, walks: Pulls<T::Conn>) {
+    pub(crate) fn walks(&self, walks: Pulls) {
         let _ = self.shared.walks.set(walks);
     }
 
@@ -1124,7 +1124,7 @@ async fn stream<T: Transport, S: Service>(
                 .and_then(|table| table.walks.get().cloned());
             match (open, walks) {
                 (Ok(Some(walk_stream::Frame::Open { collection, kind })), Some(walks)) => {
-                    walks.incoming(state.peer, collection, kind, send, recv);
+                    walks.incoming(state.peer, collection, kind, Box::new(send), Box::new(recv));
                 }
                 (open, walks) => {
                     debug!(

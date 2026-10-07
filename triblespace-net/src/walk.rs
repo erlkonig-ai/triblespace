@@ -54,7 +54,8 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail};
 use ed25519_dalek::VerifyingKey;
-use tokio::sync::mpsc;
+use tokio::io::AsyncWriteExt as _;
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::debug;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::{Blob, MemoryBlobStore};
@@ -67,12 +68,14 @@ use triblespace_core::trible::TribleSet;
 use crate::channel::NetEvent;
 use crate::clock::Mono;
 use crate::collection_activation::{
-    CollectionAuthorizationEvidenceError, CollectionRepairOverlay, held_digest, record_root,
+    CollectionAuthorizationEvidenceError, CollectionAuthorizationEvidencePatch,
+    CollectionRepairOverlay, held_digest, record_root,
 };
 use crate::collection_delta::{decode_record, encode_record};
 use crate::collection_wire::{MAX_COLLECTION_LEAF_BYTES, manifest};
 use crate::connection::{
-    ConnectionTable, Link, MAX_QUEUED_REPLIES, RESET_WALK_FAILED, ReconEvent, Service, Tracked,
+    ConnectionTable, Link, MAX_QUEUED_REPLIES, RESET_WALK_FAILED, RESET_WALK_REFUSED, ReconEvent,
+    Service, read_frame, write_frame,
 };
 use crate::health::{Health, RepairComparison, RepairFailure, RepairFrontier};
 use crate::host::{CollectionSnapshot, METADATA_BLOB_BYTES, StoreSnapshot};
@@ -82,9 +85,12 @@ use crate::patch_repair::{
     PatchRepairWalker, PatchSummary, patch_node_response, validate_patch_node,
 };
 use crate::protocol::{MAX_EXACT_BLOB_BYTES, RawHash, op_get_blob_with_limit};
-use crate::push::{ConfirmedRoots, Outcome, Push, PushKey};
+use crate::push::{ConfirmedRoots, Push, PushKey};
+use crate::receive::{Out, Receive};
 use crate::recon::{FRAME_WALK_END, FRAME_WALK_REQUEST, FRAME_WALK_RESPONSE, Frame, Malformed};
-use crate::transport::{Conn, PeerId, RecvStream as _, SendStream as _, Transport};
+use crate::transport::{PeerId, RecvStream, SendStream, Transport};
+use crate::walk_stream::Frame as StreamFrame;
+use crate::{push, receive};
 
 /// Bytes of every key a walk enumerates, relative to its kind's base.
 pub(crate) const KEY_BYTES: usize = 32;
@@ -460,7 +466,7 @@ impl Reader<'_> {
 /// for its connection's request budget is owed nothing.
 pub(crate) const WALK_DEADLINE: Duration = Duration::from_secs(60);
 /// Node and value requests and blob fetches one walk keeps in flight.
-const MAX_WALK_REQUESTS: usize = 64;
+pub(crate) const MAX_WALK_REQUESTS: usize = 64;
 /// Walk requests (opens, nodes and values) the walks on one connection keep
 /// in flight together. Each is answered by one frame, so a responder queues
 /// at most this many replies for them, beside its own walks' requests (at
@@ -469,7 +475,7 @@ const MAX_WALK_REQUESTS: usize = 64;
 const MAX_CONNECTION_WALK_REQUESTS: usize = MAX_QUEUED_REPLIES / 4;
 /// Values one walk hands to landing before they are acknowledged. A walk
 /// whose landing queue is full requests no further nodes.
-const MAX_WALK_UNLANDED: usize = 1024;
+pub(crate) const MAX_WALK_UNLANDED: usize = 1024;
 /// How often walk deadlines are checked.
 const WALK_TICK: Duration = Duration::from_secs(1);
 /// Frame events waiting for the walk task.
@@ -606,28 +612,13 @@ impl Pull {
                 if let Some(leaf) = missing {
                     let key = <[u8; KEY_BYTES]>::try_from(leaf.key)
                         .map_err(|_| anyhow!("a walk leaf key of the wrong length"))?;
-                    if kind == WalkKind::References {
-                        let held = NetEvent::Held {
-                            collection,
-                            handle: key,
-                        };
-                        if snapshot.is_some_and(|snapshot| snapshot.get_blob(&key).is_some()) {
-                            self.land(peer, vec![held], outputs);
-                        } else {
-                            self.fetching += 1;
-                            outputs.push(Output::Fetch {
-                                walk: WalkRef {
-                                    peer,
-                                    walk: self.walk,
-                                },
-                                handle: key,
-                                proof: None,
-                            });
+                    match admit_missing(kind, collection, key, snapshot) {
+                        Some(admit) => self.admit(admit, peer, outputs),
+                        None => {
+                            self.link
+                                .send(frame(self.walk, WalkBody::Request(Request::Value(key))));
+                            self.values.insert(key);
                         }
-                    } else {
-                        self.link
-                            .send(frame(self.walk, WalkBody::Request(Request::Value(key))));
-                        self.values.insert(key);
                     }
                 }
             }
@@ -635,57 +626,35 @@ impl Pull {
                 if !self.values.remove(&key) {
                     bail!("a walk value nobody requested");
                 }
-                match kind {
-                    WalkKind::Records => {
-                        let record = decode_record(collection, &bytes)?;
-                        if record.fingerprint().raw() != key {
-                            bail!("a record under another record's key");
-                        }
-                        self.land(peer, vec![NetEvent::CollectionRecord(record)], outputs);
-                    }
-                    WalkKind::Authorization => {
-                        let proof = CapabilityProof::from_bytes(&bytes)?;
-                        if proof.id().raw != key {
-                            bail!("a proof under another proof's key");
-                        }
-                        proof.verify_signatures()?;
-                        let routed = proof.resource().into_bytes() != collection.raw;
-                        let evidence = live
-                            .unwrap_or(&self.local)
-                            .repair()
-                            .authorization_evidence();
-                        match evidence.validate_proof(&proof) {
-                            Ok(()) => {
-                                self.land(peer, vec![NetEvent::CapabilityProof(proof)], outputs)
-                            }
-                            // A proof over a resource routed to C needs that
-                            // resource's descriptor, which the peer holds.
-                            Err(
-                                CollectionAuthorizationEvidenceError::ResourceDescriptorUnavailable(
-                                    descriptor,
-                                ),
-                            ) if routed => {
-                                self.fetching += 1;
-                                outputs.push(Output::Fetch {
-                                    walk: WalkRef {
-                                        peer,
-                                        walk: self.walk,
-                                    },
-                                    handle: descriptor.raw,
-                                    proof: Some(proof),
-                                });
-                            }
-                            Err(CollectionAuthorizationEvidenceError::WrongRoot) if routed => {
-                                self.deferred = true;
-                            }
-                            Err(error) => return Err(error.into()),
-                        }
-                    }
-                    WalkKind::References => bail!("held references carry no values"),
-                }
+                let evidence = live
+                    .unwrap_or(&self.local)
+                    .repair()
+                    .authorization_evidence();
+                let admit = admit_value(kind, collection, key, &bytes, evidence)?;
+                self.admit(admit, peer, outputs);
             }
         }
         Ok(())
+    }
+
+    /// Carry out what a checked value, missing leaf or fetch asks for.
+    fn admit(&mut self, admit: Admit, peer: PeerId, outputs: &mut Vec<Output>) {
+        match admit {
+            Admit::Land(events) => self.land(peer, events, outputs),
+            Admit::Fetch { handle, proof } => {
+                self.fetching += 1;
+                outputs.push(Output::Fetch {
+                    walk: WalkRef {
+                        peer,
+                        walk: self.walk,
+                    },
+                    handle,
+                    proof,
+                });
+            }
+            Admit::Defer => self.deferred = true,
+            Admit::Fail => self.failed += 1,
+        }
     }
 
     fn land(&mut self, peer: PeerId, events: Vec<NetEvent>, outputs: &mut Vec<Output>) {
@@ -862,7 +831,7 @@ impl Walks {
         peer: PeerId,
         collection: CollectionHandle,
         kind: WalkKind,
-        outcome: Outcome,
+        outcome: push::Outcome,
     ) {
         let key = (peer, collection.raw, kind);
         self.pushes.remove(&key);
@@ -1307,6 +1276,31 @@ impl Walks {
             })
     }
 
+    /// Whether this side receives C from `peer`, the mirror of
+    /// [`Self::sends`]: its peering for C receives from the peer, or the
+    /// peer passes WRITE under the live evidence.
+    fn receives(&self, peer: PeerId, live: &CollectionSnapshot) -> bool {
+        let collection = live.repair().collection();
+        let mut flagged = false;
+        self.health.update(|health| {
+            flagged = health.peerings.iter().any(|peering| {
+                peering.collection == collection
+                    && peering.peer == peer
+                    && peering.peered
+                    && peering.receives
+            });
+        });
+        flagged
+            || VerifyingKey::from_bytes(&peer).is_ok_and(|peer| {
+                let evidence = live.repair().authorization_evidence();
+                let proofs = evidence.proofs().cloned().collect::<Vec<_>>();
+                matches!(
+                    evidence.writer_is_admitted_by(peer, &proofs),
+                    QuorumOutcome::Met
+                )
+            })
+    }
+
     /// The landing task acknowledged values of `walk`.
     pub(crate) fn landed(&mut self, walk: WalkRef, landed: u64, failed: u64, now: Mono) {
         let key = (walk.peer, walk.walk.collection.raw, walk.walk.kind);
@@ -1348,25 +1342,8 @@ impl Walks {
         };
         pull.fetching -= 1;
         pull.progress = now;
-        let collection = walk.walk.collection;
-        match (proof, blob) {
-            (None, Some(blob)) => pull.land(
-                walk.peer,
-                vec![NetEvent::Blob(blob), NetEvent::Held { collection, handle }],
-                &mut self.outputs,
-            ),
-            (None, None) => pull.failed += 1,
-            (Some(proof), descriptor) => {
-                match descriptor.filter(|descriptor| routes(collection, &proof, descriptor)) {
-                    Some(descriptor) => pull.land(
-                        walk.peer,
-                        vec![NetEvent::Blob(descriptor), NetEvent::CapabilityProof(proof)],
-                        &mut self.outputs,
-                    ),
-                    None => pull.deferred = true,
-                }
-            }
-        }
+        let admit = admit_fetched(walk.walk.collection, handle, proof, blob);
+        pull.admit(admit, walk.peer, &mut self.outputs);
         self.advance(key, Ok(()), now);
     }
 
@@ -1411,8 +1388,127 @@ fn frame(walk: WalkId, body: WalkBody) -> Frame {
     Frame::Walk(WalkFrame { walk, body })
 }
 
+/// What a walk does with a value, a missing leaf or a fetched blob once it
+/// is checked.
+pub(crate) enum Admit {
+    /// Events for the landing task.
+    Land(Vec<NetEvent>),
+    /// Fetch a blob by hash from the peer: a held reference, or the routing
+    /// descriptor a deferred `proof` names.
+    Fetch {
+        handle: RawHash,
+        proof: Option<CapabilityProof>,
+    },
+    /// A proof over a resource routed to C that the evidence here cannot
+    /// place yet stays deferred: the walk does not complete.
+    Defer,
+    /// A held reference that could not be fetched: the walk does not
+    /// complete, and the blob stays in the next difference.
+    Fail,
+}
+
+/// Check the value under `key` of a `kind` walk of C against `evidence`
+/// (design 2.5). A record lands; a proof lands once its evidence validates,
+/// fetches the descriptor of the resource it is routed through, or stays
+/// deferred. Held references carry no values.
+pub(crate) fn admit_value(
+    kind: WalkKind,
+    collection: CollectionHandle,
+    key: [u8; KEY_BYTES],
+    bytes: &[u8],
+    evidence: &CollectionAuthorizationEvidencePatch,
+) -> anyhow::Result<Admit> {
+    match kind {
+        WalkKind::Records => {
+            let record = decode_record(collection, bytes)?;
+            if record.fingerprint().raw() != key {
+                bail!("a record under another record's key");
+            }
+            Ok(Admit::Land(vec![NetEvent::CollectionRecord(record)]))
+        }
+        WalkKind::Authorization => {
+            let proof = CapabilityProof::from_bytes(bytes)?;
+            if proof.id().raw != key {
+                bail!("a proof under another proof's key");
+            }
+            proof.verify_signatures()?;
+            let routed = proof.resource().into_bytes() != collection.raw;
+            match evidence.validate_proof(&proof) {
+                Ok(()) => Ok(Admit::Land(vec![NetEvent::CapabilityProof(proof)])),
+                // A proof over a resource routed to C needs that resource's
+                // descriptor, which the peer holds.
+                Err(CollectionAuthorizationEvidenceError::ResourceDescriptorUnavailable(
+                    descriptor,
+                )) if routed => Ok(Admit::Fetch {
+                    handle: descriptor.raw,
+                    proof: Some(proof),
+                }),
+                Err(CollectionAuthorizationEvidenceError::WrongRoot) if routed => Ok(Admit::Defer),
+                Err(error) => Err(error.into()),
+            }
+        }
+        WalkKind::References => bail!("held references carry no values"),
+    }
+}
+
+/// What a leaf of a `kind` walk of C that the local store lacks needs. A
+/// held reference joins the held set as it is when the blob is resident, and
+/// is fetched by hash otherwise; `None` is a value to request from the peer.
+pub(crate) fn admit_missing(
+    kind: WalkKind,
+    collection: CollectionHandle,
+    key: [u8; KEY_BYTES],
+    snapshot: Option<&StoreSnapshot>,
+) -> Option<Admit> {
+    if kind != WalkKind::References {
+        return None;
+    }
+    let held = NetEvent::Held {
+        collection,
+        handle: key,
+    };
+    Some(
+        if snapshot.is_some_and(|snapshot| snapshot.get_blob(&key).is_some()) {
+            Admit::Land(vec![held])
+        } else {
+            Admit::Fetch {
+                handle: key,
+                proof: None,
+            }
+        },
+    )
+}
+
+/// What a blob fetch of a walk of C brought back. A fetched held reference
+/// lands, noted held in C; one that could not be fetched fails. A deferred
+/// `proof`'s descriptor that routes it to C lands with it; otherwise the
+/// proof stays deferred.
+pub(crate) fn admit_fetched(
+    collection: CollectionHandle,
+    handle: RawHash,
+    proof: Option<CapabilityProof>,
+    blob: Option<Blob<UnknownBlob>>,
+) -> Admit {
+    match (proof, blob) {
+        (None, Some(blob)) => Admit::Land(vec![
+            NetEvent::Blob(blob),
+            NetEvent::Held { collection, handle },
+        ]),
+        (None, None) => Admit::Fail,
+        (Some(proof), descriptor) => {
+            match descriptor.filter(|descriptor| routes(collection, &proof, descriptor)) {
+                Some(descriptor) => Admit::Land(vec![
+                    NetEvent::Blob(descriptor),
+                    NetEvent::CapabilityProof(proof),
+                ]),
+                None => Admit::Defer,
+            }
+        }
+    }
+}
+
 /// The fixed key prefix each kind's PATCH puts before the walked key.
-fn base(kind: WalkKind, collection: CollectionHandle) -> Vec<u8> {
+pub(crate) fn base(kind: WalkKind, collection: CollectionHandle) -> Vec<u8> {
     match kind {
         WalkKind::Authorization => collection.raw.to_vec(),
         WalkKind::Records | WalkKind::References => Vec::new(),
@@ -1427,7 +1523,9 @@ pub(crate) fn summary(kind: WalkKind, overlay: &CollectionRepairOverlay) -> Patc
     }
 }
 
-fn local_summary(
+/// The summary of the subtree at `prefix` of a kind's PATCH, relative to its
+/// base, if present: what a subtree held here is compared with.
+pub(crate) fn local_summary(
     kind: WalkKind,
     overlay: &CollectionRepairOverlay,
     prefix: &[u8],
@@ -1448,7 +1546,7 @@ fn node_summary<V>(
     })
 }
 
-fn contains(kind: WalkKind, overlay: &CollectionRepairOverlay, key: &[u8]) -> bool {
+pub(crate) fn contains(kind: WalkKind, overlay: &CollectionRepairOverlay, key: &[u8]) -> bool {
     let Ok(key) = <[u8; KEY_BYTES]>::try_from(key) else {
         return false;
     };
@@ -1465,6 +1563,32 @@ fn contains(kind: WalkKind, overlay: &CollectionRepairOverlay, key: &[u8]) -> bo
     }
 }
 
+/// The node at `prefix` of a kind's PATCH, relative to its base, if present.
+pub(crate) fn node(
+    kind: WalkKind,
+    overlay: &CollectionRepairOverlay,
+    prefix: &[u8],
+) -> Option<PatchNode<()>> {
+    let found = match kind {
+        WalkKind::Records => {
+            patch_node_response(overlay.records().patch(), &[], prefix, |_, _| Ok(()))
+        }
+        WalkKind::Authorization => patch_node_response(
+            overlay.authorization_evidence().patch(),
+            &overlay.collection().raw,
+            prefix,
+            |_, _| Ok(()),
+        ),
+        WalkKind::References => {
+            patch_node_response(overlay.blob_inventory(), &[], prefix, |_, _| Ok(()))
+        }
+    };
+    match found {
+        Ok(PatchNodeResponse::Found(node)) => Some(node),
+        _ => None,
+    }
+}
+
 /// The node or value a request asks of a pinned snapshot, if present.
 pub(crate) fn answer(
     kind: WalkKind,
@@ -1474,24 +1598,8 @@ pub(crate) fn answer(
     match request {
         Request::Open => None,
         Request::Node(prefix) => {
-            let found = match kind {
-                WalkKind::Records => {
-                    patch_node_response(overlay.records().patch(), &[], &prefix, |_, _| Ok(()))
-                }
-                WalkKind::Authorization => patch_node_response(
-                    overlay.authorization_evidence().patch(),
-                    &overlay.collection().raw,
-                    &prefix,
-                    |_, _| Ok(()),
-                ),
-                WalkKind::References => {
-                    patch_node_response(overlay.blob_inventory(), &[], &prefix, |_, _| Ok(()))
-                }
-            };
-            match found {
-                Ok(PatchNodeResponse::Found(node)) => Some(Response::Node { prefix, node }),
-                _ => None,
-            }
+            let node = node(kind, overlay, &prefix)?;
+            Some(Response::Node { prefix, node })
         }
         Request::Value(key) => {
             let bytes = match kind {
@@ -1527,9 +1635,9 @@ fn routes(
 /// Starts pulls through the walk task, and hands it the `walk/1` streams
 /// peers open.
 #[derive(Clone)]
-pub(crate) struct Pulls<C: Conn>(pub(crate) mpsc::UnboundedSender<Command<C>>);
+pub(crate) struct Pulls(pub(crate) mpsc::UnboundedSender<Command>);
 
-impl<C: Conn> Pulls<C> {
+impl Pulls {
     /// Pull C from `peer`, dialling it if need be. A [`PullDone`] reports
     /// the end; while a pull of this kind from the peer runs, it stands for
     /// this one.
@@ -1541,15 +1649,16 @@ impl<C: Conn> Pulls<C> {
         });
     }
 
-    /// A `walk/1` stream `peer` opened, after its Open frame. It is reset
-    /// when the walk task is gone.
+    /// A `walk/1` stream `peer` opened for C's `kind` tree, after its tag
+    /// and Open frame were read. The stream is refused unless this side
+    /// receives C from the peer, and reset when the walk task is gone.
     pub(crate) fn incoming(
         &self,
         peer: PeerId,
         collection: CollectionHandle,
         kind: WalkKind,
-        send: Tracked<C::SendHalf>,
-        recv: Tracked<C::RecvHalf>,
+        send: Box<dyn SendStream>,
+        recv: Box<dyn RecvStream>,
     ) {
         let incoming = Command::Incoming {
             peer,
@@ -1568,7 +1677,7 @@ impl<C: Conn> Pulls<C> {
     }
 }
 
-pub(crate) enum Command<C: Conn> {
+pub(crate) enum Command {
     Start {
         peer: PeerId,
         collection: CollectionHandle,
@@ -1587,15 +1696,27 @@ pub(crate) enum Command<C: Conn> {
         proof: Option<CapabilityProof>,
         blob: Option<Blob<UnknownBlob>>,
     },
-    /// A `walk/1` stream `peer` opened on its connection: a push of C's
-    /// tree of `kind`, read from `recv` and answered on `send`.
+    /// A `walk/1` stream `peer` opened on its connection, after its tag and
+    /// Open frame: a push of C's tree of `kind`, read from `recv` and
+    /// answered on `send`.
     Incoming {
         peer: PeerId,
         collection: CollectionHandle,
         kind: WalkKind,
-        send: Tracked<C::SendHalf>,
-        recv: Tracked<C::RecvHalf>,
+        send: Box<dyn SendStream>,
+        recv: Box<dyn RecvStream>,
     },
+    /// An incoming walk stream ended.
+    Received { id: u64 },
+}
+
+/// What the landing task acknowledges values under.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum LandKey {
+    /// A walk this side pulls.
+    Pull(WalkRef),
+    /// An incoming walk stream, by its number.
+    Stream(u64),
 }
 
 /// Run one node's walks: its landing task, and a task that hears `events`
@@ -1603,11 +1724,11 @@ pub(crate) enum Command<C: Conn> {
 /// and where pulls report their ends.
 pub(crate) fn spawn<T: Transport, S: Service>(
     connections: ConnectionTable<T, S>,
-    snapshots: tokio::sync::watch::Receiver<Option<Arc<StoreSnapshot>>>,
+    snapshots: watch::Receiver<Option<Arc<StoreSnapshot>>>,
     walks: Walks,
     events: mpsc::Receiver<ReconEvent>,
     lander: LandSlot,
-) -> (Pulls<T::Conn>, mpsc::UnboundedReceiver<PullDone>) {
+) -> (Pulls, mpsc::UnboundedReceiver<PullDone>) {
     let (commands, commanded) = mpsc::unbounded_channel();
     let (landing, items) = mpsc::unbounded_channel();
     let (acks, landed) = mpsc::unbounded_channel();
@@ -1617,10 +1738,13 @@ pub(crate) fn spawn<T: Transport, S: Service>(
     connections.walks(Pulls(commands.clone()));
     let task = Task {
         connections,
+        snapshots: snapshots.clone(),
         walks,
         commands: Pulls(commands.clone()),
         landing,
         done,
+        incoming: HashMap::new(),
+        next_stream: 0,
     };
     tokio::spawn(task.run(snapshots, events, commanded, landed));
     (Pulls(commands), reports)
@@ -1628,20 +1752,33 @@ pub(crate) fn spawn<T: Transport, S: Service>(
 
 struct Task<T: Transport, S> {
     connections: ConnectionTable<T, S>,
+    snapshots: watch::Receiver<Option<Arc<StoreSnapshot>>>,
     walks: Walks,
-    /// Where dials and fetches report back.
-    commands: Pulls<T::Conn>,
-    landing: mpsc::UnboundedSender<(WalkRef, Vec<NetEvent>)>,
+    /// Where dials, fetches and incoming streams report back.
+    commands: Pulls,
+    landing: mpsc::UnboundedSender<(LandKey, Vec<NetEvent>)>,
     done: mpsc::UnboundedSender<PullDone>,
+    /// Incoming walk streams being received, by peer, collection and kind.
+    incoming: HashMap<PullKey, Receiving>,
+    next_stream: u64,
+}
+
+/// An incoming walk stream's driver, as the task reaches it.
+struct Receiving {
+    id: u64,
+    /// Its landing acknowledgements.
+    acks: mpsc::UnboundedSender<(u64, u64)>,
+    /// Dropped to replace it: the driver resets the stream.
+    _replace: oneshot::Sender<()>,
 }
 
 impl<T: Transport, S: Service> Task<T, S> {
     async fn run(
         mut self,
-        mut snapshots: tokio::sync::watch::Receiver<Option<Arc<StoreSnapshot>>>,
+        mut snapshots: watch::Receiver<Option<Arc<StoreSnapshot>>>,
         mut events: mpsc::Receiver<ReconEvent>,
-        mut commands: mpsc::UnboundedReceiver<Command<T::Conn>>,
-        mut landed: mpsc::UnboundedReceiver<Landed<WalkRef>>,
+        mut commands: mpsc::UnboundedReceiver<Command>,
+        mut landed: mpsc::UnboundedReceiver<Landed<LandKey>>,
     ) {
         let mut tick = tokio::time::interval(WALK_TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1668,9 +1805,16 @@ impl<T: Transport, S: Service> Task<T, S> {
                     _ => {}
                 },
                 Some(command) = commands.recv() => self.command(command),
-                Some(ack) = landed.recv() => {
-                    self.walks.landed(ack.key, ack.landed, ack.failed, crate::clock::mono_now());
-                }
+                Some(ack) = landed.recv() => match ack.key {
+                    LandKey::Pull(walk) => {
+                        self.walks.landed(walk, ack.landed, ack.failed, crate::clock::mono_now());
+                    }
+                    LandKey::Stream(id) => {
+                        if let Some(receiving) = self.incoming.values().find(|receiving| receiving.id == id) {
+                            let _ = receiving.acks.send((ack.landed, ack.failed));
+                        }
+                    }
+                },
                 _ = tick.tick() => self.walks.expire(crate::clock::mono_now()),
             }
             for output in self.walks.take() {
@@ -1679,7 +1823,7 @@ impl<T: Transport, S: Service> Task<T, S> {
         }
     }
 
-    fn command(&mut self, command: Command<T::Conn>) {
+    fn command(&mut self, command: Command) {
         let now = crate::clock::mono_now();
         match command {
             Command::Start {
@@ -1717,7 +1861,6 @@ impl<T: Transport, S: Service> Task<T, S> {
                 proof,
                 blob,
             } => self.walks.fetched(walk, handle, proof, blob, now),
-            // Nothing serves a pushed walk yet; the stream is reset.
             Command::Incoming {
                 peer,
                 collection,
@@ -1725,15 +1868,40 @@ impl<T: Transport, S: Service> Task<T, S> {
                 mut send,
                 mut recv,
             } => {
-                debug!(
-                    peer = %hex::encode(&peer[..4]),
-                    collection = %hex::encode(&collection.raw[..4]),
-                    ?kind,
-                    "a walk/1 stream arrived; pushes are not served yet"
+                let admitted = self
+                    .walks
+                    .local(collection)
+                    .is_some_and(|live| self.walks.receives(peer, &live));
+                let Some(receive) = Receive::on_open(peer, collection, kind, admitted) else {
+                    send.reset(RESET_WALK_REFUSED);
+                    recv.stop(RESET_WALK_REFUSED);
+                    return;
+                };
+                let id = self.next_stream;
+                self.next_stream += 1;
+                let (acks, acked) = mpsc::unbounded_channel();
+                let (replace, replaced) = oneshot::channel();
+                // A second push of the same tree from the peer replaces the
+                // first, whose driver resets it.
+                self.incoming.insert(
+                    (peer, collection.raw, kind),
+                    Receiving {
+                        id,
+                        acks,
+                        _replace: replace,
+                    },
                 );
-                send.reset(RESET_WALK_FAILED);
-                recv.stop(RESET_WALK_FAILED);
+                let driver = Driver {
+                    connections: self.connections.clone(),
+                    snapshots: self.snapshots.clone(),
+                    landing: self.landing.clone(),
+                    commands: self.commands.0.clone(),
+                    id,
+                    peer,
+                };
+                tokio::spawn(receive_stream(driver, receive, send, recv, acked, replaced));
             }
+            Command::Received { id } => self.incoming.retain(|_, receiving| receiving.id != id),
         }
     }
 
@@ -1747,7 +1915,7 @@ impl<T: Transport, S: Service> Task<T, S> {
     fn output(&self, output: Output) {
         match output {
             Output::Land(walk, events) => {
-                let _ = self.landing.send((walk, events));
+                let _ = self.landing.send((LandKey::Pull(walk), events));
             }
             Output::Done(done) => {
                 let _ = self.done.send(done);
@@ -1757,27 +1925,10 @@ impl<T: Transport, S: Service> Task<T, S> {
                 handle,
                 proof,
             } => {
-                // A descriptor is metadata; a held reference may be any blob.
-                let limit = if proof.is_some() {
-                    METADATA_BLOB_BYTES
-                } else {
-                    MAX_EXACT_BLOB_BYTES
-                };
                 let connections = self.connections.clone();
                 let commands = self.commands.0.clone();
                 tokio::spawn(async move {
-                    let fetch = async {
-                        let connection = connections.current(walk.peer)?;
-                        let local = connections.transport().local_id();
-                        op_get_blob_with_limit(&connection, local, &handle, limit)
-                            .await
-                            .ok()
-                            .flatten()
-                    };
-                    let blob = tokio::time::timeout(WALK_DEADLINE, fetch)
-                        .await
-                        .ok()
-                        .flatten();
+                    let blob = fetch_blob(connections, walk.peer, handle, proof.is_some()).await;
                     let _ = commands.send(Command::Fetched {
                         walk,
                         handle,
@@ -1786,6 +1937,145 @@ impl<T: Transport, S: Service> Task<T, S> {
                     });
                 });
             }
+        }
+    }
+}
+
+/// Fetch `handle` from `peer` within [`WALK_DEADLINE`]: a `descriptor` is
+/// metadata, a held reference may be any blob.
+async fn fetch_blob<T: Transport, S: Service>(
+    connections: ConnectionTable<T, S>,
+    peer: PeerId,
+    handle: RawHash,
+    descriptor: bool,
+) -> Option<Blob<UnknownBlob>> {
+    let limit = if descriptor {
+        METADATA_BLOB_BYTES
+    } else {
+        MAX_EXACT_BLOB_BYTES
+    };
+    let fetch = async {
+        let connection = connections.current(peer)?;
+        let local = connections.transport().local_id();
+        op_get_blob_with_limit(&connection, local, &handle, limit)
+            .await
+            .ok()
+            .flatten()
+    };
+    tokio::time::timeout(WALK_DEADLINE, fetch)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// What one incoming walk stream's driver holds of the task.
+struct Driver<T: Transport, S> {
+    connections: ConnectionTable<T, S>,
+    snapshots: watch::Receiver<Option<Arc<StoreSnapshot>>>,
+    landing: mpsc::UnboundedSender<(LandKey, Vec<NetEvent>)>,
+    commands: mpsc::UnboundedSender<Command>,
+    id: u64,
+    peer: PeerId,
+}
+
+/// A blob fetch's result, as a driver hears it.
+type Fetched = (RawHash, Option<CapabilityProof>, Option<Blob<UnknownBlob>>);
+
+/// Drive one incoming walk stream: feed its frames, while the receive wants
+/// them, and what landing and blob fetches report to the [`Receive`], write
+/// what it sends, and end the stream as the push did: finished after
+/// `Landed`, reset otherwise. A stream whose push makes no progress for
+/// [`WALK_DEADLINE`] is reset too.
+async fn receive_stream<T: Transport, S: Service>(
+    driver: Driver<T, S>,
+    mut receive: Receive,
+    mut send: Box<dyn SendStream>,
+    recv: Box<dyn RecvStream>,
+    mut acked: mpsc::UnboundedReceiver<(u64, u64)>,
+    mut replaced: oneshot::Receiver<()>,
+) {
+    let (frames, mut framed) = mpsc::channel(1);
+    let reader = tokio::spawn(read_stream(recv, frames));
+    let (fetches, mut fetched) = mpsc::unbounded_channel::<Fetched>();
+    let outcome = 'drive: loop {
+        if let Some(outcome) = receive.outcome() {
+            break Some(outcome);
+        }
+        let outs = tokio::select! {
+            frame = framed.recv(), if receive.want_read() => match frame {
+                Some(Some(frame)) => receive.on_frame(frame, driver.snapshots.borrow().clone()),
+                Some(None) | None => break None,
+            },
+            Some((landed, failed)) = acked.recv() => receive.on_landed_ack(landed, failed),
+            Some((handle, proof, blob)) = fetched.recv() => receive.on_fetched(handle, proof, blob),
+            _ = &mut replaced => break None,
+            else => break None,
+        };
+        for out in outs {
+            match out {
+                Out::Send(frame) => {
+                    let (kind, payload) = frame.encode();
+                    if write_frame(&mut send, kind, &payload).await.is_err() {
+                        break 'drive None;
+                    }
+                }
+                Out::Land(events) => {
+                    let _ = driver.landing.send((LandKey::Stream(driver.id), events));
+                }
+                Out::Fetch { handle, proof } => {
+                    let connections = driver.connections.clone();
+                    let fetches = fetches.clone();
+                    let peer = driver.peer;
+                    tokio::spawn(async move {
+                        let blob = fetch_blob(connections, peer, handle, proof.is_some()).await;
+                        let _ = fetches.send((handle, proof, blob));
+                    });
+                }
+            }
+        }
+    };
+    reader.abort();
+    match outcome {
+        Some(receive::Outcome::Landed) => {
+            let _ = send.shutdown().await;
+        }
+        Some(receive::Outcome::Failed(failure)) => {
+            debug!(?failure, "walk/1 push failed");
+            send.reset(RESET_WALK_FAILED);
+        }
+        None => send.reset(RESET_WALK_FAILED),
+    }
+    let _ = driver.commands.send(Command::Received { id: driver.id });
+}
+
+/// Read a walk stream's frames to `frames`, one ahead of the driver, so no
+/// frame is left half read when the driver turns to something else;
+/// `None` ends it: the stream ended, failed, carried a malformed frame, or
+/// went [`WALK_DEADLINE`] without one.
+async fn read_stream(mut recv: Box<dyn RecvStream>, frames: mpsc::Sender<Option<StreamFrame>>) {
+    loop {
+        let frame = match tokio::time::timeout(WALK_DEADLINE, read_frame(&mut recv)).await {
+            Ok(Ok(Some((kind, payload)))) => match StreamFrame::decode(kind, &payload) {
+                Ok(Some(frame)) => Some(frame),
+                Ok(None) => continue,
+                Err(Malformed(violation)) => {
+                    debug!(violation, "malformed walk/1 frame");
+                    None
+                }
+            },
+            Ok(Ok(None)) => None,
+            Ok(Err(error)) => {
+                debug!(?error, "walk/1 stream failed");
+                None
+            }
+            Err(_) => {
+                debug!("walk/1 stream deadline exceeded");
+                None
+            }
+        };
+        let ended = frame.is_none();
+        if frames.send(frame).await.is_err() || ended {
+            return;
         }
     }
 }
@@ -2045,6 +2335,10 @@ pub(crate) mod tests {
                 self.walks.snapshot.as_deref().unwrap()
             }
 
+            pub(crate) fn snapshot(&self) -> Arc<StoreSnapshot> {
+                self.walks.snapshot.clone().unwrap()
+            }
+
             pub(crate) fn records(
                 &mut self,
                 collection: CollectionHandle,
@@ -2086,33 +2380,37 @@ pub(crate) mod tests {
                 }
             }
 
+            /// Insert each event; how many landed and how many failed.
+            pub(crate) fn insert(&mut self, events: Vec<NetEvent>) -> (u64, u64) {
+                let (mut landed, mut failed) = (0, 0);
+                for event in events {
+                    let ok = match event {
+                        NetEvent::CollectionRecord(record) => self.store.insert(record).is_ok(),
+                        NetEvent::CapabilityProof(proof) => self.store.insert_proof(proof).is_ok(),
+                        NetEvent::Blob(blob) => self.store.put::<UnknownBlob, _>(blob).is_ok(),
+                        NetEvent::Held { collection, handle } => {
+                            self.store.note_held(
+                                collection,
+                                triblespace_core::inline::Inline::new(handle),
+                            );
+                            true
+                        }
+                    };
+                    if ok {
+                        landed += 1;
+                    } else {
+                        failed += 1;
+                    }
+                }
+                (landed, failed)
+            }
+
             /// Insert, publish once and acknowledge each walk, as the
             /// landing task does.
             pub(crate) fn land(&mut self, lands: Vec<(WalkRef, Vec<NetEvent>)>, now: Mono) {
                 let mut acks = Vec::new();
                 for (walk, events) in lands {
-                    let (mut landed, mut failed) = (0, 0);
-                    for event in events {
-                        let ok = match event {
-                            NetEvent::CollectionRecord(record) => self.store.insert(record).is_ok(),
-                            NetEvent::CapabilityProof(proof) => {
-                                self.store.insert_proof(proof).is_ok()
-                            }
-                            NetEvent::Blob(blob) => self.store.put::<UnknownBlob, _>(blob).is_ok(),
-                            NetEvent::Held { collection, handle } => {
-                                self.store.note_held(
-                                    collection,
-                                    triblespace_core::inline::Inline::new(handle),
-                                );
-                                true
-                            }
-                        };
-                        if ok {
-                            landed += 1;
-                        } else {
-                            failed += 1;
-                        }
-                    }
+                    let (landed, failed) = self.insert(events);
                     acks.push((walk, landed, failed));
                 }
                 if acks.is_empty() {
@@ -2802,6 +3100,364 @@ pub(crate) mod tests {
                     .heard(responder.id(), collection, announced[0], false, now)
                     .is_empty()
             );
+        }
+    }
+
+    /// Incoming walk streams driven through the walk task: a scripted
+    /// sender pushes over a duplex pipe, and the task admits, receives,
+    /// lands through the landing task, and ends the stream.
+    #[cfg(feature = "sim")]
+    mod receiving {
+        use super::walking::{Node, open};
+        use super::*;
+
+        use std::collections::BTreeSet;
+        use std::io;
+        use std::pin::Pin;
+        use std::sync::Mutex;
+        use std::task::{Context, Poll};
+
+        use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf, ReadHalf, WriteHalf};
+        use triblespace_core::collection::{
+            AdmissionPolicy, CollectionPolicy, CollectionRecord, CollectionStore,
+        };
+
+        use crate::landing::Land;
+        use crate::transport::sim::{SimConfig, SimNet};
+        use crate::walk_stream::held;
+
+        #[derive(Clone)]
+        struct NoRequests;
+
+        impl Service for NoRequests {
+            async fn serve<W, R>(
+                &self,
+                _peer: PeerId,
+                _tag: u8,
+                _send: &mut W,
+                _recv: &mut R,
+            ) -> anyhow::Result<()>
+            where
+                W: SendStream,
+                R: RecvStream,
+            {
+                anyhow::bail!("no request streams here")
+            }
+        }
+
+        /// The halves of a duplex pipe as stream halves; a reset or stop is
+        /// noted, not carried.
+        struct Tx(WriteHalf<DuplexStream>, Arc<Mutex<Option<u32>>>);
+        struct Rx(ReadHalf<DuplexStream>, Arc<Mutex<Option<u32>>>);
+
+        impl AsyncWrite for Tx {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Pin::new(&mut self.0).poll_write(cx, buf)
+            }
+
+            fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.0).poll_flush(cx)
+            }
+
+            fn poll_shutdown(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.0).poll_shutdown(cx)
+            }
+        }
+
+        impl SendStream for Tx {
+            fn reset(&mut self, code: u32) {
+                *self.1.lock().unwrap() = Some(code);
+            }
+        }
+
+        impl AsyncRead for Rx {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.0).poll_read(cx, buf)
+            }
+        }
+
+        impl RecvStream for Rx {
+            fn stop(&mut self, code: u32) {
+                *self.1.lock().unwrap() = Some(code);
+            }
+        }
+
+        /// The receiving node as the landing task's store side: inserts,
+        /// then publishes the next serving snapshot.
+        struct Lander {
+            node: Mutex<Node>,
+            snapshots: watch::Sender<Option<Arc<StoreSnapshot>>>,
+        }
+
+        impl Land for Lander {
+            fn land(&self, events: Vec<NetEvent>) -> Vec<bool> {
+                let mut node = self.node.lock().unwrap();
+                let landed = events
+                    .into_iter()
+                    .map(|event| node.insert(vec![event]) == (1, 0))
+                    .collect();
+                node.observe();
+                self.snapshots.send_replace(Some(node.snapshot()));
+                landed
+            }
+
+            fn reobserve(&self) {}
+        }
+
+        /// A receiving node behind a running walk task, and a stream opened
+        /// to it.
+        struct Receiving {
+            lander: Arc<Lander>,
+            pulls: Pulls,
+        }
+
+        impl Receiving {
+            fn new(receiver: Node, seed: u64) -> Self {
+                let harness = SimNet::new(seed, SimConfig::default()).join(&receiver.key);
+                let connections = ConnectionTable::new(harness.transport, NoRequests);
+                let (snapshots, snapshot) = watch::channel(Some(receiver.snapshot()));
+                let walks = Walks::new(receiver.health.clone());
+                let (_, events) = mpsc::channel(WALK_EVENTS);
+                let lander = Arc::new(Lander {
+                    node: Mutex::new(receiver),
+                    snapshots,
+                });
+                let (slot, lands) = watch::channel(Some(lander.clone() as Arc<dyn Land>));
+                std::mem::forget(slot);
+                let (pulls, _) = spawn(connections, snapshot, walks, events, lands);
+                Self { lander, pulls }
+            }
+
+            /// Open a stream for C's records from `peer`; the opener's
+            /// halves, and where the receiver's reset of it is noted.
+            fn open(
+                &self,
+                peer: PeerId,
+                collection: CollectionHandle,
+            ) -> (
+                WriteHalf<DuplexStream>,
+                ReadHalf<DuplexStream>,
+                Arc<Mutex<Option<u32>>>,
+            ) {
+                let (opener, acceptor) = tokio::io::duplex(1 << 20);
+                let (recv, send) = tokio::io::split(acceptor);
+                let reset = Arc::new(Mutex::new(None));
+                self.pulls.incoming(
+                    peer,
+                    collection,
+                    WalkKind::Records,
+                    Box::new(Tx(send, reset.clone())),
+                    Box::new(Rx(recv, reset.clone())),
+                );
+                let (from, to) = tokio::io::split(opener);
+                (to, from, reset)
+            }
+
+            fn records(&self, collection: CollectionHandle) -> BTreeSet<CollectionRecord> {
+                self.lander.node.lock().unwrap().records(collection)
+            }
+        }
+
+        async fn write(send: &mut WriteHalf<DuplexStream>, frame: StreamFrame) {
+            let (kind, payload) = frame.encode();
+            write_frame(send, kind, &payload).await.unwrap();
+        }
+
+        async fn read(recv: &mut ReadHalf<DuplexStream>) -> Option<StreamFrame> {
+            let (kind, payload) = read_frame(recv).await.ok()??;
+            StreamFrame::decode(kind, &payload).unwrap()
+        }
+
+        /// Wait for the receiver to reset or stop the stream.
+        async fn reset(reset: &Mutex<Option<u32>>) -> Option<u32> {
+            for _ in 0..500 {
+                if let Some(code) = *reset.lock().unwrap() {
+                    return Some(code);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            None
+        }
+
+        /// Push `sender`'s records of C over the stream as a sender does,
+        /// skipping what each reply says is held and answering value
+        /// requests, until the receiver says everything landed or ends the
+        /// stream. Returns whether it landed.
+        async fn push(
+            sender: &Node,
+            collection: CollectionHandle,
+            send: &mut WriteHalf<DuplexStream>,
+            recv: &mut ReadHalf<DuplexStream>,
+        ) -> bool {
+            let kind = WalkKind::Records;
+            let overlay = sender.serving().collection(collection).unwrap();
+            let overlay = overlay.repair();
+            let value = |key| {
+                let record = overlay
+                    .records()
+                    .get(CollectionRecordFingerprint::from_raw(key))
+                    .unwrap();
+                StreamFrame::Value {
+                    key,
+                    bytes: encode_record(collection, record).unwrap(),
+                }
+            };
+            write(
+                send,
+                StreamFrame::Root {
+                    summary: summary(kind, overlay),
+                },
+            )
+            .await;
+            let mut stack = vec![Vec::new()];
+            while let Some(prefix) = stack.pop() {
+                match node(kind, overlay, &prefix).unwrap() {
+                    PatchNode::Leaf { leaf, .. } => {
+                        let key = <[u8; 32]>::try_from(leaf.key).unwrap();
+                        write(send, StreamFrame::Leaf { key }).await;
+                    }
+                    pushed @ PatchNode::Branch { .. } => {
+                        let PatchNode::Branch { branch, .. } = pushed.clone() else {
+                            unreachable!()
+                        };
+                        write(
+                            send,
+                            StreamFrame::Node {
+                                prefix: prefix.clone(),
+                                node: pushed,
+                            },
+                        )
+                        .await;
+                        let children = loop {
+                            match read(recv).await {
+                                Some(StreamFrame::Held {
+                                    prefix: p,
+                                    children,
+                                }) if p == prefix => {
+                                    break children;
+                                }
+                                Some(StreamFrame::ValueRequest { key }) => {
+                                    write(send, value(key)).await;
+                                }
+                                other => panic!("waiting for a reply: {other:?}"),
+                            }
+                        };
+                        let end = usize::from(branch.end_depth);
+                        for child in branch.children.iter().rev() {
+                            if !held(&children, child.edge) {
+                                let mut locator = branch.representative[..end].to_vec();
+                                locator.push(child.edge);
+                                stack.push(locator);
+                            }
+                        }
+                    }
+                }
+            }
+            write(send, StreamFrame::Done).await;
+            loop {
+                match read(recv).await {
+                    Some(StreamFrame::Landed) => return true,
+                    Some(StreamFrame::ValueRequest { key }) => write(send, value(key)).await,
+                    Some(StreamFrame::Held { .. }) => {}
+                    Some(other) => panic!("waiting for Landed: {other:?}"),
+                    None => return false,
+                }
+            }
+        }
+
+        /// A push from an admitted peer lands through the landing task and
+        /// ends with Landed and a finished stream; one from a peer the
+        /// receiver does not receive from is refused.
+        #[tokio::test]
+        async fn an_incoming_stream_lands_through_the_task_or_is_refused() {
+            let mut sender = Node::new(50);
+            let mut receiver = Node::new(51);
+            let collection = sender.hold("stream", open());
+            receiver.hold("stream", open());
+            let owner = Node::new(52);
+            let private = CollectionPolicy::new(
+                AdmissionPolicy::direct(owner.key.verifying_key()),
+                AdmissionPolicy::direct(owner.key.verifying_key()),
+            );
+            let refused = sender.hold("refused", private.clone());
+            receiver.hold("refused", private);
+            let records = (0..200)
+                .map(|data| sender.commit(collection, data))
+                .collect::<BTreeSet<_>>();
+            for record in records.iter().take(50) {
+                receiver.store.insert(*record).unwrap();
+            }
+            sender.observe();
+            receiver.observe();
+            let receiving = Receiving::new(receiver, 1);
+
+            let (mut send, mut recv, landed) = receiving.open(sender.id(), collection);
+            assert!(push(&sender, collection, &mut send, &mut recv).await);
+            assert!(read(&mut recv).await.is_none(), "the stream finished");
+            assert_eq!(*landed.lock().unwrap(), None);
+            assert_eq!(receiving.records(collection), records);
+
+            // A second push of the same tree is answered at the root.
+            let (mut send, mut recv, _) = receiving.open(sender.id(), collection);
+            assert!(push(&sender, collection, &mut send, &mut recv).await);
+
+            let (_send, _recv, refusal) = receiving.open(sender.id(), refused);
+            assert_eq!(reset(&refusal).await, Some(RESET_WALK_REFUSED));
+        }
+
+        /// A second stream from the peer for the same tree replaces the
+        /// first, which is reset; a push that omits a leaf is reset too.
+        #[tokio::test]
+        async fn a_replaced_or_failed_stream_is_reset() {
+            let mut sender = Node::new(53);
+            let mut receiver = Node::new(54);
+            let collection = sender.hold("replaced", open());
+            receiver.hold("replaced", open());
+            let records = (0..20)
+                .map(|data| sender.commit(collection, data))
+                .collect::<Vec<_>>();
+            sender.observe();
+            receiver.observe();
+            let receiving = Receiving::new(receiver, 2);
+            let overlay = sender.serving().collection(collection).unwrap();
+            let root = summary(WalkKind::Records, overlay.repair());
+
+            let (mut first, _first_recv, first_reset) = receiving.open(sender.id(), collection);
+            write(&mut first, StreamFrame::Root { summary: root }).await;
+            let (mut second, mut second_recv, second_reset) =
+                receiving.open(sender.id(), collection);
+            assert_eq!(reset(&first_reset).await, Some(RESET_WALK_FAILED));
+
+            // The second pushes every leaf but one.
+            write(&mut second, StreamFrame::Root { summary: root }).await;
+            for record in &records[1..] {
+                write(
+                    &mut second,
+                    StreamFrame::Leaf {
+                        key: record.fingerprint().raw(),
+                    },
+                )
+                .await;
+            }
+            write(&mut second, StreamFrame::Done).await;
+            assert_eq!(reset(&second_reset).await, Some(RESET_WALK_FAILED));
+            // Its value requests went out before the end failed it.
+            let mut requested = 0;
+            while let Some(StreamFrame::ValueRequest { .. }) = read(&mut second_recv).await {
+                requested += 1;
+            }
+            assert_eq!(requested, 19);
         }
     }
 }

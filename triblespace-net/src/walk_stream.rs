@@ -319,10 +319,7 @@ mod tests {
         expected[31] = 0b1000_0000;
         assert_eq!(children, expected);
         assert!(!held(&children, 10) && !held(&children, 254));
-        assert_eq!(
-            (0..=255).filter(|edge| held(&children, *edge)).count(),
-            5
-        );
+        assert_eq!((0..=255).filter(|edge| held(&children, *edge)).count(), 5);
         let payload = roundtrip(Frame::Held {
             prefix: vec![1, 2, 3],
             children,
